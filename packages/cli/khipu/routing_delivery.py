@@ -570,7 +570,9 @@ def _render(state, out, now, component, *, delivery_point=True):
         per_page = page_limit - _size(tail) - 2  # later prompts page at the page limit
 
         def _halved(e):
-            return e["entity"].startswith("rule:") or e["entity"] == "priority"
+            # State lines already reserve their share. Priority pages can use
+            # everything they leave; a second half-cap wastes that spare room.
+            return e["entity"].startswith("rule:")
 
         def _parts(e):
             label = _header_label(e["label"])
@@ -661,6 +663,7 @@ def _render(state, out, now, component, *, delivery_point=True):
 
         plan_items = out["delivery_plan"]["items"]
 
+        account_lines = {}
         lines_room = min(cap // 2, room_all - hard)
         for line, owner in list(zip(plain_lines, owners))[1:]:
             if not line.strip() or line.endswith(":") or line.startswith(tail[:-1]):
@@ -671,9 +674,21 @@ def _render(state, out, now, component, *, delivery_point=True):
                 continue
             body.append(line)
             used += _size(line) + 1
+            if owner is not None and plan_items[owner]["entity"].startswith("account:"):
+                account_lines.setdefault(plan_items[owner]["entity"], []).append(line)
         for e in order:
             if e["whole"]:
                 break
+            forecast = out["delivery_plan"].get("pace_forecasts", {}).get(e["entity"])
+            # The producer-owned account line may already contain this exact
+            # forecast. Share its receipt, but never infer an owner from words
+            # or acknowledge a clipped/omitted forecast.
+            if forecast and any(e["text"] in line for line in
+                                account_lines.get("account:" + forecast["account"], [])):
+                placed[e["entity"]] = (None, len(e["text"]), None)
+                if e is head:
+                    hard = 0
+                continue
             if e is head:
                 got, hard = _place(e, room_all - used), 0
             elif e.get("offset") or e.get("restarted"):
@@ -705,7 +720,8 @@ def _render(state, out, now, component, *, delivery_point=True):
                 item["page"] = page
             selected.append(item)
             progress[e["entity"]] = end
-            body.append(rendered)
+            if rendered is not None:
+                body.append(rendered)
         left = any(progress.get(e["entity"], e.get("offset", 0)) < len(e["text"]) for e in due)
         if left:
             body.append(tail)

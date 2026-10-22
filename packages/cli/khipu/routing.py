@@ -4573,10 +4573,14 @@ def _check_evidence(account: str, row: dict) -> tuple[list[dict], list[datetime]
     Every saturated window with a reset is retained. Model windows never
     erase a simultaneous whole-account window, and vendor prose is ignored.
     """
+    from khipu import usage
+
     windows = row.get("windows") if isinstance(row.get("windows"), list) else []
     usable = [w for w in windows if isinstance(w, dict)
               and isinstance(w.get("used_pct"), (int, float)) and not isinstance(w.get("used_pct"), bool)]
-    limits = [w for w in usable if w["used_pct"] >= 100 and _parse(w.get("resets_at")) is not None]
+    stored = row.get("source") in ("rollout", "last_observed")
+    limits = [w for w in usable if w["used_pct"] >= 100 and _parse(w.get("resets_at")) is not None
+              and (not stored or usage._figures_time(row, w) is not None)]
     # Within one scope the last line is the limit that lasts longest. The fold
     # therefore keeps the account closed until every saturated window resets.
     limits.sort(key=lambda w: ((str(w.get("model") or "").casefold()), _parse(w["resets_at"])))
@@ -4592,18 +4596,19 @@ def _check_evidence(account: str, row: dict) -> tuple[list[dict], list[datetime]
     whole_limits = sorted(_parse(w["resets_at"]) for w in limits
                           if not (isinstance(w.get("model"), str) and w["model"])
                           and _parse(w.get("resets_at")) is not None)
-    headroom = bool(row.get("ok") and whole and all(w["used_pct"] < 100 for w in whole))
+    headroom = bool(row.get("ok") and whole and all(w["used_pct"] < 100
+                    and (not stored or usage._figures_time(row, w) is not None) for w in whole))
     if headroom:
         # Write this before model limits: the whole account is open while the
         # named models remain closed.
         events.insert(0, {"type": "evidence", "source": "check", "account": account, "state": OPEN,
                           "basis": "checked", "written_by": _check_author(), "via": "check"})
     for event in events:
-        witness = _parse(row.get("observed_at") or row.get("probed_at"))
+        witness = usage._figures_time(row)
         if event["state"] == LIMITED:
             window = next((w for w in limits if w.get("name") == event.get("window")
                            and (w.get("model") or "all") == event.get("scope", "all")), {})
-            witness = _parse(window.get("observed_at")) or witness
+            witness = usage._figures_time(row, window)
         if witness is not None:
             event["witness_at"] = _iso(witness)
     return events, whole_limits, headroom
@@ -5374,7 +5379,7 @@ def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -
             used = w.get("used_pct")
             if isinstance(used, bool) or not isinstance(used, (int, float)):
                 continue
-            witness = _parse(w.get("observed_at") or row.get("observed_at") or row.get("probed_at"))
+            witness = usage._figures_time(row, w)
             if witness is None or witness > now:
                 continue
             candidate = {"window": w["name"], "t": witness, "used": used,
@@ -5759,9 +5764,36 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
                 streams = _telemetry_streams(view)
             total = routing_sources.spend_total(streams, entry["key"],
                                                 now - timedelta(days=cap["days"]), now)
+            extra = {}
+            spend_verdict = None
+            if entry.get("harness") == "deepseek":
+                # A runner covers its own stream, not the whole prepaid
+                # account. Both sources prove lower bounds: take their max,
+                # never their sum, and never infer under-cap spending.
+                from decimal import Decimal
+                from khipu import usage
+
+                floor = usage.deepseek_spend_total(now, cap["days"], cap["usd"],
+                                                   definitions=view.get("definitions"))
+                if total.get("status") == "known" and total.get("usd") is not None:
+                    runner_floor = Decimal(str(total["usd"]))
+                    balance_floor = Decimal(floor.get("floor_usd") or "0")
+                    reason = (floor.get("reason") or "").split("; at least $")[0]
+                    floor = usage._deepseek_floor_total(
+                        {**floor, "reason": f"{reason}; runner telemetry cannot rule out other account spending",
+                         "events": total.get("events"), "partial": True},
+                        max(balance_floor, runner_floor), cap["usd"])
+                total = floor
+                spend_verdict = total.get("verdict", "unknown")
+                # Known only once the floor alone reaches the cap; below it the
+                # floor is shown, never a used share a top-up could be hiding.
+                extra["used_pct"] = (round(total["usd"] / cap["usd"] * 100, 1)
+                                     if total.get("status") == "known" and total.get("usd") is not None else None)
+                extra["at_least_usd"] = total.get("at_least_usd")
+                extra["partial"] = total.get("partial")
             out.append({**base, "cap_usd": cap.get("usd"), "days": cap.get("days"),
-                        "usd": total.get("usd"), "events": total.get("events"),
-                        "verdict": routing_pace.spend_verdict(total, cap["usd"]),
+                        "usd": total.get("usd"), "events": total.get("events"), **extra,
+                        "verdict": spend_verdict or routing_pace.spend_verdict(total, cap["usd"]),
                         "why": total.get("reason")})
         elif kind == "concurrency":
             if streams is None:
@@ -7416,7 +7448,7 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
     fact = {"readable": True, "window": usage._window_words(window), "used_pct": used, "left_pct": left,
             "resets_at": _iso(resets), "seconds": int(seconds), "pace_pct_per_hour": round(pace, 3),
             "hurry": left > 0 and pace >= even * PACE_HURRY, "words": words}
-    figures_at = _parse(row.get("observed_at") or row.get("probed_at"))
+    figures_at = usage._figures_time(row, window)
     if kept_failure:
         # A provider can return figures older than the probe that fetched them: their own time wins.
         figures_at = _parse(row.get("observed_at")) or _parse(row.get("last_good_at")) or figures_at

@@ -240,6 +240,7 @@ PATH_SETTINGS: dict[str, tuple[str, ...]] = {
     "openrouter_key_file": ("KHIPU_OPENROUTER_KEY_FILE",),
     # z.ai GLM Coding Plan key (a file holding only the key), read for plan usage
     "glm_key_file": ("KHIPU_GLM_KEY_FILE",),
+    "deepseek_key_file": ("KHIPU_DEEPSEEK_KEY_FILE",),
 }
 
 

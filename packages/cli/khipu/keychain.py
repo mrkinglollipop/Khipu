@@ -17,6 +17,7 @@ ANTHROPIC_ACCOUNT = "anthropic_api_key"
 OPENAI_ACCOUNT = "openai_api_key"
 OPENROUTER_ACCOUNT = "openrouter_api_key"
 GLM_ACCOUNT = "glm_api_key"
+DEEPSEEK_ACCOUNT = "deepseek_api_key"
 OPENAI_COMPAT_ACCOUNT = "openai_compat_api_key"
 VOYAGE_ACCOUNT = "voyage_api_key"
 CONFIG_DIR = Path.home() / ".config" / "khipu"
@@ -264,6 +265,10 @@ def set_glm_key(key: str) -> None:
     set_password(GLM_ACCOUNT, key.strip())
 
 
+def get_deepseek_key() -> str | None:
+    return get_password(DEEPSEEK_ACCOUNT)
+
+
 def _resolve_provider_key(provider: str, *, key_file: Path | None = None) -> str:
     from khipu.config import path_setting
 
@@ -307,6 +312,59 @@ def resolve_glm_key(*, key_file: Path | None = None) -> str:
     """The z.ai GLM Coding Plan key: env GLM_API_KEY, Keychain ``glm_api_key``,
     then the file named by the ``glm_key_file`` setting."""
     return _resolve_provider_key("glm", key_file=key_file)
+
+
+def read_owner_only_key_file(path: Path) -> str | None:
+    """A key file's text, or None. The file is opened without following a
+    symlink and must be a regular file this user owns that no group or other
+    user can read or write, so a planted link or a shared file can never
+    become an Authorization header."""
+    import stat
+    from khipu.paths import open_trusted_directory
+
+    try:
+        parent_fd = open_trusted_directory(path.parent)
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            return None
+        raw = os.read(fd, 4097)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(raw) > 4096:
+        return None
+    try:
+        return raw.decode("utf-8").strip() or None
+    except UnicodeError:
+        return None
+
+
+def resolve_deepseek_key(*, key_file: Path | None = None) -> str:
+    """The DeepSeek API key: env DEEPSEEK_API_KEY, Keychain ``deepseek_api_key``,
+    then the file named by the ``deepseek_key_file`` setting, read only if it
+    is an owner-only regular file (``read_owner_only_key_file``)."""
+    from khipu.config import path_setting
+
+    env = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if env:
+        return env
+    key = get_deepseek_key()
+    if key:
+        return key
+    path = key_file or path_setting("deepseek_key_file")
+    key = read_owner_only_key_file(path) if path is not None else None
+    if key:
+        return key
+    raise RuntimeError("No DeepSeek key. Pipe it to `khipu secrets --set deepseek_api_key`, "
+                       "or export DEEPSEEK_API_KEY.")
 
 
 def dsn_file_health(path: Path | None = None) -> dict:
@@ -374,7 +432,7 @@ def secrets_status() -> dict:
     gemini_file = _gemini_key_file()
     voyage_file = _voyage_key_file()
     provider_files = {provider: path_setting(f"{provider}_key_file")
-                      for provider in ("anthropic", "openai", "openrouter", "glm")}
+                      for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")}
     def file_has_key(path):
         try:
             return bool(path and path.is_file() and path.read_text(encoding="utf-8").strip())
@@ -393,12 +451,12 @@ def secrets_status() -> dict:
         "dsn_in_keychain": dsn_in_keychain,
         "gemini_in_keychain": bool(get_gemini_key()),
         **{f"{provider}_in_keychain": bool(get_password(f"{provider}_api_key"))
-           for provider in ("anthropic", "openai", "openrouter", "glm")},
+           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")},
         **{f"{provider}_env": bool((os.environ.get(f"{provider.upper()}_API_KEY") or "").strip())
-           for provider in ("anthropic", "openai", "openrouter", "glm")},
+           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")},
         **{f"{provider}_file_present": bool(provider_files[provider] and
                                             provider_files[provider].is_file())
-           for provider in ("anthropic", "openai", "openrouter", "glm")},
+           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")},
         "openai_compat_in_keychain": bool(get_openai_compat_key()),
         "voyage_in_keychain": bool(get_voyage_key()),
         "voyage_env": bool((os.environ.get("VOYAGE_API_KEY") or "").strip()),
@@ -407,7 +465,7 @@ def secrets_status() -> dict:
         "gemini_file_present": bool(gemini_file and gemini_file.is_file()),
         "gemini_file_key_present": file_has_key(gemini_file),
         **{f"{provider}_file_key_present": file_has_key(provider_files[provider])
-           for provider in ("anthropic", "openai", "openrouter", "glm")},
+           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")},
         "config_dir": str(active_dir),
         "default_config_dir": str(CONFIG_DIR),
         # The file DSN is the fallback every sandboxed harness lands on, so its
