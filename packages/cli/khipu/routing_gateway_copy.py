@@ -143,7 +143,8 @@ class PostgresHub:
         """
         from khipu import db
         identity = _digest(identity)
-        revision = _digest({k: v for k, v in body.items() if k not in {"as_of", "stale", "stale_message"}})
+        revision = _digest({k: v for k, v in body.items()
+                            if k not in {"as_of", "stale", "stale_message", "folded_at"}})
         with db.connect(statement_timeout_s=5) as conn:
             with conn.cursor() as cur:
                 self._prune_delivery(cur, now)

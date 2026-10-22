@@ -185,6 +185,113 @@ def _path(session):
     return recall_prompt._dedup_path("ledger").parent / f"recall--{digest}.routing.json"
 
 
+def _valid_time(value):
+    try:
+        return isinstance(value, str) and _parse(value).tzinfo is not None
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _valid_entry(entity, entry):
+    if not isinstance(entry, dict) or entry.get("entity") != entity:
+        return False
+    if not all(isinstance(entry.get(k), str) for k in ("entity", "text", "revision", "label")):
+        return False
+    if type(entry.get("whole")) is not bool:
+        return False
+    if any(key in entry and type(entry[key]) is not bool for key in
+           ("acked", "visible", "restarted", "removed", "child_owed", "withheld")):
+        return False
+    for key in ("offset", "shown_offset", "pages", "width", "budget", "bound", "owed_point",
+                "owed_chars", "expired"):
+        value = entry.get(key)
+        if key not in entry or (value is None and key in ("shown_offset", "bound")):
+            continue
+        if type(value) is not int or value < 0:
+            return False
+    return all(entry.get(k) is None or entry[k] <= len(entry["text"])
+               for k in ("offset", "shown_offset"))
+
+
+def _valid_flight(flight, entries):
+    if not isinstance(flight, dict) or not _valid_time(flight.get("until")):
+        return False
+    out, progress, plan = flight.get("out"), flight.get("progress"), flight.get("plan")
+    if not isinstance(out, dict) or not isinstance(progress, dict) or not isinstance(plan, dict):
+        return False
+    changes = out.get("routing_changes")
+    if not isinstance(changes, dict) or not all(isinstance(changes.get(k), str) for k in ("batch", "component")):
+        return False
+    items = changes.get("items")
+    if not isinstance(items, list) or not items:
+        return False
+    if any(entity not in entries or type(end) is not int or not 0 <= end <= len(entries[entity]["text"])
+           for entity, end in progress.items()):
+        return False
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("entity"), str):
+            return False
+        entity = item["entity"]
+        entry, end = entries.get(entity), progress.get(entity)
+        if not entry or item.get("revision") != entry["revision"] or type(end) is not int \
+                or not entry.get("offset", 0) <= end <= len(entry["text"]):
+            return False
+        if "text" in item and not isinstance(item["text"], str):
+            return False
+        if changes["component"] == "mcp" and not isinstance(item.get("text"), str):
+            return False
+        page = item.get("page")
+        if page is not None and (not isinstance(page, dict) or
+                                any(type(page.get(k)) is not int or page[k] < 0 for k in ("n", "m"))):
+            return False
+    shown = flight.get("shown")
+    if shown is not None and (not isinstance(shown, dict) or any(
+            entity not in progress or type(end) is not int or not 0 <= end <= progress[entity]
+            for entity, end in shown.items())):
+        return False
+    if any(key in plan and (not isinstance(plan[key], dict) or
+                           any(not isinstance(value, dict) for value in plan[key].values()))
+           for key in ("pace_forecasts", "advice_forecasts")):
+        return False
+    if "max_chars" in plan and (type(plan["max_chars"]) is not int or plan["max_chars"] < 0):
+        return False
+    return (isinstance(plan.get("items"), list) and all(
+        isinstance(item, dict) and _valid_entry(item.get("entity"), item) for item in plan["items"])
+        and all(type(plan.get(k)) is int and plan[k] >= 0 for k in ("limit", "page_limit", "lease"))
+        and isinstance(plan.get("heading"), str))
+
+
+def _ledger_data(data):
+    """Discard damaged receipts and debt, retaining independent valid components."""
+    if not isinstance(data, dict):
+        return {}
+    for component, state in list(data.items()):
+        if not isinstance(state, dict):
+            del data[component]
+            continue
+        if component == "attachment":
+            continue
+        entries = state.get("entries")
+        state["entries"] = {entity: entry for entity, entry in entries.items()
+                            if _valid_entry(entity, entry)} if isinstance(entries, dict) else {}
+        for key in ("batches", "done", "done_shown", "pace_acked", "advice_acked"):
+            values = state.get(key)
+            if key in state:
+                valid = (lambda v: v is True) if key == "batches" else (
+                    (lambda v: isinstance(v, dict)) if key.endswith("_acked") else
+                    (lambda v: isinstance(v, str)))
+                state[key] = {k: v for k, v in values.items() if valid(v)} if isinstance(values, dict) else {}
+        for key in ("acked_through", "source_version", "delivery_points", "expired", "slack"):
+            if key in state and (type(state[key]) is not int or state[key] < 0):
+                del state[key]
+        for key in ("touched", "last_delivery_point"):
+            if key in state and not _valid_time(state[key]):
+                del state[key]
+        if "flight" in state and not _valid_flight(state["flight"], state["entries"]):
+            del state["flight"]
+    return data
+
+
 @contextlib.contextmanager
 def _transaction(session):
     path = _path(session)
@@ -203,6 +310,7 @@ def _transaction(session):
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             data = {}
+        data = _ledger_data(data)
         yield data
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=path.name, delete=False) as f:
@@ -219,7 +327,7 @@ def snapshot(session, component="main"):
         data = json.loads(_path(session).read_text())
     except (OSError, ValueError):
         return {}
-    return data.get(component, {})
+    return _ledger_data(data).get(component, {})
 
 def notice_receipts(session):
     """Completed notice deliveries through any component of this conversation."""
@@ -227,7 +335,7 @@ def notice_receipts(session):
         data = json.loads(_path(session).read_text())
     except (OSError, ValueError):
         return set()
-    return {entity.removeprefix("notice:") for state in data.values() if isinstance(state, dict)
+    return {entity.removeprefix("notice:") for state in _ledger_data(data).values() if isinstance(state, dict)
             for entity, entry in state.get("entries", {}).items()
             if entity.startswith("notice:") and entry.get("acked")}
 
@@ -398,9 +506,16 @@ def _pages_left(text, start, width):
 
 def _merge(state, out):
     epoch = out.get("epoch")
+    if state.get("epoch") == epoch:
+        versions = [state.get("source_version"), state.get("acked_through"),
+                    ((state.get("flight") or {}).get("out") or {}).get("version")]
+        if type(out.get("version")) is int and any(
+                type(version) is int and out["version"] < version for version in versions):
+            return None  # The reader captured its plan before a newer transaction committed.
     if state.get("epoch") != epoch:
         state.clear()
         state.update(epoch=epoch, entries={}, batches={})
+    state["source_version"] = out.get("version")
     entries = state.setdefault("entries", {})
     replaced = set()
     plan = out["delivery_plan"]
@@ -441,7 +556,9 @@ def _merge(state, out):
         elif not old.get("offset"):
             old.update(item)
     flight = state.get("flight")
-    if flight and any(i["entity"] in replaced for i in flight["out"]["routing_changes"]["items"]):
+    if flight and (any(i["entity"] in replaced for i in flight["out"]["routing_changes"]["items"])
+                   or any(entity.startswith("hold:") and not entries[entity].get("acked")
+                          for entity in replaced if entity in entries)):
         state.pop("flight", None)
     return entries
 
@@ -487,12 +604,14 @@ def _expire(state, flight):
 
 def _render(state, out, now, component, *, delivery_point=True):
     entries = _merge(state, out)
+    if entries is None:
+        return {"kind": "none", "text": None, "version": state.get("source_version"),
+                "epoch": state.get("epoch")}
     if delivery_point:
         _delivery_point(state, out, now)
     flight = state.get("flight")
     if flight and _parse(flight["until"]) > now:
         answer = copy.deepcopy(flight["out"])
-        answer["generation"] = out.get("generation")
         return answer
     if flight:
         _expire(state, flight)
@@ -1246,6 +1365,8 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
     with _transaction(session) as data:
         state = data.setdefault(component, {})
         entries = _merge(state, out)
+        if entries is None:
+            return None, _delivery_summary(data, component, state, None, now, counting_component)
         _attachment(data, session, counting_component, now, harness)
         if delivery_point:
             _delivery_point(state, out, now)
@@ -1264,6 +1385,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
             _expire(state, flight)
             state.pop("flight", None)
         due = [e for e in entries.values() if not e.get("acked") and e["entity"] not in skip_entities]
+        due.sort(key=lambda e: not e["entity"].startswith("hold:"))
         if not due:
             return None, _delivery_summary(data, component, state, None, now, counting_component)
         plan_data = out["delivery_plan"]
@@ -1369,6 +1491,8 @@ def child_offer(planned, *, session=None, component, now=None, cfg=None):
 
     def build(state):
         entries = _merge(state, planned)
+        if entries is None:
+            return {"text": "", "owed_entities": [], "shown_entities": []}
         state["touched"] = _iso(now)
         _delivery_point(state, planned, now)
         ordered = _child_sorted(entries.values())
@@ -1463,6 +1587,8 @@ def child_page(planned, *, session=None, component, now=None, cfg=None):
     with _transaction(session) as data:
         state = data.setdefault(component, {})
         entries = _merge(state, planned)
+        if entries is None:
+            return None
         state["touched"] = _iso(now)
         _delivery_point(state, planned, now)
         flight = state.get("flight")
@@ -1670,12 +1796,15 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
             e["restarted"] = False
         batches = state.setdefault("batches", {})
         batches[batch] = True
-        forecasts = (flight.get("plan") or {}).get("pace_forecasts") or {}
-        if forecasts:
-            state["pace_acked"] = {**(state.get("pace_acked") or {}), **forecasts}
-        advice = (flight.get("plan") or {}).get("advice_forecasts") or {}
-        if advice:
-            state["advice_acked"] = {**(state.get("advice_acked") or {}), **advice}
+        for source, target in (("pace_forecasts", "pace_acked"), ("advice_forecasts", "advice_acked")):
+            forecasts = (flight.get("plan") or {}).get(source) or {}
+            delivered = {entity: forecast for entity, forecast in forecasts.items()
+                         if entity in (flight.get("shown") or {}) and
+                         (entry := state["entries"].get(entity)) and entry.get("acked") and
+                         flight["shown"][entity] == len(entry["text"]) and
+                         entry["text"] in (flight["out"].get("text") or "")}
+            if delivered:
+                state[target] = {**(state.get(target) or {}), **delivered}
         # Idempotence covers recent retries; older ids fail closed.
         for old in list(batches)[:-128]:
             del batches[old]
