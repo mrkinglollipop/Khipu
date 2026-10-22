@@ -396,6 +396,8 @@ function capState(a: RouteAccount, s: CapStatus, now: Date): { state: string; ta
       return { state: used || "Not known yet", tag: null };
     }
     case "pace_target": {
+      const pace = paceOf(a, s.window);
+      if (readingUnknown(pace)) return { state: `Not known: ${pace.why || "no reading yet"}`, tag: null };
       if (s.verdict === "unknown" || s.allowance_pct == null) return { state: `Not known: ${s.why || "no reading yet"}`, tag: null };
       const state = `Allowed ${num1(s.allowance_pct)}% by now, used ${s.used_pct != null ? num1(s.used_pct) : "none"}`;
       if (s.verdict === "ahead") {

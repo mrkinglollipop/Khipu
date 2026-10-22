@@ -2,8 +2,10 @@
 
 Advice is advisory only: it never blocks, refuses, permits or launches
 anything, and it never feeds a gate. A runner or conversation may choose
-to act on it; that is its own launch policy. Unknown evidence answers
-``go`` with that evidence status, so the consumer applies its own policy.
+to act on it; that is its own launch policy. Unknown evidence answers go;
+the consumer applies its own policy. The exception is an unknown DeepSeek
+spend cap: its balance floor cannot rule out spending above the ceiling,
+so it holds advice for every purpose.
 """
 from __future__ import annotations
 
@@ -240,7 +242,7 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
     # their own figures; their status is already unknown without one.
     unknown_windows = {p.get("window") for p in entry.get("pace") or []
                        if _pace_reading_unknown(p)}
-    statuses = [_without_figures(status)
+    statuses = [dict(_without_figures(status), verdict="unknown")
                 if status["kind"] == "pace_target" and status.get("window") in unknown_windows
                 else status for status in statuses]
     numbers: dict = {}
@@ -263,6 +265,10 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
                  if (h.get("scope") or {}).get("kind") == "account" else True)]
     pace_plan_closed = any((p.get("plan") or {}).get("verdict") == "limit_reached"
                            for p in entry.get("pace") or [])
+    model_limited = tier is not None and any(
+        _tier_of(m.get("model")) == tier
+        and (not m.get("until") or (routing._parse(m["until"]) or now) > now)
+        for m in entry.get("models") or [])
     verdict, reason = "go", why_eligible
     if held:
         verdict, reason = "closed", "held"
@@ -272,6 +278,8 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         verdict, reason = "closed", "limited"
     elif entry.get("state") == routing.DOWN:
         verdict, reason = "closed", "down"
+    elif model_limited:
+        verdict, reason = "closed", f"{tier} limited"
     elif pace_plan_closed:
         verdict, reason = "closed", "plan limit reached"
     elif any(s.get("kind") == "share" and s.get("verdict") == "cap_reached" for s in statuses):
@@ -290,6 +298,9 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         if holding:
             verdict = "hold_back"
             reason = "; ".join(f"{s['kind']} {s['verdict']}" for s in holding)
+        elif entry.get("harness") == "deepseek" and any(
+                s.get("kind") == "spend" and s.get("verdict") == "unknown" for s in statuses):
+            verdict, reason = "hold_back", "cap status unknown"
         elif crossing:
             verdict = "hold_back"
             reason = "a cap crosses within the hour at the trailing average"
@@ -307,8 +318,10 @@ def advice_line(advice: dict) -> str:
         purpose = f"{str(advice['tier']).capitalize()} checks" if advice.get("tier") else "checks"
         if advice.get("sensitive"):
             purpose += " of sensitive code"
+    evidence = advice.get("evidence")
+    qualifier = f"; evidence={evidence}" if evidence in ("unknown", "stale") else ""
     return (f"Advice for {purpose}: {advice['label']}: "
-            f"{advice['verdict'].replace('_', ' ')} ({advice['reason']})")
+            f"{advice['verdict'].replace('_', ' ')} ({advice['reason']}{qualifier})")
 
 
 def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,

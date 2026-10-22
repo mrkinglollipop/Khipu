@@ -1458,13 +1458,40 @@ def _participation(stream: dict, start: datetime, end: datetime) -> tuple[dateti
     core += [d["at"] for d in stream["dropped"] if d["at"] is not None and start <= d["at"] <= end]
     core += [a["at"] for a in stream["active"] if a["at"] is not None and start <= a["at"] <= end]
     core += [at for at in stream["launches"] if start <= at <= end]
-    if not core:
-        return None
     times = list(core)
     for begin, finish in stream["coverage"]:
         if finish >= start and begin <= end:
             times += [max(begin, start), min(finish, end)]
-    return min(times), max(times)
+    return (min(times), max(times)) if times else None
+
+
+def _valid_spend_corrections(stream: dict, start: datetime, end: datetime) -> set[str]:
+    """Correction ancestry must reach a base event in this stream and period."""
+    bases = {token for b in stream["buckets"] if start <= b["at"] <= end for token in b["ids"]}
+    corrections = {c["event"]: c for c in stream["corrections"]}
+    resolved: dict[str, bool] = {}
+    for event in corrections:
+        token, path, valid = event, set(), False
+        while token in corrections:
+            if token in resolved:
+                valid = resolved[token]
+                break
+            if token in path:
+                break
+            path.add(token)
+            correction = corrections[token]
+            if not start <= correction["at"] <= end:
+                break
+            target = correction["corrects"]
+            if target in path:
+                break
+            if target in bases:
+                valid = True
+                break
+            token = target
+        for token in path:
+            resolved[token] = valid
+    return {event for event, valid in resolved.items() if valid}
 
 
 def _stream_spend(stream: dict, start: datetime, end: datetime) -> tuple[float, int]:
@@ -1474,18 +1501,13 @@ def _stream_spend(stream: dict, start: datetime, end: datetime) -> tuple[float, 
     its own time inside the same period; an orphan, cross-account or
     cross-period correction counts nothing."""
     total, count = 0.0, 0
-    targets: dict[str, datetime] = {}
+    valid = _valid_spend_corrections(stream, start, end)
     for bucket in stream["buckets"]:
-        for token in bucket["ids"]:
-            targets[token] = bucket["at"]
         if start <= bucket["at"] <= end:
             total += bucket["usd"]
             count += bucket["n"]
     for correction in stream["corrections"]:
-        targets.setdefault(correction["event"], correction["at"])
-    for correction in stream["corrections"]:
-        target_at = targets.get(correction["corrects"])
-        if start <= correction["at"] <= end and target_at is not None and start <= target_at <= end:
+        if correction["event"] in valid:
             total += correction["usd"]
             count += 1
     return total, count
@@ -1511,11 +1533,11 @@ def _dropped_correction_taint(streams: list[dict], start: datetime, end: datetim
         targets.append((stream, found))
     tainted: set[tuple[str, str | None]] = set()
     for stream, found in targets:
+        valid = _valid_spend_corrections(stream, start, end)
         for correction in stream["corrections"]:
             if not start <= correction["at"] <= end:
                 continue
-            target_at = found.get(correction["corrects"])
-            if target_at is not None and start <= target_at <= end:
+            if correction["event"] in valid:
                 continue  # the correction counted
             tainted.add((stream["runner"], stream["account"]))
             for other, other_found in targets:

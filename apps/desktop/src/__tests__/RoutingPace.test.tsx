@@ -104,6 +104,20 @@ describe("Pace, caps and advice: probe regressions", () => {
     key: "probe|", label: "Probe", harness: "claude", state: "open", pace: [], cap_statuses: [], ...over,
   });
 
+  it.each([
+    "reset time spread over more than an hour",
+    "possible reset; waiting for the next reading",
+    "last reading 2 h old",
+  ])("withholds unplaceable cap figures: %s", (why) => {
+    const cap = { kind: "pace_target", revision: "fake", window: "weekly", pct: 100, slack: 0,
+      allowance_pct: 14.3, used_pct: 32, verdict: "ahead" };
+    const row = paceModel(view([acct({
+      pace: [pace({ why, used_pct: 32, pace_target: cap })], cap_statuses: [cap],
+    })]), null, NOW).rows[0];
+    expect(row.caps[0].state).toBe(`Not known: ${why}`);
+    expect(row.caps[0].tag).toBeNull();
+  });
+
   it("keeps a hold_back verdict when its evidence is unknown", () => {
     const reached = pace({
       used_pct: 95,
