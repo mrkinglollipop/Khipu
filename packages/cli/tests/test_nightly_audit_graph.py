@@ -289,7 +289,7 @@ def test_publication_preserves_database_mode(graph, tmp_path, mode):
 @pytest.mark.parametrize('corpus_rc,edges_rc', [(1, 0), (0, 7), (1, 7), (0, 3), (1, 3), (-1, 0), (0, 0)])
 def test_nightly_embedding_failure_reaches_job_receipt(tmp_path, monkeypatch, capsys,
                                                      corpus_rc, edges_rc):
-    import subprocess
+    from types import SimpleNamespace
     from khipu import jobs
     g = load('graphify_nightly')
     resolved = tmp_path / 'sources.json'
@@ -304,8 +304,14 @@ def test_nightly_embedding_failure_reaches_job_receipt(tmp_path, monkeypatch, ca
     monkeypatch.setattr(jobs, 'GRAPHIFY_NIGHTLY', GRAPH / 'graphify_nightly.py')
     monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path / 'data')
     monkeypatch.setattr(jobs, '_log_paths', lambda stem: (tmp_path / 'out.log', tmp_path / 'err.log'))
-    monkeypatch.setattr(jobs.subprocess, 'run', lambda argv, **kw:
-                        subprocess.CompletedProcess(argv, g.main()))
+    def launch(argv, *, stdout, stderr, env, start_new_session):
+        assert argv == [sys.executable, str(GRAPH / 'graphify_nightly.py')]
+        assert start_new_session is True
+        def wait(*, timeout):
+            assert timeout == jobs.DRIVER_TIMEOUT_SECONDS
+            return g.main()
+        return SimpleNamespace(wait=wait)
+    monkeypatch.setattr(jobs.subprocess, 'Popen', launch)
     offsite = []
     monkeypatch.setattr(jobs, '_offsite_if_due', lambda: offsite.append(True))
     # Edge rc=3 is deferred work, not failure; backup scheduling must remain
