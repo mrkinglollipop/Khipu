@@ -7714,7 +7714,10 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
                 return f"{_account_label(entry['label'], ident, view=view)}: no longer tracked"
             if note[0] == "tracked" and entry["state"] == UNKNOWN and not entry.get("last_seen"):
                 return f"{_account_label(entry['label'], ident, view=view)}: newly tracked, not read yet"
-        return account_line(entry, now, relative=False, view=view)
+        # This preview is built before the fold is saved. Adding its new keys
+        # to the scrub inventory can migrate identities while writing the view.
+        # Prompt readers rebuild current account lines with the bounded view.
+        return account_line(entry, now, relative=False)
     if kind == "hold":
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
         return hold_line(hold, now, relative=False, view=view) if hold else f"Hold on {prev.get('scope') or '?'} ended"
