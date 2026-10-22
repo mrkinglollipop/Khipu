@@ -400,6 +400,53 @@ describe("Settings -> Routing: the note", () => {
 });
 
 describe("Settings -> Routing: standing rules", () => {
+  it("targets a provisional rule by its stable entity and asks end-or-keep for an ordinary add", async () => {
+    const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:pending-1", text: "Keep reviews local.",
+      pending: true, pending_kind: "added" as const, pending_by: "a Codex conversation" };
+    answers.khipu_route_view = { ...view(), rules: [provisional] };
+    answers.khipu_route_rule = (args) => args?.holds
+      ? { ok: true }
+      : { ok: false, error: "say end or keep in holds for: h1" };
+    await page();
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm rule null" }));
+    const confirm = await screen.findByRole("group", { name: "Confirm rule null?" });
+    fireEvent.click(within(confirm).getByRole("button", { name: "Confirm rule null" }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:pending-1" });
+    fireEvent.click(screen.getByRole("radio", { name: "End the hold now" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:pending-1", holds: { h1: "end" } }));
+
+    fireEvent.change(screen.getByLabelText("New rule"), { target: { value: "Use the review lane." } });
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add the rule" }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    fireEvent.click(screen.getByRole("radio", { name: "End the hold now" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(calls("khipu_route_rule").at(-1)).toEqual({ action: "add", text: "Use the review lane.", holds: { h1: "end" } }));
+  });
+
+  it("confirms a provisional proposal by entity, including its hold retry", async () => {
+    const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:proposal-1", text: "Keep the fix local.",
+      pending: true, pending_kind: "added" as const, pending_by: "a Codex conversation" };
+    answers.khipu_route_view = {
+      ...view(), rules: [provisional], proposals: {
+        p1: { id: "p1", entity: "rule:proposal-1", kind: "rule", n: null, status: "live" },
+      },
+    };
+    answers.khipu_route_rule = (args) => args?.holds
+      ? { ok: true }
+      : { ok: false, error: "say end or keep in holds for: h1" };
+    await page();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm the proposed a rule" }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:proposal-1" });
+    fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and confirm" }));
+    await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:proposal-1", holds: { h1: "keep" } }));
+  });
+
   it("shows the date, source, seeded and watched marks", async () => {
     await page();
     const three = row("Standing rules", "3.");

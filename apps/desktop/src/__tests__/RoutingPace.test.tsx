@@ -178,6 +178,22 @@ describe("Pace, caps and advice: probe regressions", () => {
     expect(row.open).toBe(true);
   });
 
+  it("names a reached plan before the calm pace fallback", () => {
+    const reached = pace({
+      used_pct: 100,
+      plan: { verdict: "limit_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+    });
+    const row = paceModel(view([acct({
+      pace: [reached],
+      cap_statuses: [],
+      advice: { account: "probe", label: "Probe", purpose: "job", verdict: "closed", reason: "plan limit reached", evidence: "fresh", numbers: {}, eligible: false, why_eligible: "plan limit reached", advisory: true },
+    })]), null, NOW).rows[0];
+    expect(row.line.week).toBe("At plan limit");
+    expect(row.line.week).not.toBe("On pace");
+    expect(row.say.map((part) => part.text).join("")).toBe("At its week plan limit.");
+    expect(row.say.map((part) => part.text).join("")).not.toContain("Nothing Khipu has read");
+  });
+
   it("names the share cap that caused the hold, not the first share cap", () => {
     const five = pace({
       window: "five_hour", cycle_resets_at: at(21, 17, 10), trailing_h: 1, buckets: 12, used_pct: 10,

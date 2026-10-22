@@ -502,6 +502,7 @@ function accountTag(a: RouteAccount): PaceTag {
   const paces = a.pace ?? [];
   if (paces.length && paces.every((p) => p.why || readingUnknown(p))) return { text: "Can't tell yet", tone: "neutral" };
   if (!paces.length) return { text: "No pace", tone: "neutral" };
+  if (paces.some((p) => p.plan?.verdict === "limit_reached")) return { text: "At plan limit", tone: "err" };
   const reachedShare = reachedShareCap(a);
   if (reachedShare) return { text: `At your ${Math.round(reachedShare.pct)}%`, tone: "err" };
   const planOut = paces.find((p) => p.plan?.verdict === "outpacing");
@@ -565,6 +566,12 @@ function sayOf(a: RouteAccount, now: Date): PaceSayPart[] {
       return [{ text: `The spend total can't be told: ${spend.why || "the spend readings are incomplete"}.` }];
     }
     return [{ text: `Khipu doesn't read ${label}'s plan, so there is no pace.` }];
+  }
+
+  const reachedPlan = paces.find((p) => p.plan?.verdict === "limit_reached");
+  if (reachedPlan) {
+    const window = reachedPlan.window ? `${windowAdj(reachedPlan.window)} ` : "";
+    return [{ text: `At its ${window}plan limit.` }];
   }
 
   const reachedShare = reachedShareCap(a);
@@ -655,6 +662,7 @@ function lineOf(a: RouteAccount, now: Date, advice: PaceAdvice | null): { week: 
   }
   if (!paces.length) return { week: "No pace: plan not read", advice: adviceWords };
   if (paces.every((p) => readingUnknown(p))) return { week: "Can't tell yet", advice: adviceWords };
+  if (paces.some((p) => p.plan?.verdict === "limit_reached")) return { week: "At plan limit", advice: adviceWords };
   const reachedShare = reachedShareCap(a);
   if (reachedShare) return { week: `At your ${Math.round(reachedShare.pct)}% cap`, advice: adviceWords };
   const crossing = earliestCrossing(a, now);
