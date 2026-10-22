@@ -444,16 +444,17 @@ def test_queued_promotion_survives_retry_crash(home, monkeypatch):
     assert pm.queued() == entry, pm.queued()
 
 
-def test_the_queue_is_removed_at_one_point_after_the_run():
-    """``_clear_queue`` has one caller, in ``promote``, after
-    ``_promote_locked`` returned."""
+def test_the_queue_is_removed_only_after_promotion_or_rollback():
+    """Queue cancellation follows a completed attempt or a successful rollback flip."""
     import inspect
     import re
 
     src = inspect.getsource(pm)
-    assert len(re.findall(r"(?<!def )\b_clear_queue\(", src)) == 1
+    assert len(re.findall(r"(?<!def )\b_clear_queue\(", src)) == 2
     body = inspect.getsource(pm.promote)
     assert body.index("_promote_locked(") < body.index("_clear_queue()")
+    rollback = inspect.getsource(pm.rollback)
+    assert rollback.index('if not flipped["ok"]:') < rollback.index("_clear_queue()")
 
 
 def test_nothing_queued_is_a_quiet_no_op(home):
