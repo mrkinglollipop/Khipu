@@ -1698,9 +1698,9 @@ def _deepseek_read(dir_fd: int, now_ts: float) -> tuple[str, dict | None]:
         os.close(fd)
     try:
         data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeError):
+        return ("ok", data) if _deepseek_valid(data, now_ts) else ("damaged", None)
+    except (ValueError, UnicodeError, OverflowError, RecursionError):
         return "damaged", None
-    return ("ok", data) if _deepseek_valid(data, now_ts) else ("damaged", None)
 
 
 def _deepseek_write(dir_fd: int, data: dict) -> None:

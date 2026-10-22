@@ -393,6 +393,41 @@ def test_a_damaged_history_is_unknown_and_never_crashes_routing(ds, raw):
     assert _cap(ds)["verdict"] == "unknown"
 
 
+@pytest.mark.parametrize("corruption", ["since", "last", "bucket", "attempt", "nested"])
+def test_corrupt_numeric_or_nested_history_heals_on_next_probe(ds, corruption):
+    _read(ds, "100.00", _ago(days=8))
+    _read(ds, "90.00", _ago(seconds=1))
+    data = json.loads(ds.history.read_text())
+    huge = 10 ** 400
+    if corruption == "since":
+        data["since"] = huge
+    elif corruption == "last":
+        data["last"][0] = huge
+    elif corruption == "bucket":
+        data["buckets"][0][0] = huge
+    elif corruption == "attempt":
+        data["attempt"]["at"] = huge
+    raw = "[" * 10000 + "0" + "]" * 10000 if corruption == "nested" else json.dumps(data)
+    ds.history.write_text(raw)
+    assert _cap(ds)["verdict"] == "unknown"
+
+    # A successful provider response must replace damaged history with its
+    # actual balance, rather than keep crashing or invent any earlier spend.
+    ds.reply = _Response(_body("80.00"))
+    row = usage.probe_deepseek()
+    assert row["ok"] is True
+    assert row["spend"]["last_7d_at_least_usd"] == 0.0
+    healed = json.loads(ds.history.read_text())
+    assert healed["since"] == NOW.timestamp()
+    assert healed["last"] == [NOW.timestamp(), 80.0]
+    assert healed["buckets"] == []
+    status = _cap(ds)
+    assert status["verdict"] == "unknown" and status["at_least_usd"] == 0.0
+    assert "damaged" not in status["why"]
+    again = _read(ds, "80.00", NOW + timedelta(seconds=1))
+    assert again["ok"] is True and again["spend"]["last_7d_at_least_usd"] == 0.0
+
+
 def test_a_negative_balance_in_history_is_damaged(ds):
     _read(ds, "100.00", _ago(days=8))
     data = json.loads(ds.history.read_text())
@@ -620,8 +655,38 @@ def test_usage_unknown_job_only_cap_does_not_hold_orchestration(ds, monkeypatch,
     entry = dict(_entry(), state="open")
     monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
     monkeypatch.setattr(routing, "cap_statuses", lambda *a: [{"kind": kind, "verdict": "unknown"}])
-    assert routing_advice.account_advice({}, entry, NOW)["verdict"] == "hold_back"
+    assert routing_advice.account_advice({}, entry, NOW)["verdict"] == "go"
     assert routing_advice.account_advice({}, entry, NOW, purpose="orchestration")["verdict"] == "go"
+
+
+@pytest.mark.parametrize("purpose", ["job", "check", "orchestration"])
+@pytest.mark.parametrize("harness,kind", [
+    ("claude", "pace_target"), ("codex", "pace_target"),
+    ("deepseek", "pace_target"), ("deepseek", "per_day"),
+    ("deepseek", "concurrency"), ("deepseek", "share"),
+])
+def test_usage_unknown_non_floor_caps_keep_go_with_unknown_evidence(ds, monkeypatch, harness, kind, purpose):
+    entry = {"key": f"{harness}|acct", "harness": harness, "state": "open",
+             "caps": [{"kind": kind, "window": "weekly", "pct": 50, "n": 1}]}
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    # Exercise real cap evaluation with missing pace or runner readings.
+    (status,) = routing.cap_statuses({}, entry, NOW)
+    assert status["kind"] == kind and status["verdict"] == "unknown"
+    advice = routing_advice.account_advice({}, entry, NOW, purpose=purpose)
+    assert advice["verdict"] == "go"
+    assert advice["evidence"] == "unknown"
+
+
+@pytest.mark.parametrize("purpose", ["job", "check", "orchestration"])
+@pytest.mark.parametrize("has_key", [False, True], ids=["no-key", "no-history"])
+def test_usage_unknown_deepseek_spend_without_evidence_holds_all_purposes(ds, monkeypatch, purpose, has_key):
+    ds.key = KEY if has_key else None
+    entry = dict(_entry(), state="open")
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    (status,) = routing.cap_statuses({}, entry, NOW)
+    assert status["verdict"] == "unknown" and status["at_least_usd"] is None
+    advice = routing_advice.account_advice({}, entry, NOW, purpose=purpose)
+    assert advice["verdict"] == "hold_back" and advice["evidence"] == "unknown"
 
 
 def _runner_stream(usd):

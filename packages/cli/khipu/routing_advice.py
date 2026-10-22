@@ -2,8 +2,10 @@
 
 Advice is advisory only: it never blocks, refuses, permits or launches
 anything, and it never feeds a gate. A runner or conversation may choose
-to act on it; that is its own launch policy. An unknown applicable cap
-holds advice; an account without a cap can still go without a usage reader.
+to act on it; that is its own launch policy. Unknown evidence answers go;
+the consumer applies its own policy. The exception is an unknown DeepSeek
+spend cap: its balance floor cannot rule out spending above the ceiling,
+so it holds advice for every purpose.
 """
 from __future__ import annotations
 
@@ -290,8 +292,8 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         if holding:
             verdict = "hold_back"
             reason = "; ".join(f"{s['kind']} {s['verdict']}" for s in holding)
-        elif any(s.get("verdict") == "unknown" and _applies(
-                s, purpose, statuses, tier=check_tier, sensitive=sensitive) for s in statuses):
+        elif entry.get("harness") == "deepseek" and any(
+                s.get("kind") == "spend" and s.get("verdict") == "unknown" for s in statuses):
             verdict, reason = "hold_back", "cap status unknown"
         elif crossing:
             verdict = "hold_back"
