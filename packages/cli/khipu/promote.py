@@ -1454,7 +1454,7 @@ def _queue(ref: str, commit: str | None, error: str, previous: dict[str, Any] | 
     crash leaves the old entry or the new one, never neither. A re-queue
     carries the override the first run used (``override_set_at``)."""
     held = override_set_at or (previous or {}).get("override_set_at")
-    data = {"ref": ref, "commit": commit, "error": error,
+    data = {"ref": ref, "commit": commit, "error": error, "request_id": uuid.uuid4().hex,
             "queued_at": (previous or {}).get("queued_at") or _now(),
             "attempts": int((previous or {}).get("attempts") or 0) + 1, "last_attempt_at": _now(),
             **({"override_set_at": held} if held else {})}
@@ -1514,7 +1514,7 @@ def _after_flip() -> dict[str, Any]:
         refreshed["ok"] = r.returncode == 0 and refreshed.get("ok") is True
         if not refreshed["ok"] and not refreshed.get("error"):
             refreshed["error"] = _tail(r.stderr or r.stdout) or f"jobs refresh exited {r.returncode}"
-        out["jobs_refresh"] = {k: refreshed.get(k) for k in ("ok", "refreshed", "current", "external", "error")
+        out["jobs_refresh"] = {k: refreshed.get(k) for k in ("ok", "refreshed", "current", "external", "error", "results")
                                if k in refreshed}
     uid = os.getuid()
     for label in (PLIST_QUEUE_DRAIN, PLIST_RECALL_DAEMON):
@@ -1570,6 +1570,9 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
         if not held:
             return {"ok": False, "action": "promote", "error": "another promotion is running"}
         previous = queued()
+        if retry_of is not None and not _same_queued_request(previous, retry_of):
+            return record({"ok": True, "action": "retry-queued", "cancelled": True,
+                           "queued": previous, "reason": "queued request was replaced or cancelled"})
         out = _promote_locked(ref, t0)
         failed = next((step for step in out.get("gate") or [] if not step["ok"]), None)
         doctor = next((step for step in out.get("gate") or [] if step.get("step") == "doctor"), None)
@@ -1652,6 +1655,14 @@ def retry_queued() -> dict[str, Any]:
 RETRY_KICK_MIN_S = 4 * 60
 
 
+def _same_queued_request(current: dict[str, Any] | None, expected: dict[str, Any]) -> bool:
+    # Kicks update only scheduling metadata, not the intent being retried.
+    return current is not None and (
+        {k: v for k, v in current.items() if k != "kicked_at"}
+        == {k: v for k, v in expected.items() if k != "kicked_at"}
+    )
+
+
 def kick_queued_retry() -> dict[str, Any] | None:
     """Called at the end of each queue-drain run: when a promotion is
     queued, start ``khipu promote --retry-queued`` in its own session, so
@@ -1661,13 +1672,19 @@ def kick_queued_retry() -> dict[str, Any] | None:
         entry = queued()
         if entry is None:
             return None
-        last = entry.get("kicked_at")
-        if last:
-            age = (datetime.now(timezone.utc)
-                   - datetime.fromisoformat(str(last).replace("Z", "+00:00"))).total_seconds()
-            if 0 <= age < RETRY_KICK_MIN_S:
-                return {"kicked": False, "reason": "kicked recently"}
-        _write_queue({**entry, "kicked_at": _now()})
+        with _lock() as held:
+            if not held:
+                return {"kicked": False, "reason": "another promotion is running"}
+            current = queued()
+            if not _same_queued_request(current, entry):
+                return {"kicked": False, "reason": "queued request was replaced or cancelled"}
+            last = current.get("kicked_at")
+            if last:
+                age = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(str(last).replace("Z", "+00:00"))).total_seconds()
+                if 0 <= age < RETRY_KICK_MIN_S:
+                    return {"kicked": False, "reason": "kicked recently"}
+            _write_queue({**current, "kicked_at": _now()})
         log = config_dir() / "state" / "promote-retry.log"
         with open(log, "a", encoding="utf-8") as fh:
             proc = subprocess.Popen([sys.executable, "-m", "khipu", "promote", "--retry-queued", "--json"],
@@ -1729,6 +1746,7 @@ def rollback() -> dict[str, Any]:
         flipped = flip(target)
         if not flipped["ok"]:
             return record({**entry, "ok": False, "error": f"flip: {flipped['error']}"})
+        _clear_queue()
         return record(_post_flip_result(entry, t0))
 
 
@@ -1821,6 +1839,8 @@ def format_result(out: dict[str, Any]) -> str:
             lines.append(f"queued until the hub answers: {q.get('ref')} since {q.get('queued_at')}")
         return "\n".join(lines)
     if action == "retry-queued" and not out.get("gate"):
+        if out.get("cancelled"):
+            return f"retry-queued: cancelled; {out['reason']}"
         if out.get("queued") is None:
             return "retry-queued: nothing is queued"
         return f"retry-queued: {out.get('error')}"
@@ -1847,6 +1867,9 @@ def format_result(out: dict[str, Any]) -> str:
                 lines.append(f"kickstart failed: {after['kick_failed']}")
     else:
         lines.append(f"not done: {out.get('error')}")
+        for result in ((out.get("after") or {}).get("jobs_refresh") or {}).get("results") or []:
+            if not result.get("ok"):
+                lines.append(f"  {result.get('job') or 'job'} failed: {result.get('error') or result}")
         if out.get("live_changed"):
             lines.append(f"live is now {Path(out['slot']).name}; deployment is partial. {MCP_NOTE}")
         elif action == "promote":

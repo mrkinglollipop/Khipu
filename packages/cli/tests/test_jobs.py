@@ -12,6 +12,20 @@ from unittest import mock
 from khipu import jobs
 
 
+def _driver_process(run_fn):
+    """Adapt existing driver assertions to the deadline-aware Popen contract."""
+    def launch(cmd, *, stdout, stderr, env, start_new_session):
+        assert start_new_session is True
+        result = run_fn(cmd, stdout=stdout, stderr=stderr, env=env)
+        process = mock.Mock()
+        def wait(*, timeout):
+            assert timeout == jobs.DRIVER_TIMEOUT_SECONDS
+            return result.returncode
+        process.wait.side_effect = wait
+        return process
+    return launch
+
+
 class JobsRunTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -38,7 +52,7 @@ class JobsRunTest(unittest.TestCase):
                  self.log_dir / f"{log_stem}.out.log",
                  self.log_dir / f"{log_stem}.err.log",
              )), \
-             mock.patch.object(jobs.subprocess, "run", side_effect=run_fn) as run_mock, \
+             mock.patch.object(jobs.subprocess, "Popen", side_effect=_driver_process(run_fn)) as run_mock, \
              mock.patch("khipu.session_capture.drain", return_value={"failed": 0}), \
              mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
              mock.patch("khipu.embed.prune_query_cache", return_value=0):
@@ -320,7 +334,7 @@ class JobsRunTest(unittest.TestCase):
                  self.log_dir / "khipu-monthly.out.log",
                  self.log_dir / "khipu-monthly.err.log",
              )), \
-             mock.patch.object(jobs.subprocess, "run", side_effect=_run):
+             mock.patch.object(jobs.subprocess, "Popen", side_effect=_driver_process(_run)):
             jobs.run_monthly(dry_run=True)
         self.assertIn("--dry-run", captured[0])
 
