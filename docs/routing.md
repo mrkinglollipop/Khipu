@@ -204,6 +204,39 @@ kept.
   figure and marks the affected stream, or the unattributed bucket,
   incomplete, so the total reads unknown instead of silently omitting it.
 
+DeepSeek spend caps use Khipu's account-wide balance reader, independently
+of runner coverage or per-conversation setup. For consecutive readings,
+each balance decrease adds measured spend; each increase adds zero spend
+and records the interval's start, end and exact increase. Earlier and later
+spend is never cancelled by a top-up. Decreases enter the rolling window
+at the time the later reading measures them, so window resolution is one
+poll interval rather than the provider's individual debit timestamps.
+
+Full cap-window coverage is known. While history fills, the same measured
+amount is partial, with `since`, and is still judged under / near / reached /
+over against the owner's cap. A top-up does not make the window unknown.
+The owner sees, for example, `DeepSeek: $5 spent in the last 7 days of $35
+(since <time> while history fills; top-ups seen: 1; possible missed spend
+within 120 seconds)`. Each top-up's recorded interval bounds the time in
+which simultaneous spend could have netted against it; this is a time
+bound, not a dollar bound. A top-up netted entirely against spend can leave
+no observed increase, so the balance endpoint cannot detect every top-up.
+
+The existing daemon's usage refresh makes DeepSeek due every 60 seconds
+and caps its source-poll interval at 60 seconds (normally 10), targeting at
+most two minutes between reads while the helper runs. Owner-disabled
+polling, sleep, failures or busy refreshes can delay readings; reports retain
+actual top-up interval lengths, even when longer than that target. No
+conversation has to register usage. Failed, stale, unavailable, missing-key,
+missing-history and damaged-history reads stay unknown and hold advice.
+Runner telemetry cannot replace a failed account read or double-count spend.
+
+History keeps individual intervals for up to 366 days, with bounded record
+and byte limits. Version 3's hourly buckets lacked top-up intervals and
+restart as partial history on the next successful read. HTTPS-only requests,
+no redirects/proxies, owner-only files without symlinks, HMAC key binding,
+locked atomic writes, validation and exact decimal arithmetic are retained.
+
 Each record is attributed to an account through the same lane resolver as
 limits and reports. A record no resolution can name is unattributed, never
 guessed. An account's spend total for a period is known only when every

@@ -1181,7 +1181,19 @@ def _poll_once(routing, on_fold=None, on_probe=None, *, blocked_resets=None) -> 
             return {"folded": False, "saved": True, "busy": False, "version": None, "valid_until": None,
                     "interval": None, "reset_checks": [], "view_stat": None, "due": None}
         return _check_resets_only(routing, on_fold=on_fold, on_probe=on_probe, blocked_resets=blocked_resets)
+    from khipu import usage
+
+    deepseek = [a for a in usage.http_quota_accounts() if a.get("harness") == "deepseek"]
+    if deepseek:
+        if on_probe is not None:
+            on_probe()
+        # Let the reader record a transport timeout before the helper's
+        # outer alarm ends this child, so failed reads keep advice unknown.
+        usage.refresh_due(accounts=deepseek, max_age=usage.DEEPSEEK_POLL_S,
+                          timeout=min(usage.GLM_TIMEOUT_S, _POLL_LOOK_MOST - 2))
     out = routing.poll_refold(on_fold=on_fold)
+    if deepseek and out.get("interval") is not None:
+        out["interval"] = min(out["interval"], usage.DEEPSEEK_POLL_S)
     # Poll first so its ``folded`` answer stays truthful. When reset checks are
     # off, do not read the view through the scheduler at all. With checks on,
     # this process is already the bounded helper child: one account per child,

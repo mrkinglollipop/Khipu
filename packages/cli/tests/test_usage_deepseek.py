@@ -1,4 +1,4 @@
-"""khipu.usage DeepSeek balance reader: a spend floor from balance decreases.
+"""khipu.usage DeepSeek balance reader: measured spend from balance decreases.
 
 Hermetic: the HTTP transport is faked (``OpenerDirector.open``, or the
 handlers' ``do_open`` where the real redirect and proxy machinery must run),
@@ -157,10 +157,10 @@ def test_an_inherited_proxy_is_never_used(monkeypatch):
     assert hops and all(h["host"] == "api.deepseek.com" for h in hops)
 
 
-# ---- the floor --------------------------------------------------------------
+# ---- measured spend --------------------------------------------------------------
 
 
-def test_decreases_inside_the_window_are_the_floor(ds):
+def test_decreases_inside_the_window_are_measured_spend(ds):
     _read(ds, "30.00", _ago(days=8))
     _read(ds, "30.00", _ago(days=3))
     _read(ds, "27.50", _ago(days=2))
@@ -171,7 +171,7 @@ def test_decreases_inside_the_window_are_the_floor(ds):
     assert row["spend"]["partial"] is False
 
 
-def test_a_floor_at_the_cap_is_over(ds):
+def test_measured_spend_above_the_cap_is_over(ds):
     _read(ds, "60.00", _ago(days=8))
     _read(ds, "60.00", _ago(days=6))
     _read(ds, "40.00", _ago(days=2))
@@ -181,38 +181,38 @@ def test_a_floor_at_the_cap_is_over(ds):
     assert status["used_pct"] == round(37.5 / 35 * 100, 1)
 
 
-def test_a_floor_at_the_cap_counts_even_with_partial_history(ds):
+def test_measured_spend_over_the_cap_counts_with_partial_history(ds):
     _read(ds, "80.00", _ago(days=1))
     _read(ds, "40.00", _ago(minutes=5))
     status = _cap(ds)
     assert status["verdict"] == "over" and status["usd"] == 40.0 and status["partial"] is True
 
 
-def test_under_the_cap_is_never_reported_from_a_balance(ds):
+def test_full_history_measured_spend_can_read_under(ds):
     _read(ds, "100.00", _ago(days=8))
     _read(ds, "100.00", _ago(days=6))
     _read(ds, "95.00", _ago(minutes=5))
     status = _cap(ds)
-    assert status["verdict"] == "unknown" and status["usd"] is None and status["used_pct"] is None
-    assert status["at_least_usd"] == 5.0
-    assert "top-up" in status["why"]
+    assert status["verdict"] == "under" and status["usd"] == 5.0 and status["used_pct"] == 14.3
+    assert status["partial"] is False
+    assert status["why"] is None
 
 
-def test_spend_hidden_by_a_top_up_is_not_under(ds):
-    # Codex P2 (usage.py:1590): $50 spent and $40 topped up between reads
-    # looked like $10, under a $35 cap.
+def test_only_observed_decreases_count_as_measured_spend(ds):
+    # Spend netted against a top-up within one interval cannot be recovered
+    # from the balance endpoint; the measured decrease remains $10.
     _read(ds, "100.00", _ago(days=8))
     _read(ds, "100.00", _ago(days=1))
     _read(ds, "90.00", NOW)
     status = _cap(ds)
-    assert status["verdict"] == "unknown" and status["at_least_usd"] == 10.0
+    assert status["verdict"] == "under" and status["usd"] == 10.0
 
 
-def test_a_refund_offsetting_spend_is_not_under(ds):
+def test_an_unchanged_balance_has_zero_measured_spend(ds):
     _read(ds, "100.00", _ago(days=8))
     _read(ds, "100.00", _ago(days=1))
     _read(ds, "100.00", NOW)
-    assert _cap(ds)["verdict"] == "unknown"
+    assert _cap(ds)["verdict"] == "under"
 
 
 def test_a_top_up_is_never_negative_spend(ds):
@@ -220,18 +220,18 @@ def test_a_top_up_is_never_negative_spend(ds):
     _read(ds, "8.00", _ago(days=2))
     _read(ds, "58.00", _ago(days=1))  # topped up by 50
     row = _read(ds, "55.00", _ago(minutes=1))
-    # 58 -> 55 only: the 10 -> 8 interval began before the window, and the +50 adds nothing.
-    assert row["spend"]["last_7d_at_least_usd"] == 3.0
+    # Both observed decreases count; the +50 contributes nothing.
+    assert row["spend"]["last_7d_usd"] == 5.0
 
 
-def test_an_interval_crossing_the_window_start_is_left_out(ds):
-    # Codex P2 (usage.py:1589): $50 spent 7.5 days ago, next read 6 days ago,
-    # was counted inside a 7-day window.
+def test_a_decrease_is_attributed_to_the_read_that_measured_it(ds):
+    # A rolling window uses the time a decrease was measured; it cannot
+    # reconstruct the provider's individual debit times within an interval.
     _read(ds, "100.00", _ago(days=8))
     _read(ds, "50.00", _ago(days=6))
     _read(ds, "50.00", NOW)
     status = _cap(ds)
-    assert status["verdict"] == "unknown" and status["at_least_usd"] == 0.0
+    assert status["verdict"] == "over" and status["usd"] == 50.0
 
 
 def test_the_window_rolls(ds):
@@ -241,9 +241,9 @@ def test_the_window_rolls(ds):
     row = _read(ds, "19.00", _ago(days=1))  # -1
     assert row["spend"]["last_7d_at_least_usd"] == 11.0
     row = _read(ds, "18.00", NOW + timedelta(days=2))
-    # The window now starts 5 days ago: the -10 and the interval that began
-    # 6 days ago are out; only the last -1 is wholly inside.
-    assert row["spend"]["last_7d_at_least_usd"] == 1.0
+    # The window now starts 5 days ago: the -10 measurement is out, while
+    # both later $1 measurements remain in the rolling window.
+    assert row["spend"]["last_7d_usd"] == 2.0
 
 
 def test_reader_row_has_no_window_or_cap_of_its_own(ds):
@@ -268,12 +268,12 @@ def test_other_accounts_spend_caps_are_untouched(ds):
 # ---- partial and owner-facing figures ----------------------------------------
 
 
-def test_the_first_read_is_partial_not_zero_spent(ds):
-    # Codex P2 (usage.py:1636): the first read claimed $0 seven-day spend.
+def test_the_first_read_reports_zero_measured_spend_as_partial(ds):
+    # The first read is zero measured spend since now, never full coverage.
     report = usage.report(accounts=[dict(ACCOUNT)], fresh=True)
     spend = report["accounts"][0]["spend"]
     assert spend["partial"] is True
-    assert spend.get("last_7d_usd") is None
+    assert spend["last_7d_usd"] == 0
 
 
 def test_history_covers_long_windows(ds):
@@ -298,7 +298,8 @@ def test_history_at_the_poll_cadence_covers_the_window(ds, monkeypatch):
     assert total["partial"] is False
     assert total["at_least_usd"] == pytest.approx(7 * 86400 / step * 0.001, abs=0.05)
     stored = json.loads(ds.history.read_text())
-    assert len(stored["buckets"]) <= 7 * 24 + 3
+    assert len(stored["buckets"]) <= count
+    assert total["usd"] == pytest.approx(7 * 86400 / step * 0.001)
 
 
 def test_buckets_stay_bounded_over_a_year(ds):
@@ -309,7 +310,7 @@ def test_buckets_stay_bounded_over_a_year(ds):
         balance -= 0.01
         usage._deepseek_add(data, t, balance)
     assert len(data["buckets"]) <= usage.DEEPSEEK_HISTORY_MAX
-    assert data["buckets"][0][0] >= t - usage.DEEPSEEK_HISTORY_DAYS * 86400
+    assert data["buckets"][0][1] > t - usage.DEEPSEEK_HISTORY_DAYS * 86400
 
 
 # ---- failed, unavailable, missing or changed key -----------------------------
@@ -365,7 +366,7 @@ def test_a_changed_key_starts_a_new_history(ds):
     row = _read(ds, "1.00", NOW)
     assert row["spend"]["last_7d_at_least_usd"] == 0.0 and row["spend"]["partial"] is True
     status = _cap(ds)
-    assert status["verdict"] == "unknown" and status["at_least_usd"] == 0.0
+    assert status["verdict"] == "under" and status["usd"] == 0.0
 
 
 def test_more_than_one_deepseek_account_is_refused(ds):
@@ -422,8 +423,8 @@ def test_corrupt_numeric_or_nested_history_heals_on_next_probe(ds, corruption):
     assert healed["last"] == [NOW.timestamp(), 80.0]
     assert healed["buckets"] == []
     status = _cap(ds)
-    assert status["verdict"] == "unknown" and status["at_least_usd"] == 0.0
-    assert "damaged" not in status["why"]
+    assert status["verdict"] == "under" and status["usd"] == 0.0
+    assert status["why"] is None
     again = _read(ds, "80.00", NOW + timedelta(seconds=1))
     assert again["ok"] is True and again["spend"]["last_7d_at_least_usd"] == 0.0
 
@@ -456,12 +457,13 @@ def test_a_far_future_reading_never_crashes(ds):
     assert _cap(ds)["verdict"] == "unknown"
 
 
-def test_conflicting_readings_at_one_instant_are_not_under(ds):
+def test_conflicting_readings_at_one_instant_are_dropped(ds):
     # Codex P2: equal times sorted by balance and lost the decrease.
     _read(ds, "50.00", _ago(days=8))
     _read(ds, "100.00", NOW)
     _read(ds, "50.00", NOW)
-    assert _cap(ds)["verdict"] != "under"
+    assert _cap(ds)["verdict"] == "under"
+    assert json.loads(ds.history.read_text())["last"][1] == 100
 
 
 def test_an_older_reading_landing_late_is_dropped(ds, monkeypatch):
@@ -605,7 +607,7 @@ def test_key_never_appears_anywhere(ds, capsys, caplog):
     assert KEY not in blob and "SENTINEL" not in blob
     assert oct(ds.history.stat().st_mode & 0o777) == "0o600"
     assert set(json.loads(ds.history.read_text())) == {
-        "version", "salt", "fingerprint", "since", "last", "buckets", "attempt"}
+        "version", "salt", "fingerprint", "since", "last", "buckets", "topups", "attempt"}
 
 
 def test_non_usd_is_unsupported_not_zero(ds):
@@ -627,19 +629,19 @@ def test_usage_setup_still_asks_when_there_is_no_key(ds):
 
 
 @pytest.mark.parametrize("purpose", ["job", "check", "orchestration"])
-def test_usage_unknown_cap_holds_advice_and_rank(ds, monkeypatch, purpose):
+def test_usage_partial_cap_allows_advice_and_rank(ds, monkeypatch, purpose):
     _read(ds, "100", _ago(days=1))
     _read(ds, "90", NOW)
     entry = dict(_entry(), state="open")
     view = {"accounts": [entry]}
     monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
     advice = routing_advice.account_advice(view, entry, NOW, purpose=purpose)
-    assert advice["verdict"] == "hold_back"
-    assert advice["reason"] == "cap status unknown"
-    assert advice["evidence"] == "unknown"
-    assert routing_advice.rank(view, NOW, purpose=purpose)[0]["why_ranked"] == "cap status unknown"
+    assert advice["verdict"] == "go"
+    assert advice["reason"] != "cap status unknown"
+    assert advice["caps"][0]["partial"] is True
+    assert routing_advice.rank(view, NOW, purpose=purpose)[0]["verdict"] == "go"
     public = routing._public_account(entry, NOW, view)
-    assert public["advice"]["verdict"] == "hold_back"
+    assert public["advice"]["verdict"] == "go"
 
 
 @pytest.mark.parametrize("harness", ["deepseek", "glm"])
@@ -698,14 +700,11 @@ def _runner_stream(usd):
 
 
 @pytest.mark.parametrize("case", ["normal", "missing_key", "multiple_accounts"])
-@pytest.mark.parametrize("runner_usd,expected,floor", [(10, "unknown", 10), (20, "unknown", 20),
-                                                     (35, "reached", 35), (40, "over", 40)])
-def test_usage_runner_is_only_an_account_spend_floor(ds, monkeypatch, case, runner_usd, expected, floor):
+@pytest.mark.parametrize("runner_usd", [10, 20, 35, 40])
+def test_usage_account_balance_is_authoritative_over_runner_telemetry(ds, monkeypatch, case, runner_usd):
     _read(ds, "100", _ago(days=1))
     _read(ds, "90", NOW)
-    streams = [_runner_stream(runner_usd)]
-    assert routing_sources.spend_total(streams, "deepseek|acct", _ago(days=7), NOW)["status"] == "known"
-    monkeypatch.setattr(routing, "_telemetry_streams", lambda view: streams)
+    monkeypatch.setattr(routing, "_telemetry_streams", lambda view: [_runner_stream(runner_usd)])
     view = {}
     if case == "missing_key":
         ds.key = None
@@ -713,18 +712,16 @@ def test_usage_runner_is_only_an_account_spend_floor(ds, monkeypatch, case, runn
         view = {"definitions": {"accounts": {"a": {"provider": "deepseek"},
                                                "b": {"provider": "deepseek"}}}}
     status = _cap(ds, view=view)
-    assert status["verdict"] == expected
-    assert status["at_least_usd"] == floor
-    if expected == "unknown":
-        assert status["usd"] is None and status["used_pct"] is None and status["why"]
+    assert status["verdict"] == ("under" if case == "normal" else "unknown")
+    assert status["usd"] == (10 if case == "normal" else None)
 
 
-def test_usage_runner_and_balance_floors_are_never_added(ds, monkeypatch):
+def test_usage_runner_and_balance_spend_are_never_added(ds, monkeypatch):
     _read(ds, "100", _ago(days=1))
     _read(ds, "80", NOW)
     monkeypatch.setattr(routing, "_telemetry_streams", lambda view: [_runner_stream(10)])
     status = _cap(ds, usd=25)
-    assert status["verdict"] == "unknown" and status["at_least_usd"] == 20
+    assert status["verdict"] == "under" and status["usd"] == 20
 
 
 @pytest.mark.parametrize("component", ["root", "ancestor"])
@@ -761,11 +758,12 @@ def test_usage_history_ancestor_symlink_cannot_read_a_valid_floor(ds, tmp_path):
     assert status["verdict"] == "unknown" and status["at_least_usd"] is None
 
 
-def test_usage_imprecise_v2_history_cannot_prove_a_floor(ds):
+@pytest.mark.parametrize("version", [2, 3])
+def test_usage_legacy_history_restarts_as_partial(ds, version):
     _read(ds, "100", _ago(days=1))
     _read(ds, "65", NOW)
     stored = json.loads(ds.history.read_text())
-    stored["version"] = 2
+    stored["version"] = version
     ds.history.write_text(json.dumps(stored))
     assert _cap(ds)["verdict"] == "unknown"
     row = _read(ds, "64", NOW + timedelta(seconds=1))
@@ -797,7 +795,7 @@ def test_usage_history_rejects_writable_dirs_and_unsafe_locks(ds, target):
 @pytest.mark.parametrize("initial,final,cap,verdict", [
     ("100", "64.9951", 35.004, "over"),
     ("1", "0.9951", 0.004, "over"),
-    ("100.00004", "65.000049", 35, "unknown"),
+    ("100.00004", "65.000049", 35, "near"),
     ("1", "0.996", 0.004, "reached"),
     ("100.000000000000000001", "65", 35, "over"),
 ])
@@ -814,4 +812,151 @@ def test_usage_floor_display_never_rounds_up(ds):
     assert Decimal(str(row["spend"]["last_7d_at_least_usd"])) <= Decimal("0.006")
     total = usage.deepseek_spend_total(NOW, 7, 35)
     assert Decimal(str(total["at_least_usd"])) <= Decimal("0.006")
-    assert "$0.01" not in total["reason"]
+    assert total["reason"] is None
+
+
+# Owner's measured-spend contract (2026-10-22).
+
+def test_usage_measured_topup_keeps_spend_on_both_sides(ds):
+    _read(ds, "100", _ago(days=8))
+    _read(ds, "100", _ago(minutes=6))
+    _read(ds, "95", _ago(minutes=4))
+    _read(ds, "145", _ago(minutes=2))
+    row = _read(ds, "138", NOW)
+    total = usage.deepseek_spend_total(NOW, 7, 35)
+    assert total["status"] == "known" and total["usd"] == 12
+    assert total["partial"] is False and total["topups_seen"] == 1
+    assert total["topup_intervals"] == [{"from": usage._iso(_ago(minutes=4).timestamp()),
+                                         "to": usage._iso(_ago(minutes=2).timestamp()),
+                                         "increase_usd": "50.0", "seconds": 120.0}]
+    assert total["possible_miss_seconds"] == 120
+    assert row["spend"]["last_7d_usd"] == 12
+    assert _cap(ds)["verdict"] == "under"
+    assert routing.cap_line_for({}, _entry(), NOW) == (
+        "DeepSeek: $12 spent in the last 7 days of $35 (top-ups seen: 1; "
+        "possible missed spend within 120 seconds)")
+
+
+@pytest.mark.parametrize("days,partial", [(8, False), (1, True)])
+@pytest.mark.parametrize("purpose", ["job", "check", "orchestration"])
+def test_usage_measured_under_and_partial_allow_advice(ds, monkeypatch, days, partial, purpose):
+    _read(ds, "100", _ago(days=days))
+    _read(ds, "100", _ago(minutes=2))
+    _read(ds, "95", NOW)
+    total = usage.deepseek_spend_total(NOW, 7, 35)
+    assert total["status"] == ("partial" if partial else "known")
+    assert total["usd"] == 5 and total["partial"] is partial
+    status = _cap(ds)
+    assert status["verdict"] == "under" and status["used_pct"] == 14.3
+    assert status["since"] == usage._iso(_ago(days=days).timestamp())
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    assert routing_advice.account_advice({}, dict(_entry(), state="open"), NOW, purpose=purpose)["verdict"] == "go"
+    line = routing.cap_line_for({}, _entry(), NOW)
+    assert "DeepSeek: $5 spent in the last 7 days of $35" in line
+    assert ("while history fills" in line) is partial
+
+
+@pytest.mark.parametrize("failure", ["failed", "stale"])
+def test_usage_failed_or_stale_even_over_cap_stays_unknown_and_holds(ds, monkeypatch, failure):
+    _read(ds, "100", _ago(days=8))
+    _read(ds, "100", _ago(minutes=32))
+    _read(ds, "10", _ago(minutes=31))
+    if failure == "failed":
+        ds.now = NOW
+        ds.reply = _Response(b"{}", 500)
+        assert usage.probe_account(dict(ACCOUNT))["ok"] is False
+    assert _cap(ds)["verdict"] == "unknown"
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    advice = routing_advice.account_advice({}, dict(_entry(), state="open"), NOW)
+    assert advice["verdict"] == "hold_back" and advice["evidence"] == "unknown"
+
+
+def test_usage_topups_are_exact_validated_and_windowed(ds):
+    _read(ds, "1", _ago(days=9))
+    _read(ds, "51", _ago(days=8))
+    _read(ds, "50", _ago(minutes=4))
+    _read(ds, "50.000000000000000001", _ago(minutes=2))
+    _read(ds, "49", NOW)
+    total = usage.deepseek_spend_total(NOW, 7, 35)
+    assert total["topups_seen"] == 1
+    assert total["topup_intervals"][0]["increase_usd"] == "1E-18"
+    stored = json.loads(ds.history.read_text())
+    stored["topups"][-1][2] = "-1"
+    ds.history.write_text(json.dumps(stored))
+    assert _cap(ds)["verdict"] == "unknown"
+
+
+def test_usage_deepseek_due_within_two_minutes_on_shared_usage_poll(ds, monkeypatch):
+    monkeypatch.setattr(usage, "_key", lambda account: "fake")
+    cache = {"fake": {"last_attempt_at": usage._iso(_ago(seconds=60).timestamp())}}
+    assert usage._due([ACCOUNT], cache, NOW, 600) == [ACCOUNT]
+    assert usage._due([ACCOUNT], {"fake": {"last_attempt_at": usage._iso(_ago(seconds=59).timestamp())}}, NOW, 600) == []
+
+
+def test_usage_poll_automatically_refreshes_deepseek_without_prompt_setup(ds, monkeypatch):
+    from khipu import recall_prompt
+    calls = []
+    monkeypatch.setattr(usage, "http_quota_accounts", lambda: [dict(ACCOUNT)])
+    monkeypatch.setattr(usage, "refresh_due", lambda **kwargs: calls.append(kwargs) or {"refreshed": 1})
+    monkeypatch.setattr(routing, "poll_refold", lambda **kwargs: {"valid_until": None})
+    monkeypatch.setattr(routing, "run_due_reset_checks", lambda **kwargs: [])
+    monkeypatch.setattr(recall_prompt, "_view_snapshot", lambda routing: (None, None))
+    monkeypatch.setattr(routing, "_load_view", lambda: None)
+    monkeypatch.setattr(routing, "push_off", lambda moment: None)
+    monkeypatch.setattr(routing, "settings", lambda: {"routing_reset_check": False})
+    recall_prompt._poll_once(routing)
+    assert calls == [{"accounts": [ACCOUNT], "max_age": 60, "timeout": 10}]
+
+
+@pytest.mark.parametrize("spent,verdict", [(0, "under"), (29.75, "near"), (35, "reached"), (36, "over")])
+@pytest.mark.parametrize("days", [1, 8])
+def test_usage_measured_spend_cap_thresholds(ds, days, spent, verdict):
+    _read(ds, "100", _ago(days=days))
+    _read(ds, "100", _ago(minutes=2))
+    _read(ds, str(100 - spent), NOW)
+    status = _cap(ds)
+    assert status["verdict"] == verdict
+    assert status["usd"] == spent
+    assert status["partial"] is (days == 1)
+
+
+@pytest.mark.parametrize("corruption", ["missing", "not_list", "negative", "future", "overlap", "reordered"])
+def test_usage_damaged_topup_intervals_fail_closed(ds, corruption):
+    _read(ds, "100", _ago(minutes=6))
+    _read(ds, "95", _ago(minutes=4))
+    _read(ds, "145", _ago(minutes=2))
+    _read(ds, "140", NOW)
+    stored = json.loads(ds.history.read_text())
+    if corruption == "missing":
+        del stored["topups"]
+    elif corruption == "not_list":
+        stored["topups"] = {}
+    elif corruption == "negative":
+        stored["topups"][0][2] = -1
+    elif corruption == "future":
+        stored["topups"][0][1] = NOW.timestamp() + 1
+    elif corruption == "overlap":
+        stored["topups"][0][0] = _ago(minutes=5).timestamp()
+    else:
+        stored["topups"] *= 2
+    ds.history.write_text(json.dumps(stored))
+    assert _cap(ds)["verdict"] == "unknown"
+
+
+def test_usage_late_topup_records_actual_gap_instead_of_target_cadence(ds):
+    _read(ds, "100", _ago(minutes=10))
+    _read(ds, "150", _ago(minutes=1))
+    total = usage.deepseek_spend_total(NOW, 7, 35)
+    assert total["status"] == "partial" and total["usd"] == 0
+    assert total["topup_intervals"][0]["seconds"] == 540
+    assert total["possible_miss_seconds"] == 540
+
+
+def test_usage_poll_caps_long_source_poll_interval_for_deepseek(ds, monkeypatch):
+    from khipu import recall_prompt
+    monkeypatch.setattr(usage, "http_quota_accounts", lambda: [dict(ACCOUNT)])
+    monkeypatch.setattr(usage, "refresh_due", lambda **kwargs: {"refreshed": 0})
+    monkeypatch.setattr(routing, "poll_refold", lambda **kwargs: {"valid_until": None, "interval": 600})
+    monkeypatch.setattr(routing, "push_off", lambda moment: None)
+    monkeypatch.setattr(routing, "settings", lambda: {"routing_reset_check": False})
+    assert recall_prompt._poll_once(routing)["interval"] == 60
