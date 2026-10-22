@@ -1456,9 +1456,23 @@ def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]]) -> set[tuple
     from khipu.db import has_columns
 
     refs = set(refs)
-    live_refs = {(kind, ref) for kind, ref in refs if kind not in {"episode", "topic"}}
+    live_refs = {(kind, ref) for kind, ref in refs if kind not in {"episode", "topic", "commitment"}}
+    commitment_ids = sorted(int(ref) for kind, ref in refs if kind == "commitment")
+    opening_episodes = {}
+    if commitment_ids:
+        # Discover parents without locking commitments: forget locks the episode
+        # first, then updates its commitments. Reversing that order deadlocks.
+        cur.execute(
+            "SELECT id, opened_episode FROM commitments WHERE id = ANY(%s) AND status = 'open'",
+            (commitment_ids,),
+        )
+        opening_episodes = dict(cur.fetchall())
+    locked_episodes = set()
     for kind, table, column in (("episode", "episodes", "id"), ("topic", "topics", "slug")):
-        wanted = sorted(ref for k, ref in refs if k == kind)
+        wanted = {ref for k, ref in refs if k == kind}
+        if kind == "episode":
+            wanted.update(str(eid) for eid in opening_episodes.values() if eid is not None)
+        wanted = sorted(wanted, key=int) if kind == "episode" else sorted(wanted)
         if not wanted:
             continue
         live = " AND deleted_at IS NULL" if kind == "topic" or has_columns(cur, table, "deleted_at") else ""
@@ -1468,7 +1482,23 @@ def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]]) -> set[tuple
             f"ORDER BY {column} FOR SHARE",
             (values,),
         )
-        live_refs.update((kind, str(row[0])) for row in cur.fetchall())
+        locked = {row[0] for row in cur.fetchall()}
+        if kind == "episode":
+            locked_episodes = locked
+        live_refs.update((kind, str(value)) for value in locked if (kind, str(value)) in refs)
+    if commitment_ids:
+        # Recheck after the provider and parent locks, retaining both row locks
+        # until the vector commit. A changed parent is retried by a later sweep.
+        cur.execute(
+            "SELECT id, opened_episode FROM commitments WHERE id = ANY(%s) AND status = 'open' "
+            "ORDER BY id FOR SHARE",
+            (commitment_ids,),
+        )
+        live_refs.update(
+            ("commitment", str(cid)) for cid, eid in cur.fetchall()
+            if cid in opening_episodes and eid == opening_episodes[cid]
+            and (eid is None or eid in locked_episodes)
+        )
     return live_refs
 
 
@@ -1817,6 +1847,8 @@ def backfill(
     ``cancelled: True``."""
     from khipu.db import connect
 
+    if limit is not None and limit < 0:
+        raise ValueError("backfill chunk limit must be non-negative")
     stats: dict[str, Any] = {
         "scanned": 0, "chunks": 0, "embedded": 0, "skipped_unchanged": 0,
         "batches": 0, "orphans_removed": 0, "profile": None,
@@ -1825,6 +1857,13 @@ def backfill(
         with conn.cursor() as cur:
             profile = _resolve_profile(cur, profile)
             stats["profile"] = profile
+            if limit == 0:
+                stats.update({"outcome": "complete", "ok": True})
+                if dry_run:
+                    stats["would_embed"] = 0
+                else:
+                    stats.update({"failed_chunks": 0, "chunks_pruned": 0, "topic_chunks_pruned": 0})
+                return stats
             # ref is polymorphic (episodes.id | topics.slug) so it cannot carry an FK;
             # sweep vectors whose source row is gone or tombstoned so coverage never
             # over-reports (plan rule 4: a status that can't lie).
@@ -1863,11 +1902,11 @@ def backfill(
                         stats["skipped_unchanged"] += 1
                         continue
                     needed_by_ref[source_key] += 1
-                    if limit and len(todo) >= limit:
+                    if limit is not None and len(todo) >= limit:
                         continue
                     todo.append((k, ref, i, chunk, h, title))
                     queued_by_ref[source_key] = queued_by_ref.get(source_key, 0) + 1
-                if limit and len(todo) >= limit:
+                if limit is not None and len(todo) >= limit:
                     break
             _log(f"profile={profile} to_embed={len(todo)} unchanged={stats['skipped_unchanged']}")
             if dry_run:
@@ -3637,14 +3676,17 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 text = (ctext or "").strip()
                 if not text:
                     continue
-                out["commitments_embedded"] += 1
                 chunks = chunk_text(text)
                 api = _api_texts(profile, [("", c) for c in chunks])
                 vecs = embed_batch(api, profile=profile)
+                if ("commitment", str(cid)) not in _lock_live_embedding_refs(cur, [("commitment", str(cid))]):
+                    conn.commit()
+                    continue
                 rows = [("commitment", str(cid), i, c, _md5(c), v)
                         for i, (c, v) in enumerate(zip(chunks, vecs))]
                 built = _upsert_chunks(cur, profile, rows)
                 conn.commit()
+                out["commitments_embedded"] += 1
                 out["commitments_chunks"] += len(rows)
                 snapshot_rows.extend(
                     {"profile": profile, "kind": "commitment", "ref": str(cid), "chunk_idx": i,
