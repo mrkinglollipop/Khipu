@@ -75,6 +75,9 @@ def test_f1_priority_uses_delivered_revision_not_callers_base(home, entry, base_
         else:
             routing.conversation_priority([{"account": "Grok"}], owner_request="change",
                                           author=routing.conversation_author(), expect_current=True, **kw)
+    except mcp_server._ToolFailure as exc:
+        assert entry == "mcp" and base_mode == "omitted"
+        assert exc.payload == {"ok": False, "code": "bad_args", "error": "base is required"}
     except routing.RouteError:
         pass
     held = routing.read_view()["priority"]

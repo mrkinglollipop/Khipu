@@ -84,6 +84,15 @@ class _CommitmentsCursor:
         s = " ".join(sql.split())
         self.statements.append(s)
         params = params or ()
+        # No aliases are seeded: the canonical-group left join returns the
+        # supplied project and a null alias inside the reader's savepoint.
+        if s.startswith(("SAVEPOINT ", "RELEASE SAVEPOINT ", "ROLLBACK TO SAVEPOINT ")):
+            return
+        if s.startswith("WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases"):
+            project, fallback = params
+            assert project == fallback
+            self._result = [(project, None)]
+            return
         if s.startswith("SELECT column_name FROM information_schema.columns"):
             cols = ["id", "text", "project", "owner", "kind", "opened_episode",
                     "opened_at", "due_after", "status", "closed_episode",

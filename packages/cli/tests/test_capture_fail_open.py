@@ -146,6 +146,16 @@ class _CaptureCursor(_EpisodesFakeCursor):
     def execute(self, sql, params=None):
         s = " ".join(sql.split())
         table = params[0] if params else None
+        # No aliases are seeded in this fixture. The strict identity reader
+        # must receive the same no-match rows PostgreSQL would return.
+        if s.startswith("SELECT project FROM project_aliases WHERE alias"):
+            self.calls.append((s, params or ()))
+            self._result = []
+            return
+        if s.startswith("WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases"):
+            self.calls.append((s, params or ()))
+            self._result = [(params[1], None)]
+            return
         to_decisions = (
             (s.startswith("SELECT column_name FROM information_schema.columns")
              and table in ("decisions", "decision_links"))

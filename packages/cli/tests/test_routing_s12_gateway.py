@@ -328,7 +328,7 @@ def test_gateway_owner_writes_are_refused_and_write_nothing(gw):
     assert error and body["code"] == "not_on_gateway" and not body.get("ok")
     for name, args in (("khipu_route_report", {"state": "open", "account": "Codex"}),
                        ("khipu_route_rule", {"text": "x", "owner_request": "y"}),
-                       ("khipu_route_priority", {"entries": [], "owner_request": "y", "base": "z"}),
+                       ("khipu_route_priority", {"entries": [{"account": "Codex"}], "owner_request": "y", "base": "z"}),
                        ("khipu_route_advise", {"account": "Codex"})):
         error, body = call(gw, name, label="tok-a", **args)
         assert body.get("available") is False, (name, body)
