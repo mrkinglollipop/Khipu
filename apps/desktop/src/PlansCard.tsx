@@ -81,6 +81,7 @@ const ERROR_PHRASE: Record<string, string> = {
   no_key: "no GLM key stored",
   key_rejected: "key not accepted by z.ai",
   currency_unsupported: "balance not in USD, which Khipu reads",
+  account_unavailable: "DeepSeek says the account can't be used just now",
   redirect_refused: "quota endpoint tried to redirect to another host",
   no_plan: "no GLM Coding Plan on this key",
   no_plan_figures: "didn't send its plan figures",

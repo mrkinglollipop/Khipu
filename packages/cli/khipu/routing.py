@@ -5714,14 +5714,22 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
             total = routing_sources.spend_total(streams, entry["key"],
                                                 now - timedelta(days=cap["days"]), now)
             extra = {}
-            if entry.get("harness") == "deepseek" and total.get("status") != "known":
-                # DeepSeek has no runner telemetry of its own to cover: its spend
-                # is the decreases in the balance Khipu reads, over the cap's window.
+            if entry.get("harness") == "deepseek":
+                # DeepSeek's balance gives a spend floor (usage.py). A floor at
+                # the cap wins over any runner figure; below it the runners'
+                # known total stands, and with none the floor's unknown does.
                 from khipu import usage
 
-                total = usage.deepseek_spend_total(now, cap["days"], cap["usd"])
+                floor = usage.deepseek_spend_total(now, cap["days"], cap["usd"],
+                                                   definitions=view.get("definitions"))
+                if floor.get("status") == "known" or total.get("status") != "known":
+                    total = floor
+                # Known only once the floor alone reaches the cap; below it the
+                # floor is shown, never a used share a top-up could be hiding.
                 extra["used_pct"] = (round(total["usd"] / cap["usd"] * 100, 1)
-                                     if total.get("usd") is not None else None)
+                                     if total.get("status") == "known" and total.get("usd") is not None else None)
+                extra["at_least_usd"] = total.get("at_least_usd")
+                extra["partial"] = total.get("partial")
             out.append({**base, "cap_usd": cap.get("usd"), "days": cap.get("days"),
                         "usd": total.get("usd"), "events": total.get("events"), **extra,
                         "verdict": routing_pace.spend_verdict(total, cap["usd"]),
