@@ -310,6 +310,27 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_replication_live", value: "on" }));
   });
 
+  it("while a conversation's request waits, the toggle shows the live state and the row says it waits", async () => {
+    answers.khipu_config_show = {
+      routing: {
+        ...config().routing,
+        routing_replication_live: {
+          ...setting(false), pending: true,
+          request: { request: "turn replication on", by_words: "a conversation", at: "2026-10-14T15:00:00Z" },
+        },
+      },
+    };
+    await page();
+    expect(screen.getByRole("switch", { name: /Copy routing between your Macs through the hub/ })).not.toBeChecked();
+    expect(screen.getByText(/Replication: waiting for your OK/)).toBeInTheDocument();
+    expect(screen.queryByText(/Replication: off/)).not.toBeInTheDocument();
+  });
+
+  it("words a waiting request ahead of every other replication state", () => {
+    expect(replicationStatusWords({ status: "not_applicable" }, null, true)).toBe("waiting for your OK");
+    expect(replicationStatusWords({ status: "not_applicable" }, null, false)).toBe("off");
+  });
+
   it("words replication status as caught up, stale or never synced", () => {
     expect(replicationStatusWords({ status: "green", caught_up_at: "2026-10-14T15:00:00Z", stale: false })).toBe("caught up");
     expect(replicationStatusWords({ status: "red", caught_up_at: "2026-10-14T15:00:00Z", stale: true })).toBe("stale");

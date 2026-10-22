@@ -1401,7 +1401,7 @@ def _glm_request(key: str, timeout: float) -> tuple[int, bytes]:
 _GLM_QUOTA_TYPES = frozenset({"TOKENS_LIMIT", "CREDIT_LIMIT"})
 
 
-def _glm_pct(limit: dict):
+def _glm_pct(limit: dict, *, strict: bool = False):
     """Used percent of one limit: z.ai's own ``percentage``, else used / limit."""
     pct = limit.get("percentage")
     if pct is None:
@@ -1411,6 +1411,8 @@ def _glm_pct(limit: dict):
             return None
         pct = used / total * 100
     if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+        raise ProbeError(E_BAD)
+    if strict and pct < 0:
         raise ProbeError(E_BAD)
     return round(min(100.0, max(0.0, float(pct))), 2)
 
@@ -2132,7 +2134,7 @@ def parse_http_quota(status: int, body: bytes) -> dict:
             mins = _mins(item.get("window_mins", item.get("window_minutes")))
             name = _window_name(mins) if mins else ("quota" if i == 0 else f"quota_{i + 1}")
             resets = item.get("resets_at", item.get("reset_at", item.get("nextResetTime")))
-            window = _window(name, _glm_pct(item) if used is None and ("currentValue" in item or "usage" in item)
+            window = _window(name, _glm_pct(item, strict=True) if used is None and ("currentValue" in item or "usage" in item)
                              else used, resets, mins)
             if window:
                 windows.append(window)
@@ -2148,7 +2150,7 @@ def parse_http_quota(status: int, body: bytes) -> dict:
             name, mins = _GLM_UNITS[unit]
             if any(w["name"] == name for w in windows):
                 continue
-            window = _window(name, _glm_pct(limit), limit.get("nextResetTime"), mins)
+            window = _window(name, _glm_pct(limit, strict=True), limit.get("nextResetTime"), mins)
             if window:
                 windows.append(window)
         if not windows and ("used_pct" in data or "percentage" in data):
@@ -2913,8 +2915,16 @@ def kick_refresh(*, max_age: float = PROMPT_MAX_AGE_S, spawn=None) -> bool:
         return False
 
 
+def _figures_time(row: dict, window: dict | None = None) -> datetime | None:
+    """Stored provider figures need their observation time, not retrieval time."""
+    when = _parse_time((window or {}).get("observed_at")) or _parse_time(row.get("observed_at"))
+    if row.get("source") in ("rollout", "last_observed"):
+        return when
+    return when or _parse_time(row.get("probed_at"))
+
+
 def _age_s(row: dict, now: datetime) -> float | None:
-    when = _parse_time(row.get("observed_at")) or _parse_time(row.get("probed_at"))
+    when = _figures_time(row)
     return None if when is None else (now - when).total_seconds()
 
 
@@ -2990,6 +3000,7 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
         row["key"] = _key(account)
         age = _age_s(row, now)
         row["stale"] = bool((not row.get("ok") and row.get("last_good_at"))
+                            or (age is None and row.get("source") in ("rollout", "last_observed"))
                             or (age is not None and age > max_age))
     return {"generated_at": _iso(now.timestamp()), "max_age_s": max_age, "refreshing": refreshing,
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
@@ -3331,11 +3342,14 @@ def doctor_block(*, max_age: float = DEFAULT_MAX_AGE_S, now: datetime | None = N
             accounts.append(entry)
             continue
         age = _age_s(row, now)
-        stale = bool((not row.get("ok") and row.get("last_good_at")) or (age is not None and age > max_age))
+        stale = bool((not row.get("ok") and row.get("last_good_at"))
+                     or (age is None and row.get("source") in ("rollout", "last_observed"))
+                     or (age is not None and age > max_age))
         live = [w for w in row.get("windows") or [] if _in_force(w, now)]
         tight = max(live, key=lambda w: _shown_pct(w.get("used_pct")), default=None)
+        figures_time = _figures_time(row)
         entry.update(ok=bool(row.get("ok")), error=row.get("error"), plan=row.get("plan"),
-                     figures_at=row.get("observed_at") or row.get("probed_at"), stale=stale)
+                     figures_at=_iso(figures_time.timestamp()) if figures_time is not None else None, stale=stale)
         if tight is not None:
             entry.update(window=_window_words(tight), used_pct=_shown_pct(tight.get("used_pct")),
                          resets_at=tight.get("resets_at"))

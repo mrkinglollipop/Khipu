@@ -88,7 +88,7 @@ def test_owner_words_reassemble_byte_identically_with_unicode_and_paths(replay):
     routing.add_rule(words, via="app")
     payloads = []
     pages = []
-    for _ in range(100):
+    for _ in range(300):
         out, context, info = replay.offer()
         if not context:
             break
@@ -109,7 +109,8 @@ def test_owner_words_reassemble_byte_identically_with_unicode_and_paths(replay):
     assert "".join(payloads) == "1. " + words
     assert pages[0]["n"] == 1
     assert [p["n"] for p in pages] == list(range(1, len(pages) + 1))
-    assert {p["m"] for p in pages} == {len(pages)}
+    # The total follows each prompt's room, so only the last page names the true count.
+    assert pages[-1]["m"] == len(pages)
     assert replay.view()["rules"][0]["text"] == words
     assert not recall_prompt.routing_marker("s1").get("owed")
 
@@ -195,7 +196,7 @@ def test_crowded_recall_repacks_an_unshown_batch_without_losing_words(replay):
     assert payloads[0] in ctx
     assert entity not in info["pending"]["shown"]
     replay.ack(info)
-    for _ in range(50):
+    for _ in range(200):
         out, ctx, info = replay.offer()
         if not ctx:
             break

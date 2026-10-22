@@ -3702,6 +3702,10 @@ def cmd_config(args: argparse.Namespace) -> int:
             return request
         try:
             path = _routing.set_setting(key, args.set[1] if args.set else None, request=request or None)
+        except _routing.SettingNoChange as same:
+            print(json.dumps({"ok": True, "already_in_effect": True, key: _routing.settings_status()[key],
+                              "config_file": str(same.path)}))
+            return 0
         except ValueError as err:
             out = {"ok": False, "error": str(err)}
             if getattr(err, "code", None):
