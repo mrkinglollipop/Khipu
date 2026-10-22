@@ -138,3 +138,62 @@ def test_topic_purges_obey_pull_limit_before_writes(replica):
     assert hs._utc(hs.caught_up_at()) == dump
     assert hs.topic_detail_snapshot('purged') is not None
     assert hs.topic_detail_snapshot('control')['body'] == 'old control'
+
+
+def test_recreated_topic_after_remote_purge(replica):
+    hub, _dump = replica
+    assert hs.pull_changes()['ok']
+    assert hs.topic_detail_snapshot('purged') is None
+    hub.topics.append({'slug': 'purged', 'title': 'purged', 'body': 'LEGIT NEW topic same slug',
+                       'updated_at': datetime.now(timezone.utc) + timedelta(seconds=5)})
+    assert hs.pull_changes()['ok']
+    assert hs.topic_detail_snapshot('purged')['body'] == 'LEGIT NEW topic same slug'
+    assert 'purged' not in hs._purged_topic_slugs()
+
+
+@pytest.mark.parametrize('offset', [-5, 0])
+def test_topic_row_not_newer_than_purge_marker_stays_hidden(replica, offset):
+    assert hs.pull_changes()['ok']
+    stamp = hs._purge_marker_time(hs.snapshot_path(), 'purged') + offset
+    row = {'slug': 'purged', 'title': 'stale', 'body': 'STALE PURGED topic',
+           'updated_at': datetime.fromtimestamp(stamp, timezone.utc)}
+    parts = hs._write_pulled_tables([row], None, None, read_at=time.time())
+    assert parts['topics']['ok']
+    assert hs.topic_detail_snapshot('purged') is None
+    assert 'purged' in hs._purged_topic_slugs()
+
+
+def test_failed_recreation_keeps_purge_marker(replica):
+    assert hs.pull_changes()['ok']
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        con.execute("CREATE TRIGGER refuse_recreation BEFORE INSERT ON topics "
+                    "BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END")
+    row = {'slug': 'purged', 'title': 'new', 'body': 'LEGIT NEW topic',
+           'updated_at': datetime.now(timezone.utc) + timedelta(seconds=5)}
+    result = hs._write_pulled_tables([row], None, None, read_at=time.time())
+    assert not result['topics']['ok']
+    assert 'purged' in hs._purged_topic_slugs()
+    assert hs.topic_detail_snapshot('purged') is None
+
+
+@pytest.mark.parametrize('delta_us', [0, 1])
+def test_purge_comparison_uses_database_timestamp_precision(replica, delta_us):
+    import os
+
+    assert hs.pull_changes()['ok']
+    marker = hs._purged_topic_marker(hs.snapshot_path(), 'purged')
+    # This rounds up when represented as a PostgreSQL/Python timestamp.
+    stamp_ns = 1_800_000_000_123456789
+    os.utime(marker, ns=(stamp_ns, stamp_ns))
+    stamp = datetime.fromtimestamp(marker.stat().st_mtime, timezone.utc)
+    row = {'slug': 'purged', 'title': 'replacement', 'body': 'NEW topic',
+           'updated_at': stamp + timedelta(microseconds=delta_us)}
+    result = hs._write_pulled_tables([row], None, None, read_at=time.time())
+    assert result['topics']['ok']
+    topic = hs.topic_detail_snapshot('purged')
+    if delta_us:
+        assert topic['body'] == 'NEW topic'
+        assert not marker.exists()
+    else:
+        assert topic is None
+        assert marker.exists()

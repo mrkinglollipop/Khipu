@@ -1458,7 +1458,8 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     transaction. Each part's result by name; a part the hub or this replica
     has no table for is ``not_applicable``. A topic row older than the one
     held (by ``updated_at``) never replaces it, a tombstone held stays, and a
-    purged topic is never written back. Commitments replace the replica's
+    purged topic is written back only when its updated_at is newer than the
+    purge marker. Commitments replace the replica's
     whole table, as a dump would, unless the table held was read after
     ``read_at`` (a dump or pull that finished meanwhile): then it stays.
     ``project_aliases`` (tiny) is copied whole on every pull, replacing the
@@ -1493,6 +1494,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                 purged = _purged_topic_slugs(path)
                 written = 0
                 removed = 0
+                recreated = {}
                 for slug in sorted(topic_purges):
                     if _held_read_at(con, "topics", slug) > read_at:
                         continue
@@ -1516,8 +1518,17 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                 for row in topic_rows or ():
                     row = _topic_routing_metadata(row)
                     slug = row.get("slug")
-                    if slug is None or slug in purged:
+                    if slug is None:
                         continue
+                    if slug in purged:
+                        incoming = _utc(row.get("updated_at"))
+                        marked_at = _purge_marker_time(path, slug)
+                        # PostgreSQL timestamps and datetime have microsecond
+                        # precision; compare the filesystem time at that same
+                        # precision so rounding cannot turn equality into newer.
+                        marker_stamp = datetime.fromtimestamp(marked_at, timezone.utc)
+                        if incoming is None or incoming <= marker_stamp:
+                            continue
                     old = con.execute("SELECT updated_at, deleted_at FROM topics WHERE slug = ?", (slug,)).fetchone()
                     if old is not None and row.get("deleted_at") is None:
                         held, incoming = _utc(old[0]), _utc(row.get("updated_at"))
@@ -1533,6 +1544,8 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                         vals,
                     )
                     _record_read_at(con, "topics", slug, read_at)
+                    if slug in purged:
+                        recreated[slug] = marked_at
                     written += 1
                 if written or removed:
                     _advance_cursor(con, "topics", synced_at=_utcnow_iso(),
@@ -1558,6 +1571,12 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     parts["project_aliases"] = {"ok": True, "project_aliases": len(rows)}
                     _record_read_at(con, "project_aliases", "*", read_at)
             con.commit()
+            if "topics" in wanted:
+                for slug, marked_at in recreated.items():
+                    # Clear only after the replacement row commits, and never
+                    # remove a marker a concurrent purge just refreshed.
+                    if _purge_marker_time(path, slug) == marked_at:
+                        _purged_topic_marker(path, slug).unlink()
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - reported as the failed parts

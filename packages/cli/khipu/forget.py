@@ -171,6 +171,22 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     shared = [i in held or bool(h & owned) for i, h in zip(candidates, hashes)]
     shared_identities = [i for i, s in zip(candidates, shared) if s]
     legacy_identities = [i for i, s in zip(candidates, shared) if not s]
+    owner_sessions = sorted({str(src["session_id"])
+                             for src in [*(source_rows or []), *read["column_sources"],
+                                         *read["tombstone_payloads"]]
+                             if src.get("session_id")} | set(read["source_sessions"])
+                            | ({session_id} if session_id else set()))
+    owner_sessions_error = None
+    cur.execute("SAVEPOINT owner_word_ownership")
+    try:
+        owner_sessions_shared = _owner_sessions_held_elsewhere(
+            cur, episode_id, owner_sessions, sources=sources)
+    except Exception as exc:  # noqa: BLE001 - uncertainty must preserve the live owner's words
+        cur.execute("ROLLBACK TO SAVEPOINT owner_word_ownership")
+        owner_sessions_shared = owner_sessions
+        owner_sessions_error = f"owner-word ownership could not be checked ({type(exc).__name__})"
+    finally:
+        cur.execute("RELEASE SAVEPOINT owner_word_ownership")
     from khipu.tombstones import publish_hub_forget
 
     cur.execute(
@@ -232,11 +248,9 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "ok": True,
         "id": episode_id,
         "session_id": session_id,
-        "owner_sessions": sorted({str(src["session_id"])
-                                  for src in [*(source_rows or []), *read["column_sources"],
-                                              *read["tombstone_payloads"]]
-                                  if src.get("session_id")} | set(read["source_sessions"])
-                                 | ({session_id} if session_id else set())),
+        "owner_sessions": owner_sessions,
+        "owner_sessions_shared": owner_sessions_shared,
+        "owner_sessions_error": owner_sessions_error,
         "soft_deleted": soft_deleted,
         "embeddings_removed": embeddings_removed,
         "commitments_closed": commitments_closed,
@@ -1313,8 +1327,42 @@ def _session_forms(session_id: str) -> set[str]:
     return {f for f in forms if f}
 
 
+def _owner_sessions_held_elsewhere(cur, episode_id: int, sessions: list[str], *,
+                                  sources: bool) -> list[str]:
+    """Session-scoped words stay while another live episode holds that session.
+
+    Columns, raw origins, merge receipts and live source rows all count;
+    a separate capture in the same session need not share a source key.
+    """
+    forms = set().union(*(_session_forms(s) for s in sessions))
+    if not forms:
+        return []
+    parts = [
+        "SELECT e.session_id FROM episodes e WHERE e.id <> %(id)s AND e.deleted_at IS NULL",
+        "SELECT e.raw->>'session_id' FROM episodes e "
+        "WHERE e.id <> %(id)s AND e.deleted_at IS NULL",
+        "SELECT r.v->'payload'->>'session_id' FROM episodes e "
+        "CROSS JOIN LATERAL jsonb_array_elements(CASE "
+        "WHEN jsonb_typeof(e.raw->'merged_from') = 'array' THEN e.raw->'merged_from' "
+        "ELSE '[]'::jsonb END) AS r(v) "
+        "WHERE e.id <> %(id)s AND e.deleted_at IS NULL",
+    ]
+    if sources:
+        parts.append("SELECT s.session_id FROM episode_sources s JOIN episodes e ON e.id = s.episode_id "
+                     "WHERE e.id <> %(id)s AND e.deleted_at IS NULL AND s.deleted_at IS NULL")
+    cur.execute("SELECT session_id FROM (" + " UNION ALL ".join(parts) + ") AS owner_word_holders "
+                "WHERE session_id = ANY(%(sessions)s::text[]) "
+                "OR regexp_replace(session_id, '^[^:]*:', '') = ANY(%(sessions)s::text[])",
+                {"id": episode_id, "sessions": sorted(forms)})
+    held = set().union(*(_session_forms(row[0]) for row in cur.fetchall()
+                         if row and isinstance(row[0], str) and row[0]))
+    return sorted(s for s in sessions if _session_forms(s) & held)
+
+
 def _owner_words_scan(session_id: str | None, *, gateway: bool,
-                      sessions: list[str] | None = None) -> dict[str, Any]:
+                      sessions: list[str] | None = None,
+                      protected_sessions: list[str] | None = None,
+                      ownership_error: str | None = None) -> dict[str, Any]:
     """The owner's typed words recorded for the episode's session: its turn
     files and briefs (``owner_turns.forget_sessions``), the old widenings
     file, the words in its owner-actions lines (scrubbed, the chain and Undo
@@ -1331,24 +1379,53 @@ def _owner_words_scan(session_id: str | None, *, gateway: bool,
 
     forms = set().union(*(_session_forms(str(sid)) for sid in
                           [session_id, *(sessions or [])] if sid))
-    try:
-        removed = owner_turns.forget_sessions(forms)
-        removed["pending"] = owner_direction.remove_old_widenings()
-        removed["log_lines"] = owner_direction.scrub_words(forms)
-        temps = owner_files.clean_temps(forms)
-        removed["temps"] = temps["removed"]
-    except Exception as exc:  # noqa: BLE001 - an unfinished scan keeps the forget open
-        return {"ok": False, "removed": {}, "locations": [{
-            "place": place, "path": None, "state": "not checked",
-            "why": (f"the owner's recorded words for this session could not all be removed "
-                    f"({type(exc).__name__}), so the forget stays open")}]}
-    if temps["left"]:
-        return {"ok": False, "removed": removed, "locations": [{
-            "place": place, "path": None, "state": "not checked",
-            "why": ("a rewrite of the owner's recorded words was in progress, so its file could still hold "
-                    "this session's words; the forget stays open and the next run removes it")}]}
-    state = "removed" if any(removed.values()) else "clean"
-    return {"ok": True, "removed": removed, "locations": [{"place": place, "path": None, "state": state}]}
+    protected = set().union(*(_session_forms(s) for s in protected_sessions or []))
+    forms -= protected
+    removed = {}
+    locations = []
+    if protected:
+        locations.append({"place": place, "path": None,
+                          "state": "not checked" if ownership_error else "copy remains",
+                          "why": ownership_error or "session words are kept because another live episode "
+                                 "still holds that session; the forget stays open"})
+    errors = []
+
+    def attempt(label, action):
+        try:
+            return action()
+        except owner_turns.ForgetCleanupError as exc:
+            errors.extend(exc.errors)
+            return exc.removed
+        except Exception as exc:  # noqa: BLE001 - finish all independent cleanup steps
+            errors.append(f"{label} ({type(exc).__name__})")
+            return None
+
+    if forms:
+        turns = attempt("turns, directions and briefs", lambda: owner_turns.forget_sessions(
+            forms, **({"protected_sessions": protected} if protected else {})))
+        if turns is not None:
+            removed.update(turns)
+        # The obsolete file has no reliable session attribution. Keep it
+        # when a live holder exists, rather than erase that holder's words.
+        if not protected:
+            removed["pending"] = attempt("old widenings", owner_direction.remove_old_widenings)
+        removed["log_lines"] = attempt("owner-actions log", lambda: owner_direction.scrub_words(
+            forms, **({"protected_sessions": protected} if protected else {})))
+        temps = attempt("rewrite temps", lambda: owner_files.clean_temps(
+            forms, **({"protected_sessions": protected} if protected else {})))
+        if temps is not None:
+            removed["temps"] = temps["removed"]
+            if temps["left"]:
+                errors.append("a rewrite temp remains and may still hold this session's words")
+    if errors:
+        locations.append({"place": place, "path": None, "state": "not checked",
+                          "why": "the owner's recorded words could not all be removed: "
+                                 + "; ".join(errors) + "; the forget stays open"})
+    if not locations:
+        state = "removed" if any(removed.values()) else "clean"
+        locations.append({"place": place, "path": None, "state": state})
+    return {"ok": not any(loc["state"] in INCOMPLETE_STATES for loc in locations),
+            "removed": removed, "locations": locations}
 
 
 def _routing_words_scan(*, gateway: bool) -> dict[str, Any]:
@@ -1858,6 +1935,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         partial.append("work_view")
     out["owner_words"] = _owner_words_scan(out.get("session_id"),
                                            sessions=out.get("owner_sessions"),
+                                           protected_sessions=out.get("owner_sessions_shared"),
+                                           ownership_error=out.get("owner_sessions_error"),
                                            gateway=_is_gateway() if gateway is None else bool(gateway))
     if not out["owner_words"]["ok"]:
         partial.append("owner_words")
