@@ -81,10 +81,11 @@ Use `khipu models show` and `khipu models set --role synth --provider ...`. API 
 
 Transcript windows go to whichever provider you configure. One default to know: when a provider other than Gemini, `cloud` or `local` fails a window (an account limit, not logged in, a transport error, or a reply that is not capture JSON) and a Gemini key is configured, that window is retried once on Gemini Flash, so its text goes to Google. `synth_fallback` defaults to `gemini`; set it to `none` (`khipu config --set synth_fallback none`, or the fallback setting in the app) to leave the job queued instead.
 
-### Two queues, two meanings
+### Queues and their meanings
 
 - The **capture queue** holds sessions that are not summarised yet.
 - The **outbox** holds summaries whose database write failed. They replay when the database is back.
+- The separate **owner-writes queue** holds offline owed and decision changes in order. Replay uses hub outcome receipts to avoid applying a write twice.
 
 `khipu doctor` reports red while anything sits in the outbox, so a silent backlog is not possible.
 
@@ -96,7 +97,7 @@ Every hook run stamps a heartbeat per harness. This lets Khipu tell "the hook is
 
 Each episode can now record where it came from. Migration `0027_episode_sources.sql` adds an `episode_sources` table. A `source_key` is a hash of the harness, session, transcript range, window and part. When the session or transcript range is missing, a hash of the payload is used instead. Each row is an `origin` row (the capture that created the episode) or a `merged` row (a capture folded into it).
 
-The migration backfills one row per existing episode. New captures and merges add rows as they go (a fail-open dual write). Nothing in the capture path reads the table yet, and uniqueness is still `(ts, md5(summary))`. Moving readers and uniqueness onto `source_key` is planned.
+The migration backfills one row per existing episode. New captures and merges add rows as they go. Capture reads `episode_sources` for exact-source deduplication and forgotten-source replay protection. The legacy timestamp/summary identity remains a fallback, rather than the only identity used.
 
 ### Merging near-duplicates
 
@@ -176,7 +177,7 @@ The **graph** (`nodes` and `edges`) sits alongside as a PostgreSQL 19 SQL/PGQ pr
 
 ### Other record types
 
-The schema has 28 migrations (`0000` to `0027`). Beyond episodes, topics and the graph, it holds:
+The schema migrations extend through `0044`, including ledger, episode origin, forgotten sources, queued owner-write receipts, commitment ownership and project naming, routing replication and gateway-copy storage. Beyond episodes, topics and the graph, it holds:
 
 | Record | What it is |
 |---|---|
@@ -187,6 +188,10 @@ The schema has 28 migrations (`0000` to `0027`). Beyond episodes, topics and the
 | Media assets | PNG and JPEG files embedded for search |
 | Embedding profiles | Which model and size produce vectors, and which profile is active |
 | Episode sources | Where each episode came from (capture identity, above) |
+| Ledger | Project work rows, their vocabulary and change history |
+| Project names | Aliases and evidence grouping renamed projects |
+| Forgotten sources | Durable identities that prevent forgotten captures returning |
+| Owner-write receipts | Outcomes for queued owed and decision changes |
 
 ### Embedding profiles
 
@@ -209,6 +214,8 @@ Hooks put prior work in front of the agent before it acts.
 - **Aegis** gets no push. Its hooks run as observers and their output is discarded. Aegis agents pull with `khipu_status` and `khipu_owed`.
 - **Cursor** gets the session-start push and a project rule file, but no per-prompt hook.
 
+With `routing_push` enabled, routing updates can arrive at session start, before prompts and at delegation. `routing_push_start`, `routing_push_prompt` and `routing_push_delegation` each default on within that feature; the master feature defaults off. Recall can also label imported topic text whose routing claims may have been superseded.
+
 A warm local recall service (`khipu recall serve`) answers the per-prompt hook over a socket so each prompt skips a cold Python start. It is an optional launch job. Without it the hook uses a one-shot path.
 
 See [integrations.md](integrations.md) for what each harness gets.
@@ -230,7 +237,7 @@ khipu graph <node-id> --hops 2                           # connections
 
 Two optional stages sit behind feature switches, both off by default: a rerank pass (one model call over 12 candidates) and an absolute relevance floor. See `khipu features`.
 
-**Filters** work in the CLI and the MCP tool: `--kind` (episode, topic, node, media, library), `--source` (one library), `--project`, `--since`, `--until` (ISO dates or `7d`), `--session-id`, `--harness`, `--via`.
+**Filters** work in the CLI and the MCP tool: `--kind`, `--source` (one library), `--project`, `--since`, `--until` (ISO dates or `7d`), `--session-id`, `--harness`, `--via`. Hybrid and literal accept episode, topic, node and library; semantic accepts episode, topic, media and library. The MCP tool also accepts `t3_thread` and `tz`; the CLI has no `--t3-thread` or `--tz` flags. Timezone defaults to UTC, including for an unknown zone. Natural-language time interpretation applies only with its feature switch on and no explicit `since` or `until`.
 
 **Graph** walks expand the neighbourhood of a node. A topic slug works as an id. A digit id is an episode, and its neighbourhood is that capture's topics.
 
@@ -251,23 +258,29 @@ Every frame Khipu writes on these paths is strict UTF-8 JSON. U+2028 and U+2029 
 
 ### The offline replica
 
-When the database is unreachable, reads fall back to a local SQLite copy (`hub_snapshot.sqlite`). It holds episodes, topics, revisions, nodes, edges, embedding profiles, vectors, decisions and deliverables. It does not hold libraries or commitments. Keyword search uses a trigram index there. Semantic search offline works only when the embedding provider is a local one.
+When the database is unreachable, reads fall back to a local SQLite copy (`hub_snapshot.sqlite`). It holds episodes, topics, revisions, nodes, edges, embedding profiles, vectors, decisions and deliverables, plus ledger rows and history, commitments with their owner and close-rule fields, and project aliases. It does not hold libraries. Keyword search uses a trigram index there. Semantic search offline works only when the embedding provider is a local one.
 
 How it stays fresh:
 
 1. A nightly job rebuilds it. You can also run `khipu snapshot refresh`.
-2. Between rebuilds, captures, decision changes and forgets update it as they happen. Episode edits (`khipu episode edit`) and topic tombstones and purges do not: this Mac's copy keeps the old summary or the topic until its next full dump (nightly, or `khipu snapshot refresh`).
+2. Between rebuilds, captures, decision changes and forgets update it as they happen. Incremental pulls also bring episode edits and topic tombstones, so they need not wait for a full dump. Topic purge attempts to remove this Mac’s copy immediately after the hub commit and reports local cleanup failure separately.
 3. `doctor` and `status` report freshness per table as fresh, behind, stale or unknown. Only stale turns `doctor` red. A stale result carries a `stale: true` flag.
 
-A scheduled incremental sync is planned.
+The `replica_refresh` job runs `khipu snapshot heal`. It checks every 5 minutes by default and updates copies at least 15 minutes old, with incremental pulls falling back to full dumps as needed. `replica_check_every` and `replica_refresh_after` change those intervals.
+
+Local state lives under Khipu’s configured data directory, normally `~/.config/khipu`. `owner-writes/` holds queued owed and decision changes, `state/replica-heal.json` records healing, `state/replica-wake` requests a check, and `forgotten_sources.json` prevents forgotten sources returning. Owed and decision hub statements default to a 30-second timeout; dead connections and app CLI calls default to 60 seconds. The corresponding settings are `hub_statement_timeout` (0 for no limit), `hub_dead_connection_after` (0 to wait for the system) and `app_cli_timeout` (0 for no limit).
 
 ## 4. What Khipu tracks beyond episodes
 
 ### Owed (commitments)
 
-Open loops from a capture become commitments: follow-up, blocker, question or promise. A later capture in the same project can close them (a closed loop, a decision, or a "done:" line). A follow-up or promise with no due date goes stale after 14 days. A blocker or question goes stale after 30. A snoozed commitment is never stale before its date.
+Open loops from a capture become commitments: follow-up, blocker, question or promise. A later capture in the same project can close eligible assistant or agent items (a closed loop, a decision, or a "done:" line). Eligible follow-ups and promises with no due date go stale after 14 days; blockers and questions go stale after 30. A snoozed commitment is never stale before its date. The owner’s own items remain open instead of being automatically closed or made stale, with Quiet for N weeks or Looks done suggestions for the owner to resolve.
 
-Use `khipu owed` (list, `--close`, `--reopen`, `--snooze`), the Owed screen, or the `khipu_owed` tools. Nightly steps mark stale ones and re-judge open ones.
+Use `khipu owed` (list, `--close`, `--reopen`, `--snooze`), Owed within the Work screen, or the `khipu_owed` tools. Nightly steps mark stale ones and re-judge open ones.
+
+### Work and project names
+
+The project ledger tracks work rows and their history. The Work screen includes Owed, project ledger boards, Waiting on you, Running now and Accounts. Use `khipu ledger` or `khipu_ledger` to read and update rows. Project-name groups keep renamed projects together and expose merge and keep-separate questions to the owner; `khipu_project` shows their names, evidence and counts.
 
 ### Decisions
 
@@ -287,9 +300,11 @@ Briefs are off by default. Turn on the `briefs` switch, then use `khipu briefs p
 
 ### Forget
 
-`khipu episode forget ID` tombstones one episode. It does not erase the row: it sets `deleted_at`, and the summary and its provenance stay in the `episodes` table. Search, `khipu_get` and the episode detail view skip it. Today some recent-capture lists do not: the Activity list (`khipu activity` and the app's Activity screen), the `recent_captures` section of `khipu doctor`, `khipu status` and the full `khipu_status`, and the session-start slice when it falls back to recent captures can still show a forgotten episode's summary. A fix is planned. It also removes the episode's vectors, closes the commitments it opened (reason `forgotten`; the closed rows stay), retracts its decisions, deletes its deliverables, removes its lines from the legacy file and Khipu's own forget backups, updates the local replica, and marks briefs that cited it stale. Graph topic nodes are shared across episodes and are left alone, and database backups made before the forget still contain it. The legacy file and local replica steps can fail; capture jobs still waiting in the outbox are not removed, only reported. If anything is left, the result says `complete: false` and lists it under `partial`.
+`khipu episode forget ID` tombstones one episode. It does not erase the row: it sets `deleted_at`, and the summary and its provenance stay in the `episodes` table. Search, `khipu_get`, the episode detail view and recent-capture readers exclude it, including Activity, doctor, status, the full `khipu_status` and the session-start fallback. It also removes the episode's vectors, closes the commitments it opened (reason `forgotten`; the closed rows stay), retracts its decisions, deletes its deliverables, removes its lines from the legacy file and Khipu's own forget backups, updates the local replica, and marks briefs that cited it stale. Graph topic nodes are shared across episodes and are left alone, and database backups made before the forget still contain it. The legacy file and local replica steps can fail. Forget removes queued jobs that exactly match the episode’s sources under the outbox lock; unreadable, loosely matching or shared jobs remain and are reported with reasons and locations. If anything is left, the result says `complete: false` and lists it under `partial`.
 
-`khipu episode edit ID --summary "..."` corrects an episode in the hub database and re-embeds it; the offline copy catches up at its next refresh. `khipu topic purge SLUG --yes` hard-deletes an already tombstoned topic, with its revisions and vectors, from the hub database. This Mac's offline copy keeps the topic until its next full dump (nightly, or `khipu snapshot refresh`). In the app, use Activity.
+Forget publishes durable source identities to prevent later replay from resurrecting the episode. The tombstoned row and text remain, with no episode purge or restore command. Independent routing words remain until removed using their routing commands.
+
+`khipu episode edit ID --summary "..."` corrects an episode in the hub database and re-embeds it; the offline copy catches up through an incremental pull or full refresh. `khipu topic purge SLUG --yes` hard-deletes an already tombstoned topic, with its revisions and vectors, from the hub database. After the hub commit, purge attempts to remove the topic from this Mac’s replica immediately and reports incomplete local cleanup separately. In the app, use Activity.
 
 ## 5. Where it runs
 
@@ -399,7 +414,7 @@ During the migration, memory exists as files and as database rows, so they can d
 | `khipu revisions` | Shows conflicting topic edits across machines. The newest edit wins and the older version is kept. |
 | `khipu sources` | Lists, enables, disables, adds and removes graph roots. `sources export` writes the file graphify reads. |
 
-`khipu doctor --quick` runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and more) and leaves out the hub, network and probe checks. `khipu doctor --probe` runs a fresh end-to-end recall test.
+`khipu doctor --quick` runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and more) and omits hub reachability, network and probe checks; reads the hub only for the pending-migration check. `khipu doctor --probe` runs a fresh end-to-end recall test.
 
 Routing delivery has its own `routing_delivery` health check. It reports stalled
 budgeted pages, twice-expired leases, acknowledgements beyond shown receipts,
