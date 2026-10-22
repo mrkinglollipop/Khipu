@@ -446,17 +446,39 @@ def test_a_view_saved_while_the_poll_reads_it_is_not_acknowledged(home, monkeypa
         return {"folded": True, "saved": True, "busy": False, "version": 1,
                 "valid_until": routing._iso(clocks.now + timedelta(hours=3)), "interval": 10800.0}
 
+    mutations = 0
+
     def load_view():
+        nonlocal mutations
         view = real_load()
-        routing.report(account="Codex", state="limited", until="12s", author=ME)  # saved under the read
+        before = recall_prompt._view_stat(routing)
+        # Simulate an independent writer: its own reads must not inject
+        # another writer recursively. Every read by the poll still changes
+        # the saved view, including all of its snapshot retries.
+        with monkeypatch.context() as writer:
+            writer.setattr(routing, "_load_view", real_load)
+            routing.report(account="Codex", state="limited", until="12s", author=ME)
+        assert recall_prompt._view_stat(routing) != before
+        mutations += 1
         return view
+
+    def timed_out(_signum, _frame):
+        pytest.fail("a changing routing snapshot exceeded its 0.5 s budget")
 
     monkeypatch.setattr(routing, "poll_refold", poll_refold)
     schedule = _schedule(home, interval=routing.poll_interval())
     recall_prompt._look_at_settings(schedule, routing)
     with monkeypatch.context() as m:
         m.setattr(routing, "_load_view", load_view)
-        out = _helper_poll(schedule)
+        previous_handler = signal.signal(signal.SIGALRM, timed_out)
+        previous_timer = signal.setitimer(signal.ITIMER_REAL, 0.5)
+        try:
+            out = _helper_poll(schedule)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+    assert mutations == recall_prompt._VIEW_SNAPSHOT_TRIES
     assert out["view_stat"] is None
     recall_prompt._look_at_settings(schedule, routing)
     assert schedule.due() == ["poll"]
