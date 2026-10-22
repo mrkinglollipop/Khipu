@@ -589,7 +589,11 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
         # already happen" check a caller makes without tracking state
         # itself — same contract the pre-0024 version of this function had.
         return False
-    if not force and old.get("project") != new.get("project"):
+    from khipu.identity import project_canonical_group
+
+    old_project = project_canonical_group(cur, old.get("project"))[0]
+    new_project = project_canonical_group(cur, new.get("project"))[0]
+    if not force and old_project != new_project:
         raise ValueError(
             f"decision {old_id} (project {old.get('project')!r}) and {new_id} "
             f"(project {new.get('project')!r}) are in different projects; pass force=True to override"

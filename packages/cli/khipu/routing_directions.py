@@ -25,6 +25,8 @@ is ``unjoined``: still open, with that reason, and nothing is guessed.
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import fcntl
 import json
 import re
 import time
@@ -273,12 +275,36 @@ def store_path() -> Path:
     return owner_turns.folder() / STORE_NAME
 
 
+@contextlib.contextmanager
+def _store_lock():
+    owner_turns._ensure_folder()
+    with store_path().with_suffix(".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _valid_row(key, row):
+    if not isinstance(row, dict) or row.get("id") != key:
+        return False
+    if not all(isinstance(row.get(k), str) for k in ("id", "session", "words", "status")):
+        return False
+    if "occurrence" in row and (type(row["occurrence"]) is not int or row["occurrence"] < 1):
+        return False
+    return row.get("target") is None or isinstance(row["target"], dict)
+
+
 def _load() -> dict:
     try:
         data = json.loads(store_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {"directions": {}}
-    return data if isinstance(data, dict) and isinstance(data.get("directions"), dict) else {"directions": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("directions"), dict):
+        return {"directions": {}}
+    data["directions"] = {key: row for key, row in data["directions"].items() if _valid_row(key, row)}
+    return data
 
 
 def _save(data: dict) -> None:
@@ -295,10 +321,11 @@ def forget_sessions(sessions) -> None:
     names = {s for s in sessions if s}
     if not names:
         return
-    data = _load()
-    kept = {k: v for k, v in data["directions"].items() if v.get("session") not in names}
-    if len(kept) != len(data["directions"]):
-        _save({**data, "directions": kept})
+    with _store_lock():
+        data = _load()
+        kept = {k: v for k, v in data["directions"].items() if v.get("session") not in names}
+        if len(kept) != len(data["directions"]):
+            _save({**data, "directions": kept})
 
 
 def directions() -> list[dict]:
@@ -308,13 +335,14 @@ def directions() -> list[dict]:
 
 def dismiss(direction_id: str) -> dict | None:
     """The owner dismisses a direction: it stays dismissed on later captures."""
-    data = _load()
-    row = data["directions"].get(direction_id)
-    if row is None:
-        return None
-    row["status"] = "dismissed"
-    _save(data)
-    return row
+    with _store_lock():
+        data = _load()
+        row = data["directions"].get(direction_id)
+        if row is None:
+            return None
+        row["status"] = "dismissed"
+        _save(data)
+        return row
 
 
 def owed_items() -> list[dict]:
@@ -392,7 +420,8 @@ def _action_target(line: dict) -> dict | None:
         if not isinstance(source, dict):
             continue
         kind = source.get("kind")
-        value = source.get("value", source.get("n"))
+        field = {"share": "pct", "spend": "usd", "concurrency": "n"}.get(kind, "value")
+        value = source.get(field, source.get("value"))
         entity = source.get("account") or source.get("entity") or line.get("target")
         if kind and value is not None and entity:
             return {"entity": str(entity), "kind": kind, "value": value}
@@ -463,6 +492,11 @@ def _join_reason(row: dict, counter: dict | None) -> str | None:
 
 def refresh(actions: list[dict] | None = None) -> list[dict]:
     """Re-join every stored direction against the applied owner actions."""
+    with _store_lock():
+        return _refresh_locked(actions)
+
+
+def _refresh_locked(actions):
     applied = _applied_actions(actions)
     known = None  # loaded on the first structured match candidate
     counters: dict[str, dict | None] = {}
@@ -511,6 +545,11 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
     each is cleaned to the owner's typed words the same way the recorder
     cleans them, counted by canonical hash, and any direction in it opens
     (or keeps) its owed item. Returns this session's directions."""
+    with _store_lock():
+        return _capture_scan_locked(session, turns, now=now, actions=actions)
+
+
+def _capture_scan_locked(session, turns, *, now, actions):
     now = time.time() if now is None else now
     data = _load()
     rows = data["directions"]
@@ -591,5 +630,5 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
             row["join"] = "joined"
             row.pop("reason", None)
     _save(data)
-    refresh(actions)
+    _refresh_locked(actions)
     return [r for r in directions() if r.get("session") == session]

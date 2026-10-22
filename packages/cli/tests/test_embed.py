@@ -1033,7 +1033,7 @@ class SearchFilterPushdownTest(unittest.TestCase):
         f = em._SearchFilters(since="7d", until=None)
         self.assertTrue(f.active)
         self.assertFalse(f.episode_only)
-        self.assertIn("COALESCE(t.updated_at, t.created_at) >= %(kf_since)s", f.topic_sql("t"))
+        self.assertIn("COALESCE(t.event_at, t.updated_at, t.created_at) >= %(kf_since)s", f.topic_sql("t"))
         self.assertIn("n.built_at >= %(kf_since)s", f.node_sql("n"))
         self.assertFalse(f.media_allowed, "media has no timestamp to bound")
 

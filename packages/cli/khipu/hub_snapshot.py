@@ -105,7 +105,9 @@ _TABLES = (
 # Version 8 adds `project_aliases`, so an offline read groups a renamed
 # project's keys the way the hub does. A replica of version 7 gets them on
 # its next full refresh; a reader on a file without the table sees no groups.
-SNAPSHOT_SCHEMA_VERSION = 8
+# Version 9 adds the close-rule fields used by offline owed filters. Older
+# replicas gain these nullable columns on their next commitments pull.
+SNAPSHOT_SCHEMA_VERSION = 9
 
 _COMMITMENT_COLS = (
     "id",
@@ -135,6 +137,9 @@ _COMMITMENT_COLS = (
     "owner_prior_label",
     "linked_ids",
     "latest_text",
+    "prs",
+    "settle_suggestion",
+    "pr_check",
 )
 # The version 7 columns, added to an older replica's table before a pull
 # writes rows into it.
@@ -148,6 +153,12 @@ _COMMITMENT_LINEAGE_COLS = (
     ("owner_prior_label", "TEXT"),
     ("linked_ids", "TEXT"),
     ("latest_text", "TEXT"),
+)
+
+_COMMITMENT_CLOSE_COLS = (
+    ("prs", "TEXT"),
+    ("settle_suggestion", "TEXT"),
+    ("pr_check", "TEXT"),
 )
 
 _DELIVERABLE_COLS = (
@@ -1849,6 +1860,8 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
         )
     if version >= 7:
         _add_commitment_lineage_cols(con)
+    if version >= 9:
+        _add_commitment_close_cols(con)
     if version >= 8:
         con.executescript(
             """
@@ -2641,12 +2654,24 @@ def _add_commitment_lineage_cols(con: sqlite3.Connection) -> None:
             con.execute(f"ALTER TABLE commitments ADD COLUMN {col} {kind}")
 
 
+def _add_commitment_close_cols(con: sqlite3.Connection) -> None:
+    """Upgrade older replicas before writing close-rule data on a pull."""
+    have = _snapshot_table_columns(con, "commitments")
+    if not have:
+        return
+    for col, kind in _COMMITMENT_CLOSE_COLS:
+        if col not in have:
+            con.execute(f"ALTER TABLE commitments ADD COLUMN {col} {kind}")
+
+
 def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: Sequence[Any]) -> int:
     """Insert hub commitment rows (``cols`` order) into ``con``. A replica of
-    an older version first gains the owner's lineage columns, so its owners
-    match the hub's; other columns it lacks are left out. Caller clears the
+    an older version first gains the owner's lineage and close-rule columns,
+    so its owners and owed filters match the hub's. Other missing columns
+    are left out. Caller clears the
     table first and commits."""
     _add_commitment_lineage_cols(con)
+    _add_commitment_close_cols(con)
     have = _snapshot_table_columns(con, "commitments")
     keep = [i for i, c in enumerate(cols) if c in have]
     sel = ", ".join(cols[i] for i in keep)
@@ -2655,8 +2680,11 @@ def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: S
         vals = []
         for i in keep:
             col, val = cols[i], row[i]
-            if col == "linked_ids":
-                vals.append(json.dumps([int(v) for v in (val or [])]))
+            if col in ("linked_ids", "prs"):
+                vals.append(json.dumps([int(v) for v in val]) if val is not None else None)
+                continue
+            if col in ("settle_suggestion", "pr_check"):
+                vals.append(json.dumps(val) if val is not None else None)
                 continue
             vals.append(_ts_text(val) if col in ts_cols else (int(bool(val)) if col == "future_trigger" else val))
         con.execute(
@@ -6087,6 +6115,73 @@ def _graph_candidates_snapshot(con, results: list[dict[str, Any]]) -> tuple[list
         return results, ["graph_candidates"]
 
 
+def _filter_expanded_snapshot_rows(
+    con, rows, *, kind=None, since=None, until=None, project=None,
+    session_id=None, harness=None, t3_thread=None, via=None,
+):
+    """Graph neighbours must pass the same requested filters as seed rows."""
+    from khipu.search_text import parse_time_filter
+
+    rows = _filter_t3_snapshot_rows(con, rows, t3_thread, via)
+    if kind:
+        rows = [r for r in rows if r.get("kind") == kind]
+    episode_only = bool(project or session_id or harness or t3_thread or via)
+    if episode_only:
+        rows = [r for r in rows if r.get("kind") == "episode"]
+    since_dt = parse_time_filter(since) if since else None
+    until_dt = parse_time_filter(until) if until else None
+    if not (episode_only or since_dt is not None or until_dt is not None):
+        return rows
+
+    # Outbox rows have no replica source yet; merge_outbox_episodes has
+    # already checked their metadata against these same filters.
+    local = snapshot_row_metadata(con, [r for r in rows if not r.get("outbox")])
+    by_key = {(r["kind"], str(r["id"])): r for r in local}
+    episodes = {}
+    ids = [str(r["id"]) for r in local if r.get("kind") == "episode"]
+    if ids and episode_only:
+        cols = _snapshot_table_columns(con, "episodes")
+        sid_expr = "session_id" if "session_id" in cols else "NULL"
+        harness_expr = "harness" if "harness" in cols else "NULL"
+        for eid, sid, harn in con.execute(
+            f"SELECT CAST(id AS TEXT), {sid_expr}, {harness_expr} FROM episodes "
+            f"WHERE CAST(id AS TEXT) IN ({','.join('?' for _ in ids)})", ids,
+        ):
+            episodes[str(eid)] = (str(sid or ""), harn)
+    projects = snapshot_project_group(con, project.strip())[1] if project else []
+    node_times = {}
+    node_ids = [str(r["id"]) for r in local if r.get("kind") == "node"]
+    if node_ids and (since_dt is not None or until_dt is not None):
+        if "built_at" in _snapshot_table_columns(con, "nodes"):
+            node_times = dict(con.execute(
+                f"SELECT id, built_at FROM nodes WHERE id IN ({','.join('?' for _ in node_ids)})",
+                node_ids,
+            ))
+    out = []
+    for row in rows:
+        if row.get("outbox"):
+            out.append(row)
+            continue
+        item = by_key.get((row["kind"], str(row["id"])))
+        if item is None:
+            continue
+        if episode_only:
+            sid, harn = episodes.get(str(item["id"]), ("", None))
+            if project and not any(p.lower() in str(item.get("project") or "").lower() for p in projects):
+                continue
+            if session_id and not sid.startswith(session_id):
+                continue
+            if harness and (harn or sid.split(":", 1)[0]) != harness:
+                continue
+        if since_dt is not None or until_dt is not None:
+            value = node_times.get(str(item["id"])) if item["kind"] == "node" else item.get("ts")
+            ts = _parse_snapshot_ts(value)
+            if ts is None or (since_dt is not None and ts < since_dt) or (until_dt is not None and ts > until_dt):
+                continue
+        out.append(item)
+    return out
+
+
 def search_stale_payload(
     query: str,
     limit: int,
@@ -6131,7 +6226,10 @@ def search_stale_payload(
         except Exception:
             results = []
         results, degraded_legs = _graph_candidates_snapshot(con, results)
-        results = _filter_t3_snapshot_rows(con, results, t3_thread, via)
+        results = _filter_expanded_snapshot_rows(
+            con, results, kind=kind, since=since, until=until, project=project,
+            session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
+        )
         results = enrich_search_results_snapshot(con, results)
         results = _annotate_snapshot_validity(con, results)
         out = {
@@ -6156,7 +6254,10 @@ def search_stale_payload(
         t3_thread=t3_thread, via=via,
     )
     results, degraded_legs = _graph_candidates_snapshot(con, results)
-    results = _filter_t3_snapshot_rows(con, results, t3_thread, via)
+    results = _filter_expanded_snapshot_rows(
+        con, results, kind=kind, since=since, until=until, project=project,
+        session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
+    )
     results = enrich_search_results_snapshot(con, results)
     results = _annotate_snapshot_validity(con, results)
     out = {

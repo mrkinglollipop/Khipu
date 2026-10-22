@@ -35,6 +35,9 @@ PATTERNS: tuple[tuple[str, str, str], ...] = (
     ("temp", "turns", "occurrences/.*.tmp"),
     ("occurrences", "turns", "occurrences/*.json"),
     ("directions", "turns", "routing-directions.json"),
+    # Persistent, empty flock inode: deleting it would let new writers
+    # bypass a transaction still holding the old inode.
+    ("lock", "turns", "routing-directions.lock"),
     ("mismatches", "turns", "routing-mismatch-*.json"),
     ("turns", "turns", "*.jsonl"),
     ("temp", "data", ".owner-*.tmp"),
