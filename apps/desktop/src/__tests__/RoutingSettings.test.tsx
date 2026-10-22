@@ -885,6 +885,39 @@ describe("Settings -> Routing: standing rules", () => {
     );
   });
 
+  it("removes a provisional rule by entity and restores it by entity", async () => {
+    const provisional = {
+      n: null as unknown as number,
+      number_pending: true,
+      entity: "rule:provisional-undo",
+      text: "Keep the fix local.",
+    };
+    let removed = false;
+    answers.khipu_route_rule = (args) => {
+      if (args?.action === "retire") removed = true;
+      if (args?.action === "restore") removed = false;
+      return { ok: true };
+    };
+    answers.khipu_route_view = () => ({
+      ...view(),
+      rules: removed ? [] : [provisional],
+    });
+    await page();
+    fireEvent.click(screen.getByRole("button", { name: "Remove rule Keep the fix local." }));
+    fireEvent.click(within(await screen.findByRole("group", { name: "Remove rule Keep the fix local.?" })).getByRole("button", { name: "Remove rule Keep the fix local." }));
+    expect(await screen.findByText("Rule Keep the fix local. removed.")).toBeInTheDocument();
+    expect(screen.queryByText("Rule  removed.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() =>
+      expect(calls("khipu_route_rule")).toEqual([
+        { action: "retire", entity: "rule:provisional-undo" },
+        { action: "restore", entity: "rule:provisional-undo" },
+      ]),
+    );
+    expect(await screen.findByRole("button", { name: "Remove rule Keep the fix local." })).toBeInTheDocument();
+    expect(screen.queryByText("Rule Keep the fix local. removed.")).toBeNull();
+  });
+
   it("adds a rule after asking, and never with empty words", async () => {
     await page();
     const box = screen.getByLabelText("New rule");

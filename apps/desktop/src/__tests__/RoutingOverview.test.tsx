@@ -80,7 +80,7 @@ function view(): RouteView {
     ],
     note: { text: "We don't need cursor. Just grok.", at: "2026-10-13T14:00:00Z" },
     rules: [
-      { n: 3, text: "Never a -fast tier.", seeded: true, confirmed: false, source: "from your routing table", date: "2026-10-13" },
+      { n: 3, entity: "rule-uuid-3", text: "Never a -fast tier.", seeded: true, confirmed: false, source: "from your routing table", date: "2026-10-13" },
       { n: 7, text: "Khipu's routing record is guidance, not a gate.", seeded: true, confirmed: true, source: "from your routing table", date: "2026-10-13" },
     ],
     watched_rules: [3],
@@ -454,6 +454,7 @@ describe("Accounts and routing: links open their group", () => {
     const needs = screen.getByRole("region", { name: "Needs you" });
     fireEvent.click(within(needs).getByRole("button", { name: "Show the standing rule to confirm" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="rule:3"]')));
+    expect(document.querySelector('[data-route-item="rule:rule-uuid-3"]')).toBeNull();
     expect(groupButton("Your note and standing rules")).toHaveAttribute("aria-expanded", "true");
 
     fireEvent.click(within(needs).getByRole("button", { name: "Show the Claude second disagreement" }));

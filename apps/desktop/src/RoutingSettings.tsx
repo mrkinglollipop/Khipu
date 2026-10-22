@@ -1675,6 +1675,9 @@ function RuleRow({
   const toConfirm = pending || (r.seeded && !r.confirmed);
   const name = ruleName(r);
   const id = `rule:${identity}`;
+  // Overview links use the durable display number for standing rules; only a
+  // replicated rule without one needs its entity as the DOM target.
+  const routeItem = `rule:${typeof r.n === "number" ? r.n : identity}`;
   const fieldId = useId();
   const confirmBtn = useRef<HTMLButtonElement>(null);
   const editBtn = useRef<HTMLButtonElement>(null);
@@ -1694,7 +1697,7 @@ function RuleRow({
   const checks = ruleResultLines(watched, result, now.getTime());
   return (
     <li className={`row-item route-rule${watched && result?.result === "broken" ? " broken" : ""}`}
-      data-route-item={`rule:${identity}`} tabIndex={-1}>
+      data-route-item={routeItem} tabIndex={-1}>
       <span className="route-rule-n" aria-hidden>
         {r.n}.
       </span>
@@ -1984,7 +1987,7 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
         )}
         {removed && !rules.some((r) => ruleIdentity(r) === ruleIdentity(removed)) ? (
           <div className="route-undo" role="status">
-            <span>Rule {removed.n} removed.</span>
+            <span>Rule {ruleName(removed)} removed.</span>
             {/* It appears only after a removal here: focus lands on it (F5). */}
             <button
               type="button"
@@ -1992,8 +1995,8 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
               autoFocus
               disabled={w.isBusy(restoreId)}
               onClick={async () => {
-                const n = removed.n;
-                if (await eok.attempt(restoreId, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(ruleIdentity(removed), n), () => setRemoved(null)))
+                const n = typeof removed.n === "number" ? removed.n : undefined;
+                if (await eok.attempt(restoreId, "khipu_route_rule", { action: "restore", ...ruleTarget(removed) }, null, () => ruleRemoveButton(ruleIdentity(removed), n), () => setRemoved(null)))
                   setRemoved(null);
               }}
             >
