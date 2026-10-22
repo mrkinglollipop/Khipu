@@ -1627,6 +1627,12 @@ function ruleTarget(r: RouteRule): Record<string, unknown> {
   return r.number_pending && r.entity ? { entity: r.entity } : { n: r.n };
 }
 
+/** A replicated rule can have an entity before a display number. Controls
+ * must still name the rule in the owner's words, never expose `null`. */
+function ruleName(r: RouteRule): string {
+  return typeof r.n === "number" ? String(r.n) : r.text || r.entity || "this rule";
+}
+
 /** A standing rule's Remove button: where focus goes once the rule is back. */
 function ruleRemoveButton(n: number): HTMLElement | null {
   return document.querySelector<HTMLElement>(`.route-rule-list button[aria-label="Remove rule ${n}"]`);
@@ -1660,6 +1666,7 @@ function RuleRow({
   const mine = ask?.n === r.n ? ask.kind : null;
   const pending = !!r.pending;
   const toConfirm = pending || (r.seeded && !r.confirmed);
+  const name = ruleName(r);
   const id = `rule:${r.n}`;
   const fieldId = useId();
   const confirmBtn = useRef<HTMLButtonElement>(null);
@@ -1704,7 +1711,7 @@ function RuleRow({
       </span>
       <span className="route-acts">
         {toConfirm ? (
-          <button ref={confirmBtn} type="button" className="sm" aria-label={`Confirm rule ${r.n}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ n: r.n, kind: "confirm" })}>
+          <button ref={confirmBtn} type="button" className="sm" aria-label={`Confirm rule ${name}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ n: r.n, kind: "confirm" })}>
             Confirm
           </button>
         ) : null}
@@ -1713,7 +1720,7 @@ function RuleRow({
             type="button"
             className="sm"
             disabled={w.isBusy(`${id}:undo`)}
-            aria-label={`Undo pending rule ${r.n}`}
+            aria-label={`Undo pending rule ${name}`}
             onClick={() => void w.run(`${id}:undo`, "khipu_route_rule", { action: r.pending_kind === "added" ? "dismiss" : "undo", ...ruleTarget(r) }, null, back)}
           >
             <Busy on={w.isBusy(`${id}:undo`)} />
@@ -1724,7 +1731,7 @@ function RuleRow({
           ref={editBtn}
           type="button"
           className="sm"
-          aria-label={`Edit rule ${r.n}`}
+          aria-label={`Edit rule ${name}`}
           aria-expanded={mine === "edit"}
           onClick={() => {
             setDraft(r.text);
@@ -1734,14 +1741,14 @@ function RuleRow({
         >
           Edit
         </button>
-        <button ref={removeBtn} type="button" className="sm" aria-label={`Remove rule ${r.n}`} aria-expanded={mine === "remove"} onClick={() => setAsk({ n: r.n, kind: "remove" })}>
+        <button ref={removeBtn} type="button" className="sm" aria-label={`Remove rule ${name}`} aria-expanded={mine === "remove"} onClick={() => setAsk({ n: r.n, kind: "remove" })}>
           Remove
         </button>
       </span>
       {pending ? <WriteError w={w} id={`${id}:undo`} /> : null}
       {mine === "confirm" ? (
-        <ConfirmGroup label={`Confirm rule ${r.n}?`} onClose={close} back={() => confirmBtn.current ?? editBtn.current}>
-          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${r.n} as written? It loses its Seeded mark.`} It stays first in every conversation.</span>
+        <ConfirmGroup label={`Confirm rule ${name}?`} onClose={close} back={() => confirmBtn.current ?? editBtn.current}>
+          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${name} as written? It loses its Seeded mark.`} It stays first in every conversation.</span>
           <WriteError w={w} id={id} />
           <div className="toolbar">
             <button
@@ -1753,7 +1760,7 @@ function RuleRow({
               }}
             >
               <Busy on={w.isBusy(id)} />
-              Confirm rule {r.n}
+              Confirm rule {name}
             </button>
             <button type="button" className="sm link" onClick={close}>
               Cancel
@@ -1764,7 +1771,7 @@ function RuleRow({
       {mine === "edit" ? (
         <form
           className={editConfirm ? "route-confirm" : "route-pause"}
-          aria-label={`Edit rule ${r.n}`}
+          aria-label={`Edit rule ${name}`}
           onKeyDown={escapeCloses(close)}
           onSubmit={async (e) => {
             e.preventDefault();
@@ -1781,17 +1788,17 @@ function RuleRow({
           }}
         >
           <div className="toolbar">
-            <label htmlFor={fieldId}>Rule {r.n}</label>
+            <label htmlFor={fieldId}>Rule {name}</label>
             <input id={fieldId} value={draft} autoFocus autoComplete="off" readOnly={editConfirm} onChange={(e) => setDraft(e.target.value)} />
           </div>
           {editConfirm ? (
-            <span>Change rule {r.n} to these words? Every conversation sees them first, in full, from its next prompt.</span>
+            <span>Change rule {name} to these words? Every conversation sees them first, in full, from its next prompt.</span>
           ) : null}
           <WriteError w={w} id={id} />
           <div className="toolbar">
             <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
               <Busy on={w.isBusy(id)} />
-              {editConfirm ? `Change rule ${r.n}` : "Save…"}
+              {editConfirm ? `Change rule ${name}` : "Save…"}
             </button>
             <button type="button" className="sm link" onClick={close}>
               Cancel
@@ -1800,7 +1807,7 @@ function RuleRow({
         </form>
       ) : null}
       {mine === "remove" ? (
-        <ConfirmGroup label={`Remove rule ${r.n}?`} onClose={close} back={() => removeBtn.current}>
+        <ConfirmGroup label={`Remove rule ${name}?`} onClose={close} back={() => removeBtn.current}>
           <span>
             Remove this rule? Conversations stop seeing it on their next prompt. You can undo this here or from Recent
             changes.
@@ -1819,7 +1826,7 @@ function RuleRow({
               }}
             >
               <Busy on={w.isBusy(id)} />
-              Remove rule {r.n}
+              Remove rule {name}
             </button>
             <button type="button" className="sm link" onClick={close}>
               Keep it

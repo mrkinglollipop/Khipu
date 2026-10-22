@@ -2,7 +2,7 @@
 // 13): the Pace, caps and advice group. The fixture is the approved mock's
 // fictional data, shaped as `khipu route --json` (docs/mockups/2026-10-21-routing).
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { PaceSection } from "../RoutingSettings";
 import { paceModel } from "../routingPace";
 import { PACE_NOW, PACE_PLANS, PACE_VIEW } from "../../dev/paceFake";
@@ -192,6 +192,27 @@ describe("Pace, caps and advice: probe regressions", () => {
     expect(row.line.week).not.toBe("On pace");
     expect(row.say.map((part) => part.text).join("")).toBe("At its week plan limit.");
     expect(row.say.map((part) => part.text).join("")).not.toContain("Nothing Khipu has read");
+  });
+
+  it("renders a reached plan limit before the calm pace fallback", () => {
+    const reached = pace({
+      used_pct: 100,
+      plan: { verdict: "limit_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+    });
+    const data = view([acct({
+      pace: [reached],
+      cap_statuses: [],
+      advice: { account: "probe", label: "Probe", purpose: "job", verdict: "closed", reason: "plan limit reached", evidence: "fresh", numbers: {}, eligible: false, why_eligible: "plan limit reached", advisory: true },
+    })]);
+    render(<PaceSection data={data} plans={null} now={NOW} folds={{ ...folds, isOpen: () => true }} />);
+    const line = screen.getByRole("button", { name: /Probe.*At plan limit/ });
+    expect(line).toBeVisible();
+    expect(line).not.toHaveAccessibleName(/On pace/);
+    fireEvent.click(line);
+    const card = screen.getByRole("group", { name: "Probe pace" });
+    expect(within(card).getByText("Limit reached")).toBeVisible();
+    expect(within(card).getByText("At its week plan limit.")).toBeVisible();
+    expect(within(card).queryByText("On pace")).toBeNull();
   });
 
   it("names the share cap that caused the hold, not the first share cap", () => {

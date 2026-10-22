@@ -44,13 +44,11 @@ ${confirm}
 test("end-or-keep retries the same rule action with the collected map", async () => {
   const settings = source("RoutingSettings.tsx");
   const eok = between(settings, "function useEndOrKeep(", "function EndOrKeepChoices(");
+  const holdChoiceIds = between(source("routingProposals.ts"), "export function holdChoiceIds(", "export type HoldChoiceTarget");
   const mod = await dataModule(`
 let asked = null;
 const useState = (value) => [value, (next) => { asked = typeof next === "function" ? next(asked) : next; }];
-const holdChoiceIds = (message) => {
-  const found = /say end or keep in holds for: (.+)$/.exec((message ?? "").trim());
-  return found ? found[1].split(",").map((value) => value.trim()).filter(Boolean) : [];
-};
+${holdChoiceIds}
 ${eok}
 export async function drive() {
   const calls = [];
