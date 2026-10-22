@@ -1594,15 +1594,14 @@ def _identityless_job_state(job: dict[str, Any], path: Path, session_id: str | N
         "told apart from this episode's source, so it was kept")
 
 
-def _native_job_entries(session_id, source_rows, has_merged_sources):
+def _native_job_entries(session_id, source_rows, has_merged_sources, folders):
     """Read/classify every native job under the caller's queue claim lock."""
     from khipu import session_capture as sc
     from khipu.capture_identity import source_key
-    from khipu.capture_stores import native_job_folders
 
     keys = {row["source_key"] for row in source_rows or [] if row.get("source_key")}
     entries = []
-    for place, directory in native_job_folders():
+    for place, directory in folders:
         for name in _listing(directory):
             if not (name.endswith(".json") or ".claimed." in name or name.endswith(".tmp")):
                 continue
@@ -1660,6 +1659,7 @@ def _native_job_remainder(session_id: str | None,
     no database operation waits while holding the queue lock.
     """
     from khipu import session_capture as sc
+    from khipu.capture_stores import native_job_folders
 
     remaining: list[str] = []
     inspected: list[dict[str, str]] = []
@@ -1668,7 +1668,8 @@ def _native_job_remainder(session_id: str | None,
         with sc._claim_lock() as acquired:
             if not acquired:
                 raise OSError("queue claim lock unavailable")
-            first = _native_job_entries(session_id, source_rows, has_merged_sources)
+            first = _native_job_entries(
+                session_id, source_rows, has_merged_sources, native_job_folders())
         exact = [entry for entry in first if entry["state"] == "removed"]
         hashes = set().union(*(entry["hashes"] for entry in exact))
         idents = [ident for entry in exact for ident in entry["idents"]]
@@ -1684,7 +1685,8 @@ def _native_job_remainder(session_id: str | None,
         with sc._claim_lock() as acquired:
             if not acquired:
                 raise OSError("queue claim lock unavailable")
-            for entry in _native_job_entries(session_id, source_rows, has_merged_sources):
+            for entry in _native_job_entries(
+                    session_id, source_rows, has_merged_sources, native_job_folders()):
                 path, state, why = entry["path"], entry["state"], entry["why"]
                 if state == "removed":
                     held = {(ident["summary_md5"], _instant(ident["ts"]))
