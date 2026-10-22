@@ -194,7 +194,7 @@ These tools report account state and provide advisory account rankings. They nev
 
 ### khipu_usage
 
-Usage for Claude, Codex, Grok, Muse and GLM, provider-defined HTTP quota adapters, and configured DeepSeek accounts. DeepSeek reports measured spend and coverage rather than subscription headroom. Read-only.
+Usage for Claude, Codex, Grok, Muse and GLM, provider-defined HTTP quota adapters, and one DeepSeek account. DeepSeek reports measured spend and coverage rather than subscription headroom. Read-only.
 
 | Parameter | Meaning |
 | --- | --- |

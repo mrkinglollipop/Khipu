@@ -33,7 +33,7 @@ People who use coding agents every day, on one Mac or several, and want the agen
 - **Decisions.** A registry tracks which decisions still stand, and which were superseded or retracted.
 - **Briefs and reflect.** Optional, off by default: source-backed topic briefs, and answers from memory that cite their sources.
 - **Libraries.** Index a folder of `.txt` and `.md` files as another search space.
-- **Routing and plan usage.** Shows account state and plan usage, including the GLM Coding Plan. Configured DeepSeek accounts report measured spend from balance changes against a spend cap, with partial history labelled. Khipu reports; routing stays with you.
+- **Routing and plan usage.** Shows account state and plan usage, including the GLM Coding Plan. Supports one DeepSeek account, reporting measured spend from balance changes against a spend cap, with partial history labelled. Khipu reports; routing stays with you.
 - **Work.** Owed, project ledger boards, Waiting on you, Running now and Accounts share one view. Settings > Work manages tracker imports and runner summary sources.
 - **Owner actions and projects.** Review owner changes and eligible Undo actions in Settings > Owner actions. Settings > Projects groups current and older project names and lets you resolve same-project questions.
 - **Desktop app.** Home, Work, Recall, Activity, Harnesses and Settings, plus a first-run setup flow.

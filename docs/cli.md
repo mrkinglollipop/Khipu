@@ -30,7 +30,7 @@ There are 62 top-level commands; the reference below includes storage, ledger, w
 
 `doctor` flags:
 
-- `--quick`: runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and the rest) and leaves out the hub, network and probe checks. It is the first step of the promotion gate.
+- `--quick`: runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and the rest) and omits hub reachability, network and probe checks; reads the hub only for the pending-migration check. It is the first step of the promotion gate.
 - `--probe`: runs a fresh end-to-end recall probe. It writes a nonce episode, then soft-deletes it.
 - `--sample N`: caps the topic drift pass.
 - `--harness`: the harness label the probe records (default `$KHIPU_HARNESS`, or `doctor`).
@@ -158,7 +158,7 @@ Khipu reports account state and ranks advisory launch choices. The orchestrator 
 
 | Command | What it does |
 | --- | --- |
-| `usage` | Plan headroom for Claude, Codex, Grok, Muse, GLM Coding Plan, and configured HTTP-quota accounts. DeepSeek reports measured balance-derived spend against rolling caps, with known or partial coverage; stale, failed, missing, or untrusted history stays unknown. |
+| `usage` | Plan headroom for Claude, Codex, Grok, Muse, GLM Coding Plan, and configured HTTP-quota accounts. Supports one DeepSeek account, reporting measured balance-derived spend against rolling caps, with known or partial coverage; stale, failed, missing, or untrusted history stays unknown. |
 | `accounts` | Tracked login lifecycle: status, track, rename, stop, move, decline, offer-again, auto-track, merge, and request confirm/undo. |
 | `route` | The routing record: which accounts are open, limited or down, plus holds and owner rules. |
 

@@ -34,7 +34,7 @@ The desktop app lists the jobs under Settings, Advanced. **Health checks** expos
 
 ```bash
 khipu doctor            # full check
-khipu doctor --quick    # all local health checks; leaves out hub, network and probe checks
+khipu doctor --quick    # all local health checks; omits hub reachability, network and probe checks; reads the hub only for the pending-migration check
 khipu doctor --probe    # also runs a fresh end-to-end recall probe (writes, then soft-deletes, a test episode)
 khipu doctor --sample N # cap the topic drift pass
 ```

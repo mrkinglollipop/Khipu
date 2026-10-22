@@ -30,7 +30,7 @@ Question it answers: "Is memory working right now?"
 
 - **Health callouts** at the top. Each one names a problem and, where Khipu knows a fix, offers a button for it.
 - **Right now.** Per harness: turns waiting for capture, queued sessions, and sessions captured today. It has a capture-now action that flags a session for capture at its next stop.
-- **Plans.** Plan usage for Claude, Codex, Grok, Muse and the GLM Coding Plan. Configured DeepSeek accounts report measured spend from balance changes against a spend cap, with partial history labelled. See [routing.md](routing.md).
+- **Plans.** Plan usage for Claude, Codex, Grok, Muse and the GLM Coding Plan. Supports one DeepSeek account, reporting measured spend from balance changes against a spend cap, with partial history labelled. See [routing.md](routing.md).
 - **Routing.** One row per account with its state, where Khipu learned it, and how old that is. It also shows holds, your note, standing rules, and anything that needs attention. It has a Check now button. See [routing.md](routing.md).
 - **Four tiles.**
   - Database: connected or not reachable, and the age of the offline copy.
@@ -138,7 +138,7 @@ Session summaries send transcript text to the provider you pick. A local endpoin
 
 ### Plans and signing in again
 
-Plan usage, tracked accounts and account sign-in live under **Settings > Accounts and routing > Accounts**, with one usage block inside each account. Use **Refresh** on Home's Plans card or **Check all now** in Accounts to read usage again. Usage includes the GLM Coding Plan. Configured DeepSeek accounts report measured spend against a spend cap, with partial history labelled; they do not report subscription headroom. You can add accounts (up to 32) and remove them. A Sign in again button starts the login for Claude and Codex accounts. Grok and Muse accounts say to sign in from their own CLI.
+Plan usage, tracked accounts and account sign-in live under **Settings > Accounts and routing > Accounts**, with one usage block inside each account. Use **Refresh** on Home's Plans card or **Check all now** in Accounts to read usage again. Usage includes the GLM Coding Plan. Supports one DeepSeek account, reporting measured spend against a spend cap, with partial history labelled; it does not report subscription headroom. You can add accounts (up to 32) and remove them. A Sign in again button starts the login for Claude and Codex accounts. Grok and Muse accounts say to sign in from their own CLI.
 
 ### Another Mac
 

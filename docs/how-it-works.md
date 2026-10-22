@@ -414,7 +414,7 @@ During the migration, memory exists as files and as database rows, so they can d
 | `khipu revisions` | Shows conflicting topic edits across machines. The newest edit wins and the older version is kept. |
 | `khipu sources` | Lists, enables, disables, adds and removes graph roots. `sources export` writes the file graphify reads. |
 
-`khipu doctor --quick` runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and more) and leaves out the hub, network and probe checks. `khipu doctor --probe` runs a fresh end-to-end recall test.
+`khipu doctor --quick` runs all the local health checks (imports, config, outbox, capture liveness, jobs, backups, launchers and more) and omits hub reachability, network and probe checks; reads the hub only for the pending-migration check. `khipu doctor --probe` runs a fresh end-to-end recall test.
 
 Routing delivery has its own `routing_delivery` health check. It reports stalled
 budgeted pages, twice-expired leases, acknowledgements beyond shown receipts,

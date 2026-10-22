@@ -5137,7 +5137,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--quick",
         action="store_true",
         help="Run all local health checks, including queue, capture, job, recall, ledger, storage "
-        "and configuration checks; omit hub, network and probe checks",
+        "and configuration checks; omit hub reachability, network and probe checks; "
+        "reads the hub only for the pending-migration check",
     )
     d.set_defaults(func=cmd_doctor)
 
