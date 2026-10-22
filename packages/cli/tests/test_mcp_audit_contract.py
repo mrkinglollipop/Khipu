@@ -10,7 +10,7 @@ from unittest import mock
 import psycopg.errors
 import pytest
 
-from khipu import mcp_server as ms
+from khipu import mcp_server as ms, owner_writes
 
 
 def call(name, args):
@@ -45,12 +45,15 @@ def malformed_cases():
             types = [types] if isinstance(types, str) else types
             bad = [] if "object" in types else {} if "array" in types else None
             if bad is None:
-                bad = 1 if types == ["boolean"] else True if "integer" in types else []
+                bad = 2 if types == ["boolean"] else True if "integer" in types else []
             yield tool["name"], {**base, key: bad}, key
         for key in schema.get("required", []):
             yield tool["name"], {k: v for k, v in base.items() if k != key}, key
+        explicit = {"khipu_route_advise": {"tier", "kind", "purpose"},
+                    "khipu_status": {"prompt"}, "khipu_route_report": {"action"}}
         for key, prop in schema.get("properties", {}).items():
-            if prop.get("type") == "string":
+            if prop.get("type") == "string" and (key in schema.get("required", [])
+                                                 or key in explicit.get(tool["name"], set())):
                 yield tool["name"], {**base, key: "   "}, key
 
 
@@ -70,8 +73,10 @@ def test_schema_rejections_happen_before_handler_io(monkeypatch, name, args, fie
 def test_arguments_must_be_an_object_even_when_falsey(monkeypatch, args):
     boundary = mock.Mock(return_value={"ok": True})
     monkeypatch.setitem(ms.TOOL_FUNCS, "khipu_search", boundary)
-    failed, payload = call("khipu_search", args)
-    assert failed and "arguments" in payload["error"]
+    response = ms.handle_message({"jsonrpc": "2.0", "id": "audit", "method": "tools/call",
+                                  "params": {"name": "khipu_search", "arguments": args}})
+    assert response["error"]["code"] == -32602
+    assert "arguments" in response["error"]["message"]
     boundary.assert_not_called()
 
 
@@ -208,11 +213,11 @@ def test_f05_direction_and_commitment_share_bounded_keyset_pages(monkeypatch):
 
 def test_f06_listed_direction_can_be_closed_without_commitment_write():
     with mock.patch("khipu.routing_directions.dismiss", return_value={"id": "rd-0123456789abcdef", "status": "dismissed"}) as dismiss, \
-            mock.patch("khipu.owner_writes.run") as writer:
+            mock.patch("khipu.owner_writes.run", wraps=owner_writes.run) as writer:
         failed, out = call("khipu_owed_update", {"action": "close", "id": "rd-0123456789abcdef"})
     assert not failed and out["ok"] is True, out
     dismiss.assert_called_once_with("rd-0123456789abcdef")
-    writer.assert_not_called()
+    writer.assert_called_once_with("owed_update", {"id": "rd-0123456789abcdef", "action": "close"}, queue_ok=False)
 
 
 def test_f06_missing_direction_returns_tool_error():

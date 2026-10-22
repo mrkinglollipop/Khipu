@@ -2451,7 +2451,17 @@ class _SearchFilters:
         if self.project:
             from khipu.identity import project_group
 
-            self.projects = project_group(cur, self.project) or [self.project]
+            cur.execute("SAVEPOINT search_project_alias")
+            try:
+                projects = project_group(cur, self.project)
+            except Exception as exc:  # noqa: BLE001 — optional enrichment, never abort the caller
+                cur.execute("ROLLBACK TO SAVEPOINT search_project_alias")
+                cur.execute("RELEASE SAVEPOINT search_project_alias")
+                self.projects = [self.project]
+                _log(f"project alias expansion failed ({type(exc).__name__}); keeping original filter")
+            else:
+                cur.execute("RELEASE SAVEPOINT search_project_alias")
+                self.projects = projects or [self.project]
 
     @property
     def params(self) -> dict[str, Any]:

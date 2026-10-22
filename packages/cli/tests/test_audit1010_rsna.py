@@ -23,6 +23,7 @@ class _RegistryCursor:
         self.conn.create_function("regexp_replace", 4, lambda s, p, r, flags: re.sub(p, r, s))
         self.conn.create_function("greatest", -1, lambda *xs: max(x for x in xs if x is not None))
         self.conn.executescript("""
+            CREATE TABLE project_aliases (alias TEXT PRIMARY KEY, project TEXT NOT NULL);
             CREATE TABLE episodes (
                 id INTEGER PRIMARY KEY, session_id TEXT, parent_session_id TEXT,
                 deleted_at TEXT, ts TEXT, ingested_at TEXT, summary TEXT,

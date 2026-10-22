@@ -119,21 +119,13 @@ class ProtocolTest(unittest.TestCase):
                {"jsonrpc": "2.0", "id": {}, "method": "ping"},
                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": [1]},
                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": []}},
-               request([], {})]
+               request([], {}), request("khipu_get", [1])]
         for msg in bad:
             with self.subTest(msg=msg):
                 out = srv.handle_message(msg)
                 self.assertIn("error", out)
                 self.assertIn(out["error"]["code"], (-32600, -32602))
                 self.assertEqual(srv.handle_message({"jsonrpc": "2.0", "id": 9, "method": "ping"})["result"], {})
-
-    def test_wrong_typed_tool_arguments_are_tool_errors_and_ping_survives(self):
-        out = srv.handle_message(request("khipu_get", [1]))
-        self.assertNotIn("error", out)
-        self.assertTrue(out["result"]["isError"])
-        body = json.loads(out["result"]["content"][0]["text"])
-        self.assertIn("arguments", body["error"])
-        self.assertEqual(srv.handle_message({"jsonrpc": "2.0", "id": 9, "method": "ping"})["result"], {})
 
     def test_known_and_failing_notifications_emit_no_response(self):
         for method in ("initialize", "ping", "tools/list", "unknown"):

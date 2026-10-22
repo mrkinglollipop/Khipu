@@ -1076,9 +1076,10 @@ TOOLS: list[dict] = [
 ]
 
 
-def _validate_tool_args(name: str, arguments) -> None:
-    """Validate declared JSON types before feature gates or side effects.
+def _validate_tool_args(name: str, arguments) -> dict:
+    """Normalize baseline-compatible inputs, then validate before side effects.
 
+    Empty optional text is absent, except fields with explicit audit gates.
     Numeric bounds stay with handlers because several tools clamp them.
     Compatibility ID/version unions are advertised in TOOLS.
     """
@@ -1092,9 +1093,22 @@ def _validate_tool_args(name: str, arguments) -> None:
             message += "; an owner's action is the owner's to change: in the app (Settings → Routing) or on a terminal"
         raise _ToolFailure({"ok": False, "code": "bad_args", "error": f"{field} {message}"})
 
-    def check(value, spec: dict, field: str) -> None:
+    nonempty = {
+        "khipu_route_advise": {"tier", "kind", "purpose"},
+        "khipu_status": {"prompt"},
+        "khipu_route_report": {"action"},
+    }.get(name, set())
+
+    def check(value, spec: dict, field: str, *, required: bool = False):
         kinds = spec.get("type", [])
         kinds = [kinds] if isinstance(kinds, str) else kinds
+        if "integer" in kinds and "string" not in kinds and isinstance(value, str):
+            try:
+                value = int(value)
+            except ValueError:
+                reject(field, "must be integer")
+        if "boolean" in kinds and type(value) is int and value in (0, 1):
+            value = bool(value)
         matches = {
             "object": isinstance(value, dict), "array": isinstance(value, list),
             "string": isinstance(value, str), "integer": type(value) is int,
@@ -1103,10 +1117,12 @@ def _validate_tool_args(name: str, arguments) -> None:
         }
         if kinds and not any(matches.get(kind, False) for kind in kinds):
             reject(field, "must be " + " or ".join(kinds))
+        if "enum" in spec and isinstance(value, str):
+            value = value.strip().lower()
         if "enum" in spec and value not in spec["enum"]:
             reject(field, f"must be one of {spec['enum']}")
         if isinstance(value, str):
-            if not value.strip():
+            if not value.strip() and (required or field in nonempty):
                 reject(field, "must be non-empty text")
             if len(value) < spec.get("minLength", 0) or len(value) > spec.get("maxLength", float("inf")):
                 reject(field, "has an invalid length")
@@ -1114,27 +1130,38 @@ def _validate_tool_args(name: str, arguments) -> None:
             if len(value) < spec.get("minItems", 0):
                 reject(field, "must contain at least one item")
             if "items" in spec:
-                for index, item in enumerate(value):
-                    check(item, spec["items"], f"{field}[{index}]")
+                value = [check(item, spec["items"], f"{field}[{index}]")
+                         for index, item in enumerate(value)]
         if isinstance(value, dict):
+            required_keys = set(spec.get("required", []))
+            for condition in spec.get("allOf", []):
+                needed = condition.get("if", {}).get("required", [])
+                if needed and all(key in value for key in needed):
+                    required_keys.update(condition.get("then", {}).get("required", []))
             for key in spec.get("required", []):
                 if key not in value:
                     reject(key if field == "arguments" else f"{field}.{key}", "is required")
             properties = spec.get("properties", {})
+            normalized = {}
             for key, item in value.items():
                 child = properties.get(key)
                 if child is None and isinstance(spec.get("additionalProperties"), dict):
                     child = spec["additionalProperties"]
+                child_field = key if field == "arguments" else f"{field}.{key}"
                 if child is not None:
-                    check(item, child, key if field == "arguments" else f"{field}.{key}")
-            for condition in spec.get("allOf", []):
-                needed = condition.get("if", {}).get("required", [])
-                if needed and all(key in value for key in needed):
-                    for key in condition.get("then", {}).get("required", []):
-                        if key not in value:
-                            reject(key, "is required")
+                    child_types = child.get("type", [])
+                    if ("string" in child_types and isinstance(item, str) and not item.strip()
+                            and key not in required_keys and child_field not in nonempty):
+                        continue
+                    item = check(item, child, child_field, required=key in required_keys)
+                normalized[key] = item
+            for key in required_keys:
+                if key not in normalized:
+                    reject(key if field == "arguments" else f"{field}.{key}", "is required")
+            value = normalized
+        return value
 
-    check(arguments, schema, "arguments")
+    return check(arguments, schema, "arguments")
 
 
 def _positive_id(value, field: str) -> int:
@@ -1454,7 +1481,7 @@ def _attach_contract(payload: dict) -> None:
 
 
 def _tool_status(args: dict) -> dict:
-    _validate_tool_args("khipu_status", args)
+    args = _validate_tool_args("khipu_status", args)
     _ensure_path()
     if str(args.get("prompt") or "").strip() and not args.get("full"):
         return _tool_status_light(args)
@@ -1670,7 +1697,7 @@ def _tool_capture(args: dict) -> dict:
     # configured and capture_mode != hub: still a hard reject — nothing would
     # ever act on a flag with no hook to read it. The CLI ``khipu capture``
     # does not go through this function.
-    _validate_tool_args("khipu_capture", args)
+    args = _validate_tool_args("khipu_capture", args)
     summary = args.get("summary")
     if not isinstance(summary, str) or not summary.strip():
         raise ValueError("khipu_capture requires a non-empty string 'summary'")
@@ -1913,14 +1940,13 @@ def _tool_owed_update(args: dict) -> dict:
 
     direction_id = args.get("id")
     if isinstance(direction_id, str) and direction_id.startswith("rd-"):
+        if _via_https_gateway():
+            return {"available": False, "reason": ROUTING_GATEWAY_REASON}
         if action != "close" or args.get("ids") is not None:
             raise ValueError("routing direction ids support only a single close")
-        from khipu import routing_directions
-
-        row = routing_directions.dismiss(direction_id)
-        if row is None:
-            raise ValueError(f"no such routing direction: {direction_id}")
-        return {"ok": True, "id": direction_id, "action": "close"}
+        # Directions live on this Mac. Use the shared write dispatcher, but
+        # never queue a local dismissal behind hub writes or replay it there.
+        return owner_writes.run("owed_update", {"id": direction_id, "action": action}, queue_ok=False)
 
     if args.get("ids") is not None or action == "reassign":
         # Who closed it, and whether the owner gate passed, are set here and
@@ -2050,7 +2076,20 @@ def _owed_update_on_hub(args: dict) -> dict:
     """The hub half of ``_tool_owed_update``, also what a queued write
     replays. The write's id and outcome are recorded in the same transaction
     (``owner_writes.apply_on_hub``); an id the hub already answered applies
-    nothing again."""
+    nothing again. Local routing-direction dismissals use this shared
+    dispatcher too, without a hub connection or a queued replay."""
+    direction_id = args.get("id")
+    if isinstance(direction_id, str) and direction_id.startswith("rd-"):
+        if _via_https_gateway():
+            return {"available": False, "reason": ROUTING_GATEWAY_REASON}
+        if args.get("action") != "close" or args.get("ids") is not None:
+            raise ValueError("routing direction ids support only a single close")
+        from khipu import routing_directions
+
+        row = routing_directions.dismiss(direction_id)
+        if row is None:
+            raise ValueError(f"no such routing direction: {direction_id}")
+        return {"ok": True, "id": direction_id, "action": "close"}
     if args.get("ids") is not None:
         return _owed_change_on_hub(args)
     cid = _positive_id(args.get("id"), "id")
@@ -2169,7 +2208,7 @@ def _tool_forget(args: dict) -> dict:
     """Complete forget of one episode (khipu.forget). From the gateway only a
     cloud harness's own captures may be forgotten: a local episode belongs to
     the Mac that captured it and is forgotten there."""
-    _validate_tool_args("khipu_forget", args)
+    args = _validate_tool_args("khipu_forget", args)
     if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
         _ensure_path()
         from khipu import agent_view, ledger
@@ -2278,7 +2317,7 @@ def _tool_decisions_update(args: dict) -> dict:
     khipu_decisions(status='conflicts')). Every write here records its
     source as 'agent'. Every argument is validated before a connection is
     opened, same posture as ``_tool_owed_update``."""
-    _validate_tool_args("khipu_decisions_update", args)
+    args = _validate_tool_args("khipu_decisions_update", args)
     action = (args.get("action") or "").strip().lower()
     valid_actions = ("supersede", "restore", "retract", "confirm", "reject")
     if action not in valid_actions:
@@ -2653,7 +2692,7 @@ def _tool_route_projected(args: dict) -> dict:
 
 def _tool_route_advise(args: dict) -> dict:
     """khipu_route_advise: launch advice per account. Advisory only."""
-    _validate_tool_args("khipu_route_advise", args)
+    args = _validate_tool_args("khipu_route_advise", args)
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     _ensure_path()
@@ -2678,7 +2717,7 @@ def _tool_route_report(args: dict) -> dict:
     """khipu_route_report: a report, a hold or a hold's end. Who wrote it is
     Khipu's to say, from this server's own environment and folder (the
     harness that launched it), never from the arguments."""
-    _validate_tool_args("khipu_route_report", args)
+    args = _validate_tool_args("khipu_route_report", args)
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     _ensure_path()
@@ -2726,7 +2765,7 @@ def _tool_route_priority(args: dict) -> dict:
     """Record the owner's priority at his request through the conversation
     author path; it never speaks as the owner, and its answer names each
     account by its label and id, never a key or a login folder."""
-    _validate_tool_args("khipu_route_priority", args)
+    args = _validate_tool_args("khipu_route_priority", args)
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     _ensure_path()
@@ -3093,6 +3132,8 @@ def handle_message(msg) -> dict | None:
     elif msg["method"] == "tools/call":
         if not isinstance(params.get("name"), str):
             error = "tool name must be a string"
+        elif not isinstance(params.get("arguments", {}), dict):
+            error = "arguments must be an object"
     response = _error(req_id, -32602, error) if error else _dispatch_message(msg)
     _MESSAGE_STATE.error = _response_error(response)
     return response if "id" in msg else None
@@ -3155,8 +3196,7 @@ def _dispatch_message(msg: dict) -> dict | None:
         projection_entered = False
         try:
             arguments = params.get("arguments", {})
-            _validate_tool_args(name, arguments)
-            arguments = dict(arguments)
+            arguments = _validate_tool_args(name, arguments)
             if projection is not None:
                 projection.__enter__()
                 projection_entered = True
