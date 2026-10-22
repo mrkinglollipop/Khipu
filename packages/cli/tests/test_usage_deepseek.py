@@ -18,11 +18,12 @@ import urllib.error
 import urllib.request
 import urllib.response
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from email.message import Message
 
 import pytest
 
-from khipu import cli, config, keychain, routing, routing_providers, usage
+from khipu import cli, config, keychain, routing, routing_advice, routing_pace, routing_providers, routing_sources, usage
 
 KEY = "SENTINEL-deepseek-key-0123456789abcdef.do-not-leak"
 OTHER_KEY = "SENTINEL-deepseek-other-account-key"
@@ -588,3 +589,164 @@ def test_usage_setup_still_asks_when_there_is_no_key(ds):
     ds.key = None
     assert routing_providers.usage_setup("deepseek", {"id": "deepseek"}) == (
         "no usage reader set up; confirm its quota host in Settings → Accounts")
+
+
+@pytest.mark.parametrize("purpose", ["job", "check", "orchestration"])
+def test_usage_unknown_cap_holds_advice_and_rank(ds, monkeypatch, purpose):
+    _read(ds, "100", _ago(days=1))
+    _read(ds, "90", NOW)
+    entry = dict(_entry(), state="open")
+    view = {"accounts": [entry]}
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    advice = routing_advice.account_advice(view, entry, NOW, purpose=purpose)
+    assert advice["verdict"] == "hold_back"
+    assert advice["reason"] == "cap status unknown"
+    assert advice["evidence"] == "unknown"
+    assert routing_advice.rank(view, NOW, purpose=purpose)[0]["why_ranked"] == "cap status unknown"
+    public = routing._public_account(entry, NOW, view)
+    assert public["advice"]["verdict"] == "hold_back"
+
+
+@pytest.mark.parametrize("harness", ["deepseek", "glm"])
+def test_usage_no_cap_and_no_reader_keep_go(ds, monkeypatch, harness):
+    entry = dict(_entry(harness=harness), caps=[], state="open")
+    ds.key = None
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    assert routing_advice.account_advice({}, entry, NOW)["verdict"] == "go"
+
+
+@pytest.mark.parametrize("kind", ["pace_target", "concurrency"])
+def test_usage_unknown_job_only_cap_does_not_hold_orchestration(ds, monkeypatch, kind):
+    entry = dict(_entry(), state="open")
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    monkeypatch.setattr(routing, "cap_statuses", lambda *a: [{"kind": kind, "verdict": "unknown"}])
+    assert routing_advice.account_advice({}, entry, NOW)["verdict"] == "hold_back"
+    assert routing_advice.account_advice({}, entry, NOW, purpose="orchestration")["verdict"] == "go"
+
+
+def _runner_stream(usd):
+    return {"runner": "fake-runner", "account": "deepseek|acct", "silent": False,
+            "incomplete": False, "accumulating_since": _ago(days=8),
+            "buckets": [{"at": _ago(minutes=10), "usd": usd, "n": 1, "ids": ["fake-event"]}],
+            "corrections": [], "dropped": [], "active": [], "launches": [],
+            "coverage": [(_ago(days=7), NOW)]}
+
+
+@pytest.mark.parametrize("case", ["normal", "missing_key", "multiple_accounts"])
+@pytest.mark.parametrize("runner_usd,expected,floor", [(10, "unknown", 10), (20, "unknown", 20),
+                                                     (35, "reached", 35), (40, "over", 40)])
+def test_usage_runner_is_only_an_account_spend_floor(ds, monkeypatch, case, runner_usd, expected, floor):
+    _read(ds, "100", _ago(days=1))
+    _read(ds, "90", NOW)
+    streams = [_runner_stream(runner_usd)]
+    assert routing_sources.spend_total(streams, "deepseek|acct", _ago(days=7), NOW)["status"] == "known"
+    monkeypatch.setattr(routing, "_telemetry_streams", lambda view: streams)
+    view = {}
+    if case == "missing_key":
+        ds.key = None
+    elif case == "multiple_accounts":
+        view = {"definitions": {"accounts": {"a": {"provider": "deepseek"},
+                                               "b": {"provider": "deepseek"}}}}
+    status = _cap(ds, view=view)
+    assert status["verdict"] == expected
+    assert status["at_least_usd"] == floor
+    if expected == "unknown":
+        assert status["usd"] is None and status["used_pct"] is None and status["why"]
+
+
+def test_usage_runner_and_balance_floors_are_never_added(ds, monkeypatch):
+    _read(ds, "100", _ago(days=1))
+    _read(ds, "80", NOW)
+    monkeypatch.setattr(routing, "_telemetry_streams", lambda view: [_runner_stream(10)])
+    status = _cap(ds, usd=25)
+    assert status["verdict"] == "unknown" and status["at_least_usd"] == 20
+
+
+@pytest.mark.parametrize("component", ["root", "ancestor"])
+def test_usage_history_ancestor_symlinks_are_refused(ds, tmp_path, component):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    ds.history = alias / ("state" if component == "root" else "data/state") / usage.DEEPSEEK_HISTORY_NAME
+    _read(ds, "40")
+    assert list(outside.iterdir()) == []
+    assert _cap(ds)["verdict"] == "unknown"
+
+
+def test_usage_key_ancestor_symlink_is_refused(key_env, tmp_path):
+    outside = tmp_path / "private"
+    outside.mkdir()
+    token = outside / "token"
+    token.write_text("FAKE-UNRELATED-PRIVATE-TEXT")
+    token.chmod(0o600)
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    assert keychain.read_owner_only_key_file(alias / "token") is None
+
+
+def test_usage_history_ancestor_symlink_cannot_read_a_valid_floor(ds, tmp_path):
+    _read(ds, "100", _ago(days=1))
+    _read(ds, "10", NOW)
+    assert _cap(ds)["verdict"] == "over"
+    alias = tmp_path / "alias"
+    alias.symlink_to(ds.history.parent.parent, target_is_directory=True)
+    ds.history = alias / "state" / usage.DEEPSEEK_HISTORY_NAME
+    status = _cap(ds)
+    assert status["verdict"] == "unknown" and status["at_least_usd"] is None
+
+
+def test_usage_imprecise_v2_history_cannot_prove_a_floor(ds):
+    _read(ds, "100", _ago(days=1))
+    _read(ds, "65", NOW)
+    stored = json.loads(ds.history.read_text())
+    stored["version"] = 2
+    ds.history.write_text(json.dumps(stored))
+    assert _cap(ds)["verdict"] == "unknown"
+    row = _read(ds, "64", NOW + timedelta(seconds=1))
+    assert row["spend"]["last_7d_at_least_usd"] == 0
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_usage_nonpositive_spend_caps_are_rejected(cap):
+    assert routing_pace.checked_cap({"kind": "spend", "usd": cap, "days": 7, "revision": "fake"}) is None
+
+
+@pytest.mark.parametrize("target", ["ancestor", "state", "lock", "lock_fifo"])
+def test_usage_history_rejects_writable_dirs_and_unsafe_locks(ds, target):
+    _read(ds, "100", _ago(days=1))
+    before = ds.history.read_bytes()
+    lock = ds.history.with_name(usage.DEEPSEEK_LOCK_NAME)
+    path = {"ancestor": ds.history.parent.parent, "state": ds.history.parent, "lock": lock,
+            "lock_fifo": lock}[target]
+    if target == "lock_fifo":
+        lock.unlink()
+        os.mkfifo(lock, 0o600)
+    else:
+        path.chmod(0o666 if target == "lock" else 0o777)
+    with usage._deepseek_locked() as fd:
+        assert fd is None
+    assert ds.history.read_bytes() == before
+
+
+@pytest.mark.parametrize("initial,final,cap,verdict", [
+    ("100", "64.9951", 35.004, "over"),
+    ("1", "0.9951", 0.004, "over"),
+    ("100.00004", "65.000049", 35, "unknown"),
+    ("1", "0.996", 0.004, "reached"),
+    ("100.000000000000000001", "65", 35, "over"),
+])
+def test_usage_cap_compares_exact_money(ds, initial, final, cap, verdict):
+    assert routing_pace.checked_cap({"kind": "spend", "usd": cap, "days": 7, "revision": "fake"})
+    _read(ds, initial, _ago(days=1))
+    _read(ds, final, NOW)
+    assert _cap(ds, usd=cap)["verdict"] == verdict
+
+
+def test_usage_floor_display_never_rounds_up(ds):
+    _read(ds, "1", _ago(days=1))
+    row = _read(ds, "0.994", NOW)
+    assert Decimal(str(row["spend"]["last_7d_at_least_usd"])) <= Decimal("0.006")
+    total = usage.deepseek_spend_total(NOW, 7, 35)
+    assert Decimal(str(total["at_least_usd"])) <= Decimal("0.006")
+    assert "$0.01" not in total["reason"]

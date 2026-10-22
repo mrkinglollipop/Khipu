@@ -320,9 +320,14 @@ def read_owner_only_key_file(path: Path) -> str | None:
     user can read or write, so a planted link or a shared file can never
     become an Authorization header."""
     import stat
+    from khipu.paths import open_trusted_directory
 
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        parent_fd = open_trusted_directory(path.parent)
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
     except OSError:
         return None
     try:

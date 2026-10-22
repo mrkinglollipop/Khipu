@@ -50,6 +50,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from pathlib import Path
 
 HARNESSES = ("claude", "codex", "grok", "muse", "glm")
@@ -1491,7 +1492,8 @@ DEEPSEEK_HISTORY_DAYS = 366
 DEEPSEEK_HISTORY_MAX = DEEPSEEK_HISTORY_DAYS * 24 + 2
 DEEPSEEK_FRESH_S = 1800
 DEEPSEEK_SKEW_S = 120
-DEEPSEEK_HISTORY_VERSION = 2
+# V2 rounded balances/buckets upward; those amounts cannot prove exact floors.
+DEEPSEEK_HISTORY_VERSION = 3
 DEEPSEEK_HISTORY_BYTES = 4 << 20
 DEEPSEEK_LOCK_NAME = "deepseek-balance.lock"
 
@@ -1535,7 +1537,7 @@ def _deepseek_request(key: str, timeout: float) -> tuple[int, bytes]:
     return _https_get(DEEPSEEK_BALANCE_URL, f"Bearer {key}", timeout)
 
 
-def parse_deepseek(status: int, body: bytes) -> float:
+def parse_deepseek(status: int, body: bytes) -> Decimal:
     """The USD total balance of a /user/balance answer. An account DeepSeek
     marks unavailable is a failed read, whatever balance it shows."""
     if status in (401, 403):
@@ -1543,7 +1545,7 @@ def parse_deepseek(status: int, body: bytes) -> float:
     if status != 200:
         raise ProbeError(E_CLI)
     try:
-        reply = json.loads(body.decode("utf-8")) if body else None
+        reply = json.loads(body.decode("utf-8"), parse_float=Decimal) if body else None
     except (ValueError, UnicodeError):
         reply = None
     if not isinstance(reply, dict) or not isinstance(reply.get("balance_infos"), list):
@@ -1557,15 +1559,52 @@ def parse_deepseek(status: int, body: bytes) -> float:
     if len(usd) != 1:
         raise ProbeError(E_BAD)
     raw = usd[0].get("total_balance")
-    if isinstance(raw, bool):
-        raise ProbeError(E_BAD)
     try:
-        total = float(raw)
-    except (TypeError, ValueError):
+        total = _ds_money(raw)
+    except (TypeError, ValueError, InvalidOperation):
         raise ProbeError(E_BAD) from None
-    if not math.isfinite(total) or total < 0 or total > 1e9:
+    if total > 1e9:
         raise ProbeError(E_BAD)
-    return round(total, 4)
+    return total
+
+
+def _ds_money(value) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise ValueError("invalid money")
+    if len(str(value)) > 128:
+        raise ValueError("invalid money")
+    number = Decimal(str(value))
+    # Bounded scale keeps all retained sums exact in a 100-digit context.
+    if not number.is_finite() or not 0 <= number <= Decimal("1e14") or number.as_tuple().exponent < -64:
+        raise ValueError("invalid money")
+    return number
+
+
+def _ds_store_money(value: Decimal):
+    """Keep legacy JSON numbers where lossless; use decimal text otherwise."""
+    number = float(value)
+    return number if Decimal(str(number)) == value else str(value)
+
+
+def _ds_floor_number(value: Decimal) -> float:
+    number = float(value)
+    return math.nextafter(number, -math.inf) if Decimal(str(number)) > value else number
+
+
+def _ds_floor_display(value: Decimal) -> float:
+    with localcontext() as ctx:
+        ctx.prec = 100
+        return float(value.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+
+def _deepseek_floor_total(base: dict, floor: Decimal, cap_usd) -> dict:
+    cap = Decimal(str(cap_usd)) if cap_usd is not None else None
+    reached = cap is not None and cap > 0 and floor >= cap
+    return {**base, "floor_usd": str(floor), "at_least_usd": _ds_floor_display(floor),
+            "status": "known" if reached else "unknown",
+            "usd": _ds_floor_number(floor) if reached else None,
+            "verdict": ("over" if floor > cap else "reached") if reached else "unknown",
+            "reason": None if reached else base.get("reason")}
 
 
 def _deepseek_fingerprint(salt_hex: str, key: str) -> str:
@@ -1589,18 +1628,25 @@ def _deepseek_valid(data, now_ts: float) -> bool:
         return False
     since, last, buckets = data.get("since"), data.get("last"), data.get("buckets")
     limit = now_ts + DEEPSEEK_SKEW_S
-    if not _ds_num(since) or not isinstance(last, list) or len(last) != 2 or not all(map(_ds_num, last)):
+    if not _ds_num(since) or not isinstance(last, list) or len(last) != 2 or not _ds_num(last[0]):
         return False
-    if last[1] < 0 or not since <= last[0] <= limit:
+    try:
+        _ds_money(last[1])
+        for bucket in buckets if isinstance(buckets, list) else []:
+            if isinstance(bucket, list) and len(bucket) == 3:
+                _ds_money(bucket[2])
+    except (ValueError, TypeError, InvalidOperation):
+        return False
+    if not since <= last[0] <= limit:
         return False
     if not isinstance(buckets, list) or len(buckets) > DEEPSEEK_HISTORY_MAX:
         return False
     previous_end = None
     for bucket in buckets:
-        if not isinstance(bucket, list) or len(bucket) != 3 or not all(map(_ds_num, bucket)):
+        if not isinstance(bucket, list) or len(bucket) != 3 or not all(map(_ds_num, bucket[:2])):
             return False
         start, end, spent = bucket
-        if not (start < end <= last[0]) or spent < 0 or (previous_end is not None and start < previous_end):
+        if not (start < end <= last[0]) or (previous_end is not None and start < previous_end):
             return False
         previous_end = end
     attempt = data.get("attempt")
@@ -1617,23 +1663,12 @@ def _deepseek_dir(create: bool) -> int | None:
     """A descriptor on the history's folder. The folder itself is opened
     without following a symlink and must be a directory this user owns, so
     a planted link cannot move the history (or its lock) anywhere else."""
-    path = deepseek_history_file()
-    root = path.parent.parent
+    from khipu.paths import open_trusted_directory
+
     try:
-        if create:
-            root.mkdir(parents=True, exist_ok=True)
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        fd = open_trusted_directory(deepseek_history_file().parent, create=create)
     except OSError:
         return None
-    try:
-        if create:
-            with contextlib.suppress(FileExistsError):
-                os.mkdir(path.parent.name, 0o700, dir_fd=root_fd)
-        fd = os.open(path.parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
-    except OSError:
-        return None
-    finally:
-        os.close(root_fd)
     info = os.fstat(fd)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
         os.close(fd)
@@ -1698,7 +1733,11 @@ def _deepseek_locked():
     lock_fd = None
     try:
         try:
-            lock_fd = os.open(DEEPSEEK_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+            lock_fd = os.open(DEEPSEEK_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                              0o600, dir_fd=dir_fd)
+            info = os.fstat(lock_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise OSError("untrusted DeepSeek history lock")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         except OSError:
             yield None
@@ -1713,7 +1752,8 @@ def _deepseek_locked():
 def _deepseek_new(key: str, at: float, balance: float) -> dict:
     salt = os.urandom(16).hex()
     return {"version": DEEPSEEK_HISTORY_VERSION, "salt": salt, "fingerprint": _deepseek_fingerprint(salt, key),
-            "since": at, "last": [at, balance], "buckets": [], "attempt": {"at": at, "ok": True, "error": None}}
+            "since": at, "last": [at, _ds_store_money(_ds_money(balance))], "buckets": [],
+            "attempt": {"at": at, "ok": True, "error": None}}
 
 
 def _deepseek_add(data: dict, at: float, balance: float) -> bool:
@@ -1725,14 +1765,19 @@ def _deepseek_add(data: dict, at: float, balance: float) -> bool:
     last_at, last_balance = data["last"]
     if at <= last_at:
         return False
-    spent = round(max(0.0, last_balance - balance), 4)
+    with localcontext() as ctx:
+        ctx.prec = 100
+        spent = max(Decimal(0), _ds_money(last_balance) - _ds_money(balance))
     buckets = data["buckets"]
     if spent > 0:
         if buckets and buckets[-1][0] // DEEPSEEK_BUCKET_S == last_at // DEEPSEEK_BUCKET_S:
-            buckets[-1] = [buckets[-1][0], at, round(buckets[-1][2] + spent, 4)]
+            with localcontext() as ctx:
+                ctx.prec = 100
+                combined = _ds_money(buckets[-1][2]) + spent
+            buckets[-1] = [buckets[-1][0], at, _ds_store_money(combined)]
         else:
-            buckets.append([last_at, at, spent])
-    data["last"] = [at, balance]
+            buckets.append([last_at, at, _ds_store_money(spent)])
+    data["last"] = [at, _ds_store_money(_ds_money(balance))]
     data["attempt"] = {"at": at, "ok": True, "error": None}
     cutoff = at - DEEPSEEK_HISTORY_DAYS * 86400
     data["buckets"] = [b for b in buckets if b[0] >= cutoff][-DEEPSEEK_HISTORY_MAX:]
@@ -1740,12 +1785,14 @@ def _deepseek_add(data: dict, at: float, balance: float) -> bool:
     return True
 
 
-def deepseek_floor(data: dict, start: float, end: float) -> float:
+def deepseek_floor(data: dict, start: float, end: float) -> Decimal:
     """Dollars certainly spent in [start, end]: the decreases of buckets lying
     wholly inside it. A bucket that crosses ``start`` is left out (its debit
     may predate the window), so the floor can only understate, by at most
     the decreases of one bucket."""
-    return round(sum(spent for s, e, spent in data["buckets"] if s >= start and e <= end), 4)
+    with localcontext() as ctx:
+        ctx.prec = 100
+        return sum((_ds_money(spent) for s, e, spent in data["buckets"] if s >= start and e <= end), Decimal(0))
 
 
 def _deepseek_state(now: datetime) -> tuple[str, dict | None]:
@@ -1802,9 +1849,9 @@ def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = Non
             return {**base, "status": "unknown", "usd": None, "reason": state}
         floor = deepseek_floor(data, start.timestamp(), now.timestamp())
         partial = data["since"] > start.timestamp()
-        out = {**base, "at_least_usd": round(floor, 2), "partial": partial, "since": _iso(data["since"])}
-        if cap_usd is not None and floor >= cap_usd:
-            return {**out, "status": "known", "usd": round(floor, 2), "reason": None}
+        out = _deepseek_floor_total({**base, "partial": partial, "since": _iso(data["since"])}, floor, cap_usd)
+        if out["status"] == "known":
+            return out
         attempt = data.get("attempt") or {}
         if attempt.get("ok") is False:
             reason = "DeepSeek's last balance read failed"
@@ -1815,7 +1862,7 @@ def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = Non
         else:
             reason = "a balance cannot rule out spend a top-up or refund hid"
         return {**out, "status": "unknown", "usd": None,
-                "reason": f"{reason}; at least ${floor:.2f} spent in the window"}
+                "reason": f"{reason}; at least ${out['at_least_usd']:.2f} spent in the window"}
     except Exception:  # noqa: BLE001 - a broken history is unknown, never a crashed route
         return {**base, "status": "unknown", "usd": None, "reason": "DeepSeek's balance history can't be read"}
 
@@ -1867,7 +1914,8 @@ def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
     finally:
         key = None  # the key lives only for the request above
     start = at - 7 * 86400
-    spend = {"balance_usd": data["last"][1], "last_7d_at_least_usd": round(deepseek_floor(data, start, at), 2),
+    spend = {"balance_usd": float(data["last"][1]),
+             "last_7d_at_least_usd": _ds_floor_display(deepseek_floor(data, start, at)),
              "partial": data["since"] > start, "since": _iso(data["since"])}
     return {"ok": True, "plan": None, "windows": [], "credits": None, "version": None,
             "source": "live", "spend": spend}

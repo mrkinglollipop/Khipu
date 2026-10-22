@@ -17,6 +17,66 @@ POINTER_NAME = "data_root.json"
 SENSITIVE_FILENAMES = frozenset({"dsn", "gateway-token"})
 
 
+def open_trusted_directory(path: Path, *, create: bool = False) -> int:
+    """Walk via descriptors, refusing user symlinks and writable ancestors.
+
+    Root-owned links in root-controlled directories permit macOS's /tmp
+    and /var aliases. Sticky root-owned temporary directories are allowed;
+    all other components must be writable only by their root/current owner.
+    The caller owns the returned descriptor.
+    """
+    import errno
+
+    path = Path(path)
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if ".." in path.parts:
+        raise OSError(errno.EPERM, "parent traversal refused")
+    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    pending = list(path.parts[1:])
+    links = 0
+    try:
+        while pending:
+            part = pending.pop(0)
+            if create:
+                try:
+                    os.mkdir(part, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except OSError:
+                link = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                parent = os.fstat(fd)
+                if not (stat_module.S_ISLNK(link.st_mode) and link.st_uid == 0
+                        and parent.st_uid == 0 and not parent.st_mode & 0o022):
+                    raise
+                links += 1
+                target = Path(os.readlink(part, dir_fd=fd))
+                if links > 40 or ".." in target.parts:
+                    raise OSError(errno.ELOOP, "untrusted symlink traversal")
+                if target.is_absolute():
+                    root_fd = os.open(target.anchor, flags)
+                    os.close(fd)
+                    fd = root_fd
+                    pending = list(target.parts[1:]) + pending
+                else:
+                    pending = list(target.parts) + pending
+                continue
+            info = os.fstat(child)
+            sticky_root = info.st_uid == 0 and info.st_mode & stat_module.S_ISVTX
+            if info.st_uid not in (0, os.geteuid()) or (info.st_mode & 0o022 and not sticky_root):
+                os.close(child)
+                raise OSError(errno.EPERM, "untrusted directory")
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 @contextmanager
 def sensitive_writer(path: Path):
     """Open a sensitive local file as 0600 before any bytes are written."""

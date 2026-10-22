@@ -5714,16 +5714,26 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
             total = routing_sources.spend_total(streams, entry["key"],
                                                 now - timedelta(days=cap["days"]), now)
             extra = {}
+            spend_verdict = None
             if entry.get("harness") == "deepseek":
-                # DeepSeek's balance gives a spend floor (usage.py). A floor at
-                # the cap wins over any runner figure; below it the runners'
-                # known total stands, and with none the floor's unknown does.
+                # A runner covers its own stream, not the whole prepaid
+                # account. Both sources prove lower bounds: take their max,
+                # never their sum, and never infer under-cap spending.
+                from decimal import Decimal
                 from khipu import usage
 
                 floor = usage.deepseek_spend_total(now, cap["days"], cap["usd"],
                                                    definitions=view.get("definitions"))
-                if floor.get("status") == "known" or total.get("status") != "known":
-                    total = floor
+                if total.get("status") == "known" and total.get("usd") is not None:
+                    runner_floor = Decimal(str(total["usd"]))
+                    balance_floor = Decimal(floor.get("floor_usd") or "0")
+                    reason = (floor.get("reason") or "").split("; at least $")[0]
+                    floor = usage._deepseek_floor_total(
+                        {**floor, "reason": f"{reason}; runner telemetry cannot rule out other account spending",
+                         "events": total.get("events"), "partial": True},
+                        max(balance_floor, runner_floor), cap["usd"])
+                total = floor
+                spend_verdict = total.get("verdict", "unknown")
                 # Known only once the floor alone reaches the cap; below it the
                 # floor is shown, never a used share a top-up could be hiding.
                 extra["used_pct"] = (round(total["usd"] / cap["usd"] * 100, 1)
@@ -5732,7 +5742,7 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
                 extra["partial"] = total.get("partial")
             out.append({**base, "cap_usd": cap.get("usd"), "days": cap.get("days"),
                         "usd": total.get("usd"), "events": total.get("events"), **extra,
-                        "verdict": routing_pace.spend_verdict(total, cap["usd"]),
+                        "verdict": spend_verdict or routing_pace.spend_verdict(total, cap["usd"]),
                         "why": total.get("reason")})
         elif kind == "concurrency":
             if streams is None:
