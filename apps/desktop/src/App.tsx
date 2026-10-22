@@ -67,7 +67,7 @@ import type { OwedOwner } from "./OwedBulk";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { OwnerActions } from "./OwnerActions";
 import { ProjectsSettings, askedCount } from "./ProjectsSettings";
-import { useCliState } from "./settingsCli";
+import { requireCliSuccess, requireMigrationSuccess, useCliState } from "./settingsCli";
 import type { ProjectsList } from "./ProjectsSettings";
 import { EmbeddingsPanel } from "./EmbeddingsPanel";
 import { fmtAgo, fmtAgoFromRead, fmtClock } from "./time";
@@ -1864,7 +1864,7 @@ export default function App() {
     setProbeBusy(true);
     setError(null);
     try {
-      await invoke<string>("khipu_migrate", { dryRun: false });
+      requireMigrationSuccess(await invoke<string>("khipu_migrate", { dryRun: false }));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1879,7 +1879,7 @@ export default function App() {
     setProbeBusy(true);
     setError(null);
     try {
-      await invoke<string>("khipu_snapshot_refresh");
+      requireCliSuccess(await invoke<string>("khipu_snapshot_refresh"));
     } catch (e) {
       setError(String(e));
     } finally {

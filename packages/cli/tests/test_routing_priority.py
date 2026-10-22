@@ -468,7 +468,7 @@ class FakeProc:
         return self.code
 
 
-def _sign_in(home, monkeypatch, label, proc=None, key=None):
+def _sign_in(home, monkeypatch, label, proc=None, key=None, desktop_managed=False, direct_kill=None):
     seen = {}
 
     def popen(argv, **kw):
@@ -479,6 +479,10 @@ def _sign_in(home, monkeypatch, label, proc=None, key=None):
     monkeypatch.setattr(usage, "report", lambda **kw: {"accounts": [{"account": kw["accounts"][0]["label"],
                                                                      "ok": True, "probed": True}]})
     monkeypatch.setattr(usage, "_killpg", lambda proc: seen.setdefault("killed", True))
+    if desktop_managed:
+        monkeypatch.setenv("KHIPU_DESKTOP_MANAGED", "1")
+    if direct_kill is not None:
+        monkeypatch.setattr(usage, "_kill", direct_kill)
     out = usage.sign_in(label, key=key, popen=popen, wait=1)
     return out, seen
 
@@ -536,6 +540,19 @@ def test_a_sign_in_left_open_is_stopped_and_the_account_read_again(home, monkeyp
     out, seen = _sign_in(home, monkeypatch, "Claude second", proc=FakeProc(hang=True))
     assert out["error"] == "sign_in_timeout" and not out["ok"] and seen["killed"]
     assert out["row"]["account"] == "Claude second"
+
+
+def test_desktop_sign_in_stays_in_the_parent_group_and_directly_reaps_on_timeout(home, monkeypatch):
+    proc = FakeProc(hang=True)
+    killed = []
+    out, seen = _sign_in(
+        home, monkeypatch, "Claude second", proc=proc, desktop_managed=True,
+        direct_kill=lambda child: killed.append(child),
+    )
+    assert seen["start_new_session"] is False
+    assert "KHIPU_DESKTOP_MANAGED" not in seen["env"]
+    assert killed == [proc]
+    assert out["error"] == "sign_in_timeout"
 
 
 def test_a_conversations_role_cannot_read_as_more_entries(home):

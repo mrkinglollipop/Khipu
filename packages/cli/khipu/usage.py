@@ -3138,8 +3138,10 @@ def sign_in(label: str | None, *, key: str | None = None, wait: float = SIGN_IN_
             timeout: float = TIMEOUT_S, popen=None) -> dict:
     """Start the configured account's own login in its own login folder, in
     its own session with no terminal (it opens the browser), wait for it to
-    end, then read that account's plan again. Returns the outcome and the
-    account's new row; the login's own output is never read."""
+    end, then read that account's plan again. The desktop runner sets
+    `KHIPU_DESKTOP_MANAGED=1`, which keeps this one child in its process group
+    so its deadline can cancel the whole desktop action. Returns the outcome
+    and the account's new row; the login's own output is never read."""
     account, error = resolve_account(label, key)
     if account is None:
         return {"ok": False, "error": error}
@@ -3151,14 +3153,23 @@ def sign_in(label: str | None, *, key: str | None = None, wait: float = SIGN_IN_
         return {"ok": False, "error": E_NOT_INSTALLED}
     argv = sign_in_argv(harness, binary)
     env = probe_environment(harness, account.get("home"), binary)
+    # `probe_environment` deliberately allowlists only provider-facing values;
+    # this runner-control marker stays in Khipu's own environment.
+    desktop_managed = os.environ.get("KHIPU_DESKTOP_MANAGED") == "1"
     start = popen or subprocess.Popen
     with tempfile.TemporaryDirectory(prefix="khipu-sign-in-") as cwd:
         proc = start(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+                     stderr=subprocess.DEVNULL, start_new_session=not desktop_managed)
         try:
             code = proc.wait(timeout=wait)
         except subprocess.TimeoutExpired:
-            _killpg(proc)
+            # Under the desktop runner this child inherited the runner's
+            # process group, so _killpg(proc) would target the wrong group.
+            # Kill and reap it directly; the runner cancels the shared group.
+            if desktop_managed:
+                _kill(proc)
+            else:
+                _killpg(proc)
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)
             code = None

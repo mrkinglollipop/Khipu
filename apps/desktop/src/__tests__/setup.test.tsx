@@ -433,6 +433,26 @@ describe("Welcome › Finish step", () => {
     assertNoRawCode(container);
   });
 
+  it("shows a refused snapshot refresh instead of discarding its command-specific error", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "khipu_snapshot_refresh") return JSON.stringify({ ok: false, error: "fixture refresh refused" });
+      throw new Error(`unexpected invoke: ${cmd}`);
+    });
+    renderFinishStep(async (args) => {
+      if (args[0] === "doctor") {
+        return JSON.stringify({
+          ok: false,
+          hub_snapshot: { ok: false, reason: "snapshot_missing" },
+        });
+      }
+      return "{}";
+    });
+
+    const button = await screen.findByRole("button", { name: "Refresh offline copy" });
+    fireEvent.click(button);
+    expect(await screen.findByRole("alert")).toHaveTextContent("fixture refresh refused");
+  });
+
   it("Continue anyway is enabled while the health check is still running", () => {
     renderFinishStep(() => new Promise<string>(() => {}));
     expect(screen.getByRole("button", { name: "Continue anyway" })).not.toBeDisabled();

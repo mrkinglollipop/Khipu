@@ -545,7 +545,7 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
 
   async function cancelJob(jobId: string, rowKey: string) {
     setBusy(`cancel:${jobId}`);
-    const res = await callObject("khipu_job_cancel", { job_id: jobId });
+    const res = await callObject("khipu_job_cancel", { jobId });
     setError(rowKey, res.ok ? null : res.error);
     await loadJobs();
     setBusy(null);
@@ -1386,7 +1386,7 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
           const res = await callCli<ImportReceipt>("khipu_library_import", {
             name: l.name,
             path,
-            strip_prefix: strip || null,
+            stripPrefix: strip || null,
             profile: null,
           });
           if (res.ok) {

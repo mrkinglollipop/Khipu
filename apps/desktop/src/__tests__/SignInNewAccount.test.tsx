@@ -180,7 +180,7 @@ describe("SignInNewAccount", () => {
     await act(async () => {
       fireEvent.click(within(confirm).getByRole("button", { name: "Stop and cancel" }));
     });
-    expect(call).toHaveBeenCalledWith("khipu_account_sign_in_cancel", { remove_folder: false });
+    expect(call).toHaveBeenCalledWith("khipu_account_sign_in_cancel", { removeFolder: false });
     expect(onCancel).toHaveBeenCalled();
   });
 
@@ -203,7 +203,7 @@ describe("SignInNewAccount", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     });
-    expect(call).toHaveBeenCalledWith("khipu_account_sign_in_cancel", { remove_folder: true });
+    expect(call).toHaveBeenCalledWith("khipu_account_sign_in_cancel", { removeFolder: true });
     expect(onCancel).toHaveBeenCalled();
   });
 

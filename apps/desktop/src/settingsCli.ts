@@ -36,16 +36,8 @@ function refusalText(data: Record<string, unknown>): string {
   return parts.join(": ") || "Khipu refused the change.";
 }
 
-export async function callCli<T = Record<string, unknown>>(
-  command: string,
-  args?: Record<string, unknown>,
-): Promise<CliResult<T>> {
-  let raw: unknown;
-  try {
-    raw = await invoke<string>(command, args);
-  } catch (e) {
-    return { ok: false, error: errText(e) };
-  }
+/** Decode a fixed-command response before a caller treats it as success. */
+export function parseCliResponse<T = Record<string, unknown>>(raw: unknown): CliResult<T> {
   if (typeof raw !== "string") return { ok: false, error: "Khipu did not answer." };
   let data: unknown;
   try {
@@ -58,6 +50,35 @@ export async function callCli<T = Record<string, unknown>>(
     return { ok: false, error: refusalText(refusal), refusal };
   }
   return { ok: true, data: data as T };
+}
+
+/** Turn command-specific JSON refusals into the same rejected path as invoke. */
+export function requireCliSuccess<T = Record<string, unknown>>(raw: unknown): T {
+  const result = parseCliResponse<T>(raw);
+  if (!result.ok) throw new Error(result.error);
+  return result.data;
+}
+
+/** Migration only succeeds when it leaves no named migrations pending. */
+export function requireMigrationSuccess<T extends { pending?: unknown } = { pending?: unknown }>(raw: unknown): T {
+  const data = requireCliSuccess<T>(raw);
+  if (Array.isArray(data.pending) && data.pending.length > 0) {
+    throw new Error(`Khipu still has pending migrations: ${data.pending.map(String).join(", ")}.`);
+  }
+  return data;
+}
+
+export async function callCli<T = Record<string, unknown>>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<CliResult<T>> {
+  let raw: unknown;
+  try {
+    raw = await invoke<string>(command, args);
+  } catch (e) {
+    return { ok: false, error: errText(e) };
+  }
+  return parseCliResponse<T>(raw);
 }
 
 /** Load one read-only command's JSON while `active`, and expose `reload` for
