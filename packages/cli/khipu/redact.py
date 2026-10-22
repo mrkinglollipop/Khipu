@@ -63,7 +63,7 @@ _PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
             r"access[_-]?token|auth[_-]?token|refresh[_-]?token|token|password|passwd|pwd|"
             r"client[_-]?secret|private[_-]?key|access[_-]?key(?:[_-]?id)?|dsn|connection[_-]?string)"
             r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']))"
-            r"(?:(?!(?P=value_quote))[^\\\r\n]|\\.){8,}(?P=value_quote)"
+            r"(?P<value>(?:(?!(?P=value_quote))[^\\\r\n]|\\.){8,})(?P=value_quote)"
         ),
         r"\1" + MASK + r"\g<value_quote>",
     ),
@@ -93,9 +93,23 @@ def redact_secrets(text: str, *, force: bool = False) -> tuple[str, int]:
         return text or "", 0
     total = 0
     out = text
-    for _name, pat, repl in _PATTERNS:
-        out, n = pat.subn(repl, out)
-        total += n
+    for name, pat, repl in _PATTERNS:
+        if name not in ("assignment", "quoted-assignment"):
+            out, n = pat.subn(repl, out)
+            total += n
+            continue
+
+        def replace(match):
+            nonlocal total
+            value = match.group(2) if name == "assignment" else match.group("value")
+            # Only the complete canonical value is already masked. Suffixes
+            # and other credentials in the same text still need redaction.
+            if re.fullmatch(r"\[REDACTED\][.,;:!?)}\]”’]*", value):
+                return match.group()
+            total += 1
+            return match.expand(repl)
+
+        out = pat.sub(replace, out)
     return out, total
 
 

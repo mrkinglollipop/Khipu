@@ -832,6 +832,37 @@ def _for_agents(value, view: dict | None = None):
     return agent_view.scrub_strict(value, keep=agent_view.keep_owner_words(view), extra_keys=keys)
 
 
+def _agent_field(value: str, fallback: str = "(name withheld)", *,
+                 view: dict | None = None, colon: bool = False) -> str:
+    """Project a field before renderer punctuation can turn it into a credential."""
+    from khipu import agent_view
+
+    projected = _for_agents(value, view)
+    if projected == agent_view.WITHHELD:
+        return fallback
+    if colon and agent_view._has_secret(projected + ": unknown:"):
+        return f"[{projected}]"
+    return projected
+
+
+def _account_label(label: str, key: str | None = None, *, view: dict | None = None) -> str:
+    projected = _agent_field(label, "", view=view, colon=True)
+    if projected:
+        return projected
+    return _agent_field(account_id(key), "An account", view=view) if key else "An account"
+
+
+def _provider_line(provider: dict, view: dict) -> str:
+    from khipu.routing_providers import line
+
+    projected = dict(provider, label=_agent_field(provider.get("label") or provider["id"],
+                                                 view=view, colon=True))
+    for field in ("models_allowed", "models_never"):
+        if field in projected:
+            projected[field] = [_agent_field(model, view=view) for model in projected[field]]
+    return line(projected)
+
+
 def _typed_time(raw, now: datetime, flag: str, *, ago: bool = False) -> datetime:
     """A time typed for ``flag``: a length (after ``now``, or before it with
     ``ago``) or an ISO time; an ISO time with no zone is this Mac's local
@@ -6960,7 +6991,7 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
     at 18:52Z, in 3 h 12 min (time from Claude's message, reported by a Claude
     Code conversation in khipu)'. ``push`` keeps out a conversation's own
     words; ``relative`` adds the time remaining and ages."""
-    label, state = entry["label"], entry["state"]
+    label, state = _account_label(entry["label"], entry.get("key")), entry["state"]
     until = _parse(entry.get("until"))
     w = entry.get("witness") or {}
     at = _parse(w.get("at"))
@@ -7012,7 +7043,7 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
         m_until = _parse(m["until"])
         if m_until is None:
             continue
-        name = model_words(m, push=push)
+        name = _agent_field(model_words(m, push=push))
         text += f"; {name} limit reached, back {'about ' if m['basis'] == 'estimated' else 'at '}{when(m_until)}"
         if state == OPEN:
             text += " (other models open)"
@@ -7634,18 +7665,21 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
             moved = (view.get("forwards") or {}).get(ident)
             if moved:
                 to = next((a for a in view["accounts"] if a["key"] == _forwarded(moved, view["forwards"])), None)
-                return f"{(to or {}).get('label') or prev.get('label') or _label_for_key(ident)}'s login folder moved"
-            return f"{prev.get('label') or _label_for_key(ident)}: no longer tracked"
+                label = (to or {}).get('label') or prev.get('label') or _label_for_key(ident)
+                return f"{_account_label(label, ident, view=view)}'s login folder moved"
+            label = _account_label(prev.get('label') or _label_for_key(ident), ident, view=view)
+            return f"{label}: no longer tracked"
         note = entry.get("note")
         if note and note != prev.get("note"):
             # The owner's own change to the account (settings clarity 9B):
             # what he did, never a login folder (change lines reach agents).
             if note[0] == "renamed" and entry.get("renamed_from"):
-                return f"{entry['renamed_from']} is now called {entry['label']}"
+                return (f"{_account_label(entry['renamed_from'], ident, view=view)} is now called "
+                        f"{_account_label(entry['label'], ident, view=view)}")
             if note[0] == "untracked":
-                return f"{entry['label']}: no longer tracked"
+                return f"{_account_label(entry['label'], ident, view=view)}: no longer tracked"
             if note[0] == "tracked" and entry["state"] == UNKNOWN and not entry.get("last_seen"):
-                return f"{entry['label']}: newly tracked, not read yet"
+                return f"{_account_label(entry['label'], ident, view=view)}: newly tracked, not read yet"
         return account_line(entry, now, relative=False)
     if kind == "hold":
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
@@ -7664,9 +7698,7 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
         return lane_line(item, now, relative=False) if item else f"{runner} lane {lane}: its limit is over"
     sources = view.get("sources") or {}
     if entity == "definition:providers":
-        from khipu.routing_providers import line as provider_line
-
-        return "Provider facts: " + "; ".join(provider_line(p) or p["label"]
+        return "Provider facts: " + "; ".join(_provider_line(p, view) or _agent_field(p["label"], view=view)
                     for p in (view.get("definitions") or {}).get("providers", {}).values())
     if kind == "runner":
         item = next((r for r in sources.get("runners") or [] if r["name"] == ident), None)
@@ -7815,10 +7847,8 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
             theirs.append((len(whole), line, _priority_pointers(view["priority"], view, facts=facts), "priority"))
         whole.append(line)
         whole_owners.append("priority")
-    from khipu.routing_providers import line as provider_line
-
     provider_lines = [line for p in (view.get("definitions") or {}).get("providers", {}).values()
-                      if (line := provider_line(p))]
+                      if (line := _provider_line(p, view))]
     whole = _for_agents(whole, view)
     rules_note_chars = sum(len(line) + 1 for i, line in enumerate(whole) if i not in {t[0] for t in theirs})
     requests = [
