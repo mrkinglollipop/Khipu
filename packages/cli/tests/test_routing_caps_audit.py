@@ -168,15 +168,50 @@ def test_routing_valid_correction_chain_keeps_real_spend(monkeypatch):
 
 @pytest.mark.parametrize("payload", [
     {"limits": [{"unit": 3, "type": "CREDIT_LIMIT", "percentage": -5}]},
-    {"limits": [{"unit": 3, "type": "CREDIT_LIMIT", "percentage": 250}]},
     {"windows": [{"window_mins": 300, "currentValue": -5, "usage": 100}]},
-    {"windows": [{"window_mins": 300, "currentValue": 250, "usage": 100}]},
     {"windows": [{"window_mins": 300, "used_pct": -5}]},
 ])
-def test_usage_http_quota_rejects_raw_out_of_range_percentages(payload):
+def test_usage_http_quota_rejects_raw_negative_percentages(payload):
     with pytest.raises(usage.ProbeError) as caught:
         usage.parse_http_quota(200, json.dumps(payload).encode())
     assert caught.value.code == usage.E_BAD
+
+
+@pytest.mark.parametrize("payload", [
+    {"limits": [{"unit": 3, "type": "TOKENS_LIMIT", "percentage": 100.4}]},
+    {"limits": [{"unit": 3, "type": "TOKENS_LIMIT", "currentValue": 1004, "usage": 1000}]},
+    {"limits": [{"unit": 3, "type": "CREDIT_LIMIT", "percentage": 250}]},
+    {"windows": [{"window_mins": 300, "currentValue": 250, "usage": 100}]},
+])
+def test_usage_http_quota_clamps_overdrawn_glm_percentages(payload):
+    parsed = usage.parse_http_quota(200, json.dumps(payload).encode())
+    assert parsed["windows"][0]["used_pct"] == 100
+
+
+@pytest.mark.parametrize("source", ["rollout", "last_observed"])
+def test_usage_bad_window_observation_falls_back_to_valid_row_time(source):
+    row = {"source": source, "observed_at": "2026-10-22T12:00:00Z",
+           "probed_at": routing._iso(NOW), "windows": [{"name": "weekly", "used_pct": 100,
+           "resets_at": "2026-10-23T12:00:00Z", "observed_at": "junk"}]}
+    assert usage._figures_time(row, row["windows"][0]) == NOW - timedelta(minutes=2)
+
+
+@pytest.mark.parametrize("window, readings", [
+    ("weekly", [sample(-55, 40), sample(-30, 60), sample(-1, 100)]),
+    ("weekly", [sample(-50, 95), sample(-40, 2), sample(-30, 3), sample(-20, 4), sample(-1, 100)]),
+    ("weekly", [sample(-m, 100) for m in range(60, -1, -5)]),
+    ("weekly", [sample(-50, 100), sample(-40, 90), sample(-1, 100)]),
+    ("five_hour", [sample(-55, 40), sample(-30, 60), sample(-1, 100)]),
+], ids=["gappy", "rollover", "dense-thin-coverage", "refuted-reset", "gappy-five-hour"])
+def test_routing_fresh_reached_level_closes_despite_unknown_rate(window, readings):
+    caps = [dict(CAP, window=window),
+            dict(kind="share", window=window, pct=95, revision="fake-share")]
+    pace = routing_pace.compute_pace(readings, caps, NOW, window)
+    assert pace["why"].startswith("readings ")
+    assert pace["plan"]["verdict"] == "limit_reached"
+    assert pace["share_cap"]["verdict"] == "cap_reached"
+    advice = routing_advice.account_advice({}, entry(pace=[pace], caps=caps), NOW)
+    assert advice["verdict"] == "closed"
 
 
 def test_routing_possible_reset_is_unknown_before_reached_checks():

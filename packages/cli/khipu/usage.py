@@ -1386,7 +1386,7 @@ def _glm_pct(limit: dict, *, strict: bool = False):
         pct = used / total * 100
     if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
         raise ProbeError(E_BAD)
-    if strict and not 0 <= pct <= 100:
+    if strict and pct < 0:
         raise ProbeError(E_BAD)
     return round(min(100.0, max(0.0, float(pct))), 2)
 
@@ -2425,8 +2425,7 @@ def kick_refresh(*, max_age: float = PROMPT_MAX_AGE_S, spawn=None) -> bool:
 
 def _figures_time(row: dict, window: dict | None = None) -> datetime | None:
     """Stored provider figures need their observation time, not retrieval time."""
-    observed = (window or {}).get("observed_at") or row.get("observed_at")
-    when = _parse_time(observed)
+    when = _parse_time((window or {}).get("observed_at")) or _parse_time(row.get("observed_at"))
     if row.get("source") in ("rollout", "last_observed"):
         return when
     return when or _parse_time(row.get("probed_at"))

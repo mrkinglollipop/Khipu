@@ -369,9 +369,11 @@ def compute_pace(samples, caps, now, window):
             why = f"readings cover only {_hours(max(0.0, (valid_dur - gap_time) / 3600))} of the last {params['trailing_h']} h"
     pace["why"] = why
     allowed = why is None
-    # Thin fresh readings establish a level, but unsettled or old readings
-    # cannot establish even a reached ceiling.
-    level_known = bool(in_window) and (allowed or why.startswith("only "))
+    # Gaps and thin coverage invalidate the rate, not a fresh usage level.
+    # Unsettled, expired or stale readings cannot establish a reached ceiling.
+    level_known = (bool(in_window) and not (pending or disagrees or ambiguous)
+                   and secs_to_reset is not None and secs_to_reset > 0
+                   and (now - blist[-1]["time"]).total_seconds() <= 2 * params["sample_s"])
     if not level_known:
         pace["plan"]["needed_pct_per_h"] = None
 
