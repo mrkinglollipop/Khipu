@@ -7018,12 +7018,14 @@ def model_words(model: dict, *, push: bool = True) -> str:
     return _UNNAMED_MODEL
 
 
-def account_line(entry: dict, now: datetime, *, push: bool = True, relative: bool = True) -> str:
+def account_line(entry: dict, now: datetime, *, push: bool = True, relative: bool = True,
+                 view: dict | None = None) -> str:
     """One account in plain words, e.g. 'Claude second: limit reached, back
     at 18:52Z, in 3 h 12 min (time from Claude's message, reported by a Claude
     Code conversation in khipu)'. ``push`` keeps out a conversation's own
-    words; ``relative`` adds the time remaining and ages."""
-    label, state = _account_label(entry["label"], entry.get("key")), entry["state"]
+    words; ``relative`` adds the time remaining and ages. ``view`` keeps field
+    projection on the hook's already bounded inventory and current owner words."""
+    label, state = _account_label(entry["label"], entry.get("key"), view=view), entry["state"]
     until = _parse(entry.get("until"))
     w = entry.get("witness") or {}
     at = _parse(w.get("at"))
@@ -7075,7 +7077,7 @@ def account_line(entry: dict, now: datetime, *, push: bool = True, relative: boo
         m_until = _parse(m["until"])
         if m_until is None:
             continue
-        name = _agent_field(model_words(m, push=push))
+        name = _agent_field(model_words(m, push=push), view=view)
         text += f"; {name} limit reached, back {'about ' if m['basis'] == 'estimated' else 'at '}{when(m_until)}"
         if state == OPEN:
             text += " (other models open)"
@@ -7712,7 +7714,7 @@ def change_line(entity: str, view: dict, now: datetime, prev_effective: dict | N
                 return f"{_account_label(entry['label'], ident, view=view)}: no longer tracked"
             if note[0] == "tracked" and entry["state"] == UNKNOWN and not entry.get("last_seen"):
                 return f"{_account_label(entry['label'], ident, view=view)}: newly tracked, not read yet"
-        return account_line(entry, now, relative=False)
+        return account_line(entry, now, relative=False, view=view)
     if kind == "hold":
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
         return hold_line(hold, now, relative=False, view=view) if hold else f"Hold on {prev.get('scope') or '?'} ended"
@@ -7934,7 +7936,7 @@ def summary(view: dict | None = None, *, now: datetime | None = None, brief: boo
         for entry in accounts_in_order:
             # The pace is Khipu's own fixed words, added after the clip so a
             # long account line never cuts it off.
-            line = _clip(account_line(entry, now), width)
+            line = _clip(account_line(entry, now, view=view), width)
             fact = facts.get(entry["key"])
             if fact is not None and entry.get("configured", True):
                 line += f"; {pace_words(fact, now)}"
@@ -8027,7 +8029,7 @@ def _current_line(entity: str, view: dict, now: datetime) -> str:
     if kind == "account":
         entry = next((a for a in view["accounts"] if a["key"] == ident), None)
         if entry:
-            return account_line(entry, now)
+            return account_line(entry, now, view=view)
     if kind == "hold":
         hold = next((h for h in view["holds"] if h["id"] == ident), None)
         if hold:
