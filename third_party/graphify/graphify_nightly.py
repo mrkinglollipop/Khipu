@@ -205,8 +205,10 @@ def main() -> int:
         log("nightly FAILED — build_graph did not succeed")
         return 2
 
+    embed_failures: list[tuple[str, int]] = []
     rc = run_step("embed corpus", "embed_corpus.py", timeout=900, env=khipu_env)
     if rc != 0:
+        embed_failures.append(("embed corpus", rc))
         log("  embed step did not fully succeed — new nodes may lack embeddings until the next run")
 
     rc = run_step(
@@ -216,6 +218,8 @@ def main() -> int:
         args=["--edges", "--prune-stale-edges"],
         env=khipu_env,
     )
+    if rc != 0:
+        embed_failures.append(("embed edges", rc))
     if rc == 3:
         log("  edge-embed step deferred — will retry next run")
     elif rc != 0:
@@ -238,6 +242,11 @@ def main() -> int:
                 log(f"  khipu graph mirror rc={proc.returncode}: {tail[-1] if tail else 'failed'}")
         except OSError as exc:
             log(f"  khipu graph mirror skipped (non-fatal): {exc}")
+
+    if embed_failures:
+        detail = "; ".join(f"{label} rc={rc}" for label, rc in embed_failures)
+        log(f"nightly FAILED — {detail}")
+        return embed_failures[0][1]
 
     log("nightly complete — graph refreshed")
     return 0

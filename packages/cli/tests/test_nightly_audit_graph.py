@@ -210,3 +210,116 @@ def test_source_export_uses_the_cli_returned_path(tmp_path, monkeypatch):
     monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw:
         subprocess.CompletedProcess(a, 0, json.dumps({'ok': True, 'path': str(resolved)}), ''))
     assert g._export_sources({}) == resolved
+
+
+@pytest.mark.parametrize('fault', [None, 'invalid', 'copy', 'replace'])
+def test_embedding_crash_recovers_committed_work(graph, tmp_path, monkeypatch, capsys, fault):
+    import tempfile
+    _, e, live = graph
+    before = live.read_bytes()
+    stages = tmp_path / 'stages'
+    stages.mkdir()
+    monkeypatch.setattr(tempfile, 'tempdir', str(stages))
+    def run(args, stage, key):
+        with sqlite3.connect(stage) as conn:
+            conn.execute("INSERT INTO embeddings(node_id,chunk_text) VALUES ('paid','saved')")
+        if fault == 'invalid':
+            stage.write_bytes(b'corrupt stage')
+        raise RuntimeError('synthetic worker crash')
+    monkeypatch.setattr(e, '_run_main', run)
+    monkeypatch.setattr(e, '_load_api_key', lambda: 'synthetic')
+    monkeypatch.setattr(sys, 'argv', ['embed_corpus.py', '--db', str(live)])
+    if fault == 'copy':
+        def copy(*a, **kw): raise OSError('synthetic publication copy failure')
+        monkeypatch.setattr(shutil, 'copyfileobj', copy)
+    elif fault == 'replace':
+        def replace(*a): raise OSError('synthetic replace failure')
+        monkeypatch.setattr(os, 'replace', replace)
+    assert e.main() == 1
+    err = capsys.readouterr().err
+    assert 'synthetic worker crash' in err
+    retained = list(stages.glob('embed_stage_*.sqlite'))
+    if fault is None:
+        assert count(live, 'paid') == 1
+        assert retained == []
+    else:
+        assert live.read_bytes() == before
+        assert len(retained) == 1
+        assert str(retained[0]) in err
+        assert retained[0].stat().st_mode & 0o077 == 0
+        if fault != 'invalid':
+            assert count(retained[0], 'paid') == 1
+    assert count(live) == 1
+    assert list(live.parent.glob('.graph.sqlite.publish-*')) == []
+
+
+def test_dry_run_crash_never_publishes(graph, tmp_path, monkeypatch):
+    import tempfile
+    _, e, live = graph
+    before = live.read_bytes()
+    stages = tmp_path / 'stages'
+    stages.mkdir()
+    monkeypatch.setattr(tempfile, 'tempdir', str(stages))
+    def run(args, stage, key):
+        with sqlite3.connect(stage) as conn:
+            conn.execute("INSERT INTO embeddings(node_id,chunk_text) VALUES ('dry','private')")
+        raise RuntimeError('synthetic dry-run crash')
+    monkeypatch.setattr(e, '_run_main', run)
+    monkeypatch.setattr(e, '_load_api_key', lambda: None)
+    monkeypatch.setattr(sys, 'argv', ['embed_corpus.py', '--db', str(live), '--dry-run'])
+    assert e.main() == 1
+    assert live.read_bytes() == before
+    assert list(stages.iterdir()) == []
+
+
+@pytest.mark.parametrize('mode', [0o644, 0o640, 0o600, None])
+def test_publication_preserves_database_mode(graph, tmp_path, mode):
+    from graph_db import publish
+    _, _, live = graph
+    stage = tmp_path / 'stage.sqlite'
+    shutil.copyfile(live, stage)
+    destination = live if mode is not None else tmp_path / 'new.sqlite'
+    if mode is not None:
+        live.chmod(mode)
+    publish(stage, destination)
+    assert destination.stat().st_mode & 0o777 == (mode if mode is not None else 0o600)
+    assert count(destination) == 1
+
+
+@pytest.mark.parametrize('corpus_rc,edges_rc', [(1, 0), (0, 7), (1, 7), (0, 3), (-1, 0), (0, 0)])
+def test_nightly_embedding_failure_reaches_job_receipt(tmp_path, monkeypatch, capsys,
+                                                     corpus_rc, edges_rc):
+    import subprocess
+    from khipu import jobs
+    g = load('graphify_nightly')
+    resolved = tmp_path / 'sources.json'
+    resolved.write_text(json.dumps({'code_roots': ['synthetic']}))
+    monkeypatch.setattr(g, '_export_sources', lambda env: resolved)
+    monkeypatch.setattr(g, '_khipu_root', lambda: None)
+    steps = []
+    def step(label, *a, **kw):
+        steps.append(label)
+        return {'embed corpus': corpus_rc, 'embed edges': edges_rc}.get(label, 0)
+    monkeypatch.setattr(g, 'run_step', step)
+    monkeypatch.setattr(jobs, 'GRAPHIFY_NIGHTLY', GRAPH / 'graphify_nightly.py')
+    monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path / 'data')
+    monkeypatch.setattr(jobs, '_log_paths', lambda stem: (tmp_path / 'out.log', tmp_path / 'err.log'))
+    monkeypatch.setattr(jobs.subprocess, 'run', lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, g.main()))
+    offsite = []
+    monkeypatch.setattr(jobs, '_offsite_if_due', lambda: offsite.append(True))
+    expected = corpus_rc or edges_rc
+    assert jobs.run_graph_build() == expected
+    assert jobs._read_job_state('graph_build')['exit'] == expected
+    assert steps == ['semantic extract', 'build graph', 'embed corpus', 'embed edges']
+    output = capsys.readouterr().out
+    if expected:
+        assert 'nightly FAILED' in output
+        for label, rc in [('embed corpus', corpus_rc), ('embed edges', edges_rc)]:
+            if rc:
+                assert f'{label} rc={rc}' in output
+        assert 'nightly complete' not in output
+        assert offsite == []
+    else:
+        assert 'nightly complete' in output
+        assert offsite == [True]

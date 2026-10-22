@@ -409,15 +409,19 @@ def main() -> int:
             staged_db = Path(tmp_str)
             shutil.copyfile(str(args.db), str(staged_db))
             print(f"staged: {staged_db}\n")
-            rc = _run_main(args, staged_db, api_key)
+            try:
+                rc = _run_main(args, staged_db, api_key)
+            except Exception as exc:
+                # Completed batches are committed independently and may still
+                # be usable even when a later batch crashes.
+                print(f"ERROR: graph embedding failed: {exc}", file=sys.stderr)
+                rc = 1
             if not args.dry_run:
-                try:
-                    publish(staged_db, args.db)
-                except Exception:
-                    # Recovery is explicit: keep only this private worker stage,
-                    # never a partially copied publication sibling.
-                    preserve_stage = True
-                    raise
+                # Publication validates a disposable sibling before replacement.
+                # Keep the worker stage if validation or publication fails.
+                preserve_stage = True
+                publish(staged_db, args.db)
+                preserve_stage = False
             return rc
     except Exception as exc:
         print(f"ERROR: graph embedding failed: {exc}", file=sys.stderr)

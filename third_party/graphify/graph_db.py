@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import tempfile
 
 
@@ -29,6 +30,10 @@ def publish(stage: Path, database: Path) -> None:
     of the worker stage. Readers with an open handle retain the old inode.
     """
     database = database.resolve()
+    try:
+        mode = stat.S_IMODE(database.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o600
     fd, name = tempfile.mkstemp(prefix='.' + database.name + '.publish-',
                                 suffix='.sqlite', dir=database.parent)
     os.close(fd)
@@ -46,6 +51,7 @@ def publish(stage: Path, database: Path) -> None:
                 conn.execute(f'SELECT * FROM {table} LIMIT 0')
         finally:
             conn.close()
+        os.chmod(sibling, mode)
         os.replace(sibling, database)
         directory = os.open(database.parent, os.O_RDONLY)
         try:
