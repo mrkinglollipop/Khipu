@@ -12,6 +12,9 @@ import fcntl
 import io
 import json
 import os
+import select
+import signal
+import socket
 import threading
 import time
 import urllib.error
@@ -54,6 +57,7 @@ class _Response:
 @pytest.fixture
 def ds(monkeypatch, tmp_path):
     seen = []
+    monkeypatch.setattr(usage, "_DEEPSEEK_STATE_CACHE", {})
 
     class D:
         reply = _Response(_body("30.00"))
@@ -607,7 +611,7 @@ def test_key_never_appears_anywhere(ds, capsys, caplog):
     assert KEY not in blob and "SENTINEL" not in blob
     assert oct(ds.history.stat().st_mode & 0o777) == "0o600"
     assert set(json.loads(ds.history.read_text())) == {
-        "version", "salt", "fingerprint", "since", "last", "buckets", "topups", "attempt"}
+        "version", "salt", "fingerprint", "since", "last", "buckets", "topups", "daily", "attempt"}
 
 
 def test_non_usd_is_unsupported_not_zero(ds):
@@ -908,6 +912,68 @@ def test_usage_poll_automatically_refreshes_deepseek_without_prompt_setup(ds, mo
     assert calls == [{"accounts": [ACCOUNT], "max_age": 60, "timeout": 10}]
 
 
+def test_usage_poll_refolds_before_a_hanging_deepseek_transport(ds, monkeypatch):
+    from khipu import recall_prompt
+
+    entered, release, folded = threading.Event(), threading.Event(), threading.Event()
+    calls, outcomes, failures = [], [], []
+
+    def request(*args, **kwargs):
+        calls.append("http")
+        entered.set()
+        assert release.wait(5), "test did not release the fake hanging transport"
+        return 200, _body("100")
+
+    def refold(**kwargs):
+        calls.append("refold")
+        folded.set()
+        return {"folded": False, "valid_until": None, "interval": 600}
+
+    def poll():
+        try:
+            outcomes.append(recall_prompt._poll_once(routing))
+        except BaseException as exc:
+            failures.append(exc)
+
+    monkeypatch.setattr(usage, "http_quota_accounts", lambda: [dict(ACCOUNT)])
+    monkeypatch.setattr(usage, "_deepseek_request", request)
+    monkeypatch.setattr(usage, "_load_cache", lambda: {})
+    monkeypatch.setattr(usage, "_try_refresh_lock", lambda: -1)
+    monkeypatch.setattr(usage, "_release", lambda fd: None)
+    monkeypatch.setattr(usage, "_store", lambda *args: None)
+    monkeypatch.setattr(routing, "poll_refold", refold)
+    monkeypatch.setattr(routing, "push_off", lambda moment: None)
+    monkeypatch.setattr(routing, "settings", lambda: {"routing_reset_check": False})
+    thread = threading.Thread(target=poll, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(2), "poll did not reach the fake transport"
+        assert folded.is_set(), "a hanging provider must not delay the routing refold"
+        assert calls == ["refold", "http"]
+        assert thread.is_alive(), "the fake transport should still be hanging"
+    finally:
+        release.set()
+        thread.join(2)
+    assert not thread.is_alive()
+    assert failures == []
+    assert outcomes[0]["interval"] == 60
+
+
+def test_usage_deepseek_timestamp_order_does_not_reclassify_a_topup(ds):
+    # Chronological balance increases are top-ups; only independent
+    # decreases contribute to spend.
+    data = usage._deepseek_new(KEY, 0.5, "100")
+    for at, balance in [(1, "98"), (2, "99"), (3, "97")]:
+        assert usage._deepseek_add(data, at, balance)
+    assert usage.deepseek_spend(data, 0, 10) == Decimal("4")
+    assert usage._deepseek_topups(data, 0, 10)["topups_seen"] == 1
+    before = json.loads(json.dumps(data))
+    assert not usage._deepseek_add(data, 3, "1")
+    assert not usage._deepseek_add(data, 2.5, "1")
+    assert data == before
+    assert usage._deepseek_valid(data, 10)
+
+
 @pytest.mark.parametrize("spent,verdict", [(0, "under"), (29.75, "near"), (35, "reached"), (36, "over")])
 @pytest.mark.parametrize("days", [1, 8])
 def test_usage_measured_spend_cap_thresholds(ds, days, spent, verdict):
@@ -960,3 +1026,387 @@ def test_usage_poll_caps_long_source_poll_interval_for_deepseek(ds, monkeypatch)
     monkeypatch.setattr(routing, "push_off", lambda moment: None)
     monkeypatch.setattr(routing, "settings", lambda: {"routing_reset_check": False})
     assert recall_prompt._poll_once(routing)["interval"] == 60
+
+
+def _year_of_deepseek_history():
+    """A legacy minute history, including exact sub-cent debits and top-ups."""
+    count = 365 * 24 * 60
+    end = NOW.timestamp() - 5
+    start = end - count * 60
+    data = usage._deepseek_new(KEY, start, 100)
+    for i in range(count):
+        s = start + i * 60
+        record = [s, s + 60, "0.000000000000000001" if i % 2 else "0.0101"]
+        data["topups" if i % 17 == 0 else "buckets"].append(record)
+    data["last"] = [end, 100]
+    data["attempt"]["at"] = end
+    data["version"] = 4
+    del data["daily"]
+    return data
+
+
+def _store_deepseek_history(data):
+    with usage._deepseek_locked() as fd:
+        assert fd is not None
+        usage._deepseek_write(fd, data)
+
+
+def test_usage_deepseek_year_history_prompt_cache_budget(ds, monkeypatch, record_property):
+    data = _year_of_deepseek_history()
+    _store_deepseek_history(data)
+    reads = []
+    original = usage._deepseek_read
+
+    def read(*args):
+        reads.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(usage, "_deepseek_read", read)
+    expected = routing.cap_line_for({}, _entry(), NOW)
+    assert "$" in expected and "unknown" not in expected
+    elapsed = []
+    for seconds in (0, 1, 2):
+        before = time.perf_counter()
+        line = routing.cap_line_for({}, _entry(), NOW + timedelta(seconds=seconds))
+        elapsed.append(time.perf_counter() - before)
+        assert line == expected
+    record_property("deepseek_warm_prompt_max_ms", max(elapsed) * 1000)
+    print(f"DeepSeek unchanged year-history prompt max: {max(elapsed) * 1000:.3f} ms")
+    assert max(elapsed) < 0.020
+    assert len(reads) == 1, "unchanged histories must not be read or parsed again"
+
+
+def test_usage_deepseek_folding_preserves_exact_year_sums(ds):
+    data = _year_of_deepseek_history()
+    original = json.loads(json.dumps(data))
+    end = NOW.timestamp()
+    windows = [0, end - 366 * 86400, end - 7 * 86400, end - 0.5 * 86400]
+    expected = [usage.deepseek_spend(original, start, end) for start in windows]
+    topups = [usage._deepseek_topups(original, start, end) for start in windows]
+    usage._deepseek_compact(data, end, precise_days=7)
+    assert usage._deepseek_valid(data, end)
+    assert len(data["buckets"]) + len(data["topups"]) <= 8 * 1440 + 1
+    assert len(data["daily"]) <= 366
+    assert len(json.dumps(data)) < 1_500_000
+    for start, amount, increases in zip(windows, expected, topups):
+        assert usage.deepseek_spend(data, start, end) == amount
+        actual = usage._deepseek_topups(data, start, end)
+        assert actual["topups_seen"] == increases["topups_seen"]
+        assert actual["possible_miss_seconds"] == increases["possible_miss_seconds"]
+    first = json.dumps(data, sort_keys=True)
+    usage._deepseek_compact(data, end, precise_days=7)
+    assert json.dumps(data, sort_keys=True) == first, "folding must be idempotent"
+    _store_deepseek_history(data)
+    before = time.perf_counter()
+    line = routing.cap_line_for({}, _entry(), NOW)
+    print(f"DeepSeek compact year-history cold prompt: {(time.perf_counter() - before) * 1000:.3f} ms; "
+          f"{ds.history.stat().st_size} bytes")
+    assert "unknown" not in line and ds.seen == []
+
+
+@pytest.mark.parametrize("days", [7, 30, 366])
+def test_usage_deepseek_folding_keeps_active_cap_boundaries_exact(ds, monkeypatch, days):
+    monkeypatch.setattr(routing, "_load_view", lambda: {"accounts": [_entry(days=days)]})
+    assert usage._deepseek_precision_days() == days
+    end = NOW.timestamp()
+    data = usage._deepseek_new(KEY, end - 400 * 86400, 100)
+    # Interleave top-ups and decreases immediately around a fractional
+    # rolling boundary; aggregation must never net these against each other.
+    boundary = end - days * 86400 + 0.5
+    data["buckets"] = [[boundary - 120, boundary - 60, "0.010000000000000001"],
+                       [boundary + 60, boundary + 120, "0.020000000000000002"]]
+    data["topups"] = [[boundary - 60, boundary, "50.000000000000000001"]]
+    data["last"] = [end - 5, 100]
+    data["attempt"]["at"] = end - 5
+    expected = usage.deepseek_spend(data, boundary - 1, end)
+    usage._deepseek_compact(data, end, precise_days=usage._deepseek_precision_days())
+    assert usage._deepseek_valid(data, end)
+    assert usage.deepseek_spend(data, boundary - 1, end) == expected == Decimal("0.020000000000000002")
+    assert usage._deepseek_topups(data, boundary - 1, end)["topups_seen"] == 1
+    assert data["daily"] == []
+
+
+@pytest.mark.parametrize("change", ["replace", "rewrite", "permissions", "parent", "symlink", "missing", "key"])
+def test_usage_deepseek_prompt_cache_invalidates_changed_evidence(ds, change):
+    _read(ds, "100", _ago(minutes=4))
+    _read(ds, "95", _ago(minutes=2))
+    assert _cap(ds)["usd"] == 5
+    if change in ("replace", "rewrite"):
+        stored = json.loads(ds.history.read_text())
+        stored["buckets"][0][2] = 6.0
+        stamp = ds.history.stat()
+        payload = json.dumps(stored, separators=(",", ":"))
+        assert len(payload.encode()) == stamp.st_size
+        if change == "replace":
+            replacement = ds.history.with_name("replacement.json")
+            replacement.write_text(payload)
+            replacement.chmod(0o600)
+            os.utime(replacement, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            replacement.replace(ds.history)
+        else:
+            ds.history.write_text(payload)
+            os.utime(ds.history, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        assert _cap(ds)["usd"] == 6
+    else:
+        if change == "permissions":
+            ds.history.chmod(0o644)
+        elif change == "parent":
+            ds.history.parent.parent.chmod(0o777)
+        elif change == "symlink":
+            target = ds.history.with_name("target.json")
+            ds.history.rename(target)
+            ds.history.symlink_to(target)
+        elif change == "missing":
+            ds.history.unlink()
+        else:
+            ds.key = OTHER_KEY
+        assert _cap(ds)["verdict"] == "unknown"
+    assert len(ds.seen) == 2
+
+
+def test_usage_deepseek_prompt_cache_expires_spend_and_freshness(ds):
+    _read(ds, "100", _ago(days=7, seconds=1))
+    _read(ds, "95", _ago(days=7) + timedelta(seconds=1))
+    _read(ds, "90", _ago(minutes=1))
+    first = usage.deepseek_spend_total(NOW, 7, 35)
+    assert first["usd"] == 10
+    later = usage.deepseek_spend_total(NOW + timedelta(seconds=2), 7, 35)
+    assert later["usd"] == 5
+    stale = usage.deepseek_spend_total(NOW + timedelta(minutes=31), 7, 35)
+    assert stale["verdict"] == "unknown" and stale["usd"] is None
+    rollback = usage.deepseek_spend_total(_ago(minutes=4), 7, 35)
+    assert rollback["status"] == "unknown" and rollback["usd"] is None and "damaged" in rollback["reason"]
+    assert routing.cap_statuses({}, _entry(), _ago(minutes=4))[0]["verdict"] == "unknown"
+
+
+def test_usage_deepseek_cached_failure_and_recovery_are_not_hidden(ds):
+    _read(ds, "100", _ago(minutes=4))
+    _read(ds, "95", _ago(minutes=2))
+    assert _cap(ds)["usd"] == 5
+    ds.now = NOW
+    ds.reply = _Response(b"{}", 500)
+    assert usage.probe_account(dict(ACCOUNT))["ok"] is False
+    assert _cap(ds)["verdict"] == "unknown"
+    _read(ds, "94", NOW + timedelta(seconds=1))
+    assert usage.deepseek_spend_total(NOW + timedelta(seconds=1), 7, 35)["usd"] == 6
+
+
+@pytest.mark.parametrize("damage", ["negative", "overlap", "count", "seconds", "order", "missing", "legacy"])
+def test_usage_deepseek_damaged_daily_summaries_fail_closed(ds, damage):
+    end = NOW.timestamp()
+    data = usage._deepseek_new(KEY, end - 20 * 86400, 100)
+    usage._deepseek_add(data, end - 19 * 86400, 95)
+    usage._deepseek_add(data, end - 18 * 86400, 145)
+    usage._deepseek_add(data, end - 5, 144)
+    assert data["daily"] and usage._deepseek_valid(data, end)
+    row = data["daily"][0]
+    if damage == "negative":
+        row[2] = "-1"
+    elif damage == "overlap":
+        data["buckets"].insert(0, [row[0], row[1], 1])
+    elif damage == "count":
+        row[3] = True
+    elif damage == "seconds":
+        row[5] = row[1] - row[0] + 1
+    elif damage == "order":
+        data["daily"] = data["daily"][::-1]
+    elif damage == "missing":
+        del data["daily"]
+    else:
+        data["version"] = 4
+    _store_deepseek_history(data)
+    assert _cap(ds)["verdict"] == "unknown"
+
+
+def test_usage_deepseek_enlarged_cap_does_not_invent_boundary_spend(ds):
+    end = NOW.timestamp()
+    start = end - 20 * 86400
+    data = usage._deepseek_new(KEY, start, 100)
+    usage._deepseek_add(data, start + 60, 95)
+    usage._deepseek_add(data, start + 120, 145)
+    usage._deepseek_add(data, start + 180, 138)
+    usage._deepseek_add(data, end - 5, 137)
+    assert data["daily"][0][2] == 12
+    _store_deepseek_history(data)
+    days = (end - start - 90) / 86400
+    total = usage.deepseek_spend_total(NOW, days, 35)
+    assert total["partial"] is True and total["usd"] == 1
+    assert total["since"] == usage._iso(start + 180)
+    assert usage.deepseek_spend_total(NOW, 21, 35)["usd"] == 13
+
+
+def test_usage_deepseek_poller_migrates_v4_without_losing_spend(ds, monkeypatch):
+    data = usage._deepseek_new(KEY, _ago(days=40).timestamp(), 100)
+    data["buckets"] = [[_ago(days=40).timestamp(), _ago(days=39).timestamp(), "0.000000000000000001"],
+                       [_ago(days=2).timestamp(), _ago(minutes=2).timestamp(), 5]]
+    data["topups"] = [[_ago(days=39).timestamp(), _ago(days=38).timestamp(), 50]]
+    data["last"] = [_ago(minutes=2).timestamp(), 145]
+    data["attempt"]["at"] = _ago(minutes=2).timestamp()
+    data["version"] = 4
+    del data["daily"]
+    assert usage._deepseek_valid(data, NOW.timestamp())
+    _store_deepseek_history(data)
+    monkeypatch.setattr(routing, "_load_view", lambda: {"accounts": [_entry(days=30)]})
+    row = _read(ds, "144", NOW)
+    assert row["spend"]["last_7d_usd"] == 6
+    stored = json.loads(ds.history.read_text())
+    assert stored["version"] == 5 and stored["daily"]
+    assert usage._deepseek_valid(stored, NOW.timestamp())
+    assert usage.deepseek_spend(stored, 0, NOW.timestamp()) == Decimal("6.000000000000000001")
+    assert usage._deepseek_topups(stored, 0, NOW.timestamp())["topups_seen"] == 1
+    assert usage._deepseek_add(stored, NOW.timestamp(), 999) is False
+    assert usage.deepseek_spend(stored, 0, NOW.timestamp()) == Decimal("6.000000000000000001")
+
+
+def test_usage_deepseek_daily_topup_does_not_reduce_spend_or_double_count(ds):
+    at = _ago(days=20).timestamp()
+    data = usage._deepseek_new(KEY, at, 100)
+    usage._deepseek_add(data, at + 60, "99.995")
+    usage._deepseek_add(data, at + 120, "149.995")
+    usage._deepseek_add(data, at + 180, "149.990")
+    usage._deepseek_add(data, NOW.timestamp() - 60, "149.990")
+    assert usage.deepseek_spend(data, 0, NOW.timestamp()) == Decimal("0.010")
+    assert usage._deepseek_topups(data, 0, NOW.timestamp())["topups_seen"] == 1
+    usage._deepseek_add(data, NOW.timestamp(), "199.990")
+    assert usage.deepseek_spend(data, 0, NOW.timestamp()) == Decimal("0.010")
+    assert usage._deepseek_topups(data, 0, NOW.timestamp())["topups_seen"] == 2
+    assert usage._deepseek_add(data, NOW.timestamp() - 1, 1) is False
+    assert usage.deepseek_spend(data, 0, NOW.timestamp()) == Decimal("0.010")
+    assert usage._deepseek_valid(json.loads(json.dumps(data)), NOW.timestamp())
+
+
+def test_usage_deepseek_cache_warming_never_resolves_keys_or_calls_http(ds, monkeypatch):
+    _store_deepseek_history(usage._deepseek_new(KEY, NOW.timestamp(), 100))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("cache warming must use local history only")
+
+    monkeypatch.setattr(usage, "_deepseek_key", forbidden)
+    monkeypatch.setattr(usage, "_deepseek_request", forbidden)
+    usage._deepseek_prime_cache()
+    assert usage._DEEPSEEK_STATE_CACHE["data"]["last"][1] == 100
+    assert usage._DEEPSEEK_STATE_CACHE["windows"]
+    assert ds.seen == []
+
+
+def test_usage_deepseek_forkserver_children_inherit_cache(ds, monkeypatch, record_property):
+    from khipu import agent_view, recall_prompt
+
+    _store_deepseek_history(_year_of_deepseek_history())
+    reads = []
+    original = usage._deepseek_read
+
+    def read(*args):
+        reads.append(os.getpid())
+        return original(*args)
+
+    def prompt_push(*args, **kwargs):
+        before = time.perf_counter()
+        line = routing.cap_line_for({}, _entry(days=30), NOW)
+        result = {"line": line, "seconds": time.perf_counter() - before, "read_pids": reads,
+                  "child_pid": os.getpid()}
+        return {"kind": "full", "text": json.dumps(result)}
+
+    prime = usage._deepseek_prime_cache
+    requests = 0
+
+    def warm():
+        nonlocal requests
+        # Damage only the persistent parent's private cache, as a process
+        # cache can be absent/malformed while the history itself stays valid.
+        if requests == 3:
+            usage._DEEPSEEK_STATE_CACHE.clear()
+        elif requests == 4:
+            usage._DEEPSEEK_STATE_CACHE.pop("data", None)
+        elif requests == 5:
+            usage._DEEPSEEK_STATE_CACHE["windows"] = None
+        requests += 1
+        prime()
+
+    class Schedule:
+        def due(self):
+            return False
+
+        def sleep_for(self, most):
+            return min(most, 0.01)
+
+    monkeypatch.setattr(usage, "_deepseek_read", read)
+    monkeypatch.setattr(agent_view, "prepare_routing_table", lambda **kwargs: None)
+    monkeypatch.setattr(recall_prompt, "_look_at_settings", lambda *args: None)
+    monkeypatch.setattr(usage, "_deepseek_prime_cache", warm)
+    monkeypatch.setattr(routing, "_load_view", lambda: {"accounts": [_entry(days=30)]})
+    monkeypatch.setattr(routing, "prompt_push", prompt_push)
+    monkeypatch.setattr(routing, "prompt_budget", lambda: 0.05)
+    monkeypatch.setattr(routing, "kick_plan_refresh", lambda: None)
+    monkeypatch.setattr(recall_prompt, "routing_marker", lambda *args, **kwargs: {})
+    client, server = socket.socketpair()
+    stdin_read, stdin_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            client.close()
+            os.close(stdin_write)
+            os.dup2(stdin_read, 0)
+            with open(os.devnull, "wb") as null:
+                os.dup2(null.fileno(), 1)
+            recall_prompt.routing_forkserver_main(server.detach(), schedule=Schedule())
+        finally:
+            os._exit(0)
+    server.close()
+    os.close(stdin_read)
+    try:
+        results = []
+        for i in range(9):
+            if i in (2, 8):
+                changed = usage._deepseek_new(KEY, _ago(minutes=2).timestamp(), 100)
+                usage._deepseek_add(changed, _ago(minutes=1).timestamp(), 94)
+                _store_deepseek_history(changed)
+            elif i == 6:
+                ds.history.unlink()
+            elif i == 7:
+                ds.history.write_text("{broken history")
+                ds.history.chmod(0o600)
+            read_fd, write_fd = os.pipe()
+            try:
+                message = json.dumps({"session": "fake-session", "cap": time.monotonic() + 10}).encode()
+                socket.send_fds(client, [message], [write_fd])
+                assert select.select([read_fd], [], [], 10)[0], "prompt child did not answer"
+                answer = b""
+                while answer.count(b"\n") < 2:
+                    assert select.select([read_fd], [], [], 10)[0], "prompt child did not finish"
+                    chunk = os.read(read_fd, 65536)
+                    assert chunk, "prompt child exited without its answer"
+                    answer += chunk
+                result = json.loads(json.loads(answer.splitlines()[1])["text"])
+                assert result["child_pid"] != pid
+                if i < 6:
+                    expected_reads = (1, 1, 2, 3, 4, 5)[i]
+                    assert result["read_pids"] == [pid] * expected_reads, (
+                        "only the persistent parent may parse valid history, once per identity/cache miss")
+                    assert "unknown" not in result["line"]
+                elif i in (6, 7):
+                    assert "unknown" in result["line"]
+                else:
+                    assert result["read_pids"][-1] == pid
+                    assert result["read_pids"].count(result["child_pid"]) == 0
+                    assert "$6 spent" in result["line"]
+                assert result["seconds"] < 0.020
+                results.append(result)
+            finally:
+                os.close(read_fd)
+                os.close(write_fd)
+        assert results[0]["line"] == results[1]["line"]
+        assert "$6 spent" in results[2]["line"]
+        record_property("deepseek_forkserver_prompt_max_ms", max(r["seconds"] for r in results) * 1000)
+        print(f"DeepSeek forkserver year-history prompt max: {max(r['seconds'] for r in results) * 1000:.3f} ms")
+    finally:
+        client.close()
+        os.close(stdin_write)
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                break
+            time.sleep(0.01)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)

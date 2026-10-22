@@ -231,9 +231,24 @@ conversation has to register usage. Failed, stale, unavailable, missing-key,
 missing-history and damaged-history reads stay unknown and hold advice.
 Runner telemetry cannot replace a failed account read or double-count spend.
 
-History keeps individual intervals for up to 366 days, with bounded record
-and byte limits. Version 3's hourly buckets lacked top-up intervals and
-restart as partial history on the next successful read. HTTPS-only requests,
+History covers up to 366 days. Individual intervals cover the longest saved
+DeepSeek cap (at least seven days) plus one day. Older intervals fold into
+daily exact decrease sums and independent top-up counts, increases and gap
+seconds. Top-ups never net against decreases. Version 4 interval histories
+migrate without losing sums on the next successful background read. If a
+later cap expansion cuts a folded day, only fully enclosed daily sums count;
+the unresolved boundary is partial. Individual top-up intervals remain
+available within the retained precise window.
+
+The prompt reader caches validated history and computed window sums by file
+identity, nanosecond modification/change times, size and permissions. It still
+checks the trusted directory, key binding, rolling boundaries and freshness
+on each call. The persistent routing forkserver warms this local cache before
+forking prompt children, so an unchanged file is not parsed by each new child.
+Cache warming resolves no key, performs no network request and writes nothing.
+Version 3's hourly
+buckets lacked top-up intervals and restart as partial history on the next
+successful read. HTTPS-only requests,
 no redirects/proxies, owner-only files without symlinks, HMAC key binding,
 locked atomic writes, validation and exact decimal arithmetic are retained.
 

@@ -1183,6 +1183,8 @@ def _poll_once(routing, on_fold=None, on_probe=None, *, blocked_resets=None) -> 
         return _check_resets_only(routing, on_fold=on_fold, on_probe=on_probe, blocked_resets=blocked_resets)
     from khipu import usage
 
+    # Save the routing refold before any provider transport can stall it.
+    out = routing.poll_refold(on_fold=on_fold)
     deepseek = [a for a in usage.http_quota_accounts() if a.get("harness") == "deepseek"]
     if deepseek:
         if on_probe is not None:
@@ -1191,7 +1193,6 @@ def _poll_once(routing, on_fold=None, on_probe=None, *, blocked_resets=None) -> 
         # outer alarm ends this child, so failed reads keep advice unknown.
         usage.refresh_due(accounts=deepseek, max_age=usage.DEEPSEEK_POLL_S,
                           timeout=min(usage.GLM_TIMEOUT_S, _POLL_LOOK_MOST - 2))
-    out = routing.poll_refold(on_fold=on_fold)
     if deepseek and out.get("interval") is not None:
         out["interval"] = min(out["interval"], usage.DEEPSEEK_POLL_S)
     # Poll first so its ``folded`` answer stays truthful. When reset checks are
@@ -1506,6 +1507,11 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
                     os.set_blocking(write_fd, False)
                     _write_all(write_fd, f"{time.monotonic()!r} 0.0\n".encode("ascii") + b'{"skip": "busy"}\n')
                     raise RuntimeError("too many live routing children")
+                # A child exits after every prompt. Warm the persistent
+                # parent's local cache so later children inherit it.
+                from khipu import usage
+
+                usage._deepseek_prime_cache()
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", DeprecationWarning)
                     pid = os.fork()
