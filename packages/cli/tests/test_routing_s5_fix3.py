@@ -58,8 +58,9 @@ def test_p1b_priority_omitted_base_after_interleaved_read(home):
     shown = mcp_server._tool_route({})
     routing.set_priority([{"account": "Codex"}], via="app", expect=routing.priority_version())
     shown = mcp_server._tool_route({})
-    with pytest.raises(routing.RouteError, match="base"):
+    with pytest.raises(mcp_server._ToolFailure, match="base is required") as refusal:
         mcp_server._tool_route_priority({"entries": [{"account": "Grok"}], "owner_request": "prepared on e1"})
+    assert refusal.value.payload["code"] == "bad_args"
     held = routing.read_view()["priority"]
     assert [e["label"] for e in held["entries"]] == ["Codex"], held
 

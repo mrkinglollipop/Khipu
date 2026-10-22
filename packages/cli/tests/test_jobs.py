@@ -366,10 +366,10 @@ class OffsiteIfDueTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         off.assert_called_once_with()
 
-    def test_failed_build_skips_offsite(self):
+    def test_failed_build_still_schedules_offsite(self):
         rc, off = self._graph_build(rc=1)
         self.assertEqual(rc, 1)
-        off.assert_not_called()
+        off.assert_called_once_with()
 
     def test_offsite_runs_only_when_due_and_never_raises(self):
         from khipu import graph_backup

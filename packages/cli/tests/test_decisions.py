@@ -72,6 +72,16 @@ class _Cursor:
         s = " ".join(sql.split())
         params = params or ()
 
+        # Alias grouping reads inside a savepoint. This fixture has no aliases:
+        # the real left join returns the supplied project and a null alias.
+        if s.startswith(("SAVEPOINT ", "RELEASE SAVEPOINT ", "ROLLBACK TO SAVEPOINT ")):
+            return
+        if s.startswith("WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases"):
+            project, fallback = params
+            assert project == fallback
+            self._result = [(project, None)]
+            return
+
         if s.startswith("SELECT column_name FROM information_schema.columns"):
             (table,) = params
             if table == "decisions":

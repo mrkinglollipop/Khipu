@@ -426,6 +426,8 @@ def run() -> dict[str, Any]:
     state["last_run_at"] = now.isoformat()
     out: dict[str, Any] = {"ok": True, "action": action, "reason": reason}
     if action == "none":
+        if reason == "recently_failed":
+            out.update(ok=False, error=state.get("last_error") or "replica refresh failed")
         if state.get("last_ledger_error"):
             out.update(ok=False, error=f"ledger: {state['last_ledger_error'].get('error') or 'failed'}",
                        result={"ledger": _refresh_ledger(state, now)})

@@ -2712,6 +2712,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 out["owner_writes"] = owner_writes.drain()
         except Exception as exc:  # noqa: BLE001 — never holds up the session jobs
             out["owner_writes"] = {"error": f"{type(exc).__name__}: {exc}"}
+            out["failed"] += 1
     if not jobs:
         return out
     from khipu.capture import capture
@@ -2734,6 +2735,8 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         started += 1
         try:
             job = json.loads(jp.read_text(encoding="utf-8"))
+            if not isinstance(job, dict):
+                raise ValueError("queued job must be a JSON object")
         except (OSError, ValueError) as e:
             out["failed"] += 1
             _release(jp)

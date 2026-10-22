@@ -6182,6 +6182,20 @@ def _filter_expanded_snapshot_rows(
     return out
 
 
+
+def _snapshot_search_signals(query: str, rows: list[dict[str, Any]]) -> str:
+    from khipu.embed import search_confidence
+    from khipu.search_text import _row_text, search_tokens, token_hit_count
+
+    tokens = search_tokens(query)
+    for rank, row in enumerate(rows, 1):
+        row.setdefault("score", 1.0 / (60 + rank))
+        row.setdefault("cosine", None)
+        row["lexical_hits"] = max(int(row.get("lexical_hits") or 0),
+                                  token_hit_count(_row_text(row), tokens))
+    return search_confidence(rows, token_count=len(tokens))
+
+
 def search_stale_payload(
     query: str,
     limit: int,
@@ -6236,6 +6250,7 @@ def search_stale_payload(
             "query": query,
             "mode": "semantic",
             "results": results,
+            "confidence": _snapshot_search_signals(query, results),
             "filters_dropped": filters_dropped,
             **stale_fields(),
         }
@@ -6264,6 +6279,7 @@ def search_stale_payload(
         "query": query,
         "mode": "literal",
         "results": results[:limit],
+        "confidence": _snapshot_search_signals(query, results[:limit]),
         "filters_dropped": filters_dropped,
         **stale_fields(),
     }
