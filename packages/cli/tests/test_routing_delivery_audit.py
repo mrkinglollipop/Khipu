@@ -444,3 +444,40 @@ def test_routing_forecast_that_leaves_the_plan_is_dropped_not_announced_removed(
     ledger = json.loads(rd._path("gone").read_text())["main"]["entries"]
     assert not any(e.get("removed") or "no longer current" in (e.get("text") or "") for e in ledger.values())
     assert not any(e in ledger and not ledger[e].get("acked") for e in rows)
+
+
+@pytest.mark.parametrize("field,prefix", [("pace_forecasts", "pace"), ("advice_forecasts", "advice")])
+def test_routing_absent_forecast_never_holds_a_renewable_lease_after_invalidation(field, prefix):
+    # A generation change withdraws the live lease. A forecast the new plan no
+    # longer carries must end there, not render empty, claim and renew a lease
+    # at every call, or have its batch acknowledged as shown text.
+    entity = f"{prefix}:fake"
+    forecast = {entity: dict(account="fake", label="Fake", verdict="hold_back")}
+    row = dict(item(entity, f"Fake {prefix}: hold back until reset.", whole=False, visible=True), label="Fake")
+    anchor = item("account:fake", "Fake: open; read just now.", whole=False, visible=True)
+
+    def plan(items, version, forecasts, at=NOW):
+        out = planned(items, version=version, **{field: forecasts})
+        out["delivery_plan"]["at"] = rd._iso(at)
+        out["delivery_plan"]["line_entities"] = [None, *range(len(items))]
+        return out
+
+    first = rd.offer(plan([anchor, row], 1, forecast), session="phantom")
+    assert row["text"] in first["text"]  # offered, never acknowledged
+    for seconds in (30, 60, 90, 120):
+        answer = rd.offer(plan([anchor], 2, {}, NOW + timedelta(seconds=seconds)), session="phantom")
+        assert row["text"] not in (answer.get("text") or "")
+        claimed = [i["entity"] for i in (answer.get("routing_changes") or {}).get("items", [])]
+        assert entity not in claimed, seconds  # nothing claimed or leased for the absent offer
+    ledger = json.loads(rd._path("phantom").read_text())["main"]
+    assert entity not in ledger["entries"]
+    assert entity not in [i["entity"] for i in ledger["flight"]["out"]["routing_changes"]["items"]]
+    # The forecast returns: shown once under a fresh batch, acknowledged normally.
+    later = NOW + timedelta(seconds=150)
+    back = rd.offer(plan([anchor, row], 3, forecast, later), session="phantom")
+    assert back["text"].count(row["text"]) == 1
+    assert back["routing_changes"]["batch"] != first["routing_changes"]["batch"]
+    assert rd.acknowledge("phantom", back["routing_changes"], now=later)
+    assert entity in rd.snapshot("phantom").get(prefix + "_acked", {})
+    again = rd.offer(plan([anchor, row], 3, forecast, later + timedelta(seconds=1)), session="phantom")
+    assert entity not in [i["entity"] for i in (again.get("routing_changes") or {}).get("items", [])]
