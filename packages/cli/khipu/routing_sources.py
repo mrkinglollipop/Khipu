@@ -1745,12 +1745,9 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
             continue
         if not (row.get("ok") or row.get("last_good_at")):
             continue
-        at = _parse(row.get("observed_at") or (row.get("last_good_at") if not row.get("ok") else None)
-                    or row.get("probed_at"))
         windows = [w for w in row.get("windows") if isinstance(w, dict)] if isinstance(row.get("windows"), list) else []
-        if at is None or not windows:
+        if not windows:
             continue
-        newest = at if newest is None else max(newest, at)
         observed = row.get("source") in ("last_observed", "rollout")
         groups: dict[str, list[dict]] = {}
         for w in windows:
@@ -1758,19 +1755,25 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
         for scope, group in sorted(groups.items()):
             full: list[tuple[datetime, datetime, dict]] = []
             top = None
+            times = []
+            headroom_known = True
             for w in group:
                 used = _number(w.get("used_pct"))
-                if used is None:
+                window_at = usage._figures_time(row, w)
+                if used is None or window_at is None:
+                    headroom_known = False
                     continue
+                times.append(window_at)
                 top = used if top is None else max(top, used)
                 reset = _parse(w.get("resets_at"))
-                window_at = _parse(w.get("observed_at")) or at
                 if used >= 100 and reset is not None and reset > window_at:
                     full.append((window_at, reset, w))
             # A window at its limit is never headroom: with no reset time
             # still ahead of the probe, the scope gives no evidence at all.
-            if top is None or (top >= 100 and not full):
+            if top is None or (top >= 100 and not full) or (not full and not headroom_known):
                 continue
+            at = min(times)
+            newest = at if newest is None else max(newest, at)
             base = {"account": key, "runner": None, "lane": None, "scope": scope, "source": "probe",
                     "written_by": by, "via": "probe", "at": at, "reason": None, "message_time": False,
                     "observed": observed, "turn": row.get("source") == "turn"}

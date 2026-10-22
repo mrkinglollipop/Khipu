@@ -862,7 +862,8 @@ def test_stopping_a_poll_child_unwinds_and_kills_its_vendor_process(home, monkey
     monkeypatch.setattr(routing.os, "getloadavg", lambda: (0, 0, 0))
     vendor_pid = tmp_path / "vendor.pid"
 
-    def hanging_probe(_home, *, timeout):
+    def hanging_probe(_home, *, timeout, turn):
+        assert turn is True
         # It outlives every wait below, so only the stop can end it in time.
         script = f"import os,time;open({str(vendor_pid)!r},'w').write(str(os.getpid()));time.sleep(600)"
         usage._converse([sys.executable, "-c", script], [], lambda _frame: False,
