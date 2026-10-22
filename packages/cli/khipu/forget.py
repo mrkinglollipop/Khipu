@@ -235,7 +235,8 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "owner_sessions": sorted({str(src["session_id"])
                                   for src in [*(source_rows or []), *read["column_sources"],
                                               *read["tombstone_payloads"]]
-                                  if src.get("session_id")} | ({session_id} if session_id else set())),
+                                  if src.get("session_id")} | set(read["source_sessions"])
+                                 | ({session_id} if session_id else set())),
         "soft_deleted": soft_deleted,
         "embeddings_removed": embeddings_removed,
         "commitments_closed": commitments_closed,
@@ -343,7 +344,12 @@ def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str
     except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
         raw = None
     sources = sources_ready(cur)
+    source_sessions = []
     if sources:
+        # A merge receipt may keep only its hash. The source row still names
+        # the session whose local owner words must be erased.
+        cur.execute("SELECT session_id FROM episode_sources WHERE episode_id = %s", (episode_id,))
+        source_sessions = [row[0] for row in cur.fetchall() if row[0]]
         # Every source row, origin and merged, keeps the (ts, summary_md5) it
         # was first written under, so each legacy line this episode ever had
         # is named exactly, whatever edits and merges did to the live summary
@@ -382,7 +388,7 @@ def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str
     # read every round like the other two.
     column_sources = _natural_identities(raw, _column_identity(cur, episode_id))
     return {"raw": raw, "sources": sources, "source_rows": source_rows,
-            "column_sources": column_sources,
+            "source_sessions": source_sessions, "column_sources": column_sources,
             "candidates": candidates, "has_merged_sources": has_merged_sources,
             "unidentified_sources": unidentified_sources,
             "tombstone_payloads": tombstone_payloads,

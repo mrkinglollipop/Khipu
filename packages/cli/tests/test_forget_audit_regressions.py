@@ -142,3 +142,30 @@ def test_invalid_direction_schema_keeps_forget_incomplete(tmp_path, monkeypatch,
     assert not result['complete']
     assert not result['owner_words']['ok']
     assert json.loads(path.read_text()) == data
+
+
+def test_source_row_session_words_are_scrubbed_without_receipt_payload(tmp_path, monkeypatch):
+    merged = {**P, 'session_id': 'codex:source-row', 'transcript_range': '10:20',
+              'ts': '2026-10-01T09:01:00Z', 'summary': 'synthetic merged source'}
+    raw = {**P, 'merged_from': [{'source_id': ci.payload_sha256(merged)}]}
+    root = tmp_path / 'memory'
+    root.mkdir()
+    fo.write_lines(root, [P, merged])
+    world = {'episodes': {1: dict(P, id=1, ts=fo.BASE, raw=raw, deleted=False)},
+             'sources': [{**fo.ForgetOwnershipTest._source(None, 1, P), 'session_id': P['session_id']},
+                         {**fo.ForgetOwnershipTest._source(None, 1, merged),
+                          'role': 'merged', 'session_id': merged['session_id']}],
+             'sources_enabled': True}
+    execute = fo._WorldCur.execute
+
+    def source_sessions(cur, sql, params=None):
+        if sql.startswith('SELECT session_id FROM episode_sources'):
+            cur._all = [(r['session_id'],) for r in world['sources'] if r['episode_id'] == params[0]]
+            return
+        return execute(cur, sql, params)
+
+    monkeypatch.setattr(fo._WorldCur, 'execute', source_sessions)
+    path = write_direction('source-row', 'synthetic source-row words')
+    result = fo.run_forget(world, 1, root)
+    assert result['complete'], result
+    assert 'synthetic source-row words' not in path.read_text()
