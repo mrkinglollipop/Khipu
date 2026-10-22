@@ -734,12 +734,9 @@ def forget_sessions(sessions) -> dict:
         # session's episodes: only forget-for-good removes them.
         occurrence_file(name).unlink(missing_ok=True)
         _high_water_file(name).unlink(missing_ok=True)
-    try:
-        from khipu import routing_directions
+    from khipu import routing_directions
 
-        routing_directions.forget_sessions(names)
-    except Exception:  # noqa: BLE001 - the turn files above are the scan's core
-        pass
+    routing_directions.forget_sessions(names)
     briefs = d / "briefs.jsonl"
     rows = _read_lines(briefs)
     kept = [b for b in rows if b.get("parent") not in names and b.get("sha") not in texts]

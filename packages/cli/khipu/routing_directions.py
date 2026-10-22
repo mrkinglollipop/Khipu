@@ -296,13 +296,21 @@ def _valid_row(key, row):
     return row.get("target") is None or isinstance(row["target"], dict)
 
 
-def _load() -> dict:
+def _load(*, strict: bool = False) -> dict:
     try:
         data = json.loads(store_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"directions": {}}
     except (OSError, ValueError):
+        if strict:
+            raise
         return {"directions": {}}
     if not isinstance(data, dict) or not isinstance(data.get("directions"), dict):
+        if strict:
+            raise ValueError("invalid routing direction store")
         return {"directions": {}}
+    if strict and any(not _valid_row(key, row) for key, row in data["directions"].items()):
+        raise ValueError("invalid routing direction row")
     data["directions"] = {key: row for key, row in data["directions"].items() if _valid_row(key, row)}
     return data
 
@@ -322,7 +330,7 @@ def forget_sessions(sessions) -> None:
     if not names:
         return
     with _store_lock():
-        data = _load()
+        data = _load(strict=True)
         kept = {k: v for k, v in data["directions"].items() if v.get("session") not in names}
         if len(kept) != len(data["directions"]):
             _save({**data, "directions": kept})
