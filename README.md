@@ -33,14 +33,16 @@ People who use coding agents every day, on one Mac or several, and want the agen
 - **Decisions.** A registry tracks which decisions still stand, and which were superseded or retracted.
 - **Briefs and reflect.** Optional, off by default: source-backed topic briefs, and answers from memory that cite their sources.
 - **Libraries.** Index a folder of `.txt` and `.md` files as another search space.
-- **Routing and plan usage.** Shows each subscription account's headroom and state. Khipu reports; routing stays with you.
-- **Desktop app.** Home, Recall, Owed, Activity, Harnesses and Settings, plus a first-run setup flow.
+- **Routing and plan usage.** Shows account state and plan usage, including the GLM Coding Plan. Configured DeepSeek accounts report measured spend from balance changes against a spend cap, with partial history labelled. Khipu reports; routing stays with you.
+- **Work.** Owed, project ledger boards, Waiting on you, Running now and Accounts share one view. Settings > Work manages tracker imports and runner summary sources.
+- **Owner actions and projects.** Review owner changes and eligible Undo actions in Settings > Owner actions. Settings > Projects groups current and older project names and lets you resolve same-project questions.
+- **Desktop app.** Home, Work, Recall, Activity, Harnesses and Settings, plus a first-run setup flow.
 - **Multi-Mac and gateway.** Join another Mac with a join kit. An HTTPS gateway serves cloud agents that cannot reach the database, such as Grok Bot.
 - **Backups.** Health checks for backups and restore drills, an offline copy of memory, and local data backup and restore.
 
 Supported agents: Claude Code, Cursor, Codex and Aegis locally, and Grok Bot through the gateway. Claude accounts run inside T3 Code are covered by the Claude Code install.
 
-Planned: a Work view and work ledger, gateway provenance, and a settings clarity pass.
+Captures carry server-stamped local or gateway provenance when the schema supports it; gateway forget still uses the session-prefix boundary described in [MCP tools](docs/mcp-tools.md). Capture & models organizes recording, summary models and keys; Accounts and routing groups account usage, priorities, rules, holds and conversation delivery.
 
 ## Install
 
@@ -54,12 +56,13 @@ The app checks GitHub Releases at launch. Install an update from Settings, then 
 
 ## First run
 
-The first launch opens a six-step setup: Welcome, Database, Model, Graph, Agents, Finish. Each step checks itself, so you can stop and resume.
+The first launch opens a seven-step setup: Welcome, Database, Model, Graph, Agents, Accounts, Finish. Each step checks itself, so you can stop and resume.
 
 - **Database.** Choose one: join a Khipu you already have, set up a new database on this Mac (needs Docker), or connect to a database you already run.
 - **Model.** Pick the summariser: cloud Gemini, Claude Haiku with an API key, Claude or ChatGPT on your own login, or a local OpenAI-compatible endpoint. You can skip this for now.
 - **Graph.** Installs the graph builder. You can skip it and do it later in Settings.
 - **Agents.** Lists the agents it found. Install and verify each one in Harnesses.
+- **Accounts.** Optionally choose tracked accounts, set their priority and enable telling conversations about routing. Skip for now writes nothing.
 - **Finish.** Runs a health check and lists anything unresolved, each with one fix.
 
 Details are in [docs/setup.md](docs/setup.md).

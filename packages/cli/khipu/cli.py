@@ -5136,8 +5136,8 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument(
         "--quick",
         action="store_true",
-        help="Imports, config, secrets presence, jobs and the summariser provider only: "
-        "no hub, network or probe checks (the promotion gate's first step)",
+        help="Run all local health checks, including queue, capture, job, recall, ledger, storage "
+        "and configuration checks; omit hub, network and probe checks",
     )
     d.set_defaults(func=cmd_doctor)
 
@@ -5196,7 +5196,9 @@ def build_parser() -> argparse.ArgumentParser:
     sec_sub = sec.add_subparsers(dest="secrets_cmd", required=False)
     sv = sec_sub.add_parser(
         "verify",
-        help="Prove a configured model key works with one real, cheap call",
+        help="Run small configured-provider checks; Gemini tests embeddings and generation, "
+        "the local compatible endpoint generates, and other provider checks read models or key metadata; "
+        "a run may make several requests",
     )
     sv_group = sv.add_mutually_exclusive_group()
     sv_group.add_argument(
@@ -5684,7 +5686,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     us = sub.add_parser(
         "usage",
-        help="Plan headroom of every subscription CLI (Claude, Codex, Grok, Muse), read from the CLIs",
+        help="Report plan headroom and spend evidence for configured CLI and HTTP-quota accounts, "
+        "including Claude, Codex, Grok, Muse, GLM and DeepSeek",
     )
     us.add_argument("--json", action="store_true", help="Print the JSON report instead of a table")
     us.add_argument("--fresh", action="store_true", help="Probe now; ignore the cache")
@@ -5759,12 +5762,12 @@ def build_parser() -> argparse.ArgumentParser:
     replication = rt_sub.add_parser("replication", parents=[rt_json],
                                    help="Routing sync status, a bounded sync, or local restore with a new Mac id")
     replication.add_argument("action", choices=("status", "sync", "restore"), default="status", nargs="?")
-    rcheck = rt_sub.add_parser("check", help="Check one account now without spending a turn", parents=[rt_json])
+    rcheck = rt_sub.add_parser("check", help="Check one account now; Claude may use a bounded tiny-turn fallback if its usage reply omits figures", parents=[rt_json])
     rcheck.add_argument("account", help="The account (its label, or harness|login folder)")
     rep = rt_sub.add_parser("report", help="Record what a conversation learned about an account", parents=[rt_json])
     rep.add_argument("--account", default=None, metavar="A", help="The account (its label, or harness|login folder)")
     rep.add_argument("--runner", default=None,
-                     help="With --lane: a job runner's lane; only a lane routing_lane_map names")
+                     help="With --lane: a runner lane resolved by its provider/account declaration or named in routing_lane_map")
     rep.add_argument("--lane", default=None)
     rep.add_argument("--state", required=True, choices=("limited", "open", "down"))
     rep.add_argument("--until", default=None, metavar="T", help="When the limit ends (a guess unless --message says)")
@@ -5814,7 +5817,8 @@ def build_parser() -> argparse.ArgumentParser:
                       parents=[rt_json])
     rwait = rt_sub.add_parser(
         "wait", parents=[rt_json],
-        help="Wait until an account is open; exits 0 then, 1 at the timeout (it waits; it launches nothing)")
+        help="Wait until an account is open or probably open; --confirmed requires Khipu's own open reading. "
+        "Exit 0 on success, 1 at timeout; launch nothing")
     rwait.add_argument("account", help="The account (its label, or harness|login folder)")
     rwait.add_argument("--confirmed", action="store_true",
                        help="Only once Khipu itself has read it open (a usage probe or a reset check), "
@@ -6209,8 +6213,11 @@ def build_parser() -> argparse.ArgumentParser:
     db_sub = db.add_subparsers(dest="db_cmd", required=True)
     db_pre = db_sub.add_parser(
         "preflight",
-        help="Run setup validation against a DSN; it may modify remote schema/privileges, but does not store the DSN, install jobs, or run a probe",
-        description="Run setup validation against a DSN. It may modify remote schema/privileges, but does not store the DSN, install jobs, or run a probe.",
+        help="Check connection, version, privileges, schema readiness and graph query without changing schema/privileges, "
+        "storing the DSN, installing jobs or running the memory round trip; prepare a missing schema separately",
+        description="Preflight is read-only; setup may modify remote schema/privileges. "
+        "Check connection, server version, privileges, schema readiness and the graph query without changing "
+        "schema/privileges, storing the DSN, installing jobs or running the memory round trip. Prepare a missing schema separately.",
     )
     # --dsn is optional here (and on connect/move's --to below) so a caller that
     # cannot risk the password showing up in `ps` (the desktop app) can set
@@ -6372,12 +6379,15 @@ def build_parser() -> argparse.ArgumentParser:
         "next promotion skips once (promote_gate_ignore, comma-separated "
         "check names; the owner's only, it clears after one use or a day) "
         "or the plan usage accounts as JSON (usage_accounts "
-        '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')',
+        '\'[{"label": "Claude second", "harness": "claude", "home": "~/.claude-second"}]\')'
+        " These are common settings; CLI-path, replica, storage, ledger, work, offline and routing settings "
+        "are also supported. Run khipu config for current names, defaults and sources",
     )
     cfg.add_argument("--unset", metavar="KEY",
                      help="Remove a path setting, a daily call ceiling, a minutes setting, synth_fallback, graph_backup_remote or usage_accounts, or "
                      "relevance.cosine_floor / "
-                     "relevance.cosine_floor_by_profile.<profile> to restore its default")
+                     "relevance.cosine_floor_by_profile.<profile> to restore its default; also supports CLI-path, "
+                     "replica, storage, ledger, work, offline and routing settings")
     cfg.add_argument(
         "--set-gateway-url",
         metavar="URL",
@@ -6545,7 +6555,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gs.add_argument(
         "--sqlite",
-        help="Path to graph.sqlite (default: KHIPU_GRAPH_SQLITE or the Graph volume)",
+        help="Path to graph.sqlite; otherwise use configured graph_sqlite (environment overrides config.json); "
+        "fail if no path is configured",
     )
     gs.add_argument(
         "--dry-run",
@@ -6576,7 +6587,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     jb_sub = jb.add_subparsers(dest="jobs_cmd", required=True)
     jb_sub.add_parser("status", help="Print khipu.jobs.job_status() as JSON")
-    jbi = jb_sub.add_parser("install", help="Render + load the named jobs (default: all)")
+    jbi = jb_sub.add_parser("install", help="Render and load the named jobs; with no names, install the six default jobs, excluding opt-in recall_daemon")
     jbi.add_argument("names", nargs="*", metavar="{nightly,monthly,graph_build,notes_watch,queue_drain,recall_daemon,replica_refresh}")
     jbr = jb_sub.add_parser(
         "refresh",

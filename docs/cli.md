@@ -13,12 +13,13 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 57 top-level commands. The sections below cover all of them.
+There are 62 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
 | Command | What it does |
 | --- | --- |
+| `storage` | Free disk space and the locations and sizes of Khipu's local stores, as JSON. |
 | `status` | Row counts in Postgres. `--sample N` (default 0, which skips the file walk), `--drift` adds drift samples. |
 | `doctor` | The single health command. Exits 0 only when `ok` is true, otherwise 2. |
 | `activity` | Recent capture episodes. `--limit`, `--show ID`. |
@@ -37,7 +38,7 @@ There are 57 top-level commands. The sections below cover all of them.
 
 `doctor` prints every `*_ok` check and a `not_configured` list. Plan usage and routing appear as warnings and never gate `ok`.
 
-`secrets` has one subcommand, `verify` (`--gemini`, `--openai` or `--all`, `--json`), which proves a model key works with one cheap call. `secrets --set ACCOUNT` stores a secret read from stdin in the Keychain (accounts such as `database_url`, `gemini_api_key`, `voyage_api_key`).
+`secrets verify` (`--gemini`, `--openai` or `--all`, `--json`) makes small provider checks: `--gemini` tests embeddings and generation, `--openai` tests the configured local OpenAI-compatible endpoint, and `--all` checks every configured provider, including model-list checks. A run may make several requests. `secrets --set ACCOUNT` stores a secret read from stdin in the Keychain (accounts such as `database_url`, `gemini_api_key`, `voyage_api_key`).
 
 ## Search and recall
 
@@ -76,10 +77,17 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 
 | Command | What it does |
 | --- | --- |
-| `owed` | List, close, reopen or snooze commitments. |
+| `owed` | List, close, reopen, snooze or reassign commitments, dismiss routing directions, and plan a one-time cleanup. |
+| `work` | Project progress, running jobs, and Waiting on you; see below for summary checks and owner answers. |
 | `decisions` | The decisions registry. |
 
-`owed` flags: `--project`, `--status open|closed|stale`, `--limit`, `--close ID`, `--reopen ID`, `--snooze ID` with `--until` (a date or a window like `7d`, `2w`).
+`owed` listing flags: `--project`, `--status open|closed|stale`, `--limit` (default 50), `--owner user|assistant|agent|all`, `--kind followup|blocker|question|promise|routing_direction`, `--origin conversation|job`, `--query WORDS`, `--pr NUMBER`, and `--looks-done`. Follow `next_cursor` with `--cursor`; `--envelope` always includes stale, snapshot freshness, and waiting-to-sync metadata. `owed_page_max` caps pages at 200 by default; 0 removes the cap.
+
+`--close ID[,ID...]`, `--reopen ID[,ID...]`, and `--reassign ID[,ID...]` accept comma-separated ids. Reassignment needs `--to user|assistant|agent` and accepts `--label` for an agent. Multiple ids require `--reason` and default to a 500-item cap (`owed_bulk_max`; 0 unlimited). A multi-item change including the owner's items requires owner authorization. `--dismiss ID[,ID...]` dismisses `rd-...` routing directions. `--snooze ID --until WINDOW` takes a date or a window like `7d` or `2w`.
+
+`owed tidy --project PROJECT` plans a one-time cleanup. `--plan-out FILE` writes the plan, `--apply PLAN` applies it, and `--undo BATCH` reverses an applied batch. `--no-model` uses rules only; otherwise the model-call ceiling is `owed_tidy_calls` (25 by default). Owner-directed apply/undo uses `--owner-direction`.
+
+`work [--json]` shows the Work view. `work check FILE` validates a runner summary; `hidden`, `hide ID`, and `unhide ID` manage hidden commitments. `same ROW COMMITMENT` and `not-same ROW COMMITMENT` answer a proposed match, with ROW written as `<project>#<row id>`. Hide/unhide and match answers support `--owner-direction`.
 
 `decisions` subcommands:
 
@@ -94,14 +102,20 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 
 | Command | What it does |
 | --- | --- |
+| `ledger` | Project work rows: add, set, get, list, loose-ends, needs-owner (alias needs-matt), render, check, remove, removed, restore, purge, projects, project, import, and export. |
+| `owner-direction` | Direction settings, owner-actions log, tamper acknowledgement, and Undo; see below. |
 | `capture` | Capture an episode from a JSON payload on stdin. Routed by `capture_mode`. Flags: `--payload-file`, `--mode legacy|dual|hub`. `capture now` flags a session for capture at its next Stop, whatever the cadence (`--note`, `--harness`, `--session-id`; the last two default to the most recently active local session). |
 | `episode` | `episode forget ID` soft-deletes an episode and removes its vectors. `episode edit ID --summary S` corrects it and re-embeds. |
-| `topic` | `topic purge SLUG --yes` hard-deletes an already tombstoned topic from the hub database (with its revisions and vectors). This Mac's offline copy keeps it until its next full dump. |
+| `topic` | `topic purge SLUG --yes` hard-deletes an already tombstoned topic from the hub database (with its revisions and vectors). It immediately purges this Mac's replica too; a replica failure is reported as partial, and that copy then needs a successful full refresh. |
 | `notes` | Index per-project harness notes as topics: `reconcile` (`--dry-run`, `--changed-only`), `index` (`--project`, `--cap`, `--dry-run`, `--force`), `split PATH`, `stale` (`--project`), `supersede OLD NEW`. |
 | `reconcile` | Full sync of memory files into Postgres. |
 | `regen-memory` | Write the `MEMORY.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
 | `topic-graph` | `topic-graph backfill` updates topic links and graph edges from topic files. |
 | `outbox` | The offline queue for captures whose database write failed: `drain`, `status`, `retry-dead`. |
+
+`ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger import FILE` supports `--dry-run` and `--catch-up`; `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
+
+`owner-direction` supports `show`, `actions [--json]`, `on`, `off`, `acknowledge`, `set KEY VALUE`, and `undo ID`. Direction defaults on, with session binding on and a six-hour eligible-owner-turn window. Supported owner commands accept `--owner-direction` from a conversation with a recent hook-recorded eligible owner turn and verified prompt-hook provenance. The check does not inspect the owner's words; submit only changes the owner requested. Background and dispatched jobs are refused.
 
 ## Embeddings and libraries
 
@@ -140,27 +154,45 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 
 ## Routing and plan usage
 
-Khipu reports account state. It never picks, ranks or refuses work.
+Khipu reports account state and ranks advisory launch choices. The orchestrator decides and launches work; Khipu does not enforce its advice.
 
 | Command | What it does |
 | --- | --- |
-| `usage` | Plan headroom for each subscription CLI (Claude, Codex, Grok, Muse). |
+| `usage` | Plan headroom for Claude, Codex, Grok, Muse, GLM Coding Plan, and configured HTTP-quota accounts. DeepSeek reports measured balance-derived spend against rolling caps, with known or partial coverage; stale, failed, missing, or untrusted history stays unknown. |
+| `accounts` | Tracked login lifecycle: status, track, rename, stop, move, decline, offer-again, auto-track, merge, and request confirm/undo. |
 | `route` | The routing record: which accounts are open, limited or down, plus holds and owner rules. |
 
 ### usage
 
-Flags: `--json`, `--fresh`, `--max-age S` (default 120), `--account LABEL`, `--account-key KEY`, `--sign-in`. `--sign-in` (with `--account`) starts that CLI's own login and re-reads. It works for Claude and Codex only.
+Flags: `--json`, `--fresh`, `--max-age S` (default 120), `--account LABEL`, and `--account-key KEY`. `--refresh-due S` reads only accounts whose figures are older than S seconds. `--sign-in` with `--account` starts that CLI's own login, waits, then re-reads; it works for Claude and Codex only.
+
+`--discover` finds known login folders; `--now` checks every due folder without the daily wait. `--check FOLDER` checks one found login. `--try --harness H [--folder F]` reads an unsaved account once. `--forget-login-paths` clears login paths recorded for saved conversations.
+
+Discovery can automatically track eligible logins a conversation used. `usage_auto_track` defaults on for a new install with no config file; an existing config without the setting migrates to off. `accounts auto-track on|off` controls it.
+
+For the app's separate-login workflow, `--sign-in-offers` lists available choices; `--sign-in-folder --harness H --name N` makes a login folder. `--sign-in-new --harness H --folder F` starts login and returns an attempt id immediately; `--again` first ends a running attempt. Use `--sign-in-status ID` and `--sign-in-cancel [ID]`, optionally `--remove-folder` with the harness/folder after login ends to remove an empty folder Khipu made. `--sign-in-reap` ends a leftover attempt.
+
+Usage normally reads the CLI's usage protocol. Claude may use a tiny Haiku turn if its reply omits figures, and Muse may use a tiny turn to refresh stale observations, each at most once per 30 minutes per login. Claude reset checks can use the same fallback.
+
+`accounts status` supplies the list version for `--expect` on `track`, `rename`, `stop`, `move`, and `request confirm|undo`. `track` takes `--entries JSON`; `stop` offers choices for retained priority, pause, lane mappings, and stopping the last account. Run the subcommand's help for those choices.
 
 ### route
 
 Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `--brief` (text for a job-runner brief), `--account A`.
 
-- `check ACCOUNT`: check one account now.
-- `report`: record a state. `--state limited|open|down`, `--account` or `--runner` with `--lane`, `--until`, `--window five-hour|weekly`, `--model`, `--message`, `--seen`, `--name`, `--evidence`.
+- `check ACCOUNT`: check one account now; Claude may use the bounded tiny-turn fallback if its usage reply omits figures.
+- `report`: record a state. `--state limited|open|down`, `--account` or `--runner` with `--lane`, `--until`, `--window five-hour|weekly`, `--model`, `--message`, `--seen`, `--name`, `--evidence`. A runner lane must resolve through its provider/account declaration and local identity binding, or be named in `routing_lane_map`; unresolved or ambiguous declarations stay unmatched.
 - `hold WORDS`: hold work (`hold end ID` ends one). `--reason machine-busy|disk-low|keep|outage|other`, `--until`, one of `--account`, `--machine`, `--all`, and `--owner`.
-- `wait ACCOUNT`: waits for the account to open. Exits 0 when open, 1 on timeout. It launches nothing. `--timeout`, `--confirmed`.
+- `wait ACCOUNT`: exits 0 for open or probably open, and 1 at timeout. `--confirmed` requires an open state confirmed by Khipu's own usage probe or reset check. It launches nothing. `--timeout` bounds the wait.
 - `sources`: lists each runner folder with its last good read.
-- Owner commands, which need a typed confirmation on a terminal (or the app's Settings, Routing) and refuse without one: `pause`, `lift`, `clear`, `note {set,end}`, `priority {set,confirm,undo,clear}`, `rule {add,edit,retire,restore,confirm,undo,dismiss}`, and `hold --owner`. `priority show` needs none. With `--at-owner-request`, a conversation can record a `priority set` or a `rule add` or `rule edit` that stays unconfirmed until the owner confirms it. Every `priority set` and `priority clear`, the owner's or a conversation's, carries `--expect` (the priority's version as read) and is refused without it or once the priority moved.
+- `advise [ACCOUNT]`: rank advisory choices. Filters: `--lane`, `--tier opus|sonnet|haiku`, `--kind build|fix|check`, `--privacy`, `--sensitive`, and `--purpose job|check|orchestration` (default job).
+- `cap set|remove ACCOUNT --kind share|per_day|pace_target|spend|concurrency`: owner-managed caps for `--purpose job|check`. Check allowances can include `--tier` and `--sensitive-only` qualifiers; the subcommand help lists values for each cap kind.
+- `definition set provider|account|lane_map --value JSON`: owner-managed definitions.
+- `tier-table show|set|confirm|clear`: owner-managed tier table; a conversation can propose `set` with `--at-owner-request`.
+- `replication status|sync|restore`: report, synchronize, or restore routing replication. Cross-Mac replication defaults off and must be enabled by the owner. `copy publish` publishes the permitted closed routing copy to the hub.
+- Other owner commands: `pause`, `lift`, `clear`, `note set|end`, `priority set|confirm|undo|clear`, `rule add|edit|retire|restore|confirm|undo|dismiss`, and `hold --owner`. Supported commands accept app authorization, a typed terminal confirmation, or `--owner-direction` from an eligible conversation in which the owner typed recently; unqualified and background calls are refused. `priority show` needs no authorization.
+
+With `--at-owner-request`, a conversation can record `priority set`, `rule add`, or `rule edit` as unconfirmed changes. Priority requests and existing-rule edits carry the prepared owner revision in `--base`. Owner priority set, confirm, undo, and clear require the observed priority version in `--expect`; stale or crossed requests do not overwrite newer owner changes.
 
 ## Database, backups and other Macs
 
@@ -174,7 +206,7 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 | `paths` | Show or set the Mac-local data folder. `--set DIR` (copies the connection file and root certificate if missing). |
 | `backup-local` | Zip the Mac-local data folder. `--out PATH`. |
 | `import-local` | Restore it. `--source ZIP|DIR`. Merges and skips existing files by default; `--replace` overwrites. |
-| `snapshot` | The offline read replica: `refresh` (hub must be up), `status`. |
+| `snapshot` | Offline read replica: `refresh` (hub must be up), `status`, and `heal` (background recovery stages and refresh of an old copy). |
 | `graph-backup` | Graph snapshot backup, on the Mac that builds the graph: `record-local`, `offsite`, `status`, `drill`. |
 | `graph-sync` | Mirror the graph file into Postgres. `--dry-run`, `--check` (exits 2 on drift). |
 | `components` | Postgres and Graphify install, status and upgrades: `status`, `install {postgres,graphify}`, `upgrade {postgres,graphify}`, `check-remote [--full]`, `bootstrap-local-backup`, the single-purpose forms `install-local-postgres`, `install-graphify`, `upgrade-postgres` and `upgrade-graphify`, plus helpers for the app (`status-json`, `select-compat-row`). |
@@ -182,8 +214,26 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 - `db move`: `--to DSN` or `--new-local`, `--dry-run`, `--into-nonempty`. It copies and verifies before switching and never writes to the source.
 - `db connect`: `--dsn`, `--use-stored`, `--root-crt`, `--no-jobs`, `--no-prove`.
 - `join export --out FILE [--allow-unencrypted]`; `join import --file FILE [--skip-migrate-check]`; `join advertise [--allow-unencrypted] [--timeout] [--pin]`; `join receive --pin`. Each reads the passphrase from `KHIPU_JOIN_PASSPHRASE`, `--passphrase-stdin` (first line of stdin) or `--passphrase-fd N`; export and advertise ask for it in a terminal. A literal `--passphrase VALUE` is refused, because other processes can read command-line arguments. Export and advertise refuse without a passphrase unless `--allow-unencrypted` is passed.
-- `config`: `--set KEY VALUE`, `--unset KEY`, `--set-gateway-url URL`, `--set-capture-mode legacy|dual|hub`. See `khipu config --help` for the full key list.
+- `config`: `--set KEY VALUE`, `--unset KEY`, `--set-gateway-url URL`, `--set-capture-mode legacy|dual|hub`. Run `khipu config` to see current setting names, values, defaults, and sources. `config --help` lists common settings; `--set`/`--unset` also support CLI-path, replica, storage, ledger, work, offline, and routing groups.
 - `budget lift {synth,memory,library}` takes exactly one of `--today`, `--cap N`, `--unlimited`.
+
+`snapshot heal` checks every five minutes by default, refreshes copies at least 15 minutes old, and memoizes a failed hub connection for 60 seconds.
+
+Configuration changes to `usage_accounts` use `--expect` with the account-list version. Owner-controlled account and routing settings can be requested with `--at-owner-request` or changed through eligible `--owner-direction` authorization. Answer account-list requests with `accounts request confirm|undo --expect V`; answer routing-setting requests with `config --answer-request KEY confirm|undo`.
+
+Configuration includes these shipped defaults. Duration values below are shown in seconds (`s`) or days (`d`); use `config --set KEY VALUE` to change them.
+
+| Group | Setting = default |
+| --- | --- |
+| Replica | `replica_refresh_after=900s`, `replica_check_every=300s` (minimum 60s), `hub_down_memo_for=60s` |
+| Offline | `hub_statement_timeout=30s`, `hub_dead_connection_after=60s`, `app_cli_timeout=60s` |
+| Storage | `disk_warn_free_gb=10`, `disk_warn_free_percent=5`, `disk_fail_free_gb=3`, `disk_fail_free_percent=2`, `commitments_backup_keep_days=30`, `synth_usage_keep_days=90`, `log_max_mb=5` |
+| Ledger | `ledger_id_chars=80`, `ledger_title_chars=2000`, `ledger_evidence_chars=1000`, `ledger_stale_after=7d`, `ledger_purge_after=30d`, `ledger_owner_word="NEEDS OWNER"` |
+| Work | `work_projects=[]`, `work_file_max_bytes=262144`, `work_max_jobs=50`, `work_max_prs=200`, `work_max_trains=20`, `work_max_runs=20`, `work_line_chars=200`, `work_stale_after="auto"`, `work_job_quiet_after=900s`, `work_gone_after=86400s`, `work_finished_for=1800s`, `work_merged_for=7d`, `work_clock_slack=300s`, `work_refresh=5s` |
+| Owed | `owed_orchestrator_slice_max=3`, `owed_page_max=200`, `owed_bulk_max=500`, `owed_tidy_calls=25` |
+| CLI paths | `cli_path.claude`, `cli_path.codex`, `cli_path.grok`, `cli_path.muse`, `node_folder`; no configured path by default |
+
+Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `hub_down_memo_for=0` never skips a connection attempt. Timeouts, retention, and display limits each define their own zero meaning in `khipu config`; there is no blanket unlimited rule.
 
 ## Integrations and sessions
 
@@ -209,7 +259,7 @@ Top-level flags: `--json`, `--since V`, `--summary` (the session-start text), `-
 | `monthly` | Run the monthly wiki classification once. |
 | `graph-build` | Run the graph build once. |
 | `backfill` | `backfill identity` derives repo and project for episodes. `--dry-run`, `--apply`, `--limit`. |
-| `project` | `project backfill`: same idea for project identity. |
+| `project` | Project identity: backfill, alias add/list/remove, show NAME, list, merge A B --show-as NAME, keep-separate A B, separate NAME, and renames check. Grouped names read as one project; owner merge/separation decisions control grouping. |
 | `hygiene` | `hygiene paths` finds and purges bad path graph nodes. `hygiene commitments` re-judges open commitments. |
 
 ### jobs
@@ -221,7 +271,8 @@ Job names: `nightly`, `monthly`, `graph_build`, `notes_watch`, `queue_drain`, `r
 `promote [ref]` defaults to `origin/main`. It checks the ref out in the inactive live slot, runs the gate (doctor, a replay of recent recall queries from the last day, one real capture, a version check), and flips the live link on a pass. The recall replay needs at least one query logged in the last day.
 
 - `--rollback`: flip back to the previous slot.
-- `--status`: show the live commit, main, and how far behind.
+- `--status`: show the live commit, main, how far behind, and queued promotion.
+- `--retry-queued`: retry the queued attempt once the hub answers. A promotion blocked only by an unreachable hub stays queued and retries when the hub returns.
 - `--gate-only STEP`: run one gate step (`doctor`, `recall`, `capture`, `version`). It never flips the link.
 - `--json`: machine-readable output.
 
@@ -238,6 +289,7 @@ These are launchers, not commands you normally run by hand. `khipu integrations 
 | `khipu-aegis-capture` | Aegis capture. It only queues, because it runs in the Aegis sandbox. |
 | `khipu-recall-hook` | SessionStart recall push. `--cursor` emits Cursor's format. Refuses inside Aegis. |
 | `khipu-prompt-recall` | Per-prompt recall push on UserPromptSubmit. Returns `{}` on any error. |
+| `khipu-owner-turn.py` | Records a prompt-submit owner turn for owner-direction checks. Invoked by `khipu-prompt-recall`; recorder failures do not fail the prompt. |
 | `khipu-recall-client.py` | Asks the warm recall service for recall. |
 | `khipu-delegation-hook` | Routing push before work is handed to another agent. Never denies or alters a call. |
 

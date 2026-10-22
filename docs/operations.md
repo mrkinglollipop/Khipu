@@ -15,7 +15,7 @@ Khipu runs its upkeep as macOS LaunchAgents. A fresh install (the Database step,
 | `monthly` | 1st of the month, 09:00 | Monthly organisation pass |
 | `notes_watch` | When watched note files change (30 s throttle) | Syncs edited notes |
 | `queue_drain` | Every 5 minutes | Drains the capture queue |
-| `replica_refresh` | Every 5 minutes (setting `replica_check_every`) | Looks at this Mac's copy of the database and brings it up to date when the last update is 15 minutes old (setting `replica_refresh_after`). It connects only when an update is due |
+| `replica_refresh` | Every 5 minutes (setting `replica_check_every`) | Runs `snapshot heal`. Updates when the copy is 15 minutes old (setting `replica_refresh_after`) or recovery is needed: missing, behind, wrong schema, failed/overdue dump, or hub reconnect. Idle checks make no connection. Also runs daily local-storage maintenance |
 
 A seventh job, `recall_daemon`, is opt-in: `khipu jobs install recall_daemon`. It keeps a warm recall service running so the per-prompt hook avoids a cold Python start. See [how-it-works.md](how-it-works.md).
 
@@ -23,10 +23,10 @@ A seventh job, `recall_daemon`, is opt-in: `khipu jobs install recall_daemon`. I
 khipu jobs status                      # what is installed and loaded
 khipu jobs install [NAME ...]          # render and load (default: the six above)
 khipu jobs refresh [NAME ...]          # re-render installed jobs whose plist is stale
-khipu jobs uninstall [NAME ...]        # default: all six, recall_daemon included
+khipu jobs uninstall [NAME ...]        # default: all seven job types, recall_daemon included
 ```
 
-The desktop app lists the jobs under Settings, Advanced.
+The desktop app lists the jobs under Settings, Advanced. **Health checks** exposes disk-space thresholds and retention limits, and **Open storage report** shows local usage. The replica timer runs local-storage maintenance at most once a day.
 
 ## Doctor
 
@@ -55,6 +55,8 @@ The main ones:
 | `backup_ok` | See [Backups](#backups-and-restore) |
 | `graph_backup_ok`, `graph_offsite_ok` | See [Graph backup](#graph-backup) |
 | `hub_snapshot_ok` | The offline copy is stale. See [Snapshots](#snapshots-the-offline-copy) |
+| `ledger_copy_ok` | The separate offline ledger copy is too old while the hub answers, or its recovery failure has persisted |
+| `disk_space_ok` | Free space is below the configured red threshold. Settings > Advanced > Health checks controls disk thresholds and retention limits |
 | `jobs_ok` | An expected background job is missing or not loaded |
 | `embed_coverage_ok`, `synth_budget_ok`, `synth_provider_ok` | Embeddings, the daily call ceiling or the summariser setup need attention |
 | `recall_probe_ok`, `recall_daemon_ok`, `prompt_recall_*_ok` | Recall is slow, failing or degraded |
@@ -74,9 +76,9 @@ Related commands:
 
 ## The two queues
 
-There are two, and they are different.
+For session captures there are two queues, and they are different.
 
-- The capture queue holds session windows that have not been summarised yet. The `queue_drain` job and the hooks drain it.
+- The capture queue holds session windows that have not been summarised yet. The `queue_drain` job and hook maintenance drain it. The Stop hook queues first and normally starts detached maintenance: queue drain, outbox replay, mirror, reconcile and embedding catch-up continue outside the blocking hook. `KHIPU_HOOK_INLINE=1` restores inline execution; a failed detached start also falls back to inline maintenance.
 - The outbox holds captures that were summarised but could not be written because the database was unreachable. They replay when it is back.
 
 `outbox_ok` stays red until the outbox is empty, so a silent backlog is not possible.
@@ -91,7 +93,7 @@ What it is:
 - It binds `127.0.0.1:8787` by default (`KHIPU_GATEWAY_BIND` or `--bind`). Put a TLS-terminating reverse proxy (Caddy or nginx, with a real certificate) in front of it.
 - It refuses to start unless `KHIPU_GATEWAY_TOKEN` is set and at least 24 characters. Extra labelled tokens: `KHIPU_GATEWAY_TOKENS=label:token,...`.
 - Limits: 1 MiB request body, 120 requests a minute per IP, 240 a minute per token, 10 failed auths a minute, 32 calls per JSON-RPC batch (`KHIPU_GATEWAY_MAX_BATCH`). Browser requests with an `Origin` are refused unless listed in `KHIPU_GATEWAY_ALLOWED_ORIGINS`.
-- It serves the same tools as the local MCP server, with exceptions: `khipu_usage` and the routing tools (`khipu_route`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority`) answer `available: false` through it, and `khipu_forget` refuses only episodes whose session id starts with a local harness name (`claude_code`, `cursor`, `codex` or `aegis`); any other episode, including one with no session id, can be forgotten through it, because the gateway does not check that the episode came from a cloud harness. A stricter check is planned. Capture is accepted only in `hub` mode. See [mcp-tools.md](mcp-tools.md).
+- It advertises 20 tools; the local-only `khipu_owner_act` is omitted. `khipu_usage` and routing write/advice tools (`khipu_route_advise`, `khipu_route_report`, `khipu_route_rule`, `khipu_route_priority`) answer `available: false` through it. `khipu_route` serves the owner-enabled published cloud routing copy, with a hub timestamp, stale status and persistent pull receipts. `khipu_forget` refuses only episodes whose session id starts with a local harness name (`claude_code`, `cursor`, `codex` or `aegis`); any other episode, including one with no session id, can be forgotten through it, because the gateway does not check that the episode came from a cloud harness. A stricter check is planned. Capture is accepted only in `hub` mode. See [mcp-tools.md](mcp-tools.md).
 - For library search the gateway host also needs the embedding key of every enabled library profile. A missing key drops that library's meaning leg and reports `degraded_legs`. It does not fail the search.
 
 Khipu never opens the database to the internet itself; keep it on a private network. The gateway is the only part meant to face the internet.
@@ -173,18 +175,19 @@ You need `rclone` installed and a remote named `r2` for the offsite part. The co
 
 ## Snapshots, the offline copy
 
-Khipu keeps a read-only copy of memory in a local SQLite file, `hub_snapshot.sqlite`. Reads fall back to it when the database is unreachable, and the per-prompt recall hook reads it first. It holds episodes, topics, revisions, nodes, edges, embedding profiles, embeddings, decisions and deliverables. It does not hold libraries or commitments. Keyword search works offline. Meaning search works offline only if the embedding model is a local one that matches the stored profile.
+Khipu keeps a local copy of memory in a SQLite file, `hub_snapshot.sqlite`. Reads fall back to it when the database is unreachable, and the per-prompt recall hook reads it first. It holds episodes, topics, revisions, nodes, edges, embedding profiles, embeddings, decisions, deliverables, commitments with owner lineage, project aliases and the work ledger. Supported changes can wait locally to sync; the copy is not a second authoritative database. Libraries still require the hub. Keyword search works offline. Meaning search works offline only if the embedding model is a local one that matches the stored profile.
 
 ```bash
 khipu snapshot refresh   # full dump (the hub must be up)
+khipu snapshot heal      # bring the copy up to date when needed; includes timer housekeeping
 khipu snapshot status    # age, size, row counts
 ```
 
 - A full dump runs in the nightly job and on `khipu snapshot refresh`. Doctor and status do not dump it.
-- Between dumps, captures, decision changes and forgets update the copy as they happen. Episode edits (`khipu episode edit`) and topic tombstones and purges do not: this Mac's copy keeps the old summary or the topic until its next full dump (nightly, or `khipu snapshot refresh`).
+- Between dumps, captures, decision changes and forgets update the copy as they happen. The replica_refresh job runs `snapshot heal` every five minutes and pulls changes when due, including episode edits (`khipu episode edit`) and topic tombstones. Incremental memory failures can trigger a full dump.
+- Topic purge deletes the hub row and tries to purge this Mac's offline copy immediately; a replica failure is reported and may require a refresh.
+- Doctor reports the offline ledger copy separately. A failed ledger part triggers ledger-only recovery with a fifteen-minute backoff, leaving healthy memory parts available.
 - Doctor reports freshness per table: fresh, behind, stale or unknown. Only stale turns `hub_snapshot_ok` red. Search results from a stale copy carry `stale: true`.
-
-Planned, not built: a bounded incremental `snapshot sync` and a scheduled sync.
 
 ## Promote: merged is not live
 
@@ -204,12 +207,13 @@ khipu promote REF                # a different ref
 khipu promote --status           # live commit, main commit, how far behind, last gate result
 khipu promote --gate-only STEP   # run one step (doctor, recall, capture, version); never flips
 khipu promote --rollback         # flip back to the other slot, no gate
+khipu promote --retry-queued     # retry a queued promotion once the hub answers
 khipu promote --json
 ```
 
 Running MCP servers keep the old code until their session restarts. Never delete a slot.
 
-Planned, not built: a `promotion` block in doctor and a "merged, not live" display with a Promote button on Home. For now only `khipu promote --status` shows the gap.
+Doctor exposes promotion state. When only hub reachability blocks the gate, promotion stays queued; queue-drain maintenance starts retries, and a retry runs once the hub returns. `khipu promote --retry-queued` triggers the retry explicitly. Home shows attention for a waiting promotion; it does not offer a general Promote button.
 
 ## Adding another Mac
 
