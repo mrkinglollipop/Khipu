@@ -161,4 +161,33 @@ def test_doctor_reports_a_malformed_row_and_sweep_repairs_it(store):
     assert any("bad" in w for w in block["warnings"]) and not block["ok"]
     owner_turns.sweep()
     assert rd.malformed_rows() == []
-    assert owner_turns.doctor_block(installed=[])["ok"]
+    block = owner_turns.doctor_block(installed=[])
+    assert not block["ok"] and any("held" in w and "bad" in w for w in block["warnings"])
+
+
+def test_a_quarantined_row_survives_the_sweep_whole_and_doctor_stays_red(store):
+    import os
+
+    words = "route the fake builds to the fake lane"
+    row = _row("rd-1", "kept-session", words)
+    row["occurrence"] = "1"  # a schema-incompatible field
+    _write({"rd-1": row})
+    assert rd.repair_store() == ["rd-1"]
+    path = rd.store_path().with_name(rd.QUARANTINE_NAME)
+    then = time.time() - 61
+    os.utime(path, (then, then))
+    out = owner_turns.sweep()
+    assert out["ok"], out
+    assert path.exists() and words in path.read_text(encoding="utf-8")
+    assert not owner_turns.doctor_block(installed=[])["ok"]
+
+
+def test_a_quarantined_row_without_a_session_keeps_its_words_until_that_session_is_forgotten(store):
+    _write({"x": {"id": "x", "words": "fake words naming gone-session", "status": 3}})
+    rd.repair_store()
+    path = rd.store_path().with_name(rd.QUARANTINE_NAME)
+    assert "fake words" in path.read_text(encoding="utf-8")
+    rd.forget_sessions(["other"])
+    assert path.exists()
+    rd.forget_sessions(["gone-session"])
+    assert not path.exists()

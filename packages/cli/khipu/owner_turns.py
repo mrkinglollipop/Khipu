@@ -856,10 +856,15 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
         from khipu import routing_directions
 
         bad = routing_directions.malformed_rows()
+        held = routing_directions.quarantined_keys()
     except Exception:  # noqa: BLE001 - a failed look must not hide the rest of the row
-        bad = []
+        bad, held = [], []
     damaged = [f"Routing directions: row {row['key']} is malformed ({row['reason']}) and blocks forgetting "
                f"until the next sweep moves it aside." for row in bad]
+    if held:
+        damaged.append(f"Routing directions: {len(held)} row(s) ({', '.join(held)}) could not be read and are held "
+                       f"aside whole in {routing_directions.QUARANTINE_NAME}. They are not shown as owed, and their "
+                       f"words are kept until their session is forgotten or the file is removed.")
     if not settings()["enabled"]:
         return {"ok": not damaged, "enabled": False, "harnesses": per, "missing": [], "warnings": damaged,
                 "summary": "Owner direction is off."}

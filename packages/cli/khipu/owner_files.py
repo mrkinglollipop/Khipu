@@ -38,6 +38,8 @@ PATTERNS: tuple[tuple[str, str, str], ...] = (
     # Persistent, empty flock inode: deleting it would let new writers
     # bypass a transaction still holding the old inode.
     ("lock", "turns", "routing-directions.lock"),
+    # Rows the store could not use, kept whole for the owner: never swept.
+    ("quarantine", "turns", "routing-directions.quarantine.json"),
     ("mismatches", "turns", "routing-mismatch-*.json"),
     ("turns", "turns", "*.jsonl"),
     ("temp", "data", ".owner-*.tmp"),

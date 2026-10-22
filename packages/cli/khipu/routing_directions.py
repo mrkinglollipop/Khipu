@@ -362,9 +362,10 @@ def _session_of(row) -> str | None:
 
 def repair_store() -> list[str]:
     """Move every malformed row out of the store into a private quarantine
-    file, so a forget no longer stops on it. A row that names its session
-    keeps its content there (a later forget of that session scrubs it); a
-    row that does not is reduced to its key. The valid rows are untouched.
+    file, so a forget no longer stops on it. Every row keeps its full content
+    there (owner_files lists the file as persistent, so the sweep leaves it,
+    and a later forget of a session scrubs that session's words from it).
+    The valid rows are untouched.
     Returns the keys moved. An unreadable store file is left alone."""
     with _store_lock():
         try:
@@ -380,10 +381,22 @@ def repair_store() -> list[str]:
         except (OSError, ValueError):
             held = {}
         for key, row in bad.items():
-            held[str(key)] = row if _session_of(row) else {"key": str(key)}
+            held[str(key)] = row
         owner_turns._write_private(_quarantine_path(), json.dumps(held, indent=1) + "\n")
         _save({**data, "directions": {k: v for k, v in data["directions"].items() if k not in bad}})
         return sorted(str(k) for k in bad)
+
+
+def quarantined_keys() -> list[str]:
+    """The keys held in quarantine (doctor stays red while any remain). An
+    unreadable quarantine file is one entry keyed ``(quarantine)``."""
+    try:
+        held = json.loads(_quarantine_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        return ["(quarantine)"]
+    return sorted(str(k) for k in held) if isinstance(held, dict) else ["(quarantine)"]
 
 
 def _scrub_quarantine(names) -> None:
@@ -394,7 +407,9 @@ def _scrub_quarantine(names) -> None:
     if not isinstance(held, dict):
         _quarantine_path().unlink()
         return
-    kept = {k: v for k, v in held.items() if _session_of(v) not in names}
+    # A row whose session cannot be read is judged by its text, as a temp is.
+    kept = {k: v for k, v in held.items()
+            if not any(n in json.dumps(v, ensure_ascii=False) for n in names)}
     if len(kept) != len(held):
         if kept:
             owner_turns._write_private(_quarantine_path(), json.dumps(kept, indent=1) + "\n")
