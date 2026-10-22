@@ -56,6 +56,8 @@ _PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ("url-credential", re.compile(r"(://[^/\s:@]+:)([^@\s/]{1,})@"), r"\1" + MASK + "@"),
     # Quoted keys in source code only identify secrets when the value is a
     # literal. A variable or lookup expression is evidence, not a credential.
+    # Leave the closing quote available as an adjacent key's opening quote,
+    # including when a canonical masked value is skipped.
     (
         "quoted-assignment",
         re.compile(
@@ -63,9 +65,9 @@ _PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
             r"access[_-]?token|auth[_-]?token|refresh[_-]?token|token|password|passwd|pwd|"
             r"client[_-]?secret|private[_-]?key|access[_-]?key(?:[_-]?id)?|dsn|connection[_-]?string)"
             r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']))"
-            r"(?P<value>(?:(?!(?P=value_quote))[^\\\r\n]|\\.){8,})(?P=value_quote)"
+            r"(?P<value>(?:(?!(?P=value_quote))[^\\\r\n]|\\.){8,})(?=(?P=value_quote))"
         ),
-        r"\1" + MASK + r"\g<value_quote>",
+        r"\1" + MASK,
     ),
     # Unquoted shell/YAML assignments retain their existing value rules.
     (

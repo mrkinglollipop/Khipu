@@ -227,3 +227,76 @@ def test_routing_all_115_private_value_controls(routing_world, control, encoding
     out = agent_view.scrub_strict("Fake diagnostic: " + _encode(payload, encoding),
                                   extra_keys=[a["key"] for a in routing_world["accounts"]])
     assert all(payload.casefold() not in v.casefold() for v in agent_view._decoded_variants(out))
+
+
+# The first value's closing quote is also the next key's opening quote.
+# It must remain available even when the first value is already masked.
+_ADJACENT_QUOTES = [
+    pytest.param(key_quote, shared_quote, value_quote,
+                 id="-".join("double" if q == '\"' else "single"
+                             for q in (key_quote, shared_quote, value_quote)))
+    for key_quote in ('\"', "'")
+    for shared_quote in ('\"', "'")
+    for value_quote in ('\"', "'")
+]
+_ADJACENT_KEYS = (
+    "apikey", "api_key", "api-key", "secret", "secretkey", "secret_key", "secret-key",
+    "accesstoken", "access_token", "access-token", "authtoken", "auth_token", "auth-token",
+    "refreshtoken", "refresh_token", "refresh-token", "token", "password", "passwd", "pwd",
+    "clientsecret", "client_secret", "client-secret", "privatekey", "private_key", "private-key",
+    "accesskey", "access_key", "access-key", "accesskeyid", "accesskey_id", "accesskey-id",
+    "access_keyid", "access_key_id", "access_key-id", "access-keyid", "access-key_id", "access-key-id",
+    "dsn", "connectionstring", "connection_string", "connection-string", "APP_API_KEY",
+)
+_ADJACENT_PRIVATE = "hunter2hunter2"
+
+
+def _adjacent_quoted_secret(key, key_quote, shared_quote, value_quote):
+    return (f"{key_quote}token{key_quote}:{shared_quote}[REDACTED]{shared_quote}"
+            f"{key}{shared_quote}:{value_quote}{_ADJACENT_PRIVATE}{value_quote}")
+
+
+@pytest.mark.parametrize("key", _ADJACENT_KEYS)
+@pytest.mark.parametrize("key_quote,shared_quote,value_quote", _ADJACENT_QUOTES)
+def test_adjacent_quoted_secret_redaction_preserves_quotes_and_is_idempotent(
+        key, key_quote, shared_quote, value_quote):
+    words = _adjacent_quoted_secret(key, key_quote, shared_quote, value_quote)
+    out, count = redact.redact_secrets(words, force=True)
+    assert count > 0
+    assert _ADJACENT_PRIVATE not in out
+    assert out == words.replace(_ADJACENT_PRIVATE, redact.MASK)
+    assert redact.redact_secrets(out, force=True) == (out, 0)
+
+
+@pytest.mark.parametrize("key", _ADJACENT_KEYS)
+@pytest.mark.parametrize("key_quote,shared_quote,value_quote", _ADJACENT_QUOTES)
+@pytest.mark.parametrize("container", ["str", "dict"])
+def test_adjacent_quoted_secret_strict_scrub_withholds_real_value(
+        routing_world, key, key_quote, shared_quote, value_quote, container):
+    words = _adjacent_quoted_secret(key, key_quote, shared_quote, value_quote)
+    payload = words if container == "str" else {"note": words}
+    out = agent_view.scrub_strict(payload)
+    assert _ADJACENT_PRIVATE not in str(out)
+    assert out == (agent_view.WITHHELD if container == "str" else {"note": agent_view.WITHHELD})
+
+
+@pytest.mark.parametrize("key", ["password", "api_key", "secret", "token"])
+@pytest.mark.parametrize("key_quote,shared_quote,value_quote", _ADJACENT_QUOTES)
+@pytest.mark.parametrize("field", ["label", "pending_rule"])
+def test_adjacent_quoted_secret_routing_push_never_exposes_real_value(
+        routing_world, monkeypatch, key, key_quote, shared_quote, value_quote, field):
+    words = _adjacent_quoted_secret(key, key_quote, shared_quote, value_quote)
+    if field == "label":
+        account = routing_world["accounts"][0]
+        account["label"] = words
+        entity = "account:" + account["key"]
+    else:
+        routing_world["rules"] = [dict(n=1, entity="r-fake", text=words,
+                                       confirmed=False, pending=True)]
+        entity = "rule:r-fake"
+    out = _push_change(routing_world, monkeypatch, entity)
+    assert all(_ADJACENT_PRIVATE not in variant for variant in agent_view._decoded_variants(out))
+    if field == "label":
+        assert "open; checked by Khipu" in out
+    else:
+        assert agent_view.WITHHELD in out
