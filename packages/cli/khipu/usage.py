@@ -384,6 +384,14 @@ class _Run:
         with self._lock:
             self.until = max(self.until, deadline)
 
+    @contextlib.contextmanager
+    def committing(self):
+        """Serialize persistent writes with cancellation of this batch."""
+        with self._lock:
+            if self._closed:
+                raise ProbeError(E_TIMEOUT)
+            yield
+
     def kill_all(self) -> None:
         with self._lock:
             self._closed = True
@@ -393,6 +401,11 @@ class _Run:
 
 
 _local = threading.local()
+
+
+def _probe_commit():
+    run = getattr(_local, "run", None)
+    return run.committing() if run is not None else contextlib.nullcontext()
 
 
 def _killpg(proc: subprocess.Popen) -> None:
@@ -688,7 +701,7 @@ def parse_claude(frames: list[dict]) -> dict:
 
 
 @_guard
-def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
+def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
     """Claude Code's own ``/usage`` figures for the login in ``config_dir``
     (``CLAUDE_CONFIG_DIR``; None = the default ``~/.claude``). Never ``--bare``:
     bare mode skips the keychain, so there is no login to read."""
@@ -707,7 +720,7 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S) -
     try:
         return parse_claude(frames)
     except ProbeError as exc:
-        if exc.code != E_NO_FIGURES or not _turn_due(config_dir):
+        if exc.code != E_NO_FIGURES or not turn or not _turn_due(config_dir):
             raise
     # probe_all stops every probe OVERALL_GRACE_S after its timeout; the turn
     # ends just before that, so a slow turn reads as missing figures.
@@ -913,6 +926,8 @@ def codex_rollout(home: str | None = None, *, deadline: float | None = None) -> 
                         continue
         except OSError:
             continue
+    best = None
+    best_at = None
     for _mtime, path in sorted(newest, reverse=True):
         if time.monotonic() > deadline:
             return None
@@ -921,13 +936,16 @@ def codex_rollout(home: str | None = None, *, deadline: float | None = None) -> 
             continue
         limits = event["payload"]["rate_limits"]
         try:
-            return {"ok": True, "plan": _text(limits.get("plan_type")),
-                    "windows": _codex_windows(limits, camel=False),
-                    "credits": _codex_credits(limits, camel=False),
-                    "source": "rollout", "observed_at": _iso(event.get("timestamp"))}
+            candidate = {"ok": True, "plan": _text(limits.get("plan_type")),
+                         "windows": _codex_windows(limits, camel=False),
+                         "credits": _codex_credits(limits, camel=False),
+                         "source": "rollout", "observed_at": _iso(event.get("timestamp"))}
         except ProbeError:
             continue
-    return None
+        at = _parse_time(candidate["observed_at"])
+        if best is None or (at is not None and (best_at is None or at > best_at)):
+            best, best_at = candidate, at
+    return best
 
 
 @_guard
@@ -1088,7 +1106,6 @@ MUSE_LOG_DAYS = 3
 MUSE_LOG_FILES = 24
 _MUSE_REFUSAL = re.compile(rb"Subscription quota exhausted\. Your usage window resets at "
                            rb"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)")
-_MUSE_RECORDED = re.compile(rb'"recorded_at"\s*:\s*(\d{10,17})')
 # A refusal holds no figure: it stands in the row as one window at 100% that
 # ends at the refusal's reset time, so routing reads Muse as limited until then.
 MUSE_REFUSED_WINDOW = "refused"
@@ -1203,8 +1220,8 @@ def _muse_turn(binary: str, env: dict[str, str], deadline: float) -> dict:
 
 def _muse_log_refusal() -> tuple[str, str] | None:
     """(reset time, refused at) of the newest quota refusal in Muse's own
-    session logs, or None. Only the refusal's fixed words and the record's
-    ``recorded_at`` are read from a line; nothing else in a log is kept."""
+    session logs, or None. Only structured failed-run reasons can establish
+    a refusal; only its fixed words and ``recorded_at`` are kept."""
     root = Path.home().joinpath(*MUSE_SESSIONS)
     try:
         days = sorted(p for p in root.glob("[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]") if p.is_dir())
@@ -1225,11 +1242,20 @@ def _muse_log_refusal() -> tuple[str, str] | None:
         except OSError:
             continue
         for line in data.split(b"\n"):
-            match = _MUSE_REFUSAL.search(line)
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            payload = record.get("payload") if isinstance(record, dict) else None
+            event = payload.get("event") if isinstance(payload, dict) and payload.get("kind") == "run" else None
+            if not isinstance(event, dict) or event.get("kind") != "failed":
+                continue
+            reason = event.get("reason")
+            match = _MUSE_REFUSAL.search(reason.encode()) if isinstance(reason, str) else None
             if not match:
                 continue
-            stamp = _MUSE_RECORDED.search(line)
-            value = int(stamp.group(1)) if stamp else None
+            value = record.get("recorded_at")
+            value = value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
             # recorded_at is epoch microseconds; a line without one dates from the file.
             at = _iso(value / 1_000_000 if value and value > 100_000_000_000_000 else value) if value \
                 else _iso(mtime)
@@ -1876,7 +1902,8 @@ def _deepseek_add(data: dict, at: float, balance: float, *, precise_days: float 
             records = data["buckets" if change > 0 else "topups"]
             records.append([last_at, at, _ds_store_money(abs(change))])
     data["last"] = [at, _ds_store_money(_ds_money(balance))]
-    data["attempt"] = {"at": at, "ok": True, "error": None}
+    if at >= (data.get("attempt") or {}).get("at", last_at):
+        data["attempt"] = {"at": at, "ok": True, "error": None}
     _deepseek_compact(data, at, precise_days=precise_days)
     return True
 
@@ -2048,13 +2075,15 @@ def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = Non
 def _deepseek_record_failure(key: str, at: float, code: str) -> None:
     """Note a failed read on a history this key owns, so routing and the
     owner see the failure; no figure changes."""
-    with _deepseek_locked() as dir_fd:
+    with _deepseek_locked() as dir_fd, _probe_commit():
         if dir_fd is None:
             return
         status, data = _deepseek_read(dir_fd, at)
         if status != "ok" or not _hmac_equal(data["fingerprint"], _deepseek_fingerprint(data["salt"], key)):
             return
-        data["attempt"] = {"at": max(at, data["last"][0]), "ok": False, "error": code}
+        if at < max(data["last"][0], (data.get("attempt") or {}).get("at", 0)):
+            return
+        data["attempt"] = {"at": at, "ok": False, "error": code}
         _deepseek_write(dir_fd, data)
 
 
@@ -2081,7 +2110,7 @@ def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
         except ProbeError as exc:
             _deepseek_record_failure(key, at, exc.code)
             raise
-        with _deepseek_locked() as dir_fd:
+        with _deepseek_locked() as dir_fd, _probe_commit():
             data = None
             if dir_fd is not None:
                 state, data = _deepseek_read(dir_fd, max(at, _now().timestamp()))
@@ -2778,7 +2807,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             # home-less account reads its CLI's default folder.
             data = {"ok": False, "error": E_NO_FOLDER, "note": NO_FOLDER_NOTE}
         elif harness == "claude":
-            data = probe_claude(home, timeout=timeout)
+            data = probe_claude(home, timeout=timeout, turn=turn)
         elif harness == "codex":
             data = probe_codex(home, timeout=timeout, rollout=rollout)
         elif harness == "grok":
@@ -2842,7 +2871,7 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
     for thread in threads:
         thread.start()
     longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"]
-                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") == "glm"])
+                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") in ("glm", "deepseek")])
     end = time.monotonic() + longest + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
@@ -2929,7 +2958,9 @@ def _release(fd: int | None) -> None:
 
 
 def _merge(previous: dict | None, row: dict) -> dict:
-    """A good probe replaces the row. A failed one keeps the last good figures
+    """A good probe replaces figures only when they are at least as recent.
+    A failed live read keeps newer good figures even if a fallback succeeds.
+    A failed probe keeps the last good figures
     with their own ``probed_at`` (and ``last_good_at``); the attempt goes in
     ``last_attempt_at`` / ``last_error``, however many failures in a row.
     The note is the failure's own (the ``/login`` hint, say): a note that
@@ -2937,7 +2968,17 @@ def _merge(previous: dict | None, row: dict) -> dict:
     read was good."""
     attempt = row.get("probed_at")
     if row.get("ok"):
-        return dict(row, last_attempt_at=attempt, last_error=None, last_good_at=attempt)
+        old_time = (_oldest_figures_time(previous)
+                    if previous and not _future_times(previous, _now()) else None)
+        new_time = _oldest_figures_time(row)
+        if previous and old_time is not None and (new_time is None or new_time < old_time):
+            failure = row.get("live_error")
+            kept = dict(previous, last_attempt_at=attempt, last_error=failure, ms=row.get("ms"),
+                        account=row.get("account"), home=row.get("home"))
+            if failure:
+                kept.update(ok=False, error=failure, live_error=failure, note=row.get("note"))
+            return kept
+        return dict(row, last_attempt_at=attempt, last_error=row.get("live_error"), last_good_at=attempt)
     if previous and previous.get("last_good_at"):
         kept = {k: v for k, v in previous.items() if k != "live_error"}
         kept.update(ok=False, error=row.get("error"), last_attempt_at=attempt, last_error=row.get("error"),
@@ -3033,7 +3074,7 @@ def _due(accounts: list[dict], cache: dict[str, dict], now: datetime, max_age: f
         cached = cache.get(_key(account)) or {}
         attempted = _parse_time(cached.get("last_attempt_at") or cached.get("probed_at"))
         age_limit = min(max_age, DEEPSEEK_POLL_S) if account.get("harness") == "deepseek" else max_age
-        if attempted is None or ((now - attempted).total_seconds() >= age_limit
+        if attempted is None or _future_times(cached, now) or _reset_due(cached, now) or ((now - attempted).total_seconds() >= age_limit
                                  if account.get("harness") == "deepseek"
                                  else (now - attempted).total_seconds() > age_limit):
             out.append(account)
@@ -3105,12 +3146,44 @@ def _figures_time(row: dict, window: dict | None = None) -> datetime | None:
     when = _parse_time((window or {}).get("observed_at")) or _parse_time(row.get("observed_at"))
     if row.get("source") in ("rollout", "last_observed"):
         return when
-    return when or _parse_time(row.get("probed_at"))
+    return (when or (_parse_time(row.get("last_good_at")) if not row.get("ok") else None)
+            or _parse_time(row.get("probed_at")))
+
+
+def _oldest_figures_time(row: dict) -> datetime | None:
+    windows = [w for w in row.get("windows") or [] if isinstance(w, dict)]
+    times = [_figures_time(row, w) for w in windows] if windows else [_figures_time(row)]
+    return min(times) if all(t is not None for t in times) else None
 
 
 def _age_s(row: dict, now: datetime) -> float | None:
-    when = _figures_time(row)
+    when = _oldest_figures_time(row)
     return None if when is None else (now - when).total_seconds()
+
+
+def _expired_window(window: dict, now: datetime) -> bool:
+    reset = _parse_time(window.get("resets_at"))
+    return reset is not None and reset <= now
+
+
+def _reset_due(row: dict, now: datetime) -> bool:
+    attempted = _parse_time(row.get("last_attempt_at") or row.get("probed_at"))
+    return any(_expired_window(w, now) and (attempted is None or attempted < _parse_time(w.get("resets_at")))
+               for w in row.get("windows") or [] if isinstance(w, dict))
+
+
+def _future_times(row: dict, now: datetime) -> bool:
+    times = [_parse_time(row.get("last_attempt_at") or row.get("probed_at")), _figures_time(row)]
+    times.extend(_figures_time(row, w) for w in row.get("windows") or [] if isinstance(w, dict))
+    return any(at is not None and at > now for at in times)
+
+
+def _stale_figures(row: dict, now: datetime, max_age: float) -> bool:
+    age = _age_s(row, now)
+    return bool(_future_times(row, now) or (not row.get("ok") and row.get("last_good_at"))
+                or (age is None and row.get("source") in ("rollout", "last_observed"))
+                or (age is not None and not 0 <= age <= max_age)
+                or any(_expired_window(w, now) for w in row.get("windows") or [] if isinstance(w, dict)))
 
 
 def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: float = TIMEOUT_S,
@@ -3138,7 +3211,8 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             continue
         cached = cache.get(_key(account))
         attempted = _parse_time((cached or {}).get("last_attempt_at") or (cached or {}).get("probed_at"))
-        young = bool(cached and attempted and (now - attempted).total_seconds() <= max_age)
+        young = bool(cached and attempted and 0 <= (now - attempted).total_seconds() <= max_age
+                     and not _future_times(cached, now) and not _reset_due(cached, now))
         if fresh or not young:
             due.append(i)
         if cached and (background or (young and not fresh)):
@@ -3183,10 +3257,9 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
         # The identity the routing record keys this account by, so the app
         # matches the two by login, never by a name that may be reused.
         row["key"] = _key(account)
-        age = _age_s(row, now)
-        row["stale"] = bool((not row.get("ok") and row.get("last_good_at"))
-                            or (age is None and row.get("source") in ("rollout", "last_observed"))
-                            or (age is not None and age > max_age))
+        row["stale"] = _stale_figures(row, now, max_age)
+        row["windows"] = [dict(w, used_pct=None, expired=True) if _expired_window(w, now) else dict(w)
+                          for w in row.get("windows") or []]
     return {"generated_at": _iso(now.timestamp()), "max_age_s": max_age, "refreshing": refreshing,
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
 
@@ -3197,7 +3270,7 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
 _PUBLIC_ROW_FIELDS = ("harness", "account", "plan", "ok", "error", "live_error", "last_error", "version",
                       "source", "observed_at", "probed_at", "last_attempt_at", "last_good_at", "ms", "cached",
                       "stale", "refreshing")
-_PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model")
+_PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model", "expired")
 INVALID_PUBLIC_NOTE = "This account entry is not valid; the owner can fix it in Khipu's Settings"
 
 
@@ -3394,8 +3467,12 @@ def summary_line(row: dict) -> str:
     if not windows:
         text = f"{head}: {row.get('note') or 'no windows reported'}"
     else:
-        text = f"{head}: " + ", ".join(f"{_window_label(w)} {_pct(w.get('used_pct'))}" for w in windows)
-        tight = max(windows, key=lambda w: w.get("used_pct") if isinstance(w.get("used_pct"), (int, float)) else -1)
+        text = f"{head}: " + ", ".join(
+            f"{_window_label(w)} unknown (reset passed)" if w.get("expired") else
+            f"{_window_label(w)} {_pct(w.get('used_pct'))}" for w in windows)
+        tight = max((w for w in windows if not w.get("expired")),
+                    key=lambda w: w.get("used_pct") if isinstance(w.get("used_pct"), (int, float)) else -1,
+                    default={})
         if tight.get("resets_at"):
             text += f"; tightest {_window_label(tight)} {_pct(tight.get('used_pct'))} resets {_when(tight['resets_at'])}"
     credits = row.get("credits") or {}
@@ -3526,10 +3603,7 @@ def doctor_block(*, max_age: float = DEFAULT_MAX_AGE_S, now: datetime | None = N
             entry["never_read"] = True  # `khipu usage` has not read this account yet
             accounts.append(entry)
             continue
-        age = _age_s(row, now)
-        stale = bool((not row.get("ok") and row.get("last_good_at"))
-                     or (age is None and row.get("source") in ("rollout", "last_observed"))
-                     or (age is not None and age > max_age))
+        stale = _stale_figures(row, now, max_age)
         live = [w for w in row.get("windows") or [] if _in_force(w, now)]
         tight = max(live, key=lambda w: _shown_pct(w.get("used_pct")), default=None)
         figures_time = _figures_time(row)

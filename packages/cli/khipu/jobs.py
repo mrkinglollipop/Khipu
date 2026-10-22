@@ -8,17 +8,25 @@ Khipu owns the launchd labels and CLI entrypoints; the engines stay unchanged.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import plistlib
 import re
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from khipu.paths import DEFAULT_DIR, ensure_data_dir
+
+DRIVER_TIMEOUT_SECONDS = 3600
+DRIVER_TERMINATE_GRACE_SECONDS = 2
 
 GRAPHIFY_NOT_INSTALLED = {
     "ok": False,
@@ -225,9 +233,71 @@ def _write_job_state(name: str, exit_code: int) -> None:
         "ts": datetime.now(timezone.utc).isoformat(),
     }
     path = state_dir / f"job-{name}.json"
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    # Separate same-directory files keep concurrent receipts atomic and avoid
+    # one writer renaming another writer's temporary file out from under it.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=state_dir)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload) + "\n")
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+class _JobTerminated(BaseException):
+    """Unwind through child cleanup without being swallowed by maintenance."""
+
+
+@contextmanager
+def _sigterm_guard(name: str, *, defer: bool = False):
+    # Python only permits signal handlers on the main thread. Programmatic
+    # threaded callers still get locking/deadlines; the CLI owns SIGTERM here.
+    state = {"defer": defer, "pending": False}
+    if threading.current_thread() is not threading.main_thread():
+        yield state
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, frame):
+        # Further bootout/termination requests cannot interrupt group cleanup
+        # or the failure receipt. During Popen, defer until its PID is known.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        state["pending"] = True
+        if not state["defer"]:
+            raise _JobTerminated()
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield state
+    except _JobTerminated:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        _write_job_state(name, 143)
+        raise SystemExit(143) from None
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+@contextmanager
+def _job_lock(name: str):
+    """Exclude manual/launchd overlap for the entire wrapper, including upkeep.
+
+    Keep the inode on disk: unlinking a held lock would allow a new owner to
+    lock a different inode. Children must not inherit this descriptor.
+    """
+    state_dir = ensure_data_dir() / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with (state_dir / f"job-{name}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            with _sigterm_guard(name):
+                yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _on_demand_job_entry(name: str) -> dict[str, Any]:
@@ -259,28 +329,66 @@ def _run_script(
     log_stem: str,
     state_name: str,
 ) -> int:
-    if script is None or not script.is_file():
-        # Record the failure so doctor/status do not keep reporting the last
-        # good exit after the script path stops resolving.
+    # A fresh process group lets a timed-out engine's descendants be stopped,
+    # even when the engine or a grandchild ignores SIGTERM.
+    rc = 2
+    try:
+        if script is None or not script.is_file():
+            target = script if script is not None else "unset"
+            raise FileNotFoundError(f"job script not found: {target}")
+        out_log, err_log = _log_paths(log_stem)
+        out_log.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        header = f"\n--- khipu job {state_name} {stamp} ---\n".encode()
+        cmd = [sys.executable, str(script), *(args or [])]
+        with open(out_log, "ab") as out_f, open(err_log, "ab") as err_f:
+            out_f.write(header)
+            err_f.write(header)
+            out_f.flush()
+            err_f.flush()
+            # Install before spawn, but defer a signal until Popen returns:
+            # raising inside its constructor can strand a just-created child.
+            with _sigterm_guard(state_name, defer=True) as termination:
+                proc = subprocess.Popen(
+                    cmd, stdout=out_f, stderr=err_f, env=os.environ.copy(),
+                    start_new_session=True,
+                )
+                try:
+                    termination["defer"] = False
+                    if termination["pending"]:
+                        raise _JobTerminated()
+                    try:
+                        rc = proc.wait(timeout=DRIVER_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        _stop_driver_group(proc)
+                        rc = 124
+                        err_f.write(f"driver timed out after {DRIVER_TIMEOUT_SECONDS}s\n".encode())
+                except BaseException:
+                    _stop_driver_group(proc)
+                    raise
+    except OSError:
         _write_job_state(state_name, 2)
-        target = script if script is not None else "unset"
-        raise FileNotFoundError(f"job script not found: {target}")
-    out_log, err_log = _log_paths(log_stem)
-    out_log.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    header = f"\n--- khipu job {state_name} {stamp} ---\n".encode()
-    cmd = [sys.executable, str(script), *(args or [])]
-    with open(out_log, "ab") as out_f, open(err_log, "ab") as err_f:
-        out_f.write(header)
-        err_f.write(header)
-        proc = subprocess.run(
-            cmd,
-            stdout=out_f,
-            stderr=err_f,
-            env=os.environ.copy(),
-        )
-    _write_job_state(state_name, proc.returncode)
-    return proc.returncode
+        raise
+    _write_job_state(state_name, rc)
+    return rc
+
+
+def _stop_driver_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=DRIVER_TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    # Always kill the group, even if its leader already exited: a descendant
+    # may still be alive and ignoring the graceful termination signal.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
 
 
 def _nightly_last_path() -> Path:
@@ -327,13 +435,30 @@ def _record_nightly_step(
 
 
 def run_nightly() -> int:
+    with _job_lock("nightly") as acquired:
+        if not acquired:
+            print("nightly job is already running", file=sys.stderr)
+            return 75
+        return _run_nightly_locked()
+
+
+def _run_nightly_locked() -> int:
     steps: list[dict[str, Any]] = []
     drain_result = _step_result(_drain_sessions())
     _record_nightly_step(steps, "sessions_drain", **drain_result)
-    rc = _run_script(
-        CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
-    )
-    _record_nightly_step(steps, "consolidate_nightly", ok=(rc == 0), counts={"rc": rc})
+    driver_error = None
+    try:
+        rc = _run_script(
+            CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        rc = 124 if isinstance(exc, subprocess.TimeoutExpired) else 2
+        driver_error = f"{type(exc).__name__}: {exc}"
+        _write_job_state("nightly", rc)
+    if rc and driver_error is None:
+        driver_error = "driver timed out" if rc == 124 else f"driver failed (exit {rc})"
+    _record_nightly_step(steps, "consolidate_nightly", ok=(rc == 0),
+                         counts={"rc": rc}, error=driver_error)
     _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
@@ -349,8 +474,7 @@ def run_nightly() -> int:
         _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
     briefs_ok = briefs_result is None or _step_result(briefs_result)["ok"]
     final_rc = rc or (0 if drain_result["ok"] and briefs_ok else 1)
-    if final_rc != rc:
-        _write_job_state("nightly", final_rc)
+    _write_job_state("nightly", final_rc)
     return final_rc
 
 
@@ -1050,6 +1174,14 @@ def skipped_step_names(health: dict[str, dict[str, Any]]) -> list[str]:
 
 
 def run_monthly(*, dry_run: bool = False) -> int:
+    with _job_lock("monthly") as acquired:
+        if not acquired:
+            print("monthly job is already running", file=sys.stderr)
+            return 75
+        return _run_monthly_locked(dry_run=dry_run)
+
+
+def _run_monthly_locked(*, dry_run: bool = False) -> int:
     args: list[str] = []
     if dry_run:
         # Live Claude monthly (conversation-memory-monthly.py) has no --dry-run.
@@ -1078,8 +1210,8 @@ def run_graph_build() -> int:
         print(json.dumps(GRAPHIFY_NOT_INSTALLED))
         return 2
     rc = _run_script(script, log_stem="khipu-graph", state_name="graph_build")
-    if rc == 0:
-        _offsite_if_due()
+    # Snapshot protection is independent of embedding progress or failures.
+    _offsite_if_due()
     return rc
 
 

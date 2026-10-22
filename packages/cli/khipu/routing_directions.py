@@ -357,6 +357,8 @@ def owed_items() -> list[dict]:
     """The open directions as owed items, naming the owner's own words.
     These are the only rows that carry prompt text, and they are shown
     only to the owner."""
+    from datetime import datetime, timezone
+
     out = []
     for row in directions():
         if row.get("status") != "open":
@@ -365,6 +367,8 @@ def owed_items() -> list[dict]:
                     "text": f"Routing said here, not in Khipu: '{row['words']}'",
                     "words": row["words"], "session": row["session"], "target": row.get("target"),
                     "project": row.get("project"),
+                    "opened_at": (datetime.fromtimestamp(row["at"], timezone.utc).isoformat()
+                                  if type(row.get("at")) in (int, float) else None),
                     "join": row.get("join") or "joined", "reason": row.get("reason")})
     return out
 

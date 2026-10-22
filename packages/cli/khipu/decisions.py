@@ -756,11 +756,11 @@ def add_link(cur, old_id: int, new_id: int, *, kind: str = "supersedes",
 
 
 def list_links(cur, *, state: str | None = None, project: str | None = None,
-               limit: int = 50) -> list[dict[str, Any]]:
+               since: Any = None, limit: int = 50) -> list[dict[str, Any]]:
     """Links (candidate by default filter left to the caller — pass
     ``state="candidate"`` for the usual "what needs a decision" view), each
     carrying both decisions' text so a caller never has to join itself.
-    [] on a pre-migration hub."""
+    since filters when the conflict link was created. [] on a pre-migration hub."""
     if not _links_ready(cur):
         return []
     if state is not None and state not in VALID_LINK_STATES:
@@ -771,6 +771,9 @@ def list_links(cur, *, state: str | None = None, project: str | None = None,
     if state:
         clauses.append("l.state = %s")
         params.append(state)
+    if since is not None:
+        clauses.append("l.created_at >= %s")
+        params.append(since)
     if project:
         from khipu.identity import project_group
 

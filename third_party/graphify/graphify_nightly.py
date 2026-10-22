@@ -114,6 +114,28 @@ def _export_sources(env: dict[str, str]) -> Path | None:
     if root is None:
         return None
     log("step: export graph sources")
+    # A standalone resolved file can be the only source configuration.  With
+    # no registry, exporting defaults would reactivate its disabled collectors.
+    # A real registry still wins over a stale empty cache, so check it before
+    # deciding to preserve the explicitly selected file.
+    explicit = (env.get("KHIPU_GRAPH_SOURCES_RESOLVED") or "").strip()
+    if explicit and _should_skip_build(Path(explicit)) == (True, "no_sources"):
+        try:
+            probe = subprocess.run(
+                [sys.executable, "-c",
+                 "from khipu.sources import sources_file; "
+                 "raise SystemExit(0 if sources_file().exists() else 3)"],
+                env=env, capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log(f"  source registry check failed (non-fatal): {exc}")
+            return None
+        if probe.returncode == 3:
+            log("  keeping explicit empty sources — no source registry exists")
+            return None
+        if probe.returncode != 0:
+            log(f"  source registry check rc={probe.returncode} — keeping resolved file")
+            return None
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "khipu.cli", "sources", "export"],
@@ -133,25 +155,15 @@ def _export_sources(env: dict[str, str]) -> Path | None:
         )
         return None
     log("  sources export ok")
-    resolved = (os.environ.get("KHIPU_GRAPH_SOURCES_RESOLVED") or "").strip()
-    if resolved:
-        return Path(resolved)
     try:
-        for part in (env.get("PYTHONPATH") or "").split(":"):
-            if not part:
-                continue
-            candidate = Path(part) / "khipu" / "sources.py"
-            if candidate.is_file():
-                import importlib.util
-
-                spec = importlib.util.spec_from_file_location("khipu_sources", candidate)
-                if spec and spec.loader:
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    return mod.resolved_path()
-    except Exception:
+        payload = json.loads(proc.stdout)
+        resolved = payload.get("path") if isinstance(payload, dict) else None
+        if payload.get("ok") and isinstance(resolved, str) and resolved.strip():
+            return Path(resolved)
+    except (ValueError, AttributeError):
         pass
-    return _app_support() / "graph_sources.resolved.json"
+    log("  sources export returned no resolved path")
+    return None
 
 
 def _should_skip_build(resolved: Path | None) -> tuple[bool, str]:
@@ -177,17 +189,6 @@ def main() -> int:
     resolved = Path(resolved_override) if resolved_override else (
         _app_support() / "graph_sources.resolved.json"
     )
-    skip, reason = _should_skip_build(resolved if resolved.is_file() else None)
-    if skip:
-        payload = {
-            "ok": True,
-            "skipped": reason,
-            "message": "graph-build skipped: no graph sources configured",
-        }
-        print(json.dumps(payload))
-        log(f"skipped: {reason}")
-        return 0
-
     base_env = os.environ.copy()
     khipu_env = _khipu_env(base_env)
     exported = _export_sources(khipu_env)
@@ -226,8 +227,10 @@ def main() -> int:
         log("nightly FAILED — build_graph did not succeed")
         return 2
 
+    embed_failures: list[tuple[str, int]] = []
     rc = run_step("embed corpus", "embed_corpus.py", timeout=900, env=khipu_env)
     if rc != 0:
+        embed_failures.append(("embed corpus", rc))
         log("  embed step did not fully succeed — new nodes may lack embeddings until the next run")
 
     rc = run_step(
@@ -237,6 +240,8 @@ def main() -> int:
         args=["--edges", "--prune-stale-edges"],
         env=khipu_env,
     )
+    if rc not in (0, 3):
+        embed_failures.append(("embed edges", rc))
     if rc == 3:
         log("  edge-embed step deferred — will retry next run")
     elif rc != 0:
@@ -259,6 +264,11 @@ def main() -> int:
                 log(f"  khipu graph mirror rc={proc.returncode}: {tail[-1] if tail else 'failed'}")
         except OSError as exc:
             log(f"  khipu graph mirror skipped (non-fatal): {exc}")
+
+    if embed_failures:
+        detail = "; ".join(f"{label} rc={rc}" for label, rc in embed_failures)
+        log(f"nightly FAILED — {detail}")
+        return embed_failures[0][1]
 
     log("nightly complete — graph refreshed")
     return 0

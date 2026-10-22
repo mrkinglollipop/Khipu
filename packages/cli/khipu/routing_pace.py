@@ -511,6 +511,8 @@ def compute_pace(samples, caps, now, window):
             target["why"] = "no reading"
         elif secs_to_reset is None or secs_to_reset <= 0:
             target["why"] = "no reset time"
+        elif not level_known:
+            target["why"] = why or "no current reading"
         else:
             elapsed = min(max(params["window_s"] - secs_to_reset, 0.0), float(params["window_s"]))
             allowance = target_cap["pct"] * elapsed / params["window_s"] + target_cap["slack"]

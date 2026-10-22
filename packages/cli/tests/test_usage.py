@@ -665,7 +665,7 @@ def test_codex_without_live_answer_or_rollout_fails(fake, tmp_path):
 def _row(harness="claude", label="Claude", *, ok=True, used=10, probed_at=None, **extra):
     probed_at = probed_at or usage._iso(time.time())
     row = {"harness": harness, "account": label, "home": None, "plan": "max", "ok": ok, "error": None,
-           "windows": [{"name": "weekly", "used_pct": used, "resets_at": "2026-01-02T00:00:00Z"}] if ok else [],
+           "windows": [{"name": "weekly", "used_pct": used, "resets_at": usage._iso((datetime.now(timezone.utc) + timedelta(days=7)).timestamp())}] if ok else [],
            "credits": None, "probed_at": probed_at, "ms": 5}
     row.update(extra)
     return row

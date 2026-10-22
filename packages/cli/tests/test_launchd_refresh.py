@@ -8,9 +8,14 @@ from khipu import launchd_gen
 def _patched(tmpdir: str):
     """Context manager stack: plist paths under tmpdir, launchctl/versions no-ops."""
     tmp = Path(tmpdir)
+    loaded = set()
 
     def fake_plist_path(label: str) -> Path:
         return tmp / f"{label}.plist"
+
+    def fake_load(label: str, path: Path) -> dict:
+        loaded.add(label)
+        return {"ok": True}
 
     return [
         mock.patch.object(launchd_gen, "_plist_path", side_effect=fake_plist_path),
@@ -18,8 +23,9 @@ def _patched(tmpdir: str):
         mock.patch.object(
             launchd_gen,
             "_launchctl_load",
-            return_value={"ok": True},
+            side_effect=fake_load,
         ),
+        mock.patch.object(launchd_gen, "_plist_loaded", side_effect=lambda label: label in loaded),
         mock.patch.object(launchd_gen, "read_versions", return_value={}),
         mock.patch.object(launchd_gen, "write_versions", return_value=None),
     ]

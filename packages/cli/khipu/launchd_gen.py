@@ -25,6 +25,7 @@ from khipu.jobs import (
     _launchagents_dir,
     _log_paths,
     _plist_path,
+    _plist_loaded,
 )
 from khipu import replica_heal
 from khipu.lines import split_lines
@@ -227,6 +228,8 @@ def render_context(root: Path | None = None) -> dict[str, str]:
 # Whatever is set when the plist is rendered is baked in, otherwise the job
 # resolves only through versions.json and fails closed.
 PASSTHROUGH_ENV = (
+    "KHIPU_DATA_DIR",
+    "ALZY_DATA_DIR",
     "KHIPU_CONSOLIDATE_NIGHTLY",
     "KHIPU_CONSOLIDATE_MONTHLY",
     "KHIPU_GRAPHIFY_NIGHTLY",
@@ -241,10 +244,28 @@ PASSTHROUGH_ENV = (
 
 def render_extra_env(environ: dict[str, str] | None = None) -> str:
     env = os.environ if environ is None else environ
+    # An explicit standard default changes nothing in launchd's clean env.
+    # Keep legacy installer bytes for that case, while retaining every scoped
+    # override (including a default that deliberately overrides a data pointer
+    # or a different legacy alias).
+    data_keys = ("KHIPU_DATA_DIR", "ALZY_DATA_DIR")
+    default = Path.home() / ".config" / "khipu"
+    values = [(env.get(key) or "").strip() for key in data_keys]
+    pointer = default / "data_root.json"
+    redundant_default = (any(values)
+                         and all(not value or Path(value).expanduser() == default for value in values)
+                         and not (pointer.exists() or pointer.is_symlink()))
     lines = []
     for key in PASSTHROUGH_ENV:
+        if redundant_default and key in data_keys:
+            continue
         value = (env.get(key) or "").strip()
         if value:
+            if key in _REQUIRED_DRIVER_ENV.values():
+                # launchd runs from Application Support, not the installer's
+                # shell directory. Preserve symlinks (including live) while
+                # baking the exact expanded absolute path we validate.
+                value = str(Path(value).expanduser().absolute())
             lines.append(f"\n\t\t<key>{key}</key>\n\t\t<string>{escape(value)}</string>")
     return "".join(lines)
 
@@ -295,18 +316,21 @@ def render_plist(job: str, environ: dict[str, str] | None = None) -> bytes:
 def _launchctl_load(label: str, plist_path: Path) -> dict[str, Any]:
     uid = os.getuid()
     domain = f"gui/{uid}"
-    unload = subprocess.run(
-        ["launchctl", "bootout", domain, str(plist_path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    load = subprocess.run(
-        ["launchctl", "bootstrap", domain, str(plist_path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        unload = subprocess.run(
+            ["launchctl", "bootout", domain, str(plist_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        load = subprocess.run(
+            ["launchctl", "bootstrap", domain, str(plist_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": str(exc), "label": label}
     if load.returncode != 0:
         err = (load.stderr or load.stdout or unload.stderr or "").strip()
         return {"ok": False, "error": err or "launchctl bootstrap failed", "label": label}
@@ -370,7 +394,7 @@ def install_job(job: str, *, environ: dict[str, str] | None = None) -> dict[str,
     required_env = _REQUIRED_DRIVER_ENV.get(job)
     if required_env:
         env = os.environ if environ is None else environ
-        driver = Path((env.get(required_env) or "").strip()).expanduser()
+        driver = Path((env.get(required_env) or "").strip()).expanduser().absolute()
         if not str(driver) or not driver.is_file():
             return {
                 "ok": False,
@@ -384,10 +408,22 @@ def install_job(job: str, *, environ: dict[str, str] | None = None) -> dict[str,
     dest = _plist_path(label)
     if job == "replica_refresh":
         replica_heal.ensure_wake_file()  # launchd watches a file that exists
+    previous = dest.read_bytes() if dest.is_file() else None
     dest.write_bytes(render_plist(job, environ))
     loaded = _launchctl_load(label, dest)
     if not loaded.get("ok"):
-        return loaded
+        if previous is not None:
+            # Bootout may already have removed the working agent. Restore
+            # both its configuration and registration, retaining the original
+            # failure even when recovery succeeds. A failed recovery remains
+            # explicit and later refreshes can retry the restored stale plist.
+            try:
+                dest.write_bytes(previous)
+                recovery = _launchctl_load(label, dest)
+            except OSError as exc:
+                recovery = {"ok": False, "error": str(exc)}
+            return {**loaded, "job": job, "recovery": recovery}
+        return {**loaded, "job": job}
     versions = read_versions()
     scheduled = versions.setdefault("scheduled_jobs", {})
     if isinstance(scheduled, dict):
@@ -474,6 +510,11 @@ def ensure_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
                     "error": "required_driver_unavailable",
                     "detail": "installed plist has no resolvable scheduled driver",
                 })
+            elif not _plist_loaded(label):
+                r = install_job(job, environ=_refresh_environ(job))
+                out["results"].append(r)
+                if r.get("ok"):
+                    out["refreshed"].append(job)
             else:
                 out["current"].append(job)
     out["ok"] = all(r.get("ok") for r in out["results"])
@@ -586,7 +627,7 @@ def refresh_scheduled_jobs(jobs: list[str] | None = None) -> dict[str, Any]:
         if plist_external(job):
             external.append(job)
             continue
-        if plist_current(job) is False:
+        if plist_current(job) is False or not _plist_loaded(_LABELS[job]):
             result = install_job(job, environ=_refresh_environ(job))
             results.append(result)
             if result.get("ok"):
