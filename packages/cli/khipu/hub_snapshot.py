@@ -3476,8 +3476,9 @@ def upsert_embeddings(
                 for batch in _chunks(commitment_refs):
                     for (cid,) in con.execute(
                             "SELECT c.id FROM commitments c "
-                            "JOIN episodes e ON e.id = c.opened_episode "
-                            "WHERE c.status = 'open' AND e.deleted_at IS NULL "
+                            "LEFT JOIN episodes e ON e.id = c.opened_episode "
+                            "WHERE c.status = 'open' AND (c.opened_episode IS NULL "
+                            "OR (e.id IS NOT NULL AND e.deleted_at IS NULL)) "
                             + forget_fence_sql(con, "c", "opened_episode")
                             + " "
                             f"AND CAST(c.id AS TEXT) IN ({', '.join('?' for _ in batch)})", batch):

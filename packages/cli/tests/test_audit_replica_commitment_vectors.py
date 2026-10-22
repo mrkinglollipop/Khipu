@@ -38,3 +38,23 @@ def test_delayed_commitment_vector_requires_live_open_parent(tmp_path, monkeypat
     with sqlite3.connect(path) as con:
         retained = con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment' ORDER BY ref").fetchall()
     assert retained == [('80',)], 'delayed publication recreated a non-live commitment vector'
+
+
+def test_open_standalone_commitment_keeps_its_vector(tmp_path, monkeypatch):
+    monkeypatch.setenv('KHIPU_DATA_DIR', str(tmp_path / 'state'))
+    monkeypatch.setenv('KHIPU_KEYCHAIN', '0')
+    import psycopg
+    monkeypatch.setattr(psycopg, 'connect', lambda *a, **kw: pytest.fail('Network forbidden'))
+    path = hs.snapshot_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as con:
+        hs._create_schema(con)
+        con.execute("INSERT INTO commitments(id,text,status,opened_episode) "
+                    "VALUES (90,'standalone synthetic obligation','open',NULL)")
+    result = hs.upsert_embeddings([
+        dict(profile='synthetic', kind='commitment', ref='90', chunk_idx=0,
+             chunk_text='standalone synthetic obligation', embedding=[1.0, 0.0])])
+    assert result['ok'], result
+    with sqlite3.connect(path) as con:
+        retained = con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment'").fetchall()
+    assert retained == [('90',)], 'an open standalone commitment is valid without an opening episode'
