@@ -227,6 +227,8 @@ def render_context(root: Path | None = None) -> dict[str, str]:
 # Whatever is set when the plist is rendered is baked in, otherwise the job
 # resolves only through versions.json and fails closed.
 PASSTHROUGH_ENV = (
+    "KHIPU_DATA_DIR",
+    "ALZY_DATA_DIR",
     "KHIPU_CONSOLIDATE_NIGHTLY",
     "KHIPU_CONSOLIDATE_MONTHLY",
     "KHIPU_GRAPHIFY_NIGHTLY",
@@ -241,8 +243,21 @@ PASSTHROUGH_ENV = (
 
 def render_extra_env(environ: dict[str, str] | None = None) -> str:
     env = os.environ if environ is None else environ
+    # An explicit standard default changes nothing in launchd's clean env.
+    # Keep legacy installer bytes for that case, while retaining every scoped
+    # override (including a default that deliberately overrides a data pointer
+    # or a different legacy alias).
+    data_keys = ("KHIPU_DATA_DIR", "ALZY_DATA_DIR")
+    default = Path.home() / ".config" / "khipu"
+    values = [(env.get(key) or "").strip() for key in data_keys]
+    pointer = default / "data_root.json"
+    redundant_default = (any(values)
+                         and all(not value or Path(value).expanduser() == default for value in values)
+                         and not (pointer.exists() or pointer.is_symlink()))
     lines = []
     for key in PASSTHROUGH_ENV:
+        if redundant_default and key in data_keys:
+            continue
         value = (env.get(key) or "").strip()
         if value:
             lines.append(f"\n\t\t<key>{key}</key>\n\t\t<string>{escape(value)}</string>")

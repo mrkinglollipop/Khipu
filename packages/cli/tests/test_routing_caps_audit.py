@@ -214,6 +214,30 @@ def test_routing_fresh_reached_level_closes_despite_unknown_rate(window, reading
     assert advice["verdict"] == "closed"
 
 
+@pytest.mark.parametrize("window, used, verdict", [
+    ("weekly", [40, 60, 80], "ahead"),
+    ("five_hour", [40, 60, 80], "ahead"),
+    ("weekly", [15, 14, 14], "recovering"),
+])
+def test_routing_fresh_gappy_pace_keeps_hold_and_figures(window, used, verdict):
+    """The review repro: rate coverage does not invalidate current usage."""
+    cap = dict(CAP, window=window)
+    reset = NOW + (timedelta(days=6) if window == "weekly" else timedelta(hours=4))
+    readings = [sample(minutes, value, reset=reset)
+                for minutes, value in zip((-55, -30, -1), used)]
+    pace = routing_pace.compute_pace(readings, [cap], NOW, window)
+    assert pace["why"].startswith("readings ")
+    assert pace["plan"]["verdict"] == "unknown"
+    assert pace["pace_target"]["verdict"] == verdict
+    advice = routing_advice.account_advice({}, entry(pace=[pace], caps=[cap]), NOW)
+    assert advice["verdict"] == "hold_back"
+    assert advice["evidence"] == "fresh"
+    assert advice["caps"][0]["verdict"] == verdict
+    assert advice["numbers"]["used_pct"] == used[-1]
+    assert advice["numbers"]["allowance_pct"] == pytest.approx(
+        pace["pace_target"]["allowance_pct"])
+
+
 def test_routing_possible_reset_is_unknown_before_reached_checks():
     caps = [CAP, dict(kind="share", window="weekly", pct=95, revision="fake-share")]
     pace = routing_pace.compute_pace([sample(-59, 90), sample(-30, 96), sample(-2, 100), sample(0, 1)], caps, NOW, "weekly")
@@ -319,6 +343,7 @@ async function load(name) {
   const cap = { kind: 'pace_target', revision: 'fake', window: 'weekly', pct: 100, slack: 0,
                 allowance_pct: 14.3, used_pct: 32, verdict: 'ahead' };
   for (const why of ['reset time spread over more than an hour', 'last reading 2 h old',
+                     'reset time disagrees between readings', 'reset passed; waiting for a new reading',
                      'possible reset; waiting for the next reading']) {
     const pace = { window: 'weekly', buckets: 48, used_pct: 32, why,
                    plan: { verdict: 'unknown' }, pace_target: cap };
@@ -326,6 +351,20 @@ async function load(name) {
     const row = mod.namespace.paceModel({ accounts: [a] }, null, new Date('2026-10-22T12:02:00Z')).rows[0];
     if (!row.caps[0].state.startsWith('Not known:') || row.caps[0].tag !== null)
       throw Error(JSON.stringify(row.caps[0]));
+  }
+  for (const why of ['readings cover only 0.9 of the last 24 h',
+                     'readings disagree for 0.5 of the last 24 h']) {
+    for (const verdict of ['ahead', 'recovering']) {
+      const status = { ...cap, used_pct: 80, verdict };
+      const pace = { window: 'weekly', buckets: 3, used_pct: 80, why,
+                     plan: { verdict: 'unknown' }, pace_target: status };
+      const a = { key: 'fake|', label: 'Fake', harness: 'claude', state: 'open',
+                  pace: [pace], cap_statuses: [status] };
+      const row = mod.namespace.paceModel({ accounts: [a] }, null, new Date('2026-10-22T12:02:00Z')).rows[0];
+      const expected = verdict === 'ahead' ? '65.7 points ahead' : 'Coming back';
+      if (row.caps[0].state !== 'Allowed 14.3% by now, used 80' || row.caps[0].tag?.text !== expected)
+        throw Error(JSON.stringify(row.caps[0]));
+    }
   }
 })().catch(e => { console.error(e); process.exitCode = 1; });
 """)

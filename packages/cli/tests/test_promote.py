@@ -177,6 +177,58 @@ def test_rollback_after_rollback_never_activates_an_untested_commit(home, repo, 
     assert pm._head(pm.live_link()) != third
 
 
+
+@pytest.mark.parametrize("change", ["provisioned", "foreign", "directory", "tracked", "untracked"])
+def test_rollback_only_allows_the_provisioned_untracked_libs(home, repo, monkeypatch, change):
+    r, first, second = repo
+    a, b = pm.slots()
+    assert pm._prepare_slot(a, first, r)["ok"]
+    assert pm._prepare_slot(b, second, r)["ok"]
+    assert pm.flip(a)["ok"] and pm.flip(b)["ok"]
+    libs = a / ".python_libs"
+    if change in ("foreign", "directory"):
+        libs.unlink()
+        if change == "foreign":
+            foreign = home / "foreign-libs"
+            foreign.mkdir()
+            libs.symlink_to(foreign)
+        else:
+            libs.mkdir()
+            (libs / "injected.py").write_text("never_gated = True\n")
+    elif change in ("tracked", "untracked"):
+        name = "__init__.py" if change == "tracked" else "injected.py"
+        (a / "packages/cli/khipu" / name).write_text("never_gated = True\n")
+    monkeypatch.setattr(pm, "_after_flip", lambda: {"kicked": []})
+    out = pm.rollback()
+    assert out["ok"] is (change == "provisioned"), out
+    assert pm.live_link().resolve() == (a if change == "provisioned" else b)
+    if change != "provisioned":
+        assert "dirty" in out["error"]
+
+
+@pytest.mark.parametrize("key", ["KHIPU_DATA_DIR", "ALZY_DATA_DIR"])
+def test_launchd_omits_redundant_default_dir_but_preserves_pointer_override(home, monkeypatch, key):
+    for name in ("KHIPU_DATA_DIR", "ALZY_DATA_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    default = home / ".config/khipu"
+    monkeypatch.setenv(key, str(default))
+    env = plistlib.loads(launchd_gen.render_plist("nightly"))["EnvironmentVariables"]
+    assert key not in env
+    default.mkdir(parents=True, exist_ok=True)
+    (default / "data_root.json").write_text(json.dumps({"path": str(home / "other-data")}))
+    env = plistlib.loads(launchd_gen.render_plist("nightly"))["EnvironmentVariables"]
+    assert env[key] == str(default)
+
+
+def test_launchd_preserves_default_override_over_legacy_custom_dir(home, monkeypatch):
+    default = home / ".config/khipu"
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(default))
+    monkeypatch.setenv("ALZY_DATA_DIR", str(home / "legacy-scoped"))
+    env = plistlib.loads(launchd_gen.render_plist("nightly"))["EnvironmentVariables"]
+    # Omitting only the primary default would accidentally select the alias.
+    assert env.get("KHIPU_DATA_DIR") == str(default) or "ALZY_DATA_DIR" not in env
+
+
 def test_rollback_refuses_a_slot_that_was_never_live(home, repo, monkeypatch):
     r, first, second = repo
     a, b = pm.slots()
