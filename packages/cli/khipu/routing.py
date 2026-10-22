@@ -5736,9 +5736,9 @@ def runner_cap_flags(view: dict, account: str | None = None) -> list[dict]:
 def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool = False) -> list[dict]:
     """Each owner cap on one account with its verdict at ``now``.
 
-    ``pace_target`` reads the window's pace object; ``spend`` and
-    ``concurrency`` read only the runner telemetry Khipu already recorded
-    (slice 17t). A runner number is data here, never a permission: an
+    ``pace_target`` reads the window's pace object. DeepSeek spend reads
+    the measured account balance history; other spend and concurrency
+    read runner telemetry (slice 17t). A number is data, never a permission: an
     uncovered period or an expired snapshot reads ``unknown`` with no
     figure, and nothing in this module acts on the verdict."""
     from khipu import routing_pace, routing_sources
@@ -5767,30 +5767,19 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
             extra = {}
             spend_verdict = None
             if entry.get("harness") == "deepseek":
-                # A runner covers its own stream, not the whole prepaid
-                # account. Both sources prove lower bounds: take their max,
-                # never their sum, and never infer under-cap spending.
-                from decimal import Decimal
+                # The balance reader measures the whole account. Runner
+                # telemetry is a subset and cannot replace failed evidence
+                # or be added to an amount the balance already includes.
                 from khipu import usage
 
-                floor = usage.deepseek_spend_total(now, cap["days"], cap["usd"],
+                total = usage.deepseek_spend_total(now, cap["days"], cap["usd"],
                                                    definitions=view.get("definitions"))
-                if total.get("status") == "known" and total.get("usd") is not None:
-                    runner_floor = Decimal(str(total["usd"]))
-                    balance_floor = Decimal(floor.get("floor_usd") or "0")
-                    reason = (floor.get("reason") or "").split("; at least $")[0]
-                    floor = usage._deepseek_floor_total(
-                        {**floor, "reason": f"{reason}; runner telemetry cannot rule out other account spending",
-                         "events": total.get("events"), "partial": True},
-                        max(balance_floor, runner_floor), cap["usd"])
-                total = floor
                 spend_verdict = total.get("verdict", "unknown")
-                # Known only once the floor alone reaches the cap; below it the
-                # floor is shown, never a used share a top-up could be hiding.
                 extra["used_pct"] = (round(total["usd"] / cap["usd"] * 100, 1)
-                                     if total.get("status") == "known" and total.get("usd") is not None else None)
-                extra["at_least_usd"] = total.get("at_least_usd")
-                extra["partial"] = total.get("partial")
+                                     if total.get("usd") is not None else None)
+                for field in ("at_least_usd", "partial", "since", "topups_seen", "topup_intervals",
+                              "possible_miss_seconds"):
+                    extra[field] = total.get(field)
             out.append({**base, "cap_usd": cap.get("usd"), "days": cap.get("days"),
                         "usd": total.get("usd"), "events": total.get("events"), **extra,
                         "verdict": spend_verdict or routing_pace.spend_verdict(total, cap["usd"]),
@@ -5812,8 +5801,19 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
 
 
 def cap_line_for(view: dict, entry: dict, now: datetime) -> str | None:
-    """One short push line for a cap that needs attention, or None."""
+    """DeepSeek measured spend, or a cap that needs attention, or None."""
     for status in cap_statuses(view, entry, now):
+        if status["kind"] == "spend" and entry.get("harness") == "deepseek":
+            if status["verdict"] == "unknown":
+                return f"{entry['label']}: spend unknown; {status.get('why') or 'no balance history'}"
+            notes = []
+            if status.get("partial"):
+                notes.append(f"since {status['since']} while history fills")
+            notes.append(f"top-ups seen: {status.get('topups_seen') or 0}")
+            if status.get("topups_seen"):
+                notes.append(f"possible missed spend within {status['possible_miss_seconds']:g} seconds")
+            return (f"{entry['label']}: ${status['usd']:g} spent in the last {status['days']:g} days "
+                    f"of ${status['cap_usd']:g} ({'; '.join(notes)})")
         if status["kind"] == "spend" and status["verdict"] in ("over", "reached", "near"):
             return (f"{entry['label']} spend: ${status['usd']:g} of ${status['cap_usd']:g} "
                     f"in {status['days']:g} d ({status['verdict']})")
