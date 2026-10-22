@@ -183,3 +183,60 @@ def test_settings_status_replication_live_reports_strict_true(home):
 def test_settings_status_other_switches_still_coerce_words(home):
     _set_file(home, routing_cloud_copy="true")
     assert routing.settings_status()["routing_cloud_copy"]["value"] is True
+
+
+def test_settings_status_pending_request_shows_live_state_and_flag(home, capsys, monkeypatch):
+    _request_replication_on(home, capsys, monkeypatch)
+    status = routing.settings_status()["routing_replication_live"]
+    assert status["pending"] is True
+    assert status["value"] is False  # the live state, not the unconfirmed word
+    rc, out = _cli(["config", "--from-app", "--answer-request", "routing_replication_live", "confirm"], capsys)
+    assert rc == 0, out
+    status = routing.settings_status()["routing_replication_live"]
+    assert status["pending"] is False and status["value"] is True
+
+
+def test_settings_status_not_pending_without_request(home):
+    status = routing.settings_status()["routing_replication_live"]
+    assert status["pending"] is False
+
+
+def test_request_matching_confirmed_value_changes_nothing(home, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    _set_file(home, routing_replication_live=True)
+    before = (home["data"] / "config.json").read_text()
+    rc, out = _cli(["config", "--at-owner-request", "keep replication on",
+                    "--set", "routing_replication_live", "on"], capsys)
+    assert rc == 0, out
+    body = json.loads(out)
+    assert body["already_in_effect"] is True
+    assert (home["data"] / "config.json").read_text() == before
+    assert routing._replication_live() is True
+    assert routing.settings_status()["routing_replication_live"]["pending"] is False
+
+
+def test_request_off_when_already_off_changes_nothing(home, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc, out = _cli(["config", "--at-owner-request", "keep it off",
+                    "--set", "routing_replication_live", "off"], capsys)
+    assert rc == 0, out
+    assert json.loads(out)["already_in_effect"] is True
+    assert routing.settings_status()["routing_replication_live"]["pending"] is False
+
+
+def test_request_changing_the_value_still_waits(home, capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    _set_file(home, routing_replication_live=True)
+    rc, out = _cli(["config", "--at-owner-request", "turn replication off",
+                    "--set", "routing_replication_live", "off"], capsys)
+    assert rc == 0, out
+    assert "already_in_effect" not in json.loads(out)
+    status = routing.settings_status()["routing_replication_live"]
+    assert status["pending"] is True and status["value"] is False
+    assert routing._replication_live() is False
+
+
+def test_request_on_from_off_never_goes_live_without_owner(home, capsys, monkeypatch):
+    _request_replication_on(home, capsys, monkeypatch)
+    assert routing.settings_status()["routing_replication_live"]["pending"] is True
+    assert routing._replication_live() is False
