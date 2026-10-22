@@ -316,7 +316,20 @@ def plan(out, view, now, cfg, *, session=None, project=None):
     removed_lines = list(removed.values())
     removed_lines = project(removed_lines) if project else r._for_agents(removed_lines, view)
     removed = dict(zip(removed, removed_lines))
+    # Which item each line of the text belongs to, as its producer recorded
+    # it (``line_token``), kept as an index into this plan's own items: no
+    # entity id travels with the lines. A list that does not match the text
+    # is dropped, and the renderer then hides no line as another entity's.
+    owners = out.get("line_entities")
+    if isinstance(owners, list) and isinstance(text, str) and len(owners) == len(text.split("\n")) \
+            and all(o is None or isinstance(o, str) for o in owners):
+        index = {line_token(item["entity"]): i for i, item in enumerate(items)}
+        owners = [index.get(o) if o else None for o in owners]
+    else:
+        owners = None
+    out = {k: v for k, v in out.items() if k != "line_entities"}
     return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
+                                    "line_entities": owners,
                                     "advice_forecasts": out.get("advice_forecasts") or {},
                                     "current_entities": list(view.get("effective", {})),
                                     "harness": health_harness(_current_harness()),
@@ -327,6 +340,45 @@ def plan(out, view, now, cfg, *, session=None, project=None):
                                    "heading": text.split("\n", 1)[0] if text else
                                    r.CHANGES_HEADING.format(at=r._clock(now, now))})
 
+
+PAGE_FLOOR = 300  # UTF-16 units; narrower pages are never sent
+
+# A line's owner travels from its producer to ``plan`` as a keyed digest of
+# its entity, never the entity id itself (an account's id can name a login
+# folder). The key lives only in this process: a token read anywhere else
+# matches nothing, and its line is shown rather than hidden.
+_LINE_KEY = os.urandom(16)
+
+
+def line_token(entity):
+    return hashlib.blake2s(entity.encode("utf-8"), key=_LINE_KEY, digest_size=8).hexdigest()
+
+
+def _line_items(plan, lines):
+    """Each line's index into the plan's items, or None for every line when
+    the plan has no valid record of them (older saved state included)."""
+    owners, n = plan.get("line_entities"), len(plan.get("items") or [])
+    if isinstance(owners, list) and len(owners) == len(lines) and all(
+            o is None or (type(o) is int and 0 <= o < n) for o in owners):
+        return owners
+    return None
+# The smallest cap a block or a pull is paged at, in UTF-16 units; a smaller
+# configured cap behaves as this. It holds the tail, a page header with its
+# label at its longest (HEADER_LABEL) and a floor-sized page, so every due
+# entry can always page.
+MIN_CAP = 200
+HEADER_LABEL = 48
+
+
+def _header_label(label):
+    """A page header's label, bounded so the header always leaves room for words."""
+    if _size(label) <= HEADER_LABEL:
+        return label
+    return label[:_cut(label, 0, HEADER_LABEL - 1)].rstrip() + "…"
+
+
+def _capped(value, default):
+    return max(MIN_CAP, value or default)
 
 def _cut(text, start, width):
     end, cost = start, 0
@@ -402,6 +454,8 @@ def _delivery_point(state, out, now):
     plan = out["delivery_plan"]
     state["harness"] = health_harness(plan.get("harness"))
     state["slack"] = plan.get("slack", 2)
+    # The configured cap, not the delivered one: a cap too small for a header
+    # and a page has no bound, so health says unknown instead of green.
     budget = plan.get("page_limit") or plan.get("limit") or 8000
     ahead = 0
     entries = list(state.get("entries", {}).values())
@@ -453,17 +507,21 @@ def _render(state, out, now, component, *, delivery_point=True):
                 (state.get("done") or {}).get(item["entity"]) == item["revision"])]
     if (heard or removed) and isinstance(out.get("text"), str):
         lines = out["text"].split("\n")
-        for ident in heard:
-            line = entries["notice:" + ident]["text"]
-            if line in lines:
-                lines.remove(line)
-        for item in removed:
-            for line in list(lines):
-                prefix = line.removesuffix("…").removesuffix("...").rstrip()
-                if line == item["text"] or (prefix and line != prefix and item["text"].startswith(prefix)):
-                    lines.remove(line)
+        owners = _line_items(out["delivery_plan"], lines)
+        if owners is not None:
+            # The producer named each line's item: those lines go, by identity.
+            items = out["delivery_plan"]["items"]
+            gone = {"notice:" + ident for ident in heard} | {item["entity"] for item in removed}
+            kept = [(line, owner) for line, owner in zip(lines, owners)
+                    if owner is None or items[owner]["entity"] not in gone]
+            lines, owners = [line for line, _ in kept], [owner for _, owner in kept]
+        else:
+            # No record of whose lines these are: only a line that is exactly
+            # a completed item's own text goes, never one sharing a prefix.
+            done_text = {entries["notice:" + ident]["text"] for ident in heard} | {item["text"] for item in removed}
+            lines, owners = [line for line in lines if line not in done_text], None
         plain = "\n".join(lines)
-        out = dict(out, text=plain, delivery_plan=dict(out["delivery_plan"], text=plain))
+        out = dict(out, text=plain, delivery_plan=dict(out["delivery_plan"], text=plain, line_entities=owners))
         if heard:
             out["notices"] = [ident for ident in out.get("notices", []) if ident not in heard]
         if removed:
@@ -502,45 +560,152 @@ def _render(state, out, now, component, *, delivery_point=True):
         body, selected, progress = [], [], {}
         # Reserve the tail before fitting payload, so the cap also holds
         # when only one character fits or labels use surrogate pairs.
-        cap = min(limit or 8000, out["delivery_plan"].get("max_chars", 9000) - _size(heading) - 2)
+        cap = min(_capped(limit, 8000), out["delivery_plan"].get("max_chars", 9000) - _size(heading) - 2)
         tail = "More routing owed."
         used = 0
-        for e in due:
+        # A page narrower than this is noise; it scales down for a tiny cap.
+        floor = max(1, min(PAGE_FLOOR, cap // 5))
+        page_limit = min(_capped(out["delivery_plan"]["page_limit"], cap), cap)
+        room_all = cap - _size(tail) - 2  # every body line plus its newline fits in this
+        per_page = page_limit - _size(tail) - 2  # later prompts page at the page limit
+
+        def _halved(e):
+            return e["entity"].startswith("rule:") or e["entity"] == "priority"
+
+        def _parts(e):
+            label = _header_label(e["label"])
+            restart = f"{label} changed while being shown.\n" if e.get("restarted") else ""
+            prefix = f"{label}; revision {e['revision'][:8]}; page "
+            least = min(floor, _size(e["text"][e.get("offset", 0):]))
+            if restart and _size(restart) + _size(prefix) + 24 + least > room_all:
+                restart = ""  # a cap too small for the notice and a page sends the page
+            return restart, prefix, _size(restart) + _size(prefix) + 24  # 24: the "n/m" digits
+
+        def _whole_cap(e):  # an entry that fits the body is shown whole, whatever its share
+            return room_all
+
+        def _top(e):  # the most one page of this entry may take, whatever else is shown
+            if not (_halved(e) or not e["whole"]):
+                return room_all
+            rest = _size(e["text"][e.get("offset", 0):])
+            return min(room_all, max(cap // 2, _parts(e)[2] + min(floor, rest)))
+
+        def _payload(e, room):  # page words that fit in ``room``
+            start = e.get("offset", 0)
+            room = min(room, _top(e))
+            return (min(room, per_page) if start else room) - _parts(e)[2]
+
+        def _least(e):
+            """The smallest page worth sending: the floor, or less only when
+            no wider page of this entry can ever fit this cap. None: none can."""
             start, value = e.get("offset", 0), e["text"]
-            restart = f"{e['label']} changed while being shown.\n" if e.get("restarted") else ""
-            prefix = f"{e['label']}; revision {e['revision'][:8]}; page "
-            room = cap - used - _size(tail) - 2
-            if not start and not restart and _size(value) <= room:
-                rendered, end, page = value, len(value), None
-            else:
-                # Start has a larger budget than subsequent prompts. Count
-                # its larger first page plus exact future UTF-16 chunks.
-                future_room = min(room, (out["delivery_plan"]["page_limit"] or room) - _size(tail) - 2)
-                width = e.get("width") or max(2, future_room - _size(prefix) - 24)
-                e.setdefault("width", width)
-                available = room - _size(restart + prefix) - 24
-                if start:
-                    available = min(width, available)
-                end = _cut(value, start, available)
-                if end == start:
-                    break
-                remaining = _pages_left(value, end, width)
-                if remaining is None:
-                    break
-                n = e.get("pages", 0) + 1
-                page = {"n": n, "m": n + remaining}
-                rendered = restart + prefix + f"{n}/{page['m']}\n" + value[start:end]
-            if _size(rendered) > room:
+            if start >= len(value):
+                return None
+            most = _payload(e, room_all)
+            least = max(_size(value[start]), min(floor, _size(value[start:]), most))
+            return least if least <= most else None
+
+        def _need(e):
+            """The exact room in which ``_place`` shows this entry or a page of it."""
+            least = _least(e)
+            page = least + _parts(e)[2] if least is not None else None
+            if not e.get("offset") and not e.get("restarted") and _size(e["text"]) <= _whole_cap(e):
+                return _size(e["text"]) if page is None else min(_size(e["text"]), page)
+            return page
+
+        def _place(e, room):
+            """This entry whole, or its next page, in ``room``; None if neither fits."""
+            start, value = e.get("offset", 0), e["text"]
+            restart, prefix, over = _parts(e)
+            if not start and not restart and _size(value) <= min(room, _whole_cap(e)):
+                return value, len(value), None
+            least = _least(e)
+            available = _payload(e, room)
+            if least is None or available < least:
+                return None
+            # The width follows this prompt's room; it is never frozen. It
+            # only estimates the page count: later pages are cut afresh.
+            width = max(2, min(room, _top(e), per_page) - _size(prefix) - 24)
+            e["width"] = width
+            end = _cut(value, start, available)
+            remaining = _pages_left(value, end, width)
+            if end == start or remaining is None:
+                return None
+            n = e.get("pages", 0) + 1
+            page = {"n": n, "m": n + remaining}
+            return restart + prefix + f"{n}/{page['m']}\n" + value[start:end], end, page
+
+        # Account-state and change lines stay on every prompt that pages or
+        # refits, so hours of paging never hide them; the entries get the
+        # room they leave. Small ordinary offers kept the plain text above.
+        placed = {}
+        # One structural rule keeps every prompt progressing: the head of
+        # the queue (holds, then other single lines, then long entries)
+        # always gets room for its next page, which every other line leaves
+        # it. Everything due either fits whole or becomes the head in turn,
+        # so all of it is shown in a bounded number of prompts. The state
+        # lines come next, within half the cap; then the other due lines.
+        order = sorted(due, key=lambda e: (not e["entity"].startswith("hold:"), e["whole"]))
+        head = order[0]
+        lead = next((e for e in order if e["whole"]), None)
+        hard = (_need(head) or 0) + 1
+        # A hold may take the first long entry's page room for one prompt;
+        # other single lines leave it (the long entry is never starved).
+        soft = (_need(lead) or 0) + 1 if lead is not None and lead is not head else 0
+        # Each line's entity is the one its producer recorded, never one
+        # read from its words. Without that record no line is taken for
+        # another entity's: it is shown rather than hidden.
+        plain_lines = plain.split("\n")
+        owners = _line_items(out["delivery_plan"], plain_lines) or [None] * len(plain_lines)
+        owed = {e["entity"] for e in due}
+
+        plan_items = out["delivery_plan"]["items"]
+
+        lines_room = min(cap // 2, room_all - hard)
+        for line, owner in list(zip(plain_lines, owners))[1:]:
+            if not line.strip() or line.endswith(":") or line.startswith(tail[:-1]):
+                continue
+            if owner is not None and (plan_items[owner]["entity"] in owed or plan_items[owner]["whole"]):
+                continue  # shown as its own line or page, never beside it
+            if used + _size(line) + 1 > lines_room:
+                continue
+            body.append(line)
+            used += _size(line) + 1
+        for e in order:
+            if e["whole"]:
                 break
+            if e is head:
+                got, hard = _place(e, room_all - used), 0
+            elif e.get("offset") or e.get("restarted"):
+                got = None  # its pages resume when it is the head again
+            else:
+                keep = hard + (0 if e["entity"].startswith("hold:") else soft)
+                got = _place(e, room_all - used - keep)
+                if got and got[2]:
+                    got = None
+            if got:
+                placed[e["entity"]] = got
+                used += _size(got[0]) + 1
+        for e in order:
+            if not e["whole"]:
+                continue
+            got = _place(e, room_all - used)
+            if not got:
+                break  # only the head is owed room; this one waits its turn
+            placed[e["entity"]] = got
+            used += _size(got[0]) + 1
+            if got[1] < len(e["text"]):
+                break
+        for e in due:  # shown in the plan's order, whatever order the room was given in
+            if e["entity"] not in placed:
+                continue
+            rendered, end, page = placed[e["entity"]]
             item = dict(change=e["entity"] + "@" + e["revision"], entity=e["entity"], revision=e["revision"])
             if page:
                 item["page"] = page
             selected.append(item)
             progress[e["entity"]] = end
             body.append(rendered)
-            used += _size(rendered) + 1
-            if end < len(value):
-                break
         left = any(progress.get(e["entity"], e.get("offset", 0)) < len(e["text"]) for e in due)
         if left:
             body.append(tail)
@@ -1086,17 +1251,22 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
         if not due:
             return None, _delivery_summary(data, component, state, None, now, counting_component)
         plan_data = out["delivery_plan"]
-        page_limit = plan_data.get("page_limit") or plan_data.get("limit") or 4000
+        page_limit = _capped(plan_data.get("page_limit") or plan_data.get("limit"), 4000)
         items, progress = [], {}
         for entry in due:
             start, value = entry.get("offset", 0), entry["text"]
-            if not entry["whole"] or (not start and len(value) <= page_limit):
+            if not entry["whole"] or (not start and _size(value) <= page_limit):
                 items.append(dict(change=entry["entity"] + "@" + entry["revision"],
                                   entity=entry["entity"], revision=entry["revision"], text=value))
                 progress[entry["entity"]] = len(value)
                 continue
-            width = entry.get("width") or max(2, page_limit - _size(entry["label"]) - 44)
-            entry.setdefault("width", width)
+            # A page is never wider than the limit, nor narrower than the
+            # scaled floor unless the limit itself is that small.
+            floor = max(1, min(PAGE_FLOOR, page_limit // 5))
+            width = max(2, min(page_limit, floor), page_limit - _size(entry["label"]) - 44)
+            if entry.get("width") and floor <= entry["width"] <= width:
+                width = entry["width"]  # a stored sliver, or one wider than a shrunk limit, is healed
+            entry["width"] = width
             end = _cut(value, start, width)
             if end == start:
                 break
