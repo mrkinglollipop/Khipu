@@ -292,7 +292,9 @@ def compute_pace(samples, caps, now, window):
     current = [s for s in samples if s["_cycle_key"] == current_key]
     representative = min((s for s in current if s["t"] == max(x["t"] for x in current)), key=lambda x: x["reset"])["reset"]
     pace["cycle_resets_at"] = iso(representative)
-    span = (max(s["reset"] for s in current) - min(s["reset"] for s in current)).total_seconds()
+    confidence = [s for s in current if s["t"] >= now - timedelta(seconds=trailing)]
+    span = ((max(s["reset"] for s in confidence) - min(s["reset"] for s in confidence)).total_seconds()
+            if confidence else 0)
     ambiguous = span > 3600
     # Canonical fixed-epoch buckets per settled segment.
     buckets = {}
@@ -355,6 +357,9 @@ def compute_pace(samples, caps, now, window):
         why = "reset time spread over more than an hour"
     elif secs_to_reset is not None and secs_to_reset <= 0:
         why = "reset passed; waiting for a new reading"
+    elif blist and (now - blist[-1]["time"]).total_seconds() > 2 * params["sample_s"]:
+        age_h = (now - blist[-1]["time"]).total_seconds() / 3600
+        why = f"last reading {_hours(age_h)} h old"
     elif len(in_window) < 3:
         why = f"only {len(in_window)} readings in the last {params['trailing_h']} h"
     elif pace["valid_pct"] < 50 or pace["observed_pct"] < 50:
@@ -362,18 +367,20 @@ def compute_pace(samples, caps, now, window):
             why = f"readings disagree for {_hours(disagree_time / 3600)} of the last {params['trailing_h']} h"
         else:
             why = f"readings cover only {_hours(max(0.0, (valid_dur - gap_time) / 3600))} of the last {params['trailing_h']} h"
-    elif blist and (now - blist[-1]["time"]).total_seconds() > 2 * params["sample_s"]:
-        age_h = (now - blist[-1]["time"]).total_seconds() / 3600
-        why = f"last reading {_hours(age_h)} h old"
     pace["why"] = why
     allowed = why is None
+    # Thin fresh readings establish a level, but unsettled or old readings
+    # cannot establish even a reached ceiling.
+    level_known = bool(in_window) and (allowed or why.startswith("only "))
+    if not level_known:
+        pace["plan"]["needed_pct_per_h"] = None
 
     def target(headroom, cap_pct=None):
         out = {"verdict": "unknown", "needed_pct_per_h": None, "runs_out_at": None,
                "before_reset_s": None, "unused_at_reset_pct": None}
         if cap_pct is not None:
             out = {"revision": None, "pct": cap_pct, **out}
-        if secs_to_reset is None or secs_to_reset <= 0:
+        if not level_known or secs_to_reset is None or secs_to_reset <= 0:
             return out
         n = headroom / (secs_to_reset / 3600)
         out["needed_pct_per_h"] = n
@@ -395,7 +402,7 @@ def compute_pace(samples, caps, now, window):
             out["verdict"] = "on_pace"
         return out
 
-    if used is not None:
+    if used is not None and level_known:
         if secs_to_reset is not None and secs_to_reset <= 0:
             pace["plan"]["verdict"] = "unknown"
         elif 100 - used <= 0:
