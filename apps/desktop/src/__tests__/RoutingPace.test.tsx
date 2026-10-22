@@ -194,6 +194,21 @@ describe("Pace, caps and advice: probe regressions", () => {
     expect(row.say.map((part) => part.text).join("")).not.toContain("Nothing Khipu has read");
   });
 
+  it.each([
+    { buckets: 0, why: null },
+    { buckets: 48, why: "no reading" },
+  ])("keeps a reached plan ahead of unavailable pace readings: %o", (unavailable) => {
+    const reached = pace({
+      ...unavailable,
+      used_pct: 100,
+      plan: { verdict: "limit_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+    });
+    const row = paceModel(view([acct({ pace: [reached] })]), null, NOW).rows[0];
+    expect(row.tag).toEqual({ text: "At plan limit", tone: "err" });
+    expect(row.line.week).toBe("At plan limit");
+    expect(row.say.map((part) => part.text).join("")).toBe("At its week plan limit.");
+  });
+
   it("renders a reached plan limit before the calm pace fallback", () => {
     const reached = pace({
       used_pct: 100,

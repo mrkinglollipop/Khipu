@@ -400,6 +400,19 @@ describe("Settings -> Routing: the note", () => {
 });
 
 describe("Settings -> Routing: standing rules", () => {
+  const pendingRule = (entity: string, text: string) => ({
+    n: null as unknown as number,
+    number_pending: true,
+    entity,
+    text,
+    pending: true,
+    pending_kind: "added" as const,
+    pending_by: "a Codex conversation",
+  });
+
+  const pendingRow = (text: string) =>
+    screen.getByText(text, { selector: ".route-rule .row-main" }).closest<HTMLElement>(".route-rule")!;
+
   it("targets a provisional rule by its stable entity and asks end-or-keep for an ordinary add", async () => {
     const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:pending-1", text: "Keep reviews local.",
       pending: true, pending_kind: "added" as const, pending_by: "a Codex conversation" };
@@ -452,6 +465,63 @@ describe("Settings -> Routing: standing rules", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
     fireEvent.click(screen.getByRole("button", { name: "Save and confirm" }));
     await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:proposal-1", holds: { h1: "keep" } }));
+  });
+
+  it("opens Confirm for only the selected unnumbered provisional rule", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rules: [pendingRule("rule:pending-alpha", "Alpha words."), pendingRule("rule:pending-beta", "Beta words.")],
+    };
+    await page();
+    const alpha = pendingRow("Alpha words.");
+    const beta = pendingRow("Beta words.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Confirm rule Alpha words." }));
+    expect(within(alpha).getByRole("group", { name: "Confirm rule Alpha words.?" })).toBeInTheDocument();
+    expect(within(beta).queryByRole("group", { name: "Confirm rule Beta words.?" })).toBeNull();
+  });
+
+  it("opens Edit for only the selected unnumbered provisional rule", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rules: [pendingRule("rule:pending-alpha", "Alpha words."), pendingRule("rule:pending-beta", "Beta words.")],
+    };
+    await page();
+    const alpha = pendingRow("Alpha words.");
+    const beta = pendingRow("Beta words.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Edit rule Alpha words." }));
+    expect(within(alpha).getByRole("form", { name: "Edit rule Alpha words." })).toBeInTheDocument();
+    expect(within(beta).queryByRole("form", { name: "Edit rule Beta words." })).toBeNull();
+  });
+
+  it("opens Remove for only the selected unnumbered provisional rule", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rules: [pendingRule("rule:pending-alpha", "Alpha words."), pendingRule("rule:pending-beta", "Beta words.")],
+    };
+    await page();
+    const alpha = pendingRow("Alpha words.");
+    const beta = pendingRow("Beta words.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Remove rule Alpha words." }));
+    expect(within(alpha).getByRole("group", { name: "Remove rule Alpha words.?" })).toBeInTheDocument();
+    expect(within(beta).queryByRole("group", { name: "Remove rule Beta words.?" })).toBeNull();
+  });
+
+  it("does not carry a failed provisional confirm's error to a different entity", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rules: [pendingRule("rule:pending-alpha", "Alpha words."), pendingRule("rule:pending-beta", "Beta words.")],
+    };
+    answers.khipu_route_rule = { ok: false, error: "Alpha was refused." };
+    await page();
+    const alpha = pendingRow("Alpha words.");
+    const beta = pendingRow("Beta words.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Confirm rule Alpha words." }));
+    fireEvent.click(within(within(alpha).getByRole("group", { name: "Confirm rule Alpha words.?" })).getByRole("button", { name: "Confirm rule Alpha words." }));
+    expect(await within(alpha).findByRole("alert")).toHaveTextContent("Alpha was refused.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(within(alpha).queryByRole("group", { name: "Confirm rule Alpha words.?" })).toBeNull());
+    fireEvent.click(within(beta).getByRole("button", { name: "Confirm rule Beta words." }));
+    expect(within(beta).queryByRole("alert")).toBeNull();
   });
 
   it("shows the date, source, seeded and watched marks", async () => {
@@ -836,9 +906,18 @@ describe("Settings -> Routing: standing rules", () => {
   });
 
   it("brings back a removed rule from Recent changes", async () => {
+    answers.khipu_route_view = () => {
+      const v = view();
+      if (calls("khipu_route_rule").some((call) => call.action === "restore"))
+        v.rules!.push({ n: 6, entity: "rule:restored-6", text: "Restored rule." });
+      return v;
+    };
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Bring back standing rule 6" }));
+    const restore = screen.getByRole("button", { name: "Bring back standing rule 6" });
+    restore.focus();
+    fireEvent.click(restore);
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "restore", n: 6 }]));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Remove rule 6" })));
   });
 });
 
