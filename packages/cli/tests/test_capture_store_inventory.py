@@ -42,7 +42,8 @@ NOT_CAPTURE = {
                      "session_capture._capture_now_lock", "session_capture._claim_lock",
                      "usage._open_lock", "discover._try_lock", "config.config_write_lock",
                      "accounts._declined_lock", "signin._lock", "work._view_lock",
-                     "routing_delivery._batch_owned_elsewhere", "routing_replication._sync_lock"), _LOCKS),
+                     "routing_delivery._batch_owned_elsewhere", "routing_replication._sync_lock",
+                     "routing_directions._store_lock"), _LOCKS),
     # Account discovery (9A): which login folders exist and when they were checked,
     # and a throwaway folder a status check runs in. Folder names and counts only.
     "identity.observe_checkout": "per checkout key: its root commit; a hash and the key, no capture text",
