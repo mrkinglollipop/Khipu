@@ -1085,8 +1085,8 @@ def run_graph_build() -> int:
         print(json.dumps(GRAPHIFY_NOT_INSTALLED))
         return 2
     rc = _run_script(script, log_stem="khipu-graph", state_name="graph_build")
-    if rc == 0:
-        _offsite_if_due()
+    # Snapshot protection is independent of embedding progress or failures.
+    _offsite_if_due()
     return rc
 
 

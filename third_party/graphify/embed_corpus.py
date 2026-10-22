@@ -409,6 +409,7 @@ def main() -> int:
             staged_db = Path(tmp_str)
             shutil.copyfile(str(args.db), str(staged_db))
             print(f"staged: {staged_db}\n")
+            crashed = False
             try:
                 rc = _run_main(args, staged_db, api_key)
             except Exception as exc:
@@ -416,10 +417,21 @@ def main() -> int:
                 # be usable even when a later batch crashes.
                 print(f"ERROR: graph embedding failed: {exc}", file=sys.stderr)
                 rc = 1
+                crashed = True
             if not args.dry_run:
                 # Publication validates a disposable sibling before replacement.
                 # Keep the worker stage if validation or publication fails.
                 preserve_stage = True
+                if crashed and (args.rebuild or
+                                _embedding_count(staged_db) < _embedding_count(args.db)):
+                    # A rebuild commits deletions before replacement batches.
+                    # Other destructive paths (such as pruning) can also lose
+                    # rows: only recover a crash without reducing live coverage.
+                    print("ERROR: crashed stage may remove live embeddings; "
+                          "publication skipped", file=sys.stderr)
+                    print(f"staged database retained for recovery at {staged_db}",
+                          file=sys.stderr)
+                    return rc
                 publish(staged_db, args.db)
                 preserve_stage = False
             return rc
@@ -433,10 +445,29 @@ def main() -> int:
             staged_db.unlink(missing_ok=True)
 
 
+def _embedding_count(database: Path) -> int:
+    conn = sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)
+    try:
+        return conn.execute('SELECT COUNT(*) FROM embeddings').fetchone()[0]
+    finally:
+        conn.close()
+
+
 def _run_main(args, staged_db: Path, api_key: Optional[str]) -> int:
     conn = sqlite3.connect(str(staged_db))
-    conn.row_factory = sqlite3.Row
+    try:
+        conn.row_factory = sqlite3.Row
+        return _run_main_connected(args, conn, api_key)
+    finally:
+        # Publish only committed batches, with no open transaction or journal
+        # left behind, including failures and the early-return paths below.
+        try:
+            conn.rollback()
+        finally:
+            conn.close()
 
+
+def _run_main_connected(args, conn: sqlite3.Connection, api_key: Optional[str]) -> int:
     if args.edges or args.prune_stale:
         rc_edges = 0
         if args.edges:
@@ -444,7 +475,6 @@ def _run_main(args, staged_db: Path, api_key: Optional[str]) -> int:
         rc_prune = 0
         if args.prune_stale:
             rc_prune = _run_prune_stale(conn, args.dry_run)
-        conn.close()
         return rc_edges or rc_prune
 
     # Select target nodes
@@ -568,8 +598,6 @@ def _run_main(args, staged_db: Path, api_key: Optional[str]) -> int:
         written += len(rows)
         print(f"  written {written} / {len(pending)} chunks "
               f"(seen {seen})")
-
-    conn.close()
 
     print()
     print("=== DONE ===")

@@ -286,7 +286,7 @@ def test_publication_preserves_database_mode(graph, tmp_path, mode):
     assert count(destination) == 1
 
 
-@pytest.mark.parametrize('corpus_rc,edges_rc', [(1, 0), (0, 7), (1, 7), (0, 3), (-1, 0), (0, 0)])
+@pytest.mark.parametrize('corpus_rc,edges_rc', [(1, 0), (0, 7), (1, 7), (0, 3), (1, 3), (-1, 0), (0, 0)])
 def test_nightly_embedding_failure_reaches_job_receipt(tmp_path, monkeypatch, capsys,
                                                      corpus_rc, edges_rc):
     import subprocess
@@ -308,7 +308,9 @@ def test_nightly_embedding_failure_reaches_job_receipt(tmp_path, monkeypatch, ca
                         subprocess.CompletedProcess(argv, g.main()))
     offsite = []
     monkeypatch.setattr(jobs, '_offsite_if_due', lambda: offsite.append(True))
-    expected = corpus_rc or edges_rc
+    # Edge rc=3 is deferred work, not failure; backup scheduling must remain
+    # independent of genuine embedding failures as well.
+    expected = corpus_rc or (edges_rc if edges_rc != 3 else 0)
     assert jobs.run_graph_build() == expected
     assert jobs._read_job_state('graph_build')['exit'] == expected
     assert steps == ['semantic extract', 'build graph', 'embed corpus', 'embed edges']
@@ -316,10 +318,45 @@ def test_nightly_embedding_failure_reaches_job_receipt(tmp_path, monkeypatch, ca
     if expected:
         assert 'nightly FAILED' in output
         for label, rc in [('embed corpus', corpus_rc), ('embed edges', edges_rc)]:
-            if rc:
+            if rc and not (label == 'embed edges' and rc == 3):
                 assert f'{label} rc={rc}' in output
         assert 'nightly complete' not in output
-        assert offsite == []
     else:
         assert 'nightly complete' in output
-        assert offsite == [True]
+    assert offsite == [True]
+    if edges_rc == 3:
+        assert 'edge-embed step deferred — will retry next run' in output
+
+
+@pytest.mark.parametrize("registry_exists", [False, True])
+def test_explicit_empty_sources_export_respects_registry(tmp_path, monkeypatch,
+                                                        registry_exists):
+    from khipu import sources
+    g = load("graphify_nightly")
+    resolved = tmp_path / "standalone" / "graph_sources.resolved.json"
+    resolved.parent.mkdir()
+    original = json.dumps({
+        "collectors": {key: False for key in sources.COLLECTOR_KEYS},
+        "code_roots": [],
+    })
+    resolved.write_text(original)
+    monkeypatch.setenv("KHIPU_GRAPH_SOURCES_RESOLVED", str(resolved))
+    monkeypatch.setenv("KHIPU_ROOT", str(GRAPH.parents[1]))
+    code = tmp_path / "code"
+    code.mkdir()
+    if registry_exists:
+        sources.save_sources({"schema_version": 2, "sources": [
+            {"id": "code:synthetic", "kind": "code_ast",
+             "root": str(code), "enabled": True}]})
+    exported = g._export_sources(g._khipu_env(os.environ.copy()))
+    if registry_exists:
+        assert exported == resolved
+        payload = json.loads(resolved.read_text())
+        assert payload["code_roots"] == [str(code)]
+        assert payload["collectors"]["code_ast"] is True
+        assert g._should_skip_build(resolved) == (False, "")
+    else:
+        assert exported is None
+        assert resolved.read_text() == original
+        assert not sources.sources_file().exists()
+        assert g._should_skip_build(resolved) == (True, "no_sources")

@@ -114,6 +114,28 @@ def _export_sources(env: dict[str, str]) -> Path | None:
     if root is None:
         return None
     log("step: export graph sources")
+    # A standalone resolved file can be the only source configuration.  With
+    # no registry, exporting defaults would reactivate its disabled collectors.
+    # A real registry still wins over a stale empty cache, so check it before
+    # deciding to preserve the explicitly selected file.
+    explicit = (env.get("KHIPU_GRAPH_SOURCES_RESOLVED") or "").strip()
+    if explicit and _should_skip_build(Path(explicit)) == (True, "no_sources"):
+        try:
+            probe = subprocess.run(
+                [sys.executable, "-c",
+                 "from khipu.sources import sources_file; "
+                 "raise SystemExit(0 if sources_file().exists() else 3)"],
+                env=env, capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log(f"  source registry check failed (non-fatal): {exc}")
+            return None
+        if probe.returncode == 3:
+            log("  keeping explicit empty sources — no source registry exists")
+            return None
+        if probe.returncode != 0:
+            log(f"  source registry check rc={probe.returncode} — keeping resolved file")
+            return None
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "khipu.cli", "sources", "export"],
@@ -218,7 +240,7 @@ def main() -> int:
         args=["--edges", "--prune-stale-edges"],
         env=khipu_env,
     )
-    if rc != 0:
+    if rc not in (0, 3):
         embed_failures.append(("embed edges", rc))
     if rc == 3:
         log("  edge-embed step deferred — will retry next run")

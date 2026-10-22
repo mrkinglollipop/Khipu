@@ -1700,8 +1700,22 @@ def rollback() -> dict[str, Any]:
             return record({**entry, "ok": False,
                            "error": f"no commit is recorded as having been live in {target.name}; "
                                     "nothing known-good to roll back to"})
-        integrity = _git(["status", "--porcelain", "--untracked-files=all"], cwd=target)
-        if integrity.returncode != 0 or integrity.stdout.strip():
+        integrity = _git(["status", "--porcelain", "-z", "--untracked-files=all"], cwd=target)
+        dirty = integrity.stdout
+        # _prepare_slot provisions this one untracked link for the launchers.
+        # Accept it only when it still points to this repository's shared libs;
+        # other links, real directories, and all code changes remain dirty.
+        if integrity.returncode == 0 and dirty == "?? .python_libs\0":
+            common = _git_out(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=target)
+            if common and Path(common).name == ".git":
+                libs = target / ".python_libs"
+                expected = Path(common).parent / ".python_libs"
+                try:
+                    if libs.is_symlink() and expected.is_dir() and libs.resolve() == expected.resolve():
+                        dirty = ""
+                except (OSError, RuntimeError):
+                    pass
+        if integrity.returncode != 0 or dirty:
             return record({**entry, "ok": False,
                            "error": f"dirty or unreadable rollback target {target.name}; refusing to activate it"})
         if _head(target) != known:
