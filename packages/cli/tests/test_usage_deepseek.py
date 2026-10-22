@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from khipu import routing_providers, usage
+from khipu import config, routing, routing_providers, usage
 
 KEY = "SENTINEL-deepseek-key-0123456789abcdef.do-not-leak"
 # Wednesday; the week began Monday 2026-10-19 00:00Z.
@@ -49,7 +49,6 @@ def ds(monkeypatch, tmp_path):
         reply = _Response(_body("30.00"))
         error = None
         now = WED
-        cap = None
         history = tmp_path / "state" / "deepseek-balance.json"
 
     def urlopen(request, timeout=None):
@@ -60,7 +59,6 @@ def ds(monkeypatch, tmp_path):
 
     monkeypatch.setattr(usage, "_deepseek_key", lambda: KEY)
     monkeypatch.setattr(usage, "deepseek_history_file", lambda: D.history)
-    monkeypatch.setattr(usage, "_deepseek_cap_usd", lambda: D.cap)
     monkeypatch.setattr(usage, "_now", lambda: D.now)
     monkeypatch.setattr("urllib.request.urlopen", urlopen)
     D.seen = seen
@@ -90,7 +88,7 @@ def test_decreases_sum_to_weekly_spend(ds):
     _read(ds, "27.50", _at(20, 8))
     row = _read(ds, "24.00", _at(21, 8))
     assert row["ok"] is True
-    assert row["spend"]["week_usd"] == 6.0
+    assert row["spend"]["last_7d_usd"] == 6.0
     assert row["spend"]["balance_usd"] == 24.0
 
 
@@ -99,31 +97,88 @@ def test_a_top_up_mid_week_is_not_spend_and_never_negative(ds):
     _read(ds, "8.00", _at(20, 8))
     _read(ds, "58.00", _at(20, 9))  # topped up by 50
     row = _read(ds, "55.00", _at(21, 8))
-    assert row["spend"]["week_usd"] == 5.0  # 2 + 3, the +50 ignored
-    assert row["spend"]["week_usd"] >= 0
+    assert row["spend"]["last_7d_usd"] == 5.0  # 2 + 3, the +50 ignored
+    assert row["spend"]["last_7d_usd"] >= 0
 
 
-def test_week_rollover_resets_spend(ds):
-    _read(ds, "30.00", _at(15, 8))
-    _read(ds, "20.00", _at(16, 8))
-    row = _read(ds, "20.00", _at(19, 8))  # Monday, nothing spent since
-    assert row["spend"]["week_usd"] == 0.0
-    row = _read(ds, "19.00", _at(20, 8))
-    assert row["spend"]["week_usd"] == 1.0
+def test_spend_is_rolling_seven_days_not_since_monday(ds):
+    _read(ds, "30.00", _at(15, 8))   # last week
+    _read(ds, "20.00", _at(16, 8))   # -10, Friday 16th
+    row = _read(ds, "19.00", _at(21, 8))  # -1, Wednesday 21st
+    assert row["spend"]["last_7d_usd"] == 11.0  # the 16th is inside 7 days
+    row = _read(ds, "18.00", _at(24, 9))  # -1; the 16th and 21st-8am: 16th is out
+    assert row["spend"]["last_7d_usd"] == 2.0
 
 
-def test_cap_gives_a_weekly_window_with_used_pct(ds):
-    ds.cap = 35.0
-    _read(ds, "40.00", _at(19, 8))
-    row = _read(ds, "22.50", _at(20, 8))
-    window = next(w for w in row["windows"] if w["name"] == "weekly")
-    assert window["used_pct"] == 50.0 and window["window_mins"] == 10080
-    assert window["resets_at"] == usage._iso(datetime(2026, 10, 26, tzinfo=timezone.utc).timestamp())
-
-
-def test_no_cap_means_no_percentage_window(ds):
+def test_reader_row_has_no_window_or_cap_of_its_own(ds):
     row = _read(ds, "30.00")
     assert row["ok"] is True and row["windows"] == []
+    assert "cap_usd" not in row["spend"]
+
+
+def test_the_cap_setting_is_gone(ds):
+    assert not hasattr(usage, "_deepseek_cap_usd")
+    assert "deepseek_weekly_cap_usd" not in open(usage.__file__).read()
+    assert "deepseek_weekly_cap_usd" not in open(config.__file__).read()
+
+
+def _entry(cap=True, harness="deepseek"):
+    caps = [{"kind": "spend", "usd": 35.0, "days": 7, "revision": 1, "window": None, "purpose": "job"}] if cap else []
+    return {"key": "deepseek|acct", "label": "DeepSeek", "harness": harness, "caps": caps}
+
+
+def _history(ds, pairs):
+    ds.history.parent.mkdir(parents=True, exist_ok=True)
+    ds.history.write_text(json.dumps({"samples": [[t.timestamp(), b] for t, b in pairs]}))
+
+
+def test_used_pct_comes_from_the_routing_spend_cap(ds):
+    # tracked since before the window, 17.5 spent in the last 7 days
+    _history(ds, [(_at(10, 8), 60.0), (_at(19, 8), 40.0), (_at(21, 8), 22.5)])
+    ds.now = _at(21, 12)
+    (status,) = routing.cap_statuses({}, _entry(), ds.now)
+    assert status["kind"] == "spend" and status["cap_usd"] == 35.0 and status["days"] == 7
+    assert status["usd"] == 37.5 and status["used_pct"] == round(37.5 / 35 * 100, 1)
+    assert status["verdict"] == "over"
+
+
+def test_cap_window_is_rolling_days(ds):
+    _history(ds, [(_at(5, 8), 100.0), (_at(8, 8), 60.0), (_at(14, 8), 50.0), (_at(20, 8), 40.0), (_at(21, 8), 40.0)])
+    ds.now = _at(21, 12)  # window starts the 14th 12:00; the 14th 08:00 pair is out
+    (status,) = routing.cap_statuses({}, _entry(), ds.now)
+    assert status["usd"] == 10.0 and status["verdict"] == "under"
+
+
+def test_no_spend_cap_means_dollars_only(ds):
+    _history(ds, [(_at(10, 8), 60.0), (_at(20, 8), 40.0)])
+    ds.now = _at(21, 12)
+    assert routing.cap_statuses({}, _entry(cap=False), ds.now) == []
+    row = _read(ds, "39.00")
+    assert row["spend"]["last_7d_usd"] == 21.0 and row["windows"] == []
+
+
+def test_history_younger_than_the_window_is_unknown_unless_already_over(ds):
+    _history(ds, [(_at(20, 8), 40.0), (_at(21, 8), 38.0)])
+    ds.now = _at(21, 12)
+    (status,) = routing.cap_statuses({}, _entry(), ds.now)
+    assert status["verdict"] == "unknown" and status["usd"] is None and status["used_pct"] is None
+    _history(ds, [(_at(20, 8), 80.0), (_at(21, 8), 40.0)])
+    (status,) = routing.cap_statuses({}, _entry(), ds.now)
+    assert status["verdict"] == "over" and status["usd"] == 40.0
+
+
+def test_a_stale_last_read_is_unknown(ds):
+    _history(ds, [(_at(5, 8), 100.0), (_at(14, 8), 50.0), (_at(15, 8), 40.0)])
+    ds.now = _at(21, 12)
+    (status,) = routing.cap_statuses({}, _entry(), ds.now)
+    assert status["verdict"] == "unknown" and status["usd"] is None
+
+
+def test_other_accounts_spend_caps_are_untouched(ds):
+    _history(ds, [(_at(5, 8), 100.0), (_at(20, 8), 40.0)])
+    ds.now = _at(21, 12)
+    (status,) = routing.cap_statuses({}, _entry(harness="glm"), ds.now)
+    assert status["verdict"] == "unknown" and "used_pct" not in status
 
 
 @pytest.mark.parametrize("fail", ["http500", "badjson", "timeout", "401"])

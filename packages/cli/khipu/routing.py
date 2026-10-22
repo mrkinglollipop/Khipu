@@ -5713,8 +5713,17 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
                 streams = _telemetry_streams(view)
             total = routing_sources.spend_total(streams, entry["key"],
                                                 now - timedelta(days=cap["days"]), now)
+            extra = {}
+            if entry.get("harness") == "deepseek" and total.get("status") != "known":
+                # DeepSeek has no runner telemetry of its own to cover: its spend
+                # is the decreases in the balance Khipu reads, over the cap's window.
+                from khipu import usage
+
+                total = usage.deepseek_spend_total(now, cap["days"], cap["usd"])
+                extra["used_pct"] = (round(total["usd"] / cap["usd"] * 100, 1)
+                                     if total.get("usd") is not None else None)
             out.append({**base, "cap_usd": cap.get("usd"), "days": cap.get("days"),
-                        "usd": total.get("usd"), "events": total.get("events"),
+                        "usd": total.get("usd"), "events": total.get("events"), **extra,
                         "verdict": routing_pace.spend_verdict(total, cap["usd"]),
                         "why": total.get("reason")})
         elif kind == "concurrency":

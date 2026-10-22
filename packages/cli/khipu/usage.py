@@ -1469,8 +1469,8 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
 # ---- DeepSeek (balance, weekly spend) -------------------------------------------
 #
 # DeepSeek has no plan window: GET /user/balance answers the account's prepaid
-# balance. Weekly spend is the sum of balance decreases Khipu has seen since
-# Monday 00:00Z; an increase is a top-up, never spend. The key is read into a
+# balance. Spend is the sum of balance decreases Khipu has seen within
+# the window asked for; an increase is a top-up, never spend. The key is read into a
 # local, goes only into the Authorization header to api.deepseek.com, and never
 # reaches a row, the history file, a log or an error. The history holds
 # (time, balance) pairs only.
@@ -1489,21 +1489,6 @@ def deepseek_history_file() -> Path:
     from khipu.paths import data_dir
 
     return data_dir() / "state" / DEEPSEEK_HISTORY_NAME
-
-
-def _deepseek_cap_usd() -> float | None:
-    """The owner's weekly dollar cap on the DeepSeek account, from the
-    ``deepseek_weekly_cap_usd`` setting; None (no percentage) when unset."""
-    try:
-        from khipu.config import load_config
-
-        value = load_config().get("deepseek_weekly_cap_usd")
-    except Exception:  # noqa: BLE001 - no readable config means no cap
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
-            or not 0 < value <= 1e9:
-        return None
-    return float(value)
 
 
 def deepseek_accounts(definitions: dict) -> list[dict]:
@@ -1565,11 +1550,6 @@ def parse_deepseek(status: int, body: bytes) -> float:
     return round(total, 4)
 
 
-def _week_start(now: datetime) -> datetime:
-    day = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    return day - timedelta(days=day.weekday())
-
-
 def _deepseek_samples() -> list[list[float]]:
     try:
         data = json.loads(deepseek_history_file().read_text(encoding="utf-8"))
@@ -1602,21 +1582,44 @@ def _deepseek_store(samples: list[list[float]], now: datetime) -> None:
                 tmp.unlink()
 
 
-def deepseek_week_spend(samples: list[list[float]], now: datetime) -> float:
-    """Sum of balance decreases whose later sample falls in the current week;
+def deepseek_spend(samples: list[list[float]], start: datetime) -> float:
+    """Sum of balance decreases whose later sample is at or after ``start``;
     an increase (a top-up) adds nothing, so spend is never negative."""
-    start = _week_start(now).timestamp()
     spent = 0.0
     for (_t0, b0), (t1, b1) in zip(samples, samples[1:]):
-        if t1 >= start and b1 < b0:
+        if t1 >= start.timestamp() and b1 < b0:
             spent += b0 - b1
     return round(spent, 4)
 
 
+DEEPSEEK_FRESH_S = 86400
+
+
+def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = None) -> dict:
+    """The routing record's spend-cap read of DeepSeek over the rolling
+    ``days`` ending ``now`` (the shape of ``routing_sources.spend_total``).
+    Unknown, with no figure, when the last balance read is more than a day
+    old, or when Khipu has tracked the balance for less than the window and
+    the partial figure is still under ``cap_usd`` (it could be understated);
+    a partial figure already at the cap is known."""
+    samples = _deepseek_samples()
+    start = now - timedelta(days=days)
+    base = {"from": _iso(start.timestamp()), "to": _iso(now.timestamp())}
+    if not samples:
+        return {**base, "status": "unknown", "usd": None, "reason": "no DeepSeek balance read yet"}
+    if now.timestamp() - samples[-1][0] > DEEPSEEK_FRESH_S:
+        return {**base, "status": "unknown", "usd": None, "reason": "DeepSeek's balance has not been read lately"}
+    usd = deepseek_spend(samples, start)
+    if samples[0][0] > start.timestamp() and not (cap_usd is not None and usd >= cap_usd):
+        return {**base, "status": "unknown", "usd": None,
+                "reason": f"Khipu has read DeepSeek's balance only since {_iso(samples[0][0])}"}
+    return {**base, "status": "known", "usd": round(usd, 2), "events": None, "reason": None}
+
+
 @_guard
 def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
-    """Weekly spend (and, with a dollar cap, the share of it used) from
-    DeepSeek's balance. A failed read raises before any sample is stored, so
+    """Rolling 7-day spend in dollars from DeepSeek's balance; the cap and
+    its used share are the routing record's (``cap_statuses``). A failed read raises before any sample is stored, so
     it can only ever be unknown, never zero spent."""
     key = _deepseek_key()
     if not key:
@@ -1630,16 +1633,9 @@ def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
     samples = _deepseek_samples()
     samples.append([now.timestamp(), balance])
     _deepseek_store(samples, now)
-    spent = deepseek_week_spend(samples, now)
-    reset = _week_start(now) + timedelta(days=7)
-    spend = {"week_usd": spent, "balance_usd": balance, "since": _iso(samples[0][0]),
-             "week_started": _iso(_week_start(now).timestamp())}
-    windows = []
-    cap = _deepseek_cap_usd()
-    if cap:
-        spend["cap_usd"] = cap
-        windows.append(_window("weekly", round(spent / cap * 100, 1), reset.timestamp(), 10080, spend_usd=spent))
-    return {"ok": True, "plan": None, "windows": windows, "credits": None, "version": None,
+    spend = {"last_7d_usd": deepseek_spend(samples, now - timedelta(days=7)), "balance_usd": balance,
+             "since": _iso(samples[0][0])}
+    return {"ok": True, "plan": None, "windows": [], "credits": None, "version": None,
             "source": "live", "spend": spend}
 
 
