@@ -68,6 +68,9 @@ class PullCursor(FakeCursor):
             else:
                 raise AssertionError(sql)
         elif table == "topics":
+            if sql == "SELECT slug FROM topics WHERE slug = ANY(%s)":
+                self._rows = [(r["slug"],) for r in self.hub.topics if r["slug"] in params[0]]
+                return
             if "WHERE updated_at > %s" not in sql:
                 raise AssertionError(sql)
             rows = sorted([dict(t) for t in self.hub.topics
@@ -408,6 +411,7 @@ EPISODE_WRITERS = {
 }
 # The same for replica vectors and replica commitments.
 VECTOR_WRITERS = {
+    ("hub_snapshot.py", "_write_pulled_tables"): "remote topic purges use the refresh lock and read_at protection",
     ("hub_snapshot.py", "upsert_embeddings"): "the rule itself, per (profile, kind, ref): pull and catch-up land here",
     ("hub_snapshot.py", "_upsert_episode_unfenced"): "the rule itself, per profile, with the episode row",
     ("hub_snapshot.py", "_insert_memory_embeddings"): "the dump into a fresh file; refresh records its read floor",
@@ -417,6 +421,7 @@ VECTOR_WRITERS = {
     ("hub_snapshot.py", "purge_topic_in_snapshot"): "a topic purge, which always lands",
 }
 COMMITMENT_WRITERS = {
+    ("hub_snapshot.py", "_scrub_forgotten"): "a forget always lands before replica publication",
     ("hub_snapshot.py", "_write_pulled_tables"): "the rule itself, for the whole table: the pull lands here",
     ("hub_snapshot.py", "_write_commitment_rows"): "the row writer shared by the dump and _write_pulled_tables only",
 }
