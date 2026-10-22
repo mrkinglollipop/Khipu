@@ -765,7 +765,8 @@ def list_links(cur, *, state: str | None = None, project: str | None = None,
         return []
     if state is not None and state not in VALID_LINK_STATES:
         raise ValueError(f"state must be one of {VALID_LINK_STATES}")
-    clauses: list[str] = []
+    clauses = [clause for table in ("o", "n")
+               if (clause := _not_forgotten_clause(cur, table))]
     params: list[Any] = []
     if state:
         clauses.append("l.state = %s")

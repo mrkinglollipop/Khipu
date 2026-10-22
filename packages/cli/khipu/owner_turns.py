@@ -688,40 +688,63 @@ def _brief_keys(rows: list[dict]) -> set[str]:
     return keys
 
 
-def forget_sessions(sessions) -> dict:
-    """Forget's owner words scan on the turn files: delete every recorded
-    turn of these sessions (their files whole, whatever a crash left in
-    them, and their lines in any other file) and the briefs they gave or
-    were. Rewrite temps are ``owner_files.clean_temps``'s. Raises OSError
-    when a file can't be read or changed, so the forget stays open."""
+class ForgetCleanupError(OSError):
+    """Completed independent scrubs, with safe step labels and partial counts."""
+
+    def __init__(self, errors: list[str], removed: dict):
+        super().__init__("; ".join(errors))
+        self.errors = errors
+        self.removed = removed
+
+
+def forget_sessions(sessions, *, protected_sessions=()) -> dict:
+    """Remove session turns, counters, directions and briefs independently.
+
+    A failure in one file must not block another scrub. Report all failures
+    after attempting every step so forget stays incomplete. Words belonging
+    to a separate live episode are retained, including shared brief text.
+    """
     names = {n for n in sessions if n}
+    protected = set(protected_sessions)
+    names -= protected
     out = {"files": 0, "lines": 0, "briefs": 0}
-    d = folder()
-    if not names or not d.exists():
+    if not names:
         return out
+    errors = []
+
+    def attempt(label, action):
+        try:
+            action()
+        except Exception as err:  # noqa: BLE001 - finish the independent scrubs before raising
+            errors.append(f"{label}: {type(err).__name__}")
+
+    d = folder()
     files = {session_file(n).name for n in names}
-    # scandir, not glob: a folder that can't be listed must raise, never
-    # look empty.
-    with os.scandir(d) as entries:
-        listed = sorted(e.name for e in entries)
+    protected_files = {session_file(n).name for n in protected}
     texts: set[str] = set()
-    for name in listed:
+    listed = []
+    try:
+        # scandir must report an unreadable folder, rather than look empty.
+        with os.scandir(d) as entries:
+            listed = sorted(e.name for e in entries)
+    except FileNotFoundError:
+        pass
+    except Exception as err:  # noqa: BLE001
+        errors.append(f"turn directory: {type(err).__name__}")
+
+    def scrub_turn(name):
         path = d / name
-        if name == "briefs.jsonl" or not name.endswith(".jsonl"):
-            continue
-        path.read_text(encoding="utf-8")  # unreadable raises
+        path.read_text(encoding="utf-8")  # _read_lines alone hides read errors
         rows = _read_lines(path)
-        if path.name in files:
-            # The session's own file goes whole: a line a crash cut short
-            # holds the words too, though it reads as no turn.
-            texts |= _brief_keys(rows)
+        if name in files:
+            texts.update(_brief_keys(rows))
             path.unlink()
             out["files"] += 1
-            continue
+            return
         mine = [r for r in rows if r.get("session") in names]
         if not mine:
-            continue
-        texts |= _brief_keys(mine)
+            return
+        texts.update(_brief_keys(mine))
         kept = [r for r in rows if r not in mine]
         if kept:
             _write_private(path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
@@ -729,23 +752,38 @@ def forget_sessions(sessions) -> dict:
         else:
             path.unlink()
             out["files"] += 1
-    for name in names:
-        # The occurrence counter and any routing directions go with the
-        # session's episodes: only forget-for-good removes them.
-        occurrence_file(name).unlink(missing_ok=True)
-        _high_water_file(name).unlink(missing_ok=True)
-    try:
+
+    for name in listed:
+        if name != "briefs.jsonl" and name.endswith(".jsonl") and name not in protected_files:
+            attempt("turn file", lambda: scrub_turn(name))
+    for name in sorted(names):
+        for counter in (occurrence_file(name), _high_water_file(name)):
+            attempt("session counter", lambda: counter.unlink(missing_ok=True))
+
+    def scrub_directions():
         from khipu import routing_directions
 
         routing_directions.forget_sessions(names)
-    except Exception:  # noqa: BLE001 - the turn files above are the scan's core
-        pass
-    briefs = d / "briefs.jsonl"
-    rows = _read_lines(briefs)
-    kept = [b for b in rows if b.get("parent") not in names and b.get("sha") not in texts]
-    if len(kept) != len(rows) or any("head" in b for b in kept):
-        _write_private(briefs, "".join(json.dumps(_no_text(b)) + "\n" for b in kept))
-        out["briefs"] = len(rows) - len(kept)
+
+    attempt("routing directions", scrub_directions)
+
+    def scrub_briefs():
+        briefs = d / "briefs.jsonl"
+        try:
+            briefs.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return
+        rows = _read_lines(briefs)
+        kept = [b for b in rows if b.get("parent") in protected
+                or (b.get("parent") not in names and b.get("sha") not in texts)]
+        if len(kept) != len(rows) or any("head" in b and b.get("parent") not in protected for b in kept):
+            _write_private(briefs, "".join(json.dumps(b if b.get("parent") in protected else _no_text(b))
+                                          + "\n" for b in kept))
+            out["briefs"] = len(rows) - len(kept)
+
+    attempt("briefs", scrub_briefs)
+    if errors:
+        raise ForgetCleanupError(errors, out)
     return out
 
 

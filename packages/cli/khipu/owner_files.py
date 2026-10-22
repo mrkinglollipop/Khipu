@@ -104,7 +104,7 @@ def _names_one(path: Path, sessions: set[str]) -> bool | None:
     return any(s and s in text for s in sessions)
 
 
-def clean_temps(sessions=None, now: float | None = None) -> dict:
+def clean_temps(sessions=None, now: float | None = None, *, protected_sessions=()) -> dict:
     """Remove the rewrite temps (and unknown files) a crash left: every one
     older than ``TEMP_STALE_S``, and, for a forget (``sessions``), any that
     names one of the sessions or can't be read. A fresh one that names none
@@ -124,6 +124,11 @@ def clean_temps(sessions=None, now: float | None = None) -> dict:
         try:
             age = now - path.stat().st_mtime
         except FileNotFoundError:
+            continue
+        # An old temp may still be a separate live episode's only words.
+        # Unknown provenance is retained when any shared session is protected.
+        if protected_sessions and _names_one(path, protected_sessions) is not False:
+            out["left"] += 1
             continue
         stale = age >= TEMP_STALE_S
         if not stale and names:
