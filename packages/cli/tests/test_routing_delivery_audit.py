@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import multiprocessing
+import os
 import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -13,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from khipu import db, owner_act, owner_direction, owner_turns, routing as r
+from khipu import db, forget, owner_act, owner_direction, owner_files, owner_turns, routing as r
 from khipu import routing_advice as ra, routing_delivery as rd
 from khipu import routing_directions as directions, routing_gateway_copy as gc
 from khipu import routing_replication
@@ -216,6 +217,43 @@ def seed_direction(monkeypatch, text="Use Codex for builds."):
     return row
 
 
+@pytest.mark.parametrize("stale", [False, True])
+def test_routing_direction_lock_does_not_keep_forget_open_or_get_cleaned(monkeypatch, stale):
+    row = seed_direction(monkeypatch)
+    lock = directions.store_path().with_suffix(".lock")
+    assert lock.read_bytes() == b""
+    inode = lock.stat().st_ino
+    if stale:
+        at = lock.stat().st_mtime - owner_files.TEMP_STALE_S - 1
+        os.utime(lock, (at, at))
+
+    result = forget._owner_words_scan(row["session"], gateway=False)
+
+    assert result["ok"], result
+    assert directions.directions() == []
+    assert owner_files.kind_of(lock) == "lock"
+    assert lock.stat().st_ino == inode
+    assert owner_files.clean_temps(
+        [row["session"]], now=lock.stat().st_mtime + owner_files.TEMP_STALE_S + 1
+    ) == {"removed": 0, "left": 0}
+    assert lock.stat().st_ino == inode
+
+
+@pytest.mark.parametrize("name", ["routing-directions.other.lock", ".routing-directions.lock.tmp"])
+def test_routing_direction_lock_exception_does_not_exempt_unknown_files(monkeypatch, name):
+    row = seed_direction(monkeypatch)
+    other = owner_turns.folder() / name
+    other.write_text("unattributed synthetic owner words")
+    at = other.stat().st_mtime
+
+    assert owner_files.clean_temps([row["session"]], now=at) == {"removed": 0, "left": 1}
+    assert other.exists()
+    assert owner_files.clean_temps(
+        [row["session"]], now=at + owner_files.TEMP_STALE_S + 1
+    ) == {"removed": 1, "left": 0}
+    assert not other.exists()
+
+
 @pytest.mark.parametrize("operation", ["refresh", "capture"])
 def test_routing_direction_dismissal_survives_concurrent_writer(monkeypatch, operation):
     row = seed_direction(monkeypatch)
@@ -275,6 +313,12 @@ def test_routing_direction_dismissal_survives_process_writer(monkeypatch, operat
     writer.start()
     try:
         assert saving.wait(5)
+        lock = directions.store_path().with_suffix(".lock")
+        inode = lock.stat().st_ino
+        assert owner_files.clean_temps(
+            ["fake-session"], now=lock.stat().st_mtime + owner_files.TEMP_STALE_S + 1
+        ) == {"removed": 0, "left": 0}
+        assert lock.stat().st_ino == inode
         owner.start()
         assert attempting.wait(5)
         # The independent process must wait for the writer's entire
