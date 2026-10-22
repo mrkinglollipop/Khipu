@@ -400,6 +400,130 @@ describe("Settings -> Routing: the note", () => {
 });
 
 describe("Settings -> Routing: standing rules", () => {
+  const pendingRule = (entity: string, text: string) => ({
+    n: null as unknown as number,
+    number_pending: true,
+    entity,
+    text,
+    pending: true,
+    pending_kind: "added" as const,
+    pending_by: "a Codex conversation",
+  });
+
+  const pendingRow = (text: string) =>
+    screen.getByText(text, { selector: ".route-rule .row-main" }).closest<HTMLElement>(".route-rule")!;
+
+  it("targets a provisional rule by its stable entity and asks end-or-keep for an ordinary add", async () => {
+    const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:pending-1", text: "Keep reviews local.",
+      pending: true, pending_kind: "added" as const, pending_by: "a Codex conversation" };
+    answers.khipu_route_view = { ...view(), rules: [provisional] };
+    answers.khipu_route_rule = (args) => args?.holds
+      ? { ok: true }
+      : { ok: false, error: "say end or keep in holds for: h1" };
+    await page();
+
+    // The stable entity is the write target; the accessible name stays in
+    // owner-readable rule words while its display number is pending.
+    fireEvent.click(screen.getByRole("button", { name: "Confirm rule Keep reviews local." }));
+    const provisionalRow = screen.getByText("Keep reviews local.").closest<HTMLElement>(".route-rule")!;
+    expect(within(provisionalRow).queryAllByRole("button", { name: /null/i })).toHaveLength(0);
+    const confirm = await screen.findByRole("group", { name: "Confirm rule Keep reviews local.?" });
+    fireEvent.click(within(confirm).getByRole("button", { name: "Confirm rule Keep reviews local." }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:pending-1" });
+    fireEvent.click(screen.getByRole("radio", { name: "End the hold now" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:pending-1", holds: { h1: "end" } }));
+
+    fireEvent.change(screen.getByLabelText("New rule"), { target: { value: "Use the review lane." } });
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add the rule" }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    fireEvent.click(screen.getByRole("radio", { name: "End the hold now" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => {
+      const writes = calls("khipu_route_rule");
+      expect(writes[writes.length - 1]).toEqual({ action: "add", text: "Use the review lane.", holds: { h1: "end" } });
+    });
+  });
+
+  it("confirms a provisional proposal by entity, including its hold retry", async () => {
+    const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:proposal-1", text: "Keep the fix local.",
+      pending: true, pending_kind: "added" as const, pending_by: "a Codex conversation" };
+    answers.khipu_route_view = {
+      ...view(), rules: [provisional], proposals: {
+        p1: { id: "p1", entity: "rule:proposal-1", kind: "rule", n: null, status: "live" },
+      },
+    };
+    answers.khipu_route_rule = (args) => args?.holds
+      ? { ok: true }
+      : { ok: false, error: "say end or keep in holds for: h1" };
+    await page();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm the proposed a rule" }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:proposal-1" });
+    fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and confirm" }));
+    await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:proposal-1", holds: { h1: "keep" } }));
+  });
+
+  it("opens Confirm for only the selected unnumbered provisional rule", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rules: [pendingRule("rule:pending-alpha", "Alpha words."), pendingRule("rule:pending-beta", "Beta words.")],
+    };
+    await page();
+    const alpha = pendingRow("Alpha words.");
+    const beta = pendingRow("Beta words.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Confirm rule Alpha words." }));
+    expect(within(alpha).getByRole("group", { name: "Confirm rule Alpha words.?" })).toBeInTheDocument();
+    expect(within(beta).queryByRole("group", { name: "Confirm rule Beta words.?" })).toBeNull();
+  });
+
+  it("opens Edit for only the selected unnumbered provisional rule", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rules: [pendingRule("rule:pending-alpha", "Alpha words."), pendingRule("rule:pending-beta", "Beta words.")],
+    };
+    await page();
+    const alpha = pendingRow("Alpha words.");
+    const beta = pendingRow("Beta words.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Edit rule Alpha words." }));
+    expect(within(alpha).getByRole("form", { name: "Edit rule Alpha words." })).toBeInTheDocument();
+    expect(within(beta).queryByRole("form", { name: "Edit rule Beta words." })).toBeNull();
+  });
+
+  it("opens Remove for only the selected unnumbered provisional rule", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rules: [pendingRule("rule:pending-alpha", "Alpha words."), pendingRule("rule:pending-beta", "Beta words.")],
+    };
+    await page();
+    const alpha = pendingRow("Alpha words.");
+    const beta = pendingRow("Beta words.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Remove rule Alpha words." }));
+    expect(within(alpha).getByRole("group", { name: "Remove rule Alpha words.?" })).toBeInTheDocument();
+    expect(within(beta).queryByRole("group", { name: "Remove rule Beta words.?" })).toBeNull();
+  });
+
+  it("does not carry a failed provisional confirm's error to a different entity", async () => {
+    answers.khipu_route_view = {
+      ...view(),
+      rules: [pendingRule("rule:pending-alpha", "Alpha words."), pendingRule("rule:pending-beta", "Beta words.")],
+    };
+    answers.khipu_route_rule = { ok: false, error: "Alpha was refused." };
+    await page();
+    const alpha = pendingRow("Alpha words.");
+    const beta = pendingRow("Beta words.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Confirm rule Alpha words." }));
+    fireEvent.click(within(within(alpha).getByRole("group", { name: "Confirm rule Alpha words.?" })).getByRole("button", { name: "Confirm rule Alpha words." }));
+    expect(await within(alpha).findByRole("alert")).toHaveTextContent("Alpha was refused.");
+    fireEvent.click(within(alpha).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(within(alpha).queryByRole("group", { name: "Confirm rule Alpha words.?" })).toBeNull());
+    fireEvent.click(within(beta).getByRole("button", { name: "Confirm rule Beta words." }));
+    expect(within(beta).queryByRole("alert")).toBeNull();
+  });
+
   it("shows the date, source, seeded and watched marks", async () => {
     await page();
     const three = row("Standing rules", "3.");
@@ -713,6 +837,30 @@ describe("Settings -> Routing: standing rules", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("there is no standing rule 3");
   });
 
+  it("asks end-or-keep before ordinary edits and restores", async () => {
+    answers.khipu_route_rule = (args) => args?.holds
+      ? { ok: true }
+      : { ok: false, error: "say end or keep in holds for: h1" };
+    await page();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit rule 3" }));
+    fireEvent.change(screen.getByLabelText("Rule 3"), { target: { value: "Never a fast tier, ever." } });
+    fireEvent.click(screen.getByRole("button", { name: "Save…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change rule 3" }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save rule" }));
+    await waitFor(() => expect(calls("khipu_route_rule")).toContainEqual({
+      action: "edit", n: 3, text: "Never a fast tier, ever.", holds: { h1: "keep" },
+    }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Bring back standing rule 6" }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    fireEvent.click(screen.getByRole("radio", { name: "End the hold now" }));
+    fireEvent.click(screen.getByRole("button", { name: "Restore rule" }));
+    await waitFor(() => expect(calls("khipu_route_rule")).toContainEqual({ action: "restore", n: 6, holds: { h1: "end" } }));
+  });
+
   it("removes a rule after asking and offers Undo", async () => {
     let removed = false;
     answers.khipu_route_rule = (args) => {
@@ -737,6 +885,39 @@ describe("Settings -> Routing: standing rules", () => {
     );
   });
 
+  it("removes a provisional rule by entity and restores it by entity", async () => {
+    const provisional = {
+      n: null as unknown as number,
+      number_pending: true,
+      entity: "rule:provisional-undo",
+      text: "Keep the fix local.",
+    };
+    let removed = false;
+    answers.khipu_route_rule = (args) => {
+      if (args?.action === "retire") removed = true;
+      if (args?.action === "restore") removed = false;
+      return { ok: true };
+    };
+    answers.khipu_route_view = () => ({
+      ...view(),
+      rules: removed ? [] : [provisional],
+    });
+    await page();
+    fireEvent.click(screen.getByRole("button", { name: "Remove rule Keep the fix local." }));
+    fireEvent.click(within(await screen.findByRole("group", { name: "Remove rule Keep the fix local.?" })).getByRole("button", { name: "Remove rule Keep the fix local." }));
+    expect(await screen.findByText("Rule Keep the fix local. removed.")).toBeInTheDocument();
+    expect(screen.queryByText("Rule  removed.")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    await waitFor(() =>
+      expect(calls("khipu_route_rule")).toEqual([
+        { action: "retire", entity: "rule:provisional-undo" },
+        { action: "restore", entity: "rule:provisional-undo" },
+      ]),
+    );
+    expect(await screen.findByRole("button", { name: "Remove rule Keep the fix local." })).toBeInTheDocument();
+    expect(screen.queryByText("Rule Keep the fix local. removed.")).toBeNull();
+  });
+
   it("adds a rule after asking, and never with empty words", async () => {
     await page();
     const box = screen.getByLabelText("New rule");
@@ -758,9 +939,18 @@ describe("Settings -> Routing: standing rules", () => {
   });
 
   it("brings back a removed rule from Recent changes", async () => {
+    answers.khipu_route_view = () => {
+      const v = view();
+      if (calls("khipu_route_rule").some((call) => call.action === "restore"))
+        v.rules!.push({ n: 6, entity: "rule:restored-6", text: "Restored rule." });
+      return v;
+    };
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Bring back standing rule 6" }));
+    const restore = screen.getByRole("button", { name: "Bring back standing rule 6" });
+    restore.focus();
+    fireEvent.click(restore);
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "restore", n: 6 }]));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Remove rule 6" })));
   });
 });
 

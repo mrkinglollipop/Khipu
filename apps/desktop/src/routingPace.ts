@@ -500,6 +500,7 @@ function accountTag(a: RouteAccount): PaceTag {
   const conc = statuses.find((s) => s.kind === "concurrency");
   if (conc?.verdict === "full") return { text: `${conc.jobs ?? 0} of ${conc.cap_n ?? 0} running`, tone: "warn" };
   const paces = a.pace ?? [];
+  if (paces.some((p) => p.plan?.verdict === "limit_reached")) return { text: "At plan limit", tone: "err" };
   if (paces.length && paces.every((p) => p.why || readingUnknown(p))) return { text: "Can't tell yet", tone: "neutral" };
   if (!paces.length) return { text: "No pace", tone: "neutral" };
   const reachedShare = reachedShareCap(a);
@@ -534,8 +535,9 @@ function sayOf(a: RouteAccount, now: Date): PaceSayPart[] {
   if (classification === "down") return [{ text: `Down: ${a.reason || "out of service"}.` }];
 
   const paces = a.pace ?? [];
+  const reachedPlan = paces.find((p) => p.plan?.verdict === "limit_reached");
   const unknown = paces.filter((p) => readingUnknown(p));
-  if (paces.length && unknown.length === paces.length) {
+  if (!reachedPlan && paces.length && unknown.length === paces.length) {
     const first = unknown[0];
     return [{ text: readingWhy(first, label) }];
   }
@@ -565,6 +567,11 @@ function sayOf(a: RouteAccount, now: Date): PaceSayPart[] {
       return [{ text: `The spend total can't be told: ${spend.why || "the spend readings are incomplete"}.` }];
     }
     return [{ text: `Khipu doesn't read ${label}'s plan, so there is no pace.` }];
+  }
+
+  if (reachedPlan) {
+    const window = reachedPlan.window ? `${windowAdj(reachedPlan.window)} ` : "";
+    return [{ text: `At its ${window}plan limit.` }];
   }
 
   const reachedShare = reachedShareCap(a);
@@ -654,6 +661,7 @@ function lineOf(a: RouteAccount, now: Date, advice: PaceAdvice | null): { week: 
     return { week: "Spend can't be told", advice: adviceWords };
   }
   if (!paces.length) return { week: "No pace: plan not read", advice: adviceWords };
+  if (paces.some((p) => p.plan?.verdict === "limit_reached")) return { week: "At plan limit", advice: adviceWords };
   if (paces.every((p) => readingUnknown(p))) return { week: "Can't tell yet", advice: adviceWords };
   const reachedShare = reachedShareCap(a);
   if (reachedShare) return { week: `At your ${Math.round(reachedShare.pct)}% cap`, advice: adviceWords };
