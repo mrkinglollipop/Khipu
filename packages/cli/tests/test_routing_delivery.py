@@ -140,7 +140,7 @@ def test_c_same_version_debt_precedes_newer_priority(home, monkeypatch):
     agent_view.prepare_routing_table(refresh=True)
     second = routing.prompt_push(recall_prompt.routing_marker(SESSION), budget=1.0)
     first_owed = next(f"A{i}" for i in range(8) if f"account:{key(i)}" in owed)
-    assert second["text"].index(first_owed) < second["text"].index("Your priority")
+    assert second["text"].index(first_owed) < second["text"].index("Your priority (")
     _deliver(second)
     assert not recall_prompt.routing_marker(SESSION).get("owed")
 

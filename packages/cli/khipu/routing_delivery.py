@@ -328,6 +328,8 @@ def plan(out, view, now, cfg, *, session=None, project=None):
                                    r.CHANGES_HEADING.format(at=r._clock(now, now))})
 
 
+PAGE_FLOOR = 300  # UTF-16 units; narrower pages are never sent
+
 def _cut(text, start, width):
     end, cost = start, 0
     while end < len(text) and cost + _size(text[end]) <= width:
@@ -505,22 +507,49 @@ def _render(state, out, now, component, *, delivery_point=True):
         cap = min(limit or 8000, out["delivery_plan"].get("max_chars", 9000) - _size(heading) - 2)
         tail = "More routing owed."
         used = 0
+        def _share(e):  # a rule or the priority never takes more than half the cap (two floor pages at least)
+            whole = cap if not (e["entity"].startswith("rule:") or e["entity"] == "priority") else max(cap // 2, 2 * PAGE_FLOOR)
+            return min(cap, whole) - _size(tail) - 2
+
+        # Account-state and change lines stay on every prompt that pages, so
+        # hours of paging never hide them; paged debt gets the room they
+        # leave. An offer where everything fits whole is left as it was.
+        if any(e.get("offset") or e.get("restarted") or _size(e["text"]) > _share(e) for e in due):
+            # A paged entity's own preview line is recognised by its opening
+            # words, since the offer clips it and appends its own suffix.
+            owned = [e["text"][:40] for e in entries.values() if e["whole"]] + [e["text"][:40] for e in due]
+            for line in plain.split("\n")[1:]:
+                if not line.strip() or line.endswith(":") or line.startswith(tail[:-1]):
+                    continue
+                if any(line.startswith(t) or (len(line) < 40 and t.startswith(line)) for t in owned):
+                    continue
+                if used + _size(line) + 1 > cap // 2:
+                    continue
+                body.append(line)
+                used += _size(line) + 1
+        # A page narrower than this is noise; it scales down for a tiny cap.
+        floor = max(1, min(PAGE_FLOOR, cap // 5))
         for e in due:
             start, value = e.get("offset", 0), e["text"]
             restart = f"{e['label']} changed while being shown.\n" if e.get("restarted") else ""
             prefix = f"{e['label']}; revision {e['revision'][:8]}; page "
             room = cap - used - _size(tail) - 2
+            room = min(room, _share(e))
             if not start and not restart and _size(value) <= room:
                 rendered, end, page = value, len(value), None
             else:
                 # Start has a larger budget than subsequent prompts. Count
-                # its larger first page plus exact future UTF-16 chunks.
+                # its larger first page plus exact future UTF-16 chunks. The
+                # width follows this prompt's room; it is never frozen.
                 future_room = min(room, (out["delivery_plan"]["page_limit"] or room) - _size(tail) - 2)
-                width = e.get("width") or max(2, future_room - _size(prefix) - 24)
-                e.setdefault("width", width)
+                width = future_room - _size(prefix) - 24
+                e["width"] = max(width, 0)
+                least = min(floor, _size(value[start:]))
                 available = room - _size(restart + prefix) - 24
                 if start:
                     available = min(width, available)
+                if width < least or available < least:
+                    break
                 end = _cut(value, start, available)
                 if end == start:
                     break
@@ -1095,8 +1124,10 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
                                   entity=entry["entity"], revision=entry["revision"], text=value))
                 progress[entry["entity"]] = len(value)
                 continue
-            width = entry.get("width") or max(2, page_limit - _size(entry["label"]) - 44)
-            entry.setdefault("width", width)
+            width = max(2, page_limit - _size(entry["label"]) - 44)
+            if (entry.get("width") or 0) >= min(PAGE_FLOOR, page_limit // 5):
+                width = entry["width"]  # a stored sliver width is ignored and healed
+            entry["width"] = width
             end = _cut(value, start, width)
             if end == start:
                 break
