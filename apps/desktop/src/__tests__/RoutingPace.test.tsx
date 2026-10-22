@@ -106,6 +106,8 @@ describe("Pace, caps and advice: probe regressions", () => {
 
   it.each([
     "reset time spread over more than an hour",
+    "reset time disagrees between readings",
+    "reset passed; waiting for a new reading",
     "possible reset; waiting for the next reading",
     "last reading 2 h old",
   ])("withholds unplaceable cap figures: %s", (why) => {
@@ -116,6 +118,24 @@ describe("Pace, caps and advice: probe regressions", () => {
     })]), null, NOW).rows[0];
     expect(row.caps[0].state).toBe(`Not known: ${why}`);
     expect(row.caps[0].tag).toBeNull();
+  });
+
+  it.each([
+    "readings cover only 0.9 of the last 24 h",
+    "readings disagree for 0.5 of the last 24 h",
+  ])("keeps fresh cap figures and warnings with incomplete rate history: %s", (why) => {
+    for (const verdict of ["ahead", "recovering"]) {
+      const cap = { kind: "pace_target", revision: "fake", window: "weekly", pct: 100, slack: 0,
+        allowance_pct: 14.3, used_pct: 80, verdict };
+      const row = paceModel(view([acct({
+        pace: [pace({ why, buckets: 3, used_pct: 80, rate_pct_per_h: null, pace_target: cap })],
+        cap_statuses: [cap],
+      })]), null, NOW).rows[0];
+      expect(row.caps[0].state).toBe("Allowed 14.3% by now, used 80");
+      expect(row.caps[0].tag).toEqual({
+        text: verdict === "ahead" ? "65.7 points ahead" : "Coming back", tone: "warn",
+      });
+    }
   });
 
   it("keeps a hold_back verdict when its evidence is unknown", () => {

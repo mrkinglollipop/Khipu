@@ -113,14 +113,15 @@ def _pace_reading_unknown(pace: dict) -> bool:
     """Whether one pace object's usage reading cannot be placed at now.
 
     ``buckets`` counts the readings in the trailing window and ``why`` says
-    why the pace cannot be computed. A fresh reading that is merely too
-    thin for a rate ("only N readings ...") still says where usage stands;
-    every other reason, and no reading in the window at all, does not.
+    why the rate cannot be computed. Thin, gappy or disagreeing rate
+    history still supports a fresh current usage level. Stale or unsettled
+    readings, and no reading in the window at all, do not.
     """
     if pace.get("used_pct") is None or not pace.get("buckets"):
         return True
     why = pace.get("why") or ""
-    return bool(why) and not why.startswith("only ")
+    return bool(why) and not why.startswith((
+        "only ", "readings cover only ", "readings disagree for "))
 
 
 def _evidence(view: dict, entry: dict, now, statuses: list[dict]) -> str:

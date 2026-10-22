@@ -157,12 +157,12 @@ function paceOf(a: RouteAccount, window: string | null | undefined): Pace {
 }
 
 /** A pace reading that cannot be placed at now, as the advice module judges
- *  it. A window too thin for a rate but with a reading still says where
- *  usage stands. */
+ *  it. Thin, gappy or disagreeing rate history still supports a fresh
+ *  current usage level. */
 function readingUnknown(pace: Pace): boolean {
   if (pace.used_pct == null || !pace.buckets) return true;
   const why = pace.why || "";
-  return !!why && !why.startsWith("only ");
+  return !!why && !["only ", "readings cover only ", "readings disagree for "].some((prefix) => why.startsWith(prefix));
 }
 
 /** The plan label from the plan read: "Max plan", "Pay as you go". */
