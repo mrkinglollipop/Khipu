@@ -510,124 +510,177 @@ def _render(state, out, now, component, *, delivery_point=True):
         # A page narrower than this is noise; it scales down for a tiny cap.
         floor = max(1, min(PAGE_FLOOR, cap // 5))
         page_limit = out["delivery_plan"]["page_limit"] or cap
+        room_all = cap - _size(tail) - 2  # every body line plus its newline fits in this
+        per_page = page_limit - _size(tail) - 2  # later prompts page at the page limit
 
-        def _need(e):  # the smallest payload room in which a page of this entry can be sent
+        def _halved(e):
+            return e["entity"].startswith("rule:") or e["entity"] == "priority"
+
+        def _parts(e):
             restart = f"{e['label']} changed while being shown.\n" if e.get("restarted") else ""
             prefix = f"{e['label']}; revision {e['revision'][:8]}; page "
-            widest = max(1, page_limit - _size(tail) - 2 - _size(prefix) - 24)
-            least = max(1, min(floor, _size(e["text"][e.get("offset", 0):]), widest))
-            return _size(restart) + _size(prefix) + 24 + least
+            least = min(floor, _size(e["text"][e.get("offset", 0):]))
+            if restart and _size(restart) + _size(prefix) + 24 + least > room_all:
+                restart = ""  # a cap too small for the notice and a page sends the page
+            return restart, prefix, _size(restart) + _size(prefix) + 24  # 24: the "n/m" digits
 
-        def _share(e):  # a rule or the priority never takes more than half the cap, yet always fits one page
-            half = max(cap // 2, 2 * floor) if e["entity"].startswith("rule:") or e["entity"] == "priority" else cap
-            return min(cap - _size(tail) - 2, max(half, _need(e)))
+        def _whole_cap(e):  # a rule or the priority never takes more than half the cap whole
+            return min(room_all, max(cap // 2, 2 * floor)) if _halved(e) else room_all
+
+        def _top(e):  # the most one page of this entry may take, whatever else is shown
+            if not (_halved(e) or not e["whole"]):
+                return room_all
+            rest = _size(e["text"][e.get("offset", 0):])
+            return min(room_all, max(cap // 2, _parts(e)[2] + min(floor, rest)))
+
+        def _payload(e, room):  # page words that fit in ``room``
+            start = e.get("offset", 0)
+            room = min(room, _top(e))
+            return (min(room, per_page) if start else room) - _parts(e)[2]
+
+        def _least(e):
+            """The smallest page worth sending: the floor, or less only when
+            no wider page of this entry can ever fit this cap. None: none can."""
+            start, value = e.get("offset", 0), e["text"]
+            if start >= len(value):
+                return None
+            most = _payload(e, room_all)
+            least = max(_size(value[start]), min(floor, _size(value[start:]), most))
+            return least if least <= most else None
+
+        def _need(e):
+            """The exact room in which ``_place`` shows this entry or a page of it."""
+            least = _least(e)
+            page = least + _parts(e)[2] if least is not None else None
+            if not e.get("offset") and not e.get("restarted") and _size(e["text"]) <= _whole_cap(e):
+                return _size(e["text"]) if page is None else min(_size(e["text"]), page)
+            return page
+
+        def _place(e, room):
+            """This entry whole, or its next page, in ``room``; None if neither fits."""
+            start, value = e.get("offset", 0), e["text"]
+            restart, prefix, over = _parts(e)
+            if not start and not restart and _size(value) <= min(room, _whole_cap(e)):
+                return value, len(value), None
+            least = _least(e)
+            available = _payload(e, room)
+            if least is None or available < least:
+                return None
+            # The width follows this prompt's room; it is never frozen. It
+            # only estimates the page count: later pages are cut afresh.
+            width = max(2, min(room, _top(e), per_page) - _size(prefix) - 24)
+            e["width"] = width
+            end = _cut(value, start, available)
+            remaining = _pages_left(value, end, width)
+            if end == start or remaining is None:
+                return None
+            n = e.get("pages", 0) + 1
+            page = {"n": n, "m": n + remaining}
+            return restart + prefix + f"{n}/{page['m']}\n" + value[start:end], end, page
 
         # Account-state and change lines stay on every prompt that pages, so
         # hours of paging never hide them; paged debt gets the room they
         # leave. An offer where everything fits whole is left as it was.
-        paging = any(e.get("offset") or e.get("restarted") or _size(e["text"]) > _share(e) for e in due)
-        reserve, fits = 0, {}
+        paging = any(e.get("offset") or e.get("restarted") or _size(e["text"]) > _whole_cap(e) for e in due)
+        placed = {}
         if paging:
-            # Due non-whole entries (account changes, holds) always show: they
-            # are rendered in due order and the long entries leave them room,
-            # while one floor-sized page is reserved ahead of any plain line.
-            lead = next((e for e in due if e["whole"]), None)
-            reserve = _need(lead) + 1 if lead else 0
-            spare = cap - _size(tail) - 2 - reserve
-            for e in due:
-                # A hold is finite debt that must beat the pages: it shows
-                # even if that defers the long entry's page one prompt.
-                hold = e["entity"].startswith("hold:")
-                if not e["whole"] and _size(e["text"]) + 1 <= (spare + reserve if hold else spare):
-                    fits[e["entity"]] = _size(e["text"]) + 1
-                    spare -= fits[e["entity"]]
-            # Names that mark a long entity's own preview line, however worded.
-            marks = []
-            for e in entries.values():
+            # One structural rule keeps every prompt progressing: the head of
+            # the queue (holds, then other single lines, then long entries)
+            # always gets room for its next page, which every lower-placed
+            # line leaves it. Everything due either fits whole or becomes the
+            # head in turn, so all of it is shown in a bounded number of prompts.
+            order = sorted(due, key=lambda e: (not e["entity"].startswith("hold:"), e["whole"]))
+            head = order[0]
+            lead = next((e for e in order if e["whole"]), None)
+            hard = (_need(head) or 0) + 1
+            # A hold may take the first long entry's page room for one prompt;
+            # other single lines leave it (the long entry is never starved).
+            soft = (_need(lead) or 0) + 1 if lead is not None and lead is not head else 0
+            for e in order:
                 if e["whole"]:
-                    marks += [e["text"][:40], e["label"].split(" for ")[0]]
+                    break
+                if e is head:
+                    got, hard = _place(e, room_all), 0
+                elif e.get("offset") or e.get("restarted"):
+                    got = None  # its pages resume when it is the head again
+                else:
+                    keep = hard + (0 if e["entity"].startswith("hold:") else soft)
+                    got = _place(e, min(room_all - used - keep, _whole_cap(e)))
+                    if got and got[2]:
+                        got = None
+                if got:
+                    placed[e["entity"]] = got
+                    used += _size(got[0]) + 1
+            # The plan names each single-line entity's own words; a plain line
+            # belongs to one by those words, never by a label that another
+            # entity's name may also spell (an account called "Owner note").
+            def _owner(line):
+                core = line[:-1].rstrip() if line.endswith("…") else line[:-3].rstrip() if line.endswith("...") else line
+                for e in entries.values():
+                    text = e["text"]
+                    if not e["whole"] and text and (line == text or line.startswith(text) or
+                                                    (len(core) >= 8 and text.startswith(core))):
+                        return e
+                return None
+
+            def _preview(line):
+                for e in entries.values():
+                    if not e["whole"]:
+                        continue
+                    marks = [e["text"][:40], e["label"].split(" for ")[0]]
                     marks += {"priority": ["Your priority"], "note": ["Owner note", "The owner's note"]}.get(e["entity"], [])
-            lines_room = min(cap // 2, spare)
+                    for m in marks:
+                        if m and ((line.startswith(m) and not line[len(m):len(m) + 1].isalnum())
+                                  or (len(line) < 40 and m.startswith(line))):
+                            return True
+                return False
+
+            # While a hold pages, the state lines keep their room and the long
+            # entry waits: the hold ends within a few prompts.
+            lines_room = min(cap // 2, room_all - used - hard - (0 if head["entity"].startswith("hold:") else soft))
+            context = 0
             for line in plain.split("\n")[1:]:
                 if not line.strip() or line.endswith(":") or line.startswith(tail[:-1]):
                     continue
-                if any(line.startswith(m) or (len(line) < 40 and m.startswith(line)) for m in marks if m):
-                    continue
-                if any(line == e["text"] for e in due if not e["whole"]):
-                    continue
-                if used + _size(line) + 1 > lines_room:
+                owner = _owner(line)
+                if owner is not None and owner["entity"] in placed:
+                    continue  # shown as its own line below
+                if owner is None and _preview(line):
+                    continue  # a long entry's preview never stands beside its page
+                if context + _size(line) + 1 > lines_room:
                     continue
                 body.append(line)
-                used += _size(line) + 1
-        blocked, lead_done, rendered_nw = False, False, set()
-        for e in due:
-            start, value = e.get("offset", 0), e["text"]
-            restart = f"{e['label']} changed while being shown.\n" if e.get("restarted") else ""
-            prefix = f"{e['label']}; revision {e['revision'][:8]}; page "
-            room = cap - used - _size(tail) - 2
-            if paging:
-                if e["whole"] and blocked:
+                context += _size(line) + 1
+            used += context
+            for e in order:
+                if not e["whole"]:
                     continue
-                if not e["whole"] and e["entity"] not in fits:
-                    continue  # it stays due, and is first in line once the pages end
-                if e["whole"]:
-                    room -= sum(v for k, v in fits.items() if k not in rendered_nw)
-                elif not lead_done and not e["entity"].startswith("hold:"):
-                    room -= reserve  # the first long entry still needs its page
-            room = min(room, _share(e))
-            if not start and not restart and _size(value) <= room:
-                rendered, end, page = value, len(value), None
-            else:
-                # Start has a larger budget than subsequent prompts. Count
-                # its larger first page plus exact future UTF-16 chunks. The
-                # width follows this prompt's room; it is never frozen.
-                future_room = min(room, page_limit - _size(tail) - 2)
-                width = future_room - _size(prefix) - 24
-                e["width"] = max(width, 0)
-                least = _need(e) - _size(restart) - _size(prefix) - 24
-                available = room - _size(restart + prefix) - 24
-                if start:
-                    available = min(width, available)
-                if width < least or available < least:
-                    blocked = lead_done = True
-                    if not paging:
-                        break
-                    continue
-                end = _cut(value, start, available)
-                if end == start:
-                    blocked = lead_done = True
-                    if not paging:
-                        break
-                    continue
-                remaining = _pages_left(value, end, width)
-                if remaining is None:
-                    blocked = lead_done = True
-                    if not paging:
-                        break
-                    continue
-                n = e.get("pages", 0) + 1
-                page = {"n": n, "m": n + remaining}
-                rendered = restart + prefix + f"{n}/{page['m']}\n" + value[start:end]
-            if _size(rendered) > room:
-                blocked = lead_done = True
-                if not paging:
+                got = _place(e, room_all - used)
+                if not got:
+                    break  # only the head is owed room; this one waits its turn
+                placed[e["entity"]] = got
+                used += _size(got[0]) + 1
+                if got[1] < len(e["text"]):
                     break
+        else:
+            for e in due:
+                got = _place(e, room_all - used)
+                if not got:
+                    break
+                placed[e["entity"]] = got
+                used += _size(got[0]) + 1
+                if got[1] < len(e["text"]):
+                    break
+        for e in due:  # shown in the plan's order, whatever order the room was given in
+            if e["entity"] not in placed:
                 continue
+            rendered, end, page = placed[e["entity"]]
             item = dict(change=e["entity"] + "@" + e["revision"], entity=e["entity"], revision=e["revision"])
             if page:
                 item["page"] = page
             selected.append(item)
             progress[e["entity"]] = end
             body.append(rendered)
-            used += _size(rendered) + 1
-            if e["whole"]:
-                lead_done = True
-            else:
-                rendered_nw.add(e["entity"])
-            if end < len(value):
-                blocked = True
-                if not paging:
-                    break
         left = any(progress.get(e["entity"], e.get("offset", 0)) < len(e["text"]) for e in due)
         if left:
             body.append(tail)
@@ -1177,14 +1230,17 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
         items, progress = [], {}
         for entry in due:
             start, value = entry.get("offset", 0), entry["text"]
-            if not entry["whole"] or (not start and len(value) <= page_limit):
+            if not entry["whole"] or (not start and _size(value) <= page_limit):
                 items.append(dict(change=entry["entity"] + "@" + entry["revision"],
                                   entity=entry["entity"], revision=entry["revision"], text=value))
                 progress[entry["entity"]] = len(value)
                 continue
-            width = max(2, page_limit - _size(entry["label"]) - 44)
-            if entry.get("width") and entry["width"] >= max(1, min(PAGE_FLOOR, page_limit // 5)):
-                width = entry["width"]  # a stored sliver width is ignored and healed
+            # A page is never wider than the limit, nor narrower than the
+            # scaled floor unless the limit itself is that small.
+            floor = max(1, min(PAGE_FLOOR, page_limit // 5))
+            width = max(min(page_limit, floor), page_limit - _size(entry["label"]) - 44)
+            if entry.get("width") and floor <= entry["width"] <= width:
+                width = entry["width"]  # a stored sliver, or one wider than a shrunk limit, is healed
             entry["width"] = width
             end = _cut(value, start, width)
             if end == start:
