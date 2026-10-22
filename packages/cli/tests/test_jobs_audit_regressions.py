@@ -277,3 +277,130 @@ def test_monthly_missing_driver_keeps_exception_and_failure_receipt(tmp_path, mo
     with pytest.raises(FileNotFoundError):
         jobs.run_monthly()
     assert json.loads((tmp_path/'state/job-monthly.json').read_text())['exit'] == 2
+
+
+@pytest.mark.parametrize('name', ['nightly', 'monthly'])
+def test_sigterm_stops_driver_descendants_before_unlocking(tmp_path, name):
+    """Real owner termination must reap its detached group before releasing flock."""
+    driver = tmp_path / 'term-driver.py'
+    grandchild = (
+        'import signal,time; from pathlib import Path; '
+        'signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+        f'root=Path({str(tmp_path)!r}); end=time.monotonic()+8; '
+        '\nwhile time.monotonic()<end and not (root/"release").exists(): '
+        '(root/"grandchild-beat").write_text(str(time.monotonic())); time.sleep(.02)\n'
+    )
+    driver.write_text(
+        'import os,signal,subprocess,sys,time\nfrom pathlib import Path\n'
+        f'root=Path({str(tmp_path)!r})\n'
+        'def term(*args): (root/"stopping").touch()\n'
+        'signal.signal(signal.SIGTERM,term)\n'
+        f'child=subprocess.Popen([sys.executable,"-c",{grandchild!r}])\n'
+        '(root/("started-"+str(os.getpid()))).write_text(str(child.pid))\n'
+        'end=time.monotonic()+8\n'
+        'while time.monotonic()<end and not (root/"release").exists():\n'
+        ' (root/"driver-beat").write_text(str(time.monotonic())); time.sleep(.02)\n'
+        'child.wait(timeout=2)\n'
+    )
+    runner = tmp_path / 'term-runner.py'
+    runner.write_text(
+        'import sys,socket\nfrom pathlib import Path\nfrom khipu import jobs\n'
+        'def forbidden(*a,**kw): raise AssertionError("external operation forbidden")\n'
+        'socket.socket=forbidden\n'
+        f'root=Path({str(tmp_path)!r})\n'
+        'jobs.ensure_data_dir=lambda: root\n'
+        'jobs._log_paths=lambda stem: (root/"driver.out",root/"driver.err")\n'
+        f'jobs.CONSOLIDATE_{name.upper()}=root/"term-driver.py"\n'
+        'jobs.DRIVER_TIMEOUT_SECONDS=5\n'
+        'jobs.DRIVER_TERMINATE_GRACE_SECONDS=1\n'
+        'jobs._drain_sessions=lambda: {"ok":True,"failed":0}\n'
+        f'for attr in {MAINTENANCE!r}: setattr(jobs,attr,lambda: {{"ok":True}})\n'
+        f'raise SystemExit(jobs.run_{name}())\n'
+    )
+    jobs._write_job_state(name, 9)
+    receipt = tmp_path / f'state/job-{name}.json'
+    before = receipt.read_bytes()
+    env = dict(os.environ, PYTHONPATH=str(Path(jobs.__file__).resolve().parents[1]))
+    processes = []
+    def wait_for(path, timeout=2):
+        deadline = time.monotonic()+timeout
+        while not path.exists() and time.monotonic()<deadline:
+            time.sleep(.01)
+        assert path.exists(), f'expected {path.name}'
+    with (tmp_path / 'term-runner.log').open('wb') as log:
+        def launch():
+            proc = subprocess.Popen([sys.executable,str(runner)],env=env,
+                                    stdout=log,stderr=log,start_new_session=True)
+            processes.append(proc)
+            return proc
+        try:
+            first = launch()
+            wait_for(tmp_path/'grandchild-beat')
+            first.send_signal(signal.SIGTERM)
+            wait_for(tmp_path/'stopping')
+            # Another termination request must not interrupt the grace cleanup.
+            first.send_signal(signal.SIGTERM)
+            second = launch()
+            assert second.wait(timeout=2) == 75
+            assert first.poll() is None
+            assert receipt.read_bytes() == before
+            assert len(list(tmp_path.glob('started-*'))) == 1
+            assert first.wait(timeout=3) == 143
+            assert json.loads(receipt.read_text())['exit'] == 143
+            beats = [(tmp_path/name).read_text() for name in ('driver-beat','grandchild-beat')]
+            time.sleep(.15)
+            assert [(tmp_path/name).read_text() for name in ('driver-beat','grandchild-beat')] == beats
+            (tmp_path/'release').touch()
+            assert launch().wait(timeout=3) == 0
+            assert json.loads(receipt.read_text())['exit'] == 0
+        finally:
+            (tmp_path/'release').touch()
+            for process in processes:
+                if process.poll() is None:
+                    os.killpg(process.pid,signal.SIGKILL)
+                process.wait(timeout=3)
+            for marker in tmp_path.glob('started-*'):
+                try:
+                    os.killpg(int(marker.name.split('-')[1]),signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+@pytest.mark.parametrize('outcome', ['success', 'launch_error', 'spawn_sigterm', 'cleanup_sigterm'])
+def test_temporary_sigterm_handler_restored(tmp_path, monkeypatch, outcome):
+    previous = signal.getsignal(signal.SIGTERM)
+    script = tmp_path/'signal-driver.py'
+    script.write_text('pass\n')
+    monkeypatch.setattr(jobs, 'CONSOLIDATE_MONTHLY', script)
+    proc = Mock(pid=12345678)
+    proc.wait.return_value = 0
+    if outcome == 'cleanup_sigterm':
+        proc.wait.side_effect = subprocess.TimeoutExpired(['synthetic'], 1)
+    cleanup_calls = []
+    def stop(process):
+        cleanup_calls.append(process)
+        if outcome == 'cleanup_sigterm' and len(cleanup_calls) == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+    cleanup = Mock(side_effect=stop)
+    monkeypatch.setattr(jobs, '_stop_driver_group', cleanup)
+    def spawn(*args, **kwargs):
+        assert signal.getsignal(signal.SIGTERM) is not previous
+        if outcome == 'launch_error':
+            raise OSError('synthetic launch failure')
+        if outcome == 'spawn_sigterm':
+            os.kill(os.getpid(), signal.SIGTERM)
+        return proc
+    monkeypatch.setattr(subprocess, 'Popen', spawn)
+    if outcome == 'launch_error':
+        with pytest.raises(OSError):
+            jobs.run_monthly()
+    elif outcome in ('spawn_sigterm', 'cleanup_sigterm'):
+        with pytest.raises(SystemExit) as exc:
+            jobs.run_monthly()
+        assert exc.value.code == 143
+        assert cleanup.call_count == (2 if outcome == 'cleanup_sigterm' else 1)
+        assert cleanup_calls == [proc] * cleanup.call_count
+        assert json.loads((tmp_path/'state/job-monthly.json').read_text())['exit'] == 143
+    else:
+        assert jobs.run_monthly() == 0
+    assert signal.getsignal(signal.SIGTERM) is previous

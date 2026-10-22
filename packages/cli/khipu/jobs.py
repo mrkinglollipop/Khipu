@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -244,6 +245,39 @@ def _write_job_state(name: str, exit_code: int) -> None:
         tmp.unlink(missing_ok=True)
 
 
+class _JobTerminated(BaseException):
+    """Unwind through child cleanup without being swallowed by maintenance."""
+
+
+@contextmanager
+def _sigterm_guard(name: str, *, defer: bool = False):
+    # Python only permits signal handlers on the main thread. Programmatic
+    # threaded callers still get locking/deadlines; the CLI owns SIGTERM here.
+    state = {"defer": defer, "pending": False}
+    if threading.current_thread() is not threading.main_thread():
+        yield state
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def terminate(signum, frame):
+        # Further bootout/termination requests cannot interrupt group cleanup
+        # or the failure receipt. During Popen, defer until its PID is known.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        state["pending"] = True
+        if not state["defer"]:
+            raise _JobTerminated()
+
+    signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield state
+    except _JobTerminated:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        _write_job_state(name, 143)
+        raise SystemExit(143) from None
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 @contextmanager
 def _job_lock(name: str):
     """Exclude manual/launchd overlap for the entire wrapper, including upkeep.
@@ -260,7 +294,8 @@ def _job_lock(name: str):
             yield False
             return
         try:
-            yield True
+            with _sigterm_guard(name):
+                yield True
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
@@ -311,19 +346,26 @@ def _run_script(
             err_f.write(header)
             out_f.flush()
             err_f.flush()
-            proc = subprocess.Popen(
-                cmd, stdout=out_f, stderr=err_f, env=os.environ.copy(),
-                start_new_session=True,
-            )
-            try:
-                rc = proc.wait(timeout=DRIVER_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                _stop_driver_group(proc)
-                rc = 124
-                err_f.write(f"driver timed out after {DRIVER_TIMEOUT_SECONDS}s\n".encode())
-            except BaseException:
-                _stop_driver_group(proc)
-                raise
+            # Install before spawn, but defer a signal until Popen returns:
+            # raising inside its constructor can strand a just-created child.
+            with _sigterm_guard(state_name, defer=True) as termination:
+                proc = subprocess.Popen(
+                    cmd, stdout=out_f, stderr=err_f, env=os.environ.copy(),
+                    start_new_session=True,
+                )
+                try:
+                    termination["defer"] = False
+                    if termination["pending"]:
+                        raise _JobTerminated()
+                    try:
+                        rc = proc.wait(timeout=DRIVER_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        _stop_driver_group(proc)
+                        rc = 124
+                        err_f.write(f"driver timed out after {DRIVER_TIMEOUT_SECONDS}s\n".encode())
+                except BaseException:
+                    _stop_driver_group(proc)
+                    raise
     except OSError:
         _write_job_state(state_name, 2)
         raise
