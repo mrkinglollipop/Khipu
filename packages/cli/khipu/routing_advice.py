@@ -298,6 +298,8 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         if holding:
             verdict = "hold_back"
             reason = "; ".join(f"{s['kind']} {s['verdict']}" for s in holding)
+        # Measured DeepSeek spend, including filling history, is judged
+        # normally. Only unavailable or untrusted reads keep the cap unknown.
         elif entry.get("harness") == "deepseek" and any(
                 s.get("kind") == "spend" and s.get("verdict") == "unknown" for s in statuses):
             verdict, reason = "hold_back", "cap status unknown"
