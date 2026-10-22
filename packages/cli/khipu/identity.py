@@ -112,8 +112,8 @@ def _resolve_project_alias(cur, project: str) -> str | None:
     remote URLs or repo-root basenames for the SAME real project (a rename,
     an org-transfer, a second local checkout) can otherwise read as two
     different projects everywhere search/commitments/decisions group by
-    project. Best-effort only: never raises, and callers with no live
-    connection (every hook call — see ``resolve_repo_root``'s own contract)
+    project. Older schemas are supported; unexpected failures propagate.
+    Callers with no live connection (every hook call — see ``resolve_repo_root``'s own contract)
     simply skip it by not passing ``cur``."""
     try:
         cur.execute("SAVEPOINT project_alias_lookup", ())
@@ -121,12 +121,16 @@ def _resolve_project_alias(cur, project: str) -> str | None:
         row = cur.fetchone()
         cur.execute("RELEASE SAVEPOINT project_alias_lookup", ())
         return str(row[0]) if row and row[0] else None
-    except Exception:  # noqa: BLE001 — alias lookup is best-effort only
+    except Exception as exc:  # compatibility only for an older schema
         try:
             cur.execute("ROLLBACK TO SAVEPOINT project_alias_lookup", ())
             cur.execute("RELEASE SAVEPOINT project_alias_lookup", ())
         except Exception:  # noqa: BLE001
             pass
+        from psycopg.errors import UndefinedColumn, UndefinedTable
+
+        if not isinstance(exc, (UndefinedTable, UndefinedColumn)):
+            raise
         return None
 
 
@@ -134,9 +138,8 @@ def project_canonical_group(cur, project: str | None) -> tuple[str | None, list[
     """``(canonical, group)`` for ``project`` through ``project_aliases``: the
     canonical project is the alias's target (or ``project`` itself), and the
     group is the canonical plus every alias that points at it, canonical first.
-    One round trip. Best-effort exactly like :func:`_resolve_project_alias`:
-    never raises, and any failure (no table on a pre-0021 hub, a dead cursor)
-    yields ``(project, [project])``."""
+    One round trip. Missing tables/columns on older hubs yield
+    ``(project, [project])``; unexpected database failures propagate."""
     if not project:
         return project, [project] if project else []
     try:
@@ -153,12 +156,16 @@ def project_canonical_group(cur, project: str | None) -> tuple[str | None, list[
         canonical = str(rows[0][0])
         group = [canonical] + [str(r[1]) for r in rows if r[1] and str(r[1]) != canonical]
         return canonical, group
-    except Exception:  # noqa: BLE001 — alias expansion is best-effort only
+    except Exception as exc:  # compatibility only for an older schema
         try:
             cur.execute("ROLLBACK TO SAVEPOINT project_alias_group", ())
             cur.execute("RELEASE SAVEPOINT project_alias_group", ())
         except Exception:  # noqa: BLE001
             pass
+        from psycopg.errors import UndefinedColumn, UndefinedTable
+
+        if not isinstance(exc, (UndefinedTable, UndefinedColumn)):
+            raise
         return project, [project]
 
 
@@ -586,8 +593,9 @@ def resolve_repo_root(cwd: str, *, cur: Any = None) -> dict[str, Any]:
     per-turn path, sandboxed in Aegis, no DB) calls this with no cursor and
     gets EXACTLY today's behaviour — the alias lookup only runs when a
     caller that already holds a live cursor (a backfill, a CLI command)
-    opts in. Never raises: any git failure or unexpected shape yields the
-    empty result.
+    opts in. Git failures or unexpected git output yield the empty result.
+    With a supplied cursor, missing alias-schema tables/columns fall back to
+    the resolved project; unexpected database failures propagate.
     """
     out: dict[str, Any] = {"repo_root": None, "project": None, "is_worktree": False}
     cwd = (cwd or "").strip()

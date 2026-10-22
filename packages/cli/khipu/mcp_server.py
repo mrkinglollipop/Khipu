@@ -589,7 +589,9 @@ TOOLS: list[dict] = [
         "annotations": {"readOnlyHint": False, "idempotentHint": True},
         "description": (
             "Close, reopen, snooze or reassign commitments by id (ids come "
-            "from khipu_owed). Close it when the work is done or the question "
+            "from khipu_owed). A routing_direction has an rd-* string id: "
+            "close it singly to dismiss it; reopen, snooze, reassign and bulk "
+            "changes are unsupported for routing directions and return errors. Close it when the work is done or the question "
             "is answered; snooze it with `until` (a date, or 7d / 2w / 1m) when "
             "it is real but not now; reassign it with `owner` (and "
             "`owner_label` for an agent) when it is someone else's. `ids` "
@@ -603,9 +605,9 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "id": {"type": "integer", "description": "Commitment id"},
-                "ids": {"type": "array", "items": {"type": "integer"},
-                        "description": "Several commitment ids (at most the owed_bulk_max setting, 500, 0 for no limit)"},
+                "id": {"type": ["integer", "string"], "description": "Commitment id (integer or decimal string), or rd-* routing direction id (close only)"},
+                "ids": {"type": "array", "items": {"type": ["integer", "string"]}, "minItems": 1,
+                        "description": "Several commitment ids (integers or decimal strings) (at most the owed_bulk_max setting, 500, 0 for no limit)"},
                 "action": {"type": "string", "description": "close | reopen | snooze | reassign"},
                 "until": {"type": "string", "description": "snooze only: 2026-09-30, 7d, 2w, 1m"},
                 "owner": {"type": "string", "description": "reassign only: user | assistant | agent"},
@@ -702,9 +704,9 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "supersede | restore | retract | confirm | reject",
                 },
-                "id": {"type": "integer", "description": "Decision id (supersede/restore/retract)"},
-                "link_id": {"type": "integer", "description": "Link id (confirm/reject)"},
-                "by": {"type": "integer", "description": "supersede: an existing decision id"},
+                "id": {"type": ["integer", "string"], "description": "Decision id (supersede/restore/retract); integer or decimal string"},
+                "link_id": {"type": ["integer", "string"], "description": "Link id (confirm/reject); integer or decimal string"},
+                "by": {"type": ["integer", "string"], "description": "supersede: an existing decision id; integer or decimal string"},
                 "new_text": {"type": "string", "description": "supersede: replacement decision text"},
                 "source_kind": {
                     "type": "string",
@@ -827,8 +829,8 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "since": {"type": "string",
-                          "description": "Only what changed after this version (V or epoch:V)"},
+                "since": {"type": ["string", "integer"],
+                          "description": "Only what changed after this version (integer V, string V or epoch:V)"},
                 "account": {"type": "string", "description": "One account: its label or its id, as khipu_route lists them"},
                 "session_id": {"type": "string",
                                "description": "This conversation's own session id when its environment names none; "
@@ -1072,6 +1074,67 @@ TOOLS: list[dict] = [
         },
     },
 ]
+
+
+def _validate_tool_args(name: str, arguments) -> None:
+    """Validate declared JSON types before feature gates or side effects.
+
+    Numeric bounds stay with handlers because several tools clamp them.
+    Compatibility ID/version unions are advertised in TOOLS.
+    """
+    schema = next((tool["inputSchema"] for tool in TOOLS if tool["name"] == name),
+                  {"type": "object"})
+
+    def reject(field: str, message: str) -> None:
+        if name == "khipu_capture" and field == "summary":
+            message = "requires a non-empty string 'summary'"
+        if name == "khipu_route_report" and field == "action":
+            message += "; an owner's action is the owner's to change: in the app (Settings → Routing) or on a terminal"
+        raise _ToolFailure({"ok": False, "code": "bad_args", "error": f"{field} {message}"})
+
+    def check(value, spec: dict, field: str) -> None:
+        kinds = spec.get("type", [])
+        kinds = [kinds] if isinstance(kinds, str) else kinds
+        matches = {
+            "object": isinstance(value, dict), "array": isinstance(value, list),
+            "string": isinstance(value, str), "integer": type(value) is int,
+            "number": type(value) in (int, float), "boolean": type(value) is bool,
+            "null": value is None,
+        }
+        if kinds and not any(matches.get(kind, False) for kind in kinds):
+            reject(field, "must be " + " or ".join(kinds))
+        if "enum" in spec and value not in spec["enum"]:
+            reject(field, f"must be one of {spec['enum']}")
+        if isinstance(value, str):
+            if not value.strip():
+                reject(field, "must be non-empty text")
+            if len(value) < spec.get("minLength", 0) or len(value) > spec.get("maxLength", float("inf")):
+                reject(field, "has an invalid length")
+        if isinstance(value, list):
+            if len(value) < spec.get("minItems", 0):
+                reject(field, "must contain at least one item")
+            if "items" in spec:
+                for index, item in enumerate(value):
+                    check(item, spec["items"], f"{field}[{index}]")
+        if isinstance(value, dict):
+            for key in spec.get("required", []):
+                if key not in value:
+                    reject(key if field == "arguments" else f"{field}.{key}", "is required")
+            properties = spec.get("properties", {})
+            for key, item in value.items():
+                child = properties.get(key)
+                if child is None and isinstance(spec.get("additionalProperties"), dict):
+                    child = spec["additionalProperties"]
+                if child is not None:
+                    check(item, child, key if field == "arguments" else f"{field}.{key}")
+            for condition in spec.get("allOf", []):
+                needed = condition.get("if", {}).get("required", [])
+                if needed and all(key in value for key in needed):
+                    for key in condition.get("then", {}).get("required", []):
+                        if key not in value:
+                            reject(key, "is required")
+
+    check(arguments, schema, "arguments")
 
 
 def _positive_id(value, field: str) -> int:
@@ -1391,6 +1454,7 @@ def _attach_contract(payload: dict) -> None:
 
 
 def _tool_status(args: dict) -> dict:
+    _validate_tool_args("khipu_status", args)
     _ensure_path()
     if str(args.get("prompt") or "").strip() and not args.get("full"):
         return _tool_status_light(args)
@@ -1568,7 +1632,7 @@ def _attach_prior_work(payload: dict, args: dict) -> None:
             budget_ms = int(budget_ms) if budget_ms is not None else None
         except (TypeError, ValueError):
             budget_ms = None
-        if not budget_ms or budget_ms <= 0:
+        if budget_ms is None:
             budget_ms = DEFAULT_HUB_BUDGET_MS
         budget_ms = max(_BUDGET_MS_MIN, min(budget_ms, _BUDGET_MS_MAX))
 
@@ -1606,9 +1670,13 @@ def _tool_capture(args: dict) -> dict:
     # configured and capture_mode != hub: still a hard reject — nothing would
     # ever act on a flag with no hook to read it. The CLI ``khipu capture``
     # does not go through this function.
+    _validate_tool_args("khipu_capture", args)
     summary = args.get("summary")
     if not isinstance(summary, str) or not summary.strip():
         raise ValueError("khipu_capture requires a non-empty string 'summary'")
+
+    if args.get("scope") == "trivial":
+        return {"ok": True, "skipped": True, "scope": "trivial"}
 
     if _stdio_hook_owns_capture():
         from khipu.session_capture import request_capture_now, resolve_session_ref
@@ -1699,6 +1767,7 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     # canonical project, the same labels the rows carry; `asked` keeps the
     # name they typed (``project_group.show``'s asked/canonical pair).
     canonical = project
+    project_names = [project] if project else None
     hub_now = None
     try:
         with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
@@ -1706,7 +1775,8 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
                 if project:
                     from khipu import identity
 
-                    canonical = identity.project_canonical_group(cur, project)[0] or project
+                    canonical, project_names = identity.project_canonical_group(cur, project)
+                    canonical = canonical or project
                 rows = commitments.fetch_owed_rows(cur, project=project, status=status)
                 if hub_ages:
                     # A Mac clock ahead of or behind the hub can't make an age negative.
@@ -1720,8 +1790,21 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
         if rows is None:
             raise
         canonical = offline_reads.owed_canonical(project) if project else project
+        if project:
+            from khipu.hub_snapshot import snapshot_project_group
+
+            replica = offline_reads._open()
+            if replica is not None:
+                try:
+                    canonical, project_names = snapshot_project_group(replica, project)
+                finally:
+                    replica.close()
+            else:
+                project_names = list(dict.fromkeys([project, canonical]))
         stale = stale_fields()
-    page = commitments.page_owed(rows, **filters, limit=limit)
+    directions = _routing_direction_rows(status, {"origin": filters.get("origin")},
+                                         projects=project_names, canonical=canonical)
+    page = commitments.page_owed(rows + directions, **filters, limit=limit)
     if hub_ages:
         from datetime import datetime, timezone
 
@@ -1729,19 +1812,12 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     out = {"status": status, "project": canonical, **page, "limit": limit,
            **({"asked": project} if project and canonical != project else {}),
            **({"limit_note": note} if note else {}), **stale}
-    directions = _routing_direction_rows(status, filters)
-    if directions:
-        out["results"] = directions + out["results"]
-        out["total"] = int(out.get("total") or 0) + len(directions)
-        counts = out.setdefault("counts", {})
-        counts.setdefault("owner", {})["user"] = counts.get("owner", {}).get("user", 0) + len(directions)
-        counts.setdefault("kind", {})["routing_direction"] = \
-            counts.get("kind", {}).get("routing_direction", 0) + len(directions)
     out.update(owner_writes.annotate(out["results"], "owed_update"))
     return out
 
 
-def _routing_direction_rows(status: str, filters: dict) -> list[dict]:
+def _routing_direction_rows(status: str, filters: dict, *, projects: list[str] | None = None,
+                            canonical: str | None = None) -> list[dict]:
     """Open routing directions (slice 19a) in the owed list the owner
     reads. They live in the local routing-directions store, not the
     commitments table; the words in ``text`` come from that store and
@@ -1765,10 +1841,14 @@ def _routing_direction_rows(status: str, filters: dict) -> list[dict]:
     words = [w for w in (filters.get("query") or "").lower().split() if w]
     out = []
     for item in items:
+        if projects is not None and item.get("project") not in projects:
+            continue
         if words and not all(w in (item.get("text") or "").lower() for w in words):
             continue
         out.append({"id": item["id"], "kind": "routing_direction", "text": item["text"],
-                    "owner": "user", "session": item.get("session"), "target": item.get("target"),
+                    "owner": "user", "project": canonical or item.get("project"),
+                    "opened_at": item.get("opened_at") or item.get("at"),
+                    "session": item.get("session"), "target": item.get("target"),
                     "join": item.get("join"), "reason": item.get("reason")})
     return out
 
@@ -1830,6 +1910,17 @@ def _tool_owed_update(args: dict) -> dict:
 
     if action not in BULK_ACTIONS:
         raise ValueError("action must be 'close', 'reopen', 'snooze' or 'reassign'")
+
+    direction_id = args.get("id")
+    if isinstance(direction_id, str) and direction_id.startswith("rd-"):
+        if action != "close" or args.get("ids") is not None:
+            raise ValueError("routing direction ids support only a single close")
+        from khipu import routing_directions
+
+        row = routing_directions.dismiss(direction_id)
+        if row is None:
+            raise ValueError(f"no such routing direction: {direction_id}")
+        return {"ok": True, "id": direction_id, "action": "close"}
 
     if args.get("ids") is not None or action == "reassign":
         # Who closed it, and whether the owner gate passed, are set here and
@@ -2078,6 +2169,7 @@ def _tool_forget(args: dict) -> dict:
     """Complete forget of one episode (khipu.forget). From the gateway only a
     cloud harness's own captures may be forgotten: a local episode belongs to
     the Mac that captured it and is forgotten there."""
+    _validate_tool_args("khipu_forget", args)
     if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
         _ensure_path()
         from khipu import agent_view, ledger
@@ -2085,7 +2177,7 @@ def _tool_forget(args: dict) -> dict:
         # A ledger answer, whichever tool gives it, leaves through
         # agent_view.project, like khipu_ledger's.
         try:
-            return agent_view.project(ledger.remove_ref(args["id"], note=str(args.get("note") or ""),
+            return agent_view.project(ledger.remove_ref(args["id"], note=args.get("note", ""),
                                                         children=args.get("children"), source="mcp"))
         except ledger.LedgerError as exc:
             raise _ToolFailure(agent_view.project({"ok": False, "error": str(exc), "reason": exc.reason})) from None
@@ -2163,7 +2255,7 @@ def _tool_decisions(args: dict) -> dict:
         with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             with conn.cursor() as cur:
                 if status == "conflicts":
-                    results = _decisions.list_links(cur, state="candidate", project=project, limit=limit)
+                    results = _decisions.list_links(cur, state="candidate", project=project, since=since, limit=limit)
                 else:
                     results = _decisions.list_decisions(
                         cur, project=project, since=since, limit=limit, status=status,
@@ -2186,6 +2278,7 @@ def _tool_decisions_update(args: dict) -> dict:
     khipu_decisions(status='conflicts')). Every write here records its
     source as 'agent'. Every argument is validated before a connection is
     opened, same posture as ``_tool_owed_update``."""
+    _validate_tool_args("khipu_decisions_update", args)
     action = (args.get("action") or "").strip().lower()
     valid_actions = ("supersede", "restore", "retract", "confirm", "reject")
     if action not in valid_actions:
@@ -2218,6 +2311,8 @@ def _decisions_update_on_hub(args: dict) -> dict:
         decision_id = _positive_id(args.get("id"), "id")
     new_id_arg = _positive_id(args["by"], "by") if action == "supersede" and args.get("by") is not None else None
     new_text = args.get("new_text")
+    if new_text is not None and (not isinstance(new_text, str) or not new_text.strip()):
+        raise ValueError("new_text must be non-empty text")
     _ensure_path()
     from khipu import decisions as _decisions
     from khipu import offline, owner_writes
@@ -2262,7 +2357,7 @@ def _decisions_update_on_hub(args: dict) -> dict:
                                 "superseded_by": original["superseded_by"], "action": "supersede"}
                     new_id = _decisions.create_decision(
                         cur, project=args.get("project") or original.get("project"),
-                        text=redact_secrets(str(new_text))[0],
+                        text=redact_secrets(new_text)[0],
                         session_id=args.get("session_id") or None,
                         source_kind=args.get("source_kind") or "assistant",
                     )
@@ -2558,6 +2653,7 @@ def _tool_route_projected(args: dict) -> dict:
 
 def _tool_route_advise(args: dict) -> dict:
     """khipu_route_advise: launch advice per account. Advisory only."""
+    _validate_tool_args("khipu_route_advise", args)
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     _ensure_path()
@@ -2573,8 +2669,8 @@ def _tool_route_advise(args: dict) -> dict:
     if args.get("sensitive") is not None and not isinstance(args["sensitive"], bool):
         raise ValueError("sensitive must be true or false")
     return routing.advise(args.get("account") or None, lane=args.get("lane") or None,
-                          tier=args.get("tier") or None, kind=args.get("kind") or None,
-                          privacy=bool(args.get("privacy")), purpose=args.get("purpose") or "job",
+                          tier=args.get("tier"), kind=args.get("kind"),
+                          privacy=bool(args.get("privacy")), purpose=args.get("purpose", "job"),
                           sensitive=bool(args.get("sensitive")))
 
 
@@ -2582,6 +2678,7 @@ def _tool_route_report(args: dict) -> dict:
     """khipu_route_report: a report, a hold or a hold's end. Who wrote it is
     Khipu's to say, from this server's own environment and folder (the
     harness that launched it), never from the arguments."""
+    _validate_tool_args("khipu_route_report", args)
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     _ensure_path()
@@ -2629,6 +2726,7 @@ def _tool_route_priority(args: dict) -> dict:
     """Record the owner's priority at his request through the conversation
     author path; it never speaks as the owner, and its answer names each
     account by its label and id, never a key or a login folder."""
+    _validate_tool_args("khipu_route_priority", args)
     if _via_https_gateway():
         return {"available": False, "reason": ROUTING_GATEWAY_REASON}
     _ensure_path()
@@ -2995,8 +3093,6 @@ def handle_message(msg) -> dict | None:
     elif msg["method"] == "tools/call":
         if not isinstance(params.get("name"), str):
             error = "tool name must be a string"
-        elif not isinstance(params.get("arguments", {}), dict):
-            error = "arguments must be an object"
     response = _error(req_id, -32602, error) if error else _dispatch_message(msg)
     _MESSAGE_STATE.error = _response_error(response)
     return response if "id" in msg else None
@@ -3058,10 +3154,12 @@ def _dispatch_message(msg: dict) -> dict | None:
         projection = agent_view.pull_projection() if name == "khipu_route" and not _via_https_gateway() else None
         projection_entered = False
         try:
+            arguments = params.get("arguments", {})
+            _validate_tool_args(name, arguments)
+            arguments = dict(arguments)
             if projection is not None:
                 projection.__enter__()
                 projection_entered = True
-            arguments = dict(params.get("arguments") or {})
             if name in {"khipu_route_report", "khipu_route_rule", "khipu_route_priority"} and not _via_https_gateway():
                 from khipu import routing
 
@@ -3074,6 +3172,10 @@ def _dispatch_message(msg: dict) -> dict | None:
                     payload = func(arguments)
             else:
                 payload = func(arguments)
+            if name in {"khipu_owed_update", "khipu_decisions_update"} and payload.get("ok") is False:
+                if not payload.get("error"):
+                    payload = {**payload, "error": f"{name} refused the requested change; no matching item could be changed"}
+                raise _ToolFailure(payload)
             if name in _AGENT_SCRUBBED:
                 payload = _scrub_for_agents(name, payload)
             elif name in _AGENT_PROJECTED:

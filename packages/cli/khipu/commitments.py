@@ -2094,6 +2094,10 @@ def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict
 def resolve_owed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Owner, trigger and priority for raw commitment rows, in place."""
     for row in rows:
+        if row.get("kind") == "routing_direction":
+            row["owner"] = OWNER_USER
+            set_quiet(row)
+            continue
         row.setdefault("last_seen_at", None)
         row["seen_count"] = int(row.get("seen_count") or 1)
         # owner / future_trigger are RESOLVED here, not read raw: rows opened
@@ -2229,7 +2233,7 @@ BULK_OWNER_REFUSAL = ("Changing more than one of the owner's own items at once n
                       "typing in (khipu_owner_act with owed.change). Nothing was changed.")
 
 
-def _opened_key(row: dict[str, Any]) -> tuple[Any, int]:
+def _opened_key(row: dict[str, Any]) -> tuple[Any, tuple[int, Any]]:
     from datetime import datetime, timezone
 
     at = row.get("opened_at")
@@ -2242,10 +2246,13 @@ def _opened_key(row: dict[str, Any]) -> tuple[Any, int]:
         at = datetime.min.replace(tzinfo=timezone.utc)
     elif at.tzinfo is None:
         at = at.replace(tzinfo=timezone.utc)
-    return at, int(row.get("id") or 0)
+    cid = row.get("id")
+    # Typed tie-breaks preserve numeric order while admitting direction IDs.
+    key = (1, cid) if isinstance(cid, str) and cid.startswith("rd-") else (0, int(cid or 0))
+    return at, key
 
 
-def _page_key(row: dict[str, Any]) -> tuple[int, Any, int]:
+def _page_key(row: dict[str, Any]) -> tuple[int, Any, tuple[int, Any]]:
     """The keyset, sorted descending: active rows (1) before the owner's quiet
     ones (0), each newest first."""
     return (0 if row.get("quiet_weeks") else 1, *_opened_key(row))
@@ -2257,8 +2264,8 @@ def encode_cursor(row: dict[str, Any], as_of: datetime | None = None) -> str:
     turns quiet between pages neither repeats nor goes missing."""
     import base64
 
-    active, at, cid = _page_key(row)
-    parts = [at.isoformat(), cid, active] + ([as_of.isoformat()] if as_of else [])
+    active, at, _ = _page_key(row)
+    parts = [at.isoformat(), row["id"], active] + ([as_of.isoformat()] if as_of else [])
     return base64.urlsafe_b64encode(json.dumps(parts).encode()).decode().rstrip("=")
 
 
@@ -2275,7 +2282,7 @@ def cursor_as_of(raw: str | None) -> datetime | None:
         return None
 
 
-def decode_cursor(raw: str) -> tuple[int, Any, int]:
+def decode_cursor(raw: str) -> tuple[int, Any, tuple[int, Any]]:
     """``(active, opened_at, id)`` of the last row a page gave; a cursor from
     before the quiet group counts as active. ValueError otherwise."""
     import base64
@@ -2284,7 +2291,9 @@ def decode_cursor(raw: str) -> tuple[int, Any, int]:
     try:
         text = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
         at, cid, *active = json.loads(text)
-        return _page_key({"opened_at": datetime.fromisoformat(at), "id": int(cid),
+        if not (isinstance(cid, str) and cid.startswith("rd-")):
+            cid = int(cid)
+        return _page_key({"opened_at": datetime.fromisoformat(at), "id": cid,
                           "quiet_weeks": None if (active or [1])[0] else 1})
     except (ValueError, TypeError, UnicodeDecodeError):
         raise ValueError("cursor is not one khipu_owed gave; start again without it") from None
