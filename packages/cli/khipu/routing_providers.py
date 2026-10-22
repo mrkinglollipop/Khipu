@@ -73,6 +73,8 @@ def usage_setup(harness: str, provider: dict) -> str | None:
         return None
     if harness == "deepseek" and usage.available("deepseek"):
         return None
+    if harness == "deepseek":
+        return "store its API key with `khipu secrets --set deepseek_api_key` or the `deepseek_key_file` setting"
     if harness not in usage.HARNESSES:
         return "no usage reader set up; confirm its quota host in Settings → Accounts"
     return None

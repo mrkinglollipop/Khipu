@@ -1963,6 +1963,10 @@ export default function App() {
     [owedFetchedAt, markLoaded, fetchOwedPage],
   );
 
+  // Owed writes can change Work's waiting model even while the Work tab is
+  // closed, so initialise its reader before the write callback closes over it.
+  const work = useWork(tab === "work", dsnOk === true);
+
   /** Show more: the next page of one list, by the cursor the last returned. */
   const loadOwedMore = useCallback(
     async (key: OwedListKey) => {
@@ -2015,10 +2019,11 @@ export default function App() {
           loadOwed("open", true),
           loadOwed("closed", true),
           loadOwed("stale", true),
+          work.load(true),
         ]);
       }
     },
-    [loadOwed],
+    [loadOwed, work.load],
   );
 
   /** Home's one fix action for a harness that stopped recording: the same
@@ -2767,8 +2772,6 @@ export default function App() {
   // every few seconds while Work is open and once a minute for the rail
   // badge otherwise. The Owed tab folded into Work as its own section
   // (Decision 14); `owedFocusKey` opens Work there.
-  const work = useWork(tab === "work", dsnOk === true);
-
   /** Close… or Move to… on the ticked items, or Close on one that looks
    *  settled: one call with every id (`khipu_owed_change`), then every list
    *  and Work read again. Resolves to null, or the words to show. */

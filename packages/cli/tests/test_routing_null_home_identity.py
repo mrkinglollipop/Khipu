@@ -94,10 +94,10 @@ def test_removed_message_projection_preserves_local_receipt_key(replay):
     assert "/fake/private-login" not in planned["delivery_plan"]["removed"][entity]
 
 
-def test_deepseek_names_missing_usage_setup_without_confirming_a_host(replay):
+def test_deepseek_names_missing_usage_setup_with_its_local_key_paths(replay):
     define("deepseek", "DeepSeek")
     entry = next(a for a in replay.view()["accounts"] if a["harness"] == "deepseek")
-    assert entry["usage_setup"] == "no usage reader set up; confirm its quota host in Settings → Accounts"
+    assert entry["usage_setup"] == "store its API key with `khipu secrets --set deepseek_api_key` or the `deepseek_key_file` setting"
     assert entry["usage_setup"] in routing.account_line(entry, replay.now)
     assert "no report yet" not in routing.summary()["text"].split("DeepSeek:", 1)[1].split("\n", 1)[0]
     assert usage.http_quota_accounts() == []
@@ -107,7 +107,7 @@ def test_deepseek_names_missing_usage_setup_without_confirming_a_host(replay):
 def test_deepseek_http_quota_without_host_names_the_missing_fact(replay):
     define("deepseek", "DeepSeek", probe="http-quota")
     entry = next(a for a in replay.view()["accounts"] if a["harness"] == "deepseek")
-    assert entry["usage_setup"] == "no usage reader set up; confirm its quota host in Settings → Accounts"
+    assert entry["usage_setup"] == "store its API key with `khipu secrets --set deepseek_api_key` or the `deepseek_key_file` setting"
 
 
 def test_configured_http_quota_does_not_claim_setup_is_missing(replay):

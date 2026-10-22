@@ -623,7 +623,7 @@ def test_usage_setup_clears_when_the_reader_is_available(ds):
 def test_usage_setup_still_asks_when_there_is_no_key(ds):
     ds.key = None
     assert routing_providers.usage_setup("deepseek", {"id": "deepseek"}) == (
-        "no usage reader set up; confirm its quota host in Settings → Accounts")
+        "store its API key with `khipu secrets --set deepseek_api_key` or the `deepseek_key_file` setting")
 
 
 @pytest.mark.parametrize("purpose", ["job", "check", "orchestration"])

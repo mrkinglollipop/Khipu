@@ -210,6 +210,25 @@ describe("the priority on Home", () => {
     fireEvent.click(screen.getByRole("button", { name: "Undo" }));
     await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo", expect: "p7" }));
   });
+
+  it("collects an end-or-keep choice before confirming a held priority on Home", async () => {
+    const load = vi.fn(async () => undefined);
+    const pending = { ...PRIORITY, pending: true, confirmed: false };
+    answers.khipu_route_priority = (args) => args?.holds
+      ? { ok: true }
+      : { ok: false, error: "say end or keep in holds for: h1" };
+    const data = view(pending);
+    data.holds = [{ id: "h1", scope_label: "Claude", reason: "keep", owner: true, until: null }];
+    render(<RoutingCard state={stateOf(data, load)} />);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    await screen.findByRole("group", { name: "End or keep each hold" });
+    fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save and confirm" }));
+    await waitFor(() => expect(calls("khipu_route_priority")).toEqual([
+      { action: "confirm", expect: "p7" },
+      { action: "confirm", expect: "p7", holds: { h1: "keep" } },
+    ]));
+  });
 });
 
 describe("the priority and the pace in Settings -> Routing", () => {

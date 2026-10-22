@@ -26,8 +26,9 @@ import {
   whenLocal,
   windowWords,
 } from "./routing";
-import type { PlanFigure, RouteAccount, RoutePriority, RoutingState } from "./routing";
+import type { PlanFigure, RouteAccount, RoutePriority, RoutingState, RouteView } from "./routing";
 import { callCli } from "./settingsCli";
+import { holdChoiceIds, holdChoiceTargets } from "./routingProposals";
 
 const NO_RECORD_HINT =
   "Khipu starts one when a plan check, a job runner folder or a conversation reports on an account. Until then no account is shown as open.";
@@ -105,16 +106,29 @@ function AccountRow({
 
 /** The owner's priority at the top of the card, in his order. One a
  *  conversation set at his request carries its mark and Confirm or Undo. */
-function PriorityRow({ p, now, reload }: { p: RoutePriority; now: Date; reload: () => Promise<void> }) {
+function PriorityRow({ p, view, now, reload }: { p: RoutePriority; view: RouteView; now: Date; reload: () => Promise<void> }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const act = async (action: "confirm" | "undo") => {
+  const [holdIds, setHoldIds] = useState<string[] | null>(null);
+  const [holds, setHolds] = useState<Record<string, "end" | "keep">>({});
+  const targets = holdIds ? holdChoiceTargets(view, holdIds, now) : [];
+  const act = async (action: "confirm" | "undo", choices?: Record<string, "end" | "keep">) => {
     if (busy) return;
     setBusy(action);
     setError(null);
     try {
-      const out = await callCli("khipu_route_priority", { action, expect: p.version ?? null });
-      if (!out.ok) setError(out.error);
+      const out = await callCli("khipu_route_priority", { action, expect: p.version ?? null, ...(choices ? { holds: choices } : {}) });
+      if (!out.ok) {
+        const refused = action === "confirm" ? holdChoiceIds(out.error) : [];
+        if (refused.length) {
+          setHoldIds(refused);
+          setHolds({});
+        } else {
+          setError(out.error);
+        }
+      } else {
+        setHoldIds(null);
+      }
       await reload();
     } finally {
       setBusy(null);
@@ -143,6 +157,33 @@ function PriorityRow({ p, now, reload }: { p: RoutePriority; now: Date; reload: 
             <span className="set-error" role="alert">
               Khipu didn't make that change: {error}
             </span>
+          ) : null}
+          {holdIds ? (
+            <div className="route-choice" role="group" aria-label="End or keep each hold">
+              <p className="set-help">That change wasn't saved yet. Say whether each hold or pause ends or stays.</p>
+              {targets.map((target) => (
+                <fieldset key={target.id}>
+                  <legend>{target.legend}</legend>
+                  <label>
+                    <input type="radio" name={`priority-hold-${target.id}`} checked={holds[target.id] === "end"}
+                      onChange={() => setHolds((current) => ({ ...current, [target.id]: "end" }))} />
+                    {target.endLabel}
+                  </label>
+                  <label>
+                    <input type="radio" name={`priority-hold-${target.id}`} checked={holds[target.id] === "keep"}
+                      onChange={() => setHolds((current) => ({ ...current, [target.id]: "keep" }))} />
+                    {target.keepLabel}
+                  </label>
+                </fieldset>
+              ))}
+              <div className="toolbar">
+                <button type="button" className="primary sm" disabled={busy !== null || !targets.every((target) => holds[target.id])}
+                  onClick={() => void act("confirm", holds)}>
+                  {busy === "confirm" ? "Confirming…" : "Save and confirm"}
+                </button>
+                <button type="button" className="sm link" onClick={() => setHoldIds(null)}>Cancel</button>
+              </div>
+            </div>
           ) : null}
         </>
       ) : null}
@@ -242,7 +283,7 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
           {error ? <span className="route-src">{error}</span> : null}
         </ListRow>
       ) : null}
-      {data.priority ? <PriorityRow p={data.priority} now={now} reload={() => state.load(true)} /> : null}
+      {data.priority ? <PriorityRow p={data.priority} view={data} now={now} reload={() => state.load(true)} /> : null}
       <AccountRows state={state} plans={plans} now={now} />
       {holds.length ? (
         <div className="route-sub">
