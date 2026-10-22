@@ -316,12 +316,16 @@ def plan(out, view, now, cfg, *, session=None, project=None):
     removed_lines = list(removed.values())
     removed_lines = project(removed_lines) if project else r._for_agents(removed_lines, view)
     removed = dict(zip(removed, removed_lines))
-    # Which entity each line of the text belongs to, as its producer
-    # recorded it. A mapping that does not match the text is dropped, and the
-    # renderer then hides no line as another entity's.
+    # Which item each line of the text belongs to, as its producer recorded
+    # it (``line_token``), kept as an index into this plan's own items: no
+    # entity id travels with the lines. A list that does not match the text
+    # is dropped, and the renderer then hides no line as another entity's.
     owners = out.get("line_entities")
-    if not (isinstance(owners, list) and isinstance(text, str) and len(owners) == len(text.split("\n"))
-            and all(o is None or isinstance(o, str) for o in owners)):
+    if isinstance(owners, list) and isinstance(text, str) and len(owners) == len(text.split("\n")) \
+            and all(o is None or isinstance(o, str) for o in owners):
+        index = {line_token(item["entity"]): i for i, item in enumerate(items)}
+        owners = [index.get(o) if o else None for o in owners]
+    else:
         owners = None
     out = {k: v for k, v in out.items() if k != "line_entities"}
     return dict(out, delivery_plan={"items": items, "pace_forecasts": out.get("pace_forecasts") or {},
@@ -338,6 +342,26 @@ def plan(out, view, now, cfg, *, session=None, project=None):
 
 
 PAGE_FLOOR = 300  # UTF-16 units; narrower pages are never sent
+
+# A line's owner travels from its producer to ``plan`` as a keyed digest of
+# its entity, never the entity id itself (an account's id can name a login
+# folder). The key lives only in this process: a token read anywhere else
+# matches nothing, and its line is shown rather than hidden.
+_LINE_KEY = os.urandom(16)
+
+
+def line_token(entity):
+    return hashlib.blake2s(entity.encode("utf-8"), key=_LINE_KEY, digest_size=8).hexdigest()
+
+
+def _line_items(plan, lines):
+    """Each line's index into the plan's items, or None for every line when
+    the plan has no valid record of them (older saved state included)."""
+    owners, n = plan.get("line_entities"), len(plan.get("items") or [])
+    if isinstance(owners, list) and len(owners) == len(lines) and all(
+            o is None or (type(o) is int and 0 <= o < n) for o in owners):
+        return owners
+    return None
 # The smallest cap a block or a pull is paged at, in UTF-16 units; a smaller
 # configured cap behaves as this. It holds the tail, a page header with its
 # label at its longest (HEADER_LABEL) and a floor-sized page, so every due
@@ -430,7 +454,9 @@ def _delivery_point(state, out, now):
     plan = out["delivery_plan"]
     state["harness"] = health_harness(plan.get("harness"))
     state["slack"] = plan.get("slack", 2)
-    budget = _capped(plan.get("page_limit") or plan.get("limit"), 8000)
+    # The configured cap, not the delivered one: a cap too small for a header
+    # and a page has no bound, so health says unknown instead of green.
+    budget = plan.get("page_limit") or plan.get("limit") or 8000
     ahead = 0
     entries = list(state.get("entries", {}).values())
     entries.sort(key=lambda e: not e["entity"].startswith("hold:"))
@@ -442,7 +468,7 @@ def _delivery_point(state, out, now):
             entry["owed_point"] = point
             entry["owed_chars"] = ahead
             # The page header and owed tail consume the same cap as the words.
-            prefix = f"{_header_label(entry['label'])}; revision {entry['revision'][:8]}; page "
+            prefix = f"{entry['label']}; revision {entry['revision'][:8]}; page "
             payload = budget - _size("More routing owed.") - 2 - _size(prefix) - 24
             entry["budget"] = min(max(0, payload), entry.get("width") or max(0, payload))
             entry["bound"] = max(1, math.ceil(ahead / entry["budget"])) if entry["budget"] else None
@@ -481,23 +507,16 @@ def _render(state, out, now, component, *, delivery_point=True):
                 (state.get("done") or {}).get(item["entity"]) == item["revision"])]
     if (heard or removed) and isinstance(out.get("text"), str):
         lines = out["text"].split("\n")
-        owners = out["delivery_plan"].get("line_entities")
-        if isinstance(owners, list) and len(owners) == len(lines):
-            # The producer named each line's entity: those lines go, by identity.
+        owners = _line_items(out["delivery_plan"], lines)
+        if owners is not None:
+            # The producer named each line's item: those lines go, by identity.
+            items = out["delivery_plan"]["items"]
             gone = {"notice:" + ident for ident in heard} | {item["entity"] for item in removed}
-            kept = [(line, owner) for line, owner in zip(lines, owners) if owner not in gone]
+            kept = [(line, owner) for line, owner in zip(lines, owners)
+                    if owner is None or items[owner]["entity"] not in gone]
             lines, owners = [line for line, _ in kept], [owner for _, owner in kept]
         else:
-            owners = None
-            for ident in heard:
-                line = entries["notice:" + ident]["text"]
-                if line in lines:
-                    lines.remove(line)
-            for item in removed:
-                for line in list(lines):
-                    prefix = line.removesuffix("…").removesuffix("...").rstrip()
-                    if line == item["text"] or (prefix and line != prefix and item["text"].startswith(prefix)):
-                        lines.remove(line)
+            owners = None  # no record of whose lines these are: none is hidden
         plain = "\n".join(lines)
         out = dict(out, text=plain, delivery_plan=dict(out["delivery_plan"], text=plain, line_entities=owners))
         if heard:
@@ -634,21 +653,16 @@ def _render(state, out, now, component, *, delivery_point=True):
         # read from its words. Without that record no line is taken for
         # another entity's: it is shown rather than hidden.
         plain_lines = plain.split("\n")
-        owners = out["delivery_plan"].get("line_entities")
-        if not (isinstance(owners, list) and len(owners) == len(plain_lines)):
-            owners = [None] * len(plain_lines)
+        owners = _line_items(out["delivery_plan"], plain_lines) or [None] * len(plain_lines)
         owed = {e["entity"] for e in due}
 
-        def _long(entity):  # a rule, the note, the priority or a notice: shown whole or paged
-            e = entries.get(entity)
-            return e["whole"] if e is not None else (
-                entity.startswith(("rule:", "notice:")) or entity in ("note", "priority"))
+        plan_items = out["delivery_plan"]["items"]
 
         lines_room = min(cap // 2, room_all - hard)
         for line, owner in list(zip(plain_lines, owners))[1:]:
             if not line.strip() or line.endswith(":") or line.startswith(tail[:-1]):
                 continue
-            if owner is not None and (owner in owed or _long(owner)):
+            if owner is not None and (plan_items[owner]["entity"] in owed or plan_items[owner]["whole"]):
                 continue  # shown as its own line or page, never beside it
             if used + _size(line) + 1 > lines_room:
                 continue

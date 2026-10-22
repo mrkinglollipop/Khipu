@@ -9583,8 +9583,12 @@ def _priority_push(view: dict, now: datetime, *, changed: bool = False,
 def line_owners(pairs) -> list:
     """The entity each physical line of a block belongs to (None: no
     entity), from the (entity, line) pairs its producer joined. The
-    delivery renderer filters a block's lines by this, never by their words."""
-    return [entity for entity, line in pairs for _ in (line or "").split("\n")]
+    delivery renderer filters a block's lines by this, never by their words.
+    Each owner is a token (``routing_delivery.line_token``), never the
+    entity id: an account's id can name a login folder."""
+    from khipu.routing_delivery import line_token
+
+    return [line_token(entity) if entity else None for entity, line in pairs for _ in (line or "").split("\n")]
 
 
 def _fit_push(head, others, limit: int, *, stale: str | None = None, overflow=None,

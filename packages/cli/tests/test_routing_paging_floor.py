@@ -170,7 +170,7 @@ def test_the_per_entry_share_uses_the_scaled_floor():
 def test_a_rule_pointer_line_is_not_repeated_beside_its_page():
     pointer = "Standing rule 6 added: " + RULE[:60]
     out = _plan([_rule()], [pointer, STATE[0]], 1000)
-    out["delivery_plan"]["line_entities"] = [None, "rule:6", None]  # as its producer records it
+    out["delivery_plan"]["line_entities"] = [None, 0, None]  # rule:6, the plan's first item, as plan() records it
     answer = _step({}, out, 0)
     assert pointer not in answer["text"]
     assert STATE[0] in answer["text"]

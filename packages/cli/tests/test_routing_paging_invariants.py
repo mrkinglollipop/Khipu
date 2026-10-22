@@ -60,7 +60,10 @@ def _out(items, lines, cap, *, force=False, page_limit=None, mapped=True):
     plan = dict(items=copy.deepcopy(items), current_entities=[i["entity"] for i in items], notices=[],
                 heading=HEADING, text=text, limit=cap, page_limit=page_limit or cap, max_chars=9000,
                 lease=60, force_pages=force, pace_forecasts={}, advice_forecasts={}, harness="claude",
-                full=False, line_entities=[None, *(e for e, _ in pairs)] if mapped else None)
+                full=False, line_entities=None)
+    if mapped:  # as ``rd.plan`` leaves it: an index into the plan's own items
+        index = {item["entity"]: i for i, item in enumerate(plan["items"])}
+        plan["line_entities"] = [None, *(index.get(e) for e, _ in pairs)]
     return dict(epoch="e1", version=1, kind="changes", text=text,
                 owed_entities=[i["entity"] for i in items], shown_entities=[], notices=[], delivery_plan=plan)
 
@@ -242,6 +245,45 @@ def test_a_reworded_account_line_in_a_recorded_plan_is_kept():
     for minute in range(3):
         answer = _step(state, _out([account, note], [("account:f", shown)], 400), minute)
         assert shown in answer["text"], answer["text"]
+
+
+def test_line_owners_never_carry_an_entity_id(no_usage):
+    entity = "account:claude|/Users/someone/.claude-zqprivate"
+    owners = routing.line_owners([(None, "## Routing"), (entity, "Work: open.")])
+    assert owners[0] is None and "someone" not in str(owners) and "account:" not in str(owners)
+    item = _item(entity, "Work: open.", "account", False)
+    out = dict(epoch="e", version=1, kind="changes", text="## Routing\nWork: open.", owed_entities=[],
+               shown_entities=[], notices=[], line_entities=owners)
+    view = dict(record=True, epoch="e", version=1, accounts=[], holds=[], rules=[], unmatched=[],
+                changes=[], effective={})
+    planned = rd.plan(out, view, NOW, CFG, project=lambda x: x)
+    assert "line_entities" not in planned
+    plan = dict(planned["delivery_plan"], items=[item])
+    assert all(o is None or type(o) is int for o in plan["line_entities"] or [])
+
+
+def test_a_stale_removal_without_line_owners_hides_no_line(no_usage, monkeypatch):
+    cfg = dict(routing_line_chars=12, routing_summary_chars=800, routing_prompt_chars=400, routing_delivery_lease=60)
+    current = dict(key="current", label="X", state=routing.OPEN, configured=False, witness={"source": "owner"})
+    clipped = routing._clip(routing.account_line(current, NOW), cfg["routing_line_chars"])
+    prefix = clipped.removesuffix("...").removesuffix("…").rstrip()
+    note = {"at": rd._iso(NOW), "text": "Long note words. " * 300}
+    view = dict(record=True, epoch="fallback", version=2, accounts=[current], holds=[], rules=[], unmatched=[],
+                note=note, changes=[{"version": 1, "entities": ["account:gone"],
+                                     "lines": [prefix + " carried a longer removed account state"]}],
+                effective={"account:current": current, "note": note})
+    full = dict(routing.settings(), **cfg)
+    monkeypatch.setattr(routing, "settings", lambda: full)
+    produced = routing.summary(view, now=NOW, session_id="fake")
+    assert clipped in produced["text"].split("\n")
+    planned = rd.plan(dict(produced, kind="full", owed_entities=[*view["effective"], "account:gone"]),
+                      view, NOW, cfg, project=lambda x: x)
+    assert planned["delivery_plan"]["line_entities"] is None
+    items = {item["entity"]: item for item in planned["delivery_plan"]["items"]}
+    entries = {e: dict(copy.deepcopy(items[e]), offset=len(items[e]["text"]), acked=True)
+               for e in ("account:current", "account:gone")}
+    answer = rd._render(dict(epoch="fallback", entries=entries, batches={}), planned, NOW, "main")
+    assert clipped in answer["text"], answer["text"]
 
 
 def test_a_plan_without_line_owners_hides_no_line():
