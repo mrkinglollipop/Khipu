@@ -67,6 +67,9 @@ def test_routing_forecasts_ack_only_complete_delivered_text(field, prefix):
                *[item(e, f"{e}: hold back until reset; synthetic reason.", whole=False, visible=True)
                  for e in forecasts], item("rule:2", "Use only fake accounts. " * 100)]
     out = planned(entries, **{field: forecasts})
+    # The hold and reserved rule page consume a 400-character body. Leave
+    # room for two forecasts while the other six remain genuinely unshown.
+    out["delivery_plan"].update(limit=600, page_limit=600)
     out["delivery_plan"]["line_entities"] = [None, *[i for i, entry in enumerate(entries) if entry["visible"]]]
     answer = rd.offer(out, session="forecasts")
     shown = {e["entity"] for e in entries if e["entity"] in forecasts and e["text"] in answer["text"]}
@@ -117,6 +120,36 @@ def test_routing_new_owner_hold_preempts_live_rule_lease():
     assert second["routing_changes"]["batch"] != first["routing_changes"]["batch"]
     assert second["version"] == 2
     assert not rd.acknowledge("hold", first["routing_changes"], now=NOW)
+
+
+def test_routing_unconfirmed_flight_reissued_after_identical_view_rewrite(tmp_path):
+    from khipu import recall_prompt
+
+    source = tmp_path / "fake-view.json"
+    source.write_text('{"epoch":"fake-epoch","version":1}')
+
+    def generation():
+        stat = source.stat()
+        return [[str(source), [stat.st_mtime_ns, stat.st_size, stat.st_ino]]]
+
+    out = planned([item("account:fake", "Fake: open", whole=False, visible=True)])
+    out["generation"] = generation()
+    first = rd.offer(out, session="unconfirmed")
+    assert recall_prompt._routing_generation_current(first["generation"])
+    replacement = source.with_suffix(".new")
+    replacement.write_text(source.read_text())
+    replacement.replace(source)
+    assert not recall_prompt._routing_generation_current(first["generation"])
+
+    out["generation"] = generation()
+    second = rd.offer(out, session="unconfirmed")
+    assert second["text"] == first["text"]
+    assert second["version"] == first["version"]
+    assert second["routing_changes"]["batch"] != first["routing_changes"]["batch"]
+    assert second["generation"] == out["generation"]
+    assert recall_prompt._routing_generation_current(second["generation"])
+    assert not rd.acknowledge("unconfirmed", first["routing_changes"], now=NOW)
+    assert rd.acknowledge("unconfirmed", second["routing_changes"], now=NOW)
 
 
 @pytest.mark.parametrize("ack_new", [False, True])
@@ -208,6 +241,55 @@ def test_routing_direction_dismissal_survives_concurrent_writer(monkeypatch, ope
             release.set()
         future.result(timeout=5)
         assert dismissed.result(timeout=5)["status"] == "dismissed"
+    assert directions.directions()[0]["status"] == "dismissed"
+
+
+@pytest.mark.parametrize("operation", ["refresh", "capture"])
+def test_routing_direction_dismissal_survives_process_writer(monkeypatch, operation):
+    row = seed_direction(monkeypatch)
+    ctx = multiprocessing.get_context("fork")
+    saving, release, attempting, dismissed = (ctx.Event() for _ in range(4))
+    original = directions._save
+
+    def paused_save(data):
+        if multiprocessing.current_process().name == "direction-writer" and not saving.is_set():
+            saving.set()
+            assert release.wait(5)
+        original(data)
+
+    monkeypatch.setattr(directions, "_save", paused_save)
+
+    def write():
+        if operation == "refresh":
+            directions.refresh([])
+        else:
+            directions.capture_scan("fake-session", [row["words"]], actions=[])
+
+    def dismiss():
+        attempting.set()
+        assert directions.dismiss(row["id"])["status"] == "dismissed"
+        dismissed.set()
+
+    writer = ctx.Process(target=write, name="direction-writer")
+    owner = ctx.Process(target=dismiss, name="direction-owner")
+    writer.start()
+    try:
+        assert saving.wait(5)
+        owner.start()
+        assert attempting.wait(5)
+        # The independent process must wait for the writer's entire
+        # read/modify/write transaction, not overwrite its stale snapshot.
+        assert not dismissed.wait(0.2)
+    finally:
+        release.set()
+        for process in (writer, owner):
+            if process.pid is not None:
+                process.join(5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+    assert writer.exitcode == owner.exitcode == 0
+    assert dismissed.is_set()
     assert directions.directions()[0]["status"] == "dismissed"
 
 

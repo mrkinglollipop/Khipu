@@ -611,8 +611,14 @@ def _render(state, out, now, component, *, delivery_point=True):
         _delivery_point(state, out, now)
     flight = state.get("flight")
     if flight and _parse(flight["until"]) > now:
-        answer = copy.deepcopy(flight["out"])
-        return answer
+        if flight["out"].get("generation") == out.get("generation"):
+            return copy.deepcopy(flight["out"])
+        # A refold can rewrite the view without changing its version. The
+        # old payload's stat receipt is then stale and cannot pass the hook's
+        # final freshness check. Withdraw it and issue the fresh plan under a
+        # new batch; never lend the old batch a newer generation's authority.
+        state.pop("flight", None)
+        flight = None
     if flight:
         _expire(state, flight)
         state.pop("flight", None)
