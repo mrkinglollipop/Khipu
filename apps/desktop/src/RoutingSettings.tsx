@@ -112,6 +112,8 @@ type RouteSetting = {
   source: string;
   words?: string;
   request?: SettingRequest | null;
+  /** A conversation's change is waiting for the owner; `value` is still the live state. */
+  pending?: boolean;
 };
 type RouteConfig = { routing?: Record<string, RouteSetting> };
 
@@ -3258,7 +3260,9 @@ function SubFold({ k, name, line, folds, children }: { k: string; name: string; 
 export function replicationStatusWords(
   freshness: RouteDeliveryFreshness | null | undefined,
   healthError?: string | null,
+  pending?: boolean,
 ): string {
+  if (pending) return "waiting for your OK";
   if (healthError) return "can't be checked";
   if (!freshness) return "checking…";
   if (freshness.status === "not_applicable") return "off";
@@ -3465,7 +3469,7 @@ function TellingSection({
               error={<WriteError w={w} id="replication-live" />}
             />
             <p className="set-help" role="status">
-              Replication: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError)}
+              Replication: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError, cfg?.routing?.routing_replication_live?.pending === true)}
               {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
             </p>
           </div>

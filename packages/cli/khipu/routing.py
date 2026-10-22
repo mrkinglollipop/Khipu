@@ -462,6 +462,14 @@ class SettingError(ValueError):
         self.code = code
 
 
+class SettingNoChange(Exception):
+    """A conversation's request that matches what is already confirmed."""
+
+    def __init__(self, path: Path):
+        super().__init__("already in effect")
+        self.path = path
+
+
 def _setting_requests(config: dict) -> dict[str, dict]:
     raw = config.get(SETTINGS_REQUEST_KEY)
     return {k: v for k, v in raw.items() if k in SETTINGS and isinstance(v, dict)} if isinstance(raw, dict) else {}
@@ -490,10 +498,12 @@ def settings_status() -> dict[str, dict]:
         if key == "routing_replication_live":
             # Same strict test as _replication_live: a hand-edited word or
             # number never shows the switch on (or counts as a stored form).
-            value = config.get(key) is True
+            # Live state: a conversation's unconfirmed word never shows on.
+            value = config.get(key) is True and waiting is None
             if config.get(key) is not None and not isinstance(config.get(key), bool):
                 source = "invalid"
         out[key] = {"value": value, "default": default, "kind": kind, "source": source, "words": words,
+                    "pending": waiting is not None,
                     "request": {"request": waiting.get("request"), "by": waiting.get("by"), "at": waiting.get("at"),
                                 "by_words": author_words(waiting.get("by") if isinstance(waiting.get("by"), dict)
                                                          else None, push=True),
@@ -519,6 +529,11 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
             raise SettingError(f"a conversation's change to {key} is still waiting for the owner; he confirms or "
                                "undoes it in Settings first", "request_waiting")
         prior, prior_set = data.get(key), key in data
+        if request is not None and key == "routing_replication_live" and raw is not None \
+                and _coerce(kind, raw, key) is (prior is True):
+            # Matches the confirmed value: nothing to ask the owner, and a
+            # waiting entry would switch a live replication off.
+            raise SettingNoChange(config_file())
         if raw is None:
             data.pop(key, None)
         else:
