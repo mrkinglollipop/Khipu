@@ -516,7 +516,10 @@ def _render(state, out, now, component, *, delivery_point=True):
                     if owner is None or items[owner]["entity"] not in gone]
             lines, owners = [line for line, _ in kept], [owner for _, owner in kept]
         else:
-            owners = None  # no record of whose lines these are: none is hidden
+            # No record of whose lines these are: only a line that is exactly
+            # a completed item's own text goes, never one sharing a prefix.
+            done_text = {entries["notice:" + ident]["text"] for ident in heard} | {item["text"] for item in removed}
+            lines, owners = [line for line in lines if line not in done_text], None
         plain = "\n".join(lines)
         out = dict(out, text=plain, delivery_plan=dict(out["delivery_plan"], text=plain, line_entities=owners))
         if heard:
