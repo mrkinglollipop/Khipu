@@ -17,6 +17,7 @@ ANTHROPIC_ACCOUNT = "anthropic_api_key"
 OPENAI_ACCOUNT = "openai_api_key"
 OPENROUTER_ACCOUNT = "openrouter_api_key"
 GLM_ACCOUNT = "glm_api_key"
+DEEPSEEK_ACCOUNT = "deepseek_api_key"
 OPENAI_COMPAT_ACCOUNT = "openai_compat_api_key"
 VOYAGE_ACCOUNT = "voyage_api_key"
 CONFIG_DIR = Path.home() / ".config" / "khipu"
@@ -264,6 +265,10 @@ def set_glm_key(key: str) -> None:
     set_password(GLM_ACCOUNT, key.strip())
 
 
+def get_deepseek_key() -> str | None:
+    return get_password(DEEPSEEK_ACCOUNT)
+
+
 def _resolve_provider_key(provider: str, *, key_file: Path | None = None) -> str:
     from khipu.config import path_setting
 
@@ -276,6 +281,7 @@ def _resolve_provider_key(provider: str, *, key_file: Path | None = None) -> str
         "openai": get_openai_key,
         "openrouter": get_openrouter_key,
         "glm": get_glm_key,
+        "deepseek": get_deepseek_key,
     }
     if provider not in getters:
         raise RuntimeError(f"unknown provider key: {provider}")
@@ -307,6 +313,12 @@ def resolve_glm_key(*, key_file: Path | None = None) -> str:
     """The z.ai GLM Coding Plan key: env GLM_API_KEY, Keychain ``glm_api_key``,
     then the file named by the ``glm_key_file`` setting."""
     return _resolve_provider_key("glm", key_file=key_file)
+
+
+def resolve_deepseek_key(*, key_file: Path | None = None) -> str:
+    """The DeepSeek API key: env DEEPSEEK_API_KEY, Keychain ``deepseek_api_key``,
+    then the file named by the ``deepseek_key_file`` setting."""
+    return _resolve_provider_key("deepseek", key_file=key_file)
 
 
 def dsn_file_health(path: Path | None = None) -> dict:

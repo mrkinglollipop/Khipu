@@ -49,7 +49,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HARNESSES = ("claude", "codex", "grok", "muse", "glm")
@@ -64,6 +64,10 @@ GROK_TIMEOUT_S = 20.0
 # GLM's probe is one HTTPS call to z.ai's quota endpoint, no child process.
 GLM_TIMEOUT_S = 15.0
 GLM_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+DEEPSEEK_HISTORY_NAME = "deepseek-balance.json"
+DEEPSEEK_HISTORY_DAYS = 21
+DEEPSEEK_HISTORY_MAX = 4000
 DEFAULT_MAX_AGE_S = 120
 CACHE_NAME = "usage.json"
 CACHE_VERSION = 2
@@ -122,6 +126,8 @@ E_INTERNAL = "internal_error"
 E_PENDING = "pending"
 E_NO_FOLDER = "login_folder_missing"
 E_NO_KEY = "no_key"
+# DeepSeek reported balances only in a currency Khipu does not convert.
+E_CURRENCY = "currency_unsupported"
 E_NO_PLAN = "no_plan"
 # z.ai refused the key: not a sign-in an owner can redo in a CLI, so it has its own code.
 E_BAD_KEY = "key_rejected"
@@ -148,8 +154,12 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
     folder = " with this login folder" if home else ""
     if code == E_REDIRECT:
         return "The quota endpoint tried to send Khipu to another host, so Khipu refused the answer"
+    if code == E_CURRENCY:
+        return "This account's balance is not in USD, which is the only currency Khipu reads"
     if harness == "glm":
         return _glm_note(code)
+    if harness == "deepseek":
+        return _deepseek_note(code)
     if code == E_NOT_INSTALLED:
         return f"{name} is not installed on this Mac"
     if code == E_SIGNIN:
@@ -180,6 +190,19 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return NO_FOLDER_NOTE
     if code == E_INTERNAL:
         return "Khipu could not run the check"
+    return None
+
+
+def _deepseek_note(code: str | None) -> str | None:
+    """DeepSeek has no CLI: its read is the balance call Khipu makes with a key."""
+    if code == E_NO_KEY:
+        return "Khipu has no DeepSeek key; add it in Settings under Accounts and routing"
+    if code in (E_SIGNIN, E_BAD_KEY):
+        return "DeepSeek did not accept the key; replace it in Settings under Accounts and routing"
+    if code in (E_NOT_INSTALLED, E_TIMEOUT, E_NO_ANSWER):
+        return "Khipu can't reach DeepSeek from this Mac just now"
+    if code in (E_BAD, E_CLI):
+        return "DeepSeek answered in a way Khipu can't read; its spend is unknown"
     return None
 
 
@@ -1443,6 +1466,183 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
     return parse_glm(status, body)
 
 
+# ---- DeepSeek (balance, weekly spend) -------------------------------------------
+#
+# DeepSeek has no plan window: GET /user/balance answers the account's prepaid
+# balance. Weekly spend is the sum of balance decreases Khipu has seen since
+# Monday 00:00Z; an increase is a top-up, never spend. The key is read into a
+# local, goes only into the Authorization header to api.deepseek.com, and never
+# reaches a row, the history file, a log or an error. The history holds
+# (time, balance) pairs only.
+
+
+def _deepseek_key() -> str | None:
+    from khipu import keychain
+
+    try:
+        return keychain.resolve_deepseek_key() or None
+    except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
+        return None
+
+
+def deepseek_history_file() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / "state" / DEEPSEEK_HISTORY_NAME
+
+
+def _deepseek_cap_usd() -> float | None:
+    """The owner's weekly dollar cap on the DeepSeek account, from the
+    ``deepseek_weekly_cap_usd`` setting; None (no percentage) when unset."""
+    try:
+        from khipu.config import load_config
+
+        value = load_config().get("deepseek_weekly_cap_usd")
+    except Exception:  # noqa: BLE001 - no readable config means no cap
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
+            or not 0 < value <= 1e9:
+        return None
+    return float(value)
+
+
+def deepseek_accounts(definitions: dict) -> list[dict]:
+    """The DeepSeek accounts of the record, once a key makes them readable."""
+    if not _deepseek_key():
+        return []
+    providers = definitions.get("providers") or {}
+    out = []
+    for ident, value in sorted((definitions.get("accounts") or {}).items()):
+        if (value or {}).get("provider") == "deepseek" and "deepseek" in providers:
+            out.append({"label": value.get("label") or ident, "harness": "deepseek", "home": None,
+                        "provider": "deepseek", "quota_key": ident})
+    return out
+
+
+def _deepseek_request(key: str, timeout: float) -> tuple[int, bytes]:
+    """(HTTP status, body) of the balance call; ProbeError for anything that is
+    not an HTTP answer. No exception text is kept: it could echo the key."""
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(DEEPSEEK_BALANCE_URL, headers={
+        "Authorization": f"Bearer {key}", "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - fixed https URL
+            return response.status, response.read(1 << 20)
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+    except TimeoutError:
+        raise ProbeError(E_TIMEOUT) from None
+    except urllib.error.URLError as exc:
+        raise ProbeError(E_TIMEOUT if isinstance(exc.reason, TimeoutError) else E_NO_ANSWER) from None
+    except Exception:  # noqa: BLE001 - OSError, ssl, http.client: any text could echo the key
+        raise ProbeError(E_NO_ANSWER) from None
+
+
+def parse_deepseek(status: int, body: bytes) -> float:
+    """The USD total balance of a /user/balance answer."""
+    if status in (401, 403):
+        raise ProbeError(E_BAD_KEY)
+    if status != 200:
+        raise ProbeError(E_CLI)
+    try:
+        reply = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeError):
+        reply = None
+    if not isinstance(reply, dict) or not isinstance(reply.get("balance_infos"), list):
+        raise ProbeError(E_BAD)
+    infos = [i for i in reply["balance_infos"] if isinstance(i, dict)]
+    usd = [i for i in infos if i.get("currency") == "USD"]
+    if not usd:
+        raise ProbeError(E_CURRENCY if infos else E_BAD)
+    try:
+        total = float(usd[0].get("total_balance"))
+    except (TypeError, ValueError):
+        raise ProbeError(E_BAD) from None
+    if not math.isfinite(total) or total < 0:
+        raise ProbeError(E_BAD)
+    return round(total, 4)
+
+
+def _week_start(now: datetime) -> datetime:
+    day = now.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return day - timedelta(days=day.weekday())
+
+
+def _deepseek_samples() -> list[list[float]]:
+    try:
+        data = json.loads(deepseek_history_file().read_text(encoding="utf-8"))
+        raw = data["samples"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    out = [[float(t), float(b)] for t, b in (s for s in raw if isinstance(s, list) and len(s) == 2)
+           if all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (t, b))]
+    return sorted(out)
+
+
+def _deepseek_store(samples: list[list[float]], now: datetime) -> None:
+    """Values only, 0600, written beside the usage cache; a read-only data dir
+    costs the history, never the answer."""
+    cutoff = now.timestamp() - DEEPSEEK_HISTORY_DAYS * 86400
+    kept = [s for s in samples if s[0] >= cutoff][-DEEPSEEK_HISTORY_MAX:]
+    path = deepseek_history_file()
+    tmp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+        tmp = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"samples": kept}, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+
+def deepseek_week_spend(samples: list[list[float]], now: datetime) -> float:
+    """Sum of balance decreases whose later sample falls in the current week;
+    an increase (a top-up) adds nothing, so spend is never negative."""
+    start = _week_start(now).timestamp()
+    spent = 0.0
+    for (_t0, b0), (t1, b1) in zip(samples, samples[1:]):
+        if t1 >= start and b1 < b0:
+            spent += b0 - b1
+    return round(spent, 4)
+
+
+@_guard
+def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
+    """Weekly spend (and, with a dollar cap, the share of it used) from
+    DeepSeek's balance. A failed read raises before any sample is stored, so
+    it can only ever be unknown, never zero spent."""
+    key = _deepseek_key()
+    if not key:
+        raise ProbeError(E_NO_KEY)
+    try:
+        status, body = _deepseek_request(key, GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+    finally:
+        key = None  # the key lives only for the request above
+    balance = parse_deepseek(status, body)
+    now = _now()
+    samples = _deepseek_samples()
+    samples.append([now.timestamp(), balance])
+    _deepseek_store(samples, now)
+    spent = deepseek_week_spend(samples, now)
+    reset = _week_start(now) + timedelta(days=7)
+    spend = {"week_usd": spent, "balance_usd": balance, "since": _iso(samples[0][0]),
+             "week_started": _iso(_week_start(now).timestamp())}
+    windows = []
+    cap = _deepseek_cap_usd()
+    if cap:
+        spend["cap_usd"] = cap
+        windows.append(_window("weekly", round(spent / cap * 100, 1), reset.timestamp(), 10080, spend_usd=spent))
+    return {"ok": True, "plan": None, "windows": windows, "credits": None, "version": None,
+            "source": "live", "spend": spend}
+
+
 # ---- http-quota (owner-confirmed HTTPS quota endpoints, slice 9b) --------------
 #
 # The key floor (plan section 6): HTTPS only, to the exact host the owner
@@ -1715,12 +1915,12 @@ def http_quota_accounts() -> list[dict]:
     out = []
     for ident, value in sorted((definitions.get("accounts") or {}).items()):
         provider = providers.get((value or {}).get("provider") or "")
-        if not provider or provider.get("probe") != "http-quota":
+        if not provider or provider.get("probe") != "http-quota" or provider.get("id") == "deepseek":
             continue
         out.append({"label": value.get("label") or ident, "harness": provider["id"], "home": None,
                     "probe": "http-quota", "host": provider.get("host"), "provider": provider["id"],
                     "quota_key": ident})
-    return out
+    return out + deepseek_accounts(definitions)
 
 
 # ---- accounts ----------------------------------------------------------------
@@ -1795,6 +1995,8 @@ def _account_from_entry(entry) -> dict:
 def available(harness: str) -> bool:
     """Whether Khipu can read this harness by default: its CLI is installed,
     or (GLM, which has no CLI) a key is stored."""
+    if harness == "deepseek":
+        return bool(_deepseek_key())
     return bool(_glm_key()) if harness == "glm" else bool(_command(harness))
 
 
@@ -2093,6 +2295,8 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         if account.get("invalid"):
             data = {"ok": False, "error": E_INVALID,
                     "note": f"This account entry is not valid: {account['invalid']}"}
+        elif harness == "deepseek":
+            data = probe_deepseek(timeout=timeout)
         elif account.get("probe") == "http-quota" or account.get("quota_key"):
             data = probe_http_quota(account, timeout=timeout)
         elif harness in _HOME_VARS and not _login_folder_there(home or str(default_login(harness))):
