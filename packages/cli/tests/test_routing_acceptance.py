@@ -476,7 +476,7 @@ def test_2_pending_rule_is_whole_across_pages(replay):
     words = "Grok " + "~" * 2995
     routing.request_rule(words, author=AUTHOR)
     delivered = []
-    for _ in range(12):
+    for _ in range(40):
         out, context, info = replay.offer()
         if not context:
             break

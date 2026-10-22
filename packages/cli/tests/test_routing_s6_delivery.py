@@ -88,7 +88,7 @@ def test_owner_words_reassemble_byte_identically_with_unicode_and_paths(replay):
     routing.add_rule(words, via="app")
     payloads = []
     pages = []
-    for _ in range(100):
+    for _ in range(300):
         out, context, info = replay.offer()
         if not context:
             break
@@ -196,7 +196,7 @@ def test_crowded_recall_repacks_an_unshown_batch_without_losing_words(replay):
     assert payloads[0] in ctx
     assert entity not in info["pending"]["shown"]
     replay.ack(info)
-    for _ in range(50):
+    for _ in range(200):
         out, ctx, info = replay.offer()
         if not ctx:
             break

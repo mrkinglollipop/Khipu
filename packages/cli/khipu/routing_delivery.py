@@ -507,33 +507,73 @@ def _render(state, out, now, component, *, delivery_point=True):
         cap = min(limit or 8000, out["delivery_plan"].get("max_chars", 9000) - _size(heading) - 2)
         tail = "More routing owed."
         used = 0
-        def _share(e):  # a rule or the priority never takes more than half the cap (two floor pages at least)
-            whole = cap if not (e["entity"].startswith("rule:") or e["entity"] == "priority") else max(cap // 2, 2 * PAGE_FLOOR)
-            return min(cap, whole) - _size(tail) - 2
+        # A page narrower than this is noise; it scales down for a tiny cap.
+        floor = max(1, min(PAGE_FLOOR, cap // 5))
+        page_limit = out["delivery_plan"]["page_limit"] or cap
+
+        def _need(e):  # the smallest payload room in which a page of this entry can be sent
+            restart = f"{e['label']} changed while being shown.\n" if e.get("restarted") else ""
+            prefix = f"{e['label']}; revision {e['revision'][:8]}; page "
+            widest = max(1, page_limit - _size(tail) - 2 - _size(prefix) - 24)
+            least = max(1, min(floor, _size(e["text"][e.get("offset", 0):]), widest))
+            return _size(restart) + _size(prefix) + 24 + least
+
+        def _share(e):  # a rule or the priority never takes more than half the cap, yet always fits one page
+            half = max(cap // 2, 2 * floor) if e["entity"].startswith("rule:") or e["entity"] == "priority" else cap
+            return min(cap - _size(tail) - 2, max(half, _need(e)))
 
         # Account-state and change lines stay on every prompt that pages, so
         # hours of paging never hide them; paged debt gets the room they
         # leave. An offer where everything fits whole is left as it was.
-        if any(e.get("offset") or e.get("restarted") or _size(e["text"]) > _share(e) for e in due):
-            # A paged entity's own preview line is recognised by its opening
-            # words, since the offer clips it and appends its own suffix.
-            owned = [e["text"][:40] for e in entries.values() if e["whole"]] + [e["text"][:40] for e in due]
+        paging = any(e.get("offset") or e.get("restarted") or _size(e["text"]) > _share(e) for e in due)
+        reserve, fits = 0, {}
+        if paging:
+            # Due non-whole entries (account changes, holds) always show: they
+            # are rendered in due order and the long entries leave them room,
+            # while one floor-sized page is reserved ahead of any plain line.
+            lead = next((e for e in due if e["whole"]), None)
+            reserve = _need(lead) + 1 if lead else 0
+            spare = cap - _size(tail) - 2 - reserve
+            for e in due:
+                # A hold is finite debt that must beat the pages: it shows
+                # even if that defers the long entry's page one prompt.
+                hold = e["entity"].startswith("hold:")
+                if not e["whole"] and _size(e["text"]) + 1 <= (spare + reserve if hold else spare):
+                    fits[e["entity"]] = _size(e["text"]) + 1
+                    spare -= fits[e["entity"]]
+            # Names that mark a long entity's own preview line, however worded.
+            marks = []
+            for e in entries.values():
+                if e["whole"]:
+                    marks += [e["text"][:40], e["label"].split(" for ")[0]]
+                    marks += {"priority": ["Your priority"], "note": ["Owner note", "The owner's note"]}.get(e["entity"], [])
+            lines_room = min(cap // 2, spare)
             for line in plain.split("\n")[1:]:
                 if not line.strip() or line.endswith(":") or line.startswith(tail[:-1]):
                     continue
-                if any(line.startswith(t) or (len(line) < 40 and t.startswith(line)) for t in owned):
+                if any(line.startswith(m) or (len(line) < 40 and m.startswith(line)) for m in marks if m):
                     continue
-                if used + _size(line) + 1 > cap // 2:
+                if any(line == e["text"] for e in due if not e["whole"]):
+                    continue
+                if used + _size(line) + 1 > lines_room:
                     continue
                 body.append(line)
                 used += _size(line) + 1
-        # A page narrower than this is noise; it scales down for a tiny cap.
-        floor = max(1, min(PAGE_FLOOR, cap // 5))
+        blocked, lead_done, rendered_nw = False, False, set()
         for e in due:
             start, value = e.get("offset", 0), e["text"]
             restart = f"{e['label']} changed while being shown.\n" if e.get("restarted") else ""
             prefix = f"{e['label']}; revision {e['revision'][:8]}; page "
             room = cap - used - _size(tail) - 2
+            if paging:
+                if e["whole"] and blocked:
+                    continue
+                if not e["whole"] and e["entity"] not in fits:
+                    continue  # it stays due, and is first in line once the pages end
+                if e["whole"]:
+                    room -= sum(v for k, v in fits.items() if k not in rendered_nw)
+                elif not lead_done and not e["entity"].startswith("hold:"):
+                    room -= reserve  # the first long entry still needs its page
             room = min(room, _share(e))
             if not start and not restart and _size(value) <= room:
                 rendered, end, page = value, len(value), None
@@ -541,26 +581,38 @@ def _render(state, out, now, component, *, delivery_point=True):
                 # Start has a larger budget than subsequent prompts. Count
                 # its larger first page plus exact future UTF-16 chunks. The
                 # width follows this prompt's room; it is never frozen.
-                future_room = min(room, (out["delivery_plan"]["page_limit"] or room) - _size(tail) - 2)
+                future_room = min(room, page_limit - _size(tail) - 2)
                 width = future_room - _size(prefix) - 24
                 e["width"] = max(width, 0)
-                least = min(floor, _size(value[start:]))
+                least = _need(e) - _size(restart) - _size(prefix) - 24
                 available = room - _size(restart + prefix) - 24
                 if start:
                     available = min(width, available)
                 if width < least or available < least:
-                    break
+                    blocked = lead_done = True
+                    if not paging:
+                        break
+                    continue
                 end = _cut(value, start, available)
                 if end == start:
-                    break
+                    blocked = lead_done = True
+                    if not paging:
+                        break
+                    continue
                 remaining = _pages_left(value, end, width)
                 if remaining is None:
-                    break
+                    blocked = lead_done = True
+                    if not paging:
+                        break
+                    continue
                 n = e.get("pages", 0) + 1
                 page = {"n": n, "m": n + remaining}
                 rendered = restart + prefix + f"{n}/{page['m']}\n" + value[start:end]
             if _size(rendered) > room:
-                break
+                blocked = lead_done = True
+                if not paging:
+                    break
+                continue
             item = dict(change=e["entity"] + "@" + e["revision"], entity=e["entity"], revision=e["revision"])
             if page:
                 item["page"] = page
@@ -568,8 +620,14 @@ def _render(state, out, now, component, *, delivery_point=True):
             progress[e["entity"]] = end
             body.append(rendered)
             used += _size(rendered) + 1
+            if e["whole"]:
+                lead_done = True
+            else:
+                rendered_nw.add(e["entity"])
             if end < len(value):
-                break
+                blocked = True
+                if not paging:
+                    break
         left = any(progress.get(e["entity"], e.get("offset", 0)) < len(e["text"]) for e in due)
         if left:
             body.append(tail)
@@ -1125,7 +1183,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
                 progress[entry["entity"]] = len(value)
                 continue
             width = max(2, page_limit - _size(entry["label"]) - 44)
-            if (entry.get("width") or 0) >= min(PAGE_FLOOR, page_limit // 5):
+            if entry.get("width") and entry["width"] >= max(1, min(PAGE_FLOOR, page_limit // 5)):
                 width = entry["width"]  # a stored sliver width is ignored and healed
             entry["width"] = width
             end = _cut(value, start, width)
