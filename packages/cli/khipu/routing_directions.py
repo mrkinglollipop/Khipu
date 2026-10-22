@@ -325,15 +325,103 @@ def _direction_id(session: str, sha: str, occurrence: int, words: str) -> str:
     return "rd-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+QUARANTINE_NAME = "routing-directions.quarantine.json"
+
+
+def _quarantine_path() -> Path:
+    return store_path().with_name(QUARANTINE_NAME)
+
+
+def _raw_store() -> dict:
+    """The store as written, malformed rows included. A missing store is
+    empty; an unreadable or wrong-shaped file raises."""
+    try:
+        data = json.loads(store_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"directions": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("directions"), dict):
+        raise ValueError("invalid routing direction store")
+    return data
+
+
+def malformed_rows() -> list[dict]:
+    """The rows the store cannot use, as ``{key, reason}`` (never their
+    words), for doctor and for the repair. An unreadable store is one
+    entry keyed ``(store)``."""
+    try:
+        data = _raw_store()
+    except (OSError, ValueError) as err:
+        return [{"key": "(store)", "reason": f"{type(err).__name__}: {err}"[:200]}]
+    return [{"key": str(key), "reason": "not a valid direction row"}
+            for key, row in data["directions"].items() if not _valid_row(key, row)]
+
+
+def _session_of(row) -> str | None:
+    return row.get("session") if isinstance(row, dict) and isinstance(row.get("session"), str) else None
+
+
+def repair_store() -> list[str]:
+    """Move every malformed row out of the store into a private quarantine
+    file, so a forget no longer stops on it. A row that names its session
+    keeps its content there (a later forget of that session scrubs it); a
+    row that does not is reduced to its key. The valid rows are untouched.
+    Returns the keys moved. An unreadable store file is left alone."""
+    with _store_lock():
+        try:
+            data = _raw_store()
+        except (OSError, ValueError):
+            return []
+        bad = {k: v for k, v in data["directions"].items() if not _valid_row(k, v)}
+        if not bad:
+            return []
+        try:
+            held = json.loads(_quarantine_path().read_text(encoding="utf-8"))
+            held = held if isinstance(held, dict) else {}
+        except (OSError, ValueError):
+            held = {}
+        for key, row in bad.items():
+            held[str(key)] = row if _session_of(row) else {"key": str(key)}
+        owner_turns._write_private(_quarantine_path(), json.dumps(held, indent=1) + "\n")
+        _save({**data, "directions": {k: v for k, v in data["directions"].items() if k not in bad}})
+        return sorted(str(k) for k in bad)
+
+
+def _scrub_quarantine(names) -> None:
+    try:
+        held = json.loads(_quarantine_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    if not isinstance(held, dict):
+        _quarantine_path().unlink()
+        return
+    kept = {k: v for k, v in held.items() if _session_of(v) not in names}
+    if len(kept) != len(held):
+        if kept:
+            owner_turns._write_private(_quarantine_path(), json.dumps(kept, indent=1) + "\n")
+        else:
+            _quarantine_path().unlink()
+
+
 def forget_sessions(sessions) -> None:
+    """Remove the forgotten sessions' directions. A malformed row that names
+    a forgotten session goes with them; any other malformed row cannot be
+    shown clear of those words, so the valid rows are scrubbed and saved, and
+    the error then names the rows left (``repair_store`` moves them aside),
+    keeping the forget incomplete rather than claiming it done."""
     names = {s for s in sessions if s}
     if not names:
         return
     with _store_lock():
-        data = _load(strict=True)
-        kept = {k: v for k, v in data["directions"].items() if v.get("session") not in names}
+        _scrub_quarantine(names)
+        data = _raw_store()
+        kept = {k: v for k, v in data["directions"].items() if _session_of(v) not in names}
         if len(kept) != len(data["directions"]):
             _save({**data, "directions": kept})
+        left = sorted(str(k) for k, v in kept.items() if not _valid_row(k, v))
+    if left:
+        raise ValueError("malformed routing direction row(s) " + ", ".join(left)
+                         + " could not be checked for the forgotten session's words; "
+                         "repair them (khipu doctor names them) and forget again")
 
 
 def directions() -> list[dict]:

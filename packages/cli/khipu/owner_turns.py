@@ -676,6 +676,15 @@ def sweep(now: float | None = None) -> dict:
     except Exception as err:  # noqa: BLE001
         out["ok"] = False
         out["errors"].append(f"old widenings: {type(err).__name__}: {err}")
+    try:
+        from khipu import routing_directions
+
+        moved = routing_directions.repair_store()
+        if moved:
+            out["directions_quarantined"] = moved
+    except Exception as err:  # noqa: BLE001
+        out["ok"] = False
+        out["errors"].append(f"routing directions: {type(err).__name__}: {err}")
     return out
 
 
@@ -841,15 +850,27 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
     installed recorded none (no record means every direction from it is
     refused). Off says off."""
     per = counts(now)
+    # A row the routing-directions store cannot use blocks every forget until
+    # it is moved aside; the timer sweep does that, and doctor names the row.
+    try:
+        from khipu import routing_directions
+
+        bad = routing_directions.malformed_rows()
+    except Exception:  # noqa: BLE001 - a failed look must not hide the rest of the row
+        bad = []
+    damaged = [f"Routing directions: row {row['key']} is malformed ({row['reason']}) and blocks forgetting "
+               f"until the next sweep moves it aside." for row in bad]
     if not settings()["enabled"]:
-        return {"ok": True, "enabled": False, "harnesses": per, "missing": [], "warnings": [],
+        return {"ok": not damaged, "enabled": False, "harnesses": per, "missing": [], "warnings": damaged,
                 "summary": "Owner direction is off."}
     installed = _prompt_hook_installed() if installed is None else installed
     missing = [h for h in installed if not per.get(h, {}).get("turns")]
     warnings = [f"Owner direction is on, but no turn from {_HARNESS_WORDS.get(h, h)} was recorded in the last day; "
                 f"its prompt hook may not be running, and owner directions from it are refused." for h in missing]
+    warnings += damaged
     parts = [f"{_HARNESS_WORDS.get(h, h)} {row['turns']}" for h, row in sorted(per.items())]
-    return {"ok": not missing, "enabled": True, "harnesses": per, "missing": missing, "warnings": warnings,
+    return {"ok": not missing and not damaged, "enabled": True, "harnesses": per, "missing": missing,
+            "warnings": warnings,
             "summary": "Turns recorded in the last day: " + (", ".join(parts) if parts else "none") + "."}
 
 

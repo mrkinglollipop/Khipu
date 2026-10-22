@@ -154,7 +154,7 @@ def test_recreated_topic_after_remote_purge(replica):
 @pytest.mark.parametrize('offset', [-5, 0])
 def test_topic_row_not_newer_than_purge_marker_stays_hidden(replica, offset):
     assert hs.pull_changes()['ok']
-    stamp = hs._purge_marker_time(hs.snapshot_path(), 'purged') + offset
+    stamp = hs._purge_marker_stamp(hs.snapshot_path(), 'purged').timestamp() + offset
     row = {'slug': 'purged', 'title': 'stale', 'body': 'STALE PURGED topic',
            'updated_at': datetime.fromtimestamp(stamp, timezone.utc)}
     parts = hs._write_pulled_tables([row], None, None, read_at=time.time())
@@ -182,6 +182,7 @@ def test_purge_comparison_uses_database_timestamp_precision(replica, delta_us):
 
     assert hs.pull_changes()['ok']
     marker = hs._purged_topic_marker(hs.snapshot_path(), 'purged')
+    marker.write_text('purged', encoding='utf-8')  # an older marker: no hub time, the file's time stands in
     # This rounds up when represented as a PostgreSQL/Python timestamp.
     stamp_ns = 1_800_000_000_123456789
     os.utime(marker, ns=(stamp_ns, stamp_ns))
