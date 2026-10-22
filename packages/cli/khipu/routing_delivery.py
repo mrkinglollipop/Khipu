@@ -528,10 +528,28 @@ def _merge(state, out):
         if entity.startswith("notice:") and not entries[entity].get("acked") and entity not in plan.get("notices", []):
             del entries[entity]
             replaced.add(entity)
+    # A pace or advice forecast is an offer, never part of the routing view:
+    # nothing is retracted when a later plan stops offering it (the start
+    # block's child plan, or a forecast that no longer differs). The unshown
+    # offer ends silently, like notice debt, unless a live lease still holds
+    # it for a display that has not recorded delivery yet.
+    leased = set()
+    flight = state.get("flight")
+    try:
+        if flight and _parse(flight["until"]) > _parse(plan["at"]):
+            leased = {i["entity"] for i in flight["out"]["routing_changes"]["items"]}
+    except (KeyError, TypeError, ValueError):
+        leased = set()
+    for entity in list(entries):
+        if entity.startswith(("pace:", "advice:")) and not entries[entity].get("acked") \
+                and entity not in planned and entity not in leased:
+            del entries[entity]
+            replaced.add(entity)
     # SessionStart's parent has only the scrubbed plan, not the routing view.
     # Missing saved debt needs a removal message, never its former words.
     for entity, old in entries.items():
-        if not old.get("acked") and entity not in planned and entity not in current:
+        if not old.get("acked") and entity not in planned and entity not in current \
+                and not entity.startswith(("pace:", "advice:")):
             fallback = ("The owner's note ended" if entity == "note" else
                         old["label"] + (" retired" if entity.startswith("rule:") else " is no longer current"))
             line = plan.get("removed", {}).get(entity, fallback)

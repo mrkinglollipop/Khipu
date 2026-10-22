@@ -413,3 +413,34 @@ def test_routing_gateway_fold_metadata_does_not_redeliver(monkeypatch):
         changes, _ = hub.delivery("fake-session", changed, "", NOW + timedelta(seconds=61))
         assert changes is not None, field
         assert hub.delivery("fake-session", changed, changes["batch"], NOW + timedelta(seconds=61))[0] is None
+
+
+@pytest.mark.parametrize("prefix", ["pace", "advice", "advice:check"])
+def test_routing_forecast_that_leaves_the_plan_is_dropped_not_announced_removed(prefix):
+    # A pace or advice forecast is an offer, never part of the routing view.
+    # When a later plan stops offering it (the SessionStart parent's scrubbed
+    # plan, or a forecast that no longer differs), the unacknowledged offer
+    # ends silently: no "is no longer current" page, no "changed while being
+    # shown" restart, and one page per entity sharing a label.
+    rows = [f"{prefix}:fake-{i}" for i in range(3)]
+    forecast_field = "pace_forecasts" if prefix == "pace" else "advice_forecasts"
+    first = [item("account:fake", "Fake: open; read just now.", whole=False, visible=True),
+             *[dict(item(e, f"Fake {prefix}: hold back until reset {i}.", whole=False, visible=True), label="Fake")
+               for i, e in enumerate(rows)]]
+    out = planned(first, **{forecast_field: {e: dict(account="fake", label="Fake") for e in rows}})
+    out["delivery_plan"]["line_entities"] = [None, *range(len(first))]
+    shown = rd.offer(out, session="gone")
+    assert shown["text"] and "Fake" in shown["text"]  # offered, never acknowledged
+    second = planned([first[0]], version=2)
+    second["delivery_plan"]["line_entities"] = [None, 0]
+    # While the first display's lease is live its offers stay for the ack;
+    # the leftovers must still never turn into removal pages.
+    leased = rd.offer(copy.deepcopy(second), session="gone")
+    assert "no longer current" not in (leased.get("text") or "")
+    second["delivery_plan"]["at"] = rd._iso(NOW + timedelta(seconds=120))
+    answer = rd.offer(second, session="gone")
+    text = (answer.get("text") or "") + json.dumps(answer.get("routing_changes") or {})
+    assert "no longer current" not in text and "changed while being shown" not in text
+    ledger = json.loads(rd._path("gone").read_text())["main"]["entries"]
+    assert not any(e.get("removed") or "no longer current" in (e.get("text") or "") for e in ledger.values())
+    assert not any(e in ledger and not ledger[e].get("acked") for e in rows)
