@@ -155,16 +155,18 @@ def pr_refs(text: str, project_repo: str | None) -> list[tuple[str | None, int]]
 def item_refs(item: dict[str, Any], project_repo: str | None) -> list[tuple[str | None, int]]:
     """Every pull request an item was ever said to need: those its text and
     its latest restatement name, every number in its stored ``prs`` and every
-    other repository's PR an earlier restatement named (``pr_check["refs"]``;
+    repository/number pair an earlier restatement named (``pr_check["refs"]``;
     a restatement adds to both lists, never replaces them). All are
     required."""
     refs = pr_refs(item.get("text") or "", project_repo)
     check = item.get("pr_check") if isinstance(item.get("pr_check"), dict) else {}
-    kept = [(m.group(1), int(m.group(2))) for m in (_QUALIFIED_RE.match(str(r)) for r in check.get("refs") or [])
+    kept = [(_repo(m.group(1)), int(m.group(2))) for m in (_QUALIFIED_RE.match(str(r)) for r in check.get("refs") or [])
             if m]
     for ref in pr_refs(item.get("latest_text") or "", project_repo) + kept:
         if ref not in refs:
             refs.append(ref)
+    # prs is the legacy number index, not a repository identity. Qualified
+    # history above retains both repositories when their numbers coincide.
     named = {n for _, n in refs}
     refs += [(_repo(project_repo), int(n)) for n in (item.get("prs") or []) if int(n) not in named]
     return refs
@@ -173,12 +175,14 @@ def item_refs(item: dict[str, Any], project_repo: str | None) -> list[tuple[str 
 _QUALIFIED_RE = re.compile(r"^([A-Za-z0-9][\w.-]*/[\w.-]+)#(\d{1,7})$")
 
 
-def other_repo_labels(text: str, project: str | None) -> list[str]:
-    """``owner/repo#N`` for each PR ``text`` names in a repository other
-    than ``project``'s: what a restatement keeps in ``pr_check["refs"]``,
-    since ``prs`` holds only numbers."""
+def pr_requirement_labels(text: str, project: str | None) -> list[str]:
+    """Qualified requirements for every repository, including the project's.
+
+    ``prs`` indexes numbers only; it cannot distinguish two repositories
+    that both have PR #41 after the latest wording changes.
+    """
     repo = _project_repo(project)
-    return [f"{r}#{n}" for r, n in pr_refs(text, repo) if r and r != _repo(repo)]
+    return [f"{r}#{n}" for r, n in pr_refs(text, repo) if r]
 
 
 def ref_label(ref: tuple[str | None, int], project_repo: str | None) -> str:

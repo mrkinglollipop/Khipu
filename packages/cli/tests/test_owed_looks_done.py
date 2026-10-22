@@ -166,11 +166,13 @@ def test_an_in_between_restatements_other_repository_pr_is_kept(hub, monkeypatch
                     mock.patch.object(co, "_has_commitment_embeddings", lambda cur, ids: False):
                 assert co.open_from_episode(cur, dict(JOB, open_loops=[{"text": wording}]), ep) == 0
         row = _row(cur, theirs)
-        assert row["prs"] == [41, 42] and row["pr_check"]["refs"] == ["other/repo#41"]
+        assert row["prs"] == [41, 42]
+        assert row["pr_check"]["refs"] == ["acme/widget#41", "other/repo#41", "acme/widget#42"]
         close_rules.run(cur)
         row = _row(cur, theirs)
         assert row["status"] == "open"
-        assert "other/repo#41" in row["pr_check"]["waiting"] and row["pr_check"]["refs"] == ["other/repo#41"]
+        assert "other/repo#41" in row["pr_check"]["waiting"]
+        assert row["pr_check"]["refs"] == ["acme/widget#41", "other/repo#41", "acme/widget#42"]
 
 
 # ---- the clean-up preview (round 5: its fingerprint) --------------------------
