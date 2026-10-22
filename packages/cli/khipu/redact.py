@@ -18,9 +18,14 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 
 MASK = "[REDACTED]"
+
+# Use exactly the assignment pattern's case folding, including Unicode's
+# additional matches for ASCII letters under IGNORECASE.
+_ASSIGNMENT_NAME_RUN = re.compile(r"[A-Za-z0-9_.-]+", re.I)
+_ASSIGNMENT_START = re.compile(r"\b(?=[A-Za-z0-9_.-])", re.I)
 
 # Order matters only where patterns overlap: blocks first, then vendor
 # prefixes, then structural shapes, then name/value assignments.
@@ -87,6 +92,34 @@ def enabled() -> bool:
     return os.environ.get("KHIPU_REDACT_SECRETS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _sub_assignment(
+    pattern: re.Pattern[str], render_match: Callable[[re.Match[str]], str], text: str
+) -> str:
+    """Apply the original pattern once per maximal candidate name run.
+
+    Searching the pattern at every word boundary retries each dotted or
+    hyphenated suffix, making a long nonmatching run quadratic. Any later
+    match in a run also matches at its first word boundary: the prefix can
+    absorb every intervening name character. Keep the original pattern for
+    the anchored match, so its whitespace, value and boundary rules survive.
+    Both candidate scans and the anchored matches take linear total work.
+    """
+    pieces = []
+    consumed = 0
+    for run in _ASSIGNMENT_NAME_RUN.finditer(text):
+        if run.start() < consumed:
+            continue
+        start = _ASSIGNMENT_START.search(text, run.start(), run.end())
+        if start is None:
+            continue
+        match = pattern.match(text, start.start())
+        if match is not None:
+            pieces.extend((text[consumed:match.start()], render_match(match)))
+            consumed = match.end()
+    pieces.append(text[consumed:])
+    return "".join(pieces)
+
+
 def redact_secrets(text: str, *, force: bool = False) -> tuple[str, int]:
     """Return (redacted text, number of replacements). Idempotent.
     ``force`` masks even when ``KHIPU_REDACT_SECRETS`` turns masking off (the
@@ -111,7 +144,7 @@ def redact_secrets(text: str, *, force: bool = False) -> tuple[str, int]:
             total += 1
             return match.expand(repl)
 
-        out = pat.sub(replace, out)
+        out = _sub_assignment(pat, replace, out) if name == "assignment" else pat.sub(replace, out)
     return out, total
 
 
