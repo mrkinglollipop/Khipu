@@ -49,7 +49,8 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from pathlib import Path
 
 HARNESSES = ("claude", "codex", "grok", "muse", "glm")
@@ -64,6 +65,8 @@ GROK_TIMEOUT_S = 20.0
 # GLM's probe is one HTTPS call to z.ai's quota endpoint, no child process.
 GLM_TIMEOUT_S = 15.0
 GLM_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+DEEPSEEK_HISTORY_NAME = "deepseek-balance.json"
 DEFAULT_MAX_AGE_S = 120
 CACHE_NAME = "usage.json"
 CACHE_VERSION = 2
@@ -122,6 +125,10 @@ E_INTERNAL = "internal_error"
 E_PENDING = "pending"
 E_NO_FOLDER = "login_folder_missing"
 E_NO_KEY = "no_key"
+# DeepSeek reported balances only in a currency Khipu does not convert.
+E_CURRENCY = "currency_unsupported"
+# DeepSeek answered is_available false: the account cannot be used just now.
+E_UNAVAILABLE = "account_unavailable"
 E_NO_PLAN = "no_plan"
 # z.ai refused the key: not a sign-in an owner can redo in a CLI, so it has its own code.
 E_BAD_KEY = "key_rejected"
@@ -148,8 +155,14 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
     folder = " with this login folder" if home else ""
     if code == E_REDIRECT:
         return "The quota endpoint tried to send Khipu to another host, so Khipu refused the answer"
+    if code == E_CURRENCY:
+        return "This account's balance is not in USD, which is the only currency Khipu reads"
+    if code == E_UNAVAILABLE:
+        return "The provider says this account can't be used just now, so its spend is unknown"
     if harness == "glm":
         return _glm_note(code)
+    if harness == "deepseek":
+        return _deepseek_note(code)
     if code == E_NOT_INSTALLED:
         return f"{name} is not installed on this Mac"
     if code == E_SIGNIN:
@@ -180,6 +193,19 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return NO_FOLDER_NOTE
     if code == E_INTERNAL:
         return "Khipu could not run the check"
+    return None
+
+
+def _deepseek_note(code: str | None) -> str | None:
+    """DeepSeek has no CLI: its read is the balance call Khipu makes with a key."""
+    if code == E_NO_KEY:
+        return "Khipu has no DeepSeek key; add it in Settings under Accounts and routing"
+    if code in (E_SIGNIN, E_BAD_KEY):
+        return "DeepSeek did not accept the key; replace it in Settings under Accounts and routing"
+    if code in (E_NOT_INSTALLED, E_TIMEOUT, E_NO_ANSWER):
+        return "Khipu can't reach DeepSeek from this Mac just now"
+    if code in (E_BAD, E_CLI):
+        return "DeepSeek answered in a way Khipu can't read; its spend is unknown"
     return None
 
 
@@ -1445,6 +1471,458 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
     return parse_glm(status, body)
 
 
+# ---- DeepSeek (balance, spend floor) ---------------------------------------------
+#
+# DeepSeek has no plan window and no usage API Khipu reads: GET /user/balance
+# answers the account's prepaid balance. A balance is net of spend, top-ups,
+# grants and refunds, so a decrease between two reads proves at least that
+# much was spent in that interval, and nothing proves an upper bound: $50
+# spent and $40 topped up between reads looks like $10. Khipu therefore keeps
+# only a floor. A spend cap reads ``over``/``reached`` once the floor alone
+# reaches it, and ``unknown`` otherwise, never ``under``.
+#
+# The key is read into a local, goes only into the Authorization header of
+# one HTTPS GET to api.deepseek.com (no redirect, no proxy), and never reaches
+# a row, the history file, a log or an error. The history is bound to the key
+# by a keyed hash (HMAC-SHA256 under a random per-history salt), never the key.
+
+DEEPSEEK_BUCKET_S = 3600
+# Spend caps accept up to 366 days (routing_pace), so the floor's evidence is
+# kept that long: at most one bucket starts per clock hour, so a full year is
+# at most 8,784 buckets whatever the poll cadence.
+DEEPSEEK_HISTORY_DAYS = 366
+DEEPSEEK_HISTORY_MAX = DEEPSEEK_HISTORY_DAYS * 24 + 2
+DEEPSEEK_FRESH_S = 1800
+DEEPSEEK_SKEW_S = 120
+# V2 rounded balances/buckets upward; those amounts cannot prove exact floors.
+DEEPSEEK_HISTORY_VERSION = 3
+DEEPSEEK_HISTORY_BYTES = 4 << 20
+DEEPSEEK_LOCK_NAME = "deepseek-balance.lock"
+
+
+def _deepseek_key() -> str | None:
+    from khipu import keychain
+
+    try:
+        return keychain.resolve_deepseek_key() or None
+    except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
+        return None
+
+
+def deepseek_history_file() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / "state" / DEEPSEEK_HISTORY_NAME
+
+
+def deepseek_accounts(definitions: dict) -> list[dict]:
+    """The DeepSeek accounts of the record, once a key makes them readable.
+    Khipu reads one DeepSeek key, so with more than one DeepSeek account
+    defined no balance can be attributed: each is marked invalid."""
+    if not _deepseek_key():
+        return []
+    providers = definitions.get("providers") or {}
+    out = []
+    for ident, value in sorted((definitions.get("accounts") or {}).items()):
+        if (value or {}).get("provider") == "deepseek" and "deepseek" in providers:
+            out.append({"label": value.get("label") or ident, "harness": "deepseek", "home": None,
+                        "provider": "deepseek", "quota_key": ident})
+    if len(out) > 1:
+        for account in out:
+            account["invalid"] = "Khipu reads one DeepSeek key, and more than one DeepSeek account is defined"
+    return out
+
+
+def _deepseek_request(key: str, timeout: float) -> tuple[int, bytes]:
+    """(HTTP status, body) of the balance call. No redirect is followed and no
+    proxy is used, so the key can only ever reach api.deepseek.com over TLS."""
+    return _https_get(DEEPSEEK_BALANCE_URL, f"Bearer {key}", timeout)
+
+
+def parse_deepseek(status: int, body: bytes) -> Decimal:
+    """The USD total balance of a /user/balance answer. An account DeepSeek
+    marks unavailable is a failed read, whatever balance it shows."""
+    if status in (401, 403):
+        raise ProbeError(E_BAD_KEY)
+    if status != 200:
+        raise ProbeError(E_CLI)
+    try:
+        reply = json.loads(body.decode("utf-8"), parse_float=Decimal) if body else None
+    except (ValueError, UnicodeError):
+        reply = None
+    if not isinstance(reply, dict) or not isinstance(reply.get("balance_infos"), list):
+        raise ProbeError(E_BAD)
+    if reply.get("is_available") is not True:
+        raise ProbeError(E_UNAVAILABLE)
+    infos = [i for i in reply["balance_infos"] if isinstance(i, dict)]
+    usd = [i for i in infos if i.get("currency") == "USD"]
+    if not usd:
+        raise ProbeError(E_CURRENCY if infos else E_BAD)
+    if len(usd) != 1:
+        raise ProbeError(E_BAD)
+    raw = usd[0].get("total_balance")
+    try:
+        total = _ds_money(raw)
+    except (TypeError, ValueError, InvalidOperation):
+        raise ProbeError(E_BAD) from None
+    if total > 1e9:
+        raise ProbeError(E_BAD)
+    return total
+
+
+def _ds_money(value) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise ValueError("invalid money")
+    if len(str(value)) > 128:
+        raise ValueError("invalid money")
+    number = Decimal(str(value))
+    # Bounded scale keeps all retained sums exact in a 100-digit context.
+    if not number.is_finite() or not 0 <= number <= Decimal("1e14") or number.as_tuple().exponent < -64:
+        raise ValueError("invalid money")
+    return number
+
+
+def _ds_store_money(value: Decimal):
+    """Keep legacy JSON numbers where lossless; use decimal text otherwise."""
+    number = float(value)
+    return number if Decimal(str(number)) == value else str(value)
+
+
+def _ds_floor_number(value: Decimal) -> float:
+    number = float(value)
+    return math.nextafter(number, -math.inf) if Decimal(str(number)) > value else number
+
+
+def _ds_floor_display(value: Decimal) -> float:
+    with localcontext() as ctx:
+        ctx.prec = 100
+        return float(value.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+
+def _deepseek_floor_total(base: dict, floor: Decimal, cap_usd) -> dict:
+    cap = Decimal(str(cap_usd)) if cap_usd is not None else None
+    reached = cap is not None and cap > 0 and floor >= cap
+    return {**base, "floor_usd": str(floor), "at_least_usd": _ds_floor_display(floor),
+            "status": "known" if reached else "unknown",
+            "usd": _ds_floor_number(floor) if reached else None,
+            "verdict": ("over" if floor > cap else "reached") if reached else "unknown",
+            "reason": None if reached else base.get("reason")}
+
+
+def _deepseek_fingerprint(salt_hex: str, key: str) -> str:
+    import hmac
+
+    return hmac.new(bytes.fromhex(salt_hex), key.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _ds_num(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _deepseek_valid(data, now_ts: float) -> bool:
+    """The whole history, or nothing: a damaged file is never repaired into
+    evidence. Times may not be in the future (beyond a small clock skew)."""
+    if not isinstance(data, dict) or data.get("version") != DEEPSEEK_HISTORY_VERSION:
+        return False
+    salt, fp = data.get("salt"), data.get("fingerprint")
+    if not (isinstance(salt, str) and re.fullmatch(r"[0-9a-f]{32}", salt)
+            and isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{64}", fp)):
+        return False
+    since, last, buckets = data.get("since"), data.get("last"), data.get("buckets")
+    limit = now_ts + DEEPSEEK_SKEW_S
+    if not _ds_num(since) or not isinstance(last, list) or len(last) != 2 or not _ds_num(last[0]):
+        return False
+    try:
+        _ds_money(last[1])
+        for bucket in buckets if isinstance(buckets, list) else []:
+            if isinstance(bucket, list) and len(bucket) == 3:
+                _ds_money(bucket[2])
+    except (ValueError, TypeError, InvalidOperation):
+        return False
+    if not since <= last[0] <= limit:
+        return False
+    if not isinstance(buckets, list) or len(buckets) > DEEPSEEK_HISTORY_MAX:
+        return False
+    previous_end = None
+    for bucket in buckets:
+        if not isinstance(bucket, list) or len(bucket) != 3 or not all(map(_ds_num, bucket[:2])):
+            return False
+        start, end, spent = bucket
+        if not (start < end <= last[0]) or (previous_end is not None and start < previous_end):
+            return False
+        previous_end = end
+    attempt = data.get("attempt")
+    if attempt is not None:
+        if not isinstance(attempt, dict) or not _ds_num(attempt.get("at")) or attempt["at"] > limit:
+            return False
+        if not isinstance(attempt.get("ok"), bool) or not (attempt.get("error") is None
+                                                          or isinstance(attempt.get("error"), str)):
+            return False
+    return True
+
+
+def _deepseek_dir(create: bool) -> int | None:
+    """A descriptor on the history's folder. The folder itself is opened
+    without following a symlink and must be a directory this user owns, so
+    a planted link cannot move the history (or its lock) anywhere else."""
+    from khipu.paths import open_trusted_directory
+
+    try:
+        fd = open_trusted_directory(deepseek_history_file().parent, create=create)
+    except OSError:
+        return None
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        os.close(fd)
+        return None
+    return fd
+
+
+def _deepseek_read(dir_fd: int, now_ts: float) -> tuple[str, dict | None]:
+    """("missing" | "damaged" | "ok", history). Not a regular file this user
+    owns with no group or other access, or not valid: damaged."""
+    try:
+        fd = os.open(DEEPSEEK_HISTORY_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "damaged", None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077 or info.st_size > DEEPSEEK_HISTORY_BYTES):
+            return "damaged", None
+        with os.fdopen(os.dup(fd), "rb") as fh:
+            raw = fh.read(DEEPSEEK_HISTORY_BYTES + 1)
+    except OSError:
+        return "damaged", None
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        return ("ok", data) if _deepseek_valid(data, now_ts) else ("damaged", None)
+    except (ValueError, UnicodeError, OverflowError, RecursionError):
+        return "damaged", None
+
+
+def _deepseek_write(dir_fd: int, data: dict) -> None:
+    """Atomic, 0600, inside the descriptor's folder only. A failed write
+    costs the history, never the answer."""
+    tmp = f".{DEEPSEEK_HISTORY_NAME}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    except OSError:
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, separators=(",", ":"))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, DEEPSEEK_HISTORY_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp, dir_fd=dir_fd)
+
+
+@contextlib.contextmanager
+def _deepseek_locked():
+    """The history folder's descriptor, holding the history lock: every
+    read-merge-write of the history runs under it, across processes."""
+    dir_fd = _deepseek_dir(create=True)
+    if dir_fd is None:
+        yield None
+        return
+    lock_fd = None
+    try:
+        try:
+            lock_fd = os.open(DEEPSEEK_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                              0o600, dir_fd=dir_fd)
+            info = os.fstat(lock_fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+                raise OSError("untrusted DeepSeek history lock")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError:
+            yield None
+            return
+        yield dir_fd
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(dir_fd)
+
+
+def _deepseek_new(key: str, at: float, balance: float) -> dict:
+    salt = os.urandom(16).hex()
+    return {"version": DEEPSEEK_HISTORY_VERSION, "salt": salt, "fingerprint": _deepseek_fingerprint(salt, key),
+            "since": at, "last": [at, _ds_store_money(_ds_money(balance))], "buckets": [],
+            "attempt": {"at": at, "ok": True, "error": None}}
+
+
+def _deepseek_add(data: dict, at: float, balance: float) -> bool:
+    """Merge one reading taken at ``at`` into ``data``. A reading not after the
+    last one recorded (a slower concurrent poll, or a clock step back) is
+    dropped: its place in the order is unknown. A decrease is added to the
+    bucket of the clock hour its interval starts in (a bucket's floor is the
+    sum of the decreases of intervals inside it)."""
+    last_at, last_balance = data["last"]
+    if at <= last_at:
+        return False
+    with localcontext() as ctx:
+        ctx.prec = 100
+        spent = max(Decimal(0), _ds_money(last_balance) - _ds_money(balance))
+    buckets = data["buckets"]
+    if spent > 0:
+        if buckets and buckets[-1][0] // DEEPSEEK_BUCKET_S == last_at // DEEPSEEK_BUCKET_S:
+            with localcontext() as ctx:
+                ctx.prec = 100
+                combined = _ds_money(buckets[-1][2]) + spent
+            buckets[-1] = [buckets[-1][0], at, _ds_store_money(combined)]
+        else:
+            buckets.append([last_at, at, _ds_store_money(spent)])
+    data["last"] = [at, _ds_store_money(_ds_money(balance))]
+    data["attempt"] = {"at": at, "ok": True, "error": None}
+    cutoff = at - DEEPSEEK_HISTORY_DAYS * 86400
+    data["buckets"] = [b for b in buckets if b[0] >= cutoff][-DEEPSEEK_HISTORY_MAX:]
+    data["since"] = max(data["since"], cutoff)
+    return True
+
+
+def deepseek_floor(data: dict, start: float, end: float) -> Decimal:
+    """Dollars certainly spent in [start, end]: the decreases of buckets lying
+    wholly inside it. A bucket that crosses ``start`` is left out (its debit
+    may predate the window), so the floor can only understate, by at most
+    the decreases of one bucket."""
+    with localcontext() as ctx:
+        ctx.prec = 100
+        return sum((_ds_money(spent) for s, e, spent in data["buckets"] if s >= start and e <= end), Decimal(0))
+
+
+def _deepseek_state(now: datetime) -> tuple[str, dict | None]:
+    """("ok", history) when the stored history speaks for the current key;
+    otherwise (why not, None)."""
+    key = _deepseek_key()
+    if not key:
+        return "Khipu has no DeepSeek key, so no balance history speaks for an account", None
+    dir_fd = _deepseek_dir(create=False)
+    if dir_fd is None:
+        return "no DeepSeek balance read yet", None
+    try:
+        status, data = _deepseek_read(dir_fd, now.timestamp())
+    finally:
+        os.close(dir_fd)
+    if status == "missing":
+        return "no DeepSeek balance read yet", None
+    if status != "ok":
+        return "DeepSeek's balance history is damaged; Khipu starts it again at the next read", None
+    if not _hmac_equal(data["fingerprint"], _deepseek_fingerprint(data["salt"], key)):
+        return "DeepSeek's key changed since its balance history began; Khipu starts it again at the next read", None
+    return "ok", data
+
+
+def _hmac_equal(a: str, b: str) -> bool:
+    import hmac
+
+    return hmac.compare_digest(a, b)
+
+
+def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = None, *,
+                         definitions: dict | None = None) -> dict:
+    """The routing record's spend-cap read of DeepSeek over the rolling
+    ``days`` ending ``now`` (the shape of ``routing_sources.spend_total``).
+
+    Known, with the floor as its figure, only when the floor alone has
+    reached ``cap_usd``: that is true whatever a top-up hid, and a later read
+    can never lower it. Anything less is unknown, with the floor as
+    ``at_least_usd``: a balance cannot rule out spend a top-up or refund
+    netted away. Unknown with no floor when the key is gone or changed, the
+    history is damaged, or more than one DeepSeek account is defined. Never
+    raises: a damaged input is unknown, not a broken route."""
+    start = now - timedelta(days=days)
+    base = {"from": _iso(start.timestamp()), "to": _iso(now.timestamp()), "events": None,
+            "at_least_usd": None, "partial": True, "since": None}
+    try:
+        if definitions is not None and sum(
+                1 for v in (definitions.get("accounts") or {}).values()
+                if isinstance(v, dict) and v.get("provider") == "deepseek") > 1:
+            return {**base, "status": "unknown", "usd": None,
+                    "reason": "more than one DeepSeek account is defined, and Khipu reads one DeepSeek key"}
+        state, data = _deepseek_state(now)
+        if state != "ok":
+            return {**base, "status": "unknown", "usd": None, "reason": state}
+        floor = deepseek_floor(data, start.timestamp(), now.timestamp())
+        partial = data["since"] > start.timestamp()
+        out = _deepseek_floor_total({**base, "partial": partial, "since": _iso(data["since"])}, floor, cap_usd)
+        if out["status"] == "known":
+            return out
+        attempt = data.get("attempt") or {}
+        if attempt.get("ok") is False:
+            reason = "DeepSeek's last balance read failed"
+        elif now.timestamp() - data["last"][0] > DEEPSEEK_FRESH_S:
+            reason = "DeepSeek's balance has not been read in the last 30 minutes"
+        elif partial:
+            reason = f"Khipu has read DeepSeek's balance only since {_iso(data['since'])}"
+        else:
+            reason = "a balance cannot rule out spend a top-up or refund hid"
+        return {**out, "status": "unknown", "usd": None,
+                "reason": f"{reason}; at least ${out['at_least_usd']:.2f} spent in the window"}
+    except Exception:  # noqa: BLE001 - a broken history is unknown, never a crashed route
+        return {**base, "status": "unknown", "usd": None, "reason": "DeepSeek's balance history can't be read"}
+
+
+def _deepseek_record_failure(key: str, at: float, code: str) -> None:
+    """Note a failed read on a history this key owns, so routing and the
+    owner see the failure; no figure changes."""
+    with _deepseek_locked() as dir_fd:
+        if dir_fd is None:
+            return
+        status, data = _deepseek_read(dir_fd, at)
+        if status != "ok" or not _hmac_equal(data["fingerprint"], _deepseek_fingerprint(data["salt"], key)):
+            return
+        data["attempt"] = {"at": max(at, data["last"][0]), "ok": False, "error": code}
+        _deepseek_write(dir_fd, data)
+
+
+@_guard
+def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
+    """DeepSeek's balance and the floor of its rolling 7-day spend; the cap
+    and its used share are the routing record's (``cap_statuses``). A failed
+    read stores no sample. The 7-day figure is a floor and is marked
+    ``partial`` until the history covers the whole 7 days."""
+    key = _deepseek_key()
+    if not key:
+        raise ProbeError(E_NO_KEY)
+    # The reading's time is taken before the request: a slower concurrent
+    # poll then sorts before a faster later one and is dropped, not merged.
+    at = _now().timestamp()
+    try:
+        try:
+            status, body = _deepseek_request(key, GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+            balance = parse_deepseek(status, body)
+        except ProbeError as exc:
+            _deepseek_record_failure(key, at, exc.code)
+            raise
+        with _deepseek_locked() as dir_fd:
+            data = None
+            if dir_fd is not None:
+                state, data = _deepseek_read(dir_fd, max(at, _now().timestamp()))
+                if state != "ok" or not _hmac_equal(data["fingerprint"],
+                                                    _deepseek_fingerprint(data["salt"], key)):
+                    data = _deepseek_new(key, at, balance)
+                    _deepseek_write(dir_fd, data)
+                elif _deepseek_add(data, at, balance):
+                    _deepseek_write(dir_fd, data)
+            if data is None:
+                data = _deepseek_new(key, at, balance)
+    finally:
+        key = None  # the key lives only for the request above
+    start = at - 7 * 86400
+    spend = {"balance_usd": float(data["last"][1]),
+             "last_7d_at_least_usd": _ds_floor_display(deepseek_floor(data, start, at)),
+             "partial": data["since"] > start, "since": _iso(data["since"])}
+    return {"ok": True, "plan": None, "windows": [], "credits": None, "version": None,
+            "source": "live", "spend": spend}
+
+
 # ---- http-quota (owner-confirmed HTTPS quota endpoints, slice 9b) --------------
 #
 # The key floor (plan section 6): HTTPS only, to the exact host the owner
@@ -1487,16 +1965,26 @@ def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes
     only the owner-confirmed host is ever contacted, and ``timeout`` is an
     overall deadline (connect through status line, headers and body read),
     not a per-read budget."""
+    # P3-4: the key goes out as a bare ``Authorization: <key>`` header value,
+    # with no scheme (no ``Bearer`` prefix) — the form the z.ai-style quota
+    # APIs this adapter targets accept, same as the GLM probe above.
+    return _https_get(f"https://{host}/", key, timeout)
+
+
+def _https_get(url: str, authorization: str, timeout: float) -> tuple[int, bytes]:
+    """One HTTPS GET to exactly ``url`` with ``authorization`` as its
+    Authorization header: no redirect is followed (a 3xx is E_REDIRECT), no
+    proxy is used, no error body is read, and ``timeout`` is one overall
+    deadline."""
     import http.client
     import socket as socket_module
     import urllib.error
     import urllib.request
 
-    # P3-4: the key goes out as a bare ``Authorization: <key>`` header value,
-    # with no scheme (no ``Bearer`` prefix) — the form the z.ai-style quota
-    # APIs this adapter targets accept, same as the GLM probe above.
-    request = urllib.request.Request(f"https://{host}/",
-                                     headers={"Authorization": key, "Accept": "application/json"})
+    if not url.startswith("https://"):
+        raise ProbeError(E_BAD)
+    request = urllib.request.Request(url, headers={"Authorization": authorization,
+                                                   "Accept": "application/json"})
     deadline = time.monotonic() + timeout
 
     # One watchdog deadline covers connect, TLS, the status line, the
@@ -1717,12 +2205,12 @@ def http_quota_accounts() -> list[dict]:
     out = []
     for ident, value in sorted((definitions.get("accounts") or {}).items()):
         provider = providers.get((value or {}).get("provider") or "")
-        if not provider or provider.get("probe") != "http-quota":
+        if not provider or provider.get("probe") != "http-quota" or provider.get("id") == "deepseek":
             continue
         out.append({"label": value.get("label") or ident, "harness": provider["id"], "home": None,
                     "probe": "http-quota", "host": provider.get("host"), "provider": provider["id"],
                     "quota_key": ident})
-    return out
+    return out + deepseek_accounts(definitions)
 
 
 # ---- accounts ----------------------------------------------------------------
@@ -1797,6 +2285,8 @@ def _account_from_entry(entry) -> dict:
 def available(harness: str) -> bool:
     """Whether Khipu can read this harness by default: its CLI is installed,
     or (GLM, which has no CLI) a key is stored."""
+    if harness == "deepseek":
+        return bool(_deepseek_key())
     return bool(_glm_key()) if harness == "glm" else bool(_command(harness))
 
 
@@ -2095,6 +2585,8 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         if account.get("invalid"):
             data = {"ok": False, "error": E_INVALID,
                     "note": f"This account entry is not valid: {account['invalid']}"}
+        elif harness == "deepseek":
+            data = probe_deepseek(timeout=timeout)
         elif account.get("probe") == "http-quota" or account.get("quota_key"):
             data = probe_http_quota(account, timeout=timeout)
         elif harness in _HOME_VARS and not _login_folder_there(home or str(default_login(harness))):

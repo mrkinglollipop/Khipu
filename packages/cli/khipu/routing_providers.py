@@ -71,6 +71,8 @@ def usage_setup(harness: str, provider: dict) -> str | None:
 
     if provider.get("probe") == "http-quota" and provider.get("host"):
         return None
+    if harness == "deepseek" and usage.available("deepseek"):
+        return None
     if harness not in usage.HARNESSES:
         return "no usage reader set up; confirm its quota host in Settings → Accounts"
     return None

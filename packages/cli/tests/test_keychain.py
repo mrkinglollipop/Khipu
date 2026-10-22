@@ -141,6 +141,9 @@ class SecretsStatusTest(unittest.TestCase):
         self._cfg.start()
         self._legacy = mock.patch.object(kc, "LEGACY_CONFIG_DIR", self.root / "legacy-config")
         self._legacy.start()
+        self._security = mock.patch.object(kc, "_security", return_value=_cp(44))
+        self._security.start()
+        self.addCleanup(self._security.stop)
 
     def tearDown(self):
         self._legacy.stop()
@@ -352,6 +355,7 @@ class VoyageKeyTest(unittest.TestCase):
              mock.patch.object(kc, "get_gemini_key", return_value=None), \
              mock.patch.object(kc, "get_openai_compat_key", return_value=None), \
              mock.patch.object(kc, "get_voyage_key", return_value="pa-REAL-KC"), \
+             mock.patch.object(kc, "_security", return_value=_cp(44)), \
              mock.patch.object(kc, "keychain_available", return_value=True):
             st = kc.secrets_status()
         self.assertTrue(st["voyage_in_keychain"])
