@@ -1509,6 +1509,11 @@ def _after_flip() -> dict[str, Any]:
             refreshed = json.loads(r.stdout or "{}")
         except ValueError:
             refreshed = {"ok": False, "error": _tail(r.stderr or r.stdout)}
+        if not isinstance(refreshed, dict):
+            refreshed = {"ok": False, "error": "jobs refresh returned an invalid result"}
+        refreshed["ok"] = r.returncode == 0 and refreshed.get("ok") is True
+        if not refreshed["ok"] and not refreshed.get("error"):
+            refreshed["error"] = _tail(r.stderr or r.stdout) or f"jobs refresh exited {r.returncode}"
         out["jobs_refresh"] = {k: refreshed.get(k) for k in ("ok", "refreshed", "current", "external", "error")
                                if k in refreshed}
     uid = os.getuid()
@@ -1524,12 +1529,30 @@ def _after_flip() -> dict[str, Any]:
     return out
 
 
+def _post_flip_result(entry: dict[str, Any], t0: float) -> dict[str, Any]:
+    # The live link has already moved. Never report it as unchanged, or queue
+    # a second promotion as though this were a pre-flip gate refusal.
+    entry["live_changed"] = True
+    try:
+        entry["after"] = _after_flip()
+        refresh = entry["after"].get("jobs_refresh")
+        error = (f"jobs refresh: {refresh.get('error') or 'failed'}"
+                 if refresh is not None and not refresh.get("ok") else None)
+    except Exception as exc:
+        error = f"post-flip refresh: {type(exc).__name__}: {exc}"
+    if error:
+        return {**entry, "ok": False, "partial": True, "error": error,
+                "ms": round((time.monotonic() - t0) * 1000)}
+    return {**entry, "ok": True, "ms": round((time.monotonic() - t0) * 1000)}
+
+
 # ---- commands ----------------------------------------------------------------
 
 
 def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None) -> dict[str, Any]:
     """Fetch, check the inactive slot out at ``ref``, gate it, and on a pass
-    flip ``live`` to it. A failure anywhere leaves the link as it was.
+    flip ``live`` to it. Pre-flip failures leave the link as it was;
+    post-flip refresh failures report a partial deployment with the link moved.
 
     A hub-only gate refusal is queued for ``retry_queued``. During a retry,
     a non-gate local failure stays queued too; only success, cancellation, or
@@ -1557,6 +1580,7 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
             and not out.get("ok")
             and failed is None
             and not out.get("cancelled")
+            and not out.get("live_changed")
         )
         if retryable_hub_refusal or retryable_local_failure:
             # Written first (an atomic replace): a crash here keeps the old entry.
@@ -1567,7 +1591,7 @@ def promote(ref: str = "origin/main", *, retry_of: dict[str, Any] | None = None)
         else:
             _clear_queue()
         if override:
-            consumed = out.get("ok") or (doctor.get("ignored_reds") and failed is None)
+            consumed = out.get("ok") or out.get("live_changed") or (doctor.get("ignored_reds") and failed is None)
             cleared = bool(consumed and not out.get("queued") and clear_gate_override(override.get("set_at")))
             out["override"] = {**override, "skipped": doctor.get("ignored_reds") or [], "cleared": cleared}
         if retry_of is not None:
@@ -1610,8 +1634,7 @@ def _promote_locked(ref: str, t0: float) -> dict[str, Any]:
     if not flipped["ok"]:
         return {**entry, "ok": False, "error": f"flip: {flipped['error']}",
                 "ms": round((time.monotonic() - t0) * 1000)}
-    entry["after"] = _after_flip()
-    return {**entry, "ok": True, "ms": round((time.monotonic() - t0) * 1000)}
+    return _post_flip_result(entry, t0)
 
 
 def retry_queued() -> dict[str, Any]:
@@ -1677,6 +1700,10 @@ def rollback() -> dict[str, Any]:
             return record({**entry, "ok": False,
                            "error": f"no commit is recorded as having been live in {target.name}; "
                                     "nothing known-good to roll back to"})
+        integrity = _git(["status", "--porcelain", "--untracked-files=all"], cwd=target)
+        if integrity.returncode != 0 or integrity.stdout.strip():
+            return record({**entry, "ok": False,
+                           "error": f"dirty or unreadable rollback target {target.name}; refusing to activate it"})
         if _head(target) != known:
             r = _git(["checkout", "--detach", "--quiet", known], cwd=target)
             if r.returncode != 0 or _head(target) != known:
@@ -1688,8 +1715,7 @@ def rollback() -> dict[str, Any]:
         flipped = flip(target)
         if not flipped["ok"]:
             return record({**entry, "ok": False, "error": f"flip: {flipped['error']}"})
-        entry["after"] = _after_flip()
-        return record({**entry, "ok": True, "ms": round((time.monotonic() - t0) * 1000)})
+        return record(_post_flip_result(entry, t0))
 
 
 def gate_only(step: str, ref: str | None = None) -> dict[str, Any]:
@@ -1807,7 +1833,9 @@ def format_result(out: dict[str, Any]) -> str:
                 lines.append(f"kickstart failed: {after['kick_failed']}")
     else:
         lines.append(f"not done: {out.get('error')}")
-        if action == "promote":
+        if out.get("live_changed"):
+            lines.append(f"live is now {Path(out['slot']).name}; deployment is partial. {MCP_NOTE}")
+        elif action == "promote":
             lines.append("live is unchanged")
         if out.get("queued"):
             lines.append("queued: it runs again by itself once the hub answers")

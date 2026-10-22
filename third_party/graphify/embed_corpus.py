@@ -42,6 +42,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
+from graph_db import publish, writer_lock
+
 # ── workspace + config ────────────────────────────────────────────────────────
 
 def _find_workspace() -> Path:
@@ -392,33 +394,39 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
-    # Stage the db on local /tmp to dodge Dropbox-mount sqlite I/O errors.
-    # Original is preserved; we copy back at end (even on failure).
+    # Only actual writers hold the shared build/embed lock. A dry run reads
+    # its own disposable stage and never publishes it over concurrent changes.
+    from contextlib import nullcontext
     import shutil
     import tempfile
-    fd, tmp_str = tempfile.mkstemp(prefix="embed_stage_", suffix=".sqlite")
-    os.close(fd)
-    staged_db = Path(tmp_str)
-    shutil.copyfile(str(args.db), str(staged_db))
-    print(f"staged: {staged_db}")
-    print()
 
+    staged_db = None
+    preserve_stage = False
     try:
-        return _run_main(args, staged_db, api_key)
+        with writer_lock(args.db) if not args.dry_run else nullcontext():
+            fd, tmp_str = tempfile.mkstemp(prefix="embed_stage_", suffix=".sqlite")
+            os.close(fd)
+            staged_db = Path(tmp_str)
+            shutil.copyfile(str(args.db), str(staged_db))
+            print(f"staged: {staged_db}\n")
+            rc = _run_main(args, staged_db, api_key)
+            if not args.dry_run:
+                try:
+                    publish(staged_db, args.db)
+                except Exception:
+                    # Recovery is explicit: keep only this private worker stage,
+                    # never a partially copied publication sibling.
+                    preserve_stage = True
+                    raise
+            return rc
+    except Exception as exc:
+        print(f"ERROR: graph embedding failed: {exc}", file=sys.stderr)
+        if preserve_stage:
+            print(f"staged database retained for recovery at {staged_db}", file=sys.stderr)
+        return 1
     finally:
-        # Byte-copy /tmp → original (works around Dropbox unlink/rename issues)
-        try:
-            with open(staged_db, "rb") as src, open(args.db, "wb") as dst:
-                while True:
-                    chunk = src.read(1 << 20)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
+        if staged_db is not None and not preserve_stage:
             staged_db.unlink(missing_ok=True)
-        except Exception as e:
-            print(f"\nWARNING: copy-back failed: {e}", file=sys.stderr)
-            print(f"         staged db preserved at {staged_db}", file=sys.stderr)
-            print(f"         to recover manually: cp '{staged_db}' '{args.db}'", file=sys.stderr)
 
 
 def _run_main(args, staged_db: Path, api_key: Optional[str]) -> int:

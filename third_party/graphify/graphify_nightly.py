@@ -133,25 +133,15 @@ def _export_sources(env: dict[str, str]) -> Path | None:
         )
         return None
     log("  sources export ok")
-    resolved = (os.environ.get("KHIPU_GRAPH_SOURCES_RESOLVED") or "").strip()
-    if resolved:
-        return Path(resolved)
     try:
-        for part in (env.get("PYTHONPATH") or "").split(":"):
-            if not part:
-                continue
-            candidate = Path(part) / "khipu" / "sources.py"
-            if candidate.is_file():
-                import importlib.util
-
-                spec = importlib.util.spec_from_file_location("khipu_sources", candidate)
-                if spec and spec.loader:
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    return mod.resolved_path()
-    except Exception:
+        payload = json.loads(proc.stdout)
+        resolved = payload.get("path") if isinstance(payload, dict) else None
+        if payload.get("ok") and isinstance(resolved, str) and resolved.strip():
+            return Path(resolved)
+    except (ValueError, AttributeError):
         pass
-    return _app_support() / "graph_sources.resolved.json"
+    log("  sources export returned no resolved path")
+    return None
 
 
 def _should_skip_build(resolved: Path | None) -> tuple[bool, str]:
@@ -177,17 +167,6 @@ def main() -> int:
     resolved = Path(resolved_override) if resolved_override else (
         _app_support() / "graph_sources.resolved.json"
     )
-    skip, reason = _should_skip_build(resolved if resolved.is_file() else None)
-    if skip:
-        payload = {
-            "ok": True,
-            "skipped": reason,
-            "message": "graph-build skipped: no graph sources configured",
-        }
-        print(json.dumps(payload))
-        log(f"skipped: {reason}")
-        return 0
-
     base_env = os.environ.copy()
     khipu_env = _khipu_env(base_env)
     exported = _export_sources(khipu_env)

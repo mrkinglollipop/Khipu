@@ -330,10 +330,17 @@ def run_nightly() -> int:
     steps: list[dict[str, Any]] = []
     drain_result = _step_result(_drain_sessions())
     _record_nightly_step(steps, "sessions_drain", **drain_result)
-    rc = _run_script(
-        CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
-    )
-    _record_nightly_step(steps, "consolidate_nightly", ok=(rc == 0), counts={"rc": rc})
+    driver_error = None
+    try:
+        rc = _run_script(
+            CONSOLIDATE_NIGHTLY, log_stem="khipu-nightly", state_name="nightly"
+        )
+    except OSError as exc:
+        rc = 2
+        driver_error = f"{type(exc).__name__}: {exc}"
+        _write_job_state("nightly", rc)
+    _record_nightly_step(steps, "consolidate_nightly", ok=(rc == 0),
+                         counts={"rc": rc}, error=driver_error)
     _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))

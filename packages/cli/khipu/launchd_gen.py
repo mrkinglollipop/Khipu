@@ -227,6 +227,8 @@ def render_context(root: Path | None = None) -> dict[str, str]:
 # Whatever is set when the plist is rendered is baked in, otherwise the job
 # resolves only through versions.json and fails closed.
 PASSTHROUGH_ENV = (
+    "KHIPU_DATA_DIR",
+    "ALZY_DATA_DIR",
     "KHIPU_CONSOLIDATE_NIGHTLY",
     "KHIPU_CONSOLIDATE_MONTHLY",
     "KHIPU_GRAPHIFY_NIGHTLY",
