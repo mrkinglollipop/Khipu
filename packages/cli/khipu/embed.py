@@ -2507,7 +2507,7 @@ class _SearchFilters:
         if self.episode_only:
             return "FALSE"
         parts: list[str] = []
-        ts = f"COALESCE({a}updated_at, {a}created_at)"
+        ts = f"COALESCE({a}event_at, {a}updated_at, {a}created_at)"
         if self.since_dt is not None:
             parts.append(f"{ts} >= %(kf_since)s")
         if self.until_dt is not None:

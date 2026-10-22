@@ -766,12 +766,18 @@ class _RestateCursor:
     def __init__(self, prs):
         self.latest_text = None
         self.prs = list(prs)
+        self.pr_check = {}
 
     def execute(self, sql, params=()):
         if "SET latest_text" in sql:
             self.latest_text = params[0]
         if "SET prs = ARRAY" in sql:
             self.prs = sorted(set(self.prs) | set(params[0]))
+        if "SET pr_check" in sql:
+            self.pr_check = json.loads(params[0])
+
+    def fetchone(self):
+        return (self.pr_check,)
 
 
 def test_restatement_that_adds_a_pr_cannot_close_on_the_original_pr_only(monkeypatch):
@@ -791,6 +797,7 @@ def test_restatement_that_adds_a_pr_cannot_close_on_the_original_pr_only(monkeyp
     ) == 0
     assert cur.latest_text == expanded
     assert cur.prs == [12, 13]
+    assert cur.pr_check["refs"] == ["acme/widget#12", "acme/widget#13"]
 
     # The item as the rule reads it after the restatement: its first words,
     # its newer wording and its stored list.

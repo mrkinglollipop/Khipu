@@ -1170,7 +1170,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                 # A restatement in other words keeps the newer wording.
                 cur.execute("UPDATE commitments SET latest_text = %s WHERE id = %s", (norm["text"], existing))
             if close_ready:
-                from khipu.close_rules import other_repo_labels, parse_prs
+                from khipu.close_rules import pr_requirement_labels, parse_prs
 
                 added = parse_prs(norm["text"])
                 if added:
@@ -1180,12 +1180,13 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                         "UPDATE commitments SET prs = ARRAY(SELECT DISTINCT n FROM "
                         "unnest(COALESCE(prs, '{}'::int[]) || %s::int[]) AS n ORDER BY n) WHERE id = %s",
                         (added, existing))
-                elsewhere = other_repo_labels(norm["text"], payload.get("project"))
-                if elsewhere:
-                    # prs keeps numbers only, and latest_text only the newest
-                    # wording: another repository's PR an in-between wording
-                    # named is kept here, or a later wording would lose it.
-                    _keep_other_repo_refs(cur, existing, elsewhere)
+                labels = pr_requirement_labels(norm["text"], payload.get("project"))
+                if row is not None:
+                    # Retain the previous wording too when upgrading rows
+                    # whose history stored only other repositories' refs.
+                    labels += pr_requirement_labels(row.get("latest_text") or "", payload.get("project"))
+                if labels:
+                    _keep_pr_refs(cur, existing, labels)
             continue
         linked = [r["id"] for r in others
                   if r["id"] == exact or _match_score(norm["text"], r["text"]) >= NEAR_DUP_MIN_SCORE]
@@ -1268,14 +1269,14 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     return inserted
 
 
-def _keep_other_repo_refs(cur, commitment_id: int, labels: list[str]) -> None:
+def _keep_pr_refs(cur, commitment_id: int, labels: list[str]) -> None:
     """Add ``owner/repo#N`` labels to the item's ``pr_check["refs"]``, the
-    other repositories' PRs ``khipu.close_rules.item_refs`` requires."""
+    repository/number pairs ``khipu.close_rules.item_refs`` requires."""
     cur.execute("SELECT pr_check FROM commitments WHERE id = %s FOR UPDATE", (commitment_id,))
     got = cur.fetchone()
     check = got[0] if got and isinstance(got[0], dict) else {}
     refs = list(check.get("refs") or [])
-    new = [label for label in labels if label not in refs]
+    new = list(dict.fromkeys(label for label in labels if label not in refs))
     if new:
         cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
                     (json.dumps({**check, "refs": refs + new}), commitment_id))

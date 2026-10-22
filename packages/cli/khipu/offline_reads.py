@@ -86,11 +86,19 @@ def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
             row[col] = hub_snapshot._utc(row.get(col))
         if row.get("owner_reassigned_at"):
             row["owner_reassigned_at"] = hub_snapshot._utc(row["owner_reassigned_at"])
-        if "linked_ids" in row:
+        for col in ("linked_ids", "prs", "settle_suggestion", "pr_check"):
+            if col not in row:
+                continue
             try:
-                row["linked_ids"] = [int(v) for v in json.loads(row["linked_ids"] or "[]")]
+                value = json.loads(row[col]) if row[col] is not None else None
+                if col in ("linked_ids", "prs"):
+                    row[col] = [int(v) for v in value] if isinstance(value, list) else None
+                else:
+                    row[col] = value if isinstance(value, dict) else None
             except (TypeError, ValueError):
-                row["linked_ids"] = []
+                row[col] = None
+            if col == "linked_ids" and row[col] is None:
+                row[col] = []
         row["future_trigger"] = bool(row.get("future_trigger"))
         row["stale"] = True
     return rows
