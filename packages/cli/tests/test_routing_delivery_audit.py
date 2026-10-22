@@ -17,7 +17,7 @@ import pytest
 from khipu import db, forget, owner_act, owner_direction, owner_files, owner_turns, routing as r
 from khipu import routing_advice as ra, routing_delivery as rd
 from khipu import routing_directions as directions, routing_gateway_copy as gc
-from khipu import routing_replication
+from khipu import routing_pace, routing_replication
 
 NOW = datetime(2026, 10, 22, 12, tzinfo=timezone.utc)
 
@@ -81,11 +81,14 @@ def test_routing_forecasts_ack_only_complete_delivered_text(field, prefix):
 
 
 def test_routing_full_push_does_not_ack_unshown_hold_back_advice(monkeypatch):
-    account = dict(key="fake", harness="claude", label="Fake", state="open",
-        caps=[dict(kind="pace_target", window="weekly", purpose="job", pct=65, slack=5, revision="cap1")],
-        pace=[dict(window="weekly", used_pct=18, buckets=1, why="one synthetic reading",
-                   pace_target=dict(verdict="ahead", allowance_pct=9.26, used_pct=18),
-                   plan=dict(verdict="unknown"))])
+    caps = [dict(kind="pace_target", window="weekly", purpose="job", pct=65, slack=5, revision="cap1")]
+    # Cover the full trailing day with fresh readings, well above the weekly
+    # target's allowance but below any reached level or imminent crossing.
+    readings = [dict(t=NOW - timedelta(minutes=minutes), used=18 + (1440 - minutes) / 120,
+                     reset=NOW + timedelta(days=6), mac="fake", source="probe", cycle=None, t_err=0)
+                for minutes in range(1440, -1, -30)]
+    account = dict(key="fake", harness="claude", label="Fake", state="open", caps=caps,
+                   pace=[routing_pace.compute_pace(readings, caps, NOW, "weekly")])
     view = dict(accounts=[account], priority=dict(entries=[dict(account="fake")]), holds=[],
                 effective={"account:fake": "open"}, record=True, epoch="fake-epoch", version=1)
     cfg = dict(r.settings(), routing_line_chars=1000, routing_summary_chars=8000,
