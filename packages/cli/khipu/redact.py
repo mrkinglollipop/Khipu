@@ -18,9 +18,14 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 
 MASK = "[REDACTED]"
+
+# Use exactly the assignment pattern's case folding, including Unicode's
+# additional matches for ASCII letters under IGNORECASE.
+_ASSIGNMENT_NAME_RUN = re.compile(r"[A-Za-z0-9_.-]+", re.I)
+_ASSIGNMENT_START = re.compile(r"\b(?=[A-Za-z0-9_.-])", re.I)
 
 # Order matters only where patterns overlap: blocks first, then vendor
 # prefixes, then structural shapes, then name/value assignments.
@@ -56,6 +61,8 @@ _PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ("url-credential", re.compile(r"(://[^/\s:@]+:)([^@\s/]{1,})@"), r"\1" + MASK + "@"),
     # Quoted keys in source code only identify secrets when the value is a
     # literal. A variable or lookup expression is evidence, not a credential.
+    # Leave the closing quote available as an adjacent key's opening quote,
+    # including when a canonical masked value is skipped.
     (
         "quoted-assignment",
         re.compile(
@@ -63,9 +70,9 @@ _PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
             r"access[_-]?token|auth[_-]?token|refresh[_-]?token|token|password|passwd|pwd|"
             r"client[_-]?secret|private[_-]?key|access[_-]?key(?:[_-]?id)?|dsn|connection[_-]?string)"
             r"(?P=key_quote)\s*[:=]\s*(?P<value_quote>[\"']))"
-            r"(?:(?!(?P=value_quote))[^\\\r\n]|\\.){8,}(?P=value_quote)"
+            r"(?P<value>(?:(?!(?P=value_quote))[^\\\r\n]|\\.){8,})(?=(?P=value_quote))"
         ),
-        r"\1" + MASK + r"\g<value_quote>",
+        r"\1" + MASK,
     ),
     # Unquoted shell/YAML assignments retain their existing value rules.
     (
@@ -85,6 +92,34 @@ def enabled() -> bool:
     return os.environ.get("KHIPU_REDACT_SECRETS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def _sub_assignment(
+    pattern: re.Pattern[str], render_match: Callable[[re.Match[str]], str], text: str
+) -> str:
+    """Apply the original pattern once per maximal candidate name run.
+
+    Searching the pattern at every word boundary retries each dotted or
+    hyphenated suffix, making a long nonmatching run quadratic. Any later
+    match in a run also matches at its first word boundary: the prefix can
+    absorb every intervening name character. Keep the original pattern for
+    the anchored match, so its whitespace, value and boundary rules survive.
+    Both candidate scans and the anchored matches take linear total work.
+    """
+    pieces = []
+    consumed = 0
+    for run in _ASSIGNMENT_NAME_RUN.finditer(text):
+        if run.start() < consumed:
+            continue
+        start = _ASSIGNMENT_START.search(text, run.start(), run.end())
+        if start is None:
+            continue
+        match = pattern.match(text, start.start())
+        if match is not None:
+            pieces.extend((text[consumed:match.start()], render_match(match)))
+            consumed = match.end()
+    pieces.append(text[consumed:])
+    return "".join(pieces)
+
+
 def redact_secrets(text: str, *, force: bool = False) -> tuple[str, int]:
     """Return (redacted text, number of replacements). Idempotent.
     ``force`` masks even when ``KHIPU_REDACT_SECRETS`` turns masking off (the
@@ -93,9 +128,23 @@ def redact_secrets(text: str, *, force: bool = False) -> tuple[str, int]:
         return text or "", 0
     total = 0
     out = text
-    for _name, pat, repl in _PATTERNS:
-        out, n = pat.subn(repl, out)
-        total += n
+    for name, pat, repl in _PATTERNS:
+        if name not in ("assignment", "quoted-assignment"):
+            out, n = pat.subn(repl, out)
+            total += n
+            continue
+
+        def replace(match):
+            nonlocal total
+            value = match.group(2) if name == "assignment" else match.group("value")
+            # Only the complete canonical value is already masked. Suffixes
+            # and other credentials in the same text still need redaction.
+            if re.fullmatch(r"\[REDACTED\][.,;:!?)}\]”’]*", value):
+                return match.group()
+            total += 1
+            return match.expand(repl)
+
+        out = _sub_assignment(pat, replace, out) if name == "assignment" else pat.sub(replace, out)
     return out, total
 
 

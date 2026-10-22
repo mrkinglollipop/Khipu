@@ -479,8 +479,14 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
         def __exit__(self, *exc):
             pass
 
-        def execute(self, *args, **kwargs):
-            pass
+        def execute(self, sql, params=()):
+            self.sql, self.params = sql, params
+
+        def fetchall(self):
+            assert self.sql.startswith("WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases")
+            project, fallback = self.params
+            assert project == fallback
+            return [(project, None)]  # Canonical project with no aliases.
 
         def fetchone(self):
             return (at,)

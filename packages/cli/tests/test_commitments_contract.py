@@ -227,6 +227,15 @@ class _DecisionsCursor:
     def execute(self, sql, params=None):
         s = " ".join(sql.split())
         params = params or ()
+        # No aliases are seeded in this fixture; support the strict reader's
+        # savepoint and the canonical-group left join's no-match row.
+        if s.startswith(("SAVEPOINT ", "RELEASE SAVEPOINT ", "ROLLBACK TO SAVEPOINT ")):
+            return
+        if s.startswith("WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases"):
+            project, fallback = params
+            assert project == fallback
+            self._result = [(project, None)]
+            return
         if s.startswith("SELECT column_name FROM information_schema.columns"):
             cols = (
                 ["id", "project", "text", "rationale", "decided_at", "episode_id",

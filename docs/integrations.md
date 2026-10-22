@@ -36,7 +36,7 @@ In each home's `settings.json`:
 | PreToolUse (delegation tools and shell commands) | `khipu-delegation-hook` | 3 s |
 | SubagentStart | `khipu-delegation-hook` | 10 s |
 
-The MCP server (id `khipu`, launcher `khipu-mcp`) is written to `~/.claude.json` and to each home's own `.claude.json`.
+The MCP server has id `khipu` and launcher `khipu-mcp`. The default Claude home uses `~/.claude.json`; homes named by `CLAUDE_CONFIG_DIR` or an explicit T3 home path use `<home>/.claude.json`. Installation writes the locations associated with each selected home.
 
 The delegation hook is a routing feature: it only adds context when the `routing_push` feature is on.
 
@@ -58,9 +58,9 @@ The delegation hook is a routing feature: it only adds context when the `routing
 
 - `~/.grok/config.toml` gets an `[mcp_servers.khipu]` entry and a managed block of `[[hooks.Stop]]`, `[[hooks.PreCompact]]` and `[[hooks.SessionEnd]]`. Each runs `khipu-aegis-capture` with `KHIPU_HARNESS=aegis` (15 s).
 - That hook only queues. Aegis's sandbox cannot reach the Keychain or the database. The model call and the database write happen outside the sandbox, in `khipu sessions drain` (also reachable as `khipu aegis`), in another harness's stop hook, or in the `queue_drain` background job.
-- There is no recall push of any kind: Aegis discards hook output at session start and prompt submit. There is no SubagentStop and no delegation hook. Khipu's recall, prompt-recall and delegation scripts refuse to run when they detect Aegis. Aegis agents pull memory with `khipu_status` and `khipu_owed` instead.
+- There is no recall push: Aegis discards hook output at session start and prompt submit. Its `UserPromptSubmit` hook runs `khipu-prompt-recall` to record that the owner typed for owner-direction authorization, then emits empty output. There is no SubagentStop or delegation hook; the recall and delegation scripts refuse Aegis. Aegis agents pull memory with `khipu_status` and `khipu_owed` instead.
 - Aegis search needs the gateway. It reads a bearer token from the `KHIPU_GATEWAY_TOKEN` environment variable or the token file (never the Keychain). `khipu gateway token set` stores it, and `khipu integrations verify aegis` does a real round trip.
-- If the token file exists, the install also writes a `[memory]` backend entry that points at Khipu.
+- When the token file exists, install adds a Khipu memory backend only if `[memory]` is absent, preserves any existing backend choice, and wires the token path under `[memory.khipu]`.
 
 ### Grok Bot (cloud)
 
@@ -89,10 +89,10 @@ Migration apply and gateway deploy remain separate operator steps.
 
 | Hook | Event | What it does |
 | --- | --- | --- |
-| `khipu-stop-hook` | Stop, PreCompact, SessionEnd, SubagentStop | Capture. Reads the transcript named in the hook payload and decides whether a capture is due. If so, it queues a job. It also drains the shared queue (summarise, write to the database, mirror, embed), replays the outbox, reconciles edited notes, does a bounded embedding catch-up, and writes a heartbeat per harness. SubagentStop tracks the subagent's own transcript under a separate key. |
+| `khipu-stop-hook` | Stop, PreCompact, SessionEnd, SubagentStop | Capture. Reads the transcript named in the hook payload and decides whether a capture is due. If so, it queues a job. It normally starts detached maintenance to drain the shared queue (summarise, write to the database, mirror, embed), replay the outbox, reconcile edited notes, do a bounded embedding catch-up and write a heartbeat per harness. This runs outside the blocking hook; `KHIPU_HOOK_INLINE=1` restores inline execution, and a failed detached start also falls back to inline maintenance. SubagentStop tracks the subagent's own transcript under a separate key. |
 | `khipu-recall-hook` | SessionStart | Pushes the recall rule, a project slice (open commitments, recent episodes, linked topics) and the routing summary into context, fitted to the harness's size budget. Helper sessions get nothing. `--cursor` emits Cursor's format. |
-| `khipu-prompt-recall` | UserPromptSubmit | Runs a bounded search on the prompt. 1.2 s budget, top 3 hits under a "Prior work on this topic" heading, hard cap of 600 characters, relative score floor, dedup over the last 3 prompts, trivial prompts skipped. No summariser or chat model; on a query-vector cache miss with an embedding profile active it makes one embedding call, so the prompt goes to that provider. Returns `{}` on any error. |
-| `khipu-delegation-hook` | PreToolUse, SubagentStart | Before work is handed to another agent, adds routing changes as extra context. A starting subagent gets the full routing summary. It never denies or alters a call. See [routing](routing.md). |
+| `khipu-prompt-recall` | UserPromptSubmit | Records the owner's turn before recall work, including when there are no memory hits. Recent eligible owner activity enables requested changes through `khipu_owner_act`, subject to trusted front-end/session checks. Under Aegis it then emits empty output. Elsewhere it runs a bounded search on the prompt. 1.2 s budget, top 3 hits under a "Prior work on this topic" heading, hard cap of 600 characters, relative score floor, dedup over the last 3 prompts, trivial prompts skipped. No summariser or chat model; on a query-vector cache miss with an embedding profile active it makes one embedding call, so the prompt goes to that provider. Returns `{}` on any error. |
+| `khipu-delegation-hook` | PreToolUse, SubagentStart | Before work is handed to another agent, adds routing changes as extra context. A starting subagent gets a bounded routing snapshot. Claude children receive remaining pages on their own tool calls; Codex children pull with their own conversation identity. Parent delivery state is separate. It never denies or alters a call. See [routing](routing.md). |
 | `khipu-aegis-capture` | Stop, PreCompact, SessionEnd (Aegis) | Queues the session for capture. Nothing else. |
 
 All hooks fail open: a Khipu problem must not block your agent. The recall and delegation pushes are controlled by feature switches (`khipu features`).
@@ -113,7 +113,7 @@ Every capture is labelled with a harness and a session id of the form `<harness>
 
 Search filters use these labels: `--harness`, `--session-id` and `--via` (capture origin, such as `t3`). The `khipu_search` MCP tool also takes `t3_thread`, an exact T3 thread id.
 
-A source record table (`episode_sources`) now records where each episode came from. Each row has a source key, a hash of the harness, session id, transcript range, window and part. It is written alongside each capture. Nothing reads it yet, and episode uniqueness still works as before. Moving readers onto it is planned.
+A source record table (`episode_sources`) records where each episode came from. Each row has a source key, a hash of the harness, session id, transcript range, window and part. Written alongside each capture, it now drives exact-source dedup, drift reconciliation and forget checks, retaining identity across merges and edits. Older hubs use compatibility fallbacks.
 
 ## Install and repair
 

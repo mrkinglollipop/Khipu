@@ -10,18 +10,18 @@ Related pages: [How it works](how-it-works.md), [Desktop app](desktop-app.md), [
 
 1. Download the latest `Khipu_*.dmg` from the [GitHub releases page](https://github.com/mrkinglollipop/Khipu/releases/latest).
 2. Open the DMG and drag **Khipu.app** to **Applications**.
-3. Launch **Khipu**. The first launch opens **Welcome**, a six-step walkthrough: Welcome, Database, Model, Graph, Agents, Finish.
+3. Launch **Khipu**. The first launch opens **Welcome**, a seven-step walkthrough: Welcome, Database, Model, Graph, Agents, Accounts, Finish.
 
 Each step checks itself, so you can stop and resume later. A step ends in one of these states, shown on screen: working (a real check passed, not just "saved"), needs you (one plain-words action), or checking (the app is doing the work, so wait it out).
 
 After setup, the left rail has six screens, one per job:
 
 - **Home**: is memory working right now.
+- **Work**: Owed, project ledger boards, Waiting on you, Running now and Accounts.
 - **Recall**: ask what it remembers. It has a Search and Graph switch.
-- **Owed**: what you still owe on each project.
 - **Activity**: every session it recorded.
 - **Harnesses**: which agents are wired in, and whether each is recording.
-- **Settings**: ten sections (Database, Capture & models, Routing, Optional features, Embeddings, Data & backups, Another Mac, Components, Updates, Advanced).
+- **Settings**: thirteen sections (Database, Capture & models, Accounts and routing, Owner actions, Work, Projects, Optional features, Embeddings, Data & backups, Another Mac, Components, Updates, Advanced).
 
 You can reopen Welcome later from Settings, Advanced, **Run setup again**.
 
@@ -35,7 +35,7 @@ More detail: [Desktop app](desktop-app.md) and [`apps/desktop/README.md`](../app
 
 ## The Database step
 
-The Database step offers three choices. Each one makes the schema current and schedules the background upkeep jobs: nightly (02:05), graph (02:17), monthly (the 1st, 09:00), a notes watcher, and a capture-queue drain every five minutes. The warm recall service is a sixth job and is opt-in. Details are in [Operations](operations.md).
+The Database step offers three choices. Each one makes the schema current and schedules six background upkeep jobs: nightly (02:05), graph (02:17), monthly (the 1st, 09:00), a notes watcher, a capture-queue drain every five minutes, and replica_refresh every five minutes. The warm recall service is the seventh job and is opt-in. Details are in [Operations](operations.md).
 
 The last stage is a memory round trip: write a test memory, find it by search, and show the time it took. The round trip is skipped if capture mode is "Files only" or no embedding key is set.
 
@@ -67,7 +67,7 @@ You need Postgres 19 or later with the `vector` extension, reachable from every 
 
 The Database step runs a pipeline of stages: reach, version, privileges, schema, graph, store, upkeep, prove, summary. Each shows as Working, Needs you, Skipped, Waiting or Checking.
 
-## Model, Graph, Agents, Finish
+## Model, Graph, Agents, Accounts, Finish
 
 **Model** chooses who writes your session summaries. Skip for now is always there. The choices are:
 
@@ -77,11 +77,13 @@ The Database step runs a pipeline of stages: reach, version, privileges, schema,
 - ChatGPT on your own login (runs `codex`).
 - A local OpenAI-compatible endpoint.
 
-For key-based choices, the key is proven with one cheap real call when you save it. You see "Key works" with the model name, not just "saved". Keys go in the macOS Keychain. The login choices use your own CLI sign-in, and Khipu holds no credential for them. Transcript text is sent to whichever provider you pick. See [How it works](how-it-works.md) and [FAQ](faq.md).
+For key-based choices, saving runs small provider checks. A run may make several requests, including Gemini embedding and generation checks. You see "Key works" with the model name, not just "saved". Keys go in the macOS Keychain. The login choices use your own CLI sign-in, and Khipu holds no credential for them. Transcript text is sent to whichever provider you pick. See [How it works](how-it-works.md) and [FAQ](faq.md).
 
 **Graph** installs the graph builder next to the app. It can be skipped or retried, and added later from Settings, Components.
 
 **Agents** lists the harnesses it detects (found, not installed, or installed). Claude Code, Cursor, Aegis and Codex install on this Mac. Grok Bot is a cloud harness that goes through the gateway (see the self-host section). The install buttons live in **Harnesses**, and Welcome links there with **Open Harnesses to install and verify**. Restart the harness and start a session. Its card turns green by itself once it records. Claude accounts run inside T3 Code are covered by the Claude Code install. See [Integrations](integrations.md).
+
+**Accounts** optionally selects which accounts Khipu tracks, sets their priority and enables telling conversations about routing. Next applies your choices against the current saved state; Skip for now writes nothing.
 
 **Finish** runs a health check and lists anything still unproven, each with one fix. **Continue anyway** is always available, so nothing here can leave you stuck.
 

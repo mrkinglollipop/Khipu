@@ -2,7 +2,7 @@
 
 Khipu keeps a record of which of your agent accounts can take work right now. It also reads how much of each subscription plan is left.
 
-**Khipu reports. Agents route.** Khipu never picks an account, ranks work, refuses a job, launches anything or reorders anything. Every answer is data, not instructions, and guidance, not a gate. An orchestrator with better live information can route differently. The owner decides the rules. The agent decides the route.
+**Khipu reports. Agents route.** Khipu provides advisory account rankings, but never picks an account for you, ranks jobs, refuses a job, launches anything or reorders work. Every answer is data, not instructions, and guidance, not a gate. An orchestrator with better live information can route differently. The owner decides the rules. The agent decides the route.
 
 This page covers what the record holds, how agents read it, and how you change it.
 
@@ -78,10 +78,17 @@ owner-written table governs the advisory dispatch check. Each owner write is
 logged, and Undo restores the prior table (or clears it when there was none).
 No adapter or provider fact launches a probe by itself. Model and use checks
 are advisory. DeepSeek's rule 13 model restriction is `models_allowed: [deepseek-flash]`,
-not merely a ban on one Pro model. Spend and concurrency remain with slices
-17a/17b; rule 13 stays standing until those facts are represented and verified.
+not merely a ban on one Pro model. Spend and concurrency caps are implemented
+as owner facts and appear in launch advice; rule 13 remains an independent
+standing rule.
 An undeclared model causes no model-violation warning. `use: on_request` is a
 neutral reminder: the dispatch hook does not establish whether the owner asked.
+
+Put `task: <task-class>` in a dispatch brief for an explicit tier-table check.
+Otherwise Khipu may infer the work class and label it as a guess. Mismatches
+are advisory and appear at dispatch and in today's owner-local Checks list.
+Their local records retain labels, class, tiers and time for seven days, never
+the brief text.
 
 Runner identity contract:
 
@@ -122,6 +129,27 @@ the runner's files are never written. A lane's own `cap` is local capacity
 on that Mac, not a quota, and is not compared. `khipu route --json` and
 `khipu doctor` carry the report as `runner_caps`.
 
+### Owner caps and launch advice
+
+Set or remove owner caps with `khipu route cap`. Share, per-day and pace targets
+require a usage window (`weekly` or `five_hour`); spend uses dollars over rolling
+days, and concurrency uses an active-job count. The Pace, caps and advice group
+displays these facts. Create or change them through the owner-gated CLI or
+owner actions.
+
+These commands illustrate owner choices, not built-in defaults:
+
+```sh
+khipu route cap set Codex --window weekly --kind share --pct 95
+khipu route cap set Codex --window weekly --kind per_day --pct 15
+khipu route cap set Codex --window weekly --kind pace_target --pct 100 --slack 0
+khipu route cap set DeepSeek --kind spend --usd 10 --days 7
+khipu route cap set GLM --kind concurrency --n 1
+```
+
+Use `remove` with the same account, kind, purpose and, for a window cap, window
+to remove one. `--revision` can name the cap revision.
+
 Caps by purpose. A cap fact may carry `purpose: "job"` (the default for
 old facts too) or `purpose: "check"`. Only `pace_target` accepts check purpose; share,
 per-day, spend and concurrency caps reject it. A check `pace_target` is a separate
@@ -141,11 +169,11 @@ khipu route cap set Codex --window weekly --kind pace_target --pct 100 --slack 5
 khipu route cap set Claude --window weekly --kind pace_target --pct 100 --slack 20 --purpose check --tier sonnet --sensitive-only
 ```
 
-These add check allowances to the existing job caps; they do not set job
-caps or share ceilings. Codex's job cap is even weekly pace with zero
-slack and a 95% share ceiling. Main Claude's job cap is even plus 5 with
-a 91% share ceiling. The Claude check allowance is for Sonnet checks of
-sensitive code. Check caps accept optional `tier` (`opus`, `sonnet` or `haiku`)
+These examples add check allowances without setting job caps or share
+ceilings. Existing job caps are whatever the owner has explicitly confirmed;
+inspect each account's `caps` and `cap_statuses`. The illustrated Claude check
+allowance is for Sonnet checks of sensitive code. Check caps accept optional
+`tier` (`opus`, `sonnet` or `haiku`)
 and `sensitive_only` (boolean). A qualified allowance applies only when the
 call matches every qualifier; otherwise checks use the job cap for that window.
 An unqualified check cap, such as Codex's, applies to checks on any code.
@@ -158,6 +186,16 @@ khipu route advise --lane codex-check --purpose check --kind check --json
 khipu route advise Claude --purpose check --kind check --tier sonnet --sensitive --privacy --json
 khipu route cap remove Codex --window weekly --kind pace_target --purpose check
 ```
+
+`khipu route advise` and `khipu_route_advise` return advisory `go`, `hold_back`,
+`not_eligible` or `closed` verdicts, with reasons, figures, evidence and ranked
+accounts. Eligible `go` accounts come first in the owner's priority order,
+then `hold_back`, `closed` and ineligible accounts. They never launch, stop or
+enforce a route. Advice accepts `account`, `lane`, `tier` (`opus`, `sonnet` or
+`haiku`), `kind` (`build`, `fix` or `check`), `privacy`, `sensitive` and `purpose`.
+Purpose defaults to `job` and may be `check` or `orchestration`; dispatched work
+requesting orchestration receives job advice. An on-request provider is
+ineligible unless the caller targets its account or a lane that resolves to it.
 
 Runners use the same `purpose: "check"` on `khipu_route_advise` and their
 budget declarations. MCP advice also takes caller-declared `tier` and
@@ -205,7 +243,8 @@ kept.
   incomplete, so the total reads unknown instead of silently omitting it.
 
 DeepSeek spend caps use Khipu's account-wide balance reader, independently
-of runner coverage or per-conversation setup. For consecutive readings,
+of runner coverage or per-conversation setup. Its balance history stays in
+local `state/deepseek-balance.json`. For consecutive readings,
 each balance decrease adds measured spend; each increase adds zero spend
 and records the interval's start, end and exact increase. Earlier and later
 spend is never cancelled by a top-up. Decreases enter the rolling window
@@ -276,7 +315,7 @@ def heartbeat(path, active, spend, coverage, interval=20):
     path.write_text(json.dumps(doc))
 ```
 
-A runner's lane maps to an account through the lane map (`routing_lane_map`). A lane with no match is shown and pushed as one line. Khipu does not guess.
+A runner's lane resolves through its provider/account declaration and local identity binding, or through the owner's lane map (`routing_lane_map`). With `route report --lane`, name a lane resolved by one of those paths. Ambiguous or unresolved declarations remain unmatched, shown and pushed as one line; Khipu does not guess.
 
 ### Holds
 
@@ -286,7 +325,7 @@ These are the defaults. Each is a setting you can change or switch off.
 
 - Hold text is capped at 300 characters.
 - A hold set by a conversation lasts 24 hours unless it says otherwise, and never more than 7 days.
-- An owner hold is set by you and asks for typed confirmation. A reminder comes after 90 days.
+- An owner hold is set by you through the verified app path, eligible owner direction, or typed terminal confirmation. A reminder comes after 90 days.
 
 ### Owner rules, note and pauses
 
@@ -297,15 +336,26 @@ These are yours:
 - **Pause.** Mark an account paused, optionally until a time. Lift it later.
 - **Clear.** Clear an account's state, or dismiss one report.
 
-A conversation can record a rule or a priority only when you asked it to. Khipu keeps it pending until you confirm it in the app. A conversation cannot confirm, retire, dismiss or undo anything.
+Ordinary conversation proposal tools can record a rule or priority only when you asked them to. They cannot confirm, retire, dismiss or undo owner state. Eligible owner conversations can perform those owner actions through `--owner-direction` or `khipu_owner_act`; standalone terminal writes ask for typed confirmation, and app writes use the verified app path.
 
 Rule edits and priority requests must carry `base`, the owner revision returned by the conversation's earlier `khipu_route` read. A missing or unread base is refused; later reads never fill it in. The CLI takes the same revision as `--base` with `--at-owner-request`. Replacement notices name the rule number or priority and go only to their author's session, once delivered; undelivered notices expire after seven days.
+
+Live proposals overlay the current owner revision while visibly unconfirmed.
+A later proposal replaces the prior live proposal for that rule or priority;
+a stale-base proposal is recorded as crossed and never applies. Live overlays
+expire after seven days, restoring the underlying owner state. Proposals and
+holds shows live, crossed and ended entries, with confirm, edit-then-confirm and
+dismiss controls. Crossed entries remain alongside live ones for 48 hours,
+then move to history. Authenticated owner-direction writes are owner actions;
+this proposal lifecycle describes ordinary conversation proposals.
 
 Sessionless CLI reads, including the app's polling command, create no receipt file and take no routing lock to record a receipt. Sessionless MCP callers can propose against revisions read on the same connection: receipts stay in that server process's memory and never pass to another connection or process. Replacement notices match either the recorded canonical session id (including `t3:<thread>`) or its provider session id.
 
 ### Priority and pace
 
-You can set an order for your accounts, with your own words for each role and an optional end date. An order set by a conversation stays unconfirmed until you confirm or undo it. A warning appears if it stays unconfirmed for more than 24 hours.
+You can set an order for your accounts, with your own words for each role and an optional end date. An ordinary conversation proposal stays visibly unconfirmed until resolved or expired as described above. A warning appears if it stays unconfirmed for more than 24 hours.
+
+Read the current `priority_version` from `khipu route --json` and pass it as `--expect` for owner priority set, confirm, undo and clear operations. Missing or stale versions are refused. When a set or confirm request names held or paused accounts, explicitly choose `end` or `keep` for each returned id with `--holds '{"id":"end"}'`. Conversation `--base` is the earlier owner revision and serves a separate purpose.
 
 Pace comes from the plan usage cache. For each account's longest window still in force, Khipu shows:
 
@@ -317,11 +367,44 @@ It says "a lot left, little time" when the needed pace is at least 1.5 times the
 
 This order is arithmetic. It is not your priority and not an instruction.
 
+Alongside the arithmetic needed pace, Khipu estimates actual usage from stored
+readings for each weekly and five-hour window, using trailing periods of 24
+hours and one hour respectively. It compares that measured rate with plan
+limits and owner caps, and reports coverage reasons when a forecast is uncertain.
+The rate is on pace between 85% and 115% of the rate needed to reach the target
+at reset, underpacing below that band and outpacing above it. A pace target also
+reports within, ahead or recovering against the elapsed-window allowance plus
+slack. These figures differ from the arithmetic needed pace used for default
+account ordering.
+
+Pace and advice changes, forecast threshold crossings (24 hours, 6 hours,
+1 hour and 15 minutes) and sufficiently moved forecasts are pushed through the
+delivery protocol. Acknowledgement records which text was received.
+
 ### Plan usage
 
-Khipu reads the headroom of each subscription CLI without using a model turn: Claude, Codex, Grok Build and Muse. Errors show as short codes. Muse figures are as of its last turn. The cache is `state/usage.json`.
+Usage supports Claude, Codex, Grok Build, Muse and GLM, owner-defined HTTP-quota
+providers, and DeepSeek balance and measured rolling-spend observations.
+DeepSeek reports measured spend with coverage and top-up caveats as described
+above, rather than subscription quota windows. Codex may fall back to rollout
+figures, and Muse may carry its last observation; source, observation time and
+live errors distinguish those from a fresh live read. Errors show as short
+codes. The cache is `state/usage.json`.
 
-Plan usage shows on the Home screen (a Plans card) and under Settings > Capture & models. You can add and remove accounts there (up to 32). `khipu doctor` carries a cache-only plan usage block that lists a warning per window at 90% or more. Warnings never turn doctor red.
+Usage reads normally use the CLI's usage protocol. Claude may use a tiny Haiku
+turn when its usage reply omits figures, and Muse may use a tiny turn to refresh
+stale observations, each at most once per 30 minutes per login. `khipu_usage`
+replies from cache immediately; its background refresh can use these fallbacks.
+
+Plan usage shows on the Home screen (a Plans card) and under Settings → Accounts and routing → Accounts. You can manage tracked accounts there (up to 32). `khipu doctor` carries a cache-only plan usage block that lists a warning per window at 90% or more. Warnings never turn doctor red.
+
+Accounts also discovers known login folders. You can Track or decline them,
+recognize a moved login, Rename or Stop tracking an account, Offer again after
+declining, and control automatic tracking. Automatic tracking is on for a
+genuinely new install with no config file; existing installs with no stored
+choice are migrated to off. Use **Sign in to another account** to create a
+separate login, with status and cancel controls. See the [CLI reference](cli.md)
+for `usage --discover`, `--check`, `--try` and the sign-in lifecycle flags.
 
 ### Sign-in again
 
@@ -334,15 +417,15 @@ Either one starts that CLI's own login in its own login folder. A browser opens.
 
 ### Reset checks
 
-When an account's known limit time passes, Khipu can check whether it really reopened. The check is on by default. By default it waits 2 minutes after the reset, then retries at 10 and 30 minutes. If the machine is busy (load above 75), it waits up to 5 minutes, up to 3 times. All of these are settings. A check costs no model turn. Muse and unreadable accounts say "This account can't be checked without using a turn".
+When an account's known limit time passes, Khipu can check whether it really reopened. The check is on by default. By default it waits 2 minutes after the reset, then retries at 10 and 30 minutes. If the machine is busy (load above 75), it waits up to 5 minutes, up to 3 times. All of these are settings. Claude reset checks can use the same bounded tiny-turn fallback when its usage reply omits figures. Muse and unreadable accounts say "This account can't be checked without using a turn".
 
-Settings > Routing has a switch for this and a **Check now** button per account. On the command line: `khipu route check ACCOUNT`.
+Settings → Accounts and routing has a switch for this and a **Check now** button per account. On the command line: `khipu route check ACCOUNT`.
 
 ## How agents read it
 
 ### MCP tools
 
-Five tools. Locally all five work as below. Through the HTTPS gateway, `khipu_route` answers only the closed gateway projection (account labels and states, structured holds, and — under their switches — owner hold words, the confirmed rules and note, and the confirmed priority; paths are cut even inside owner words, and pending proposals never appear), and only when the owner has turned on `routing_cloud_copy`. The other routing tools and `khipu_owner_act` answer `available: false` there, and every owner write is refused. A gateway caller's identity is its token label plus its `session_id`: it sees only its own delivery state, and an ack for another identity's batch is refused (`ack_not_yours`). `since` is not available through the gateway. See [MCP tools](mcp-tools.md) for the full list.
+Six tools. Locally all six work as below. Through the HTTPS gateway, `khipu_route` answers only the closed gateway projection (account labels and states, structured holds, and — under their switches — owner hold words, the confirmed rules and note, and the confirmed priority; paths are cut even inside owner words, and pending proposals never appear), and only when the owner has turned on `routing_cloud_copy`. The other routing tools answer `available: false` there. `khipu_owner_act` is omitted from the gateway tool list and refuses every call; every owner write is refused. A gateway caller's identity is its token label plus its `session_id`: it sees only its own delivery state, and an ack for another identity's batch is refused (`ack_not_yours`). `since` is not available through the gateway. See [MCP tools](mcp-tools.md) for the full list.
 
 The cloud copy is **published by the Mac**, not folded in the gateway container.
 Migration `0044_routing_gateway_copy.sql` adds `routing_gateway_copies`, one
@@ -420,11 +503,20 @@ never travel back to the Mac. Health display itself never contacts the hub.
 
 | Tool | What it does |
 | --- | --- |
-| `khipu_route` | Reads the record: account states, rules, holds. Takes `since` (only what changed after a version) and `account`. Read-only. |
+| `khipu_route` | Reads the record: account states, rules, holds. Takes `since` (only what changed after a version), `account`, `session_id` and `ack`. Read-only. |
+| `khipu_route_advise` | Returns advisory account rankings, verdicts, reasons, figures and evidence. Read-only. |
 | `khipu_usage` | Reads plan headroom per account. Takes `fresh` and `max_age`. Read-only. |
 | `khipu_route_report` | Records that an account hit a limit, is open, or is down. Also starts or ends a hold. It refuses rules, notes, pauses and clears. |
 | `khipu_route_rule` | Records a rule you asked for. Pending until you confirm it. |
 | `khipu_route_priority` | Records an order you asked for. Unconfirmed until you confirm it. |
+
+Local `khipu_route` returns `routing_changes` and `delivery`. Read the returned
+batch and acknowledge its id with `ack` on your next call. Use your own stable
+canonical session identity. A caller without environment identity passes
+`session_id`; descendants use the exact canonical root plus `/<child>`.
+Foreign identities and acknowledgements are refused. Without identity the
+result is untracked and marks nothing delivered. `since` filters record changes;
+it does not acknowledge delivery.
 
 `khipu_status` also carries a short routing field in its light payload.
 
@@ -444,9 +536,13 @@ Agents do not have to ask. When the `routing_push` feature is on, Khipu puts rou
 
 What the agent sees:
 
-- **Session start**: a block headed "Routing at HH:MMZ" with the full summary (rules, accounts, holds, pace). It has a time budget of 1 second by default.
-- **Each prompt**: only what changed since that session last saw the record, headed "Routing changes at HH:MMZ". The prompt update is capped at 400 characters and a 50 ms budget. The full summary is sent again when the session is 20 versions behind or 6 hours old. A session only counts a change as seen once it was really delivered.
-- **Delegation**: a hook watches the moment an agent hands work to another one (agent and task calls, `delegate_task`, and shell commands that start `claude -p`, `codex exec`, `grok` or `muse exec`, plus any dispatch scripts you name in settings). It adds the same changes block. Calls made inside a subagent get nothing. A subagent gets the full summary when it starts (Claude Code).
+- **Session start**: a block headed "Routing at HH:MMZ" offers a bounded summary (rules, accounts, holds, pace). It has a time budget of 1 second by default. Words that do not fit remain owed and arrive as revision-labelled continuation pages.
+- **Each prompt**: changes and owed pages arrive under "Routing changes at HH:MMZ", with a default 50 ms budget. A summary resend is offered when the session is 20 versions behind or 6 hours old. Prompt and resend delivery advance only through text actually shown and acknowledged.
+- **Delegation**: a hook watches the moment an agent hands work to another one (agent and task calls, `delegate_task`, and shell commands that start `claude -p`, `codex exec`, `grok` or `muse exec`, plus any dispatch scripts you name in settings). It adds the same changes block. A child receives a bounded routing snapshot at start. Claude Code subagents receive remaining pages on their own tool calls; Codex children receive remaining pages through their own Khipu pull calls under their own identity. Child receipts do not settle the parent's debt.
+
+Default sizes are 1,500, 400 and 4,000 UTF-16 units for summary, prompt and child
+blocks, subject to hook ceilings. Paging uses a minimum effective cap of 200;
+unacknowledged batches have a 60-second lease by default.
 
 The hooks never deny or alter a call. The delegation context arrives alongside the tool result, after the call. They are installed by `khipu integrations install` for Claude Code and Codex (Codex runs them only after you approve Khipu's hooks in Codex). Cursor hears routing at session start only: it gets no per-prompt or delegation hook. Aegis refuses these hooks; it, Grok Build and cloud agents hear routing only when they ask. See [Integrations](integrations.md).
 
@@ -465,26 +561,46 @@ khipu route hold end ID
 khipu route wait ACCOUNT --timeout S
 ```
 
-`route wait` exits 0 when the account is open and 1 at the timeout. It waits and launches nothing. With `--confirmed` it counts only Khipu's own read (a probe or a reset check).
+`route wait` exits 0 for open or probably open and 1 at timeout. It waits and launches nothing. `--confirmed` requires an open state confirmed by Khipu's own usage probe or reset check.
 
 ## How the owner changes it
 
-**In the app first.** Settings > Routing holds everything, in this order:
+**In the app first.** Open Settings → Accounts and routing. The page uses
+collapsible groups, with Needs you links to actionable items. Usage and account
+management are in Accounts. The groups are:
 
-1. **Accounts.** State, source and age per account. Priority and pace switch, Check now, Mark paused until, Lift, Clear, and dismissing one side of a disagreement.
-2. **Note.**
-3. **Standing rules.** Confirm, edit, remove, add, undo.
-4. **Holds.**
-5. **Reset checks.**
-6. **Telling conversations.** The master switch, the start, prompt and delegation moments, what each harness hears, sizes and times, and dispatch scripts.
-7. **Job runner folders.**
-8. **Which account each job lane uses.**
-9. **Routing table file.**
-10. **Recent changes.**
+1. **Accounts.**
+2. **Pace, caps and advice.**
+3. **Priority.**
+4. **Your note and standing rules.**
+5. **Proposals and holds.**
+6. **Checks and copies.**
+7. **Telling conversations.**
+8. **Checking for resets.**
+9. **Providers and lanes.**
+10. **Old routing table file.**
+11. **Recent changes.**
+
+Checks and copies flags conflicting account states and structured directions,
+and rule upkeep: expired deadlines, overlapping rules, roles repeating rules
+and edits pending over 24 hours. Follow its links to edit owner state; checks
+themselves stop or change nothing.
+
+It also lists routing claims found in approved instruction and memory files,
+with file and line. Khipu marks them superseded by its record and never edits
+those files. The bounded report and quoted words stay local to the owner in
+`state/routing/scan-report.json`.
+
+The scan includes `~/.claude/CLAUDE.md`, `~/.claude/AGENTS.md`,
+`~/.codex/AGENTS.md`, `~/AGENTS.md`, root `CLAUDE.md` and `AGENTS.md` files for
+projects Khipu already knows, and imported memory notes. It never walks for
+arbitrary repositories. Files over 1,000,000 bytes are skipped, quotes are
+limited to 140 characters, and at most 50 hits per file and 500 total are shown,
+with omissions counted.
 
 The Home screen has a Routing card with one row per account, holds, your note, a priority headline, and attention items (a broken rule, a silent runner, two sources that disagree). It also has a Plans card for usage.
 
-**CLI equivalent.** Owner commands ask for typed confirmation in a terminal and refuse without one:
+**CLI equivalent.** Owner commands use the verified app path, eligible `--owner-direction` (also through `khipu_owner_act`), or typed confirmation in a standalone terminal:
 
 | Command | Does |
 | --- | --- |
@@ -494,7 +610,8 @@ The Home screen has a Routing card with one row per account, holds, your note, a
 | `khipu route note set TEXT` / `note end` | Set or end the note. |
 | `khipu route hold WORDS --owner ...` | Set an owner hold. |
 | `khipu route rule add\|edit\|retire\|restore\|confirm\|undo\|dismiss` | Manage standing rules. |
-| `khipu route priority show\|set\|confirm\|undo\|clear` | Manage the priority order. |
+| `khipu route priority show\|set\|confirm\|undo\|clear` | Manage the priority order; owner writes require `--expect`. |
+| `khipu route cap set\|remove ACCOUNT --kind KIND ...` | Manage owner caps as described above. |
 
 `khipu route sources` lists each job runner folder with its last good read and any error. Run `khipu route --help` and each subcommand's `--help` for every flag. See the [CLI reference](cli.md).
 
@@ -505,14 +622,14 @@ The Home screen has a Routing card with one row per account, holds, your note, a
 - Routing stays local by default. Opt-in Mac replication is described below; the HTTPS gateway projection is gated by `routing_cloud_copy` (with `routing_cloud_copy_rules` and `routing_cloud_copy_hold_words`), not by the replication switch, and deploying it to the live gateway is a separate step.
 - Replacing the routing table file with a view generated by Khipu is planned. Today the file is only read.
 - A push for stock Grok Build is planned, not built.
-- Related work that is planned and not described here: a Work view and work ledger.
+- The [Work view and work ledger](desktop-app.md) show running work, project boards and owed items.
 
 
 ## Replication between Macs (slice 11b)
 
 `routing_replication_live` is the owner's switch for network replication
 between Macs. It defaults off. Turn it on or off in the app at
-Settings → Routing, beside the other Mac-to-Mac switch ("Copy routing
+Settings → Accounts and routing, beside the other Mac-to-Mac switch ("Copy routing
 between your Macs through the hub"), or with
 `khipu config --set routing_replication_live on --owner-direction` (or
 `--from-app` from the app, or a typed `yes` on a terminal). Like the other
@@ -570,7 +687,11 @@ live hub, live configuration, hook or launch agent was changed for this slice.
 `routing_delivery_ok`. The check reads existing delivery ledgers, today's stamped
 hook outcomes, replication cursors and gateway delivery rows; it never probes or
 changes routing, owner actions, dispatch policy or the promotion gate. Desktop
-clients can consume the same check; the app delivery view is slice 15a.
+clients can consume the same check. Settings → Accounts and routing →
+Telling conversations includes the delivery view: health and missing evidence,
+live conversations, recent changes and who has them, and other-Mac/cloud
+freshness. It reads doctor evidence; opening the display does not probe or
+send routing.
 
 For each identity active within `routing_delivery_live_after` (12 hours), the
 current attachment selects `main` for hooked clients and `mcp` for pull-only
@@ -608,3 +729,8 @@ names) and each component's `last_delivery_point`, with no session ids, routing
 words or login paths. Green requires affirmative evidence
 for every applicable check. Recovery requires the corresponding receipt, current
 outcome log, caught-up cursor, delivered projection or resolved lane mapping.
+
+Owner-local `khipu route --json` also provides friendly `delivery_rows`,
+`delivery_macs` freshness rows and per-change `recipients` counts. Doctor still
+uses hashed identities. `routing_mac_names` maps Mac ids to local display
+names, defaults to an empty map, and is never replicated or pushed.

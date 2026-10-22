@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import unittest
 from unittest import mock
 
@@ -49,6 +50,35 @@ class RedactSecretsTest(unittest.TestCase):
         self.assertEqual(out, 'password = "[REDACTED]"')
         out = self._one("GEMINI_API_KEY: AbCdEfGhIjKlMnOp")
         self.assertIn("GEMINI_API_KEY: [REDACTED]", out)
+
+    def test_assignment_name_runs_preserve_boundaries_and_case_folding(self):
+        names = [
+            ".-password", "é.-password", "épassword", "é-password",
+            "foo.bar-password", "foo.ſecret", "foo.PRİVATE_KEY", "ı.password",
+        ]
+        for name in names:
+            with self.subTest(name=name):
+                text = name + "=fake-credential"
+                expected = text if name == "épassword" else name + "=" + redact.MASK
+                self.assertEqual(redact.redact_secrets(text, force=True),
+                                 (expected, int(expected != text)))
+
+    @unittest.skipUnless(hasattr(signal, "setitimer"), "requires a bounded signal timer")
+    def test_long_assignment_name_run_finishes_within_deadline(self):
+        def deadline_expired(signum, frame):
+            raise AssertionError("assignment scan exceeded its 0.5 second deadline")
+
+        previous_handler = signal.signal(signal.SIGALRM, deadline_expired)
+        previous_timer = signal.setitimer(signal.ITIMER_REAL, 0.5)
+        try:
+            prefix = "a-" * 20_000
+            self.assertEqual(redact.redact_secrets(prefix, force=True), (prefix, 0))
+            text = prefix + "password=fake-credential"
+            self.assertEqual(redact.redact_secrets(text, force=True),
+                             (prefix + "password=" + redact.MASK, 1))
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+            signal.signal(signal.SIGALRM, previous_handler)
 
     def test_ordinary_memory_content_is_untouched(self):
         keep = [
