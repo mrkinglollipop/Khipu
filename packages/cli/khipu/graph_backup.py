@@ -471,6 +471,22 @@ def run_offsite(
     keep: int = 3,
     rclone_bin: str = "rclone",
 ) -> dict:
+    """Record every attempted copy outcome, including preflight failures."""
+    try:
+        out = _run_offsite(dest_remote=dest_remote, keep=keep, rclone_bin=rclone_bin)
+    except Exception:  # noqa: BLE001 — preflight must leave a failure receipt
+        out = {"ok": False, "reason": "offsite operation failed"}
+    from khipu import ops_events
+
+    detail = {key: value for key, value in out.items() if key != "ok"}
+    try:
+        event = ops_events.record("graph_snapshot_offsite", "ok" if out["ok"] else "fail", detail)
+    except Exception:  # noqa: BLE001
+        return {**out, "ok": False, "ops_error": "offsite ops_events insert failed"}
+    return {**out, "event": event}
+
+
+def _run_offsite(*, dest_remote: str | None, keep: int, rclone_bin: str) -> dict:
     from khipu.config import check_graph_backup_remote
 
     try:
@@ -534,12 +550,6 @@ def run_offsite(
         r = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
     except (OSError, subprocess.TimeoutExpired):
         detail = {"path": str(snap), "dest": dest, "error": "offsite copy failed to run"}
-        try:
-            from khipu import ops_events
-
-            ops_events.record("graph_snapshot_offsite", "fail", detail)
-        except Exception:  # noqa: BLE001
-            detail["ops_error"] = "offsite ops_events insert failed"
         return {"ok": False, "reason": "offsite copy failed to run", **detail}
 
     if r.returncode != 0:
@@ -549,12 +559,6 @@ def run_offsite(
             "reason": "offsite copy failed",
             "returncode": r.returncode,
         }
-        try:
-            from khipu import ops_events
-
-            ops_events.record("graph_snapshot_offsite", "fail", detail)
-        except Exception:  # noqa: BLE001
-            detail["ops_error"] = "offsite ops_events insert failed"
         return {"ok": False, **detail}
 
     pruned: list[str] = []
@@ -565,13 +569,7 @@ def run_offsite(
         detail["prune_error"] = "offsite prune failed"
 
     detail["pruned"] = pruned
-    from khipu import ops_events
-
-    try:
-        ev = ops_events.record("graph_snapshot_offsite", "ok", detail)
-    except Exception:  # noqa: BLE001
-        return {"ok": False, "ops_error": "offsite ops_events insert failed", **detail}
-    return {"ok": True, "event": ev, **detail}
+    return {"ok": True, **detail}
 
 
 def _prune_remote_snapshots(
