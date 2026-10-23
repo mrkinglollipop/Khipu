@@ -305,9 +305,6 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
         return 0
     if not _decisions_ready(cur):
         return 0
-    from khipu import fact_support
-
-    support_ready = fact_support.lock(cur)
     project = payload.get("project")
     session_id = payload.get("session_id")
     decided_at = payload.get("ts")
@@ -321,22 +318,15 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
         norm = normalize_text(text)
         if not norm:
             continue
-        detail = details.get(text)
-        support = {"text": text, "session_id": session_id, "decided_at": decided_at,
-                   "source_kind": (detail or {}).get("by") or None,
-                   "rationale": (detail or {}).get("rationale") or None,
-                   "evidence": ({"derivation": "extract-details-v1", "episode_id": episode_id,
-                                 "reverses": detail.get("reverses") or None} if detail else None)}
-        duplicate = _find_recent_duplicate(cur, project, norm, decided_at)
-        if duplicate is not None:
-            fact_support.record(cur, "decision", duplicate, episode_id, support)
+        if _find_recent_duplicate(cur, project, norm, decided_at) is not None:
             continue
+        detail = details.get(text)
         if detail is None:
             cur.execute(
                 """
                 INSERT INTO decisions (project, text, episode_id, session_id, decided_at)
                 VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()))
-                """ + (" RETURNING id" if support_ready else ""),
+                """,
                 (project, text, episode_id, session_id, decided_at),
             )
         else:
@@ -353,14 +343,12 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
                     (project, text, episode_id, session_id, decided_at,
                      source_kind, rationale, evidence)
                 VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()), %s, %s, %s::jsonb)
-                """ + (" RETURNING id" if support_ready else ""),
+                """,
                 (project, text, episode_id, session_id, decided_at,
                  source_kind, rationale, json.dumps(evidence)),
             )
         if cur.rowcount > 0:
             inserted += 1
-            if support_ready:
-                fact_support.record(cur, "decision", int(cur.fetchone()[0]), episode_id, support)
     if inserted:
         _log(f"recorded {inserted} decision(s) for episode {episode_id} (project={project!r})")
     return inserted

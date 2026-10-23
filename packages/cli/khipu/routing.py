@@ -517,9 +517,7 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
     their order (routing, then config), so neither write loses the other.
     Only the owner's write (the app, or a typed yes) or a conversation's at
     his request (``request``: kept with the value it replaced until he
-    answers it) reaches here; the owner's own write ends such a request.
-    Gateway uploads hold the same routing lock at their final commit: a
-    sharing revocation acknowledges only after any prior upload finishes."""
+    answers it) reaches here; the owner's own write ends such a request."""
     from khipu.config import config_file, mutate_config
 
     if key not in SETTINGS:

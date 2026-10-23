@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import time
-from types import SimpleNamespace
 
 import psycopg
 import pytest
@@ -27,7 +26,6 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_TEST", "1")
     monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
     db._TABLE_COLUMNS_CACHE.clear()
-    monkeypatch.setenv("KHIPU_DATABASE_URL", "postgresql://synthetic@127.0.0.1:5432/owner_fixture")
     return tmp_path
 
 
@@ -50,8 +48,6 @@ def test_direct_lost_commit_reply_is_not_applied_twice(home, monkeypatch):
 class _QueryHub:
     """A hub whose commitment shows an older snooze still in the future,
     and whose record of applied writes does not hold this write's id."""
-
-    info = SimpleNamespace(get_parameters=lambda: {"host": "127.0.0.1", "port": "5432", "dbname": "owner_fixture"})
 
     def __init__(self):
         self.sql = []
@@ -116,8 +112,6 @@ class _TxHub:
 
 
 class _TxConn:
-    info = SimpleNamespace(get_parameters=lambda: {"host": "127.0.0.1", "port": "5432", "dbname": "owner_fixture"})
-
     def __init__(self, owner):
         self.hub, self.pending, self.writes = owner, {}, 0
 
@@ -253,7 +247,6 @@ def _refused(pg) -> list[tuple[str, str]]:
 def _point_at(pg, monkeypatch) -> None:
     # The suite forbids psycopg.connect; the throwaway cluster is reached the
     # way tests/hermetic_pg.py reaches it.
-    monkeypatch.setenv("KHIPU_DATABASE_URL", pg.dsn)
     monkeypatch.setattr(db, "connect", lambda **_kw: psycopg.Connection.connect(pg.dsn))
 
 

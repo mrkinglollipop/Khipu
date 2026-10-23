@@ -596,8 +596,7 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
                 view = routing.read_view(now)
                 keys = [a["key"] for a in view.get("accounts") or []]
                 agent_view._table(keys).owner = []
-                projection = agent_view.scrub_strict(routing.gateway_projection(view, now=now), keep=(),
-                                                      extra_keys=keys, cut_paths=True)
+                projection = agent_view.scrub_strict(routing.gateway_projection(view, now=now), keep=(), extra_keys=keys)
             validate(projection)
             digest = _digest([projection["epoch"], projection["version"],
                               cfg["routing_cloud_copy_rules"], cfg["routing_cloud_copy_hold_words"],
@@ -614,18 +613,7 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
                 if state.get("digest") == digest and state.get("published_at") and (
                         now - routing._parse(state["published_at"])).total_seconds() < heartbeat:
                     return {"ok": True, "unchanged": True}
-            # Settings writers hold the routing lock through their config
-            # commit. Take it only after folding/scrubbing (never take the
-            # fold lock under it), in the existing sync -> routing order.
-            # A revocation that won this lock invalidates this projection;
-            # one that follows the upload cannot acknowledge until its
-            # commit has finished. Never overwrite the owner's choice.
-            with routing._lock():
-                current = routing.settings()
-                sharing = ("routing_cloud_copy", "routing_cloud_copy_rules", "routing_cloud_copy_hold_words")
-                if any(current[key] != cfg[key] for key in sharing):
-                    return {"ok": True, "pending": True}
-                published_at = hub.publish(publisher, projection, cfg["routing_cloud_copy_stale_after"])
+            published_at = hub.publish(publisher, projection, cfg["routing_cloud_copy_stale_after"])
             state.update(digest=digest, published_at=published_at, epoch=projection["epoch"],
                          revision=projection["version"], folded_at=projection["folded_at"])
             _on_published(state)

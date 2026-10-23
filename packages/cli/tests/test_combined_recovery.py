@@ -30,12 +30,6 @@ def fake_world(tmp_path, monkeypatch):
     return tmp_path
 
 
-@pytest.fixture
-def owner_destination(fake_world, monkeypatch):
-    """Only the owner replay probes model a configured (unreachable) hub."""
-    monkeypatch.setenv("KHIPU_DATABASE_URL", "postgresql://synthetic@127.0.0.1:5432/owner_fixture")
-
-
 def test_enospc_heal_must_still_reach_storage_cleanup(fake_world, monkeypatch):
     data = fake_world / "data"
     state = data / "state"
@@ -100,7 +94,6 @@ def test_promotion_retry_survives_transient_git_failure(fake_world, monkeypatch)
     assert pm.queued() is not None, f"retry discarded promotion: {result}"
 
 
-@pytest.mark.usefixtures("owner_destination")
 def test_owner_replay_preserves_write_after_transient_enospc(fake_world, monkeypatch):
     ow._enqueue("owed_update", {"id": 1, "action": "close"}, "hub away")
     monkeypatch.setattr(ow, "_landed", lambda *a: None)
@@ -154,7 +147,6 @@ def test_heal_timer_stages_are_isolated_and_storage_runs_first(fake_world, monke
 
 
 @pytest.mark.parametrize("failure_point", ["read", "landed_check", "mark_sending", "apply"])
-@pytest.mark.usefixtures("owner_destination")
 def test_owner_local_io_failure_keeps_the_queued_write(fake_world, monkeypatch, failure_point):
     ow._enqueue("owed_update", {"id": 2, "action": "close"}, "hub away")
     monkeypatch.setattr(ow, "_landed", lambda *_: None)
@@ -190,7 +182,6 @@ def test_owner_local_io_failure_keeps_the_queued_write(fake_world, monkeypatch, 
 
 
 @pytest.mark.parametrize("outcome", [("applied", None), ("refused", "owner denied")])
-@pytest.mark.usefixtures("owner_destination")
 def test_owner_replay_checks_hub_landing_before_sending_again(fake_world, monkeypatch, outcome):
     ow._enqueue("owed_update", {"id": 3, "action": "close"}, "hub away")
     monkeypatch.setattr(ow, "_landed", lambda *_: outcome)
@@ -203,7 +194,6 @@ def test_owner_replay_checks_hub_landing_before_sending_again(fake_world, monkey
     assert ow.status()["pending"] == 0
 
 
-@pytest.mark.usefixtures("owner_destination")
 def test_owner_post_apply_ack_io_failure_keeps_the_write_for_landed_dedupe(fake_world, monkeypatch):
     ow._enqueue("owed_update", {"id": 4, "action": "close"}, "hub away")
     monkeypatch.setattr(ow, "_landed", lambda *_: None)
@@ -227,7 +217,6 @@ def test_owner_post_apply_ack_io_failure_keeps_the_write_for_landed_dedupe(fake_
     assert second["replayed"] == 1 and sent == [True] and ow.status()["pending"] == 0
 
 
-@pytest.mark.usefixtures("owner_destination")
 def test_only_an_explicit_hub_refusal_moves_an_owner_write_to_refused(fake_world, monkeypatch):
     ow._enqueue("owed_update", {"id": 5, "action": "close"}, "hub away")
     monkeypatch.setattr(ow, "_landed", lambda *_: None)
