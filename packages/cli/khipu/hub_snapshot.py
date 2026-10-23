@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
@@ -618,40 +618,58 @@ def _purged_topic_marker(path: Path, slug: str) -> Path:
     return _purged_topics_dir(path) / hashlib.sha256(slug.encode("utf-8")).hexdigest()
 
 
+@contextmanager
+def _purge_marker_lock(path: Path):
+    """Serialize marker publication and removal, independently of sqlite's
+    refresh lock. A purge must be able to fence readers while that lock is busy.
+    The stable lock lives outside the directory whose entries are markers."""
+    import fcntl
+
+    fd = os.open(path.parent / ".hub_snapshot.purge-markers.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _mark_purged_topic(slug: str, path: Path | None = None, *, hub_at: datetime | None = None) -> bool:
-    """Record a purged topic beside the replica before the replica is
-    touched, so an embedding catch-up whose replica write lands after the
-    purge can never put the topic back, even when the purge could not take
-    the lock. ``hub_at`` is the hub's clock when the purge was seen; a
-    recreated topic is judged against it, hub time to hub time, so this
-    Mac's clock cannot hide or resurrect it. Without it the marker file's
-    own time stands in."""
+    """Publish a purge fence before touching sqlite, even when its refresh
+    lock is busy. Hub time takes precedence over this Mac's clock. Atomic
+    replacement keeps every open descriptor an immutable marker version."""
     path = path or snapshot_path()
     marker = _purged_topic_marker(path, slug)
+    pending = None
     try:
         marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
+        fd, name = tempfile.mkstemp(prefix=".hub_snapshot.purge-marker-", dir=path.parent)
+        pending = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
             stamp = _utc(hub_at)
             body = slug if stamp is None else json.dumps({"slug": slug, "hub_at": stamp.isoformat()})
-            os.write(fd, body.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        dfd = os.open(marker.parent, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+            file.write(body)
+            file.flush()
+            os.fsync(file.fileno())
+        with _purge_marker_lock(path):
+            os.replace(pending, marker)
+            dfd = os.open(marker.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         return True
     except OSError:
         return False
+    finally:
+        if pending is not None:
+            try:
+                pending.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
-def _read_marker(marker: Path) -> tuple[str, datetime | None]:
-    """A marker's slug and recorded hub time. Older markers hold the bare
-    slug and no hub time."""
-    text = marker.read_text(encoding="utf-8")
+def _decode_marker(text: str) -> tuple[str, datetime | None]:
+    """Older markers hold only the bare slug, without a hub timestamp."""
     if text.startswith("{"):
         try:
             data = json.loads(text)
@@ -660,6 +678,35 @@ def _read_marker(marker: Path) -> tuple[str, datetime | None]:
         except ValueError:
             pass
     return text, None
+
+
+def _read_marker(marker: Path) -> tuple[str, datetime | None]:
+    return _decode_marker(marker.read_text(encoding="utf-8"))
+
+
+def _purge_marker_version(path: Path, slug: str) -> tuple[datetime, tuple[Any, ...]] | None:
+    """Capture freshness and deletion identity from the SAME open version.
+    Writers replace rather than truncate, so content cannot change under us.
+    Legacy file times are rounded to database/datetime microsecond precision."""
+    try:
+        with _purged_topic_marker(path, slug).open(encoding="utf-8") as file:
+            stat = os.fstat(file.fileno())
+            text = file.read()
+        _slug, hub_at = _decode_marker(text)
+        version = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, text)
+        stamp = hub_at or datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+        return stamp, version
+    except (OSError, UnicodeError):
+        return None
+
+
+def _clear_purge_marker_version(path: Path, slug: str, version: tuple[Any, ...]) -> None:
+    # The lock covers both comparison and unlink: a purge can publish before
+    # or after this critical section, never into the check/delete gap.
+    with _purge_marker_lock(path):
+        current = _purge_marker_version(path, slug)
+        if current is not None and current[1] == version:
+            _purged_topic_marker(path, slug).unlink(missing_ok=True)
 
 
 def _purged_topic_slugs(path: Path | None = None) -> set[str]:
@@ -686,36 +733,30 @@ def _purge_marker_time(path: Path, slug: str) -> float | None:
 
 
 def _purge_marker_stamp(path: Path, slug: str) -> datetime | None:
-    """When the purge happened, for comparing with a topic's ``updated_at``:
-    the hub time recorded in the marker, else the file's time at database
-    precision. None when the marker is gone."""
-    try:
-        _slug, hub_at = _read_marker(_purged_topic_marker(path, slug))
-    except (OSError, UnicodeError):
-        return None
-    if hub_at is not None:
-        return hub_at
-    marked_at = _purge_marker_time(path, slug)
-    # PostgreSQL timestamps and datetime have microsecond precision; compare
-    # the filesystem time at that same precision so rounding cannot turn
-    # equality into newer.
-    return None if marked_at is None else datetime.fromtimestamp(marked_at, timezone.utc)
+    """Hub purge time, or the same marker version's file time for legacy markers."""
+    marker = _purge_marker_version(path, slug)
+    return None if marker is None else marker[0]
 
 
 def _clear_purged_topics(path: Path | None = None, *, dumped_after: float) -> None:
-    """Drop the markers a full dump already reflects: the hub delete commits
-    before its marker is written, so a dump that began at or after a marker
-    cannot hold that topic unless it was legitimately created again."""
+    """Drop only markers reflected by the dump, without racing a new purge.
+    The hub delete commits before publication, so a dump begun at or after
+    the marker cannot hold the topic unless it was legitimately recreated."""
+    path = path or snapshot_path()
     try:
-        markers = list(_purged_topics_dir(path).iterdir())
-    except FileNotFoundError:
+        with _purge_marker_lock(path):
+            try:
+                markers = list(_purged_topics_dir(path).iterdir())
+            except FileNotFoundError:
+                return
+            for marker in markers:
+                try:
+                    if marker.stat().st_mtime <= dumped_after:
+                        marker.unlink()
+                except OSError:
+                    continue
+    except OSError:
         return
-    for marker in markers:
-        try:
-            if marker.stat().st_mtime <= dumped_after:
-                marker.unlink()
-        except OSError:
-            continue
 
 
 def _erase_episode_commitments(con: sqlite3.Connection, episode_id: int) -> None:
@@ -1589,15 +1630,15 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     slug = row.get("slug")
                     if slug is None:
                         continue
-                    marked_at = None
+                    marker_version = None
                     if slug in purged:
                         incoming = _utc(row.get("updated_at"))
                         # A marker a concurrent dump just cleared is no marker.
-                        marker_stamp = _purge_marker_stamp(path, slug)
-                        if marker_stamp is not None:
+                        marker = _purge_marker_version(path, slug)
+                        if marker is not None:
+                            marker_stamp, marker_version = marker
                             if incoming is None or incoming <= marker_stamp:
                                 continue
-                            marked_at = _purge_marker_time(path, slug)
                     old = con.execute("SELECT updated_at, deleted_at FROM topics WHERE slug = ?", (slug,)).fetchone()
                     if old is not None and row.get("deleted_at") is None:
                         held, incoming = _utc(old[0]), _utc(row.get("updated_at"))
@@ -1613,8 +1654,8 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                         vals,
                     )
                     _record_read_at(con, "topics", slug, read_at)
-                    if slug in purged and marked_at is not None:
-                        recreated[slug] = marked_at
+                    if slug in purged and marker_version is not None:
+                        recreated[slug] = marker_version
                     written += 1
                 if written or removed:
                     _advance_cursor(con, "topics", synced_at=_utcnow_iso(),
@@ -1652,11 +1693,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     _record_read_at(con, "project_aliases", "*", read_at)
             con.commit()
             if "topics" in wanted:
-                for slug, marked_at in recreated.items():
-                    # Clear only after the replacement row commits, and never
-                    # remove a marker a concurrent purge just refreshed.
-                    if _purge_marker_time(path, slug) == marked_at:
-                        _purged_topic_marker(path, slug).unlink(missing_ok=True)
+                for slug, marker_version in recreated.items():
+                    # Clear only the observed fence after the row commits.
+                    _clear_purge_marker_version(path, slug, marker_version)
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - reported as the failed parts
