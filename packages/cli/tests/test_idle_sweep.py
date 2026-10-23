@@ -94,13 +94,23 @@ class IdleSweepTest(unittest.TestCase):
 
     def test_nothing_unread_is_not_read(self):
         path, st = self.session()
-        for offset in (path.stat().st_size, path.stat().st_size + 1):
-            st["offset"] = offset
-            sc.save_state("codex", "s1", st)
-            with mock.patch.object(sc, "read_window") as read:
-                out = sc.sweep_idle(now=self.now)
-            read.assert_not_called()
-            self.assertEqual(out["skipped"], {"nothing_unread": 1})
+        st["offset"] = path.stat().st_size
+        sc.save_state("codex", "s1", st)
+        with mock.patch.object(sc, "read_window") as read:
+            out = sc.sweep_idle(now=self.now)
+        read.assert_not_called()
+        self.assertEqual(out["skipped"], {"nothing_unread": 1})
+
+    def test_offset_past_eof_reads_rotated_transcript(self):
+        path, st = self.session()
+        st["offset"] = path.stat().st_size + 1
+        sc.save_state("codex", "s1", st)
+        with mock.patch.object(sc, "read_window", wraps=sc.read_window) as read:
+            out = sc.sweep_idle(now=self.now)
+        self.assertEqual(out["jobs"], 1)
+        self.assertEqual(out["read"], 1)
+        self.assertEqual(read.call_args.args, (path, 0))
+        self.assertEqual(sc.load_state("codex", "s1")["offset"], path.stat().st_size)
 
     def test_helpers_subagents_flags_recall_and_unknown_harness_are_skipped(self):
         self.session("helper", cwd="/tmp/t3code-claude-title-test")

@@ -35,6 +35,9 @@ class TransactionCursor:
             return
         if self.aborted:
             raise InFailedSqlTransaction("synthetic aborted transaction")
+        if sql == "SELECT pg_advisory_xact_lock(%s)":
+            assert len(params) == 1 and -(1 << 63) <= params[0] < (1 << 63)
+            return
         if sql.startswith("SAVEPOINT "):
             self.savepoints.append((sql.split()[-1], len(self.writes)))
         elif sql.startswith("RELEASE SAVEPOINT "):

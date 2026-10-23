@@ -282,6 +282,10 @@ class _EpisodesFakeCursor:
         s = " ".join(sql.split())
         params = params or ()
         self.calls.append((s, params))
+        if s == "SELECT pg_advisory_xact_lock(%s)":
+            assert len(params) == 1 and -(1 << 63) <= params[0] < (1 << 63)
+            self._result = [(None,)]
+            return
         if s.startswith("SAVEPOINT") or s.startswith("ROLLBACK TO SAVEPOINT") \
                 or s.startswith("RELEASE SAVEPOINT"):
             return
