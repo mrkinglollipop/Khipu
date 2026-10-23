@@ -635,6 +635,9 @@ def _doctor_start_workers(pool, args, mem, sample_drift) -> dict:
     from khipu.migrate import doctor_check as _schema_check
 
     workers["schema"] = pool.submit(_schema_check)
+    from khipu.provenance import doctor_check as _provenance_check
+
+    workers["provenance"] = pool.submit(_provenance_check)
     return workers
 
 
@@ -896,6 +899,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     if not hub_ok and schema.get("error"):
         schema = {**schema, "ok": True, "skipped": "the database did not answer"}
     schema_ok = bool(schema.get("ok"))
+    # Fact provenance (docs/plans/2026-10-23-fact-provenance.md, phase 5): 0047
+    # on the hub or not, open fact_gaps, section 4's limit count. Visibility
+    # only: a hub without 0047 is a state, not red, and it never gates `ok`.
+    fact_provenance = workers["provenance"].result()
+    if not hub_ok and fact_provenance.get("error"):
+        fact_provenance = {"ok": True, "warnings": [], "skipped": "the database did not answer"}
     liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
     if not gw_liveness.get("ok", True):
         liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
@@ -1011,6 +1020,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "owner_actions_log": owner_actions_log_block,
         "ledger": ledger_block,
         "schema_migrations": schema,
+        "fact_provenance": fact_provenance,
         "work": work_block,
         "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
@@ -1018,7 +1028,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + list(owner_direction_block.get("warnings") or [])
                      + list(owner_actions_log_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
-                     + list(schema.get("warnings") or []) + _disk_space_warnings(local)
+                     + list(schema.get("warnings") or [])
+                     + list(fact_provenance.get("warnings") or []) + _disk_space_warnings(local)
                      + _replica_schema_warnings(local)),
         "not_configured": not_configured,
         "ok": (

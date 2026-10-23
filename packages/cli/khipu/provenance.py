@@ -460,3 +460,101 @@ def prune_changes(conn, *, keep_days: int = CHANGES_KEEP_DAYS) -> dict[str, Any]
             )
     conn.commit()
     return {"ok": True, "pruned": int(removed or 0)}
+
+
+# ---- Doctor (section 8, phase 5) -------------------------------------------------
+#
+# Visibility only: the block is red (``ok`` False) only when it could not be
+# read, and it never gates doctor's overall ``ok``. A hub without 0047 is a
+# plain state, not a fault: the schema check already names the pending update.
+
+_MIGRATION = "0047_fact_provenance"
+
+
+def _doctor_read(cur) -> dict[str, Any]:
+    cur.execute("SELECT to_regclass('public.fact_claims') IS NOT NULL")
+    row = cur.fetchone()
+    if not (row and row[0] is True):
+        return {
+            "state": "not_migrated",
+            "reason": ("Fact provenance (database update 0047) is not on the memory database yet; "
+                       "facts are stored and forgotten as before until it is."),
+        }
+    out: dict[str, Any] = {"state": "active"}
+    cur.execute("SELECT applied_at FROM schema_migrations WHERE version = %s", (_MIGRATION,))
+    row = cur.fetchone()
+    applied_at = row[0] if row else None
+    out["applied_at"] = applied_at
+    # I4: capture fact steps that failed and were kept as a gap.
+    cur.execute("SELECT step, count(*) FROM fact_gaps WHERE resolved_at IS NULL "
+                "GROUP BY step ORDER BY step")
+    by_step = {step: int(n) for step, n in cur.fetchall()}
+    cur.execute("SELECT count(*), min(at) FROM fact_gaps WHERE resolved_at IS NULL")
+    n_gaps, oldest = cur.fetchone()
+    out["fact_gaps"] = {"open": int(n_gaps or 0), "oldest_at": oldest, "by_step": by_step}
+    # Section 4's witness backfill: projects with live episodes not covered yet.
+    out["backfill_pending_projects"] = len(pending_projects(cur))
+    # Section 4's accepted limit. Only commitments count sightings
+    # (seen_count). A legacy commitment is one opened before 0047.
+    # at_risk: open legacy commitments with more sightings than live proven
+    # claimants (a restater whose words were overwritten); forgetting every
+    # proven claimant retires them. retired: legacy commitments retired as
+    # forgotten since 0047 that had more than one sighting. Forget deletes
+    # the forgotten episodes' claims, so the hub no longer knows how many of
+    # those sightings were proven: an upper bound on the facts the limit cost.
+    limit = {"at_risk": 0, "retired": 0}
+    if applied_at is not None:
+        cur.execute(
+            "SELECT count(*) FROM commitments c WHERE c.status IN ('open', 'stale') "
+            "AND c.opened_at < %(at)s AND c.seen_count > ("
+            " SELECT count(DISTINCT fc.episode_id) FROM fact_claims fc "
+            " JOIN episodes e ON e.id = fc.episode_id AND e.deleted_at IS NULL "
+            " WHERE fc.kind = 'commitment' AND fc.fact_id = c.id AND fc.claimant = 'episode' "
+            " AND fc.field IN ('text', 'restatement'))",
+            {"at": applied_at},
+        )
+        limit["at_risk"] = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            "SELECT count(*) FROM commitments c WHERE c.status = 'closed' "
+            "AND c.close_reason = 'forgotten' AND c.opened_at < %(at)s "
+            "AND c.closed_at >= %(at)s AND c.seen_count > 1",
+            {"at": applied_at},
+        )
+        limit["retired"] = int(cur.fetchone()[0] or 0)
+    out["limit"] = limit
+    return out
+
+
+def doctor_check(conn=None) -> dict[str, Any]:
+    """Doctor's fact-provenance block: whether 0047 is on the hub, open
+    ``fact_gaps`` and section 4's limit count. Read-only; ``conn`` is the
+    caller's and stays open, else the resolved hub is opened and closed here.
+    No configured database is a skip; a failed read is red, never a pass."""
+    block: dict[str, Any] = {"ok": True, "warnings": []}
+    try:
+        if conn is None:
+            from khipu.db import connect, dsn_configured
+
+            if not dsn_configured():
+                return {**block, "skipped": "no database configured"}
+            with connect() as owned, owned.cursor() as cur:
+                block.update(_doctor_read(cur))
+                owned.rollback()
+        else:
+            with conn.cursor() as cur:
+                block.update(_doctor_read(cur))
+    except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
+        return {**block, "ok": False, "error": f"{type(e).__name__}: {e}",
+                "warnings": [f"Fact provenance could not be checked: {type(e).__name__}"]}
+    gaps = (block.get("fact_gaps") or {}).get("open") or 0
+    if gaps:
+        block["warnings"].append(
+            f"{gaps} capture fact step{'s' if gaps != 1 else ''} failed and "
+            f"{'were' if gaps != 1 else 'was'} kept as a gap (fact_gaps), not yet resolved")
+    retired = (block.get("limit") or {}).get("retired") or 0
+    if retired:
+        block["warnings"].append(
+            f"{retired} older commitment{'s' if retired != 1 else ''} retired when "
+            f"{'their' if retired != 1 else 'its'} proven sources were forgotten; a restatement "
+            "from before fact provenance could not be proven and may have been lost")
+    return block
