@@ -387,12 +387,18 @@ def _disabled_skip_inner(state, now, *, force):
     known = _publishers(state)
     if not known:
         # A recomputable id is not evidence this Mac ever published. A
-        # cleanup that never ran (or whose outcome was lost) is not
-        # retried, but one that failed against a configured hub is:
-        # otherwise a row published before both local files were lost
+        # first speculative cleanup whose outcome was lost is not retried
+        # automatically, but one with a recorded failure (an error, or
+        # counted cleanup failures carried by an attempt marker) is, and
+        # the owner's forced retry always runs an unresolved one: only
+        # "disabled" (set by _on_cleaned after the delete) means cleaned.
+        # Otherwise a row published before both local files were lost
         # would stay on the hub forever.
         if state.get("cleanup_attempted") is True:
-            if state.get("disabled") is True or not state.get("error"):
+            if state.get("disabled") is True:
+                return {"ok": True, "disabled": True}
+            unresolved = bool(state.get("error") or _count(state.get("cleanup_failures")))
+            if not unresolved and not force:
                 return {"ok": True, "disabled": True}
             if not _hub_configured_cached(now):
                 return {"ok": True, "disabled": True}

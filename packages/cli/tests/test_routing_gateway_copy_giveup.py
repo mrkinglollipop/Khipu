@@ -217,6 +217,7 @@ LIFECYCLE = (
     [("auto", 1, n, n == 6) for n in range(1, 7)]       # fresh -> retrying -> stopped
     + [("auto", 0, 6, True), ("auto", 0, 6, True)]      # stopped: automatic ticks do nothing
     + [("rekey_pending", 0, 6, True)]                   # new id, no publication yet: still stopped
+    + [("crash_marker", 0, 6, True)]                    # died before the delete: still stopped
     + [("force", 1, 7, True)]                           # owner retry passes the cap, fails
     + [("cleanup_only_on", 0, 7, True)]                 # copy on: no writes, no hub calls
     + [("publish_up", 0, 0, False)]                     # new publication: fresh budget
@@ -249,6 +250,13 @@ def test_counter_lifecycle_table(gw, monkeypatch):
             gateway_tests.configure(gw, routing_cloud_copy=True)
             assert gc.publish(hub=Up()).get("pending") is True
             gateway_tests.configure(gw, routing_cloud_copy=False)
+        elif step == "crash_marker":
+            # The speculative cleanup's attempt marker, with the delete's outcome lost.
+            state = gc._load()
+            gc._publishers_path().unlink()
+            gc._save(dict(cleanup_attempted=True, cleanup_publisher=state["publisher"],
+                          **gc._counters(state)))
+            gc.publish()
         elif step == "cleanup_only_on":
             gateway_tests.configure(gw, routing_cloud_copy=True)
             files = gc._path().read_bytes()
