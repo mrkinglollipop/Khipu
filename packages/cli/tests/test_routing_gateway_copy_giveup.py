@@ -553,3 +553,18 @@ def test_random_cleanup_sequences_keep_the_invariant(gw, monkeypatch, seed):
     if visible:
         assert gc.publish(force=True, cleanup_only=True, hub=hub)["ok"] is True
         assert not hub.rows, seed
+
+
+def test_an_empty_manual_retry_persists_the_cleaned_transition(gw, monkeypatch):
+    never_on_mac(gw, monkeypatch)
+    gc._save(dict(cleanup_attempted=True, cleanup_publishers=[], cleanup_failures=6, failures=6,
+                  error="copy_publish_failed"))
+    (routing.routing_dir() / "mac-id").unlink()  # no current identity either
+    assert gc.status()["cleanup_gave_up"] is True
+    hub = Hub()
+    assert gc.publish(force=True, cleanup_only=True, hub=hub)["ok"] is True
+    assert hub.deleted == []
+    state = gc.status()
+    assert gc._cleaned(gc._load()) and not state.get("cleanup_gave_up") and not state.get("error")
+    assert "gateway-cleanup-stopped" not in health()["reasons"]
+    assert not any("stopped after 6" in w for w in routing.doctor_block()["warnings"])

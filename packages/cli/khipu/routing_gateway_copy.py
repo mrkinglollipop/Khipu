@@ -231,6 +231,12 @@ def _path():
 #                               one shared count; a recorded failed cleanup
 #                               (cleanup_attempted + error, not cleaned) reads
 #                               that count as cleanup_failures.
+#
+# Known limits (both only repeat an idempotent DELETE):
+#   - cleanup_admitted keeps the last 64 admitted ids; an older id that became
+#     the current identity again would be admitted, and deleted, once more.
+#   - _confirm_deleted writes the state file, then the journal; a crash between
+#     the two leaves the id in the journal, so it is deleted once more.
 _COUNTERS = ("error", "failures", "cleanup_failures", "retry_at")
 
 
@@ -429,7 +435,10 @@ def _disabled_skip(state, now, *, force):
     if not evidence:
         if state.get("cleanup_attempted") is True or targets:
             if not targets and _publisher(create=False) is None:
-                return {"ok": True, "disabled": True}  # nothing was ever recorded
+                # Nothing is pending. The owner's retry goes on to _cleanup,
+                # which persists the cleaned transition (no hub call), so the
+                # counters and the warning clear.
+                return None if force else {"ok": True, "disabled": True}
             recorded = bool(state.get("error") or _count(state.get("cleanup_failures")))
             if not recorded and not force:
                 # A first cleanup whose outcome was lost: shown as interrupted.
