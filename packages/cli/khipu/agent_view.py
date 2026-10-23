@@ -1031,11 +1031,15 @@ def redact_owner_tokens(text: str, words: Iterable[str]) -> str:
     return text
 
 
-def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None = None):
+def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] | None = None,
+                 cut_paths: bool = False):
     """``scrub``, then the strict projection's final scan: any string still
     holding an account key (``harness|``) or a secret-shaped token is
     withheld whole. Current owner phrases preserve their words while
-    secret tokens inside them are removed before any exemption is applied."""
+    secret tokens inside them are removed before any exemption is applied.
+    ``cut_paths`` additionally removes arbitrary filesystem path shapes for
+    a gateway copy, including inside owner words; local projections keep
+    their existing owner-word policy."""
     table = _table(extra_keys)
     words = sorted({w for w in [*keep, *table.owner] if isinstance(w, str) and w}, key=len, reverse=True)
     # Only a complete owner phrase may authorize token-level redaction.
@@ -1058,7 +1062,14 @@ def scrub_strict(value, *, keep: Iterable[str] = (), extra_keys: Iterable[str] |
             scrubbed = _scrub_text(item, table, words)
             # An unchanged value already passed this exact scan; only a
             # scrubbed value can have joined fragments into a new shape.
-            return scrubbed if scrubbed == item else _strict_text(scrubbed, table, words)
+            scrubbed = scrubbed if scrubbed == item else _strict_text(scrubbed, table, words)
+            if cut_paths:
+                from khipu import work
+
+                scrubbed = work._cut_paths(scrubbed)
+                if any(work._has_path(variant) for variant in _decoded_variants(scrubbed)):
+                    return WITHHELD
+            return scrubbed
         if isinstance(item, dict):
             return {(walk(k) if isinstance(k, str) else k): walk(v) for k, v in item.items()}
         if isinstance(item, list):
