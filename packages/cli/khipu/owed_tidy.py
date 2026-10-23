@@ -725,7 +725,8 @@ def batch_project(batch: str) -> str | None:
     return None if found is None else str(found[0])
 
 
-def undo(batch: str, *, project: str | None = None, owner_gate: str | None = None) -> dict[str, Any]:
+def undo(batch: str, *, project: str | None = None, owner_gate: str | None = None,
+         write_id: str | None = None) -> dict[str, Any]:
     """Undo one applied batch (see the module docstring). With ``project``,
     a batch of another project is refused before anything changes.
     ``owner_gate`` is how the owner gate already passed for this Undo (the
@@ -746,6 +747,11 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 return {"ok": False, "restored": 0, "batch": batch, "project": found[0],
                         "error": f"batch {batch!r} is for project {found[0]!r}, not {project!r}; "
                                  "nothing was changed"}
+            if write_id:
+                from khipu import owner_writes
+
+                if not owner_writes.record_on_hub(cur, "owner_undo", {"write_id": write_id}):
+                    return {"ok": True, "batch": batch, "restored": 0, "already_applied": True}
             project = found[0] or None
             cur.execute("SELECT commitment_id, action, prior, after_fingerprint FROM commitment_tidy_items "
                         "WHERE batch_id = %s AND undone_at IS NULL ORDER BY commitment_id", (batch,))
@@ -763,6 +769,7 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
             prior_users = {cid for cid, _, prior in todo if prior.get("owner") == co.OWNER_USER}
             passed, gate, mine = _gate(cur, rows, [t[0] for t in todo], prior_users, owner_gate)
             if not passed:
+                conn.rollback()
                 return {"ok": False, "restored": 0, "batch": batch, "needs_owner": mine,
                         "error": co.BULK_OWNER_REFUSAL}
             restored = 0
@@ -830,7 +837,8 @@ def _redo_states(cur, batch: str) -> dict:
     return dict(redo_from) if isinstance(redo_from, dict) else {}
 
 
-def redo(batch: str, *, project: str | None = None, owner_gate: str | None = None) -> dict[str, Any]:
+def redo(batch: str, *, project: str | None = None, owner_gate: str | None = None,
+         write_id: str | None = None) -> dict[str, Any]:
     """Put an undone batch's changes back: each item ``undo`` restored and
     that has not changed since gets the state it had before that undo; an
     item changed since is left alone and listed. The owner-actions log's
@@ -851,6 +859,11 @@ def redo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 return {"ok": False, "reapplied": 0, "batch": batch, "project": found[0],
                         "error": f"batch {batch!r} is for project {found[0]!r}, not {project!r}; "
                                  "nothing was changed"}
+            if write_id:
+                from khipu import owner_writes
+
+                if not owner_writes.record_on_hub(cur, "owner_undo", {"write_id": write_id}):
+                    return {"ok": True, "batch": batch, "reapplied": 0, "already_applied": True}
             project = found[0] or None
             redo_from = _redo_states(cur, batch)
             cur.execute("SELECT commitment_id FROM commitment_tidy_items WHERE batch_id = %s "
@@ -869,6 +882,7 @@ def redo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
             then_users = {cid for cid in todo if redo_from[str(cid)]["state"].get("owner") == co.OWNER_USER}
             passed, gate, mine = _gate(cur, rows, todo, then_users, owner_gate)
             if not passed:
+                conn.rollback()
                 return {"ok": False, "reapplied": 0, "batch": batch, "needs_owner": mine,
                         "error": co.BULK_OWNER_REFUSAL}
             reapplied = 0
