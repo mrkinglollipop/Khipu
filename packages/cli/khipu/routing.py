@@ -8165,6 +8165,8 @@ def doctor_block(now: datetime | None = None) -> dict:
     from khipu import routing_health
 
     delivery_health = routing_health.doctor_block(view, now, cfg)
+    if any((delivery_health.get("gateway") or {}).get(k) for k in ("cleanup_gave_up", "cleanup_interrupted", "cleanup_full")):
+        warnings.append(delivery_health["gateway"]["reason_words"])
     held = view.get("priority")
     return {"routing_delivery": delivery_health, "priority": {"set": held is not None, "pending": bool(held and held.get("pending")),
                          "entries": [e["label"] for e in (held or {}).get("entries") or []],
@@ -10652,7 +10654,8 @@ def run_cli(args) -> int:
         if cmd == "copy":
             from khipu import routing_gateway_copy
 
-            out = routing_gateway_copy.publish(force=True, now=now)
+            out = routing_gateway_copy.publish(force=True, now=now,
+                                               cleanup_only=getattr(args, "action", "") == "cleanup")
             _print_json(out)
             return 0 if out["ok"] else 1
         if cmd == "replication":

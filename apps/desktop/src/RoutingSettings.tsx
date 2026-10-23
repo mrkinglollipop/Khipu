@@ -3504,6 +3504,24 @@ function TellingSection({
               Replication: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError, cfg?.routing?.routing_replication_live?.pending === true)}
               {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
             </p>
+            {deliveryHealth?.gateway?.cleanup_gave_up || deliveryHealth?.gateway?.cleanup_interrupted
+              || deliveryHealth?.gateway?.cleanup_full ? (
+              <div className="set-help" role="alert">
+                <p>{deliveryHealth.gateway.reason_words ?? "Routing copy cleanup stopped; a copy may still be on the hub."}</p>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={w.anyBusy}
+                  onClick={() => void w.run("gateway-cleanup", "khipu_gateway_copy_cleanup", {}, async () => {
+                    await reread();
+                    await onRetryDelivery?.();
+                  })}
+                >
+                  {w.isBusy("gateway-cleanup") ? "Retrying…" : "Retry cleanup"}
+                </button>
+                <WriteError w={w} id="gateway-cleanup" />
+              </div>
+            ) : null}
           </div>
         </SubFold>
 

@@ -519,6 +519,15 @@ export type RouteDeliveryFreshness = {
    *  last completed Mac-to-Mac copy finished, and whether it is now stale. */
   caught_up_at?: string | null;
   stale?: boolean;
+  /** The routing copy was switched off but removing it from the hub kept
+   *  failing; automatic retries stopped (`khipu route copy cleanup` retries). */
+  cleanup_gave_up?: boolean;
+  /** A cleanup was interrupted before its outcome was known; it is not
+   *  retried automatically, so the same Retry cleanup is offered. */
+  cleanup_interrupted?: boolean;
+  /** Too many unresolved cleanup targets are pending; Retry cleanup is offered. */
+  cleanup_full?: boolean;
+  reason_words?: string;
 };
 
 export type RouteDeliveryHealth = {
@@ -1339,6 +1348,9 @@ export function deliveryReason(reason: string): string {
     "prompt-skips": "too many prompts skipped routing",
     "cross-mac-stale": "the cross-Mac copy is behind",
     "gateway-stale": "the cloud copy is behind",
+    "gateway-cleanup-stopped": "removing the cloud copy stopped after 6 failed tries",
+    "gateway-cleanup-interrupted": "removing the cloud copy was interrupted",
+    "gateway-cleanup-full": "too many unresolved cloud copy cleanups",
     "unmatched-limit": "an unmatched lane has a limit for over an hour",
   };
   return words[reason] ?? reason.replace(/-/g, " ");
