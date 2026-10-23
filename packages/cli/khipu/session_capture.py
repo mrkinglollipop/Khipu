@@ -96,6 +96,7 @@ MIN_TURNS = int(_env_int("KHIPU_CAPTURE_MIN_TURNS", "KHIPU_AEGIS_MIN_TURNS", "5"
 MIN_MINUTES = float(_env_int("KHIPU_CAPTURE_MIN_MINUTES", "KHIPU_AEGIS_MIN_MINUTES", "20"))
 MIN_CHARS = 200          # a window smaller than this is never worth a model call
 MAX_TRANSCRIPT = 14_000  # chars carried in a job (tail of the window)
+MAX_CAPTURE_NOTE = 14_000  # newest characters retained across capture-now requests
 # Parts (= summariser calls = episodes) one capture may queue. 0 (default) =
 # every part; a positive value is the owner's opt-in to keep only the newest.
 # See the window-split note above _split_messages.
@@ -1456,10 +1457,21 @@ def request_capture_now(harness: str, sid: str, note: str | None = None) -> Path
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
         pending = _pending_capture_now(harness, sid)
-        notes = [str(pending["note"])] if pending and pending.get("note") else []
-        if note:
-            notes.append(note)
-        tmp.write_text(json.dumps({"note": "\n\n".join(notes) or None, "requested_at": _mint_ts(),
+        text = str(pending.get("note") or "") if pending else ""
+        # End offsets preserve exact request boundaries, including multiline
+        # notes, while hashes recognize repeats after the oldest text is cut.
+        parts = pending.get("note_parts") if pending else None
+        if not (isinstance(parts, list) and parts
+                and all(isinstance(part, dict) and isinstance(part.get("end"), int)
+                        and isinstance(part.get("hash"), str) for part in parts)
+                and parts[-1]["end"] == len(text)):
+            parts = [{"end": len(text), "hash": hashlib.sha256(text.encode()).hexdigest()}] if text else []
+        if note and hashlib.sha256(note.encode()).hexdigest() not in {part["hash"] for part in parts}:
+            text += ("\n\n" if text else "") + note
+            parts.append({"end": len(text), "hash": hashlib.sha256(note.encode()).hexdigest()})
+        cut = max(0, len(text) - MAX_CAPTURE_NOTE)
+        parts = [dict(part, end=part["end"] - cut) for part in parts if part["end"] > cut]
+        tmp.write_text(json.dumps({"note": text[cut:] or None, "note_parts": parts, "requested_at": _mint_ts(),
                                    "request_id": uuid.uuid4().hex}), encoding="utf-8")
         os.replace(tmp, p)
     return p
@@ -1485,7 +1497,14 @@ def _pending_capture_now(harness: str, sid: str) -> dict | None:
         data = json.loads(_capture_now_flag_path(harness, sid).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if isinstance(data, dict) and _capture_request_id(data) == load_state(harness, sid).get("queued_capture_request_id"):
+        return None
     return data if isinstance(data, dict) else {}
+
+
+def _capture_request_id(request: dict) -> str:
+    return str(request.get("request_id") or
+               hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest())
 
 
 def _ack_capture_now(harness: str, sid: str, expected: dict) -> None:
@@ -1656,7 +1675,8 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
     only session active in the last half hour. Shared issuers are narrowed by
     directory; two recently prompted holders refuse. Folder fallback also
     refuses between sessions active in the last half hour. The caller's
-    ancestry and directory default to this process's."""
+    ancestry and directory default to this process's. Conflicting harness
+    markers require the nearest issuer's verified pid and start time."""
     if harness and harness not in HARNESSES:
         raise ValueError(f"unknown capture harness {harness!r}; expected one of {', '.join(HARNESSES)}")
     if harness and sid:
@@ -1665,8 +1685,11 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
     # The own-session marker is authoritative even before its first hook.
     # An unmatched marker cannot fall through to another session's heuristics.
     codex_tid = os.environ.get("CODEX_THREAD_ID")
+    claude_sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    grok_marker = any(k.startswith("GROK_HOOK_") for k in os.environ)
+    mixed_markers = sum(bool(marker) for marker in (codex_tid, claude_sid, grok_marker)) > 1
     if (not sid and codex_tid and harness in (None, "codex")
-            and not os.environ.get("CLAUDE_CODE_SESSION_ID")):
+            and not mixed_markers):
         own = [c for c in cands if c["harness"] == "codex"
                and (c["state"].get("session_id") or c["sid"]) == codex_tid]
         if len(own) == 1:
@@ -1706,16 +1729,9 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
             c["turn_ts"] = None
         issuer = turn.get("issuer")
         issuers.append((c, issuer if isinstance(issuer, dict) else {}))
-    # A Codex or Grok job started from a Claude session's shell inherits that
-    # session's CLAUDE_CODE_SESSION_ID; its own markers say it is not Claude.
-    codex_tid = os.environ.get("CODEX_THREAD_ID")
-    if codex_tid:
-        own = [c for c, _ in issuers if c["harness"] == "codex"
-               and (c["state"].get("session_id") or c["sid"]) == codex_tid]
-        if len(own) == 1:
-            return own[0]["harness"], own[0]["sid"], "session_env"
-    foreign = codex_tid or any(k.startswith("GROK_HOOK_") for k in os.environ)
-    env_sid = None if foreign else os.environ.get("CLAUDE_CODE_SESSION_ID")
+    # Nested harnesses inherit each other's markers in either direction.
+    # No environment variable can establish which process is nearer.
+    env_sid = None if mixed_markers or grok_marker else claude_sid
     if env_sid:
         for candidate, issuer in issuers:
             if (candidate["harness"] != "claude_code"
@@ -1737,6 +1753,25 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
                     candidate = best
             return candidate["harness"], candidate["sid"], "session_env"
     pids = ancestor_pids() if host_pids is None else host_pids
+    if mixed_markers:
+        from khipu.owner_direction import _nearest_harness
+
+        # Stop at the nearest actual harness, even if it has no prompt record
+        # yet. Skipping it could send a child's note to its recorded parent.
+        chain = []
+        for pid in pids:
+            info = owner_turns._proc_info(pid)
+            if info is None:
+                raise _capture_ambiguity_error(cands)
+            chain.append((pid, info[2], os.path.basename(os.path.realpath(info[1]))))
+            nearest = _nearest_harness(chain)
+            if nearest is not None:
+                holders = [c for c, issuer in issuers
+                           if (issuer.get("pid"), issuer.get("start")) == nearest]
+                if len(holders) == 1:
+                    return holders[0]["harness"], holders[0]["sid"], "process"
+                raise _capture_ambiguity_error(cands)
+        raise _capture_ambiguity_error(cands)
     mismatched = set()
     ambiguous_process = False
     # Prompt records stay current even when the capture state has been idle.
@@ -2457,6 +2492,8 @@ def _enqueue_window(*, harness: str, sid: str, track_sid: str, cwd: str, event: 
     now = time.time()
     st.update(offset=new_off, last_ts=now, window_started_ts=now,
               queued=int(st.get("queued", 0)) + len(queued_names))
+    if queued_names and capture_request_id:
+        st["queued_capture_request_id"] = capture_request_id
     remember_seen(st, fresh_seen or [])
     save_state(harness, track_sid, st, preserve_mtime=preserve_mtime)
     return queued_names
@@ -2656,9 +2693,7 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                         cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
                         new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
                         capture_note=capture_note, fresh_seen=dedupe.get("fresh"),
-                        capture_request_id=(str(capture_now.get("request_id") or
-                            hashlib.sha256(json.dumps(capture_now, sort_keys=True).encode()).hexdigest())
-                            if capture_now is not None else ""),
+                        capture_request_id=_capture_request_id(capture_now) if capture_now is not None else "",
                     )
                     out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
                     if queued_names and capture_now is not None:
