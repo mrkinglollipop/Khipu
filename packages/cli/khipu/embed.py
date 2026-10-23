@@ -2085,6 +2085,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
         if not summary or not ts:
             return False
         deliverable_rows = None
+        fact_xmin = None
         with connect() as conn:
             with conn.cursor() as cur:
                 profile = _active_profile(cur)
@@ -2131,7 +2132,14 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                      for i, (c, v) in enumerate(zip(chunks, vecs))],
                 )
                 from khipu import deliverables as _deliverables
+                from khipu.hub_snapshot import _hub_snapshot_xmin
 
+                # Read before the rows, so it never overstates their
+                # snapshot: the replica's fact-stream freshness rule.
+                try:
+                    fact_xmin = _hub_snapshot_xmin(cur)
+                except Exception:  # noqa: BLE001 — no xmin: the stream brings them
+                    fact_xmin = None
                 deliverable_rows = _deliverables.deliverables_for_episode(cur, int(eid))
             conn.commit()
         _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
@@ -2155,7 +2163,8 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                 for i, (c, v, b) in enumerate(zip(chunks, vecs, _stamps(built, len(chunks))))
             ]
             snap = upsert_episode(
-                episode_row, embedding_rows, deliverable_rows=deliverable_rows
+                episode_row, embedding_rows, deliverable_rows=deliverable_rows,
+                fact_xmin=fact_xmin,
             )
             if not snap.get("ok"):
                 _log(f"snapshot upsert skipped: {snap.get('error')}")

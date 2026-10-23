@@ -74,6 +74,10 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
         return 0
     project = payload.get("project")
     prov = _provenance_ready(cur)
+    if prov:
+        from khipu import provenance
+
+        provenance.declare_writer(cur)  # 0047's writer gate (scope 3.1)
     inserted = 0
     for raw in items:
         if not isinstance(raw, dict):

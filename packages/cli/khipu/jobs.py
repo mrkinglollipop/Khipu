@@ -772,6 +772,9 @@ def _provenance_backfill(conn) -> dict[str, Any]:
         from khipu import provenance
 
         out = provenance.backfill(conn)
+        # Fact steps a capture kept as gaps are re-run (invariant I4), after
+        # the backfill and before tonight's rules read the facts.
+        out["gaps"] = provenance.replay_gaps(conn)
         # The replica stream's 30-day retention (section 6 of the design).
         out["changes"] = provenance.prune_changes(conn)
         return out

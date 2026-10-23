@@ -163,7 +163,13 @@ CREATE TABLE IF NOT EXISTS fact_gaps (
     step         TEXT NOT NULL,
     error        TEXT,
     at           TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at  TIMESTAMPTZ
+    resolved_at  TIMESTAMPTZ,
+    -- The merged capture's payload hash for a merge step's gap (its payload
+    -- is raw->'merged_from'[...]); NULL for the episode's own capture.
+    source_id    TEXT,
+    -- The nightly replay (provenance.replay_gaps): how it ended, and tries.
+    resolution   TEXT,
+    attempts     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_fact_gaps_open ON fact_gaps (at) WHERE resolved_at IS NULL;
 
@@ -604,6 +610,75 @@ BEGIN
     RETURN NEW;
 END
 $fn$;
+
+-- The writer gate (Astra review 2026-10-23 #5). A capture that repeats
+-- facts already on file word for word changes no fact column, so the fact
+-- gate above never fires for it, and an old writer would commit the episode
+-- with no claims. So an episode written or merged with fact items must come
+-- from a writer whose fact steps declared themselves in this transaction
+-- (provenance.declare_writer: the transaction-local setting below, set by a
+-- fact step that records claims or by the fact-gap record). An old writer
+-- never sets it and is refused at COMMIT like every other old wording write.
+CREATE OR REPLACE FUNCTION khipu_has_fact_items(p JSONB)
+RETURNS BOOLEAN LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT coalesce(bool_or(jsonb_typeof(p -> k) = 'array' AND jsonb_array_length(p -> k) > 0), false)
+    FROM unnest(ARRAY['open_loops', 'decisions', 'deliverables']) AS k
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_writer_gate()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF coalesce(current_setting('khipu.fact_writer', true), '') <> 'on' THEN
+        RAISE EXCEPTION 'khipu: this writer predates fact provenance; upgrade it'
+            USING ERRCODE = '08K01',
+                  DETAIL = format('episode %s carries fact items but no fact step recorded claims', NEW.id);
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+-- An owner supersession endorses its replacement with an owner claim
+-- (decisions.supersede, design 3.3); an old writer that reuses an existing
+-- decision as the replacement records none, so it is refused too.
+CREATE OR REPLACE FUNCTION khipu_supersede_gate()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM fact_changes
+                   WHERE kind = 'decision' AND fact_id = NEW.superseded_by
+                     AND xid = pg_current_xact_id() AND via = 'project') THEN
+        RAISE EXCEPTION 'khipu: this writer predates fact provenance; upgrade it'
+            USING ERRCODE = '08K01',
+                  DETAIL = format('decision %s was superseded by %s without the owner''s claim',
+                                  NEW.id, NEW.superseded_by);
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS khipu_episodes_writer_insert ON episodes;
+CREATE CONSTRAINT TRIGGER khipu_episodes_writer_insert
+    AFTER INSERT ON episodes DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    WHEN (NEW.deleted_at IS NULL AND khipu_has_fact_items(NEW.raw))
+    EXECUTE FUNCTION khipu_writer_gate();
+
+DROP TRIGGER IF EXISTS khipu_episodes_writer_merge ON episodes;
+CREATE CONSTRAINT TRIGGER khipu_episodes_writer_merge
+    AFTER UPDATE OF raw ON episodes DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    WHEN (NEW.deleted_at IS NULL
+          AND (OLD.raw -> 'merged_from') IS DISTINCT FROM (NEW.raw -> 'merged_from')
+          AND khipu_has_fact_items(NEW.raw -> 'merged_from' -> -1 -> 'payload'))
+    EXECUTE FUNCTION khipu_writer_gate();
+
+DROP TRIGGER IF EXISTS khipu_decisions_supersede_gate ON decisions;
+CREATE CONSTRAINT TRIGGER khipu_decisions_supersede_gate
+    AFTER UPDATE OF superseded_by ON decisions DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW
+    WHEN (NEW.superseded_by IS NOT NULL
+          AND OLD.superseded_by IS DISTINCT FROM NEW.superseded_by
+          AND NEW.supersede_source IN ('manual', 'agent'))
+    EXECUTE FUNCTION khipu_supersede_gate();
 
 DROP TRIGGER IF EXISTS khipu_commitments_fact_insert ON commitments;
 CREATE CONSTRAINT TRIGGER khipu_commitments_fact_insert

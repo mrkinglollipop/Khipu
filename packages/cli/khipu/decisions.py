@@ -29,6 +29,9 @@ DEDUP_WINDOW_DAYS = 30
 VALID_LINK_KINDS = ("supersedes", "conflicts")
 VALID_LINK_STATES = ("candidate", "applied", "rejected", "restored")
 VALID_SUPERSEDE_SOURCES = ("manual", "agent", "auto")
+# The sources that carry the owner's endorsement of the replacement (the
+# same two migration 0047 classifies as owner links).
+OWNER_SUPERSEDE_SOURCES = ("manual", "agent")
 
 # Reversal-detection thresholds (Phase 2, session C) — provisional until
 # measured against the private golden set; nothing has scored them yet.
@@ -350,6 +353,10 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
     evidence_ready = _evidence_ready(cur)
     details = _decision_details_by_text(payload) if evidence_ready else {}
     prov = _provenance_ready(cur)
+    if prov:
+        from khipu import provenance
+
+        provenance.declare_writer(cur)  # 0047's writer gate (scope 3.1)
     inserted = 0
     for raw in items:
         text = _redacted_value(str(raw or "").strip())
@@ -630,7 +637,11 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
         raise ValueError(f"source must be one of {VALID_SUPERSEDE_SOURCES}")
     if old_id == new_id:
         raise ValueError("a decision cannot supersede itself")
-    _lock_decision_row(cur, old_id)
+    owner_claim = source in OWNER_SUPERSEDE_SOURCES and _provenance_ready(cur)
+    # Both rows are written when the owner's claim is recorded below: lock
+    # them in id order, the fact lock order (scope 3.4).
+    for decision_id in (sorted((old_id, new_id)) if owner_claim else (old_id,)):
+        _lock_decision_row(cur, decision_id)
     old = _fetch_decision_row(cur, old_id)
     if old is None:
         raise ValueError(f"no such decision: {old_id}")
@@ -668,6 +679,21 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
             (new_id, old_id),
         )
     ok = cur.rowcount > 0
+    if ok and owner_claim:
+        # The owner (or an agent acting for them) chose the replacement: an
+        # owner claim on its words, as migration 0047 records for an owner
+        # link made before it. Selecting an existing decision by id never
+        # passes through create_decision, so the claim is made here, the one
+        # path every manual or agent supersession takes (Astra review
+        # 2026-10-23 #4). Forgetting the replacement's capture then leaves
+        # it standing on the owner's endorsement.
+        from khipu import provenance
+
+        cur.execute("SELECT text FROM decisions WHERE id = %s", (new_id,))
+        row = cur.fetchone()
+        if row and row[0]:
+            provenance.record_claim(cur, "decision", new_id, "text", row[0], claimant="owner")
+            provenance.project(cur, "decision", new_id)
     if ok and _links_ready(cur):
         _record_applied_link(cur, old_id, new_id, source=source, reason=reason)
     if ok:

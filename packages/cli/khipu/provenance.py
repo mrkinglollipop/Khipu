@@ -114,6 +114,20 @@ def project(cur, kind: str, fact_id: int) -> str:
     return str(cur.fetchone()[0])
 
 
+WRITER_SETTING = "khipu.fact_writer"
+
+
+def declare_writer(cur) -> None:
+    """Declare, for this transaction only, that its fact steps record
+    claims. The hub refuses at COMMIT an episode written or merged with fact
+    items in a transaction that never declared it (0047's writer gate): an
+    old writer whose repeat of facts already on file changes no fact column
+    (Astra review 2026-10-23 #5). Call it in the step itself, so a step that
+    a test or an old module skips never declares, and again when a fact gap
+    is recorded (its savepoint rollback undoes the step's declaration)."""
+    cur.execute("SELECT set_config(%s, 'on', true)", (WRITER_SETTING,))
+
+
 def claims(cur, kind: str, fact_id: int) -> list[dict[str, Any]]:
     """Every claim on one fact, oldest first. Hub only: legacy_unproven
     values are listed here and must never be shown to a reader."""
@@ -427,6 +441,118 @@ def backfill(conn, *, batch: int = BACKFILL_BATCH) -> dict[str, Any]:
             "claims": sum(c["claims"] for c in done),
             "projected": sum(c["projected"] for c in done),
             "episodes": sum(c["episodes"] for c in done)}
+
+
+# ---- Fact-gap replay (invariant I4) ---------------------------------------------
+
+GAP_REPLAY_LIMIT = 200
+
+
+def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
+    """Re-run one capture fact step, exactly the calls capture made in it
+    (``capture.write_pg`` and its merge path)."""
+    name = step[len("merge "):] if step.startswith("merge ") else step
+    if name == "commitments":
+        from khipu import commitments
+
+        commitments.open_from_episode(cur, payload, episode_id)
+        commitments.auto_close(cur, payload, episode_id)
+        commitments.close_session_plan(cur, payload, episode_id)
+    elif name == "decisions":
+        from khipu import decisions
+
+        decisions.insert_decisions_from_episode(cur, payload, episode_id)
+    elif name == "decision detection":
+        from khipu import decisions
+
+        decisions.detect_reversals_from_episode(cur, payload, episode_id)
+    elif name == "close rules":
+        from khipu import close_rules
+
+        close_rules.run(cur, payload=payload, episode_id=episode_id)
+    elif name == "deliverables":
+        from khipu import deliverables
+
+        deliverables.insert_deliverables_from_episode(cur, payload, episode_id)
+    else:
+        raise ValueError(f"unknown fact step {step!r}")
+
+
+def _gap_payload(raw: Any, step: str, source_id: str | None) -> dict[str, Any] | None:
+    """The capture a gap's step ran on: the episode's own (its stored raw),
+    or for a merge step the merged capture ``source_id`` names."""
+    raw = raw if isinstance(raw, dict) else {}
+    if not step.startswith("merge "):
+        return {k: v for k, v in raw.items() if k != "merged_from"}
+    for entry in raw.get("merged_from") or []:
+        if isinstance(entry, dict) and entry.get("source_id") == source_id and isinstance(entry.get("payload"), dict):
+            return entry["payload"]
+    return None
+
+
+def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
+    """The nightly's re-run of fact steps kept as gaps (I4): for each open
+    ``fact_gaps`` group (episode, step, merged capture), lock the episode,
+    re-run that step on its capture and mark the gap resolved, all in one
+    transaction (commits each). Idempotent: the step's own dedup turns a
+    second run into claims already held. A forgotten episode or source is
+    never replayed; its gap is resolved as ``forgotten``. A replay that
+    fails rolls back, and its gap stays open (doctor keeps reporting it)
+    with the error and one more attempt counted, for the next night. A hub
+    without 0047 has none."""
+    from khipu.tombstones import hub_source_forgotten
+
+    with conn.cursor() as cur:
+        if not ready(cur):
+            conn.rollback()
+            return {"ok": True, "skipped": "the hub has no fact provenance yet (migration 0047)"}
+        cur.execute(
+            "SELECT episode_id, step, source_id, array_agg(id ORDER BY id) FROM fact_gaps "
+            "WHERE resolved_at IS NULL GROUP BY episode_id, step, source_id "
+            "ORDER BY min(id) LIMIT %s", (int(limit),))
+        groups = cur.fetchall()
+    conn.commit()
+    out = {"ok": True, "replayed": 0, "forgotten": 0, "failed": 0, "unreplayable": 0}
+    for episode_id, step, source_id, ids in groups:
+        ids = [int(i) for i in ids]
+        resolution = "replayed"
+        try:
+            with conn.cursor() as cur:
+                # Episode first (the lock order in 3.4), as capture holds it.
+                cur.execute("SELECT raw, deleted_at FROM episodes WHERE id = %s FOR SHARE", (episode_id,))
+                row = cur.fetchone()
+                payload = None if row is None or row[1] is not None else _gap_payload(row[0], step, source_id)
+                if row is None or row[1] is not None:
+                    resolution = "forgotten"
+                elif payload is None:
+                    resolution = None  # the merged capture is not in raw: kept open
+                    out["unreplayable"] += 1
+                elif hub_source_forgotten(cur, payload, None):
+                    resolution = "forgotten"
+                else:
+                    _gap_step(cur, step, payload, int(episode_id))
+                if resolution is not None:
+                    cur.execute(
+                        "UPDATE fact_gaps SET resolved_at = now(), resolution = %s, attempts = attempts + 1 "
+                        "WHERE id = ANY(%s) AND resolved_at IS NULL", (resolution, ids))
+                    out[resolution] += 1
+                else:
+                    cur.execute(
+                        "UPDATE fact_gaps SET resolution = %s, attempts = attempts + 1 WHERE id = ANY(%s)",
+                        ("unreplayable: the merged capture is not in the episode's raw", ids))
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 — the gap stays open for the next night
+            conn.rollback()
+            out["failed"] += 1
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE fact_gaps SET resolution = %s, attempts = attempts + 1 WHERE id = ANY(%s)",
+                        (f"replay failed: {type(exc).__name__}: {exc}"[:500], ids))
+                conn.commit()
+            except Exception:  # noqa: BLE001 — counted above; nothing else to keep
+                conn.rollback()
+    return out
 
 
 # ---- The replica change stream's retention (section 6) -------------------------

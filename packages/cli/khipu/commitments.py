@@ -29,6 +29,9 @@ STALE_AFTER_DAYS = 30           # blockers / questions: a long-lived shape
 STALE_AFTER_DAYS_SOFT = 14      # followups / promises with no due date
 DONE_MATCH_MIN_SCORE = 0.2  # fix 4: a minimal bar even for an explicit "done:" close
 NEAR_DUP_MIN_SCORE = 0.5    # quality: token-containment bar for "already open"
+# A lost ON CONFLICT insert whose winner retired before it was locked is
+# retried this many times in all, then the capture defers (scope 3.4, I4).
+_CONFLICT_INSERT_ATTEMPTS = 3
 # Kind → sort rank for `khipu owed` (0 = most urgent). Surfaced as the row's
 # `priority` so the desktop sorts without re-deriving the rule.
 KIND_PRIORITY = {"blocker": 0, "question": 1, "promise": 2, "followup": 3}
@@ -1185,6 +1188,10 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     # from its claims. Without the table this step behaves exactly as before.
     prov = _provenance_ready(cur)
     origin = capture_origin(payload)
+    if prov:
+        from khipu import provenance
+
+        provenance.declare_writer(cur)  # 0047's writer gate (scope 3.1)
     inserted = 0
     rejected = 0
     relayed = 0
@@ -1328,17 +1335,21 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             vals += ", %s"
             params = (*params, parse_prs(norm["text"]))
         returning = " RETURNING id" if owner_ready or prov else ""
-        cur.execute(
-            f"""
-            INSERT INTO commitments
-              ({cols})
-            VALUES ({vals})
-            ON CONFLICT (project, content_hash) WHERE status = 'open' DO NOTHING{returning}
-            """,
-            params,
-        )
-        landed = cur.rowcount > 0
-        if not landed and prov:
+        attempts = 0
+        while True:
+            attempts += 1
+            cur.execute(
+                f"""
+                INSERT INTO commitments
+                  ({cols})
+                VALUES ({vals})
+                ON CONFLICT (project, content_hash) WHERE status = 'open' DO NOTHING{returning}
+                """,
+                params,
+            )
+            landed = cur.rowcount > 0
+            if landed or not prov:
+                break
             # The same words were opened by a concurrent capture after this
             # one read the table: this episode claims that item instead.
             other = _open_id_for_hash(cur, scope, h)
@@ -1346,6 +1357,16 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                 if seen_ready:
                     _touch_seen(cur, other)
                 _claim_restatement(cur, other, episode_id, norm["text"], payload.get("project"))
+                break
+            # The winner retired (closed, or forgotten) before it could be
+            # locked: its open slot is free again, so this item takes the
+            # insert path once more (scope 3.4). Never return without a claim:
+            # a winner that keeps vanishing defers the whole capture.
+            if attempts >= _CONFLICT_INSERT_ATTEMPTS:
+                from khipu.capture import FactStepDeferred
+
+                raise FactStepDeferred(
+                    "commitments: the open item this capture restates kept retiring; retry")
         if landed:
             inserted += 1
             if prov:

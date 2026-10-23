@@ -1215,6 +1215,9 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
 # dump instead of guessing what it missed.
 
 _FACT_CURSOR_KEY = "fact_stream_xid"
+# The hub episode columns, beyond raw, that name a capture's source.
+_ANCHOR_SOURCE_COLS = ("harness", "session_id", "transcript_range", "window_id", "part",
+                       "repo_root", "project", "parent_session_id")
 
 
 def _hub_has_fact_stream(cur) -> bool:
@@ -1295,7 +1298,88 @@ def _read_fact_rows(cur, ids: Mapping[str, Sequence[int]]) -> dict[str, Any]:
             found.extend(dict(zip(cols, r)) for r in cur.fetchall())
         out[table] = found
         out[f"{table}_gone"] = sorted(set(want) - {int(r["id"]) for r in found})
+    # Each row's anchor episode, read in the same snapshot, so the replica
+    # can check the source against its durable erasure registry even when it
+    # never held that episode (an unseen parent; Astra review 2026-10-23 #1).
+    out["anchors"] = _read_anchor_rows(
+        cur, {int(r["episode_id"]) for t in ("decisions", "deliverables") for r in out[t]
+              if r.get("episode_id") is not None})
     return out
+
+
+def _unseen_commitment_anchors(cur, commitments: tuple[list[str], list[Any]] | None,
+                               ) -> dict[int, dict[str, Any]]:
+    """The hub rows of the episodes that opened the pulled commitments but
+    that this replica does not hold (an unseen parent: Astra review
+    2026-10-23 #1), for the forgotten-source gate. A held episode already
+    passed the fence when it was written."""
+    if not commitments or "opened_episode" not in commitments[0]:
+        return {}
+    at = commitments[0].index("opened_episode")
+    wanted = {int(r[at]) for r in commitments[1] if r[at] is not None}
+    if not wanted:
+        return {}
+    with closing(sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)) as con:
+        held = ({int(r[0]) for r in con.execute("SELECT id FROM episodes")}
+                if "id" in _snapshot_table_columns(con, "episodes") else set())
+    return _read_anchor_rows(cur, wanted - held)
+
+
+def _patch_covers_stream(con: sqlite3.Connection, fact_xmin: int | None) -> bool:
+    """Whether an episode patch's deliverable rows may replace the held
+    ones. On a replica that follows the fact stream (it holds a cursor),
+    deliverables are one stream: a patch read in a snapshot older than the
+    stream read already applied (a lower xmin, or no xmin at all) would put
+    back a row the stream has since moved or deleted, and the cursor is
+    already past that change, so no later pull repairs it (Astra review
+    2026-10-23 #2). Such a patch leaves deliverables to the stream. A patch
+    at or above the cursor is no older than anything the stream applied,
+    and every change it missed is at or above the cursor, so the next stream
+    read brings it. A replica with no cursor keeps the per-episode copy."""
+    held = _held_fact_cursor(con)
+    if held is None:
+        return True
+    return fact_xmin is not None and int(fact_xmin) >= held
+
+
+def _read_anchor_rows(cur, episode_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
+    """The hub's episode rows for ``episode_ids``: the columns the replica's
+    forgotten-source fence reads (``_tombstone_payloads_for_episode``)."""
+    want = sorted({int(i) for i in episode_ids})
+    if not want:
+        return {}
+    hub_cols = _pg_columns(cur, "episodes")
+    cols = [c for c in dict.fromkeys(("id", "ts", "summary", "raw", "deleted_at", *_ANCHOR_SOURCE_COLS))
+            if c in hub_cols]
+    rows: dict[int, dict[str, Any]] = {}
+    for part in _chunks(want):
+        cur.execute(f"SELECT {', '.join(cols)} FROM episodes WHERE id = ANY(%s)", (part,))
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            rows[int(row["id"])] = row
+    return rows
+
+
+def _registry_rejected_anchors(anchors: Mapping[Any, Mapping[str, Any]], known: set[int]) -> set[int]:
+    """The anchor episodes the durable forgotten-source registry refuses,
+    beyond the ids already in ``known``. ``RegistryError`` propagates: an
+    unreadable registry must abort the write, never read as empty."""
+    if not anchors:
+        return set()
+    from khipu.tombstones import read_gate
+
+    gate = read_gate()
+    if gate.empty:
+        return set()
+    refused: set[int] = set()
+    for eid, row in anchors.items():
+        eid = int(eid)
+        if eid in known:
+            continue
+        if eid in gate.episode_ids or not all(
+                gate.allows(p) for p in _tombstone_payloads_for_episode(row)):
+            refused.add(eid)
+    return refused
 
 
 def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any]) -> dict[str, Any]:
@@ -1310,6 +1394,15 @@ def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any]) -> di
     if held is not None and xmin < held:
         return {"ok": True, "decisions": 0, "deliverables": 0, "skipped": "the replica holds a newer read"}
     rejected = _rejected_episode_ids(con)
+    # Gate every row on its anchor's source identity before anything is
+    # written or the cursor moves: a source this Mac's registry knows as
+    # forgotten is refused even when the replica never held its episode.
+    # The id is queued for erasure first, so every later derivative import
+    # (and this one's decision writer) refuses it by id too.
+    for eid in sorted(_registry_rejected_anchors(stream.get("anchors") or {}, rejected)):
+        if not _queue_erasure(eid):
+            raise OSError("could not record rejected replica source")
+        rejected.add(eid)
     decisions_written = deliverables_written = 0
     if _snapshot_table_columns(con, "decisions"):
         for part in _chunks(list(stream.get("decisions_gone") or ())):
@@ -1646,6 +1739,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
             cur.execute("SELECT slug FROM topics WHERE slug = ANY(%s)", (batch,))
             topic_purges.update(set(batch) - {r[0] for r in cur.fetchall()})
     commitments = _hub_commitments(cur)
+    commitment_anchors = _unseen_commitment_anchors(cur, commitments)
     aliases = _hub_project_aliases(cur)
     if max(len(fresh), len(gone), len(groups), len(topic_rows or ()) + len(topic_purges)) > limit:
         return _pull_needs_dump(limit)
@@ -1724,7 +1818,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
             tomb = row.get("deleted_at") is not None
             out = upsert_episode(row, [] if tomb else vecs.get(eid, []),
                                  deliverable_rows=None if tomb or not has_deliv else deliv.get(eid, []),
-                                 read_at=read_at)
+                                 read_at=read_at, fact_xmin=facts.get("xmin"))
             error = str(out.get("error") or "")
             if not out.get("ok") and tomb and "forgotten source" in error:
                 # The fence refuses a forgotten source's row, tombstone
@@ -1769,7 +1863,8 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
 
     parts = _write_pulled_tables(topic_rows, commitments, aliases, read_at=read_at,
                                 topic_purges=topic_purges, purge_hub_at=hub_now,
-                                facts=None if facts.get("not_applicable") else facts)
+                                facts=None if facts.get("not_applicable") else facts,
+                                commitment_anchors=commitment_anchors)
     if ledger_payload is not None and not ledger_payload.get("ok"):
         parts["ledger"] = ledger_payload
     else:
@@ -1805,7 +1900,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                          aliases: tuple[list[str], list[Any]] | None, *,
                          read_at: float, topic_purges: Iterable[str] = (),
                          purge_hub_at: datetime | None = None,
-                         facts: Mapping[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+                         facts: Mapping[str, Any] | None = None,
+                         commitment_anchors: Mapping[int, Mapping[str, Any]] | None = None,
+                         ) -> dict[str, dict[str, Any]]:
     """The pull's topic bodies and commitments, under the refresh lock, in one
     transaction. Each part's result by name; a part the hub or this replica
     has no table for is ``not_applicable``. A topic row older than the one
@@ -1914,6 +2011,12 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     parts["commitments"] = {"ok": True, "commitments": 0,
                                             "skipped": "the replica holds a newer copy"}
                 else:
+                    # The same source-identity gate as the fact stream's, for
+                    # commitments whose episode this replica never held.
+                    for eid in sorted(_registry_rejected_anchors(commitment_anchors or {},
+                                                                 _rejected_episode_ids(con))):
+                        if not _queue_erasure(eid):
+                            raise OSError("could not record rejected replica source")
                     con.execute("DELETE FROM commitments")
                     parts["commitments"] = {"ok": True, "commitments": _write_commitment_rows(con, cols, rows)}
                     # A commitment gone from the hub (its episode forgotten)
@@ -3645,10 +3748,14 @@ def upsert_episode(
     deliverable_rows: Sequence[Mapping[str, Any]] | None = None,
     *,
     read_at: float | None = None,
+    fact_xmin: int | None = None,
 ) -> dict[str, Any]:
     """Write-through fenced by the durable forgotten-source registry.
     ``read_at``: when the caller read this row from the hub (``time.time()``),
-    for the freshness rule above; ``None`` is a live patch, read now."""
+    for the freshness rule above; ``None`` is a live patch, read now.
+    ``fact_xmin``: the hub snapshot xmin at or before the read of
+    ``deliverable_rows``, so they take part in the fact stream's freshness
+    rule (``_patch_covers_stream``)."""
     from khipu.tombstones import RegistryError, write_guard
 
     payloads = _tombstone_payloads_for_episode(episode_row)
@@ -3666,7 +3773,7 @@ def upsert_episode(
                     return {"ok": False, "error": "could not queue rejected source erasure"}
                 return {"ok": False, "error": "forgotten source"}
             return _upsert_episode_unfenced(episode_row, embedding_rows, decision_rows,
-                                            deliverable_rows, read_at=read_at)
+                                            deliverable_rows, read_at=read_at, fact_xmin=fact_xmin)
     except RegistryError as exc:
         return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
 
@@ -3678,6 +3785,7 @@ def _upsert_episode_unfenced(
     deliverable_rows: Sequence[Mapping[str, Any]] | None = None,
     *,
     read_at: float | None = None,
+    fact_xmin: int | None = None,
 ) -> dict[str, Any]:
     """Incremental snapshot update: one episode + its embedding chunks (W2.4),
     plus (Phase 2, session B) any decision rows minted for it in the same
@@ -3804,7 +3912,7 @@ def _upsert_episode_unfenced(
                 _write_decision_rows(con, decision_rows)
             if merged.get("deleted_at") is not None:
                 _write_deliverable_rows(con, eid, ())
-            elif deliverable_rows is not None:
+            elif deliverable_rows is not None and _patch_covers_stream(con, fact_xmin):
                 _write_deliverable_rows(con, eid, deliverable_rows)
             if not older:
                 _record_read_at(con, "episodes", eid, version)

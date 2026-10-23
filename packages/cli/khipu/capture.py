@@ -156,7 +156,8 @@ def _defer_if_transient(exc: BaseException, step: str) -> None:
         raise FactStepDeferred(f"{step}: {reason}: {exc}") from exc
 
 
-def _record_fact_gap(cur, episode_id: int | None, step: str, exc: BaseException) -> None:
+def _record_fact_gap(cur, episode_id: int | None, step: str, exc: BaseException, *,
+                     source_id: str | None = None) -> None:
     """After a fact step failed open (its savepoint rolled back), record the
     gap in the same transaction, so doctor reports it and the nightly
     re-runs it (invariant I4). Only on a hub with migration 0047; a gap that
@@ -173,9 +174,12 @@ def _record_fact_gap(cur, episode_id: int | None, step: str, exc: BaseException)
         return
     try:
         cur.execute(
-            "INSERT INTO fact_gaps (episode_id, step, error) VALUES (%s, %s, %s)",
-            (episode_id, step, f"{type(exc).__name__}: {str(exc)[:500]}"),
+            "INSERT INTO fact_gaps (episode_id, step, error, source_id) VALUES (%s, %s, %s, %s)",
+            (episode_id, step, f"{type(exc).__name__}: {str(exc)[:500]}", source_id),
         )
+        # A recorded gap is this writer's participation (0047's writer gate):
+        # the step's own declaration rolled back with its savepoint.
+        provenance.declare_writer(cur)
     except Exception as gap_exc:  # noqa: BLE001 — classified: the capture is retried
         raise FactStepDeferred(f"{step}: fact gap not recorded ({type(gap_exc).__name__})") from gap_exc
 
@@ -750,7 +754,7 @@ def _merge_into_episode(
         except Exception:  # noqa: BLE001
             pass
         else:
-            _record_fact_gap(cur, target_id, "merge commitments", exc)
+            _record_fact_gap(cur, target_id, "merge commitments", exc, source_id=source_id)
         _log(f"merge commitments step failed ({type(exc).__name__}: {exc})")
 
     # O2: the merged capture's own decision strings belong to the target
@@ -770,7 +774,7 @@ def _merge_into_episode(
         except Exception:  # noqa: BLE001
             pass
         else:
-            _record_fact_gap(cur, target_id, "merge decisions", exc)
+            _record_fact_gap(cur, target_id, "merge decisions", exc, source_id=source_id)
         _log(f"merge decisions step failed ({type(exc).__name__}: {exc})")
 
     # Phase 2, session C: conservative reversal detection reads the row
@@ -791,7 +795,7 @@ def _merge_into_episode(
         except Exception:  # noqa: BLE001
             pass
         else:
-            _record_fact_gap(cur, target_id, "merge decision detection", exc)
+            _record_fact_gap(cur, target_id, "merge decision detection", exc, source_id=source_id)
         _log(f"merge decision detection step failed ({type(exc).__name__}: {exc})")
 
     # Owed close rules (slice 2): this capture's project, with this capture
@@ -811,7 +815,7 @@ def _merge_into_episode(
         except Exception:  # noqa: BLE001
             pass
         else:
-            _record_fact_gap(cur, target_id, "merge close rules", exc)
+            _record_fact_gap(cur, target_id, "merge close rules", exc, source_id=source_id)
         _log(f"merge close rules step failed ({type(exc).__name__}: {exc})")
 
     # O4: same posture for the merged capture's own deliverables.
@@ -830,7 +834,7 @@ def _merge_into_episode(
         except Exception:  # noqa: BLE001
             pass
         else:
-            _record_fact_gap(cur, target_id, "merge deliverables", exc)
+            _record_fact_gap(cur, target_id, "merge deliverables", exc, source_id=source_id)
         _log(f"merge deliverables step failed ({type(exc).__name__}: {exc})")
 
     return True
