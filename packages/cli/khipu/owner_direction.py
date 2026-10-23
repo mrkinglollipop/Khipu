@@ -26,6 +26,7 @@ import contextlib
 import contextvars
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -789,6 +790,43 @@ def record_owed_batch(batch: str) -> None:
     pend["before"] = before
 
 
+def record_setting_before(key: str, data: dict) -> None:
+    """Record the exact replaced state while the setter holds both locks."""
+    from khipu import routing
+
+    pend = _PENDING.get()
+    if (not pend or pend["intent"]["action"] not in
+            ("config.routing_setting", "config.answer_request.confirm", "config.answer_request.undo")
+            or pend["intent"]["target"] != key):
+        return
+    before = {"value": data.get(key), "set": key in data}
+    request = routing._setting_requests(data).get(key)
+    if request is not None or key == "routing_replication_live":
+        before["request"] = request
+    line = pend.get("line")
+    pend["before"] = before
+    if line is None:
+        if pend["stamp"].get("auth") == "direction":
+            raise OSError("the owner action must be recorded before its setting can change")
+        return
+    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+             "state": "pending", "before": before})
+
+
+def record_owner_write(tool: str, args: dict) -> None:
+    """Keep the hub identity before sending, even if its COMMIT reply is lost."""
+    pend = _PENDING.get()
+    if not pend or pend["stamp"].get("auth") != "direction":
+        return
+    line = pend.get("line")
+    if line is None:
+        raise OSError("the owner action must be recorded before its hub write")
+    write = {"tool": tool, "args": {"write_id": args["write_id"]}}
+    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+             "state": "pending", "owner_write": write})
+    pend["owner_write"] = write
+
+
 def import_source(path, project: str, *, catch_up: bool = False) -> dict | None:
     """The parsed tracker read by this import's gate; never stored in the log."""
     pend = _PENDING.get()
@@ -809,7 +847,8 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
     if want["action"] == "direction.undo":
         undone = _find(want["target"]) or {}
         line = {"kind": "undo", "id": _new_id(), "at": _iso(_clock()), "undoes": want["target"],
-                "action": undone.get("action"), "target": undone.get("target"), "auth": stamp.get("auth")}
+                "action": undone.get("action"), "target": undone.get("target"), "auth": stamp.get("auth"),
+                "inverse_id": "owner-undo:" + want["target"]}
         if want.get("facts"):
             line["facts"] = want["facts"]
     else:
@@ -839,15 +878,25 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
 
 
 def _abandon() -> None:
-    """End a written-ahead owner action that never reached ``finish``: the
-    change raised, so it is marked failed (best effort: unmarked, it reads
-    as unconfirmed, and Undo still works)."""
+    """A lost hub reply is uncertain until its durable outcome can be read."""
     pend = _PENDING.get()
     _PENDING.set(None)
     if pend and pend.get("line"):
+        state = "failed"
+        write = pend.get("owner_write")
+        if write:
+            from khipu import owner_writes
+
+            state = "pending"
+            try:
+                outcome = owner_writes._landed(write["tool"], write["args"])
+                if outcome is not None and outcome[0] in ("applied", "refused"):
+                    state = "applied" if outcome[0] == "applied" else "failed"
+            except Exception:  # noqa: BLE001 - reply and reconciliation may both be unavailable
+                pass
         try:
             _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": pend["line"]["id"],
-                     "state": "failed"})
+                     "state": state})
         except OSError:
             pass
 
@@ -1068,19 +1117,15 @@ def _before(want: dict):
         if action == "accounts.request.confirm":
             return {"list": request.get("prior") if isinstance(request.get("prior"), list) else None}
         return {"list": stored if isinstance(stored, list) else None}
-    if action == "config.routing_setting":
+    if action in ("config.routing_setting", "config.answer_request.confirm", "config.answer_request.undo"):
         from khipu import config
 
         data = config.load_config()
-        return {"value": data.get(target), "set": target in data}
-    if action in ("config.answer_request.confirm", "config.answer_request.undo"):
-        from khipu import config
-
-        data = config.load_config()
-        waiting = routing._setting_requests(data).get(target) or {}
-        if action == "config.answer_request.confirm":
-            return {"value": waiting.get("prior"), "set": bool(waiting.get("prior_set"))}
-        return {"value": data.get(target), "set": target in data}
+        before = {"value": data.get(target), "set": target in data}
+        request = routing._setting_requests(data).get(target)
+        if request is not None or target == "routing_replication_live":
+            before["request"] = request
+        return before
     if action in ("promote.gate_ignore", "promote.gate_ignore.cancel"):
         from khipu import promote
 
@@ -1149,8 +1194,11 @@ def _before(want: dict):
     if action == "direction.acknowledge":
         return {"alarm": read_alarm()}
     if action == "direction.set":
-        return {"settings": {k: owner_turns.settings()[k] for k in ("latest_window_h",
-                                                                   "trusted", "session_binding")}}
+        key, _, member = target.partition(" ")
+        current = owner_turns.settings()
+        if key in ("trust", "untrust"):
+            return {"member": member, "trusted": member in current["trusted"]}
+        return {"settings": {key: current[key]}}
     if action.startswith("project."):
         # Read, changed and diffed under the group lock in the change's own
         # transaction: its result's ``delta`` (on the finish line) is the Undo.
@@ -1167,7 +1215,7 @@ def _after(want: dict, result) -> Any:
     return {k: result[k] for k in keep if k in result} or None
 
 
-def _restore_setting(key: str, value, was_set: bool) -> None:
+def _restore_setting(key: str, value, was_set: bool, request=None) -> None:
     from khipu import routing
     from khipu.config import mutate_config
 
@@ -1177,7 +1225,10 @@ def _restore_setting(key: str, value, was_set: bool) -> None:
         else:
             data.pop(key, None)
         requests = routing._setting_requests(data)
-        requests.pop(key, None)
+        if request is not None:
+            requests[key] = request
+        else:
+            requests.pop(key, None)
         if requests:
             data[routing.SETTINGS_REQUEST_KEY] = requests
         else:
@@ -1311,7 +1362,18 @@ def _undo_direction(line, via):
     before = line.get("before") or {}
     if line["action"] in ("direction.off", "direction.on"):
         return {"ok": True, "settings": owner_turns.write_settings({"enabled": bool(before.get("enabled"))})}
-    return {"ok": True, "settings": owner_turns.write_settings(dict(before.get("settings") or {}))}
+    key, _, member = line["target"].partition(" ")
+    if key in ("trust", "untrust"):
+        # Restore this member only, including logs from before member snapshots.
+        was_trusted = before.get("trusted") if "member" in before else member in (
+            (before.get("settings") or {}).get("trusted") or [])
+        trusted = [x for x in owner_turns.settings()["trusted"] if x != member]
+        if was_trusted:
+            trusted.append(member)
+        values = {"trusted": trusted}
+    else:
+        values = {key: (before.get("settings") or {})[key]}
+    return {"ok": True, "settings": owner_turns.write_settings(values)}
 
 
 def _undo_acknowledge(line, via):
@@ -1350,10 +1412,10 @@ def _undo_clear(line, via):
         return routing.undismiss(line["target"], report, via=via)
     clear_id = (line.get("after") or {}).get("id")
     if clear_id is None:
-        # Unconfirmed: the clear's own id was never recorded, but a clear
-        # newer than the one it superseded can only be this one.
-        now = routing.current_clear(line["target"])
-        clear_id = now if now != _b(line).get("clear") else None
+        # A lost completion does not make the account's newest clear ours.
+        matches = [e for e in routing.read_events()[0]
+                   if e.get("type") == "clear" and e.get("op") == line["id"]]
+        clear_id = matches[0].get("id") if len(matches) == 1 else None
     if clear_id is None:
         raise ValueError("Khipu can't tell which clear this was, so it can't undo it")
     return routing.undo_clear(line["target"], clear_id, via=via)
@@ -1465,7 +1527,13 @@ def _undo_auto_track(line, via):
 
 
 def _undo_setting(line, via):
-    _restore_setting(line["target"], _b(line).get("value"), bool(_b(line).get("set")))
+    before = _b(line)
+    if (line["target"] == "routing_replication_live" and before.get("value") is True
+            and "request" not in before):
+        raise ValueError("Khipu cannot confirm the prior replication permission from this older Undo; "
+                         "choose the replication setting in Settings")
+    _restore_setting(line["target"], _b(line).get("value"), bool(_b(line).get("set")),
+                     _b(line).get("request"))
     return {"ok": True}
 
 
@@ -1697,6 +1765,13 @@ def timer(now: float | None = None) -> dict:
 # ---- undo ----------------------------------------------------------------------------------
 
 
+def _unfinished_undos(line_id: str) -> list[dict]:
+    inflight = ((_PENDING.get() or {}).get("line") or {}).get("id")
+    return [row for row in _merged(read_log()).values()
+            if row.get("kind") == "undo" and row.get("undoes") == line_id
+            and row.get("state") == "unconfirmed" and row.get("id") != inflight]
+
+
 def _undo_refusal(line: dict | None, line_id: str) -> str | None:
     """Why the logged action ``line_id`` can't be undone now, or None."""
     if line is None:
@@ -1706,6 +1781,21 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
         return f"owner action {line_id} was already undone"
     if state == "failed":
         return f"owner action {line_id} did not happen, so there is nothing to undo"
+    if not line["action"].startswith("route.") and _unfinished_undos(line_id):
+        return ("Khipu cannot confirm whether the previous Undo finished; it will not apply its inverse "
+                "again and overwrite a newer owner choice")
+    if state == "unconfirmed" and line.get("owner_write"):
+        from khipu import owner_writes
+
+        write = line["owner_write"]
+        try:
+            outcome = owner_writes._landed(write["tool"], write["args"])
+        except Exception:  # noqa: BLE001 - no inverse until the hub confirms the original
+            outcome = None
+        if outcome is None:
+            return "Khipu cannot confirm this write's hub outcome yet; retry Undo when the hub is available"
+        if outcome[0] != "applied":
+            return "the hub refused this owner write, so there is nothing to undo"
     if line["action"] == "ledger.purge":
         if state == "done":
             return f"the purge {line_id} already ran; a row removed for good can't come back"
@@ -1734,7 +1824,26 @@ def undo(line_id: str, via: str, *, holds: dict | None = None) -> dict:
     if line["action"] == "ledger.purge":
         _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line_id, "state": "cancelled"})
         return {"ok": True, "undid": line_id, "state": "cancelled"}
-    inverse = _UNDO[line["action"]]
+    from khipu import routing
+
+    with routing._lock() if line["action"].startswith("route.") else contextlib.nullcontext():
+        inverse_id = "owner-undo:" + line_id
+        if line["action"].startswith("route."):
+            # Older Undo rows used their own line id as the routing operation.
+            known_ids = {inverse_id} | {u.get("inverse_id") or u["id"] for u in _unfinished_undos(line_id)}
+            matches = [e for e in routing.read_events()[0]
+                       if e.get("op") in known_ids and e.get("type") != "owner_change"]
+            if matches:
+                return {"ok": True, "undid": line_id, "id": matches[0].get("id"), "already_applied": True}
+        inverse = _UNDO[line["action"]]
+        operation = routing._OP.set(inverse_id)
+        try:
+            return _run_inverse(line, inverse, via, holds, line_id)
+        finally:
+            routing._OP.reset(operation)
+
+
+def _run_inverse(line, inverse, via, holds, line_id):
     if line["action"] in {"route.rule.confirm", "route.rule.edit", "route.rule.retire",
                            "route.rule.undo", "route.rule.dismiss", "route.priority.set", "route.priority.confirm",
                            "route.priority.undo", "route.priority.clear"}:
@@ -1750,7 +1859,7 @@ def undo(line_id: str, via: str, *, holds: dict | None = None) -> dict:
 
 
 def _print(data: dict) -> None:
-    print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+    print(json.dumps(data, indent=2, ensure_ascii=False, default=str, allow_nan=False))
 
 
 def _set_values(key: str, raw: str) -> dict:
@@ -1760,8 +1869,8 @@ def _set_values(key: str, raw: str) -> dict:
             value = float(raw)
         except ValueError:
             raise ValueError(f"{key} takes a number") from None
-        if not value > 0:
-            raise ValueError(f"{key} must be above 0")
+        if not math.isfinite(value) or not value > 0:
+            raise ValueError(f"{key} must be a finite number above 0")
         return {key: value}
     if key == "session_binding":
         if raw not in ("on", "off"):

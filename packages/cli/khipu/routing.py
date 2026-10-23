@@ -529,6 +529,10 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
             raise SettingError(f"a conversation's change to {key} is still waiting for the owner; he confirms or "
                                "undoes it in Settings first", "request_waiting")
         prior, prior_set = data.get(key), key in data
+        if request is None:
+            from khipu import owner_direction
+
+            owner_direction.record_setting_before(key, data)
         if request is not None and key == "routing_replication_live" and raw is not None \
                 and _coerce(kind, raw, key) is (prior is True):
             # Matches the confirmed value: nothing to ask the owner, and a
@@ -564,6 +568,9 @@ def answer_setting_request(key: str, action: str) -> Path:
     if action not in ("confirm", "undo"):
         raise SettingError("answer confirm or undo", "bad_answer")
     with _lock(), mutate_config() as data:
+        from khipu import owner_direction
+
+        owner_direction.record_setting_before(key, data)
         requests = _setting_requests(data)
         waiting = requests.pop(key, None)
         if waiting is None:

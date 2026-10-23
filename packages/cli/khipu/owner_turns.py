@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -119,7 +120,12 @@ def settings() -> dict:
                 out[key] = value
             elif isinstance(default, float) and isinstance(value, (int, float)) and not isinstance(value, bool) \
                     and value > 0:
-                out[key] = float(value)
+                try:
+                    number = float(value)
+                except OverflowError:
+                    continue
+                if math.isfinite(number):
+                    out[key] = number
             elif isinstance(default, list) and isinstance(value, list) \
                     and all(isinstance(v, str) for v in value):
                 out[key] = list(value)
@@ -127,9 +133,17 @@ def settings() -> dict:
 
 
 def write_settings(values: dict) -> dict:
+    if "latest_window_h" in values:
+        try:
+            value = float(values["latest_window_h"])
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("latest_window_h must be a finite number above 0") from None
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("latest_window_h must be a finite number above 0")
+        values = dict(values, latest_window_h=value)
     current = settings()
     current.update(values)
-    _write_private(_ensure_folder() / "settings.json", json.dumps(current, indent=2) + "\n")
+    _write_private(_ensure_folder() / "settings.json", json.dumps(current, indent=2, allow_nan=False) + "\n")
     return settings()
 
 
