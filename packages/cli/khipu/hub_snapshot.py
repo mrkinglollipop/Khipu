@@ -618,18 +618,23 @@ def _purged_topic_marker(path: Path, slug: str) -> Path:
     return _purged_topics_dir(path) / hashlib.sha256(slug.encode("utf-8")).hexdigest()
 
 
-def _mark_purged_topic(slug: str, path: Path | None = None) -> bool:
+def _mark_purged_topic(slug: str, path: Path | None = None, *, hub_at: datetime | None = None) -> bool:
     """Record a purged topic beside the replica before the replica is
     touched, so an embedding catch-up whose replica write lands after the
     purge can never put the topic back, even when the purge could not take
-    the lock."""
+    the lock. ``hub_at`` is the hub's clock when the purge was seen; a
+    recreated topic is judged against it, hub time to hub time, so this
+    Mac's clock cannot hide or resurrect it. Without it the marker file's
+    own time stands in."""
     path = path or snapshot_path()
     marker = _purged_topic_marker(path, slug)
     try:
         marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, slug.encode("utf-8"))
+            stamp = _utc(hub_at)
+            body = slug if stamp is None else json.dumps({"slug": slug, "hub_at": stamp.isoformat()})
+            os.write(fd, body.encode("utf-8"))
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -643,6 +648,20 @@ def _mark_purged_topic(slug: str, path: Path | None = None) -> bool:
         return False
 
 
+def _read_marker(marker: Path) -> tuple[str, datetime | None]:
+    """A marker's slug and recorded hub time. Older markers hold the bare
+    slug and no hub time."""
+    text = marker.read_text(encoding="utf-8")
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and isinstance(data.get("slug"), str):
+                return data["slug"], _utc(data.get("hub_at"))
+        except ValueError:
+            pass
+    return text, None
+
+
 def _purged_topic_slugs(path: Path | None = None) -> set[str]:
     try:
         markers = list(_purged_topics_dir(path).iterdir())
@@ -651,14 +670,36 @@ def _purged_topic_slugs(path: Path | None = None) -> set[str]:
     out = set()
     for marker in markers:
         try:
-            out.add(marker.read_text(encoding="utf-8"))
+            out.add(_read_marker(marker)[0])
         except (OSError, UnicodeError):
             continue
     return out
 
 
-def _purge_marker_time(path: Path, slug: str) -> float:
-    return _purged_topic_marker(path, slug).stat().st_mtime
+def _purge_marker_time(path: Path, slug: str) -> float | None:
+    """The marker file's modification time, or None when it is gone (a
+    concurrent dump cleared it)."""
+    try:
+        return _purged_topic_marker(path, slug).stat().st_mtime
+    except OSError:
+        return None
+
+
+def _purge_marker_stamp(path: Path, slug: str) -> datetime | None:
+    """When the purge happened, for comparing with a topic's ``updated_at``:
+    the hub time recorded in the marker, else the file's time at database
+    precision. None when the marker is gone."""
+    try:
+        _slug, hub_at = _read_marker(_purged_topic_marker(path, slug))
+    except (OSError, UnicodeError):
+        return None
+    if hub_at is not None:
+        return hub_at
+    marked_at = _purge_marker_time(path, slug)
+    # PostgreSQL timestamps and datetime have microsecond precision; compare
+    # the filesystem time at that same precision so rounding cannot turn
+    # equality into newer.
+    return None if marked_at is None else datetime.fromtimestamp(marked_at, timezone.utc)
 
 
 def _clear_purged_topics(path: Path | None = None, *, dumped_after: float) -> None:
@@ -677,6 +718,19 @@ def _clear_purged_topics(path: Path | None = None, *, dumped_after: float) -> No
             continue
 
 
+def _erase_episode_commitments(con: sqlite3.Connection, episode_id: int) -> None:
+    """Delete the commitments an episode opened and their vectors (the
+    vector holds the commitment's text). Other episodes' commitments stay."""
+    if not {"id", "opened_episode"} <= _snapshot_table_columns(con, "commitments"):
+        return
+    ids = [str(row[0]) for row in con.execute(
+        "DELETE FROM commitments WHERE opened_episode = ? RETURNING id", (episode_id,))]
+    if {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings"):
+        for batch in _chunks(ids):
+            con.execute("DELETE FROM memory_embeddings WHERE kind = 'commitment' "
+                        f"AND ref IN ({', '.join('?' for _ in batch)})", batch)
+
+
 def _apply_pending_erasures(con: sqlite3.Connection, path: Path) -> None:
     ids = _pending_erasure_ids(path)
     for episode_id in ids:
@@ -684,6 +738,7 @@ def _apply_pending_erasures(con: sqlite3.Connection, path: Path) -> None:
         con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(episode_id),))
         if _snapshot_table_columns(con, "deliverables"):
             con.execute("DELETE FROM deliverables WHERE episode_id = ?", (episode_id,))
+        _erase_episode_commitments(con, episode_id)
 
 
 def _fair_shares(total: int, n: int) -> list[int]:
@@ -1419,7 +1474,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
     last_fresh = _utc(fresh_stamps[-1][0]) if fresh_stamps else None
 
     parts = _write_pulled_tables(topic_rows, commitments, aliases, read_at=read_at,
-                                topic_purges=topic_purges)
+                                topic_purges=topic_purges, purge_hub_at=hub_now)
     if ledger_payload is not None and not ledger_payload.get("ok"):
         parts["ledger"] = ledger_payload
     else:
@@ -1453,7 +1508,8 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
 def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                          commitments: tuple[list[str], list[Any]] | None,
                          aliases: tuple[list[str], list[Any]] | None, *,
-                         read_at: float, topic_purges: Iterable[str] = ()) -> dict[str, dict[str, Any]]:
+                         read_at: float, topic_purges: Iterable[str] = (),
+                         purge_hub_at: datetime | None = None) -> dict[str, dict[str, Any]]:
     """The pull's topic bodies and commitments, under the refresh lock, in one
     transaction. Each part's result by name; a part the hub or this replica
     has no table for is ``not_applicable``. A topic row older than the one
@@ -1466,7 +1522,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     replica's rows in the same transaction, so a deleted alias arrives too;
     like commitments, a copy read after ``read_at`` stays. ``topic_purges``
     names held keys absent from the same hub transaction; a newer local
-    topic publication or dump stays when that older absence is applied."""
+    topic publication or dump stays when that older absence is applied.
+    ``purge_hub_at`` is the hub's clock in that transaction, recorded in
+    each purge marker."""
     parts: dict[str, dict[str, Any]] = {}
     path = snapshot_path()
     con = sqlite3.connect(str(path))
@@ -1498,7 +1556,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                 for slug in sorted(topic_purges):
                     if _held_read_at(con, "topics", slug) > read_at:
                         continue
-                    if not _mark_purged_topic(slug, path):
+                    if not _mark_purged_topic(slug, path, hub_at=purge_hub_at):
                         raise OSError("could not record the remote topic purge")
                     purged.add(slug)
                     # Old replicas can lack the external-content delete
@@ -1520,15 +1578,15 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     slug = row.get("slug")
                     if slug is None:
                         continue
+                    marked_at = None
                     if slug in purged:
                         incoming = _utc(row.get("updated_at"))
-                        marked_at = _purge_marker_time(path, slug)
-                        # PostgreSQL timestamps and datetime have microsecond
-                        # precision; compare the filesystem time at that same
-                        # precision so rounding cannot turn equality into newer.
-                        marker_stamp = datetime.fromtimestamp(marked_at, timezone.utc)
-                        if incoming is None or incoming <= marker_stamp:
-                            continue
+                        # A marker a concurrent dump just cleared is no marker.
+                        marker_stamp = _purge_marker_stamp(path, slug)
+                        if marker_stamp is not None:
+                            if incoming is None or incoming <= marker_stamp:
+                                continue
+                            marked_at = _purge_marker_time(path, slug)
                     old = con.execute("SELECT updated_at, deleted_at FROM topics WHERE slug = ?", (slug,)).fetchone()
                     if old is not None and row.get("deleted_at") is None:
                         held, incoming = _utc(old[0]), _utc(row.get("updated_at"))
@@ -1544,7 +1602,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                         vals,
                     )
                     _record_read_at(con, "topics", slug, read_at)
-                    if slug in purged:
+                    if slug in purged and marked_at is not None:
                         recreated[slug] = marked_at
                     written += 1
                 if written or removed:
@@ -1559,6 +1617,16 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                 else:
                     con.execute("DELETE FROM commitments")
                     parts["commitments"] = {"ok": True, "commitments": _write_commitment_rows(con, cols, rows)}
+                    # A commitment gone from the hub (its episode forgotten)
+                    # must not leave its vector, and its text, behind.
+                    if {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings") and "id" in cols:
+                        at = list(cols).index("id")
+                        live = {str(row[at]) for row in rows}
+                        for (ref,) in con.execute(
+                                "SELECT DISTINCT ref FROM memory_embeddings WHERE kind = 'commitment'").fetchall():
+                            if str(ref) not in live:
+                                con.execute("DELETE FROM memory_embeddings WHERE kind = 'commitment' "
+                                            "AND ref = ?", (ref,))
                     _record_read_at(con, "commitments", "*", read_at)
             if "project_aliases" in wanted:
                 cols, rows = aliases  # type: ignore[misc]
@@ -1576,7 +1644,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     # Clear only after the replacement row commits, and never
                     # remove a marker a concurrent purge just refreshed.
                     if _purge_marker_time(path, slug) == marked_at:
-                        _purged_topic_marker(path, slug).unlink()
+                        _purged_topic_marker(path, slug).unlink(missing_ok=True)
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - reported as the failed parts
@@ -3596,6 +3664,7 @@ def forget_episode_in_snapshot(episode_id: int) -> dict[str, Any]:
             )
             if _snapshot_table_columns(con, "deliverables"):
                 con.execute("DELETE FROM deliverables WHERE episode_id = ?", (episode_id,))
+            _erase_episode_commitments(con, episode_id)
             _advance_cursor(con, "tombstones", synced_at=now, newest=now)
             con.commit()
         finally:
