@@ -784,7 +784,9 @@ def remember_seen(st: dict, fresh: list[str]) -> None:
 
 
 def read_window(path: Path, offset: int, *, seen: Any = None,
-                stats: dict | None = None) -> tuple[list[tuple[str, str]], int, int]:
+                stats: dict | None = None, prefix: dict | None = None,
+                replay_prefix: dict | None = None,
+                end_offset: int | None = None) -> tuple[list[tuple[str, str]], int, int]:
     """Parse the transcript from ``offset``. Returns (messages, new_offset,
     user_turns). Consecutive same-role text is coalesced; tool calls become
     one-line markers; thoughts / reasoning / meta lines are dropped.
@@ -814,7 +816,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         offset = 0
     with path.open("rb") as f:
         f.seek(offset)
-        data = f.read()
+        data = f.read() if end_offset is None else f.read(max(0, end_offset - offset))
     end = offset + len(data)
     if data and not data.endswith(b"\n"):  # partial trailing line: leave it for next time
         cut = data.rfind(b"\n")
@@ -837,14 +839,14 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     # turns or repeated messages from a single representation.
     from collections import Counter
 
-    event_copies = Counter((r, t) for d, r, t, _ in parsed
+    event_copies = Counter((r, t.strip()) for d, r, t, _ in parsed
                            if r in ("user", "assistant") and d.get("type") == "event_msg")
     items: list[tuple[dict, str, str, int]] = []
     for d, role, text, line_end in parsed:
         if role.startswith("codex:"):
             role = role[6:]
-            if event_copies[(role, text)]:
-                event_copies[(role, text)] -= 1
+            if event_copies[(role, text.strip())]:
+                event_copies[(role, text.strip())] -= 1
                 continue
         # ACP chunks include meaningful standalone spaces and newlines. Clean
         # the assembled turn once, instead of stripping individual fragments.
@@ -854,9 +856,32 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             items[-1] = (previous[0], role, previous[2] + text, line_end)
             continue
         items.append((d, role, text, line_end))
+    # An ordered digest proves an entire copied prefix, including short turns
+    # and tool markers. A text set cannot distinguish an old "yes" from a new
+    # one. Only skip this prefix after a file reset and an exact sequence match.
+    checkpoints: list[dict | None] = []
+    progress = dict(prefix) if prefix is not None else (
+        {"count": 0, "digest": ""} if offset == 0 else None)
+    replay_end = 0
+    for index, (_, role, text, _) in enumerate(items, start=1):
+        if progress is not None:
+            progress = {"count": progress["count"] + 1, "digest": hashlib.sha256(
+                f"{progress['digest']}\n{role}\n{text}".encode("utf-8")).hexdigest()}
+            if replay_prefix and progress == replay_prefix:
+                replay_end = index
+        checkpoints.append(progress)
+    if stats is not None:
+        stats["prefix"] = progress
+    if replay_end:
+        dropped = replay_end
+        dropped_chars = sum(len(text) for _, _, text, _ in items[:replay_end])
+        if stats is not None:
+            stats.update(skip_to=items[replay_end - 1][3], skip_prefix=checkpoints[replay_end - 1])
+    items = items[replay_end:]
+    checkpoints = checkpoints[replay_end:]
     last_user_counted = False   # the open user block already holds a real turn
     head_open = True            # every message so far was an already-seen copy
-    for d, role, text, line_end in items:
+    for (d, role, text, line_end), checkpoint in zip(items, checkpoints):
         real = False
         if role == "user":
             text = _clean_user_text(text)
@@ -880,6 +905,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                 dropped_chars += len(text)
                 if head_open and stats is not None:
                     stats["skip_to"] = line_end
+                    stats["skip_prefix"] = checkpoint
                 continue
             known.add(fp)
             fresh.append(fp)
@@ -911,9 +937,17 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
     """Byte offsets belong to a particular file, unlike text fingerprints."""
     info = path.stat()
     identity = [info.st_dev, info.st_ino]
-    if ((st.get("transcript_path") and st["transcript_path"] != str(path))
+    reset = ((st.get("transcript_path") and st["transcript_path"] != str(path))
             or st.get("transcript_identity") not in (None, identity)
-            or int(st.get("offset", 0)) > info.st_size):
+            or int(st.get("offset", 0)) > info.st_size)
+    if (not reset and not st.get("transcript_prefix") and not st.get("replay_prefix")
+            and int(st.get("offset", 0)) > 0 and st.get("transcript_identity") == identity):
+        # Upgrade existing offsets while the original file is still present.
+        # Once it has been replaced, its uncached short history is unprovable.
+        prior: dict = {}
+        read_window(path, 0, stats=prior, end_offset=int(st["offset"]))
+        st["transcript_prefix"] = prior.get("prefix")
+    if reset:
         # A reset can reuse an earlier 0:N range. Namespace every later window
         # by this file generation so fresh text is not an exact-window replay.
         # Deterministic from persisted state + file identity: a crash between
@@ -922,6 +956,8 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
             [st.get("transcript_generation"), identity, str(path)],
             separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
         st["offset"] = 0
+        if st.get("transcript_prefix"):
+            st["replay_prefix"] = st.pop("transcript_prefix")
         st.pop("carry", None)
         st.pop("sweep_checked_mtime", None)
     st["transcript_identity"] = identity
@@ -1419,7 +1455,11 @@ def request_capture_now(harness: str, sid: str, note: str | None = None) -> Path
             raise OSError("capture request lock unavailable")
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"note": note or None, "requested_at": _mint_ts(),
+        pending = _pending_capture_now(harness, sid)
+        notes = [str(pending["note"])] if pending and pending.get("note") else []
+        if note:
+            notes.append(note)
+        tmp.write_text(json.dumps({"note": "\n\n".join(notes) or None, "requested_at": _mint_ts(),
                                    "request_id": uuid.uuid4().hex}), encoding="utf-8")
         os.replace(tmp, p)
     return p
@@ -1625,7 +1665,8 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
     # The own-session marker is authoritative even before its first hook.
     # An unmatched marker cannot fall through to another session's heuristics.
     codex_tid = os.environ.get("CODEX_THREAD_ID")
-    if not sid and codex_tid and harness in (None, "codex"):
+    if (not sid and codex_tid and harness in (None, "codex")
+            and not os.environ.get("CLAUDE_CODE_SESSION_ID")):
         own = [c for c in cands if c["harness"] == "codex"
                and (c["state"].get("session_id") or c["sid"]) == codex_tid]
         if len(own) == 1:
@@ -1941,10 +1982,13 @@ def _claim(job: Path) -> Path | None:
         claimed = job.with_suffix(f".claimed.{os.getpid()}")
         try:
             start = _claim_process_start(os.getpid())
-            if start is None:
-                return None
             # Ownership is bookkeeping, never a mutation of queued evidence.
-            _write_claim_owner(claimed, {"pid": os.getpid(), "start": start})
+            # A restricted process lookup falls back to conservative legacy
+            # ownership, which is reclaimed only after the PID is gone.
+            if start is not None:
+                _write_claim_owner(claimed, {"pid": os.getpid(), "start": start})
+            else:
+                _claim_owner_path(claimed).unlink(missing_ok=True)
             os.rename(job, claimed)
             fd = os.open(queue_dir(), os.O_RDONLY)
             try:
@@ -2539,7 +2583,9 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
             _reset_transcript_offset(st, path)
             dedupe: dict[str, Any] = {}
             msgs, new_off, turns = read_window(path, int(st.get("offset", 0)),
-                                               seen=st.get("seen_text") or (), stats=dedupe)
+                                               seen=st.get("seen_text") or (), stats=dedupe,
+                                               prefix=st.get("transcript_prefix"),
+                                               replay_prefix=st.get("replay_prefix"))
             if dedupe.get("deduped_msgs"):
                 out.update(deduped_msgs=dedupe["deduped_msgs"], deduped_chars=dedupe["deduped_chars"])
             carried = [tuple(m) for m in st.pop("carry", None) or []]
@@ -2603,6 +2649,8 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                     out["pending_since"] = datetime.fromtimestamp(last, tz=timezone.utc).isoformat(
                         timespec="seconds").replace("+00:00", "Z") if last else out["at"]
                 if due:
+                    st["transcript_prefix"] = dedupe.get("prefix")
+                    st.pop("replay_prefix", None)
                     queued_names = _enqueue_window(
                         harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
                         cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
@@ -2624,6 +2672,8 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                     # past them so the next run does not re-parse them.
                     if int(dedupe.get("skip_to") or 0) > int(st.get("offset", 0)):
                         st["offset"] = dedupe["skip_to"]
+                        st["transcript_prefix"] = dedupe.get("skip_prefix")
+                        st.pop("replay_prefix", None)
                         carried += dedupe.get("carry") or []
                     if carried:
                         st["carry"] = carried
@@ -2762,7 +2812,8 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                         out["read"] += 1
                         dedupe: dict[str, Any] = {}
                         msgs, new_off, turns = read_window(path, offset, seen=st.get("seen_text") or (),
-                                                           stats=dedupe)
+                                                           stats=dedupe, prefix=st.get("transcript_prefix"),
+                                                           replay_prefix=st.get("replay_prefix"))
                         sid = str(st.get("session_id") or track_sid)
                         carried = [tuple(m) for m in st.get("carry") or []]
                         msgs = _redact_messages(carried + msgs, harness, sid)
@@ -2786,6 +2837,9 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                             if not dry_run:
                                 if not dedupe.get("carry"):
                                     st["offset"] = max(offset, int(dedupe.get("skip_to") or 0))
+                                    if st["offset"] > offset:
+                                        st["transcript_prefix"] = dedupe.get("skip_prefix")
+                                        st.pop("replay_prefix", None)
                                 save_state(harness, track_sid, st, preserve_mtime=True)
                             continue
                         if dry_run:
@@ -2796,6 +2850,8 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                             })
                         else:
                             st.pop("carry", None)  # now part of msgs
+                            st["transcript_prefix"] = dedupe.get("prefix")
+                            st.pop("replay_prefix", None)
                             names = _enqueue_window(
                                 harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
                                 event="idle_sweep", path=path, st=st, msgs=msgs,

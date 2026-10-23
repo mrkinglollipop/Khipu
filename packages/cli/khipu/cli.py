@@ -238,7 +238,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
     outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
-    if not outbox_oldest_ok:
+    if not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
         outbox["fix"] = "run `khipu sessions drain`"
     # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
     # of a failure (hook error, drain failure, stale queue, cadence never

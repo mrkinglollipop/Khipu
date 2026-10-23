@@ -328,6 +328,7 @@ def status() -> dict[str, Any]:
     oldest_job: str | None = None
     unreadable = 0
     offline = 0
+    evidence_conflicts = 0
     now = datetime.now(timezone.utc)
     for jp in js:
         try:
@@ -342,6 +343,8 @@ def status() -> dict[str, Any]:
             unreadable += 1
             continue
         attempts = job.get("attempts", 0)
+        if job.get("evidence_conflict"):
+            evidence_conflicts += 1
         if (not isinstance(job.get("payload"), dict) or isinstance(attempts, bool)
                 or not isinstance(attempts, int) or attempts < 0):
             unreadable += 1
@@ -354,11 +357,17 @@ def status() -> dict[str, Any]:
     dead = len(dead_jobs()) + quarantined
     # Every waiting capture is waiting only because the hub could not be
     # reached: the promotion gate does not refuse a candidate on that.
-    offline_only = bool(js) and offline == len(js) and not unreadable and not dead
-    return {"dir": str(outbox_dir()), "pending": len(js), "oldest_age_s": oldest_age,
+    offline_only = (bool(js) and offline == len(js) and not unreadable
+                    and not dead and not evidence_conflicts)
+    result = {"dir": str(outbox_dir()), "pending": len(js), "oldest_age_s": oldest_age,
             "oldest_job": oldest_job, "unreadable": unreadable,
             "dead": dead, "quarantined": quarantined,
-            "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only}
+            "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
+            "evidence_conflicts": evidence_conflicts}
+    if evidence_conflicts:
+        result["fix"] = ("Inspect the conflicting evidence in the local outbox and hub; "
+                         "owner reconciliation is required before these jobs can replay.")
+    return result
 
 
 def _retry_order(jp: Path) -> tuple[bool, str, str]:
