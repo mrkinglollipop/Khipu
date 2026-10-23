@@ -272,6 +272,9 @@ def run(tool: str, args: dict[str, Any], *, queue_ok: bool = True) -> dict[str, 
 
     args = _with_id(args)
     if not queue_ok:
+        from khipu import owner_direction
+
+        owner_direction.record_owner_write(tool, args)
         return _apply(tool, args)
     path, held = _reserve(tool, args)
     _HELD.entry = (path, (tool, args))
@@ -283,7 +286,7 @@ def run(tool: str, args: dict[str, Any], *, queue_ok: bool = True) -> dict[str, 
         try:
             result = _apply(tool, args)
         except Exception as exc:  # noqa: BLE001 - only a hub that is away queues
-            if hub_connection_failed(exc):
+            if isinstance(exc, HubRecordMissing) or hub_connection_failed(exc):
                 return _enqueue(tool, args, f"{type(exc).__name__}: {str(exc)[:200]}")
             _remove(path)
             raise

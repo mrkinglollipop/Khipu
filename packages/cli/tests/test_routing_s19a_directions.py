@@ -40,7 +40,7 @@ def say(text, *, now=None, session=SESSION):
 
 def act(*, facts=None, target="x", now=None):
     """An applied owner action by direction, from the session's latest turn."""
-    want = owner_direction.intent("route.rule.add", target, facts=facts)
+    want = owner_direction.intent("route.cap.set" if (facts or {}).get("cap") else "route.rule.add", target, facts=facts)
     owner_direction.gate(want, env=ENV, now=time.time() if now is None else now)
     return owner_direction.finish({"ok": True})
 

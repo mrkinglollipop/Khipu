@@ -1782,20 +1782,21 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
             if resets:
                 base["reset_at"] = _iso(min(resets))
             if full:
-                # The newest full window wins, then the latest reset: a fresh refusal must
-                # not hide behind an older full window carried beside it (which an owner
-                # clear may have overruled). Windows without their own time all share ``at``.
-                window_at, reset, w = max(full, key=lambda item: item[:2])
-                session_logs = key.partition("|")[0] == "muse" and w.get("source") == "session_logs"
-                if session_logs:
-                    base.update(observed=True, turn=False, session_logs=True)
-                base["at"] = window_at
-                newest = max(newest, window_at)
-                name = safe_name(w.get("name")) or ""
-                window = "weekly" if name.startswith("weekly") else name or None
-                out.append(dict(base, id="p" + _sid(key, scope, "limited", _iso(window_at), _iso(reset)), state="limited",
-                                until=reset, basis="cli", window=window, used_pct=_number(w.get("used_pct")),
-                                evidence=_redacted(f"usage probe: {name or 'window'} at {_number(w.get('used_pct'))}%")))
+                # Independent windows can reset at different times. Keep each observation
+                # so the fold applies owner clears and expiry to that constraint alone.
+                for window_at, reset, w in sorted(full, key=lambda item: item[:2], reverse=True):
+                    window_base = dict(base, at=window_at)
+                    session_logs = key.partition("|")[0] == "muse" and w.get("source") == "session_logs"
+                    if session_logs:
+                        window_base.update(observed=True, turn=False, session_logs=True)
+                    newest = max(newest, window_at)
+                    name = safe_name(w.get("name")) or ""
+                    window = "weekly" if name.startswith("weekly") else name or None
+                    out.append(dict(window_base,
+                                    id="p" + _sid(key, scope, "limited", _iso(window_at), _iso(reset)),
+                                    state="limited", until=reset, basis="cli", window=window,
+                                    used_pct=_number(w.get("used_pct")),
+                                    evidence=_redacted(f"usage probe: {name or 'window'} at {_number(w.get('used_pct'))}%")))
             else:
                 out.append(dict(base, id="p" + _sid(key, scope, "open", _iso(at)), state="open", until=None,
                                 basis="checked", window=None, used_pct=top,

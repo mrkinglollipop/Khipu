@@ -5852,6 +5852,8 @@ def build_parser() -> argparse.ArgumentParser:
     rrule.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (rule add or edit; stays unconfirmed)")
     rrule.add_argument("--base", default=None, help="Owner revision read when preparing a rule edit request")
+    rrule.add_argument("--expect", default=None, metavar="REVISION",
+                       help="Rule revision shown when confirming; refused if it changed since")
     rrule.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rrule)
 

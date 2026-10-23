@@ -154,7 +154,7 @@ def _dedup_path(session_id: str) -> Path:
     return state_dir() / f"recall--{_safe(session_id)}.json"
 
 
-def _load_recent_batches(session_id: str) -> list[tuple[str, ...]]:
+def _load_recent_prompt_slots(session_id: str) -> list[tuple[str, ...]]:
     if not session_id:
         return []
     try:
@@ -165,6 +165,11 @@ def _load_recent_batches(session_id: str) -> list[tuple[str, ...]]:
     if not isinstance(batches, list):
         return []
     return [tuple(b) for b in batches if isinstance(b, list)]
+
+
+def _load_recent_batches(session_id: str) -> list[tuple[str, ...]]:
+    """Delivered batches only; silent prompt slots remain internal."""
+    return [batch for batch in _load_recent_prompt_slots(session_id) if batch]
 
 
 def _load_session_state(session_id: str) -> dict:
@@ -1852,13 +1857,15 @@ def _dedup_transaction(session_id: str, hits: list[dict[str, Any]], delivery: di
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         ids = _hit_ids(hits)
         recent = _load_recent_batches(session_id)
-        if _batch_seen(ids, recent):
+        slots = _load_recent_prompt_slots(session_id)
+        if ids and _batch_seen(ids, recent):
+            _save_recent_batches(session_id, slots + [()])
             lock.close()
             return True
         def finish(commit: bool):
             try:
                 if commit:
-                    _save_recent_batches(session_id, recent + [ids])
+                    _save_recent_batches(session_id, slots + [ids])
             finally:
                 lock.close()
         if delivery is None:
@@ -1869,6 +1876,15 @@ def _dedup_transaction(session_id: str, hits: list[dict[str, Any]], delivery: di
     except Exception:
         lock.close()
         raise
+
+
+def _dedup_silent_prompt(session_id: str | None) -> None:
+    if not session_id:
+        return
+    try:
+        _dedup_transaction(session_id, [], None)
+    except OSError:
+        pass  # Same fail-open behavior as delivery dedup state.
 
 
 def _hit_ids(hits: list[dict[str, Any]]) -> tuple[str, ...]:
@@ -2261,7 +2277,7 @@ def _snapshot_search_hits(
     # any) is in flight on its own daemon thread above.
     lexical_rows = hub_snapshot.search_snapshot(prompt, _SEARCH_LIMIT, kind=None, indexed_tokens_only=True)
     for r in lexical_rows:
-        r["rank_text"] = f"{r.get('label') or ''} {r.get('snippet') or ''}"
+        r.setdefault("rank_text", f"{r.get('label') or ''} {r.get('snippet') or ''}")
     if tokens:
         lexical_rows.sort(key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens))
 
@@ -2328,6 +2344,11 @@ def _fuse_and_annotate(
     from khipu.recency import apply_project_and_status
     from khipu.search_text import fuse_ranked_lists, token_hit_count
 
+    if not lexical_rows and not cosine_rows:
+        return {"hits": [], "legs": legs, "degraded": degraded}
+    con = hub_snapshot.open_snapshot()
+    lexical_rows = hub_snapshot.snapshot_filter_live_sources(con, lexical_rows)
+    cosine_rows = hub_snapshot.snapshot_filter_live_sources(con, cosine_rows)
     lists: list[list[dict[str, Any]]] = [lexical_rows] if lexical_rows else []
 
     if cosine_rows:
@@ -2335,11 +2356,12 @@ def _fuse_and_annotate(
             r["cosine"] = r.get("score")
         lists.insert(0, list(cosine_rows))
         if tokens:
-            union: dict[tuple[str, str], dict[str, Any]] = {
-                (r["kind"], str(r["id"])): r for r in cosine_rows
-            }
-            for r in lexical_rows:
-                union.setdefault((r["kind"], str(r["id"])), r)
+            union: dict[tuple[str, str], dict[str, Any]] = {}
+            for r in [*cosine_rows, *lexical_rows]:
+                key = (r["kind"], str(r["id"]))
+                previous = union.get(key)
+                if previous is None or token_hit_count(r.get("rank_text") or "", tokens) > token_hit_count(previous.get("rank_text") or "", tokens):
+                    union[key] = r
             lex_rows = sorted(
                 union.values(), key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens)
             )
@@ -2363,7 +2385,6 @@ def _fuse_and_annotate(
         return {"hits": [], "legs": legs, "degraded": degraded}
 
     fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
-    con = hub_snapshot.open_snapshot()
 
     # Graph candidates (Phase 3, session A): switch-gated, own 150ms
     # deadline, dropped entirely (never partially) on a miss — named in
@@ -2391,6 +2412,7 @@ def _fuse_and_annotate(
                     via = r.get("via")
                     if isinstance(via, dict):
                         r["via"] = via.get("seed")
+                cand_rows = hub_snapshot.snapshot_filter_live_sources(con, cand_rows)
                 fused = fuse_ranked_lists([fused, cand_rows], limit=_SEARCH_LIMIT)
                 legs.append("graph_candidates")
         except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
@@ -2399,8 +2421,8 @@ def _fuse_and_annotate(
 
     # Once, after fusion and graph expansion: candidate rows carry no signal,
     # so they can never make an otherwise empty list pass.
-    fused = _relevance_gate(fused, tokens)
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
+    fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
 
     # Time interpretation (Phase 3, session A): switch-gated. This lane never
@@ -3195,6 +3217,7 @@ def prior_work_for_prompt(
         return meta
 
     def _gated(reason: str) -> dict[str, Any]:
+        _dedup_silent_prompt(session_id)
         out = {"context": "", "hits": [], "reason": reason, "ms": 0.0}
         out["legs"] = []
         out["degraded"] = None
@@ -3341,6 +3364,8 @@ def prior_work_for_prompt(
         # cannot suppress a repeat. Logged so the gap is visible, not silent.
         reason = "ok (no session_id: dedup skipped)"
 
+    if not hits or not context or thread:
+        _dedup_silent_prompt(session_id)
     ms = round((time.monotonic() - t0) * 1000, 1)
     out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
     out["legs"] = legs
