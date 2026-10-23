@@ -36,7 +36,8 @@ _REPLICA_META = "replica bookkeeping: meta, freshness, erasure and purge markers
 _REGISTRY = "the forgotten-source registry: identities and ids, never text"
 
 NOT_CAPTURE = {
-    **dict.fromkeys(("hub_snapshot._acquire_refresh_lock", "ledger._flock", "jobs._job_lock",
+    **dict.fromkeys(("hub_snapshot._acquire_refresh_lock", "hub_snapshot._purge_marker_lock",
+                     "ledger._flock", "jobs._job_lock",
                      "memory_lock._take", "outbox._locked_outbox", "promote._lock",
                      "recall_prompt._session_lock", "routing._lock", "session_capture._beat_lock",
                      "session_capture._capture_now_lock", "session_capture._claim_lock",

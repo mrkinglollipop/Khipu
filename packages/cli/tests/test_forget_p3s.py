@@ -122,7 +122,8 @@ def store(tmp_path, monkeypatch):
 
 
 def _row(key, session, words="route the fake builds"):
-    return {"id": key, "session": session, "words": words, "status": "open", "target": None, "occurrence": 1}
+    return {"id": key, "session": session, "words": words, "status": "open", "target": None, "occurrence": 1,
+            "prompt_sha256": "synthetic-hash"}
 
 
 def _write(rows):

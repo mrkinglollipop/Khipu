@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
@@ -416,11 +416,12 @@ def try_hub_connect(
     return conn
 
 
-def open_snapshot() -> sqlite3.Connection:
+def open_snapshot(*, shared: bool = False) -> sqlite3.Connection:
     path = snapshot_path()
     if not path.is_file():
         raise FileNotFoundError(f"hub snapshot missing: {path}")
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    # Only the matrix reader opts into sharing, serialized by _MATRIX_LOCK.
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=not shared)
     cols = _snapshot_table_columns(con, "episodes")
     pending = _pending_erasure_ids(path)
     if "id" in cols:
@@ -618,40 +619,58 @@ def _purged_topic_marker(path: Path, slug: str) -> Path:
     return _purged_topics_dir(path) / hashlib.sha256(slug.encode("utf-8")).hexdigest()
 
 
+@contextmanager
+def _purge_marker_lock(path: Path):
+    """Serialize marker publication and removal, independently of sqlite's
+    refresh lock. A purge must be able to fence readers while that lock is busy.
+    The stable lock lives outside the directory whose entries are markers."""
+    import fcntl
+
+    fd = os.open(path.parent / ".hub_snapshot.purge-markers.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def _mark_purged_topic(slug: str, path: Path | None = None, *, hub_at: datetime | None = None) -> bool:
-    """Record a purged topic beside the replica before the replica is
-    touched, so an embedding catch-up whose replica write lands after the
-    purge can never put the topic back, even when the purge could not take
-    the lock. ``hub_at`` is the hub's clock when the purge was seen; a
-    recreated topic is judged against it, hub time to hub time, so this
-    Mac's clock cannot hide or resurrect it. Without it the marker file's
-    own time stands in."""
+    """Publish a purge fence before touching sqlite, even when its refresh
+    lock is busy. Hub time takes precedence over this Mac's clock. Atomic
+    replacement keeps every open descriptor an immutable marker version."""
     path = path or snapshot_path()
     marker = _purged_topic_marker(path, slug)
+    pending = None
     try:
         marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
+        fd, name = tempfile.mkstemp(prefix=".hub_snapshot.purge-marker-", dir=path.parent)
+        pending = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
             stamp = _utc(hub_at)
             body = slug if stamp is None else json.dumps({"slug": slug, "hub_at": stamp.isoformat()})
-            os.write(fd, body.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        dfd = os.open(marker.parent, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+            file.write(body)
+            file.flush()
+            os.fsync(file.fileno())
+        with _purge_marker_lock(path):
+            os.replace(pending, marker)
+            dfd = os.open(marker.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         return True
     except OSError:
         return False
+    finally:
+        if pending is not None:
+            try:
+                pending.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
-def _read_marker(marker: Path) -> tuple[str, datetime | None]:
-    """A marker's slug and recorded hub time. Older markers hold the bare
-    slug and no hub time."""
-    text = marker.read_text(encoding="utf-8")
+def _decode_marker(text: str) -> tuple[str, datetime | None]:
+    """Older markers hold only the bare slug, without a hub timestamp."""
     if text.startswith("{"):
         try:
             data = json.loads(text)
@@ -660,6 +679,35 @@ def _read_marker(marker: Path) -> tuple[str, datetime | None]:
         except ValueError:
             pass
     return text, None
+
+
+def _read_marker(marker: Path) -> tuple[str, datetime | None]:
+    return _decode_marker(marker.read_text(encoding="utf-8"))
+
+
+def _purge_marker_version(path: Path, slug: str) -> tuple[datetime, tuple[Any, ...]] | None:
+    """Capture freshness and deletion identity from the SAME open version.
+    Writers replace rather than truncate, so content cannot change under us.
+    Legacy file times are rounded to database/datetime microsecond precision."""
+    try:
+        with _purged_topic_marker(path, slug).open(encoding="utf-8") as file:
+            stat = os.fstat(file.fileno())
+            text = file.read()
+        _slug, hub_at = _decode_marker(text)
+        version = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, text)
+        stamp = hub_at or datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+        return stamp, version
+    except (OSError, UnicodeError):
+        return None
+
+
+def _clear_purge_marker_version(path: Path, slug: str, version: tuple[Any, ...]) -> None:
+    # The lock covers both comparison and unlink: a purge can publish before
+    # or after this critical section, never into the check/delete gap.
+    with _purge_marker_lock(path):
+        current = _purge_marker_version(path, slug)
+        if current is not None and current[1] == version:
+            _purged_topic_marker(path, slug).unlink(missing_ok=True)
 
 
 def _purged_topic_slugs(path: Path | None = None) -> set[str]:
@@ -686,36 +734,30 @@ def _purge_marker_time(path: Path, slug: str) -> float | None:
 
 
 def _purge_marker_stamp(path: Path, slug: str) -> datetime | None:
-    """When the purge happened, for comparing with a topic's ``updated_at``:
-    the hub time recorded in the marker, else the file's time at database
-    precision. None when the marker is gone."""
-    try:
-        _slug, hub_at = _read_marker(_purged_topic_marker(path, slug))
-    except (OSError, UnicodeError):
-        return None
-    if hub_at is not None:
-        return hub_at
-    marked_at = _purge_marker_time(path, slug)
-    # PostgreSQL timestamps and datetime have microsecond precision; compare
-    # the filesystem time at that same precision so rounding cannot turn
-    # equality into newer.
-    return None if marked_at is None else datetime.fromtimestamp(marked_at, timezone.utc)
+    """Hub purge time, or the same marker version's file time for legacy markers."""
+    marker = _purge_marker_version(path, slug)
+    return None if marker is None else marker[0]
 
 
 def _clear_purged_topics(path: Path | None = None, *, dumped_after: float) -> None:
-    """Drop the markers a full dump already reflects: the hub delete commits
-    before its marker is written, so a dump that began at or after a marker
-    cannot hold that topic unless it was legitimately created again."""
+    """Drop only markers reflected by the dump, without racing a new purge.
+    The hub delete commits before publication, so a dump begun at or after
+    the marker cannot hold the topic unless it was legitimately recreated."""
+    path = path or snapshot_path()
     try:
-        markers = list(_purged_topics_dir(path).iterdir())
-    except FileNotFoundError:
+        with _purge_marker_lock(path):
+            try:
+                markers = list(_purged_topics_dir(path).iterdir())
+            except FileNotFoundError:
+                return
+            for marker in markers:
+                try:
+                    if marker.stat().st_mtime <= dumped_after:
+                        marker.unlink()
+                except OSError:
+                    continue
+    except OSError:
         return
-    for marker in markers:
-        try:
-            if marker.stat().st_mtime <= dumped_after:
-                marker.unlink()
-        except OSError:
-            continue
 
 
 def _erase_episode_commitments(con: sqlite3.Connection, episode_id: int) -> None:
@@ -1578,15 +1620,15 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     slug = row.get("slug")
                     if slug is None:
                         continue
-                    marked_at = None
+                    marker_version = None
                     if slug in purged:
                         incoming = _utc(row.get("updated_at"))
                         # A marker a concurrent dump just cleared is no marker.
-                        marker_stamp = _purge_marker_stamp(path, slug)
-                        if marker_stamp is not None:
+                        marker = _purge_marker_version(path, slug)
+                        if marker is not None:
+                            marker_stamp, marker_version = marker
                             if incoming is None or incoming <= marker_stamp:
                                 continue
-                            marked_at = _purge_marker_time(path, slug)
                     old = con.execute("SELECT updated_at, deleted_at FROM topics WHERE slug = ?", (slug,)).fetchone()
                     if old is not None and row.get("deleted_at") is None:
                         held, incoming = _utc(old[0]), _utc(row.get("updated_at"))
@@ -1602,8 +1644,8 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                         vals,
                     )
                     _record_read_at(con, "topics", slug, read_at)
-                    if slug in purged and marked_at is not None:
-                        recreated[slug] = marked_at
+                    if slug in purged and marker_version is not None:
+                        recreated[slug] = marker_version
                     written += 1
                 if written or removed:
                     _advance_cursor(con, "topics", synced_at=_utcnow_iso(),
@@ -1640,11 +1682,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     _record_read_at(con, "project_aliases", "*", read_at)
             con.commit()
             if "topics" in wanted:
-                for slug, marked_at in recreated.items():
-                    # Clear only after the replacement row commits, and never
-                    # remove a marker a concurrent purge just refreshed.
-                    if _purge_marker_time(path, slug) == marked_at:
-                        _purged_topic_marker(path, slug).unlink(missing_ok=True)
+                for slug, marker_version in recreated.items():
+                    # Clear only the observed fence after the row commits.
+                    _clear_purge_marker_version(path, slug, marker_version)
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001 - reported as the failed parts
@@ -4661,6 +4701,14 @@ def stale_fields() -> dict[str, Any]:
     }
 
 
+def _topic_timestamp_expr(con: sqlite3.Connection) -> str:
+    """Hub event-date precedence, including replicas predating event_at."""
+    columns = _snapshot_table_columns(con, "topics")
+    available = [name for name in ("event_at", "updated_at", "created_at") if name in columns]
+    return ("COALESCE(" + ", ".join(available) + ")" if len(available) > 1
+            else available[0] if available else "NULL")
+
+
 def _episode_ilike_columns() -> tuple[str, ...]:
     return (
         "summary",
@@ -4949,14 +4997,15 @@ def search_snapshot(
             return None
 
     if topic_n > 0:
+        topic_ts = _topic_timestamp_expr(con)
         topic_time_clause = ""
         topic_time_params: list[Any] = []
         if time_filtered:
-            topic_time_clause = " AND khipu_in_range(COALESCE(updated_at, created_at), ?, ?)"
+            topic_time_clause = f" AND khipu_in_range({topic_ts}, ?, ?)"
             topic_time_params.extend((since_dt.isoformat() if since_dt else None, until_dt.isoformat() if until_dt else None))
         sql = f"""
             SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
-                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts
+                   body AS snippet, {topic_ts} AS ts
             FROM topics
             WHERE deleted_at IS NULL AND ({topic_where}){topic_time_clause}
             ORDER BY {topic_order}
@@ -4965,7 +5014,7 @@ def search_snapshot(
         rows = fts_rows(
             f"""
             SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
-                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts
+                   body AS snippet, {topic_ts} AS ts
             FROM {_fts_coverage_sql("topics_fts", len(match_terms))} c
             JOIN topics ON topics.rowid = c.rid
             WHERE deleted_at IS NULL{topic_time_clause}
@@ -4987,6 +5036,7 @@ def search_snapshot(
                     "id": r[1],
                     "label": clip_snippet(r[2], LABEL_LIMIT),
                     "snippet": clip_snippet(r[3], SNIPPET_LIMIT),
+                    **({"rank_text": f"{r[1]} {r[2] or ''} {r[3] or ''}"} if indexed_tokens_only else {}),
                 }
             )
 
@@ -5018,7 +5068,9 @@ def search_snapshot(
         sql = f"""
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
                    summary AS snippet, ts, {session_expr} AS sid,
-                   {project_expr} AS proj, {harness_expr} AS harn
+                   {project_expr} AS proj, {harness_expr} AS harn,
+                   COALESCE(topics, '') || char(10) || COALESCE(decisions, '') || char(10) ||
+                   COALESCE(preferences, '') || char(10) || COALESCE(people, '') AS extracts
             FROM episodes
             WHERE {ep_live}({episode_where}) AND ({t3_predicate}){identity_clause}
             ORDER BY {episode_order}
@@ -5034,7 +5086,9 @@ def search_snapshot(
             f"""
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
                    summary AS snippet, ts, {session_expr} AS sid,
-                   {project_expr} AS proj, {harness_expr} AS harn
+                   {project_expr} AS proj, {harness_expr} AS harn,
+                   COALESCE(topics, '') || char(10) || COALESCE(decisions, '') || char(10) ||
+                   COALESCE(preferences, '') || char(10) || COALESCE(people, '') AS extracts
             FROM {_fts_coverage_sql("episodes_fts", len(match_terms))} c
             JOIN episodes ON episodes.id = c.rid
             WHERE {ep_live}({t3_predicate}){identity_clause}
@@ -5065,6 +5119,7 @@ def search_snapshot(
                     "id": r[1],
                     "label": clip_snippet(r[2], LABEL_LIMIT),
                     "snippet": clip_snippet(r[3], SNIPPET_LIMIT),
+                    **({"rank_text": f"{r[2] or ''} {r[8] or ''}"} if indexed_tokens_only else {}),
                 }
             )
 
@@ -5311,10 +5366,10 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
                 SELECT e.src, e.dst, e.type, e.weight
                 FROM edges e
                 WHERE e.src IN ({ph}) OR e.dst IN ({ph})
-                ORDER BY e.type ASC
+                ORDER BY (CASE WHEN e.src IN ({ph}) THEN e.dst ELSE e.src END) ASC, e.type ASC
                 LIMIT ?
                 """,
-                (*aliases, *aliases, limit),
+                (*aliases, *aliases, *aliases, limit),
             ).fetchall()
         merged = synthetic + [
             {"src": a, "dst": b, "type": t, "weight": w} for a, b, t, w in sql_edges
@@ -5338,7 +5393,7 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
             if not frontier:
                 break
             ph = ", ".join("?" * len(frontier))
-            batch = list(frontier)
+            batch = sorted(frontier)
             rows = con.execute(
                 f"""
                 SELECT src, dst, type FROM edges
@@ -5346,29 +5401,24 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
                 """,
                 (*batch, *batch),
             ).fetchall()
+            candidates = sorted(
+                (other, etype, node)
+                for src, dst, etype in rows for node in batch
+                for other in ([dst] if src == node else [src] if dst == node else [])
+            )
             next_frontier: set[str] = set()
-            for src, dst, etype in rows:
-                for node in batch:
-                    if src == node:
-                        other, via = dst, src
-                    elif dst == node:
-                        other, via = src, dst
-                    else:
-                        continue
-                    if other in seen_nodes:
-                        continue
-                    seen_nodes.add(other)
-                    walk.append((other, via, etype, hop))
-                    next_frontier.add(other)
-                    if len(walk) >= limit:
-                        break
+            for other, etype, node in candidates:
+                if other in seen_nodes:
+                    continue
+                seen_nodes.add(other)
+                walk.append((other, node, etype, hop))
+                next_frontier.add(other)
                 if len(walk) >= limit:
                     break
             frontier = next_frontier
             if len(walk) >= limit:
                 break
         walk_rows = [(a, b, t, h) for a, b, t, h in walk[:limit]]
-
     synthetic_walk = [
         {"node_id": e["dst"], "via": e["src"], "type": e["type"], "hops": 1}
         for e in synthetic
@@ -5634,7 +5684,7 @@ def semantic_search_snapshot(
         ts_val = None
         if knd == "topic":
             trow = con.execute(
-                "SELECT COALESCE(title, slug), COALESCE(updated_at, created_at) "
+                f"SELECT COALESCE(title, slug), {_topic_timestamp_expr(con)} "
                 "FROM topics WHERE slug = ? AND deleted_at IS NULL",
                 (ref,),
             ).fetchone()
@@ -5911,14 +5961,85 @@ def active_snapshot_profile() -> str | None:
 # keyed by the replica's identity: a refresh replaces the file and an
 # incremental write moves its mtime or size, and either one misses and reloads.
 _MATRIX_LOCK = threading.Lock()
-_MATRIX_CACHE: dict[str, Any] = {}
+
+
+def _close_matrix_reader(reader: dict[str, Any] | None) -> None:
+    if reader and reader.get("con") is not None:
+        reader["con"].close()
+        reader.clear()
+
+
+class _MatrixCache(dict):
+    def clear(self) -> None:
+        _close_matrix_reader(self.get("reader"))
+        super().clear()
+
+
+_MATRIX_CACHE: dict[str, Any] = _MatrixCache()
 _MATRIX_RELOADING = False
+
+
+def _matrix_file_identity(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return st.st_dev, st.st_ino
+
+
+def _matrix_tombstone_sources(con: sqlite3.Connection) -> list[tuple[str, str, str]]:
+    return [(table, key, knd)
+            for table, key, knd in (("episodes", "id", "episode"), ("topics", "slug", "topic"))
+            if {key, "deleted_at"} <= _snapshot_table_columns(con, table)]
+
+
+def _open_matrix_reader(path: Path) -> dict[str, Any]:
+    identity = _matrix_file_identity(path)
+    con = open_snapshot(shared=True)
+    try:
+        if _matrix_file_identity(path) != identity:
+            raise OSError("replica replaced while opening matrix reader")
+        return {"con": con, "identity": identity,
+                "sources": _matrix_tombstone_sources(con),
+                "schema_version": con.execute("PRAGMA schema_version").fetchone()[0]}
+    except BaseException:
+        con.close()
+        raise
+
+
+def _current_matrix_rows(path: Path, rows: list, reader: dict[str, Any]) -> list:
+    """Called only under _MATRIX_LOCK; no vector reload or held read transaction.
+
+    The existing load connection also observes current tombstones. data_version
+    notices commits by other connections, including WAL-only changes; replacing
+    the file reopens this lightweight reader before any candidate budget.
+    """
+    if not reader:
+        return rows  # A supplied matrix without an underlying snapshot reader.
+    if reader["identity"] != _matrix_file_identity(path):
+        replacement = _open_matrix_reader(path)
+        _close_matrix_reader(reader)
+        reader.update(replacement)
+    con = reader["con"]
+    version = con.execute("PRAGMA data_version").fetchone()[0]
+    if reader.get("version") != version or "deleted" not in reader:
+        schema_version = con.execute("PRAGMA schema_version").fetchone()[0]
+        if reader.get("schema_version") != schema_version:
+            reader.update(sources=_matrix_tombstone_sources(con), schema_version=schema_version)
+        deleted = {}
+        for table, key, knd in reader["sources"]:
+            deleted[knd] = {str(r[0]) for r in con.execute(
+                f"SELECT {key} FROM main.{table} WHERE deleted_at IS NOT NULL"
+            ).fetchall()}
+        reader.update(version=version, deleted=deleted)
+    deleted = reader["deleted"]
+    return [r for r in rows if str(r[2]) not in deleted.get(r[1], set())]
 
 
 def _load_matrix(
     path: Path, profile: str, kind: str | None, *, deadline: float | None = None,
+    reader: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[Any, ...]], dict[int, tuple[str, str, int, str]]]:
-    con = open_snapshot()
+    opened = _open_matrix_reader(path)
+    con = opened["con"]
+    retained = False
     if deadline is not None:
         con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     try:
@@ -5941,8 +6062,14 @@ def _load_matrix(
             f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL{topic_live}",
             params,
         ).fetchall()
+        if reader is not None:
+            # A load deadline must not poison this long-lived metadata reader.
+            con.set_progress_handler(None, 0)
+            reader.update(opened)
+            retained = True
     finally:
-        con.close()
+        if not retained:
+            con.close()
     # Stored vectors are L2-normalized on the write path (embed_batch,
     # every shipped profile has normalize='l2'), so the rows are scored as
     # read. Re-normalizing 16,000 rows in Python here cost about a second
@@ -5956,8 +6083,9 @@ def _load_matrix(
 
 def _reload_matrix(path: Path, profile: str, kind: str | None, key: tuple[Any, ...]) -> None:
     global _MATRIX_RELOADING
+    reader: dict[str, Any] = {}
     try:
-        rows, by_rowid = _load_matrix(path, profile, kind)
+        rows, by_rowid = _load_matrix(path, profile, kind, reader=reader)
     except Exception as exc:  # noqa: BLE001 — the stale generation keeps serving
         _log(f"replica matrix background reload failed: {type(exc).__name__}: {exc}")
         rows = None
@@ -5966,7 +6094,10 @@ def _reload_matrix(path: Path, profile: str, kind: str | None, key: tuple[Any, .
         # A synchronous load for another profile may have replaced the entry
         # meanwhile; only a newer generation of the same one is swapped in.
         if rows is not None and old is not None and old[0] == key[0] and old[3:] == key[3:]:
-            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})
+            _close_matrix_reader(_MATRIX_CACHE.get("reader"))
+            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid, "reader": reader})
+        else:
+            _close_matrix_reader(reader)
         _MATRIX_RELOADING = False
 
 
@@ -5981,8 +6112,9 @@ def _matrix_rows(
     Every incremental replica write (each capture, the queue drain every 300 s)
     moves the key, and a synchronous reload costs about a second: the next
     prompt then lost its cosine leg (2026-10-12). So a changed file is served
-    from the previous generation, one write behind (a write only adds rows),
-    while exactly one daemon thread loads the new one outside the lock."""
+    from the previous vector generation while exactly one daemon thread loads
+    the new one outside the lock. Current tombstones are observed separately
+    through the retained reader before any cached candidates are returned."""
     global _MATRIX_RELOADING
     try:
         st = path.stat()
@@ -5995,19 +6127,24 @@ def _matrix_rows(
     try:
         cached = _MATRIX_CACHE.get("key")
         if key is not None and cached == key:
-            return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
+            return (_current_matrix_rows(path, _MATRIX_CACHE["rows"], _MATRIX_CACHE.get("reader", {})),
+                    _MATRIX_CACHE["by_rowid"])
         if key is not None and cached is not None and cached[0] == key[0] and cached[3:] == key[3:]:
             if not _MATRIX_RELOADING:
                 _MATRIX_RELOADING = True
                 threading.Thread(
                     target=_reload_matrix, args=(path, profile, kind, key), daemon=True,
                 ).start()
-            return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
-        rows, by_rowid = _load_matrix(path, profile, kind, deadline=deadline)
+            return (_current_matrix_rows(path, _MATRIX_CACHE["rows"], _MATRIX_CACHE.get("reader", {})),
+                    _MATRIX_CACHE["by_rowid"])
+        reader: dict[str, Any] = {}
+        rows, by_rowid = _load_matrix(path, profile, kind, deadline=deadline, reader=reader)
         _MATRIX_CACHE.clear()
         if key is not None:
-            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})
-        return rows, by_rowid
+            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid, "reader": reader})
+        else:
+            _close_matrix_reader(reader)
+        return _current_matrix_rows(path, rows, reader), by_rowid
     finally:
         _MATRIX_LOCK.release()
 
@@ -6054,6 +6191,8 @@ def cosine_candidates_snapshot(
     rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind)
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("replica scan deadline expired")
+    # Pending erasures are a separate owner-choice fence even while a SQLite
+    # source row is still live. _matrix_rows fences current DB tombstones.
     pending = {str(i) for i in _pending_erasure_ids(snapshot_path())}
     rows = [r for r in rows if r[1] != "episode" or str(r[2]) not in pending]
     # Stored vectors are unit length (see _matrix_rows); only the query is
@@ -6116,6 +6255,34 @@ def _topic_routing_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
     return item
 
 
+def snapshot_filter_live_sources(
+    con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fence source liveness before fusion limits, without metadata enrichment.
+
+    Real snapshot readers always return SQLite connections. A synthetic caller
+    supplying a metadata stand-in can keep its own source contract.
+    """
+    if not rows or not isinstance(con, sqlite3.Connection):
+        return list(rows)
+    live: dict[str, set[str]] = {}
+    for knd, table, key in (("episode", "episodes", "id"), ("topic", "topics", "slug")):
+        ids = sorted({str(r["id"]) for r in rows if r.get("kind") == knd})
+        if not ids:
+            continue
+        columns = _snapshot_table_columns(con, table)
+        live[knd] = set()
+        if key not in columns:
+            continue
+        predicate = " AND deleted_at IS NULL" if "deleted_at" in columns else ""
+        live[knd] = {str(r[0]) for r in con.execute(
+            f"SELECT {key} FROM {table} WHERE CAST({key} AS TEXT) IN "
+            f"({','.join('?' for _ in ids)}){predicate}", ids,
+        )}
+    return [r for r in rows if r.get("kind") not in live
+            or str(r["id"]) in live[r["kind"]]]
+
+
 def snapshot_row_metadata(
     con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -6156,14 +6323,7 @@ def snapshot_row_metadata(
         topic_cols = _snapshot_table_columns(con, "topics")
         if "slug" in topic_cols:
             placeholders = ",".join("?" for _ in topic_ids)
-            if {"updated_at", "created_at"} <= topic_cols:
-                ts_expr = "COALESCE(updated_at, created_at)"
-            elif "updated_at" in topic_cols:
-                ts_expr = "updated_at"
-            elif "created_at" in topic_cols:
-                ts_expr = "created_at"
-            else:
-                ts_expr = "NULL"
+            ts_expr = _topic_timestamp_expr(con)
             status_expr = "status" if "status" in topic_cols else "NULL"
             frontmatter_expr = "frontmatter" if "frontmatter" in topic_cols else "NULL"
             deleted_expr = "deleted_at" if "deleted_at" in topic_cols else "NULL"

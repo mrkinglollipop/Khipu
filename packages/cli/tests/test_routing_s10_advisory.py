@@ -409,7 +409,7 @@ def test_10_confirming_old_edit_clears_only_its_long_pending_flag(replay, monkey
     replay.advance(25 * 3600)
     expect(any(f.get("kind") == "long_pending" for f in flags(replay, "rule_hygiene", "mcp")),
            True, "10: old edit has no pending flag before confirmation")
-    routing.confirm_rule(rule["n"], via="app")
+    routing.confirm_rule(rule["n"], via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == rule["n"]))
     assert not any(f.get("kind") == "long_pending" for f in flags(replay, "rule_hygiene", "mcp"))
 
 
