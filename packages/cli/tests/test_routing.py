@@ -905,7 +905,7 @@ def test_the_seed_imports_once(home):
     assert sum(1 for e in events if e["type"] == "seed_import") == 1
     assert sum(1 for e in events if e["type"] == "rule_add") == 2
     before = routing.read_view()["version"]
-    routing.confirm_rule(1, via="app")
+    routing.confirm_rule(1, via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 1))
     view = routing.read_view()
     assert (view["rules"][0]["confirmed"], view["rules"][1]["confirmed"]) == (True, False)
     assert view["version"] == before + 1, "a confirmed rule is pushed again without its seeded mark"
@@ -2235,7 +2235,7 @@ def test_owner_requested_rules_are_live_pending_and_owner_can_confirm_undo_or_di
     assert delta["entities"] == ["rule:1"] and "owner has not confirmed" in delta["lines"][0]
     assert routing.read_view()["rules"][0]["pending_kind"] == "added"
     assert routing.doctor_block()["pending_conversation_rules"] == 1
-    routing.confirm_rule(1, via="app")
+    routing.confirm_rule(1, via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 1))
     confirmed = routing.read_view()["rules"][0]
     assert not confirmed["pending"] and confirmed["prior_text"] is None
 
@@ -2253,7 +2253,7 @@ def test_owner_requested_rules_are_live_pending_and_owner_can_confirm_undo_or_di
     account_delta = routing.conversation_view(since_version=before_edit, account="Codex")
     assert account_delta["entities"] == ["rule:2"]
     assert "it replaced: “Original wording.”" in account_delta["lines"][0]
-    routing.confirm_rule(2, via="app")
+    routing.confirm_rule(2, via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 2))
     assert "owner has not confirmed" not in routing.summary()["text"]
     assert "it replaced: “Original wording.”" not in routing.summary()["text"]
     # Confirming made "Second replacement." the owner's wording, so Undo of
@@ -2624,7 +2624,7 @@ def test_a_conversation_replaces_another_conversations_unconfirmed_change(home, 
     # resolves it, another conversation may ask again.
     shown = routing.conversation_view()
     routing.request_rule("Theirs, refined.", n=1, author=OTHER, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
-    routing.confirm_rule(1, via="app")
+    routing.confirm_rule(1, via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 1))
     shown = routing.conversation_view()
     routing.request_rule("Mine.", n=1, author=ME, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
     assert routing.read_view()["rules"][0]["prior_text"] == "Theirs, refined."
@@ -2673,7 +2673,7 @@ def test_doctor_counts_a_pending_change_of_a_confirmed_seeded_rule_once(home, mo
     monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     routing._write({"type": "rule_add", "n": 1, "text": "Seeded rule.", "seeded": True,
                     "source": "seed", "date": "2026-10-14", "written_by": {"kind": "seed"}, "via": "seed"})
-    routing.confirm_rule(1, via="app")
+    routing.confirm_rule(1, via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 1))
     shown = routing.conversation_view()
     routing.request_rule("Requested change.", n=1, author=ME, base=next(r["owner_revision"] for r in shown["rules"] if r["n"] == 1))
     block = routing.doctor_block()

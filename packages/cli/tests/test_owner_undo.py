@@ -77,7 +77,9 @@ def test_rule_confirm_undo_reuses_its_original_hold_choice(world):
     pending = routing.request_rule("Grok new rule", n=1, owner_request="the owner asked", author=REPORTER, via="mcp", base=shown["rules"][0]["owner_revision"])
     assert pending["ok"] is True
     world.say("confirm Grok's edited rule")
-    rc, out = world.run(["route", "rule", "confirm", "1", "--holds=" + json.dumps(choices)], True)
+    revision = next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 1)
+    rc, out = world.run(["route", "rule", "confirm", "1", "--expect", revision,
+                         "--holds=" + json.dumps(choices)], True)
     assert rc == 0, out
     (line,) = owner_direction.actions()
     assert line["facts"]["holds"] == choices and line["before"]["pending_kind"] == "changed"

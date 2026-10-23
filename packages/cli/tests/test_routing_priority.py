@@ -674,10 +674,11 @@ def test_an_owner_write_that_skipped_the_check_shows_as_unchecked(home, capsys):
     from khipu import cli
 
     _owner_world(home, capsys)
-    assert cli.main(["route", "rule", "--from-app", "--", "confirm", "1"]) == 0
+    rule_revision = next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 1)
+    assert cli.main(["route", "rule", "--from-app", "--expect", rule_revision, "--", "confirm", "1"]) == 0
     # Imported and called directly, as a conversation could: no check ran.
     routing.confirm_priority(via="app", expect=routing.priority_version())
-    routing.confirm_rule(2, via="app")
+    routing.confirm_rule(2, via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 2))
     view = routing.read_view()
     assert view["priority"]["via"] == "app-unchecked"
     assert view["unchecked"] == ["priority", "rule 2"]

@@ -91,7 +91,8 @@ def test_nonobject_arguments_are_protocol_errors(args):
 def seed_direction():
     did = "rd-00000000000000aa"
     routing_directions._save({"directions": {did: {"id": did, "session": "fixture", "words": "fixture",
-                                                 "status": "open", "at": 1, "occurrence": 1}}})
+                                                 "status": "open", "at": 1, "occurrence": 1,
+                                                 "prompt_sha256": "synthetic-hash"}}})
     return did
 
 

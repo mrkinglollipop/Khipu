@@ -1766,7 +1766,7 @@ function RuleRow({
               className="primary sm"
               disabled={w.isBusy(id)}
               onClick={async () => {
-                if (await attempt(id, "khipu_route_rule", { action: "confirm", ...ruleTarget(r) }, null, undefined, close)) close();
+                if (await attempt(id, "khipu_route_rule", { action: "confirm", ...ruleTarget(r), expect: r.revision }, null, undefined, close)) close();
               }}
             >
               <Busy on={w.isBusy(id)} />
@@ -2255,7 +2255,7 @@ function ProposalRowView({
     ruleMissing
       ? refuse(confirmId)
       : p.kind === "rule" && rule
-        ? attempt(confirmId, "khipu_route_rule", { action: "confirm", ...ruleTarget(rule) })
+        ? attempt(confirmId, "khipu_route_rule", { action: "confirm", ...ruleTarget(rule), expect: rule.revision })
         : attempt(confirmId, "khipu_route_priority", { action: "confirm", expect });
   const dismiss = () =>
     ruleMissing

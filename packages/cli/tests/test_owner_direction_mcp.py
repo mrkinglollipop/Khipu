@@ -240,7 +240,8 @@ def test_a_pending_rule_confirmed_by_direction(world):
     n = _pending_rule()
     world.say("yes, keep that rule", session="s-1")
     world.server("s-1")
-    is_error, out = _act("route.rule.confirm", {"rule": n})
+    revision = next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == n)
+    is_error, out = _act("route.rule.confirm", {"rule": n, "expect": revision})
     assert not is_error and out["ok"] is True, out
     (rule,) = routing.read_view()["rules"]
     assert rule["pending"] is False
