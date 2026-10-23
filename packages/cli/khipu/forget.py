@@ -27,6 +27,15 @@ readable through every other reader. Steps 4-5 close that; every reader
 forgotten episode's rows, so this cascade is belt-and-suspenders cleanup,
 not the only thing standing between a forgotten row and a reader.
 
+Fact provenance (migration 0047, docs/plans/2026-10-23-fact-provenance.md):
+on a hub with ``fact_claims`` steps 3-5 act through claims instead. The
+episode's claims are deleted and every fact it claimed or anchored is
+re-projected (``provenance.project``): a fact another live episode or the
+owner also claims keeps that claimant's wording, and only a fact left with no
+live or owner claim is closed, retracted or deleted as above. A project the
+legacy witness backfill has not covered is backfilled first, in the same
+transaction.
+
 Topic nodes and edges in the graph are shared by every episode that mentions
 the topic and carry no episode provenance, so they are left alone and the
 result says so.
@@ -93,6 +102,84 @@ def _decision_evidence_ready(cur) -> bool:
         return has_columns(cur, "decisions", "retracted_at", "retract_reason")
     except Exception:  # noqa: BLE001 — introspection is best-effort
         return False
+
+
+def _provenance_ready(cur) -> bool:
+    """Whether the hub records fact claims (migration 0047); positive-only.
+    A probe that fails reads as not ready, and the hub's forget gate then
+    refuses the tombstone of a claimed episode, so nothing half-forgets."""
+    try:
+        from khipu import provenance
+
+        return provenance.ready(cur)
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+_FACT_TABLES = (("commitment", "commitments"), ("decision", "decisions"), ("deliverable", "deliverables"))
+
+
+def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
+    """Section 3.4's forget: the episode row is already locked FOR UPDATE.
+    Lock every fact the episode claims or anchors in ``(kind, id)`` order,
+    run the project's witness backfill when it has not run yet (section 4:
+    a legacy restater gets its claim before the forget decides anything),
+    then delete the episode's claims and project each fact. The tombstone is
+    already set in this transaction, so the backfill never credits the
+    forgotten episode itself. Counts are what the
+    projection retired: open commitments closed as forgotten, decisions
+    retracted as forgotten, deliverables deleted."""
+    from khipu import provenance
+
+    cur.execute(
+        "SELECT kind, fact_id FROM fact_claims WHERE episode_id = %(e)s "
+        "UNION SELECT 'commitment', id FROM commitments WHERE opened_episode = %(e)s "
+        "UNION SELECT 'decision', id FROM decisions WHERE episode_id = %(e)s "
+        "UNION SELECT 'deliverable', id FROM deliverables WHERE episode_id = %(e)s",
+        {"e": episode_id},
+    )
+    facts: dict[str, list[int]] = {}
+    for kind, fact_id in cur.fetchall():
+        facts.setdefault(kind, []).append(int(fact_id))
+    before: dict[tuple[str, int], Any] = {}
+    for kind, table in _FACT_TABLES:
+        ids = sorted(facts.get(kind) or [])
+        if not ids:
+            continue
+        state = {"commitment": "status IN ('open', 'stale')", "decision": "retracted_at IS NULL",
+                 "deliverable": "true"}[kind]
+        cur.execute(f"SELECT id, {state} FROM {table} WHERE id = ANY(%s) ORDER BY id FOR UPDATE", (ids,))
+        for fact_id, live in cur.fetchall():
+            before[(kind, int(fact_id))] = bool(live)
+    cur.execute("SELECT project FROM episodes WHERE id = %s", (episode_id,))
+    row = cur.fetchone()
+    backfill = provenance.ensure_backfilled(cur, row[0] if row else None)
+    cur.execute("DELETE FROM fact_claims WHERE episode_id = %s", (episode_id,))
+    out = {"commitments_closed": 0, "commitment_vectors_removed": 0, "deliverables_removed": 0,
+           "decisions_retracted": 0, "facts_reprojected": 0, "backfill": backfill}
+    retired: list[int] = []
+    for kind, _table in _FACT_TABLES:
+        for fact_id in sorted(facts.get(kind) or []):
+            if (kind, fact_id) not in before:
+                continue
+            result = provenance.project(cur, kind, fact_id)
+            out["facts_reprojected"] += 1
+            if result == "deleted":
+                out["deliverables_removed"] += 1
+            elif result == "retired" and before[(kind, fact_id)]:
+                if kind == "commitment":
+                    out["commitments_closed"] += 1
+                else:
+                    out["decisions_retracted"] += 1
+            if result == "retired" and kind == "commitment":
+                retired.append(fact_id)
+    if retired:
+        # A retired commitment keeps its (forgotten) text on the row for the
+        # reader fences; its vector goes, as the old cascade did.
+        cur.execute("DELETE FROM memory_embeddings WHERE kind = 'commitment' AND ref = ANY(%s)",
+                    ([str(i) for i in retired],))
+        out["commitment_vectors_removed"] = cur.rowcount
+    return out
 
 
 def _briefs_ready(cur) -> bool:
@@ -208,32 +295,44 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         (str(episode_id),),
     )
     embeddings_removed = cur.rowcount
-    cur.execute(
-        "DELETE FROM memory_embeddings WHERE kind = 'commitment' AND ref IN "
-        "(SELECT id::text FROM commitments WHERE opened_episode = %s)",
-        (episode_id,),
-    )
-    commitment_vectors_removed = cur.rowcount
-    cur.execute(
-        "UPDATE commitments SET status = 'closed', closed_at = now(), "
-        "close_reason = 'forgotten' WHERE opened_episode = %s AND status IN ('open', 'stale')",
-        (episode_id,),
-    )
-    commitments_closed = cur.rowcount
-
-    deliverables_removed = 0
-    if _deliverables_ready(cur):
-        cur.execute("DELETE FROM deliverables WHERE episode_id = %s", (episode_id,))
-        deliverables_removed = cur.rowcount
-
-    decisions_retracted = 0
-    if _decision_evidence_ready(cur):
+    provenance_out = None
+    if _provenance_ready(cur):
+        # Fact provenance (0047): the episode's claims go and each fact it
+        # claimed is re-projected from the claims that are left. A fact
+        # another live episode or the owner also claims keeps that wording;
+        # one with no live claim left retires exactly as below.
+        provenance_out = _forget_claims(cur, episode_id)
+        commitment_vectors_removed = provenance_out["commitment_vectors_removed"]
+        commitments_closed = provenance_out["commitments_closed"]
+        deliverables_removed = provenance_out["deliverables_removed"]
+        decisions_retracted = provenance_out["decisions_retracted"]
+    else:
         cur.execute(
-            "UPDATE decisions SET retracted_at = now(), retract_reason = 'forgotten' "
-            "WHERE episode_id = %s AND retracted_at IS NULL",
+            "DELETE FROM memory_embeddings WHERE kind = 'commitment' AND ref IN "
+            "(SELECT id::text FROM commitments WHERE opened_episode = %s)",
             (episode_id,),
         )
-        decisions_retracted = cur.rowcount
+        commitment_vectors_removed = cur.rowcount
+        cur.execute(
+            "UPDATE commitments SET status = 'closed', closed_at = now(), "
+            "close_reason = 'forgotten' WHERE opened_episode = %s AND status IN ('open', 'stale')",
+            (episode_id,),
+        )
+        commitments_closed = cur.rowcount
+
+        deliverables_removed = 0
+        if _deliverables_ready(cur):
+            cur.execute("DELETE FROM deliverables WHERE episode_id = %s", (episode_id,))
+            deliverables_removed = cur.rowcount
+
+        decisions_retracted = 0
+        if _decision_evidence_ready(cur):
+            cur.execute(
+                "UPDATE decisions SET retracted_at = now(), retract_reason = 'forgotten' "
+                "WHERE episode_id = %s AND retracted_at IS NULL",
+                (episode_id,),
+            )
+            decisions_retracted = cur.rowcount
 
     briefs_staled = 0
     if _briefs_ready(cur):
@@ -258,6 +357,8 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "deliverables_removed": deliverables_removed,
         "decisions_retracted": decisions_retracted,
         "briefs_staled": briefs_staled,
+        "facts_reprojected": (provenance_out or {}).get("facts_reprojected", 0),
+        "provenance_backfill": (provenance_out or {}).get("backfill"),
         "graph": "topic nodes are shared across episodes; none removed",
         "identity": live,
         "legacy_identities": legacy_identities,

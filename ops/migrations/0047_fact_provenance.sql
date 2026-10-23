@@ -324,6 +324,13 @@ BEGIN
         WHERE fc.kind = 'commitment' AND fc.fact_id = p_id AND fc.field = 'pr'
           AND ((fc.claimant = 'episode' AND e.deleted_at IS NULL AND e.id IS NOT NULL)
                OR fc.claimant = 'owner');
+        -- prs NULL means "not parsed yet" (a row from before 0034): it stays
+        -- NULL until close_rules.backfill_prs records the anchor's numbers as
+        -- claims and marks it parsed. Any PR claim makes it parsed.
+        IF c.prs IS NULL AND NOT EXISTS (
+            SELECT 1 FROM fact_claims fc WHERE fc.kind = 'commitment' AND fc.fact_id = p_id AND fc.field = 'pr') THEN
+            v_prs := NULL;
+        END IF;
 
         -- In the order the refs were first claimed: the order the writer
         -- appended them to pr_check.refs before claims existed.
@@ -469,16 +476,14 @@ CROSS JOIN LATERAL unnest(coalesce(c.prs, '{}'::INTEGER[])) AS n
 WHERE n IS NOT NULL
 ON CONFLICT DO NOTHING;
 
--- A row whose prs was never parsed (NULL, from before 0034): its one writer,
--- close_rules.backfill_prs, would store parse_prs(text), the anchor's own
--- words; the numbers the stricter khipu_text_prs finds are proven.
-INSERT INTO fact_claims (kind, fact_id, field, value, claimant, episode_id)
-SELECT 'commitment', c.id, 'pr', n::TEXT, 'episode', c.opened_episode
-FROM commitments c
-JOIN episodes e ON e.id = c.opened_episode AND e.deleted_at IS NULL
-CROSS JOIN LATERAL unnest(khipu_text_prs(c.text)) AS n
-WHERE c.prs IS NULL
-ON CONFLICT DO NOTHING;
+-- A row whose prs was never parsed (NULL, from before 0034) keeps NULL: its
+-- one writer, close_rules.backfill_prs, stores parse_prs(text) (the anchor's
+-- own words, read by the exact Python parser rather than the stricter SQL
+-- one) as the anchor's claims after this migration. A text with no "pr" or
+-- "pull" in it names no PR under any reading, so it is settled here as
+-- parsed and empty.
+UPDATE commitments SET prs = '{}'
+WHERE prs IS NULL AND text !~ '[pP][rR]|[pP][uU][lL][lL]';
 
 INSERT INTO fact_claims (kind, fact_id, field, value, claimant, episode_id)
 SELECT 'commitment', c.id, 'pr_ref', r.value,

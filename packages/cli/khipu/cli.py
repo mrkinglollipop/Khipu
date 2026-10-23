@@ -2794,6 +2794,19 @@ def cmd_episode(args: argparse.Namespace) -> int:
     return 0 if out.get("ok") and snapshot_ok and legacy_ok else 1
 
 
+def cmd_provenance(args: argparse.Namespace) -> int:
+    """`khipu provenance backfill`: fact provenance's legacy witness backfill
+    (docs/plans/2026-10-23-fact-provenance.md, section 4) over every project
+    not yet covered. The nightly runs it too until all are."""
+    from khipu import provenance
+    from khipu.db import connect
+
+    with connect() as conn:
+        out = provenance.backfill(conn)
+    print(json.dumps(out, default=str))
+    return 0 if out.get("ok") else 1
+
+
 def cmd_topic(args: argparse.Namespace) -> int:
     """W5.6: `khipu topic purge SLUG --yes` — hard-delete a TOMBSTONED topic
     (deleted_at already set) and its revisions/embeddings. The command a
@@ -5959,6 +5972,11 @@ def build_parser() -> argparse.ArgumentParser:
     ep_edit.add_argument("id", type=int)
     ep_edit.add_argument("--summary", required=True, help="Replacement summary text")
     ep.set_defaults(func=cmd_episode)
+
+    pv = sub.add_parser("provenance", help="Fact provenance maintenance (migration 0047)")
+    pv_sub = pv.add_subparsers(dest="provenance_cmd", required=True)
+    pv_sub.add_parser("backfill", help="Prove legacy restaters' claims, project by project")
+    pv.set_defaults(func=cmd_provenance)
 
     tp = sub.add_parser("topic", help="Topic maintenance (memory reliability W5.6)")
     tp_sub = tp.add_subparsers(dest="topic_cmd", required=True)

@@ -1126,6 +1126,14 @@ def _claim_restatement(cur, commitment_id: int, episode_id: int, text: str, proj
     from khipu import provenance
     from khipu.close_rules import parse_prs, pr_requirement_labels
 
+    cur.execute("SELECT prs IS NULL FROM commitments WHERE id = %s", (commitment_id,))
+    if cur.fetchone()[0]:
+        # Never parsed (a row from before 0034): the item's own numbers first,
+        # as close_rules.backfill_prs would store them, so this restatement's
+        # numbers add to them rather than stand in for them.
+        from khipu.close_rules import claim_text_prs
+
+        claim_text_prs(cur, commitment_id)
     provenance.record_claim(cur, "commitment", commitment_id, "restatement", text, episode_id=episode_id)
     for n in parse_prs(text):
         provenance.record_claim(cur, "commitment", commitment_id, "pr", n, episode_id=episode_id)

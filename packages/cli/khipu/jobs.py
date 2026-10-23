@@ -763,8 +763,25 @@ def _mark_stale_commitments() -> dict[str, Any]:
     return out
 
 
+def _provenance_backfill(conn) -> dict[str, Any]:
+    """``khipu provenance backfill`` inside the nightly's close-rules step,
+    until every project is covered. Fail-open: an error is reported and the
+    rules still run."""
+    try:
+        from khipu import provenance
+
+        return provenance.backfill(conn)
+    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+
+
 def _commitment_close_rules() -> dict[str, Any]:
-    """Owed slice 2: fill ``prs`` on rows from before migration 0034, then
+    """Owed slice 2: the fact-provenance witness backfill while projects
+    are pending, fill ``prs`` on rows from before migration 0034, then
     run the PR and decision close rules over every open item
     (``close_rules.run``). Before mark_stale, so an item whose PR merged
     closes as done rather than aging out. Fail-open like its neighbours."""
@@ -773,13 +790,17 @@ def _commitment_close_rules() -> dict[str, Any]:
         from khipu.db import connect
 
         with connect() as conn:
+            # Fact provenance's witness backfill first (section 4 of the
+            # 2026-10-23 design): a legacy restater proven tonight counts
+            # for tonight's rules (its PR refs clear needs_owner).
+            witness = _provenance_backfill(conn)
             with conn.cursor() as cur:
                 filled = close_rules.backfill_prs(cur)
             conn.commit()
             with conn.cursor() as cur:
                 report = close_rules.run(cur)
             conn.commit()
-        out = {**report, "backfilled": int(filled)}
+        out = {**report, "backfilled": int(filled), "provenance": witness}
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
     _nightly_log(f"commitments-close-rules: {json.dumps(out, default=str)[:300]}")
