@@ -54,6 +54,7 @@ ALLOWED = {
         "inside:mirror._upsert_episode,capture._merge_into_episode",
     ("cli", "_cmd_episode_edit"): "metadata",
     ("embed", "embed_on_capture"): "calls:hub_snapshot.upsert_episode",
+    ("fact_support", "remove"): "metadata",
     ("forget", "forget_episode"): "erase",
     ("hub_snapshot", "_apply_pending_erasures"): "erase",
     ("hub_snapshot", "_insert_episodes"): "inside:hub_snapshot._refresh_locked",

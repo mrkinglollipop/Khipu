@@ -30,6 +30,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_TEST", "1")
     (tmp_path / "data").mkdir()
     db._TABLE_COLUMNS_CACHE.clear()
+    monkeypatch.setenv("KHIPU_DATABASE_URL", "postgresql://synthetic@127.0.0.1:5432/owner_fixture")
     # No hub here: its record of applied writes holds none of these ids.
     monkeypatch.setattr(owner_writes, "_landed", lambda tool, args: None)
     return tmp_path / "data"

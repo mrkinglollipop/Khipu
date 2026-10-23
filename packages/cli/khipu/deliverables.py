@@ -48,6 +48,9 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
         return 0
     if not _deliverables_ready(cur):
         return 0
+    from khipu import fact_support
+
+    support_ready = fact_support.lock(cur)
     project = payload.get("project")
     inserted = 0
     for raw in items:
@@ -69,15 +72,20 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
             + title_clause + "LIMIT 1",
             params,
         )
-        if cur.fetchone():
+        duplicate = cur.fetchone()
+        support = {"kind": kind, "path": path, "url": url, "title": title}
+        if duplicate:
+            fact_support.record(cur, "deliverable", int(duplicate[0]), episode_id, support)
             continue
         cur.execute(
             "INSERT INTO deliverables (project, kind, path, url, title, episode_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s, %s)" + (" RETURNING id" if support_ready else ""),
             (project, kind, path, url, title, episode_id),
         )
         if cur.rowcount > 0:
             inserted += 1
+            if support_ready:
+                fact_support.record(cur, "deliverable", int(cur.fetchone()[0]), episode_id, support)
     if inserted:
         _log(f"recorded {inserted} deliverable(s) for episode {episode_id} (project={project!r})")
     return inserted
