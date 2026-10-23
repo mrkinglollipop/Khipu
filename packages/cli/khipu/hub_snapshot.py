@@ -416,11 +416,12 @@ def try_hub_connect(
     return conn
 
 
-def open_snapshot() -> sqlite3.Connection:
+def open_snapshot(*, shared: bool = False) -> sqlite3.Connection:
     path = snapshot_path()
     if not path.is_file():
         raise FileNotFoundError(f"hub snapshot missing: {path}")
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    # Only the matrix reader opts into sharing, serialized by _MATRIX_LOCK.
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=not shared)
     cols = _snapshot_table_columns(con, "episodes")
     pending = _pending_erasure_ids(path)
     if "id" in cols:
@@ -4661,6 +4662,14 @@ def stale_fields() -> dict[str, Any]:
     }
 
 
+def _topic_timestamp_expr(con: sqlite3.Connection) -> str:
+    """Hub event-date precedence, including replicas predating event_at."""
+    columns = _snapshot_table_columns(con, "topics")
+    available = [name for name in ("event_at", "updated_at", "created_at") if name in columns]
+    return ("COALESCE(" + ", ".join(available) + ")" if len(available) > 1
+            else available[0] if available else "NULL")
+
+
 def _episode_ilike_columns() -> tuple[str, ...]:
     return (
         "summary",
@@ -4949,14 +4958,15 @@ def search_snapshot(
             return None
 
     if topic_n > 0:
+        topic_ts = _topic_timestamp_expr(con)
         topic_time_clause = ""
         topic_time_params: list[Any] = []
         if time_filtered:
-            topic_time_clause = " AND khipu_in_range(COALESCE(updated_at, created_at), ?, ?)"
+            topic_time_clause = f" AND khipu_in_range({topic_ts}, ?, ?)"
             topic_time_params.extend((since_dt.isoformat() if since_dt else None, until_dt.isoformat() if until_dt else None))
         sql = f"""
             SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
-                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts
+                   body AS snippet, {topic_ts} AS ts
             FROM topics
             WHERE deleted_at IS NULL AND ({topic_where}){topic_time_clause}
             ORDER BY {topic_order}
@@ -4965,7 +4975,7 @@ def search_snapshot(
         rows = fts_rows(
             f"""
             SELECT 'topic' AS kind, slug AS id, COALESCE(title, slug) AS label,
-                   substr(body, 1, 4000) AS snippet, COALESCE(updated_at, created_at) AS ts
+                   body AS snippet, {topic_ts} AS ts
             FROM {_fts_coverage_sql("topics_fts", len(match_terms))} c
             JOIN topics ON topics.rowid = c.rid
             WHERE deleted_at IS NULL{topic_time_clause}
@@ -4987,6 +4997,7 @@ def search_snapshot(
                     "id": r[1],
                     "label": clip_snippet(r[2], LABEL_LIMIT),
                     "snippet": clip_snippet(r[3], SNIPPET_LIMIT),
+                    **({"rank_text": f"{r[1]} {r[2] or ''} {r[3] or ''}"} if indexed_tokens_only else {}),
                 }
             )
 
@@ -5018,7 +5029,9 @@ def search_snapshot(
         sql = f"""
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
                    summary AS snippet, ts, {session_expr} AS sid,
-                   {project_expr} AS proj, {harness_expr} AS harn
+                   {project_expr} AS proj, {harness_expr} AS harn,
+                   COALESCE(topics, '') || char(10) || COALESCE(decisions, '') || char(10) ||
+                   COALESCE(preferences, '') || char(10) || COALESCE(people, '') AS extracts
             FROM episodes
             WHERE {ep_live}({episode_where}) AND ({t3_predicate}){identity_clause}
             ORDER BY {episode_order}
@@ -5034,7 +5047,9 @@ def search_snapshot(
             f"""
             SELECT 'episode' AS kind, CAST(id AS TEXT) AS id, summary AS label,
                    summary AS snippet, ts, {session_expr} AS sid,
-                   {project_expr} AS proj, {harness_expr} AS harn
+                   {project_expr} AS proj, {harness_expr} AS harn,
+                   COALESCE(topics, '') || char(10) || COALESCE(decisions, '') || char(10) ||
+                   COALESCE(preferences, '') || char(10) || COALESCE(people, '') AS extracts
             FROM {_fts_coverage_sql("episodes_fts", len(match_terms))} c
             JOIN episodes ON episodes.id = c.rid
             WHERE {ep_live}({t3_predicate}){identity_clause}
@@ -5065,6 +5080,7 @@ def search_snapshot(
                     "id": r[1],
                     "label": clip_snippet(r[2], LABEL_LIMIT),
                     "snippet": clip_snippet(r[3], SNIPPET_LIMIT),
+                    **({"rank_text": f"{r[2] or ''} {r[8] or ''}"} if indexed_tokens_only else {}),
                 }
             )
 
@@ -5311,10 +5327,10 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
                 SELECT e.src, e.dst, e.type, e.weight
                 FROM edges e
                 WHERE e.src IN ({ph}) OR e.dst IN ({ph})
-                ORDER BY e.type ASC
+                ORDER BY (CASE WHEN e.src IN ({ph}) THEN e.dst ELSE e.src END) ASC, e.type ASC
                 LIMIT ?
                 """,
-                (*aliases, *aliases, limit),
+                (*aliases, *aliases, *aliases, limit),
             ).fetchall()
         merged = synthetic + [
             {"src": a, "dst": b, "type": t, "weight": w} for a, b, t, w in sql_edges
@@ -5338,7 +5354,7 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
             if not frontier:
                 break
             ph = ", ".join("?" * len(frontier))
-            batch = list(frontier)
+            batch = sorted(frontier)
             rows = con.execute(
                 f"""
                 SELECT src, dst, type FROM edges
@@ -5346,29 +5362,24 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
                 """,
                 (*batch, *batch),
             ).fetchall()
+            candidates = sorted(
+                (other, etype, node)
+                for src, dst, etype in rows for node in batch
+                for other in ([dst] if src == node else [src] if dst == node else [])
+            )
             next_frontier: set[str] = set()
-            for src, dst, etype in rows:
-                for node in batch:
-                    if src == node:
-                        other, via = dst, src
-                    elif dst == node:
-                        other, via = src, dst
-                    else:
-                        continue
-                    if other in seen_nodes:
-                        continue
-                    seen_nodes.add(other)
-                    walk.append((other, via, etype, hop))
-                    next_frontier.add(other)
-                    if len(walk) >= limit:
-                        break
+            for other, etype, node in candidates:
+                if other in seen_nodes:
+                    continue
+                seen_nodes.add(other)
+                walk.append((other, node, etype, hop))
+                next_frontier.add(other)
                 if len(walk) >= limit:
                     break
             frontier = next_frontier
             if len(walk) >= limit:
                 break
         walk_rows = [(a, b, t, h) for a, b, t, h in walk[:limit]]
-
     synthetic_walk = [
         {"node_id": e["dst"], "via": e["src"], "type": e["type"], "hops": 1}
         for e in synthetic
@@ -5634,7 +5645,7 @@ def semantic_search_snapshot(
         ts_val = None
         if knd == "topic":
             trow = con.execute(
-                "SELECT COALESCE(title, slug), COALESCE(updated_at, created_at) "
+                f"SELECT COALESCE(title, slug), {_topic_timestamp_expr(con)} "
                 "FROM topics WHERE slug = ? AND deleted_at IS NULL",
                 (ref,),
             ).fetchone()
@@ -5911,14 +5922,85 @@ def active_snapshot_profile() -> str | None:
 # keyed by the replica's identity: a refresh replaces the file and an
 # incremental write moves its mtime or size, and either one misses and reloads.
 _MATRIX_LOCK = threading.Lock()
-_MATRIX_CACHE: dict[str, Any] = {}
+
+
+def _close_matrix_reader(reader: dict[str, Any] | None) -> None:
+    if reader and reader.get("con") is not None:
+        reader["con"].close()
+        reader.clear()
+
+
+class _MatrixCache(dict):
+    def clear(self) -> None:
+        _close_matrix_reader(self.get("reader"))
+        super().clear()
+
+
+_MATRIX_CACHE: dict[str, Any] = _MatrixCache()
 _MATRIX_RELOADING = False
+
+
+def _matrix_file_identity(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return st.st_dev, st.st_ino
+
+
+def _matrix_tombstone_sources(con: sqlite3.Connection) -> list[tuple[str, str, str]]:
+    return [(table, key, knd)
+            for table, key, knd in (("episodes", "id", "episode"), ("topics", "slug", "topic"))
+            if {key, "deleted_at"} <= _snapshot_table_columns(con, table)]
+
+
+def _open_matrix_reader(path: Path) -> dict[str, Any]:
+    identity = _matrix_file_identity(path)
+    con = open_snapshot(shared=True)
+    try:
+        if _matrix_file_identity(path) != identity:
+            raise OSError("replica replaced while opening matrix reader")
+        return {"con": con, "identity": identity,
+                "sources": _matrix_tombstone_sources(con),
+                "schema_version": con.execute("PRAGMA schema_version").fetchone()[0]}
+    except BaseException:
+        con.close()
+        raise
+
+
+def _current_matrix_rows(path: Path, rows: list, reader: dict[str, Any]) -> list:
+    """Called only under _MATRIX_LOCK; no vector reload or held read transaction.
+
+    The existing load connection also observes current tombstones. data_version
+    notices commits by other connections, including WAL-only changes; replacing
+    the file reopens this lightweight reader before any candidate budget.
+    """
+    if not reader:
+        return rows  # A supplied matrix without an underlying snapshot reader.
+    if reader["identity"] != _matrix_file_identity(path):
+        replacement = _open_matrix_reader(path)
+        _close_matrix_reader(reader)
+        reader.update(replacement)
+    con = reader["con"]
+    version = con.execute("PRAGMA data_version").fetchone()[0]
+    if reader.get("version") != version or "deleted" not in reader:
+        schema_version = con.execute("PRAGMA schema_version").fetchone()[0]
+        if reader.get("schema_version") != schema_version:
+            reader.update(sources=_matrix_tombstone_sources(con), schema_version=schema_version)
+        deleted = {}
+        for table, key, knd in reader["sources"]:
+            deleted[knd] = {str(r[0]) for r in con.execute(
+                f"SELECT {key} FROM main.{table} WHERE deleted_at IS NOT NULL"
+            ).fetchall()}
+        reader.update(version=version, deleted=deleted)
+    deleted = reader["deleted"]
+    return [r for r in rows if str(r[2]) not in deleted.get(r[1], set())]
 
 
 def _load_matrix(
     path: Path, profile: str, kind: str | None, *, deadline: float | None = None,
+    reader: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[Any, ...]], dict[int, tuple[str, str, int, str]]]:
-    con = open_snapshot()
+    opened = _open_matrix_reader(path)
+    con = opened["con"]
+    retained = False
     if deadline is not None:
         con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     try:
@@ -5941,8 +6023,14 @@ def _load_matrix(
             f"WHERE profile = ? AND kind != 'commitment'{kind_clause} AND embedding IS NOT NULL{topic_live}",
             params,
         ).fetchall()
+        if reader is not None:
+            # A load deadline must not poison this long-lived metadata reader.
+            con.set_progress_handler(None, 0)
+            reader.update(opened)
+            retained = True
     finally:
-        con.close()
+        if not retained:
+            con.close()
     # Stored vectors are L2-normalized on the write path (embed_batch,
     # every shipped profile has normalize='l2'), so the rows are scored as
     # read. Re-normalizing 16,000 rows in Python here cost about a second
@@ -5956,8 +6044,9 @@ def _load_matrix(
 
 def _reload_matrix(path: Path, profile: str, kind: str | None, key: tuple[Any, ...]) -> None:
     global _MATRIX_RELOADING
+    reader: dict[str, Any] = {}
     try:
-        rows, by_rowid = _load_matrix(path, profile, kind)
+        rows, by_rowid = _load_matrix(path, profile, kind, reader=reader)
     except Exception as exc:  # noqa: BLE001 — the stale generation keeps serving
         _log(f"replica matrix background reload failed: {type(exc).__name__}: {exc}")
         rows = None
@@ -5966,7 +6055,10 @@ def _reload_matrix(path: Path, profile: str, kind: str | None, key: tuple[Any, .
         # A synchronous load for another profile may have replaced the entry
         # meanwhile; only a newer generation of the same one is swapped in.
         if rows is not None and old is not None and old[0] == key[0] and old[3:] == key[3:]:
-            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})
+            _close_matrix_reader(_MATRIX_CACHE.get("reader"))
+            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid, "reader": reader})
+        else:
+            _close_matrix_reader(reader)
         _MATRIX_RELOADING = False
 
 
@@ -5981,8 +6073,9 @@ def _matrix_rows(
     Every incremental replica write (each capture, the queue drain every 300 s)
     moves the key, and a synchronous reload costs about a second: the next
     prompt then lost its cosine leg (2026-10-12). So a changed file is served
-    from the previous generation, one write behind (a write only adds rows),
-    while exactly one daemon thread loads the new one outside the lock."""
+    from the previous vector generation while exactly one daemon thread loads
+    the new one outside the lock. Current tombstones are observed separately
+    through the retained reader before any cached candidates are returned."""
     global _MATRIX_RELOADING
     try:
         st = path.stat()
@@ -5995,19 +6088,24 @@ def _matrix_rows(
     try:
         cached = _MATRIX_CACHE.get("key")
         if key is not None and cached == key:
-            return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
+            return (_current_matrix_rows(path, _MATRIX_CACHE["rows"], _MATRIX_CACHE.get("reader", {})),
+                    _MATRIX_CACHE["by_rowid"])
         if key is not None and cached is not None and cached[0] == key[0] and cached[3:] == key[3:]:
             if not _MATRIX_RELOADING:
                 _MATRIX_RELOADING = True
                 threading.Thread(
                     target=_reload_matrix, args=(path, profile, kind, key), daemon=True,
                 ).start()
-            return _MATRIX_CACHE["rows"], _MATRIX_CACHE["by_rowid"]
-        rows, by_rowid = _load_matrix(path, profile, kind, deadline=deadline)
+            return (_current_matrix_rows(path, _MATRIX_CACHE["rows"], _MATRIX_CACHE.get("reader", {})),
+                    _MATRIX_CACHE["by_rowid"])
+        reader: dict[str, Any] = {}
+        rows, by_rowid = _load_matrix(path, profile, kind, deadline=deadline, reader=reader)
         _MATRIX_CACHE.clear()
         if key is not None:
-            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid})
-        return rows, by_rowid
+            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid, "reader": reader})
+        else:
+            _close_matrix_reader(reader)
+        return _current_matrix_rows(path, rows, reader), by_rowid
     finally:
         _MATRIX_LOCK.release()
 
@@ -6054,6 +6152,8 @@ def cosine_candidates_snapshot(
     rows, by_rowid = _matrix_rows(snapshot_path(), profile, kind)
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("replica scan deadline expired")
+    # Pending erasures are a separate owner-choice fence even while a SQLite
+    # source row is still live. _matrix_rows fences current DB tombstones.
     pending = {str(i) for i in _pending_erasure_ids(snapshot_path())}
     rows = [r for r in rows if r[1] != "episode" or str(r[2]) not in pending]
     # Stored vectors are unit length (see _matrix_rows); only the query is
@@ -6116,6 +6216,34 @@ def _topic_routing_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
     return item
 
 
+def snapshot_filter_live_sources(
+    con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fence source liveness before fusion limits, without metadata enrichment.
+
+    Real snapshot readers always return SQLite connections. A synthetic caller
+    supplying a metadata stand-in can keep its own source contract.
+    """
+    if not rows or not isinstance(con, sqlite3.Connection):
+        return list(rows)
+    live: dict[str, set[str]] = {}
+    for knd, table, key in (("episode", "episodes", "id"), ("topic", "topics", "slug")):
+        ids = sorted({str(r["id"]) for r in rows if r.get("kind") == knd})
+        if not ids:
+            continue
+        columns = _snapshot_table_columns(con, table)
+        live[knd] = set()
+        if key not in columns:
+            continue
+        predicate = " AND deleted_at IS NULL" if "deleted_at" in columns else ""
+        live[knd] = {str(r[0]) for r in con.execute(
+            f"SELECT {key} FROM {table} WHERE CAST({key} AS TEXT) IN "
+            f"({','.join('?' for _ in ids)}){predicate}", ids,
+        )}
+    return [r for r in rows if r.get("kind") not in live
+            or str(r["id"]) in live[r["kind"]]]
+
+
 def snapshot_row_metadata(
     con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -6156,14 +6284,7 @@ def snapshot_row_metadata(
         topic_cols = _snapshot_table_columns(con, "topics")
         if "slug" in topic_cols:
             placeholders = ",".join("?" for _ in topic_ids)
-            if {"updated_at", "created_at"} <= topic_cols:
-                ts_expr = "COALESCE(updated_at, created_at)"
-            elif "updated_at" in topic_cols:
-                ts_expr = "updated_at"
-            elif "created_at" in topic_cols:
-                ts_expr = "created_at"
-            else:
-                ts_expr = "NULL"
+            ts_expr = _topic_timestamp_expr(con)
             status_expr = "status" if "status" in topic_cols else "NULL"
             frontmatter_expr = "frontmatter" if "frontmatter" in topic_cols else "NULL"
             deleted_expr = "deleted_at" if "deleted_at" in topic_cols else "NULL"

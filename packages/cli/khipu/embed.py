@@ -2227,8 +2227,6 @@ def _cosine_candidates(
             _t0 = time.monotonic()
             cur.execute("SELECT to_regclass('public.media_assets') IS NOT NULL")
             has_media = bool(cur.fetchone()[0])
-            if not filtered:
-                _tune_hnsw(cur, fetch)
             sql = _cosine_sql(
                 vcast, filters if filtered else None, kind=kind,
                 episode_live=episode_live, has_media=has_media,
@@ -2240,13 +2238,33 @@ def _cosine_candidates(
             # the lexical side (FETCH_LIMIT still clips some extract headers
             # on long summaries; CHUNK_CHARS covers all single-chunk episode
             # embeddings today).
-            cur.execute(
-                sql,
-                {"q": qlit, "p": profile, "kind": kind, "lim": fetch,
-                 "fetch": FETCH_LIMIT, "rank_fetch": CHUNK_CHARS, **filter_params},
-            )
+            # SQL limits chunks; the caller's budget counts distinct sources.
+            # Widen the existing index-friendly query until that budget is met
+            # or the scan is exhausted. No fixed chunk cap: a long source must
+            # not hide its next neighbor. Keep chunk evidence for lexical fusion.
+            chunk_limit = fetch
+            previous_chunks: set[tuple[str, str, int]] = set()
+            while True:
+                if not filtered:
+                    _tune_hnsw(cur, chunk_limit)
+                cur.execute(
+                    sql,
+                    {"q": qlit, "p": profile, "kind": kind, "lim": chunk_limit,
+                     "fetch": FETCH_LIMIT, "rank_fetch": CHUNK_CHARS, **filter_params},
+                )
+                candidates = cur.fetchall()
+                entities = list(dict.fromkeys((r[0], str(r[1])) for r in candidates))
+                chunk_keys = {(r[0], str(r[1]), r[2]) for r in candidates}
+                if (len(entities) >= fetch or len(candidates) < chunk_limit
+                        or chunk_keys <= previous_chunks):
+                    break
+                previous_chunks = chunk_keys
+                chunk_limit *= 2
+            selected = set(entities[:fetch])
             out = []
-            for k, r, i, s, snip, rank_src, lbl in cur.fetchall():
+            for k, r, i, s, snip, rank_src, lbl in candidates:
+                if (k, str(r)) not in selected:
+                    continue
                 # Episodes: snippet from the stored summary, not chunk_text
                 # (which appends decisions/topics and used to mid-word clip at 200).
                 # RRF ranks on rank_src (full embed window) so extract fields
@@ -3053,12 +3071,15 @@ def hybrid_search(
                         r["cosine"] = r.get("score")
                     lists.append(list(lst))
                 if tokens:
-                    union: dict[tuple[str, str], dict[str, Any]] = {
-                        (r["kind"], str(r["id"])): r for lst in cos_lists for r in lst
-                    }
+                    union: dict[tuple[str, str], dict[str, Any]] = {}
+                    lexical_candidates = [r for lst in cos_lists for r in lst]
                     if mode == "hybrid":
-                        for r in [*literal_rows, *lib_literal]:
-                            union.setdefault((r["kind"], str(r["id"])), r)
+                        lexical_candidates.extend([*literal_rows, *lib_literal])
+                    for r in lexical_candidates:
+                        key = (r["kind"], str(r["id"]))
+                        previous = union.get(key)
+                        if previous is None or token_hit_count(r.get("rank_text") or "", tokens) > token_hit_count(previous.get("rank_text") or "", tokens):
+                            union[key] = r
                     lex_rows = sorted(
                         union.values(),
                         key=lambda r: -token_hit_count(r.get("rank_text") or "", tokens),
