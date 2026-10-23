@@ -520,7 +520,7 @@ export type RouteDeliveryFreshness = {
   caught_up_at?: string | null;
   stale?: boolean;
   /** The routing copy was switched off but removing it from the hub kept
-   *  failing; automatic retries stopped (`khipu route copy publish` retries). */
+   *  failing; automatic retries stopped (`khipu route copy cleanup` retries). */
   cleanup_gave_up?: boolean;
   reason_words?: string;
 };

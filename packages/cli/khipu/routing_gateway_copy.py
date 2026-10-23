@@ -193,12 +193,74 @@ def _path():
     return routing.routing_dir() / "gateway-copy.json"
 
 
-def _read():
+# Failure counters: the one place their lifecycle lives.
+#
+#   failures          every failed try, publish or cleanup; drives the backoff
+#                     (5 s doubling, capped at 300 s).
+#   cleanup_failures  failed deletes of a switched-off copy; drives the give-up.
+#
+#   fresh     no error, cleanup_failures 0.
+#   retrying  error set, cleanup_failures < 6: automatic ticks retry on backoff.
+#   stopped   error set, not cleaned, cleanup_failures >= 6: automatic ticks
+#             never touch the hub; only the owner's forced cleanup goes on.
+#
+#   _on_failure(cleanup=False)  publish failed: failures+1, budget untouched.
+#   _on_failure(cleanup=True)   delete failed: both +1, ends any cleaned marker.
+#   _on_published               a new publication: back to fresh, so a later
+#                               switch-off gets a whole cleanup budget again.
+#   _on_cleaned                 every copy gone, or nothing left to clean
+#                               (manual or automatic): back to fresh.
+#   _load (legacy)              state from before cleanup_failures existed kept
+#                               one shared count; a recorded failed cleanup
+#                               (cleanup_attempted + error, not cleaned) reads
+#                               that count as cleanup_failures, so a stopped
+#                               cleanup stays stopped and visible.
+_COUNTERS = ("error", "failures", "cleanup_failures", "retry_at")
+
+
+def _count(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _load():
     try:
         value = json.loads(_path().read_text())
-        return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+    if not isinstance(value, dict):
+        return {}
+    if "cleanup_failures" not in value:
+        legacy = (value.get("cleanup_attempted") is True and value.get("error")
+                  and value.get("disabled") is not True)
+        value["cleanup_failures"] = _count(value.get("failures")) if legacy else 0
+    return value
+
+
+def _counters(state):
+    """The counters an attempt marker carries forward."""
+    return {key: state[key] for key in ("failures", "cleanup_failures") if _count(state.get(key))}
+
+
+def _on_failure(state, now, *, cleanup):
+    state["error"] = "copy_publish_failed"
+    state["failures"] = _count(state.get("failures")) + 1
+    state["cleanup_failures"] = _count(state.get("cleanup_failures")) + int(cleanup)
+    if cleanup:
+        state.pop("disabled", None)
+    state["retry_at"] = routing._iso(now + timedelta(seconds=min(300, 5 * 2 ** min(state["failures"], 6))))
+    return state
+
+
+def _on_published(state):
+    state.update(error=None, retry_at=None, failures=0, cleanup_failures=0)
+    return state
+
+
+def _on_cleaned(state):
+    for key in _COUNTERS:
+        state.pop(key, None)
+    state["disabled"] = True
+    return state
 
 
 GAVE_UP_WORDS = ("Routing copy cleanup stopped after 6 failed tries; a copy may still be on the hub. "
@@ -206,15 +268,13 @@ GAVE_UP_WORDS = ("Routing copy cleanup stopped after 6 failed tries; a copy may 
 
 
 def gave_up(state):
-    """The automatic cleanup of a switched-off copy has hit its cap."""
-    failures = state.get("cleanup_failures")
+    """The stopped state: automatic cleanup of a switched-off copy hit its cap."""
     return bool(state.get("error") and state.get("disabled") is not True
-                and isinstance(failures, int) and not isinstance(failures, bool)
-                and failures >= _CLEANUP_MAX_FAILURES)
+                and _count(state.get("cleanup_failures")) >= _CLEANUP_MAX_FAILURES)
 
 
 def status():
-    value = _read()
+    value = _load()
     try:
         off = not routing.settings()["routing_cloud_copy"]
     except Exception:
@@ -279,14 +339,7 @@ def _publishers(state):
 def _failed(state, now, cleanup=False):
     # Exceptions can contain DSNs or local paths; expose fixed codes only.
     if state is not None:
-        state["error"] = "copy_publish_failed"
-        state["failures"] = state.get("failures", 0) + 1
-        if cleanup:
-            # Cleanup failures count apart from publish failures, and a
-            # failure ends any earlier "cleaned up" marker.
-            state["cleanup_failures"] = state.get("cleanup_failures", 0) + 1
-            state.pop("disabled", None)
-        state["retry_at"] = routing._iso(now + timedelta(seconds=min(300, 5 * 2 ** min(state["failures"], 6))))
+        _on_failure(state, now, cleanup=cleanup)
         try:
             _save(state)
         except OSError:
@@ -319,7 +372,7 @@ def _disabled_skip(state, now, *, force):
     out = _disabled_skip_inner(state, now, force=force)
     if force and out and out.get("ok") and gave_up(state):
         # Nothing is left to clean (no hub, no id): the give-up is moot.
-        _save(dict(cleanup_attempted=True, disabled=True))
+        _save(_on_cleaned(dict(cleanup_attempted=True)))
     return out
 
 
@@ -361,7 +414,7 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
     state, acquired, attempting_lock, cleanup = None, False, False, False
     try:
         from khipu.routing_replication import _sync_lock
-        state = _read()
+        state = _load()
         cleanup = not routing.settings()["routing_cloud_copy"]
         if cleanup_only and not cleanup:
             # The owner's cleanup retry never publishes.
@@ -373,7 +426,7 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
         attempting_lock = True
         with _sync_lock():
             acquired, attempting_lock = True, False
-            state = _read()
+            state = _load()
             cfg = routing.settings()
             enabled = cfg["routing_cloud_copy"]
             cleanup = not enabled
@@ -389,16 +442,10 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
                 # Commit the attempt marker before remote I/O. If the outcome
                 # is lost, an idle Mac cannot retry this speculative deletion;
                 # a recorded failure instead retries on its bounded backoff.
-                failures = state.get("failures")
-                prior_cleanup = state.get("cleanup_failures")
-                state = dict(cleanup_attempted=True, cleanup_publisher=publisher)
-                if isinstance(failures, int) and not isinstance(failures, bool) and failures > 0:
-                    state["failures"] = failures
-                if isinstance(prior_cleanup, int) and not isinstance(prior_cleanup, bool) and prior_cleanup > 0:
-                    state["cleanup_failures"] = prior_cleanup
+                state = dict(cleanup_attempted=True, cleanup_publisher=publisher, **_counters(state))
                 _save(state)
                 (hub or PostgresHub()).delete(publisher)
-                state = dict(cleanup_attempted=True, cleanup_publisher=publisher, disabled=True)
+                state = _on_cleaned(dict(cleanup_attempted=True, cleanup_publisher=publisher))
                 _save(state)
                 return {"ok": True, "disabled": True, "deleted": True}
             if publisher:
@@ -418,13 +465,15 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
             if not enabled:
                 for previous in used:
                     hub.delete(previous)
-                _save(dict(publisher=publisher, publishers=used, disabled=True))
+                _save(_on_cleaned(dict(publisher=publisher, publishers=used)))
                 return {"ok": True, "disabled": True, "deleted": True}
             if state.get("publisher") != publisher:
                 for previous in used:
                     if previous != publisher:
                         hub.delete(previous)
-                state = dict(publisher=publisher, publishers=used)
+                # A new identity keeps the budget: only a publication or a
+                # finished cleanup starts a fresh one.
+                state = dict(publisher=publisher, publishers=used, **_counters(state))
                 _save(state)
             state.pop("disabled", None)
             state.pop("cleanup_attempted", None)
@@ -453,8 +502,8 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
                     return {"ok": True, "unchanged": True}
             published_at = hub.publish(publisher, projection, cfg["routing_cloud_copy_stale_after"])
             state.update(digest=digest, published_at=published_at, epoch=projection["epoch"],
-                         revision=projection["version"], folded_at=projection["folded_at"], error=None,
-                         retry_at=None, failures=0)
+                         revision=projection["version"], folded_at=projection["folded_at"])
+            _on_published(state)
             refreshed = routing._parse(state.get("health_refreshed_at"))
             if force or refreshed is None or (now - refreshed).total_seconds() >= HEALTH_REFRESH_SECONDS:
                 rows = hub.health_rows(now=now, live_after=cfg["routing_delivery_live_after"])

@@ -249,7 +249,7 @@ def doctor_block(view, now, cfg):
 
         left = routing_gateway_copy.status()
         if left.get("cleanup_gave_up"):
-            gateway = dict(status="red", cleanup_gave_up=True, failures=left.get("failures"),
+            gateway = dict(status="red", cleanup_gave_up=True, cleanup_failures=left.get("cleanup_failures"),
                            reason_words=routing_gateway_copy.GAVE_UP_WORDS)
             reasons.append("gateway-cleanup-stopped")
     if not rows:

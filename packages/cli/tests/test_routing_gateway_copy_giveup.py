@@ -1,6 +1,8 @@
 """The cleanup give-up is visible and the owner's retry goes past the cap."""
 from datetime import timedelta
 
+import pytest
+
 from khipu import db, routing, routing_gateway_copy as gc, routing_health
 from tests import routing_gateway_fixture as gateway_fixtures
 from tests import test_routing_s12_gateway as gateway_tests
@@ -133,3 +135,124 @@ def test_cleanup_only_retry_never_publishes_while_copy_is_on(gw, monkeypatch):
 
     assert gc.publish(force=True, hub=Spy(), cleanup_only=True) == {"ok": False, "error": "copy_is_on"}
     assert published == []
+
+
+class Up:
+    """A reachable fake hub."""
+
+    def __init__(self):
+        self.deleted, self.published = [], []
+
+    def delete(self, publisher):
+        self.deleted.append(publisher)
+
+    def publish(self, publisher, projection, stale_after):
+        self.published.append(publisher)
+        return routing._iso(routing._now())
+
+    def health_rows(self, **kwargs):
+        return []
+
+
+def hub_down(monkeypatch):
+    calls = []
+
+    def down(**kwargs):
+        calls.append(True)
+        raise OSError("configured hub offline")
+
+    monkeypatch.setattr(db, "connect", down)
+    return calls
+
+
+@pytest.mark.parametrize("legacy_failures, automatic_left", [(6, 0), (3, 3)])
+def test_legacy_shared_counter_is_read_as_cleanup_failures(gw, monkeypatch, legacy_failures, automatic_left):
+    # State written before the cleanup counter existed: one shared count.
+    gateway_tests.configure(gw, routing_cloud_copy=False)
+    routing._id_salt()
+    with routing._lock():
+        routing._mac_locked()
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    gc._save(dict(cleanup_attempted=True, error="copy_publish_failed", failures=legacy_failures,
+                  retry_at=routing._iso(routing._now() - timedelta(seconds=1))))
+    calls = hub_down(monkeypatch)
+    assert bool(gc.status().get("cleanup_gave_up")) is (automatic_left == 0)
+    for _ in range(20):
+        routing._now.now += timedelta(seconds=400)
+        gc.publish()
+    assert len(calls) == automatic_left
+    assert gc.status()["cleanup_gave_up"] is True
+    assert gc.status()["cleanup_failures"] == 6
+    assert "gateway-cleanup-stopped" in health()["reasons"]
+
+
+def published_mac(gw, monkeypatch):
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    assert gc.publish(force=True, hub=Up())["published"]
+    gateway_tests.configure(gw, routing_cloud_copy=False)
+
+
+def test_successful_publication_starts_a_fresh_cleanup_budget(gw, monkeypatch):
+    published_mac(gw, monkeypatch)
+    calls = hub_down(monkeypatch)
+    for _ in range(20):
+        gc.publish()
+        routing._now.now += timedelta(seconds=400)
+    assert gc.status()["cleanup_gave_up"] is True
+    gateway_tests.configure(gw, routing_cloud_copy=True)
+    assert gc.publish(force=True, hub=Up())["published"]
+    gateway_tests.configure(gw, routing_cloud_copy=False)
+    before = len(calls)
+    assert gc.publish() == {"ok": False, "error": "copy_publish_failed"}
+    assert gc.status()["cleanup_failures"] == 1
+    assert not gc.status().get("cleanup_gave_up")
+    for _ in range(20):
+        routing._now.now += timedelta(seconds=400)
+        gc.publish()
+    assert len(calls) - before == 6
+
+
+# (step, hub calls it makes, cleanup_failures after, stopped after)
+LIFECYCLE = (
+    [("auto", 1, n, n == 6) for n in range(1, 7)]       # fresh -> retrying -> stopped
+    + [("auto", 0, 6, True), ("auto", 0, 6, True)]      # stopped: automatic ticks do nothing
+    + [("force", 1, 7, True)]                           # owner retry passes the cap, fails
+    + [("cleanup_only_on", 0, 7, True)]                 # copy on: no writes, no hub calls
+    + [("publish_up", 0, 0, False)]                     # new publication: fresh budget
+    + [("auto", 1, n, n == 6) for n in range(1, 7)]
+    + [("auto", 0, 6, True)]
+    + [("force_up", 0, 0, False)]                       # owner retry succeeds: cleared
+    + [("auto", 0, 0, False)]                           # cleaned: idle
+)
+
+
+def test_counter_lifecycle_table(gw, monkeypatch):
+    published_mac(gw, monkeypatch)
+    calls = hub_down(monkeypatch)
+    for i, (step, made, cleanup_failures, stopped) in enumerate(LIFECYCLE):
+        before = len(calls)
+        routing._now.now += timedelta(seconds=400)
+        if step == "auto":
+            gc.publish()
+        elif step == "force":
+            assert gc.publish(force=True, cleanup_only=True)["ok"] is False
+        elif step == "force_up":
+            assert gc.publish(force=True, cleanup_only=True, hub=Up())["deleted"]
+        elif step == "publish_up":
+            gateway_tests.configure(gw, routing_cloud_copy=True)
+            assert gc.publish(force=True, hub=Up())["published"]
+            gateway_tests.configure(gw, routing_cloud_copy=False)
+        elif step == "cleanup_only_on":
+            gateway_tests.configure(gw, routing_cloud_copy=True)
+            files = gc._path().read_bytes()
+            spy = Up()
+            assert gc.publish(force=True, cleanup_only=True, hub=spy) == {"ok": False, "error": "copy_is_on"}
+            assert gc._path().read_bytes() == files and not spy.deleted and not spy.published
+            assert not gc.status().get("cleanup_gave_up")
+            gateway_tests.configure(gw, routing_cloud_copy=False)
+        state = gc.status()
+        assert (len(calls) - before, state.get("cleanup_failures", 0), bool(state.get("cleanup_gave_up"))) \
+            == (made, cleanup_failures, stopped), (i, step)
+        assert ("gateway-cleanup-stopped" in health()["reasons"]) is stopped, (i, step)
+        if state.get("retry_at"):
+            assert routing._parse(state["retry_at"]) - routing._now() <= timedelta(seconds=300)
