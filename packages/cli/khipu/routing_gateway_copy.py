@@ -201,8 +201,10 @@ def _path():
 #
 #   fresh     no error, cleanup_failures 0.
 #   retrying  error set, cleanup_failures < 6: automatic ticks retry on backoff.
-#   stopped   error set, not cleaned, cleanup_failures >= 6: automatic ticks
-#             never touch the hub; only the owner's forced cleanup goes on.
+#   stopped   not cleaned, cleanup_failures >= 6: automatic ticks never touch
+#             the hub; only the owner's forced cleanup goes on. It reads the
+#             counter alone (never error), so a state rebuilt with the counts
+#             carried, such as a new publisher id, stays stopped.
 #
 #   _on_failure(cleanup=False)  publish failed: failures+1, budget untouched.
 #   _on_failure(cleanup=True)   delete failed: both +1, ends any cleaned marker.
@@ -268,8 +270,10 @@ GAVE_UP_WORDS = ("Routing copy cleanup stopped after 6 failed tries; a copy may 
 
 
 def gave_up(state):
-    """The stopped state: automatic cleanup of a switched-off copy hit its cap."""
-    return bool(state.get("error") and state.get("disabled") is not True
+    """The stopped state: automatic cleanup of a switched-off copy hit its cap.
+
+    Only _on_published and _on_cleaned leave it; both zero the counter."""
+    return bool(state.get("disabled") is not True
                 and _count(state.get("cleanup_failures")) >= _CLEANUP_MAX_FAILURES)
 
 
@@ -379,7 +383,7 @@ def _disabled_skip(state, now, *, force):
 def _disabled_skip_inner(state, now, *, force):
     if gave_up(state) and not force:
         # Automatic retries stop for good; only the owner's forced retry goes on.
-        return {"ok": False, "error": state["error"]}
+        return {"ok": False, "error": "copy_publish_failed"}
     known = _publishers(state)
     if not known:
         # A recomputable id is not evidence this Mac ever published. A
