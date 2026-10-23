@@ -1928,7 +1928,7 @@ fn checked_holds_arg(holds: &serde_json::Map<String, Value>) -> Result<String, S
 }
 
 fn route_rule_argv(action: &str, n: Option<u32>, text: Option<&str>) -> Result<Vec<String>, String> {
-    route_rule_argv_holds(action, n, text, None)
+    route_rule_argv_holds(action, n, text, None, None)
 }
 
 fn route_rule_argv_holds(
@@ -1936,6 +1936,7 @@ fn route_rule_argv_holds(
     n: Option<u32>,
     text: Option<&str>,
     holds: Option<&serde_json::Map<String, Value>>,
+    entity: Option<&str>,
 ) -> Result<Vec<String>, String> {
     if !ROUTE_RULE_ACTIONS.contains(&action) {
         return Err(format!("not a rule change: {action:?}"));
@@ -1946,8 +1947,13 @@ fn route_rule_argv_holds(
     }
     argv.extend(["--".to_string(), action.to_string()]);
     if action != "add" {
-        let n = n.filter(|n| *n >= 1).ok_or_else(|| "name the rule's number".to_string())?;
-        argv.push(n.to_string());
+        if let Some(n) = n.filter(|n| *n >= 1) {
+            argv.push(n.to_string());
+        } else if let Some(entity) = entity {
+            argv.push(checked_route_id(entity)?);
+        } else {
+            return Err("name the rule's number".to_string());
+        }
     }
     if action == "add" || action == "edit" {
         argv.push(checked_route_words(text.unwrap_or(""), false)?);
@@ -2612,11 +2618,12 @@ async fn khipu_route_note_end(op: Option<String>) -> Result<String, String> {
 async fn khipu_route_rule(
     action: String,
     n: Option<u32>,
+    entity: Option<String>,
     text: Option<String>,
     holds: Option<serde_json::Map<String, Value>>,
     op: Option<String>,
 ) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_rule_argv_holds(&action, n, text.as_deref(), holds.as_ref())?, op.as_deref())?).await
+    run_khipu_cli_async(route_operation_argv(route_rule_argv_holds(&action, n, text.as_deref(), holds.as_ref(), entity.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -5842,11 +5849,15 @@ mod settings_command_tests {
         }
         let holds = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("end")))]);
         assert_eq!(
-            route_rule_argv_holds("confirm", Some(6), None, Some(&holds)).unwrap(),
+            route_rule_argv_holds("confirm", Some(6), None, Some(&holds), None).unwrap(),
             v(&["route", "rule", "--from-app", "--holds={\"h-grok\":\"end\"}", "--", "confirm", "6"])
         );
         let bad = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("drop")))]);
-        assert!(route_rule_argv_holds("confirm", Some(6), None, Some(&bad)).is_err());
+        assert!(route_rule_argv_holds("confirm", Some(6), None, Some(&bad), None).is_err());
+        assert_eq!(
+            route_rule_argv_holds("confirm", None, None, None, Some("rule:pending-1")).unwrap(),
+            v(&["route", "rule", "--from-app", "--", "confirm", "rule:pending-1"])
+        );
         assert_eq!(
             route_hold_add_argv("No new launches", "machine-busy", "machine", None, None).unwrap(),
             v(&["route", "hold", "--from-app", "--reason=machine-busy", "--machine", "--", "No new launches"])

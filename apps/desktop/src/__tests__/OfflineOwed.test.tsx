@@ -2,7 +2,7 @@
 // "Waiting to sync" label and the "Saved on this Mac" notice, through App's
 // real loadOwed / owedWrite, plus the pure helpers.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "../App";
 import { WELCOME_DONE_KEY } from "../Welcome";
 import { clockTime, isHubUnreachable, OfflineBanner, parseOwedAnswer } from "../OfflineBanner";
@@ -39,6 +39,13 @@ const item = (id: number, over: Record<string, unknown> = {}) => ({
 function script(owed: (args: string[]) => unknown, write?: (args: string[]) => unknown) {
   invokeMock.mockImplementation(async (cmd: string, payload?: { args?: string[] }) => {
     if (cmd === "dsn_configured") return true;
+    if (cmd === "khipu_work_view") {
+      return JSON.stringify({
+        format: "khipu-work-view", version: 1, generated_at: REFRESHED, refresh_s: 3600,
+        projects: [], live: [], waiting: [],
+        counts: { waiting: 0, blocking: 0, running: 0, flagged: 0, stale_sources: 0, ledger_outbox: 0 },
+      });
+    }
     if (cmd !== "run_khipu") return JSON.stringify({ ok: true });
     const args = payload?.args ?? [];
     if (args[0] === "owed") {
@@ -111,6 +118,21 @@ describe("the Owed tab with the hub away", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Done" }));
     await screen.findByText("Saved on this Mac. It will sync when the hub is back.");
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("refreshes Work immediately after a successful single Owed write", async () => {
+    script(
+      () => ({ results: [item(1)], stale: false, snapshot_refreshed_at: null, waiting_to_sync: false }),
+      () => ({ ok: true }),
+    );
+    await openOwed();
+    await screen.findByRole("button", { name: "Done" });
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "khipu_work_view").length).toBeGreaterThanOrEqual(2));
+    const before = invokeMock.mock.calls.filter(([cmd]) => cmd === "khipu_work_view").length;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    });
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "khipu_work_view").length).toBeGreaterThan(before));
   });
 });
 

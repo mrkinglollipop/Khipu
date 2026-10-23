@@ -544,6 +544,10 @@ class _CatchupCursor:
             self._result = []
         elif "FROM commitments c WHERE c.status = 'open'" in s:
             self._result = self.commitment_rows
+        elif s.startswith("SELECT id, opened_episode FROM commitments"):
+            # These fixtures represent open commitments without an episode.
+            # The post-provider lock reads their parent as well as their id.
+            self._result = [(cid, None) for cid, _text in self.commitment_rows if cid in params[0]]
         elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
             self._result = [(slug, title, body, {"slug": slug, "title": title, "body": body})
                             for slug, title, body in self.topic_rows]

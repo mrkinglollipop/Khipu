@@ -2,7 +2,7 @@
 // 13): the Pace, caps and advice group. The fixture is the approved mock's
 // fictional data, shaped as `khipu route --json` (docs/mockups/2026-10-21-routing).
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { PaceSection } from "../RoutingSettings";
 import { paceModel } from "../routingPace";
 import { PACE_NOW, PACE_PLANS, PACE_VIEW } from "../../dev/paceFake";
@@ -106,6 +106,8 @@ describe("Pace, caps and advice: probe regressions", () => {
 
   it.each([
     "reset time spread over more than an hour",
+    "reset time disagrees between readings",
+    "reset passed; waiting for a new reading",
     "possible reset; waiting for the next reading",
     "last reading 2 h old",
   ])("withholds unplaceable cap figures: %s", (why) => {
@@ -116,6 +118,24 @@ describe("Pace, caps and advice: probe regressions", () => {
     })]), null, NOW).rows[0];
     expect(row.caps[0].state).toBe(`Not known: ${why}`);
     expect(row.caps[0].tag).toBeNull();
+  });
+
+  it.each([
+    "readings cover only 0.9 of the last 24 h",
+    "readings disagree for 0.5 of the last 24 h",
+  ])("keeps fresh cap figures and warnings with incomplete rate history: %s", (why) => {
+    for (const verdict of ["ahead", "recovering"]) {
+      const cap = { kind: "pace_target", revision: "fake", window: "weekly", pct: 100, slack: 0,
+        allowance_pct: 14.3, used_pct: 80, verdict };
+      const row = paceModel(view([acct({
+        pace: [pace({ why, buckets: 3, used_pct: 80, rate_pct_per_h: null, pace_target: cap })],
+        cap_statuses: [cap],
+      })]), null, NOW).rows[0];
+      expect(row.caps[0].state).toBe("Allowed 14.3% by now, used 80");
+      expect(row.caps[0].tag).toEqual({
+        text: verdict === "ahead" ? "65.7 points ahead" : "Coming back", tone: "warn",
+      });
+    }
   });
 
   it("keeps a hold_back verdict when its evidence is unknown", () => {
@@ -176,6 +196,58 @@ describe("Pace, caps and advice: probe regressions", () => {
     expect(row.line.week).toContain("60%");
     expect(row.line.week).not.toContain("unused");
     expect(row.open).toBe(true);
+  });
+
+  it("names a reached plan before the calm pace fallback", () => {
+    const reached = pace({
+      used_pct: 100,
+      plan: { verdict: "limit_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+    });
+    const row = paceModel(view([acct({
+      pace: [reached],
+      cap_statuses: [],
+      advice: { account: "probe", label: "Probe", purpose: "job", verdict: "closed", reason: "plan limit reached", evidence: "fresh", numbers: {}, eligible: false, why_eligible: "plan limit reached", advisory: true },
+    })]), null, NOW).rows[0];
+    expect(row.line.week).toBe("At plan limit");
+    expect(row.line.week).not.toBe("On pace");
+    expect(row.say.map((part) => part.text).join("")).toBe("At its week plan limit.");
+    expect(row.say.map((part) => part.text).join("")).not.toContain("Nothing Khipu has read");
+  });
+
+  it.each([
+    { buckets: 0, why: null },
+    { buckets: 48, why: "no reading" },
+  ])("keeps a reached plan ahead of unavailable pace readings: %o", (unavailable) => {
+    const reached = pace({
+      ...unavailable,
+      used_pct: 100,
+      plan: { verdict: "limit_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+    });
+    const row = paceModel(view([acct({ pace: [reached] })]), null, NOW).rows[0];
+    expect(row.tag).toEqual({ text: "At plan limit", tone: "err" });
+    expect(row.line.week).toBe("At plan limit");
+    expect(row.say.map((part) => part.text).join("")).toBe("At its week plan limit.");
+  });
+
+  it("renders a reached plan limit before the calm pace fallback", () => {
+    const reached = pace({
+      used_pct: 100,
+      plan: { verdict: "limit_reached", needed_pct_per_h: null, runs_out_at: null, before_reset_s: null, unused_at_reset_pct: null },
+    });
+    const data = view([acct({
+      pace: [reached],
+      cap_statuses: [],
+      advice: { account: "probe", label: "Probe", purpose: "job", verdict: "closed", reason: "plan limit reached", evidence: "fresh", numbers: {}, eligible: false, why_eligible: "plan limit reached", advisory: true },
+    })]);
+    render(<PaceSection data={data} plans={null} now={NOW} folds={{ ...folds, isOpen: () => true }} />);
+    const line = screen.getByRole("button", { name: /Probe.*At plan limit/ });
+    expect(line).toBeVisible();
+    expect(line).not.toHaveAccessibleName(/On pace/);
+    fireEvent.click(line);
+    const card = screen.getByRole("group", { name: "Probe pace" });
+    expect(within(card).getByText("Limit reached")).toBeVisible();
+    expect(within(card).getByText("At its week plan limit.")).toBeVisible();
+    expect(within(card).queryByText("On pace")).toBeNull();
   });
 
   it("names the share cap that caused the hold, not the first share cap", () => {

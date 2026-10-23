@@ -171,6 +171,22 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     shared = [i in held or bool(h & owned) for i, h in zip(candidates, hashes)]
     shared_identities = [i for i, s in zip(candidates, shared) if s]
     legacy_identities = [i for i, s in zip(candidates, shared) if not s]
+    owner_sessions = sorted({str(src["session_id"])
+                             for src in [*(source_rows or []), *read["column_sources"],
+                                         *read["tombstone_payloads"]]
+                             if src.get("session_id")} | set(read["source_sessions"])
+                            | ({session_id} if session_id else set()))
+    owner_sessions_error = None
+    cur.execute("SAVEPOINT owner_word_ownership")
+    try:
+        owner_sessions_shared = _owner_sessions_held_elsewhere(
+            cur, episode_id, owner_sessions, sources=sources)
+    except Exception as exc:  # noqa: BLE001 - uncertainty must preserve the live owner's words
+        cur.execute("ROLLBACK TO SAVEPOINT owner_word_ownership")
+        owner_sessions_shared = owner_sessions
+        owner_sessions_error = f"owner-word ownership could not be checked ({type(exc).__name__})"
+    finally:
+        cur.execute("RELEASE SAVEPOINT owner_word_ownership")
     from khipu.tombstones import publish_hub_forget
 
     cur.execute(
@@ -232,6 +248,9 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "ok": True,
         "id": episode_id,
         "session_id": session_id,
+        "owner_sessions": owner_sessions,
+        "owner_sessions_shared": owner_sessions_shared,
+        "owner_sessions_error": owner_sessions_error,
         "soft_deleted": soft_deleted,
         "embeddings_removed": embeddings_removed,
         "commitments_closed": commitments_closed,
@@ -339,7 +358,12 @@ def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str
     except Exception:  # noqa: BLE001 — old schema/driver must still forget the hub row
         raw = None
     sources = sources_ready(cur)
+    source_sessions = []
     if sources:
+        # A merge receipt may keep only its hash. The source row still names
+        # the session whose local owner words must be erased.
+        cur.execute("SELECT session_id FROM episode_sources WHERE episode_id = %s", (episode_id,))
+        source_sessions = [row[0] for row in cur.fetchall() if row[0]]
         # Every source row, origin and merged, keeps the (ts, summary_md5) it
         # was first written under, so each legacy line this episode ever had
         # is named exactly, whatever edits and merges did to the live summary
@@ -378,7 +402,7 @@ def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str
     # read every round like the other two.
     column_sources = _natural_identities(raw, _column_identity(cur, episode_id))
     return {"raw": raw, "sources": sources, "source_rows": source_rows,
-            "column_sources": column_sources,
+            "source_sessions": source_sessions, "column_sources": column_sources,
             "candidates": candidates, "has_merged_sources": has_merged_sources,
             "unidentified_sources": unidentified_sources,
             "tombstone_payloads": tombstone_payloads,
@@ -1303,7 +1327,42 @@ def _session_forms(session_id: str) -> set[str]:
     return {f for f in forms if f}
 
 
-def _owner_words_scan(session_id: str | None, *, gateway: bool) -> dict[str, Any]:
+def _owner_sessions_held_elsewhere(cur, episode_id: int, sessions: list[str], *,
+                                  sources: bool) -> list[str]:
+    """Session-scoped words stay while another live episode holds that session.
+
+    Columns, raw origins, merge receipts and live source rows all count;
+    a separate capture in the same session need not share a source key.
+    """
+    forms = set().union(*(_session_forms(s) for s in sessions))
+    if not forms:
+        return []
+    parts = [
+        "SELECT e.session_id FROM episodes e WHERE e.id <> %(id)s AND e.deleted_at IS NULL",
+        "SELECT e.raw->>'session_id' FROM episodes e "
+        "WHERE e.id <> %(id)s AND e.deleted_at IS NULL",
+        "SELECT r.v->'payload'->>'session_id' FROM episodes e "
+        "CROSS JOIN LATERAL jsonb_array_elements(CASE "
+        "WHEN jsonb_typeof(e.raw->'merged_from') = 'array' THEN e.raw->'merged_from' "
+        "ELSE '[]'::jsonb END) AS r(v) "
+        "WHERE e.id <> %(id)s AND e.deleted_at IS NULL",
+    ]
+    if sources:
+        parts.append("SELECT s.session_id FROM episode_sources s JOIN episodes e ON e.id = s.episode_id "
+                     "WHERE e.id <> %(id)s AND e.deleted_at IS NULL AND s.deleted_at IS NULL")
+    cur.execute("SELECT session_id FROM (" + " UNION ALL ".join(parts) + ") AS owner_word_holders "
+                "WHERE session_id = ANY(%(sessions)s::text[]) "
+                "OR regexp_replace(session_id, '^[^:]*:', '') = ANY(%(sessions)s::text[])",
+                {"id": episode_id, "sessions": sorted(forms)})
+    held = set().union(*(_session_forms(row[0]) for row in cur.fetchall()
+                         if row and isinstance(row[0], str) and row[0]))
+    return sorted(s for s in sessions if _session_forms(s) & held)
+
+
+def _owner_words_scan(session_id: str | None, *, gateway: bool,
+                      sessions: list[str] | None = None,
+                      protected_sessions: list[str] | None = None,
+                      ownership_error: str | None = None) -> dict[str, Any]:
     """The owner's typed words recorded for the episode's session: its turn
     files and briefs (``owner_turns.forget_sessions``), the old widenings
     file, the words in its owner-actions lines (scrubbed, the chain and Undo
@@ -1314,29 +1373,59 @@ def _owner_words_scan(session_id: str | None, *, gateway: bool) -> dict[str, Any
     if gateway:
         return {"ok": True, "removed": {}, "locations": [{
             "place": place, "path": None, "state": "not applicable", "why": OWNER_WORDS_GATEWAY_WHY}]}
-    if not session_id:
+    if not session_id and not sessions:
         return {"ok": True, "removed": {}, "locations": [{"place": place, "path": None, "state": "clean"}]}
     from khipu import owner_direction, owner_files, owner_turns
 
-    forms = _session_forms(str(session_id))
-    try:
-        removed = owner_turns.forget_sessions(forms)
-        removed["pending"] = owner_direction.remove_old_widenings()
-        removed["log_lines"] = owner_direction.scrub_words(forms)
-        temps = owner_files.clean_temps(forms)
-        removed["temps"] = temps["removed"]
-    except Exception as exc:  # noqa: BLE001 - an unfinished scan keeps the forget open
-        return {"ok": False, "removed": {}, "locations": [{
-            "place": place, "path": None, "state": "not checked",
-            "why": (f"the owner's recorded words for this session could not all be removed "
-                    f"({type(exc).__name__}), so the forget stays open")}]}
-    if temps["left"]:
-        return {"ok": False, "removed": removed, "locations": [{
-            "place": place, "path": None, "state": "not checked",
-            "why": ("a rewrite of the owner's recorded words was in progress, so its file could still hold "
-                    "this session's words; the forget stays open and the next run removes it")}]}
-    state = "removed" if any(removed.values()) else "clean"
-    return {"ok": True, "removed": removed, "locations": [{"place": place, "path": None, "state": state}]}
+    forms = set().union(*(_session_forms(str(sid)) for sid in
+                          [session_id, *(sessions or [])] if sid))
+    protected = set().union(*(_session_forms(s) for s in protected_sessions or []))
+    forms -= protected
+    removed = {}
+    locations = []
+    if protected:
+        locations.append({"place": place, "path": None,
+                          "state": "not checked" if ownership_error else "copy remains",
+                          "why": ownership_error or "session words are kept because another live episode "
+                                 "still holds that session; the forget stays open"})
+    errors = []
+
+    def attempt(label, action):
+        try:
+            return action()
+        except owner_turns.ForgetCleanupError as exc:
+            errors.extend(exc.errors)
+            return exc.removed
+        except Exception as exc:  # noqa: BLE001 - finish all independent cleanup steps
+            errors.append(f"{label} ({type(exc).__name__})")
+            return None
+
+    if forms:
+        turns = attempt("turns, directions and briefs", lambda: owner_turns.forget_sessions(
+            forms, **({"protected_sessions": protected} if protected else {})))
+        if turns is not None:
+            removed.update(turns)
+        # The obsolete file has no reliable session attribution. Keep it
+        # when a live holder exists, rather than erase that holder's words.
+        if not protected:
+            removed["pending"] = attempt("old widenings", owner_direction.remove_old_widenings)
+        removed["log_lines"] = attempt("owner-actions log", lambda: owner_direction.scrub_words(
+            forms, **({"protected_sessions": protected} if protected else {})))
+        temps = attempt("rewrite temps", lambda: owner_files.clean_temps(
+            forms, **({"protected_sessions": protected} if protected else {})))
+        if temps is not None:
+            removed["temps"] = temps["removed"]
+            if temps["left"]:
+                errors.append("a rewrite temp remains and may still hold this session's words")
+    if errors:
+        locations.append({"place": place, "path": None, "state": "not checked",
+                          "why": "the owner's recorded words could not all be removed: "
+                                 + "; ".join(errors) + "; the forget stays open"})
+    if not locations:
+        state = "removed" if any(removed.values()) else "clean"
+        locations.append({"place": place, "path": None, "state": state})
+    return {"ok": not any(loc["state"] in INCOMPLETE_STATES for loc in locations),
+            "removed": removed, "locations": locations}
 
 
 def _routing_words_scan(*, gateway: bool) -> dict[str, Any]:
@@ -1582,90 +1671,126 @@ def _identityless_job_state(job: dict[str, Any], path: Path, session_id: str | N
         "told apart from this episode's source, so it was kept")
 
 
-def _native_job_remainder(session_id: str | None,
-                          source_rows: list[dict[str, Any]] | None,
-                          has_merged_sources: bool = False) -> dict[str, Any]:
-    """Remove native capture jobs (queued, claimed, a crash-left checkpoint,
-    or archived as empty) that will capture, or did capture, one of the
-    episode's sources, and report every job kept. The folders come from the
-    store inventory (``capture_stores.native_job_folders``).
-
-    A job is matched on the source key its capture will carry
-    (``session_capture.job_source_identity``). It holds the transcript, and a
-    claimed one may hold the extracted episode too, so a match is removed,
-    under the queue's claim lock. A drainer that still holds the claim cannot
-    write it back: its checkpoint refuses a forgotten source or a removed
-    claim, and its hub write is refused. A job that cannot be read, or, with
-    no source rows, any job from the same session, is kept and reported."""
+def _native_job_entries(session_id, source_rows, has_merged_sources, folders):
+    """Read/classify every native job under the caller's queue claim lock."""
     from khipu import session_capture as sc
     from khipu.capture_identity import source_key
 
     keys = {row["source_key"] for row in source_rows or [] if row.get("source_key")}
+    entries = []
+    for place, directory in folders:
+        for name in _listing(directory):
+            if not (name.endswith(".json") or ".claimed." in name or name.endswith(".tmp")):
+                continue
+            path = directory / name
+            if not _present_file(path):
+                continue
+            entry = {"place": place, "path": path, "state": "clean", "why": None,
+                     "hashes": set(), "idents": []}
+            try:
+                entry["data"] = path.read_bytes()
+                job = json.loads(entry["data"])
+                if not isinstance(job, dict):
+                    raise ValueError("job is not an object")
+                ident = sc.job_source_identity(job)
+                if ident is None:
+                    entry["state"], entry["why"] = _identityless_job_state(
+                        job, path, session_id, source_rows, has_merged_sources)
+                elif keys and source_key(ident) in keys:
+                    entry["state"] = "removed"
+                    key = source_key(ident)
+                    entry["hashes"].add(key)
+                    for row in source_rows or []:
+                        if row.get("source_key") == key:
+                            if row.get("payload_sha256"):
+                                entry["hashes"].add(row["payload_sha256"])
+                            if row.get("ts") and row.get("summary_md5"):
+                                entry["idents"].append(row)
+                elif not keys and session_id and ident["session_id"] == session_id:
+                    entry["state"] = "copy remains"
+                    entry["why"] = (f"native capture job {path} is from the same session, but with "
+                                    "no source rows it cannot be matched exactly, so it was kept")
+                extracted = job.get("extracted_payload")
+                if entry["state"] == "removed" and isinstance(extracted, dict):
+                    entry["hashes"].update(_job_hashes(extracted))
+                    if legacy := _job_identity(extracted):
+                        entry["idents"].append(legacy)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, UnicodeError, TypeError) as exc:
+                entry["state"] = "unreadable"
+                entry["why"] = (f"native capture job {path} could not be read "
+                                f"({type(exc).__name__}), so it was kept")
+            entries.append(entry)
+    return entries
+
+
+def _native_job_remainder(session_id: str | None,
+                          source_rows: list[dict[str, Any]] | None,
+                          has_merged_sources: bool = False, *,
+                          episode_id: int | None = None) -> dict[str, Any]:
+    """Remove only exact native copies no other live episode holds.
+
+    Read twice under the queue claim lock, checking live ownership between
+    passes without the lock. Changed/new jobs and uncheckable owners stay;
+    no database operation waits while holding the queue lock.
+    """
+    from khipu import session_capture as sc
+    from khipu.capture_stores import native_job_folders
+
     remaining: list[str] = []
     inspected: list[dict[str, str]] = []
     removed = 0
-    from khipu.capture_stores import native_job_folders
-
     try:
-        # One claim lock across every folder: a job moves from the queue to
-        # the empty archive under it, so it cannot slip past the scan.
         with sc._claim_lock() as acquired:
             if not acquired:
                 raise OSError("queue claim lock unavailable")
-            listed: list[tuple[str, Path]] = []
-            for place, directory in native_job_folders():
-                listed += [(place, directory / name) for name in _listing(directory)]
-            for place, path in listed:
-                name = path.name
-                if not (name.endswith(".json") or ".claimed." in name or name.endswith(".tmp")):
-                    continue
-                if not _present_file(path):
-                    continue
-                state, why = "clean", None
-                try:
-                    job = json.loads(path.read_text(encoding="utf-8"))
-                    if not isinstance(job, dict):
-                        raise ValueError("job is not an object")
-                    ident = sc.job_source_identity(job)
-                except FileNotFoundError:
-                    continue
-                except (OSError, ValueError, UnicodeError) as exc:
-                    state = "unreadable"
-                    why = (f"native capture job {path} could not be read "
-                           f"({type(exc).__name__}), so it was kept")
-                    ident = None
-                if state == "clean" and ident is None:
-                    state, why = _identityless_job_state(job, path, session_id, source_rows,
-                                                         has_merged_sources)
-                    if state == "removed":
+            first = _native_job_entries(
+                session_id, source_rows, has_merged_sources, native_job_folders())
+        exact = [entry for entry in first if entry["state"] == "removed"]
+        hashes = set().union(*(entry["hashes"] for entry in exact))
+        idents = [ident for entry in exact for ident in entry["idents"]]
+        owners = None
+        owner_error = "no episode id was given"
+        if episode_id is not None:
+            try:
+                owners = (_job_owners(episode_id, hashes, idents, sources=source_rows is not None)
+                          if exact else (set(), set()))
+            except Exception as exc:  # noqa: BLE001 - unchecked ownership keeps the copy
+                owner_error = type(exc).__name__
+        checked = {entry["path"]: entry["data"] for entry in exact}
+        with sc._claim_lock() as acquired:
+            if not acquired:
+                raise OSError("queue claim lock unavailable")
+            for entry in _native_job_entries(
+                    session_id, source_rows, has_merged_sources, native_job_folders()):
+                path, state, why = entry["path"], entry["state"], entry["why"]
+                if state == "removed":
+                    held = {(ident["summary_md5"], _instant(ident["ts"]))
+                            for ident in entry["idents"]}
+                    if owners is None:
+                        state, why = "copy remains", (
+                            f"native capture job {path} could not be checked against other "
+                            f"episodes ({owner_error}), so it was kept")
+                    elif checked.get(path) != entry["data"]:
+                        state, why = "copy remains", (
+                            f"native capture job {path} changed while the forget ran, so it was kept")
+                    elif entry["hashes"] & owners[0] or held & owners[1]:
+                        state, why = "copy remains", (
+                            f"native capture job {path} is also held by another live episode, "
+                            "so it was kept")
+                    else:
                         try:
                             path.unlink()
                         except FileNotFoundError:
                             continue
                         except OSError as exc:
-                            state = "copy remains"
-                            why = (f"native capture job {path} could not be removed "
-                                   f"({type(exc).__name__}), so it was kept")
+                            state, why = "copy remains", (
+                                f"native capture job {path} could not be removed "
+                                f"({type(exc).__name__}), so it was kept")
                         else:
                             removed += 1
-                elif state == "clean":
-                    if keys and source_key(ident) in keys:
-                        try:
-                            path.unlink()
-                        except FileNotFoundError:
-                            continue
-                        except OSError as exc:
-                            state = "copy remains"
-                            why = (f"native capture job {path} could not be removed "
-                                   f"({type(exc).__name__}), so it was kept")
-                        else:
-                            state = "removed"
-                            removed += 1
-                    elif not keys and session_id and ident["session_id"] == session_id:
-                        state = "copy remains"
-                        why = (f"native capture job {path} is from the same session, but with "
-                               "no source rows it cannot be matched exactly, so it was kept")
-                loc = {"place": place, "path": str(path), "state": state}
+                loc = {"place": entry["place"], "path": str(path), "state": state}
                 if why:
                     loc["why"] = why
                     remaining.append(f"native jobs: {why}")
@@ -1795,7 +1920,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     if not out["replica_temps"]["ok"]:
         partial.append("replica_temp")
     out["native_jobs"] = _native_job_remainder(out.get("session_id"), out.get("scan_sources"),
-                                               out.get("has_merged_sources", False))
+                                               out.get("has_merged_sources", False),
+                                               episode_id=episode_id)
     if not out["native_jobs"]["ok"]:
         partial.append("native_jobs")
     out["legacy_writers"] = writers
@@ -1808,6 +1934,9 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
     if not out["work_view"]["ok"]:
         partial.append("work_view")
     out["owner_words"] = _owner_words_scan(out.get("session_id"),
+                                           sessions=out.get("owner_sessions"),
+                                           protected_sessions=out.get("owner_sessions_shared"),
+                                           ownership_error=out.get("owner_sessions_error"),
                                            gateway=_is_gateway() if gateway is None else bool(gateway))
     if not out["owner_words"]["ok"]:
         partial.append("owner_words")

@@ -44,6 +44,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from graph_db import publish, writer_lock
+
 try:
     import yaml
 except ImportError:
@@ -1114,22 +1116,20 @@ def collect_task_type_nodes_and_edges(ledger_rows: list[dict]) -> tuple[list[dic
 # ── persistence ───────────────────────────────────────────────────────────────
 
 def write_atomic(out_path: Path, nodes: list[dict], edges: list[dict],
-                  model_call_rows: list[dict] = None) -> None:
-    """Write atomically. Stages to local /tmp first because sqlite + cloud-mounted
-    filesystems (Dropbox) can fail with disk I/O errors during the write transaction.
+                 model_call_rows: list[dict] = None) -> None:
+    """Serialize the complete read/modify/publish interval with embedding."""
+    out_path = out_path.resolve()
+    with writer_lock(out_path):
+        _write_atomic_locked(out_path, nodes, edges, model_call_rows)
 
-    PRESERVES EXISTING EMBEDDINGS: copies existing out_path → /tmp first if it
-    exists, so the embeddings table (populated by embed_corpus.py) survives the
-    rebuild. Schema uses CREATE TABLE IF NOT EXISTS, and we INSERT OR REPLACE
-    nodes/edges, so no data clobbering."""
+
+def _write_atomic_locked(out_path: Path, nodes: list[dict], edges: list[dict],
+                         model_call_rows: list[dict] = None) -> None:
+    """Build locally, carrying embeddings forward; the original survives errors."""
     import shutil
     import secrets
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Build a staging path manually rather than via tempfile.mkstemp.
-    # Python's mkstemp uses O_EXCL which Dropbox-mounted filesystems can fail
-    # in some sandbox configurations, AND the sandbox /tmp can fill up with
-    # orphan staged copies from prior runs (each ~140 MB). Try /tmp first; on
-    # any failure fall back to a `.tmp/` dir co-located with out_path.
+    # Reserve a private inode before copying any graph data into it.
     tmp = None
     # We need at least ~200 MB of free space — the staged DB grows to ~140 MB
     # once embeddings are carried forward; leave headroom for the COPY back.
@@ -1147,9 +1147,8 @@ def write_atomic(out_path: Path, nodes: list[dict], edges: list[dict],
                 print(f"  staging skipped at {cand.parent}: only {free / 1024 / 1024:.0f} MB free "
                       f"(need {MIN_STAGE_BYTES / 1024 / 1024:.0f} MB)", file=sys.stderr)
                 continue
-            # Probe writability with a tiny file write (after disk-space check).
-            cand.write_bytes(b"")
-            cand.unlink()
+            fd = os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
             tmp = cand
             print(f"  staging at {cand.parent} ({free / 1024 / 1024 / 1024:.1f} GB free)")
             break
@@ -1158,85 +1157,78 @@ def write_atomic(out_path: Path, nodes: list[dict], edges: list[dict],
             continue
     if tmp is None:
         raise RuntimeError("no writable staging directory available with >=200 MB free")
-    if out_path.exists():
-        # carry forward existing data (embeddings + anything else)
-        try:
+    try:
+        if out_path.exists():
+            # carry forward existing data (embeddings + anything else)
             shutil.copyfile(str(out_path), str(tmp))
-        except Exception as e:
-            print(f"  WARNING: couldn't carry forward existing graph ({e}); rebuilding fresh", file=sys.stderr)
-    # If carry-forward worked, clear nodes + edges so the rebuild is authoritative.
-    # Both must be truncated: collectors can change node IDs between runs (e.g. the
-    # AST extractor's ID scheme differs from the retired graphify bridge), so stale
-    # nodes with old IDs would never be overwritten by INSERT OR REPLACE.
-    # The embeddings table is left intact — its node_id values reference stable
-    # domain-node IDs that are re-inserted unchanged on every build.
-    conn = sqlite3.connect(str(tmp))
-    if tmp.stat().st_size > 0:
-        try:
-            conn.execute("DELETE FROM edges")
-            conn.execute("DELETE FROM nodes")
-            # model_call_log: also truncate, since the JSONL source is
-            # authoritative — re-ingesting on each build is the simplest
-            # path to correctness (matches the edges pattern).
+        # If carry-forward worked, clear nodes + edges so the rebuild is authoritative.
+        # Both must be truncated: collectors can change node IDs between runs (e.g. the
+        # AST extractor's ID scheme differs from the retired graphify bridge), so stale
+        # nodes with old IDs would never be overwritten by INSERT OR REPLACE.
+        # The embeddings table is left intact — its node_id values reference stable
+        # domain-node IDs that are re-inserted unchanged on every build.
+        conn = sqlite3.connect(str(tmp))
+        if tmp.stat().st_size > 0:
             try:
-                conn.execute("DELETE FROM model_call_log")
+                conn.execute("DELETE FROM edges")
+                conn.execute("DELETE FROM nodes")
+                # model_call_log: also truncate, since the JSONL source is
+                # authoritative — re-ingesting on each build is the simplest
+                # path to correctness (matches the edges pattern).
+                try:
+                    conn.execute("DELETE FROM model_call_log")
+                except sqlite3.OperationalError:
+                    pass  # table doesn't exist on the staged copy yet
+                conn.commit()
             except sqlite3.OperationalError:
-                pass  # table doesn't exist on the staged copy yet
-            conn.commit()
-        except sqlite3.OperationalError:
-            pass  # tables might not exist yet on a fresh stage
-    try:
-        conn.executescript(SCHEMA)
-        conn.executemany(
-            "INSERT OR REPLACE INTO nodes (id, type, bucket, name, payload, source_path, built_at, frozen) "
-            "VALUES (:id, :type, :bucket, :name, :payload, :source_path, :built_at, :frozen)",
-            nodes,
-        )
-        seen = set()
-        unique_edges = []
-        for e in edges:
-            key = (e["src"], e["dst"], e["type"])
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_edges.append(e)
-        conn.executemany(
-            "INSERT INTO edges (src, dst, type, weight, payload, built_at) "
-            "VALUES (:src, :dst, :type, :weight, :payload, :built_at)",
-            unique_edges,
-        )
-        # Bite 8 (2026-05-07): ingest the gateway's append-only ledger.
-        if model_call_rows:
+                pass  # tables might not exist yet on a fresh stage
+        try:
+            conn.executescript(SCHEMA)
             conn.executemany(
-                "INSERT INTO model_call_log "
-                "(ts, task_type, model, provider, prompt_tokens, completion_tokens, "
-                " cost_usd, duration_ms, status, caller_script, identifier) "
-                "VALUES (:ts, :task_type, :model, :provider, :prompt_tokens, :completion_tokens, "
-                ":cost_usd, :duration_ms, :status, :caller_script, :identifier)",
-                model_call_rows,
+                "INSERT OR REPLACE INTO nodes (id, type, bucket, name, payload, source_path, built_at, frozen) "
+                "VALUES (:id, :type, :bucket, :name, :payload, :source_path, :built_at, :frozen)",
+                nodes,
             )
-        conn.commit()
-    finally:
-        conn.close()
-    # Diagnostic: count embeddings on staged file before copy-back
-    diag_conn = sqlite3.connect(str(tmp))
-    try:
-        emb_count = diag_conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
-    except sqlite3.OperationalError:
-        emb_count = 0
-    diag_conn.close()
-    print(f"  staged db has {emb_count} embeddings before copy-back")
+            seen = set()
+            unique_edges = []
+            for e in edges:
+                key = (e["src"], e["dst"], e["type"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_edges.append(e)
+            conn.executemany(
+                "INSERT INTO edges (src, dst, type, weight, payload, built_at) "
+                "VALUES (:src, :dst, :type, :weight, :payload, :built_at)",
+                unique_edges,
+            )
+            # Bite 8 (2026-05-07): ingest the gateway's append-only ledger.
+            if model_call_rows:
+                conn.executemany(
+                    "INSERT INTO model_call_log "
+                    "(ts, task_type, model, provider, prompt_tokens, completion_tokens, "
+                    " cost_usd, duration_ms, status, caller_script, identifier) "
+                    "VALUES (:ts, :task_type, :model, :provider, :prompt_tokens, :completion_tokens, "
+                    ":cost_usd, :duration_ms, :status, :caller_script, :identifier)",
+                    model_call_rows,
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        # Diagnostic: count embeddings on staged file before copy-back
+        diag_conn = sqlite3.connect(str(tmp))
+        try:
+            emb_count = diag_conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+        except sqlite3.OperationalError:
+            emb_count = 0
+        diag_conn.close()
+        print(f"  staged db has {emb_count} embeddings before copy-back")
 
-    # Byte-copy + fsync (Dropbox-mount sync race needs fsync to commit)
-    with open(tmp, "rb") as src, open(out_path, "wb") as dst:
-        while True:
-            chunk = src.read(1 << 20)
-            if not chunk:
-                break
-            dst.write(chunk)
-        dst.flush()
-        os.fsync(dst.fileno())
-    tmp.unlink(missing_ok=True)
+        publish(tmp, out_path)
+    finally:
+        # Builds are reproducible from sources. Failed publication leaves the
+        # original intact; no automatic build-stage recovery copy is retained.
+        tmp.unlink(missing_ok=True)
 
 
 # ── summary ───────────────────────────────────────────────────────────────────

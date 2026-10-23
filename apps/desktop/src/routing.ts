@@ -100,6 +100,8 @@ export type RouteRule = {
   text: string;
   /** The rule's stable id, as the advisory flags name it (`routing_advisory`). */
   entity?: string;
+  /** This Mac has the rule but is still waiting for its replicated display number. */
+  number_pending?: boolean;
   seeded?: boolean;
   confirmed?: boolean;
   owner_revision?: string;

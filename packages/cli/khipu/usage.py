@@ -49,6 +49,7 @@ import sys
 import tempfile
 import threading
 import time
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from pathlib import Path
@@ -383,6 +384,14 @@ class _Run:
         with self._lock:
             self.until = max(self.until, deadline)
 
+    @contextlib.contextmanager
+    def committing(self):
+        """Serialize persistent writes with cancellation of this batch."""
+        with self._lock:
+            if self._closed:
+                raise ProbeError(E_TIMEOUT)
+            yield
+
     def kill_all(self) -> None:
         with self._lock:
             self._closed = True
@@ -392,6 +401,11 @@ class _Run:
 
 
 _local = threading.local()
+
+
+def _probe_commit():
+    run = getattr(_local, "run", None)
+    return run.committing() if run is not None else contextlib.nullcontext()
 
 
 def _killpg(proc: subprocess.Popen) -> None:
@@ -687,7 +701,7 @@ def parse_claude(frames: list[dict]) -> dict:
 
 
 @_guard
-def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
+def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
     """Claude Code's own ``/usage`` figures for the login in ``config_dir``
     (``CLAUDE_CONFIG_DIR``; None = the default ``~/.claude``). Never ``--bare``:
     bare mode skips the keychain, so there is no login to read."""
@@ -706,7 +720,7 @@ def probe_claude(config_dir: str | None = None, *, timeout: float = TIMEOUT_S) -
     try:
         return parse_claude(frames)
     except ProbeError as exc:
-        if exc.code != E_NO_FIGURES or not _turn_due(config_dir):
+        if exc.code != E_NO_FIGURES or not turn or not _turn_due(config_dir):
             raise
     # probe_all stops every probe OVERALL_GRACE_S after its timeout; the turn
     # ends just before that, so a slow turn reads as missing figures.
@@ -912,6 +926,8 @@ def codex_rollout(home: str | None = None, *, deadline: float | None = None) -> 
                         continue
         except OSError:
             continue
+    best = None
+    best_at = None
     for _mtime, path in sorted(newest, reverse=True):
         if time.monotonic() > deadline:
             return None
@@ -920,13 +936,16 @@ def codex_rollout(home: str | None = None, *, deadline: float | None = None) -> 
             continue
         limits = event["payload"]["rate_limits"]
         try:
-            return {"ok": True, "plan": _text(limits.get("plan_type")),
-                    "windows": _codex_windows(limits, camel=False),
-                    "credits": _codex_credits(limits, camel=False),
-                    "source": "rollout", "observed_at": _iso(event.get("timestamp"))}
+            candidate = {"ok": True, "plan": _text(limits.get("plan_type")),
+                         "windows": _codex_windows(limits, camel=False),
+                         "credits": _codex_credits(limits, camel=False),
+                         "source": "rollout", "observed_at": _iso(event.get("timestamp"))}
         except ProbeError:
             continue
-    return None
+        at = _parse_time(candidate["observed_at"])
+        if best is None or (at is not None and (best_at is None or at > best_at)):
+            best, best_at = candidate, at
+    return best
 
 
 @_guard
@@ -1087,7 +1106,6 @@ MUSE_LOG_DAYS = 3
 MUSE_LOG_FILES = 24
 _MUSE_REFUSAL = re.compile(rb"Subscription quota exhausted\. Your usage window resets at "
                            rb"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)")
-_MUSE_RECORDED = re.compile(rb'"recorded_at"\s*:\s*(\d{10,17})')
 # A refusal holds no figure: it stands in the row as one window at 100% that
 # ends at the refusal's reset time, so routing reads Muse as limited until then.
 MUSE_REFUSED_WINDOW = "refused"
@@ -1202,8 +1220,8 @@ def _muse_turn(binary: str, env: dict[str, str], deadline: float) -> dict:
 
 def _muse_log_refusal() -> tuple[str, str] | None:
     """(reset time, refused at) of the newest quota refusal in Muse's own
-    session logs, or None. Only the refusal's fixed words and the record's
-    ``recorded_at`` are read from a line; nothing else in a log is kept."""
+    session logs, or None. Only structured failed-run reasons can establish
+    a refusal; only its fixed words and ``recorded_at`` are kept."""
     root = Path.home().joinpath(*MUSE_SESSIONS)
     try:
         days = sorted(p for p in root.glob("[0-9][0-9][0-9][0-9]/[0-9][0-9]/[0-9][0-9]") if p.is_dir())
@@ -1224,11 +1242,20 @@ def _muse_log_refusal() -> tuple[str, str] | None:
         except OSError:
             continue
         for line in data.split(b"\n"):
-            match = _MUSE_REFUSAL.search(line)
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            payload = record.get("payload") if isinstance(record, dict) else None
+            event = payload.get("event") if isinstance(payload, dict) and payload.get("kind") == "run" else None
+            if not isinstance(event, dict) or event.get("kind") != "failed":
+                continue
+            reason = event.get("reason")
+            match = _MUSE_REFUSAL.search(reason.encode()) if isinstance(reason, str) else None
             if not match:
                 continue
-            stamp = _MUSE_RECORDED.search(line)
-            value = int(stamp.group(1)) if stamp else None
+            value = record.get("recorded_at")
+            value = value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
             # recorded_at is epoch microseconds; a line without one dates from the file.
             at = _iso(value / 1_000_000 if value and value > 100_000_000_000_000 else value) if value \
                 else _iso(mtime)
@@ -1471,33 +1498,30 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
     return parse_glm(status, body)
 
 
-# ---- DeepSeek (balance, spend floor) ---------------------------------------------
+# ---- DeepSeek (measured account spend) ---------------------------------------
 #
-# DeepSeek has no plan window and no usage API Khipu reads: GET /user/balance
-# answers the account's prepaid balance. A balance is net of spend, top-ups,
-# grants and refunds, so a decrease between two reads proves at least that
-# much was spent in that interval, and nothing proves an upper bound: $50
-# spent and $40 topped up between reads looks like $10. Khipu therefore keeps
-# only a floor. A spend cap reads ``over``/``reached`` once the floor alone
-# reaches it, and ``unknown`` otherwise, never ``under``.
+# Balance decreases are spend; increases are top-ups and never offset spend.
+# Polling measures the whole account, regardless of which conversation used it.
+# Spend and a top-up within one interval can net out; retain each observed
+# increase with its interval so that limitation is explicit.
 #
-# The key is read into a local, goes only into the Authorization header of
-# one HTTPS GET to api.deepseek.com (no redirect, no proxy), and never reaches
-# a row, the history file, a log or an error. The history is bound to the key
-# by a keyed hash (HMAC-SHA256 under a random per-history salt), never the key.
+# The key goes only into one HTTPS Authorization header (no redirects/proxies).
+# Owner-only, symlink-free history and locked atomic writes remain key-bound
+# by HMAC-SHA256 under a random per-history salt; the key is never persisted.
 
-DEEPSEEK_BUCKET_S = 3600
-# Spend caps accept up to 366 days (routing_pace), so the floor's evidence is
-# kept that long: at most one bucket starts per clock hour, so a full year is
-# at most 8,784 buckets whatever the poll cadence.
+DEEPSEEK_POLL_S = 60
 DEEPSEEK_HISTORY_DAYS = 366
-DEEPSEEK_HISTORY_MAX = DEEPSEEK_HISTORY_DAYS * 24 + 2
+# This also admits pre-compaction V4 histories for lossless migration. Only
+# the active cap windows (plus a day) need individual reading intervals.
+DEEPSEEK_HISTORY_MAX = DEEPSEEK_HISTORY_DAYS * 86400 // DEEPSEEK_POLL_S + 2
 DEEPSEEK_FRESH_S = 1800
 DEEPSEEK_SKEW_S = 120
-# V2 rounded balances/buckets upward; those amounts cannot prove exact floors.
-DEEPSEEK_HISTORY_VERSION = 3
-DEEPSEEK_HISTORY_BYTES = 4 << 20
+# V4 intervals migrate losslessly on the next poll. V5 daily sums have an
+# explicit version so an older reader cannot silently omit the folded spend.
+DEEPSEEK_HISTORY_VERSION = 5
+DEEPSEEK_HISTORY_BYTES = 128 << 20
 DEEPSEEK_LOCK_NAME = "deepseek-balance.lock"
+_DEEPSEEK_STATE_CACHE: dict = {}
 
 
 def _deepseek_key() -> str | None:
@@ -1599,14 +1623,17 @@ def _ds_floor_display(value: Decimal) -> float:
         return float(value.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
 
 
-def _deepseek_floor_total(base: dict, floor: Decimal, cap_usd) -> dict:
-    cap = Decimal(str(cap_usd)) if cap_usd is not None else None
-    reached = cap is not None and cap > 0 and floor >= cap
-    return {**base, "floor_usd": str(floor), "at_least_usd": _ds_floor_display(floor),
-            "status": "known" if reached else "unknown",
-            "usd": _ds_floor_number(floor) if reached else None,
-            "verdict": ("over" if floor > cap else "reached") if reached else "unknown",
-            "reason": None if reached else base.get("reason")}
+def _deepseek_measured_total(base: dict, amount: Decimal, cap_usd) -> dict:
+    cap = _ds_money(cap_usd) if cap_usd is not None else None
+    verdict = "unknown"
+    if cap is not None and cap > 0:
+        with localcontext() as ctx:
+            ctx.prec = 100
+            verdict = ("over" if amount > cap else "reached" if amount == cap else
+                       "near" if amount >= cap * Decimal("0.85") else "under")
+    return {**base, "measured_usd": str(amount), "at_least_usd": _ds_floor_display(amount),
+            "status": "partial" if base.get("partial") else "known",
+            "usd": _ds_floor_number(amount), "verdict": verdict, "reason": None}
 
 
 def _deepseek_fingerprint(salt_hex: str, key: str) -> str:
@@ -1622,7 +1649,9 @@ def _ds_num(value) -> bool:
 def _deepseek_valid(data, now_ts: float) -> bool:
     """The whole history, or nothing: a damaged file is never repaired into
     evidence. Times may not be in the future (beyond a small clock skew)."""
-    if not isinstance(data, dict) or data.get("version") != DEEPSEEK_HISTORY_VERSION:
+    if not isinstance(data, dict) or data.get("version") not in (4, DEEPSEEK_HISTORY_VERSION):
+        return False
+    if (data["version"] == 4 and "daily" in data) or (data["version"] == 5 and "daily" not in data):
         return False
     salt, fp = data.get("salt"), data.get("fingerprint")
     if not (isinstance(salt, str) and re.fullmatch(r"[0-9a-f]{32}", salt)
@@ -1634,23 +1663,63 @@ def _deepseek_valid(data, now_ts: float) -> bool:
         return False
     try:
         _ds_money(last[1])
-        for bucket in buckets if isinstance(buckets, list) else []:
-            if isinstance(bucket, list) and len(bucket) == 3:
-                _ds_money(bucket[2])
     except (ValueError, TypeError, InvalidOperation):
         return False
     if not since <= last[0] <= limit:
         return False
     if not isinstance(buckets, list) or len(buckets) > DEEPSEEK_HISTORY_MAX:
         return False
+    topups = data.get("topups")
+    if not isinstance(topups, list) or len(topups) > DEEPSEEK_HISTORY_MAX:
+        return False
+    for records in (buckets, topups):
+        previous_end = None
+        for record in records:
+            if not isinstance(record, list) or len(record) != 3 or not all(map(_ds_num, record[:2])):
+                return False
+            start, end, amount = record
+            try:
+                if _ds_money(amount) <= 0:
+                    return False
+            except (ValueError, TypeError, InvalidOperation):
+                return False
+            if not (start < end <= last[0]) or (previous_end is not None and start < previous_end):
+                return False
+            previous_end = end
+    daily = data.get("daily", [])
+    if not isinstance(daily, list) or len(daily) > DEEPSEEK_HISTORY_DAYS + 1:
+        return False
     previous_end = None
-    for bucket in buckets:
-        if not isinstance(bucket, list) or len(bucket) != 3 or not all(map(_ds_num, bucket[:2])):
+    for record in daily:
+        if not isinstance(record, list) or len(record) != 6:
             return False
-        start, end, spent = bucket
-        if not (start < end <= last[0]) or (previous_end is not None and start < previous_end):
+        start, end, spent, count, increase, seconds = record
+        if (not _ds_num(start) or not _ds_num(end) or not start < end <= last[0]
+                or (previous_end is not None and start < previous_end)
+                or not isinstance(count, int) or isinstance(count, bool) or not 0 <= count <= DEEPSEEK_HISTORY_MAX
+                or not _ds_num(seconds) or not 0 <= seconds <= end - start):
+            return False
+        try:
+            debit, credit = _ds_money(spent), _ds_money(increase)
+            if ((count == 0 and (credit != 0 or seconds != 0))
+                    or (count > 0 and (credit <= 0 or seconds <= 0))
+                    or (debit == 0 and count == 0)):
+                return False
+        except (ValueError, TypeError, InvalidOperation):
+            return False
+        if previous_end is not None and int(end // 86400) <= int(previous_end // 86400):
             return False
         previous_end = end
+    # A single reading cannot be both a decrease and an increase. Check the
+    # combined order too, so damaged cross-list intervals cannot invent spend.
+    previous_end = None
+    for record in heapq.merge(buckets, topups, daily):
+        start, end = record[:2]
+        if previous_end is not None and start < previous_end:
+            return False
+        previous_end = end
+    if daily and any(records and records[0][0] < daily[-1][1] for records in (buckets, topups)):
+        return False
     attempt = data.get("attempt")
     if attempt is not None:
         if not isinstance(attempt, dict) or not _ds_num(attempt.get("at")) or attempt["at"] > limit:
@@ -1754,47 +1823,193 @@ def _deepseek_locked():
 def _deepseek_new(key: str, at: float, balance: float) -> dict:
     salt = os.urandom(16).hex()
     return {"version": DEEPSEEK_HISTORY_VERSION, "salt": salt, "fingerprint": _deepseek_fingerprint(salt, key),
-            "since": at, "last": [at, _ds_store_money(_ds_money(balance))], "buckets": [],
+            "since": at, "last": [at, _ds_store_money(_ds_money(balance))], "buckets": [], "topups": [], "daily": [],
             "attempt": {"at": at, "ok": True, "error": None}}
 
 
-def _deepseek_add(data: dict, at: float, balance: float) -> bool:
-    """Merge one reading taken at ``at`` into ``data``. A reading not after the
-    last one recorded (a slower concurrent poll, or a clock step back) is
-    dropped: its place in the order is unknown. A decrease is added to the
-    bucket of the clock hour its interval starts in (a bucket's floor is the
-    sum of the decreases of intervals inside it)."""
+def _deepseek_cap_days() -> list[float]:
+    """The saved local routing record's DeepSeek caps; no refold or IO
+    beyond that file. Seven days also serves the usage report's own window."""
+    from khipu import routing
+
+    try:
+        view = routing._load_view() or {}
+        days = [7.0]
+        for entry in (view.get("accounts") or []):
+            if entry.get("harness") != "deepseek":
+                continue
+            for cap in entry.get("caps") or []:
+                value = cap.get("days")
+                if cap.get("kind") == "spend" and _ds_num(value) and 0 < value <= DEEPSEEK_HISTORY_DAYS:
+                    days.append(value)
+        return sorted(set(days))
+    except Exception:  # noqa: BLE001 - retain precision when the local record cannot be read
+        return [7.0, float(DEEPSEEK_HISTORY_DAYS)]
+
+
+def _deepseek_precision_days() -> float:
+    return max(_deepseek_cap_days())
+
+
+def _deepseek_compact(data: dict, at: float, *, precise_days: float = 7) -> None:
+    """Fold only intervals older than the longest cap plus one day. Daily
+    rows keep independent exact decreases, top-up counts/increases and gap
+    seconds; no net balance and no synthetic top-up interval enters spend."""
+    cutoff = at - DEEPSEEK_HISTORY_DAYS * 86400
+    fine_cutoff = at - (max(7, precise_days) + 1) * 86400
+    data["version"] = DEEPSEEK_HISTORY_VERSION
+    data["since"] = max(data["since"], cutoff)
+    daily = data.setdefault("daily", [])
+    remove = bisect_right(daily, cutoff, key=lambda r: r[1])
+    if remove:
+        data["since"] = max(data["since"], daily[remove - 1][1])
+        del daily[:remove]
+    retired = []
+    for records, is_topup in ((data["buckets"], False), (data["topups"], True)):
+        remove = max(bisect_right(records, cutoff, key=lambda r: r[1]),
+                     len(records) - DEEPSEEK_HISTORY_MAX)
+        if remove > 0:
+            data["since"] = max(data["since"], records[remove - 1][1])
+            del records[:remove]
+        fold = bisect_right(records, fine_cutoff, key=lambda r: r[1])
+        retired.extend((r, is_topup) for r in records[:fold])
+        del records[:fold]
+    with localcontext() as ctx:
+        ctx.prec = 100
+        for (start, end, amount), is_topup in sorted(retired, key=lambda item: item[0][0]):
+            if not daily or int(daily[-1][1] // 86400) != int(end // 86400):
+                daily.append([start, end, 0, 0, 0, 0])
+            row = daily[-1]
+            row[1] = end
+            column = 4 if is_topup else 2
+            row[column] = _ds_store_money(_ds_money(row[column]) + _ds_money(amount))
+            if is_topup:
+                row[3] += 1
+                row[5] += end - start
+
+
+def _deepseek_add(data: dict, at: float, balance: float, *, precise_days: float = 7) -> bool:
+    """Record a consecutive reading, discarding late or same-time replies.
+    Each positive decrease is attributed to the reading that measures it.
+    An increase records its own interval and never subtracts from spend."""
     last_at, last_balance = data["last"]
     if at <= last_at:
         return False
     with localcontext() as ctx:
         ctx.prec = 100
-        spent = max(Decimal(0), _ds_money(last_balance) - _ds_money(balance))
-    buckets = data["buckets"]
-    if spent > 0:
-        if buckets and buckets[-1][0] // DEEPSEEK_BUCKET_S == last_at // DEEPSEEK_BUCKET_S:
-            with localcontext() as ctx:
-                ctx.prec = 100
-                combined = _ds_money(buckets[-1][2]) + spent
-            buckets[-1] = [buckets[-1][0], at, _ds_store_money(combined)]
-        else:
-            buckets.append([last_at, at, _ds_store_money(spent)])
+        change = _ds_money(last_balance) - _ds_money(balance)
+        if change:
+            records = data["buckets" if change > 0 else "topups"]
+            records.append([last_at, at, _ds_store_money(abs(change))])
     data["last"] = [at, _ds_store_money(_ds_money(balance))]
-    data["attempt"] = {"at": at, "ok": True, "error": None}
-    cutoff = at - DEEPSEEK_HISTORY_DAYS * 86400
-    data["buckets"] = [b for b in buckets if b[0] >= cutoff][-DEEPSEEK_HISTORY_MAX:]
-    data["since"] = max(data["since"], cutoff)
+    if at >= (data.get("attempt") or {}).get("at", last_at):
+        data["attempt"] = {"at": at, "ok": True, "error": None}
+    _deepseek_compact(data, at, precise_days=precise_days)
     return True
 
 
-def deepseek_floor(data: dict, start: float, end: float) -> Decimal:
-    """Dollars certainly spent in [start, end]: the decreases of buckets lying
-    wholly inside it. A bucket that crosses ``start`` is left out (its debit
-    may predate the window), so the floor can only understate, by at most
-    the decreases of one bucket."""
+def _deepseek_window(data: dict, start: float, end: float) -> tuple[Decimal, dict, float | None]:
+    """Cache computed sums by interval indices, so advancing prompt times
+    still expire individual intervals at the exact rolling boundary."""
+    buckets, topups, daily = data["buckets"], data["topups"], data.get("daily", [])
+    b0 = bisect_right(buckets, start, key=lambda r: r[1])
+    b1 = bisect_right(buckets, end, key=lambda r: r[1])
+    t0 = bisect_right(topups, start, key=lambda r: r[1])
+    t1 = bisect_right(topups, end, key=lambda r: r[1])
+    d0 = bisect_left(daily, start, key=lambda r: r[0])
+    d1 = bisect_right(daily, end, key=lambda r: r[1])
+    # A boundary inside a folded day lacks individual intervals. Never
+    # attribute the whole day to it or claim complete coverage for it.
+    partial_since = None
+    if d0 and daily[d0 - 1][1] > start:
+        partial_since = daily[d0 - 1][1]
+    if d1 < len(daily) and daily[d1][0] < end:
+        partial_since = max(partial_since or start, daily[d1][1])
+    cache = _DEEPSEEK_STATE_CACHE.get("windows") if _DEEPSEEK_STATE_CACHE.get("data") is data else None
+    indices = (b0, b1, t0, t1, d0, d1, partial_since)
+    if cache is not None and indices in cache:
+        return cache[indices]
     with localcontext() as ctx:
         ctx.prec = 100
-        return sum((_ds_money(spent) for s, e, spent in data["buckets"] if s >= start and e <= end), Decimal(0))
+        amount = sum((_ds_money(r[2]) for r in buckets[b0:b1]), Decimal(0))
+        amount += sum((_ds_money(r[2]) for r in daily[d0:d1]), Decimal(0))
+    intervals = [{"from": _iso(s), "to": _iso(e), "increase_usd": str(_ds_money(value)), "seconds": e - s}
+                 for s, e, value in topups[t0:t1]]
+    increases = {"topups_seen": len(intervals) + sum(r[3] for r in daily[d0:d1]),
+                 "topup_intervals": intervals,
+                 "possible_miss_seconds": sum(i["seconds"] for i in intervals) + sum(r[5] for r in daily[d0:d1])}
+    out = (amount, increases, partial_since)
+    if cache is not None:
+        if len(cache) >= 32:
+            cache.clear()
+        cache[indices] = out
+    return out
+
+
+def deepseek_spend(data: dict, start: float, end: float) -> Decimal:
+    """Exact decreases in (start, end]; folded days contribute only when
+    wholly enclosed. Active cap windows retain individual intervals."""
+    return _deepseek_window(data, start, end)[0]
+
+
+def _deepseek_topups(data: dict, start: float, end: float) -> dict:
+    return copy.deepcopy(_deepseek_window(data, start, end)[1])
+
+
+def _deepseek_identity(dir_fd: int) -> tuple:
+    """Metadata only, through the same trusted directory as the reader.
+    Permission/owner changes and atomic replacements invalidate the cache."""
+    parent = os.fstat(dir_fd)
+    info = os.stat(DEEPSEEK_HISTORY_NAME, dir_fd=dir_fd, follow_symlinks=False)
+    return (parent.st_dev, parent.st_ino, info.st_dev, info.st_ino, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_size, info.st_mode, info.st_uid)
+
+
+def _deepseek_cached_history(now: datetime) -> tuple[str, dict | None]:
+    """Validated local data only; key binding is checked by each consumer."""
+    dir_fd = _deepseek_dir(create=False)
+    if dir_fd is None:
+        return "missing", None
+    try:
+        identity = _deepseek_identity(dir_fd)
+        cached = _DEEPSEEK_STATE_CACHE
+        data = cached.get("data")
+        hit = (cached.get("identity") == identity and isinstance(data, dict)
+               and isinstance(cached.get("windows"), dict))
+        if hit:
+            try:
+                # A clock rollback must not bypass the reader's future-time check.
+                limit = now.timestamp() + DEEPSEEK_SKEW_S
+                future = data["last"][0] > limit or (data.get("attempt") or {}).get("at", 0) > limit
+            except (KeyError, TypeError, IndexError):
+                hit = False  # damaged/missing process cache: reread the trusted file
+        if hit:
+            status, data = ("damaged", None) if future else ("ok", data)
+        else:
+            cached.clear()
+            status, data = _deepseek_read(dir_fd, now.timestamp())
+            if status == "ok" and identity == _deepseek_identity(dir_fd):
+                cached.update(identity=identity, data=data, windows={})
+    except FileNotFoundError:
+        status, data = "missing", None
+    except OSError:
+        status, data = "damaged", None
+    finally:
+        os.close(dir_fd)
+    return status, data
+
+
+def _deepseek_prime_cache() -> None:
+    """Warm the persistent forkserver, so each prompt child inherits the
+    same validated history and configured cap sums. No keys, network or writes."""
+    try:
+        now = _now()
+        status, data = _deepseek_cached_history(now)
+        if status == "ok":
+            for days in _deepseek_cap_days():
+                _deepseek_window(data, (now - timedelta(days=days)).timestamp(), now.timestamp())
+    except Exception:  # noqa: BLE001 - a cache miss never prevents a prompt fork
+        _DEEPSEEK_STATE_CACHE.clear()
 
 
 def _deepseek_state(now: datetime) -> tuple[str, dict | None]:
@@ -1803,13 +2018,7 @@ def _deepseek_state(now: datetime) -> tuple[str, dict | None]:
     key = _deepseek_key()
     if not key:
         return "Khipu has no DeepSeek key, so no balance history speaks for an account", None
-    dir_fd = _deepseek_dir(create=False)
-    if dir_fd is None:
-        return "no DeepSeek balance read yet", None
-    try:
-        status, data = _deepseek_read(dir_fd, now.timestamp())
-    finally:
-        os.close(dir_fd)
+    status, data = _deepseek_cached_history(now)
     if status == "missing":
         return "no DeepSeek balance read yet", None
     if status != "ok":
@@ -1827,19 +2036,16 @@ def _hmac_equal(a: str, b: str) -> bool:
 
 def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = None, *,
                          definitions: dict | None = None) -> dict:
-    """The routing record's spend-cap read of DeepSeek over the rolling
-    ``days`` ending ``now`` (the shape of ``routing_sources.spend_total``).
-
-    Known, with the floor as its figure, only when the floor alone has
-    reached ``cap_usd``: that is true whatever a top-up hid, and a later read
-    can never lower it. Anything less is unknown, with the floor as
-    ``at_least_usd``: a balance cannot rule out spend a top-up or refund
-    netted away. Unknown with no floor when the key is gone or changed, the
-    history is damaged, or more than one DeepSeek account is defined. Never
-    raises: a damaged input is unknown, not a broken route."""
+    """Measured account spend over the rolling cap window, independent of
+    conversation setup. Full coverage is known; filling history is partial
+    but still judged against the cap as measured. A top-up does not make
+    either unknown: its interval bounds where spend might have netted out.
+    Failed/stale/unavailable reads and untrusted or missing history are
+    unknown, even when previously measured spend reached the cap."""
     start = now - timedelta(days=days)
     base = {"from": _iso(start.timestamp()), "to": _iso(now.timestamp()), "events": None,
-            "at_least_usd": None, "partial": True, "since": None}
+            "at_least_usd": None, "partial": True, "since": None,
+            "topups_seen": None, "topup_intervals": [], "possible_miss_seconds": 0}
     try:
         if definitions is not None and sum(
                 1 for v in (definitions.get("accounts") or {}).values()
@@ -1849,22 +2055,19 @@ def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = Non
         state, data = _deepseek_state(now)
         if state != "ok":
             return {**base, "status": "unknown", "usd": None, "reason": state}
-        floor = deepseek_floor(data, start.timestamp(), now.timestamp())
-        partial = data["since"] > start.timestamp()
-        out = _deepseek_floor_total({**base, "partial": partial, "since": _iso(data["since"])}, floor, cap_usd)
-        if out["status"] == "known":
-            return out
+        amount, topups, partial_since = _deepseek_window(data, start.timestamp(), now.timestamp())
+        since = max(data["since"], partial_since or data["since"])
+        partial = since > start.timestamp()
+        out = _deepseek_measured_total(
+            {**base, "partial": partial, "since": _iso(since), **copy.deepcopy(topups)}, amount, cap_usd)
         attempt = data.get("attempt") or {}
         if attempt.get("ok") is False:
             reason = "DeepSeek's last balance read failed"
         elif now.timestamp() - data["last"][0] > DEEPSEEK_FRESH_S:
             reason = "DeepSeek's balance has not been read in the last 30 minutes"
-        elif partial:
-            reason = f"Khipu has read DeepSeek's balance only since {_iso(data['since'])}"
         else:
-            reason = "a balance cannot rule out spend a top-up or refund hid"
-        return {**out, "status": "unknown", "usd": None,
-                "reason": f"{reason}; at least ${out['at_least_usd']:.2f} spent in the window"}
+            return out
+        return {**out, "status": "unknown", "usd": None, "verdict": "unknown", "reason": reason}
     except Exception:  # noqa: BLE001 - a broken history is unknown, never a crashed route
         return {**base, "status": "unknown", "usd": None, "reason": "DeepSeek's balance history can't be read"}
 
@@ -1872,22 +2075,28 @@ def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = Non
 def _deepseek_record_failure(key: str, at: float, code: str) -> None:
     """Note a failed read on a history this key owns, so routing and the
     owner see the failure; no figure changes."""
-    with _deepseek_locked() as dir_fd:
+    with _deepseek_locked() as dir_fd, _probe_commit():
         if dir_fd is None:
             return
         status, data = _deepseek_read(dir_fd, at)
         if status != "ok" or not _hmac_equal(data["fingerprint"], _deepseek_fingerprint(data["salt"], key)):
             return
-        data["attempt"] = {"at": max(at, data["last"][0]), "ok": False, "error": code}
+        if at < max(data["last"][0], (data.get("attempt") or {}).get("at", 0)):
+            return
+        data["attempt"] = {"at": at, "ok": False, "error": code}
         _deepseek_write(dir_fd, data)
 
 
 @_guard
 def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
-    """DeepSeek's balance and the floor of its rolling 7-day spend; the cap
-    and its used share are the routing record's (``cap_statuses``). A failed
-    read stores no sample. The 7-day figure is a floor and is marked
-    ``partial`` until the history covers the whole 7 days."""
+    """DeepSeek's balance and measured seven-day account spend. The shared
+    usage poll makes DeepSeek due every 60 seconds; the daemon normally
+    looks every 10 seconds (at most 60 while DeepSeek is tracked), bounding
+    normal top-up intervals to two minutes. Sleep, failures and blocked
+    refreshes can delay a read; each recorded top-up reports its actual
+    interval rather than claiming the target cadence was achieved.
+    The routing record owns the cap. History is partial until seven days
+    are covered. A failed read stores no sample."""
     key = _deepseek_key()
     if not key:
         raise ProbeError(E_NO_KEY)
@@ -1901,7 +2110,7 @@ def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
         except ProbeError as exc:
             _deepseek_record_failure(key, at, exc.code)
             raise
-        with _deepseek_locked() as dir_fd:
+        with _deepseek_locked() as dir_fd, _probe_commit():
             data = None
             if dir_fd is not None:
                 state, data = _deepseek_read(dir_fd, max(at, _now().timestamp()))
@@ -1909,7 +2118,7 @@ def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
                                                     _deepseek_fingerprint(data["salt"], key)):
                     data = _deepseek_new(key, at, balance)
                     _deepseek_write(dir_fd, data)
-                elif _deepseek_add(data, at, balance):
+                elif _deepseek_add(data, at, balance, precise_days=_deepseek_precision_days()):
                     _deepseek_write(dir_fd, data)
             if data is None:
                 data = _deepseek_new(key, at, balance)
@@ -1917,7 +2126,9 @@ def probe_deepseek(*, timeout: float = TIMEOUT_S) -> dict:
         key = None  # the key lives only for the request above
     start = at - 7 * 86400
     spend = {"balance_usd": float(data["last"][1]),
-             "last_7d_at_least_usd": _ds_floor_display(deepseek_floor(data, start, at)),
+             "last_7d_usd": _ds_floor_number(deepseek_spend(data, start, at)),
+             "last_7d_at_least_usd": _ds_floor_display(deepseek_spend(data, start, at)),
+             **_deepseek_topups(data, start, at),
              "partial": data["since"] > start, "since": _iso(data["since"])}
     return {"ok": True, "plan": None, "windows": [], "credits": None, "version": None,
             "source": "live", "spend": spend}
@@ -2596,7 +2807,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             # home-less account reads its CLI's default folder.
             data = {"ok": False, "error": E_NO_FOLDER, "note": NO_FOLDER_NOTE}
         elif harness == "claude":
-            data = probe_claude(home, timeout=timeout)
+            data = probe_claude(home, timeout=timeout, turn=turn)
         elif harness == "codex":
             data = probe_codex(home, timeout=timeout, rollout=rollout)
         elif harness == "grok":
@@ -2660,7 +2871,7 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
     for thread in threads:
         thread.start()
     longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"]
-                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") == "glm"])
+                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") in ("glm", "deepseek")])
     end = time.monotonic() + longest + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
@@ -2747,7 +2958,9 @@ def _release(fd: int | None) -> None:
 
 
 def _merge(previous: dict | None, row: dict) -> dict:
-    """A good probe replaces the row. A failed one keeps the last good figures
+    """A good probe replaces figures only when they are at least as recent.
+    A failed live read keeps newer good figures even if a fallback succeeds.
+    A failed probe keeps the last good figures
     with their own ``probed_at`` (and ``last_good_at``); the attempt goes in
     ``last_attempt_at`` / ``last_error``, however many failures in a row.
     The note is the failure's own (the ``/login`` hint, say): a note that
@@ -2755,7 +2968,17 @@ def _merge(previous: dict | None, row: dict) -> dict:
     read was good."""
     attempt = row.get("probed_at")
     if row.get("ok"):
-        return dict(row, last_attempt_at=attempt, last_error=None, last_good_at=attempt)
+        old_time = (_oldest_figures_time(previous)
+                    if previous and not _future_times(previous, _now()) else None)
+        new_time = _oldest_figures_time(row)
+        if previous and old_time is not None and (new_time is None or new_time < old_time):
+            failure = row.get("live_error")
+            kept = dict(previous, last_attempt_at=attempt, last_error=failure, ms=row.get("ms"),
+                        account=row.get("account"), home=row.get("home"))
+            if failure:
+                kept.update(ok=False, error=failure, live_error=failure, note=row.get("note"))
+            return kept
+        return dict(row, last_attempt_at=attempt, last_error=row.get("live_error"), last_good_at=attempt)
     if previous and previous.get("last_good_at"):
         kept = {k: v for k, v in previous.items() if k != "live_error"}
         kept.update(ok=False, error=row.get("error"), last_attempt_at=attempt, last_error=row.get("error"),
@@ -2850,7 +3073,10 @@ def _due(accounts: list[dict], cache: dict[str, dict], now: datetime, max_age: f
             continue
         cached = cache.get(_key(account)) or {}
         attempted = _parse_time(cached.get("last_attempt_at") or cached.get("probed_at"))
-        if attempted is None or (now - attempted).total_seconds() > max_age:
+        age_limit = min(max_age, DEEPSEEK_POLL_S) if account.get("harness") == "deepseek" else max_age
+        if attempted is None or _future_times(cached, now) or _reset_due(cached, now) or ((now - attempted).total_seconds() >= age_limit
+                                 if account.get("harness") == "deepseek"
+                                 else (now - attempted).total_seconds() > age_limit):
             out.append(account)
     return out
 
@@ -2920,12 +3146,44 @@ def _figures_time(row: dict, window: dict | None = None) -> datetime | None:
     when = _parse_time((window or {}).get("observed_at")) or _parse_time(row.get("observed_at"))
     if row.get("source") in ("rollout", "last_observed"):
         return when
-    return when or _parse_time(row.get("probed_at"))
+    return (when or (_parse_time(row.get("last_good_at")) if not row.get("ok") else None)
+            or _parse_time(row.get("probed_at")))
+
+
+def _oldest_figures_time(row: dict) -> datetime | None:
+    windows = [w for w in row.get("windows") or [] if isinstance(w, dict)]
+    times = [_figures_time(row, w) for w in windows] if windows else [_figures_time(row)]
+    return min(times) if all(t is not None for t in times) else None
 
 
 def _age_s(row: dict, now: datetime) -> float | None:
-    when = _figures_time(row)
+    when = _oldest_figures_time(row)
     return None if when is None else (now - when).total_seconds()
+
+
+def _expired_window(window: dict, now: datetime) -> bool:
+    reset = _parse_time(window.get("resets_at"))
+    return reset is not None and reset <= now
+
+
+def _reset_due(row: dict, now: datetime) -> bool:
+    attempted = _parse_time(row.get("last_attempt_at") or row.get("probed_at"))
+    return any(_expired_window(w, now) and (attempted is None or attempted < _parse_time(w.get("resets_at")))
+               for w in row.get("windows") or [] if isinstance(w, dict))
+
+
+def _future_times(row: dict, now: datetime) -> bool:
+    times = [_parse_time(row.get("last_attempt_at") or row.get("probed_at")), _figures_time(row)]
+    times.extend(_figures_time(row, w) for w in row.get("windows") or [] if isinstance(w, dict))
+    return any(at is not None and at > now for at in times)
+
+
+def _stale_figures(row: dict, now: datetime, max_age: float) -> bool:
+    age = _age_s(row, now)
+    return bool(_future_times(row, now) or (not row.get("ok") and row.get("last_good_at"))
+                or (age is None and row.get("source") in ("rollout", "last_observed"))
+                or (age is not None and not 0 <= age <= max_age)
+                or any(_expired_window(w, now) for w in row.get("windows") or [] if isinstance(w, dict)))
 
 
 def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: float = TIMEOUT_S,
@@ -2953,7 +3211,8 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
             continue
         cached = cache.get(_key(account))
         attempted = _parse_time((cached or {}).get("last_attempt_at") or (cached or {}).get("probed_at"))
-        young = bool(cached and attempted and (now - attempted).total_seconds() <= max_age)
+        young = bool(cached and attempted and 0 <= (now - attempted).total_seconds() <= max_age
+                     and not _future_times(cached, now) and not _reset_due(cached, now))
         if fresh or not young:
             due.append(i)
         if cached and (background or (young and not fresh)):
@@ -2998,10 +3257,9 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
         # The identity the routing record keys this account by, so the app
         # matches the two by login, never by a name that may be reused.
         row["key"] = _key(account)
-        age = _age_s(row, now)
-        row["stale"] = bool((not row.get("ok") and row.get("last_good_at"))
-                            or (age is None and row.get("source") in ("rollout", "last_observed"))
-                            or (age is not None and age > max_age))
+        row["stale"] = _stale_figures(row, now, max_age)
+        row["windows"] = [dict(w, used_pct=None, expired=True) if _expired_window(w, now) else dict(w)
+                          for w in row.get("windows") or []]
     return {"generated_at": _iso(now.timestamp()), "max_age_s": max_age, "refreshing": refreshing,
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
 
@@ -3012,7 +3270,7 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
 _PUBLIC_ROW_FIELDS = ("harness", "account", "plan", "ok", "error", "live_error", "last_error", "version",
                       "source", "observed_at", "probed_at", "last_attempt_at", "last_good_at", "ms", "cached",
                       "stale", "refreshing")
-_PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model")
+_PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model", "expired")
 INVALID_PUBLIC_NOTE = "This account entry is not valid; the owner can fix it in Khipu's Settings"
 
 
@@ -3220,8 +3478,12 @@ def summary_line(row: dict) -> str:
     if not windows:
         text = f"{head}: {row.get('note') or 'no windows reported'}"
     else:
-        text = f"{head}: " + ", ".join(f"{_window_label(w)} {_pct(w.get('used_pct'))}" for w in windows)
-        tight = max(windows, key=lambda w: w.get("used_pct") if isinstance(w.get("used_pct"), (int, float)) else -1)
+        text = f"{head}: " + ", ".join(
+            f"{_window_label(w)} unknown (reset passed)" if w.get("expired") else
+            f"{_window_label(w)} {_pct(w.get('used_pct'))}" for w in windows)
+        tight = max((w for w in windows if not w.get("expired")),
+                    key=lambda w: w.get("used_pct") if isinstance(w.get("used_pct"), (int, float)) else -1,
+                    default={})
         if tight.get("resets_at"):
             text += f"; tightest {_window_label(tight)} {_pct(tight.get('used_pct'))} resets {_when(tight['resets_at'])}"
     credits = row.get("credits") or {}
@@ -3352,10 +3614,7 @@ def doctor_block(*, max_age: float = DEFAULT_MAX_AGE_S, now: datetime | None = N
             entry["never_read"] = True  # `khipu usage` has not read this account yet
             accounts.append(entry)
             continue
-        age = _age_s(row, now)
-        stale = bool((not row.get("ok") and row.get("last_good_at"))
-                     or (age is None and row.get("source") in ("rollout", "last_observed"))
-                     or (age is not None and age > max_age))
+        stale = _stale_figures(row, now, max_age)
         live = [w for w in row.get("windows") or [] if _in_force(w, now)]
         tight = max(live, key=lambda w: _shown_pct(w.get("used_pct")), default=None)
         figures_time = _figures_time(row)

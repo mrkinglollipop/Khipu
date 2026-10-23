@@ -504,6 +504,29 @@ def _pages_left(text, start, width):
         start, count = end, count + 1
     return count
 
+def _drop_absent_forecasts(state, planned, at):
+    """End unacknowledged pace/advice offers the plan no longer carries.
+
+    Only a live lease on the batch that holds an offer keeps it, so that
+    batch's acknowledgement still lands. Called again once a lease has been
+    withdrawn or has expired, so an absent offer is never rendered, claimed
+    or leased anew."""
+    entries = state.get("entries", {})
+    leased = set()
+    flight = state.get("flight")
+    try:
+        if flight and _parse(flight["until"]) > _parse(at):
+            leased = {i["entity"] for i in flight["out"]["routing_changes"]["items"]}
+    except (KeyError, TypeError, ValueError):
+        leased = set()
+    dropped = {e for e, old in entries.items()
+               if e.startswith(("pace:", "advice:")) and not old.get("acked")
+               and e not in planned and e not in leased}
+    for entity in dropped:
+        del entries[entity]
+    return dropped
+
+
 def _merge(state, out):
     epoch = out.get("epoch")
     if state.get("epoch") == epoch:
@@ -528,10 +551,17 @@ def _merge(state, out):
         if entity.startswith("notice:") and not entries[entity].get("acked") and entity not in plan.get("notices", []):
             del entries[entity]
             replaced.add(entity)
+    # A pace or advice forecast is an offer, never part of the routing view:
+    # nothing is retracted when a later plan stops offering it (the start
+    # block's child plan, or a forecast that no longer differs). The unshown
+    # offer ends silently, like notice debt, unless a live lease still holds
+    # it for a display that has not recorded delivery yet.
+    replaced |= _drop_absent_forecasts(state, planned, plan.get("at"))
     # SessionStart's parent has only the scrubbed plan, not the routing view.
     # Missing saved debt needs a removal message, never its former words.
     for entity, old in entries.items():
-        if not old.get("acked") and entity not in planned and entity not in current:
+        if not old.get("acked") and entity not in planned and entity not in current \
+                and not entity.startswith(("pace:", "advice:")):
             fallback = ("The owner's note ended" if entity == "note" else
                         old["label"] + (" retired" if entity.startswith("rule:") else " is no longer current"))
             line = plan.get("removed", {}).get(entity, fallback)
@@ -622,6 +652,10 @@ def _render(state, out, now, component, *, delivery_point=True):
     if flight:
         _expire(state, flight)
         state.pop("flight", None)
+    # No lease holds an absent offer any more: it ends here, before anything
+    # is rendered, claimed or leased on its behalf.
+    _drop_absent_forecasts(state, {i["entity"] for i in out["delivery_plan"]["items"]},
+                           out["delivery_plan"].get("at"))
     # A receipt can arrive after the plan was rendered, through another
     # hook or identity. Completed removals can also remain in a stale offer;
     # their matching receipt takes precedence over that old omission.
@@ -1390,6 +1424,8 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
         if flight:
             _expire(state, flight)
             state.pop("flight", None)
+        _drop_absent_forecasts(state, {i["entity"] for i in out["delivery_plan"]["items"]},
+                               out["delivery_plan"].get("at"))
         due = [e for e in entries.values() if not e.get("acked") and e["entity"] not in skip_entities]
         due.sort(key=lambda e: not e["entity"].startswith("hold:"))
         if not due:
@@ -1606,6 +1642,8 @@ def child_page(planned, *, session=None, component, now=None, cfg=None):
         if flight:
             _expire(state, flight)
             state.pop("flight", None)
+        _drop_absent_forecasts(state, {i["entity"] for i in planned["delivery_plan"]["items"]},
+                               planned["delivery_plan"].get("at"))
         due = [e for e in _child_sorted(entries.values())
                if not e.get("acked") and e.get("offset", 0) < len(e["text"])
                and (e.get("whole") or e.get("child_owed"))]

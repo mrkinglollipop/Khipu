@@ -151,8 +151,10 @@ def test_nightly_step_failed_sweep_is_recorded_not_raised():
 
 
 def test_nightly_runs_the_step():
-    src = jobs.run_nightly.__code__.co_names
-    assert "_project_renames_sweep" in src
+    wrapper_names = jobs.run_nightly.__code__.co_names
+    assert "_job_lock" in wrapper_names
+    assert "_run_nightly_locked" in wrapper_names
+    assert "_project_renames_sweep" in jobs._run_nightly_locked.__code__.co_names
 
 
 # ---- doctor block ----------------------------------------------------------------

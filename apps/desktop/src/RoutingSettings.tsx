@@ -351,6 +351,7 @@ function useEndOrKeep(w: Writer) {
     args: Record<string, unknown>,
     after?: (() => Promise<unknown>) | null,
     back?: Back,
+    onRetrySuccess?: () => void,
   ): Promise<boolean> => {
     const ok = await w.run(id, command, args, after, back);
     if (ok) return true;
@@ -362,6 +363,7 @@ function useEndOrKeep(w: Writer) {
         const done = await w.run(id, command, { ...args, holds }, after, back);
         if (done) {
           setAsk(null);
+          onRetrySuccess?.();
           return true;
         }
         const again = holdChoiceIds(w.errorOf(id));
@@ -1617,11 +1619,29 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
 // Standing rules
 // ---------------------------------------------------------------------------
 
-type RuleAsk = { n: number; kind: "confirm" | "edit" | "remove" } | null;
+type RuleAsk = { id: string; kind: "confirm" | "edit" | "remove" } | null;
+
+/** A replicated rule can be live before it has a display number. Its entity
+ * is the stable CLI target for every action during that interval. */
+function ruleTarget(r: RouteRule): Record<string, unknown> {
+  return r.number_pending && r.entity ? { entity: r.entity } : { n: r.n };
+}
+
+/** A replicated rule can have an entity before a display number. Controls
+ * must still name the rule in the owner's words, never expose `null`. */
+function ruleName(r: RouteRule): string {
+  return typeof r.n === "number" ? String(r.n) : r.text || r.entity || "this rule";
+}
+
+/** UI identity stays distinct while a replicated rule awaits its display number. */
+function ruleIdentity(r: RouteRule): string {
+  return r.entity ?? String(r.n);
+}
 
 /** A standing rule's Remove button: where focus goes once the rule is back. */
-function ruleRemoveButton(n: number): HTMLElement | null {
-  return document.querySelector<HTMLElement>(`.route-rule-list button[aria-label="Remove rule ${n}"]`);
+function ruleRemoveButton(id: string, n?: number): HTMLElement | null {
+  return document.querySelector<HTMLElement>(`[data-route-item="rule:${selectorValue(id)}"] button[aria-label^="Remove rule "]`)
+    ?? (n == null ? null : document.querySelector<HTMLElement>(`.route-rule-list button[aria-label="Remove rule ${n}"]`));
 }
 
 function RuleRow({
@@ -1631,6 +1651,7 @@ function RuleRow({
   ask,
   setAsk,
   w,
+  attempt,
   now,
   onRemoved,
   back,
@@ -1641,16 +1662,22 @@ function RuleRow({
   ask: RuleAsk;
   setAsk: (a: RuleAsk) => void;
   w: Writer;
+  attempt: (id: string, command: string, args: Record<string, unknown>, after?: (() => Promise<unknown>) | null, back?: Back, onRetrySuccess?: () => void) => Promise<boolean>;
   now: Date;
   onRemoved: (r: RouteRule) => void;
   back: Back;
 }) {
   const [draft, setDraft] = useState(r.text);
   const [editConfirm, setEditConfirm] = useState(false);
-  const mine = ask?.n === r.n ? ask.kind : null;
+  const identity = ruleIdentity(r);
+  const mine = ask?.id === identity ? ask.kind : null;
   const pending = !!r.pending;
   const toConfirm = pending || (r.seeded && !r.confirmed);
-  const id = `rule:${r.n}`;
+  const name = ruleName(r);
+  const id = `rule:${identity}`;
+  // Overview links use the durable display number for standing rules; only a
+  // replicated rule without one needs its entity as the DOM target.
+  const routeItem = `rule:${typeof r.n === "number" ? r.n : identity}`;
   const fieldId = useId();
   const confirmBtn = useRef<HTMLButtonElement>(null);
   const editBtn = useRef<HTMLButtonElement>(null);
@@ -1670,7 +1697,7 @@ function RuleRow({
   const checks = ruleResultLines(watched, result, now.getTime());
   return (
     <li className={`row-item route-rule${watched && result?.result === "broken" ? " broken" : ""}`}
-      data-route-item={`rule:${r.n}`} tabIndex={-1}>
+      data-route-item={routeItem} tabIndex={-1}>
       <span className="route-rule-n" aria-hidden>
         {r.n}.
       </span>
@@ -1694,7 +1721,7 @@ function RuleRow({
       </span>
       <span className="route-acts">
         {toConfirm ? (
-          <button ref={confirmBtn} type="button" className="sm" aria-label={`Confirm rule ${r.n}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ n: r.n, kind: "confirm" })}>
+          <button ref={confirmBtn} type="button" className="sm" aria-label={`Confirm rule ${name}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ id: identity, kind: "confirm" })}>
             Confirm
           </button>
         ) : null}
@@ -1703,8 +1730,8 @@ function RuleRow({
             type="button"
             className="sm"
             disabled={w.isBusy(`${id}:undo`)}
-            aria-label={`Undo pending rule ${r.n}`}
-            onClick={() => void w.run(`${id}:undo`, "khipu_route_rule", { action: r.pending_kind === "added" ? "dismiss" : "undo", n: r.n }, null, back)}
+            aria-label={`Undo pending rule ${name}`}
+            onClick={() => void w.run(`${id}:undo`, "khipu_route_rule", { action: r.pending_kind === "added" ? "dismiss" : "undo", ...ruleTarget(r) }, null, back)}
           >
             <Busy on={w.isBusy(`${id}:undo`)} />
             Undo
@@ -1714,24 +1741,24 @@ function RuleRow({
           ref={editBtn}
           type="button"
           className="sm"
-          aria-label={`Edit rule ${r.n}`}
+          aria-label={`Edit rule ${name}`}
           aria-expanded={mine === "edit"}
           onClick={() => {
             setDraft(r.text);
             setEditConfirm(false);
-            setAsk({ n: r.n, kind: "edit" });
+            setAsk({ id: identity, kind: "edit" });
           }}
         >
           Edit
         </button>
-        <button ref={removeBtn} type="button" className="sm" aria-label={`Remove rule ${r.n}`} aria-expanded={mine === "remove"} onClick={() => setAsk({ n: r.n, kind: "remove" })}>
+        <button ref={removeBtn} type="button" className="sm" aria-label={`Remove rule ${name}`} aria-expanded={mine === "remove"} onClick={() => setAsk({ id: identity, kind: "remove" })}>
           Remove
         </button>
       </span>
       {pending ? <WriteError w={w} id={`${id}:undo`} /> : null}
       {mine === "confirm" ? (
-        <ConfirmGroup label={`Confirm rule ${r.n}?`} onClose={close} back={() => confirmBtn.current ?? editBtn.current}>
-          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${r.n} as written? It loses its Seeded mark.`} It stays first in every conversation.</span>
+        <ConfirmGroup label={`Confirm rule ${name}?`} onClose={close} back={() => confirmBtn.current ?? editBtn.current}>
+          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${name} as written? It loses its Seeded mark.`} It stays first in every conversation.</span>
           <WriteError w={w} id={id} />
           <div className="toolbar">
             <button
@@ -1739,11 +1766,11 @@ function RuleRow({
               className="primary sm"
               disabled={w.isBusy(id)}
               onClick={async () => {
-                if (await w.run(id, "khipu_route_rule", { action: "confirm", n: r.n })) close();
+                if (await attempt(id, "khipu_route_rule", { action: "confirm", ...ruleTarget(r) }, null, undefined, close)) close();
               }}
             >
               <Busy on={w.isBusy(id)} />
-              Confirm rule {r.n}
+              Confirm rule {name}
             </button>
             <button type="button" className="sm link" onClick={close}>
               Cancel
@@ -1754,7 +1781,7 @@ function RuleRow({
       {mine === "edit" ? (
         <form
           className={editConfirm ? "route-confirm" : "route-pause"}
-          aria-label={`Edit rule ${r.n}`}
+          aria-label={`Edit rule ${name}`}
           onKeyDown={escapeCloses(close)}
           onSubmit={async (e) => {
             e.preventDefault();
@@ -1767,21 +1794,21 @@ function RuleRow({
               setEditConfirm(true);
               return;
             }
-            if (await w.run(id, "khipu_route_rule", { action: "edit", n: r.n, text: draft })) close();
+            if (await attempt(id, "khipu_route_rule", { action: "edit", ...ruleTarget(r), text: draft }, null, undefined, close)) close();
           }}
         >
           <div className="toolbar">
-            <label htmlFor={fieldId}>Rule {r.n}</label>
+            <label htmlFor={fieldId}>Rule {name}</label>
             <input id={fieldId} value={draft} autoFocus autoComplete="off" readOnly={editConfirm} onChange={(e) => setDraft(e.target.value)} />
           </div>
           {editConfirm ? (
-            <span>Change rule {r.n} to these words? Every conversation sees them first, in full, from its next prompt.</span>
+            <span>Change rule {name} to these words? Every conversation sees them first, in full, from its next prompt.</span>
           ) : null}
           <WriteError w={w} id={id} />
           <div className="toolbar">
             <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
               <Busy on={w.isBusy(id)} />
-              {editConfirm ? `Change rule ${r.n}` : "Save…"}
+              {editConfirm ? `Change rule ${name}` : "Save…"}
             </button>
             <button type="button" className="sm link" onClick={close}>
               Cancel
@@ -1790,7 +1817,7 @@ function RuleRow({
         </form>
       ) : null}
       {mine === "remove" ? (
-        <ConfirmGroup label={`Remove rule ${r.n}?`} onClose={close} back={() => removeBtn.current}>
+        <ConfirmGroup label={`Remove rule ${name}?`} onClose={close} back={() => removeBtn.current}>
           <span>
             Remove this rule? Conversations stop seeing it on their next prompt. You can undo this here or from Recent
             changes.
@@ -1802,14 +1829,14 @@ function RuleRow({
               className="sm danger"
               disabled={w.isBusy(id)}
               onClick={async () => {
-                if (await w.run(id, "khipu_route_rule", { action: "retire", n: r.n })) {
+                if (await w.run(id, "khipu_route_rule", { action: "retire", ...ruleTarget(r) })) {
                   close();
                   onRemoved(r);
                 }
               }}
             >
               <Busy on={w.isBusy(id)} />
-              Remove rule {r.n}
+              Remove rule {name}
             </button>
             <button type="button" className="sm link" onClick={close}>
               Keep it
@@ -1849,6 +1876,11 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
   const [adding, setAdding] = useState(false);
   const fieldId = useId();
   const addBtn = useRef<HTMLButtonElement>(null);
+  const eok = useEndOrKeep(w);
+  const resetAdd = () => {
+    setDraft("");
+    setAdding(false);
+  };
   const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
   const inFilter: Record<RuleFilter, (r: RouteRule) => boolean> = {
     all: () => true,
@@ -1872,12 +1904,9 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
       setAdding(true);
       return;
     }
-    if (await w.run("rule-add", "khipu_route_rule", { action: "add", text: draft })) {
-      setDraft("");
-      setAdding(false);
-    }
+    if (await eok.attempt("rule-add", "khipu_route_rule", { action: "add", text: draft }, null, undefined, resetAdd)) resetAdd();
   }
-  const restoreId = removed ? `rule-restore:${removed.n}` : "";
+  const restoreId = removed ? `rule-restore:${ruleIdentity(removed)}` : "";
   return (
     <div className="section-body">
         <h2 className="sub-title">
@@ -1933,7 +1962,7 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
         {shown.length ? (
           <ol className="rows route-rule-list" role="list" aria-label="Standing rules">
             {shown.map((r) => (
-              <RuleRow key={r.n} r={r} watched={watchedRules.includes(r.n)} result={resultOf(r.n)} ask={ask} setAsk={setAsk} w={w} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
+              <RuleRow key={r.entity ?? r.n} r={r} watched={watchedRules.includes(r.n)} result={resultOf(r.n)} ask={ask} setAsk={setAsk} w={w} attempt={eok.attempt} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
             ))}
           </ol>
         ) : searching && query.trim() && inFilterRules.length ? (
@@ -1956,9 +1985,9 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
         ) : (
           <p className="set-help">No standing rules yet. Add one below.</p>
         )}
-        {removed && !rules.some((r) => r.n === removed.n) ? (
+        {removed && !rules.some((r) => ruleIdentity(r) === ruleIdentity(removed)) ? (
           <div className="route-undo" role="status">
-            <span>Rule {removed.n} removed.</span>
+            <span>Rule {ruleName(removed)} removed.</span>
             {/* It appears only after a removal here: focus lands on it (F5). */}
             <button
               type="button"
@@ -1966,8 +1995,8 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
               autoFocus
               disabled={w.isBusy(restoreId)}
               onClick={async () => {
-                const n = removed.n;
-                if (await w.run(restoreId, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(n)))
+                const n = typeof removed.n === "number" ? removed.n : undefined;
+                if (await eok.attempt(restoreId, "khipu_route_rule", { action: "restore", ...ruleTarget(removed) }, null, () => ruleRemoveButton(ruleIdentity(removed), n), () => setRemoved(null)))
                   setRemoved(null);
               }}
             >
@@ -1977,6 +2006,9 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
           </div>
         ) : null}
         {removed ? <WriteError w={w} id={restoreId} /> : null}
+        {eok.ask ? (
+          <EndOrKeepChoices view={data} ask={eok.ask} now={now} busy={w.anyBusy} saveLabel="Save rule" onCancel={() => eok.setAsk(null)} />
+        ) : null}
         <form className="route-form" aria-label="Add a standing rule" onSubmit={add}>
           <div className="toolbar">
             <label htmlFor={fieldId}>New rule</label>
@@ -2195,7 +2227,7 @@ function ProposalRowView({
   row: ProposalRow;
   data: RouteView;
   w: Writer;
-  attempt: (id: string, command: string, args: Record<string, unknown>) => Promise<boolean>;
+  attempt: (id: string, command: string, args: Record<string, unknown>, after?: (() => Promise<unknown>) | null, back?: Back, onRetrySuccess?: () => void) => Promise<boolean>;
   ask: string | null;
   setAsk: (a: string | null) => void;
   now: Date;
@@ -2223,13 +2255,13 @@ function ProposalRowView({
     ruleMissing
       ? refuse(confirmId)
       : p.kind === "rule" && rule
-        ? attempt(confirmId, "khipu_route_rule", { action: "confirm", n: rule.n })
+        ? attempt(confirmId, "khipu_route_rule", { action: "confirm", ...ruleTarget(rule) })
         : attempt(confirmId, "khipu_route_priority", { action: "confirm", expect });
   const dismiss = () =>
     ruleMissing
       ? refuse(dismissId)
       : p.kind === "rule" && rule
-        ? w.run(dismissId, "khipu_route_rule", { action: "dismiss", n: rule.n })
+        ? w.run(dismissId, "khipu_route_rule", { action: "dismiss", ...ruleTarget(rule) })
         : w.run(dismissId, "khipu_route_priority", { action: "undo", expect });
   return (
     <div className="mrow prop" role="listitem" data-route-item={`proposal:${p.id}`} tabIndex={-1}>
@@ -2323,7 +2355,7 @@ function ProposalRowView({
               setEditConfirm(true);
               return;
             }
-            if (await attempt(editId, "khipu_route_rule", { action: "edit", n: rule.n, text: draft })) close();
+            if (await attempt(editId, "khipu_route_rule", { action: "edit", ...ruleTarget(rule), text: draft }, null, undefined, close)) close();
           }}>
           <div className="toolbar">
             <label htmlFor={editId}>Words</label>
@@ -4432,6 +4464,7 @@ function TableSection({
 }
 
 function ChangesSection({ data, lists, w, now }: { data: RouteView; lists: ListControls; w: Writer; now: Date }) {
+  const eok = useEndOrKeep(w);
   const days = changeDays(data, now);
   const active = new Set((data.rules ?? []).map((r) => r.n));
   const { changeBy, changeAbout } = lists.prefs;
@@ -4498,7 +4531,7 @@ function ChangesSection({ data, lists, w, now }: { data: RouteView; lists: ListC
                         aria-label={`Bring back standing rule ${row.restore}`}
                         onClick={() => {
                           const n = row.restore!;
-                          void w.run(id, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(n));
+                          void eok.attempt(id, "khipu_route_rule", { action: "restore", n }, null, () => ruleRemoveButton(String(n), n));
                         }}
                       >
                         <Busy on={w.isBusy(id)} />
@@ -4564,6 +4597,16 @@ function ChangesSection({ data, lists, w, now }: { data: RouteView; lists: ListC
       ) : (
         <p className="set-help">No changes yet.</p>
       )}
+      {eok.ask ? (
+        <EndOrKeepChoices
+          view={data}
+          ask={eok.ask}
+          now={now}
+          busy={w.anyBusy}
+          saveLabel="Restore rule"
+          onCancel={() => eok.setAsk(null)}
+        />
+      ) : null}
     </div>
   );
 }

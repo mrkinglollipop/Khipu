@@ -163,9 +163,12 @@ class ResolveRepoRootTest(GitFixtureTestCase):
     def test_a_failing_alias_lookup_falls_back_to_the_resolved_project(self):
         _git(self.repo, "remote", "add", "origin", "git@github.com:acme/widget.git")
 
+        from psycopg.errors import UndefinedTable
+
         class _BrokenCur:
             def execute(self, sql, params):
-                raise RuntimeError("no such table")
+                if sql.startswith("SELECT project FROM project_aliases"):
+                    raise UndefinedTable("synthetic missing project_aliases table")
 
         out = identity.resolve_repo_root(str(self.repo), cur=_BrokenCur())
         self.assertEqual(out["project"], "acme/widget")

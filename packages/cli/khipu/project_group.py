@@ -46,12 +46,16 @@ def _savepoint(cur, name: str, sql: str, params: tuple) -> list[tuple]:
         rows = cur.fetchall()
         cur.execute(f"RELEASE SAVEPOINT {name}", ())
         return rows
-    except Exception:  # noqa: BLE001 - a missing table reads as no rows
+    except Exception as exc:  # compatibility only for an older schema
         try:
             cur.execute(f"ROLLBACK TO SAVEPOINT {name}", ())
             cur.execute(f"RELEASE SAVEPOINT {name}", ())
         except Exception:  # noqa: BLE001
             pass
+        from psycopg.errors import UndefinedColumn, UndefinedTable
+
+        if not isinstance(exc, (UndefinedTable, UndefinedColumn)):
+            raise
         return []
 
 

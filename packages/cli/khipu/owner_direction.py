@@ -401,13 +401,16 @@ def _append(line: dict) -> dict:
     return line
 
 
-def scrub_words(sessions) -> int:
+def scrub_words(sessions, *, protected_sessions=()) -> int:
     """Forget's owner words scan on the log: blank the quoted words of every
     line these sessions wrote or acted for (``"words": null, "scrubbed":
     true``). ``words_sha`` and the hash stay, so the chain still holds and
     the action and its Undo stay. Returns how many lines were scrubbed;
-    raises OSError when the log can't be read or rewritten."""
+    raises OSError when the log can't be read or rewritten. A line linked
+    to a protected live session keeps its words even if its other session
+    is being forgotten."""
     names = set(sessions)
+    protected = set(protected_sessions)
     with _log_locked() as path:
         try:
             raw = path.read_text(encoding="utf-8")
@@ -420,7 +423,8 @@ def scrub_words(sessions) -> int:
             except ValueError:
                 row = None
             if (isinstance(row, dict) and isinstance(row.get("words"), str)
-                    and (row.get("session") in names or row.get("via_session") in names)):
+                    and (row.get("session") in names or row.get("via_session") in names)
+                    and row.get("session") not in protected and row.get("via_session") not in protected):
                 row["words_sha"] = row.get("words_sha") or _sha(row["words"])
                 row["words"], row["scrubbed"] = None, True
                 text, count = json.dumps(row, ensure_ascii=False), count + 1

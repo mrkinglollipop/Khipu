@@ -1015,7 +1015,19 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
             if payload.get("project"):
                 from khipu.identity import _resolve_project_alias
 
-                payload["project"] = _resolve_project_alias(cur, payload["project"]) or payload["project"]
+                # Alias enrichment is optional. Keep its failure inside a
+                # caller-owned savepoint so even a lookup that raises before
+                # recovering its own savepoint cannot abort the capture.
+                cur.execute("SAVEPOINT capture_project_alias")
+                try:
+                    canonical = _resolve_project_alias(cur, payload["project"])
+                except Exception as exc:  # noqa: BLE001 — optional enrichment, never abort the caller
+                    cur.execute("ROLLBACK TO SAVEPOINT capture_project_alias")
+                    cur.execute("RELEASE SAVEPOINT capture_project_alias")
+                    _log(f"project alias lookup failed ({type(exc).__name__}); keeping original project")
+                else:
+                    cur.execute("RELEASE SAVEPOINT capture_project_alias")
+                    payload["project"] = canonical or payload["project"]
             _note_project_root(cur, payload)
             dedup = dedup_before_insert(cur, payload, source=source)
             if dedup["action"] in ("skip", "merge"):
