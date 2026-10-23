@@ -10,12 +10,13 @@ import pytest
 from tests.test_capture_audit_regressions import isolated, write, codex, claude, hook  # noqa: F401
 
 
-def test_claude_started_in_codex_shell_resolves_by_cwd(tmp_path, monkeypatch):
+def test_claude_started_in_codex_shell_refuses_without_issuer_proof(tmp_path, monkeypatch):
     from khipu import session_capture as sc
     sc.save_state('claude_code', 'mine', {'offset': 0, 'cwd': str(tmp_path)})
     monkeypatch.setenv('CODEX_THREAD_ID', 'outer-codex')
     monkeypatch.setenv('CLAUDE_CODE_SESSION_ID', 'mine')
-    assert sc.resolve_session_ref(host_pids=[], cwd=str(tmp_path)) == ('claude_code', 'mine', 'cwd')
+    with pytest.raises(ValueError, match='cannot tell which session is yours'):
+        sc.resolve_session_ref(host_pids=[], cwd=str(tmp_path))
 
 
 @pytest.mark.parametrize('parallel', [False, True])

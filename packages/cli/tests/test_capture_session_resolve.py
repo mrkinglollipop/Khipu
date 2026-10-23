@@ -54,14 +54,14 @@ def _owner_turn(sid: str, pid: int, start: float | None, *, harness: str = "clau
 
 
 class ResolverTest(unittest.TestCase):
-    def test_a_codex_job_inheriting_a_claude_session_id_never_resolves_to_that_claude_session(self):
+    def test_a_codex_job_inheriting_a_claude_session_id_requires_issuer_proof(self):
         with tempfile.TemporaryDirectory() as td, _home(td), \
                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "parent",
                                              "CODEX_THREAD_ID": "job"}):
             _state("claude_code", "parent", cwd=td)
             _state("codex", "job", cwd=td, age_s=60)
-            self.assertEqual(sc.resolve_session_ref(host_pids=[], cwd=td),
-                             ("codex", "job", "session_env"))
+            with self.assertRaisesRegex(ValueError, "cannot tell which session is yours"):
+                sc.resolve_session_ref(host_pids=[], cwd=td)
 
     def test_an_unknown_codex_thread_id_still_ignores_the_inherited_claude_id(self):
         with tempfile.TemporaryDirectory() as td, _home(td), \
