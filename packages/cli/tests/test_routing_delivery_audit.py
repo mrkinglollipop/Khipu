@@ -363,8 +363,14 @@ def test_routing_damaged_direction_row_does_not_break_reads_or_capture(monkeypat
     directions._save({"directions": {row["id"]: row, "damaged": bad}})
     assert [owed["id"] for owed in directions.owed_items()] == [row["id"]]
     assert directions.capture_scan(row["session"], [row["words"]], actions=[]) == [row]
-    directions.forget_sessions([row["session"]])
+    raw = json.loads(directions.store_path().read_text())["directions"]
+    assert raw["damaged"] == bad  # a writer keeps a row it cannot use exactly as written
+    # Its session cannot be read, so the forget scrubs the rest and stays incomplete.
+    with pytest.raises(directions.MalformedRows) as err:
+        directions.forget_sessions([row["session"]])
+    assert err.value.keys == ["damaged"]
     assert directions.directions() == []
+    assert json.loads(directions.store_path().read_text())["directions"] == {"damaged": bad}
 
 
 class SQLStore:

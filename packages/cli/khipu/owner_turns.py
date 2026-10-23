@@ -676,15 +676,6 @@ def sweep(now: float | None = None) -> dict:
     except Exception as err:  # noqa: BLE001
         out["ok"] = False
         out["errors"].append(f"old widenings: {type(err).__name__}: {err}")
-    try:
-        from khipu import routing_directions
-
-        moved = routing_directions.repair_store()
-        if moved:
-            out["directions_quarantined"] = moved
-    except Exception as err:  # noqa: BLE001
-        out["ok"] = False
-        out["errors"].append(f"routing directions: {type(err).__name__}: {err}")
     return out
 
 
@@ -772,7 +763,13 @@ def forget_sessions(sessions, *, protected_sessions=()) -> dict:
     def scrub_directions():
         from khipu import routing_directions
 
-        routing_directions.forget_sessions(names)
+        try:
+            routing_directions.forget_sessions(names)
+        except routing_directions.MalformedRows as err:
+            # Row keys only (ids), never a row's words.
+            errors.append(f"routing directions: malformed row(s) {', '.join(err.keys)} left unchecked")
+        except routing_directions.StoreUnreadable:
+            errors.append("routing directions: store unreadable, left as it is")
 
     attempt("routing directions", scrub_directions)
 
@@ -850,21 +847,21 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
     installed recorded none (no record means every direction from it is
     refused). Off says off."""
     per = counts(now)
-    # A row the routing-directions store cannot use blocks every forget until
-    # it is moved aside; the timer sweep does that, and doctor names the row.
+    # A row the routing-directions store cannot use is never repaired or
+    # moved automatically: it stays as written, is skipped by readers, and
+    # can keep a forget incomplete. Doctor names it and stays red.
     try:
         from khipu import routing_directions
 
         bad = routing_directions.malformed_rows()
-        held = routing_directions.quarantined_keys()
-    except Exception:  # noqa: BLE001 - a failed look must not hide the rest of the row
-        bad, held = [], []
-    damaged = [f"Routing directions: row {row['key']} is malformed ({row['reason']}) and blocks forgetting "
-               f"until the next sweep moves it aside." for row in bad]
-    if held:
-        damaged.append(f"Routing directions: {len(held)} row(s) ({', '.join(held)}) could not be read and are held "
-                       f"aside whole in {routing_directions.QUARANTINE_NAME}. They are not shown as owed, and their "
-                       f"words are kept until their session is forgotten or the file is removed.")
+    except Exception as err:  # noqa: BLE001 - a failed look is reported, never read as clean
+        bad = [{"key": "(store)", "reason": f"could not be checked: {type(err).__name__}"}]
+    damaged = [(f"Routing directions: the store file {routing_directions.STORE_NAME} cannot be read ({row['reason']}); "
+                f"it is left as it is, nothing is shown as owed from it, and forgets stay incomplete until it is "
+                f"fixed or removed by hand.") if row["key"] == "(store)" else
+               (f"Routing directions: row {row['key']} is malformed ({row['reason']}); it is kept as written and "
+                f"not shown as owed, and a forget stays incomplete while its session cannot be read. "
+                f"Fix or remove it by hand.") for row in bad]
     if not settings()["enabled"]:
         return {"ok": not damaged, "enabled": False, "harnesses": per, "missing": [], "warnings": damaged,
                 "summary": "Owner direction is off."}

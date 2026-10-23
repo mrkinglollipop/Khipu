@@ -1,6 +1,8 @@
 """#342 review P3 follow-ups: replica forget removes commitments and their
-vectors, a purge marker compares hub time to hub time, and one malformed
-routing-direction row never blocks a forget. Fake data, no network."""
+vectors, a purge marker compares hub time to hub time, and a malformed
+routing-direction row is kept as written, never substring-matched, and keeps
+a forget incomplete only when its session cannot be read. Fake data, no
+network."""
 import json
 import sqlite3
 import time
@@ -127,15 +129,31 @@ def _write(rows):
     rd._save({"directions": rows})
 
 
-def test_a_malformed_row_blocks_nothing_valid_is_still_scrubbed_and_the_error_names_it(store):
-    _write({"a": _row("a", "forgotten"), "b": _row("b", "kept"), "bad": {"id": "bad", "words": 5}})
-    with pytest.raises(ValueError) as err:
+def _raw():
+    return rd.store_path().read_bytes()
+
+
+def _rows():
+    return json.loads(_raw())["directions"]
+
+
+def test_a_malformed_row_without_a_session_keeps_the_forget_incomplete_and_is_kept_whole(store):
+    bad = {"id": "bad", "words": 5}
+    _write({"a": _row("a", "forgotten"), "b": _row("b", "kept"), "bad": bad})
+    with pytest.raises(rd.MalformedRows) as err:
         rd.forget_sessions(["forgotten"])
-    assert "bad" in str(err.value)
-    left = rd._load()["directions"]
-    assert set(left) == {"b"}
-    raw = json.loads(rd.store_path().read_text(encoding="utf-8"))["directions"]
-    assert "a" not in raw and "b" in raw and "bad" in raw  # the bad row is kept for repair, not lost
+    assert err.value.keys == ["bad"] and "bad" in str(err.value)
+    assert set(rd._load()["directions"]) == {"b"}
+    raw = _rows()
+    assert "a" not in raw and raw["b"] == _row("b", "kept") and raw["bad"] == bad
+
+
+def test_owner_forget_reports_the_unchecked_row_by_key(store):
+    _write({"a": _row("a", "forgotten"), "rd-bad1": {"id": "rd-bad1", "words": "fake words"}})
+    with pytest.raises(owner_turns.ForgetCleanupError) as err:
+        owner_turns.forget_sessions(["forgotten"])
+    assert any("rd-bad1" in e and "routing directions" in e for e in err.value.errors)
+    assert not any("fake words" in e for e in err.value.errors)
 
 
 def test_a_malformed_row_that_names_the_forgotten_session_is_scrubbed(store):
@@ -145,49 +163,71 @@ def test_a_malformed_row_that_names_the_forgotten_session_is_scrubbed(store):
     assert "forgotten" not in rd.store_path().read_text(encoding="utf-8")
 
 
-def test_repair_moves_malformed_rows_aside_and_forget_then_completes(store):
-    _write({"b": _row("b", "kept"), "bad": {"id": "bad", "words": 5}})
-    assert [m["key"] for m in rd.malformed_rows()] == ["bad"]
-    assert rd.repair_store() == ["bad"]
-    assert rd.malformed_rows() == []
-    assert set(rd._load()["directions"]) == {"b"}
-    rd.forget_sessions(["kept"])
-    assert rd._load()["directions"] == {}
+def test_forgetting_a_session_never_touches_a_session_it_prefixes(store):
+    gone_live = {"id": "m2", "session": "codex:gone-live", "words": "fake live words", "status": 3}
+    _write({"v1": _row("v1", "codex:gone"), "v2": _row("v2", "codex:gone-live"),
+            "m1": {"id": "m1", "session": "codex:gone", "words": 7}, "m2": gone_live})
+    rd.forget_sessions(["codex:gone"])  # every malformed row has a readable session: complete
+    raw = _rows()
+    assert set(raw) == {"v2", "m2"}
+    assert raw["m2"] == gone_live and raw["v2"] == _row("v2", "codex:gone-live")
 
 
-def test_doctor_reports_a_malformed_row_and_sweep_repairs_it(store):
-    _write({"bad": {"id": "bad", "words": 5}})
+def test_words_mentioning_a_forgotten_session_do_not_remove_another_sessions_rows(store):
+    live_bad = {"id": "m1", "session": "codex:live", "words": "fake: ask codex:gone again", "status": None}
+    live = _row("v1", "codex:live", "fake: route what codex:gone said")
+    _write({"v1": live, "m1": live_bad})
+    rd.forget_sessions(["codex:gone"])
+    assert _rows() == {"v1": live, "m1": live_bad}
+
+
+@pytest.mark.parametrize("content", [b'{"directions": {"a":', b"[1, 2]", b"\xff\xfe not utf-8", b""])
+def test_an_unreadable_store_is_left_byte_identical_by_sweep_forget_and_writers(store, content):
+    rd.store_path().write_bytes(content)
+    assert owner_turns.sweep()["ok"] is not None
+    assert _raw() == content
+    with pytest.raises(rd.StoreUnreadable):
+        rd.forget_sessions(["codex:gone"])
+    assert _raw() == content
+    with pytest.raises(owner_turns.ForgetCleanupError) as err:
+        owner_turns.forget_sessions(["codex:gone"])
+    assert any("routing directions" in e for e in err.value.errors)
+    assert _raw() == content
+    for write in (lambda: rd.dismiss("rd-x"), lambda: rd.refresh([]),
+                  lambda: rd.capture_scan("codex:gone", ["fake turn"])):
+        with pytest.raises(rd.StoreUnreadable):
+            write()
+        assert _raw() == content
+    assert rd.owed_items() == [] and rd.directions() == []
     block = owner_turns.doctor_block(installed=[])
-    assert any("bad" in w for w in block["warnings"]) and not block["ok"]
-    owner_turns.sweep()
-    assert rd.malformed_rows() == []
-    block = owner_turns.doctor_block(installed=[])
-    assert not block["ok"] and any("held" in w and "bad" in w for w in block["warnings"])
+    assert not block["ok"] and any("(store)" in w or rd.STORE_NAME in w for w in block["warnings"])
+    assert _raw() == content
 
 
-def test_a_quarantined_row_survives_the_sweep_whole_and_doctor_stays_red(store):
+def test_a_valid_row_next_to_a_malformed_one_is_still_owed_and_delivered(store):
+    bad = {"id": "rd-bad", "session": 4, "words": "fake"}
+    good = {**_row("rd-good", "codex:live", "fake route words"), "project": "fake-proj", "join": "joined"}
+    _write({"rd-good": good, "rd-bad": bad})
+    assert [i["id"] for i in rd.owed_items()] == ["rd-good"]
+    assert rd.pushed_slice_ids("fake-proj") == ["rd-good"]
+    assert rd.dismiss("rd-good")["status"] == "dismissed"
+    raw = _rows()
+    assert raw["rd-bad"] == bad and raw["rd-good"]["status"] == "dismissed"
+
+
+def test_doctor_names_a_malformed_row_and_stays_red_after_the_sweep(store):
     import os
 
-    words = "route the fake builds to the fake lane"
-    row = _row("rd-1", "kept-session", words)
-    row["occurrence"] = "1"  # a schema-incompatible field
-    _write({"rd-1": row})
-    assert rd.repair_store() == ["rd-1"]
-    path = rd.store_path().with_name(rd.QUARANTINE_NAME)
-    then = time.time() - 61
-    os.utime(path, (then, then))
-    out = owner_turns.sweep()
-    assert out["ok"], out
-    assert path.exists() and words in path.read_text(encoding="utf-8")
-    assert not owner_turns.doctor_block(installed=[])["ok"]
-
-
-def test_a_quarantined_row_without_a_session_keeps_its_words_until_that_session_is_forgotten(store):
-    _write({"x": {"id": "x", "words": "fake words naming gone-session", "status": 3}})
-    rd.repair_store()
-    path = rd.store_path().with_name(rd.QUARANTINE_NAME)
-    assert "fake words" in path.read_text(encoding="utf-8")
-    rd.forget_sessions(["other"])
-    assert path.exists()
-    rd.forget_sessions(["gone-session"])
-    assert not path.exists()
+    bad = {"id": "rd-bad7", "session": "codex:kept", "words": "fake owner words", "occurrence": "1",
+           "status": "open"}
+    _write({"rd-bad7": bad})
+    block = owner_turns.doctor_block(installed=[])
+    assert not block["ok"] and any("rd-bad7" in w for w in block["warnings"])
+    assert not any("fake owner words" in w for w in block["warnings"])
+    then = time.time() - 3600
+    os.utime(rd.store_path(), (then, then))
+    owner_turns.sweep()
+    assert _rows() == {"rd-bad7": bad}
+    assert [m["key"] for m in rd.malformed_rows()] == ["rd-bad7"]
+    block = owner_turns.doctor_block(installed=[])
+    assert not block["ok"] and any("rd-bad7" in w for w in block["warnings"])
