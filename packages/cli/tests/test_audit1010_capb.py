@@ -225,25 +225,35 @@ class CaptureTest(unittest.TestCase):
             cap.write_pg(episode(project="new/app"))
         self.assertEqual(next(iter(cur.episodes.values()))["project"], "old/app")
 
-    def test_collision_with_other_source_is_logged_and_still_acknowledged(self):
-        # A replay whose payload differs from the stored raw is ordinary
-        # (ingestion mutates raw); failing the job here stranded it in the
-        # queue and turned the harness red on 2026-10-11. Until captures carry
-        # an immutable identity the difference is logged, not fatal.
-        old = episode()
+    def test_collision_with_other_source_retains_evidence_and_original_owner(self):
+        from khipu import outbox
+        old = episode(origin="gateway:original")
         cur = Cursor({1: old})
+        before = copy.deepcopy(cur.episodes)
+        incoming = episode(session_id="codex:other", project="different/app",
+                           verbatim={"note": "do not lose this"})
         logged = []
-        with mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox"),
+                                             "KHIPU_HUB_FILE_MIRROR": "0"}), \
+                mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
                 mock.patch.object(cap, "dedup_before_insert", return_value={"action": "none"}), \
-                mock.patch.object(cap, "run_capture_v2", return_value=0), \
+                mock.patch.object(cap, "_claim_required", return_value=False), \
+                mock.patch.object(cap, "run_capture_v2") as file_writer, \
                 mock.patch.object(cap, "_log", side_effect=logged.append), \
-                mock.patch("khipu.outbox.enqueue") as enqueue:
-            rc = cap.capture(episode(session_id="codex:other", project="different/app",
-                                     verbatim={"note": "do not lose this"}), mode="hub")
-        self.assertEqual(rc, 0)
+                mock.patch.object(outbox, "_queued_origin", return_value={"origin": "gateway:incoming"}):
+            rc = cap.capture(incoming, mode="hub")
+            self.assertEqual(rc, cap.EX_SOFTWARE, "pending conflicting evidence is not delivered")
+            self.assertEqual(len(outbox.jobs()), 1)
+            queued = json.loads(outbox.jobs()[0].read_text())
+            self.assertEqual(queued["payload"]["verbatim"], {"note": "do not lose this"})
+            self.assertEqual(queued["payload"]["session_id"], "codex:other")
+            self.assertEqual(queued["origin"], "gateway:incoming")
+            self.assertEqual(queued["reason"], "CaptureEvidenceConflict")
+        self.assertEqual(cur.episodes, before)
         self.assertEqual(len(cur.episodes), 1, "no second row for the same identity")
-        self.assertTrue(any("replay identity differs" in m for m in logged), logged)
-        enqueue.assert_not_called()
+        self.assertTrue(any("CaptureEvidenceConflict" in m for m in logged), logged)
+        file_writer.assert_not_called()
 
     def test_nested_secrets_redacted_before_sql_and_outbox(self):
         secret = "sk-test" + "a" * 32

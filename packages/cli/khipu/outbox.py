@@ -394,7 +394,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
             js = js[:limit]
         out["jobs"] = len(js)
         from khipu import memory_lock
-        from khipu.capture import ClaimDeferred, write_pg
+        from khipu.capture import CaptureEvidenceConflict, ClaimDeferred, write_pg
         from khipu.embed import embed_on_capture
         from khipu.request_context import replaying
         from khipu.tombstones import RegistryError, write_guard
@@ -485,8 +485,9 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                     unreachable = unreachable_error(e)
                     # A deferred origin claim is transient and its job holds the
                     # only record of the owner: retried, never buried.
-                    deferred = isinstance(e, ClaimDeferred)
-                    job["claim_deferred"] = deferred
+                    job["claim_deferred"] = isinstance(e, ClaimDeferred)
+                    job["evidence_conflict"] = isinstance(e, CaptureEvidenceConflict)
+                    deferred = job["claim_deferred"] or job["evidence_conflict"]
                     if deferred:
                         unreachable = False
                         out["deferred"] = out.get("deferred", 0) + 1

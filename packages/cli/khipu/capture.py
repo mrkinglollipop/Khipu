@@ -114,6 +114,14 @@ class ClaimDeferred(RuntimeError):
     the queued owner, the only ownership evidence, would be discarded."""
 
 
+class CaptureEvidenceConflict(RuntimeError):
+    """A legacy uniqueness collision would discard distinct incoming evidence.
+
+    Preserve it in the outbox for explicit resolution, without changing the
+    original episode, its owner or the caller's timestamp/summary choices.
+    """
+
+
 def _receipt_match(cur, payload: dict[str, Any],
                    source: dict[str, Any] | None) -> tuple[int, str] | None:
     """The episode this capture was already merged into, and how that merge
@@ -995,7 +1003,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     # arrived: before project inheritance and alias resolution read hub state
     # into it, and before ingestion rewrites topics, tags and scope. Replaying
     # the same capture must always produce the same key.
-    from khipu.capture_identity import source_identity
+    from khipu.capture_identity import payload_sha256, source_identity
 
     source = source_identity(payload)
     topics_written = 0
@@ -1008,6 +1016,14 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
         with conn.cursor() as cur:
             from khipu.tombstones import hub_source_forgotten
 
+            # Lock source ownership before looking it up, through commit. Two
+            # independent extractors may produce different summaries for the
+            # same natural window; both must not insert from an empty lookup.
+            # Collisions of this 64-bit advisory key only serialize extra work.
+            lock_key = int(source["source_key"][:16], 16)
+            if lock_key >= 1 << 63:
+                lock_key -= 1 << 64
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
             if hub_source_forgotten(cur, payload, source):
                 return _forgotten_result(cur, payload, source)
             _inherit_project(cur, payload)
@@ -1179,19 +1195,15 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001 - only a required claim runs SQL
                     raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                 stored_raw = target.get("raw") or {}
-                # The stored raw is not the payload as sent: ingestion adds
-                # tags, normalizes scope and rewrites fields on merge, so a
-                # field-by-field comparison flags ordinary replays. Until
-                # captures carry an immutable identity this is logged only;
-                # failing the job here stranded it in the queue and turned the
-                # harness red (2026-10-11).
-                if not target or any(payload.get(k) != target.get(k, stored_raw.get(k)) for k in
-                                     ("session_id", "project", "harness", "transcript_range")) \
-                        or any(payload.get(k) and payload[k] != stored_raw.get(k) for k in
-                               ("verbatim", "decisions", "preferences", "open_loops", "closed_loops",
-                                "decision_details", "deliverables", "window_id", "part")):
-                    _log("capture replay identity differs from stored source evidence; "
-                         "treating as the same episode (capture identity needed)")
+                # Known immutable sources/receipts were already matched above.
+                # At this legacy collision, only matching canonical raw content can
+                # prove another replay. Enrichment can make that proof absent;
+                # retaining an unproven capture is safer than discarding fields
+                # omitted from an ever-incomplete evidence allowlist.
+                if not target or payload_sha256(stored_raw) != source["payload_sha256"]:
+                    raise CaptureEvidenceConflict(
+                        f"legacy episode key conflicts with distinct evidence on episode {episode_id}; "
+                        "incoming capture retained for resolution")
             from khipu.config import path_setting
             from khipu.topic_graph import persist_capture_graph
 

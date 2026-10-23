@@ -132,7 +132,12 @@ def test_malformed_job_does_not_block_healthy_job(monkeypatch):
     assert not (q / '99-good-codex.json').exists()
     cap.capture.assert_called_once()
     again = sc.drain()
-    assert again['failed'] == 1
+    assert again['failed'] == 0
+    assert sc.queued_jobs() == []
+    assert (sc.empty_dir() / '00-corrupt-codex.json').read_bytes() == b'[]'
+    reason = json.loads((sc.empty_dir() / '00-corrupt-codex.error').read_text())
+    assert reason['disposition'] == 'malformed' and reason['reason']
+    cap.capture.assert_called_once()
 
 
 def test_replica_failure_remains_failed_in_cooldown(monkeypatch):

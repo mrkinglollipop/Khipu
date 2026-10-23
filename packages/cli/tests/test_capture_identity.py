@@ -5,6 +5,7 @@ against real Postgres in test_episode_sources_scratch.py."""
 from __future__ import annotations
 
 import hashlib
+import json
 import unittest
 from unittest import mock
 
@@ -184,12 +185,16 @@ class DualWriteTest(_WritePgCase):
         self.assertEqual(list(cur.sources), [expected["source_key"]])
         self.assertEqual(expected["source_key"], expected["payload_sha256"])
 
-    def test_replay_on_the_legacy_identity_writes_no_source_row(self):
+    def test_distinct_session_on_legacy_identity_is_an_explicit_conflict(self):
         cur = _SourcesFakeCursor()
         self._write(cur, self._payload())
         before = dict(cur.sources)
-        stats = self._write(cur, self._payload(session_id="claude_code:other"))
-        self.assertFalse(stats["episode_inserted"])
+        episodes_before = json.loads(json.dumps(cur.episodes))
+        # Same legacy ts/summary with another session is distinct evidence,
+        # not a replay: acknowledging it used to delete the incoming outbox.
+        with self.assertRaises(cap.CaptureEvidenceConflict):
+            self._write(cur, self._payload(session_id="claude_code:other"))
+        self.assertEqual(json.loads(json.dumps(cur.episodes)), episodes_before)
         self.assertEqual(cur.sources, before)
 
     def test_origin_key_held_by_another_episode_falls_back_to_the_episode_key(self):

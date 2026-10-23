@@ -359,20 +359,33 @@ class CaptureCapaTest(unittest.TestCase):
             self.assertFalse(health["ok"])
             self.assertTrue(any("nothing is reclaiming" in reason for reason in health["reasons"]))
 
-    def test_scalar_and_malformed_queue_jobs_remain_visible_and_retryable(self):
+    def test_scalar_and_malformed_queue_jobs_preserve_bytes_and_do_not_starve(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh")}):
             q = sc.queue_dir()
             q.mkdir(parents=True)
             scalar = q / "scalar.json"
             scalar.write_text("[]")
             self.assertEqual(sc.status("aegis")["queue_depth"], 1)
-            scalar.unlink()
             malformed = q / "malformed.json"
             malformed.write_text("{broken")
-            with mock.patch("khipu.config.capture_mode", return_value="hub"):
-                out = sc.drain()
-            self.assertEqual(out["failed"], 1)
-            self.assertTrue(malformed.exists())
+            healthy = sc.enqueue({"ts": sc._mint_ts(), "harness": "codex", "session_id": "healthy",
+                                  "transcript": "USER: retain this synthetic decision"})
+            with mock.patch("khipu.config.capture_mode", return_value="hub"), \
+                    mock.patch("khipu.extract.extract_memory", return_value={"summary": "healthy synthetic decision"}), \
+                    mock.patch("khipu.capture.capture", return_value=0) as capture, \
+                    mock.patch("khipu.hub_snapshot.sync_decision_changes", return_value={}):
+                reports = [sc.drain(limit=1) for _ in range(3)]
+            self.assertEqual(sum(r["failed"] for r in reports), 2)
+            self.assertEqual(sum(r["quarantined"] for r in reports if "quarantined" in r), 2)
+            self.assertFalse(healthy.exists())
+            capture.assert_called_once()
+            self.assertEqual(sc.queued_jobs(), [])
+            self.assertEqual((sc.empty_dir() / "scalar.json").read_bytes(), b"[]")
+            self.assertEqual((sc.empty_dir() / "malformed.json").read_bytes(), b"{broken")
+            for name in ("scalar", "malformed"):
+                reason = json.loads((sc.empty_dir() / f"{name}.error").read_text())
+                self.assertEqual(reason["disposition"], "malformed")
+                self.assertTrue(reason["reason"])
 
     def test_default_hook_drains_and_embeds_unless_queue_only(self):
         repo = Path(__file__).resolve().parents[3]

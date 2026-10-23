@@ -396,7 +396,10 @@ class _ReplayCursor(_OriginFakeCursor):
         super().__init__(with_origin=with_origin)
         self.episodes[1] = {
             "ts": self.TS, "session_id": "s1", "summary": self.SUMMARY,
-            "topics": [], "decisions": [], "preferences": [], "raw": {},
+            "topics": [], "decisions": [], "preferences": [],
+            # A file-sync replay needs its actual immutable evidence, rather
+            # than an empty invented raw object that proves no replay at all.
+            "raw": {"ts": self.TS, "session_id": "s1", "summary": self.SUMMARY},
         }
         self._existing_keys.add((self.TS, hashlib.md5(self.SUMMARY.encode()).hexdigest()))
         self.next_id = 2
@@ -408,7 +411,7 @@ class _ReplayCursor(_OriginFakeCursor):
             self.claims.append((s, params))
             return
         if s.startswith("SELECT to_jsonb(e) FROM episodes e"):
-            self._result = [({"session_id": "s1", "raw": {}},)]
+            self._result = [(self.episodes[1],)]
             return
         super().execute(sql, params)
 
