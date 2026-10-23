@@ -13,6 +13,7 @@ import type { RecallProbeStatus } from "./IntegrationsPanel";
 import { ModelCheckRow, modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 import { SetupAccountsStep } from "./SetupAccounts";
 import { SynthAccess, defaultSynthModel, synthModelError } from "./SynthProvider";
+import { requireCliSuccess, requireMigrationSuccess } from "./settingsCli";
 
 /** `docs/plans/2026-09-05-setup-that-cannot-strand-you.md` stage ids.
  *  Preflight (`khipu db preflight`) only ever reaches `reach..graph`; a full
@@ -266,7 +267,7 @@ export function Welcome({
   const loadPlan = useCallback(async () => {
     setPlanErr(null);
     try {
-      setPlan(parse(await invoke<string>("khipu_migrate", { dryRun: true })) as MigratePlan);
+      setPlan(requireCliSuccess<MigratePlan>(await invoke<string>("khipu_migrate", { dryRun: true })));
     } catch (e) {
       setPlan(null);
       setPlanErr(String(e));
@@ -277,7 +278,7 @@ export function Welcome({
     setMigrating(true);
     setPlanErr(null);
     try {
-      setPlan(parse(await invoke<string>("khipu_migrate", { dryRun: false })) as MigratePlan);
+      setPlan(requireMigrationSuccess<MigratePlan>(await invoke<string>("khipu_migrate", { dryRun: false })));
     } catch (e) {
       setPlanErr(String(e));
     } finally {
@@ -830,6 +831,7 @@ export function Welcome({
   const [doctorBusy, setDoctorBusy] = useState(false);
   const [probeSeconds, setProbeSeconds] = useState<number | null>(null);
   const [fixBusy, setFixBusy] = useState<string | null>(null);
+  const [fixErr, setFixErr] = useState<string | null>(null);
   // Invalidates any in-flight `reloadDoctor()` run when the user leaves
   // Finish and comes back (or the component unmounts) — a stale response
   // landing after a fresh run started used to resurrect the previous
@@ -908,18 +910,19 @@ export function Welcome({
     async (item: Attention) => {
       if (!item.fix || item.fix.kind === "revisions" || item.fix.kind === "storage-report") return;
       setFixBusy(item.key);
+      setFixErr(null);
       try {
         if (item.fix.kind === "reinstall-hook" && item.harness) {
           await runKhipu(["integrations", "install", item.harness]);
         } else if (item.fix.kind === "recall-probe") {
           await runKhipu(["doctor", "--probe"]);
         } else if (item.fix.kind === "apply-migrations") {
-          await invoke<string>("khipu_migrate", { dryRun: false });
+          requireMigrationSuccess(await invoke<string>("khipu_migrate", { dryRun: false }));
         } else if (item.fix.kind === "refresh-snapshot") {
-          await invoke<string>("khipu_snapshot_refresh");
+          requireCliSuccess(await invoke<string>("khipu_snapshot_refresh"));
         }
-      } catch {
-        // reloadDoctor below reports whatever state actually resulted.
+      } catch (e) {
+        setFixErr(String(e));
       } finally {
         setFixBusy(null);
         await reloadDoctor();
@@ -1724,6 +1727,7 @@ export function Welcome({
               ) : null}
             </>
           )}
+          {fixErr ? <p role="alert" className="muted">That repair did not finish: {fixErr}</p> : null}
           {probeSeconds != null ? (
             <Callout tone="ok" title="Memory round trip proved">
               Memory round trip: {probeSeconds.toFixed(1)} s

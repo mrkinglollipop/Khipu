@@ -141,7 +141,7 @@ export function SignInNewAccount({
     doneRef.current = true;
     setStopProblem(null);
     setPhase("stopping");
-    const res = await call<CancelAnswer>("khipu_account_sign_in_cancel", { remove_folder: false });
+    const res = await call<CancelAnswer>("khipu_account_sign_in_cancel", { removeFolder: false });
     const answer = res.ok ? res.data : (res.refusal as CancelAnswer | undefined);
     const left = stillRunning(answer);
     if ((res.ok && !left) || (!res.ok && answer?.error === "no_attempt")) {
@@ -296,7 +296,7 @@ export function SignInNewAccount({
     await finishStop();
   };
   const cancelFailed = async () => {
-    const res = await call<CancelAnswer>("khipu_account_sign_in_cancel", { remove_folder: true });
+    const res = await call<CancelAnswer>("khipu_account_sign_in_cancel", { removeFolder: true });
     if (stillRunning(res.ok ? res.data : (res.refusal as CancelAnswer | undefined))) {
       setStopProblem(NOT_FULLY_STOPPED);
       setPhase("stuck");
