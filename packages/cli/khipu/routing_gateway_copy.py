@@ -193,35 +193,44 @@ def _path():
     return routing.routing_dir() / "gateway-copy.json"
 
 
-# Failure counters: the one place their lifecycle lives.
+# Cleanup of a switched-off copy: one invariant.
 #
-#   failures          every failed try, publish or cleanup; drives the backoff
-#                     (5 s doubling, capped at 300 s).
-#   cleanup_failures  failed deletes of a switched-off copy; drives the give-up.
+#   A target leaves the pending set only after its own delete is confirmed;
+#   nothing else ever removes or re-adds a target. Give-up, interrupted and
+#   full are pure functions of the pending set and the counters.
 #
-#   fresh     no error, cleanup_failures 0.
-#   retrying  error set, cleanup_failures < 6: automatic ticks retry on backoff.
-#   interrupted  a first speculative cleanup (no recorded failure) whose
-#             outcome was lost: never retried automatically, but shown, and
-#             the owner's forced retry runs it.
-#   stopped   not cleaned, cleanup_failures >= 6: automatic ticks never touch
-#             the hub; only the owner's forced cleanup goes on. It reads the
-#             counter alone (never error), so a state rebuilt with the counts
-#             carried, such as a new publisher id, stays stopped.
+# The pending set (_pending) is every id this Mac may still have on the hub:
+# the evidence ids (journal, publishers, publisher: written before any
+# upload) plus the speculative targets (cleanup_publishers: recorded before
+# any delete). _confirm_deleted is the only code that takes an id out, and
+# only after hub.delete(id) returned. A speculative current id is admitted
+# at most once per cleanup (cleanup_admitted), only while the speculative
+# list has room (_CLEANUP_MAX_TARGETS). An unconfigured or unreachable hub
+# never removes anything: it waits, or counts a failure.
+#
+# Counters: failures (every failed try; backoff 5 s doubling, capped at
+# 300 s) and cleanup_failures (failed deletes; the give-up at 6).
+#
+#   fresh        nothing pending, or counters at zero.
+#   retrying     pending, error set, cleanup_failures < 6: automatic ticks
+#                retry on backoff.
+#   interrupted  speculative targets pending, no error and no counts: a first
+#                cleanup whose outcome was lost. Never retried automatically;
+#                shown; the owner's forced retry runs it.
+#   stopped      cleanup_failures >= 6 and not cleaned: automatic ticks never
+#                touch the hub; only the owner's forced retry goes on.
+#   full         speculative list at its bound: shown; new ids wait.
+#   cleaned      "disabled": set only when the pending set is empty.
 #
 #   _on_failure(cleanup=False)  publish failed: failures+1, budget untouched.
 #   _on_failure(cleanup=True)   delete failed: both +1, ends any cleaned marker.
 #   _on_published               a new publication: back to fresh, so a later
 #                               switch-off gets a whole cleanup budget again.
-#   A visible state (stopped, interrupted) clears only through _on_cleaned
-#   or a new publication (_on_published, which also drops the marker).
-#   _on_cleaned                 every copy gone, or nothing left to clean
-#                               (manual or automatic): back to fresh.
+#   _on_cleaned                 the pending set is empty: back to fresh.
 #   _load (legacy)              state from before cleanup_failures existed kept
 #                               one shared count; a recorded failed cleanup
 #                               (cleanup_attempted + error, not cleaned) reads
-#                               that count as cleanup_failures, so a stopped
-#                               cleanup stays stopped and visible.
+#                               that count as cleanup_failures.
 _COUNTERS = ("error", "failures", "cleanup_failures", "retry_at")
 
 
@@ -278,8 +287,7 @@ def gave_up(state):
     """The stopped state: automatic cleanup of a switched-off copy hit its cap.
 
     Only _on_published and _on_cleaned leave it; both zero the counter."""
-    return bool(state.get("disabled") is not True
-                and _count(state.get("cleanup_failures")) >= _CLEANUP_MAX_FAILURES)
+    return bool(not _cleaned(state) and _count(state.get("cleanup_failures")) >= _CLEANUP_MAX_FAILURES)
 
 
 INTERRUPTED_WORDS = ("Routing copy cleanup was interrupted; a copy may still be on the hub. "
@@ -292,12 +300,12 @@ FULL_WORDS = ("Too many unresolved routing copy cleanups; copies may still be on
 
 def cleanup_full(state):
     """The pending target list is at its bound: new speculative ids wait."""
-    return bool(state.get("disabled") is not True and len(_cleanup_targets(state)) >= _CLEANUP_MAX_TARGETS)
+    return bool(not _cleaned(state) and len(_cleanup_targets(state)) >= _CLEANUP_MAX_TARGETS)
 
 
 def interrupted(state):
     """A cleanup was attempted, its outcome is unknown, and it is not cleaned."""
-    return bool(state.get("cleanup_attempted") is True and state.get("disabled") is not True
+    return bool(not _cleaned(state) and _cleanup_targets(state)
                 and not state.get("error") and not _count(state.get("cleanup_failures")))
 
 
@@ -411,49 +419,108 @@ def _hub_configured_cached(now):
 
 
 def _disabled_skip(state, now, *, force):
-    out = _disabled_skip_inner(state, now, force=force)
-    if force and out and out.get("ok") and gave_up(state):
-        # Nothing is left to clean (no hub, no id): the give-up is moot.
-        _save(_on_cleaned(dict(cleanup_attempted=True)))
-    return out
-
-
-def _disabled_skip_inner(state, now, *, force):
+    """Whether a switched-off tick may touch the hub. Never writes state."""
     if gave_up(state) and not force:
         # Automatic retries stop for good; only the owner's forced retry goes on.
         return {"ok": False, "error": "copy_publish_failed"}
-    known = _publishers(state)
-    if not known:
-        # A recomputable id is not evidence this Mac ever published. A
-        # first speculative cleanup whose outcome was lost is not retried
-        # automatically, but one with a recorded failure (an error, or
-        # counted cleanup failures carried by an attempt marker) is, and
-        # the owner's forced retry always runs an unresolved one: only
-        # "disabled" (set by _on_cleaned after the delete) means cleaned.
-        # Otherwise a row published before both local files were lost
-        # would stay on the hub forever.
-        if state.get("cleanup_attempted") is True:
-            if state.get("disabled") is True:
-                return {"ok": True, "disabled": True}
-            unresolved = bool(state.get("error") or _count(state.get("cleanup_failures")))
-            if not unresolved and not force:
+    if _cleaned(state):
+        return {"ok": True, "disabled": True}
+    evidence, targets = _publishers(state), _cleanup_targets(state)
+    if not evidence:
+        if state.get("cleanup_attempted") is True or targets:
+            if not targets and _publisher(create=False) is None:
+                return {"ok": True, "disabled": True}  # nothing was ever recorded
+            recorded = bool(state.get("error") or _count(state.get("cleanup_failures")))
+            if not recorded and not force:
+                # A first cleanup whose outcome was lost: shown as interrupted.
                 return {"ok": True, "disabled": True}
             if not _hub_configured_cached(now):
+                return {"ok": False, "error": "cleanup_waiting_for_hub"}
+        else:
+            # A recomputable id is not evidence this Mac ever published:
+            # with no hub there is nothing to try, and nothing is recorded.
+            if not _hub_configured_cached(now) or _publisher(create=False) is None:
                 return {"ok": True, "disabled": True}
-            retry = routing._parse(state.get("retry_at"))
-            if not force and retry and retry > now:
-                return {"ok": False, "error": "copy_retry_pending"}
-            if _publisher(create=False) is None and not _cleanup_targets(state):
-                return {"ok": True, "disabled": True}
-            return None
-        if not _hub_configured_cached(now):
-            return {"ok": True, "disabled": True}
-        if _publisher(create=False) is None:
-            return {"ok": True, "disabled": True}
     retry = routing._parse(state.get("retry_at"))
     if not force and retry and retry > now:
         return {"ok": False, "error": "copy_retry_pending"}
     return None
+
+
+def _ids(values):
+    return {v for v in values if isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v)}
+
+
+def _journal():
+    try:
+        value = json.loads(_publishers_path().read_text())
+    except (OSError, ValueError):
+        return []
+    return sorted(_ids(value)) if isinstance(value, list) else []
+
+
+def _pending(state):
+    return _publishers(state) | _cleanup_targets(state)
+
+
+def _cleaned(state):
+    """Cleaned: marked so by _on_cleaned and nothing pending since."""
+    return state.get("disabled") is True and not state.get("error") and not _pending(state)
+
+
+def _confirm_deleted(state, target):
+    """The only way out of the pending set: after hub.delete(target) returned.
+    Each removal is its own atomic replace, so a crash neither loses an
+    unresolved id nor brings back a deleted one."""
+    state["cleanup_publishers"] = sorted(_cleanup_targets(state) - {target})
+    state.pop("cleanup_publisher", None)
+    state["publishers"] = sorted(_ids(state.get("publishers") or []) - {target})
+    if state.get("publisher") == target:
+        state.pop("publisher")
+    _save(state)
+    journal = _journal()
+    if target in journal:
+        _save([t for t in journal if t != target], path=_publishers_path())
+
+
+def _cleanup(state, hub):
+    """Delete every pending target; record each confirmed delete. Mutates
+    ``state`` in place, so a failure records its counts on the same dict."""
+    publisher = _publisher(create=False)
+    admitted = [a for a in state.get("cleanup_admitted") or [] if a in _ids([a])]
+    if not _publishers(state):
+        # Speculative: the current id is a guess, admitted once per cleanup.
+        targets = _cleanup_targets(state)
+        if publisher and publisher not in admitted and len(targets) < _CLEANUP_MAX_TARGETS:
+            targets.add(publisher)
+            admitted.append(publisher)
+        # Commit the targets before remote I/O.
+        marker = dict(cleanup_attempted=True, cleanup_publishers=sorted(targets),
+                      cleanup_admitted=admitted[-64:], **_counters(state))
+        state.clear()
+        state.update(marker)
+        _save(state)
+    else:
+        state["publishers"] = sorted(_publishers(state))
+        _save(state)
+    hub = hub or PostgresHub()
+    failed = None
+    for target in sorted(_pending(state)):
+        try:
+            hub.delete(target)
+        except Exception as exc:
+            failed = failed or exc
+            continue
+        _confirm_deleted(state, target)
+    if failed is not None:
+        raise failed
+    if _pending(state):
+        raise RuntimeError("pending targets remain")
+    cleaned = _on_cleaned(dict(cleanup_attempted=True, cleanup_publishers=[], cleanup_admitted=admitted[-64:]))
+    state.clear()
+    state.update(cleaned)
+    _save(state)
+    return {"ok": True, "disabled": True, "deleted": True}
 
 
 def publish(*, force=False, now=None, hub=None, cleanup_only=False):
@@ -484,41 +551,10 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
                 skipped = _disabled_skip(state, now, force=force)
                 if skipped:
                     return skipped
-            publisher = _publisher(create=enabled)
+            if not enabled:
+                return _cleanup(state, hub)
+            publisher = _publisher(create=True)
             known = _publishers(state)
-            if not enabled and not known:
-                # Commit the attempt marker before remote I/O. If the outcome
-                # is lost, an idle Mac cannot retry this speculative deletion;
-                # a recorded failure instead retries on its bounded backoff.
-                # Earlier recorded targets (e.g. from before an identity
-                # recovery) are kept until their own delete succeeds. The
-                # current id joins them only while the list has room; a
-                # full list is shown (cleanup_full) and never trimmed.
-                pending = _cleanup_targets(state)
-                if publisher and len(pending) < _CLEANUP_MAX_TARGETS:
-                    pending.add(publisher)
-                if not pending:
-                    return {"ok": True, "disabled": True}
-                state = dict(cleanup_attempted=True, cleanup_publishers=sorted(pending), **_counters(state))
-                _save(state)
-                hub = hub or PostgresHub()
-                failed = None
-                for target in sorted(pending):
-                    try:
-                        hub.delete(target)
-                    except Exception as exc:
-                        failed = failed or exc
-                        continue
-                    # Persist each confirmed removal on its own (atomic replace):
-                    # a crash mid-loop neither loses an unresolved id nor
-                    # brings back a deleted one.
-                    state["cleanup_publishers"] = [t for t in state["cleanup_publishers"] if t != target]
-                    _save(state)
-                if failed is not None:
-                    raise failed
-                state = _on_cleaned(dict(cleanup_attempted=True, cleanup_publishers=[]))
-                _save(state)
-                return {"ok": True, "disabled": True, "deleted": True}
             # Pending speculative targets become journaled targets here, so
             # the journal is durable before the marker fields are dropped.
             known |= _cleanup_targets(state)
@@ -527,20 +563,12 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
             if not known:
                 return {"ok": True, "disabled": True}
             used = sorted(known)
-            if (not enabled and not force and state.get("disabled") and not state.get("error")
-                    and state.get("publisher") == publisher and state.get("publishers") == used):
-                return {"ok": True, "disabled": True}
             # Keep the journal independently of replaceable publication state.
             # Both ids are durable before a delete or upload can commit remotely.
             _save(used, path=_publishers_path())
             state["publishers"] = used
             _save(state)
             hub = hub or PostgresHub()
-            if not enabled:
-                for previous in used:
-                    hub.delete(previous)
-                _save(_on_cleaned(dict(publisher=publisher, publishers=used)))
-                return {"ok": True, "disabled": True, "deleted": True}
             if state.get("publisher") != publisher:
                 for previous in used:
                     if previous != publisher:
@@ -553,6 +581,7 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
             state.pop("cleanup_attempted", None)
             state.pop("cleanup_publisher", None)
             state.pop("cleanup_publishers", None)
+            state.pop("cleanup_admitted", None)
             from khipu import agent_view
             with agent_view.pull_projection():
                 view = routing.read_view(now)

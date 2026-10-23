@@ -295,7 +295,7 @@ def test_counter_lifecycle_table(gw, monkeypatch):
             with contextlib.suppress(FileNotFoundError):
                 gc._publishers_path().unlink()
             gc._save(dict(cleanup_attempted=True, cleanup_publisher=state.get("publisher")
-                          or state.get("cleanup_publisher")))
+                          or state.get("cleanup_publisher") or gc._publisher(create=False)))
             gc.publish()
         elif step == "cleanup_only_on":
             gateway_tests.configure(gw, routing_cloud_copy=True)
@@ -372,3 +372,184 @@ def test_each_target_leaves_the_list_after_its_own_delete(gw, monkeypatch):
     # The last id clears once its delete succeeds.
     assert gc.publish(force=True, cleanup_only=True, hub=Up())["deleted"]
     assert gc._cleanup_targets(gc._load()) == set()
+
+
+class Crash(BaseException):
+    """The process dies: nothing after this point runs."""
+
+
+class Hub:
+    """A fake hub holding rows; deletes can fail or kill the process."""
+
+    def __init__(self, rows=()):
+        self.rows, self.deleted, self.configured, self.fail = set(rows), [], True, False
+        self.published, self.unconfirmed = [], set()  # unconfirmed: committed, then the process died
+        self.crash = None  # None, "before" or "after", for the next delete only
+
+    def delete(self, publisher):
+        if not self.configured or self.fail:
+            raise OSError("hub offline")
+        crash, self.crash = self.crash, None
+        if crash == "before":
+            raise Crash()
+        self.rows.discard(publisher)
+        self.deleted.append(publisher)
+        if crash == "after":
+            self.unconfirmed.add(publisher)
+            raise Crash()
+
+    def publish(self, publisher, projection, stale_after):
+        if not self.configured or self.fail:
+            raise OSError("hub offline")
+        self.rows.add(publisher)
+        self.published.append(publisher)
+        return routing._iso(routing._now())
+
+    def health_rows(self, **kwargs):
+        return []
+
+
+def test_unconfigured_hub_is_never_evidence_of_cleanup(gw, monkeypatch):
+    never_on_mac(gw, monkeypatch)
+    target = gc._publisher(create=False)
+    hub = Hub([target])
+    hub.fail = True
+    for _ in range(8):
+        gc.publish(hub=hub)
+        routing._now.now += timedelta(seconds=400)
+    assert gc.status()["cleanup_gave_up"] is True
+    (routing.routing_dir() / "mac-id").unlink()  # the current identity is gone
+    monkeypatch.setattr(routing, "_hub_configured", lambda: False)
+    hub.fail, hub.configured = False, False
+    out = gc.publish(force=True, cleanup_only=True, hub=hub)
+    assert out == {"ok": False, "error": "cleanup_waiting_for_hub"}
+    assert gc._cleanup_targets(gc._load()) == {target}
+    assert gc.status()["cleanup_gave_up"] is True
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    hub.configured = True
+    assert gc.publish(force=True, cleanup_only=True, hub=hub)["deleted"]
+    assert hub.rows == set() and hub.deleted == [target]
+
+
+def test_a_confirmed_delete_is_not_redone_after_a_crash(gw, monkeypatch):
+    never_on_mac(gw, monkeypatch)
+    old = gc._publisher(create=False)
+    hub = Hub([old])
+    hub.fail = True
+    gc.publish(hub=hub)  # the first speculative cleanup fails: old is pending
+    while True:
+        replication.restore()
+        current = gc._publisher(create=False)
+        if current < old:  # the current id is deleted first
+            break
+    hub.fail, hub.crash = False, None
+    hub_crash_on = old
+
+    class CrashOnOld(Hub):
+        def delete(self, publisher):
+            if publisher == hub_crash_on:
+                raise Crash()
+            super().delete(publisher)
+
+    crashing = CrashOnOld([old])
+    with pytest.raises(Crash):
+        gc.publish(force=True, cleanup_only=True, hub=crashing)
+    assert crashing.deleted == [current]
+    assert gc._cleanup_targets(gc._load()) == {old}
+    retry = Hub([old])
+    assert gc.publish(force=True, cleanup_only=True, hub=retry)["deleted"]
+    assert retry.deleted == [old]
+
+
+OPS = ("tick", "tick", "tick", "force", "hub_ok", "hub_fail", "crash_before", "crash_after",
+       "restore", "unconfigure", "configure", "switch_on", "switch_off", "publish")
+
+
+def journal():
+    return set(gc._journal())
+
+
+def recorded(state):
+    return gc._pending(state)
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_random_cleanup_sequences_keep_the_invariant(gw, monkeypatch, seed):
+    import random
+
+    rng = random.Random(seed)
+    configured = {"on": True}
+    monkeypatch.setattr(routing, "_hub_configured", lambda: configured["on"])
+    hub = Hub()
+    # Start published (a row on the hub), then switched off.
+    assert gc.publish(force=True, hub=hub)["published"]
+    gateway_tests.configure(gw, routing_cloud_copy=False)
+    on = False
+    episode_deleted = set()  # ids confirmed deleted in this cleanup (since switch-off)
+    for step in range(60):
+        op = rng.choice(OPS)
+        before_state, deletes, pubs = gc._load(), len(hub.deleted), len(hub.published)
+        before_pending = recorded(before_state)
+        routing._now.now += timedelta(seconds=rng.choice((1, 60, 400)))
+        try:
+            if op == "tick":
+                gc.publish(hub=hub)
+            elif op == "force":
+                gc.publish(force=True, cleanup_only=True, hub=hub)
+            elif op == "publish" and on:
+                if gc.publish(force=True, hub=hub).get("published"):
+                    episode_deleted.clear()
+            elif op in ("hub_ok", "hub_fail"):
+                hub.fail = op == "hub_fail"
+            elif op in ("crash_before", "crash_after"):
+                hub.crash = op.split("_")[1]
+            elif op == "restore":
+                replication.restore()
+            elif op in ("unconfigure", "configure"):
+                configured["on"] = hub.configured = op == "configure"
+            elif op in ("switch_on", "switch_off"):
+                on = op == "switch_on"
+                gateway_tests.configure(gw, routing_cloud_copy=on)
+                if on:
+                    # Switching on ends the cleanup: the copy's id is journaled
+                    # again before any upload, so a later cleanup starts anew.
+                    episode_deleted.clear()
+        except Crash:
+            hub.crash = None
+        state, confirmed = gc._load(), set(hub.deleted[deletes:])
+        episode_deleted -= set(hub.published[pubs:])  # published again: a new row
+        where = (seed, step, op)
+        # Every row this Mac may own is recorded, or is its current id.
+        assert hub.rows <= recorded(state) | {gc._publisher(create=False)}, where
+        if not on:
+            # A target leaves the pending set only after its own confirmed delete.
+            assert before_pending - recorded(state) <= confirmed, where
+            # Nothing re-adds a target: no id is deleted twice in one cleanup.
+            assert not (confirmed & episode_deleted), where
+            # A delete whose process died before recording it is not
+            # confirmed: repeating it is the only safe move.
+            episode_deleted |= confirmed - hub.unconfirmed
+            # Cleaned means nothing pending and nothing left on the hub.
+            if gc._cleaned(state):
+                assert not recorded(state) and not hub.rows, where
+            # The visible states are pure functions of the pending set and counts.
+            shown = gc.status()
+            assert bool(shown.get("cleanup_gave_up")) == gc.gave_up(state), where
+            assert bool(shown.get("cleanup_full")) == gc.cleanup_full(state), where
+            if not shown.get("cleanup_gave_up"):
+                assert bool(shown.get("cleanup_interrupted")) == gc.interrupted(state), where
+        episode_deleted -= hub.unconfirmed
+        hub.unconfirmed.clear()
+    # Liveness: with the hub back, automatic ticks remove every row, or it is shown.
+    gateway_tests.configure(gw, routing_cloud_copy=False)
+    configured["on"] = hub.configured = True
+    hub.fail, hub.crash = False, None
+    for _ in range(30):
+        routing._now.now += timedelta(seconds=400)
+        gc.publish(hub=hub)
+    shown = gc.status()
+    visible = shown.get("cleanup_gave_up") or shown.get("cleanup_interrupted") or shown.get("cleanup_full")
+    assert not hub.rows or visible, (seed, hub.rows, shown)
+    if visible:
+        assert gc.publish(force=True, cleanup_only=True, hub=hub)["ok"] is True
+        assert not hub.rows, seed

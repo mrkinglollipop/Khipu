@@ -38,7 +38,8 @@ def test_restore_deletes_prior_row_and_off_revokes_every_used_id(gw, gateway_hub
     gateway_tests.configure(gw, routing_cloud_copy=False)
     assert gc.publish(force=True)["deleted"]
     assert publishers(gateway_hub) == {"unrelated-publisher"}
-    assert set(gc.status()["publishers"]) == used
+    # Each id left the pending set after its own confirmed delete.
+    assert not gc._pending(gc._load()) and gc._journal() == []
 
 
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])

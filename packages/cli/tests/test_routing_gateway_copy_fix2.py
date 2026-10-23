@@ -125,12 +125,14 @@ def test_cleanup_retry_stops_when_the_hub_is_removed(gw, monkeypatch):
     assert gc.publish() == {"ok": False, "error": "copy_publish_failed"}
     assert calls == [True]
     monkeypatch.setattr(routing, "_hub_configured", lambda: False)
-    routing._now.now += timedelta(seconds=400)
-    assert gc.publish() == {"ok": True, "disabled": True}
-    assert calls == [True]
-    routing._now.now += timedelta(seconds=400)
-    assert gc.publish() == {"ok": True, "disabled": True}
-    assert calls == [True]
+    target = gc._cleanup_targets(gc._load())
+    assert target
+    # An unconfigured hub is never evidence of cleanup: the target waits.
+    for _ in range(2):
+        routing._now.now += timedelta(seconds=400)
+        assert gc.publish() == {"ok": False, "error": "cleanup_waiting_for_hub"}
+        assert calls == [True]
+        assert gc._cleanup_targets(gc._load()) == target
 
 
 def test_cleanup_retry_recovers_before_the_cap_then_goes_idle(gw, monkeypatch):
