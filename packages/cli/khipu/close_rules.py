@@ -392,14 +392,9 @@ def _episode_states(cur, project: str, after_episode: int) -> dict[EvidenceKey, 
     """Evidence from the git and gh lines in the project's captures after
     ``after_episode`` (the nightly's view of source 3): the newest capture's
     line about each PR, with that capture's id as ``episode``."""
-    from khipu.db import has_columns
-
-    # A forgotten capture is no evidence (the original audit's P2: the
-    # nightly closed items on a forgotten episode's git lines).
-    live = " AND e.deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
     cur.execute(
         "SELECT e.id, e.ts, e.summary, e.raw->'decisions', e.raw->'closed_loops' FROM episodes e "
-        f"WHERE e.project = %s AND e.id > %s{live} "
+        "WHERE e.project = %s AND e.id > %s AND e.deleted_at IS NULL "
         "AND (e.summary ~* 'pull request' OR (e.raw->'decisions')::text ~* 'pull request' "
         "OR (e.raw->'closed_loops')::text ~* 'pull request') ORDER BY e.id",
         (project, after_episode),
