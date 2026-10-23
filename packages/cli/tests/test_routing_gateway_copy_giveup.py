@@ -1,4 +1,5 @@
 """The cleanup give-up is visible and the owner's retry goes past the cap."""
+import contextlib
 from datetime import timedelta
 
 import pytest
@@ -212,26 +213,35 @@ def test_successful_publication_starts_a_fresh_cleanup_budget(gw, monkeypatch):
     assert len(calls) - before == 6
 
 
-# (step, hub calls it makes, cleanup_failures after, stopped after)
+# (step, hub calls it makes, cleanup_failures after, visible state after)
+# Visible states: "" (fresh, retrying, cleaned), "stopped", "interrupted".
+S, I = "stopped", "interrupted"
 LIFECYCLE = (
-    [("auto", 1, n, n == 6) for n in range(1, 7)]       # fresh -> retrying -> stopped
-    + [("auto", 0, 6, True), ("auto", 0, 6, True)]      # stopped: automatic ticks do nothing
-    + [("rekey_pending", 0, 6, True)]                   # new id, no publication yet: still stopped
-    + [("crash_marker", 0, 6, True)]                    # died before the delete: still stopped
-    + [("force", 1, 7, True)]                           # owner retry passes the cap, fails
-    + [("cleanup_only_on", 0, 7, True)]                 # copy on: no writes, no hub calls
-    + [("publish_up", 0, 0, False)]                     # new publication: fresh budget
-    + [("auto", 1, n, n == 6) for n in range(1, 7)]
-    + [("auto", 0, 6, True)]
-    + [("force_up", 0, 0, False)]                       # owner retry succeeds: cleared
-    + [("auto", 0, 0, False)]                           # cleaned: idle
+    [("auto", 1, n, S if n == 6 else "") for n in range(1, 7)]  # fresh -> retrying -> stopped
+    + [("auto", 0, 6, S), ("auto", 0, 6, S)]            # stopped: automatic ticks do nothing
+    + [("rekey_pending", 0, 6, S)]                      # new id, no publication yet: still stopped
+    + [("crash_marker", 0, 6, S)]                       # died before the delete: still stopped
+    + [("force", 1, 7, S)]                              # owner retry passes the cap, fails
+    + [("cleanup_only_on", 0, 7, S)]                    # copy on: no writes, no hub calls
+    + [("publish_up", 0, 0, "")]                        # new publication: fresh budget
+    + [("auto", 1, n, S if n == 6 else "") for n in range(1, 7)]
+    + [("auto", 0, 6, S)]
+    + [("force_up", 0, 0, "")]                          # owner retry succeeds: cleared
+    + [("auto", 0, 0, "")]                              # cleaned: idle
+    + [("lost_marker", 0, 0, I)]                        # first cleanup's outcome lost: visible
+    + [("auto", 0, 0, I), ("auto", 0, 0, I)]            # never retried automatically
+    + [("publish_up", 0, 0, "")]                        # a publication clears it
+    + [("lost_marker", 0, 0, I)]
+    + [("force", 1, 1, "")]                             # owner retry runs the delete: retrying
+    + [("lost_marker", 0, 0, I)]
+    + [("force_up", 0, 0, "")]                          # owner retry succeeds: cleared
 )
 
 
 def test_counter_lifecycle_table(gw, monkeypatch):
     published_mac(gw, monkeypatch)
     calls = hub_down(monkeypatch)
-    for i, (step, made, cleanup_failures, stopped) in enumerate(LIFECYCLE):
+    for i, (step, made, cleanup_failures, shown) in enumerate(LIFECYCLE):
         before = len(calls)
         routing._now.now += timedelta(seconds=400)
         if step == "auto":
@@ -257,6 +267,14 @@ def test_counter_lifecycle_table(gw, monkeypatch):
             gc._save(dict(cleanup_attempted=True, cleanup_publisher=state["publisher"],
                           **gc._counters(state)))
             gc.publish()
+        elif step == "lost_marker":
+            # A first speculative cleanup (no recorded failure) whose outcome was lost.
+            state = gc._load()
+            with contextlib.suppress(FileNotFoundError):
+                gc._publishers_path().unlink()
+            gc._save(dict(cleanup_attempted=True, cleanup_publisher=state.get("publisher")
+                          or state.get("cleanup_publisher")))
+            gc.publish()
         elif step == "cleanup_only_on":
             gateway_tests.configure(gw, routing_cloud_copy=True)
             files = gc._path().read_bytes()
@@ -266,8 +284,14 @@ def test_counter_lifecycle_table(gw, monkeypatch):
             assert not gc.status().get("cleanup_gave_up")
             gateway_tests.configure(gw, routing_cloud_copy=False)
         state = gc.status()
-        assert (len(calls) - before, state.get("cleanup_failures", 0), bool(state.get("cleanup_gave_up"))) \
-            == (made, cleanup_failures, stopped), (i, step)
-        assert ("gateway-cleanup-stopped" in health()["reasons"]) is stopped, (i, step)
+        visible = S if state.get("cleanup_gave_up") else I if state.get("cleanup_interrupted") else ""
+        assert (len(calls) - before, state.get("cleanup_failures", 0), visible) \
+            == (made, cleanup_failures, shown), (i, step)
+        reasons = health()["reasons"]
+        assert ("gateway-cleanup-stopped" in reasons) is (shown == S), (i, step)
+        assert ("gateway-cleanup-interrupted" in reasons) is (shown == I), (i, step)
+        warned = " ".join(routing.doctor_block()["warnings"])
+        assert ("stopped after 6" in warned) is (shown == S), (i, step)
+        assert ("interrupted" in warned) is (shown == I), (i, step)
         if state.get("retry_at"):
             assert routing._parse(state["retry_at"]) - routing._now() <= timedelta(seconds=300)

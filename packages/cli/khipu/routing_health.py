@@ -252,6 +252,10 @@ def doctor_block(view, now, cfg):
             gateway = dict(status="red", cleanup_gave_up=True, cleanup_failures=left.get("cleanup_failures"),
                            reason_words=routing_gateway_copy.GAVE_UP_WORDS)
             reasons.append("gateway-cleanup-stopped")
+        elif left.get("cleanup_interrupted"):
+            gateway = dict(status="red", cleanup_interrupted=True,
+                           reason_words=routing_gateway_copy.INTERRUPTED_WORDS)
+            reasons.append("gateway-cleanup-interrupted")
     if not rows:
         missing.append("live delivery identities")
     for lane in view.get("unmatched") or []:

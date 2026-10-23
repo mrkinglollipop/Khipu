@@ -201,6 +201,9 @@ def _path():
 #
 #   fresh     no error, cleanup_failures 0.
 #   retrying  error set, cleanup_failures < 6: automatic ticks retry on backoff.
+#   interrupted  a first speculative cleanup (no recorded failure) whose
+#             outcome was lost: never retried automatically, but shown, and
+#             the owner's forced retry runs it.
 #   stopped   not cleaned, cleanup_failures >= 6: automatic ticks never touch
 #             the hub; only the owner's forced cleanup goes on. It reads the
 #             counter alone (never error), so a state rebuilt with the counts
@@ -210,6 +213,8 @@ def _path():
 #   _on_failure(cleanup=True)   delete failed: both +1, ends any cleaned marker.
 #   _on_published               a new publication: back to fresh, so a later
 #                               switch-off gets a whole cleanup budget again.
+#   A visible state (stopped, interrupted) clears only through _on_cleaned
+#   or a new publication (_on_published, which also drops the marker).
 #   _on_cleaned                 every copy gone, or nothing left to clean
 #                               (manual or automatic): back to fresh.
 #   _load (legacy)              state from before cleanup_failures existed kept
@@ -277,6 +282,16 @@ def gave_up(state):
                 and _count(state.get("cleanup_failures")) >= _CLEANUP_MAX_FAILURES)
 
 
+INTERRUPTED_WORDS = ("Routing copy cleanup was interrupted; a copy may still be on the hub. "
+                     "Retry it from Settings.")
+
+
+def interrupted(state):
+    """A cleanup was attempted, its outcome is unknown, and it is not cleaned."""
+    return bool(state.get("cleanup_attempted") is True and state.get("disabled") is not True
+                and not state.get("error") and not _count(state.get("cleanup_failures")))
+
+
 def status():
     value = _load()
     try:
@@ -285,6 +300,8 @@ def status():
         off = False
     if off and gave_up(value):
         value = dict(value, cleanup_gave_up=True, cleanup_gave_up_words=GAVE_UP_WORDS)
+    elif off and interrupted(value):
+        value = dict(value, cleanup_interrupted=True, cleanup_interrupted_words=INTERRUPTED_WORDS)
     return value
 
 

@@ -522,6 +522,9 @@ export type RouteDeliveryFreshness = {
   /** The routing copy was switched off but removing it from the hub kept
    *  failing; automatic retries stopped (`khipu route copy cleanup` retries). */
   cleanup_gave_up?: boolean;
+  /** A cleanup was interrupted before its outcome was known; it is not
+   *  retried automatically, so the same Retry cleanup is offered. */
+  cleanup_interrupted?: boolean;
   reason_words?: string;
 };
 
@@ -1344,6 +1347,7 @@ export function deliveryReason(reason: string): string {
     "cross-mac-stale": "the cross-Mac copy is behind",
     "gateway-stale": "the cloud copy is behind",
     "gateway-cleanup-stopped": "removing the cloud copy stopped after 6 failed tries",
+    "gateway-cleanup-interrupted": "removing the cloud copy was interrupted",
     "unmatched-limit": "an unmatched lane has a limit for over an hour",
   };
   return words[reason] ?? reason.replace(/-/g, " ");

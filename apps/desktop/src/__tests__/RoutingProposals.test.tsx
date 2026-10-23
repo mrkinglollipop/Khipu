@@ -341,6 +341,17 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     await waitFor(() => expect(invokeMock.mock.calls.filter((c) => c[0] === "khipu_gateway_copy_cleanup")).toHaveLength(1));
   });
 
+  it("shows Retry cleanup when an interrupted copy cleanup was never confirmed", async () => {
+    render(<RoutingSettings active deliveryHealth={{ status: "red", gateway: {
+      status: "red", cleanup_interrupted: true,
+      reason_words: "Routing copy cleanup was interrupted; a copy may still be on the hub. Retry it from Settings.",
+    } }} />);
+    await screen.findByRole("list", { name: "Proposals" });
+    expect(screen.getByText(/cleanup was interrupted/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Retry cleanup/ }));
+    await waitFor(() => expect(invokeMock.mock.calls.filter((c) => c[0] === "khipu_gateway_copy_cleanup")).toHaveLength(1));
+  });
+
   it("words a waiting request ahead of every other replication state", () => {
     expect(replicationStatusWords({ status: "not_applicable" }, null, true)).toBe("waiting for your OK");
     expect(replicationStatusWords({ status: "not_applicable" }, null, false)).toBe("off");
