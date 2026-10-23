@@ -27,7 +27,7 @@ def give_up(gw, monkeypatch):
     for _ in range(20):
         gc.publish()
         routing._now.now += timedelta(seconds=400)
-    assert gc.status()["failures"] == 6
+    assert gc.status()["cleanup_failures"] == 6
     return calls
 
 
@@ -77,6 +77,59 @@ def test_forced_retry_failure_records_one_more_and_stays_red(gw, monkeypatch):
     before = len(calls)
     assert gc.publish(force=True) == {"ok": False, "error": "copy_publish_failed"}
     assert len(calls) == before + 1
-    assert gc.status()["failures"] == 7
+    assert gc.status()["cleanup_failures"] == 7
     assert gc.status()["cleanup_gave_up"] is True
     assert health()["gateway"]["status"] == "red"
+
+
+def test_forced_failure_after_success_still_stops_at_six(gw, monkeypatch):
+    calls = give_up(gw, monkeypatch)
+
+    class Up:
+        def delete(self, publisher):
+            pass
+
+    assert gc.publish(force=True, hub=Up())["deleted"]
+    gc._save(["a" * 64], path=gc._publishers_path())  # a copy is known again
+    before = len(calls)
+    assert gc.publish(force=True)["ok"] is False
+    for _ in range(20):
+        routing._now.now += timedelta(seconds=400)
+        gc.publish()
+    assert len(calls) - before <= 6
+    assert gc.status()["cleanup_gave_up"] is True
+
+
+def test_publish_failures_do_not_count_as_cleanup_failures(gw, monkeypatch):
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+    gateway_tests.seed(gw)
+    calls = []
+
+    def down(**kwargs):
+        calls.append(True)
+        raise OSError("hub offline")
+
+    monkeypatch.setattr(db, "connect", down)
+    for _ in range(8):
+        gc.publish(force=True)
+    gateway_tests.configure(gw, routing_cloud_copy=False)
+    assert not gc.status().get("cleanup_gave_up")
+    assert "gateway-cleanup-stopped" not in health()["reasons"]
+    before = len(calls)
+    routing._now.now += timedelta(seconds=400)
+    gc.publish()
+    assert len(calls) > before
+
+
+def test_cleanup_only_retry_never_publishes_while_copy_is_on(gw, monkeypatch):
+    published = []
+
+    class Spy:
+        def publish(self, *a):
+            published.append(a)
+
+        def delete(self, publisher):
+            published.append("delete")
+
+    assert gc.publish(force=True, hub=Spy(), cleanup_only=True) == {"ok": False, "error": "copy_is_on"}
+    assert published == []

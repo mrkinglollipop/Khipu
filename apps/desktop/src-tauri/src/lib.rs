@@ -1882,7 +1882,7 @@ fn route_check_argv(account: &str) -> Result<Vec<String>, String> {
 
 /// The owner's retry of the routing-copy cleanup (forced, past the cap).
 fn gateway_copy_cleanup_argv() -> Vec<String> {
-    vec!["route".to_string(), "copy".to_string(), "publish".to_string()]
+    vec!["route".to_string(), "copy".to_string(), "cleanup".to_string()]
 }
 
 /// Clear the account, or with `report` dismiss that one report.
@@ -5833,7 +5833,7 @@ mod settings_command_tests {
         );
         assert_eq!(route_pause_argv("Codex", None).unwrap(), v(&["route", "pause", "--from-app", "--", "Codex"]));
         assert_eq!(route_lift_argv("Codex").unwrap(), v(&["route", "lift", "--from-app", "--", "Codex"]));
-        assert_eq!(gateway_copy_cleanup_argv(), v(&["route", "copy", "publish"]));
+        assert_eq!(gateway_copy_cleanup_argv(), v(&["route", "copy", "cleanup"]));
         assert_eq!(route_check_argv("Codex").unwrap(), v(&["route", "check", "--", "Codex"]));
         assert_eq!(route_clear_argv("Codex", None).unwrap(), v(&["route", "clear", "--from-app", "--", "Codex"]));
         assert_eq!(

@@ -10654,7 +10654,8 @@ def run_cli(args) -> int:
         if cmd == "copy":
             from khipu import routing_gateway_copy
 
-            out = routing_gateway_copy.publish(force=True, now=now)
+            out = routing_gateway_copy.publish(force=True, now=now,
+                                               cleanup_only=getattr(args, "action", "") == "cleanup")
             _print_json(out)
             return 0 if out["ok"] else 1
         if cmd == "replication":

@@ -207,7 +207,7 @@ GAVE_UP_WORDS = ("Routing copy cleanup stopped after 6 failed tries; a copy may 
 
 def gave_up(state):
     """The automatic cleanup of a switched-off copy has hit its cap."""
-    failures = state.get("failures")
+    failures = state.get("cleanup_failures")
     return bool(state.get("error") and state.get("disabled") is not True
                 and isinstance(failures, int) and not isinstance(failures, bool)
                 and failures >= _CLEANUP_MAX_FAILURES)
@@ -276,11 +276,16 @@ def _publishers(state):
     return {value for value in candidates if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)}
 
 
-def _failed(state, now):
+def _failed(state, now, cleanup=False):
     # Exceptions can contain DSNs or local paths; expose fixed codes only.
     if state is not None:
         state["error"] = "copy_publish_failed"
         state["failures"] = state.get("failures", 0) + 1
+        if cleanup:
+            # Cleanup failures count apart from publish failures, and a
+            # failure ends any earlier "cleaned up" marker.
+            state["cleanup_failures"] = state.get("cleanup_failures", 0) + 1
+            state.pop("disabled", None)
         state["retry_at"] = routing._iso(now + timedelta(seconds=min(300, 5 * 2 ** min(state["failures"], 6))))
         try:
             _save(state)
@@ -350,13 +355,17 @@ def _disabled_skip_inner(state, now, *, force):
     return None
 
 
-def publish(*, force=False, now=None, hub=None):
+def publish(*, force=False, now=None, hub=None, cleanup_only=False):
     """Trailing debounce and bounded retry, polled independently of refolding."""
     now = now or routing._now()
-    state, acquired, attempting_lock = None, False, False
+    state, acquired, attempting_lock, cleanup = None, False, False, False
     try:
         from khipu.routing_replication import _sync_lock
         state = _read()
+        cleanup = not routing.settings()["routing_cloud_copy"]
+        if cleanup_only and not cleanup:
+            # The owner's cleanup retry never publishes.
+            return {"ok": False, "error": "copy_is_on"}
         if not routing.settings()["routing_cloud_copy"]:
             skipped = _disabled_skip(state, now, force=force)
             if skipped:
@@ -367,6 +376,9 @@ def publish(*, force=False, now=None, hub=None):
             state = _read()
             cfg = routing.settings()
             enabled = cfg["routing_cloud_copy"]
+            cleanup = not enabled
+            if cleanup_only and enabled:
+                return {"ok": False, "error": "copy_is_on"}
             if not enabled:
                 skipped = _disabled_skip(state, now, force=force)
                 if skipped:
@@ -378,9 +390,12 @@ def publish(*, force=False, now=None, hub=None):
                 # is lost, an idle Mac cannot retry this speculative deletion;
                 # a recorded failure instead retries on its bounded backoff.
                 failures = state.get("failures")
+                prior_cleanup = state.get("cleanup_failures")
                 state = dict(cleanup_attempted=True, cleanup_publisher=publisher)
                 if isinstance(failures, int) and not isinstance(failures, bool) and failures > 0:
                     state["failures"] = failures
+                if isinstance(prior_cleanup, int) and not isinstance(prior_cleanup, bool) and prior_cleanup > 0:
+                    state["cleanup_failures"] = prior_cleanup
                 _save(state)
                 (hub or PostgresHub()).delete(publisher)
                 state = dict(cleanup_attempted=True, cleanup_publisher=publisher, disabled=True)
@@ -451,9 +466,9 @@ def publish(*, force=False, now=None, hub=None):
     except BlockingIOError:
         if attempting_lock and not acquired:
             return {"ok": True, "skipped": "busy"}
-        return _failed(state, now)
+        return _failed(state, now, cleanup)
     except Exception:
-        return _failed(state, now)
+        return _failed(state, now, cleanup)
 
 
 def answer(*, identity, account=None, ack="", now=None, hub=None):
