@@ -1398,20 +1398,38 @@ def _read_receipt_path() -> Path | None:
     return routing_dir() / "reads" / (key + ".json")
 
 
+def _normalized_read_receipts(value) -> dict:
+    """Damaged receipt branches grant no revision; keep the valid branches."""
+    value = value if isinstance(value, dict) else {}
+    entities = value.get("entities")
+    versions = value.get("priority_versions")
+    return {
+        "entities": {key: [r for r in revisions if isinstance(r, str) and r][-32:]
+                     for key, revisions in (entities.items() if isinstance(entities, dict) else ())
+                     if isinstance(key, str) and isinstance(revisions, list)},
+        "priority_versions": dict([(key, revision)
+                                   for key, revision in (versions.items() if isinstance(versions, dict) else ())
+                                   if isinstance(key, str) and isinstance(revision, str)][-64:]),
+    }
+
+
 def _read_receipts() -> dict:
     path = _read_receipt_path()
     if path is None:
         receipts = _MCP_READ_RECEIPTS.get()
-        return receipts if receipts is not None else {}
+        return _normalized_read_receipts(receipts) if receipts is not None else {}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
+        return _normalized_read_receipts(value)
     except (OSError, ValueError):
         return {}
 
 
 def _remember_read(data: dict, view: dict, *, rules: bool, priority: bool) -> None:
-    entities = data.setdefault("entities", {})
+    normalized = _normalized_read_receipts(data)
+    data.clear()
+    data.update(normalized)
+    entities = data["entities"]
     if rules:
         for rule in view.get("rules") or []:
             key = rule["entity"]
@@ -1709,14 +1727,14 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
                   "prior_confirmed": "bool"},
     "rule_retire": dict(_RULE_TARGET_FIELDS),
     "rule_restore": {**_RULE_TARGET_FIELDS},
-    "rule_confirm": dict(_RULE_TARGET_FIELDS),
+    "rule_confirm": {**_RULE_TARGET_FIELDS, "confirm_revision": "revision_id"},
     "rule_unconfirm": dict(_RULE_TARGET_FIELDS),
     "rule_undo": dict(_RULE_TARGET_FIELDS),
     "rule_dismiss": dict(_RULE_TARGET_FIELDS),
     "note_set": {},
     "note_end": {},
     "priority_set": {"until": "time", "pending": "bool"},
-    "priority_confirm": {},
+    "priority_confirm": {"confirm_proposal": "id", },
     "priority_undo": {},
     "priority_clear": {},
     "priority_drop": {"account": "account"},
@@ -2159,7 +2177,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
                 "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
-                "resets_at", "cycle", "revision", "cap_kind")
+                "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err")
@@ -2389,20 +2407,28 @@ def _checked(data: dict) -> dict | None:
                        or not 0 <= hlc[k] <= _WHOLE_MOST for k in ("wall", "counter"))):
             return None
         out["hlc"] = dict(hlc)
+    def finite_number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+
     used = data.get("used_pct")
     if used is not None:
-        if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
+        if not finite_number(used):
             return None
         out["used_pct"] = used
     pct = data.get("pct")
     if pct is not None:
-        if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct):
+        if not finite_number(pct):
             return None
         out["pct"] = pct
     for field in ("slack", "usd", "days"):
         value = data.get(field)
         if value is not None:
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            if not finite_number(value):
                 return None
             out[field] = value
     cuts = data.get("lanes_cut")
@@ -3750,7 +3776,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         only the overlay: the owner revision underneath (or, for a
         proposed addition, nothing) remains, and a replaced or crossed
         proposal never returns."""
-        nonlocal priority
+        nonlocal priority, priority_version
         for entity_key, key in list(live_proposals.items()):
             written = _parse(proposals[key].get("at"))
             if written is None or at < written + timedelta(days=7):
@@ -3760,6 +3786,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             if proposals[key]["kind"] == "priority":
                 if priority is not None and priority.get("pending"):
                     priority = priority.get("prior")
+                    # Expiry changes the displayed state but is no owner write.
+                    # Its deterministic CAS generation cannot authorize a stale
+                    # pending snapshot to clear the owner state restored here.
+                    priority_version = _priority_mark({"id": key + ":expired"})
             elif entity_key in rules:
                 rule = rules[entity_key]
                 if rule.get("pending_kind") == "added":
@@ -3930,6 +3960,20 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         # Expiry is settled as of this line, before it can act: a later
         # Confirm, Retire or new proposal never sees an expired overlay.
         expire_proposals(info["at"])
+        # A confirmation which no longer applies is not an owner revision.
+        # This also makes old logs with an append crossing expiry harmless.
+        if kind == "priority_confirm" and (
+                priority is None or not priority.get("pending")
+                or (event.get("confirm_proposal") is not None
+                    and event["confirm_proposal"] != live_proposals.get(entity or "priority"))):
+            continue
+        if kind == "rule_confirm":
+            candidate = rules.get(entity)
+            if (candidate is None or candidate.get("retired")
+                    or not (candidate.get("pending") or (candidate["seeded"] and not candidate["confirmed"]))
+                    or (event.get("confirm_revision") is not None
+                        and event["confirm_revision"] != candidate["revision"])):
+                continue
         if info["written_by"].get("kind") == "owner" and not event.get("pending"):
             for target, choice in (event.get("holds") or {}).items():
                 if choice != "end":
@@ -4393,6 +4437,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
 
     # The next change the clock alone will cause.
     times: list[datetime] = []
+    if pace_samples:
+        # Pace allowances and rolling forecasts change continuously, not only
+        # at reset/freshness deadlines. Views have second-resolution clocks;
+        # keep a pace snapshot for at most that second rather than scheduling
+        # only some of its verdict transitions and hiding the others.
+        times.append(now.replace(microsecond=0) + timedelta(seconds=1))
     for key in live_proposals.values():
         written = _parse(proposals[key].get("at"))
         if written is not None:
@@ -5084,7 +5134,7 @@ def _save_view(view: dict) -> None:
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     if (not view or view.get("fingerprint") != fingerprint or "priority_version" not in view
             or "priority_owner_revision" not in view or view.get("event_identity") != 2
-            or view.get("proposal_schema") != 1):
+            or view.get("proposal_schema") != 1 or view.get("fold_audit_schema") != 1):
         return False
     # A whole-log read of a runner's events still under way goes on at the
     # next read, one bounded chunk at a time, though no file changed.
@@ -5208,7 +5258,7 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
             change["directions"] = directions
         changes.append(change)
         changes = changes[-CHANGES_KEPT:]
-    out = dict(body, schema=SCHEMA, event_identity=2, proposal_schema=1, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
+    out = dict(body, schema=SCHEMA, event_identity=2, proposal_schema=1, fold_audit_schema=1, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
     if not saved:
         out["saved"] = False
@@ -5957,9 +6007,13 @@ def _write_many(events: list[dict]) -> tuple[list[dict], dict]:
                 results.append(event)
                 existing[event["op"]] = event
             if fresh:
-                for event in fresh:
-                    _require_hold_choices(event, clock)
-                for event, stamp in zip(fresh, _stamp_locked(clock, len(fresh))):
+                stamps = _stamp_locked(clock, len(fresh))
+                for event, stamp in zip(fresh, stamps):
+                    # Validate against the actual append timestamp, which may
+                    # be later than the clock when this operation began.
+                    append_at = _parse(stamp["written_at"]) or clock
+                    _require_confirmation(event, append_at)
+                    _require_hold_choices(event, append_at)
                     event.update(stamp)
                 _append_locked(*fresh)
             events = [dict(_checked(_scrub(event)) or event) for event in results]
@@ -6210,6 +6264,24 @@ def _owner_write(event: dict, via: str) -> dict:
     event = _owner_stamp(dict(event, written_by=OWNER, via=via))
     written, view = _write(event)
     return _done(written, view)
+
+
+def _require_confirmation(event: dict, now: datetime) -> None:
+    """A confirmation must still name the proposal at its append time."""
+    if event.get("type") == "priority_confirm":
+        view = read_view(now)
+        held = view.get("priority")
+        live = [p["id"] for p in (view.get("proposals") or {}).values()
+                if p.get("kind") == "priority" and p.get("status") == "live"]
+        if (not held or not held.get("pending") or held.get("proposal_withheld")
+                or event.get("confirm_proposal") not in live):
+            raise PriorityMoved("the priority changed after it was read; read it again")
+    elif event.get("type") == "rule_confirm":
+        rule = next((r for r in read_view(now)["rules"]
+                     if r["entity"] == (event.get("entity") or event.get("target"))), None)
+        if (rule is None or event.get("confirm_revision") != rule["revision"] or rule.get("proposal_withheld")
+                or not (rule.get("pending") or (rule.get("seeded") and not rule.get("confirmed")))):
+            raise RouteError("the rule changed after it was read; read its revision again")
 
 
 def _require_hold_choices(event: dict, now: datetime) -> None:
@@ -6595,14 +6667,22 @@ def rule_reference(n) -> tuple[str, int | None]:
     raise RouteError(f"there is no standing rule {number}")
 
 
-def confirm_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None) -> dict:
+def confirm_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None, expect=None) -> dict:
     with _lock():
         rule = _rule(n, now)
         if rule.get("pending") and rule.get("proposal_withheld"):
             raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
         if not rule.get("pending") and not (rule.get("seeded") and not rule.get("confirmed")):
             raise RouteError(f"standing rule {rule['n']} has no unconfirmed proposal to confirm")
+        # A pending replacement needs the revision actually displayed to the
+        # owner. Seed-only legacy calls remain safe: a newer proposal makes
+        # the rule pending and therefore requires an explicit token.
+        if rule.get("pending") and (not isinstance(expect, str) or not expect.strip()):
+            raise RouteError("confirm needs the rule revision shown to the owner (--expect); read it again")
+        if expect is not None and expect != rule["revision"]:
+            raise RouteError("the rule changed after it was read; read its revision again")
         return dict(_owner_write({"type": "rule_confirm", "text": rule["text"], **_rule_target(rule),
+                                 "confirm_revision": rule["revision"],
                                  **({"holds": holds} if holds is not None else {})}, via), n=rule["n"])
 
 
@@ -6889,7 +6969,11 @@ def confirm_priority(*, via: str, now: datetime | None = None, expect=None, hold
         held = _held_priority(now, pending=True)
         if held.get("proposal_withheld"):
             raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
-        return _owner_write({"type": "priority_confirm", "entries": held["entries"], **({"holds": holds} if holds is not None else {})}, via)
+        proposal = next(p["id"] for p in read_view(now)["proposals"].values()
+                        if p.get("kind") == "priority" and p.get("status") == "live")
+        return _owner_write({"type": "priority_confirm", "entries": held["entries"],
+                             "confirm_proposal": proposal,
+                             **({"holds": holds} if holds is not None else {})}, via)
 
 
 def undo_priority(*, via: str, now: datetime | None = None, expect=None) -> dict:
@@ -10837,7 +10921,7 @@ def run_cli(args) -> int:
             elif args.action == "dismiss":
                 out = dismiss_rule_request(params[0], via=via, now=now)
             else:
-                out = confirm_rule(params[0], via=via, now=now, holds=_holds_arg(args))
+                out = confirm_rule(params[0], via=via, now=now, holds=_holds_arg(args), expect=getattr(args, "expect", None))
         else:
             raise RouteError(f"unknown route command {cmd!r}")
         _print_json(_finish_owner(out))

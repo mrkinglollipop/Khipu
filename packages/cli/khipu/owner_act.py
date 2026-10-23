@@ -30,7 +30,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.edit": (("rule", "text"), ()),
     "route.rule.retire": (("rule",), ()),
     "route.rule.restore": (("rule",), ()),
-    "route.rule.confirm": (("rule",), ()),
+    "route.rule.confirm": (("rule",), ("expect",)),
     "route.rule.undo": (("rule",), ()),
     "route.rule.dismiss": (("rule",), ()),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
@@ -281,7 +281,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "route.rule.edit":
         return ["route", "rule", "edit"], [str(v["rule"]), v["text"]]
     if action.startswith("route.rule."):
-        return ["route", "rule", verb], [str(v["rule"])]
+        return ["route", "rule", verb, *_opts(v, "expect")], [str(v["rule"])]
     if action == "route.hold.add":
         scope = v["scope"]
         if (scope == "account") != ("account" in v):

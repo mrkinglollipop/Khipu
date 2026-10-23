@@ -1933,7 +1933,7 @@ fn checked_holds_arg(holds: &serde_json::Map<String, Value>) -> Result<String, S
 }
 
 fn route_rule_argv(action: &str, n: Option<u32>, text: Option<&str>) -> Result<Vec<String>, String> {
-    route_rule_argv_holds(action, n, text, None, None)
+    route_rule_argv_holds(action, n, text, None, None, None)
 }
 
 fn route_rule_argv_holds(
@@ -1942,11 +1942,15 @@ fn route_rule_argv_holds(
     text: Option<&str>,
     holds: Option<&serde_json::Map<String, Value>>,
     entity: Option<&str>,
+    expect: Option<&str>,
 ) -> Result<Vec<String>, String> {
     if !ROUTE_RULE_ACTIONS.contains(&action) {
         return Err(format!("not a rule change: {action:?}"));
     }
     let mut argv = route_base("rule");
+    if let Some(expect) = expect {
+        argv.push(format!("--expect={}", checked_route_id(expect)?));
+    }
     if let Some(holds) = holds {
         argv.push(checked_holds_arg(holds)?);
     }
@@ -2629,11 +2633,12 @@ async fn khipu_route_rule(
     action: String,
     n: Option<u32>,
     entity: Option<String>,
+    expect: Option<String>,
     text: Option<String>,
     holds: Option<serde_json::Map<String, Value>>,
     op: Option<String>,
 ) -> Result<String, String> {
-    run_khipu_cli_async(route_operation_argv(route_rule_argv_holds(&action, n, text.as_deref(), holds.as_ref(), entity.as_deref())?, op.as_deref())?).await
+    run_khipu_cli_async(route_operation_argv(route_rule_argv_holds(&action, n, text.as_deref(), holds.as_ref(), entity.as_deref(), expect.as_deref())?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -5861,14 +5866,23 @@ mod settings_command_tests {
         }
         let holds = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("end")))]);
         assert_eq!(
-            route_rule_argv_holds("confirm", Some(6), None, Some(&holds), None).unwrap(),
-            v(&["route", "rule", "--from-app", "--holds={\"h-grok\":\"end\"}", "--", "confirm", "6"])
+            route_rule_argv_holds("confirm", Some(6), None, Some(&holds), None, Some("shown-revision")).unwrap(),
+            v(&["route", "rule", "--from-app", "--expect=shown-revision", "--holds={\"h-grok\":\"end\"}", "--", "confirm", "6"])
         );
-        let bad = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("drop")))]);
-        assert!(route_rule_argv_holds("confirm", Some(6), None, Some(&bad), None).is_err());
+        // A rule revision is an event id (UUID), not a priority version.
+        let revision = "ff724c09-6767-42bd-8b91-dc05490ad654";
         assert_eq!(
-            route_rule_argv_holds("confirm", None, None, None, Some("rule:pending-1")).unwrap(),
-            v(&["route", "rule", "--from-app", "--", "confirm", "rule:pending-1"])
+            route_rule_argv_holds("confirm", Some(6), None, None, None, Some(revision)).unwrap(),
+            v(&["route", "rule", "--from-app", &format!("--expect={revision}"), "--", "confirm", "6"])
+        );
+        for invalid in ["", "--from-app", "revision\nconfirm", "revision value"] {
+            assert!(route_rule_argv_holds("confirm", Some(6), None, None, None, Some(invalid)).is_err());
+        }
+        let bad = serde_json::Map::from_iter([(String::from("h-grok"), Value::String(String::from("drop")))]);
+        assert!(route_rule_argv_holds("confirm", Some(6), None, Some(&bad), None, Some("shown-revision")).is_err());
+        assert_eq!(
+            route_rule_argv_holds("confirm", None, None, None, Some("rule:pending-1"), Some("shown-revision")).unwrap(),
+            v(&["route", "rule", "--from-app", "--expect=shown-revision", "--", "confirm", "rule:pending-1"])
         );
         assert_eq!(
             route_hold_add_argv("No new launches", "machine-busy", "machine", None, None).unwrap(),
