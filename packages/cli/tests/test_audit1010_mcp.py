@@ -10,7 +10,6 @@ import unittest
 import urllib.error
 from pathlib import Path
 from unittest import mock
-from types import SimpleNamespace
 
 from khipu import gateway as gw, mcp_server as srv
 import pytest
@@ -21,8 +20,6 @@ def _no_hub_record(monkeypatch):
     # The fake connections here model the write itself; the record of applied
     # owner writes (migration 0031) is tested in test_owner_writes_exactly_once.
     from khipu import owner_writes
-
-    monkeypatch.setenv("KHIPU_DATABASE_URL", "postgresql://synthetic@127.0.0.1:5432/owner_fixture")
 
     monkeypatch.setattr(owner_writes, "record_on_hub", lambda cur, tool, args: True)
     monkeypatch.setattr(owner_writes, "_refuse_on_hub", lambda conn, cur, tool, args, error: conn.rollback())
@@ -227,8 +224,6 @@ class GatewayEvidenceTest(unittest.TestCase):
 
 
 class _Connection:
-    info = SimpleNamespace(get_parameters=lambda: {"host": "127.0.0.1", "port": "5432", "dbname": "owner_fixture"})
-
     def __init__(self, row=None):
         self.row = row
         self.committed = 0

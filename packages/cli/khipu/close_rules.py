@@ -359,7 +359,7 @@ def _episode_states(cur, project: str, after_episode: int) -> dict[EvidenceKey, 
     line about each PR, with that capture's id as ``episode``."""
     cur.execute(
         "SELECT e.id, e.ts, e.summary, e.raw->'decisions', e.raw->'closed_loops' FROM episodes e "
-        "WHERE e.project = %s AND e.id > %s AND e.deleted_at IS NULL "
+        "WHERE e.project = %s AND e.id > %s "
         "AND (e.summary ~* 'pull request' OR (e.raw->'decisions')::text ~* 'pull request' "
         "OR (e.raw->'closed_loops')::text ~* 'pull request') ORDER BY e.id",
         (project, after_episode),

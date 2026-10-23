@@ -280,7 +280,6 @@ through the gate and added here.
 | migrations 0027, 0029, 0030 | backfills (source rows, origin, `forgotten_sources`) | 0030 backfills the forgotten identities | none (table locks, see below) |
 | `hygiene.apply_backfill_*`, `capture._claim_unowned_episode`, `cli._cmd_episode_edit` | project/repo_root, origin, summary on existing rows | metadata only; the edit skips forgotten rows | none |
 | `forget.forget_episode` | hub tombstone, `forgotten_sources` | erase | exclusive (`forget.forget_everywhere`) |
-| `fact_support.remove` | existing kept parent episode's `changed_at` only, when its supported deliverables change | metadata; cannot insert or restore source content | inside `forget.forget_episode`, with the support mutex and replacement-parent row locks |
 
 ### The four holes and the test that pins each
 

@@ -48,7 +48,6 @@ def owed(hub, tmp_path, monkeypatch):  # noqa: F811
     data.mkdir()
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("KHIPU_DATABASE_URL", hub.dsn)
     conn = hub.connect()
     hub.migrate(conn=conn)
     conn.commit()

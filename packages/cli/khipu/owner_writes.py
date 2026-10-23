@@ -27,25 +27,17 @@ hub without the record (0031 not applied) keeps every entry waiting. A refused
 entry moves to ``refused/`` with the reason and is reported, never counted as
 done. An entry with no id was queued by a build before ids existed; whether
 it landed cannot be known, so it is refused for the owner to check, never sent.
-Each entry also carries a credential-free fingerprint of its host, port and
-name of database. Replay checks that binding on each connection before reading
-an answer or writing. A different or missing destination stays blocked in the
-queue with its original words and action; status/drain report why. Returning
-to the original destination lets a bound job retry. The fingerprint identifies
-an endpoint, not destruction/recreation of a database at that same endpoint.
 Forgetting is not queued here: a forget that only looked done would be a
 privacy failure.
 """
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 import threading
 import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -56,64 +48,6 @@ TOOLS = ("owed_update", "decisions_update")
 _ECHO = ("id", "ids", "link_id", "action", "until", "by")
 _HELD = threading.local()  # the entry this thread's run() is applying
 _NO_ID = "queued by an older build; check it and redo it"
-
-
-class DestinationBlocked(RuntimeError):
-    """The queue cannot establish that this is the owner's intended hub."""
-
-
-def _destination(params: dict[str, str]) -> str | None:
-    """Versioned non-secret endpoint identity, independent of credentials.
-
-    This binds the configured endpoint, not a database incarnation: restoring
-    or replacing a database at the exact same endpoint preserves its identity.
-    Ambiguous libpq defaults/services and multi-host destinations fail closed.
-    """
-    host = params.get("host") or params.get("hostaddr") or ""
-    database = params.get("dbname") or ""
-    if not host or not database or any("," in str(params.get(k) or "") for k in ("host", "hostaddr", "port")):
-        return None
-    endpoint = {"host": host, "hostaddr": params.get("hostaddr") or "",
-                "port": params.get("port") or "5432", "dbname": database}
-    return "endpoint-v1:" + hashlib.sha256(
-        json.dumps(endpoint, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _configured_destination() -> str | None:
-    from psycopg.conninfo import conninfo_to_dict
-    from khipu.db import resolve_dsn
-
-    try:
-        return _destination(conninfo_to_dict(resolve_dsn()))
-    except (RuntimeError, ValueError):
-        return None
-
-
-@contextmanager
-def _bound_job(job: dict[str, Any]):
-    prior = getattr(_HELD, "job", None)
-    _HELD.job = job
-    try:
-        yield
-    finally:
-        _HELD.job = prior
-
-
-def _check_destination(conn) -> None:
-    # Inspect the connection actually about to read the outcome or mutate rows;
-    # resolving config a second time would leave a check/use destination race.
-    job = getattr(_HELD, "job", None)
-    if job is None:
-        return  # direct gateway / non-queued hub call
-    expected = job.get("destination")
-    if not expected:
-        raise DestinationBlocked("destination binding is missing; owner must check and redo this write")
-    actual = conn.info.get_parameters()
-    # libpq adds hostaddr after resolving host. A host-only binding follows
-    # that hostname; an explicitly pinned hostaddr must still match exactly.
-    host_only = {k: v for k, v in actual.items() if k != "hostaddr"}
-    if expected not in (_destination(actual), _destination(host_only)):
-        raise DestinationBlocked("destination differs from the queued hub; restore that destination to retry")
 
 
 class HubRecordMissing(RuntimeError):
@@ -175,7 +109,6 @@ def apply_on_hub(conn, cur, tool: str, args: dict[str, Any], write, echo: dict[s
     a reply with ``ok: false`` or a ``ValueError`` is a refusal: the change is
     undone and the id committed as refused. An id the hub already answered
     applies nothing and replies with the recorded outcome."""
-    _check_destination(conn)
     if not record_on_hub(cur, tool, args):
         conn.rollback()
         prior = _outcome_on_hub(cur, args)
@@ -245,7 +178,6 @@ def _landed(tool: str, args: dict[str, Any]) -> tuple[str, str | None] | None:
     from khipu.db import connect
 
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
-        _check_destination(conn)
         with conn.cursor() as cur:
             try:
                 return _outcome_on_hub(cur, args)
@@ -284,8 +216,7 @@ def _reserve(tool: str, args: dict[str, Any]) -> tuple[Path, int]:
         held = os.open(str(_held_path(path)), os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(held, fcntl.LOCK_EX)
         _write(path, {"tool": tool, "args": args, "state": "reserved",
-                      "made_at": datetime.now(timezone.utc).isoformat(),
-                      "destination": _configured_destination()})
+                      "made_at": datetime.now(timezone.utc).isoformat()})
     finally:
         os.close(order)
     return path, held
@@ -328,8 +259,7 @@ def _enqueue(tool: str, args: dict[str, Any], reason: str) -> dict[str, Any]:
         args = _with_id(args)
         path, held = _reserve(tool, args)
         _release(path, held)
-    job = _read(path) or {}
-    _write(path, {**job, "tool": tool, "args": args, "state": "waiting", "queued_at": queued_at, "reason": reason})
+    _write(path, {"tool": tool, "args": args, "state": "waiting", "queued_at": queued_at, "reason": reason})
     return {"ok": True, "waiting_to_sync": True, "queued_at": queued_at,
             **{k: args[k] for k in _ECHO if args.get(k) is not None}}
 
@@ -351,12 +281,7 @@ def run(tool: str, args: dict[str, Any], *, queue_ok: bool = True) -> dict[str, 
             if _jobs()[0] != path:
                 return _enqueue(tool, args, "earlier writes are still waiting for the hub")
         try:
-            with _bound_job(_read(path) or {}):
-                result = _apply(tool, args)
-        except DestinationBlocked as exc:
-            out = _enqueue(tool, args, str(exc))
-            _block(path, _read(path) or {}, str(exc))
-            return {**out, "blocked": True, "reason": str(exc)}
+            result = _apply(tool, args)
         except Exception as exc:  # noqa: BLE001 - only a hub that is away queues
             if hub_connection_failed(exc):
                 return _enqueue(tool, args, f"{type(exc).__name__}: {str(exc)[:200]}")
@@ -404,27 +329,8 @@ def _replay(path: Path) -> str | None:
     if not job["args"].get("write_id"):
         # It may have landed already, and no record can say: never sent.
         return "refused" if _refuse(path, job, _NO_ID) else "local_error"
-    if not job.get("destination"):
-        return _block(path, job, "destination binding is missing; owner must check and redo this write")
-    with _bound_job(job):
-        return _replay_bound(path, job)
-
-
-def _block(path: Path, job: dict[str, Any], reason: str) -> str:
-    try:
-        _write(path, {**job, "state": "blocked", "blocked_reason": reason})
-    except OSError:
-        return "local_error"
-    return "blocked"
-
-
-def _replay_bound(path: Path, job: dict[str, Any]) -> str:
-    from khipu.hub_snapshot import hub_connection_failed
-
     try:
         landed = _landed(job["tool"], job["args"])
-    except DestinationBlocked as exc:
-        return _block(path, job, str(exc))
     except HubRecordMissing:
         return "unrecorded"
     except Exception as exc:  # noqa: BLE001
@@ -445,8 +351,6 @@ def _replay_bound(path: Path, job: dict[str, Any]) -> str:
         return "local_error"
     try:
         result = _apply(job["tool"], job["args"])
-    except DestinationBlocked as exc:
-        return _block(path, job, str(exc))
     except HubRecordMissing:
         return "unrecorded"
     except ValueError as exc:
@@ -490,12 +394,8 @@ def drain() -> dict[str, Any]:
                 step = _replay(path)
             finally:
                 os.close(claim)
-            if step in ("away", "unrecorded", "local_error", "blocked"):
+            if step in ("away", "unrecorded", "local_error"):
                 out["stopped_early"] = True
-                if step == "blocked":
-                    out["blocked"] = True
-                    job = _read(path) or {}
-                    out["blocked_reason"] = job.get("blocked_reason")
                 if step == "unrecorded":
                     out["hub_needs_migrate"] = True
                 if step == "local_error":
@@ -524,36 +424,19 @@ def status() -> dict[str, Any]:
     except OSError:
         refused = 0
     queued = sorted(str(j.get("queued_at") or j.get("made_at") or "") for j in jobs)
-    destination = _configured_destination() if jobs else None
-    blocked_reasons = set()
-    blocked = 0
-    for job in jobs:
-        reason = None
-        if not job.get("destination"):
-            reason = "destination binding is missing"
-        elif job["destination"] != destination:
-            reason = "destination differs from the queued hub; restore that destination to retry"
-        elif job.get("state") == "blocked":
-            reason = str(job.get("blocked_reason") or "destination could not be verified")
-        if reason:
-            blocked += 1
-            blocked_reasons.add(reason)
-    return {"pending": len(paths), "refused": refused, "oldest_queued_at": queued[0] if queued else None,
-            **({"blocked": blocked, "blocked_reasons": sorted(blocked_reasons)} if blocked else {})}
+    return {"pending": len(paths), "refused": refused, "oldest_queued_at": queued[0] if queued else None}
 
 
 def pending_marks(tool: str) -> dict[int, str]:
     """``{id: action}`` for rows with a write still waiting, the newest
     write for an id winning."""
     marks: dict[int, str] = {}
-    destination = _configured_destination()
     for path in _jobs():
         try:
             job = _read(path)
         except OSError:
             continue
-        if (job is None or job["tool"] != tool
-                or not destination or job.get("destination") != destination):
+        if job is None or job["tool"] != tool:
             continue
         ids = job["args"].get("ids")
         for one in (ids if isinstance(ids, list) else [job["args"].get("id")]):
