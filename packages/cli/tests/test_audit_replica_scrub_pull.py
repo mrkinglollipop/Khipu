@@ -3,6 +3,7 @@ import json
 import sqlite3
 
 import pytest
+from tests import fact_seed
 from tests.hermetic_pg import hub, pg_cluster
 from khipu import db, hub_snapshot as hs, offline_reads, tombstones
 
@@ -28,10 +29,13 @@ def test_pull_cannot_restore_derivatives_of_scrubbed_source(hub, tmp_path, monke
                           "VALUES (%s,%s,%s::jsonb,%s,%s,%s) RETURNING id",
                           (payload['ts'], payload['summary'], json.dumps(payload),
                            payload['session_id'], payload['harness'], payload['transcript_range'])).fetchone()[0]
-        con.execute("INSERT INTO commitments(text,opened_episode,content_hash) VALUES (%s,%s,%s)",
-                    ('PRIVATE COMMITMENT', eid, 'fake-commitment-hash'))
-        con.execute("INSERT INTO decisions(text,episode_id) VALUES (%s,%s)",
-                    ('PRIVATE DECISION', eid))
+        cid = con.execute("INSERT INTO commitments(text,opened_episode,content_hash) VALUES (%s,%s,%s) "
+                          "RETURNING id", ('PRIVATE COMMITMENT', eid, 'fake-commitment-hash')).fetchone()[0]
+        did = con.execute("INSERT INTO decisions(text,episode_id) VALUES (%s,%s) RETURNING id",
+                          ('PRIVATE DECISION', eid)).fetchone()[0]
+        # Fact provenance (0047): raw-seeded facts get their claims.
+        fact_seed.adopt(con.cursor(), 'commitment', cid)
+        fact_seed.adopt(con.cursor(), 'decision', did)
     if refresh_first:
         refreshed = hs.refresh()
         assert refreshed['ok'], refreshed

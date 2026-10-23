@@ -156,7 +156,8 @@ def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
     backfill = provenance.ensure_backfilled(cur, row[0] if row else None)
     cur.execute("DELETE FROM fact_claims WHERE episode_id = %s", (episode_id,))
     out = {"commitments_closed": 0, "commitment_vectors_removed": 0, "deliverables_removed": 0,
-           "decisions_retracted": 0, "facts_reprojected": 0, "backfill": backfill}
+           "decisions_retracted": 0, "facts_reprojected": 0, "backfill": backfill,
+           "changed_facts": []}
     retired: list[int] = []
     for kind, _table in _FACT_TABLES:
         for fact_id in sorted(facts.get(kind) or []):
@@ -164,6 +165,7 @@ def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
                 continue
             result = provenance.project(cur, kind, fact_id)
             out["facts_reprojected"] += 1
+            out["changed_facts"].append((kind, fact_id))
             if result == "deleted":
                 out["deliverables_removed"] += 1
             elif result == "retired" and before[(kind, fact_id)]:
@@ -358,6 +360,9 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         "decisions_retracted": decisions_retracted,
         "briefs_staled": briefs_staled,
         "facts_reprojected": (provenance_out or {}).get("facts_reprojected", 0),
+        # (kind, id) of every fact the forget re-projected: forget_everywhere
+        # writes their new rows into this Mac's replica at once (section 6).
+        "changed_facts": (provenance_out or {}).get("changed_facts", []),
         "provenance_backfill": (provenance_out or {}).get("backfill"),
         "graph": "topic nodes are shared across episodes; none removed",
         "identity": live,
@@ -1924,6 +1929,42 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
                 "error": f"forget not started: {exc}"}
 
 
+# Two forgets that both run a project's first witness backfill can deadlock
+# (design section 4: each holds its facts, then the backfill's claim gate
+# takes FOR SHARE on other episodes). PostgreSQL refuses one; the refused
+# transaction changed nothing, so it is run again, a bounded number of times.
+FORGET_DEADLOCK_ATTEMPTS = 4
+_FORGET_RETRY_SQLSTATES = frozenset({"40P01", "40001"})  # deadlock, serialization
+
+
+def _retryable(exc: BaseException) -> bool:
+    state = getattr(getattr(exc, "diag", None), "sqlstate", None) or getattr(exc, "sqlstate", None)
+    return state in _FORGET_RETRY_SQLSTATES
+
+
+def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None) -> dict[str, Any]:
+    """The hub transaction, retried on a deadlock or serialization failure
+    (``FORGET_DEADLOCK_ATTEMPTS`` in all, with a short growing pause). Each
+    attempt is a fresh connection and transaction; the local fence it
+    publishes first is idempotent."""
+    import random
+
+    for attempt in range(FORGET_DEADLOCK_ATTEMPTS):
+        try:
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    out = forget_episode(cur, episode_id, memory_root=memory_root)
+                conn.commit()
+            if attempt:
+                out["deadlock_retries"] = attempt
+            return out
+        except Exception as exc:  # noqa: BLE001 - only a retryable refusal is retried
+            if not _retryable(exc) or attempt == FORGET_DEADLOCK_ATTEMPTS - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1) + random.uniform(0, 0.05))
+    raise AssertionError("unreachable")
+
+
 def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
                        gateway: bool | None) -> dict[str, Any]:
     from khipu import writer_groups
@@ -1948,10 +1989,7 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         except Exception:  # noqa: BLE001
             memory_root = None
             root_resolved = False
-    with connect() as conn:
-        with conn.cursor() as cur:
-            out = forget_episode(cur, episode_id, memory_root=memory_root)
-        conn.commit()
+    out = _forget_on_hub(connect, episode_id, memory_root=memory_root)
     if not out.get("ok"):
         return out
     if out.get("registry_error"):
@@ -1977,6 +2015,20 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         if (out["snapshot"].get("error") == "hub snapshot missing"
                 and not snapshot_path().exists()):
             out["snapshot"] = {"ok": True, "skipped": True, "reason": "no snapshot exists"}
+        if out["snapshot"].get("ok") and out.get("changed_facts"):
+            # After the local tombstone, so its fence is up: the facts the
+            # forget re-projected reach this Mac's replica now, not at its
+            # next pull (design section 6). Best-effort: the next pull's
+            # stream reads them again either way.
+            from khipu.hub_snapshot import apply_fact_rows
+
+            try:
+                with connect() as conn:
+                    with conn.cursor() as cur:
+                        out["snapshot"]["facts"] = apply_fact_rows(cur, out["changed_facts"])
+                    conn.rollback()
+            except Exception as exc:  # noqa: BLE001 - the hub forget committed
+                out["snapshot"]["facts"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     except Exception as exc:  # noqa: BLE001 — the hub write already succeeded
         out["snapshot"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     if not out["snapshot"].get("ok"):

@@ -765,12 +765,16 @@ def _mark_stale_commitments() -> dict[str, Any]:
 
 def _provenance_backfill(conn) -> dict[str, Any]:
     """``khipu provenance backfill`` inside the nightly's close-rules step,
-    until every project is covered. Fail-open: an error is reported and the
+    until every project is covered, then the 30-day prune of the replica
+    change stream (``fact_changes``). Fail-open: an error is reported and the
     rules still run."""
     try:
         from khipu import provenance
 
-        return provenance.backfill(conn)
+        out = provenance.backfill(conn)
+        # The replica stream's 30-day retention (section 6 of the design).
+        out["changes"] = provenance.prune_changes(conn)
+        return out
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         try:
             conn.rollback()

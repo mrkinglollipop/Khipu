@@ -13,9 +13,12 @@
 --
 --   fact_claims          (kind, fact_id, field, value, claimant, episode_id).
 --                        One row per claimed value; a replay writes nothing.
---   fact_changes         one row per projection, stamped with its
---                        transaction id: the commit gate below and, later,
---                        the replica change stream.
+--   fact_changes         one row per projection (via 'project'), and per
+--                        other decision/deliverable row write (via 'row'),
+--                        stamped with its transaction id: the commit gate
+--                        below (via 'project' only) and the replica change
+--                        stream (section 6). fact_changes_floor records how
+--                        far the 30-day prune has removed rows.
 --   fact_gaps            a capture fact step that failed and was kept as a
 --                        gap (doctor reports it, the nightly re-runs it).
 --   provenance_projects  legacy witness backfill progress, per project
@@ -131,13 +134,28 @@ CREATE TABLE IF NOT EXISTS fact_changes (
     seq      BIGSERIAL PRIMARY KEY,
     xid      XID8 NOT NULL DEFAULT pg_current_xact_id(),
     kind     TEXT NOT NULL CHECK (kind IN ('commitment', 'decision', 'deliverable')),
-    fact_id  BIGINT NOT NULL
+    fact_id  BIGINT NOT NULL,
+    -- 'project': khipu_project_fact() recorded it (the only kind the fact
+    -- gate accepts). 'row': any other write to a decision or deliverable row
+    -- (an owner's supersede, retract or confirm), recorded by
+    -- khipu_fact_row_change() so replicas see lifecycle changes too.
+    via      TEXT NOT NULL DEFAULT 'project' CHECK (via IN ('project', 'row')),
+    at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_fact_changes_fact_xid ON fact_changes (kind, fact_id, xid);
 CREATE INDEX IF NOT EXISTS idx_fact_changes_xid ON fact_changes (xid);
+CREATE INDEX IF NOT EXISTS idx_fact_changes_at ON fact_changes (at);
 
 COMMENT ON TABLE fact_changes IS
-    'One row per khipu_project_fact() call, stamped with its transaction id (0047). The fact gate requires one for every wording change; replicas read it as their change stream.';
+    'One row per khipu_project_fact() call (via project), and per other decision or deliverable row write (via row), stamped with its transaction id (0047). The fact gate requires a via-project row for every wording change; replicas read the table as their decisions and deliverables change stream (section 6). Rows older than 30 days are pruned (khipu.provenance.prune_changes).';
+
+-- The replica stream's floor: the highest xid whose rows the prune removed.
+-- A replica whose cursor is at or below it may have missed a change and asks
+-- for a full dump. One row at most.
+CREATE TABLE IF NOT EXISTS fact_changes_floor (
+    one             BOOLEAN PRIMARY KEY DEFAULT true CHECK (one),
+    pruned_through  XID8 NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS fact_gaps (
     id           BIGSERIAL PRIMARY KEY,
@@ -235,7 +253,8 @@ CREATE OR REPLACE FUNCTION khipu_fact_record_change(p_kind TEXT, p_id BIGINT)
 RETURNS void LANGUAGE plpgsql AS $fn$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM fact_changes
-                   WHERE kind = p_kind AND fact_id = p_id AND xid = pg_current_xact_id()) THEN
+                   WHERE kind = p_kind AND fact_id = p_id AND xid = pg_current_xact_id()
+                     AND via = 'project') THEN
         INSERT INTO fact_changes (kind, fact_id) VALUES (p_kind, p_id);
     END IF;
 END
@@ -547,7 +566,8 @@ CREATE OR REPLACE FUNCTION khipu_fact_gate()
 RETURNS trigger LANGUAGE plpgsql AS $fn$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM fact_changes
-                   WHERE kind = TG_ARGV[0] AND fact_id = NEW.id AND xid = pg_current_xact_id()) THEN
+                   WHERE kind = TG_ARGV[0] AND fact_id = NEW.id AND xid = pg_current_xact_id()
+                     AND via = 'project') THEN
         RAISE EXCEPTION 'khipu: this writer predates fact provenance; upgrade it'
             USING ERRCODE = '08K01',
                   DETAIL = format('%s %s changed its wording without khipu_project_fact()', TG_ARGV[0], NEW.id);
@@ -636,6 +656,33 @@ CREATE CONSTRAINT TRIGGER khipu_episodes_forget_gate
     WHEN (OLD.deleted_at IS DISTINCT FROM NEW.deleted_at)
     EXECUTE FUNCTION khipu_forget_gate();
 
+-- The replica stream (section 6): every other write to a decision or
+-- deliverable row (owner lifecycle changes, deletes) is recorded too, as
+-- via 'row', which the fact gate never accepts. One row per fact per
+-- transaction is enough: a replica re-reads the fact's current row.
+CREATE OR REPLACE FUNCTION khipu_fact_row_change()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_id BIGINT := CASE WHEN TG_OP = 'DELETE' THEN OLD.id ELSE NEW.id END;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM fact_changes
+                   WHERE kind = TG_ARGV[0] AND fact_id = v_id AND xid = pg_current_xact_id()) THEN
+        INSERT INTO fact_changes (kind, fact_id, via) VALUES (TG_ARGV[0], v_id, 'row');
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS khipu_decisions_fact_stream ON decisions;
+CREATE TRIGGER khipu_decisions_fact_stream
+    AFTER INSERT OR UPDATE OR DELETE ON decisions
+    FOR EACH ROW EXECUTE FUNCTION khipu_fact_row_change('decision');
+
+DROP TRIGGER IF EXISTS khipu_deliverables_fact_stream ON deliverables;
+CREATE TRIGGER khipu_deliverables_fact_stream
+    AFTER INSERT OR UPDATE OR DELETE ON deliverables
+    FOR EACH ROW EXECUTE FUNCTION khipu_fact_row_change('deliverable');
+
 DROP TRIGGER IF EXISTS khipu_fact_claims_gate ON fact_claims;
 CREATE TRIGGER khipu_fact_claims_gate
     BEFORE INSERT ON fact_claims
@@ -644,6 +691,6 @@ CREATE TRIGGER khipu_fact_claims_gate
 INSERT INTO schema_migrations (version, note)
 VALUES (
     '0047_fact_provenance',
-    'Fact provenance: fact_claims, fact_changes, fact_gaps, provenance_projects; legacy claims proven by the writer inventory (the rest legacy_unproven); initial projection by khipu_project_fact(); deferred gates refuse wording writes outside the projector and forgets of claimed episodes (SQLSTATE 08K01), and claims for forgotten episodes'
+    'Fact provenance: fact_claims, fact_changes (+ floor), fact_gaps, provenance_projects; legacy claims proven by the writer inventory (the rest legacy_unproven); initial projection by khipu_project_fact(); deferred gates refuse wording writes outside the projector and forgets of claimed episodes (SQLSTATE 08K01), and claims for forgotten episodes'
 )
 ON CONFLICT (version) DO NOTHING;

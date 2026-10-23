@@ -427,3 +427,36 @@ def backfill(conn, *, batch: int = BACKFILL_BATCH) -> dict[str, Any]:
             "claims": sum(c["claims"] for c in done),
             "projected": sum(c["projected"] for c in done),
             "episodes": sum(c["episodes"] for c in done)}
+
+
+# ---- The replica change stream's retention (section 6) -------------------------
+
+CHANGES_KEEP_DAYS = 30
+
+
+def prune_changes(conn, *, keep_days: int = CHANGES_KEEP_DAYS) -> dict[str, Any]:
+    """Delete ``fact_changes`` rows older than ``keep_days`` and raise
+    ``fact_changes_floor`` to the highest xid removed, in one transaction
+    (commits). A replica whose stream cursor is at or below the floor may
+    have missed a change and asks for a full dump. The fact gate only ever
+    looks at the current transaction's rows, so pruning old ones never
+    affects a writer. A hub without 0047 has nothing to prune."""
+    with conn.cursor() as cur:
+        if not ready(cur):
+            conn.rollback()
+            return {"ok": True, "skipped": "the hub has no fact provenance yet (migration 0047)"}
+        cur.execute(
+            "WITH gone AS (DELETE FROM fact_changes WHERE at < now() - make_interval(days => %s) "
+            "RETURNING xid) SELECT count(*), max(xid::text::numeric) FROM gone",
+            (int(keep_days),),
+        )
+        removed, through = cur.fetchone()
+        if removed:
+            cur.execute(
+                "INSERT INTO fact_changes_floor (one, pruned_through) VALUES (true, %s::text::xid8) "
+                "ON CONFLICT (one) DO UPDATE SET pruned_through = "
+                "greatest(fact_changes_floor.pruned_through, excluded.pruned_through)",
+                (str(through),),
+            )
+    conn.commit()
+    return {"ok": True, "pruned": int(removed or 0)}

@@ -1151,29 +1151,39 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
     try:
         with try_hub_connect() as pg:
             with pg.cursor() as cur:
-                cols = [c for c in _DECISION_COLS if c in _pg_columns(cur, "decisions")]
-                if "id" not in cols:
-                    return {"ok": False, "not_applicable": True, "error": "hub decisions table not migrated"}
-                watermark_expr = "created_at"
-                if "superseded_at" in cols:
-                    watermark_expr = f"GREATEST({watermark_expr}, COALESCE(superseded_at, {watermark_expr}))"
-                if "retracted_at" in cols:
-                    watermark_expr = f"GREATEST({watermark_expr}, COALESCE(retracted_at, {watermark_expr}))"
-                sel = ", ".join(cols)
-                params: list[Any] = []
-                where = ""
-                if since:
-                    where = f"WHERE ({watermark_expr}, id) > (%s, %s)"
-                    params.extend((since, since_id))
-                cur.execute(
-                    f"SELECT {sel}, {watermark_expr} AS _watermark FROM decisions "
-                    f"{where} ORDER BY _watermark ASC, id ASC LIMIT %s",
-                    (*params, limit),
-                )
-                fetched = cur.fetchall()
+                if _hub_has_fact_stream(cur):
+                    # Migration 0047: the timestamp watermark is retired
+                    # (a slow transaction's earlier stamp fell behind it,
+                    # first review #4); the fact stream replaces it.
+                    pg.rollback()
+                    stream = True
+                else:
+                    stream = False
+                    cols = [c for c in _DECISION_COLS if c in _pg_columns(cur, "decisions")]
+                    if "id" not in cols:
+                        return {"ok": False, "not_applicable": True, "error": "hub decisions table not migrated"}
+                    watermark_expr = "created_at"
+                    if "superseded_at" in cols:
+                        watermark_expr = f"GREATEST({watermark_expr}, COALESCE(superseded_at, {watermark_expr}))"
+                    if "retracted_at" in cols:
+                        watermark_expr = f"GREATEST({watermark_expr}, COALESCE(retracted_at, {watermark_expr}))"
+                    sel = ", ".join(cols)
+                    params: list[Any] = []
+                    where = ""
+                    if since:
+                        where = f"WHERE ({watermark_expr}, id) > (%s, %s)"
+                        params.extend((since, since_id))
+                    cur.execute(
+                        f"SELECT {sel}, {watermark_expr} AS _watermark FROM decisions "
+                        f"{where} ORDER BY _watermark ASC, id ASC LIMIT %s",
+                        (*params, limit),
+                    )
+                    fetched = cur.fetchall()
     except Exception as exc:  # noqa: BLE001 — fail-open, same posture as maybe_refresh
         _record_write_error(("decisions",), f"decision sync: {type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "hub_unreachable": hub_connection_failed(exc)}
+    if stream:
+        return sync_fact_changes(limit=PULL_LIMIT)
     if not fetched:
         return {"ok": True, "decisions": 0}
     rows = [dict(zip(cols, r[:-1])) for r in fetched]
@@ -1188,6 +1198,236 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
             pass
     out.setdefault("decisions", len(rows))
     return out
+
+
+# ---- The fact change stream (migration 0047; design section 6) -----------------
+#
+# Decisions and deliverables reach a replica through the hub's
+# ``fact_changes``: one row per projection, and per other row write (an owner
+# lifecycle change, a delete), stamped with its transaction id. The cursor is
+# the ``pg_snapshot_xmin`` of the hub snapshot that last read the stream: every
+# transaction below it had finished, so one that commits late with an earlier
+# id is still at or above it and is read next time (first review #4). The
+# cursor lives in ``snapshot_meta`` (``_FACT_CURSOR_KEY``) beside the rows it
+# describes, written in the same SQLite transaction, so a dump that replaces
+# the file brings its own. A replica with no cursor (dumped before 0047, the
+# first review #7 shape), or one at or below the prune floor, asks for a full
+# dump instead of guessing what it missed.
+
+_FACT_CURSOR_KEY = "fact_stream_xid"
+
+
+def _hub_has_fact_stream(cur) -> bool:
+    """Whether the hub has 0047's ``fact_changes``. Only a yes stays cached
+    (section 5.1): a long-lived process sees the migration on its next
+    read."""
+    if {"xid", "kind", "fact_id"} <= _pg_columns(cur, "fact_changes"):
+        return True
+    from khipu import db
+
+    db._TABLE_COLUMNS_CACHE.pop("fact_changes", None)
+    return False
+
+
+def _hub_snapshot_xmin(cur) -> int:
+    """The current snapshot's xmin (the transaction snapshot under
+    REPEATABLE READ): every transaction id below it has committed or
+    aborted."""
+    cur.execute("SELECT pg_snapshot_xmin(pg_current_snapshot())::text")
+    return int(cur.fetchone()[0])
+
+
+def _held_fact_cursor(con: sqlite3.Connection) -> int | None:
+    if not _snapshot_table_columns(con, "snapshot_meta"):
+        return None
+    row = con.execute("SELECT value FROM snapshot_meta WHERE key = ?", (_FACT_CURSOR_KEY,)).fetchone()
+    try:
+        return int(row[0]) if row and row[0] is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_fact_stream(cur, cursor: int | None, limit: int) -> dict[str, Any]:
+    """The decisions and deliverables changed since ``cursor``, read in
+    ``cur``'s snapshot: their current rows by id, and the ids now gone (a
+    deleted row, or one whose episode is forgotten: the same rows a dump
+    leaves out or a replica's fences hide). ``not_applicable`` on a hub
+    without 0047; ``needs_dump`` when the cursor is missing or pruned past,
+    or more than ``limit`` facts changed."""
+    if not _hub_has_fact_stream(cur):
+        return {"ok": True, "not_applicable": True}
+    xmin = _hub_snapshot_xmin(cur)
+    if cursor is None:
+        return {"ok": False, "needs_dump": True,
+                "error": "the replica has no fact-stream cursor (dumped before migration 0047)"}
+    cur.execute("SELECT pruned_through::text FROM fact_changes_floor")
+    floor = cur.fetchone()
+    if floor and floor[0] is not None and int(floor[0]) >= cursor:
+        return {"ok": False, "needs_dump": True, "error": "the fact stream was pruned past this replica's cursor"}
+    cur.execute(
+        "SELECT kind, array_agg(DISTINCT fact_id) FROM fact_changes "
+        "WHERE xid >= %s::text::xid8 AND kind IN ('decision', 'deliverable') GROUP BY kind",
+        (str(cursor),))
+    ids = {kind: sorted(int(i) for i in fact_ids) for kind, fact_ids in cur.fetchall()}
+    if sum(len(v) for v in ids.values()) > limit:
+        return _pull_needs_dump(limit)
+    return {"ok": True, "xmin": xmin, **_read_fact_rows(cur, ids)}
+
+
+def _read_fact_rows(cur, ids: Mapping[str, Sequence[int]]) -> dict[str, Any]:
+    """The current hub rows of the named decisions and deliverables, and
+    the ids now gone: deleted, or anchored to a forgotten episode (the rows
+    a dump leaves out, or a replica's fences hide)."""
+    out: dict[str, Any] = {"decisions": [], "deliverables": [], "decisions_gone": [], "deliverables_gone": []}
+    for kind, table, wanted in (("decision", "decisions", _DECISION_COLS),
+                                ("deliverable", "deliverables", _DELIVERABLE_COLS)):
+        want = sorted({int(i) for i in ids.get(kind) or ()})
+        if not want:
+            continue
+        cols = [c for c in wanted if c in _pg_columns(cur, table)]
+        where = "id = ANY(%s)"
+        if "episode_id" in cols:
+            where += (f" AND (episode_id IS NULL OR NOT EXISTS (SELECT 1 FROM episodes e "
+                      f"WHERE e.id = {table}.episode_id AND e.deleted_at IS NOT NULL))")
+        found: list[dict[str, Any]] = []
+        for part in _chunks(want):
+            cur.execute(f"SELECT {', '.join(cols)} FROM {table} WHERE {where} ORDER BY id", (part,))
+            found.extend(dict(zip(cols, r)) for r in cur.fetchall())
+        out[table] = found
+        out[f"{table}_gone"] = sorted(set(want) - {int(r["id"]) for r in found})
+    return out
+
+
+def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any]) -> dict[str, Any]:
+    """Write a stream read into ``con`` (caller holds the refresh lock and
+    commits): changed rows replace the held ones, gone ids are deleted, and
+    the cursor moves to the read's xmin. A read older than the one already
+    applied (a lower xmin: an earlier snapshot) is skipped whole; the newer
+    one held already covers it. Rows of an episode this replica rejects
+    (forgotten here, or queued for erasure) are deleted, never written."""
+    held = _held_fact_cursor(con)
+    xmin = int(stream["xmin"])
+    if held is not None and xmin < held:
+        return {"ok": True, "decisions": 0, "deliverables": 0, "skipped": "the replica holds a newer read"}
+    rejected = _rejected_episode_ids(con)
+    decisions_written = deliverables_written = 0
+    if _snapshot_table_columns(con, "decisions"):
+        for part in _chunks(list(stream.get("decisions_gone") or ())):
+            con.execute(f"DELETE FROM decisions WHERE id IN ({', '.join('?' * len(part))})", part)
+        decisions_written = _write_decision_rows(con, stream.get("decisions") or ()) or 0
+    if set(_DELIVERABLE_COLS) <= _snapshot_table_columns(con, "deliverables"):
+        for part in _chunks(list(stream.get("deliverables_gone") or ())):
+            con.execute(f"DELETE FROM deliverables WHERE id IN ({', '.join('?' * len(part))})", part)
+        sel = ", ".join(_DELIVERABLE_COLS)
+        for row in stream.get("deliverables") or ():
+            if row.get("episode_id") in rejected:
+                con.execute("DELETE FROM deliverables WHERE id = ?", (row["id"],))
+                continue
+            con.execute(
+                f"INSERT OR REPLACE INTO deliverables ({sel}) VALUES ({', '.join('?' * len(_DELIVERABLE_COLS))})",
+                [_ts_text(row.get(c)) if c == "created_at" else row.get(c) for c in _DELIVERABLE_COLS])
+            deliverables_written += 1
+    if _snapshot_table_columns(con, "snapshot_meta"):
+        con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, ?)",
+                    (_FACT_CURSOR_KEY, str(max(xmin, held or 0))))
+    return {"ok": True, "decisions": decisions_written, "deliverables": deliverables_written,
+            "gone": len(stream.get("decisions_gone") or ()) + len(stream.get("deliverables_gone") or ())}
+
+
+def _apply_fact_stream_locked(stream: Mapping[str, Any]) -> dict[str, Any]:
+    """:func:`_apply_fact_stream` under the refresh lock, in its own
+    transaction. Never raises."""
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": False, "error": "hub snapshot missing"}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        _record_write_error(("decisions", "deliverables"), "hub snapshot refresh in progress")
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            out = _apply_fact_stream(con, stream)
+            con.commit()
+        finally:
+            con.close()
+        return out
+    except Exception as exc:  # noqa: BLE001 - reported to the caller
+        _record_write_error(("decisions", "deliverables"), f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    finally:
+        _release_refresh_lock(lock)
+
+
+def sync_fact_changes(*, limit: int = 2000) -> dict[str, Any]:
+    """Read the fact stream in one REPEATABLE READ hub snapshot and apply it
+    to the replica, outside a pull (the capture drain's decision sync on a
+    0047 hub). Fail-open like ``sync_decision_changes``: never raises."""
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": False, "error": "hub snapshot missing"}
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
+            cursor = _held_fact_cursor(con)
+    except sqlite3.Error as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        with try_hub_connect() as pg:
+            from psycopg import IsolationLevel
+
+            pg.isolation_level = IsolationLevel.REPEATABLE_READ
+            with pg.cursor() as cur:
+                stream = _read_fact_stream(cur, cursor, limit)
+            pg.rollback()
+    except Exception as exc:  # noqa: BLE001 — fail-open, same posture as maybe_refresh
+        _record_write_error(("decisions",), f"fact stream: {type(exc).__name__}: {exc}")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "hub_unreachable": hub_connection_failed(exc)}
+    if not stream.get("ok") or stream.get("not_applicable"):
+        return stream
+    return _apply_fact_stream_locked(stream)
+
+
+def apply_fact_rows(cur, facts: Iterable[tuple[str, int]]) -> dict[str, Any]:
+    """Re-read the named facts' current hub rows on ``cur`` and write them
+    into this Mac's replica at once (``forget_everywhere`` after its hub
+    commit, design section 6), without moving the stream cursor: the next
+    pull still reads every change. Decisions and deliverables only:
+    commitments keep arriving as the whole table on every pull, under its
+    freshness rule, so a commitment the forget moved to another episode is
+    hidden here until that pull (never shown with forgotten wording). Never
+    raises."""
+    by_kind: dict[str, list[int]] = {}
+    for kind, fact_id in facts:
+        by_kind.setdefault(kind, []).append(int(fact_id))
+    if not by_kind:
+        return {"ok": True, "facts": 0}
+    path = snapshot_path()
+    if not path.is_file():
+        return {"ok": True, "skipped": True, "reason": "no snapshot exists"}
+    try:
+        stream = _read_fact_rows(cur, by_kind)
+    except Exception as exc:  # noqa: BLE001 - the hub forget already committed
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    lock = _acquire_refresh_lock()
+    if lock is None:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    try:
+        con = sqlite3.connect(str(path))
+        try:
+            held = _held_fact_cursor(con)
+            # The rows replace held ones without touching the cursor.
+            out = _apply_fact_stream(con, {**stream, "xmin": held or 0})
+            if held is None and _snapshot_table_columns(con, "snapshot_meta"):
+                con.execute("DELETE FROM snapshot_meta WHERE key = ?", (_FACT_CURSOR_KEY,))
+            con.commit()
+        finally:
+            con.close()
+        return out
+    except Exception as exc:  # noqa: BLE001 - the hub forget already committed
+        _record_write_error(("decisions", "deliverables"), f"{type(exc).__name__}: {exc}")
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    finally:
+        _release_refresh_lock(lock)
 
 
 # Rows per kind one pull applies. Past it a full dump is the cheaper way to
@@ -1409,6 +1649,14 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
     aliases = _hub_project_aliases(cur)
     if max(len(fresh), len(gone), len(groups), len(topic_rows or ()) + len(topic_purges)) > limit:
         return _pull_needs_dump(limit)
+    # Decisions and deliverables by the fact stream (0047), in this same
+    # snapshot as the tombstones above: a replica never holds an episode's
+    # tombstone without the re-projections that forget made with it.
+    with closing(sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)) as con:
+        fact_cursor = _held_fact_cursor(con)
+    facts = _read_fact_stream(cur, fact_cursor, limit)
+    if facts.get("needs_dump"):
+        return facts
 
     # Even schema discovery belongs to the savepoint: any failed PostgreSQL
     # statement would otherwise abort the memory transaction too.
@@ -1520,7 +1768,8 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
     last_fresh = _utc(fresh_stamps[-1][0]) if fresh_stamps else None
 
     parts = _write_pulled_tables(topic_rows, commitments, aliases, read_at=read_at,
-                                topic_purges=topic_purges, purge_hub_at=hub_now)
+                                topic_purges=topic_purges, purge_hub_at=hub_now,
+                                facts=None if facts.get("not_applicable") else facts)
     if ledger_payload is not None and not ledger_payload.get("ok"):
         parts["ledger"] = ledger_payload
     else:
@@ -1555,7 +1804,8 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                          commitments: tuple[list[str], list[Any]] | None,
                          aliases: tuple[list[str], list[Any]] | None, *,
                          read_at: float, topic_purges: Iterable[str] = (),
-                         purge_hub_at: datetime | None = None) -> dict[str, dict[str, Any]]:
+                         purge_hub_at: datetime | None = None,
+                         facts: Mapping[str, Any] | None = None) -> dict[str, dict[str, Any]]:
     """The pull's topic bodies and commitments, under the refresh lock, in one
     transaction. Each part's result by name; a part the hub or this replica
     has no table for is ``not_applicable``. A topic row older than the one
@@ -1570,11 +1820,14 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     names held keys absent from the same hub transaction; a newer local
     topic publication or dump stays when that older absence is applied.
     ``purge_hub_at`` is the hub's clock in that transaction, recorded in
-    each purge marker."""
+    each purge marker. ``facts``: a fact-stream read (0047), applied as
+    the ``facts`` part in the same transaction; ``None`` on an older hub."""
     parts: dict[str, dict[str, Any]] = {}
     path = snapshot_path()
     con = sqlite3.connect(str(path))
     try:
+        if facts is None:
+            parts["facts"] = {"ok": True, "not_applicable": True}
         if topic_rows is None or not {"slug", "updated_at"} <= _snapshot_table_columns(con, "topics"):
             parts["topics"] = {"ok": True, "not_applicable": True}
         if commitments is None or not _snapshot_table_columns(con, "commitments"):
@@ -1583,7 +1836,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
             parts["project_aliases"] = {"ok": True, "not_applicable": True}
     finally:
         con.close()
-    wanted = [name for name in ("topics", "commitments", "project_aliases") if name not in parts]
+    wanted = [name for name in ("topics", "commitments", "project_aliases", "facts") if name not in parts]
     if not wanted:
         return parts
     lock = _acquire_refresh_lock()
@@ -1685,6 +1938,8 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     _write_project_alias_rows(con, cols, rows)
                     parts["project_aliases"] = {"ok": True, "project_aliases": len(rows)}
                     _record_read_at(con, "project_aliases", "*", read_at)
+            if "facts" in wanted:
+                parts["facts"] = _apply_fact_stream(con, facts)  # type: ignore[arg-type]
             con.commit()
             if "topics" in wanted:
                 for slug, marker_version in recreated.items():
@@ -1771,7 +2026,12 @@ def pull_changes(*, limit: int = PULL_LIMIT, include_ledger: bool = True) -> dic
                 "hub_unreachable": hub_connection_failed(exc)}
     if not result.get("ok"):
         return result
-    parts = {**result["parts"], "decisions": sync_decision_changes()}
+    parts = dict(result["parts"])
+    facts_part = parts.pop("facts", None) or {"ok": True, "not_applicable": True}
+    # A 0047 hub: decisions came with the pull's own snapshot. An older hub
+    # keeps the timestamp watermark (new code on the old schema behaves as
+    # main, section 5.1).
+    parts["decisions"] = sync_decision_changes() if facts_part.get("not_applicable") else facts_part
     # Ledger repair has its own retry clock; only a memory failure asks the
     # caller to rebuild the complete copy.
     failed = [name for name, part in parts.items() if not part.get("ok") and not part.get("not_applicable")]
@@ -2923,6 +3183,10 @@ def _refresh_locked() -> dict[str, Any]:
                     cur.execute("SELECT now()")
                     row = cur.fetchone()
                     hub_dumped_at = _ts_text(_utc(row[0] if row else None))
+                    # The fact stream's cursor (0047) from this same
+                    # snapshot: its decisions and deliverables are complete
+                    # below its xmin.
+                    fact_xmin = _hub_snapshot_xmin(cur) if _hub_has_fact_stream(cur) else None
                     counts["episodes"] = _insert_episodes(cur, con)
                     counts["topics"] = _insert_topics(cur, con)
                     counts["topic_revisions"] = _insert_topic_revisions(cur, con)
@@ -2943,6 +3207,9 @@ def _refresh_locked() -> dict[str, Any]:
                 if hub_dumped_at:
                     con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('hub_dumped_at', ?)",
                                 (hub_dumped_at,))
+                if fact_xmin is not None:
+                    con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, ?)",
+                                (_FACT_CURSOR_KEY, str(fact_xmin)))
                 # The ledger is as fresh as the dump's start: its one
                 # repeatable-read snapshot was taken after this, and a change
                 # committed while the dump ran is not in it.

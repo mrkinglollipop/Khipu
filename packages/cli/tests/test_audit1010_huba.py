@@ -714,6 +714,7 @@ class HubAuditRegressionTest(unittest.TestCase):
                 def cursor(self): return self
                 def execute(self, *args, **kwargs): pass
                 def fetchone(self): return None
+                def fetchall(self): return []
 
             inserts = ["_insert_episodes", "_insert_topics", "_insert_topic_revisions", "_insert_nodes",
                        "_insert_edges", "_insert_profiles", "_insert_memory_embeddings",
