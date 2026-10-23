@@ -8165,6 +8165,8 @@ def doctor_block(now: datetime | None = None) -> dict:
     from khipu import routing_health
 
     delivery_health = routing_health.doctor_block(view, now, cfg)
+    if (delivery_health.get("gateway") or {}).get("cleanup_gave_up"):
+        warnings.append(delivery_health["gateway"]["reason_words"])
     held = view.get("priority")
     return {"routing_delivery": delivery_health, "priority": {"set": held is not None, "pending": bool(held and held.get("pending")),
                          "entries": [e["label"] for e in (held or {}).get("entries") or []],

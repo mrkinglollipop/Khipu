@@ -1808,6 +1808,11 @@ fn route_check_argv(account: &str) -> Result<Vec<String>, String> {
     Ok(vec!["route".to_string(), "check".to_string(), "--".to_string(), checked_route_account(account)?])
 }
 
+/// The owner's retry of the routing-copy cleanup (forced, past the cap).
+fn gateway_copy_cleanup_argv() -> Vec<String> {
+    vec!["route".to_string(), "copy".to_string(), "publish".to_string()]
+}
+
 /// Clear the account, or with `report` dismiss that one report.
 fn route_clear_argv(account: &str, report: Option<&str>) -> Result<Vec<String>, String> {
     let mut argv = route_base("clear");
@@ -2354,6 +2359,11 @@ async fn khipu_route_pause(account: String, until: Option<String>, op: Option<St
 #[tauri::command]
 async fn khipu_route_lift(account: String, op: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_lift_argv(&account)?, op.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_gateway_copy_cleanup() -> Result<String, String> {
+    run_khipu_cli_async(gateway_copy_cleanup_argv()).await
 }
 
 #[tauri::command]
@@ -5057,6 +5067,7 @@ pub fn run() {
             khipu_route_pause,
             khipu_route_lift,
             khipu_route_check,
+            khipu_gateway_copy_cleanup,
             khipu_owner_direction_show,
             khipu_owner_direction_actions,
             khipu_owner_direction_undo,
@@ -5750,6 +5761,7 @@ mod settings_command_tests {
         );
         assert_eq!(route_pause_argv("Codex", None).unwrap(), v(&["route", "pause", "--from-app", "--", "Codex"]));
         assert_eq!(route_lift_argv("Codex").unwrap(), v(&["route", "lift", "--from-app", "--", "Codex"]));
+        assert_eq!(gateway_copy_cleanup_argv(), v(&["route", "copy", "publish"]));
         assert_eq!(route_check_argv("Codex").unwrap(), v(&["route", "check", "--", "Codex"]));
         assert_eq!(route_clear_argv("Codex", None).unwrap(), v(&["route", "clear", "--from-app", "--", "Codex"]));
         assert_eq!(

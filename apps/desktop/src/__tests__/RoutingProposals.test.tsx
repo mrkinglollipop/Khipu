@@ -326,6 +326,21 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     expect(screen.queryByText(/Replication: off/)).not.toBeInTheDocument();
   });
 
+  it("shows Retry cleanup only when the copy cleanup gave up, and runs the cleanup command", async () => {
+    const { unmount } = render(<RoutingSettings active deliveryHealth={{ status: "green", gateway: { status: "not_applicable" } }} />);
+    await screen.findByRole("list", { name: "Proposals" });
+    expect(screen.queryByRole("button", { name: /Retry cleanup/ })).toBeNull();
+    unmount();
+    render(<RoutingSettings active deliveryHealth={{ status: "red", gateway: {
+      status: "red", cleanup_gave_up: true,
+      reason_words: "Routing copy cleanup stopped after 6 failed tries; a copy may still be on the hub. Retry it from Settings.",
+    } }} />);
+    await screen.findByRole("list", { name: "Proposals" });
+    expect(screen.getByText(/stopped after 6 failed tries/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Retry cleanup/ }));
+    await waitFor(() => expect(invokeMock.mock.calls.filter((c) => c[0] === "khipu_gateway_copy_cleanup")).toHaveLength(1));
+  });
+
   it("words a waiting request ahead of every other replication state", () => {
     expect(replicationStatusWords({ status: "not_applicable" }, null, true)).toBe("waiting for your OK");
     expect(replicationStatusWords({ status: "not_applicable" }, null, false)).toBe("off");

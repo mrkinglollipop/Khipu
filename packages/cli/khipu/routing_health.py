@@ -244,6 +244,14 @@ def doctor_block(view, now, cfg):
             if age is not None and cfg["routing_cloud_copy_stale_after"] and age > cfg["routing_cloud_copy_stale_after"]:
                 gateway["status"] = "red"
                 reasons.append("gateway-stale")
+    else:
+        from khipu import routing_gateway_copy
+
+        left = routing_gateway_copy.status()
+        if left.get("cleanup_gave_up"):
+            gateway = dict(status="red", cleanup_gave_up=True, failures=left.get("failures"),
+                           reason_words=routing_gateway_copy.GAVE_UP_WORDS)
+            reasons.append("gateway-cleanup-stopped")
     if not rows:
         missing.append("live delivery identities")
     for lane in view.get("unmatched") or []:

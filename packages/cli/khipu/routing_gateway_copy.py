@@ -193,12 +193,35 @@ def _path():
     return routing.routing_dir() / "gateway-copy.json"
 
 
-def status():
+def _read():
     try:
         value = json.loads(_path().read_text())
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+GAVE_UP_WORDS = ("Routing copy cleanup stopped after 6 failed tries; a copy may still be on the hub. "
+                 "Retry it from Settings.")
+
+
+def gave_up(state):
+    """The automatic cleanup of a switched-off copy has hit its cap."""
+    failures = state.get("failures")
+    return bool(state.get("error") and state.get("disabled") is not True
+                and isinstance(failures, int) and not isinstance(failures, bool)
+                and failures >= _CLEANUP_MAX_FAILURES)
+
+
+def status():
+    value = _read()
+    try:
+        off = not routing.settings()["routing_cloud_copy"]
+    except Exception:
+        off = False
+    if off and gave_up(value):
+        value = dict(value, cleanup_gave_up=True, cleanup_gave_up_words=GAVE_UP_WORDS)
+    return value
 
 
 def _save(state, *, path=None):
@@ -257,8 +280,8 @@ def _failed(state, now):
     # Exceptions can contain DSNs or local paths; expose fixed codes only.
     if state is not None:
         state["error"] = "copy_publish_failed"
-        state["failures"] = min(6, state.get("failures", 0) + 1)
-        state["retry_at"] = routing._iso(now + timedelta(seconds=min(300, 5 * 2 ** state["failures"])))
+        state["failures"] = state.get("failures", 0) + 1
+        state["retry_at"] = routing._iso(now + timedelta(seconds=min(300, 5 * 2 ** min(state["failures"], 6))))
         try:
             _save(state)
         except OSError:
@@ -288,6 +311,17 @@ def _hub_configured_cached(now):
 
 
 def _disabled_skip(state, now, *, force):
+    out = _disabled_skip_inner(state, now, force=force)
+    if force and out and out.get("ok") and gave_up(state):
+        # Nothing is left to clean (no hub, no id): the give-up is moot.
+        _save(dict(cleanup_attempted=True, disabled=True))
+    return out
+
+
+def _disabled_skip_inner(state, now, *, force):
+    if gave_up(state) and not force:
+        # Automatic retries stop for good; only the owner's forced retry goes on.
+        return {"ok": False, "error": state["error"]}
     known = _publishers(state)
     if not known:
         # A recomputable id is not evidence this Mac ever published. A
@@ -298,10 +332,6 @@ def _disabled_skip(state, now, *, force):
         if state.get("cleanup_attempted") is True:
             if state.get("disabled") is True or not state.get("error"):
                 return {"ok": True, "disabled": True}
-            failures = state.get("failures")
-            if isinstance(failures, int) and not isinstance(failures, bool) \
-                    and failures >= _CLEANUP_MAX_FAILURES:
-                return {"ok": False, "error": state["error"]}
             if not _hub_configured_cached(now):
                 return {"ok": True, "disabled": True}
             retry = routing._parse(state.get("retry_at"))
@@ -326,7 +356,7 @@ def publish(*, force=False, now=None, hub=None):
     state, acquired, attempting_lock = None, False, False
     try:
         from khipu.routing_replication import _sync_lock
-        state = status()
+        state = _read()
         if not routing.settings()["routing_cloud_copy"]:
             skipped = _disabled_skip(state, now, force=force)
             if skipped:
@@ -334,7 +364,7 @@ def publish(*, force=False, now=None, hub=None):
         attempting_lock = True
         with _sync_lock():
             acquired, attempting_lock = True, False
-            state = status()
+            state = _read()
             cfg = routing.settings()
             enabled = cfg["routing_cloud_copy"]
             if not enabled:
