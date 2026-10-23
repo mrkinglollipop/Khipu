@@ -157,7 +157,7 @@ def apply_recency(
             age = age_days(row.get("ts"), now)
             if age is None:
                 continue
-            bonus = RECENCY_WEIGHT * (0.5 ** (age / half_life))
+            bonus = RECENCY_WEIGHT * (0.5 ** (max(0.0, age) / half_life))
             row["score"] = round((row.get("score") or 0.0) + bonus, 6)
             row["recency"] = round(bonus, 6)
         except Exception:  # noqa: BLE001 — a single bad row must not sink the search.

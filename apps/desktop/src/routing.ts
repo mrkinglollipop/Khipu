@@ -105,6 +105,8 @@ export type RouteRule = {
   seeded?: boolean;
   confirmed?: boolean;
   owner_revision?: string;
+  /** The displayed wording revision; confirmations must carry this exact token. */
+  revision?: string;
   /** Its live proposal's words are not shared on this Mac. */
   proposal_withheld?: boolean;
   /** A live conversation request awaiting the owner's reconfirmation. */

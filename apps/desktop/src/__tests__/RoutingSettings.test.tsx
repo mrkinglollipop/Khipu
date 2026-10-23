@@ -74,7 +74,7 @@ function view(): RouteView {
     ],
     note: { text: "We don't need cursor. Just grok.", at: "2026-10-13T14:00:00Z" },
     rules: [
-      { n: 3, text: "Never a -fast tier.", seeded: true, confirmed: false, source: "from your routing table", date: "2026-10-13" },
+      { n: 3, revision: "shown-rule-3", text: "Never a -fast tier.", seeded: true, confirmed: false, source: "from your routing table", date: "2026-10-13" },
       { n: 7, text: "Khipu's routing record is guidance, not a gate.", seeded: true, confirmed: true, source: "from your routing table", date: "2026-10-13" },
     ],
     watched_rules: [3],
@@ -414,7 +414,7 @@ describe("Settings -> Routing: standing rules", () => {
     screen.getByText(text, { selector: ".route-rule .row-main" }).closest<HTMLElement>(".route-rule")!;
 
   it("targets a provisional rule by its stable entity and asks end-or-keep for an ordinary add", async () => {
-    const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:pending-1", text: "Keep reviews local.",
+    const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:pending-1", revision: "shown-pending-1", text: "Keep reviews local.",
       pending: true, pending_kind: "added" as const, pending_by: "a Codex conversation" };
     answers.khipu_route_view = { ...view(), rules: [provisional] };
     answers.khipu_route_rule = (args) => args?.holds
@@ -430,10 +430,10 @@ describe("Settings -> Routing: standing rules", () => {
     const confirm = await screen.findByRole("group", { name: "Confirm rule Keep reviews local.?" });
     fireEvent.click(within(confirm).getByRole("button", { name: "Confirm rule Keep reviews local." }));
     await screen.findByRole("group", { name: "End or keep each hold" });
-    expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:pending-1" });
+    expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:pending-1", expect: "shown-pending-1" });
     fireEvent.click(screen.getByRole("radio", { name: "End the hold now" }));
     fireEvent.click(screen.getByRole("button", { name: "Save rule" }));
-    await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:pending-1", holds: { h1: "end" } }));
+    await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:pending-1", expect: "shown-pending-1", holds: { h1: "end" } }));
 
     fireEvent.change(screen.getByLabelText("New rule"), { target: { value: "Use the review lane." } });
     fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
@@ -448,7 +448,7 @@ describe("Settings -> Routing: standing rules", () => {
   });
 
   it("confirms a provisional proposal by entity, including its hold retry", async () => {
-    const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:proposal-1", text: "Keep the fix local.",
+    const provisional = { n: null as unknown as number, number_pending: true, entity: "rule:proposal-1", revision: "shown-proposal-1", text: "Keep the fix local.",
       pending: true, pending_kind: "added" as const, pending_by: "a Codex conversation" };
     answers.khipu_route_view = {
       ...view(), rules: [provisional], proposals: {
@@ -461,10 +461,10 @@ describe("Settings -> Routing: standing rules", () => {
     await page();
     fireEvent.click(screen.getByRole("button", { name: "Confirm the proposed a rule" }));
     await screen.findByRole("group", { name: "End or keep each hold" });
-    expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:proposal-1" });
+    expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:proposal-1", expect: "shown-proposal-1" });
     fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
     fireEvent.click(screen.getByRole("button", { name: "Save and confirm" }));
-    await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:proposal-1", holds: { h1: "keep" } }));
+    await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:proposal-1", expect: "shown-proposal-1", holds: { h1: "keep" } }));
   });
 
   it("opens Confirm for only the selected unnumbered provisional rule", async () => {
@@ -766,7 +766,7 @@ describe("Settings -> Routing: standing rules", () => {
     expect(calls("khipu_route_rule")).toEqual([]);
     const ask = screen.getByRole("group", { name: "Confirm rule 3?" });
     fireEvent.click(within(ask).getByRole("button", { name: "Confirm rule 3" }));
-    await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "confirm", n: 3 }]));
+    await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "confirm", n: 3, expect: "shown-rule-3" }]));
   });
 
   it("shows a pending conversation rule with its prior wording, then clears it after confirmation", async () => {
@@ -777,7 +777,7 @@ describe("Settings -> Routing: standing rules", () => {
     };
     answers.khipu_route_view = () => {
       const v = view();
-      v.rules = [{ n: 3, text: "Never a fast tier, ever.", seeded: true, confirmed,
+      v.rules = [{ n: 3, revision: "shown-rule-3", text: "Never a fast tier, ever.", seeded: true, confirmed,
         pending: !confirmed, pending_kind: "changed", pending_by: "a Codex conversation", prior_text: confirmed ? null : "Never a -fast tier.",
         source: "from your routing table", date: "2026-10-13" }];
       return v;
@@ -788,7 +788,7 @@ describe("Settings -> Routing: standing rules", () => {
     expect(three).toHaveTextContent("It replaced: “Never a -fast tier.”");
     fireEvent.click(screen.getByRole("button", { name: "Confirm rule 3" }));
     fireEvent.click(within(screen.getByRole("group", { name: "Confirm rule 3?" })).getByRole("button", { name: "Confirm rule 3" }));
-    await waitFor(() => expect(calls("khipu_route_rule")).toContainEqual({ action: "confirm", n: 3 }));
+    await waitFor(() => expect(calls("khipu_route_rule")).toContainEqual({ action: "confirm", n: 3, expect: "shown-rule-3" }));
     await waitFor(() => expect(screen.queryByText(/owner has not confirmed/)).toBeNull());
     expect(screen.queryByRole("button", { name: "Undo pending rule 3" })).toBeNull();
   });

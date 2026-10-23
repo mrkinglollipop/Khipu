@@ -41,7 +41,7 @@ def say(text, *, now=None, session=SESSION):
 
 
 def act(*, facts=None, target="x", now=None):
-    want = owner_direction.intent("route.rule.add", target, facts=facts)
+    want = owner_direction.intent("route.cap.set" if (facts or {}).get("cap") else "route.rule.add", target, facts=facts)
     owner_direction.gate(want, env=ENV, now=time.time() if now is None else now)
     return owner_direction.finish({"ok": True})
 
@@ -83,7 +83,7 @@ def test_the_sentence_splitter_keeps_a_version_number_whole(world):
 
 def test_a_spend_direction_needs_and_names_a_real_account(world):
     (found,) = routing_directions.extract("Keep GLM spend to $35 a week.")
-    assert found["target"] == {"entity": "GLM", "kind": "spend", "value": 35}
+    assert found["target"] == {"entity": "GLM", "kind": "spend", "value": 35, "days": 7, "purpose": "job"}
 
 
 def test_dismiss_through_the_cli_owed_close_survives_capture(world, capsys):

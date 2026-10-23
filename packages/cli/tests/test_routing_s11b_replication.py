@@ -240,7 +240,7 @@ def test_4_text_off_placeholder_and_confirmed_words_cross_macs(pair, addition):
     with pytest.raises(routing.RouteError, match="source Mac"):
         routing.confirm_rule(entity, via="app")
     a.activate()
-    routing.confirm_rule(entity, via="app")
+    routing.confirm_rule(entity, via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["entity"] == entity))
     assert sync(a, hub)["ok"]
     assert sync(b, hub)["ok"]
     remote = next(r for r in b.view()["rules"] if r["entity"] == entity)
@@ -528,7 +528,7 @@ def test_confirmed_words_and_proposal_identity_share_one_locked_read(pair, monke
         return current
 
     monkeypatch.setattr(routing, "_rule", read_then_race)
-    routing.confirm_rule(rule["entity"], via="app")
+    routing.confirm_rule(rule["entity"], via="app", expect=rule["revision"])
     worker.join(5)
     assert not worker.is_alive() and not errors
     view = a.view()
