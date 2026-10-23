@@ -31,7 +31,7 @@ def lose_completion(monkeypatch):
     original = od._append
 
     def append(row):
-        if row.get('kind') == 'state':
+        if row.get('kind') == 'state' and row.get('inverse_started') is not True:
             raise OSError('synthetic completion-write failure')
         return original(row)
 
@@ -198,4 +198,7 @@ def test_lost_directed_commit_reply_keeps_batch_undo(pg_world, world, monkeypatc
     act('direction.undo', {'id': line['id']})
     with pg_world.connect() as conn:
         assert conn.execute('SELECT status FROM commitments WHERE id=ANY(%s)', (ids,)).fetchall() == [('open',), ('open',)]
-        assert conn.execute('SELECT outcome FROM owner_writes_applied').fetchall() == [('applied',)]
+        assert conn.execute('SELECT tool, outcome FROM owner_writes_applied ORDER BY tool').fetchall() == [
+            ('owed_update', 'applied'), ('owner_undo', 'applied')]
+        assert conn.execute("SELECT write_id FROM owner_writes_applied WHERE tool='owner_undo'").fetchall() == [
+            (f"owner-undo:{line['id']}:{replies[0]['batches'][0]}",)]

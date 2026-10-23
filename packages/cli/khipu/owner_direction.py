@@ -849,6 +849,11 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
         line = {"kind": "undo", "id": _new_id(), "at": _iso(_clock()), "undoes": want["target"],
                 "action": undone.get("action"), "target": undone.get("target"), "auth": stamp.get("auth"),
                 "inverse_id": "owner-undo:" + want["target"]}
+        if not (undone.get("action") or "").startswith("route."):
+            line["inverse_started"] = False
+        writes = _hub_inverse_writes(undone)
+        if writes:
+            line["inverse_writes"] = writes
         if want.get("facts"):
             line["facts"] = want["facts"]
     else:
@@ -877,6 +882,28 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
     return line
 
 
+def _hub_write_state(write: dict) -> str:
+    """Only an unavailable outcome is uncertain; an absent receipt means no write."""
+    from khipu import owner_writes
+
+    try:
+        outcome = owner_writes._landed(write["tool"], write["args"])
+    except Exception:  # noqa: BLE001 - includes a hub without the receipt migration
+        return "pending"
+    if outcome is None or outcome[0] == "refused":
+        return "failed"
+    return "applied" if outcome[0] == "applied" else "pending"
+
+
+def _inverse_state(writes: list[dict]) -> str:
+    states = [_hub_write_state(write) for write in writes]
+    if "pending" in states:
+        return "pending"
+    # A partially committed multi-batch inverse can resume: each committed
+    # part keeps its own receipt, so retrying cannot apply it twice.
+    return "applied" if all(state == "applied" for state in states) else "failed"
+
+
 def _abandon() -> None:
     """A lost hub reply is uncertain until its durable outcome can be read."""
     pend = _PENDING.get()
@@ -885,15 +912,9 @@ def _abandon() -> None:
         state = "failed"
         write = pend.get("owner_write")
         if write:
-            from khipu import owner_writes
-
-            state = "pending"
-            try:
-                outcome = owner_writes._landed(write["tool"], write["args"])
-                if outcome is not None and outcome[0] in ("applied", "refused"):
-                    state = "applied" if outcome[0] == "applied" else "failed"
-            except Exception:  # noqa: BLE001 - reply and reconciliation may both be unavailable
-                pass
+            state = _hub_write_state(write)
+        elif pend["line"].get("inverse_writes"):
+            state = _inverse_state(pend["line"]["inverse_writes"])
         try:
             _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": pend["line"]["id"],
                      "state": state})
@@ -1372,7 +1393,10 @@ def _undo_direction(line, via):
             trusted.append(member)
         values = {"trusted": trusted}
     else:
-        values = {key: (before.get("settings") or {})[key]}
+        settings = before.get("settings")
+        if not isinstance(settings, dict) or key not in settings:
+            raise ValueError(f"Khipu's Undo snapshot has no prior value for {key}; nothing was changed")
+        values = {key: settings[key]}
     return {"ok": True, "settings": owner_turns.write_settings(values)}
 
 
@@ -1567,7 +1591,7 @@ def _undo_owed_change(line, via):
         raise ValueError("Khipu has no record of which batch this change wrote, so it can't undo it")
     restored, left_alone = 0, []
     for batch in batches:
-        out = owed_tidy.undo(batch, owner_gate=_by(via))
+        out = owed_tidy.undo(batch, owner_gate=_by(via), write_id=_inverse_write_id(line, batch))
         if not out.get("ok"):
             raise ValueError(out.get("error") or f"batch {batch} could not be undone")
         restored += int(out.get("restored") or 0)
@@ -1582,10 +1606,12 @@ def _undo_owed_tidy(line, via):
     if not batch:
         raise ValueError("Khipu has no record of which batch this clean-up wrote, so it can't undo it")
     if _b(line).get("change") == "undo":
-        out = owed_tidy.redo(batch, project=line["target"], owner_gate=_by(via))
+        out = owed_tidy.redo(batch, project=line["target"], owner_gate=_by(via),
+                             write_id=_inverse_write_id(line, batch))
         counted = {"reapplied": int(out.get("reapplied") or 0)}
     else:
-        out = owed_tidy.undo(batch, project=line["target"], owner_gate=_by(via))
+        out = owed_tidy.undo(batch, project=line["target"], owner_gate=_by(via),
+                             write_id=_inverse_write_id(line, batch))
         counted = {"restored": int(out.get("restored") or 0)}
     if not out.get("ok"):
         raise ValueError(out.get("error") or f"batch {batch} could not be undone")
@@ -1765,6 +1791,22 @@ def timer(now: float | None = None) -> dict:
 # ---- undo ----------------------------------------------------------------------------------
 
 
+def _inverse_write_id(line: dict, batch: str) -> str:
+    return "owner-undo:" + line["id"] + ":" + batch
+
+
+def _hub_inverse_writes(line: dict) -> list[dict]:
+    before, result = line.get("before") or {}, line.get("result") or {}
+    if line.get("action") == "owed.change":
+        batches = before.get("batches") or result.get("batches") or []
+    elif line.get("action") == "owed.tidy":
+        batch = before.get("batch") or result.get("batch")
+        batches = [batch] if batch else []
+    else:
+        return []
+    return [{"tool": "owner_undo", "args": {"write_id": _inverse_write_id(line, batch)}} for batch in batches]
+
+
 def _unfinished_undos(line_id: str) -> list[dict]:
     inflight = ((_PENDING.get() or {}).get("line") or {}).get("id")
     return [row for row in _merged(read_log()).values()
@@ -1776,6 +1818,22 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
     """Why the logged action ``line_id`` can't be undone now, or None."""
     if line is None:
         return f"no owner action {line_id} is in the log"
+    for row in _unfinished_undos(line_id):
+        writes = row.get("inverse_writes")
+        if writes:
+            settled = _inverse_state(writes)
+        elif row.get("inverse_started") is False:
+            settled = "failed"
+        else:
+            continue
+        if settled == "pending":
+            continue
+        try:
+            _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()),
+                     "target": row["id"], "state": settled})
+        except OSError:
+            continue
+        line.update(_find(line_id) or {})
     state = line["state"]
     if state in ("undone", "cancelled"):
         return f"owner action {line_id} was already undone"
@@ -1785,17 +1843,17 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
         return ("Khipu cannot confirm whether the previous Undo finished; it will not apply its inverse "
                 "again and overwrite a newer owner choice")
     if state == "unconfirmed" and line.get("owner_write"):
-        from khipu import owner_writes
-
-        write = line["owner_write"]
-        try:
-            outcome = owner_writes._landed(write["tool"], write["args"])
-        except Exception:  # noqa: BLE001 - no inverse until the hub confirms the original
-            outcome = None
-        if outcome is None:
+        settled = _hub_write_state(line["owner_write"])
+        if settled == "pending":
             return "Khipu cannot confirm this write's hub outcome yet; retry Undo when the hub is available"
-        if outcome[0] != "applied":
-            return "the hub refused this owner write, so there is nothing to undo"
+        try:
+            _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()),
+                     "target": line_id, "state": settled})
+        except OSError:
+            return "Khipu cannot record this write's confirmed hub outcome; retry Undo when the log is writable"
+        line["state"] = settled
+        if settled == "failed":
+            return f"owner action {line_id} did not happen, so there is nothing to undo"
     if line["action"] == "ledger.purge":
         if state == "done":
             return f"the purge {line_id} already ran; a row removed for good can't come back"
@@ -1836,6 +1894,12 @@ def undo(line_id: str, via: str, *, holds: dict | None = None) -> dict:
             if matches:
                 return {"ok": True, "undid": line_id, "id": matches[0].get("id"), "already_applied": True}
         inverse = _UNDO[line["action"]]
+        pending = (_PENDING.get() or {}).get("line")
+        if (pending and pending.get("kind") == "undo" and pending.get("undoes") == line_id
+                and pending.get("inverse_started") is False):
+            # A crash before this durable marker proves the inverse never ran.
+            _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()),
+                     "target": pending["id"], "state": "pending", "inverse_started": True})
         operation = routing._OP.set(inverse_id)
         try:
             return _run_inverse(line, inverse, via, holds, line_id)
