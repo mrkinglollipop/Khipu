@@ -149,7 +149,7 @@ def test_cleanup_retry_recovers_before_the_cap_then_goes_idle(gw, monkeypatch):
     assert gc.publish(hub=Down()) == {"ok": False, "error": "copy_publish_failed"}
     routing._now.now += timedelta(seconds=400)
     assert gc.publish(hub=Up()) == {"ok": True, "disabled": True, "deleted": True}
-    assert deleted == [gc.status()["cleanup_publisher"]]
+    assert deleted == gc.status()["cleanup_publishers"]
     for _ in range(3):
         routing._now.now += timedelta(seconds=400)
         assert gc.publish(hub=Up()) == {"ok": True, "disabled": True}

@@ -357,6 +357,15 @@ def _publishers(state):
     return {value for value in candidates if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)}
 
 
+def _cleanup_targets(state):
+    """Ids a speculative cleanup recorded before its delete. Each stays a
+    target until a cleanup naming it succeeds; none is ever replaced."""
+    candidates = [state.get("cleanup_publisher")]
+    if isinstance(state.get("cleanup_publishers"), list):
+        candidates.extend(state["cleanup_publishers"])
+    return {value for value in candidates if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)}
+
+
 def _failed(state, now, cleanup=False):
     # Exceptions can contain DSNs or local paths; expose fixed codes only.
     if state is not None:
@@ -422,7 +431,7 @@ def _disabled_skip_inner(state, now, *, force):
             retry = routing._parse(state.get("retry_at"))
             if not force and retry and retry > now:
                 return {"ok": False, "error": "copy_retry_pending"}
-            if _publisher(create=False) is None:
+            if _publisher(create=False) is None and not _cleanup_targets(state):
                 return {"ok": True, "disabled": True}
             return None
         if not _hub_configured_cached(now):
@@ -469,12 +478,22 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
                 # Commit the attempt marker before remote I/O. If the outcome
                 # is lost, an idle Mac cannot retry this speculative deletion;
                 # a recorded failure instead retries on its bounded backoff.
-                state = dict(cleanup_attempted=True, cleanup_publisher=publisher, **_counters(state))
+                # Earlier recorded targets (e.g. from before an identity
+                # recovery) join the current id; none is dropped.
+                targets = sorted(_cleanup_targets(state) | ({publisher} if publisher else set()))
+                if not targets:
+                    return {"ok": True, "disabled": True}
+                state = dict(cleanup_attempted=True, cleanup_publishers=targets, **_counters(state))
                 _save(state)
-                (hub or PostgresHub()).delete(publisher)
-                state = _on_cleaned(dict(cleanup_attempted=True, cleanup_publisher=publisher))
+                hub = hub or PostgresHub()
+                for target in targets:
+                    hub.delete(target)
+                state = _on_cleaned(dict(cleanup_attempted=True, cleanup_publishers=targets))
                 _save(state)
                 return {"ok": True, "disabled": True, "deleted": True}
+            # Pending speculative targets become journaled targets here, so
+            # the journal is durable before the marker fields are dropped.
+            known |= _cleanup_targets(state)
             if publisher:
                 known.add(publisher)
             if not known:
@@ -505,6 +524,7 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
             state.pop("disabled", None)
             state.pop("cleanup_attempted", None)
             state.pop("cleanup_publisher", None)
+            state.pop("cleanup_publishers", None)
             from khipu import agent_view
             with agent_view.pull_projection():
                 view = routing.read_view(now)

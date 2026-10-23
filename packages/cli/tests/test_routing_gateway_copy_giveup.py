@@ -1,10 +1,12 @@
 """The cleanup give-up is visible and the owner's retry goes past the cap."""
 import contextlib
+import json
 from datetime import timedelta
 
 import pytest
 
 from khipu import db, routing, routing_gateway_copy as gc, routing_health
+from khipu import routing_replication as replication
 from tests import routing_gateway_fixture as gateway_fixtures
 from tests import test_routing_s12_gateway as gateway_tests
 
@@ -235,7 +237,22 @@ LIFECYCLE = (
     + [("force", 1, 1, "")]                             # owner retry runs the delete: retrying
     + [("lost_marker", 0, 0, I)]
     + [("force_up", 0, 0, "")]                          # owner retry succeeds: cleared
+    + [("lost_marker", 0, 0, I)]
+    + [("restore", 0, 0, I)]                            # identity recovery keeps the old target
+    + [("auto", 0, 0, I)]
+    + [("force_up", 0, 0, "")]                          # deletes the old target and the new id
+    + [("auto", 0, 0, "")]
 )
+
+
+def recorded_targets():
+    """Every publisher id the local files name, by raw field."""
+    state = json.loads(gc._path().read_text())
+    ids = {state.get("publisher"), state.get("cleanup_publisher")}
+    ids.update(state.get("publishers") or [], state.get("cleanup_publishers") or [])
+    with contextlib.suppress(OSError, ValueError):
+        ids.update(json.loads(gc._publishers_path().read_text()))
+    return {i for i in ids if isinstance(i, str)}
 
 
 def test_counter_lifecycle_table(gw, monkeypatch):
@@ -249,7 +266,9 @@ def test_counter_lifecycle_table(gw, monkeypatch):
         elif step == "force":
             assert gc.publish(force=True, cleanup_only=True)["ok"] is False
         elif step == "force_up":
-            assert gc.publish(force=True, cleanup_only=True, hub=Up())["deleted"]
+            targets, up = recorded_targets(), Up()
+            assert gc.publish(force=True, cleanup_only=True, hub=up)["deleted"]
+            assert targets <= set(up.deleted), (i, step, targets - set(up.deleted))
         elif step == "publish_up":
             gateway_tests.configure(gw, routing_cloud_copy=True)
             assert gc.publish(force=True, hub=Up())["published"]
@@ -266,6 +285,9 @@ def test_counter_lifecycle_table(gw, monkeypatch):
             gc._publishers_path().unlink()
             gc._save(dict(cleanup_attempted=True, cleanup_publisher=state["publisher"],
                           **gc._counters(state)))
+            gc.publish()
+        elif step == "restore":
+            assert replication.restore()["mac"]
             gc.publish()
         elif step == "lost_marker":
             # A first speculative cleanup (no recorded failure) whose outcome was lost.
