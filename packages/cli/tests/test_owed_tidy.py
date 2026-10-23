@@ -26,6 +26,7 @@ import pytest
 
 from khipu import cli, commitments as co, config, db, owed_tidy, routing, work
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests import fact_seed
 
 PROJECT = "acme/widget"
 BASE_AT = datetime(2026, 10, 8, tzinfo=timezone.utc)
@@ -96,12 +97,13 @@ class Flood:
             return int(cur.fetchone()[0])
 
     def item(self, group: str, text: str, *, kind="followup", episode: int, owner="user", at=None) -> int:
-        with self.conn.cursor() as cur:
+        with self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO commitments (text, project, owner, kind, opened_episode, opened_at, status, "
                 "content_hash) VALUES (%s, %s, %s, %s, %s, %s, 'open', %s) RETURNING id",
                 (text, PROJECT, owner, kind, episode, at or BASE_AT, co.content_hash(PROJECT, text)))
             cid = int(cur.fetchone()[0])
+            fact_seed.adopt(cur, "commitment", cid)
         self.groups.setdefault(group, []).append(cid)
         return cid
 
@@ -151,11 +153,13 @@ def _flood(conn, *, model_questions: int = 6) -> Flood:
         f.item("dup", keeper + " soon", episode=conv, owner="assistant", at=BASE_AT + timedelta(hours=1))
     later = f.episode(summary="Merge pull request #801 from acme/fix\n✓ Merged pull request acme/widget#802 (Fix)",
                       at=BASE_AT + timedelta(days=1))
-    with conn.cursor() as cur:
+    with conn.transaction(), conn.cursor() as cur:
         for i in range(3):
-            cur.execute("INSERT INTO decisions (project, text, episode_id, decided_at) VALUES (%s, %s, %s, %s)",
+            cur.execute("INSERT INTO decisions (project, text, episode_id, decided_at) VALUES (%s, %s, %s, %s) "
+                        "RETURNING id",
                         (PROJECT, f"Decide whether the gateway keeps the {_words(i + 900)} route", later,
                          BASE_AT + timedelta(days=1)))
+            fact_seed.adopt(cur, "decision", cur.fetchone()[0])
     return f
 
 
@@ -363,8 +367,9 @@ def test_a_plan_whose_items_changed_skips_them_and_lists_them(owed, monkeypatch)
     plan = _plan(owed, judge=FakeModel())
     changed = f.groups["conv_cache"][0]
     gone = f.groups["dup"][0]
-    with owed.cursor() as cur:
+    with owed.transaction(), owed.cursor() as cur:
         cur.execute("UPDATE commitments SET text = text || ' today' WHERE id = %s", (changed,))
+        fact_seed.adopt(cur, "commitment", changed)
         assert co.set_status(cur, gone, "closed", reason="done", by=co.BY_APP)
     _app(monkeypatch)
     res = owed_tidy.apply(plan)

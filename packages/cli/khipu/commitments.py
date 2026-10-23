@@ -1081,6 +1081,72 @@ def _near_duplicate_open(cur, scope: str | None, text: str, *,
     return None
 
 
+def _provenance_ready(cur) -> bool:
+    """Whether the hub records fact claims (migration 0047). Positive-only
+    (``provenance.ready``); a probe that fails reads as not ready, and the
+    hub's commit gate then refuses the unprojected write so it is retried."""
+    try:
+        from khipu import provenance
+
+        return provenance.ready(cur)
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+def _lock_open(cur, commitment_id: int) -> bool:
+    """Lock a dedup target and re-check that it is still open (section 3.4):
+    one that retired after it was read is not a target."""
+    cur.execute(
+        f"SELECT id FROM commitments WHERE id = %s AND status = 'open' AND {_not_forgotten_clause(cur)} "
+        "FOR UPDATE",
+        (commitment_id,),
+    )
+    return cur.fetchone() is not None
+
+
+def _claim_opened(cur, commitment_id: int, episode_id: int, stored_text: str, text: str) -> None:
+    """The opening episode's claims on the item it inserted: the stored text
+    and the PR numbers its words name, then the projection."""
+    from khipu import provenance
+    from khipu.close_rules import parse_prs
+
+    provenance.record_claim(cur, "commitment", commitment_id, "text", stored_text, episode_id=episode_id)
+    for n in parse_prs(text):
+        provenance.record_claim(cur, "commitment", commitment_id, "pr", n, episode_id=episode_id)
+    provenance.project(cur, "commitment", commitment_id)
+
+
+def _claim_restatement(cur, commitment_id: int, episode_id: int, text: str, project: str | None) -> None:
+    """A later episode restating an open item claims it: its own words as a
+    restatement (the projection shows the newest one that differs from the
+    text as ``latest_text``), the PR numbers and repository refs those words
+    name. The refs the current ``latest_text`` names are kept too, each
+    claimed by whoever supplied that wording, as the pre-provenance writer
+    kept them. Then the projection; nothing else writes the wording."""
+    from khipu import provenance
+    from khipu.close_rules import parse_prs, pr_requirement_labels
+
+    provenance.record_claim(cur, "commitment", commitment_id, "restatement", text, episode_id=episode_id)
+    for n in parse_prs(text):
+        provenance.record_claim(cur, "commitment", commitment_id, "pr", n, episode_id=episode_id)
+    for label in pr_requirement_labels(text, project):
+        provenance.record_claim(cur, "commitment", commitment_id, "pr_ref", label, episode_id=episode_id)
+    cur.execute(
+        "SELECT fc.claimant, fc.episode_id, fc.value FROM commitments c "
+        "JOIN fact_claims fc ON fc.kind = 'commitment' AND fc.fact_id = c.id "
+        "AND fc.field = 'restatement' AND fc.value = c.latest_text "
+        "AND fc.claimant IN ('episode', 'owner') "
+        "LEFT JOIN episodes e ON e.id = fc.episode_id "
+        "WHERE c.id = %s AND (fc.claimant = 'owner' OR (e.id IS NOT NULL AND e.deleted_at IS NULL))",
+        (commitment_id,),
+    )
+    for claimant, by, value in cur.fetchall():
+        for label in pr_requirement_labels(value or "", project):
+            provenance.record_claim(cur, "commitment", commitment_id, "pr_ref", label,
+                                    episode_id=by, claimant=claimant)
+    provenance.project(cur, "commitment", commitment_id)
+
+
 def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     """Insert one open commitment per ``open_loops`` item. Returns the count
     actually inserted.
@@ -1106,6 +1172,10 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     owner_ready = _owner_columns_ready(cur)
     close_ready = _close_columns_ready(cur)
     lineage_ready = _lineage_columns_ready(cur)
+    # Fact provenance (migration 0047): every wording value this capture
+    # supplies is recorded as this episode's claim and the fact is projected
+    # from its claims. Without the table this step behaves exactly as before.
+    prov = _provenance_ready(cur)
     origin = capture_origin(payload)
     inserted = 0
     rejected = 0
@@ -1162,6 +1232,17 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             existing = _near_duplicate_open(cur, scope, norm["text"], rows=same)
         if existing is None and job_rows:
             relay_ids = _relay_matches(cur, norm["text"], exact, scope, job_rows)
+        if existing is not None and prov and not _lock_open(cur, existing):
+            # The target retired (closed, or its last claimant forgotten)
+            # since it was read: this item takes the insert path.
+            if exact == existing:
+                exact = None
+            existing = None
+        if existing is not None and prov:
+            if seen_ready:
+                _touch_seen(cur, existing)
+            _claim_restatement(cur, existing, episode_id, norm["text"], payload.get("project"))
+            continue
         if existing is not None:
             if seen_ready:
                 _touch_seen(cur, existing)
@@ -1238,7 +1319,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             cols += ", prs"
             vals += ", %s"
             params = (*params, parse_prs(norm["text"]))
-        returning = " RETURNING id" if owner_ready else ""
+        returning = " RETURNING id" if owner_ready or prov else ""
         cur.execute(
             f"""
             INSERT INTO commitments
@@ -1248,9 +1329,22 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             """,
             params,
         )
-        if cur.rowcount > 0:
+        landed = cur.rowcount > 0
+        if not landed and prov:
+            # The same words were opened by a concurrent capture after this
+            # one read the table: this episode claims that item instead.
+            other = _open_id_for_hash(cur, scope, h)
+            if other is not None and _lock_open(cur, other):
+                if seen_ready:
+                    _touch_seen(cur, other)
+                _claim_restatement(cur, other, episode_id, norm["text"], payload.get("project"))
+        if landed:
             inserted += 1
-            row = cur.fetchone() if (relay_ids or (linked and lineage_ready)) and owner_ready else None
+            if prov:
+                row = cur.fetchone()
+                _claim_opened(cur, int(row[0]), episode_id, stored_text, norm["text"])
+            else:
+                row = cur.fetchone() if (relay_ids or (linked and lineage_ready)) and owner_ready else None
             if relay_ids:
                 if row:
                     cur.execute("UPDATE commitments SET close_reason = %s WHERE id = ANY(%s)",

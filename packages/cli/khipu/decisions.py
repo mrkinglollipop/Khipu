@@ -281,6 +281,45 @@ def _decision_details_by_text(payload: dict[str, Any]) -> dict[str, dict[str, An
     return out
 
 
+def _provenance_ready(cur) -> bool:
+    """Whether the hub records fact claims (migration 0047); positive-only,
+    and a failed probe reads as not ready (the hub's commit gate then
+    refuses the unprojected write, so it is retried)."""
+    try:
+        from khipu import provenance
+
+        return provenance.ready(cur)
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+def _locked_duplicate(cur, project: str | None, norm_text: str, decided_at: Any) -> int | None:
+    """:func:`_find_recent_duplicate`, with the row locked and the match
+    re-checked under the lock (section 3.4 of the fact-provenance scope): a
+    duplicate retracted or superseded meanwhile is not one."""
+    for _ in range(3):
+        dup = _find_recent_duplicate(cur, project, norm_text, decided_at)
+        if dup is None:
+            return None
+        _lock_decision_row(cur, dup)
+        if _find_recent_duplicate(cur, project, norm_text, decided_at) == dup:
+            return dup
+    return None
+
+
+def _claim_details(cur, decision_id: int, text: str, *, episode_id: int | None,
+                   rationale: Any = None, evidence: Any = None) -> None:
+    from khipu import provenance
+
+    provenance.record_claim(cur, "decision", decision_id, "text", text, episode_id=episode_id)
+    if rationale:
+        provenance.record_claim(cur, "decision", decision_id, "rationale", rationale, episode_id=episode_id)
+    if evidence is not None:
+        provenance.record_claim(cur, "decision", decision_id, "evidence", json.dumps(evidence),
+                                episode_id=episode_id)
+    provenance.project(cur, "decision", decision_id)
+
+
 def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     """One row per string in ``payload['decisions']``. Returns the count
     actually inserted.
@@ -310,6 +349,7 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
     decided_at = payload.get("ts")
     evidence_ready = _evidence_ready(cur)
     details = _decision_details_by_text(payload) if evidence_ready else {}
+    prov = _provenance_ready(cur)
     inserted = 0
     for raw in items:
         text = _redacted_value(str(raw or "").strip())
@@ -318,37 +358,51 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
         norm = normalize_text(text)
         if not norm:
             continue
-        if _find_recent_duplicate(cur, project, norm, decided_at) is not None:
-            continue
         detail = details.get(text)
-        if detail is None:
-            cur.execute(
-                """
-                INSERT INTO decisions (project, text, episode_id, session_id, decided_at)
-                VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()))
-                """,
-                (project, text, episode_id, session_id, decided_at),
-            )
-        else:
-            source_kind = detail.get("by") or None
+        rationale = evidence = None
+        if detail is not None:
             rationale = detail.get("rationale") or None
             evidence = {
                 "derivation": "extract-details-v1",
                 "episode_id": episode_id,
                 "reverses": detail.get("reverses") or None,
             }
+        if prov:
+            # Fact provenance (0047): a repeat is this episode's claim on the
+            # decision already on file (its own words, rationale and
+            # evidence, shown once the earlier claimants are forgotten).
+            dup = _locked_duplicate(cur, project, norm, decided_at)
+            if dup is not None:
+                _claim_details(cur, dup, text, episode_id=episode_id, rationale=rationale, evidence=evidence)
+                continue
+        elif _find_recent_duplicate(cur, project, norm, decided_at) is not None:
+            continue
+        returning = " RETURNING id" if prov else ""
+        if detail is None:
+            cur.execute(
+                """
+                INSERT INTO decisions (project, text, episode_id, session_id, decided_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()))
+                """ + returning,
+                (project, text, episode_id, session_id, decided_at),
+            )
+        else:
+            source_kind = detail.get("by") or None
             cur.execute(
                 """
                 INSERT INTO decisions
                     (project, text, episode_id, session_id, decided_at,
                      source_kind, rationale, evidence)
                 VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()), %s, %s, %s::jsonb)
-                """,
+                """ + returning,
                 (project, text, episode_id, session_id, decided_at,
                  source_kind, rationale, json.dumps(evidence)),
             )
         if cur.rowcount > 0:
             inserted += 1
+            if prov:
+                _claim_details(cur, int(cur.fetchone()[0]), text, episode_id=episode_id,
+                               rationale=rationale, evidence=evidence)
     if inserted:
         _log(f"recorded {inserted} decision(s) for episode {episode_id} (project={project!r})")
     return inserted
@@ -704,16 +758,26 @@ def create_decision(cur, *, project: str | None, text: str, session_id: str | No
     if not text:
         raise ValueError("text is required")
     norm = normalize_text(text)
-    dup = _find_recent_duplicate(cur, project, norm, decided_at) if norm else None
-    if dup is not None:
-        return dup
+    prov = _provenance_ready(cur)
+    owner_evidence = _redacted_value(evidence) if evidence is not None else None
+    if prov:
+        # The owner's words are an owner claim, on the duplicate already on
+        # file too (shown when no live episode claims it).
+        dup = _locked_duplicate(cur, project, norm, decided_at) if norm else None
+        if dup is not None:
+            _claim_details(cur, dup, text, episode_id=None, evidence=owner_evidence)
+            return dup
+    else:
+        dup = _find_recent_duplicate(cur, project, norm, decided_at) if norm else None
+        if dup is not None:
+            return dup
     if _evidence_ready(cur):
         cur.execute(
             "INSERT INTO decisions (project, text, session_id, decided_at, source_kind, evidence) "
             "VALUES (%s, %s, %s, COALESCE(%s::timestamptz, now()), %s, %s::jsonb) "
             "RETURNING id",
             (project, text, session_id, decided_at, source_kind,
-             json.dumps(_redacted_value(evidence)) if evidence is not None else None),
+             json.dumps(owner_evidence) if evidence is not None else None),
         )
     else:
         cur.execute(
@@ -721,7 +785,11 @@ def create_decision(cur, *, project: str | None, text: str, session_id: str | No
             "VALUES (%s, %s, %s, COALESCE(%s::timestamptz, now())) RETURNING id",
             (project, text, session_id, decided_at),
         )
-    return int(cur.fetchone()[0])
+    new_id = int(cur.fetchone()[0])
+    if prov:
+        _claim_details(cur, new_id, text, episode_id=None,
+                       evidence=owner_evidence if _evidence_ready(cur) else None)
+    return new_id
 
 
 def add_link(cur, old_id: int, new_id: int, *, kind: str = "supersedes",

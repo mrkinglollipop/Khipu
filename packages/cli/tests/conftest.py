@@ -125,11 +125,15 @@ def _isolate_routing_inventory(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_table_columns_cache():
-    from khipu import db
+    from khipu import db, provenance
 
+    # provenance.ready caches a yes for the life of the process; each test
+    # brings its own database, at its own migration.
     db._TABLE_COLUMNS_CACHE.clear()
+    provenance._reset_ready_cache()
     yield
     db._TABLE_COLUMNS_CACHE.clear()
+    provenance._reset_ready_cache()
 
 
 @pytest.fixture(autouse=True)

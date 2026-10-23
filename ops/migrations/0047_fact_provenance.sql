@@ -325,11 +325,15 @@ BEGIN
           AND ((fc.claimant = 'episode' AND e.deleted_at IS NULL AND e.id IS NOT NULL)
                OR fc.claimant = 'owner');
 
-        SELECT jsonb_agg(r ORDER BY r) INTO v_refs FROM (
-            SELECT DISTINCT fc.value AS r FROM fact_claims fc LEFT JOIN episodes e ON e.id = fc.episode_id
+        -- In the order the refs were first claimed: the order the writer
+        -- appended them to pr_check.refs before claims existed.
+        SELECT jsonb_agg(r ORDER BY first_id) INTO v_refs FROM (
+            SELECT fc.value AS r, min(fc.id) AS first_id FROM fact_claims fc
+            LEFT JOIN episodes e ON e.id = fc.episode_id
             WHERE fc.kind = 'commitment' AND fc.fact_id = p_id AND fc.field = 'pr_ref'
               AND ((fc.claimant = 'episode' AND e.deleted_at IS NULL AND e.id IS NOT NULL)
-                   OR fc.claimant = 'owner')) refs;
+                   OR fc.claimant = 'owner')
+            GROUP BY fc.value) refs;
 
         -- A legacy PR value no live claim also holds: the item may need a PR
         -- nobody can show, so the close rules leave it to the owner.
@@ -463,6 +467,17 @@ FROM commitments c
 LEFT JOIN episodes e ON e.id = c.opened_episode AND e.deleted_at IS NULL
 CROSS JOIN LATERAL unnest(coalesce(c.prs, '{}'::INTEGER[])) AS n
 WHERE n IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+-- A row whose prs was never parsed (NULL, from before 0034): its one writer,
+-- close_rules.backfill_prs, would store parse_prs(text), the anchor's own
+-- words; the numbers the stricter khipu_text_prs finds are proven.
+INSERT INTO fact_claims (kind, fact_id, field, value, claimant, episode_id)
+SELECT 'commitment', c.id, 'pr', n::TEXT, 'episode', c.opened_episode
+FROM commitments c
+JOIN episodes e ON e.id = c.opened_episode AND e.deleted_at IS NULL
+CROSS JOIN LATERAL unnest(khipu_text_prs(c.text)) AS n
+WHERE c.prs IS NULL
 ON CONFLICT DO NOTHING;
 
 INSERT INTO fact_claims (kind, fact_id, field, value, claimant, episode_id)

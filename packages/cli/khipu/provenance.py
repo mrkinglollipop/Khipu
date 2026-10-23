@@ -49,7 +49,9 @@ def ready(cur) -> bool:
         return True
     cur.execute("SELECT to_regclass('public.fact_claims') IS NOT NULL")
     row = cur.fetchone()
-    _READY = bool(row and row[0])
+    # Only a real boolean yes counts: a cursor that answers anything else
+    # (a test double, a stale result) is not a hub with the table.
+    _READY = bool(row) and row[0] is True
     return _READY
 
 

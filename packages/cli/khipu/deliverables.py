@@ -38,6 +38,30 @@ def _deliverables_ready(cur) -> bool:
         return False
 
 
+def _provenance_ready(cur) -> bool:
+    """Whether the hub records fact claims (migration 0047); positive-only,
+    and a failed probe reads as not ready (the hub's commit gate then
+    refuses the unprojected write, so it is retried)."""
+    try:
+        from khipu import provenance
+
+        return provenance.ready(cur)
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+def _claim(cur, deliverable_id: int, episode_id: int, title: str | None) -> None:
+    """The episode's claim on a deliverable: its title, or, with none, a
+    support claim with no wording. Then the projection."""
+    from khipu import provenance
+
+    if title:
+        provenance.record_claim(cur, "deliverable", deliverable_id, "title", title, episode_id=episode_id)
+    else:
+        provenance.record_claim(cur, "deliverable", deliverable_id, "support", "", episode_id=episode_id)
+    provenance.project(cur, "deliverable", deliverable_id)
+
+
 def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     """One row per item in ``payload['deliverables']`` (the shape
     ``khipu.extract.extract_deliverables`` returns). Dedup: the same
@@ -49,6 +73,7 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
     if not _deliverables_ready(cur):
         return 0
     project = payload.get("project")
+    prov = _provenance_ready(cur)
     inserted = 0
     for raw in items:
         if not isinstance(raw, dict):
@@ -66,18 +91,25 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
         cur.execute(
             "SELECT id FROM deliverables WHERE project IS NOT DISTINCT FROM %s "
             "AND kind = %s AND path IS NOT DISTINCT FROM %s AND url IS NOT DISTINCT FROM %s "
-            + title_clause + "LIMIT 1",
+            + title_clause + ("ORDER BY id LIMIT 1 FOR UPDATE" if prov else "LIMIT 1"),
             params,
         )
-        if cur.fetchone():
+        found = cur.fetchone()
+        if found:
+            if prov:
+                # Fact provenance (0047): the repeat is this episode's claim
+                # on the deliverable already on file.
+                _claim(cur, int(found[0]), episode_id, title)
             continue
         cur.execute(
             "INSERT INTO deliverables (project, kind, path, url, title, episode_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s, %s)" + (" RETURNING id" if prov else ""),
             (project, kind, path, url, title, episode_id),
         )
         if cur.rowcount > 0:
             inserted += 1
+            if prov:
+                _claim(cur, int(cur.fetchone()[0]), episode_id, title)
     if inserted:
         _log(f"recorded {inserted} deliverable(s) for episode {episode_id} (project={project!r})")
     return inserted

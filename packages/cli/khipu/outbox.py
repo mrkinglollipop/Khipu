@@ -403,7 +403,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
             js = js[:limit]
         out["jobs"] = len(js)
         from khipu import memory_lock
-        from khipu.capture import CaptureEvidenceConflict, ClaimDeferred, write_pg
+        from khipu.capture import CaptureEvidenceConflict, ClaimDeferred, FactStepDeferred, write_pg
         from khipu.embed import embed_on_capture
         from khipu.request_context import replaying
         from khipu.tombstones import RegistryError, write_guard
@@ -496,7 +496,15 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                     # only record of the owner: retried, never buried.
                     job["claim_deferred"] = isinstance(e, ClaimDeferred)
                     job["evidence_conflict"] = isinstance(e, CaptureEvidenceConflict)
-                    deferred = job["claim_deferred"] or job["evidence_conflict"]
+                    # A fact step that met a lock or timeout error, or the
+                    # hub's fact gate: the transaction rolled back whole and
+                    # a retry lands it with its claims; never buried.
+                    job["fact_deferred"] = isinstance(e, FactStepDeferred)
+                    if job["fact_deferred"]:
+                        job["deferral_reason"] = str(e)[:200]
+                    else:
+                        job.pop("deferral_reason", None)
+                    deferred = job["claim_deferred"] or job["evidence_conflict"] or job["fact_deferred"]
                     if deferred:
                         unreachable = False
                         out["deferred"] = out.get("deferred", 0) + 1
