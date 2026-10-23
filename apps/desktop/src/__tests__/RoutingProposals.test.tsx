@@ -33,7 +33,7 @@ function view(extra: Partial<RouteView> = {}): RouteView {
         until: "2026-10-16T22:00:00Z", owner: true, by: "you", at: "2026-10-14T13:14:00Z" },
     ],
     rules: [
-      { n: 1, entity: "rule-a", text: "Use at most 76% of the xAI week.", pending: true, pending_kind: "changed",
+      { n: 1, entity: "rule-a", revision: "shown-rule-1", text: "Use at most 76% of the xAI week.", pending: true, pending_kind: "changed",
         pending_by: "a Claude Code conversation in project-a", prior_text: "Use at most 80% of the xAI week." },
     ],
     priority: {
@@ -150,7 +150,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
   it("confirms a rule proposal only through the owner's Confirm, on the existing rule command", async () => {
     await page();
     fireEvent.click(screen.getByRole("button", { name: "Confirm the proposed rule 1" }));
-    await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "confirm", n: 1 }]));
+    await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "confirm", n: 1, expect: "shown-rule-1" }]));
   });
 
   it("dismisses a priority proposal in two steps, through Undo on the existing priority command", async () => {

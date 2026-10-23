@@ -189,7 +189,7 @@ def test_p5_replayed_request_with_base_is_crossed(home):
     base = mcp_server._tool_route({})["rules"][0]["owner_revision"]
     req = {"text": "P", "rule": 1, "owner_request": "x", "base": base}
     mcp_server._tool_route_rule(req)
-    routing.confirm_rule(1, via="app")
+    routing.confirm_rule(1, via="app", expect=next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == 1))
     shown = mcp_server._tool_route({})  # reads again; the replay still names e1
     mcp_server._tool_route_rule(dict(req, text="REPLAY"))
     v = routing.read_view()

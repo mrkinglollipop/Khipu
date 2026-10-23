@@ -28,6 +28,7 @@ import hashlib
 import contextlib
 import fcntl
 import json
+import math
 import re
 import time
 import unicodedata
@@ -135,6 +136,8 @@ def known_entities() -> dict:
             label = acct.get("label")
             if label:
                 add(label, account=True)
+            if acct.get("key"):
+                add(acct["key"], account=True, canonical=label or acct["key"])
             ident = acct.get("id")
             if ident:
                 add(ident, account=True, canonical=label or _entity(str(ident).replace(":", " ")))
@@ -224,8 +227,16 @@ def _target(span: str, known: dict) -> dict | None:
         if not canonical:
             return None
         value = float(m.group(2))
+        # Calendar months and unspecified periods have no exact rolling-day
+        # equivalent. Preserve the amount, but leave fulfillment unresolved.
+        periods = re.findall(r"\b(?:a|per|each|every)\s+(day|week)\b", span, re.I)
+        days = {"day": 1, "week": 7}.get(periods[0].lower()) if len(periods) == 1 else None
+        if re.search(r"\b(month|year|calendar)\b", span, re.I):
+            days = None
+        purpose = None if re.search(r"\b(project|reads?|api|tier|sensitive)\b", span, re.I) else "job"
         return {"entity": canonical, "kind": "spend",
-                "value": int(value) if value == int(value) else value}
+                "value": int(value) if value == int(value) else value,
+                "days": days, "purpose": purpose}
     canonical = _find_known(span, known["all"])
     return {"entity": canonical, "kind": None, "value": None} if canonical else None
 
@@ -289,10 +300,21 @@ def _store_lock():
 def _valid_row(key, row):
     if not isinstance(row, dict) or row.get("id") != key:
         return False
-    if not all(isinstance(row.get(k), str) for k in ("id", "session", "words", "status")):
+    if not all(isinstance(row.get(k), str) for k in ("id", "session", "words", "status", "prompt_sha256")):
         return False
-    if "occurrence" in row and (type(row["occurrence"]) is not int or row["occurrence"] < 1):
+    if type(row.get("occurrence")) is not int or row["occurrence"] < 1:
         return False
+    if row.get("at") is not None:
+        from datetime import datetime, timezone
+
+        if type(row["at"]) not in (int, float):
+            return False
+        try:
+            if not math.isfinite(row["at"]):
+                return False
+            datetime.fromtimestamp(row["at"], timezone.utc)
+        except (OverflowError, ValueError, OSError):
+            return False
     return row.get("target") is None or isinstance(row["target"], dict)
 
 
@@ -474,15 +496,19 @@ def pushed_slice_ids(project, *, job: bool = False) -> list[str]:
     direction names only in its own project's slice."""
     if job or not project:
         return []
-    own: dict[str, str | None] = {}
+    own: dict[tuple, str | None] = {}
     ids = []
     for row in directions():
         if row.get("status") != "open":
             continue
         session = row.get("session")
-        if session not in own:
-            own[session] = row.get("project") or _project_for(session, row.get("prompt_sha256"))
-        if own[session] and own[session] == project:
+        key = (session, row.get("prompt_sha256"))
+        row_project = row.get("project")
+        if not row_project:
+            if key not in own:
+                own[key] = _project_for(*key)
+            row_project = own[key]
+        if row_project and row_project == project:
             ids.append(row["id"])
     return ids
 
@@ -491,17 +517,22 @@ def pushed_slice_ids(project, *, job: bool = False) -> list[str]:
 
 
 def _action_target(line: dict) -> dict | None:
+    if line.get("action") != "route.cap.set":
+        return None
     facts = line.get("facts") if isinstance(line.get("facts"), dict) else {}
     after = line.get("after") if isinstance(line.get("after"), dict) else {}
-    for source in (facts.get("cap"), facts, after):
+    for source in (after.get("cap"), facts.get("cap"), facts, after):
         if not isinstance(source, dict):
             continue
         kind = source.get("kind")
         field = {"share": "pct", "spend": "usd", "concurrency": "n"}.get(kind, "value")
         value = source.get(field, source.get("value"))
-        entity = source.get("account") or source.get("entity") or line.get("target")
+        entity = after.get("account") or source.get("account") or source.get("entity") or line.get("target")
         if kind and value is not None and entity:
-            return {"entity": str(entity), "kind": kind, "value": value}
+            return {"entity": str(entity), "kind": kind, "value": value,
+                    "days": source.get("days"), "purpose": source.get("purpose", "job"),
+                    "tier": source.get("tier"), "sensitive_only": source.get("sensitive_only"),
+                    "window": source.get("window")}
     return None
 
 
@@ -510,34 +541,32 @@ def _entity_key(name, known: dict | None = None) -> str:
     resolving a stable id or key to its known name, so 'Claude' and
     'Claude second' are different keys in both directions."""
     norm = _norm_entity(name)
-    if known:
-        accounts = known.get("accounts") or {}
-        if norm in accounts:
-            return norm
-        # A stable id (claude:second) or a usage key (claude|home) names
-        # the account its parts name, when the record knows that name.
-        for variant in (norm.replace(" ", " "), norm.split(" ")[0],
-                        " ".join(norm.split(" ")[1:])):
-            if variant in accounts:
-                return variant
-    return norm
+    accounts = (known or {}).get("accounts") or {}
+    # Full usage keys and stable aliases must be registered explicitly.
+    # Never infer identity from a provider prefix or a filesystem basename.
+    return _norm_entity(accounts.get(norm, name))
 
 
 def _matches(direction: dict, line: dict, known: dict | None = None) -> bool:
     facts = line.get("facts") if isinstance(line.get("facts"), dict) else {}
-    if facts.get("direction") == direction["id"]:
-        return True
     target = direction.get("target") or {}
     if not target.get("kind"):
-        return False
+        return facts.get("direction") == direction["id"]
     got = _action_target(line)
     if got is None or got["kind"] != target["kind"]:
         return False
     try:
         if float(got["value"]) != float(target["value"]):
             return False
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
+    if got.get("purpose") != target.get("purpose", "job"):
+        return False
+    if any(got.get(k) != target.get(k) for k in ("tier", "sensitive_only")):
+        return False
+    if target["kind"] == "spend":
+        if target.get("days") is None or got.get("days") != target["days"]:
+            return False
     known = known if known is not None else known_entities()
     return _entity_key(target["entity"], known) == _entity_key(got["entity"], known)
 

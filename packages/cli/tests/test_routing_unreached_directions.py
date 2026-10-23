@@ -46,6 +46,8 @@ def directions(replay):
         {"id": "rd-synthetic-applied", "status": "applied", "words": "AppliedSentinel",
          "session": SESSION},
     ]
+    for occurrence, row in enumerate(rows, 1):
+        row.update(occurrence=occurrence, prompt_sha256="synthetic-hash")
     routing_directions._save({"directions": {r["id"]: r for r in rows}})
     return replay
 
