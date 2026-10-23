@@ -286,6 +286,15 @@ INTERRUPTED_WORDS = ("Routing copy cleanup was interrupted; a copy may still be 
                      "Retry it from Settings.")
 
 
+FULL_WORDS = ("Too many unresolved routing copy cleanups; copies may still be on the hub. "
+              "Retry cleanup from Settings.")
+
+
+def cleanup_full(state):
+    """The pending target list is at its bound: new speculative ids wait."""
+    return bool(state.get("disabled") is not True and len(_cleanup_targets(state)) >= _CLEANUP_MAX_TARGETS)
+
+
 def interrupted(state):
     """A cleanup was attempted, its outcome is unknown, and it is not cleaned."""
     return bool(state.get("cleanup_attempted") is True and state.get("disabled") is not True
@@ -302,6 +311,8 @@ def status():
         value = dict(value, cleanup_gave_up=True, cleanup_gave_up_words=GAVE_UP_WORDS)
     elif off and interrupted(value):
         value = dict(value, cleanup_interrupted=True, cleanup_interrupted_words=INTERRUPTED_WORDS)
+    if off and cleanup_full(value):
+        value = dict(value, cleanup_full=True, cleanup_full_words=FULL_WORDS)
     return value
 
 
@@ -379,6 +390,7 @@ def _failed(state, now, cleanup=False):
 
 _HUB_CONFIGURED_TTL_SECONDS = 300
 _CLEANUP_MAX_FAILURES = 6
+_CLEANUP_MAX_TARGETS = 16
 _hub_configured_cache = None
 
 
@@ -479,16 +491,32 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
                 # is lost, an idle Mac cannot retry this speculative deletion;
                 # a recorded failure instead retries on its bounded backoff.
                 # Earlier recorded targets (e.g. from before an identity
-                # recovery) join the current id; none is dropped.
-                targets = sorted(_cleanup_targets(state) | ({publisher} if publisher else set()))
-                if not targets:
+                # recovery) are kept until their own delete succeeds. The
+                # current id joins them only while the list has room; a
+                # full list is shown (cleanup_full) and never trimmed.
+                pending = _cleanup_targets(state)
+                if publisher and len(pending) < _CLEANUP_MAX_TARGETS:
+                    pending.add(publisher)
+                if not pending:
                     return {"ok": True, "disabled": True}
-                state = dict(cleanup_attempted=True, cleanup_publishers=targets, **_counters(state))
+                state = dict(cleanup_attempted=True, cleanup_publishers=sorted(pending), **_counters(state))
                 _save(state)
                 hub = hub or PostgresHub()
-                for target in targets:
-                    hub.delete(target)
-                state = _on_cleaned(dict(cleanup_attempted=True, cleanup_publishers=targets))
+                failed = None
+                for target in sorted(pending):
+                    try:
+                        hub.delete(target)
+                    except Exception as exc:
+                        failed = failed or exc
+                        continue
+                    # Persist each confirmed removal on its own (atomic replace):
+                    # a crash mid-loop neither loses an unresolved id nor
+                    # brings back a deleted one.
+                    state["cleanup_publishers"] = [t for t in state["cleanup_publishers"] if t != target]
+                    _save(state)
+                if failed is not None:
+                    raise failed
+                state = _on_cleaned(dict(cleanup_attempted=True, cleanup_publishers=[]))
                 _save(state)
                 return {"ok": True, "disabled": True, "deleted": True}
             # Pending speculative targets become journaled targets here, so

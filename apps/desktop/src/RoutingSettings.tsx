@@ -3504,7 +3504,8 @@ function TellingSection({
               Replication: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError, cfg?.routing?.routing_replication_live?.pending === true)}
               {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
             </p>
-            {deliveryHealth?.gateway?.cleanup_gave_up || deliveryHealth?.gateway?.cleanup_interrupted ? (
+            {deliveryHealth?.gateway?.cleanup_gave_up || deliveryHealth?.gateway?.cleanup_interrupted
+              || deliveryHealth?.gateway?.cleanup_full ? (
               <div className="set-help" role="alert">
                 <p>{deliveryHealth.gateway.reason_words ?? "Routing copy cleanup stopped; a copy may still be on the hub."}</p>
                 <button

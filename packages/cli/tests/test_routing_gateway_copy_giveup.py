@@ -317,3 +317,58 @@ def test_counter_lifecycle_table(gw, monkeypatch):
         assert ("interrupted" in warned) is (shown == I), (i, step)
         if state.get("retry_at"):
             assert routing._parse(state["retry_at"]) - routing._now() <= timedelta(seconds=300)
+
+
+class RefusesCurrent:
+    """Deletes every id except this Mac's current one, which fails."""
+
+    def __init__(self):
+        self.deleted = []
+
+    def delete(self, publisher):
+        self.deleted.append(publisher)
+        if publisher == gc._publisher(create=False):
+            raise OSError("current row busy")
+
+
+def never_on_mac(gw, monkeypatch):
+    gateway_tests.configure(gw, routing_cloud_copy=False)
+    routing._id_salt()
+    with routing._lock():
+        routing._mac_locked()
+    monkeypatch.setattr(routing, "_hub_configured", lambda: True)
+
+
+CAP = 16
+
+
+def test_restore_failed_retry_cycles_keep_a_bounded_visible_target_list(gw, monkeypatch):
+    assert getattr(gc, "_CLEANUP_MAX_TARGETS", CAP) == CAP
+    never_on_mac(gw, monkeypatch)
+    hub_down(monkeypatch)
+    first = []
+    for n in range(32):
+        assert replication.restore()["mac"]
+        first.append(gc._publisher(create=False))
+        assert gc.publish(force=True, cleanup_only=True)["ok"] is False
+    targets = gc._cleanup_targets(gc._load())
+    assert len(targets) == CAP
+    assert targets == set(first[:CAP])  # every admitted id kept
+    state = gc.status()
+    assert state["cleanup_full"] is True
+    assert "gateway-cleanup-full" in health()["reasons"]
+    assert any("too many unresolved" in w.lower() for w in routing.doctor_block()["warnings"])
+
+
+def test_each_target_leaves_the_list_after_its_own_delete(gw, monkeypatch):
+    never_on_mac(gw, monkeypatch)
+    hub = RefusesCurrent()
+    for n in range(128):
+        assert replication.restore()["mac"]
+        gc.publish(force=True, cleanup_only=True, hub=hub)
+        assert len(gc._cleanup_targets(gc._load())) <= 1, n
+    assert len(hub.deleted) <= 2 * 128
+    assert not gc.status().get("cleanup_full")
+    # The last id clears once its delete succeeds.
+    assert gc.publish(force=True, cleanup_only=True, hub=Up())["deleted"]
+    assert gc._cleanup_targets(gc._load()) == set()
