@@ -1099,6 +1099,9 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     items = payload.get("open_loops") or []
     if not isinstance(items, list) or not items:
         return 0
+    from khipu import fact_support
+
+    support_ready = fact_support.lock(cur)
     scope = _coalesce_scope(payload)
     seen_ready = _seen_columns_ready(cur)
     trigger_ready = _future_trigger_ready(cur)
@@ -1163,6 +1166,11 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
         if existing is None and job_rows:
             relay_ids = _relay_matches(cur, norm["text"], exact, scope, job_rows)
         if existing is not None:
+            if support_ready:
+                fact_support.record(
+                    cur, "commitment", existing, episode_id,
+                    fact_support.commitment_value(cur, existing, norm["text"], h, scope),
+                )
             if seen_ready:
                 _touch_seen(cur, existing)
             row = next((r for r in same if r["id"] == existing), None)
@@ -1238,7 +1246,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             cols += ", prs"
             vals += ", %s"
             params = (*params, parse_prs(norm["text"]))
-        returning = " RETURNING id" if owner_ready else ""
+        returning = " RETURNING id" if owner_ready or support_ready else ""
         cur.execute(
             f"""
             INSERT INTO commitments
@@ -1250,7 +1258,12 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
         )
         if cur.rowcount > 0:
             inserted += 1
-            row = cur.fetchone() if (relay_ids or (linked and lineage_ready)) and owner_ready else None
+            row = cur.fetchone() if support_ready or ((relay_ids or (linked and lineage_ready)) and owner_ready) else None
+            if support_ready and row:
+                fact_support.record(
+                    cur, "commitment", int(row[0]), episode_id,
+                    fact_support.commitment_value(cur, int(row[0]), stored_text, h, scope, inserted=True),
+                )
             if relay_ids:
                 if row:
                     cur.execute("UPDATE commitments SET close_reason = %s WHERE id = ANY(%s)",

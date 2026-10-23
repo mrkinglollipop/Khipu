@@ -111,6 +111,8 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     md5) identity the legacy file uses, or ``{"ok": False}`` when unknown.
     With ``memory_root`` the legacy lines themselves are hashed too, so a line
     another episode holds only by payload hash is recognised as shared."""
+    from khipu import fact_support
+
     # The row lock first: a merge takes the same lock, so none can commit
     # into this episode between the reads below and the tombstone.
     cur.execute("SELECT ts, summary, session_id FROM episodes WHERE id = %s FOR UPDATE",
@@ -118,6 +120,8 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     row = cur.fetchone()
     if row is None:
         return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+    fact_support.lock(cur)
+    fact_support.prepare_forget(cur, episode_id)
     ts, summary, session_id = row
     live = {
         "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
@@ -203,6 +207,7 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
     # committed before it.
     publish_hub_forget(cur, episode_id, [*(source_rows or []), *read["column_sources"],
                                          *_payload_identities(read["tombstone_payloads"])])
+    fact_support.remove(cur, episode_id)
     cur.execute(
         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
         (str(episode_id),),

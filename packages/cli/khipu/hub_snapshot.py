@@ -1079,10 +1079,14 @@ def _write_decision_rows(con: sqlite3.Connection, rows: Sequence[Mapping[str, An
     if not cols_present:
         return None
     written = 0
+    rejected = _rejected_episode_ids(con)
     ts_cols = {"decided_at", "created_at", "superseded_at", "retracted_at"}
     for row in rows:
         rid = row.get("id")
         if rid is None:
+            continue
+        if row.get("episode_id") in rejected:
+            con.execute("DELETE FROM decisions WHERE id = ?", (rid,))
             continue
         cols = [c for c in _DECISION_COLS if c in row and c in cols_present]
         if "id" not in cols:
@@ -1120,6 +1124,10 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
     call this directly (a per-prompt/session-start hook must never open a
     hub connection on its own).
 
+    Migration 0046's changed_at also captures provenance/wording corrections.
+    Older hubs retain lifecycle sync, but provenance-only edits on those hubs
+    require a full refresh until that migration is installed.
+
     Bounded to ``limit`` rows per call, oldest-changed first, ordered so a
     caller that never quite catches up still makes forward progress instead
     of re-scanning the same window. Its own watermark
@@ -1146,7 +1154,8 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
     try:
         with try_hub_connect() as pg:
             with pg.cursor() as cur:
-                cols = [c for c in _DECISION_COLS if c in _pg_columns(cur, "decisions")]
+                hub_cols = _pg_columns(cur, "decisions")
+                cols = [c for c in _DECISION_COLS if c in hub_cols]
                 if "id" not in cols:
                     return {"ok": False, "not_applicable": True, "error": "hub decisions table not migrated"}
                 watermark_expr = "created_at"
@@ -1154,6 +1163,8 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
                     watermark_expr = f"GREATEST({watermark_expr}, COALESCE(superseded_at, {watermark_expr}))"
                 if "retracted_at" in cols:
                     watermark_expr = f"GREATEST({watermark_expr}, COALESCE(retracted_at, {watermark_expr}))"
+                if "changed_at" in hub_cols:
+                    watermark_expr = f"GREATEST({watermark_expr}, COALESCE(changed_at, {watermark_expr}))"
                 sel = ", ".join(cols)
                 params: list[Any] = []
                 where = ""
@@ -1661,8 +1672,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     # A commitment gone from the hub (its episode forgotten)
                     # must not leave its vector, and its text, behind.
                     if {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings") and "id" in cols:
-                        at = list(cols).index("id")
-                        live = {str(row[at]) for row in rows}
+                        live = {str(row[0]) for row in con.execute(
+                            "SELECT id FROM commitments WHERE 1 = 1"
+                            + forget_fence_sql(con, "commitments", "opened_episode"))}
                         for (ref,) in con.execute(
                                 "SELECT DISTINCT ref FROM memory_embeddings WHERE kind = 'commitment'").fetchall():
                             if str(ref) not in live:
@@ -2836,7 +2848,12 @@ def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: S
     keep = [i for i, c in enumerate(cols) if c in have]
     sel = ", ".join(cols[i] for i in keep)
     ts_cols = {"opened_at", "due_after", "closed_at", "last_seen_at", "owner_reassigned_at"}
+    rejected = _rejected_episode_ids(con)
+    episode_at = list(cols).index("opened_episode") if "opened_episode" in cols else None
+    written = 0
     for row in rows:
+        if episode_at is not None and row[episode_at] in rejected:
+            continue
         vals = []
         for i in keep:
             col, val = cols[i], row[i]
@@ -2851,7 +2868,8 @@ def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: S
             f"INSERT INTO commitments ({sel}) VALUES ({', '.join('?' * len(keep))})",
             vals,
         )
-    return len(rows)
+        written += 1
+    return written
 
 
 def refresh() -> dict[str, Any]:
@@ -3230,7 +3248,7 @@ def _tombstone_payloads_for_episode(episode_row: Mapping[str, Any]) -> list[dict
 
 
 def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
-    """Delete every live replica episode whose source the gate refuses, with
+    """Erase every live replica episode whose source the gate refuses, with
     its vectors, commitments, decisions and deliverables. The hub can hold
     a forgotten source under another id (written before the forget, or by a
     Mac that never saw it), and a dump must not carry it into this replica.
@@ -3262,12 +3280,26 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
                 con.execute("DELETE FROM memory_embeddings WHERE kind = 'commitment' "
                             f"AND ref IN ({', '.join('?' for _ in batch)})", batch)
         con.execute("DELETE FROM episodes WHERE id = ?", (eid,))
+        # Missing parents are permitted in partial replicas. Keep the refused
+        # id in the durable erasure registry so independently pulled facts
+        # cannot use that exception, even across another complete refresh.
+        if not _queue_erasure(int(eid)):
+            raise OSError("could not record rejected replica source")
         con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(eid),))
         if has_decisions:
             con.execute("DELETE FROM decisions WHERE episode_id = ?", (eid,))
         if has_deliverables:
             con.execute("DELETE FROM deliverables WHERE episode_id = ?", (eid,))
     return len(refused)
+
+
+def _rejected_episode_ids(con: sqlite3.Connection) -> set[int]:
+    """Rejections shared by every derivative writer, including old replicas."""
+    rejected = _pending_erasure_ids()
+    if "deleted_at" in _snapshot_table_columns(con, "episodes"):
+        rejected.update(row[0] for row in con.execute(
+            "SELECT id FROM main.episodes WHERE deleted_at IS NOT NULL"))
+    return rejected
 
 
 def scrub_forgotten_snapshot() -> dict[str, Any]:
@@ -3365,6 +3397,12 @@ def upsert_episode(
         # a source after forget returns.
         with write_guard(*payloads) as allowed:
             if not allowed:
+                # A source can first arrive under a new hub id during an
+                # incremental pull. Remember that id before independent
+                # commitment/decision imports get a chance to use it.
+                eid = episode_row.get("id")
+                if eid is not None and not _queue_erasure(int(eid)):
+                    return {"ok": False, "error": "could not queue rejected source erasure"}
                 return {"ok": False, "error": "forgotten source"}
             return _upsert_episode_unfenced(episode_row, embedding_rows, decision_rows,
                                             deliverable_rows, read_at=read_at)
@@ -4166,11 +4204,13 @@ def _lag_decisions(cur, con, since, hub_now, limit, hub_dump) -> dict[str, Any]:
         return {"lag_seconds": None, "not_applicable": "hub decisions table not migrated"}
     if not _snapshot_table_columns(con, "decisions"):
         return {"lag_seconds": None, "not_applicable": "replica has no decisions table"}
-    tracked = [c for c in ("superseded_at", "retracted_at", "superseded_by") if c in cols]
+    tracked = [c for c in ("superseded_at", "retracted_at", "superseded_by", "episode_id", "text") if c in cols]
     wm = "created_at"
     for c in ("superseded_at", "retracted_at"):
         if c in cols:
             wm = f"GREATEST({wm}, COALESCE({c}, {wm}))"
+    if "changed_at" in cols:
+        wm = f"GREATEST({wm}, COALESCE(changed_at, {wm}))"
     sel = ", ".join(["id", *tracked])
     cur.execute(
         f"SELECT {sel}, {wm} AS _wm FROM decisions WHERE {wm} > %s ORDER BY _wm, id LIMIT %s",
@@ -4190,6 +4230,8 @@ def _lag_decisions(cur, con, since, hub_now, limit, hub_dump) -> dict[str, Any]:
     def same(hub_val: Any, rep_val: Any, col: str) -> bool:
         if col.endswith("_at"):
             return _utc(hub_val) == _utc(rep_val)
+        if col == "text":
+            return hub_val == rep_val
         return (hub_val if hub_val is None else int(hub_val)) == (rep_val if rep_val is None else int(rep_val))
 
     unapplied = []
@@ -4215,7 +4257,13 @@ def _lag_decisions(cur, con, since, hub_now, limit, hub_dump) -> dict[str, Any]:
         for r in rows:
             hub_vals = dict(zip(tracked, r[1:-1]))
             mine_all[int(r[0])] = tuple(hub_vals[c] for c in rep_tracked)
-        text = "\n".join(_decision_digest_line((i, *v)) for i, v in sorted(mine_all.items()))
+        text = "\n".join(
+            "\t".join([str(i), *(
+                "" if value is None else (_vec_built_key(value) if col.endswith("_at") else str(value))
+                for col, value in zip(rep_tracked, values)
+            )])
+            for i, values in sorted(mine_all.items())
+        )
         if (got[0] if got else None) != (hashlib.md5(text.encode("utf-8")).hexdigest() if mine_all else None):
             unapplied.append(hub_dump)
     return {"lag_seconds": _lag_from(hub_now, unapplied), "missing": len(unapplied),
