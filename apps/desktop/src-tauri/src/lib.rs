@@ -5,6 +5,9 @@ use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use serde_json::Value;
 use tauri::{
     image::Image,
@@ -356,49 +359,112 @@ enum CliWaitError {
     TimedOut(u64),
 }
 
-/// `Command::output()` with a deadline: the child is killed when it passes.
-/// `None` waits as long as the child runs, as `.output()` did.
+#[cfg(unix)]
+extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn terminate_owned_process_group(child: &mut std::process::Child) {
+    let process_group = -(child.id() as i32);
+    // `output_with_timeout` made the direct child the group leader. The
+    // desktop sign-in marker keeps the browser-login child in this group too.
+    unsafe { kill(process_group, 15) };
+    std::thread::sleep(Duration::from_millis(40));
+    unsafe { kill(process_group, 9) };
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn terminate_owned_process_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `Command::output()` with one deadline covering the child *and* both pipe
+/// readers. On timeout its owned process group is signalled and the direct
+/// child is reaped before the caller gets the timeout result.
 fn output_with_timeout(mut cmd: Command, timeout: Option<std::time::Duration>) -> Result<std::process::Output, CliWaitError> {
     use std::io::Read;
     use std::process::Stdio;
+    use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
+    #[cfg(unix)]
+    cmd.process_group(0);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(CliWaitError::Spawn)?;
-    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+    fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+        let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = pipe {
                 let _ = p.read_to_end(&mut buf);
             }
-            buf
-        })
+            let _ = sender.send(buf);
+        });
+        receiver
     }
     let out_t = drain(child.stdout.take());
     let err_t = drain(child.stderr.take());
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
-    let status = loop {
-        match child.try_wait().map_err(CliWaitError::Spawn)? {
-            Some(st) => break st,
-            None => {
-                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    // Readers are left to end on their own: a grandchild may
-                    // still hold the pipe open, and we must not wait on it.
-                    return Err(CliWaitError::TimedOut(timeout.map_or(0, |t| t.as_secs())));
+    let mut status = None;
+    let mut stdout = None;
+    let mut stderr = None;
+    loop {
+        if status.is_none() {
+            status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    terminate_owned_process_group(&mut child);
+                    return Err(CliWaitError::Spawn(error));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+            };
+        }
+        if stdout.is_none() {
+            match out_t.try_recv() {
+                Ok(value) => stdout = Some(value),
+                Err(TryRecvError::Disconnected) => stdout = Some(Vec::new()),
+                Err(TryRecvError::Empty) => {}
             }
         }
-    };
-    Ok(std::process::Output {
-        status,
-        stdout: out_t.join().unwrap_or_default(),
-        stderr: err_t.join().unwrap_or_default(),
-    })
+        if stderr.is_none() {
+            match err_t.try_recv() {
+                Ok(value) => stderr = Some(value),
+                Err(TryRecvError::Disconnected) => stderr = Some(Vec::new()),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if status.is_some() && stdout.is_some() && stderr.is_some() {
+            return Ok(std::process::Output {
+                status: status.expect("status was checked"),
+                stdout: stdout.take().expect("stdout was checked"),
+                stderr: stderr.take().expect("stderr was checked"),
+            });
+        }
+        if let Some(deadline) = deadline {
+            let now = Instant::now();
+            if now >= deadline {
+                terminate_owned_process_group(&mut child);
+                return Err(CliWaitError::TimedOut(timeout.map_or(0, |t| t.as_secs())));
+            }
+            let remaining = deadline.saturating_duration_since(now).min(Duration::from_millis(20));
+            // Sleep on a reader when possible, but never beyond the shared deadline.
+            if stdout.is_none() {
+                match out_t.recv_timeout(remaining) {
+                    Ok(value) => stdout = Some(value),
+                    Err(RecvTimeoutError::Disconnected) => stdout = Some(Vec::new()),
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            } else {
+                std::thread::sleep(remaining);
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 /// Seconds the app waits for one CLI answer: `app_cli_timeout` in the data
@@ -440,6 +506,9 @@ fn cli_has_no_time_limit(args: &[String]) -> bool {
 }
 
 fn cli_timeout_for(args: &[String]) -> Option<std::time::Duration> {
+    if args.first().map(String::as_str) == Some("usage") && args.iter().any(|arg| arg == "--sign-in") {
+        return Some(Duration::from_secs(900));
+    }
     if cli_has_no_time_limit(args) {
         return None;
     }
@@ -472,6 +541,9 @@ fn run_khipu_cli_with_env(args: &[String], extra_env: &[(String, String)]) -> Re
         .env("PYTHONPATH", &pythonpath)
         .env("KHIPU_ROOT", &root)
         .env("KHIPU_APP_VERSION", khipu_app_version())
+        // `usage --sign-in` keeps its browser-login child in this runner's
+        // process group, so a desktop timeout can cancel the whole action.
+        .env("KHIPU_DESKTOP_MANAGED", "1")
         .env(bc_key, &bc_val);
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -6378,6 +6450,42 @@ mod settings_command_tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "done");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn deadline_covers_a_descendant_that_keeps_the_output_pipe_open() {
+        // The shell exits immediately; its background child inherits stdout
+        // and stderr. Before the process-group cancellation this waited for
+        // the child to close those pipes after the direct child was gone.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sleep 5 & exit 0"]);
+        let started = Instant::now();
+        assert!(matches!(
+            output_with_timeout(cmd, Some(Duration::from_millis(300))),
+            Err(CliWaitError::TimedOut(_))
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_signals_the_whole_cli_process_group() {
+        let marker = std::env::temp_dir().join(format!(
+            "khipu-cli-timeout-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
+        ));
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!("(sleep 1; : > '{}') & sleep 5", marker.display()),
+        ]);
+        assert!(matches!(
+            output_with_timeout(cmd, Some(Duration::from_millis(300))),
+            Err(CliWaitError::TimedOut(_))
+        ));
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(!marker.exists(), "background child escaped the CLI process group");
+    }
+
     #[test]
     fn the_cli_timeout_reads_the_config_and_falls_back_to_sixty() {
         assert_eq!(app_cli_timeout_secs_from(None), 60);
@@ -6399,6 +6507,15 @@ mod settings_command_tests {
         }
         assert!(!cli_has_no_time_limit(&v(&["owed", "--envelope"])));
         assert!(!cli_has_no_time_limit(&v(&["db", "status"])));
+    }
+
+    #[test]
+    fn interactive_usage_sign_in_gets_its_documented_fifteen_minute_deadline() {
+        assert_eq!(
+            cli_timeout_for(&v(&["usage", "--sign-in"])),
+            Some(Duration::from_secs(900)),
+        );
+        assert_eq!(cli_timeout_for(&v(&["usage", "--json"])), Some(Duration::from_secs(CLI_TIMEOUT_DEFAULT_SECS)));
     }
 
     #[test]

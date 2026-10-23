@@ -391,7 +391,7 @@ describe("estimate, start, progress and cancel", () => {
     expect(within(n).getByRole("button", { name: /Embed missing/ })).toBeDisabled();
     expect(within(n).getByRole("button", { name: "Delete index" })).toBeDisabled();
     fireEvent.click(within(n).getByRole("button", { name: "Cancel" }));
-    await waitFor(() => expect(callsTo("khipu_job_cancel")).toEqual([{ job_id: "app-1-aa" }]));
+    await waitFor(() => expect(callsTo("khipu_job_cancel")).toEqual([{ jobId: "app-1-aa" }]));
   });
 
   it("polls the job files every two seconds while a job runs", async () => {
@@ -611,7 +611,7 @@ describe("libraries", () => {
     fireEvent.click(importButton);
     await waitFor(() =>
       expect(callsTo("khipu_library_import")).toEqual([
-        { name: "biblical", path: "/Users/me/graphify.sqlite", strip_prefix: "Biblical System/corpus/", profile: null },
+        { name: "biblical", path: "/Users/me/graphify.sqlite", stripPrefix: "Biblical System/corpus/", profile: null },
       ]),
     );
     const receipt = await within(l).findByRole("group", { name: "Receipt" });
