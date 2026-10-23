@@ -1080,10 +1080,14 @@ def _write_decision_rows(con: sqlite3.Connection, rows: Sequence[Mapping[str, An
     if not cols_present:
         return None
     written = 0
+    rejected = _rejected_episode_ids(con)
     ts_cols = {"decided_at", "created_at", "superseded_at", "retracted_at"}
     for row in rows:
         rid = row.get("id")
         if rid is None:
+            continue
+        if row.get("episode_id") in rejected:
+            con.execute("DELETE FROM decisions WHERE id = ?", (rid,))
             continue
         cols = [c for c in _DECISION_COLS if c in row and c in cols_present]
         if "id" not in cols:
@@ -1662,8 +1666,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     # A commitment gone from the hub (its episode forgotten)
                     # must not leave its vector, and its text, behind.
                     if {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings") and "id" in cols:
-                        at = list(cols).index("id")
-                        live = {str(row[at]) for row in rows}
+                        live = {str(row[0]) for row in con.execute(
+                            "SELECT id FROM commitments WHERE 1 = 1"
+                            + forget_fence_sql(con, "commitments", "opened_episode"))}
                         for (ref,) in con.execute(
                                 "SELECT DISTINCT ref FROM memory_embeddings WHERE kind = 'commitment'").fetchall():
                             if str(ref) not in live:
@@ -2837,7 +2842,12 @@ def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: S
     keep = [i for i, c in enumerate(cols) if c in have]
     sel = ", ".join(cols[i] for i in keep)
     ts_cols = {"opened_at", "due_after", "closed_at", "last_seen_at", "owner_reassigned_at"}
+    rejected = _rejected_episode_ids(con)
+    episode_at = list(cols).index("opened_episode") if "opened_episode" in cols else None
+    written = 0
     for row in rows:
+        if episode_at is not None and row[episode_at] in rejected:
+            continue
         vals = []
         for i in keep:
             col, val = cols[i], row[i]
@@ -2852,7 +2862,8 @@ def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: S
             f"INSERT INTO commitments ({sel}) VALUES ({', '.join('?' * len(keep))})",
             vals,
         )
-    return len(rows)
+        written += 1
+    return written
 
 
 def refresh() -> dict[str, Any]:
@@ -3231,7 +3242,7 @@ def _tombstone_payloads_for_episode(episode_row: Mapping[str, Any]) -> list[dict
 
 
 def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
-    """Delete every live replica episode whose source the gate refuses, with
+    """Erase every live replica episode whose source the gate refuses, with
     its vectors, commitments, decisions and deliverables. The hub can hold
     a forgotten source under another id (written before the forget, or by a
     Mac that never saw it), and a dump must not carry it into this replica.
@@ -3263,12 +3274,26 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
                 con.execute("DELETE FROM memory_embeddings WHERE kind = 'commitment' "
                             f"AND ref IN ({', '.join('?' for _ in batch)})", batch)
         con.execute("DELETE FROM episodes WHERE id = ?", (eid,))
+        # Missing parents are permitted in partial replicas. Keep the refused
+        # id in the durable erasure registry so independently pulled facts
+        # cannot use that exception, even across another complete refresh.
+        if not _queue_erasure(int(eid)):
+            raise OSError("could not record rejected replica source")
         con.execute("DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = ?", (str(eid),))
         if has_decisions:
             con.execute("DELETE FROM decisions WHERE episode_id = ?", (eid,))
         if has_deliverables:
             con.execute("DELETE FROM deliverables WHERE episode_id = ?", (eid,))
     return len(refused)
+
+
+def _rejected_episode_ids(con: sqlite3.Connection) -> set[int]:
+    """Rejections shared by every derivative writer, including old replicas."""
+    rejected = _pending_erasure_ids()
+    if "deleted_at" in _snapshot_table_columns(con, "episodes"):
+        rejected.update(row[0] for row in con.execute(
+            "SELECT id FROM main.episodes WHERE deleted_at IS NOT NULL"))
+    return rejected
 
 
 def scrub_forgotten_snapshot() -> dict[str, Any]:
@@ -3366,6 +3391,12 @@ def upsert_episode(
         # a source after forget returns.
         with write_guard(*payloads) as allowed:
             if not allowed:
+                # A source can first arrive under a new hub id during an
+                # incremental pull. Remember that id before independent
+                # commitment/decision imports get a chance to use it.
+                eid = episode_row.get("id")
+                if eid is not None and not _queue_erasure(int(eid)):
+                    return {"ok": False, "error": "could not queue rejected source erasure"}
                 return {"ok": False, "error": "forgotten source"}
             return _upsert_episode_unfenced(episode_row, embedding_rows, decision_rows,
                                             deliverable_rows, read_at=read_at)
