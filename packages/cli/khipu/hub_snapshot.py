@@ -834,8 +834,7 @@ def decision_counts_snapshot(
         retract_expr = "retracted_at IS NOT NULL" if has_retract else "0"
         placeholders = ",".join("?" for _ in episode_ids)
         fence = forget_fence_sql(con, "decisions", "episode_id")
-        rows = fenced_rows(
-            con,
+        rows = con.execute(
             f"""
             SELECT CAST(episode_id AS TEXT),
                    SUM(CASE WHEN NOT ({retract_expr}) AND superseded_by IS NULL THEN 1 ELSE 0 END),
@@ -846,7 +845,7 @@ def decision_counts_snapshot(
             GROUP BY episode_id
             """,
             [str(e) for e in episode_ids],
-        )
+        ).fetchall()
         return {eid: (int(c or 0), int(s or 0), int(r or 0)) for eid, c, s, r in rows}
     except Exception:  # noqa: BLE001 — validity is best-effort metadata, never a search failure
         return None
@@ -867,12 +866,11 @@ def recent_deliverables_snapshot(
         return []
     extra = forget_fence_sql(con, "deliverables", "episode_id")
     try:
-        rows = fenced_rows(
-            con,
+        rows = con.execute(
             f"SELECT {', '.join(cols)} FROM deliverables WHERE project = ?{extra} "
             "ORDER BY created_at DESC, id DESC LIMIT ?",
             (project, limit),
-        )
+        ).fetchall()
     except sqlite3.Error:
         return None
     return [dict(zip(cols, row)) for row in rows]
@@ -1672,9 +1670,6 @@ def _current_refusal_digest(path: Path | None = None) -> str | None:
         return None
 
 
-# The digest the epoch function last returned on each reader connection (by
-# ``id``), for the post-query check in ``fenced_rows``.
-_EPOCH_SEEN: dict[int, str] = {}
 _EPOCH_UNREADABLE = "unreadable"
 
 
@@ -1693,12 +1688,9 @@ def _install_fact_epoch(con: sqlite3.Connection) -> None:
     review #2). The queued erasures are those beside this connection's own
     file (a dump's temp file and a staged import sit beside the replica)."""
     path = _con_path(con)
-    key = id(con)
 
     def epoch() -> str:
-        digest = _current_refusal_digest(path) or _EPOCH_UNREADABLE
-        _EPOCH_SEEN[key] = digest
-        return digest
+        return _current_refusal_digest(path) or _EPOCH_UNREADABLE
 
     con.create_function("khipu_fact_epoch", 0, epoch)
 
@@ -1724,22 +1716,6 @@ def _fact_vector_epoch_sql(con: sqlite3.Connection, alias: str = "") -> str:
     kind = f"{alias}.kind" if alias else "kind"
     kinds = ", ".join(f"'{k}'" for k in _FACT_VECTOR_KINDS)
     return f" AND ({kind} NOT IN ({kinds}) OR (1 = 1{epoch}))"
-
-
-def fenced_rows(con: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> list[Any]:
-    """Run a fact read whose SQL carries ``forget_fence_sql`` (or the vector
-    view) and re-check the refusal set after it: if it moved while the
-    query ran, run it once more; if it moved again, return nothing. So a
-    read never returns rows fenced against a set it saw replaced (the
-    in-flight-read contract, design section 6)."""
-    path = _con_path(con)
-    for _attempt in range(2):
-        _EPOCH_SEEN.pop(id(con), None)
-        rows = con.execute(sql, params).fetchall()
-        seen = _EPOCH_SEEN.pop(id(con), None)
-        if seen is None or seen == (_current_refusal_digest(path) or _EPOCH_UNREADABLE):
-            return rows
-    return []
 
 
 def _replica_fact_state(path: Path | None = None) -> str | None:
@@ -1952,6 +1928,10 @@ class _SourceFence:
                 self.scrub()
             self.digest = _refusal_digest(self.gate, self.path)
         _meta_put(self.con, _FACT_DIGEST_KEY, self.digest)
+        # Every fenced write is a new generation (an ordinary pull, a patch,
+        # a load): a rebuild whose hub read predates it is discarded, never
+        # published over it (sixth Astra review #2).
+        _meta_put(self.con, _FACT_GENERATION_KEY, uuid.uuid4().hex)
 
 
 @contextmanager
@@ -2385,7 +2365,6 @@ def _load_facts(con: sqlite3.Connection, fence: _SourceFence, read: Mapping[str,
     counts["vectors"] = _write_commitment_vectors(con, read.get("vectors") or ())
     _meta_put(con, _FACT_CURSOR_KEY, None if read.get("xmin") is None else str(read["xmin"]))
     _meta_put(con, _FACT_STATE_KEY, None)
-    _meta_put(con, _FACT_GENERATION_KEY, uuid.uuid4().hex)
     return counts
 
 
@@ -3997,7 +3976,6 @@ def _fence_dumped_facts(con: sqlite3.Connection, fence: _SourceFence, inputs: Ma
                 changed += 1
     _drop_mismatched_commitment_vectors(con)
     _meta_put(con, _FACT_STATE_KEY, None)
-    _meta_put(con, _FACT_GENERATION_KEY, uuid.uuid4().hex)
     return changed
 
 
@@ -7210,15 +7188,14 @@ def semantic_search_snapshot(
         kind_clause += (" AND kind = 'episode' AND ref IN "
                         f"(SELECT CAST(id AS TEXT) FROM episodes WHERE {predicate})")
         params.extend(t3_params)
-    rows = fenced_rows(
-        con,
+    rows = con.execute(
         f"""
         SELECT kind, ref, chunk_idx, chunk_text, embedding
         FROM memory_embeddings
         WHERE profile = ?{kind_clause} AND embedding IS NOT NULL
         """,
         params,
-    )
+    ).fetchall()
     time_filtered = since_dt is not None or until_dt is not None
     ep_cols = _snapshot_table_columns(con, "episodes")
     # Tombstoned episodes never come back through the offline replica either

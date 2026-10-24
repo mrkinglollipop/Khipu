@@ -1345,7 +1345,8 @@ def topic_text(slug: str, title: str | None, body: str | None) -> str:
 
 
 def _iter_sources(
-    cur, *, kind: str | None = None, refs: list[str] | None = None
+    cur, *, kind: str | None = None, refs: list[str] | None = None,
+    commitment_wording: dict[str, str] | None = None,
 ) -> Iterable[tuple[str, str, str, str]]:
     """Yield (kind, ref, text, title) for every embeddable row.
 
@@ -1407,6 +1408,10 @@ def _iter_sources(
         for cid, ctext in cur.fetchall():
             text = (ctext or "").strip()
             if text:
+                if commitment_wording is not None:
+                    # The md5 of the hub text as read, for the publication
+                    # lock's wording check (_lock_live_embedding_refs).
+                    commitment_wording[str(cid)] = _md5(ctext or "")
                 yield "commitment", str(cid), text, ""
 
 
@@ -1896,7 +1901,8 @@ def backfill(
             valid_idx: dict[tuple[str, str], set[int]] = {}
             needed_by_ref: dict[tuple[str, str], int] = {}
             queued_by_ref: dict[tuple[str, str], int] = {}
-            for k, ref, text, title in _iter_sources(cur, kind=kind):
+            wording: dict[str, str] = {}
+            for k, ref, text, title in _iter_sources(cur, kind=kind, commitment_wording=wording):
                 stats["scanned"] += 1
                 chunks = _chunks_for(k, text)
                 source_key = (k, ref)
@@ -1971,7 +1977,12 @@ def backfill(
                         if start + BATCH < len(todo):
                             time.sleep(BACKFILL_PAUSE_S)
                         continue
-                    live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
+                    # Commitment vectors are bound to the wording embedded
+                    # (sixth Astra review #3, as the catch-up).
+                    batch_wording = [wording[r] for k, r, *_ in batch if k == "commitment" and r in wording]
+                    live_refs = _lock_live_embedding_refs(
+                        cur, ((k, r) for k, r, *_ in batch),
+                        commitment_wording=batch_wording or None)
                     writable = [row for row in batch if row[:2] in live_refs]
                     _upsert_chunks(
                         cur, profile,

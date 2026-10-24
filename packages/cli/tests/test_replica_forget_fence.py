@@ -25,9 +25,7 @@ PACKAGE = Path(hs.__file__).resolve().parent
 LINKED = ("commitments", "decisions", "deliverables")
 _SELECT = re.compile(r"\bSELECT\b.*?\bFROM\s+(?:main\.)?(" + "|".join(LINKED) + r")\b", re.S | re.I)
 # Signs a function works on the sqlite replica rather than the hub.
-# ``fenced_rows(``: the fact readers run their fenced SQL through it (the
-# post-query refusal-set check, design section 6).
-_REPLICA_SIDE = ("con.execute", "open_snapshot(", "sqlite3.connect(", "_present(con", "fenced_rows(")
+_REPLICA_SIDE = ("con.execute", "open_snapshot(", "sqlite3.connect(", "_present(con")
 # Functions that read a linked table on the replica side without the fence:
 # (module, name) -> why.
 UNFENCED = {

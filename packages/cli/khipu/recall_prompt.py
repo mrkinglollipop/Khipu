@@ -3102,15 +3102,14 @@ def _thread_memory_hits(thread: str, *, progress: dict | None = None) -> list[di
             cols = hub_snapshot._snapshot_table_columns(con, "decisions")
             retracted = "AND d.retracted_at IS NULL" if "retracted_at" in cols else ""
             fence = hub_snapshot.forget_fence_sql(con, "d", "episode_id")
-            rows = hub_snapshot.fenced_rows(
-                con,
+            rows = con.execute(
                 "SELECT 'decision', d.id, d.text, d.episode_id, d.decided_at "
                 "FROM decisions d JOIN episodes e ON e.id = d.episode_id "
                 "WHERE CASE WHEN json_valid(e.raw) THEN "
                 "json_extract(e.raw, '$.t3_thread_id') END = ? "
                 "AND e.deleted_at IS NULL AND d.superseded_by IS NULL "
                 f"{retracted}{fence} ORDER BY d.decided_at DESC, d.id DESC LIMIT 3", (thread,),
-            )
+            ).fetchall()
             local_hits = rows_to_hits(rows)
             for hit in local_hits:
                 hit["status"] = "standing (replica)"

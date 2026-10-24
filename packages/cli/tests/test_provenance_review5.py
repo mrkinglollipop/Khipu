@@ -6,7 +6,6 @@ recovered, the hub binds a vector to its wording, a backup carries no fact
 row of a refused generation."""
 from __future__ import annotations
 
-import itertools
 import json
 import sqlite3
 import zipfile
@@ -97,34 +96,6 @@ def test_retained_vector_view_rechecks_registry(pg, replica):
     assert before == [(CANON,)]
     assert not current
     assert not held, "reader view captured the old refusal digest"
-
-
-def test_fenced_rows_retries_once_then_returns_nothing(pg, replica, monkeypatch):
-    """#2: a refusal landing while a fact query runs: ``fenced_rows`` re-reads
-    once, and returns no row if the set moved again."""
-    replica(pg)
-    _capture(loop=CANON)
-    assert hs.refresh()["ok"]
-    con = hs.open_snapshot()
-    sql = "SELECT text FROM commitments c WHERE 1" + hs.forget_fence_sql(con, "c", "opened_episode")
-    try:
-        assert hs.fenced_rows(con, sql) == [(CANON,)]
-        real = hs._current_refusal_digest()
-
-        def stub(answers):
-            calls = itertools.count()
-            # Even calls: the epoch read while SQLite runs the query; odd
-            # calls: the re-check after it.
-            return lambda path=None: real if answers(next(calls)) else "moved"
-
-        # Moved once during the query: the retry reads a stable set.
-        monkeypatch.setattr(hs, "_current_refusal_digest", stub(lambda n: n != 1))
-        assert hs.fenced_rows(con, sql) == [(CANON,)]
-        # Moved during the query and again during the retry: nothing.
-        monkeypatch.setattr(hs, "_current_refusal_digest", stub(lambda n: n % 2 == 0))
-        assert hs.fenced_rows(con, sql) == []
-    finally:
-        con.close()
 
 
 def test_older_rebuild_cannot_overwrite_newer_pull(pg, replica):

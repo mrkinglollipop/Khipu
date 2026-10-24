@@ -72,7 +72,7 @@ def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
             sql += f" AND project IN ({', '.join('?' * len(group))})"
             params.extend(group)
         sql += hub_snapshot.forget_fence_sql(con, "commitments", "opened_episode")
-        rows = [dict(r) for r in hub_snapshot.fenced_rows(con, sql, params)]
+        rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         if canonical:
             for row in rows:
                 if row.get("project"):
@@ -126,7 +126,7 @@ def decisions(project: str | None, since: Any, status: str, limit: int) -> dict[
             sql += f" AND project IN ({', '.join('?' * len(group))})"
             params.extend(group)
         sql += hub_snapshot.forget_fence_sql(con, "decisions", "episode_id")
-        rows = [dict(r) for r in hub_snapshot.fenced_rows(con, sql, params)]
+        rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         if canonical:
             for row in rows:
                 if row.get("project"):
