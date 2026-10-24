@@ -351,6 +351,25 @@ def _savepoint(cur, name: str) -> bool:
         return False
 
 
+_IDENTITY_KEYS = frozenset({
+    "ts", "session_id", "harness", "repo_root", "project",
+    "parent_session_id", "transcript_range", "window_id",
+})
+
+
+def _stored_form(payload: dict[str, Any]) -> dict[str, Any]:
+    """The copy ``_upsert_episode`` stores as an episode's raw: the payload
+    without a caller's ``origin`` or ``merged_from``, every non-identity
+    field redacted."""
+    safe = deepcopy(payload)
+    safe.pop("origin", None)
+    safe.pop("merged_from", None)
+    for key, value in list(safe.items()):
+        if key not in _IDENTITY_KEYS:
+            safe[key], _ = _redact_free_text(value)
+    return safe
+
+
 def _upsert_episode(cur, payload: dict[str, Any], *,
                     source: dict[str, Any] | None = None,
                     out: dict[str, Any] | None = None,
@@ -382,16 +401,7 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
     # capture.write_pg already uses for the hygiene step.
     identity_cols = ("harness", "repo_root", "project", "parent_session_id",
                      "transcript_range")
-    identity_keys = {
-        "ts", "session_id", "harness", "repo_root", "project",
-        "parent_session_id", "transcript_range", "window_id",
-    }
-    safe = deepcopy(payload)
-    safe.pop("origin", None)
-    safe.pop("merged_from", None)
-    for key, value in list(safe.items()):
-        if key not in identity_keys:
-            safe[key], _ = _redact_free_text(value)
+    safe = _stored_form(payload)
     has_identity = has_tags = True
     has_windows = has_verbatim = False
     try:
@@ -518,6 +528,91 @@ def _recover_line_facts(cur, obj: dict[str, Any], episode_id: int | None) -> Non
     capture.run_fact_steps(cur, payload, int(episode_id))
 
 
+_FACT_KEYS = ("open_loops", "decisions", "deliverables")
+
+
+def _fact_items(payload: Any) -> set[str]:
+    """A capture's fact items, each as ``key`` + canonical JSON."""
+    out: set[str] = set()
+    if not isinstance(payload, dict):
+        return out
+    for key in _FACT_KEYS:
+        items = payload.get(key)
+        for item in items if isinstance(items, list) else ():
+            out.add(f"{key}\x1f{json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)}")
+    return out
+
+
+def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]]]) -> list[dict[str, Any]]:
+    """Of fact-bearing file lines whose legacy key ``(ts, md5(summary))`` the
+    hub already holds, the ones carrying a fact item that no episode at that
+    key holds (its own raw, or a capture merged into it; an origin or merged
+    source receipt with that key counts as the key). An equal replay holds
+    every item and is not listed; a held key is never proof on its own that
+    a distinct line's facts arrived (third Astra review #2). A key whose
+    episode is forgotten is not listed: that line is a forgotten source."""
+    want = [(obj, key) for obj, key in lines if _carries_fact_items(obj)]
+    if not want:
+        return []
+    from khipu.capture_identity import sources_ready
+
+    held: dict[tuple[str, str], set[str]] = {}
+    forgotten: set[tuple[str, str]] = set()
+    cols = ("e.deleted_at, e.raw->'open_loops', e.raw->'decisions', e.raw->'deliverables', "
+            "jsonb_path_query_array(e.raw, '$.merged_from[*].payload.open_loops[*]'), "
+            "jsonb_path_query_array(e.raw, '$.merged_from[*].payload.decisions[*]'), "
+            "jsonb_path_query_array(e.raw, '$.merged_from[*].payload.deliverables[*]')")
+    by_source = sources_ready(cur)
+    for start in range(0, len(want), 500):
+        part = want[start:start + 500]
+        ts = [key[0] for _obj, key in part]
+        md = [key[1] for _obj, key in part]
+        sql = (f"SELECT v.ts, v.md, {cols} FROM unnest(%s::text[], %s::text[]) AS v(ts, md) "
+               "JOIN episodes e ON e.ts = v.ts::timestamptz AND md5(e.summary) = v.md")
+        params: list[Any] = [ts, md]
+        if by_source:
+            sql += (f" UNION ALL SELECT v.ts, v.md, {cols} FROM unnest(%s::text[], %s::text[]) AS v(ts, md) "
+                    "JOIN episode_sources s ON s.ts = v.ts::timestamptz AND s.summary_md5 = v.md "
+                    "JOIN episodes e ON e.id = s.episode_id")
+            params += [ts, md]
+        cur.execute(sql, params)
+        for row in cur.fetchall():
+            key = (row[0], row[1])
+            if row[2] is not None:
+                forgotten.add(key)
+            items = held.setdefault(key, set())
+            for at, name in ((3, "open_loops"), (4, "decisions"), (5, "deliverables"),
+                             (6, "open_loops"), (7, "decisions"), (8, "deliverables")):
+                items |= _fact_items({name: row[at]})
+    return [obj for obj, key in want
+            if key not in forgotten and not _fact_items(_stored_form(obj)) <= held.get(key, set())]
+
+
+def _queue_conflict(obj: dict[str, Any]) -> None:
+    """Keep a recovered line whose legacy key holds different facts as
+    durable work: queued in the outbox with its owner unknown. Its drain
+    lands it through ``capture.write_pg``, whose legacy-key collision keeps
+    it queued as an ``evidence_conflict`` (never buried; ``khipu outbox
+    status`` and doctor count it) unless capture's dedup lands its facts."""
+    from khipu.outbox import enqueue
+
+    enqueue(obj, reason="recovery: the legacy key holds different facts", origin=None)
+    _log("recovered line kept in the outbox: its legacy key holds different facts")
+
+
+def _queue_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]]]) -> int:
+    """``_queue_conflict`` each line ``_legacy_key_conflicts`` lists, on a
+    hub with fact provenance (0047) only. Returns how many."""
+    from khipu import provenance
+
+    if not lines or not any(_carries_fact_items(obj) for obj, _key in lines) or not provenance.ready(cur):
+        return 0
+    conflicts = _legacy_key_conflicts(cur, lines)
+    for obj in conflicts:
+        _queue_conflict(obj)
+    return len(conflicts)
+
+
 def _line_deferred(cur, obj: dict[str, Any], exc: BaseException) -> bool:
     """A recovered line whose fact step must be retried (a lock or timeout,
     ``FactStepDeferred``) is rolled back alone and queued in the outbox,
@@ -531,7 +626,10 @@ def _line_deferred(cur, obj: dict[str, Any], exc: BaseException) -> bool:
     cur.execute("RELEASE SAVEPOINT mirror_recover_line")
     from khipu.outbox import enqueue
 
-    enqueue(obj, reason=f"recovery fact step deferred: {exc}"[:200])
+    # A synced file can hold another machine's captures: the queued line
+    # keeps the unknown owner a direct recovery leaves (origin NULL), never
+    # the recovering caller's (third Astra review #3).
+    enqueue(obj, reason=f"recovery fact step deferred: {exc}"[:200], origin=None)
     _log(f"recovered line deferred to the outbox ({exc})")
     return True
 
@@ -687,8 +785,10 @@ def sync_recent_episodes(memory_root: Path, *, tail_lines: int = 40) -> dict[str
     with memory_lock.shared(), connect() as conn:
         with conn.cursor() as cur:
             missing = set(episodes_missing_in_pg(cur, keys))
+            collided: list[tuple[dict[str, Any], tuple[str, str]]] = []
             for obj, key in zip(objs, keys):
                 if key not in missing:
+                    collided.append((obj, key))
                     continue
                 upserted: dict[str, Any] = {}
                 cur.execute("SAVEPOINT mirror_recover_line")
@@ -704,6 +804,12 @@ def sync_recent_episodes(memory_root: Path, *, tail_lines: int = 40) -> dict[str
                 if inserted:
                     stats["inserted"] += 1
                     inserted_payloads.append((obj, upserted.get("episode_id")))
+                elif not upserted.get("forgotten_source"):
+                    collided.append((obj, key))
+            # A held key is not proof that a line's facts arrived.
+            conflicts = _queue_key_conflicts(cur, collided)
+            if conflicts:
+                stats["conflicts"] = conflicts
         conn.commit()
     if inserted_payloads:
         try:
@@ -793,8 +899,10 @@ def reconcile_memory_root(memory_root: Path) -> dict[str, int]:
                             )
                             stats["episodes"] += 1
                 missing = set(episodes_missing_in_pg(cur, keys))
+                collided: list[tuple[dict[str, Any], tuple[str, str]]] = []
                 for obj, key in zip(objs, keys):
                     if key not in missing:
+                        collided.append((obj, key))
                         continue
                     upserted: dict[str, Any] = {}
                     cur.execute("SAVEPOINT mirror_recover_line")
@@ -809,6 +917,12 @@ def reconcile_memory_root(memory_root: Path) -> dict[str, int]:
                     cur.execute("RELEASE SAVEPOINT mirror_recover_line")
                     if inserted:
                         stats["episodes_new"] += 1
+                    elif not upserted.get("forgotten_source"):
+                        collided.append((obj, key))
+                # A held key is not proof that a line's facts arrived.
+                conflicts = _queue_key_conflicts(cur, collided)
+                if conflicts:
+                    stats["episodes_conflicts"] = conflicts
             if topics_dir.is_dir():
                 seen: list[str] = []
                 for path in sorted(topics_dir.glob("*.md")):

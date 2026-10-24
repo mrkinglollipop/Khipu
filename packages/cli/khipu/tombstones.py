@@ -29,6 +29,48 @@ class ForgottenSource(RegistryError):
     """A writer attempted to persist a source that was already forgotten."""
 
 
+class RegistryBusy(RegistryError):
+    """Another writer held the registry lock past this caller's wait. Nothing
+    was checked or written; the caller retries or defers its write (third
+    Astra review #5: a held replica write must never block a capture)."""
+
+
+# How long a writer waits for the registry lock before ``RegistryBusy``. The
+# longest holder is a replica write (a pull, or a dump's scrub), bounded by
+# its own work. A reader never waits: it reads the file, which every
+# publication replaces atomically.
+REGISTRY_WAIT_S = float(os.environ.get("KHIPU_REGISTRY_WAIT_S", "30"))
+_LOCK_POLL_S = 0.02
+_WAIT: ContextVar[float | None] = ContextVar("khipu_tombstone_lock_wait", default=None)
+
+
+@contextmanager
+def lock_wait(seconds: float) -> Iterator[None]:
+    """Wait at most ``seconds`` for the registry lock inside this context
+    (a foreground writer that would rather defer than wait long)."""
+    token = _WAIT.set(max(0.0, float(seconds)))
+    try:
+        yield
+    finally:
+        _WAIT.reset(token)
+
+
+def _flock_bounded(fd: int) -> None:
+    """``LOCK_EX`` on ``fd`` within this context's wait, else ``RegistryBusy``."""
+    import time
+
+    wait = _WAIT.get()
+    deadline = time.monotonic() + (REGISTRY_WAIT_S if wait is None else wait)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise RegistryBusy("tombstone registry busy: another writer holds it") from None
+            time.sleep(_LOCK_POLL_S)
+
+
 _HANDOFF_ENV = ("KHIPU_TOMBSTONE_LOCK_FD", "KHIPU_TOMBSTONE_LOCK_DEV",
                 "KHIPU_TOMBSTONE_LOCK_INO", "KHIPU_TOMBSTONE_REGISTRY")
 
@@ -206,7 +248,7 @@ def _locked_registry() -> Iterator[tuple[Path, dict[str, Any], _LockLease]]:
             if lease is None:
                 fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
                 os.fchmod(fd, 0o600)
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                _flock_bounded(fd)
                 lease = _LockLease(fd, path, lock_path, borrowed=False)
             value = _read(path)
         except RegistryError:
@@ -267,15 +309,20 @@ class Gate:
         self._value = value
         self._tagged: frozenset[str] | None = None
 
-    def refuses(self, identities: Any) -> bool:
-        """Whether any of ``identities`` (``identity_strings`` tags, or a
-        source receipt's ``k:``/``h:`` tag) names a forgotten source."""
+    @property
+    def tags(self) -> frozenset[str]:
+        """Every forgotten source identity, as the tags ``refuses`` matches."""
         if self._tagged is None:
             self._tagged = frozenset(
                 [f"k:{k}" for k in self._value["source_keys"]]
                 + [f"h:{h}" for h in self._value["payload_hashes"]]
                 + [f"l:{x}" for x in self._value["legacy_identities"]])
-        return not self._tagged.isdisjoint(identities)
+        return self._tagged
+
+    def refuses(self, identities: Any) -> bool:
+        """Whether any of ``identities`` (``identity_strings`` tags, or a
+        source receipt's ``k:``/``h:`` tag) names a forgotten source."""
+        return not self.tags.isdisjoint(identities)
 
     @property
     def digest(self) -> str:
@@ -339,17 +386,41 @@ def write_guard(payload: dict[str, Any], *also: dict[str, Any]) -> Iterator[bool
         yield all(gate.allows(p) for p in (payload, *also))
 
 
+def _read_unlocked() -> dict[str, Any]:
+    """The registry as published, without its lock. Every publication
+    replaces the file atomically (``_atomic_write``), so a read sees one
+    whole version: the one before a publication in flight, as if it had
+    read just before that publisher took the lock. A reader holds nothing
+    afterwards, so it needs no exclusion; a writer still takes the lock
+    from its check through its write. Same refusals as the locked read."""
+    try:
+        path = registry_path()
+        if path.is_symlink():
+            raise RegistryError("tombstone registry must not be a symlink")
+        # A handed-down lock is still validated: a forged or stale one is
+        # refused here exactly as on the locked path (nonblocking).
+        _borrowed_lease(path, path.parent / f".{path.stem}.lock")
+        return _read(path)
+    except RegistryError:
+        raise
+    except OSError as exc:
+        raise RegistryError(f"tombstone registry unavailable: {type(exc).__name__}") from exc
+
+
 def read_gate() -> Gate:
     """One registry snapshot for a reader that writes nothing (a search
-    deciding which pending captures it may show). ``RegistryError`` when the
-    registry cannot be read: the reader must then show none of them."""
-    with _locked_registry() as (_path, value, _lease):
-        return Gate(copy.deepcopy(value))
+    deciding which pending captures it may show, a hub write's local source
+    check). It never waits on a writer's lock (third Astra review #5).
+    ``RegistryError`` when the registry cannot be read: the reader must then
+    show none of them."""
+    return Gate(_read_unlocked())
 
 
 def is_forgotten(payload: dict[str, Any]) -> bool:
-    with _locked_registry() as (_path, value, _lease):
-        return _known(value, payload)
+    """Whether this Mac's registry names ``payload``. A read: never waits
+    on a writer's lock (a capture's hub write must not block on a replica
+    write; the hub fences its own writes, 0030)."""
+    return _known(_read_unlocked(), payload)
 
 
 def subprocess_lock_handoff() -> tuple[dict[str, str], tuple[int, ...]]:

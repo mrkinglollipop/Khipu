@@ -478,6 +478,27 @@ def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
         raise ValueError(f"unknown fact step {step!r}")
 
 
+# The capture steps that read what an earlier step wrote (capture's order,
+# ``capture.run_fact_steps`` and the merge path): reversal detection reads the
+# decisions just inserted, and the close rules read the commitments and the
+# decisions. When the earlier step failed, the later ones ran against
+# incomplete state and returned normally, so no gap names them; a replay of
+# the earlier step re-runs them after it, in capture's order, in the same
+# transaction (third Astra review #4). Each is idempotent.
+DEPENDENT_STEPS: dict[str, tuple[str, ...]] = {
+    "commitments": ("close rules",),
+    "decisions": ("decision detection", "close rules"),
+}
+
+
+def dependent_steps(step: str) -> tuple[str, ...]:
+    """The steps a replay of ``step`` re-runs after it (merge steps keep
+    their ``merge `` prefix)."""
+    prefix = "merge " if step.startswith("merge ") else ""
+    name = step[len(prefix):]
+    return tuple(prefix + dep for dep in DEPENDENT_STEPS.get(name, ()))
+
+
 def _gap_payload(raw: Any, step: str, source_id: str | None) -> dict[str, Any] | None:
     """The capture a gap's step ran on: the episode's own (its stored raw),
     or for a merge step the merged capture ``source_id`` names."""
@@ -506,7 +527,9 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
     episode lock and before any side effect, and skips a group another
     runner holds or has resolved (second Astra review #3). Groups are
     taken fewest attempts first, then oldest, so groups that keep failing
-    move behind ones never tried and cannot starve them (#4)."""
+    move behind ones never tried and cannot starve them (#4). A replayed
+    step is followed by the steps that depend on it (``dependent_steps``),
+    which had run against its missing rows (third review #4)."""
     from khipu.tombstones import hub_source_forgotten
 
     with conn.cursor() as cur:
@@ -552,6 +575,8 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
                     resolution = "forgotten"
                 else:
                     _gap_step(cur, step, payload, int(episode_id))
+                    for dependent in dependent_steps(step):
+                        _gap_step(cur, dependent, payload, int(episode_id))
                 if resolution is not None:
                     cur.execute(
                         "UPDATE fact_gaps SET resolved_at = now(), resolution = %s, attempts = attempts + 1 "

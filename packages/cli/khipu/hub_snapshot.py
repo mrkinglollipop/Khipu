@@ -35,7 +35,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
@@ -108,6 +108,10 @@ _TABLES = (
 # Version 9 adds the close-rule fields used by offline owed filters. Older
 # replicas gain these nullable columns on their next commitments pull.
 SNAPSHOT_SCHEMA_VERSION = 9
+
+# A writer that read no fact contributors (``read_fact_sources``) passes
+# this, and the replica's record of them is left as it was.
+_UNKNOWN: Any = object()
 
 _COMMITMENT_COLS = (
     "id",
@@ -1033,19 +1037,24 @@ def _dump_cursors(con: sqlite3.Connection, at: str) -> None:
 
 
 def apply_decision_changes(rows: Sequence[Mapping[str, Any]],
-                           anchors: Mapping[int, Any] | None = None) -> dict[str, Any]:
+                           anchors: Mapping[int, Any] | None = None,
+                           sources: Any = _UNKNOWN) -> dict[str, Any]:
     """Upsert decision rows into the local replica's ``decisions`` table —
     the write half of validity's local-lane visibility (Phase 2, session B):
     ``khipu.decisions`` calls this right after a successful supersede/
     restore/retract on THIS machine so the local lane sees the correction at
     once; ``sync_decision_changes`` below calls it for corrections made
     elsewhere. ``anchors``: the rows' anchor episodes' identities, read from
-    the hub with them (``read_anchor_identities``), for the source fence.
-    Same lock/fail-open contract as ``upsert_episode``: a no-op
+    the hub with them (``read_anchor_identities``), for the source fence,
+    contributors included; ``sources``: the rows' contributors
+    (``read_fact_sources``). Same lock/fail-open contract as ``upsert_episode``: a no-op
     ``{"ok": False}`` when the snapshot is missing, too old to have a
     ``decisions`` table, or a full dump is in progress — never a raise.
+    A live write: it waits at most ``LIVE_PATCH_WAIT_S`` for another replica
+    write (the caller may hold a hub transaction), then defers to the next
+    sync, which reads the change again (third Astra review #5).
     """
-    from khipu.tombstones import RegistryError
+    from khipu.tombstones import RegistryBusy, RegistryError, lock_wait
 
     if not rows:
         return {"ok": True, "decisions": 0}
@@ -1053,15 +1062,18 @@ def apply_decision_changes(rows: Sequence[Mapping[str, Any]],
     if not path.is_file():
         return {"ok": False, "error": "hub snapshot missing"}
     try:
-        with _replica_write_gate(path) as fence:
+        with lock_wait(LIVE_PATCH_WAIT_S), _replica_write_gate(path) as fence:
             fence.check(anchors or {})
-            written = _write_decision_rows(fence.con, rows, fence=fence)
+            written = _write_decision_rows(fence.con, rows, fence=fence, sources=sources)
             if written is None:
                 return {"ok": False, "error": "replica has no decisions table (version 1)"}
         return {"ok": True, "decisions": written}
     except _ReplicaBusy:
         _record_write_error(("decisions",), "hub snapshot refresh in progress")
         return {"ok": False, "error": "hub snapshot refresh in progress"}
+    except RegistryBusy as exc:
+        _record_write_error(("decisions",), f"replica write deferred: {exc}")
+        return {"ok": False, "deferred": True, "error": f"replica write deferred: {exc}"}
     except RegistryError as exc:
         return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
     except Exception as exc:  # noqa: BLE001 — the PG write already succeeded
@@ -1070,7 +1082,7 @@ def apply_decision_changes(rows: Sequence[Mapping[str, Any]],
 
 
 def _write_decision_rows(con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]],
-                         fence: _SourceFence | None = None) -> int | None:
+                         fence: _SourceFence | None = None, sources: Any = _UNKNOWN) -> int | None:
     """Insert-or-replace ``rows`` into ``con``'s ``decisions`` table. Caller
     owns the transaction (commit/rollback) and any locking — this never
     commits or acquires a lock itself, so ``upsert_episode`` (already
@@ -1079,11 +1091,14 @@ def _write_decision_rows(con: sqlite3.Connection, rows: Sequence[Mapping[str, An
     (not 0) when the replica has no ``decisions`` table at all, so a caller
     can tell that apart from "zero rows written". Every import passes the
     ``fence`` of its ``_replica_write_gate``, which already checked the
-    rows' anchors; without one only ids already refused are left out."""
+    rows' anchors; without one only ids already refused are left out.
+    ``sources``: the rows' contributors (``read_fact_sources``), kept and
+    fenced with the rows (third Astra review #1)."""
     cols_present = _snapshot_table_columns(con, "decisions")
     if not cols_present:
         return None
     written = 0
+    written_ids: list[int] = []
     rejected = _rejected_episode_ids(con) if fence is None else None
     ts_cols = {"decided_at", "created_at", "superseded_at", "retracted_at"}
     for row in rows:
@@ -1111,6 +1126,10 @@ def _write_decision_rows(con: sqlite3.Connection, rows: Sequence[Mapping[str, An
             vals,
         )
         written += 1
+        written_ids.append(int(rid))
+    if fence is not None:
+        _store_fact_sources(con, "decision", written_ids, sources)
+        _fence_fact_wording(con, fence, "decision", written_ids)
     if written:
         _advance_cursor(
             con, "decisions", synced_at=_utcnow_iso(),
@@ -1194,7 +1213,8 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
     if not fetched:
         return {"ok": True, "decisions": 0}
     rows = [dict(zip(cols, r[:-1])) for r in fetched]
-    out = apply_decision_changes(rows, anchors)
+    # A hub without the fact stream has no fact provenance: anchor-only.
+    out = apply_decision_changes(rows, anchors, sources=None)
     if out.get("ok"):
         new_watermark = fetched[-1][-1]
         m["last_decision_sync_at"] = _ts_text(new_watermark) or since
@@ -1359,7 +1379,8 @@ def read_anchor_identities(cur, episode_ids: Iterable[int]) -> dict[int, frozens
     return out
 
 
-def _commitment_anchors(cur, commitments: tuple[list[str], list[Any]] | None
+def _commitment_anchors(cur, commitments: tuple[list[str], list[Any]] | None,
+                        contributors: Iterable[int] = ()
                         ) -> tuple[dict[int, frozenset[str] | None], dict[int, str]]:
     """The anchor (opening) episodes of the pulled commitments, held or not,
     for the source fence, and each one's hub version. The whole table is
@@ -1368,11 +1389,13 @@ def _commitment_anchors(cur, commitments: tuple[list[str], list[Any]] | None
     stored identities). The version is the row's ``changed_at`` (migration
     0032: a trigger moves it on every change, and a merge writes the
     episode's raw and its source receipt in one transaction); a hub without
-    it re-reads every anchor."""
+    it re-reads every anchor. ``contributors``: the other episodes whose
+    claims the commitments' wording shows (``read_fact_sources``), checked
+    the same way (third Astra review #1)."""
     if not commitments or "opened_episode" not in commitments[0]:
         return {}, {}
     at = commitments[0].index("opened_episode")
-    wanted = sorted({int(r[at]) for r in commitments[1] if r[at] is not None})
+    wanted = sorted({int(r[at]) for r in commitments[1] if r[at] is not None} | {int(e) for e in contributors})
     if not wanted:
         return {}, {}
     digests: dict[int, str] = {}
@@ -1414,13 +1437,318 @@ def _registry_rejected_anchors(anchors: Mapping[Any, Any], known: set[int], *, g
             if int(e) not in known and (int(e) in gate.episode_ids or gate.refuses(ids or ()))}
 
 
+# ---- Fact contributors (third Astra review #1) --------------------------------
+#
+# A fact's wording can come from more than its anchor: a commitment's
+# latest_text is another episode's restatement, its PR numbers and refs are
+# the union of every claimant's. So the replica keeps, for every projected
+# field of every commitment, decision and deliverable it holds, which source
+# episodes contributed it (``replica_fact_sources``: kind, fact id, column,
+# item, episode; NULL is the owner), computed on the hub from 0047's
+# ``fact_claims`` in the same snapshot as the row, and carried through every
+# import path. Each contributor's identities go through the source fence with
+# the anchors' (``replica_anchor_sources``). A field is kept only while one
+# of its contributors is the owner or an admitted episode whose identities the
+# replica holds; otherwise it is hidden locally (a text the replica cannot
+# support takes its row out, a restatement or rationale becomes NULL, a PR
+# number or ref drops out). The hub is unchanged. A later registry change
+# re-fences exactly the facts its refused episodes contributed to.
+#
+# Coverage marker per fact (column ``*``): ``claims`` (read from a 0047 hub
+# with live claims), ``none`` (a hub without fact provenance, or a retired
+# fact: its anchor fence hides it), ``stripped`` (provenance unknown, fenced
+# closed). No marker means unknown: a replica file written before this code.
+# Column ``~`` marks a fact whose wording the fence changed, so its vector is
+# refused until the hub's next copy (the vector holds the hidden words).
+
+_SOURCES_TABLE = "replica_fact_sources"
+_INDEX_TABLE = "replica_source_index"
+_APPLIED_TABLE = "replica_fence_applied"
+_INDEX_KEY = "fence_index_complete"
+_SOURCE_TABLES = {"commitment": "commitments", "decision": "decisions", "deliverable": "deliverables"}
+_COVER, _ALTERED = "*", "~"
+_SCRUB_BATCH = 500
+
+
+def _ensure_fence_tables(con: sqlite3.Connection) -> None:
+    """The fence's own tables: anchor identities, fact contributors, the
+    identity index (``tag_hash`` of each identity tag, episode) and the
+    registry entries already applied to this replica."""
+    _ensure_anchor_table(con)
+    con.execute(f"CREATE TABLE IF NOT EXISTS {_SOURCES_TABLE} (kind TEXT NOT NULL, fact_id INTEGER NOT NULL, "
+                "col TEXT NOT NULL, item TEXT NOT NULL, episode_id INTEGER)")
+    con.execute(f"CREATE INDEX IF NOT EXISTS {_SOURCES_TABLE}_fact ON {_SOURCES_TABLE} (kind, fact_id)")
+    con.execute(f"CREATE INDEX IF NOT EXISTS {_SOURCES_TABLE}_episode ON {_SOURCES_TABLE} (episode_id)")
+    con.execute(f"CREATE TABLE IF NOT EXISTS {_INDEX_TABLE} (tag_hash INTEGER NOT NULL, "
+                "episode_id INTEGER NOT NULL, PRIMARY KEY (tag_hash, episode_id)) WITHOUT ROWID")
+    con.execute(f"CREATE TABLE IF NOT EXISTS {_APPLIED_TABLE} (tag_hash INTEGER PRIMARY KEY) WITHOUT ROWID")
+
+
+def _tag_hash(tag: str) -> int:
+    return int.from_bytes(hashlib.sha256(tag.encode("utf-8", "surrogatepass")).digest()[:8], "big", signed=True)
+
+
+def _index_identities(con: sqlite3.Connection, episode_id: int, identities: Iterable[str]) -> None:
+    con.executemany(f"INSERT OR IGNORE INTO {_INDEX_TABLE} (tag_hash, episode_id) VALUES (?, ?)",
+                    [(_tag_hash(t), int(episode_id)) for t in identities])
+
+
+def _registry_tags(gate: Any) -> set[str]:
+    """Every registry entry as a tag: identities, and forgotten episode ids."""
+    return set(gate.tags) | {f"e:{int(i)}" for i in gate.episode_ids}
+
+
+def _fact_source_sql(kind: str, filtered: bool) -> str:
+    """Per fact of ``kind``: its coverage marker and, for each projected
+    field value, the live claimants holding exactly that value (section 3.2:
+    the projection shows only live and owner claims)."""
+    table = _SOURCE_TABLES[kind]
+    live = ("SELECT fc.fact_id, fc.field, fc.value, fc.episode_id FROM fact_claims fc "
+            "LEFT JOIN episodes e ON e.id = fc.episode_id WHERE fc.kind = %(kind)s "
+            + ("AND fc.fact_id = ANY(%(ids)s) " if filtered else "")
+            + "AND ((fc.claimant = 'episode' AND e.id IS NOT NULL AND e.deleted_at IS NULL) "
+              "OR fc.claimant = 'owner')")
+    join = f"FROM {table} f JOIN live l ON l.fact_id = f.id AND "
+    parts = ["SELECT DISTINCT l.fact_id, '*', 'claims', NULL::bigint FROM live l"]
+    if kind == "commitment":
+        parts += [
+            f"SELECT f.id, 'text', '', l.episode_id {join}l.field IN ('text', 'restatement') AND l.value = f.text",
+            f"SELECT f.id, 'latest_text', '', l.episode_id {join}l.field = 'restatement' "
+            "AND l.value = f.latest_text",
+            f"SELECT f.id, 'prs', l.value, l.episode_id {join}l.field = 'pr' AND l.value ~ '^[0-9]{{1,9}}$' "
+            "AND l.value::integer = ANY(f.prs)",
+            f"SELECT f.id, 'refs', l.value, l.episode_id {join}l.field = 'pr_ref' "
+            "AND jsonb_typeof(f.pr_check->'refs') = 'array' AND (f.pr_check->'refs') ? l.value",
+        ]
+    elif kind == "decision":
+        parts += [
+            f"SELECT f.id, 'text', '', l.episode_id {join}l.field = 'text' AND l.value = f.text",
+            f"SELECT f.id, 'rationale', '', l.episode_id {join}l.field = 'rationale' AND l.value = f.rationale",
+            f"SELECT f.id, 'evidence', '', l.episode_id {join}l.field = 'evidence' AND f.evidence IS NOT NULL "
+            "AND l.value::jsonb = f.evidence",
+        ]
+    else:
+        parts += [f"SELECT f.id, 'title', '', l.episode_id {join}l.field IN ('title', 'support') "
+                  "AND l.value = f.title"]
+    return f"WITH live AS ({live}) " + " UNION ALL ".join(parts)
+
+
+def read_fact_sources(cur, kind: str, ids: Iterable[int] | None = None
+                      ) -> dict[int, list[tuple[str, str, int | None]]] | None:
+    """The contributors of each ``kind`` fact (``ids``, or all of them), read
+    on ``cur`` (so in its snapshot), for the replica: ``{id: [(column, item,
+    episode_id or None for the owner), ...]}``, the coverage marker
+    included. A fact with no live claim is left out (it is retired; its
+    anchor fence hides it). ``None`` on a hub without fact provenance."""
+    if not {"kind", "fact_id", "field", "value", "claimant", "episode_id"} <= _pg_columns(cur, "fact_claims"):
+        return None
+    out: dict[int, list[tuple[str, str, int | None]]] = {}
+    batches: Iterable[Any] = [None] if ids is None else _chunks(sorted({int(i) for i in ids}))
+    for part in batches:
+        if part is not None and not part:
+            continue
+        cur.execute(_fact_source_sql(kind, part is not None), {"kind": kind, "ids": part})
+        for fid, col, item, eid in cur.fetchall():
+            out.setdefault(int(fid), []).append((str(col), str(item), None if eid is None else int(eid)))
+    return out
+
+
+def fact_source_episodes(*sources: Mapping[int, Sequence[tuple[str, str, int | None]]] | None) -> set[int]:
+    """Every contributing episode named in ``sources``."""
+    return {int(e) for got in sources for rows in (got or {}).values() for _c, _i, e in rows if e is not None}
+
+
+def _store_fact_sources(con: sqlite3.Connection, kind: str, ids: Iterable[int], sources: Any) -> None:
+    """Keep ``sources`` (``read_fact_sources``) for the written ``ids``,
+    replacing what the replica held for them. ``None``: the hub has no fact
+    provenance. ``_UNKNOWN``: the writer read none; nothing is changed."""
+    if sources is _UNKNOWN:
+        return
+    _ensure_fence_tables(con)
+    want = sorted({int(i) for i in ids})
+    for part in _chunks(want):
+        con.execute(f"DELETE FROM {_SOURCES_TABLE} WHERE kind = ? AND fact_id IN ({', '.join('?' * len(part))})",
+                    [kind, *part])
+    rows: list[tuple[Any, ...]] = []
+    for fid in want:
+        got = (sources or {}).get(fid)
+        if not got:
+            rows.append((kind, fid, _COVER, "none", None))
+            continue
+        rows.extend((kind, fid, col, item, eid) for col, item, eid in got)
+    con.executemany(f"INSERT INTO {_SOURCES_TABLE} (kind, fact_id, col, item, episode_id) VALUES (?, ?, ?, ?, ?)",
+                    rows)
+
+
+def _json_list_value(text: Any) -> list[Any] | None:
+    if text is None:
+        return None
+    try:
+        value = json.loads(text) if isinstance(text, str) else text
+    except ValueError:
+        return None
+    return value if isinstance(value, list) else None
+
+
+_FENCE_SETS = {
+    ("commitment", "latest_text"): "UPDATE commitments SET latest_text = ? WHERE id = ?",
+    ("commitment", "prs"): "UPDATE commitments SET prs = ? WHERE id = ?",
+    ("commitment", "pr_check"): "UPDATE commitments SET pr_check = ? WHERE id = ?",
+    ("decision", "rationale"): "UPDATE decisions SET rationale = ? WHERE id = ?",
+    ("decision", "evidence"): "UPDATE decisions SET evidence = ? WHERE id = ?",
+}
+
+
+def _set_fact_fields(con: sqlite3.Connection, kind: str, fact_id: int, sets: Mapping[str, Any]) -> None:
+    """The fence's only field writes: wording columns, never status or owner."""
+    for col, value in sets.items():
+        con.execute(_FENCE_SETS[(kind, col)], (value, fact_id))
+
+
+def _fence_fact_wording(con: sqlite3.Connection, fence: Any, kind: str, ids: Iterable[int] | None = None,
+                        *, strip_unknown: bool = False) -> int:
+    """Hide each field of the ``kind`` facts (``ids``, or all held) that no
+    admitted contributor supports (see the section comment above). A
+    contributor counts when it is the owner, or an episode the fence admits
+    whose identities the replica holds (a live episode row, or kept
+    identities): one the replica cannot check never supports a value.
+    ``strip_unknown``: a commitment of unknown provenance (a replica file
+    from before this code) keeps only what its anchor itself supports, its
+    text; its restatement and PR values are hidden until the hub's next copy.
+    Decisions and deliverables show only their anchor's own words (3.2), so
+    the anchor fence is exact for them when provenance is unknown. Returns
+    how many facts changed."""
+    table = _SOURCE_TABLES[kind]
+    have = _snapshot_table_columns(con, table)
+    if "id" not in have or not _snapshot_table_columns(con, _SOURCES_TABLE):
+        return 0
+    if ids is None:
+        want = [int(r[0]) for r in con.execute(f"SELECT id FROM {table} ORDER BY id")]
+    else:
+        want = sorted({int(i) for i in ids})
+    ep_cols = _snapshot_table_columns(con, "episodes")
+    live_sql = " AND deleted_at IS NULL" if "deleted_at" in ep_cols else ""
+    has_vectors = {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings")
+    vector_kind = {"commitment": "commitment"}.get(kind)
+    changed = 0
+    for part in _chunks(want):
+        marks = ", ".join("?" * len(part))
+        srcs: dict[int, dict[str, dict[str, list[int | None]]]] = {}
+        for fid, col, item, eid in con.execute(
+                f"SELECT fact_id, col, item, episode_id FROM {_SOURCES_TABLE} "
+                f"WHERE kind = ? AND fact_id IN ({marks})", [kind, *part]):
+            srcs.setdefault(int(fid), {}).setdefault(col, {}).setdefault(str(item), []).append(eid)
+        eids = sorted({int(e) for cols in srcs.values() for c, items in cols.items() if c not in (_COVER, _ALTERED)
+                       for es in items.values() for e in es if e is not None})
+        verified: set[int] = set(_stored_anchor_identities(con, eids))
+        if "id" in ep_cols:
+            for epart in _chunks(eids):
+                verified |= {int(r[0]) for r in con.execute(
+                    f"SELECT id FROM episodes WHERE id IN ({', '.join('?' * len(epart))}){live_sql}", epart)}
+
+        def ok(fid: int, col: str, item: str = "") -> bool:
+            return any(e is None or (int(e) in verified and fence.admits(int(e)))
+                       for e in srcs.get(fid, {}).get(col, {}).get(item, ()))
+
+        def mark(fid: int, *extra: tuple[str, str]) -> None:
+            con.executemany(f"INSERT INTO {_SOURCES_TABLE} (kind, fact_id, col, item, episode_id) "
+                            "VALUES (?, ?, ?, ?, NULL)", [(kind, fid, c, i) for c, i in ((_ALTERED, ""), *extra)])
+
+        cols = [c for c in {"commitment": ("id", "text", "latest_text", "prs", "pr_check"),
+                            "decision": ("id", "text", "rationale", "evidence"),
+                            "deliverable": ("id", "title")}[kind] if c in have]
+        for values in con.execute(f"SELECT {', '.join(cols)} FROM {table} WHERE id IN ({marks})", part).fetchall():
+            row = dict(zip(cols, values))
+            fid = int(row["id"])
+            cover = set(srcs.get(fid, {}).get(_COVER, {}))
+            if "claims" not in cover:
+                if kind != "commitment" or cover or not strip_unknown:
+                    continue
+                # Unknown provenance: only the anchor's own text is kept.
+                sets = {}
+                if row.get("latest_text") is not None:
+                    sets["latest_text"] = None
+                if _json_list_value(row.get("prs")):
+                    sets["prs"] = "[]"
+                try:
+                    pr_check = json.loads(row["pr_check"]) if isinstance(row.get("pr_check"), str) else None
+                except ValueError:
+                    pr_check = None
+                if isinstance(pr_check, dict) and pr_check.get("refs"):
+                    pr_check.pop("refs")
+                    sets["pr_check"] = json.dumps(pr_check)
+                mark(fid, (_COVER, "stripped"))
+                if sets:
+                    _set_fact_fields(con, kind, fid, sets)
+                    if has_vectors:
+                        con.execute("DELETE FROM memory_embeddings WHERE kind = 'commitment' AND ref = ?",
+                                    (str(fid),))
+                    changed += 1
+                continue
+            main = "title" if kind == "deliverable" else "text"
+            if row.get(main) is not None and not ok(fid, main):
+                con.execute({"commitment": "DELETE FROM commitments WHERE id = ?",
+                             "decision": "DELETE FROM decisions WHERE id = ?",
+                             "deliverable": "DELETE FROM deliverables WHERE id = ?"}[kind], (fid,))
+                if has_vectors and vector_kind:
+                    con.execute("DELETE FROM memory_embeddings WHERE kind = ? AND ref = ?", (vector_kind, str(fid)))
+                changed += 1
+                continue
+            sets = {}
+            if kind == "commitment":
+                if row.get("latest_text") is not None and not ok(fid, "latest_text"):
+                    sets["latest_text"] = None
+                prs = _json_list_value(row.get("prs"))
+                if prs:
+                    keep = [n for n in prs if ok(fid, "prs", str(n))]
+                    if keep != prs:
+                        sets["prs"] = json.dumps(keep)
+                try:
+                    pr_check = json.loads(row["pr_check"]) if isinstance(row.get("pr_check"), str) else None
+                except ValueError:
+                    pr_check = None
+                refs = pr_check.get("refs") if isinstance(pr_check, dict) else None
+                if isinstance(refs, list) and refs:
+                    keep_refs = [r for r in refs if ok(fid, "refs", str(r))]
+                    if keep_refs != refs:
+                        if keep_refs:
+                            pr_check["refs"] = keep_refs
+                        else:
+                            pr_check.pop("refs")
+                        sets["pr_check"] = json.dumps(pr_check)
+            elif kind == "decision":
+                for col in ("rationale", "evidence"):
+                    if row.get(col) is not None and not ok(fid, col):
+                        sets[col] = None
+            if sets:
+                _set_fact_fields(con, kind, fid, sets)
+                if has_vectors and vector_kind:
+                    con.execute("DELETE FROM memory_embeddings WHERE kind = ? AND ref = ?", (vector_kind, str(fid)))
+                mark(fid)
+                changed += 1
+    return changed
+
+
+def _facts_sourced_by(con: sqlite3.Connection, episode_ids: Iterable[int]) -> dict[str, list[int]]:
+    """The facts, by kind, that any of ``episode_ids`` contributed to."""
+    want = sorted({int(i) for i in episode_ids})
+    out: dict[str, set[int]] = {}
+    if not want or not _snapshot_table_columns(con, _SOURCES_TABLE):
+        return {}
+    for part in _chunks(want):
+        for kind, fid in con.execute(f"SELECT DISTINCT kind, fact_id FROM {_SOURCES_TABLE} "
+                                     f"WHERE episode_id IN ({', '.join('?' * len(part))})", part):
+            out.setdefault(str(kind), set()).add(int(fid))
+    return {k: sorted(v) for k, v in out.items()}
+
+
 class _SourceFence:
     """One replica write's source fence: the registry snapshot its gate
     holds, the episode ids refused so far, and the connection it guards."""
 
     def __init__(self, con: sqlite3.Connection, gate: Any, path: Path):
         self.con, self.gate, self.path = con, gate, path
-        _ensure_anchor_table(con)
+        _ensure_fence_tables(con)
         self.rejected = _rejected_episode_ids(con)
         self.unverified: set[int] = set()
         self.scrubbed = 0
@@ -1433,14 +1761,16 @@ class _SourceFence:
 
     def start(self, *, scrub: bool = False) -> None:
         """Re-fence what is already written when the registry changed since
-        the last fenced write (or always, for a dump or an import)."""
+        the last fenced write: only the rows the new registry entries name,
+        through the replica's identity index (third Astra review #5). A dump,
+        an import or an explicit scrub checks the whole replica."""
         if scrub:
             _apply_pending_erasures(self.con, self.path)
         if scrub or (not self.gate.empty and self._meta() != self.gate.digest):
-            self.scrub()
+            self.scrub(full=scrub)
 
-    def scrub(self) -> None:
-        self.scrubbed += _scrub_forgotten(self.con, self.gate)
+    def scrub(self, *, full: bool = True) -> None:
+        self.scrubbed += _scrub_forgotten(self.con, _ScrubGate(self.gate, self, full))
         self.rejected |= _rejected_episode_ids(self.con)
 
     def check(self, anchors: Mapping[Any, Any], digests: Mapping[int, str] | None = None) -> set[int]:
@@ -1466,6 +1796,8 @@ class _SourceFence:
                 f"ON CONFLICT(episode_id) DO UPDATE SET identities = excluded.identities, "
                 f"digest = COALESCE(excluded.digest, {_ANCHOR_TABLE}.digest)",
                 (eid, (digests or {}).get(eid), json.dumps(sorted(resolved[eid]))))
+            # The index a later registry change is looked up in.
+            _index_identities(self.con, eid, resolved[eid])
         refused = _registry_rejected_anchors(resolved, self.rejected, gate=self.gate)
         self.refuse(refused)
         return refused
@@ -1482,6 +1814,9 @@ class _SourceFence:
                 for part in _chunks(ids):
                     self.con.execute(f"DELETE FROM decisions WHERE episode_id IN ({', '.join('?' * len(part))})",
                                      part)
+            # What the refused episodes contributed to other episodes' facts.
+            for kind, fids in _facts_sourced_by(self.con, ids).items():
+                _fence_fact_wording(self.con, self, kind, fids)
 
     def admits(self, episode_id: Any) -> bool:
         if episode_id is None:
@@ -1498,7 +1833,7 @@ class _SourceFence:
         current = read_gate()
         if current.digest != self.gate.digest:
             self.gate = current
-            self.scrub()
+            self.scrub(full=False)
         if _snapshot_table_columns(self.con, "snapshot_meta"):
             self.con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, ?)",
                              (_FENCE_DIGEST_KEY, self.gate.digest))
@@ -1624,12 +1959,15 @@ def _read_fact_rows(cur, ids: Mapping[str, Sequence[int]]) -> dict[str, Any]:
             found.extend(dict(zip(cols, r)) for r in cur.fetchall())
         out[table] = found
         out[f"{table}_gone"] = sorted(set(want) - {int(r["id"]) for r in found})
-    # Every source identity of each row's anchor episode, read in the same
-    # snapshot, for the replica's source fence: held or not, a held copy is
-    # never proof (Astra reviews 2026-10-23, #1 of each).
+    # Each row's contributors (third Astra review #1), and every source
+    # identity of each row's anchor and contributor episodes, read in the
+    # same snapshot, for the replica's source fence: held or not, a held
+    # copy is never proof (Astra reviews 2026-10-23, #1 of each).
+    out["sources"] = {kind: read_fact_sources(cur, kind, [int(r["id"]) for r in out[table]])
+                      for kind, table in (("decision", "decisions"), ("deliverable", "deliverables"))}
     out["anchors"] = read_anchor_identities(
         cur, {int(r["episode_id"]) for t in ("decisions", "deliverables") for r in out[t]
-              if r.get("episode_id") is not None})
+              if r.get("episode_id") is not None} | fact_source_episodes(*out["sources"].values()))
     return out
 
 
@@ -1673,11 +2011,14 @@ def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any],
     if _snapshot_table_columns(con, "decisions"):
         for part in _chunks(list(stream.get("decisions_gone") or ())):
             con.execute(f"DELETE FROM decisions WHERE id IN ({', '.join('?' * len(part))})", part)
-        decisions_written = _write_decision_rows(con, stream.get("decisions") or (), fence=fence) or 0
+        decisions_written = _write_decision_rows(
+            con, stream.get("decisions") or (), fence=fence,
+            sources=(stream.get("sources") or {}).get("decision", _UNKNOWN)) or 0
     if set(_DELIVERABLE_COLS) <= _snapshot_table_columns(con, "deliverables"):
         for part in _chunks(list(stream.get("deliverables_gone") or ())):
             con.execute(f"DELETE FROM deliverables WHERE id IN ({', '.join('?' * len(part))})", part)
         sel = ", ".join(_DELIVERABLE_COLS)
+        written: list[int] = []
         for row in stream.get("deliverables") or ():
             if not fence.admits(row.get("episode_id")):
                 con.execute("DELETE FROM deliverables WHERE id = ?", (row["id"],))
@@ -1685,7 +2026,11 @@ def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any],
             con.execute(
                 f"INSERT OR REPLACE INTO deliverables ({sel}) VALUES ({', '.join('?' * len(_DELIVERABLE_COLS))})",
                 [_ts_text(row.get(c)) if c == "created_at" else row.get(c) for c in _DELIVERABLE_COLS])
+            written.append(int(row["id"]))
             deliverables_written += 1
+        _store_fact_sources(con, "deliverable", written,
+                            (stream.get("sources") or {}).get("deliverable", _UNKNOWN))
+        _fence_fact_wording(con, fence, "deliverable", written)
     if _snapshot_table_columns(con, "snapshot_meta"):
         con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, ?)",
                     (_FACT_CURSOR_KEY, str(max(xmin, held or 0))))
@@ -1787,6 +2132,9 @@ def apply_fact_rows(cur, facts: Iterable[tuple[str, int]]) -> dict[str, Any]:
 # catch up (the live hub took about 900 episodes in a day, 2026-10-15), and a
 # bounded pull is one that cannot hold the refresh lock for long.
 PULL_LIMIT = 2000
+# How long a live replica patch (a capture's, an outbox replay's) waits for
+# another replica write before it is deferred to the next pull.
+LIVE_PATCH_WAIT_S = float(os.environ.get("KHIPU_LIVE_PATCH_WAIT_S", "2"))
 _PULL_BATCH = 100
 
 
@@ -1999,7 +2347,11 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
             cur.execute("SELECT slug FROM topics WHERE slug = ANY(%s)", (batch,))
             topic_purges.update(set(batch) - {r[0] for r in cur.fetchall()})
     commitments = _hub_commitments(cur)
-    commitment_anchors = _commitment_anchors(cur, commitments)
+    # The commitments' contributors, beyond their anchors (third Astra
+    # review #1), read in this snapshot and fenced with them.
+    commitment_sources = read_fact_sources(cur, "commitment") if commitments is not None else _UNKNOWN
+    commitment_anchors = _commitment_anchors(
+        cur, commitments, fact_source_episodes(None if commitment_sources is _UNKNOWN else commitment_sources))
     aliases = _hub_project_aliases(cur)
     if max(len(fresh), len(gone), len(groups), len(topic_rows or ()) + len(topic_purges)) > limit:
         return _pull_needs_dump(limit)
@@ -2079,13 +2431,16 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
                 for r in cur.fetchall():
                     row = dict(zip(_DELIVERABLE_COLS, r))
                     deliv.setdefault(int(row["episode_id"]), []).append(row)
+                deliv_sources = read_fact_sources(
+                    cur, "deliverable", [int(r["id"]) for rows in deliv.values() for r in rows])
         for eid in batch:
             row = changed[eid]
             tomb = row.get("deleted_at") is not None
             out = upsert_episode(row, [] if tomb else vecs.get(eid, []),
                                  deliverable_rows=None if tomb or not has_deliv else deliv.get(eid, []),
                                  read_at=read_at, fact_xmin=facts.get("xmin"),
-                                 receipts=receipts.get(eid, ()))
+                                 receipts=receipts.get(eid, ()),
+                                 deliverable_sources=deliv_sources if has_deliv and alive else _UNKNOWN)
             error = str(out.get("error") or "")
             if not out.get("ok") and tomb and "forgotten source" in error:
                 # The fence refuses a forgotten source's row, tombstone
@@ -2100,7 +2455,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
                 live_count += not tomb
             elif "forgotten source" in error:
                 forgotten += 1
-            elif "in progress" in error:
+            elif "in progress" in error or out.get("deferred"):
                 return {"ok": False, "error": "hub snapshot refresh in progress"}
             else:
                 return {"ok": False, "error": error or "episode write refused"}
@@ -2133,7 +2488,8 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
     parts = _write_pulled_tables(topic_rows, commitments, aliases, read_at=read_at,
                                 topic_purges=topic_purges, purge_hub_at=hub_now,
                                 facts=None if facts.get("not_applicable") else facts,
-                                commitment_anchors=commitment_anchors)
+                                commitment_anchors=commitment_anchors,
+                                commitment_sources=commitment_sources)
     if ledger_payload is not None and not ledger_payload.get("ok"):
         parts["ledger"] = ledger_payload
     else:
@@ -2171,6 +2527,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                          purge_hub_at: datetime | None = None,
                          facts: Mapping[str, Any] | None = None,
                          commitment_anchors: tuple[Mapping[int, Any], Mapping[int, str]] | None = None,
+                         commitment_sources: Any = _UNKNOWN,
                          ) -> dict[str, dict[str, Any]]:
     """The pull's topic bodies and commitments, under the refresh lock, in one
     transaction. Each part's result by name; a part the hub or this replica
@@ -2188,8 +2545,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     ``purge_hub_at`` is the hub's clock in that transaction, recorded in
     each purge marker. ``facts``: a fact-stream read (0047), applied as
     the ``facts`` part in the same transaction; ``None`` on an older hub.
-    ``commitment_anchors``: ``_commitment_anchors`` for the commitments.
-    One fenced write (``_replica_write_gate``) for all of it."""
+    ``commitment_anchors``: ``_commitment_anchors`` for the commitments,
+    their contributors included; ``commitment_sources``: their
+    ``read_fact_sources``. One fenced write (``_replica_write_gate``) for all of it."""
     parts: dict[str, dict[str, Any]] = {}
     path = snapshot_path()
     con = sqlite3.connect(str(path))
@@ -2289,8 +2647,11 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     anchors, digests = commitment_anchors or ({}, {})
                     fence.check(anchors, digests)
                     con.execute("DELETE FROM commitments")
+                    # The whole table is replaced, its contributors with it.
+                    con.execute(f"DELETE FROM {_SOURCES_TABLE} WHERE kind = 'commitment'")
                     parts["commitments"] = {"ok": True,
-                                            "commitments": _write_commitment_rows(con, cols, rows, fence)}
+                                            "commitments": _write_commitment_rows(con, cols, rows, fence,
+                                                                                  commitment_sources)}
                     # A commitment gone from the hub (its episode forgotten)
                     # must not leave its vector, and its text, behind.
                     if {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings") and "id" in cols:
@@ -3168,6 +3529,18 @@ def _insert_anchor_receipts(cur, con: sqlite3.Connection) -> None:
                     (int(eid), json.dumps(tags)))
 
 
+def _insert_fact_sources(cur, con: sqlite3.Connection) -> None:
+    """The dump's fact contributors (``read_fact_sources``) for every
+    commitment, decision and deliverable it holds, from the same snapshot
+    (third Astra review #1); the dump's scrub fences them."""
+    for kind, table in _SOURCE_TABLES.items():
+        if "id" not in _snapshot_table_columns(con, table):
+            continue
+        ids = [int(r[0]) for r in con.execute(f"SELECT id FROM {table}")]
+        if ids:
+            _store_fact_sources(con, kind, ids, read_fact_sources(cur, kind))
+
+
 def _insert_topics(cur, con: sqlite3.Connection) -> int:
     cols = [c for c in _TOPIC_COLS if c in _pg_columns(cur, "topics")]
     sel = ", ".join(cols)
@@ -3475,14 +3848,16 @@ def _add_commitment_close_cols(con: sqlite3.Connection) -> None:
 
 
 def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: Sequence[Any],
-                           fence: _SourceFence | None = None) -> int:
+                           fence: _SourceFence | None = None, sources: Any = _UNKNOWN) -> int:
     """Insert hub commitment rows (``cols`` order) into ``con``. A replica of
     an older version first gains the owner's lineage and close-rule columns,
     so its owners and owed filters match the hub's. Other missing columns
     are left out. Caller clears the
     table first and commits. Every import passes the ``fence`` of its
     ``_replica_write_gate``, which already checked the opening episodes;
-    without one only ids already refused are left out."""
+    without one only ids already refused are left out. ``sources``: the
+    rows' contributors (``read_fact_sources``), kept and fenced with them
+    when a fence is given (third Astra review #1)."""
     _add_commitment_lineage_cols(con)
     _add_commitment_close_cols(con)
     have = _snapshot_table_columns(con, "commitments")
@@ -3491,7 +3866,9 @@ def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: S
     ts_cols = {"opened_at", "due_after", "closed_at", "last_seen_at", "owner_reassigned_at"}
     rejected = _rejected_episode_ids(con) if fence is None else set()
     episode_at = list(cols).index("opened_episode") if "opened_episode" in cols else None
+    id_at = list(cols).index("id") if "id" in cols else None
     written = 0
+    written_ids: list[int] = []
     for row in rows:
         if episode_at is not None and (row[episode_at] in rejected if fence is None
                                        else not fence.admits(row[episode_at])):
@@ -3511,6 +3888,11 @@ def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: S
             vals,
         )
         written += 1
+        if id_at is not None:
+            written_ids.append(int(row[id_at]))
+    if fence is not None:
+        _store_fact_sources(con, "commitment", written_ids, sources)
+        _fence_fact_wording(con, fence, "commitment", written_ids)
     return written
 
 
@@ -3588,6 +3970,7 @@ def _refresh_locked() -> dict[str, Any]:
                     counts["decisions"] = _insert_decisions(cur, con)
                     counts["deliverables"] = _insert_deliverables(cur, con)
                     counts["commitments"] = _insert_commitments(cur, con)
+                    _insert_fact_sources(cur, con)
                     counts["project_aliases"] = _insert_project_aliases(cur, con)
                     counts["ledger_rows"] = _insert_ledger(cur, con)
             refreshed_at = _utcnow_iso()
@@ -3780,15 +4163,20 @@ def _release_refresh_lock(lock) -> None:
 
 
 def _write_deliverable_rows(
-    con: sqlite3.Connection, episode_id: Any, rows: Sequence[Mapping[str, Any]]
+    con: sqlite3.Connection, episode_id: Any, rows: Sequence[Mapping[str, Any]],
+    fence: _SourceFence | None = None, sources: Any = _UNKNOWN,
 ) -> None:
     """Replace one episode's deliverables on ``con``. A no-op when this
     replica has no (or a partial) ``deliverables`` table, so an older dump is
-    left exactly as it was. Caller holds the refresh lock and commits."""
+    left exactly as it was. Caller holds the refresh lock and commits.
+    ``sources``: the rows' contributors, kept and fenced with them when a
+    ``fence`` is given (third Astra review #1)."""
     if not set(_DELIVERABLE_COLS) <= _snapshot_table_columns(con, "deliverables"):
         return
     con.execute("DELETE FROM deliverables WHERE episode_id = ?", (episode_id,))
     sel = ", ".join(_DELIVERABLE_COLS)
+    if fence is not None:
+        ids = [int(r["id"]) for r in rows if r.get("id") is not None]
     for row in rows:
         vals = [
             _ts_text(row.get(c)) if c == "created_at" else row.get(c)
@@ -3799,6 +4187,9 @@ def _write_deliverable_rows(
             f"VALUES ({', '.join('?' * len(_DELIVERABLE_COLS))})",
             vals,
         )
+    if fence is not None:
+        _store_fact_sources(con, "deliverable", ids, sources)
+        _fence_fact_wording(con, fence, "deliverable", ids)
     _advance_cursor(
         con, "deliverables", synced_at=_utcnow_iso(),
         newest=_newest_ts(r.get("created_at") for r in rows),
@@ -3897,41 +4288,119 @@ def _tombstone_payloads_for_episode(episode_row: Mapping[str, Any]) -> list[dict
     return payloads
 
 
+class _ScrubGate:
+    """The registry snapshot one scrub checks against, with the fence it
+    runs in and whether it reads the whole replica (``_scrub_forgotten``)."""
+
+    def __init__(self, gate: Any, fence: Any, full: bool):
+        self._gate, self.fence, self.full = gate, fence, full
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._gate, name)
+
+
 def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
     """Erase every live replica episode whose source the gate refuses, with
-    its vectors, commitments, decisions and deliverables. The hub can hold
-    a forgotten source under another id (written before the forget, or by a
-    Mac that never saw it), and a dump must not carry it into this replica.
-    Rows already marked forgotten keep their tombstone. A live row whose id
-    the registry records as forgotten is refused too: a backup can hold that
-    episode under an older raw that no source identity matches.
+    its vectors, commitments, decisions and deliverables, and hide what it
+    contributed to other episodes' facts (``_fence_fact_wording``). The hub
+    can hold a forgotten source under another id (written before the
+    forget, or by a Mac that never saw it), and a dump must not carry it
+    into this replica. Rows already marked forgotten keep their tombstone.
+    A live row whose id the registry records as forgotten is refused too: a
+    backup can hold that episode under an older raw that no source identity
+    matches.
 
-    The source fence's whole-replica check: every source identity a row
-    represents counts (its merged captures and receipts too,
-    ``_anchor_identities``), with the identities kept for it when it was
-    an anchor (``replica_anchor_sources``). An anchor the replica never
-    held as an episode is refused the same way, and its derivative rows
-    are erased by id. ``RegistryError`` propagates. Caller commits."""
+    The source fence's check: every source identity a row represents counts
+    (its merged captures and receipts too, ``_anchor_identities``), with the
+    identities kept for it when it was an anchor or a contributor
+    (``replica_anchor_sources``). An anchor the replica never held as an
+    episode is refused the same way, and its derivative rows are erased by
+    id. ``gate.full`` (a ``_ScrubGate``: a dump, an import, an explicit
+    scrub; or a replica whose identity index is not complete) reads every episode in batches of
+    ``_SCRUB_BATCH``, never all at once, and rebuilds the index of every
+    identity tag to its episodes. Otherwise only the registry entries not
+    yet applied here are looked up in that index, and only the episodes
+    they name are read (third Astra review #5). ``RegistryError``
+    propagates. Caller commits."""
+    fence, full = getattr(gate, "fence", None), getattr(gate, "full", True)
     cols = _snapshot_table_columns(con, "episodes")
     if "id" not in cols or gate.empty:
         return 0
-    stored = _stored_anchor_identities(con)
-    held = {int(r[0]) for r in con.execute("SELECT id FROM episodes")}
-    live = " WHERE deleted_at IS NULL" if "deleted_at" in cols else ""
-    cursor = con.execute(f"SELECT * FROM episodes{live}")
-    names = [d[0] for d in cursor.description]
-    refused = []
+    _ensure_fence_tables(con)
+    meta = bool(_snapshot_table_columns(con, "snapshot_meta"))
+    if not full and not (meta and con.execute("SELECT 1 FROM snapshot_meta WHERE key = ? AND value = '1'",
+                                              (_INDEX_KEY,)).fetchone()):
+        full = True
+    live = " AND deleted_at IS NULL" if "deleted_at" in cols else ""
     forgotten_ids = gate.episode_ids
-    for values in cursor.fetchall():
-        row = dict(zip(names, values, strict=True))
-        if row["id"] in forgotten_ids or gate.refuses(
-                _anchor_identities(row) | stored.get(int(row["id"]), frozenset())):
-            refused.append(row["id"])
     pending = _pending_erasure_ids()
-    unheld = sorted(eid for eid, ids in stored.items()
-                    if eid not in held and eid not in pending
-                    and (eid in forgotten_ids or gate.refuses(ids)))
-    refused.extend(unheld)
+    tags = _registry_tags(gate)
+    refused: list[int] = []
+    if full:
+        last = -(1 << 63)
+        while True:
+            cursor = con.execute(f"SELECT * FROM episodes WHERE id > ?{live} ORDER BY id LIMIT ?",
+                                 (last, _SCRUB_BATCH))
+            names = [d[0] for d in cursor.description]
+            rows = [dict(zip(names, values, strict=True)) for values in cursor.fetchall()]
+            if not rows:
+                break
+            last = rows[-1]["id"]
+            stored = _stored_anchor_identities(con, [int(r["id"]) for r in rows])
+            for row in rows:
+                ids = _anchor_identities(row) | stored.get(int(row["id"]), frozenset())
+                _index_identities(con, int(row["id"]), ids)
+                if row["id"] in forgotten_ids or gate.refuses(ids):
+                    refused.append(int(row["id"]))
+        # Anchors and contributors the replica never held as episodes.
+        last = -(1 << 63)
+        while True:
+            batch = con.execute(
+                f"SELECT a.episode_id, a.identities FROM {_ANCHOR_TABLE} a WHERE a.episode_id > ? "
+                "AND NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id = a.episode_id) "
+                "ORDER BY a.episode_id LIMIT ?", (last, _SCRUB_BATCH)).fetchall()
+            if not batch:
+                break
+            last = batch[-1][0]
+            stored = _stored_anchor_identities(con, [int(r[0]) for r in batch])
+            for eid, ids in stored.items():
+                _index_identities(con, eid, ids)
+                if eid not in pending and (eid in forgotten_ids or gate.refuses(ids)):
+                    refused.append(eid)
+        con.execute(f"DELETE FROM {_APPLIED_TABLE}")
+        if meta:
+            con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, '1')", (_INDEX_KEY,))
+        new = tags
+    else:
+        applied = {int(h) for (h,) in con.execute(f"SELECT tag_hash FROM {_APPLIED_TABLE}")}
+        new = {t for t in tags if _tag_hash(t) not in applied}
+        candidates = {int(t[2:]) for t in new if t.startswith("e:")}
+        hashes = sorted({_tag_hash(t) for t in new if not t.startswith("e:")})
+        for part in _chunks(hashes):
+            candidates |= {int(r[0]) for r in con.execute(
+                f"SELECT DISTINCT episode_id FROM {_INDEX_TABLE} WHERE tag_hash IN ({', '.join('?' * len(part))})",
+                part)}
+        for part in _chunks(sorted(candidates)):
+            cursor = con.execute(f"SELECT * FROM episodes WHERE id IN ({', '.join('?' * len(part))})", part)
+            names = [d[0] for d in cursor.description]
+            held = {int(v[names.index("id")]): dict(zip(names, v, strict=True)) for v in cursor.fetchall()}
+            stored = _stored_anchor_identities(con, part)
+            for eid in part:
+                row = held.get(eid)
+                if row is not None:
+                    if row.get("deleted_at") is not None:
+                        continue
+                    ids = _anchor_identities(row) | stored.get(eid, frozenset())
+                elif eid in pending or eid not in stored:
+                    # Not held and never checked: nothing here to erase
+                    # (the fence refuses that id on any later import).
+                    continue
+                else:
+                    ids = stored[eid]
+                if eid in forgotten_ids or gate.refuses(ids):
+                    refused.append(eid)
+    con.executemany(f"INSERT OR IGNORE INTO {_APPLIED_TABLE} (tag_hash) VALUES (?)",
+                    [(_tag_hash(t),) for t in new])
     has_decisions = "episode_id" in _snapshot_table_columns(con, "decisions")
     has_deliverables = "episode_id" in _snapshot_table_columns(con, "deliverables")
     has_commitments = {"id", "opened_episode"} <= _snapshot_table_columns(con, "commitments")
@@ -3953,6 +4422,18 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
             con.execute("DELETE FROM decisions WHERE episode_id = ?", (eid,))
         if has_deliverables:
             con.execute("DELETE FROM deliverables WHERE episode_id = ?", (eid,))
+    if fence is not None:
+        # What the refused episodes contributed to other episodes' facts. A
+        # whole-replica check re-fences every fact (its contributors may be
+        # refused from an earlier write), and fences closed what has no
+        # recorded provenance.
+        fence.rejected.update(refused)
+        if full:
+            for kind in _SOURCE_TABLES:
+                _fence_fact_wording(con, fence, kind, None, strip_unknown=True)
+        else:
+            for kind, fids in _facts_sourced_by(con, refused).items():
+                _fence_fact_wording(con, fence, kind, fids)
     return len(refused)
 
 
@@ -4033,6 +4514,7 @@ def upsert_episode(
     read_at: float | None = None,
     fact_xmin: int | None = None,
     receipts: Iterable[Sequence[Any]] = (),
+    deliverable_sources: Any = _UNKNOWN,
 ) -> dict[str, Any]:
     """Write-through fenced by the durable forgotten-source registry.
     ``read_at``: when the caller read this row from the hub (``time.time()``),
@@ -4041,16 +4523,23 @@ def upsert_episode(
     ``deliverable_rows``, so they take part in the fact stream's freshness
     rule (``_patch_covers_stream``). ``receipts``: the episode's retained
     source receipts ``(source_key, payload_sha256)``, read with the row, for
-    the source fence (``_anchor_identities``)."""
-    from khipu.tombstones import RegistryError, write_guard
+    the source fence (``_anchor_identities``). ``deliverable_sources``: the
+    contributors of ``deliverable_rows`` (``read_fact_sources``).
+
+    A live patch (``read_at`` None: a capture, an outbox replay) waits at
+    most ``LIVE_PATCH_WAIT_S`` for another replica write; past that it is
+    deferred (queued as a missed patch, which the next pull reads again),
+    so a held replica write never blocks a capture (third Astra review #5)."""
+    from khipu.tombstones import RegistryBusy, RegistryError, lock_wait, write_guard
 
     payloads = _tombstone_payloads_for_episode(episode_row)
+    wait = lock_wait(LIVE_PATCH_WAIT_S) if read_at is None else nullcontext()
     try:
         # The registry lease, kept through the SQLite transaction in
         # _upsert_episode_unfenced, whose source fence checks every identity
         # the row represents. Forget takes it before its replica erase, so a
         # late incremental write cannot restore a source after forget returns.
-        with write_guard(*payloads) as allowed:
+        with wait, write_guard(*payloads) as allowed:
             if not allowed:
                 # A source can first arrive under a new hub id during an
                 # incremental pull. Remember that id before independent
@@ -4061,7 +4550,12 @@ def upsert_episode(
                 return {"ok": False, "error": "forgotten source"}
             return _upsert_episode_unfenced(episode_row, embedding_rows, decision_rows,
                                             deliverable_rows, read_at=read_at, fact_xmin=fact_xmin,
-                                            receipts=receipts)
+                                            receipts=receipts, deliverable_sources=deliverable_sources)
+    except RegistryBusy as exc:
+        eid = episode_row.get("id")
+        if eid is not None:
+            _queue_missed_patch(eid, snapshot_path())
+        return {"ok": False, "deferred": True, "error": f"replica write deferred: {exc}"}
     except RegistryError as exc:
         return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
 
@@ -4075,6 +4569,7 @@ def _upsert_episode_unfenced(
     read_at: float | None = None,
     fact_xmin: int | None = None,
     receipts: Iterable[Sequence[Any]] = (),
+    deliverable_sources: Any = _UNKNOWN,
 ) -> dict[str, Any]:
     """Incremental snapshot update: one episode + its embedding chunks (W2.4),
     plus (Phase 2, session B) any decision rows minted for it in the same
@@ -4205,9 +4700,9 @@ def _upsert_episode_unfenced(
                 # above must still commit regardless.
                 _write_decision_rows(con, decision_rows, fence=fence)
             if merged.get("deleted_at") is not None:
-                _write_deliverable_rows(con, eid, ())
+                _write_deliverable_rows(con, eid, (), fence=fence)
             elif deliverable_rows is not None and _patch_covers_stream(con, fact_xmin):
-                _write_deliverable_rows(con, eid, deliverable_rows)
+                _write_deliverable_rows(con, eid, deliverable_rows, fence=fence, sources=deliverable_sources)
             if not older:
                 _record_read_at(con, "episodes", eid, version)
             now = _utcnow_iso()
@@ -4302,6 +4797,11 @@ def upsert_embeddings(
             if (commitment_refs
                     and {"id", "status", "opened_episode"} <= _snapshot_table_columns(con, "commitments")
                     and {"id", "deleted_at"} <= _snapshot_table_columns(con, "episodes")):
+                # A commitment whose wording the fence changed keeps no
+                # vector: the hub's holds the words it hid.
+                altered = (f" AND NOT EXISTS (SELECT 1 FROM {_SOURCES_TABLE} f WHERE f.kind = 'commitment' "
+                           f"AND f.fact_id = c.id AND f.col = '{_ALTERED}')"
+                           if _snapshot_table_columns(con, _SOURCES_TABLE) else "")
                 for batch in _chunks(commitment_refs):
                     for (cid,) in con.execute(
                             "SELECT c.id FROM commitments c "
@@ -4309,7 +4809,7 @@ def upsert_embeddings(
                             "WHERE c.status = 'open' AND (c.opened_episode IS NULL "
                             "OR (e.id IS NOT NULL AND e.deleted_at IS NULL)) "
                             + forget_fence_sql(con, "c", "opened_episode")
-                            + " "
+                            + altered + " "
                             f"AND CAST(c.id AS TEXT) IN ({', '.join('?' for _ in batch)})", batch):
                         live_commitments.add(str(cid))
             for profile, kind, ref in replace_refs:

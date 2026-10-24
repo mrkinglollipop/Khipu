@@ -45,6 +45,7 @@ MEMORY_WRITERS = {
     "upsert_embeddings": "fenced: vectors, by their episode's identities",
     "refuse": "fenced: the fence's own erasure of a refused anchor",
     "_scrub_forgotten": "fenced: the fence's whole-replica check",
+    "_fence_fact_wording": "fenced: hides a fact's fields no admitted contributor supports",
     "_insert_decisions": "dump builder: a fresh file the dump publishes through the fence",
     "_insert_deliverables": "dump builder",
     "_insert_episodes": "dump builder",
@@ -322,3 +323,111 @@ def test_identities_cover_merged_payloads_and_receipts():
     ids = hs._anchor_identities(row, [("key-1", "sha-1")])
     assert identity_strings(merged, redact=False) <= ids
     assert {"h:abc", "k:key-1", "h:sha-1"} <= ids
+
+
+# ---- contributors: every path, multi-episode facts (third Astra review #1) --------
+
+def test_every_fact_writer_keeps_its_contributors():
+    """Each writer of commitment, decision or deliverable rows keeps the
+    rows' contributors and fences their fields; each hub read that feeds
+    one reads them in its own snapshot, with their identities."""
+    fns = _functions()
+    for writer in ("_write_commitment_rows", "_write_decision_rows", "_apply_fact_stream",
+                   "_write_deliverable_rows", "_insert_fact_sources"):
+        assert "_store_fact_sources" in _called(fns[writer]), writer
+    for writer in ("_write_commitment_rows", "_write_decision_rows", "_apply_fact_stream",
+                   "_write_deliverable_rows", "refuse", "_scrub_forgotten"):
+        assert "_fence_fact_wording" in _called(fns[writer]), writer
+    for reader in ("_read_fact_rows", "_pull_apply", "_insert_fact_sources"):
+        assert "read_fact_sources" in _called(fns[reader]), reader
+    assert "fact_source_episodes" in _called(fns["_read_fact_rows"])
+    assert "fact_source_episodes" in _called(fns["_pull_apply"])
+    assert "_insert_fact_sources" in _called(fns["_refresh_locked"])
+    for caller, writer in (("_write_pulled_tables", "_write_commitment_rows"),
+                           ("_pull_apply", "upsert_episode")):
+        calls = [c for c in ast.walk(fns[caller]) if isinstance(c, ast.Call)
+                 and getattr(c.func, "id", None) == writer]
+        assert calls and all(len(c.args) >= 5 or any(k.arg in ("sources", "deliverable_sources")
+                                                       for k in c.keywords) for c in calls), (caller, writer)
+    for module, needle in (("decisions.py", "read_fact_sources"), ("embed.py", "read_fact_sources")):
+        assert needle in (PACKAGE / module).read_text(encoding="utf-8"), module
+
+
+SHARED_DECISION = "Ship the shared release checklist"
+SHARED_TITLE = "Shared release checklist"
+B_WORDS = "Review the deployment checklist before the release goes out"
+A_WORDS = "Review the deployment checklist before release"
+
+
+def _contributors() -> set[tuple[str, str, int]]:
+    return {(k, c, e) for k, c, e in _replica(
+        "SELECT kind, col, episode_id FROM replica_fact_sources WHERE episode_id IS NOT NULL")}
+
+
+def _patch_with_sources(pg, eid):
+    from khipu import deliverables
+
+    with pg.connect() as conn, conn.cursor() as cur:
+        # As embed_on_capture reads them: the xmin before the rows.
+        fact_xmin = hs._hub_snapshot_xmin(cur)
+        row = cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (eid,)).fetchone()[0]
+        rows = deliverables.deliverables_for_episode(cur, eid)
+        sources = hs.read_fact_sources(cur, "deliverable", [r["id"] for r in rows])
+        receipts = hs._read_receipts(cur, [eid]).get(eid, [])
+        conn.rollback()
+    return hs.upsert_episode(row, [], deliverable_rows=rows, receipts=receipts, fact_xmin=fact_xmin,
+                             deliverable_sources=sources)
+
+
+CONTRIBUTOR_IMPORTS = {
+    "sync_fact_changes": (lambda pg, a: hs.sync_fact_changes(), {"decision", "deliverable"}),
+    "pull_changes": (lambda pg, a: hs.pull_changes(include_ledger=False),
+                     {"commitment", "decision", "deliverable"}),
+    "refresh": (lambda pg, a: hs.refresh(), {"commitment", "decision", "deliverable"}),
+    "apply_fact_rows": (_apply_fact_rows, {"decision", "deliverable"}),
+    "apply_decision_changes": (_decision_mirror, {"decision"}),
+    "upsert_episode": (_patch_with_sources, {"deliverable"}),
+}
+
+
+@pytest.mark.parametrize("path", sorted(CONTRIBUTOR_IMPORTS))
+def test_every_import_path_keeps_and_fences_every_contributor(pg, replica, gate_spy, path):
+    """Two separate live episodes share each fact: B restates A's
+    commitment (its latest_text) and repeats A's decision and deliverable
+    word for word. This Mac has forgotten B's source; the hub is unchanged.
+    Each import path alone records both episodes as the contributors of
+    what it writes, hides B's own words, and keeps A's (which A supports)."""
+    replica(pg)
+    assert hs.refresh()["ok"]
+    a = _capture(loop=A_WORDS, decision=SHARED_DECISION, title=SHARED_TITLE)
+    bpayload = _payload(loop=B_WORDS, decision=SHARED_DECISION, title=SHARED_TITLE)
+    b = capture.write_pg(dict(bpayload))["episode_id"]
+    assert a != b
+    with pg.connect() as conn:
+        assert conn.execute("SELECT opened_episode, latest_text FROM commitments").fetchall() == [(a, B_WORDS)]
+        claimants = {(k, e) for k, e in conn.execute(
+            "SELECT kind, episode_id FROM fact_claims WHERE claimant = 'episode'").fetchall()}
+    assert {("commitment", b), ("decision", b), ("deliverable", b)} <= claimants, claimants
+    tombstones.publish_payloads([bpayload])
+    gate_spy.clear()
+    run, kinds = CONTRIBUTOR_IMPORTS[path]
+    out = run(pg, a)
+    assert out.get("ok", True), out
+    assert gate_spy, f"{path} did not go through _replica_write_gate"
+    found = _contributors()
+    expected = {"commitment": {("commitment", "text", a), ("commitment", "latest_text", b)},
+                "decision": {("decision", "text", a), ("decision", "text", b)},
+                "deliverable": {("deliverable", "title", a), ("deliverable", "title", b)}}
+    for kind in kinds:
+        assert expected[kind] <= found, (path, kind, found)
+    # B's own words never show; A's, which A supports, stay.
+    tables = json.dumps([_replica("SELECT * FROM commitments"), _replica("SELECT * FROM decisions"),
+                         _replica("SELECT * FROM deliverables")])
+    assert B_WORDS not in tables and B_WORDS not in _replica_readers(), path
+    readers = _replica_readers()
+    if "decision" in kinds:
+        assert SHARED_DECISION in readers, path
+    if "deliverable" in kinds:
+        assert SHARED_TITLE in readers, path
+    if "commitment" in kinds:
+        assert A_WORDS in readers, path

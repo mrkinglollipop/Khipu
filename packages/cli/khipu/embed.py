@@ -2153,6 +2153,18 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                     cur.execute("ROLLBACK TO SAVEPOINT embed_receipts")
                     receipts = []
                 cur.execute("RELEASE SAVEPOINT embed_receipts")
+                from khipu.hub_snapshot import _UNKNOWN, read_fact_sources
+
+                # The deliverables' contributors, for the same fence; on a
+                # failed read they stay unknown (their anchor fence holds).
+                cur.execute("SAVEPOINT embed_fact_sources")
+                try:
+                    deliverable_sources = read_fact_sources(
+                        cur, "deliverable", [int(r["id"]) for r in deliverable_rows if r.get("id") is not None])
+                except Exception:  # noqa: BLE001
+                    cur.execute("ROLLBACK TO SAVEPOINT embed_fact_sources")
+                    deliverable_sources = _UNKNOWN
+                cur.execute("RELEASE SAVEPOINT embed_fact_sources")
             conn.commit()
         _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
         # W2.4: keep the sqlite hub replica current without a full dump, so a
@@ -2176,7 +2188,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
             ]
             snap = upsert_episode(
                 episode_row, embedding_rows, deliverable_rows=deliverable_rows,
-                fact_xmin=fact_xmin, receipts=receipts,
+                fact_xmin=fact_xmin, receipts=receipts, deliverable_sources=deliverable_sources,
             )
             if not snap.get("ok"):
                 _log(f"snapshot upsert skipped: {snap.get('error')}")

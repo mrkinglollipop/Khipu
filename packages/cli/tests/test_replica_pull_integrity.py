@@ -420,12 +420,14 @@ VECTOR_WRITERS = {
     ("hub_snapshot.py", "_scrub_forgotten"): "a forget, which always lands",
     ("hub_snapshot.py", "purge_topic_in_snapshot"): "a topic purge, which always lands",
     ("hub_snapshot.py", "_erase_episode_commitments"): "a forget, which always lands",
+    ("hub_snapshot.py", "_fence_fact_wording"): "only removes: a hidden fact's vector, which holds its words",
 }
 COMMITMENT_WRITERS = {
     ("hub_snapshot.py", "_scrub_forgotten"): "a forget always lands before replica publication",
     ("hub_snapshot.py", "_write_pulled_tables"): "the rule itself, for the whole table: the pull lands here",
     ("hub_snapshot.py", "_write_commitment_rows"): "the row writer shared by the dump and _write_pulled_tables only",
     ("hub_snapshot.py", "_erase_episode_commitments"): "a forget always lands",
+    ("hub_snapshot.py", "_fence_fact_wording"): "only hides held rows' fields; the hub's next copy replaces them",
 }
 # Functions in recall_prompt that answer from the replica: each builds the one
 # stale marker, unless it only works on rows another one already marked.
