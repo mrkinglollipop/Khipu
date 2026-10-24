@@ -2787,6 +2787,8 @@ def cmd_episode(args: argparse.Namespace) -> int:
     episode_cmd = getattr(args, "episode_cmd", None)
     if episode_cmd == "edit":
         return _cmd_episode_edit(args)
+    if episode_cmd == "forget-pending":
+        return _cmd_episode_forget_pending(args)
     if episode_cmd != "forget":
         print(json.dumps({
             "ok": False,
@@ -2803,6 +2805,26 @@ def cmd_episode(args: argparse.Namespace) -> int:
     legacy_reason = str((out.get("legacy_file") or {}).get("reason") or "")
     legacy_ok = not legacy_reason.startswith("unreadable:")
     return 0 if out.get("ok") and snapshot_ok and legacy_ok else 1
+
+
+def _cmd_episode_forget_pending(args: argparse.Namespace) -> int:
+    """`khipu episode forget-pending [--send]`: the forgets this Mac's replica
+    waits on before it shows facts again (design section 6, the wait rule),
+    and the owner's "Send N forgets to the hub" (``--send``: the app, a typed
+    yes, or owner direction ``forget.send``)."""
+    from khipu import forget
+
+    if not args.send:
+        print(json.dumps(forget.pending_forgets(), default=str))
+        return 0
+    from khipu import owner_direction
+
+    via = _owner_only(args, owner_direction.intent("forget.send", "hub"))
+    if isinstance(via, int):
+        return via
+    out = forget.send_pending()
+    print(json.dumps(owner_direction.finish(out) or out, default=str))
+    return 0 if out.get("ok") else 1
 
 
 def cmd_provenance(args: argparse.Namespace) -> int:
@@ -5979,6 +6001,14 @@ def build_parser() -> argparse.ArgumentParser:
     ep_sub = ep.add_subparsers(dest="episode_cmd", required=True)
     ep_forget = ep_sub.add_parser("forget", help="Soft-delete an episode and remove its vectors")
     ep_forget.add_argument("id", type=int)
+    ep_pending = ep_sub.add_parser(
+        "forget-pending", help="Forgets this Mac's replica waits on the hub for; --send sends them")
+    ep_pending.add_argument("--send", action="store_true",
+                            help="Run the hub forget for each one (the owner's)")
+    ep_pending.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    from khipu.owner_direction import add_owner_flags as _add_owner_flags
+
+    _add_owner_flags(ep_pending)
     ep_edit = ep_sub.add_parser("edit", help="Correct an episode's summary and re-embed it")
     ep_edit.add_argument("id", type=int)
     ep_edit.add_argument("--summary", required=True, help="Replacement summary text")

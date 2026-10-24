@@ -131,7 +131,7 @@ NOT_CAPTURE = {
                      "hub_snapshot._queue_missed_patch", "hub_snapshot._clear_missed_patches"),
                     _REPLICA_META),
     **dict.fromkeys(("tombstones._atomic_write", "tombstones._locked_registry",
-                     "tombstones.publish_identities"), _REGISTRY),
+                     "tombstones.publish_identities", "tombstones.record_confirmations"), _REGISTRY),
 }
 
 _NAMED = {"write_text", "write_bytes", "mkstemp", "mkdtemp", "NamedTemporaryFile",

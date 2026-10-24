@@ -203,7 +203,10 @@ def test_superseded_rebuild_takes_priority_over_a_patch_stream(pg, replica):
     replica(pg)
     _capture(loop=CANON)
     assert hs.refresh()["ok"]
-    tombstones.publish_payloads([_payload(loop=None)])
+    unrelated = _payload(loop=None)
+    tombstones.publish_payloads([unrelated])
+    # A forget the hub confirmed (it holds no carrier): the wait rule passes.
+    tombstones.record_confirmations({t: [] for t in tombstones.identity_strings(unrelated)})
     with hs._replica_write_gate():
         pass
     assert hs.facts_rebuilding()

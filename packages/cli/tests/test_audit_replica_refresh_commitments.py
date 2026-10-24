@@ -1,8 +1,9 @@
 """Expected invariant: a full refresh must not serve a source the registry refused.
 
 Since the owner ruling of 2026-10-24 (the wait rule, design section 6) a
-replica keeps no fact row while the hub still holds a refused episode live,
-and serves the live facts once the hub's forget has landed."""
+replica keeps no fact row until the hub shows every confirmed refusal's
+episode id tombstoned (a forgotten episode id confirms itself), and serves
+the live facts once the hub's forget has landed."""
 from datetime import datetime, timezone
 import sqlite3
 
@@ -29,14 +30,13 @@ class FullHub:
         if sql == 'SELECT now()':
             self.rows = [(datetime.now(timezone.utc),)]
             return
-        if 'to_regprocedure' in sql:
-            self.rows = [(False,)]  # a hub before 0030: the wait rule checks rows in Python
-            return
         columns, table = sql[len('SELECT '):].split(' FROM ', 1)
         table = table.split()[0]
         rows = self.data.get(table, [])
-        # The wait rule's reads: live hub episodes only, by id when asked.
-        if 'deleted_at IS NULL' in sql:
+        # The wait rule's read: which confirmed ids the hub shows tombstoned.
+        if table == 'episodes' and 'deleted_at IS NOT NULL' in sql:
+            rows = [r for r in rows if r.get('deleted_at') is not None]
+        elif 'deleted_at IS NULL' in sql:
             rows = [r for r in rows if r.get('deleted_at') is None]
         if 'id = ANY(%s)' in sql:
             rows = [r for r in rows if r.get('id') in params[0]]

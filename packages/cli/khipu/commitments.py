@@ -1153,6 +1153,21 @@ def _claim_restatement(cur, commitment_id: int, episode_id: int, text: str, proj
     )
     for claimant, by, value in cur.fetchall():
         for label in pr_requirement_labels(value or "", project):
+            # The fact row is locked already, so a claim on file is not
+            # re-inserted: its claim trigger would lock the other episode's
+            # row after the fact's, the reverse of forget's order (seventh
+            # Astra review #2). A missing one takes that row NOWAIT, so a
+            # forget holding it defers this capture instead of deadlocking.
+            cur.execute(
+                "SELECT 1 FROM fact_claims WHERE kind = 'commitment' AND fact_id = %s "
+                "AND field = 'pr_ref' AND md5(value) = md5(%s) "
+                "AND coalesce(episode_id, 0) = coalesce(%s::bigint, 0) AND claimant = %s",
+                (commitment_id, label, by, claimant),
+            )
+            if cur.fetchone() is not None:
+                continue
+            if by is not None:
+                cur.execute("SELECT 1 FROM episodes WHERE id = %s FOR SHARE NOWAIT", (by,))
             provenance.record_claim(cur, "commitment", commitment_id, "pr_ref", label,
                                     episode_id=by, claimant=claimant)
     provenance.project(cur, "commitment", commitment_id)

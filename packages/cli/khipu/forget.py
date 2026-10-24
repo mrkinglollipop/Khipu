@@ -222,10 +222,15 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
 
     read = _read_forget_sources(cur, episode_id, live)
     registry_error: str | None = None
+    # Each refusal is recorded with this episode's id as its hub
+    # confirmation, in the same publication: the replica's wait rule imports
+    # facts only once the hub shows that id tombstoned (design section 6), so
+    # a confirmation whose transaction then rolls back keeps it waiting.
+    confirm = {int(episode_id)}
     try:
         for _round in range(_PUBLISH_ROUNDS):
             publish_forget(_registered_sources(read), read["tombstone_payloads"],
-                           read["candidates"])
+                           read["candidates"], confirm=confirm)
             again = _read_forget_sources(cur, episode_id, live)
             grown = bool(_read_identities(again) - _read_identities(read))
             read = again
@@ -236,7 +241,7 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
                               "forgotten; run the forget again")
         # The id too: a backup can hold this episode under an older raw whose
         # hash no published identity matches, and its import scrubs by id.
-        publish_episode_ids({episode_id})
+        publish_episode_ids({episode_id}, confirm=confirm)
     except RegistryError as exc:
         # Keep the hub tombstone/cascade semantics intact, but absolutely do
         # not touch a local store when the writer fence could not be published.
@@ -1932,8 +1937,9 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
 # Two forgets that both run a project's first witness backfill can deadlock
 # (design section 4: each holds its facts, then the backfill's claim gate
 # takes FOR SHARE on other episodes). PostgreSQL refuses one; the refused
-# transaction changed nothing, so it is run again, a bounded number of times.
-FORGET_DEADLOCK_ATTEMPTS = 4
+# transaction changed nothing, so it is run again until a time budget runs
+# out (design section 4: time-bounded, not a count of attempts).
+FORGET_RETRY_BUDGET_S = float(os.environ.get("KHIPU_FORGET_RETRY_BUDGET_S", "90"))
 _FORGET_RETRY_SQLSTATES = frozenset({"40P01", "40001"})  # deadlock, serialization
 
 
@@ -1944,12 +1950,15 @@ def _retryable(exc: BaseException) -> bool:
 
 def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None) -> dict[str, Any]:
     """The hub transaction, retried on a deadlock or serialization failure
-    (``FORGET_DEADLOCK_ATTEMPTS`` in all, with a short growing pause). Each
-    attempt is a fresh connection and transaction; the local fence it
-    publishes first is idempotent."""
+    until ``FORGET_RETRY_BUDGET_S`` has passed since the first attempt, with
+    a short growing pause (at most a second). Each attempt is a fresh
+    connection and transaction; the local fence it publishes first is
+    idempotent."""
     import random
 
-    for attempt in range(FORGET_DEADLOCK_ATTEMPTS):
+    deadline = time.monotonic() + FORGET_RETRY_BUDGET_S
+    attempt = 0
+    while True:
         try:
             with connect() as conn:
                 with conn.cursor() as cur:
@@ -1959,10 +1968,164 @@ def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None) -> dic
                 out["deadlock_retries"] = attempt
             return out
         except Exception as exc:  # noqa: BLE001 - only a retryable refusal is retried
-            if not _retryable(exc) or attempt == FORGET_DEADLOCK_ATTEMPTS - 1:
+            if not _retryable(exc) or time.monotonic() >= deadline:
                 raise
-            time.sleep(0.05 * (attempt + 1) + random.uniform(0, 0.05))
-    raise AssertionError("unreachable")
+            attempt += 1
+            time.sleep(min(1.0, 0.05 * attempt) + random.uniform(0, 0.05))
+
+
+# ---- Hub confirmations of this Mac's refusals (design section 6, the wait rule) ----
+
+
+def _hub_opener(connect: Any = None):
+    if connect is not None:
+        return connect
+    from khipu.hub_snapshot import HUB_CONNECT_TIMEOUT_S, try_hub_connect
+
+    return lambda: try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S)
+
+
+def confirm_from_hub(connect: Any = None) -> dict[str, Any]:
+    """Confirm, by the hub's own forget record, refusals this Mac learned
+    before confirmations were recorded (rollout 5.4) or from a backup: a
+    source key or payload hash the hub's ``forgotten_sources`` lists is
+    confirmed with the episode id that record names. The wait rule still
+    needs the hub to show that id tombstoned. Anything the record does not
+    name stays unconfirmed (``send_pending``). Best effort; never raises."""
+    from khipu.tombstones import read_gate, record_confirmations
+
+    try:
+        gate = read_gate()
+        loose = [t for t in gate.unconfirmed if t.startswith(("k:", "h:"))]
+        if not loose:
+            return {"ok": True, "confirmed": 0}
+        from khipu.db import has_table
+
+        with _hub_opener(connect)() as conn, conn.cursor() as cur:
+            if not has_table(cur, "forgotten_sources"):
+                return {"ok": True, "confirmed": 0}
+            cur.execute("SELECT identity, episode_id FROM forgotten_sources "
+                        "WHERE identity = ANY(%s) AND episode_id IS NOT NULL",
+                        (sorted({t[2:] for t in loose}),))
+            by_identity: dict[str, set[int]] = {}
+            for identity, eid in cur.fetchall():
+                by_identity.setdefault(str(identity), set()).add(int(eid))
+        found = {t: sorted(by_identity[t[2:]]) for t in loose if t[2:] in by_identity}
+        record_confirmations(found)
+        return {"ok": True, "confirmed": len(found)}
+    except Exception as exc:  # noqa: BLE001 - unconfirmed refusals keep the replica waiting
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
+def pending_forgets(connect: Any = None) -> dict[str, Any]:
+    """The refusals this Mac's replica waits on before it shows facts
+    again: ``unconfirmed`` (no hub forget confirmed them) and ``waiting``
+    (confirmed hub ids the hub does not show tombstoned). ``count`` is the
+    number ``send_pending`` would send. With the hub away, ``waiting`` is
+    unknown (``hub_unreachable``)."""
+    from khipu.hub_snapshot import read_refusal_wait
+    from khipu.tombstones import RegistryError, read_gate
+
+    confirm_from_hub(connect)
+    try:
+        gate = read_gate()
+    except RegistryError as exc:
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"[:300]}
+    out: dict[str, Any] = {"ok": True, "unconfirmed": gate.unconfirmed, "waiting": []}
+    if not gate.empty:
+        try:
+            with _hub_opener(connect)() as conn, conn.cursor() as cur:
+                out["waiting"] = read_refusal_wait(cur, gate)["waiting"]
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            out.update(hub_unreachable=True, error=f"{type(exc).__name__}: {exc}"[:300])
+    out["count"] = len(out["unconfirmed"]) + len(out["waiting"])
+    return out
+
+
+def _live_carriers(cur, refusals: set[str]) -> dict[str, list[int]]:
+    """The live hub episodes carrying each of ``refusals``, by every source
+    identity a row represents (the replica's episode fence,
+    ``hub_snapshot._anchor_identities``), over the whole hub in pages.
+    ``RegistryError`` when a row's identity cannot be computed."""
+    from khipu import hub_snapshot as hs
+
+    cols = hs._anchor_cols(cur)
+    found: dict[str, list[int]] = {}
+    last = 0
+    while True:
+        cur.execute(f"SELECT {', '.join(cols)} FROM episodes WHERE id > %s AND deleted_at IS NULL "
+                    "ORDER BY id LIMIT 500", (last,))
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        if not rows:
+            return found
+        receipts = hs._read_receipts(cur, [int(r["id"]) for r in rows])
+        for row in rows:
+            eid = int(row["id"])
+            for refusal in refusals & hs._anchor_identities(row, receipts.get(eid, ())):
+                found.setdefault(refusal, []).append(eid)
+        last = int(rows[-1]["id"])
+
+
+def send_pending(*, memory_root: Path | None = None, connect: Any = None) -> dict[str, Any]:
+    """The owner's "Send N forgets to the hub": run the hub forget for every
+    refusal the replica waits on and record its confirmation. A confirmed id
+    the hub has not tombstoned is forgotten again (``forget_everywhere``,
+    which records it); a confirmed id the hub does not hold is dropped from
+    its refusals' confirmations (it supplies no wording there). Each
+    unconfirmed refusal is looked for in every live hub episode by every
+    identity it represents; each carrier is forgotten, then the refusal is
+    confirmed with their ids (none: the hub holds no live carrier) and its
+    source key or payload hash is recorded in the hub's ``forgotten_sources``,
+    so a later upload of it is refused there. Then the replica rebuilds."""
+    from khipu.hub_snapshot import rebuild_facts
+    from khipu.tombstones import RegistryError, publish_hub_forget, read_gate, record_confirmations
+
+    before = pending_forgets(connect)
+    if not before.get("ok") or before.get("hub_unreachable"):
+        return {**before, "ok": False, "sent": []}
+    opener = _hub_opener(connect)
+    sent: list[dict[str, Any]] = []
+    for eid in before["waiting"]:
+        out = forget_everywhere(eid, memory_root=memory_root)
+        if str(out.get("error") or "").startswith("no such episode"):
+            gate = read_gate()
+            record_confirmations({r: [i for i in gate.hub_ids(r) or () if i != eid]
+                                  for r in gate.refusals if eid in (gate.hub_ids(r) or ())}, replace=True)
+            sent.append({"id": eid, "hub": "not held"})
+        else:
+            sent.append({"id": eid, "hub": "forgotten" if out.get("soft_deleted") or out.get("ok")
+                         else "failed", **({"error": out["error"]} if out.get("error") else {})})
+    loose = set(before["unconfirmed"])
+    error = None
+    if loose:
+        try:
+            with opener() as conn, conn.cursor() as cur:
+                carriers = _live_carriers(cur, loose)
+        except RegistryError as exc:
+            carriers, error = None, f"a hub episode's identity could not be read: {exc}"[:300]
+        if carriers is not None:
+            forgotten: dict[int, bool] = {}
+            for eid in sorted({i for ids in carriers.values() for i in ids}):
+                out = forget_everywhere(eid, memory_root=memory_root)
+                forgotten[eid] = bool(out.get("soft_deleted"))
+                sent.append({"id": eid, "hub": "forgotten" if forgotten[eid] else "failed",
+                             **({"error": out["error"]} if out.get("error") else {})})
+            done = {r: carriers.get(r, []) for r in loose
+                    if all(forgotten.get(i) for i in carriers.get(r, []))}
+            with opener() as conn, conn.cursor() as cur:
+                publish_hub_forget(cur, None, [
+                    {"source_key" if r.startswith("k:") else "payload_sha256": r[2:]}
+                    for r in sorted(done) if r.startswith(("k:", "h:"))])
+                conn.commit()
+            record_confirmations(done)
+    out: dict[str, Any] = {"ok": False, "sent": sent, "facts": rebuild_facts(connect=connect)}
+    after = pending_forgets(connect)
+    out.update(pending=after.get("count"), unconfirmed=after.get("unconfirmed"),
+               waiting=after.get("waiting"))
+    if error:
+        out["error"] = error
+    out["ok"] = bool(after.get("ok")) and not after.get("hub_unreachable") and after.get("count") == 0
+    return out
 
 
 def _forget_everywhere(episode_id: int, *, memory_root: Path | None,

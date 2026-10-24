@@ -283,7 +283,7 @@ def test_the_stream_records_lifecycle_writes_but_the_gate_still_wants_the_projec
 # ---- forget retries a deadlock ---------------------------------------------------
 
 
-def test_forget_retries_a_deadlock_a_bounded_number_of_times(pg, monkeypatch):
+def test_forget_retries_a_deadlock_within_its_time_budget(pg, monkeypatch):
     a = _capture()
     real = forget.forget_episode
     calls = []
@@ -305,9 +305,11 @@ def test_forget_retries_a_deadlock_a_bounded_number_of_times(pg, monkeypatch):
     monkeypatch.setattr(forget, "forget_episode",
                         lambda cur, eid, **kw: (calls.append(eid), (_ for _ in ()).throw(
                             psycopg.errors.DeadlockDetected("deadlock detected")))[1])
+    # Time-bounded (design section 4): retried until the budget is spent.
+    monkeypatch.setattr(forget, "FORGET_RETRY_BUDGET_S", 0.2)
     with pytest.raises(psycopg.errors.DeadlockDetected):
         forget._forget_on_hub(db.connect, b, memory_root=pg.memory)
-    assert len(calls) == forget.FORGET_DEADLOCK_ATTEMPTS
+    assert len(calls) >= 2, calls
     calls.clear()
     monkeypatch.setattr(forget, "forget_episode",
                         lambda cur, eid, **kw: (calls.append(eid), (_ for _ in ()).throw(

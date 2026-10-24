@@ -85,7 +85,7 @@ ACTIONS: frozenset[str] = frozenset({
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
-    "project.separate",
+    "project.separate", "forget.send",
 })
 
 
@@ -993,6 +993,7 @@ _PUSH_WORDS = {
     "accounts.decline": "Stopped offering an account", "accounts.offer_again": "Offered an account again",
     "accounts.auto_track": "Changed whether new accounts are tracked",
     "owed.tidy": "Applied or undid an Owed list clean-up",
+    "forget.send": "Sent this Mac's waiting forgets to the hub",
 }
 
 
@@ -1021,6 +1022,7 @@ _UNREADABLE = object()  # what it changes can't be read now: a direction is refu
 # Why a change has no undo, in words the app shows beside it.
 _NO_UNDO_WHY = {
     "ledger.import": "A catch-up import can't be undone: it changes rows that were already there.",
+    "forget.send": "A forget sent to the hub can't be undone: the hub keeps the episodes forgotten.",
 }
 
 

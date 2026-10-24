@@ -95,7 +95,7 @@ def test_merge_committed_after_forget_reads_sources_is_fenced(tmp_path, monkeypa
     original_publish = tombstones.publish_forget
     calls = []
 
-    def merge_then_publish(stale_sources, stale_payloads, stale_identities):
+    def merge_then_publish(stale_sources, stale_payloads, stale_identities, **kw):
         if not calls:
             # forget_episode has read raw and the source rows. A capture now
             # merges and commits before the registry names its source.
@@ -106,7 +106,7 @@ def test_merge_committed_after_forget_reads_sources_is_fenced(tmp_path, monkeypa
             world["sources"].append({"source_key": ci.source_key(Q), **merged})
             assert all(row.get("source_key") != ci.source_key(Q) for row in stale_sources)
         calls.append(stale_sources)
-        original_publish(stale_sources, stale_payloads, stale_identities)
+        original_publish(stale_sources, stale_payloads, stale_identities, **kw)
 
     db._TABLE_COLUMNS_CACHE.clear()
     with mock.patch("khipu.db.connect", side_effect=lambda *a, **k: fo._Conn(fo._WorldCur(world))), \

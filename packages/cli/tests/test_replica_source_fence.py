@@ -173,17 +173,18 @@ def test_every_fenced_writer_is_only_reached_inside_the_gate():
 
 def test_every_anchor_read_carries_every_identity():
     """Each episode import reads its episodes' identities from the hub in
-    its own snapshot, merged captures and source receipts included; every
+    its own snapshot, merged captures and source receipts included. Every
     fact read carries the wait rule's hub read (``read_refusal_wait``),
-    which judges a hub episode by the same identities."""
+    which since the owner decision of 2026-10-24 compares ids only: the
+    registry's confirmed hub ids against the hub's tombstones, never an
+    identity."""
     fns = _functions()
     assert {"_read_receipts", "read_anchor_identities", "read_refusal_wait"} <= _called(fns["_pull_apply"])
     for reader in ("_read_fact_rows", "_read_all_facts", "_dump_fact_inputs", "sync_decision_changes"):
         assert "read_refusal_wait" in _called(fns[reader]), reader
     for module in ("decisions.py", "embed.py"):
         assert "read_refusal_wait" in (PACKAGE / module).read_text(encoding="utf-8"), module
-    assert "_episode_refused" in _called(fns["read_refusal_wait"])
-    assert "_anchor_identities" in _called(fns["_episode_refused"])
+    assert "_episode_refused" not in fns
     assert "_read_receipts" in _called(fns["read_anchor_identities"])
     assert "_anchor_identities" in _called(fns["read_anchor_identities"])
     assert "_anchor_identities" in _called(fns["_scrub_forgotten"])
@@ -191,7 +192,10 @@ def test_every_anchor_read_carries_every_identity():
     body = ast.get_source_segment(SOURCE, fns["_anchor_identities"])
     assert "merged_from" in body and "receipts" in body
     wait = ast.get_source_segment(SOURCE, fns["read_refusal_wait"])
-    assert "episode_sources" in wait and "merged_from" in wait and "khipu_natural_source_key" in wait
+    assert "confirmed_ids" in wait and "unconfirmed" in wait and "deleted_at IS NOT NULL" in wait
+    for identity_read in ("episode_sources", "merged_from", "khipu_natural_source_key", "_anchor_identities",
+                          "refuses"):
+        assert identity_read not in wait, identity_read
 
 
 # ---- behaviour: every path, one schedule ------------------------------------------

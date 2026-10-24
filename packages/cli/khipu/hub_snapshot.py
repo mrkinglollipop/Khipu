@@ -1063,7 +1063,7 @@ def apply_decision_changes(rows: Sequence[Mapping[str, Any]],
     try:
         with lock_wait(LIVE_PATCH_WAIT_S), _replica_write_gate(path, live=True) as fence:
             if not fence.facts_confirmed(confirm):
-                return {"ok": True, "decisions": 0, "waiting": fence.waiting}
+                return {"ok": True, "decisions": 0, **fence.wait_report()}
             written = _write_decision_rows(fence.con, rows, fence=fence)
             if written is None:
                 return {"ok": False, "error": "replica has no decisions table (version 1)"}
@@ -1259,9 +1259,10 @@ _ANCHOR_SOURCE_COLS = ("harness", "session_id", "transcript_range", "window_id",
 # waits for the commit. Episodes are checked on the way in by every source
 # identity they represent. Fact rows are not checked one by one: the hub's
 # projector is the one source of truth for their wording, and a fact import
-# is written only when the hub showed, in the snapshot the facts were read
-# from, that it holds no live episode carrying a source this Mac refuses
-# (``read_refusal_wait``; owner ruling 2026-10-24). Until then the replica
+# is written only when every refusal this Mac holds carries a confirmed hub
+# episode id and the hub showed each tombstoned, in the snapshot the facts
+# were read from (``read_refusal_wait``; owner decision 2026-10-24: ids, never
+# identities). Until then the replica
 # keeps no fact row (it stays rebuilding) and waits for the next pull.
 #
 # Nothing is re-fenced later. The replica records the refusal set its fact
@@ -1428,30 +1429,18 @@ def _registry_rejected_anchors(anchors: Mapping[Any, Any], known: set[int], *, g
 # ---- The wait rule: fact imports follow the hub's projection -----------------
 
 
-def _episode_refused(row: Mapping[str, Any], gate: Any) -> bool:
-    """Whether the registry refuses one hub episode row, by id or by any
-    source identity it represents; an identity that cannot be computed
-    refuses (fail closed)."""
-    from khipu.tombstones import RegistryError
-
-    if row.get("id") is not None and int(row["id"]) in gate.episode_ids:
-        return True
-    try:
-        return gate.refuses(_anchor_identities(row))
-    except RegistryError:
-        return True
-
-
 def read_refusal_wait(cur, gate: Any = None) -> dict[str, Any]:
-    """Whether the hub reflects every refusal this Mac knows, read on ``cur``
-    before the facts it guards (in their REPEATABLE READ snapshot, or before
-    them in a read-committed one): the live hub episodes still carrying a
-    source this Mac's registry (``gate``, read now by default) refuses, by
-    id, retained source receipt, natural key, merge receipt or legacy
-    ts/summary identity. A fact import is written only when none is left and
-    the registry is unchanged at its write (``_SourceFence.facts_confirmed``):
-    the hub's forget then re-projected every fact those sources supplied, so
-    its wording is the truth. ``{"registry": digest, "waiting": [ids]}``."""
+    """The wait rule's hub read, on ``cur`` before the facts it guards (in
+    their REPEATABLE READ snapshot, or before them in a read-committed one).
+    Plain id comparison (owner decision, 2026-10-24): every refusal in this
+    Mac's registry (``gate``, read now by default) must carry a confirmed hub
+    episode id, recorded by the hub forget that tombstoned it, and this
+    snapshot must show each of those ids tombstoned. ``unconfirmed``: the
+    refusals no hub forget confirmed (``forget.send_pending`` sends them);
+    ``waiting``: confirmed ids the hub does not show tombstoned. A fact
+    import is written only when both are empty and the registry is unchanged
+    at its write (``_SourceFence.facts_confirmed``). ``{"registry": digest,
+    "waiting": [ids], "unconfirmed": [refusals]}``."""
     if gate is None:
         from khipu.tombstones import RegistryError, read_gate
 
@@ -1459,63 +1448,16 @@ def read_refusal_wait(cur, gate: Any = None) -> dict[str, Any]:
             gate = read_gate()
         except RegistryError:
             # Unknowable: confirms nothing (the write's own gate fails closed).
-            return {"registry": None, "waiting": []}
-    out: dict[str, Any] = {"registry": gate.digest, "waiting": []}
-    if gate.empty:
+            return {"registry": None, "waiting": [], "unconfirmed": []}
+    out: dict[str, Any] = {"registry": gate.digest, "waiting": [], "unconfirmed": gate.unconfirmed}
+    ids = sorted(gate.confirmed_ids)
+    if not ids:
         return out
-    tags = gate.tags
-    keys = sorted(t[2:] for t in tags if t.startswith("k:"))
-    hashes = sorted(t[2:] for t in tags if t.startswith("h:"))
-    legacy_md5 = sorted({t.rsplit("\x1f", 1)[-1] for t in tags if t.startswith("l:")})
-    hub_cols = _pg_columns(cur, "episodes")
-    live = "e.deleted_at IS NULL" if "deleted_at" in hub_cols else "TRUE"
-    found: set[int] = set()
-    if gate.episode_ids:
-        cur.execute(f"SELECT e.id FROM episodes e WHERE e.id = ANY(%s) AND {live}", (sorted(gate.episode_ids),))
-        found |= {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
-    receipts = {"episode_id", "source_key", "payload_sha256"} <= _pg_columns(cur, "episode_sources")
-    if receipts and (keys or hashes):
-        cur.execute("SELECT DISTINCT s.episode_id FROM episode_sources s JOIN episodes e ON e.id = s.episode_id "
-                    f"WHERE {live} AND (s.source_key = ANY(%s) OR s.payload_sha256 = ANY(%s))", (keys, hashes))
-        found |= {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
-    cur.execute("SELECT to_regprocedure('khipu_natural_source_key(text,text,text,text,text)') IS NOT NULL")
-    row = cur.fetchone()
-    natural = bool(row and row[0])
-    cols = _anchor_cols(cur)
-    if natural:
-        nk = ("khipu_natural_source_key(coalesce(e.harness, e.raw->>'harness'), e.session_id, "
-              "coalesce(e.transcript_range, e.raw->>'transcript_range'), "
-              "coalesce(e.window_id, e.raw->>'window_id'), e.raw->>'part')")
-        mk = ("khipu_natural_source_key(m.entry->'payload'->>'harness', "
-              "coalesce(m.entry->'payload'->>'session_id', m.entry->>'session_id'), "
-              "m.entry->'payload'->>'transcript_range', m.entry->'payload'->>'window_id', "
-              "m.entry->'payload'->>'part')")
-        if keys:
-            cur.execute(f"SELECT e.id FROM episodes e WHERE {live} AND {nk} = ANY(%s)", (keys,))
-            found |= {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
-        cur.execute(
-            "SELECT DISTINCT e.id FROM episodes e CROSS JOIN LATERAL jsonb_array_elements("
-            "CASE WHEN jsonb_typeof(e.raw->'merged_from') = 'array' THEN e.raw->'merged_from' "
-            f"ELSE '[]'::jsonb END) AS m(entry) WHERE {live} AND jsonb_typeof(m.entry) = 'object' "
-            f"AND (m.entry->>'source_id' = ANY(%s) OR {mk} = ANY(%s))", (hashes, keys))
-        found |= {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
-        # What no receipt or natural key names (an episode older than 0027
-        # with no session range) and the legacy ts/summary identities are
-        # checked by every identity the row represents, in Python.
-        receipt_less = ("NOT EXISTS (SELECT 1 FROM episode_sources s WHERE s.episode_id = e.id)"
-                        if receipts else "TRUE")
-        where = f"{receipt_less} AND {nk} IS NULL"
-    else:
-        where = "TRUE"  # a hub before 0030: every row is checked in Python
-    if legacy_md5:
-        where = f"({where} OR md5(e.summary) = ANY(%s))"
-    if "id" in cols:
-        sel = ", ".join(f"e.{c}" for c in cols)
-        cur.execute(f"SELECT {sel} FROM episodes e WHERE {live} AND {where}",
-                    (legacy_md5,) if legacy_md5 else ())
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        found |= {int(r["id"]) for r in rows if _episode_refused(r, gate)}
-    out["waiting"] = sorted(found)
+    landed: set[int] = set()
+    if "deleted_at" in _pg_columns(cur, "episodes"):
+        cur.execute("SELECT id FROM episodes WHERE id = ANY(%s) AND deleted_at IS NOT NULL", (ids,))
+        landed = {int(r[0]) for r in cur.fetchall() if r and r[0] is not None}
+    out["waiting"] = [i for i in ids if i not in landed]
     return out
 
 
@@ -1713,6 +1655,7 @@ class _SourceFence:
         self.rejected = _rejected_episode_ids(con)
         self.scrubbed = 0
         self.waiting: list[int] = []
+        self.unconfirmed: list[str] = []
         self.dropped = False
         self.digest = _refusal_digest(gate, path)
         # The generation before this write changed anything.
@@ -1772,21 +1715,29 @@ class _SourceFence:
 
     def facts_confirmed(self, confirm: Mapping[str, Any] | None) -> bool:
         """The wait rule: a fact import read with ``confirm``
-        (``read_refusal_wait``) is written only when the hub held no live
-        episode carrying a refused source and the registry is the one this
-        write holds. Otherwise the fact state is dropped (rebuilding: readers
-        show no fact row) until a later read finds the hub caught up. An
-        empty registry needs no confirmation; a writer that read none
-        (``None``) writes no fact row and drops nothing."""
+        (``read_refusal_wait``) is written only when every refusal has a
+        confirmed hub id, the hub showed each tombstoned, and the registry is
+        the one this write holds. Otherwise the fact state is dropped
+        (rebuilding: readers show no fact row) until a later read finds the
+        hub caught up. An empty registry needs no confirmation; a writer that
+        read none (``None``) writes no fact row and drops nothing."""
         if self.gate.empty:
             return True
         if confirm is None:
             return False
-        if not confirm.get("waiting") and confirm.get("registry") == self.gate.digest:
+        if (not confirm.get("waiting") and not confirm.get("unconfirmed")
+                and confirm.get("registry") == self.gate.digest):
             return True
         self.waiting = list(confirm.get("waiting") or ())
+        self.unconfirmed = list(confirm.get("unconfirmed") or ())
         self.drop_facts(force=True)
         return False
+
+    def wait_report(self) -> dict[str, Any]:
+        """What the wait rule is waiting for, for a result: ``waiting`` (hub
+        ids not yet tombstoned there) and ``unconfirmed`` (refusals no hub
+        forget confirmed), each only when non-empty."""
+        return {k: v for k, v in (("waiting", self.waiting), ("unconfirmed", self.unconfirmed)) if v}
 
     def refuse(self, ids: Iterable[int]) -> None:
         """Refuse episodes newly: queue their erasure, erase what the replica
@@ -2022,7 +1973,7 @@ def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any],
         fence = _SourceFence(con, read_gate(), snapshot_path())
     if not fence.facts_confirmed(stream.get("confirm")):
         # Waiting for the hub: no fact row until it reflects every refusal.
-        return {"ok": True, "decisions": 0, "deliverables": 0, "rebuild": True, "waiting": fence.waiting}
+        return {"ok": True, "decisions": 0, "deliverables": 0, "rebuild": True, **fence.wait_report()}
     if _meta_get(con, _FACT_STATE_KEY) == "rebuilding":
         return {"ok": True, "decisions": 0, "deliverables": 0, "rebuild": True}
     decisions_written = deliverables_written = 0
@@ -2119,7 +2070,7 @@ def _read_all_facts(cur) -> dict[str, Any]:
     on ``cur`` (one REPEATABLE READ snapshot): the input of
     ``_load_facts``."""
     confirm = read_refusal_wait(cur)
-    if confirm["waiting"]:
+    if confirm["waiting"] or confirm["unconfirmed"]:
         # Nothing to load until the hub catches up: the rows are not read.
         return {"confirm": confirm}
     read: dict[str, Any] = {"xmin": _hub_snapshot_xmin(cur) if _hub_has_fact_stream(cur) else None}
@@ -2283,7 +2234,10 @@ def rebuild_facts(*, connect: Any = None, _priority: bool = False) -> dict[str, 
     REPEATABLE READ snapshot (``connect``: a connection factory, the hub's by
     default) and loaded in one fenced write (``_load_facts``) when the hub
     reflects every refusal this Mac knows (the wait rule); otherwise the
-    replica stays rebuilding (``waiting``: the hub episodes still live).
+    replica stays rebuilding (``waiting``: confirmed hub ids not yet
+    tombstoned there; ``unconfirmed``: refusals no hub forget confirmed).
+    First, refusals the hub's own forget record already confirms are
+    confirmed by id (``forget.confirm_from_hub``: rollout 5.4).
     The rebuild belongs to the fact generation current when it started:
     if any fenced write landed before its load (a pull, a patch), its older
     read is discarded (``superseded``, sixth Astra review #2). A replica
@@ -2298,6 +2252,10 @@ def rebuild_facts(*, connect: Any = None, _priority: bool = False) -> dict[str, 
         return {"ok": True, "skipped": True, "reason": "no snapshot exists"}
     started = time.monotonic()
     read_at = time.time()
+    if not _priority:
+        from khipu.forget import confirm_from_hub
+
+        confirm_from_hub(connect)
     generation = None if _priority else _replica_generation(path)
     read: dict[str, Any] | None = None
     if not _priority:
@@ -2309,7 +2267,7 @@ def rebuild_facts(*, connect: Any = None, _priority: bool = False) -> dict[str, 
                     "hub_unreachable": hub_connection_failed(exc)}
     read_s = time.monotonic() - started
     superseded = False
-    waiting: list[int] = []
+    waiting: dict[str, Any] = {}
     try:
         with _replica_write_gate(path) as fence:
             if read is None:
@@ -2320,7 +2278,7 @@ def rebuild_facts(*, connect: Any = None, _priority: bool = False) -> dict[str, 
                 counts: dict[str, int] = {}
             else:
                 counts = _load_facts(fence.con, fence, read, read_at=read_at)
-                waiting = fence.waiting
+                waiting = fence.wait_report()
     except _ReplicaBusy:
         return {"ok": False, "rebuilding": True, "error": "hub snapshot refresh in progress"}
     except RegistryError as exc:
@@ -2334,8 +2292,7 @@ def rebuild_facts(*, connect: Any = None, _priority: bool = False) -> dict[str, 
         return {**rebuild_facts(connect=connect, _priority=True), "superseded": True}
     out = {"ok": True, "rebuilt": not still and not superseded, "rebuilding": still, **counts,
            "read_seconds": round(read_s, 3), "seconds": round(time.monotonic() - started, 3)}
-    if waiting:
-        out["waiting"] = waiting
+    out.update(waiting)
     if superseded:
         out["superseded"] = True
     if _priority:
@@ -2884,7 +2841,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                 elif not fence.facts_confirmed(confirm):
                     # The wait rule: no fact row until the hub reflects
                     # every refusal this Mac knows (the facts were dropped).
-                    parts["commitments"] = {"ok": True, "commitments": 0, "waiting": fence.waiting}
+                    parts["commitments"] = {"ok": True, "commitments": 0, **fence.wait_report()}
                 else:
                     con.execute("DELETE FROM commitments")
                     parts["commitments"] = {"ok": True,

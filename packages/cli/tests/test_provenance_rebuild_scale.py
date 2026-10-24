@@ -71,9 +71,12 @@ def test_rebuild_is_bounded_and_does_not_block_a_live_patch(pg, replica):
     assert dumped["ok"], dumped
     held = sum(dumped["counts"][t] for t in ("commitments", "decisions", "deliverables"))
     assert held == FACTS, dumped["counts"]
-    # A forget elsewhere in the registry: the refusal set changes.
-    tombstones.publish_payloads([{"ts": "2026-10-24T09:00:00Z", "summary": "unrelated forgotten",
-                                  "session_id": "codex:unrelated", "transcript_range": "0:1"}])
+    # A forget elsewhere in the registry, confirmed by the hub (which holds
+    # no carrier of it): the refusal set changes, and the wait rule passes.
+    unrelated = {"ts": "2026-10-24T09:00:00Z", "summary": "unrelated forgotten",
+                 "session_id": "codex:unrelated", "transcript_range": "0:1"}
+    tombstones.publish_payloads([unrelated])
+    tombstones.record_confirmations({t: [] for t in tombstones.identity_strings(unrelated)})
     assert hs.facts_rebuilding()
     with pg.connect() as conn:
         live_row = conn.execute("SELECT to_jsonb(e) FROM episodes e ORDER BY id DESC LIMIT 1").fetchone()[0]

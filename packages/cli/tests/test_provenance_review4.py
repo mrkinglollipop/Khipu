@@ -124,7 +124,10 @@ def test_forget_nonanchor_erases_its_wording_immediately(pg, replica, prior_regi
     _capture(loop=CANON)
     b = _capture(loop=ALT, decision="Independent contributor decision")
     if prior_registry:
-        tombstones.publish_payloads([_payload(loop=None)])
+        unrelated = _payload(loop=None)
+        tombstones.publish_payloads([unrelated])
+        # A forget the hub confirmed (it holds no carrier): the wait rule passes.
+        tombstones.record_confirmations({t: [] for t in tombstones.identity_strings(unrelated)})
     assert hs.refresh()["ok"]
     assert ALT in _replica_readers()
     result = forget.forget_everywhere(b, memory_root=pg.memory, gateway=False)
