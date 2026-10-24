@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from khipu import hub_snapshot as hs
+from khipu.embed import _md5
 
 
 @pytest.mark.parametrize('state', ['forgotten', 'pending', 'closed', 'missing_parent', 'missing_commitment'])
@@ -30,8 +31,10 @@ def test_delayed_commitment_vector_requires_live_open_parent(tmp_path, monkeypat
         assert hs.forget_episode_in_snapshot(7)['ok']
     elif state == 'pending':
         assert hs._queue_erasure(7)
+    # The publication shape since 2026-10-24: each row carries the wording
+    # it was built from (design section 6, fourth Astra review #1).
     rows = [dict(profile='synthetic', kind='commitment', ref=str(cid), chunk_idx=0,
-                 chunk_text=text, embedding=[1.0, 0.0])
+                 chunk_text=text, embedding=[1.0, 0.0], fact_wording=_md5(text))
             for cid, text in [(70, 'FORGOTTEN synthetic obligation'), (80, 'live obligation')]]
     result = hs.upsert_embeddings(rows)
     assert result['ok'], result
@@ -53,7 +56,8 @@ def test_open_standalone_commitment_keeps_its_vector(tmp_path, monkeypatch):
                     "VALUES (90,'standalone synthetic obligation','open',NULL)")
     result = hs.upsert_embeddings([
         dict(profile='synthetic', kind='commitment', ref='90', chunk_idx=0,
-             chunk_text='standalone synthetic obligation', embedding=[1.0, 0.0])])
+             chunk_text='standalone synthetic obligation', embedding=[1.0, 0.0],
+             fact_wording=_md5('standalone synthetic obligation'))])
     assert result['ok'], result
     with sqlite3.connect(path) as con:
         retained = con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment'").fetchall()

@@ -2015,18 +2015,18 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         if (out["snapshot"].get("error") == "hub snapshot missing"
                 and not snapshot_path().exists()):
             out["snapshot"] = {"ok": True, "skipped": True, "reason": "no snapshot exists"}
-        if out["snapshot"].get("ok") and out.get("changed_facts"):
-            # After the local tombstone, so its fence is up: the facts the
-            # forget re-projected reach this Mac's replica now, not at its
-            # next pull (design section 6). Best-effort: the next pull's
-            # stream reads them again either way.
-            from khipu.hub_snapshot import apply_fact_rows
+        if out["snapshot"].get("ok") and not out["snapshot"].get("skipped"):
+            # After the local tombstone and the registry publication: the
+            # forget changed the refusal set, so this Mac's replica drops its
+            # commitments, decisions and deliverables and re-reads them from
+            # the hub now, through the source fence, not at its next pull
+            # (design section 6, owner decision 2026-10-24). Readers show
+            # none of them until it lands. Best-effort: a failed rebuild
+            # leaves the replica rebuilding and its next pull does it.
+            from khipu.hub_snapshot import rebuild_facts
 
             try:
-                with connect() as conn:
-                    with conn.cursor() as cur:
-                        out["snapshot"]["facts"] = apply_fact_rows(cur, out["changed_facts"])
-                    conn.rollback()
+                out["snapshot"]["facts"] = rebuild_facts(connect=connect)
             except Exception as exc:  # noqa: BLE001 - the hub forget committed
                 out["snapshot"]["facts"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     except Exception as exc:  # noqa: BLE001 — the hub write already succeeded

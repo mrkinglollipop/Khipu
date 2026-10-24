@@ -36,17 +36,20 @@ TREE = ast.parse(SOURCE)
 # why it is safe. "fenced" means it is only ever reached inside a
 # _replica_write_gate (checked below through the call graph).
 MEMORY_WRITERS = {
-    "_apply_fact_stream": "fenced: the fact stream (sync, pull, forget's local apply)",
-    "_write_decision_rows": "fenced: decision rows, by the fence's admission",
-    "_write_commitment_rows": "fenced: the pull's commitments copy; the dump's builder",
+    "_apply_fact_stream": "fenced: the fact stream (sync, pull)",
+    "_write_decision_rows": "fenced: decision rows, each through _admit_fact",
+    "_write_commitment_rows": "fenced: the pull's and the rebuild's commitments copy; the dump's builder",
     "_write_deliverable_rows": "fenced: an episode patch's deliverables",
+    "_write_fact_deliverables": "fenced: deliverable rows, each through _admit_fact",
     "_upsert_episode_unfenced": "fenced: an episode patch (pull, capture, outbox replay)",
-    "_write_pulled_tables": "fenced: the pull's commitments, topics and fact stream",
-    "upsert_embeddings": "fenced: vectors, by their episode's identities",
-    "refuse": "fenced: the fence's own erasure of a refused anchor",
+    "_write_pulled_tables": "fenced: the pull's commitments, their vectors, topics and fact stream",
+    "upsert_embeddings": "fenced: vectors, by their episode's identities or their fact's wording",
+    "_load_facts": "fenced: the rebuild's whole fact state",
+    "_drop_fact_state": "fenced: the drop when the refusal set changes (only removes)",
+    "_drop_mismatched_commitment_vectors": "fenced: removes vectors whose wording is not shown",
+    "_insert_vector_row": "fenced: a vector row a fenced writer already checked",
     "_scrub_forgotten": "fenced: the fence's whole-replica check",
-    "_fence_fact_wording": "fenced: hides a fact's fields no admitted contributor supports",
-    "_insert_decisions": "dump builder: a fresh file the dump publishes through the fence",
+    "_insert_decisions": "dump builder: a fresh file the dump checks (_fence_dumped_facts) and publishes",
     "_insert_deliverables": "dump builder",
     "_insert_episodes": "dump builder",
     "_insert_memory_embeddings": "dump builder",
@@ -61,7 +64,7 @@ DUMP_BUILDERS = {name for name, how in MEMORY_WRITERS.items() if how.startswith(
 # opens the fenced write.
 IMPORT_PATHS = {
     "sync_fact_changes": "_apply_fact_stream_locked",
-    "apply_fact_rows": "apply_fact_rows",
+    "rebuild_facts": "rebuild_facts",
     "apply_decision_changes": "apply_decision_changes",
     "sync_decision_changes": "apply_decision_changes",
     "upsert_episode": "_upsert_episode_unfenced",
@@ -72,7 +75,7 @@ IMPORT_PATHS = {
     "scrub_forgotten_snapshot": "scrub_forgotten_snapshot",
 }
 # Every function that opens _replica_write_gate.
-GATE_OPENERS = {"_apply_fact_stream_locked", "apply_fact_rows", "apply_decision_changes",
+GATE_OPENERS = {"_apply_fact_stream_locked", "rebuild_facts", "apply_decision_changes",
                 "_upsert_episode_unfenced", "upsert_embeddings", "_write_pulled_tables",
                 "_refresh_locked", "publish_imported_snapshot", "scrub_forgotten_snapshot"}
 
@@ -135,13 +138,20 @@ def test_every_fenced_writer_is_only_reached_inside_the_gate():
     dump, and the fact-table row writers always with the fence."""
     fenced = {n for n, how in MEMORY_WRITERS.items() if how.startswith("fenced")}
     fns = _functions()
-    for name in fenced - GATE_OPENERS - {"refuse", "_scrub_forgotten"}:
+    # The fence's own methods (drop, scrub) and the dump's in-place check run
+    # inside the gate that made the fence.
+    inside = {"drop_facts", "scrub", "_fence_dumped_facts", "_write_commitment_vectors"}
+    for name in fenced - GATE_OPENERS - {"_scrub_forgotten", "_drop_fact_state"}:
         for caller in _callers(name):
-            assert caller in GATE_OPENERS | fenced | {"upsert_episode", "_insert_commitments"}, (name, caller)
+            assert caller in GATE_OPENERS | fenced | inside | {"upsert_episode", "_insert_commitments"}, \
+                (name, caller)
     for name in DUMP_BUILDERS | {"_insert_commitments"}:
         assert _callers(name) == {"_refresh_locked"}, name
     assert _callers("_upsert_episode_unfenced") == {"upsert_episode"}
     assert _callers("_scrub_forgotten") == {"scrub"}
+    assert _callers("_drop_fact_state") == {"drop_facts"}
+    assert _callers("_fence_dumped_facts") == {"_refresh_locked"}
+    assert _callers("_write_commitment_vectors") <= fenced
     # Production calls of the row writers pass the fence.
     for writer, at in (("_write_decision_rows", 2), ("_write_commitment_rows", 3), ("_apply_fact_stream", 2)):
         for caller in _callers(writer):
@@ -151,7 +161,7 @@ def test_every_fenced_writer_is_only_reached_inside_the_gate():
                 if isinstance(call, ast.Call) and getattr(call.func, "id", None) == writer:
                     assert len(call.args) > at or any(k.arg == "fence" for k in call.keywords), (writer, caller)
     for name in ("apply_decision_changes", "_upsert_episode_unfenced", "upsert_embeddings",
-                 "_write_pulled_tables", "_apply_fact_stream"):
+                 "_write_pulled_tables", "_apply_fact_stream", "_load_facts", "_fence_dumped_facts"):
         assert "check" in _called(fns[name]), f"{name} does not check its anchors"
 
 
@@ -161,6 +171,8 @@ def test_every_anchor_read_carries_every_identity():
     fns = _functions()
     assert "read_anchor_identities" in _called(fns["_read_fact_rows"])
     assert {"_commitment_anchors", "_read_receipts", "read_anchor_identities"} <= _called(fns["_pull_apply"])
+    assert {"_commitment_anchors", "_read_fact_rows"} <= _called(fns["_read_all_facts"])
+    assert "_anchor_identities" in _called(fns["_dumped_identities"])
     assert "_read_receipts" in _called(fns["read_anchor_identities"])
     assert "_anchor_identities" in _called(fns["read_anchor_identities"])
     assert "_anchor_identities" in _called(fns["_scrub_forgotten"])
@@ -225,13 +237,8 @@ IMPORTS = {
 }
 
 
-def _apply_fact_rows(pg, eid):
-    with pg.connect() as conn, conn.cursor() as cur:
-        facts = [("decision", r[0]) for r in cur.execute("SELECT id FROM decisions").fetchall()]
-        facts += [("deliverable", r[0]) for r in cur.execute("SELECT id FROM deliverables").fetchall()]
-        out = hs.apply_fact_rows(cur, facts)
-        conn.rollback()
-    return out
+def _rebuild_facts(pg, eid):
+    return hs.rebuild_facts()
 
 
 def _decision_mirror(pg, eid):
@@ -260,7 +267,7 @@ def _vectors(pg, eid):
     return hs.upsert_embeddings([_vector_row(eid)], anchors=anchors)
 
 
-IMPORTS.update({"apply_fact_rows": _apply_fact_rows, "apply_decision_changes": _decision_mirror,
+IMPORTS.update({"rebuild_facts": _rebuild_facts, "apply_decision_changes": _decision_mirror,
                 "upsert_episode": _episode_patch, "upsert_embeddings": _vectors})
 
 
@@ -327,22 +334,23 @@ def test_identities_cover_merged_payloads_and_receipts():
 
 # ---- contributors: every path, multi-episode facts (third Astra review #1) --------
 
-def test_every_fact_writer_keeps_its_contributors():
-    """Each writer of commitment, decision or deliverable rows keeps the
-    rows' contributors and fences their fields; each hub read that feeds
-    one reads them in its own snapshot, with their identities."""
+def test_every_fact_writer_checks_each_row():
+    """Each writer of commitment, decision or deliverable rows passes every
+    row through the one check (``_admit_fact``) with the contributors its
+    hub read carried; each hub read that feeds one reads them in its own
+    snapshot, with their identities. No contributor state is kept in the
+    replica (the incremental re-fence was retired 2026-10-24)."""
     fns = _functions()
-    for writer in ("_write_commitment_rows", "_write_decision_rows", "_apply_fact_stream",
-                   "_write_deliverable_rows", "_insert_fact_sources"):
-        assert "_store_fact_sources" in _called(fns[writer]), writer
-    for writer in ("_write_commitment_rows", "_write_decision_rows", "_apply_fact_stream",
-                   "_write_deliverable_rows", "refuse", "_scrub_forgotten"):
-        assert "_fence_fact_wording" in _called(fns[writer]), writer
-    for reader in ("_read_fact_rows", "_pull_apply", "_insert_fact_sources"):
+    for writer in ("_write_commitment_rows", "_write_decision_rows", "_write_fact_deliverables",
+                   "_fence_dumped_facts"):
+        assert "_admit_fact" in _called(fns[writer]), writer
+    for writer in ("_apply_fact_stream", "_write_deliverable_rows", "_load_facts"):
+        assert "_write_fact_deliverables" in _called(fns[writer]), writer
+    for reader in ("_read_fact_rows", "_pull_apply", "_dump_fact_inputs", "_read_all_facts"):
         assert "read_fact_sources" in _called(fns[reader]), reader
     assert "fact_source_episodes" in _called(fns["_read_fact_rows"])
     assert "fact_source_episodes" in _called(fns["_pull_apply"])
-    assert "_insert_fact_sources" in _called(fns["_refresh_locked"])
+    assert {"_dump_fact_inputs", "_fence_dumped_facts"} <= _called(fns["_refresh_locked"])
     for caller, writer in (("_write_pulled_tables", "_write_commitment_rows"),
                            ("_pull_apply", "upsert_episode")):
         calls = [c for c in ast.walk(fns[caller]) if isinstance(c, ast.Call)
@@ -351,17 +359,16 @@ def test_every_fact_writer_keeps_its_contributors():
                                                        for k in c.keywords) for c in calls), (caller, writer)
     for module, needle in (("decisions.py", "read_fact_sources"), ("embed.py", "read_fact_sources")):
         assert needle in (PACKAGE / module).read_text(encoding="utf-8"), module
+    fns_and_classes = {n.name for n in ast.walk(TREE) if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+    for retired in ("_fence_fact_wording", "_store_fact_sources", "_facts_sourced_by", "_ScrubGate",
+                    "_index_identities", "apply_fact_rows"):
+        assert retired not in fns_and_classes, retired
 
 
 SHARED_DECISION = "Ship the shared release checklist"
 SHARED_TITLE = "Shared release checklist"
 B_WORDS = "Review the deployment checklist before the release goes out"
 A_WORDS = "Review the deployment checklist before release"
-
-
-def _contributors() -> set[tuple[str, str, int]]:
-    return {(k, c, e) for k, c, e in _replica(
-        "SELECT kind, col, episode_id FROM replica_fact_sources WHERE episode_id IS NOT NULL")}
 
 
 def _patch_with_sources(pg, eid):
@@ -384,7 +391,7 @@ CONTRIBUTOR_IMPORTS = {
     "pull_changes": (lambda pg, a: hs.pull_changes(include_ledger=False),
                      {"commitment", "decision", "deliverable"}),
     "refresh": (lambda pg, a: hs.refresh(), {"commitment", "decision", "deliverable"}),
-    "apply_fact_rows": (_apply_fact_rows, {"decision", "deliverable"}),
+    "rebuild_facts": (_rebuild_facts, {"commitment", "decision", "deliverable"}),
     "apply_decision_changes": (_decision_mirror, {"decision"}),
     "upsert_episode": (_patch_with_sources, {"deliverable"}),
 }
@@ -395,8 +402,9 @@ def test_every_import_path_keeps_and_fences_every_contributor(pg, replica, gate_
     """Two separate live episodes share each fact: B restates A's
     commitment (its latest_text) and repeats A's decision and deliverable
     word for word. This Mac has forgotten B's source; the hub is unchanged.
-    Each import path alone records both episodes as the contributors of
-    what it writes, hides B's own words, and keeps A's (which A supports)."""
+    Each import path alone hides B's own words and keeps A's (which A
+    supports), checking both episodes as the contributors of what it
+    writes."""
     replica(pg)
     assert hs.refresh()["ok"]
     a = _capture(loop=A_WORDS, decision=SHARED_DECISION, title=SHARED_TITLE)
@@ -414,12 +422,6 @@ def test_every_import_path_keeps_and_fences_every_contributor(pg, replica, gate_
     out = run(pg, a)
     assert out.get("ok", True), out
     assert gate_spy, f"{path} did not go through _replica_write_gate"
-    found = _contributors()
-    expected = {"commitment": {("commitment", "text", a), ("commitment", "latest_text", b)},
-                "decision": {("decision", "text", a), ("decision", "text", b)},
-                "deliverable": {("deliverable", "title", a), ("deliverable", "title", b)}}
-    for kind in kinds:
-        assert expected[kind] <= found, (path, kind, found)
     # B's own words never show; A's, which A supports, stay.
     tables = json.dumps([_replica("SELECT * FROM commitments"), _replica("SELECT * FROM decisions"),
                          _replica("SELECT * FROM deliverables")])

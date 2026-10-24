@@ -528,7 +528,10 @@ def _recover_line_facts(cur, obj: dict[str, Any], episode_id: int | None) -> Non
     capture.run_fact_steps(cur, payload, int(episode_id))
 
 
-_FACT_KEYS = ("open_loops", "decisions", "deliverables")
+# Every capture input the fact steps derive facts from (capture.run_fact_steps):
+# the decision details carry a decision's rationale and its reversal
+# evidence, the closed loops its closes (fourth Astra review #3).
+_FACT_KEYS = ("open_loops", "decisions", "decision_details", "deliverables", "closed_loops")
 
 
 def _fact_items(payload: Any) -> set[str]:
@@ -545,8 +548,9 @@ def _fact_items(payload: Any) -> set[str]:
 
 def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]]]) -> list[dict[str, Any]]:
     """Of fact-bearing file lines whose legacy key ``(ts, md5(summary))`` the
-    hub already holds, the ones carrying a fact item that no episode at that
-    key holds (its own raw, or a capture merged into it; an origin or merged
+    hub already holds, the ones carrying a fact item (any input the fact
+    steps derive facts from, ``_FACT_KEYS``) that no episode at that key
+    holds (its own raw, or a capture merged into it; an origin or merged
     source receipt with that key counts as the key). An equal replay holds
     every item and is not listed; a held key is never proof on its own that
     a distinct line's facts arrived (third Astra review #2). A key whose
@@ -558,10 +562,9 @@ def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]
 
     held: dict[tuple[str, str], set[str]] = {}
     forgotten: set[tuple[str, str]] = set()
-    cols = ("e.deleted_at, e.raw->'open_loops', e.raw->'decisions', e.raw->'deliverables', "
-            "jsonb_path_query_array(e.raw, '$.merged_from[*].payload.open_loops[*]'), "
-            "jsonb_path_query_array(e.raw, '$.merged_from[*].payload.decisions[*]'), "
-            "jsonb_path_query_array(e.raw, '$.merged_from[*].payload.deliverables[*]')")
+    cols = "e.deleted_at, " + ", ".join(
+        [f"e.raw->'{k}'" for k in _FACT_KEYS]
+        + [f"jsonb_path_query_array(e.raw, '$.merged_from[*].payload.{k}[*]')" for k in _FACT_KEYS])
     by_source = sources_ready(cur)
     for start in range(0, len(want), 500):
         part = want[start:start + 500]
@@ -581,8 +584,7 @@ def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]
             if row[2] is not None:
                 forgotten.add(key)
             items = held.setdefault(key, set())
-            for at, name in ((3, "open_loops"), (4, "decisions"), (5, "deliverables"),
-                             (6, "open_loops"), (7, "decisions"), (8, "deliverables")):
+            for at, name in enumerate((*_FACT_KEYS, *_FACT_KEYS), start=3):
                 items |= _fact_items({name: row[at]})
     return [obj for obj, key in want
             if key not in forgotten and not _fact_items(_stored_form(obj)) <= held.get(key, set())]

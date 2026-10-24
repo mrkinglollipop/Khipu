@@ -3770,9 +3770,15 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 conn.commit()
                 out["commitments_embedded"] += 1
                 out["commitments_chunks"] += len(rows)
+                # The wording the vectors were built from, read with the
+                # commitment: the replica stores them only against that
+                # wording (hub_snapshot._commitment_vector_ok), so a
+                # publication delayed past a forget or a re-projection is
+                # dropped (fourth Astra review #1).
                 snapshot_rows.extend(
                     {"profile": profile, "kind": "commitment", "ref": str(cid), "chunk_idx": i,
-                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": b}
+                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": b,
+                     "fact_wording": _md5(ctext or "")}
                     for i, (c, v, b) in enumerate(zip(chunks, vecs, _stamps(built, len(rows))))
                 )
             if snapshot_rows:

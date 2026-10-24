@@ -243,24 +243,29 @@ def test_full_rescrub_memory_is_bounded(tmp_path, monkeypatch):
 
 
 def test_changed_registry_scrub_reads_only_matching_rows(tmp_path, monkeypatch):
-    """After a full scrub indexed the replica, a registry change makes the
-    next fenced write look only at the rows whose identities match it."""
+    """A registry change makes the next fenced write rescrub the replica
+    (the incremental index was retired 2026-10-24, design section 6): in
+    bounded batches, erasing exactly the episode the change names and
+    keeping every other one."""
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "state"))
     _bulk_replica(3_000, 64)
     tombstones.publish_payloads([_unrelated(1)])
     assert hs.scrub_forgotten_snapshot()["ok"]
-    real = hs._anchor_identities
-    calls = []
-
-    def counted(*args, **kwargs):
-        calls.append(1)
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(hs, "_anchor_identities", counted)
     tombstones.publish_payloads([_unrelated(2)])
+    batches = []
+    real = hs._stored_anchor_identities
+
+    def counted(con, ids=None):
+        batches.append(len(ids) if ids is not None else None)
+        return real(con, ids)
+
+    monkeypatch.setattr(hs, "_stored_anchor_identities", counted)
     with hs._replica_write_gate():
         pass
-    assert len(calls) < 10, f"a changed registry re-read {len(calls)} episodes"
+    # Every read is a batch of at most _SCRUB_BATCH rows, never the whole table.
+    assert batches and None not in batches and max(batches) <= hs._SCRUB_BATCH, batches
+    with sqlite3.connect(hs.snapshot_path()) as c:
+        assert c.execute("SELECT count(*) FROM episodes WHERE deleted_at IS NULL").fetchone() == (3_000,)
     # A change that names a held episode still erases exactly that one.
     target = {"ts": "2026-10-23T12:00:00Z", "summary": "public 7", "harness": "codex",
               "session_id": "large:7", "transcript_range": "0:1", "unrelated": "x" * 64}
@@ -270,4 +275,3 @@ def test_changed_registry_scrub_reads_only_matching_rows(tmp_path, monkeypatch):
     with sqlite3.connect(hs.snapshot_path()) as c:
         live = {r[0] for r in c.execute("SELECT id FROM episodes WHERE deleted_at IS NULL")}
     assert 8 not in live and len(live) == 2_999
-    assert len(calls) < 20

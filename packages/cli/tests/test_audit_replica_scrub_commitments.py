@@ -2,7 +2,6 @@
 Synthetic IDs/text only. No hub access, no source changes.
 """
 import sqlite3
-from pathlib import Path
 
 import pytest
 from khipu import hub_snapshot as hs, offline_reads, tombstones
@@ -37,11 +36,15 @@ def test_import_scrubs_episode_but_serves_its_forgotten_commitment(replica):
     assert result['ok'] and result['scrubbed'] == 1, result
     with sqlite3.connect(hs.snapshot_path()) as con:
         assert con.execute('SELECT id FROM episodes').fetchall() == [(8,)]
-        assert con.execute('SELECT id FROM commitments').fetchall() == [(80,)]
-        assert con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment'").fetchall() == [('80',)]
-    # Public offline owed surface, with a live control to prevent vacuous success.
+        # A backup import drops the fact state and rebuilds it from the hub
+        # (design section 6, owner decision 2026-10-24); this test has no
+        # hub, so the replica stays rebuilding and serves no commitment.
+        assert con.execute('SELECT id FROM commitments').fetchall() == []
+        assert con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment'").fetchall() == []
+    assert result["facts"]["rebuilding"], result
+    # Public offline owed surface: the rebuilding state is said plainly.
     served = offline_reads.owed('scratch', 'open', 20)
-    assert served is not None and any(r['id'] == 80 for r in served['results']), served
+    assert served is not None and served.get("facts_rebuilding"), served
     ids = [r['id'] for r in served['results']]
     print(f'import={result}; offline owed ids={ids}')
-    assert ids == [80], 'privacy invariant: imported replica must not serve forgotten commitment 70'
+    assert 70 not in ids, 'privacy invariant: imported replica must not serve forgotten commitment 70'

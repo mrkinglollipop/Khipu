@@ -64,7 +64,7 @@ def test_pulled_commitments_replace_keeps_a_standalone_commitments_vector(replic
         con.execute("INSERT INTO memory_embeddings(profile,kind,ref,chunk_idx,chunk_text) "
                     "VALUES ('p','commitment','90',0,'solo')")
     cols = ["id", "text", "status", "opened_episode"]
-    hs._write_pulled_tables(None, (cols, [(80, "x", "open", 8), (90, "solo", "open", None)]), None,
+    hs._write_pulled_tables(None, (cols, [(80, "live obligation", "open", 8), (90, "solo", "open", None)]), None,
                             read_at=time.time())
     assert _vectors(replica) == ["80", "90"]
 

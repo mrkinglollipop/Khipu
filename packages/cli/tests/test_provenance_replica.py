@@ -228,8 +228,13 @@ def test_forget_everywhere_applies_the_reprojected_facts_at_once(pg, replica):
     assert _replica("SELECT episode_id, text FROM decisions") == [(b, DECISION)]
     assert _replica("SELECT episode_id, title FROM deliverables") == [(b, "The checklist v2")]
     assert "the checklist\"" not in _replica_readers()
-    # The cursor was not moved: the next pull still reads the change.
-    assert _pull()["decisions"]["decisions"] >= 1
+    # The forget rebuilt the replica's facts from the hub (design section 6,
+    # owner decision 2026-10-24): its cursor is that read's, so the next pull
+    # has nothing to bring and the replica still shows B's.
+    assert out["snapshot"]["facts"].get("rebuilt"), out["snapshot"]
+    assert _pull()["ok"]
+    assert _replica("SELECT episode_id, text FROM decisions") == [(b, DECISION)]
+    assert _replica("SELECT episode_id, title FROM deliverables") == [(b, "The checklist v2")]
 
 
 # ---- the prune floor ----------------------------------------------------------------
