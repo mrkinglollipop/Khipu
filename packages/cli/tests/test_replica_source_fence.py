@@ -1,0 +1,324 @@
+# ruff: noqa: F811 - pytest fixtures imported from test_provenance_forget
+"""The replica's one source fence (design section 6; second Astra review
+2026-10-23, findings 1 and 2): every import into the replica goes through
+``hub_snapshot._replica_write_gate`` and its ``_SourceFence``.
+
+The structural half enumerates every function that writes the replica's
+memory tables and every import entry point, and pins how each one is
+fenced, so a new import path that skips the mechanism breaks the build.
+The behavioural half runs every import path against one schedule: a
+public episode gains a merged capture whose source this Mac has forgotten
+(the source is in the durable registry, the episode is live on the hub),
+and asserts the merged capture's words never reach the replica's tables
+and that the path entered the mechanism.
+"""
+from __future__ import annotations
+
+import ast
+import json
+import re
+import shutil
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+
+from khipu import capture, decisions, hub_snapshot as hs, tombstones
+from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.test_provenance_forget import env, pg, PROJECT, _capture, _payload  # noqa: F401
+from tests.test_provenance_replica import replica, _replica, _replica_readers  # noqa: F401
+
+PACKAGE = Path(hs.__file__).resolve().parent
+SOURCE = (PACKAGE / "hub_snapshot.py").read_text(encoding="utf-8")
+TREE = ast.parse(SOURCE)
+
+# Every function in hub_snapshot.py that writes a replica memory table, and
+# why it is safe. "fenced" means it is only ever reached inside a
+# _replica_write_gate (checked below through the call graph).
+MEMORY_WRITERS = {
+    "_apply_fact_stream": "fenced: the fact stream (sync, pull, forget's local apply)",
+    "_write_decision_rows": "fenced: decision rows, by the fence's admission",
+    "_write_commitment_rows": "fenced: the pull's commitments copy; the dump's builder",
+    "_write_deliverable_rows": "fenced: an episode patch's deliverables",
+    "_upsert_episode_unfenced": "fenced: an episode patch (pull, capture, outbox replay)",
+    "_write_pulled_tables": "fenced: the pull's commitments, topics and fact stream",
+    "upsert_embeddings": "fenced: vectors, by their episode's identities",
+    "refuse": "fenced: the fence's own erasure of a refused anchor",
+    "_scrub_forgotten": "fenced: the fence's whole-replica check",
+    "_insert_decisions": "dump builder: a fresh file the dump publishes through the fence",
+    "_insert_deliverables": "dump builder",
+    "_insert_episodes": "dump builder",
+    "_insert_memory_embeddings": "dump builder",
+    "_apply_pending_erasures": "erasure: a forget, which only removes",
+    "_erase_episode_commitments": "erasure",
+    "forget_episode_in_snapshot": "erasure",
+    "purge_topic_in_snapshot": "erasure: a topic purge",
+}
+DUMP_BUILDERS = {name for name, how in MEMORY_WRITERS.items() if how.startswith("dump builder")}
+
+# Every public way rows reach the replica, and the function in it that
+# opens the fenced write.
+IMPORT_PATHS = {
+    "sync_fact_changes": "_apply_fact_stream_locked",
+    "apply_fact_rows": "apply_fact_rows",
+    "apply_decision_changes": "apply_decision_changes",
+    "sync_decision_changes": "apply_decision_changes",
+    "upsert_episode": "_upsert_episode_unfenced",
+    "upsert_embeddings": "upsert_embeddings",
+    "pull_changes": "_write_pulled_tables",
+    "refresh": "_refresh_locked",
+    "publish_imported_snapshot": "publish_imported_snapshot",
+    "scrub_forgotten_snapshot": "scrub_forgotten_snapshot",
+}
+# Every function that opens _replica_write_gate.
+GATE_OPENERS = {"_apply_fact_stream_locked", "apply_fact_rows", "apply_decision_changes",
+                "_upsert_episode_unfenced", "upsert_embeddings", "_write_pulled_tables",
+                "_refresh_locked", "publish_imported_snapshot", "scrub_forgotten_snapshot"}
+
+_WRITE = re.compile(r"\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+(?:main\.)?"
+                    r"(episodes|decisions|deliverables|commitments|memory_embeddings)\b", re.I)
+
+
+def _text(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value if isinstance(v, ast.Constant) else "{}" for v in node.values)
+    return None
+
+
+def _functions():
+    return {fn.name: fn for fn in ast.walk(TREE) if isinstance(fn, ast.FunctionDef)}
+
+
+def _called(fn) -> set[str]:
+    return {c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, "id", None)
+            for c in ast.walk(fn) if isinstance(c, ast.Call)}
+
+
+def _callers(name: str) -> set[str]:
+    return {f for f, fn in _functions().items() if name in _called(fn) and f != name}
+
+
+def _opens_gate(fn) -> bool:
+    return any(isinstance(n, ast.withitem) and isinstance(n.context_expr, ast.Call)
+               and getattr(n.context_expr.func, "id", None) == "_replica_write_gate"
+               for n in ast.walk(fn))
+
+
+def test_every_replica_memory_writer_is_enumerated():
+    found = {name for name, fn in _functions().items()
+             if any((t := _text(n)) and "%s" not in t and _WRITE.search(t) for n in ast.walk(fn))}
+    assert found == set(MEMORY_WRITERS), "a replica memory writer is not listed with how it is fenced"
+
+
+def test_every_import_path_opens_the_one_gate():
+    fns = _functions()
+    assert {name for name, fn in fns.items() if _opens_gate(fn)} == GATE_OPENERS
+    for entry, opener in IMPORT_PATHS.items():
+        assert opener in GATE_OPENERS
+        # The entry reaches its opener through hub_snapshot's own calls.
+        seen, todo = set(), [entry]
+        while todo:
+            name = todo.pop()
+            if name in seen or name not in fns:
+                continue
+            seen.add(name)
+            todo.extend(_called(fns[name]))
+        assert opener in seen, f"{entry} does not reach {opener}"
+
+
+def test_every_fenced_writer_is_only_reached_inside_the_gate():
+    """A fenced writer is called only by a gate opener or by another fenced
+    writer (never from outside the mechanism), the dump builders only by the
+    dump, and the fact-table row writers always with the fence."""
+    fenced = {n for n, how in MEMORY_WRITERS.items() if how.startswith("fenced")}
+    fns = _functions()
+    for name in fenced - GATE_OPENERS - {"refuse", "_scrub_forgotten"}:
+        for caller in _callers(name):
+            assert caller in GATE_OPENERS | fenced | {"upsert_episode", "_insert_commitments"}, (name, caller)
+    for name in DUMP_BUILDERS | {"_insert_commitments"}:
+        assert _callers(name) == {"_refresh_locked"}, name
+    assert _callers("_upsert_episode_unfenced") == {"upsert_episode"}
+    assert _callers("_scrub_forgotten") == {"scrub"}
+    # Production calls of the row writers pass the fence.
+    for writer, at in (("_write_decision_rows", 2), ("_write_commitment_rows", 3), ("_apply_fact_stream", 2)):
+        for caller in _callers(writer):
+            if caller == "_insert_commitments":
+                continue
+            for call in ast.walk(fns[caller]):
+                if isinstance(call, ast.Call) and getattr(call.func, "id", None) == writer:
+                    assert len(call.args) > at or any(k.arg == "fence" for k in call.keywords), (writer, caller)
+    for name in ("apply_decision_changes", "_upsert_episode_unfenced", "upsert_embeddings",
+                 "_write_pulled_tables", "_apply_fact_stream"):
+        assert "check" in _called(fns[name]), f"{name} does not check its anchors"
+
+
+def test_every_anchor_read_carries_every_identity():
+    """Each import reads its anchors' identities from the hub in its own
+    snapshot, merged captures and source receipts included."""
+    fns = _functions()
+    assert "read_anchor_identities" in _called(fns["_read_fact_rows"])
+    assert {"_commitment_anchors", "_read_receipts", "read_anchor_identities"} <= _called(fns["_pull_apply"])
+    assert "_read_receipts" in _called(fns["read_anchor_identities"])
+    assert "_anchor_identities" in _called(fns["read_anchor_identities"])
+    assert "_anchor_identities" in _called(fns["_scrub_forgotten"])
+    assert "_anchor_identities" in _called(fns["_upsert_episode_unfenced"])
+    body = ast.get_source_segment(SOURCE, fns["_anchor_identities"])
+    assert "merged_from" in body and "receipts" in body
+
+
+# ---- behaviour: every path, one schedule ------------------------------------------
+
+MARKER = "Rotate PRIVATE-MERGED-FENCE-WORDS before the release"
+
+
+def _private():
+    return _payload(loop=MARKER, decision=MARKER, title=MARKER,
+                    summary="A private merged capture", session_id="codex:fence-private")
+
+
+def _merge(pg, eid, private, *, before_commit=lambda: None):
+    """A real capture merge; ``before_commit`` runs while it is still open
+    (the merge's own registry check passed before the source was forgotten)."""
+    with pg.connect() as conn, conn.cursor() as cur:
+        assert capture._merge_into_episode(cur, eid, private, matched_via="review", score=1.0)
+        before_commit()
+        conn.commit()
+
+
+def _leaked() -> list[str]:
+    tables = {"decisions": "text", "deliverables": "title", "commitments": "text",
+              "memory_embeddings": "chunk_text"}
+    found = [t for t, col in tables.items()
+             if any(MARKER in str(v) for (v,) in _replica(f"SELECT {col} FROM {t}"))]
+    if MARKER in _replica_readers():
+        found.append("readers")
+    return found
+
+
+@pytest.fixture
+def gate_spy(monkeypatch):
+    opened: list[str] = []
+    real = hs._replica_write_gate
+
+    @contextmanager
+    def spy(*args, **kwargs):
+        opened.append("gate")
+        with real(*args, **kwargs) as fence:
+            yield fence
+
+    monkeypatch.setattr(hs, "_replica_write_gate", spy)
+    return opened
+
+
+def _vector_row(eid):
+    return {"profile": "fence", "kind": "episode", "ref": str(eid), "chunk_idx": 0, "chunk_text": MARKER,
+            "content_hash": "x", "embedding": [1.0, 0.0], "built_at": "2026-10-23T12:00:00+00:00"}
+
+
+IMPORTS = {
+    "sync_fact_changes": lambda pg, eid: hs.sync_fact_changes(),
+    "pull_changes": lambda pg, eid: hs.pull_changes(include_ledger=False),
+    "refresh": lambda pg, eid: hs.refresh(),
+}
+
+
+def _apply_fact_rows(pg, eid):
+    with pg.connect() as conn, conn.cursor() as cur:
+        facts = [("decision", r[0]) for r in cur.execute("SELECT id FROM decisions").fetchall()]
+        facts += [("deliverable", r[0]) for r in cur.execute("SELECT id FROM deliverables").fetchall()]
+        out = hs.apply_fact_rows(cur, facts)
+        conn.rollback()
+    return out
+
+
+def _decision_mirror(pg, eid):
+    with pg.connect() as conn, conn.cursor() as cur:
+        for (fid,) in cur.execute("SELECT id FROM decisions").fetchall():
+            decisions._mirror_to_snapshot(cur, fid)
+        conn.rollback()
+    return {"ok": True}
+
+
+def _episode_patch(pg, eid):
+    from khipu import deliverables
+
+    with pg.connect() as conn, conn.cursor() as cur:
+        row = cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (eid,)).fetchone()[0]
+        rows = deliverables.deliverables_for_episode(cur, eid)
+        receipts = hs._read_receipts(cur, [eid]).get(eid, [])
+        conn.rollback()
+    return hs.upsert_episode(row, [_vector_row(eid)], deliverable_rows=rows, receipts=receipts)
+
+
+def _vectors(pg, eid):
+    with pg.connect() as conn, conn.cursor() as cur:
+        anchors = hs.read_anchor_identities(cur, [eid])
+        conn.rollback()
+    return hs.upsert_embeddings([_vector_row(eid)], anchors=anchors)
+
+
+IMPORTS.update({"apply_fact_rows": _apply_fact_rows, "apply_decision_changes": _decision_mirror,
+                "upsert_episode": _episode_patch, "upsert_embeddings": _vectors})
+
+
+@pytest.mark.parametrize("path", sorted(IMPORTS))
+def test_every_import_path_fences_a_forgotten_merged_source(pg, replica, gate_spy, path):
+    """A live public episode gains a merged capture on the hub whose source
+    this Mac forgets while the merge is open, before the replica's last
+    fenced write (so no registry change is left to trigger a scrub). Each
+    import path alone must refuse its words."""
+    replica(pg)
+    eid = _capture(loop=None)
+    private = _private()
+
+    def forget_then_dump():
+        tombstones.publish_payloads([private])
+        assert hs.refresh()["ok"]
+
+    _merge(pg, eid, private, before_commit=forget_then_dump)
+    with pg.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM decisions").fetchone() == (1,)
+    gate_spy.clear()
+    IMPORTS[path](pg, eid)
+    assert gate_spy, f"{path} did not go through _replica_write_gate"
+    assert _leaked() == [], path
+
+
+@pytest.mark.parametrize("path", ["publish_imported_snapshot", "scrub_forgotten_snapshot"])
+def test_imported_and_scrubbed_replicas_fence_a_merged_source(pg, replica, gate_spy, path, tmp_path):
+    """A replica copy made before the source was forgotten holds its words;
+    the backup import and the scrub refuse them by the merged identity."""
+    replica(pg)
+    eid = _capture(loop=None)
+    private = _private()
+    _merge(pg, eid, private)
+    assert hs.refresh()["ok"]
+    assert "decisions" in _leaked()
+    staged = hs.staging_path()
+    shutil.copyfile(hs.snapshot_path(), staged)
+    tombstones.publish_payloads([private])
+    gate_spy.clear()
+    if path == "publish_imported_snapshot":
+        out = hs.publish_imported_snapshot(staged)
+    else:
+        staged.unlink()
+        out = hs.scrub_forgotten_snapshot()
+    assert out["ok"], out
+    assert gate_spy
+    assert _leaked() == []
+
+
+def test_identities_cover_merged_payloads_and_receipts():
+    """Unit: the identity set names the merged capture by payload and by
+    receipt hash, and a source receipt by its key and hash."""
+    from khipu.tombstones import identity_strings
+
+    merged = {"ts": "2026-10-23T10:00:00Z", "summary": "merged", "harness": "codex",
+              "session_id": "codex:m", "transcript_range": "0:1"}
+    row = {"id": 1, "raw": json.dumps({"ts": "2026-10-23T09:00:00Z", "summary": "own",
+                                       "merged_from": [{"source_id": "abc", "payload": merged}]})}
+    ids = hs._anchor_identities(row, [("key-1", "sha-1")])
+    assert identity_strings(merged, redact=False) <= ids
+    assert {"h:abc", "k:key-1", "h:sha-1"} <= ids

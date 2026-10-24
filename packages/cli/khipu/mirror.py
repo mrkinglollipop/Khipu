@@ -494,6 +494,48 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
     return inserted
 
 
+def _carries_fact_items(payload: dict[str, Any]) -> bool:
+    """What 0047's writer gate calls a fact-bearing capture."""
+    return any(isinstance(payload.get(k), list) and payload.get(k)
+               for k in ("open_loops", "decisions", "deliverables"))
+
+
+def _recover_line_facts(cur, obj: dict[str, Any], episode_id: int | None) -> None:
+    """A file line a recovery writer just imported as a new episode gets its
+    fact items through capture's own fact steps (``capture.run_fact_steps``:
+    claims, or a recorded fact gap), so the hub's writer gate (migration
+    0047) admits it; recovery used to be refused there for good (second
+    Astra review #5). Only on a 0047 hub, so an older hub sees exactly the
+    former episode-only import."""
+    if episode_id is None or not _carries_fact_items(obj):
+        return
+    from khipu import capture, provenance
+
+    if not provenance.ready(cur):
+        return
+    payload = deepcopy(obj)
+    capture._redact_capture_values(payload)
+    capture.run_fact_steps(cur, payload, int(episode_id))
+
+
+def _line_deferred(cur, obj: dict[str, Any], exc: BaseException) -> bool:
+    """A recovered line whose fact step must be retried (a lock or timeout,
+    ``FactStepDeferred``) is rolled back alone and queued in the outbox,
+    whose drain lands it through ``capture.write_pg``; the rest of the
+    batch still commits. False for any other error."""
+    from khipu.capture import FactStepDeferred
+
+    if not isinstance(exc, FactStepDeferred):
+        return False
+    cur.execute("ROLLBACK TO SAVEPOINT mirror_recover_line")
+    cur.execute("RELEASE SAVEPOINT mirror_recover_line")
+    from khipu.outbox import enqueue
+
+    enqueue(obj, reason=f"recovery fact step deferred: {exc}"[:200])
+    _log(f"recovered line deferred to the outbox ({exc})")
+    return True
+
+
 def mirror_episode(payload: dict[str, Any]) -> bool:
     """Insert one episode row. Returns True on success (or already mirrored).
 
@@ -646,8 +688,20 @@ def sync_recent_episodes(memory_root: Path, *, tail_lines: int = 40) -> dict[str
         with conn.cursor() as cur:
             missing = set(episodes_missing_in_pg(cur, keys))
             for obj, key in zip(objs, keys):
+                if key not in missing:
+                    continue
                 upserted: dict[str, Any] = {}
-                if key in missing and _upsert_episode(cur, obj, out=upserted):
+                cur.execute("SAVEPOINT mirror_recover_line")
+                try:
+                    inserted = _upsert_episode(cur, obj, out=upserted)
+                    if inserted:
+                        _recover_line_facts(cur, obj, upserted.get("episode_id"))
+                except Exception as exc:
+                    if not _line_deferred(cur, obj, exc):
+                        raise
+                    continue
+                cur.execute("RELEASE SAVEPOINT mirror_recover_line")
+                if inserted:
                     stats["inserted"] += 1
                     inserted_payloads.append((obj, upserted.get("episode_id")))
         conn.commit()
@@ -740,7 +794,20 @@ def reconcile_memory_root(memory_root: Path) -> dict[str, int]:
                             stats["episodes"] += 1
                 missing = set(episodes_missing_in_pg(cur, keys))
                 for obj, key in zip(objs, keys):
-                    if key in missing and _upsert_episode(cur, obj):
+                    if key not in missing:
+                        continue
+                    upserted: dict[str, Any] = {}
+                    cur.execute("SAVEPOINT mirror_recover_line")
+                    try:
+                        inserted = _upsert_episode(cur, obj, out=upserted)
+                        if inserted:
+                            _recover_line_facts(cur, obj, upserted.get("episode_id"))
+                    except Exception as exc:
+                        if not _line_deferred(cur, obj, exc):
+                            raise
+                        continue
+                    cur.execute("RELEASE SAVEPOINT mirror_recover_line")
+                    if inserted:
                         stats["episodes_new"] += 1
             if topics_dir.is_dir():
                 seen: list[str] = []

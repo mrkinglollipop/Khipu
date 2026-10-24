@@ -1058,6 +1058,83 @@ def _forgotten_result(cur, payload: dict[str, Any], source: dict[str, Any], *,
     }
 
 
+def run_fact_steps(cur, payload: dict[str, Any], episode_id: int) -> None:
+    """The fact steps of a newly inserted capture, each in its own
+    savepoint: commitments, decisions, reversal detection, close rules and
+    deliverables. A transient or old-writer error raises
+    :class:`FactStepDeferred` (the whole transaction must roll back and be
+    retried); any other error rolls its step back and records a
+    ``fact_gaps`` row (invariant I4). ``write_pg`` runs them for a capture,
+    and the file recovery writers (``mirror.sync_recent_episodes``,
+    ``mirror.reconcile_memory_root``) for a file line they import, so the
+    episode commits with its claims (0047's writer gate)."""
+    cur.execute("SAVEPOINT capture_commitments")
+    try:
+        from khipu import commitments
+
+        commitments.open_from_episode(cur, payload, episode_id)
+        commitments.auto_close(cur, payload, episode_id)
+        commitments.close_session_plan(cur, payload, episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "commitments")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
+        _record_fact_gap(cur, episode_id, "commitments", exc)
+        _log(f"commitments step failed ({type(exc).__name__}: {exc})")
+
+    # O2: each string in payload['decisions'] becomes a row.
+    cur.execute("SAVEPOINT capture_decisions")
+    try:
+        from khipu import decisions as _decisions
+
+        _decisions.insert_decisions_from_episode(cur, payload, episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "decisions")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_decisions")
+        _record_fact_gap(cur, episode_id, "decisions", exc)
+        _log(f"decisions step failed ({type(exc).__name__}: {exc})")
+
+    # Phase 2, session C: conservative reversal detection over
+    # the rows the step above just inserted — its own
+    # SAVEPOINT, same fail-open posture as every neighbour
+    # here, so a detection failure can never take the
+    # episode (or the decisions just written) down with it.
+    cur.execute("SAVEPOINT capture_decision_detection")
+    try:
+        from khipu import decisions as _decisions
+
+        _decisions.detect_reversals_from_episode(cur, payload, episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "decision detection")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_decision_detection")
+        _record_fact_gap(cur, episode_id, "decision detection", exc)
+        _log(f"decision detection step failed ({type(exc).__name__}: {exc})")
+
+    # Owed close rules (slice 2): PR and decision closes for
+    # this capture's project, after the decisions they read.
+    cur.execute("SAVEPOINT capture_close_rules")
+    try:
+        from khipu import close_rules
+
+        close_rules.run(cur, payload=payload, episode_id=episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "close rules")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_close_rules")
+        _record_fact_gap(cur, episode_id, "close rules", exc)
+        _log(f"close rules step failed ({type(exc).__name__}: {exc})")
+
+    # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
+    cur.execute("SAVEPOINT capture_deliverables")
+    try:
+        from khipu import deliverables as _deliverables
+
+        _deliverables.insert_deliverables_from_episode(cur, payload, episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "deliverables")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_deliverables")
+        _record_fact_gap(cur, episode_id, "deliverables", exc)
+        _log(f"deliverables step failed ({type(exc).__name__}: {exc})")
+
+
 def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
@@ -1307,71 +1384,7 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
 
                 if inserted:
                     if episode_id is not None:
-                        cur.execute("SAVEPOINT capture_commitments")
-                        try:
-                            from khipu import commitments
-
-                            commitments.open_from_episode(cur, payload, episode_id)
-                            commitments.auto_close(cur, payload, episode_id)
-                            commitments.close_session_plan(cur, payload, episode_id)
-                        except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                            _defer_if_transient(exc, "commitments")
-                            cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
-                            _record_fact_gap(cur, episode_id, "commitments", exc)
-                            _log(f"commitments step failed ({type(exc).__name__}: {exc})")
-
-                        # O2: each string in payload['decisions'] becomes a row.
-                        cur.execute("SAVEPOINT capture_decisions")
-                        try:
-                            from khipu import decisions as _decisions
-
-                            _decisions.insert_decisions_from_episode(cur, payload, episode_id)
-                        except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                            _defer_if_transient(exc, "decisions")
-                            cur.execute("ROLLBACK TO SAVEPOINT capture_decisions")
-                            _record_fact_gap(cur, episode_id, "decisions", exc)
-                            _log(f"decisions step failed ({type(exc).__name__}: {exc})")
-
-                        # Phase 2, session C: conservative reversal detection over
-                        # the rows the step above just inserted — its own
-                        # SAVEPOINT, same fail-open posture as every neighbour
-                        # here, so a detection failure can never take the
-                        # episode (or the decisions just written) down with it.
-                        cur.execute("SAVEPOINT capture_decision_detection")
-                        try:
-                            from khipu import decisions as _decisions
-
-                            _decisions.detect_reversals_from_episode(cur, payload, episode_id)
-                        except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                            _defer_if_transient(exc, "decision detection")
-                            cur.execute("ROLLBACK TO SAVEPOINT capture_decision_detection")
-                            _record_fact_gap(cur, episode_id, "decision detection", exc)
-                            _log(f"decision detection step failed ({type(exc).__name__}: {exc})")
-
-                        # Owed close rules (slice 2): PR and decision closes for
-                        # this capture's project, after the decisions they read.
-                        cur.execute("SAVEPOINT capture_close_rules")
-                        try:
-                            from khipu import close_rules
-
-                            close_rules.run(cur, payload=payload, episode_id=episode_id)
-                        except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                            _defer_if_transient(exc, "close rules")
-                            cur.execute("ROLLBACK TO SAVEPOINT capture_close_rules")
-                            _record_fact_gap(cur, episode_id, "close rules", exc)
-                            _log(f"close rules step failed ({type(exc).__name__}: {exc})")
-
-                        # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
-                        cur.execute("SAVEPOINT capture_deliverables")
-                        try:
-                            from khipu import deliverables as _deliverables
-
-                            _deliverables.insert_deliverables_from_episode(cur, payload, episode_id)
-                        except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                            _defer_if_transient(exc, "deliverables")
-                            cur.execute("ROLLBACK TO SAVEPOINT capture_deliverables")
-                            _record_fact_gap(cur, episode_id, "deliverables", exc)
-                            _log(f"deliverables step failed ({type(exc).__name__}: {exc})")
+                        run_fact_steps(cur, payload, episode_id)
 
                 memory_root = path_setting("memory_root")
                 # In dual mode capture_v2 has not run yet, so topic pages named in the

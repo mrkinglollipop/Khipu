@@ -1032,61 +1032,65 @@ def _dump_cursors(con: sqlite3.Connection, at: str) -> None:
     _advance_cursor(con, "vectors", synced_at=at, newest=_newest_ts(column("memory_embeddings", "built_at")))
 
 
-def apply_decision_changes(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def apply_decision_changes(rows: Sequence[Mapping[str, Any]],
+                           anchors: Mapping[int, Any] | None = None) -> dict[str, Any]:
     """Upsert decision rows into the local replica's ``decisions`` table —
     the write half of validity's local-lane visibility (Phase 2, session B):
     ``khipu.decisions`` calls this right after a successful supersede/
     restore/retract on THIS machine so the local lane sees the correction at
     once; ``sync_decision_changes`` below calls it for corrections made
-    elsewhere. Same lock/fail-open contract as ``upsert_episode``: a no-op
+    elsewhere. ``anchors``: the rows' anchor episodes' identities, read from
+    the hub with them (``read_anchor_identities``), for the source fence.
+    Same lock/fail-open contract as ``upsert_episode``: a no-op
     ``{"ok": False}`` when the snapshot is missing, too old to have a
     ``decisions`` table, or a full dump is in progress — never a raise.
     """
+    from khipu.tombstones import RegistryError
+
     if not rows:
         return {"ok": True, "decisions": 0}
     path = snapshot_path()
     if not path.is_file():
         return {"ok": False, "error": "hub snapshot missing"}
-    lock = _acquire_refresh_lock()
-    if lock is None:
-        _record_write_error(("decisions",), "hub snapshot refresh in progress")
-        return {"ok": False, "error": "hub snapshot refresh in progress"}
     try:
-        con = sqlite3.connect(str(path))
-        try:
-            written = _write_decision_rows(con, rows)
+        with _replica_write_gate(path) as fence:
+            fence.check(anchors or {})
+            written = _write_decision_rows(fence.con, rows, fence=fence)
             if written is None:
                 return {"ok": False, "error": "replica has no decisions table (version 1)"}
-            con.commit()
-        finally:
-            con.close()
         return {"ok": True, "decisions": written}
+    except _ReplicaBusy:
+        _record_write_error(("decisions",), "hub snapshot refresh in progress")
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    except RegistryError as exc:
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
     except Exception as exc:  # noqa: BLE001 — the PG write already succeeded
         _record_write_error(("decisions",), f"{type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    finally:
-        _release_refresh_lock(lock)
 
 
-def _write_decision_rows(con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]]) -> int | None:
+def _write_decision_rows(con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]],
+                         fence: _SourceFence | None = None) -> int | None:
     """Insert-or-replace ``rows`` into ``con``'s ``decisions`` table. Caller
     owns the transaction (commit/rollback) and any locking — this never
     commits or acquires a lock itself, so ``upsert_episode`` (already
     holding the refresh lock) and ``apply_decision_changes`` (which acquires
     its own) can both use it without a reentrant-lock risk. Returns ``None``
     (not 0) when the replica has no ``decisions`` table at all, so a caller
-    can tell that apart from "zero rows written"."""
+    can tell that apart from "zero rows written". Every import passes the
+    ``fence`` of its ``_replica_write_gate``, which already checked the
+    rows' anchors; without one only ids already refused are left out."""
     cols_present = _snapshot_table_columns(con, "decisions")
     if not cols_present:
         return None
     written = 0
-    rejected = _rejected_episode_ids(con)
+    rejected = _rejected_episode_ids(con) if fence is None else None
     ts_cols = {"decided_at", "created_at", "superseded_at", "retracted_at"}
     for row in rows:
         rid = row.get("id")
         if rid is None:
             continue
-        if row.get("episode_id") in rejected:
+        if (row.get("episode_id") in rejected if fence is None else not fence.admits(row.get("episode_id"))):
             con.execute("DELETE FROM decisions WHERE id = ?", (rid,))
             continue
         cols = [c for c in _DECISION_COLS if c in row and c in cols_present]
@@ -1179,6 +1183,9 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
                         (*params, limit),
                     )
                     fetched = cur.fetchall()
+                    at = cols.index("episode_id") if "episode_id" in cols else None
+                    anchors = read_anchor_identities(
+                        cur, {r[at] for r in fetched if at is not None and r[at] is not None})
     except Exception as exc:  # noqa: BLE001 — fail-open, same posture as maybe_refresh
         _record_write_error(("decisions",), f"decision sync: {type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "hub_unreachable": hub_connection_failed(exc)}
@@ -1187,7 +1194,7 @@ def sync_decision_changes(*, limit: int = 500) -> dict[str, Any]:
     if not fetched:
         return {"ok": True, "decisions": 0}
     rows = [dict(zip(cols, r[:-1])) for r in fetched]
-    out = apply_decision_changes(rows)
+    out = apply_decision_changes(rows, anchors)
     if out.get("ok"):
         new_watermark = fetched[-1][-1]
         m["last_decision_sync_at"] = _ts_text(new_watermark) or since
@@ -1218,6 +1225,325 @@ _FACT_CURSOR_KEY = "fact_stream_xid"
 # The hub episode columns, beyond raw, that name a capture's source.
 _ANCHOR_SOURCE_COLS = ("harness", "session_id", "transcript_range", "window_id", "part",
                        "repo_root", "project", "parent_session_id")
+
+
+# ---- The replica source fence (design section 6) ------------------------------
+#
+# One mechanism for every import into the replica: the fact stream, the
+# pull's commitments copy and episode patches, vectors, the decision mirror,
+# the full dump and a backup import. Each runs inside ``_replica_write_gate``,
+# which holds the forgotten-source registry's lease (and the shared memory
+# lock it takes first) from the source check through the SQLite commit, so
+# a publication on another process waits for the commit and then finds the
+# rows to erase (the second Astra review's #2). Each row's anchor episode is
+# checked by every source identity it represents, read from the hub in the
+# same snapshot as the row: its raw and column identities, every merged
+# capture's payload and receipt hash, and its retained ``episode_sources``
+# receipts. A replica's held copy of the episode is never proof (the
+# second review's #1: a merge that committed behind the episode cursor).
+# Those identities are kept in the replica (``replica_anchor_sources``, hashes
+# only), so a registry that changes later re-fences rows already written:
+# before its commit each write re-reads the registry (a publication from
+# this very process reuses the lease), and the first write after any
+# change scrubs the whole replica, unseen anchors included.
+
+_ANCHOR_TABLE = "replica_anchor_sources"
+_FENCE_DIGEST_KEY = "fence_registry_digest"
+
+
+class _ReplicaBusy(RuntimeError):
+    """A full dump holds the refresh lock; the write is not made."""
+
+
+def _ensure_anchor_table(con: sqlite3.Connection) -> None:
+    con.execute(f"CREATE TABLE IF NOT EXISTS {_ANCHOR_TABLE} ("
+                "episode_id INTEGER PRIMARY KEY, digest TEXT, identities TEXT NOT NULL)")
+
+
+def _stored_anchor_identities(con: sqlite3.Connection, ids: Iterable[int] | None = None
+                              ) -> dict[int, frozenset[str]]:
+    """The identities the replica keeps for anchor episodes (all, or ``ids``)."""
+    if not _snapshot_table_columns(con, _ANCHOR_TABLE):
+        return {}
+    out: dict[int, frozenset[str]] = {}
+    if ids is None:
+        rows: Iterable[Any] = con.execute(f"SELECT episode_id, identities FROM {_ANCHOR_TABLE}")
+    else:
+        want = sorted({int(i) for i in ids})
+        rows = [r for part in _chunks(want) for r in con.execute(
+            f"SELECT episode_id, identities FROM {_ANCHOR_TABLE} "
+            f"WHERE episode_id IN ({', '.join('?' * len(part))})", part)]
+    for eid, text in rows:
+        try:
+            out[int(eid)] = frozenset(str(v) for v in json.loads(text))
+        except (TypeError, ValueError) as exc:
+            # Unknown is never admitted: the write aborts, as for an
+            # unreadable registry.
+            from khipu.tombstones import RegistryError
+
+            raise RegistryError(f"replica anchor identities unreadable for episode {eid}") from exc
+    return out
+
+
+def _anchor_identities(row: Mapping[str, Any], receipts: Iterable[Sequence[Any]] = ()) -> frozenset[str]:
+    """Every source identity one episode row represents, as registry tags
+    (``tombstones.identity_strings``): its raw and column identities (the
+    forms forget publishes, ``_tombstone_payloads_for_episode``), each
+    merged capture's payload and receipt hash, and its source receipts
+    ``(source_key, payload_sha256)``. Stored rows are already redacted.
+    ``RegistryError`` when a payload has no identity."""
+    from khipu.tombstones import identity_strings
+
+    payloads = _tombstone_payloads_for_episode(row)
+    raw = row.get("raw")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    found: set[str] = set()
+    merged = raw.get("merged_from") if isinstance(raw, dict) else None
+    for entry in merged if isinstance(merged, list) else ():
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("source_id"), str) and entry["source_id"]:
+            found.add(f"h:{entry['source_id']}")
+        if isinstance(entry.get("payload"), dict):
+            payloads.append(entry["payload"])
+    for payload in payloads:
+        found |= identity_strings(payload, redact=False)
+    for key, sha in receipts:
+        if key:
+            found.add(f"k:{key}")
+        if sha:
+            found.add(f"h:{sha}")
+    return frozenset(found)
+
+
+def _read_receipts(cur, episode_ids: Iterable[int]) -> dict[int, list[tuple[Any, Any]]]:
+    """The hub's retained source receipts (``episode_sources``, migration
+    0027) of ``episode_ids``, deleted ones too."""
+    want = sorted({int(i) for i in episode_ids})
+    if not want or not {"episode_id", "source_key", "payload_sha256"} <= _pg_columns(cur, "episode_sources"):
+        return {}
+    out: dict[int, list[tuple[Any, Any]]] = {}
+    for part in _chunks(want):
+        cur.execute("SELECT episode_id, source_key, payload_sha256 FROM episode_sources "
+                    "WHERE episode_id = ANY(%s)", (part,))
+        for eid, key, sha in cur.fetchall():
+            out.setdefault(int(eid), []).append((key, sha))
+    return out
+
+
+def _anchor_cols(cur) -> list[str]:
+    hub_cols = _pg_columns(cur, "episodes")
+    return [c for c in dict.fromkeys(("id", "ts", "summary", "raw", "deleted_at", *_ANCHOR_SOURCE_COLS))
+            if c in hub_cols]
+
+
+def read_anchor_identities(cur, episode_ids: Iterable[int]) -> dict[int, frozenset[str]]:
+    """Every source identity each of ``episode_ids`` represents on the hub,
+    read on ``cur`` (so in its snapshot), for the replica's source fence.
+    An id the hub does not hold is left out."""
+    want = sorted({int(i) for i in episode_ids})
+    if not want:
+        return {}
+    cols = _anchor_cols(cur)
+    receipts = _read_receipts(cur, want)
+    out: dict[int, frozenset[str]] = {}
+    for part in _chunks(want):
+        cur.execute(f"SELECT {', '.join(cols)} FROM episodes WHERE id = ANY(%s)", (part,))
+        for r in cur.fetchall():
+            row = dict(zip(cols, r))
+            out[int(row["id"])] = _anchor_identities(row, receipts.get(int(row["id"]), ()))
+    return out
+
+
+def _commitment_anchors(cur, commitments: tuple[list[str], list[Any]] | None
+                        ) -> tuple[dict[int, frozenset[str] | None], dict[int, str]]:
+    """The anchor (opening) episodes of the pulled commitments, held or not,
+    for the source fence, and each one's hub version. The whole table is
+    pulled every time, so an anchor whose version equals the one the
+    replica stored with its identities is not re-read (``None``: use the
+    stored identities). The version is the row's ``changed_at`` (migration
+    0032: a trigger moves it on every change, and a merge writes the
+    episode's raw and its source receipt in one transaction); a hub without
+    it re-reads every anchor."""
+    if not commitments or "opened_episode" not in commitments[0]:
+        return {}, {}
+    at = commitments[0].index("opened_episode")
+    wanted = sorted({int(r[at]) for r in commitments[1] if r[at] is not None})
+    if not wanted:
+        return {}, {}
+    digests: dict[int, str] = {}
+    held: dict[int, str] = {}
+    if {"changed_at", "ingested_at"} <= _pg_columns(cur, "episodes"):
+        with closing(sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)) as con:
+            if {"episode_id", "digest"} <= _snapshot_table_columns(con, _ANCHOR_TABLE):
+                held = {int(e): d for e, d in con.execute(
+                    f"SELECT episode_id, digest FROM {_ANCHOR_TABLE} WHERE digest IS NOT NULL")}
+        for part in _chunks(wanted):
+            cur.execute("SELECT id, changed_at, ingested_at FROM episodes WHERE id = ANY(%s)", (part,))
+            for eid, changed, ingested in cur.fetchall():
+                # NULL changed_at: unchanged since 0032 (any update sets it).
+                if changed is not None or ingested is not None:
+                    digests[int(eid)] = (f"changed:{_ts_text(changed)}" if changed is not None
+                                         else f"ingested:{_ts_text(ingested)}")
+    changed_ids = [e for e in wanted if e not in digests or held.get(e) != digests[e]]
+    full = read_anchor_identities(cur, changed_ids)
+    anchors: dict[int, frozenset[str] | None] = {e: None for e in wanted}
+    anchors.update({e: full.get(e, frozenset()) for e in changed_ids})
+    return anchors, digests
+
+
+def _registry_rejected_anchors(anchors: Mapping[Any, Any], known: set[int], *, gate: Any = None) -> set[int]:
+    """The anchor episodes the forgotten-source registry refuses, beyond the
+    ids already in ``known``: forgotten by id, or by any identity they
+    represent. ``gate`` is the registry snapshot of the caller's
+    ``_replica_write_gate``. ``RegistryError`` propagates: an unreadable
+    registry aborts the write, never reads as empty."""
+    if not anchors:
+        return set()
+    if gate is None:
+        from khipu.tombstones import read_gate
+
+        gate = read_gate()
+    if gate.empty:
+        return set()
+    return {int(e) for e, ids in anchors.items()
+            if int(e) not in known and (int(e) in gate.episode_ids or gate.refuses(ids or ()))}
+
+
+class _SourceFence:
+    """One replica write's source fence: the registry snapshot its gate
+    holds, the episode ids refused so far, and the connection it guards."""
+
+    def __init__(self, con: sqlite3.Connection, gate: Any, path: Path):
+        self.con, self.gate, self.path = con, gate, path
+        _ensure_anchor_table(con)
+        self.rejected = _rejected_episode_ids(con)
+        self.unverified: set[int] = set()
+        self.scrubbed = 0
+
+    def _meta(self) -> str | None:
+        if not _snapshot_table_columns(self.con, "snapshot_meta"):
+            return None
+        row = self.con.execute("SELECT value FROM snapshot_meta WHERE key = ?", (_FENCE_DIGEST_KEY,)).fetchone()
+        return row[0] if row else None
+
+    def start(self, *, scrub: bool = False) -> None:
+        """Re-fence what is already written when the registry changed since
+        the last fenced write (or always, for a dump or an import)."""
+        if scrub:
+            _apply_pending_erasures(self.con, self.path)
+        if scrub or (not self.gate.empty and self._meta() != self.gate.digest):
+            self.scrub()
+
+    def scrub(self) -> None:
+        self.scrubbed += _scrub_forgotten(self.con, self.gate)
+        self.rejected |= _rejected_episode_ids(self.con)
+
+    def check(self, anchors: Mapping[Any, Any], digests: Mapping[int, str] | None = None) -> set[int]:
+        """Check anchor episodes (``{id: identities}``; ``None`` = the ones
+        stored, for an unchanged fingerprint) and keep their identities.
+        Refused ids are queued for erasure and their rows erased here; an
+        anchor that cannot be verified is admitted nowhere in this write."""
+        if not anchors:
+            return set()
+        anchors = {int(e): v for e, v in anchors.items()}
+        stored = _stored_anchor_identities(self.con, anchors)
+        resolved: dict[int, frozenset[str]] = {}
+        for eid, idents in anchors.items():
+            if idents is None:
+                if eid not in stored:
+                    self.unverified.add(eid)
+                    continue
+                resolved[eid] = stored[eid]
+                continue
+            resolved[eid] = frozenset(idents) | stored.get(eid, frozenset())
+            self.con.execute(
+                f"INSERT INTO {_ANCHOR_TABLE} (episode_id, digest, identities) VALUES (?, ?, ?) "
+                f"ON CONFLICT(episode_id) DO UPDATE SET identities = excluded.identities, "
+                f"digest = COALESCE(excluded.digest, {_ANCHOR_TABLE}.digest)",
+                (eid, (digests or {}).get(eid), json.dumps(sorted(resolved[eid]))))
+        refused = _registry_rejected_anchors(resolved, self.rejected, gate=self.gate)
+        self.refuse(refused)
+        return refused
+
+    def refuse(self, ids: Iterable[int]) -> None:
+        ids = sorted({int(i) for i in ids} - self.rejected)
+        for eid in ids:
+            if not _queue_erasure(eid, self.path):
+                raise OSError("could not record rejected replica source")
+            self.rejected.add(eid)
+        if ids:
+            _apply_pending_erasures(self.con, self.path)
+            if "episode_id" in _snapshot_table_columns(self.con, "decisions"):
+                for part in _chunks(ids):
+                    self.con.execute(f"DELETE FROM decisions WHERE episode_id IN ({', '.join('?' * len(part))})",
+                                     part)
+
+    def admits(self, episode_id: Any) -> bool:
+        if episode_id is None:
+            return True
+        eid = int(episode_id)
+        return eid not in self.rejected and eid not in self.unverified and eid not in self.gate.episode_ids
+
+    def finish(self) -> None:
+        """Before the commit: re-read the registry under the held lease. A
+        publication since the check (only this process can make one while
+        the lease is held) re-fences everything, this write's rows too."""
+        from khipu.tombstones import read_gate
+
+        current = read_gate()
+        if current.digest != self.gate.digest:
+            self.gate = current
+            self.scrub()
+        if _snapshot_table_columns(self.con, "snapshot_meta"):
+            self.con.execute("INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES (?, ?)",
+                             (_FENCE_DIGEST_KEY, self.gate.digest))
+
+
+@contextmanager
+def _replica_write_gate(path: Path | None = None, *, target: Path | None = None,
+                        con: sqlite3.Connection | None = None, refresh_lock_held: bool = False,
+                        scrub: bool = False, on_commit: Any = None):
+    """The one way into the replica for imported rows: the registry's
+    ``write_gate`` (memory lock first), then the refresh lock without
+    waiting (``_ReplicaBusy``), one SQLite transaction on ``target`` (the
+    replica, or a staged copy; or the caller's open ``con``) guarded by a
+    ``_SourceFence``, the pre-commit registry re-check, the commit, then
+    ``on_commit`` (a dump's replace) before the lease is released.
+    ``RegistryError`` propagates."""
+    from khipu.tombstones import write_gate
+
+    path = path or snapshot_path()
+    with write_gate() as gate:
+        lock = None
+        if not refresh_lock_held:
+            lock = _acquire_refresh_lock()
+            if lock is None:
+                raise _ReplicaBusy("hub snapshot refresh in progress")
+        try:
+            own = con is None
+            db = sqlite3.connect(str(target or path)) if own else con
+            try:
+                fence = _SourceFence(db, gate, path)
+                fence.start(scrub=scrub)
+                yield fence
+                fence.finish()
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                if own:
+                    db.close()
+            if on_commit is not None:
+                on_commit()
+        finally:
+            if lock is not None:
+                _release_refresh_lock(lock)
 
 
 def _hub_has_fact_stream(cur) -> bool:
@@ -1298,31 +1624,13 @@ def _read_fact_rows(cur, ids: Mapping[str, Sequence[int]]) -> dict[str, Any]:
             found.extend(dict(zip(cols, r)) for r in cur.fetchall())
         out[table] = found
         out[f"{table}_gone"] = sorted(set(want) - {int(r["id"]) for r in found})
-    # Each row's anchor episode, read in the same snapshot, so the replica
-    # can check the source against its durable erasure registry even when it
-    # never held that episode (an unseen parent; Astra review 2026-10-23 #1).
-    out["anchors"] = _read_anchor_rows(
+    # Every source identity of each row's anchor episode, read in the same
+    # snapshot, for the replica's source fence: held or not, a held copy is
+    # never proof (Astra reviews 2026-10-23, #1 of each).
+    out["anchors"] = read_anchor_identities(
         cur, {int(r["episode_id"]) for t in ("decisions", "deliverables") for r in out[t]
               if r.get("episode_id") is not None})
     return out
-
-
-def _unseen_commitment_anchors(cur, commitments: tuple[list[str], list[Any]] | None,
-                               ) -> dict[int, dict[str, Any]]:
-    """The hub rows of the episodes that opened the pulled commitments but
-    that this replica does not hold (an unseen parent: Astra review
-    2026-10-23 #1), for the forgotten-source gate. A held episode already
-    passed the fence when it was written."""
-    if not commitments or "opened_episode" not in commitments[0]:
-        return {}
-    at = commitments[0].index("opened_episode")
-    wanted = {int(r[at]) for r in commitments[1] if r[at] is not None}
-    if not wanted:
-        return {}
-    with closing(sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)) as con:
-        held = ({int(r[0]) for r in con.execute("SELECT id FROM episodes")}
-                if "id" in _snapshot_table_columns(con, "episodes") else set())
-    return _read_anchor_rows(cur, wanted - held)
 
 
 def _patch_covers_stream(con: sqlite3.Connection, fact_xmin: int | None) -> bool:
@@ -1342,78 +1650,36 @@ def _patch_covers_stream(con: sqlite3.Connection, fact_xmin: int | None) -> bool
     return fact_xmin is not None and int(fact_xmin) >= held
 
 
-def _read_anchor_rows(cur, episode_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
-    """The hub's episode rows for ``episode_ids``: the columns the replica's
-    forgotten-source fence reads (``_tombstone_payloads_for_episode``)."""
-    want = sorted({int(i) for i in episode_ids})
-    if not want:
-        return {}
-    hub_cols = _pg_columns(cur, "episodes")
-    cols = [c for c in dict.fromkeys(("id", "ts", "summary", "raw", "deleted_at", *_ANCHOR_SOURCE_COLS))
-            if c in hub_cols]
-    rows: dict[int, dict[str, Any]] = {}
-    for part in _chunks(want):
-        cur.execute(f"SELECT {', '.join(cols)} FROM episodes WHERE id = ANY(%s)", (part,))
-        for r in cur.fetchall():
-            row = dict(zip(cols, r))
-            rows[int(row["id"])] = row
-    return rows
-
-
-def _registry_rejected_anchors(anchors: Mapping[Any, Mapping[str, Any]], known: set[int]) -> set[int]:
-    """The anchor episodes the durable forgotten-source registry refuses,
-    beyond the ids already in ``known``. ``RegistryError`` propagates: an
-    unreadable registry must abort the write, never read as empty."""
-    if not anchors:
-        return set()
-    from khipu.tombstones import read_gate
-
-    gate = read_gate()
-    if gate.empty:
-        return set()
-    refused: set[int] = set()
-    for eid, row in anchors.items():
-        eid = int(eid)
-        if eid in known:
-            continue
-        if eid in gate.episode_ids or not all(
-                gate.allows(p) for p in _tombstone_payloads_for_episode(row)):
-            refused.add(eid)
-    return refused
-
-
-def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any]) -> dict[str, Any]:
-    """Write a stream read into ``con`` (caller holds the refresh lock and
+def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any],
+                       fence: _SourceFence | None = None) -> dict[str, Any]:
+    """Write a stream read into ``con`` inside ``fence``'s write (the caller
     commits): changed rows replace the held ones, gone ids are deleted, and
     the cursor moves to the read's xmin. A read older than the one already
     applied (a lower xmin: an earlier snapshot) is skipped whole; the newer
-    one held already covers it. Rows of an episode this replica rejects
-    (forgotten here, or queued for erasure) are deleted, never written."""
+    one held already covers it. Every row's anchor goes through the source
+    fence first; a row the fence does not admit is deleted, never written.
+    Without ``fence`` (a test's direct call) a fence on a registry snapshot
+    stands in."""
     held = _held_fact_cursor(con)
     xmin = int(stream["xmin"])
     if held is not None and xmin < held:
         return {"ok": True, "decisions": 0, "deliverables": 0, "skipped": "the replica holds a newer read"}
-    rejected = _rejected_episode_ids(con)
-    # Gate every row on its anchor's source identity before anything is
-    # written or the cursor moves: a source this Mac's registry knows as
-    # forgotten is refused even when the replica never held its episode.
-    # The id is queued for erasure first, so every later derivative import
-    # (and this one's decision writer) refuses it by id too.
-    for eid in sorted(_registry_rejected_anchors(stream.get("anchors") or {}, rejected)):
-        if not _queue_erasure(eid):
-            raise OSError("could not record rejected replica source")
-        rejected.add(eid)
+    if fence is None:
+        from khipu.tombstones import read_gate
+
+        fence = _SourceFence(con, read_gate(), snapshot_path())
+    fence.check(stream.get("anchors") or {})
     decisions_written = deliverables_written = 0
     if _snapshot_table_columns(con, "decisions"):
         for part in _chunks(list(stream.get("decisions_gone") or ())):
             con.execute(f"DELETE FROM decisions WHERE id IN ({', '.join('?' * len(part))})", part)
-        decisions_written = _write_decision_rows(con, stream.get("decisions") or ()) or 0
+        decisions_written = _write_decision_rows(con, stream.get("decisions") or (), fence=fence) or 0
     if set(_DELIVERABLE_COLS) <= _snapshot_table_columns(con, "deliverables"):
         for part in _chunks(list(stream.get("deliverables_gone") or ())):
             con.execute(f"DELETE FROM deliverables WHERE id IN ({', '.join('?' * len(part))})", part)
         sel = ", ".join(_DELIVERABLE_COLS)
         for row in stream.get("deliverables") or ():
-            if row.get("episode_id") in rejected:
+            if not fence.admits(row.get("episode_id")):
                 con.execute("DELETE FROM deliverables WHERE id = ?", (row["id"],))
                 continue
             con.execute(
@@ -1428,28 +1694,24 @@ def _apply_fact_stream(con: sqlite3.Connection, stream: Mapping[str, Any]) -> di
 
 
 def _apply_fact_stream_locked(stream: Mapping[str, Any]) -> dict[str, Any]:
-    """:func:`_apply_fact_stream` under the refresh lock, in its own
-    transaction. Never raises."""
+    """:func:`_apply_fact_stream` in its own fenced write
+    (``_replica_write_gate``). Never raises."""
+    from khipu.tombstones import RegistryError
+
     path = snapshot_path()
     if not path.is_file():
         return {"ok": False, "error": "hub snapshot missing"}
-    lock = _acquire_refresh_lock()
-    if lock is None:
+    try:
+        with _replica_write_gate(path) as fence:
+            return _apply_fact_stream(fence.con, stream, fence)
+    except _ReplicaBusy:
         _record_write_error(("decisions", "deliverables"), "hub snapshot refresh in progress")
         return {"ok": False, "error": "hub snapshot refresh in progress"}
-    try:
-        con = sqlite3.connect(str(path))
-        try:
-            out = _apply_fact_stream(con, stream)
-            con.commit()
-        finally:
-            con.close()
-        return out
+    except RegistryError as exc:
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"[:300]}
     except Exception as exc:  # noqa: BLE001 - reported to the caller
         _record_write_error(("decisions", "deliverables"), f"{type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
-    finally:
-        _release_refresh_lock(lock)
 
 
 def sync_fact_changes(*, limit: int = 2000) -> dict[str, Any]:
@@ -1489,6 +1751,8 @@ def apply_fact_rows(cur, facts: Iterable[tuple[str, int]]) -> dict[str, Any]:
     freshness rule, so a commitment the forget moved to another episode is
     hidden here until that pull (never shown with forgotten wording). Never
     raises."""
+    from khipu.tombstones import RegistryError
+
     by_kind: dict[str, list[int]] = {}
     for kind, fact_id in facts:
         by_kind.setdefault(kind, []).append(int(fact_id))
@@ -1501,26 +1765,22 @@ def apply_fact_rows(cur, facts: Iterable[tuple[str, int]]) -> dict[str, Any]:
         stream = _read_fact_rows(cur, by_kind)
     except Exception as exc:  # noqa: BLE001 - the hub forget already committed
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
-    lock = _acquire_refresh_lock()
-    if lock is None:
-        return {"ok": False, "error": "hub snapshot refresh in progress"}
     try:
-        con = sqlite3.connect(str(path))
-        try:
+        with _replica_write_gate(path) as fence:
+            con = fence.con
             held = _held_fact_cursor(con)
             # The rows replace held ones without touching the cursor.
-            out = _apply_fact_stream(con, {**stream, "xmin": held or 0})
+            out = _apply_fact_stream(con, {**stream, "xmin": held or 0}, fence)
             if held is None and _snapshot_table_columns(con, "snapshot_meta"):
                 con.execute("DELETE FROM snapshot_meta WHERE key = ?", (_FACT_CURSOR_KEY,))
-            con.commit()
-        finally:
-            con.close()
         return out
+    except _ReplicaBusy:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    except RegistryError as exc:
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"[:300]}
     except Exception as exc:  # noqa: BLE001 - the hub forget already committed
         _record_write_error(("decisions", "deliverables"), f"{type(exc).__name__}: {exc}")
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
-    finally:
-        _release_refresh_lock(lock)
 
 
 # Rows per kind one pull applies. Past it a full dump is the cheaper way to
@@ -1739,7 +1999,7 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
             cur.execute("SELECT slug FROM topics WHERE slug = ANY(%s)", (batch,))
             topic_purges.update(set(batch) - {r[0] for r in cur.fetchall()})
     commitments = _hub_commitments(cur)
-    commitment_anchors = _unseen_commitment_anchors(cur, commitments)
+    commitment_anchors = _commitment_anchors(cur, commitments)
     aliases = _hub_project_aliases(cur)
     if max(len(fresh), len(gone), len(groups), len(topic_rows or ()) + len(topic_purges)) > limit:
         return _pull_needs_dump(limit)
@@ -1796,6 +2056,12 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
     done: set[int] = set()
     live_count = tomb_count = forgotten = kept_newer = 0
     ordered = sorted(changed)
+    # The source fence reads every identity an episode represents, its
+    # retained source receipts too; vectors applied alone are checked by
+    # their episode's identities, read in this same snapshot.
+    receipts = _read_receipts(cur, [i for i in ordered if changed[i].get("deleted_at") is None])
+    vector_anchors = read_anchor_identities(
+        cur, {int(g[2]) for g in apply_groups if g[1] == "episode" and str(g[2]).isdigit()})
     for start in range(0, len(ordered), _PULL_BATCH):
         batch = ordered[start:start + _PULL_BATCH]
         alive = [i for i in batch if changed[i].get("deleted_at") is None]
@@ -1818,7 +2084,8 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
             tomb = row.get("deleted_at") is not None
             out = upsert_episode(row, [] if tomb else vecs.get(eid, []),
                                  deliverable_rows=None if tomb or not has_deliv else deliv.get(eid, []),
-                                 read_at=read_at, fact_xmin=facts.get("xmin"))
+                                 read_at=read_at, fact_xmin=facts.get("xmin"),
+                                 receipts=receipts.get(eid, ()))
             error = str(out.get("error") or "")
             if not out.get("ok") and tomb and "forgotten source" in error:
                 # The fence refuses a forgotten source's row, tombstone
@@ -1848,7 +2115,9 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
             cur.execute(f"SELECT {emb_sel} FROM memory_embeddings WHERE profile = %s AND kind = %s "
                         "AND ref = ANY(%s)", (profile, kind, part))
             rows = [dict(zip(emb_names, r)) for r in cur.fetchall()]
-            out = upsert_embeddings(rows, replace_refs=[(profile, kind, ref) for ref in part], read_at=read_at)
+            out = upsert_embeddings(rows, replace_refs=[(profile, kind, ref) for ref in part], read_at=read_at,
+                                    anchors={int(r): vector_anchors.get(int(r), frozenset())
+                                             for r in part if kind == "episode" and str(r).isdigit()})
             if not out.get("ok"):
                 error = str(out.get("error") or "")
                 return {"ok": False, "error": "hub snapshot refresh in progress" if "in progress" in error
@@ -1901,7 +2170,7 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                          read_at: float, topic_purges: Iterable[str] = (),
                          purge_hub_at: datetime | None = None,
                          facts: Mapping[str, Any] | None = None,
-                         commitment_anchors: Mapping[int, Mapping[str, Any]] | None = None,
+                         commitment_anchors: tuple[Mapping[int, Any], Mapping[int, str]] | None = None,
                          ) -> dict[str, dict[str, Any]]:
     """The pull's topic bodies and commitments, under the refresh lock, in one
     transaction. Each part's result by name; a part the hub or this replica
@@ -1918,7 +2187,9 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     topic publication or dump stays when that older absence is applied.
     ``purge_hub_at`` is the hub's clock in that transaction, recorded in
     each purge marker. ``facts``: a fact-stream read (0047), applied as
-    the ``facts`` part in the same transaction; ``None`` on an older hub."""
+    the ``facts`` part in the same transaction; ``None`` on an older hub.
+    ``commitment_anchors``: ``_commitment_anchors`` for the commitments.
+    One fenced write (``_replica_write_gate``) for all of it."""
     parts: dict[str, dict[str, Any]] = {}
     path = snapshot_path()
     con = sqlite3.connect(str(path))
@@ -1936,19 +2207,22 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
     wanted = [name for name in ("topics", "commitments", "project_aliases", "facts") if name not in parts]
     if not wanted:
         return parts
-    lock = _acquire_refresh_lock()
-    if lock is None:
-        _record_write_error(wanted, "hub snapshot refresh in progress")
-        return {**parts, **{n: {"ok": False, "error": "hub snapshot refresh in progress"} for n in wanted}}
+    recreated: dict[str, Any] = {}
+
+    def clear_recreated() -> None:
+        # Clear only the observed fence after the row commits, still under
+        # the refresh lock.
+        for slug, marker_version in recreated.items():
+            _clear_purge_marker_version(path, slug, marker_version)
+
     try:
-        con = sqlite3.connect(str(path))
-        try:
+        with _replica_write_gate(path, on_commit=clear_recreated) as fence:
+            con = fence.con
             if "topics" in wanted:
                 topic_cols = _snapshot_table_columns(con, "topics")
                 purged = _purged_topic_slugs(path)
                 written = 0
                 removed = 0
-                recreated = {}
                 for slug in sorted(topic_purges):
                     if _held_read_at(con, "topics", slug) > read_at:
                         continue
@@ -2011,14 +2285,12 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     parts["commitments"] = {"ok": True, "commitments": 0,
                                             "skipped": "the replica holds a newer copy"}
                 else:
-                    # The same source-identity gate as the fact stream's, for
-                    # commitments whose episode this replica never held.
-                    for eid in sorted(_registry_rejected_anchors(commitment_anchors or {},
-                                                                 _rejected_episode_ids(con))):
-                        if not _queue_erasure(eid):
-                            raise OSError("could not record rejected replica source")
+                    # The source fence for every opening episode, held or not.
+                    anchors, digests = commitment_anchors or ({}, {})
+                    fence.check(anchors, digests)
                     con.execute("DELETE FROM commitments")
-                    parts["commitments"] = {"ok": True, "commitments": _write_commitment_rows(con, cols, rows)}
+                    parts["commitments"] = {"ok": True,
+                                            "commitments": _write_commitment_rows(con, cols, rows, fence)}
                     # A commitment gone from the hub (its episode forgotten)
                     # must not leave its vector, and its text, behind.
                     if {"kind", "ref"} <= _snapshot_table_columns(con, "memory_embeddings") and "id" in cols:
@@ -2042,21 +2314,15 @@ def _write_pulled_tables(topic_rows: Sequence[Mapping[str, Any]] | None,
                     parts["project_aliases"] = {"ok": True, "project_aliases": len(rows)}
                     _record_read_at(con, "project_aliases", "*", read_at)
             if "facts" in wanted:
-                parts["facts"] = _apply_fact_stream(con, facts)  # type: ignore[arg-type]
-            con.commit()
-            if "topics" in wanted:
-                for slug, marker_version in recreated.items():
-                    # Clear only the observed fence after the row commits.
-                    _clear_purge_marker_version(path, slug, marker_version)
-        finally:
-            con.close()
+                parts["facts"] = _apply_fact_stream(con, facts, fence)  # type: ignore[arg-type]
+    except _ReplicaBusy:
+        _record_write_error(wanted, "hub snapshot refresh in progress")
+        return {**parts, **{n: {"ok": False, "error": "hub snapshot refresh in progress"} for n in wanted}}
     except Exception as exc:  # noqa: BLE001 - reported as the failed parts
         error = f"{type(exc).__name__}: {exc}"[:300]
         _record_write_error(wanted, error)
         return {**{n: p for n, p in parts.items() if n not in wanted},
                 **{n: {"ok": False, "error": error} for n in wanted}}
-    finally:
-        _release_refresh_lock(lock)
     return parts
 
 
@@ -2887,6 +3153,21 @@ def _insert_episodes(cur, con: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def _insert_anchor_receipts(cur, con: sqlite3.Connection) -> None:
+    """The dump's retained source receipts (``episode_sources``), kept as
+    each episode's anchor identities so the source fence's scrub checks
+    them too (``_anchor_identities``); the rest it reads from the rows."""
+    if not {"episode_id", "source_key", "payload_sha256"} <= _pg_columns(cur, "episode_sources"):
+        return
+    _ensure_anchor_table(con)
+    cur.execute("SELECT episode_id, array_agg(source_key), array_agg(payload_sha256) FROM episode_sources "
+                "GROUP BY episode_id")
+    for eid, keys, shas in cur.fetchall():
+        tags = sorted({f"k:{k}" for k in keys or () if k} | {f"h:{h}" for h in shas or () if h})
+        con.execute(f"INSERT OR REPLACE INTO {_ANCHOR_TABLE} (episode_id, digest, identities) VALUES (?, NULL, ?)",
+                    (int(eid), json.dumps(tags)))
+
+
 def _insert_topics(cur, con: sqlite3.Connection) -> int:
     cols = [c for c in _TOPIC_COLS if c in _pg_columns(cur, "topics")]
     sel = ", ".join(cols)
@@ -3193,23 +3474,27 @@ def _add_commitment_close_cols(con: sqlite3.Connection) -> None:
             con.execute(f"ALTER TABLE commitments ADD COLUMN {col} {kind}")
 
 
-def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: Sequence[Any]) -> int:
+def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: Sequence[Any],
+                           fence: _SourceFence | None = None) -> int:
     """Insert hub commitment rows (``cols`` order) into ``con``. A replica of
     an older version first gains the owner's lineage and close-rule columns,
     so its owners and owed filters match the hub's. Other missing columns
     are left out. Caller clears the
-    table first and commits."""
+    table first and commits. Every import passes the ``fence`` of its
+    ``_replica_write_gate``, which already checked the opening episodes;
+    without one only ids already refused are left out."""
     _add_commitment_lineage_cols(con)
     _add_commitment_close_cols(con)
     have = _snapshot_table_columns(con, "commitments")
     keep = [i for i, c in enumerate(cols) if c in have]
     sel = ", ".join(cols[i] for i in keep)
     ts_cols = {"opened_at", "due_after", "closed_at", "last_seen_at", "owner_reassigned_at"}
-    rejected = _rejected_episode_ids(con)
+    rejected = _rejected_episode_ids(con) if fence is None else set()
     episode_at = list(cols).index("opened_episode") if "opened_episode" in cols else None
     written = 0
     for row in rows:
-        if episode_at is not None and row[episode_at] in rejected:
+        if episode_at is not None and (row[episode_at] in rejected if fence is None
+                                       else not fence.admits(row[episode_at])):
             continue
         vals = []
         for i in keep:
@@ -3291,6 +3576,7 @@ def _refresh_locked() -> dict[str, Any]:
                     # below its xmin.
                     fact_xmin = _hub_snapshot_xmin(cur) if _hub_has_fact_stream(cur) else None
                     counts["episodes"] = _insert_episodes(cur, con)
+                    _insert_anchor_receipts(cur, con)
                     counts["topics"] = _insert_topics(cur, con)
                     counts["topic_revisions"] = _insert_topic_revisions(cur, con)
                     counts["nodes"] = _insert_nodes(cur, con)
@@ -3325,18 +3611,18 @@ def _refresh_locked() -> dict[str, Any]:
                             (_ROWS_READ_FLOOR_KEY, repr(dump_started)))
             _apply_pending_erasures(con, dest)
             _dump_cursors(con, refreshed_at)
-            from khipu.tombstones import RegistryError, write_gate
+            from khipu.tombstones import RegistryError
 
             try:
-                # Held from the scrub through the replace: a forget publishes
-                # under this lock before it erases the replica, so the dump
-                # cannot land a source forgotten after the scrub read the
-                # registry.
-                with write_gate() as gate:
-                    counts["forgotten_scrubbed"] = _scrub_forgotten(con, gate)
-                    con.commit()
-                    con.close()
-                    os.replace(tmp_path, dest)
+                # The source fence, held from the scrub through the replace:
+                # a forget publishes under this lease before it erases the
+                # replica, so the dump cannot land a source forgotten after
+                # the scrub read the registry.
+                with _replica_write_gate(dest, con=con, refresh_lock_held=True, scrub=True,
+                                         on_commit=lambda: os.replace(tmp_path, dest)) as fence:
+                    pass
+                con.close()
+                counts["forgotten_scrubbed"] = fence.scrubbed
             except RegistryError as exc:
                 con.close()
                 remove_replica_temp(tmp_path)
@@ -3619,10 +3905,18 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
     Rows already marked forgotten keep their tombstone. A live row whose id
     the registry records as forgotten is refused too: a backup can hold that
     episode under an older raw that no source identity matches.
-    ``RegistryError`` propagates. Caller commits."""
+
+    The source fence's whole-replica check: every source identity a row
+    represents counts (its merged captures and receipts too,
+    ``_anchor_identities``), with the identities kept for it when it was
+    an anchor (``replica_anchor_sources``). An anchor the replica never
+    held as an episode is refused the same way, and its derivative rows
+    are erased by id. ``RegistryError`` propagates. Caller commits."""
     cols = _snapshot_table_columns(con, "episodes")
     if "id" not in cols or gate.empty:
         return 0
+    stored = _stored_anchor_identities(con)
+    held = {int(r[0]) for r in con.execute("SELECT id FROM episodes")}
     live = " WHERE deleted_at IS NULL" if "deleted_at" in cols else ""
     cursor = con.execute(f"SELECT * FROM episodes{live}")
     names = [d[0] for d in cursor.description]
@@ -3630,9 +3924,14 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
     forgotten_ids = gate.episode_ids
     for values in cursor.fetchall():
         row = dict(zip(names, values, strict=True))
-        if row["id"] in forgotten_ids or not all(
-                gate.allows_stored(p) for p in _tombstone_payloads_for_episode(row)):
+        if row["id"] in forgotten_ids or gate.refuses(
+                _anchor_identities(row) | stored.get(int(row["id"]), frozenset())):
             refused.append(row["id"])
+    pending = _pending_erasure_ids()
+    unheld = sorted(eid for eid, ids in stored.items()
+                    if eid not in held and eid not in pending
+                    and (eid in forgotten_ids or gate.refuses(ids)))
+    refused.extend(unheld)
     has_decisions = "episode_id" in _snapshot_table_columns(con, "decisions")
     has_deliverables = "episode_id" in _snapshot_table_columns(con, "deliverables")
     has_commitments = {"id", "opened_episode"} <= _snapshot_table_columns(con, "commitments")
@@ -3668,30 +3967,22 @@ def _rejected_episode_ids(con: sqlite3.Connection) -> set[int]:
 
 def scrub_forgotten_snapshot() -> dict[str, Any]:
     """Scrub the existing replica of forgotten sources (after a backup import
-    brought in an older one). Same lock order as ``upsert_episode``: the
-    registry first, then the refresh lock without waiting."""
-    from khipu.tombstones import RegistryError, write_gate
+    brought in an older one). One fenced write (``_replica_write_gate``,
+    which takes write_gate first): the registry, then the refresh lock
+    without waiting."""
+    from khipu.tombstones import RegistryError
 
     path = snapshot_path()
     if not path.is_file():
         return {"ok": True, "scrubbed": 0, "snapshot": False}
     try:
-        with write_gate() as gate:
-            lock = _acquire_refresh_lock()
-            if lock is None:
-                return {"ok": False, "error": "hub snapshot refresh in progress"}
-            try:
-                con = sqlite3.connect(str(path))
-                try:
-                    scrubbed = _scrub_forgotten(con, gate)
-                    con.commit()
-                finally:
-                    con.close()
-            finally:
-                _release_refresh_lock(lock)
+        with _replica_write_gate(path, scrub=True) as fence:
+            pass
+    except _ReplicaBusy:
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
     except RegistryError as exc:
         return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
-    return {"ok": True, "scrubbed": scrubbed, "snapshot": True}
+    return {"ok": True, "scrubbed": fence.scrubbed, "snapshot": True}
 
 
 def staging_path() -> Path:
@@ -3710,35 +4001,27 @@ def staging_path() -> Path:
 def publish_imported_snapshot(staged: Path) -> dict[str, Any]:
     """Scrub a replica copy a backup import staged, then atomically make it
     the replica. Readers never see the copy before its scrub: it is not the
-    replica until ``os.replace``. Same lock order as a refresh: the registry,
-    then the refresh lock without waiting. When the scrub cannot run, the
-    staged copy is discarded and the current replica is left as it was."""
-    from khipu.tombstones import RegistryError, write_gate
+    replica until ``os.replace``. One fenced write (``_replica_write_gate``,
+    which takes write_gate first) on the staged copy: the registry, then the
+    refresh lock without waiting; the replace happens before the lease is
+    released. When the scrub cannot run, the staged copy is discarded and
+    the current replica is left as it was."""
+    from khipu.tombstones import RegistryError
 
     try:
-        with write_gate() as gate:
-            lock = _acquire_refresh_lock()
-            if lock is None:
-                staged.unlink(missing_ok=True)
-                return {"ok": False, "imported": False,
-                        "error": "hub snapshot refresh in progress; the next refresh rebuilds it"}
-            try:
-                con = sqlite3.connect(str(staged))
-                try:
-                    # Erasures this Mac queued but has not applied yet name
-                    # episode ids the backup may hold live.
-                    _apply_pending_erasures(con, snapshot_path())
-                    scrubbed = _scrub_forgotten(con, gate)
-                    con.commit()
-                finally:
-                    con.close()
-                os.replace(staged, snapshot_path())
-            finally:
-                _release_refresh_lock(lock)
+        # Erasures this Mac queued but has not applied yet name episode ids
+        # the backup may hold live (the fence's scrub applies them first).
+        with _replica_write_gate(snapshot_path(), target=staged, scrub=True,
+                                 on_commit=lambda: os.replace(staged, snapshot_path())) as fence:
+            pass
+    except _ReplicaBusy:
+        staged.unlink(missing_ok=True)
+        return {"ok": False, "imported": False,
+                "error": "hub snapshot refresh in progress; the next refresh rebuilds it"}
     except (RegistryError, sqlite3.Error, OSError) as exc:
         remove_replica_temp(staged)
         return {"ok": False, "imported": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": True, "imported": True, "scrubbed": scrubbed, "snapshot": True}
+    return {"ok": True, "imported": True, "scrubbed": fence.scrubbed, "snapshot": True}
 
 
 def upsert_episode(
@@ -3749,20 +4032,24 @@ def upsert_episode(
     *,
     read_at: float | None = None,
     fact_xmin: int | None = None,
+    receipts: Iterable[Sequence[Any]] = (),
 ) -> dict[str, Any]:
     """Write-through fenced by the durable forgotten-source registry.
     ``read_at``: when the caller read this row from the hub (``time.time()``),
     for the freshness rule above; ``None`` is a live patch, read now.
     ``fact_xmin``: the hub snapshot xmin at or before the read of
     ``deliverable_rows``, so they take part in the fact stream's freshness
-    rule (``_patch_covers_stream``)."""
+    rule (``_patch_covers_stream``). ``receipts``: the episode's retained
+    source receipts ``(source_key, payload_sha256)``, read with the row, for
+    the source fence (``_anchor_identities``)."""
     from khipu.tombstones import RegistryError, write_guard
 
     payloads = _tombstone_payloads_for_episode(episode_row)
     try:
-        # Keep this lock through the SQLite transaction below. Forget takes it
-        # before its replica erase, so a late incremental write cannot restore
-        # a source after forget returns.
+        # The registry lease, kept through the SQLite transaction in
+        # _upsert_episode_unfenced, whose source fence checks every identity
+        # the row represents. Forget takes it before its replica erase, so a
+        # late incremental write cannot restore a source after forget returns.
         with write_guard(*payloads) as allowed:
             if not allowed:
                 # A source can first arrive under a new hub id during an
@@ -3773,7 +4060,8 @@ def upsert_episode(
                     return {"ok": False, "error": "could not queue rejected source erasure"}
                 return {"ok": False, "error": "forgotten source"}
             return _upsert_episode_unfenced(episode_row, embedding_rows, decision_rows,
-                                            deliverable_rows, read_at=read_at, fact_xmin=fact_xmin)
+                                            deliverable_rows, read_at=read_at, fact_xmin=fact_xmin,
+                                            receipts=receipts)
     except RegistryError as exc:
         return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
 
@@ -3786,13 +4074,16 @@ def _upsert_episode_unfenced(
     *,
     read_at: float | None = None,
     fact_xmin: int | None = None,
+    receipts: Iterable[Sequence[Any]] = (),
 ) -> dict[str, Any]:
     """Incremental snapshot update: one episode + its embedding chunks (W2.4),
     plus (Phase 2, session B) any decision rows minted for it in the same
     capture — additive and optional, so every existing caller (just
-    ``episode_row``/``embedding_rows``) is unchanged. Written via
-    ``apply_decision_changes`` under the SAME lock this function already
-    holds, so a full dump never interleaves with either half.
+    ``episode_row``/``embedding_rows``) is unchanged. One fenced write
+    (``_replica_write_gate``): the episode is its own anchor, checked by
+    every source identity it represents before anything is written, so a
+    full dump never interleaves with either half. (The name predates the
+    fence; ``upsert_episode`` is its only caller.)
 
     ``deliverable_rows`` (the hub's rows for this episode) REPLACE whatever
     the replica holds for it, so a re-capture cannot duplicate; ``None``
@@ -3813,8 +4104,11 @@ def _upsert_episode_unfenced(
     A row read from the hub before the copy the replica holds (``read_at``
     older than that copy's) never replaces it: only its tombstone lands, and
     the id is queued as a missed patch so the next pull reads it again.
+    A forgotten source returns ``{"ok": False, "error": "forgotten source"}``
+    with its id queued for erasure.
     """
     path = snapshot_path()
+    eid = episode_row.get("id")
     if not path.is_file():
         return {
             "ok": False,
@@ -3822,20 +4116,20 @@ def _upsert_episode_unfenced(
         }
     touched = ("episodes", "vectors", *(("decisions",) if decision_rows else ()),
                *(("deliverables",) if deliverable_rows is not None else ()))
-    lock = _acquire_refresh_lock()
-    if lock is None:
-        _record_write_error(touched, "hub snapshot refresh in progress")
-        if episode_row.get("id") is not None:
-            _queue_missed_patch(episode_row["id"], path)
-        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    if eid is None:
+        return {"ok": False, "error": "episode_row missing id"}
+    identities = _anchor_identities(episode_row, receipts)
     try:
-        eid = episode_row.get("id")
-        if eid is None:
-            return {"ok": False, "error": "episode_row missing id"}
-        pending_erasure = int(eid) in _pending_erasure_ids(path)
-        version = time.time() if read_at is None else float(read_at)
-        con = sqlite3.connect(str(path))
-        try:
+        with _replica_write_gate(path) as fence:
+            con = fence.con
+            if int(eid) in fence.check({int(eid): identities}):
+                # A source can first arrive under a new hub id during an
+                # incremental pull. The fence queued that id for erasure
+                # before any independent commitment/decision import can use
+                # it, and erases what this replica held for it.
+                return {"ok": False, "error": "forgotten source"}
+            pending_erasure = int(eid) in _pending_erasure_ids(path)
+            version = time.time() if read_at is None else float(read_at)
             older = _held_read_at(con, "episodes", eid) > version
             if older:
                 _queue_missed_patch(eid, path)
@@ -3909,7 +4203,7 @@ def _upsert_episode_unfenced(
                 # table at all — _write_decision_rows returns None, not an
                 # error, for that case, and the episode/embedding write
                 # above must still commit regardless.
-                _write_decision_rows(con, decision_rows)
+                _write_decision_rows(con, decision_rows, fence=fence)
             if merged.get("deleted_at") is not None:
                 _write_deliverable_rows(con, eid, ())
             elif deliverable_rows is not None and _patch_covers_stream(con, fact_xmin):
@@ -3924,21 +4218,19 @@ def _upsert_episode_unfenced(
             elif embedding_rows:
                 _advance_cursor(con, "vectors", synced_at=now,
                                 newest=_newest_ts(r.get("built_at") for r in embedding_rows))
-            con.commit()
-        finally:
-            con.close()
         m = meta()
         m["last_incremental_upsert_at"] = _utcnow_iso()
         m["last_incremental_episode_id"] = eid
         _write_meta(m)
         return {"ok": True, "episode_id": eid, "embeddings": len(embedding_rows)}
+    except _ReplicaBusy:
+        _record_write_error(touched, "hub snapshot refresh in progress")
+        _queue_missed_patch(eid, path)
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
     except Exception as exc:
         _record_write_error(touched, f"{type(exc).__name__}: {exc}")
-        if episode_row.get("id") is not None:
-            _queue_missed_patch(episode_row["id"], path)
+        _queue_missed_patch(eid, path)
         raise
-    finally:
-        _release_refresh_lock(lock)
 
 
 def upsert_embeddings(
@@ -3946,8 +4238,13 @@ def upsert_embeddings(
     topic_rows: Sequence[Mapping[str, Any]] = (),
     replace_refs: Sequence[tuple[str, str, str]] = (),
     read_at: float | None = None,
+    anchors: Mapping[int, Any] | None = None,
 ) -> dict[str, Any]:
     """Incremental vectors with optional topic sources and complete ref replacement.
+    One fenced write (``_replica_write_gate``): an episode's vectors carry its
+    text, so ``anchors`` (``read_anchor_identities`` for the episode refs,
+    read with the vectors) go through the source fence first, and a vector
+    of an episode the fence refuses is never written.
     Replacements affect only the named profiles, including an empty chunk set.
     ``read_at``: when the caller read these vectors from the hub, for the
     freshness rule; ``None`` is a live write, read now. A ref whose held
@@ -3965,14 +4262,13 @@ def upsert_embeddings(
         }
     if not embedding_rows and not topic_rows and not replace_refs:
         return {"ok": True, "embeddings": 0}
+    from khipu.tombstones import RegistryError
+
     touched = ("vectors", *(("topics",) if topic_rows else ()))
-    lock = _acquire_refresh_lock()
-    if lock is None:
-        _record_write_error(touched, "hub snapshot refresh in progress")
-        return {"ok": False, "error": "hub snapshot refresh in progress"}
     try:
-        con = sqlite3.connect(str(path))
-        try:
+        with _replica_write_gate(path) as fence:
+            con = fence.con
+            fence.check(anchors or {})
             topic_cols = _snapshot_table_columns(con, "topics")
             # A catch-up that read a topic before it was purged must not put
             # it back: its hub write may have committed before the purge.
@@ -4025,7 +4321,9 @@ def upsert_embeddings(
             for erow in embedding_rows:
                 if (str(erow.get("profile")), str(erow.get("kind")), str(erow.get("ref"))) in newer:
                     continue
-                if erow.get("kind") == "episode" and str(erow.get("ref")) in {str(i) for i in _pending_erasure_ids(path)}:
+                if erow.get("kind") == "episode" and (
+                        str(erow.get("ref")) in {str(i) for i in _pending_erasure_ids(path)}
+                        or (str(erow.get("ref")).isdigit() and not fence.admits(int(erow["ref"])))):
                     continue
                 if erow.get("kind") == "topic" and str(erow.get("ref")) in purged:
                     continue
@@ -4059,9 +4357,6 @@ def upsert_embeddings(
                 # reconciled_at stays at the last full dump.
                 _advance_cursor(con, "topics", synced_at=now,
                                 newest=_newest_ts(r.get("updated_at") for r in topic_rows))
-            con.commit()
-        finally:
-            con.close()
         m = meta()
         m["last_incremental_upsert_at"] = _utcnow_iso()
         _write_meta(m)
@@ -4069,11 +4364,15 @@ def upsert_embeddings(
         if newer:
             out["kept_newer"] = len(newer)
         return out
+    except _ReplicaBusy:
+        _record_write_error(touched, "hub snapshot refresh in progress")
+        return {"ok": False, "error": "hub snapshot refresh in progress"}
+    except RegistryError as exc:
+        _record_write_error(touched, f"tombstone registry unavailable: {exc}")
+        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"}
     except Exception as exc:
         _record_write_error(touched, f"{type(exc).__name__}: {exc}")
         raise
-    finally:
-        _release_refresh_lock(lock)
 
 
 def forget_episode_in_snapshot(episode_id: int) -> dict[str, Any]:

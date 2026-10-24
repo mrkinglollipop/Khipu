@@ -2086,6 +2086,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
             return False
         deliverable_rows = None
         fact_xmin = None
+        receipts: list = []
         with connect() as conn:
             with conn.cursor() as cur:
                 profile = _active_profile(cur)
@@ -2141,6 +2142,17 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                 except Exception:  # noqa: BLE001 — no xmin: the stream brings them
                     fact_xmin = None
                 deliverable_rows = _deliverables.deliverables_for_episode(cur, int(eid))
+                from khipu.hub_snapshot import _read_receipts
+
+                # The episode's retained source receipts, for the replica's
+                # source fence. Fail-open: the row's own identities remain.
+                cur.execute("SAVEPOINT embed_receipts")
+                try:
+                    receipts = _read_receipts(cur, [int(eid)]).get(int(eid), [])
+                except Exception:  # noqa: BLE001
+                    cur.execute("ROLLBACK TO SAVEPOINT embed_receipts")
+                    receipts = []
+                cur.execute("RELEASE SAVEPOINT embed_receipts")
             conn.commit()
         _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
         # W2.4: keep the sqlite hub replica current without a full dump, so a
@@ -2164,7 +2176,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
             ]
             snap = upsert_episode(
                 episode_row, embedding_rows, deliverable_rows=deliverable_rows,
-                fact_xmin=fact_xmin,
+                fact_xmin=fact_xmin, receipts=receipts,
             )
             if not snap.get("ok"):
                 _log(f"snapshot upsert skipped: {snap.get('error')}")
@@ -3682,11 +3694,29 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     "AND ref = %s AND NOT (chunk_idx = ANY(%s))", (profile, ref, indices),
                 )
             if episode_replacements:
+                from khipu.hub_snapshot import read_anchor_identities, upsert_embeddings
+
+                # Each episode's source identities, for the replica's source
+                # fence: vectors carry the episode's text. Read in a
+                # savepoint before the commit; without them nothing is
+                # written to the replica here, and the next pull brings it.
+                anchors = None
+                cur.execute("SAVEPOINT embed_anchor_read")
+                try:
+                    anchors = read_anchor_identities(
+                        cur, [int(r) for r in episode_replacements if str(r).isdigit()])
+                except Exception as exc:  # noqa: BLE001
+                    cur.execute("ROLLBACK TO SAVEPOINT embed_anchor_read")
+                    _log(f"episode snapshot anchors unread: {type(exc).__name__}: {exc}")
+                cur.execute("RELEASE SAVEPOINT embed_anchor_read")
                 conn.commit()
                 try:
-                    from khipu.hub_snapshot import upsert_embeddings
+                    if anchors is None:
+                        raise RuntimeError("no anchor identities")
                     upsert_embeddings(episode_snapshot_rows, replace_refs=[
-                        (profile, "episode", ref) for ref in episode_replacements])
+                        (profile, "episode", ref) for ref in episode_replacements],
+                        anchors={int(r): anchors.get(int(r), frozenset())
+                                 for r in episode_replacements if str(r).isdigit()})
                 except Exception as exc:  # noqa: BLE001 — replica cannot roll back the hub commit
                     _log(f"episode snapshot upsert failed: {type(exc).__name__}: {exc}")
 

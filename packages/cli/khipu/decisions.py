@@ -164,7 +164,28 @@ def _mirror_to_snapshot(cur, decision_id: int) -> None:
         payload = dict(zip(cols, row))
         from khipu import hub_snapshot
 
-        hub_snapshot.apply_decision_changes([payload])
+        if not hub_snapshot.snapshot_path().is_file():
+            return
+        # The anchor's source identities, read with the row, for the
+        # replica's source fence; in a savepoint, so a failed read never
+        # aborts the caller's transaction.
+        anchors: dict = {}
+        if payload.get("episode_id") is not None:
+            # A savepoint only inside a transaction (an autocommit cursor
+            # has nothing to abort).
+            savepoint = not getattr(getattr(cur, "connection", None), "autocommit", False)
+            if savepoint:
+                cur.execute("SAVEPOINT decision_mirror_anchor")
+            try:
+                anchors = hub_snapshot.read_anchor_identities(cur, [payload["episode_id"]])
+            except Exception:
+                if savepoint:
+                    cur.execute("ROLLBACK TO SAVEPOINT decision_mirror_anchor")
+                    cur.execute("RELEASE SAVEPOINT decision_mirror_anchor")
+                raise
+            if savepoint:
+                cur.execute("RELEASE SAVEPOINT decision_mirror_anchor")
+        hub_snapshot.apply_decision_changes([payload], anchors)
     except Exception as exc:  # noqa: BLE001 — the PG write already succeeded; mirror is best-effort
         _log(f"snapshot mirror for decision {decision_id} failed ({type(exc).__name__}: {exc})")
 

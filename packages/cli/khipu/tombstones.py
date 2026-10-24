@@ -238,11 +238,50 @@ def _known(value: dict[str, Any], payload: dict[str, Any], *, redact: bool = Tru
                 or legacy in set(value["legacy_identities"]))
 
 
+def identity_strings(payload: dict[str, Any], *, redact: bool = True) -> set[str]:
+    """Every registry identity ``payload`` is known by, as tagged strings
+    (``k:`` source key, ``h:`` payload hash, ``l:`` legacy ts/summary), so a
+    caller can keep them and check them later without the payload: the
+    replica's source fence stores them per anchor episode. ``redact=False``
+    for a payload a writer already redacted before storing it (see
+    ``Gate.allows_stored``). ``RegistryError`` when it has no identity."""
+    try:
+        keys, hashes = _identity_values(payload, redact=redact)
+    except RegistryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - identity uncertainty must block writes
+        raise RegistryError(f"tombstone identity failed: {type(exc).__name__}") from exc
+    from khipu.wire import clean_text
+
+    out = {f"k:{k}" for k in keys} | {f"h:{h}" for h in hashes}
+    ts, summary = payload.get("ts"), payload.get("summary")
+    if isinstance(ts, str) and isinstance(summary, str):
+        out.add(f"l:{clean_text(ts)}\x1f{hashlib.md5(clean_text(summary).encode('utf-8')).hexdigest()}")
+    return out
+
+
 class Gate:
     """One registry snapshot, valid while its ``write_gate`` is open."""
 
     def __init__(self, value: dict[str, Any]):
         self._value = value
+        self._tagged: frozenset[str] | None = None
+
+    def refuses(self, identities: Any) -> bool:
+        """Whether any of ``identities`` (``identity_strings`` tags, or a
+        source receipt's ``k:``/``h:`` tag) names a forgotten source."""
+        if self._tagged is None:
+            self._tagged = frozenset(
+                [f"k:{k}" for k in self._value["source_keys"]]
+                + [f"h:{h}" for h in self._value["payload_hashes"]]
+                + [f"l:{x}" for x in self._value["legacy_identities"]])
+        return not self._tagged.isdisjoint(identities)
+
+    @property
+    def digest(self) -> str:
+        """The registry content's fingerprint: equal digests, equal answers."""
+        return hashlib.sha256(json.dumps(self._value, sort_keys=True, separators=(",", ":"))
+                              .encode("utf-8")).hexdigest()
 
     def allows(self, payload: dict[str, Any]) -> bool:
         """False for a forgotten source; ``RegistryError`` when unknowable."""

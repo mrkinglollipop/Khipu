@@ -117,7 +117,7 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
                 if sql == "SELECT now()":
                     self._result = [(datetime(2026, 10, 3, tzinfo=timezone.utc),)]
                 elif "FROM information_schema.columns" in sql and params in (("ledger_rows",), ("commitments",), ("project_aliases",),
-                                                                         ("fact_changes",)):
+                                                                         ("fact_changes",), ("episode_sources",)):
                     # This fixture has no optional ledger or commitments schema.
                     self._result = []
                 else:

@@ -499,7 +499,14 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
     never replayed; its gap is resolved as ``forgotten``. A replay that
     fails rolls back, and its gap stays open (doctor keeps reporting it)
     with the error and one more attempt counted, for the next night. A hub
-    without 0047 has none."""
+    without 0047 has none.
+
+    Two runners (two Macs' nightlies) never both replay one group: each
+    claims the group's open gap rows ``FOR UPDATE SKIP LOCKED`` after the
+    episode lock and before any side effect, and skips a group another
+    runner holds or has resolved (second Astra review #3). Groups are
+    taken fewest attempts first, then oldest, so groups that keep failing
+    move behind ones never tried and cannot starve them (#4)."""
     from khipu.tombstones import hub_source_forgotten
 
     with conn.cursor() as cur:
@@ -509,10 +516,10 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
         cur.execute(
             "SELECT episode_id, step, source_id, array_agg(id ORDER BY id) FROM fact_gaps "
             "WHERE resolved_at IS NULL GROUP BY episode_id, step, source_id "
-            "ORDER BY min(id) LIMIT %s", (int(limit),))
+            "ORDER BY max(attempts), min(id) LIMIT %s", (int(limit),))
         groups = cur.fetchall()
     conn.commit()
-    out = {"ok": True, "replayed": 0, "forgotten": 0, "failed": 0, "unreplayable": 0}
+    out = {"ok": True, "replayed": 0, "forgotten": 0, "failed": 0, "unreplayable": 0, "skipped": 0}
     for episode_id, step, source_id, ids in groups:
         ids = [int(i) for i in ids]
         resolution = "replayed"
@@ -521,6 +528,20 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
                 # Episode first (the lock order in 3.4), as capture holds it.
                 cur.execute("SELECT raw, deleted_at FROM episodes WHERE id = %s FOR SHARE", (episode_id,))
                 row = cur.fetchone()
+                # Then claim the group's still-open gaps. Locked by another
+                # runner, or resolved since the selection: that runner owns
+                # it, so this one skips it without a side effect.
+                cur.execute("SELECT id FROM fact_gaps WHERE id = ANY(%s) AND resolved_at IS NULL "
+                            "ORDER BY id FOR UPDATE SKIP LOCKED", (ids,))
+                claimed = sorted(int(r[0]) for r in cur.fetchall())
+                cur.execute("SELECT id FROM fact_gaps WHERE id = ANY(%s) AND resolved_at IS NULL ORDER BY id",
+                            (ids,))
+                still_open = sorted(int(r[0]) for r in cur.fetchall())
+                if not claimed or claimed != still_open:
+                    conn.rollback()
+                    out["skipped"] += 1
+                    continue
+                ids = claimed
                 payload = None if row is None or row[1] is not None else _gap_payload(row[0], step, source_id)
                 if row is None or row[1] is not None:
                     resolution = "forgotten"
