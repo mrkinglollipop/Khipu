@@ -107,7 +107,7 @@ STORES: tuple[Store, ...] = (
           Restore(("hub_snapshot.sqlite",), "replica staging")),
     Store("replica temp", "data folder .hub_snapshot.<random>.sqlite and its journal and WAL",
           "a refresh dump or a staged backup replica", "replica temps",
-          _w("hub_snapshot.staging_path")),
+          _w("hub_snapshot.staging_path", "hub_snapshot.export_replica_copy")),
     Store("legacy writer", "data folder .legacy_writers/<pgid>.json",
           "the process group of a legacy writer that may still append", "legacy writers",
           _w("writer_groups.record")),

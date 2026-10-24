@@ -1447,11 +1447,16 @@ def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tup
     return out
 
 
-def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]]) -> set[tuple[str, str]]:
+def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]], *,
+                              commitment_wording: Iterable[str] | None = None) -> set[tuple[str, str]]:
     """Lock sources until the caller commits their vectors.
 
     Provider calls happen before this check. Forget/purge either wins first
     and excludes the source, or waits for the vectors and then removes them.
+    ``commitment_wording``: the md5s of the commitment texts that were
+    embedded; a commitment whose locked row no longer carries one of them (a
+    forget re-pointed it to another wording while the provider ran) is not
+    live, so its old vector is never written (fifth Astra review #5).
     """
     from khipu.db import has_columns
 
@@ -1489,10 +1494,12 @@ def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]]) -> set[tuple
     if commitment_ids:
         # Recheck after the provider and parent locks, retaining both row locks
         # until the vector commit. A changed parent is retried by a later sweep.
+        wording = sorted(set(commitment_wording)) if commitment_wording is not None else None
         cur.execute(
             "SELECT id, opened_episode FROM commitments WHERE id = ANY(%s) AND status = 'open' "
-            "ORDER BY id FOR SHARE",
-            (commitment_ids,),
+            + ("AND md5(text) = ANY(%s) " if wording is not None else "")
+            + "ORDER BY id FOR SHARE",
+            (commitment_ids, wording) if wording is not None else (commitment_ids,),
         )
         live_refs.update(
             ("commitment", str(cid)) for cid, eid in cur.fetchall()
@@ -3761,7 +3768,12 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 chunks = chunk_text(text)
                 api = _api_texts(profile, [("", c) for c in chunks])
                 vecs = embed_batch(api, profile=profile)
-                if ("commitment", str(cid)) not in _lock_live_embedding_refs(cur, [("commitment", str(cid))]):
+                # Bound to the wording embedded: a forget that changed it
+                # while the provider ran leaves these vectors unwritten, and
+                # the next catch-up embeds the new wording. The projector
+                # deletes vectors on any later change (section 3.2).
+                if ("commitment", str(cid)) not in _lock_live_embedding_refs(
+                        cur, [("commitment", str(cid))], commitment_wording=[_md5(ctext or "")]):
                     conn.commit()
                     continue
                 rows = [("commitment", str(cid), i, c, _md5(c), v)

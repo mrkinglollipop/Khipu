@@ -304,13 +304,31 @@ def backup_local(*, dest: Path) -> dict:
         dest = dest / f"khipu-local-{stamp}.zip"
     dest.parent.mkdir(parents=True, exist_ok=True)
     count = 0
+    replica = src / _SNAPSHOT_NAME
+    staged: Path | None = None
     try:
         with sensitive_writer(dest) as archive_file:
             with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                if replica.is_file():
+                    # The replica goes in as a checked copy, never its live
+                    # file or journal: a copy whose fact rows belong to a
+                    # refused generation carries none (hub_snapshot.
+                    # export_replica_copy).
+                    from khipu import hub_snapshot
+
+                    staged = hub_snapshot.staging_path()
+                    hub_snapshot.export_replica_copy(replica, staged)
+                    zf.write(staged, arcname=_SNAPSHOT_NAME)
+                    count += 1
                 for p in src.rglob("*"):
                     if not p.is_file():
                         continue
                     if p.name == POINTER_NAME and src == DEFAULT_DIR:
+                        continue
+                    if staged is not None and p == staged:
+                        continue
+                    if p.parent == src and (p.name == _SNAPSHOT_NAME
+                                            or p.name.startswith(_SNAPSHOT_NAME + "-")):
                         continue
                     zf.write(p, arcname=str(p.relative_to(src)))
                     count += 1
@@ -323,6 +341,9 @@ def backup_local(*, dest: Path) -> dict:
         dest.unlink(missing_ok=True)
         return {"ok": False, "error": f"the backup could not be written: {describe_os_error(exc)}",
                 "archive": str(dest), "source": str(src)}
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
     return {"ok": True, "archive": str(dest), "files": count, "source": str(src)}
 
 

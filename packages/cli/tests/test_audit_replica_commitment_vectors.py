@@ -40,7 +40,14 @@ def test_delayed_commitment_vector_requires_live_open_parent(tmp_path, monkeypat
     assert result['ok'], result
     with sqlite3.connect(path) as con:
         retained = con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment' ORDER BY ref").fetchall()
-    assert retained == [('80',)], 'delayed publication recreated a non-live commitment vector'
+    assert ('70',) not in retained, 'delayed publication recreated a non-live commitment vector'
+    if state in ('forgotten', 'pending'):
+        # A forget changes the refusal set: the write drops the replica's
+        # fact state for a rebuild (design section 6) instead of patching
+        # it, so the live control's vector waits for that rebuild too.
+        assert hs.facts_rebuilding()
+    else:
+        assert retained == [('80',)], 'a live commitment vector was refused'
 
 
 def test_open_standalone_commitment_keeps_its_vector(tmp_path, monkeypatch):

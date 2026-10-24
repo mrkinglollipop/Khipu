@@ -29,6 +29,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import random
 import threading
 import time
 from pathlib import Path
@@ -384,24 +385,32 @@ def test_p2_1_concurrent_captures_and_forgets_lose_no_fact_step(pg):
                 landed.append(int(out["episode_id"]))
                 victim = landed[-2] if i % 2 and len(landed) > 1 else None
             if victim is not None:
-                for _attempt in range(20):
+                # A forget refused by a deadlock or serialization failure is
+                # retried (the documented contract); the timing assumption is
+                # only how long the retries may take. A count of attempts
+                # failed under full-suite load, so the bound is wall time,
+                # with jittered backoff so the four workers stop colliding.
+                deadline = time.monotonic() + 90
+                attempt = 0
+                while True:
                     try:
                         with db.connect() as conn, conn.cursor() as cur:
                             forget.forget_episode(cur, victim, memory_root=pg.memory)
                             conn.commit()
                         break
                     except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure) as exc:
-                        last = exc
-                        time.sleep(0.02 * _attempt)
-                        continue
-                else:
-                    errors.append(("forget never landed", victim, repr(last)))
+                        attempt += 1
+                        if time.monotonic() > deadline:
+                            errors.append(("forget never landed", victim, attempt, repr(exc)))
+                            break
+                        time.sleep(min(0.5, 0.02 * attempt) * (0.5 + random.random()))
 
     threads = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join(120)
+        t.join(300)
+    assert not any(t.is_alive() for t in threads)
     assert not errors, errors
     assert _rows(pg, "SELECT count(*) FROM fact_gaps") == [(0,)]
     live = {e for (e,) in _rows(pg, "SELECT id FROM episodes WHERE deleted_at IS NULL")}

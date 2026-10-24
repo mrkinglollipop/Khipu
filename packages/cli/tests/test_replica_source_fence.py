@@ -149,7 +149,9 @@ def test_every_fenced_writer_is_only_reached_inside_the_gate():
         assert _callers(name) == {"_refresh_locked"}, name
     assert _callers("_upsert_episode_unfenced") == {"upsert_episode"}
     assert _callers("_scrub_forgotten") == {"scrub"}
-    assert _callers("_drop_fact_state") == {"drop_facts"}
+    # The backup export drops the facts of its own staged copy (a refused
+    # generation's rows never reach an archive), never the replica's.
+    assert _callers("_drop_fact_state") == {"drop_facts", "export_replica_copy"}
     assert _callers("_fence_dumped_facts") == {"_refresh_locked"}
     assert _callers("_write_commitment_vectors") <= fenced
     # Production calls of the row writers pass the fence.

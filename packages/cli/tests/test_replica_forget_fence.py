@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import re
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,9 @@ PACKAGE = Path(hs.__file__).resolve().parent
 LINKED = ("commitments", "decisions", "deliverables")
 _SELECT = re.compile(r"\bSELECT\b.*?\bFROM\s+(?:main\.)?(" + "|".join(LINKED) + r")\b", re.S | re.I)
 # Signs a function works on the sqlite replica rather than the hub.
-_REPLICA_SIDE = ("con.execute", "open_snapshot(", "sqlite3.connect(", "_present(con")
+# ``fenced_rows(``: the fact readers run their fenced SQL through it (the
+# post-query refusal-set check, design section 6).
+_REPLICA_SIDE = ("con.execute", "open_snapshot(", "sqlite3.connect(", "_present(con", "fenced_rows(")
 # Functions that read a linked table on the replica side without the fence:
 # (module, name) -> why.
 UNFENCED = {
@@ -97,6 +100,12 @@ def replica(tmp_path, monkeypatch):
     con.commit()
     con.close()
     hs._queue_erasure(3)
+    # These rows stand for a replica fenced against the refusal set with
+    # episode 3's erasure queued: record that set's fingerprint, as the
+    # fenced write that queued it would (an unrecorded or older one shows
+    # no fact row, design section 6).
+    with closing(sqlite3.connect(hs.snapshot_path())) as con, con:
+        hs._meta_put(con, hs._FACT_DIGEST_KEY, hs._current_refusal_digest(hs.snapshot_path()))
     return tmp_path
 
 

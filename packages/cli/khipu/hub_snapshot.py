@@ -834,7 +834,8 @@ def decision_counts_snapshot(
         retract_expr = "retracted_at IS NOT NULL" if has_retract else "0"
         placeholders = ",".join("?" for _ in episode_ids)
         fence = forget_fence_sql(con, "decisions", "episode_id")
-        rows = con.execute(
+        rows = fenced_rows(
+            con,
             f"""
             SELECT CAST(episode_id AS TEXT),
                    SUM(CASE WHEN NOT ({retract_expr}) AND superseded_by IS NULL THEN 1 ELSE 0 END),
@@ -845,7 +846,7 @@ def decision_counts_snapshot(
             GROUP BY episode_id
             """,
             [str(e) for e in episode_ids],
-        ).fetchall()
+        )
         return {eid: (int(c or 0), int(s or 0), int(r or 0)) for eid, c, s, r in rows}
     except Exception:  # noqa: BLE001 — validity is best-effort metadata, never a search failure
         return None
@@ -866,11 +867,12 @@ def recent_deliverables_snapshot(
         return []
     extra = forget_fence_sql(con, "deliverables", "episode_id")
     try:
-        rows = con.execute(
+        rows = fenced_rows(
+            con,
             f"SELECT {', '.join(cols)} FROM deliverables WHERE project = ?{extra} "
             "ORDER BY created_at DESC, id DESC LIMIT ?",
             (project, limit),
-        ).fetchall()
+        )
     except sqlite3.Error:
         return None
     return [dict(zip(cols, row)) for row in rows]
@@ -1292,6 +1294,9 @@ _FACT_DIGEST_KEY = "fact_refusal_digest"
 _SCRUB_DIGEST_KEY = "episode_scrub_digest"
 # "rebuilding" from a drop until ``rebuild_facts`` (or a dump) re-reads them.
 _FACT_STATE_KEY = "fact_state"
+# A fresh token at every drop and every whole load: a rebuild publishes only
+# into the generation it was started for (fifth Astra review #3).
+_FACT_GENERATION_KEY = "fact_generation"
 _FACT_TABLES = ("commitments", "decisions", "deliverables")
 _FACT_VECTOR_KINDS = ("commitment", "decision", "deliverable")
 # The incremental re-fence's tables (third Astra review #5), retired
@@ -1667,42 +1672,82 @@ def _current_refusal_digest(path: Path | None = None) -> str | None:
         return None
 
 
-def _fact_epoch_sql(con: sqlite3.Connection) -> str:
-    """An ``" AND (...)"`` clause, true only while the replica's fact rows
-    were fenced against the current refusal set (``_FACT_DIGEST_KEY``),
-    evaluated in the reader's own SQLite snapshot with the rows. A replica
-    from before this rule (no digest recorded) reads as current until its
-    first fenced write."""
-    if not _snapshot_table_columns(con, "snapshot_meta"):
-        return ""
-    # The queued erasures beside this connection's own file (a dump's temp
-    # file and a staged import sit beside the replica too).
+# The digest the epoch function last returned on each reader connection (by
+# ``id``), for the post-query check in ``fenced_rows``.
+_EPOCH_SEEN: dict[int, str] = {}
+_EPOCH_UNREADABLE = "unreadable"
+
+
+def _con_path(con: sqlite3.Connection) -> Path | None:
     try:
         main = next((r[2] for r in con.execute("PRAGMA database_list") if r[1] == "main"), "")
     except sqlite3.Error:
         main = ""
-    digest = _current_refusal_digest(Path(main) if main else None)
-    if digest is None:
+    return Path(main) if main else None
+
+
+def _install_fact_epoch(con: sqlite3.Connection) -> None:
+    """Register ``khipu_fact_epoch()`` on ``con``: the current refusal set's
+    fingerprint, computed when SQLite evaluates it (each statement, a TEMP
+    view's every use included), never frozen into the SQL text (fifth Astra
+    review #2). The queued erasures are those beside this connection's own
+    file (a dump's temp file and a staged import sit beside the replica)."""
+    path = _con_path(con)
+    key = id(con)
+
+    def epoch() -> str:
+        digest = _current_refusal_digest(path) or _EPOCH_UNREADABLE
+        _EPOCH_SEEN[key] = digest
+        return digest
+
+    con.create_function("khipu_fact_epoch", 0, epoch)
+
+
+def _fact_epoch_sql(con: sqlite3.Connection) -> str:
+    """An ``" AND (...)"`` clause, true only while the replica's fact rows
+    were fenced against the refusal set current when the statement runs
+    (``_FACT_DIGEST_KEY`` against ``khipu_fact_epoch()``), both read in the
+    reader's own SQLite snapshot of the rows. A replica with no recorded
+    fingerprint (one written before this rule, or with no ``snapshot_meta``)
+    is unverified and shows no fact row until a rebuild certifies it."""
+    if not _snapshot_table_columns(con, "snapshot_meta"):
         return " AND 0"
-    return (f" AND COALESCE((SELECT value FROM main.snapshot_meta WHERE key = '{_FACT_DIGEST_KEY}'), "
-            f"'{digest}') = '{digest}'")
+    _install_fact_epoch(con)
+    return (f" AND (SELECT value FROM main.snapshot_meta WHERE key = '{_FACT_DIGEST_KEY}') "
+            "IS (SELECT khipu_fact_epoch())")
 
 
 def _fact_vector_epoch_sql(con: sqlite3.Connection, alias: str = "") -> str:
     """The same clause for ``memory_embeddings`` rows: a fact vector shows
     only while the fact rows are current; other kinds are untouched."""
     epoch = _fact_epoch_sql(con)
-    if not epoch:
-        return ""
     kind = f"{alias}.kind" if alias else "kind"
     kinds = ", ".join(f"'{k}'" for k in _FACT_VECTOR_KINDS)
     return f" AND ({kind} NOT IN ({kinds}) OR (1 = 1{epoch}))"
 
 
+def fenced_rows(con: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> list[Any]:
+    """Run a fact read whose SQL carries ``forget_fence_sql`` (or the vector
+    view) and re-check the refusal set after it: if it moved while the
+    query ran, run it once more; if it moved again, return nothing. So a
+    read never returns rows fenced against a set it saw replaced (the
+    in-flight-read contract, design section 6)."""
+    path = _con_path(con)
+    for _attempt in range(2):
+        _EPOCH_SEEN.pop(id(con), None)
+        rows = con.execute(sql, params).fetchall()
+        seen = _EPOCH_SEEN.pop(id(con), None)
+        if seen is None or seen == (_current_refusal_digest(path) or _EPOCH_UNREADABLE):
+            return rows
+    return []
+
+
 def _replica_fact_state(path: Path | None = None) -> str | None:
     """``"rebuilding"`` while the replica's fact rows await a full re-read,
     ``"stale"`` when they were fenced against an older refusal set (the next
-    fenced write drops them), ``None`` otherwise or with no replica."""
+    fenced write drops them), ``"unverified"`` with no fingerprint recorded
+    (a replica written before this rule: never certified), ``None``
+    otherwise or with no replica."""
     path = path or snapshot_path()
     if not path.is_file():
         return None
@@ -1714,7 +1759,9 @@ def _replica_fact_state(path: Path | None = None) -> str | None:
         return None
     if state == "rebuilding":
         return state
-    if stored is not None and stored != _current_refusal_digest(path):
+    if stored is None:
+        return "unverified"
+    if stored != _current_refusal_digest(path):
         return "stale"
     return None
 
@@ -1742,6 +1789,28 @@ def _drop_fact_state(con: sqlite3.Connection) -> None:
         con.execute(f"DELETE FROM {_ROW_VERSIONS_TABLE} WHERE tbl IN ('commitments', 'decisions', 'deliverables') "
                     "OR (tbl = 'vectors' AND instr(key, char(31) || 'commitment' || char(31)) > 0)")
     _meta_put(con, _FACT_STATE_KEY, "rebuilding")
+    _meta_put(con, _FACT_GENERATION_KEY, uuid.uuid4().hex)
+
+
+def export_replica_copy(src: Path, dest: Path) -> dict[str, Any]:
+    """Write a consistent copy of the replica at ``src`` to ``dest`` (the
+    SQLite backup API, so no journal file is needed beside it) for a backup
+    archive, through the same generation check readers use (fifth Astra
+    review #6): when the copy's fact rows were not fenced against the refusal
+    set current now (a stale or missing fingerprint, or a rebuild pending),
+    its derived fact state is dropped, so the archive carries no fact row of
+    a refused generation; restoring it rebuilds them from the hub."""
+    with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as source, \
+            closing(sqlite3.connect(str(dest))) as copy:
+        source.backup(copy)
+        stored = _meta_get(copy, _FACT_DIGEST_KEY)
+        state = _meta_get(copy, _FACT_STATE_KEY)
+        current = _current_refusal_digest(src)
+        if state == "rebuilding" or stored is None or current is None or stored != current:
+            _drop_fact_state(copy)
+            copy.commit()
+            return {"facts_dropped": True}
+    return {"facts_dropped": False}
 
 
 class _SourceFence:
@@ -1764,6 +1833,8 @@ class _SourceFence:
         self.scrubbed = 0
         self.dropped = False
         self.digest = _refusal_digest(gate, path)
+        # The generation before this write changed anything.
+        self.generation = _meta_get(con, _FACT_GENERATION_KEY)
 
     def start(self, *, scrub: bool = False) -> None:
         """A dump, a backup import or an explicit scrub (``scrub``) applies
@@ -1779,7 +1850,10 @@ class _SourceFence:
             self.scrub()
         else:
             stored = _meta_get(self.con, _FACT_DIGEST_KEY)
-            if stored is not None and stored != self.digest:
+            # No fingerprint is unverified, never current: an upgraded
+            # replica's rows were never checked against any refusal set
+            # (fifth Astra review #1).
+            if stored != self.digest:
                 self.drop_facts()
             if not self.live and _meta_get(self.con, _SCRUB_DIGEST_KEY) != self.gate.digest:
                 self.scrub()
@@ -2311,18 +2385,31 @@ def _load_facts(con: sqlite3.Connection, fence: _SourceFence, read: Mapping[str,
     counts["vectors"] = _write_commitment_vectors(con, read.get("vectors") or ())
     _meta_put(con, _FACT_CURSOR_KEY, None if read.get("xmin") is None else str(read["xmin"]))
     _meta_put(con, _FACT_STATE_KEY, None)
+    _meta_put(con, _FACT_GENERATION_KEY, uuid.uuid4().hex)
     return counts
 
 
-def rebuild_facts(*, connect: Any = None) -> dict[str, Any]:
+def _replica_generation(path: Path) -> str | None:
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
+            return _meta_get(con, _FACT_GENERATION_KEY)
+    except sqlite3.Error:
+        return None
+
+
+def rebuild_facts(*, connect: Any = None, _retry: bool = True) -> dict[str, Any]:
     """Rebuild the replica's derived fact state from the hub: every
     commitment, decision, deliverable and commitment vector, read in one
     REPEATABLE READ snapshot (``connect``: a connection factory, the hub's by
     default) and loaded through the source fence in one write
-    (``_load_facts``). Bounded by one read and one write; the write holds the
-    replica gate, so a capture's live patch waits at most
-    ``LIVE_PATCH_WAIT_S`` and is deferred to the next pull, never blocked.
-    Never raises."""
+    (``_load_facts``). The rebuild belongs to the fact generation current
+    when it started: if another drop or whole load landed before its write
+    (a newer pull's rebuild, say), its older read is discarded, never
+    published over the newer state (fifth Astra review #3); a replica still
+    rebuilding then gets one fresh attempt. Bounded by one read and one
+    write; the write holds the replica gate, so a capture's live patch waits
+    at most ``LIVE_PATCH_WAIT_S`` and is deferred to the next pull, never
+    blocked. Never raises."""
     from khipu.tombstones import RegistryError
 
     path = snapshot_path()
@@ -2330,6 +2417,7 @@ def rebuild_facts(*, connect: Any = None) -> dict[str, Any]:
         return {"ok": True, "skipped": True, "reason": "no snapshot exists"}
     started = time.monotonic()
     read_at = time.time()
+    generation = _replica_generation(path)
     try:
         opener = connect or (lambda: try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S))
         with opener() as pg:
@@ -2343,9 +2431,14 @@ def rebuild_facts(*, connect: Any = None) -> dict[str, Any]:
         return {"ok": False, "rebuilding": True, "error": f"{type(exc).__name__}: {exc}"[:300],
                 "hub_unreachable": hub_connection_failed(exc)}
     read_s = time.monotonic() - started
+    superseded = False
     try:
         with _replica_write_gate(path) as fence:
-            counts = _load_facts(fence.con, fence, read, read_at=read_at)
+            if fence.generation != generation:
+                superseded = True
+                counts: dict[str, int] = {}
+            else:
+                counts = _load_facts(fence.con, fence, read, read_at=read_at)
     except _ReplicaBusy:
         return {"ok": False, "rebuilding": True, "error": "hub snapshot refresh in progress"}
     except RegistryError as exc:
@@ -2354,8 +2447,13 @@ def rebuild_facts(*, connect: Any = None) -> dict[str, Any]:
         _record_write_error(_FACT_TABLES, f"fact rebuild: {type(exc).__name__}: {exc}")
         return {"ok": False, "rebuilding": True, "error": f"{type(exc).__name__}: {exc}"[:300]}
     still = _replica_fact_state(path) is not None
-    return {"ok": True, "rebuilt": not still, "rebuilding": still, **counts,
-            "read_seconds": round(read_s, 3), "seconds": round(time.monotonic() - started, 3)}
+    if superseded and still and _retry:
+        return rebuild_facts(connect=connect, _retry=False)
+    out = {"ok": True, "rebuilt": not still and not superseded, "rebuilding": still, **counts,
+           "read_seconds": round(read_s, 3), "seconds": round(time.monotonic() - started, 3)}
+    if superseded:
+        out["superseded"] = True
+    return out
 
 
 # Rows per kind one pull applies. Past it a full dump is the cheaper way to
@@ -3253,6 +3351,13 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             "INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('schema_version', ?)",
             (str(version),),
         )
+        # A new file holds no fact row yet, so it is current against the
+        # refusal set of now; one written before the rule has no
+        # fingerprint and stays unverified (design section 6, rollout).
+        digest = _current_refusal_digest(_con_path(con))
+        if digest is not None:
+            _meta_put(con, _FACT_DIGEST_KEY, digest)
+        _meta_put(con, _FACT_GENERATION_KEY, uuid.uuid4().hex)
     if version >= 3:
         con.executescript(
             """
@@ -3892,6 +3997,7 @@ def _fence_dumped_facts(con: sqlite3.Connection, fence: _SourceFence, inputs: Ma
                 changed += 1
     _drop_mismatched_commitment_vectors(con)
     _meta_put(con, _FACT_STATE_KEY, None)
+    _meta_put(con, _FACT_GENERATION_KEY, uuid.uuid4().hex)
     return changed
 
 
@@ -7104,14 +7210,15 @@ def semantic_search_snapshot(
         kind_clause += (" AND kind = 'episode' AND ref IN "
                         f"(SELECT CAST(id AS TEXT) FROM episodes WHERE {predicate})")
         params.extend(t3_params)
-    rows = con.execute(
+    rows = fenced_rows(
+        con,
         f"""
         SELECT kind, ref, chunk_idx, chunk_text, embedding
         FROM memory_embeddings
         WHERE profile = ?{kind_clause} AND embedding IS NOT NULL
         """,
         params,
-    ).fetchall()
+    )
     time_filtered = since_dt is not None or until_dt is not None
     ep_cols = _snapshot_table_columns(con, "episodes")
     # Tombstoned episodes never come back through the offline replica either

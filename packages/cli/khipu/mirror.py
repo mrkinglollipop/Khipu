@@ -505,9 +505,11 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
 
 
 def _carries_fact_items(payload: dict[str, Any]) -> bool:
-    """What 0047's writer gate calls a fact-bearing capture."""
-    return any(isinstance(payload.get(k), list) and payload.get(k)
-               for k in ("open_loops", "decisions", "deliverables"))
+    """Whether a capture carries any input the fact steps derive facts or
+    closes from (``_FACT_KEYS``: a closure-only line too, fifth Astra review
+    #4). Wider than 0047's writer gate, which only needs the open loops,
+    decisions and deliverables; recovery runs the steps for all of them."""
+    return any(isinstance(payload.get(k), list) and payload.get(k) for k in _FACT_KEYS)
 
 
 def _recover_line_facts(cur, obj: dict[str, Any], episode_id: int | None) -> None:
