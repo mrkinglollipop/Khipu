@@ -26,7 +26,7 @@ import pytest
 from khipu import capture, decisions, hub_snapshot as hs, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import env, pg, PROJECT, _capture, _payload  # noqa: F401
-from tests.test_provenance_replica import replica, _replica, _replica_readers  # noqa: F401
+from tests.test_provenance_replica import hub_forget, replica, _replica, _replica_readers  # noqa: F401
 
 PACKAGE = Path(hs.__file__).resolve().parent
 SOURCE = (PACKAGE / "hub_snapshot.py").read_text(encoding="utf-8")
@@ -162,25 +162,36 @@ def test_every_fenced_writer_is_only_reached_inside_the_gate():
             for call in ast.walk(fns[caller]):
                 if isinstance(call, ast.Call) and getattr(call.func, "id", None) == writer:
                     assert len(call.args) > at or any(k.arg == "fence" for k in call.keywords), (writer, caller)
-    for name in ("apply_decision_changes", "_upsert_episode_unfenced", "upsert_embeddings",
-                 "_write_pulled_tables", "_apply_fact_stream", "_load_facts", "_fence_dumped_facts"):
-        assert "check" in _called(fns[name]), f"{name} does not check its anchors"
+    # Episodes and their vectors are checked by every identity they carry;
+    # every fact import by the wait rule (owner ruling 2026-10-24).
+    for name in ("_upsert_episode_unfenced", "upsert_embeddings"):
+        assert "check" in _called(fns[name]), f"{name} does not check its episodes"
+    for name in ("apply_decision_changes", "_upsert_episode_unfenced", "_write_pulled_tables",
+                 "_apply_fact_stream", "_load_facts", "_fence_dumped_facts"):
+        assert "facts_confirmed" in _called(fns[name]), f"{name} skips the wait rule"
 
 
 def test_every_anchor_read_carries_every_identity():
-    """Each import reads its anchors' identities from the hub in its own
-    snapshot, merged captures and source receipts included."""
+    """Each episode import reads its episodes' identities from the hub in
+    its own snapshot, merged captures and source receipts included; every
+    fact read carries the wait rule's hub read (``read_refusal_wait``),
+    which judges a hub episode by the same identities."""
     fns = _functions()
-    assert "read_anchor_identities" in _called(fns["_read_fact_rows"])
-    assert {"_commitment_anchors", "_read_receipts", "read_anchor_identities"} <= _called(fns["_pull_apply"])
-    assert {"_commitment_anchors", "_read_fact_rows"} <= _called(fns["_read_all_facts"])
-    assert "_anchor_identities" in _called(fns["_dumped_identities"])
+    assert {"_read_receipts", "read_anchor_identities", "read_refusal_wait"} <= _called(fns["_pull_apply"])
+    for reader in ("_read_fact_rows", "_read_all_facts", "_dump_fact_inputs", "sync_decision_changes"):
+        assert "read_refusal_wait" in _called(fns[reader]), reader
+    for module in ("decisions.py", "embed.py"):
+        assert "read_refusal_wait" in (PACKAGE / module).read_text(encoding="utf-8"), module
+    assert "_episode_refused" in _called(fns["read_refusal_wait"])
+    assert "_anchor_identities" in _called(fns["_episode_refused"])
     assert "_read_receipts" in _called(fns["read_anchor_identities"])
     assert "_anchor_identities" in _called(fns["read_anchor_identities"])
     assert "_anchor_identities" in _called(fns["_scrub_forgotten"])
     assert "_anchor_identities" in _called(fns["_upsert_episode_unfenced"])
     body = ast.get_source_segment(SOURCE, fns["_anchor_identities"])
     assert "merged_from" in body and "receipts" in body
+    wait = ast.get_source_segment(SOURCE, fns["read_refusal_wait"])
+    assert "episode_sources" in wait and "merged_from" in wait and "khipu_natural_source_key" in wait
 
 
 # ---- behaviour: every path, one schedule ------------------------------------------
@@ -338,32 +349,19 @@ def test_identities_cover_merged_payloads_and_receipts():
 
 def test_every_fact_writer_checks_each_row():
     """Each writer of commitment, decision or deliverable rows passes every
-    row through the one check (``_admit_fact``) with the contributors its
-    hub read carried; each hub read that feeds one reads them in its own
-    snapshot, with their identities. No contributor state is kept in the
-    replica (the incremental re-fence was retired 2026-10-24)."""
+    row through the one anchor check (``_admit_fact``), under the wait rule
+    its caller applied. The per-row contributor admission was cut by the
+    owner ruling of 2026-10-24: no contributor state is read or kept."""
     fns = _functions()
-    for writer in ("_write_commitment_rows", "_write_decision_rows", "_write_fact_deliverables",
-                   "_fence_dumped_facts"):
+    for writer in ("_write_commitment_rows", "_write_decision_rows", "_write_fact_deliverables"):
         assert "_admit_fact" in _called(fns[writer]), writer
     for writer in ("_apply_fact_stream", "_write_deliverable_rows", "_load_facts"):
         assert "_write_fact_deliverables" in _called(fns[writer]), writer
-    for reader in ("_read_fact_rows", "_pull_apply", "_dump_fact_inputs", "_read_all_facts"):
-        assert "read_fact_sources" in _called(fns[reader]), reader
-    assert "fact_source_episodes" in _called(fns["_read_fact_rows"])
-    assert "fact_source_episodes" in _called(fns["_pull_apply"])
     assert {"_dump_fact_inputs", "_fence_dumped_facts"} <= _called(fns["_refresh_locked"])
-    for caller, writer in (("_write_pulled_tables", "_write_commitment_rows"),
-                           ("_pull_apply", "upsert_episode")):
-        calls = [c for c in ast.walk(fns[caller]) if isinstance(c, ast.Call)
-                 and getattr(c.func, "id", None) == writer]
-        assert calls and all(len(c.args) >= 5 or any(k.arg in ("sources", "deliverable_sources")
-                                                       for k in c.keywords) for c in calls), (caller, writer)
-    for module, needle in (("decisions.py", "read_fact_sources"), ("embed.py", "read_fact_sources")):
-        assert needle in (PACKAGE / module).read_text(encoding="utf-8"), module
     fns_and_classes = {n.name for n in ast.walk(TREE) if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
     for retired in ("_fence_fact_wording", "_store_fact_sources", "_facts_sourced_by", "_ScrubGate",
-                    "_index_identities", "apply_fact_rows"):
+                    "_index_identities", "apply_fact_rows", "read_fact_sources", "_fact_source_sql",
+                    "fact_source_episodes", "_commitment_anchors", "_dumped_identities", "supports"):
         assert retired not in fns_and_classes, retired
 
 
@@ -373,19 +371,19 @@ B_WORDS = "Review the deployment checklist before the release goes out"
 A_WORDS = "Review the deployment checklist before release"
 
 
-def _patch_with_sources(pg, eid):
+def _patch_with_confirm(pg, eid):
     from khipu import deliverables
 
     with pg.connect() as conn, conn.cursor() as cur:
         # As embed_on_capture reads them: the xmin before the rows.
         fact_xmin = hs._hub_snapshot_xmin(cur)
         row = cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (eid,)).fetchone()[0]
+        confirm = hs.read_refusal_wait(cur)
         rows = deliverables.deliverables_for_episode(cur, eid)
-        sources = hs.read_fact_sources(cur, "deliverable", [r["id"] for r in rows])
         receipts = hs._read_receipts(cur, [eid]).get(eid, [])
         conn.rollback()
     return hs.upsert_episode(row, [], deliverable_rows=rows, receipts=receipts, fact_xmin=fact_xmin,
-                             deliverable_sources=sources)
+                             confirm=confirm)
 
 
 CONTRIBUTOR_IMPORTS = {
@@ -395,7 +393,7 @@ CONTRIBUTOR_IMPORTS = {
     "refresh": (lambda pg, a: hs.refresh(), {"commitment", "decision", "deliverable"}),
     "rebuild_facts": (_rebuild_facts, {"commitment", "decision", "deliverable"}),
     "apply_decision_changes": (_decision_mirror, {"decision"}),
-    "upsert_episode": (_patch_with_sources, {"deliverable"}),
+    "upsert_episode": (_patch_with_confirm, {"deliverable"}),
 }
 
 
@@ -404,9 +402,10 @@ def test_every_import_path_keeps_and_fences_every_contributor(pg, replica, gate_
     """Two separate live episodes share each fact: B restates A's
     commitment (its latest_text) and repeats A's decision and deliverable
     word for word. This Mac has forgotten B's source; the hub is unchanged.
-    Each import path alone hides B's own words and keeps A's (which A
-    supports), checking both episodes as the contributors of what it
-    writes."""
+    Under the wait rule (owner ruling 2026-10-24) each import path alone
+    writes no fact row while the hub still holds B live; once the hub's
+    forget re-projects the facts, the same path shows A's words and never
+    B's."""
     replica(pg)
     assert hs.refresh()["ok"]
     a = _capture(loop=A_WORDS, decision=SHARED_DECISION, title=SHARED_TITLE)
@@ -424,10 +423,20 @@ def test_every_import_path_keeps_and_fences_every_contributor(pg, replica, gate_
     out = run(pg, a)
     assert out.get("ok", True), out
     assert gate_spy, f"{path} did not go through _replica_write_gate"
-    # B's own words never show; A's, which A supports, stay.
-    tables = json.dumps([_replica("SELECT * FROM commitments"), _replica("SELECT * FROM decisions"),
-                         _replica("SELECT * FROM deliverables")])
-    assert B_WORDS not in tables and B_WORDS not in _replica_readers(), path
+    def tables():
+        return json.dumps([_replica("SELECT * FROM commitments"), _replica("SELECT * FROM decisions"),
+                           _replica("SELECT * FROM deliverables")])
+
+    # Waiting: no fact row at all, B's words least of all.
+    assert B_WORDS not in tables() and B_WORDS not in _replica_readers(), path
+    assert SHARED_DECISION not in tables() and A_WORDS not in tables(), path
+    # The hub catches up; the same path alone brings A's words back.
+    hub_forget(pg, b)
+    gate_spy.clear()
+    out = run(pg, a)
+    assert out.get("ok", True), out
+    assert gate_spy, path
+    assert B_WORDS not in tables() and B_WORDS not in _replica_readers(), path
     readers = _replica_readers()
     if "decision" in kinds:
         assert SHARED_DECISION in readers, path

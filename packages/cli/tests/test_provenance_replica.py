@@ -337,3 +337,17 @@ def test_two_forgets_racing_a_first_backfill_land_without_the_caller_retrying(pg
     for t in threads:
         t.join(120)
     assert sorted(results) == [(eids[0], True), (eids[1], True)], results
+
+
+def hub_forget(pg, eid):
+    """The hub half of a forget alone, no replica write: the hub tombstones
+    the episode and re-projects what it supplied (this Mac's registry
+    already names its source). The replica's wait rule then lets live
+    wording back on its next import."""
+    from khipu import db, forget
+
+    pg.memory.mkdir(exist_ok=True)
+    with db.connect() as conn, conn.cursor() as cur:
+        out = forget.forget_episode(cur, eid, memory_root=pg.memory)
+        assert out.get("ok") is not False, out
+        conn.commit()

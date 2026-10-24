@@ -166,25 +166,17 @@ def _mirror_to_snapshot(cur, decision_id: int) -> None:
 
         if not hub_snapshot.snapshot_path().is_file():
             return
-        # The anchor's source identities, read with the row, for the
-        # replica's source fence; in a savepoint, so a failed read never
-        # aborts the caller's transaction.
-        # And its contributors (third Astra review #1): every episode whose
-        # claim its wording shows, with their identities too.
-        anchors: dict = {}
-        sources = None
+        # The wait rule's confirmation (the hub reflects every refusal this
+        # Mac knows), read with the row; in a savepoint, so a failed read
+        # never aborts the caller's transaction. This transaction holds the
+        # decision row, so a forget cannot re-project it in between.
         # A savepoint only inside a transaction (an autocommit cursor has
         # nothing to abort).
         savepoint = not getattr(getattr(cur, "connection", None), "autocommit", False)
         if savepoint:
             cur.execute("SAVEPOINT decision_mirror_anchor")
         try:
-            sources = hub_snapshot.read_fact_sources(cur, "decision", [decision_id])
-            episodes = hub_snapshot.fact_source_episodes(sources)
-            if payload.get("episode_id") is not None:
-                episodes.add(int(payload["episode_id"]))
-            if episodes:
-                anchors = hub_snapshot.read_anchor_identities(cur, episodes)
+            confirm = hub_snapshot.read_refusal_wait(cur)
         except Exception:
             if savepoint:
                 cur.execute("ROLLBACK TO SAVEPOINT decision_mirror_anchor")
@@ -192,7 +184,7 @@ def _mirror_to_snapshot(cur, decision_id: int) -> None:
             raise
         if savepoint:
             cur.execute("RELEASE SAVEPOINT decision_mirror_anchor")
-        hub_snapshot.apply_decision_changes([payload], anchors, sources=sources)
+        hub_snapshot.apply_decision_changes([payload], confirm)
     except Exception as exc:  # noqa: BLE001 — the PG write already succeeded; mirror is best-effort
         _log(f"snapshot mirror for decision {decision_id} failed ({type(exc).__name__}: {exc})")
 

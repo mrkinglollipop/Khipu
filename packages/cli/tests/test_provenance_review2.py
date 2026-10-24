@@ -110,17 +110,19 @@ def test_source_publication_after_anchor_check_cannot_race_derivative_write(pg, 
         assert hs.refresh()["ok"]
         assert _replica("SELECT id FROM episodes") == []
         conn.commit()
-    checked = hs._registry_rejected_anchors
+    # Since the 2026-10-24 ruling the check is the wait rule's hub read
+    # (read_refusal_wait); the source is published right after it.
+    checked = hs.read_refusal_wait
     intercepted = []
 
-    def publish_after_check(anchors, *args, **kwargs):
-        result = checked(anchors, *args, **kwargs)
-        if not intercepted and eid in {int(a) for a in anchors}:
+    def publish_after_check(*args, **kwargs):
+        result = checked(*args, **kwargs)
+        if not intercepted:
             intercepted.append(True)
             tombstones.publish_payloads([payload])
         return result
 
-    monkeypatch.setattr(hs, "_registry_rejected_anchors", publish_after_check)
+    monkeypatch.setattr(hs, "read_refusal_wait", publish_after_check)
     out = hs.pull_changes(include_ledger=False) if kind == "commitment" else hs.sync_fact_changes()
     assert out["ok"], out
     assert intercepted

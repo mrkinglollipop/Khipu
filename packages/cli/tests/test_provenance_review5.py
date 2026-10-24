@@ -18,7 +18,7 @@ from khipu import capture, commitments, embed, forget, mirror, offline_reads, ou
 from khipu import hub_snapshot as hs
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401 - fixtures
 from tests.test_provenance_forget import ALT, CANON, _capture, _payload, env, pg  # noqa: F401
-from tests.test_provenance_replica import _replica, _replica_readers, replica  # noqa: F401
+from tests.test_provenance_replica import _replica, _replica_readers, hub_forget, replica  # noqa: F401
 
 
 def test_first_live_patch_does_not_certify_unchecked_legacy_facts(pg, replica):
@@ -41,7 +41,11 @@ def test_first_live_patch_does_not_certify_unchecked_legacy_facts(pg, replica):
     assert hs.sync_fact_changes()["ok"]
     rows = offline_reads.owed(None, "open", 100)
     assert ALT not in json.dumps(rows, default=str), "first fenced write blessed unchecked legacy facts"
-    assert CANON in _replica_readers()
+    # The wait rule (2026-10-24 ruling): live wording returns once the hub's
+    # forget of the private episode lands.
+    hub_forget(pg, private_id)
+    assert hs.sync_fact_changes()["ok"]
+    assert CANON in _replica_readers() and ALT not in _replica_readers()
     # Before the first write, the unfingerprinted replica served no fact row.
     assert unverified[0] == "unverified" and ALT not in unverified[1]
 

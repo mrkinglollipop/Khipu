@@ -187,3 +187,48 @@ def test_manual_commitment_backfill_does_not_restore_old_hub_chunks(pg, replica)
                             (str(cid),)).fetchall()
     assert CANON not in str(_replica("SELECT chunk_text FROM memory_embeddings WHERE kind='commitment'"))
     assert CANON not in str(hubrows), "manual backfill restored old wording on the hub"
+
+
+def test_superseded_rebuild_takes_priority_over_a_patch_stream(pg, replica):
+    """The liveness edge (owner ruling 2026-10-24): a rebuild superseded
+    once is retried with priority, its hub read inside the replica gate, so
+    a patch arriving meanwhile queues behind it (deferred to the next pull)
+    instead of superseding it again."""
+    import os
+    import subprocess
+    import sys
+
+    from khipu import tombstones
+
+    replica(pg)
+    _capture(loop=CANON)
+    assert hs.refresh()["ok"]
+    tombstones.publish_payloads([_payload(loop=None)])
+    with hs._replica_write_gate():
+        pass
+    assert hs.facts_rebuilding()
+    with pg.connect() as c:
+        row = c.execute("SELECT to_jsonb(e) FROM episodes e ORDER BY id DESC LIMIT 1").fetchone()[0]
+    code = ("import json;from pathlib import Path;from khipu import tombstones, hub_snapshot as hs;"
+            f"tombstones.registry_path=lambda:Path({str(tombstones.registry_path())!r});"
+            f"print(json.dumps(hs.upsert_episode(json.loads({json.dumps(json.dumps(row, default=str))}), [])))")
+    patches = []
+    real = hs._read_all_facts
+
+    def patch_stream(cur):
+        read = real(cur)
+        # A live capture patch lands while each rebuild read is in flight.
+        child = subprocess.run([sys.executable, "-c", code], env=os.environ.copy(),
+                               capture_output=True, text=True, timeout=30)
+        assert child.returncode == 0, child.stderr
+        patches.append(json.loads(child.stdout.strip().splitlines()[-1]))
+        return read
+
+    with mock.patch.object(hs, "_read_all_facts", patch_stream):
+        result = hs.rebuild_facts()
+    assert len(patches) == 2, patches
+    assert patches[0].get("ok"), patches  # the first patch superseded the plain rebuild
+    assert patches[1].get("deferred"), patches  # the second queued behind the priority one
+    assert result["rebuilt"] and result.get("priority") and result.get("superseded"), result
+    assert not hs.facts_rebuilding()
+    assert CANON in _replica_readers()

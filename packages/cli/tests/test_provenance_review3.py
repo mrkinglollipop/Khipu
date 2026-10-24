@@ -30,7 +30,7 @@ import pytest
 from khipu import capture, hub_snapshot as hs, mirror, outbox, provenance, request_context, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import ALT, CANON, env, pg, _capture, _payload  # noqa: F401
-from tests.test_provenance_replica import replica, _replica, _replica_readers  # noqa: F401
+from tests.test_provenance_replica import hub_forget, replica, _replica, _replica_readers  # noqa: F401
 
 
 # ---- 1. P1 a non-anchor claimant's wording on a shared commitment ---------------
@@ -40,8 +40,10 @@ from tests.test_provenance_replica import replica, _replica, _replica_readers  #
 def test_nonanchor_claimant_source_is_fenced(pg, replica, method):
     """A opens a commitment; a separate episode B deduplicates into it and
     supplies latest_text. The replica's registry then records B's source as
-    forgotten (the hub is unchanged). B's words must leave A's commitment in
-    the replica on every write path."""
+    forgotten (the hub is unchanged). B's words must leave the replica on
+    every write path; since the 2026-10-24 ruling (the wait rule) the replica
+    keeps no fact row until the hub's forget re-projects A's commitment, and
+    then shows A's own wording."""
     replica(pg)
     a = _capture(loop=CANON)
     bpayload = _payload(loop=ALT)
@@ -59,10 +61,17 @@ def test_nonanchor_claimant_source_is_fenced(pg, replica, method):
     rows = _replica("SELECT opened_episode, text, latest_text FROM commitments")
     assert ALT not in str(rows), "forgotten claimant wording remained under a different anchor"
     assert ALT not in _replica_readers()
-    # A's own wording stays: only B's contribution is fenced.
-    assert rows == [(a, CANON, None)], rows
+    assert rows == [] and hs.facts_rebuilding(), rows  # waiting for the hub
     with pg.connect() as c:
         assert c.execute("SELECT latest_text FROM commitments").fetchall() == [(ALT,)]
+    # The hub catches up: A's own wording returns, B's never.
+    hub_forget(pg, b)
+    out = (hs.pull_changes(include_ledger=False) if method == "pull" else hs.refresh()
+           if method == "dump" else hs.scrub_forgotten_snapshot())
+    assert out["ok"], out
+    rows = _replica("SELECT opened_episode, text, latest_text FROM commitments")
+    assert rows == [(a, CANON, None)], rows
+    assert ALT not in _replica_readers()
 
 
 # ---- 2. P2 recovery at an existing legacy key -----------------------------------

@@ -31,7 +31,7 @@ import pytest
 from khipu import capture, deliverables, embed, forget, hub_snapshot as hs, mirror, outbox, provenance, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import ALT, CANON, env, pg, _capture, _payload, _readers  # noqa: F401
-from tests.test_provenance_replica import replica, _replica, _replica_readers  # noqa: F401
+from tests.test_provenance_replica import hub_forget, replica, _replica, _replica_readers  # noqa: F401
 from tests.test_provenance_review2 import _gap_capture
 
 
@@ -212,7 +212,7 @@ def test_pr_and_owner_contributors_are_fenced_per_value(pg, replica):
             "rollback steps, monitoring checks, alerts, access controls, and release approval")
     _capture(loop=base)
     payload = _payload(loop=base + " in PR #41 and https://github.com/other/lib/pull/7")
-    capture.write_pg(payload)
+    forgotten = capture.write_pg(payload)["episode_id"]
     with pg.connect() as c:
         facts = c.execute("SELECT id FROM commitments").fetchall()
         assert len(facts) == 1, facts
@@ -223,10 +223,16 @@ def test_pr_and_owner_contributors_are_fenced_per_value(pg, replica):
     assert hs.refresh()["ok"]
     tombstones.publish_payloads([payload])
     assert hs.pull_changes(include_ledger=False)["ok"]
+    # The wait rule (2026-10-24 ruling): no fact row while the hub still
+    # holds the forgotten episode live.
+    assert _replica("SELECT text FROM commitments") == [] and hs.facts_rebuilding()
+    with pg.connect() as c:
+        assert c.execute("SELECT prs FROM commitments").fetchone()[0] == [7, 41]
+    # The hub's forget re-projects per value: the owner's PR 7 stays.
+    hub_forget(pg, forgotten)
+    assert hs.pull_changes(include_ledger=False)["ok"]
     after = _replica("SELECT text, latest_text, prs, pr_check FROM commitments")
     assert len(after) == 1 and after[0][0] == base and after[0][1] is None, after
     assert json.loads(after[0][2]) == [7], after
     refs = (json.loads(after[0][3]) or {}).get("refs") if after[0][3] else None
     assert not refs or all("other/lib" not in str(r) and "41" not in str(r) for r in refs), after
-    with pg.connect() as c:
-        assert c.execute("SELECT prs FROM commitments").fetchone()[0] == [7, 41]

@@ -2159,6 +2159,17 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                     fact_xmin = _hub_snapshot_xmin(cur)
                 except Exception:  # noqa: BLE001 — no xmin: the stream brings them
                     fact_xmin = None
+                from khipu.hub_snapshot import read_refusal_wait
+
+                # The replica's wait rule, read before the rows; on a failed
+                # read the deliverables are left to the next pull.
+                cur.execute("SAVEPOINT embed_refusal_wait")
+                try:
+                    confirm = read_refusal_wait(cur)
+                except Exception:  # noqa: BLE001
+                    cur.execute("ROLLBACK TO SAVEPOINT embed_refusal_wait")
+                    confirm = None
+                cur.execute("RELEASE SAVEPOINT embed_refusal_wait")
                 deliverable_rows = _deliverables.deliverables_for_episode(cur, int(eid))
                 from khipu.hub_snapshot import _read_receipts
 
@@ -2171,18 +2182,6 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                     cur.execute("ROLLBACK TO SAVEPOINT embed_receipts")
                     receipts = []
                 cur.execute("RELEASE SAVEPOINT embed_receipts")
-                from khipu.hub_snapshot import _UNKNOWN, read_fact_sources
-
-                # The deliverables' contributors, for the same fence; on a
-                # failed read they stay unknown (their anchor fence holds).
-                cur.execute("SAVEPOINT embed_fact_sources")
-                try:
-                    deliverable_sources = read_fact_sources(
-                        cur, "deliverable", [int(r["id"]) for r in deliverable_rows if r.get("id") is not None])
-                except Exception:  # noqa: BLE001
-                    cur.execute("ROLLBACK TO SAVEPOINT embed_fact_sources")
-                    deliverable_sources = _UNKNOWN
-                cur.execute("RELEASE SAVEPOINT embed_fact_sources")
             conn.commit()
         _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
         # W2.4: keep the sqlite hub replica current without a full dump, so a
@@ -2206,7 +2205,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
             ]
             snap = upsert_episode(
                 episode_row, embedding_rows, deliverable_rows=deliverable_rows,
-                fact_xmin=fact_xmin, receipts=receipts, deliverable_sources=deliverable_sources,
+                fact_xmin=fact_xmin, receipts=receipts, confirm=confirm,
             )
             if not snap.get("ok"):
                 _log(f"snapshot upsert skipped: {snap.get('error')}")
