@@ -47,7 +47,7 @@ MEMORY_WRITERS = {
     "_write_commitment_rows": "copy: commitment rows",
     "_write_fact_deliverables": "copy: deliverable rows",
     "_insert_vector_row": "fenced or copy: a vector row its caller checked (never a fact vector outside the copy)",
-    "_drop_facts": "removes: a backup copy's and a restored replica's fact rows",
+    "_drop_facts": "removes: a restored replica's fact rows",
     "_upsert_episode_unfenced": "fenced: an episode patch (pull, capture, outbox replay)",
     "_write_pulled_tables": "fenced: the pull's topics and project aliases",
     "upsert_embeddings": "fenced: vectors, by their episode's identities; never a fact vector",
@@ -159,7 +159,9 @@ def test_fact_rows_have_one_writer_the_copys_publication():
         assert _callers(name) == {"_refresh_locked"}, name
     assert _callers("_upsert_episode_unfenced") == {"upsert_episode"}
     assert _callers("_scrub_forgotten") == {"scrub"}
-    assert _callers("_drop_facts") == {"export_replica_copy", "publish_imported_snapshot"}
+    # A backup export copies only kept rows (``_copy_kept_rows``); it never drops facts in place.
+    assert _callers("_drop_facts") == {"publish_imported_snapshot"}
+    assert _callers("_copy_kept_rows") == {"export_replica_copy"}
     for name in ("_upsert_episode_unfenced", "upsert_embeddings"):
         assert "check" in _called(fns[name]), f"{name} does not check its episodes"
     for name in ("_upsert_episode_unfenced", "_write_pulled_tables", "_refresh_locked", "upsert_embeddings"):

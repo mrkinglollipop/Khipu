@@ -416,7 +416,7 @@ VECTOR_WRITERS = {
     ("hub_snapshot.py", "_scrub_forgotten"): "a forget, which always lands",
     ("hub_snapshot.py", "purge_topic_in_snapshot"): "a topic purge, which always lands",
     ("hub_snapshot.py", "_erase_episode_commitments"): "a forget, which always lands",
-    ("hub_snapshot.py", "_drop_facts"): "only removes: a backup copy's or a restored replica's fact rows",
+    ("hub_snapshot.py", "_drop_facts"): "only removes: a restored replica's fact rows",
     ("hub_snapshot.py", "_write_copy"): "the fact copy's publication: copies are serial under fact-copy.lock",
     ("hub_snapshot.py", "_insert_vector_row"): "the row writer of the fact copy's publication",
 }

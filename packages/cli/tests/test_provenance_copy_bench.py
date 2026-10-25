@@ -250,7 +250,22 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
         threads = [threading.Thread(target=f) for f in (read_loop, patch_loop, rss_loop)]
         for t in threads:
             t.start()
-        changed, unchanged, unchanged_copy, wrote = [], [], [], []
+        changed, unchanged, unchanged_copy, wrote, unchanged_phases = [], [], [], [], []
+        # Where an unchanged pull's time goes (measurement only; the bounds are unchanged).
+        phases: dict[str, float] = {}
+
+        def timed(name, fn):
+            def run(*args, **kw):
+                started = time.monotonic()
+                try:
+                    return fn(*args, **kw)
+                finally:
+                    phases[name] = round(phases.get(name, 0.0) + time.monotonic() - started, 4)
+            return run
+
+        for name in ("try_hub_connect", "_one_exchange", "_pull_apply", "_pull_finish", "copy_facts",
+                     "_local_copy_state"):
+            monkeypatch.setattr(hs, name, timed(name, getattr(hs, name)))
         try:
             for i in range(ROUNDS):
                 _capture(loop=None, decision=f"bench capture decision {i}")
@@ -263,9 +278,11 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
                 quiet.clear()
                 time.sleep(0.25)
                 before = _file_hash()
+                phases.clear()
                 started = time.monotonic()
                 out = hs.pull_changes(include_ledger=False)
                 unchanged.append(time.monotonic() - started)
+                unchanged_phases.append(dict(phases))
                 unchanged_copy.append(out["facts"]["seconds"])
                 assert out["ok"] and out["facts"].get("skipped"), out
                 # A pull that re-read an episode (a deferred live patch's
@@ -284,6 +301,9 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
         report = {
             "rounds": ROUNDS, "facts": FACTS, "vectors": VECTORS, "round_trip_s": 2 * ONE_WAY_S,
             "unchanged_pull_max_s": round(max(unchanged), 3), "unchanged_copy_max_s": round(max(unchanged_copy), 3),
+            "unchanged_pull_median_s": round(sorted(unchanged)[len(unchanged) // 2], 3),
+            "unchanged_pull_p99_s": round(sorted(unchanged)[min(len(unchanged) - 1, int(len(unchanged) * 0.99))], 3),
+            "slowest_unchanged_phases_s": unchanged_phases[unchanged.index(max(unchanged))],
             "changed_pull_max_s": round(max(changed), 3), "gate_hold_max_s": round(max(holds), 3),
             "gate_holds": len(holds), "incremental_peak_rss_mib": round(peak / 2**20, 1),
             "unchanged_pulls_that_wrote": len(wrote), "reads": side["reads"], "patches": side["patches"],

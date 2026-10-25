@@ -37,6 +37,7 @@ _REGISTRY = "the forgotten-source registry: identities and ids, never text"
 
 NOT_CAPTURE = {
     "session_capture._write_claim_owner": "PID and kernel process birth metadata only; no capture text",
+    "hub_snapshot._record_destination": "the hub endpoint's sha256 fingerprint (host, port, database, role); no capture text",
     **dict.fromkeys(("hub_snapshot._acquire_refresh_lock", "hub_snapshot._purge_marker_lock",
                      "hub_snapshot._fact_copy_lock",
                      "ledger._flock", "jobs._job_lock",

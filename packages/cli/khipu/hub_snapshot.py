@@ -27,7 +27,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import sqlite3
 import struct
 import sys
@@ -1415,61 +1414,90 @@ def _con_path(con: sqlite3.Connection) -> Path | None:
     return Path(main) if main else None
 
 
-# The reader's view of the configured endpoint, recomputed when what it is
-# resolved from changes (the environment, the DSN files, the endpoint-change
-# markers); a configuration write (``endpoint_changed``) clears it. The
-# Keychain is a subprocess, too slow to ask on every read: once per process,
-# and again after any Khipu endpoint save (its marker directory changes).
-_READER_DESTINATION: dict[str, Any] = {}
-# One empty file per endpoint save whose stamp clearing is not confirmed
-# (``endpoint_changed``); while any exists readers show no fact row, and
-# only a copy that began after it removes it.
+# One empty file per stamp clearing that is not confirmed (an endpoint save,
+# a pull that met a new incarnation: ``_hide_until_copy``); while any exists
+# readers show no fact row, and only a copy that began after it removes it.
 _ENDPOINT_CHANGES_DIR = "fact-endpoint-changes"
+# The saved endpoint's fingerprint (``_destination_of``, never the
+# password), recorded by every endpoint save and by each copy that resolved
+# the endpoint without an environment override, so readers never ask the
+# Keychain (``_reader_destination``).
+_DESTINATION_FILE = "fact-endpoint"
+# What a reader compares when no endpoint fingerprint is recorded; no stamp
+# names it, so no fact row shows.
+_UNRESOLVED = "unresolved"
 _LEGACY_DSN_FILE = Path.home() / ".config" / "alzy" / "dsn"  # khipu.db.LEGACY_DSN_FILE
 
 
-def _file_key(path: Path) -> tuple | None:
-    try:
-        st = path.stat()
-    except OSError:
-        return None
-    return (str(path), st.st_mtime_ns, st.st_size)
-
-
-def _reader_destination() -> str:
-    """The configured endpoint's fingerprint for a reader: with ``khipu.db``
-    loaded, ``_hub_destination``; on the replica-only read path (the prompt
-    hook never imports the driver), resolved as ``db.resolve_dsn`` does,
-    without it (``_driver_free_dsn``)."""
-    db = sys.modules.get("khipu.db")
-    env = (os.environ.get("KHIPU_DSN_FILE") or "").strip() or (os.environ.get("ALZY_DSN_FILE") or "").strip()
-    dsn_file = Path(env) if env else _configured_dsn_file()
-    key = (db.resolve_dsn if db is not None else None,
-           *(os.environ.get(k) for k in ("KHIPU_DATABASE_URL", "ALZY_DATABASE_URL", "KHIPU_KEYCHAIN")),
-           _file_key(dsn_file), _file_key(_LEGACY_DSN_FILE), _file_key(snapshot_path().parent / _ENDPOINT_CHANGES_DIR))
-    if _READER_DESTINATION.get("key") != key:
-        dsn = None if db is not None else _driver_free_dsn(dsn_file)
-        value = _hub_destination() if db is not None else (_destination_of(dsn) if dsn else "unconfigured")
-        _READER_DESTINATION.update(key=key, value=value)
-    return _READER_DESTINATION["value"]
-
-
-def _driver_free_dsn(dsn_file: Path) -> str | None:
-    """``db.resolve_dsn``'s answer without the driver or its legacy-secret
-    migration: the environment, the Keychain (legacy service too), the DSN
-    file, the legacy file; ``None`` when none is set."""
+def _env_dsn() -> str | None:
     for name in ("KHIPU_DATABASE_URL", "ALZY_DATABASE_URL"):
-        if (os.environ.get(name) or "").strip():
-            return os.environ[name].strip()
-    try:
-        from khipu import keychain
+        if value := (os.environ.get(name) or "").strip():
+            return value
+    return None
 
-        for service in (keychain.SERVICE, keychain.LEGACY_SERVICE):
-            if val := keychain.get_password(keychain.DSN_ACCOUNT, service=service):
-                return val
-    except Exception:  # noqa: BLE001 - db.resolve_dsn falls through to the file too
+
+def _reader_destination(replica: Path | None = None) -> str:
+    """The configured endpoint's fingerprint for a reader, never through
+    the Keychain (a subprocess the prompt hook must not start): the
+    environment's endpoint; with the Keychain off, the DSN files, as
+    ``db.resolve_dsn`` reads them (through it when ``khipu.db`` is loaded;
+    the prompt hook never imports the driver); otherwise the recorded
+    fingerprint (``_DESTINATION_FILE``), and ``_UNRESOLVED`` without one."""
+    if dsn := _env_dsn():
+        return _destination_of(dsn)
+    from khipu.keychain import keychain_available
+
+    if not keychain_available():
+        if "khipu.db" in sys.modules:
+            return _hub_destination()
+        dsn = _saved_dsn(ask_keychain=False)
+        return _destination_of(dsn) if dsn else "unconfigured"
+    try:
+        recorded = ((replica or snapshot_path()).parent / _DESTINATION_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return _UNRESOLVED
+    return recorded or _UNRESOLVED
+
+
+def _record_destination(replica: Path, destination: str) -> None:
+    """Record the saved endpoint's fingerprint beside the replica (an
+    atomic file), unless it is already the one recorded."""
+    target = replica.parent / _DESTINATION_FILE
+    if not replica.parent.is_dir():
+        return
+    try:
+        if target.read_text(encoding="utf-8").strip() == destination:
+            return
+    except OSError:
         pass
-    for path in (dsn_file, _LEGACY_DSN_FILE):
+    fd, name = tempfile.mkstemp(prefix="." + _DESTINATION_FILE + ".", dir=replica.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(destination + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(name, target)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
+
+
+def _saved_dsn(*, ask_keychain: bool) -> str | None:
+    """``db.resolve_dsn``'s answer without the environment, the driver or
+    its legacy-secret migration: the Keychain (legacy service too) when
+    ``ask_keychain``, the DSN file, the legacy file; ``None`` when none is
+    set."""
+    if ask_keychain:
+        try:
+            from khipu import keychain
+
+            for service in (keychain.SERVICE, keychain.LEGACY_SERVICE):
+                if val := keychain.get_password(keychain.DSN_ACCOUNT, service=service):
+                    return val
+        except Exception:  # noqa: BLE001 - db.resolve_dsn falls through to the file too
+            pass
+    env = (os.environ.get("KHIPU_DSN_FILE") or "").strip() or (os.environ.get("ALZY_DSN_FILE") or "").strip()
+    for path in (Path(env) if env else _configured_dsn_file(), _LEGACY_DSN_FILE):
         try:
             return path.read_text(encoding="utf-8").strip()
         except OSError:
@@ -1503,7 +1531,7 @@ def _certified(digest: Any, text: Any, path: Path | None) -> bool:
     if not isinstance(stamp, dict) or not all(
             isinstance(stamp.get(k), str) and stamp[k] for k in ("incarnation", "destination", "snapshot")):
         return False
-    return stamp["destination"] == _reader_destination() and not _endpoint_changes(path or snapshot_path()) \
+    return stamp["destination"] == _reader_destination(path) and not _endpoint_changes(path or snapshot_path()) \
         and digest == _current_refusal_digest(path)
 
 
@@ -1566,10 +1594,27 @@ def _file_revision(path: Path) -> int:
         return 0
 
 
+def _fact_rows() -> dict[str, tuple[str, tuple, set[str]]]:
+    """The rows no backup carries (6.2), per table: a predicate true for
+    them, its parameters, and the columns it needs (a table without them
+    has no such rows): what ``_drop_facts`` deletes, which
+    ``export_replica_copy`` never copies."""
+    meta_keys = (_FACT_DIGEST_KEY, _FACT_STAMP_KEY, _FACT_UNSENT_KEY, _FACT_CERTIFIED_KEY, *_RETIRED_FACT_KEYS)
+    return {
+        **{table: ("1", (), set()) for table in _FACT_TABLES},
+        "memory_embeddings": (f"kind IN ({', '.join('?' * len(_FACT_VECTOR_KINDS))})", _FACT_VECTOR_KINDS,
+                              {"kind"}),
+        "snapshot_meta": (f"key IN ({', '.join('?' * len(meta_keys))})", meta_keys, {"key"}),
+        _ROW_VERSIONS_TABLE: ("tbl IN ('commitments', 'decisions', 'deliverables') "
+                              "OR (tbl = 'vectors' AND instr(key, char(31) || 'commitment' || char(31)) > 0)", (),
+                              {"tbl", "key"}),
+    }
+
+
 def _drop_facts(con: sqlite3.Connection) -> None:
     """Remove every fact row, fact vector, the stamp and the listing, in the
-    caller's transaction (a backup copy, a restored replica). Episodes,
-    topics and the rest stay."""
+    caller's transaction (a restored replica). Episodes, topics and the
+    rest stay."""
     for table in _FACT_TABLES:
         if _snapshot_table_columns(con, table):
             con.execute(f"DELETE FROM {table}")
@@ -1627,16 +1672,24 @@ def note_sent(tags: Sequence[str], deadline: float) -> None:
 
 
 def endpoint_changed() -> None:
-    """A configuration write changed the hub endpoint (N3): this Mac's
-    stamp is cleared and the revision bumped at once, before any copy;
-    readers also compare the stamp with the endpoint. A durable marker is
-    written first and removed only once the clearing commits, so a replica
-    too busy to clear leaves facts hidden until a copy that began after the
-    change (``_copy_once``)."""
-    _READER_DESTINATION.clear()
+    """A configuration write changed the hub endpoint (N3): its fingerprint
+    is recorded for readers (``_reader_destination``), then this Mac's stamp
+    is cleared and the revision bumped at once, before any copy."""
     path = snapshot_path()
-    if not path.is_file():
-        return
+    dsn = _saved_dsn(ask_keychain=True)
+    try:
+        _record_destination(path, _destination_of(dsn) if dsn else "unconfigured")
+    except OSError as exc:  # the clearing below still hides the old copy
+        _record_write_error(_FACT_TABLES, f"endpoint fingerprint: {type(exc).__name__}: {exc}")
+    if path.is_file():
+        _hide_until_copy(path, "endpoint change")
+
+
+def _hide_until_copy(path: Path, what: str) -> None:
+    """Clear the stamp and bump the invalidation revision now. A durable
+    marker is written first and removed only once the clearing commits, so
+    a replica too busy to clear leaves facts hidden until a copy that began
+    after it (``_copy_once``)."""
     marker = path.parent / _ENDPOINT_CHANGES_DIR / uuid.uuid4().hex
     try:
         marker.parent.mkdir(mode=0o700, exist_ok=True)
@@ -1644,9 +1697,35 @@ def endpoint_changed() -> None:
         with _admitted(path, time.monotonic() + 5) as (con, _gate):
             _invalidate_facts(con)
     except Exception as exc:  # noqa: BLE001 - the marker (or the endpoint check) still hides the old copy
-        _record_write_error(_FACT_TABLES, f"endpoint change: {type(exc).__name__}: {exc}")
+        _record_write_error(_FACT_TABLES, f"{what}: {type(exc).__name__}: {exc}")
         return
     marker.unlink(missing_ok=True)
+
+
+def _learn_incarnation(incarnation: str | None) -> None:
+    """A pull read the hub's incarnation (D2): another than the stamp's
+    hides the held copy at once, whatever the pull does next."""
+    path = snapshot_path()
+    if incarnation is None or not path.is_file():
+        return
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
+            held = _read_stamp(con)
+    except sqlite3.Error:
+        held = None
+    if held is not None and held.get("incarnation") != str(incarnation):
+        _hide_until_copy(path, "incarnation change")
+
+
+def _reread_incarnation(cur) -> str | None:
+    """The session's incarnation, read alone after a failed exchange; None
+    when the session cannot answer."""
+    try:
+        cur.connection.rollback()
+        cur.execute(_INCARNATION_READ)
+        return str(cur.fetchone()[0])
+    except Exception:  # noqa: BLE001 - a dead session taught this Mac nothing
+        return None
 
 
 def unsent_forgets(path: Path | None = None) -> dict[str, Any]:
@@ -1682,49 +1761,76 @@ def unsent_forgets(path: Path | None = None) -> dict[str, Any]:
 
 
 def export_replica_copy(src: Path, dest: Path) -> dict[str, Any]:
-    """Write a consistent copy of the replica at ``src`` to ``dest`` (the
-    SQLite backup API, so no journal file is needed beside it) for a backup
-    archive. A backup never carries fact rows or fact vectors (6.2): they
-    are dropped from the copy, with its stamp, so a restore shows none until
-    a copy from the hub. Deleted rows leave their bytes in freed pages, so
-    ``dest`` is rebuilt by ``VACUUM INTO`` from a scratch copy, which holds
-    only live pages. The scratch copy still has the fact rows, so it is made
-    outside the data folder every backup walks (``export_scratch_dir``), in
-    a directory of its own (concurrent exports never share one), removed
-    after; one a crashed export left is removed by the next export."""
-    from khipu.paths import export_scratch_dir
-
-    root = export_scratch_dir()
-    _sweep_export_scratch(root)
-    work = Path(tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=root))
-    scratch = work / "replica.sqlite"
+    """Write a consistent copy of the replica at ``src`` to ``dest`` for a
+    backup archive. A backup never carries fact rows or fact vectors (6.2),
+    nor the stamp, so a restore shows none until a copy from the hub. The
+    copy is a new, empty database beside ``dest`` (named as a refresh's
+    temporary replica, which no backup or restore takes) into which only the
+    rows a backup may carry are inserted, in one read of ``src``; it is
+    synced, then renamed to ``dest``. No file this export writes ever holds
+    a fact row, so a crash leaves none behind."""
+    fd, name = tempfile.mkstemp(prefix=".hub_snapshot.", suffix=".sqlite", dir=dest.parent)
+    os.close(fd)
+    part = Path(name)
     try:
-        with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as source, \
-                closing(sqlite3.connect(str(scratch))) as copy:
-            source.backup(copy)
-            _drop_facts(copy)
-            copy.commit()
-            dest.unlink(missing_ok=True)
-            copy.execute("VACUUM INTO ?", (str(dest),))
+        with closing(sqlite3.connect(str(part), uri=True, isolation_level=None)) as copy:
+            copy.execute("ATTACH DATABASE ? AS src", (f"file:{src}?mode=ro",))
+            copy.execute("BEGIN")
+            _copy_kept_rows(copy)
+            copy.execute("COMMIT")
+            copy.execute("DETACH DATABASE src")
+        _fsync_path(part)
+        os.replace(part, dest)
+        _fsync_path(dest.parent)
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        remove_replica_temp(part)
     return {"facts_dropped": True}
 
 
-def _sweep_export_scratch(root: Path) -> None:
-    """Remove the scratch directories of exports whose process is gone."""
-    for entry in root.iterdir():
-        pid = entry.name.split("-", 1)[0]
-        if not pid.isdigit() or int(pid) == os.getpid():
+def _fsync_path(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _copy_kept_rows(copy: sqlite3.Connection) -> None:
+    """Rebuild the attached ``src``'s schema in ``copy`` and insert every
+    row but those ``_fact_rows`` names, in the caller's transaction: tables
+    (a virtual table's own tables with it, their rows copied as stored),
+    then the rows, then indexes, triggers and views, so no trigger fires on
+    the copy. Retired fact tables are left out."""
+    schema = copy.execute("SELECT type, name, tbl_name, sql FROM src.sqlite_master "
+                          "WHERE sql IS NOT NULL ORDER BY rowid").fetchall()
+    retired = set(_RETIRED_FACT_TABLES)
+    tables: list[str] = []
+    for kind, name, table, sql in schema:
+        if kind != "table" or table in retired or name.startswith("sqlite_"):
             continue
-        try:
-            os.kill(int(pid), 0)
-            continue  # a live export's
-        except ProcessLookupError:
-            pass
-        except PermissionError:
+        if sql.lstrip().upper().startswith("CREATE VIRTUAL TABLE"):
+            copy.execute(sql)
             continue
-        shutil.rmtree(entry, ignore_errors=True)
+        if not copy.execute("SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?",
+                            (name,)).fetchone():
+            copy.execute(sql)
+        tables.append(name)
+    facts = _fact_rows()
+    for name in tables:
+        quoted = '"' + name.replace('"', '""') + '"'
+        cols = {r[1] for r in copy.execute(f"PRAGMA src.table_info({quoted})")}
+        where, params, needs = facts.get(name, ("0", (), set()))
+        if not needs <= cols:
+            where, params = "0", ()
+        copy.execute(f"DELETE FROM main.{quoted}")  # a virtual table's own rows, made with it
+        copy.execute(f"INSERT INTO main.{quoted} SELECT * FROM src.{quoted} WHERE ({where}) IS NOT 1", params)
+    if copy.execute("SELECT 1 FROM src.sqlite_master WHERE name = 'sqlite_sequence'").fetchone() \
+            and copy.execute("SELECT 1 FROM main.sqlite_master WHERE name = 'sqlite_sequence'").fetchone():
+        copy.execute("DELETE FROM main.sqlite_sequence")
+        copy.execute("INSERT INTO main.sqlite_sequence SELECT * FROM src.sqlite_sequence")
+    for kind, name, table, sql in schema:
+        if kind in ("index", "trigger", "view") and table not in retired:
+            copy.execute(sql)
 
 
 class _CopyBusy(RuntimeError):
@@ -2064,8 +2170,16 @@ def _local_copy_state(path: Path) -> dict[str, Any]:
 
     state["held_vectors"] = held
     state["endpoint_changes"] = _endpoint_changes(path)
+    destination = _hub_destination()
+    if _env_dsn() is None:
+        # The saved endpoint itself: recorded for readers, which never ask
+        # the Keychain (a Mac configured before any save records it here).
+        try:
+            _record_destination(path, destination)
+        except OSError as exc:  # readers then show no fact row; the copy goes on
+            _record_write_error(_FACT_TABLES, f"endpoint fingerprint: {type(exc).__name__}: {exc}")
     return {**state, "fingerprint": _refusal_digest(gate, path), "tags": sorted(gate.tags),
-            "ids": sorted(gate.episode_ids), "destination": _hub_destination()}
+            "ids": sorted(gate.episode_ids), "destination": destination}
 
 
 def _write_fact_deliverables(con: sqlite3.Connection, rows: Iterable[Mapping[str, Any]]) -> int:
@@ -2567,7 +2681,17 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
     acols = [c for c in ("alias", "project", "created_at", "source", "evidence") if c in alias_cols]
     if {"alias", "project"} <= alias_cols:
         reads.append(("aliases", f"SELECT {', '.join(acols)} FROM project_aliases ORDER BY alias", ()))
-    got = _one_exchange(cur, reads, prelude=_INCARNATION_READ)
+    try:
+        got = _one_exchange(cur, reads, prelude=_INCARNATION_READ)
+    except Exception:
+        # D2: the exchange's incarnation is lost with its error (a read a lock
+        # held past its timeout); read it alone, so a failed pull still hides
+        # another incarnation's facts.
+        _learn_incarnation(_reread_incarnation(cur))
+        raise
+    # Before anything else here can fail (D2).
+    _learn_incarnation((getattr(getattr(cur, "connection", None), "khipu_prelude", None) or {})
+                       .get(_INCARNATION_READ))
     hub_now = _utc(got["now"][0][0]) or datetime.now(timezone.utc)
     cap = hub_now - timedelta(seconds=FRESHNESS_OVERLAP_S)
     fresh = [dict(zip([*cols, "changed_at"] if stamped else cols, r)) for r in got["fresh"]]

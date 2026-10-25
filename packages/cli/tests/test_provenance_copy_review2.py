@@ -41,15 +41,21 @@ def test_crashed_export_scratch_never_enters_next_backup(pg, replica, tmp_path):
     with pg.connect() as conn:
         conn.execute("UPDATE episodes SET summary = 'ordinary anchor'")
     assert hs.refresh()["facts"].get("copied")
+    # The export dies with its copy committed and synced, just before the rename.
     code = ("import os, sys\nfrom pathlib import Path\nfrom khipu import hub_snapshot as hs\n"
-            "hs._drop_facts = lambda con: os._exit(17)\n"
+            "hs._fsync_path = lambda path: os._exit(17)\n"
             "hs.export_replica_copy(Path(sys.argv[1]), Path(sys.argv[2]))\n")
-    done = subprocess.run([sys.executable, "-c", code, str(hs.snapshot_path()), str(hs.staging_path())],
+    staged = hs.staging_path()
+    done = subprocess.run([sys.executable, "-c", code, str(hs.snapshot_path()), str(staged)],
                           capture_output=True, text=True, timeout=30)
     assert done.returncode == 17, done.stderr
-    assert list(paths.export_scratch_dir().glob("*/replica.sqlite")), "the crash left its scratch outside"
-    # A scratch copy an older export left in the data folder, its process gone.
-    legacy = paths.data_dir() / ".hub_snapshot.old.sqlite.facts-999999"
+    left = [p for p in paths.data_dir().iterdir() if hs.is_replica_temp(p.name) and p != staged]
+    assert any(b"ordinary anchor" in p.read_bytes() for p in left), "the crash left its whole copy"
+    assert not [p.name for p in left if b"CRASH_EXPORT_FACT_ONLY_" in p.read_bytes()], \
+        "the crashed export's file holds fact bytes"
+    # A scratch copy an earlier export left in the data folder (its exact
+    # name: ``.<staged name>.facts-<pid>``), its process gone.
+    legacy = paths.data_dir() / "..hub_snapshot.ab12_x9z.sqlite.facts-999999"
     legacy.write_bytes(b"CRASH_EXPORT_FACT_ONLY_ legacy scratch")
     out = paths.backup_local(dest=tmp_path / "next.zip")
     assert out["ok"], out
@@ -57,7 +63,6 @@ def test_crashed_export_scratch_never_enters_next_backup(pg, replica, tmp_path):
         leaks = [n for n in z.namelist() if b"CRASH_EXPORT_FACT_ONLY_" in z.read(n)]
     assert not leaks, "next backup archived the crashed export scratch with fact bytes"
     assert not legacy.exists()
-    assert not list(paths.export_scratch_dir().iterdir()), "the next export removed the crashed scratch"
 
 
 # ---- 2 (R3): the driver-free reader resolves the endpoint; a busy save still hides --

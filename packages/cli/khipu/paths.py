@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import stat as stat_module
-import tempfile
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -271,20 +270,6 @@ def pycache_dir() -> Path:
     return Path.home() / "Library" / "Caches" / "Khipu" / "pycache"
 
 
-def export_scratch_dir() -> Path:
-    """Where a backup's replica export makes its scratch copy, which still
-    holds the fact rows (``hub_snapshot.export_replica_copy``): owner-only
-    and outside the data folder, so no backup walk ever reads it, the way
-    ``pycache_dir`` is."""
-    d = Path.home() / "Library" / "Caches" / "Khipu" / "export-scratch"
-    data = data_dir().expanduser().resolve()
-    if d.resolve() == data or data in d.resolve().parents:
-        d = Path(tempfile.gettempdir()) / f"khipu-export-scratch-{os.getuid()}"
-    d.mkdir(mode=0o700, parents=True, exist_ok=True)
-    d.chmod(0o700)
-    return d
-
-
 def ensure_pycache_dir() -> Path:
     d = pycache_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -428,15 +413,17 @@ def _skipped_name(parts: tuple[str, ...]) -> bool:
 
 
 _REPLICA_TEMP = re.compile(r"^\.hub_snapshot\..+\.sqlite(-.+)?$")
-# The scratch copy an export made beside the data folder's staged replica
-# before export_scratch_dir (``.<staged name>.facts-<pid>``), with its sidecars.
-_EXPORT_SCRATCH = re.compile(r"^\..+\.facts-(\d+)(-journal|-wal|-shm)?$")
+# The scratch copy (fact rows included) an earlier export made beside its
+# staged replica, ``.<staged name>.facts-<pid>`` where the staged name is
+# ``staging_path``'s ``.hub_snapshot.<8 mkstemp characters>.sqlite``, with
+# its sidecars. Exactly that name: any other file is the owner's.
+_EXPORT_SCRATCH = re.compile(r"^\.\.hub_snapshot\.[a-z0-9_]{8}\.sqlite\.facts-(\d+)(-journal|-wal|-shm)?$")
 
 
 def _remove_crashed_export_scratch(src: Path) -> None:
-    """Delete the scratch copies (fact rows included) crashed exports left in
-    the data folder, those whose process is gone."""
-    for p in src.glob(".*.facts-*"):
+    """Delete the scratch copies crashed earlier exports left in the data
+    folder, those whose process is gone."""
+    for p in src.glob("..hub_snapshot.*.sqlite.facts-*"):
         found = _EXPORT_SCRATCH.match(p.name)
         if not found or not p.is_file():
             continue
