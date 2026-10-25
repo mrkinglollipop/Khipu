@@ -17,6 +17,7 @@ import pytest
 
 from khipu import hub_snapshot as hs
 from khipu import identity
+from tests.replica_copy import certify
 from tests.hermetic_pg import MIGRATIONS, hub, pg_cluster  # noqa: F401
 
 A, B, C = "o/alpha", "o/beta", "o/gamma"
@@ -619,6 +620,7 @@ def replica(tmp_path):
     snap = tmp_path / "hub_snapshot.sqlite"
     con = sqlite3.connect(str(snap))
     hs._create_schema(con)
+    certify(con)
     con.execute("INSERT INTO project_aliases (alias, project) VALUES (?, ?)", (A, B))
     for i, project in enumerate((A, B, C), start=1):
         con.execute("INSERT INTO episodes (id, ts, session_id, summary, topics, people, decisions, preferences, "
@@ -674,6 +676,7 @@ def test_dump_copies_project_aliases_from_the_hub(cur, tmp_path):
     identity.record_rename(cur, A, B, source="checkout", evidence={"root_commit": "r1"})
     con = sqlite3.connect(str(tmp_path / "s.sqlite"))
     hs._create_schema(con)
+    certify(con)
     assert hs._insert_project_aliases(cur, con) == 1
     assert hs.snapshot_project_group(con, A) == (B, [B, A])
     assert con.execute("SELECT source, evidence FROM project_aliases").fetchone() == ("checkout", '{"root_commit": "r1"}')

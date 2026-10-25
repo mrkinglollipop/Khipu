@@ -173,14 +173,15 @@ def _rss() -> int:
 
 
 def _file_hash() -> tuple[str, int]:
+    # Streamed, so the measured RSS is the product's, not a file-sized buffer.
     path = hs.snapshot_path()
-    return hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest(), path.stat().st_mtime_ns
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "bounds missed, stopped and reported (phase 7B): 200 rounds at 50 ms round trip measured an "
-    "unchanged pull of 2.41 s (its copy 1.55 s; bound 0.5 s) and 253.6 MiB incremental peak RSS "
-    "(bound 200 MiB); the changed pull's write_gate hold was 1.02 s (bound 2 s, met)"))
 def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cluster, monkeypatch):
     replica(pg, ready=False)
     _seed(pg, FACTS)
@@ -197,8 +198,9 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
 
     @contextmanager
     def timed(path, deadline):
+        # From gate entry (the locks and BEGIN IMMEDIATE) to their release.
+        started = time.monotonic()
         with real_admitted(path, deadline) as got:
-            started = time.monotonic()
             yield got
         holds.append(time.monotonic() - started)
 

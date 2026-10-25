@@ -22,6 +22,7 @@ hub answers. It skips when a snapshot already exists and is younger than
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import math
@@ -1373,6 +1374,10 @@ _FACT_STAMP_KEY = "fact_stamp"
 _FACT_REVISION_KEY = "fact_revision"
 # The forgets the hub lacks, as the last copy found them (6.2).
 _FACT_UNSENT_KEY = "fact_unsent"
+# The registry strings the last published copy found on the hub. Any other
+# registry string is pending (published here, not yet seen on the hub), and
+# listed even when no copy can run (6.2).
+_FACT_CERTIFIED_KEY = "fact_certified"
 FACT_COPY_LOCK_NAME = "fact-copy.lock"
 # Tables and keys of the retired replica designs, dropped at the first copy.
 _RETIRED_FACT_TABLES = ("replica_fact_sources", "replica_source_index", "replica_fence_applied",
@@ -1409,30 +1414,80 @@ def _con_path(con: sqlite3.Connection) -> Path | None:
     return Path(main) if main else None
 
 
+# The reader's view of the configured endpoint, recomputed when what it is
+# resolved from changes; a configuration write (``endpoint_changed``) clears
+# it. The Keychain is a subprocess, too slow to ask on every read.
+_READER_DESTINATION: dict[str, Any] = {}
+
+
+def _reader_destination() -> str | None:
+    """The configured endpoint's fingerprint for a reader, or ``None`` when
+    it cannot be known without the driver: the replica-only read path (the
+    prompt hook) never imports ``khipu.db``, so there only an endpoint set in
+    the environment is checked, and the stamp cleared by a configuration
+    write (``endpoint_changed``) covers the Keychain and the DSN file."""
+    db = sys.modules.get("khipu.db")
+    if db is None:
+        env = os.environ.get("KHIPU_DATABASE_URL") or os.environ.get("ALZY_DATABASE_URL")
+        return _destination_of(env) if env else None
+    try:
+        dsn_file = Path(os.environ.get("KHIPU_DSN_FILE") or os.environ.get("ALZY_DSN_FILE")
+                           or str(_configured_dsn_file()))
+        stat = dsn_file.stat()
+        file_key = (str(dsn_file), stat.st_mtime_ns, stat.st_size)
+    except Exception:  # noqa: BLE001 - no file is one state too
+        file_key = None
+    key = (db.resolve_dsn, os.environ.get("KHIPU_DATABASE_URL"), os.environ.get("ALZY_DATABASE_URL"), file_key)
+    if _READER_DESTINATION.get("key") != key:
+        _READER_DESTINATION.update(key=key, value=_hub_destination())
+    return _READER_DESTINATION["value"]
+
+
+def _configured_dsn_file() -> Path:
+    from khipu.paths import dsn_file
+
+    return dsn_file()
+
+
+def _certified(digest: Any, text: Any, path: Path | None) -> bool:
+    """Whether a replica's stamp certifies its fact rows for a reader now
+    (6.2): a complete stamp (incarnation, destination, snapshot), its
+    destination the configured endpoint, its fingerprint the registry's."""
+    if digest is None or text is None:
+        return False
+    try:
+        stamp = json.loads(text)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(stamp, dict) or not all(
+            isinstance(stamp.get(k), str) and stamp[k] for k in ("incarnation", "destination", "snapshot")):
+        return False
+    destination = _reader_destination()
+    return (destination is None or stamp["destination"] == destination) \
+        and digest == _current_refusal_digest(path)
+
+
 def _install_fact_epoch(con: sqlite3.Connection) -> None:
-    """Register ``khipu_fact_epoch()`` on ``con``: the current registry
-    fingerprint, computed when SQLite evaluates it (each statement, a TEMP
-    view's every use included), never frozen into the SQL text. The queued
-    erasures are those beside this connection's own file."""
+    """Register ``khipu_fact_certified(digest, stamp)`` on ``con``
+    (``_certified``), computed when SQLite evaluates it (each statement, a
+    TEMP view's every use included), never frozen into the SQL text. The
+    queued erasures are those beside this connection's own file."""
     path = _con_path(con)
-
-    def epoch() -> str:
-        return _current_refusal_digest(path) or _EPOCH_UNREADABLE
-
-    con.create_function("khipu_fact_epoch", 0, epoch)
+    con.create_function("khipu_fact_certified", 2, lambda d, t: int(_certified(d, t, path)))
 
 
 def _fact_epoch_sql(con: sqlite3.Connection) -> str:
-    """An ``" AND (...)"`` clause, true only while the replica's stamp names
-    the registry fingerprint current when the statement runs, both read in
-    the reader's own SQLite snapshot of the rows. A replica with no stamp
-    (cleared, never copied, restored from a backup, or with no
-    ``snapshot_meta``) shows no fact row."""
+    """An ``" AND (...)"`` clause, true only while the replica's stamp
+    certifies its facts when the statement runs (``_certified``), the stamp
+    read in the reader's own SQLite snapshot of the rows. A replica with no
+    complete stamp (cleared, never copied, restored from a backup, written
+    before 7B, or with no ``snapshot_meta``) shows no fact row."""
     if not _snapshot_table_columns(con, "snapshot_meta"):
         return " AND 0"
     _install_fact_epoch(con)
-    return (f" AND (SELECT value FROM main.snapshot_meta WHERE key = '{_FACT_DIGEST_KEY}') "
-            "IS (SELECT khipu_fact_epoch())")
+    return (" AND (SELECT khipu_fact_certified("
+            f"(SELECT value FROM main.snapshot_meta WHERE key = '{_FACT_DIGEST_KEY}'), "
+            f"(SELECT value FROM main.snapshot_meta WHERE key = '{_FACT_STAMP_KEY}')))")
 
 
 def _fact_vector_epoch_sql(con: sqlite3.Connection, alias: str = "") -> str:
@@ -1482,7 +1537,7 @@ def _drop_facts(con: sqlite3.Connection) -> None:
         con.execute("DELETE FROM memory_embeddings WHERE kind IN "
                     f"({', '.join('?' * len(_FACT_VECTOR_KINDS))})", _FACT_VECTOR_KINDS)
     _drop_retired(con)
-    for key in (_FACT_DIGEST_KEY, _FACT_STAMP_KEY, _FACT_UNSENT_KEY):
+    for key in (_FACT_DIGEST_KEY, _FACT_STAMP_KEY, _FACT_UNSENT_KEY, _FACT_CERTIFIED_KEY):
         _meta_put(con, key, None)
 
 
@@ -1505,30 +1560,74 @@ def facts_hidden(path: Path | None = None) -> bool:
         return False
     try:
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
-            stored = _meta_get(con, _FACT_DIGEST_KEY)
+            digest, text = _meta_get(con, _FACT_DIGEST_KEY), _meta_get(con, _FACT_STAMP_KEY)
     except sqlite3.Error:
         return True
-    return stored is None or stored != _current_refusal_digest(path)
+    return not _certified(digest, text, path)
+
+
+def note_sent(tags: Sequence[str], deadline: float) -> None:
+    """The owner send committed ``tags`` on the hub: they leave the list
+    and count as seen there, in one admitted publication (6.4, D4). The
+    stamp is untouched; facts show again only after a copy. Fail-open: a
+    later copy lists what is left."""
+    path = snapshot_path()
+    if not tags or not path.is_file():
+        return
+    try:
+        with _admitted(path, deadline) as (con, _gate):
+            listing = json.loads(_meta_get(con, _FACT_UNSENT_KEY) or "{}")
+            if listing.get("strings"):
+                listing["strings"] = [t for t in listing["strings"] if t not in set(tags)]
+                _meta_put(con, _FACT_UNSENT_KEY, json.dumps(listing, sort_keys=True))
+            seen = set(json.loads(_meta_get(con, _FACT_CERTIFIED_KEY) or "[]")) | set(tags)
+            _meta_put(con, _FACT_CERTIFIED_KEY, json.dumps(sorted(seen)))
+    except Exception as exc:  # noqa: BLE001 - reconciled by the next copy
+        _record_write_error(_FACT_TABLES, f"owner send listing: {type(exc).__name__}: {exc}")
+
+
+def endpoint_changed() -> None:
+    """A configuration write changed the hub endpoint (N3): this Mac's
+    stamp is cleared and the revision bumped at once, before any copy;
+    readers also compare the stamp with the endpoint. Fail-open."""
+    _READER_DESTINATION.clear()
+    path = snapshot_path()
+    if not path.is_file():
+        return
+    try:
+        with _admitted(path, time.monotonic() + 5) as (con, _gate):
+            _invalidate_facts(con)
+    except Exception as exc:  # noqa: BLE001 - readers still refuse the old endpoint's copy
+        _record_write_error(_FACT_TABLES, f"endpoint change: {type(exc).__name__}: {exc}")
 
 
 def unsent_forgets(path: Path | None = None) -> dict[str, Any]:
-    """The forgets the hub lacks, as the last copy found them (6.2):
-    ``strings`` (registry tags with no hub refusal) and ``ids`` (bare ids
-    whose hub episode is live, each with that episode's summary)."""
+    """The forgets the hub lacks (6.2): ``strings``, the registry tags the
+    last copy found no hub refusal for and every registry tag no published
+    copy has seen on the hub yet (a forget whose hub step failed lists its
+    strings at once, with no copy), and ``ids`` (bare ids whose hub episode
+    is live, each with that episode's summary)."""
+    from khipu.tombstones import read_gate
+
     path = path or snapshot_path()
     empty: dict[str, Any] = {"strings": [], "ids": []}
     if not path.is_file():
         return empty
     try:
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
-            text = _meta_get(con, _FACT_UNSENT_KEY)
+            text, certified = _meta_get(con, _FACT_UNSENT_KEY), _meta_get(con, _FACT_CERTIFIED_KEY)
     except sqlite3.Error:
         return empty
     try:
         value = json.loads(text) if text else empty
+        seen = set(json.loads(certified)) if certified else set()
     except ValueError:
-        return empty
-    return {"strings": list(value.get("strings") or []), "ids": list(value.get("ids") or []),
+        value, seen = empty, set()
+    try:
+        pending = set(read_gate().tags) - seen
+    except Exception:  # noqa: BLE001 - an unreadable registry lists what the copy found
+        pending = set()
+    return {"strings": sorted(set(value.get("strings") or []) | pending), "ids": list(value.get("ids") or []),
             **({"at": value["at"]} if value.get("at") else {})}
 
 
@@ -1537,12 +1636,22 @@ def export_replica_copy(src: Path, dest: Path) -> dict[str, Any]:
     SQLite backup API, so no journal file is needed beside it) for a backup
     archive. A backup never carries fact rows or fact vectors (6.2): they
     are dropped from the copy, with its stamp, so a restore shows none until
-    a copy from the hub."""
-    with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as source, \
-            closing(sqlite3.connect(str(dest))) as copy:
-        source.backup(copy)
-        _drop_facts(copy)
-        copy.commit()
+    a copy from the hub. Deleted rows leave their bytes in freed pages, so
+    ``dest`` is rebuilt by ``VACUUM INTO`` from a scratch copy beside it,
+    which holds only live pages; the scratch copy is removed."""
+    scratch = dest.with_name(f".{dest.name}.facts-{os.getpid()}")
+    scratch.unlink(missing_ok=True)
+    try:
+        with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as source, \
+                closing(sqlite3.connect(str(scratch))) as copy:
+            source.backup(copy)
+            _drop_facts(copy)
+            copy.commit()
+            dest.unlink(missing_ok=True)
+            copy.execute("VACUUM INTO ?", (str(dest),))
+    finally:
+        for leftover in (scratch, scratch.with_name(scratch.name + "-journal")):
+            leftover.unlink(missing_ok=True)
     return {"facts_dropped": True}
 
 
@@ -1628,17 +1737,37 @@ def _admitted(path: Path, deadline: float):
         raise _NotAdmitted(f"a local lock stayed busy until the deadline ({exc})") from exc
 
 
+def _conninfo_parts(dsn: str) -> dict[str, str]:
+    """A libpq connection string's fields, URI or ``key=value`` form."""
+    from urllib.parse import parse_qsl, unquote, urlsplit
+
+    if dsn.startswith(("postgresql://", "postgres://")):
+        url = urlsplit(dsn)
+        parts = {"host": unquote(url.hostname or ""), "port": str(url.port or ""),
+                 "dbname": unquote(url.path.lstrip("/")), "user": unquote(url.username or "")}
+        parts.update((k, v) for k, v in parse_qsl(url.query) if k in ("host", "hostaddr", "port", "dbname", "user"))
+        return {k: v for k, v in parts.items() if v}
+    import re
+
+    return {k: re.sub(r"\\(.)", r"\1", v[1:-1]) if v.startswith("'") else v
+            for k, v in re.findall(r"(\w+)\s*=\s*('(?:\\.|[^'\\])*'|\S+)", dsn)}
+
+
 def _hub_destination() -> str:
     """The configured hub endpoint's fingerprint: host, port, database and
-    role, never the password."""
+    role, never the password. Parsed without the driver: readers check it
+    on the replica-only path, which never imports psycopg."""
     try:
-        from psycopg.conninfo import conninfo_to_dict
-
         from khipu.db import resolve_dsn
 
-        parts = conninfo_to_dict(resolve_dsn())
+        dsn = resolve_dsn()
     except Exception:  # noqa: BLE001 - no endpoint configured is one value too
         return "unconfigured"
+    return _destination_of(dsn)
+
+
+def _destination_of(dsn: str) -> str:
+    parts = _conninfo_parts(dsn)
     keep = {k: str(parts.get(k) or "") for k in ("host", "hostaddr", "port", "dbname", "user")}
     return hashlib.sha256(json.dumps(keep, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -1646,29 +1775,41 @@ def _hub_destination() -> str:
 def _hub_incarnation(cur) -> str:
     """The hub's incarnation (6.1, N3): its cluster's system identifier and
     timeline, and its database's oid."""
-    cur.execute("SELECT (SELECT system_identifier::text FROM pg_control_system()) || ':' || "
-                "(SELECT timeline_id::text FROM pg_control_checkpoint()) || ':' || "
-                "(SELECT oid::text FROM pg_database WHERE datname = current_database())")
+    cur.execute(f"SELECT {_INCARNATION_SQL}")
     return str(cur.fetchone()[0])
 
 
-# The load rule's hub half and the skip, in one statement of the copy's
-# snapshot: readiness, the snapshot itself, which registry strings are hub
-# refusals, which bare ids are live episodes, and whether any fact change
-# is missing from the held stamp's snapshot S (``min(xid) <= xmin(S)`` and
-# no row at or above ``xmin(S)`` invisible in S; an empty table never skips).
-_COPY_CHECK_SQL = """
+# The copy's first exchange, one simple query: the end of a handed-over
+# pull's read-only transaction (a warning on an idle session), its own
+# REPEATABLE READ snapshot,
+# the statement bounds (6.4), then one statement with the incarnation, the
+# load rule's hub half and the skip: readiness, the snapshot itself, which
+# registry strings are hub refusals, which bare ids are live episodes, and,
+# when the held stamp names this incarnation, whether any fact change is
+# missing from its snapshot S (``min(xid) <= xmin(S)`` and no row at or
+# above ``xmin(S)`` invisible in S; an empty table never skips).
+_INCARNATION_SQL = ("(SELECT system_identifier::text FROM pg_control_system()) || ':' || "
+                    "(SELECT timeline_id::text FROM pg_control_checkpoint()) || ':' || "
+                    "(SELECT oid::text FROM pg_database WHERE datname = current_database())")
+_COPY_CHECK_SQL = f"""
+ROLLBACK;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SELECT set_config('statement_timeout', %(ms)s, true), set_config('lock_timeout', %(ms)s, true);
+WITH inc AS (SELECT {_INCARNATION_SQL} AS v),
+     held AS (SELECT CASE WHEN (SELECT v FROM inc) = %(held_incarnation)s
+                          THEN %(held)s::pg_snapshot END AS s)
 SELECT
+  (SELECT v FROM inc),
   (SELECT state FROM fact_copy_ready),
   pg_current_snapshot()::text,
   ARRAY(SELECT identity FROM forgotten_sources WHERE identity = ANY(%(forms)s::text[])),
   ARRAY(SELECT json_build_object('id', id, 'summary', summary)::text FROM episodes
         WHERE id = ANY(%(ids)s::bigint[]) AND deleted_at IS NULL ORDER BY id),
-  CASE WHEN %(held)s::text IS NULL THEN false ELSE
-    coalesce((SELECT min(xid) FROM fact_changes) <= pg_snapshot_xmin(%(held)s::pg_snapshot), false)
+  CASE WHEN (SELECT s FROM held) IS NULL THEN false ELSE
+    coalesce((SELECT min(xid) FROM fact_changes) <= pg_snapshot_xmin((SELECT s FROM held)), false)
     AND NOT EXISTS (SELECT 1 FROM fact_changes
-                    WHERE xid >= pg_snapshot_xmin(%(held)s::pg_snapshot)
-                      AND NOT pg_visible_in_snapshot(xid, %(held)s::pg_snapshot)) END
+                    WHERE xid >= pg_snapshot_xmin((SELECT s FROM held))
+                      AND NOT pg_visible_in_snapshot(xid, (SELECT s FROM held))) END
 """
 
 
@@ -1723,50 +1864,73 @@ def _read_commitment_vectors(cur, held: Mapping[tuple, tuple]) -> tuple[dict[tup
 
 def _copy_read(tx, local: Mapping[str, Any]) -> dict[str, Any]:
     """The copy's hub work, on the worker (``provenance.hub_call``), in one
-    REPEATABLE READ snapshot. The incarnation is its first statement and is
-    handed to the caller at once (D2); then readiness, the load rule's hub
-    reads and the skip, and unless skipped or refused the facts. Writes
-    nothing locally."""
-    from psycopg import IsolationLevel
+    REPEATABLE READ snapshot. Its first statement reads the incarnation with
+    the load rule's hub half and the skip, in one exchange; the incarnation
+    is handed to the caller before any of them is acted on (D2), and unless
+    skipped or refused the facts follow. Writes nothing locally."""
+    from psycopg import ClientCursor
     from psycopg.errors import UndefinedTable
 
+    from khipu import provenance
     from khipu.tombstones import hub_form
 
-    tx.conn.isolation_level = IsolationLevel.REPEATABLE_READ
-    cur = tx.cur
-    out: dict[str, Any] = {"incarnation": _hub_incarnation(cur)}
-    if tx.handoff(out["incarnation"]):
+    conn = tx.conn
+    if not conn.autocommit:  # a handed-over pull session already is, mid-transaction
+        conn.autocommit = True  # the transaction is the statement's own BEGIN
+
+    def end() -> None:
         tx.rollback()
-        return {**out, "restart": True}
+        conn.autocommit = False
+
     stamp = local.get("stamp")
-    held = (stamp["snapshot"] if stamp and stamp.get("incarnation") == out["incarnation"]
-            and stamp.get("destination") == local["destination"] else None)
+    held = stamp if stamp and stamp.get("destination") == local["destination"] else None
     forms = {t: hub_form(t) for t in local["tags"]}
+    ms = str(provenance.remaining_ms(tx.deadline))
     try:
-        cur.execute(_COPY_CHECK_SQL, {"forms": sorted({f for f in forms.values() if f}),
-                                      "ids": sorted(local["ids"]), "held": held})
+        with ClientCursor(conn) as cur:
+            cur.execute(_COPY_CHECK_SQL, {
+                "ms": ms, "forms": sorted({f for f in forms.values() if f}), "ids": sorted(local["ids"]),
+                "held_incarnation": held and held.get("incarnation"), "held": held and held.get("snapshot")})
+            while cur.nextset():
+                pass
+            incarnation, state, snapshot, present, unmet, unchanged = cur.fetchone()
     except UndefinedTable:
-        tx.rollback()
+        # A hub before 0047: the incarnation alone, still handed over first.
+        end()
+        out: dict[str, Any] = {"incarnation": _hub_incarnation(tx.cur)}
+        if tx.handoff(out["incarnation"]):
+            return {**out, "restart": True}
         return {**out, "not_ready": "the hub has no fact provenance yet (migration 0047)"}
-    state, snapshot, present, unmet, unchanged = cur.fetchone()
+    out = {"incarnation": str(incarnation)}
+    if tx.handoff(out["incarnation"]):
+        end()
+        return {**out, "restart": True}
     if state != "ready":
-        tx.rollback()
+        end()
         return {**out, "not_ready": ("the hub's readiness row is missing" if state is None
                                      else "the hub is still indexing its history")}
     present = set(present or ())
     out.update(snapshot=snapshot, missing=sorted(t for t, f in forms.items() if f not in present),
                unmet=[json.loads(u) for u in unmet or ()])
     if out["missing"] or out["unmet"]:
-        tx.rollback()
+        end()
         return out
     if unchanged:
-        tx.rollback()
+        end()
         return {**out, "skip": True}
+    cur = tx.cur
     out["commitments"] = _hub_commitments(cur)
     out.update(_read_fact_rows(cur))
-    out["vector_keys"], out["vectors"] = _read_commitment_vectors(cur, local["held_vectors"])
-    tx.rollback()
+    out["vector_keys"], out["vectors"] = _read_commitment_vectors(cur, _held_vectors(local))
+    end()
     return out
+
+
+def _held_vectors(local: Mapping[str, Any]) -> dict[tuple, tuple]:
+    """The held commitment vectors, read once and only when a copy changes
+    (a skip never needs them)."""
+    held = local.get("held_vectors")
+    return (held() if callable(held) else held) or {}
 
 
 def _held_commitment_vectors(con: sqlite3.Connection) -> dict[tuple, tuple]:
@@ -1805,8 +1969,19 @@ def _local_copy_state(path: Path) -> dict[str, Any]:
     with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
         state = {"meta": bool(_snapshot_table_columns(con, "snapshot_meta")),
                  "stamp": _read_stamp(con), "revision": _revision(con),
-                 "listed": _meta_get(con, _FACT_UNSENT_KEY) is not None,
-                 "held_vectors": _held_commitment_vectors(con)}
+                 "listed": _meta_get(con, _FACT_UNSENT_KEY) is not None}
+        try:
+            state["certified"] = json.loads(_meta_get(con, _FACT_CERTIFIED_KEY) or "null")
+        except ValueError:
+            state["certified"] = None
+
+    @functools.lru_cache(maxsize=1)
+    def held() -> dict[tuple, tuple]:
+        # Fact vectors change only under the copy lock this copy holds.
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
+            return _held_commitment_vectors(con)
+
+    state["held_vectors"] = held
     return {**state, "fingerprint": _refusal_digest(gate, path), "tags": sorted(gate.tags),
             "ids": sorted(gate.episode_ids), "destination": _hub_destination()}
 
@@ -1877,7 +2052,7 @@ def _write_copy(con: sqlite3.Connection, local: Mapping[str, Any], read: Mapping
         if {"id", "text", "status"} <= _snapshot_table_columns(con, "commitments"):
             texts = {str(i): t for i, t in con.execute("SELECT id, text FROM commitments WHERE status = 'open'")}
         keys = read.get("vector_keys") or {}
-        held = local.get("held_vectors") or {}
+        held = _held_vectors(local)
         keep = {k for k, v in keys.items() if held.get(k) == v and k[1] in texts}
         con.execute("DELETE FROM memory_embeddings WHERE kind IN "
                     f"({', '.join('?' * len(_FACT_VECTOR_KINDS[1:]))})", _FACT_VECTOR_KINDS[1:])
@@ -1903,6 +2078,7 @@ def _write_copy(con: sqlite3.Connection, local: Mapping[str, Any], read: Mapping
                                                 "destination": local["destination"],
                                                 "snapshot": read["snapshot"]}, sort_keys=True))
     _meta_put(con, _FACT_UNSENT_KEY, None)
+    _meta_put(con, _FACT_CERTIFIED_KEY, json.dumps(local.get("tags", [])))
     return counts
 
 
@@ -1935,6 +2111,8 @@ def _publish_copy(con: sqlite3.Connection, gate: Any, local: Mapping[str, Any], 
     if read.get("skip"):
         if _meta_get(con, _FACT_DIGEST_KEY) != local["fingerprint"]:
             _meta_put(con, _FACT_DIGEST_KEY, local["fingerprint"])
+        if _meta_get(con, _FACT_CERTIFIED_KEY) != json.dumps(local["tags"]):
+            _meta_put(con, _FACT_CERTIFIED_KEY, json.dumps(local["tags"]))
         if local["listed"]:
             _meta_put(con, _FACT_UNSENT_KEY, None)
         return {"ok": True, "skipped": True}
@@ -1991,7 +2169,7 @@ def _copy_once(path: Path, deadline: float, connect: Any, *, may_restart: bool) 
         return _not_refreshed(read["not_ready"], not_ready=True)
     held = local["stamp"]
     if read.get("skip") and not local["listed"] and held is not None \
-            and held.get("fingerprint") == local["fingerprint"]:
+            and held.get("fingerprint") == local["fingerprint"] and local["certified"] == local["tags"]:
         # Nothing changed on the hub or here: nothing to write, unless an
         # invalidation landed since the local read (then the admitted path
         # reports it).
@@ -2012,7 +2190,7 @@ def _copy_once(path: Path, deadline: float, connect: Any, *, may_restart: bool) 
         return _not_refreshed(f"{type(exc).__name__}: {exc}")
 
 
-def copy_facts(*, connect: Any = None, deadline: float | None = None) -> dict[str, Any]:
+def copy_facts(*, connect: Any = None, deadline: float | None = None, session: Any = None) -> dict[str, Any]:
     """Copy the hub's facts into this Mac's replica (design section 6.2):
     under ``fact-copy.lock``, read the hub in one snapshot on a worker
     bounded by one deadline (``FORGET_RETRY_BUDGET_S``, section 6.4), then
@@ -2021,7 +2199,23 @@ def copy_facts(*, connect: Any = None, deadline: float | None = None) -> dict[st
     hub's by default). A copy that fails publishes nothing and the last
     good copy stays, unless an invalidation cleared it. Never raises, but
     for being called inside the memory lock or ``write_gate`` (the copy
-    lock is outermost: a ``RuntimeError``)."""
+    lock is outermost: a ``RuntimeError``). ``session``: an idle hub
+    connection the copy uses first instead of connecting (a pull's), closed
+    by the copy whether it is used or not."""
+    if session is not None:
+        fallback = connect or (lambda **kw: try_hub_connect(**kw))
+        handed = [session]
+
+        def connect(**kw):
+            if handed:
+                return handed.pop()
+            return fallback(**kw)
+
+        try:
+            return copy_facts(connect=connect, deadline=deadline)
+        finally:
+            for unused in handed:
+                _close_quietly(unused)
     path = snapshot_path()
     if not path.is_file():
         return {"ok": True, "skipped": True, "reason": "no snapshot exists"}
@@ -2030,6 +2224,8 @@ def copy_facts(*, connect: Any = None, deadline: float | None = None) -> dict[st
 
         deadline = time.monotonic() + FORGET_RETRY_BUDGET_S
     started = time.monotonic()
+    if started >= deadline:
+        return {**_not_refreshed("the operation's deadline passed; a later copy reconciles"), "seconds": 0.0}
     try:
         with _fact_copy_lock(path, deadline):
             out = _copy_once(path, deadline, connect, may_restart=True)
@@ -2187,6 +2383,40 @@ def _apply_ledger_pull(con: sqlite3.Connection, payload: Mapping[str, Any], *,
     return {"ok": True}
 
 
+def _one_exchange(cur, reads: Sequence[tuple[str, str, Sequence[Any]]]) -> dict[str, list]:
+    """``reads`` in one simple query, so one round trip: the session bounds
+    (``provenance.SESSION_SETTINGS``, D3), a REPEATABLE READ transaction,
+    then each read, bound client side. Returns each read's rows by name; the
+    transaction stays open on ``conn`` (autocommit, so the caller's later
+    statements run inside it and its ``rollback`` ends it). The session is
+    marked bounded, so a copy handed it (``copy_facts``) does not set the
+    bounds again."""
+    from psycopg import ClientCursor, Connection
+
+    from khipu.provenance import SESSION_SETTINGS
+
+    conn = getattr(cur, "connection", None)
+    if not isinstance(conn, Connection):
+        # A DB-API cursor with no psycopg connection to batch on: one by one.
+        out: dict[str, list] = {}
+        for name, sql, params in reads:
+            cur.execute(sql, params)
+            out[name] = list(cur.fetchall())
+        return out
+    conn.rollback()  # a schema probe may have opened a transaction; nothing is read yet
+    conn.autocommit = True
+    with ClientCursor(conn) as batch:
+        batch.execute("; ".join([*SESSION_SETTINGS, "BEGIN ISOLATION LEVEL REPEATABLE READ",
+                                 *(batch.mogrify(sql, params) for _name, sql, params in reads)]))
+        results: list[list] = []
+        while True:
+            results.append(batch.fetchall() if batch.description else [])
+            if not batch.nextset():
+                break
+    conn.khipu_bounded = True
+    return {name: rows for (name, _sql, _params), rows in zip(reads, results[len(SESSION_SETTINGS) + 1:])}
+
+
 def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bool = True) -> dict[str, Any]:
     """The hub half of ``pull_changes``, on its one cursor. Everything the
     memory limit can refuse is read before the first write. Ledger failures
@@ -2195,81 +2425,84 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
 
     # Taken before the transaction snapshot, never after its first read.
     read_at = time.time()
-    cur.execute("SELECT now()")
-    hub_now = _utc(cur.fetchone()[0]) or datetime.now(timezone.utc)
-    cap = hub_now - timedelta(seconds=FRESHNESS_OVERLAP_S)
     hub_cols = _pg_columns(cur, "episodes")
+    emb_cols = _pg_columns(cur, "memory_embeddings")
+    topic_hub_cols = _pg_columns(cur, "topics")
+    alias_cols = _pg_columns(cur, "project_aliases")
     cols = [c for c in _EPISODE_COLS if c in hub_cols]
     sel = ", ".join(cols)
     after = (state["episodes_after"], state["episodes_after_id"])
+    # Every read below depends on nothing read here, so all go in one
+    # exchange (``_one_exchange``) that also opens the snapshot.
+    reads: list[tuple[str, str, Sequence[Any]]] = [("now", "SELECT now()", ())]
     # Episodes by their change stamp (migration 0032), so an episode edited in
     # place (a capture merged into it) is read again; a row the stamp has not
     # reached yet, or a hub without it, by its ingest time.
     stamped = "changed_at" in hub_cols
     if stamped:
-        cur.execute(
-            f"SELECT {sel}, changed_at FROM episodes WHERE (changed_at, id) > (%s, %s) "
-            "OR (changed_at IS NULL AND (ingested_at, id) > (%s, %s)) "
-            "ORDER BY coalesce(changed_at, ingested_at), id LIMIT %s",
-            (*after, *after, limit + 1))
-        fresh = [dict(zip([*cols, "changed_at"], r)) for r in cur.fetchall()]
+        reads.append(("fresh", f"SELECT {sel}, changed_at FROM episodes WHERE (changed_at, id) > (%s, %s) "
+                      "OR (changed_at IS NULL AND (ingested_at, id) > (%s, %s)) "
+                      "ORDER BY coalesce(changed_at, ingested_at), id LIMIT %s", (*after, *after, limit + 1)))
     else:
-        cur.execute(
-            f"SELECT {sel} FROM episodes WHERE (ingested_at, id) > (%s, %s) ORDER BY ingested_at, id LIMIT %s",
-            (*after, limit + 1))
-        fresh = [dict(zip(cols, r)) for r in cur.fetchall()]
-    # Where each row puts the episodes cursor; the stamp itself is hub-only
-    # and never written into the replica.
-    fresh_stamps = [(r.pop("changed_at", None) or r.get("ingested_at"), r.get("id")) for r in fresh]
-    gone: list[dict[str, Any]] = []
+        reads.append(("fresh", f"SELECT {sel} FROM episodes WHERE (ingested_at, id) > (%s, %s) "
+                      "ORDER BY ingested_at, id LIMIT %s", (*after, limit + 1)))
     if "deleted_at" in hub_cols:
-        cur.execute(
-            f"SELECT {sel} FROM episodes WHERE deleted_at > %s ORDER BY deleted_at, id LIMIT %s",
-            (state["tombstones_after"], limit + 1))
-        gone = [dict(zip(cols, r)) for r in cur.fetchall()]
-    groups: list[tuple[Any, ...]] = []
-    emb_cols = _pg_columns(cur, "memory_embeddings")
+        reads.append(("gone", f"SELECT {sel} FROM episodes WHERE deleted_at > %s ORDER BY deleted_at, id LIMIT %s",
+                      (state["tombstones_after"], limit + 1)))
     if {"profile", "kind", "ref", "built_at"} <= emb_cols:
-        cur.execute(
-            "SELECT profile, kind, ref, max(built_at) FROM memory_embeddings WHERE built_at > %s "
-            "GROUP BY profile, kind, ref ORDER BY max(built_at), profile, kind, ref LIMIT %s",
-            (state["vectors_after"], limit + 1))
-        groups = list(cur.fetchall())
-    # Topic bodies by their change stamp. ``None``: the hub has no such table.
-    topic_rows: list[dict[str, Any]] | None = None
-    topic_purges: set[str] = set()
-    topic_hub_cols = _pg_columns(cur, "topics")
+        reads.append(("groups", "SELECT profile, kind, ref, max(built_at) FROM memory_embeddings WHERE built_at > %s "
+                      "GROUP BY profile, kind, ref ORDER BY max(built_at), profile, kind, ref LIMIT %s",
+                      (state["vectors_after"], limit + 1)))
+    held_batches: list[list[str]] = []
+    tcols = [c for c in _TOPIC_COLS if c in topic_hub_cols]
     if {"slug", "updated_at"} <= topic_hub_cols:
-        tcols = [c for c in _TOPIC_COLS if c in topic_hub_cols]
         where, params = "updated_at > %s", [state["topics_after"]]
         if "deleted_at" in topic_hub_cols:
             where += " OR deleted_at > %s"
             params.append(state["topics_after"])
-        cur.execute(f"SELECT {', '.join(tcols)} FROM topics WHERE {where} ORDER BY updated_at, slug LIMIT %s",
-                    (*params, limit + 1))
-        topic_rows = [dict(zip(tcols, r)) for r in cur.fetchall()]
+        reads.append(("topics", f"SELECT {', '.join(tcols)} FROM topics WHERE {where} "
+                      "ORDER BY updated_at, slug LIMIT %s", (*params, limit + 1)))
         # A hard purge removes even the tombstone. Compare held keys with
         # this same hub snapshot: a change cursor cannot discover absent rows.
         with closing(sqlite3.connect(f"file:{snapshot_path()}?mode=ro", uri=True)) as con:
             held_topics = ({r[0] for r in con.execute("SELECT slug FROM topics")}
                            if "slug" in _snapshot_table_columns(con, "topics") else set())
-        for batch in _chunks(sorted(held_topics)):
-            cur.execute("SELECT slug FROM topics WHERE slug = ANY(%s)", (batch,))
-            topic_purges.update(set(batch) - {r[0] for r in cur.fetchall()})
-    aliases = _hub_project_aliases(cur)
+        held_batches = list(_chunks(sorted(held_topics)))
+        reads.extend((f"held{i}", "SELECT slug FROM topics WHERE slug = ANY(%s)", (b,))
+                     for i, b in enumerate(held_batches))
+    acols = [c for c in ("alias", "project", "created_at", "source", "evidence") if c in alias_cols]
+    if {"alias", "project"} <= alias_cols:
+        reads.append(("aliases", f"SELECT {', '.join(acols)} FROM project_aliases ORDER BY alias", ()))
+    got = _one_exchange(cur, reads)
+    hub_now = _utc(got["now"][0][0]) or datetime.now(timezone.utc)
+    cap = hub_now - timedelta(seconds=FRESHNESS_OVERLAP_S)
+    fresh = [dict(zip([*cols, "changed_at"] if stamped else cols, r)) for r in got["fresh"]]
+    # Where each row puts the episodes cursor; the stamp itself is hub-only
+    # and never written into the replica.
+    fresh_stamps = [(r.pop("changed_at", None) or r.get("ingested_at"), r.get("id")) for r in fresh]
+    gone = [dict(zip(cols, r)) for r in got.get("gone", ())]
+    groups: list[tuple[Any, ...]] = list(got.get("groups", ()))
+    # Topic bodies by their change stamp. ``None``: the hub has no such table.
+    topic_rows = [dict(zip(tcols, r)) for r in got["topics"]] if "topics" in got else None
+    topic_purges: set[str] = set()
+    for i, batch in enumerate(held_batches):
+        topic_purges.update(set(batch) - {r[0] for r in got[f"held{i}"]})
+    aliases = (acols, got["aliases"]) if "aliases" in got else None
     if max(len(fresh), len(gone), len(groups), len(topic_rows or ()) + len(topic_purges)) > limit:
         return _pull_needs_dump(limit)
 
-    # Even schema discovery belongs to the savepoint: any failed PostgreSQL
-    # statement would otherwise abort the memory transaction too.
-    cur.execute("SAVEPOINT ledger_pull")
-    try:
-        ledger_payload = _read_ledger_pull(cur, limit) if include_ledger else None
-    except Exception as exc:  # noqa: BLE001 - the ledger is an independent part
-        cur.execute("ROLLBACK TO SAVEPOINT ledger_pull")
-        ledger_payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
-    finally:
-        cur.execute("RELEASE SAVEPOINT ledger_pull")
+    ledger_payload = None
+    if include_ledger:
+        # Even schema discovery belongs to the savepoint: any failed
+        # PostgreSQL statement would otherwise abort the memory transaction.
+        cur.execute("SAVEPOINT ledger_pull")
+        try:
+            ledger_payload = _read_ledger_pull(cur, limit)
+        except Exception as exc:  # noqa: BLE001 - the ledger is an independent part
+            cur.execute("ROLLBACK TO SAVEPOINT ledger_pull")
+            ledger_payload = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+        finally:
+            cur.execute("RELEASE SAVEPOINT ledger_pull")
 
     changed: dict[int, dict[str, Any]] = {int(r["id"]): r for r in [*fresh, *gone]}
     want = set(state["missed"])
@@ -2589,16 +2822,34 @@ def pull_changes(*, limit: int = PULL_LIMIT, include_ledger: bool = True) -> dic
         "missed": _missed_patch_ids(path),
     }
     started = time.time()
+    pg = None
     try:
-        with try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S) as pg:
-            from psycopg import IsolationLevel
-
-            pg.isolation_level = IsolationLevel.REPEATABLE_READ
-            with pg.cursor() as cur:
-                result = _pull_apply(cur, state, limit, include_ledger=include_ledger)
+        pg = try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S)
+        with pg.cursor() as cur:
+            result = _pull_apply(cur, state, limit, include_ledger=include_ledger)
+        # The read-only transaction stays open: the copy's first exchange
+        # ends it (``_COPY_CHECK_SQL``), or closing the session does.
     except Exception as exc:  # noqa: BLE001 - reported to the caller, which decides what to do next
+        _close_quietly(pg)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300],
                 "hub_unreachable": hub_connection_failed(exc)}
+    try:
+        return _pull_finish(pg, result, m, path, started)
+    finally:
+        _close_quietly(pg)
+
+
+def _close_quietly(conn) -> None:
+    try:
+        if conn is not None:
+            conn.close()
+    except Exception:  # noqa: BLE001 - a closed or broken session is closed
+        pass
+
+
+def _pull_finish(pg, result: dict[str, Any], m: Mapping[str, Any], path: Path, started: float) -> dict[str, Any]:
+    """The local half of ``pull_changes`` after its hub read: cursors, the
+    missed patches, then the fact copy on the pull's own hub session."""
     if not result.get("ok"):
         return result
     parts = dict(result["parts"])
@@ -2624,7 +2875,7 @@ def pull_changes(*, limit: int = PULL_LIMIT, include_ledger: bool = True) -> dic
     except OSError as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     _clear_missed_patches(result["cleared"], path=path, written_before=started)
-    facts = copy_facts()
+    facts = copy_facts(session=pg)
     out: dict[str, Any] = {
         "ok": not any(name != "ledger" for name in failed),
         **{k: result[k] for k in ("episodes", "tombstones", "vectors", "missed_retried",
@@ -2814,13 +3065,9 @@ def _create_schema(con: sqlite3.Connection, *, version: int = SNAPSHOT_SCHEMA_VE
             "INSERT OR REPLACE INTO snapshot_meta (key, value) VALUES ('schema_version', ?)",
             (str(version),),
         )
-        # A new file holds no fact row, so it shows none against the
-        # registry of now; only a copy writes fact rows (copy_facts), and a
-        # file without the copy's stamp is never skipped. A dump's or an
-        # import's new file is invalidated instead (_invalidate_facts).
-        digest = _current_refusal_digest(_con_path(con))
-        if digest is not None:
-            _meta_put(con, _FACT_DIGEST_KEY, digest)
+        # A new file has no stamp, so it shows no fact row until a copy
+        # (copy_facts) writes both; a dump's or an import's new file is
+        # invalidated too (_invalidate_facts).
     if version >= 3:
         con.executescript(
             """

@@ -303,13 +303,10 @@ def _forget_read(cur, episode_id: int, *, lock: bool, refusals: bool) -> dict[st
     if refusals:
         from khipu import provenance
 
-        from khipu.tombstones import forget_hub_forms
-
-        # Every string the local registry gains is refused on the hub too, so
-        # the replica copy's load rule finds each one there (design 6.2).
-        read["hub"] = (provenance.stored_identities(cur, [episode_id]).get(episode_id, set())
-                       | forget_hub_forms(_registered_sources(read), read["tombstone_payloads"],
-                                          read["candidates"]))
+        # Only what the hub records this episode as carrying is refused: a
+        # string guessed from its columns could name another capture. A
+        # registry string outside this set is listed for the owner (6.2).
+        read["hub"] = provenance.stored_identities(cur, [episode_id]).get(episode_id, set())
     return read
 
 
@@ -525,21 +522,22 @@ def _column_identity(cur, episode_id: int) -> dict[str, Any] | None:
 
 
 def _natural_identities(raw: Any, column: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Every natural source identity an episode holds outside its source rows:
-    its own columns, and its columns completed by what raw still carries (a
-    part number, a window id). Raw itself is keyed through its payload."""
+    """The natural source identity an episode holds outside its source rows:
+    its own columns, completed by what raw still carries (a part number, a
+    window id). The columns alone are not one when raw completes them: that
+    key names a different capture (the partless one of the same session).
+    Raw itself is keyed through its payload."""
     from khipu.capture_identity import SOURCE_FIELDS, source_key
 
     if column is None:
         return []
-    found = [column]
     if isinstance(raw, dict):
         merged = {k: column.get(k) if column.get(k) is not None else
                   (None if raw.get(k) is None else str(raw.get(k))) for k in SOURCE_FIELDS}
         key = source_key(merged)
         if key != column["source_key"]:
-            found.append({"source_key": key, **merged})
-    return found
+            return [{"source_key": key, **merged}]
+    return [column]
 
 
 def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str, Any]:
@@ -2033,10 +2031,12 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
         # After the memory lock (the copy lock is outermost, design 6.2):
         # this Mac's facts are copied from the hub now, not at its next
         # pull. Readers showed none since the registry publication. A failed
-        # copy leaves them hidden until the next pull's copy.
+        # copy leaves them hidden until the next pull's copy. Within the
+        # forget's own deadline (6.4): past it, the forget reports what it
+        # did and a later copy reconciles.
         from khipu.hub_snapshot import copy_facts
 
-        snapshot["facts"] = copy_facts()
+        snapshot["facts"] = copy_facts(deadline=deadline)
     return out
 
 
@@ -2206,7 +2206,10 @@ def send_to_hub(*, connect: Any = None) -> dict[str, Any]:
         if error:
             break
         sent += len(batch)
-    facts = hub_snapshot.copy_facts(connect=connect)
+        # Durable at once: if the copy below cannot run in time, the list
+        # still shows only what is left.
+        hub_snapshot.note_sent(batch, deadline)
+    facts = hub_snapshot.copy_facts(connect=connect, deadline=deadline)
     left = unsent_forgets()
     out: dict[str, Any] = {"ok": error is None and left["count"] == 0, "sent": sent,
                            "pending": left["count"], "facts": facts}

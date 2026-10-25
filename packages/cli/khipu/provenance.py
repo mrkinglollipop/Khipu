@@ -781,10 +781,21 @@ def hub_call(work, *, deadline: float, connect=None, on_handoff=None):
             with guard:
                 state["conn"] = conn
             try:
-                with conn.cursor() as cur:
-                    for setting in SESSION_SETTINGS:
-                        cur.execute(setting)
-                conn.commit()
+                # One exchange: both settings in one simple query, outside a
+                # transaction, so they hold for the session. A session handed
+                # over already bounded (a pull's, ``khipu_bounded``) has them,
+                # and is left as handed: the copy's first exchange ends the
+                # pull's read-only transaction itself.
+                from psycopg import pq
+
+                if not getattr(conn, "khipu_bounded", False):
+                    idle = pq.TransactionStatus.IDLE
+                    if getattr(getattr(conn, "info", None), "transaction_status", idle) != idle:
+                        conn.commit()  # a connection handed over mid-transaction
+                    conn.autocommit = True
+                    with conn.cursor() as cur:
+                        cur.execute("; ".join(SESSION_SETTINGS))
+                    conn.autocommit = False
             except Exception as exc:  # noqa: BLE001 - a session without them is not used
                 raise NotDone(f"the hub session could not be bounded ({type(exc).__name__})") from exc
             with conn.cursor() as cur:

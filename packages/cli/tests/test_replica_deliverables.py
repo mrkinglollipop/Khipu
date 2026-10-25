@@ -25,6 +25,7 @@ from unittest import mock
 from khipu import deliverables as dl
 from khipu import features
 from khipu import hub_snapshot as hs
+from tests.replica_copy import certify
 from khipu import recall_prompt as rp
 
 _COLS = ("id", "project", "kind", "path", "url", "title", "episode_id", "created_at")
@@ -111,6 +112,7 @@ def _replica_with(rows: list[dict], *, forgotten: set[int] = frozenset(), versio
     """An in-memory replica holding ``rows`` (and tombstoned episodes)."""
     con = sqlite3.connect(":memory:")
     hs._create_schema(con, version=version)
+    certify(con)
     episode_ids = {r["episode_id"] for r in rows if r["episode_id"] is not None}
     for eid in episode_ids:
         con.execute(
@@ -249,6 +251,7 @@ class ExportTest(unittest.TestCase):
     def _export(self, cur: _FakeHubCursor) -> tuple[int, sqlite3.Connection]:
         con = sqlite3.connect(":memory:")
         hs._create_schema(con)
+        certify(con)
         return hs._write_fact_deliverables(con, hs._read_fact_rows(cur)["deliverables"]), con
 
     def test_rows_are_exported(self) -> None:

@@ -386,7 +386,10 @@ def test_the_owner_send_of_1000_strings_keeps_a_timed_out_batch_listed(pg, repli
 
     monkeypatch.setattr(provenance, "refuse", refuse)
     monkeypatch.setattr(forget, "FORGET_RETRY_BUDGET_S", 12)
+    started = time.monotonic()
     out = forget.send_to_hub()
+    # One deadline for the send and the copy after it (6.4).
+    assert time.monotonic() - started < 12.7, out
     assert not out["ok"] and out["sent"] == 400 and out["pending"] == 600, out
     assert calls == [200, 200, 200], calls
     with pg.connect() as conn:
@@ -745,9 +748,11 @@ def test_a_publication_that_would_begin_after_the_deadline_is_not_admitted(pg, r
     assert held.wait(10)
     try:
         out = hs.copy_facts(deadline=deadline)
+        ended = time.monotonic()
     finally:
         release.set()
         holder.join(30)
+    assert ended < deadline + 0.5, ended - deadline
     assert not out["ok"] and "deadline" in out["error"], out
     assert stamp() == before and rows("SELECT retract_reason FROM decisions") == [(None,)]
 

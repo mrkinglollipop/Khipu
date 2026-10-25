@@ -23,6 +23,7 @@ from khipu import hub_snapshot as hs
 from khipu import offline_reads
 from khipu import recall_prompt as rp
 from khipu import replica_heal as rh
+from tests.replica_copy import certify
 from tests.test_replica_freshness import FakeCursor, FakeHub
 
 
@@ -121,6 +122,7 @@ def replica(tmp_path, monkeypatch):
                         "last_seen_at": now}]
     con = sqlite3.connect(hs.snapshot_path())
     hs._create_schema(con)
+    certify(con)
     con.execute("INSERT INTO episodes(id,summary,ingested_at,raw,session_id,harness) VALUES (1,?,?,?,?,?)",
                 ("old summary", hub.episodes[0]["ingested_at"].isoformat(),
                  json.dumps({"t3_thread_id": "probe-thread"}), "codex:probe", "codex"))

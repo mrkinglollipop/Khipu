@@ -501,15 +501,6 @@ def _forget_identities(source_rows: list[dict[str, Any]] | None, payloads: list[
     return keys, hashes, legacy
 
 
-def forget_hub_forms(source_rows: list[dict[str, Any]] | None, payloads: list[dict[str, Any]],
-                     legacy_identities: list[dict[str, Any]]) -> set[str]:
-    """What ``publish_forget`` publishes for these sources, in hub form, so
-    the hub forget refuses every string the registry gains (the replica
-    copy's load rule needs each one to be a hub refusal, design 6.2)."""
-    keys, hashes, legacy = _forget_identities(source_rows, payloads, legacy_identities)
-    return keys | hashes | {"legacy:" + x for x in legacy}
-
-
 def publish_forget(source_rows: list[dict[str, Any]] | None,
                    payloads: list[dict[str, Any]],
                    legacy_identities: list[dict[str, Any]], *,

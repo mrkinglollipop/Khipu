@@ -1006,6 +1006,11 @@ def _make_decisions_snapshot(data: Path) -> Path:
         "INSERT INTO decisions (id, project, text, decided_at, episode_id) "
         "VALUES (2, 'acme/widget', 'new decision', '2026-08-15T00:00:00Z', 1)"
     )
+    # Certified as a copy would leave it: readers show no fact row without
+    # a complete stamp (design 6.2).
+    hs._meta_put(con, hs._FACT_DIGEST_KEY, hs._current_refusal_digest(snap))
+    hs._meta_put(con, hs._FACT_STAMP_KEY, json.dumps(
+        {"incarnation": "test", "destination": hs._hub_destination(), "snapshot": "1:1:"}))
     con.commit()
     con.close()
     return snap

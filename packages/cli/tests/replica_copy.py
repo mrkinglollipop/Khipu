@@ -41,6 +41,16 @@ def mark_ready(h) -> None:
     assert out.get("state") == "ready", out
 
 
+def certify(con: sqlite3.Connection) -> None:
+    """Stamp a hand-built replica as a copy would (design 6.2): readers show
+    no fact row without a complete stamp naming this endpoint and registry."""
+    if not hs._snapshot_table_columns(con, "snapshot_meta"):
+        return
+    hs._meta_put(con, hs._FACT_DIGEST_KEY, hs._current_refusal_digest(hs._con_path(con)))
+    hs._meta_put(con, hs._FACT_STAMP_KEY, json.dumps(
+        {"incarnation": "test", "destination": hs._hub_destination(), "snapshot": "1:1:"}))
+
+
 def rows(sql: str, params=()) -> list:
     with sqlite3.connect(f"file:{hs.snapshot_path()}?mode=ro", uri=True) as con:
         return con.execute(sql, params).fetchall()

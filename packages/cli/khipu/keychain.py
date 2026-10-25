@@ -141,6 +141,10 @@ def get_dsn() -> str | None:
 
 def set_dsn(dsn: str) -> None:
     set_password(DSN_ACCOUNT, dsn.strip())
+    # A configured hub change hides the old hub's facts on this Mac at once.
+    from khipu.hub_snapshot import endpoint_changed
+
+    endpoint_changed()
 
 
 def get_gemini_key() -> str | None:

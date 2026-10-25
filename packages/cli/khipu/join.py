@@ -306,6 +306,9 @@ def _write_dsn_file(dsn: str) -> None:
     ensure_data_dir()
     path = dsn_file()
     write_private_file(path, (dsn.strip() + "\n").encode("utf-8"))
+    from khipu.hub_snapshot import endpoint_changed
+
+    endpoint_changed()
 
 
 _UNSET = object()

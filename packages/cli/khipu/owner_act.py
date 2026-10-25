@@ -386,6 +386,18 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 
+def _forget_list() -> dict:
+    from khipu import forget
+
+    return forget.unsent_forgets()
+
+
+# Actions that only read, answered without the owner-direction check: the
+# forgets this Mac holds that the hub lacks (design 6.2), each bare id with
+# its hub summary, so the owner can choose forget.here or forget.not_same.
+_READS = {"forget.list": _forget_list}
+
+
 def _parsed(text: str) -> dict:
     text = text.strip()
     try:
@@ -416,6 +428,11 @@ def act(action, args) -> tuple[bool, dict]:
     or (False, ``{ok: false, code, error}``) when refused."""
     from khipu import cli, owner_direction
 
+    if isinstance(action, str) and action in _READS:
+        # An inspection: never a change, a send or a direction check.
+        if not isinstance(args, dict) or args:
+            return False, _bad(f"{action} takes no arguments").refusal()
+        return True, _READS[action]()
     if not isinstance(action, str) or action not in owner_direction.ACTIONS or action not in SPECS:
         return False, {"ok": False, "code": "not_by_direction", "error": "That change can't be made by direction."}
     try:

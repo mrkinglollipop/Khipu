@@ -7,6 +7,7 @@ from tests import fact_seed
 from tests.hermetic_pg import hub, pg_cluster
 from khipu import db, hub_snapshot as hs, offline_reads, tombstones
 from tests.fact_seed import announce
+from tests.replica_copy import certify
 
 
 @pytest.mark.parametrize('refresh_first', [True, False])
@@ -62,6 +63,7 @@ def test_rejected_source_keeps_missing_and_unlinked_controls(tmp_path, monkeypat
     monkeypatch.setenv('KHIPU_DATA_DIR', str(tmp_path))
     with sqlite3.connect(hs.snapshot_path()) as con:
         hs._create_schema(con)
+        certify(con)
         con.execute("INSERT INTO episodes(id,summary,deleted_at) VALUES (1,'','2026-10-20')")
         rows = [{'id': eid, 'text': text, 'episode_id': source} for eid, text, source in
                 [(1, 'refused', 1), (2, 'partial replica', 2), (3, 'unlinked', None)]]

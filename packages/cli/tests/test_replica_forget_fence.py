@@ -20,6 +20,7 @@ import pytest
 
 from khipu import hub_snapshot as hs
 from khipu import offline_reads
+from tests.replica_copy import certify
 
 PACKAGE = Path(hs.__file__).resolve().parent
 LINKED = ("commitments", "decisions", "deliverables")
@@ -102,7 +103,7 @@ def replica(tmp_path, monkeypatch):
     # published them would (an unstamped replica shows no fact row, design
     # section 6.2).
     with closing(sqlite3.connect(hs.snapshot_path())) as con, con:
-        hs._meta_put(con, hs._FACT_DIGEST_KEY, hs._current_refusal_digest(hs.snapshot_path()))
+        certify(con)
     return tmp_path
 
 
