@@ -2243,28 +2243,31 @@ def retry_held(*, auto: bool = False) -> int:
     """Owner recovery used by `outbox retry-dead`; never replay a forgotten job.
     ``auto`` is the slow drain-driven retry: only held jobs past the cool-down,
     each left one attempt so another failure re-holds it."""
+    return sum(_thaw_held(path, auto=auto)
+               for path in held_jobs(CAPTURE_HELD_COOLDOWN_S if auto else None))
+
+
+def _thaw_held(path: Path, *, auto: bool) -> bool:
+    """Take one held job out of hold; True when it is queued again."""
     from khipu import memory_lock
 
-    moved = 0
-    for path in held_jobs(CAPTURE_HELD_COOLDOWN_S if auto else None):
-        with memory_lock.shared():
-            claimed = _claim(path, retry_held=True)
-            if claimed is None:
-                continue
-            try:
-                state = _retry_state(claimed)
-                state.pop("disposition", None)
-                state.pop("next_attempt_at", None)
-                state["attempts"] = CAPTURE_MAX_ATTEMPTS - 1 if auto else 0
-                job = json.loads(claimed.read_text(encoding="utf-8"))
-                _checkpoint_retry(claimed, job, state)
-                if _release(claimed):
-                    moved += 1
-            except JobForgotten:
-                continue
-            except (OSError, ValueError) as exc:
-                _log(f"retry-dead: native retry refused for {path.name}: {type(exc).__name__}")
-    return moved
+    with memory_lock.shared():
+        claimed = _claim(path, retry_held=True)
+        if claimed is None:
+            return False
+        try:
+            state = _retry_state(claimed)
+            state.pop("disposition", None)
+            state.pop("next_attempt_at", None)
+            state["attempts"] = CAPTURE_MAX_ATTEMPTS - 1 if auto else 0
+            job = json.loads(claimed.read_text(encoding="utf-8"))
+            _checkpoint_retry(claimed, job, state)
+            return _release(claimed)
+        except JobForgotten:
+            return False
+        except (OSError, ValueError) as exc:
+            _log(f"retry-dead: native retry refused for {path.name}: {type(exc).__name__}")
+            return False
 
 
 def _archive_empty(claimed: Path, job: dict) -> None:
@@ -3082,11 +3085,6 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
     deadline = time.monotonic() + max(0, time_budget_s) if time_budget_s is not None else None
     sweep_out = sweep_idle(dry_run=dry_run) if sweep else None
     reclaimed = _reclaim_stale()
-    if not dry_run:
-        try:
-            retry_held(auto=True)
-        except Exception as exc:  # noqa: BLE001 — a thaw problem never blocks the drain
-            _log(f"drain: held-capture retry skipped ({type(exc).__name__}: {exc})")
     jobs = queued_jobs()
     out = {"jobs": len(jobs), "captured": 0, "empty": 0, "failed": 0, "skipped_claimed": 0}
     if sweep_out is not None:
@@ -3128,6 +3126,16 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         if deadline is not None and time.monotonic() >= deadline:
             out["time_budget_exhausted"] = True
             break
+        if not dry_run:
+            # Thaw only a job this pass is about to claim: a pass that stops
+            # early must not spend a held job's single retry.
+            try:
+                if _retry_state(original).get("disposition") == "held":
+                    age = _age(_retry_state(original).get("last_attempt_at"))
+                    if age is None or age >= CAPTURE_HELD_COOLDOWN_S:
+                        _thaw_held(original, auto=True)
+            except Exception as exc:  # noqa: BLE001 — a thaw problem never blocks the drain
+                _log(f"drain: held-capture retry skipped ({type(exc).__name__}: {exc})")
         jp = _claim(original)
         if jp is None:                       # another drain got it first
             out["skipped_claimed"] += 1
@@ -3226,7 +3234,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                     continue
                 except OSError as e:
                     out["failed"] += 1
-                    _release(jp)
+                    _capture_failure(jp, job, "empty checkpoint: OSError", out)
                     _record_drain(harness, captured=False, error=f"empty checkpoint: {e}")
                     continue
                 _record_drain(harness, captured=False, empty=True)
@@ -3243,7 +3251,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 continue
             except OSError as e:
                 out["failed"] += 1
-                _release(jp)
+                _capture_failure(jp, job, "extract checkpoint: OSError", out)
                 _record_drain(harness, captured=False, error=f"extract checkpoint: {e}")
                 continue
         payload["session_id"] = f"{harness}:{job.get('session_id')}"

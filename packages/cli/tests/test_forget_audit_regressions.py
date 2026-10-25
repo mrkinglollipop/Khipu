@@ -134,6 +134,20 @@ def test_native_job_is_kept_when_ownership_check_cannot_cover_it(tmp_path, monke
     assert reason in str(result['remaining'])
 
 
+def test_forgotten_native_job_takes_its_retry_state_with_it(tmp_path, monkeypatch):
+    job = sc.enqueue({'ts': P['ts'], 'harness': 'codex', 'session_id': 'old',
+                      'transcript_range': P['transcript_range'], 'text': 'synthetic transcript'})
+    sc._write_retry_state(job, {'disposition': 'held', 'attempts': sc.CAPTURE_MAX_ATTEMPTS,
+                                'last_error': 'extract: RuntimeError'})
+    source = {**ci.source_identity(P), 'ts': P['ts'], 'summary_md5': fo.md5(P['summary'])}
+    monkeypatch.setattr(forget, '_job_owners', lambda *a, **k: (set(), set()))
+    result = forget._native_job_remainder(P['session_id'], [source], episode_id=1)
+    assert result['removed'] == 1, result
+    assert not job.exists()
+    assert not sc._retry_state_path(job).exists()
+    assert sc._retry_state(job) == {}
+
+
 @pytest.mark.parametrize('data', [{'directions': []}, {'directions': {'rd-test': {'words': 'private'}}}])
 def test_invalid_direction_schema_keeps_forget_incomplete(tmp_path, monkeypatch, data):
     path = write_direction('old', 'synthetic words')

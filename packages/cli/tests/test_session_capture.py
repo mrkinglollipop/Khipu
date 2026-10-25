@@ -242,6 +242,49 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         self.assertTrue(first.exists())
         self.assertEqual(list(sc.queue_dir().glob("*.claimed.*")), [])
 
+    def test_persistent_checkpoint_write_error_backs_off_instead_of_reextracting(self):
+        first, _ = self.enqueue("1/1")
+        self.extract.side_effect = lambda *a, **kw: {"summary": "s", "topics": []}
+        with mock.patch.object(sc, "_save_claimed_job", side_effect=OSError("disk full")):
+            for _ in range(3):
+                sc.drain()
+        self.assertEqual(list(sc.queue_dir().glob("*.claimed.*")), [])
+        self.assertEqual(list(sc.queue_dir().glob("*.json")), [first])
+        self.assertEqual(self.extract.call_count, 1)
+        self.assertEqual(sc._retry_state(first)["attempts"], 1)
+
+    def test_persistent_empty_archive_error_backs_off_then_holds(self):
+        first, _ = self.enqueue("1/1", capture_note="")
+        self.extract.side_effect = lambda *a, **kw: None
+        with mock.patch.object(sc, "_archive_empty", side_effect=OSError("disk full")):
+            for _ in range(3):
+                sc.drain()
+            self.assertEqual(self.extract.call_count, 1)
+            for _ in range(sc.CAPTURE_MAX_ATTEMPTS):
+                kept = sc._retry_state(first)
+                if "next_attempt_at" in kept:
+                    self.now = sc._parse_ts(kept["next_attempt_at"])
+                sc.drain()
+        self.assertEqual(sc._retry_state(first)["disposition"], "held")
+        self.assertEqual(list(sc.queue_dir().glob("*.claimed.*")), [])
+
+    def test_zero_budget_drain_leaves_held_retry_state_alone(self):
+        first, _ = self.enqueue("1/1")
+        for _ in range(sc.CAPTURE_MAX_ATTEMPTS):
+            sc.drain()
+            kept = sc._retry_state(first)
+            if "next_attempt_at" in kept:
+                self.now = sc._parse_ts(kept["next_attempt_at"])
+        calls = self.extract.call_count
+        self.now += sc.CAPTURE_HELD_COOLDOWN_S
+        before = sc._retry_state(first)
+        sc.drain(time_budget_s=0)
+        self.assertEqual(sc._retry_state(first), before)
+        sc.drain()
+        sc.drain()
+        self.assertEqual(self.extract.call_count, calls + 1)
+        self.assertEqual(sc._retry_state(first)["disposition"], "held")
+
     def test_failure_record_keeps_only_the_extracted_payload(self):
         first, _ = self.enqueue("1/1")
         extracted = {"summary": "fresh", "topics": []}
