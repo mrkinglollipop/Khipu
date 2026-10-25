@@ -193,16 +193,18 @@ class CaptureEvidenceConflict(RuntimeError):
 
 
 def _receipt_match(cur, payload: dict[str, Any],
-                   source: dict[str, Any] | None) -> tuple[int, str] | None:
+                   source: dict[str, Any] | None, *,
+                   live_only: bool = False) -> tuple[int, str] | None:
     """The episode this capture was already merged into, and how that merge
     matched: identity only when its receipt says so."""
+    live = " AND deleted_at IS NULL" if live_only else ""
     receipts = _receipts(payload, source)
     for match in (MATCH_IDENTITY, None):
         for receipt_id in receipts:
             entry = {"source_id": receipt_id}
             if match:
                 entry["match"] = match
-            cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
+            cur.execute(f"SELECT id FROM episodes WHERE raw @> %s::jsonb{live} LIMIT 1",
                         (json.dumps({"merged_from": [entry]}),))
             row = cur.fetchone()
             if row:
@@ -211,7 +213,8 @@ def _receipt_match(cur, payload: dict[str, Any],
 
 
 def _dedup_exact_window(cur, payload: dict[str, Any], *,
-                        source: dict[str, Any] | None = None) -> int | None:
+                        source: dict[str, Any] | None = None,
+                        live_only: bool = False) -> int | None:
     """K3: every sibling PART of one split window shares the same (harness,
     session_id, transcript_range) — that alone would match the FIRST part
     inserted and silently skip every part after it as an "exact window"
@@ -222,11 +225,20 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
 
     A hub with episode_sources (0027) answers by the capture's source key
     first; the column match below stays as the pre-0027 path and for sources
-    recorded before the key existed."""
+    recorded before the key existed. ``live_only`` matches live episodes only."""
     from khipu.capture_identity import episode_for_source, source_key, sources_ready
 
+    live = " AND deleted_at IS NULL" if live_only else ""
     if sources_ready(cur) and _source_key_is_safe(payload):
-        recorded = episode_for_source(cur, source["source_key"] if source else source_key(payload))
+        key = source["source_key"] if source else source_key(payload)
+        if live_only:
+            cur.execute("SELECT s.episode_id FROM episode_sources s JOIN episodes e "
+                        "ON e.id = s.episode_id AND e.deleted_at IS NULL WHERE s.source_key = %s",
+                        (key,))
+            row = cur.fetchone()
+            recorded = int(row[0]) if row else None
+        else:
+            recorded = episode_for_source(cur, key)
         if recorded is not None:
             return recorded
     harness = payload.get("harness")
@@ -245,14 +257,14 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
         if has_window_col:
             cur.execute(
                 "SELECT id FROM episodes WHERE harness = %s AND session_id = %s "
-                "AND transcript_range = %s AND window_id = %s AND raw->>'part' = %s LIMIT 1",
+                f"AND transcript_range = %s AND window_id = %s AND raw->>'part' = %s{live} LIMIT 1",
                 (harness, session_id, tr, window_id, payload.get("part")),
             )
             row = cur.fetchone()
             return int(row[0]) if row else None
     cur.execute(
         "SELECT id FROM episodes WHERE harness = %s AND session_id = %s "
-        "AND transcript_range = %s LIMIT 1",
+        f"AND transcript_range = %s{live} LIMIT 1",
         (harness, session_id, tr),
     )
     row = cur.fetchone()
@@ -861,19 +873,21 @@ def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any], *,
 
 
 def dedup_before_insert(cur, payload: dict[str, Any], *,
-                        source: dict[str, Any] | None = None) -> dict[str, Any]:
+                        source: dict[str, Any] | None = None,
+                        live_only: bool = False) -> dict[str, Any]:
     """W1.4: {'action': 'skip'|'merge'|'none', ...}. Never raises — any
     failure in the similarity path degrades to 'none' (a normal insert).
-    ``source`` is write_pg's pre-enrichment source identity snapshot."""
+    ``source`` is write_pg's pre-enrichment source identity snapshot.
+    ``live_only`` ignores tombstoned episodes."""
     from khipu.config import float_setting
 
-    receipt = _receipt_match(cur, payload, source)
+    receipt = _receipt_match(cur, payload, source, live_only=live_only)
     if receipt is not None:
         receipt_id, match = receipt
         _log(f"dedup: merge receipt on episode {receipt_id} ({match}); skipping insert")
         return {"action": "skip", "matched_episode": receipt_id,
                 "matched_via": "receipt", "match": match}
-    exact_id = _dedup_exact_window(cur, payload, source=source)
+    exact_id = _dedup_exact_window(cur, payload, source=source, live_only=live_only)
     if exact_id is not None:
         _log(f"dedup: exact window match episode {exact_id} — skipping insert")
         return {"action": "skip", "matched_episode": exact_id, "matched_via": "exact_window",
@@ -1042,6 +1056,19 @@ def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> N
         return
     cur.execute("UPDATE episodes SET origin = %s WHERE id = %s AND origin IS NULL",
                 (origin, episode_id))
+
+
+def _refusals_settled(cur) -> bool | None:
+    """None on a hub without 0047's identity index, where a tombstone is the
+    forget. Otherwise whether its history is indexed, so the refusal table
+    alone says what is forgotten (section 6.1)."""
+    from khipu.db import has_table
+
+    if not has_table(cur, "fact_copy_ready"):
+        return None
+    cur.execute("SELECT indexed_through >= target_id FROM fact_copy_ready")
+    row = cur.fetchone()
+    return bool(row and row[0])
 
 
 def _forgotten_result(cur, payload: dict[str, Any], source: dict[str, Any], *,
@@ -1224,10 +1251,23 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     # invitation to insert it again. It is a terminal outcome,
                     # not an ordinary dedup skip, so callers can avoid every
                     # secondary persistence leg (legacy file, mirror, vectors).
+                    # On a hub with 0047's index the refusal table checked above
+                    # is the one authority instead: a tombstone left by another
+                    # capture's forget (a collateral carrier) does not forget
+                    # this one, so it is matched against live episodes only.
                     cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
                                 (dedup.get("matched_episode"),))
                     matched = cur.fetchone()
                     target = matched[0] if matched else {}
+                    settled = (_refusals_settled(cur)
+                               if isinstance(target, dict) and target.get("deleted_at") else None)
+                    if settled is False:
+                        raise FactStepDeferred("history is not indexed yet; the capture matches "
+                                               "a tombstoned episode and waits")
+                    if settled:
+                        dedup = dedup_before_insert(cur, payload, source=source, live_only=True)
+                        target = {}
+                if dedup["action"] in ("skip", "merge"):
                     if isinstance(target, dict) and target.get("deleted_at"):
                         conn.commit()
                         return {
@@ -1340,7 +1380,8 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     # key is where this capture landed (the key stays unique until
                     # phase 3 moves uniqueness to the source).
                     cur.execute(
-                        "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
+                        "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s "
+                        "ORDER BY deleted_at IS NOT NULL, id DESC LIMIT 1",
                         (payload["ts"], _md5_hex(payload["summary"])),
                     )
                     existing = cur.fetchone()
@@ -1351,6 +1392,12 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     target = row[0] if row else {}
                     # Legacy backfills can have only an episode key and no payload
                     # hash, so source dedup misses them even on an exact replay.
+                    # With 0047's index only a tombstone of a hub whose history
+                    # is not indexed yet holds the key (the insert trigger
+                    # skipped the row): the capture waits for the pass.
+                    if target.get("deleted_at") and _refusals_settled(cur) is not None:
+                        raise FactStepDeferred("history is not indexed yet; the capture's legacy "
+                                               "key is held by a tombstone and waits")
                     if target.get("deleted_at"):
                         conn.commit()
                         return {

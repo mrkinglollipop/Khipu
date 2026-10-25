@@ -22,6 +22,7 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -70,7 +71,7 @@ def _inherited() -> int | None:
 
 
 @contextmanager
-def _take(mode: str) -> Iterator[None]:
+def _take(mode: str, wait: float | None = None) -> Iterator[None]:
     try:
         path = lock_path()
         # A data folder that is not a real directory is refused rather than
@@ -81,8 +82,22 @@ def _take(mode: str) -> Iterator[None]:
     except (OSError, TypeError) as exc:
         raise MemoryLockError(f"memory lock unavailable: {type(exc).__name__}") from exc
     try:
+        flag = fcntl.LOCK_EX if mode == "exclusive" else fcntl.LOCK_SH
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX if mode == "exclusive" else fcntl.LOCK_SH)
+            if wait is None:
+                fcntl.flock(fd, flag)
+            else:
+                # Bounded: waited for no longer than ``wait`` seconds.
+                until = time.monotonic() + wait
+                while True:
+                    try:
+                        fcntl.flock(fd, flag | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        left = until - time.monotonic()
+                        if left <= 0:
+                            raise MemoryLockError("memory lock busy until the deadline") from None
+                        time.sleep(min(0.05, left))
         except OSError as exc:
             raise MemoryLockError(f"memory lock unavailable: {type(exc).__name__}") from exc
         token = _HELD.set((mode, fd))
@@ -114,15 +129,16 @@ def shared() -> Iterator[None]:
 
 
 @contextmanager
-def exclusive() -> Iterator[None]:
-    """Hold the lock for a whole forget. Waits for every writer to finish."""
+def exclusive(wait: float | None = None) -> Iterator[None]:
+    """Hold the lock for a whole forget. Waits for every writer to finish,
+    for at most ``wait`` seconds when given."""
     held = _HELD.get()
     if held is not None and held[0] == "exclusive":
         yield
         return
     if held is not None or any(os.environ.get(name) for name in _HANDOFF_ENV):
         raise MemoryLockError("a forget cannot start inside a local write")
-    with _take("exclusive"):
+    with _take("exclusive", wait):
         yield
 
 

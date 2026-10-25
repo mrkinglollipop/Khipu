@@ -429,6 +429,8 @@ class ForgetReaderTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, \
                 mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
                 mock.patch.object(forget, "forget_episode", return_value=result), \
+                mock.patch.object(forget, "_forget_read", return_value={"hub": set()}), \
+                mock.patch.object(forget, "publish_local"), \
                 mock.patch("khipu.hub_snapshot.forget_episode_in_snapshot",
                            return_value={"ok": True}), \
                 mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}):

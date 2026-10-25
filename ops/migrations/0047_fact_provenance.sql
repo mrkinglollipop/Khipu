@@ -890,6 +890,15 @@ RETURNS SETOF JSONB LANGUAGE sql IMMUTABLE AS $fn$
                     THEN old_raw -> 'merged_from' ELSE '[]'::jsonb END) @> jsonb_build_array(entry)
 $fn$;
 
+-- Every identity the receipts already in a raw name (an insert that
+-- arrives with merged_from).
+CREATE OR REPLACE FUNCTION khipu_raw_receipt_identities(p_raw JSONB)
+RETURNS TEXT[] LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT coalesce(array_agg(x), ARRAY[]::TEXT[])
+    FROM khipu_new_receipts('{}'::jsonb, p_raw) AS r(entry),
+         unnest(khipu_receipt_identities(entry)) AS t(x)
+$fn$;
+
 CREATE OR REPLACE FUNCTION khipu_record_identities(p_episode BIGINT, identities TEXT[])
 RETURNS void LANGUAGE sql AS $fn$
     INSERT INTO episode_identities (identity, episode_id)
@@ -917,7 +926,10 @@ END
 $fn$;
 
 -- 0030's episode insert check, now READ COMMITTED, announced, and with the
--- legacy form of the row's raw.
+-- legacy form of the row's raw and every receipt its raw already holds.
+-- Until history is indexed a tombstone still holds its legacy key (its
+-- refusals may not all be rows yet), so such an insert is skipped, as the
+-- old unique key skipped it; after that the refusals alone decide.
 CREATE OR REPLACE FUNCTION khipu_episodes_forgotten_insert()
 RETURNS trigger LANGUAGE plpgsql AS $fn$
 BEGIN
@@ -925,7 +937,12 @@ BEGIN
     PERFORM khipu_refuse_unannounced();
     PERFORM khipu_refuse_forgotten(
         khipu_row_identities(NEW.raw, NEW.harness, NEW.session_id, NEW.transcript_range, NEW.window_id)
-        || khipu_announced());
+        || khipu_raw_receipt_identities(NEW.raw) || khipu_announced());
+    IF NOT EXISTS (SELECT 1 FROM fact_copy_ready WHERE indexed_through >= target_id)
+       AND EXISTS (SELECT 1 FROM episodes WHERE ts = NEW.ts AND md5(summary) = md5(NEW.summary)
+                   AND deleted_at IS NOT NULL) THEN
+        RETURN NULL;
+    END IF;
     RETURN NEW;
 END
 $fn$;
@@ -944,6 +961,15 @@ BEGIN
     IF OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL THEN
         RAISE EXCEPTION 'khipu: forgotten episode % cannot be restored', OLD.id
             USING ERRCODE = 'check_violation';
+    END IF;
+    -- A tombstoned episode's stored payloads are frozen (D1): the index
+    -- pass and refuse() derive its identities from them.
+    IF OLD.deleted_at IS NOT NULL
+       AND (NEW.raw IS DISTINCT FROM OLD.raw OR NEW.harness IS DISTINCT FROM OLD.harness
+            OR NEW.session_id IS DISTINCT FROM OLD.session_id
+            OR NEW.transcript_range IS DISTINCT FROM OLD.transcript_range
+            OR NEW.window_id IS DISTINCT FROM OLD.window_id) THEN
+        PERFORM khipu_refuse_tombstoned(OLD.id);
     END IF;
     IF (NEW.raw -> 'merged_from') IS DISTINCT FROM (OLD.raw -> 'merged_from') THEN
         FOR entry IN SELECT khipu_new_receipts(OLD.raw, NEW.raw) LOOP
@@ -968,7 +994,7 @@ RETURNS trigger LANGUAGE plpgsql AS $fn$
 BEGIN
     PERFORM khipu_record_identities(NEW.id,
         khipu_row_identities(NEW.raw, NEW.harness, NEW.session_id, NEW.transcript_range, NEW.window_id)
-        || khipu_announced());
+        || khipu_raw_receipt_identities(NEW.raw) || khipu_announced());
     RETURN NULL;
 END
 $fn$;
@@ -1139,6 +1165,23 @@ DROP TRIGGER IF EXISTS khipu_episode_sources_identities ON episode_sources;
 CREATE TRIGGER khipu_episode_sources_identities
     AFTER INSERT ON episode_sources
     FOR EACH ROW EXECUTE FUNCTION khipu_episode_sources_identities();
+
+DROP TRIGGER IF EXISTS khipu_episode_sources_frozen ON episode_sources;
+CREATE TRIGGER khipu_episode_sources_frozen
+    BEFORE UPDATE ON episode_sources
+    FOR EACH ROW
+    WHEN (NEW.source_key IS DISTINCT FROM OLD.source_key
+          OR NEW.payload_sha256 IS DISTINCT FROM OLD.payload_sha256
+          OR NEW.episode_id IS DISTINCT FROM OLD.episode_id)
+    EXECUTE FUNCTION khipu_refuse_change('a source receipt keeps its identity and its episode');
+
+-- The legacy key is unique among live episodes only: once history is
+-- indexed a capture whose identities are not refused lands beside a
+-- tombstone holding the same key (the refusal table is the one authority).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_episodes_ts_summary_md5_live
+    ON episodes (ts, md5(summary)) WHERE deleted_at IS NULL;
+DROP INDEX IF EXISTS uq_episodes_ts_summary_md5;
+CREATE INDEX IF NOT EXISTS idx_episodes_ts_summary_md5 ON episodes (ts, md5(summary));
 
 DROP TRIGGER IF EXISTS khipu_episode_identities_insert ON episode_identities;
 CREATE TRIGGER khipu_episode_identities_insert

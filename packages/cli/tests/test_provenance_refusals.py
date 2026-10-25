@@ -596,15 +596,50 @@ def test_overlapping_carriers_refuse_exactly_what_was_asked(pg):
     assert {k2, h2} <= _refused(pg) and g2 not in _refused(pg)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "stopped (design vs code): capture's dedup finds the tombstoned F by G's source row "
-    "and ends the upload as a forgotten source, so a re-upload of G never lands live"))
 def test_overlapping_carriers_an_upload_of_g_afterwards_lands(pg):
+    """Owner ruling: the refusal table is the one authority, so G, never
+    refused, lands beside its collateral tombstone F, and lands once."""
     e, f, _k, _h, g, pf = _pair(pg)
     assert forget._forget_on_hub(db.connect, e, memory_root=pg.memory)["ok"]
     assert g not in _refused(pg)
     out = capture.write_pg(dict(pf))
     assert out["episode_inserted"], out
+    assert out["episode_id"] != f and _live(pg, out["episode_id"]) and not _live(pg, f)
+    again = capture.write_pg(dict(pf))
+    assert not again["episode_inserted"] and again["episode_id"] == out["episode_id"], again
+
+
+def test_overlapping_carriers_new_evidence_under_g_lands_with_its_claims(pg):
+    """The review's variant: new evidence under G's natural identity is a
+    capture of its own, not consumed as forgotten with its outbox job."""
+    e, f, _k, _h, g, pf = _pair(pg)
+    assert forget._forget_on_hub(db.connect, e, memory_root=pg.memory)["ok"]
+    newer = {**pf, "summary": "New evidence collected after collateral forget",
+             "open_loops": [{"text": CANON, "kind": "followup", "owner": "assistant"}]}
+    assert source_key(newer) == g
+    outbox.enqueue(newer, reason="new evidence under G")
+    assert outbox.drain()["replayed"] == 1 and not outbox.jobs()
+    assert _rows(pg, "SELECT count(*) FROM commitments WHERE text = %s",
+                 (newer["open_loops"][0]["text"],)) == [(1,)]
+    assert not _live(pg, f)
+
+
+def test_a_distinct_capture_on_a_collateral_tombstones_legacy_key_lands(pg):
+    """The review's probe: a distinct source colliding only on F's legacy key
+    is retained as a conflict while F is live, and lands with its claims
+    once F is a collateral tombstone, never consumed without them."""
+    e, f, _k, _h, g, pf = _pair(pg)
+    distinct = {k: v for k, v in pf.items()
+                if k not in ("harness", "session_id", "transcript_range", "window_id", "part")}
+    distinct["open_loops"] = [{"text": ALT, "kind": "followup", "owner": "assistant"}]
+    assert source_key(distinct) != g
+    outbox.enqueue(distinct, reason="distinct source legacy collision")
+    first = outbox.drain()
+    assert first["failed"] == 1 and len(outbox.jobs()) == 1
+    assert forget._forget_on_hub(db.connect, e, memory_root=pg.memory)["ok"]
+    assert outbox.drain()["replayed"] == 1 and not outbox.jobs()
+    assert _rows(pg, "SELECT count(*) FROM commitments WHERE text = %s",
+                 (distinct["open_loops"][0]["text"],)) == [(1,)]
 
 
 # ---- a merge deadlocked by refuse() -----------------------------------------------------

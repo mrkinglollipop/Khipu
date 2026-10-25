@@ -741,7 +741,16 @@ def _abandon(conn) -> None:
         except Exception:  # noqa: BLE001 - best effort; never waited for
             pass
 
-    threading.Thread(target=cancel, daemon=True, name="khipu-hub-cancel").start()
+    # Without it cancel_safe falls back to that blocking cancel, so no cancel
+    # is sent: the server ends the statement by its statement_timeout (D3).
+    try:
+        from psycopg import capabilities
+
+        safe = capabilities.has_cancel_safe()
+    except Exception:  # noqa: BLE001 - an unknown client is treated as unsafe
+        safe = False
+    if safe:
+        threading.Thread(target=cancel, daemon=True, name="khipu-hub-cancel").start()
     try:
         sock = socket.socket(fileno=os.dup(conn.fileno()))
         try:

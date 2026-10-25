@@ -321,7 +321,8 @@ def publish_local(read: dict[str, Any], episode_id: int, hub: set[str]) -> None:
 
 
 def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
-                   known: set[str] | None = None) -> dict[str, Any]:
+                   known: set[str] | None = None,
+                   published: dict[str, Any] | None = None) -> dict[str, Any]:
     """The hub half. Caller commits. Returns the counts and the (ts, summary
     md5) identity the legacy file uses, or ``{"ok": False}`` when unknown.
     With ``memory_root`` the legacy lines themselves are hashed too, so a line
@@ -334,7 +335,12 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
     with nothing written: the caller rolls back, publishes the grown set in
     this Mac's registry and starts again with it (``_forget_on_hub``).
     ``known=None`` (a caller in its own transaction) publishes what the hub
-    holds first and goes on with that set."""
+    holds first and goes on with that set.
+
+    On a hub without the index, ``published`` is the read the caller already
+    published (``_forget_on_hub``): this publishes nothing itself, and a read
+    under the row lock that names more returns ``{"grown": []}`` the same
+    way."""
     from khipu.tombstones import RegistryError
 
     registry_error: str | None = None
@@ -360,12 +366,17 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
         read = _forget_read(cur, episode_id, lock=True, refusals=False)
         if read is None:
             return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+        if published is not None:
+            if _read_identities(read) - _read_identities(published):
+                return {"ok": False, "id": episode_id, "grown": [], "read": read,
+                        "registry_error": None}
+            registry_error = published.get("registry_error")
         # Publish before _candidate_hashes reads any local legacy line. Each
         # publish is followed by a re-read: a source that reached this
         # episode without the row lock is fenced before the forget can report
         # itself complete. A hub without 0047's index keeps main's path.
         try:
-            for _round in range(_PUBLISH_ROUNDS):
+            for _round in range(_PUBLISH_ROUNDS if published is None else 0):
                 publish_local(read, episode_id, set())
                 again = {**read, **_read_forget_sources(cur, episode_id, read["live"])}
                 grown = bool(_read_identities(again) - _read_identities(read))
@@ -373,8 +384,9 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
                 if not grown:
                     break
             else:
-                registry_error = ("the episode's sources kept changing while it was being "
-                                  "forgotten; run the forget again")
+                if published is None:
+                    registry_error = ("the episode's sources kept changing while it was being "
+                                      "forgotten; run the forget again")
         except RegistryError as exc:
             # Keep the hub tombstone/cascade semantics intact, but absolutely do
             # not touch a local store when the writer fence could not be published.
@@ -2002,9 +2014,12 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
     local writer (each holds it shared) interleaves with one."""
     from khipu import memory_lock
 
+    # Section 6.4: the deadline starts here, so the local lock wait counts.
+    deadline = time.monotonic() + FORGET_RETRY_BUDGET_S
     try:
-        with memory_lock.exclusive():
-            return _forget_everywhere(episode_id, memory_root=memory_root, gateway=gateway)
+        with memory_lock.exclusive(wait=FORGET_RETRY_BUDGET_S):
+            return _forget_everywhere(episode_id, memory_root=memory_root, gateway=gateway,
+                                      deadline=deadline)
     except memory_lock.MemoryLockError as exc:
         return {"ok": False, "id": episode_id, "complete": False,
                 "error": f"forget not started: {exc}"}
@@ -2024,7 +2039,8 @@ def _retryable(exc: BaseException) -> bool:
     return state in _FORGET_RETRY_SQLSTATES
 
 
-def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None) -> dict[str, Any]:
+def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None,
+                   deadline: float | None = None) -> dict[str, Any]:
     """The hub forget under one deadline, ``FORGET_RETRY_BUDGET_S`` from its
     start (section 6.4), on a worker (``provenance.hub_call``) abandoned at
     the deadline. On one connection: read the episode's identity set, roll
@@ -2039,10 +2055,11 @@ def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None) -> dic
 
     from khipu import provenance, tombstones
 
-    deadline = time.monotonic() + FORGET_RETRY_BUDGET_S
+    if deadline is None:
+        deadline = time.monotonic() + FORGET_RETRY_BUDGET_S
 
     def publish(value):
-        read, hub = value
+        read, hub, refusals = value
         left = deadline - time.monotonic()
         if left <= 0:
             raise provenance.NotDone("the deadline passed before the registry was published")
@@ -2052,10 +2069,16 @@ def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None) -> dic
         except tombstones.RegistryBusy as exc:
             raise provenance.NotDone("the tombstone registry was busy until the deadline") from exc
         except tombstones.RegistryError as exc:
+            if not refusals:
+                # Main's path on a hub without the index: the hub forget goes
+                # on and the forget reports the registry incomplete.
+                return str(exc)
             raise provenance.NotDone(f"the tombstone registry was not published: {exc}") from exc
+        return None
 
     def work(tx):
         known: set[str] | None = None
+        published: dict[str, Any] | None = None
         attempt = 0
         last: BaseException | None = None
         while True:
@@ -2064,18 +2087,25 @@ def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None) -> dic
                     raise last
                 raise provenance.NotDone("the deadline passed")
             try:
-                if known is None and _refusals_ready(tx.cur):
-                    read = _forget_read(tx.cur, episode_id, lock=False, refusals=True)
+                if known is None:
+                    # Either schema: the worker never publishes locally; the
+                    # read is handed to the caller between transactions.
+                    refusals = _refusals_ready(tx.cur)
+                    read = _forget_read(tx.cur, episode_id, lock=False, refusals=refusals)
                     tx.rollback()
                     if read is None:
                         return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
                     known = set(read["hub"])
-                    tx.handoff((read, known))
-                out = forget_episode(tx.cur, episode_id, memory_root=memory_root, known=known)
+                    error = tx.handoff((read, known, refusals))
+                    published = None if refusals else {**read, "registry_error": error}
+                out = forget_episode(tx.cur, episode_id, memory_root=memory_root, known=known,
+                                     published=published)
                 if out.get("grown") is not None:
                     tx.rollback()
                     known = set(out["grown"])
-                    tx.handoff((out["read"], known))
+                    error = tx.handoff((out["read"], known, published is None))
+                    if published is not None:
+                        published = {**out["read"], "registry_error": error}
                     continue
                 if out.get("ok"):
                     tx.commit()
@@ -2256,7 +2286,7 @@ def send_pending(*, memory_root: Path | None = None, connect: Any = None) -> dic
 
 
 def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
-                       gateway: bool | None) -> dict[str, Any]:
+                       gateway: bool | None, deadline: float | None = None) -> dict[str, Any]:
     from khipu import writer_groups
     from khipu.db import connect
 
@@ -2279,7 +2309,7 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         except Exception:  # noqa: BLE001
             memory_root = None
             root_resolved = False
-    out = _forget_on_hub(connect, episode_id, memory_root=memory_root)
+    out = _forget_on_hub(connect, episode_id, memory_root=memory_root, deadline=deadline)
     if not out.get("ok"):
         return out
     if out.get("registry_error"):

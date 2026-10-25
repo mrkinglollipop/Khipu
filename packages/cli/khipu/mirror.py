@@ -451,7 +451,7 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
         cols.append("origin")
         vals.append("%s")
         params.append(origin)
-    from khipu.capture_identity import record_source, source_identity
+    from khipu.capture_identity import is_transient, record_source, source_identity
     from khipu.tombstones import announce_hub_identities, hub_source_forgotten, is_forgotten_refusal
 
     # The one hub insert every writer reaches (write_pg, the mirror, the tail
@@ -487,7 +487,7 @@ def _upsert_episode(cur, payload: dict[str, Any], *,
                         out["episode_id"] = int(row[0])
                     record_source(cur, int(row[0]), "origin", origin_source)
             except Exception as exc:  # noqa: BLE001 — the episode row stays; fail-open
-                if is_forgotten_refusal(exc):
+                if is_forgotten_refusal(exc) or is_transient(exc):
                     raise
                 _log(f"source row skipped ({type(exc).__name__}: {exc})")
     except Exception as exc:

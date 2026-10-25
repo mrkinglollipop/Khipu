@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import sys
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -194,11 +195,6 @@ def _atomic_write(path: Path, value: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(name, path)
-        directory = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
     except OSError as exc:
         raise RegistryError(f"tombstone registry publish failed: {type(exc).__name__}") from exc
     finally:
@@ -206,6 +202,19 @@ def _atomic_write(path: Path, value: dict[str, Any]) -> None:
             os.unlink(name)
         except FileNotFoundError:
             pass
+    # The replace is the publication: every reader already sees the new
+    # registry, so a failed directory fsync after it cannot report the
+    # registry unpublished. Only its survival of a power loss is uncertain.
+    try:
+        directory = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        print(f"[khipu] tombstone registry published; its directory fsync failed "
+              f"({type(exc).__name__}), so its durability across a power loss is uncertain",
+              file=sys.stderr, flush=True)
 
 
 def _marker_present() -> bool:

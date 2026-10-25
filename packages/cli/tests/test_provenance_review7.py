@@ -65,7 +65,9 @@ def test_legacy_hash_only_receipt_refusal_waits_until_sent(pg, replica, method):
     a = _capture(loop=CANON)
     b = capture.write_pg(dict(_payload(loop=ALT, session_id=None, transcript_range=None)))["episode_id"]
     with pg.connect() as c:
-        # 0027's backfilled origin: an episode key and no payload hash.
+        # 0027's backfilled origin: an episode key and no payload hash. History
+        # from before 0047, which now refuses moving a receipt's identity.
+        c.execute("SET LOCAL session_replication_role = replica")
         c.execute("UPDATE episode_sources SET source_key = %s, payload_sha256 = NULL WHERE episode_id = %s",
                   (episode_key(b), b))
     assert hs.refresh()["ok"]
@@ -382,6 +384,9 @@ def test_forget_retry_is_time_bounded(pg, monkeypatch):  # noqa: F811
             pass
 
     monkeypatch.setattr(forget, "forget_episode", deadlock)
+    # Every schema's forget now reads and hands over its set first (7A review 4).
+    monkeypatch.setattr(forget, "_forget_read", lambda cur, eid, **kw: {"hub": set()})
+    monkeypatch.setattr(forget, "publish_local", lambda *a, **kw: None)
     with pytest.raises(psycopg.errors.DeadlockDetected):
         forget._forget_on_hub(lambda **kw: _Conn(), b, memory_root=pg.memory)
     # Attempts at 0, 3, 6 and 9 s; the next would start at 12 s, past the
