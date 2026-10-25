@@ -2021,11 +2021,12 @@ def _claim(job: Path, *, retry_held: bool = False) -> Path | None:
         except ValueError:
             contents = {}
         if isinstance(contents, dict):
+            state = _retry_state(job)
             if retry_held:
-                if contents.get("disposition") != "held":
+                if state.get("disposition") != "held":
                     return None
-            elif (contents.get("disposition") == "held" or
-                  (_parse_ts(contents.get("next_attempt_at")) or 0) > time.time() or
+            elif (state.get("disposition") == "held" or
+                  (_parse_ts(state.get("next_attempt_at")) or 0) > time.time() or
                   _has_earlier_sibling(contents)):
                 return None
         claimed = job.with_suffix(f".claimed.{os.getpid()}")
@@ -2102,6 +2103,7 @@ def _discard_claim(claimed: Path) -> None:
         if acquired:
             claimed.unlink(missing_ok=True)
             _claim_owner_path(claimed).unlink(missing_ok=True)
+            _retry_state_path(claimed).unlink(missing_ok=True)
 
 
 def _save_claimed_job(claimed: Path, job: dict) -> None:
@@ -2142,27 +2144,79 @@ def _save_claimed_job(claimed: Path, job: dict) -> None:
                 pass
 
 
-def _capture_failure(claimed: Path, job: dict, error: str, out: dict) -> None:
-    """Checkpoint the retry before releasing; preserve every evidence field."""
+def _job_original(path: Path) -> Path:
+    """The queued name of a job, whether it is queued or claimed."""
+    return path if path.name.endswith(".json") else path.with_suffix("").with_suffix(".json")
+
+
+def _retry_state_path(path: Path) -> Path:
+    # Beside the job, never in it: a failed attempt must leave the job's bytes
+    # untouched. Holds no capture text; neither *.json nor *.claimed.* match.
+    key = hashlib.sha256(_job_original(path).name.encode("utf-8")).hexdigest()
+    return path.parent / f".retry-{key}.meta"
+
+
+def _retry_state(path: Path) -> dict:
+    try:
+        state = json.loads(_retry_state_path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _write_retry_state(path: Path, state: dict) -> None:
+    target = _retry_state_path(path)
+    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as stream:
+            json.dump(state, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _checkpoint_retry(claimed: Path, job: dict, state: dict) -> None:
+    """Write retry state like a job checkpoint: raises ``JobForgotten`` rather
+    than writing for a forgotten source or a claim a forget already removed."""
+    from khipu import memory_lock
+    from khipu.tombstones import write_gate
+
+    with memory_lock.shared(), write_gate() as gate:
+        ident = job_source_identity(job)
+        if ident is not None and not gate.allows(ident):
+            _discard_claim(claimed)
+            raise JobForgotten(f"forgotten source: {claimed.name}")
+        if not claimed.exists():
+            _discard_claim(claimed)
+            raise JobForgotten(f"claim removed: {claimed.name}")
+        _write_retry_state(claimed, state)
+
+
+def _capture_failure(claimed: Path, job: dict, error: str, out: dict, *, free_first: bool = False) -> None:
+    """Checkpoint the retry beside the job before releasing it. ``free_first``
+    retries a first failure at the next drain (a delivery that returned a
+    failure code spends no model call); every later one backs off. ``error`` is a kind, not text."""
     from khipu import memory_lock
 
-    attempts = job.get("attempts", 0)
+    state = _retry_state(claimed)
+    attempts = state.get("attempts", 0)
     attempts = attempts if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0 else 0
     attempts += 1
     now = time.time()
-    job.update(attempts=attempts, last_error=error,
-               last_attempt_at=datetime.fromtimestamp(now, timezone.utc).isoformat())
+    state = {"attempts": attempts, "last_error": error,
+             "last_attempt_at": datetime.fromtimestamp(now, timezone.utc).isoformat()}
     if attempts >= CAPTURE_MAX_ATTEMPTS:
-        job["disposition"] = "held"
-        job.pop("next_attempt_at", None)
-    else:
+        state["disposition"] = "held"
+    elif not (free_first and attempts == 1):
         delay = min(CAPTURE_RETRY_CAP_S, CAPTURE_RETRY_BASE_S * 2 ** (attempts - 1))
-        job["next_attempt_at"] = datetime.fromtimestamp(now + delay, timezone.utc).isoformat()
+        state["next_attempt_at"] = datetime.fromtimestamp(now + delay, timezone.utc).isoformat()
     try:
         with memory_lock.shared():
-            _save_claimed_job(claimed, job)
+            _checkpoint_retry(claimed, job, state)
             _release(claimed)
-        if job.get("disposition") == "held":
+        if state.get("disposition") == "held":
             out["held"] = out.get("held", 0) + 1
     except JobForgotten:
         out["forgotten"] = out.get("forgotten", 0) + 1
@@ -2177,14 +2231,11 @@ def held_jobs(min_age_s: float | None = None) -> list[Path]:
     ``min_age_s`` keeps only those whose last attempt is at least that old."""
     held = []
     for path in queued_jobs():
-        try:
-            job = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(job, dict) and job.get("disposition") == "held":
-                age = _age(job.get("last_attempt_at"))
-                if min_age_s is None or age is None or age >= min_age_s:
-                    held.append(path)
-        except (OSError, ValueError):
-            continue
+        state = _retry_state(path)
+        if state.get("disposition") == "held":
+            age = _age(state.get("last_attempt_at"))
+            if min_age_s is None or age is None or age >= min_age_s:
+                held.append(path)
     return held
 
 
@@ -2201,11 +2252,12 @@ def retry_held(*, auto: bool = False) -> int:
             if claimed is None:
                 continue
             try:
+                state = _retry_state(claimed)
+                state.pop("disposition", None)
+                state.pop("next_attempt_at", None)
+                state["attempts"] = CAPTURE_MAX_ATTEMPTS - 1 if auto else 0
                 job = json.loads(claimed.read_text(encoding="utf-8"))
-                job.pop("disposition", None)
-                job.pop("next_attempt_at", None)
-                job["attempts"] = CAPTURE_MAX_ATTEMPTS - 1 if auto else 0
-                _save_claimed_job(claimed, job)
+                _checkpoint_retry(claimed, job, state)
                 if _release(claimed):
                     moved += 1
             except JobForgotten:
@@ -2237,6 +2289,7 @@ def _archive_claimed(claimed: Path) -> Path:
             os.fsync(stream.fileno())
         os.replace(claimed, destination)
         _claim_owner_path(claimed).unlink(missing_ok=True)
+        _retry_state_path(claimed).unlink(missing_ok=True)
         for directory in (archive, queue_dir()):
             fd = os.open(directory, os.O_RDONLY)
             try:
@@ -3148,7 +3201,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 break
             except Exception as e:  # noqa: BLE001 — model/transport: keep the job, retry later
                 out["failed"] += 1
-                _capture_failure(jp, job, f"extract: {type(e).__name__}: {e}", out)
+                _capture_failure(jp, job, f"extract: {type(e).__name__}", out)
                 _record_drain(harness, captured=False, error=f"extract: {type(e).__name__}: {e}")
                 _log(f"drain: extraction failed for {original.name}, kept: {e}")
                 continue
@@ -3266,13 +3319,13 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         except Exception as e:  # noqa: BLE001 — retain the checkpointed payload
             out["failed"] += 1
             error = f"capture: {type(e).__name__}: {e}"
-            _capture_failure(jp, job, error, out)
+            _capture_failure(jp, job, f"capture: {type(e).__name__}", out)
             _record_drain(harness, captured=False, error=error)
             _log(f"drain: capture failed for {original.name}, kept: {type(e).__name__}")
             continue
         if rc != 0:
             out["failed"] += 1
-            _capture_failure(jp, job, f"capture rc={rc}", out)
+            _capture_failure(jp, job, f"capture rc={rc}", out, free_first=True)
             _record_drain(harness, captured=False, error=f"capture rc={rc}")
             _log(f"drain: capture rc={rc} for {original.name}; kept")
             continue
@@ -3327,6 +3380,7 @@ def _queue_by_harness() -> dict[str, dict]:
             job = {}
         if not isinstance(job, dict):
             job = {}
+        job = {**job, **{k: v for k, v in _retry_state(p).items() if k in ("disposition", "last_error")}}
         records.append((p, claimed, job))
         if job.get("disposition") == "held" and job.get("window_id"):
             window = str(job["window_id"])
@@ -3470,7 +3524,7 @@ def liveness(harness: str) -> dict:
         reasons.append(f"hook error on last run: {str(beat['last_error'])[:120]}")
     if beat.get("last_drain_error") and \
             (_parse_ts(beat.get("last_drain_error_at")) or 0) > (_parse_ts(beat.get("last_captured_at")) or 0) and \
-            beat["last_drain_error"] not in q.get("held_errors", []):
+            not any(str(beat["last_drain_error"]).startswith(str(k)) for k in q.get("held_errors", []) if k):
         reasons.append(f"last capture attempt failed: {str(beat['last_drain_error'])[:120]}")
     # Held work (and its waiting siblings) is surfaced once by outbox.status's
     # existing doctor dead-letter gate, with the owner's retry-dead action.

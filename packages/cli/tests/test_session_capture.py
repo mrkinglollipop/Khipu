@@ -64,6 +64,8 @@ class PersistentCaptureRetryTest(unittest.TestCase):
             self.addCleanup(patch.stop)
 
     def enqueue(self, part="1/2", **extra):
+        retry = {k: extra.pop(k) for k in ("disposition", "attempts", "next_attempt_at", "last_error",
+                                           "last_attempt_at") if k in extra}
         job = {"harness": "codex", "session_id": "fake-session", "event": "sessionend",
                "ts": "2026-10-23T19:59:22Z", "window_id": "fake-window", "part": part,
                "offset_before": 0 if part == "1/2" else 100,
@@ -71,7 +73,10 @@ class PersistentCaptureRetryTest(unittest.TestCase):
                "transcript": 'USER: Remember this decision.\n\nASSISTANT: Created `/tmp/fake-evidence.md`.',
                "capture_note": "original owner note", "checkout": {"root": "/fake/repo"},
                **extra}
-        return sc.enqueue(job), job
+        path = sc.enqueue(job)
+        if retry:
+            sc._write_retry_state(path, retry)
+        return path, job
 
     def test_failure_is_persistent_backed_off_and_held_until_existing_owner_retry(self):
         from khipu import outbox
@@ -82,10 +87,11 @@ class PersistentCaptureRetryTest(unittest.TestCase):
             out = sc.drain()
             self.assertEqual(out["failed"], 1)
             self.assertEqual(self.extract.call_count, attempt)
-            kept = json.loads(first.read_text())
+            kept = sc._retry_state(first)
             self.assertEqual(kept["attempts"], attempt)
+            job_now = json.loads(first.read_text())
             for key, value in evidence.items():
-                self.assertEqual(kept[key], value)
+                self.assertEqual(job_now[key], value)
             self.assertTrue(second.exists())
             self.capture.assert_not_called()
             if attempt < sc.CAPTURE_MAX_ATTEMPTS:
@@ -105,7 +111,7 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         self.assertFalse(any("nothing is draining" in r for r in sc.liveness("codex")["reasons"]))
         self.assertFalse(any("last capture attempt failed" in r for r in sc.liveness("codex")["reasons"]))
         self.assertEqual(outbox.retry_dead()["native_moved"], 1)
-        requeued = json.loads(first.read_text())
+        requeued = sc._retry_state(first)
         self.assertEqual(requeued["attempts"], 0)
         self.assertNotIn("disposition", requeued)
         self.assertIsNone(sc._claim(second))  # Requeue alone does not release the sibling.
@@ -125,9 +131,10 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         self.capture.return_value = 1
         for attempt in range(sc.CAPTURE_MAX_ATTEMPTS):
             sc.drain()
-            kept = json.loads(first.read_text())
-            self.assertEqual(kept["extracted_payload"], original_payload)
-            self.assertEqual(kept["transcript"], evidence["transcript"])
+            job_now = json.loads(first.read_text())
+            kept = sc._retry_state(first)
+            self.assertEqual(job_now["extracted_payload"], original_payload)
+            self.assertEqual(job_now["transcript"], evidence["transcript"])
             if "next_attempt_at" in kept:
                 self.now = sc._parse_ts(kept["next_attempt_at"])
         self.extract.assert_not_called()
@@ -146,7 +153,7 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         first, _ = self.enqueue(extracted_payload={"summary": "cached"})
         self.capture.side_effect = RuntimeError("delivery rejected")
         self.assertEqual(sc.drain()["failed"], 1)
-        kept = json.loads(first.read_text())
+        kept = sc._retry_state(first)
         self.assertEqual(kept["attempts"], 1)
         self.assertIn("capture: RuntimeError", kept["last_error"])
         sc.drain()
@@ -192,7 +199,7 @@ class PersistentCaptureRetryTest(unittest.TestCase):
 
     def test_failed_retry_checkpoint_keeps_exclusive_claim_instead_of_releasing(self):
         first, _ = self.enqueue()
-        with mock.patch.object(sc, "_save_claimed_job", side_effect=OSError("disk full")):
+        with mock.patch.object(sc, "_write_retry_state", side_effect=OSError("disk full")):
             sc.drain()
         self.assertFalse(first.exists())
         self.assertEqual(len(list(sc.queue_dir().glob("*.claimed.*"))), 1)
@@ -203,7 +210,7 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         first, _ = self.enqueue("1/1")
         for _ in range(sc.CAPTURE_MAX_ATTEMPTS):
             sc.drain()
-            kept = json.loads(first.read_text())
+            kept = sc._retry_state(first)
             if "next_attempt_at" in kept:
                 self.now = sc._parse_ts(kept["next_attempt_at"])
         self.assertEqual(kept["disposition"], "held")
@@ -214,7 +221,7 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         sc.drain()
         sc.drain()
         self.assertEqual(self.extract.call_count, calls + 1)
-        self.assertEqual(json.loads(first.read_text())["disposition"], "held")
+        self.assertEqual(sc._retry_state(first)["disposition"], "held")
         self.extract.side_effect = lambda *a, **kw: {"summary": "recovered", "topics": []}
         self.now += sc.CAPTURE_HELD_COOLDOWN_S
         self.assertEqual(sc.drain()["captured"], 1)
