@@ -1424,6 +1424,10 @@ _ENDPOINT_CHANGES_DIR = "fact-endpoint-changes"
 # an environment override, so readers never ask the Keychain
 # (``_reader_destination``).
 _DESTINATION_FILE = "fact-endpoint"
+# The endpoint generation, kept apart from the record and only ever raised
+# (``_endpoint_generation``): an endpoint save raises it before writing or
+# removing the record, so a copy that read it earlier records nothing.
+_GENERATION_FILE = "fact-endpoint-generation"
 # What a reader compares when no endpoint fingerprint is recorded; no stamp
 # names it, so no fact row shows.
 _UNRESOLVED = "unresolved"
@@ -1490,42 +1494,88 @@ def _endpoint_source(destination: str) -> str:
     return "file" if dsn and _destination_of(dsn) == destination else "keychain"
 
 
-def _record_destination(replica: Path, destination: str, source: str, *, expect: int | None = None) -> bool:
-    """Record the endpoint's fingerprint and source beside the replica (an
-    atomic file, written under an exclusive lock on its folder). An endpoint
-    save (``expect`` None) bumps the record's revision. A copy passes the
-    revision it read before resolving the endpoint, and writes nothing when
-    a save landed since (False), so a delayed copy never restores an older
-    endpoint over a newer one."""
+def _endpoint_generation(replica: Path) -> int:
+    """The endpoint generation: the larger of the record's revision and
+    ``_GENERATION_FILE`` (0 when neither exists). Removing the record never
+    lowers it. ``OSError`` when the counter cannot be read."""
+    held = _endpoint_record(replica)
+    try:
+        text = (replica.parent / _GENERATION_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        counter = 0
+    else:
+        try:
+            counter = int(text.strip())
+        except ValueError as exc:
+            raise OSError(f"the endpoint generation is unreadable ({exc})") from exc
+    return max(counter, held["revision"] if held else 0)
+
+
+@contextmanager
+def _destination_lock(replica: Path):
+    """The exclusive lock on the replica's folder every endpoint record and
+    generation change is made under."""
     import fcntl
 
-    if not replica.parent.is_dir():
-        return False
-    target = replica.parent / _DESTINATION_FILE
     lock = os.open(str(replica.parent), os.O_RDONLY)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        held = _endpoint_record(replica)
-        revision = held["revision"] if held else 0
-        if expect is not None and revision != expect:
-            return False
-        record = {"destination": destination, "source": source,
-                  "revision": revision if expect is not None else revision + 1}
-        if record == held:
-            return True
-        fd, name = tempfile.mkstemp(prefix="." + _DESTINATION_FILE + ".", dir=replica.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, sort_keys=True) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(name, target)
-        except BaseException:
-            Path(name).unlink(missing_ok=True)
-            raise
-        return True
+        yield
     finally:
         os.close(lock)
+
+
+def _write_endpoint_file(replica: Path, name: str, text: str) -> None:
+    """Replace ``name`` beside the replica atomically (fsynced)."""
+    fd, temp = tempfile.mkstemp(prefix="." + name + ".", dir=replica.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp, replica.parent / name)
+    except BaseException:
+        Path(temp).unlink(missing_ok=True)
+        raise
+
+
+def _record_destination(replica: Path, destination: str, source: str, *, expect: int | None = None) -> bool:
+    """Record the endpoint's fingerprint and source beside the replica (an
+    atomic file, written under ``_destination_lock``). An endpoint save
+    (``expect`` None) raises the generation first and records it as the
+    revision. A copy passes the generation it read before resolving the
+    endpoint, and writes nothing when a save or an invalidation landed since
+    (False), so a delayed copy never restores an older endpoint, even after
+    the record was removed."""
+    if not replica.parent.is_dir():
+        return False
+    with _destination_lock(replica):
+        generation = _endpoint_generation(replica)
+        if expect is not None and generation != expect:
+            return False
+        if expect is None:
+            generation += 1
+            _write_endpoint_file(replica, _GENERATION_FILE, f"{generation}\n")
+        record = {"destination": destination, "source": source, "revision": generation}
+        if record != _endpoint_record(replica):
+            _write_endpoint_file(replica, _DESTINATION_FILE, json.dumps(record, sort_keys=True) + "\n")
+        return True
+
+
+def _invalidate_destination(replica: Path) -> bool:
+    """An endpoint save that could not record its endpoint: under
+    ``_destination_lock``, raise the generation (so no copy that read the
+    old one records) and remove the record (readers show no fact row).
+    True only when both landed; ``OSError`` when the record stays."""
+    with _destination_lock(replica):
+        try:
+            _write_endpoint_file(replica, _GENERATION_FILE, f"{_endpoint_generation(replica) + 1}\n")
+            raised = True
+        except OSError as exc:
+            _record_write_error(_FACT_TABLES, f"endpoint generation: {type(exc).__name__}: {exc}")
+            raised = False
+        (replica.parent / _DESTINATION_FILE).unlink(missing_ok=True)
+    return raised
 
 
 def _saved_dsn(*, ask_keychain: bool) -> str | None:
@@ -1731,9 +1781,11 @@ def endpoint_changed() -> None:
     """A configuration write changed the hub endpoint (N3): its fingerprint
     is recorded for readers (``_reader_destination``) with a new revision,
     then this Mac's stamp is cleared and the revision bumped at once, before
-    any copy. A record that cannot be written is removed (readers then show
-    no fact row); when neither that nor the clearing lands, the save fails
-    closed: ``EndpointChangeUnrecorded``."""
+    any copy. A record that cannot be written is removed with the
+    generation raised (``_invalidate_destination``: readers then show no
+    fact row, and no delayed copy records the old endpoint); when neither
+    that nor the clearing lands, the save fails closed:
+    ``EndpointChangeUnrecorded``."""
     path = snapshot_path()
     dsn = _saved_dsn(ask_keychain=True)
     destination = _destination_of(dsn) if dsn else "unconfigured"
@@ -1742,9 +1794,9 @@ def endpoint_changed() -> None:
     except OSError as exc:
         _record_write_error(_FACT_TABLES, f"endpoint fingerprint: {type(exc).__name__}: {exc}")
         try:
-            (path.parent / _DESTINATION_FILE).unlink(missing_ok=True)
-            recorded = True
-        except OSError:
+            recorded = _invalidate_destination(path)
+        except OSError as exc:
+            _record_write_error(_FACT_TABLES, f"endpoint fingerprint removal: {type(exc).__name__}: {exc}")
             recorded = False
     if path.is_file() and not _hide_until_copy(path, "endpoint change") and not recorded:
         raise EndpointChangeUnrecorded("the endpoint change could not be recorded beside the replica; "
@@ -2251,14 +2303,17 @@ def _local_copy_state(path: Path) -> dict[str, Any]:
     state["held_vectors"] = held
     state["endpoint_changes"] = _endpoint_changes(path)
     # Read before resolving: a save landing after it makes this record stale.
-    record = _endpoint_record(path)
+    try:
+        generation: int | None = _endpoint_generation(path)
+    except OSError as exc:
+        _record_write_error(_FACT_TABLES, f"endpoint generation: {type(exc).__name__}: {exc}")
+        generation = None
     destination = _hub_destination()
-    if _env_dsn() is None:
+    if _env_dsn() is None and generation is not None:
         # The saved endpoint itself: recorded for readers, which never ask
         # the Keychain (a Mac configured before any save records it here).
         try:
-            _record_destination(path, destination, _endpoint_source(destination),
-                                expect=record["revision"] if record else 0)
+            _record_destination(path, destination, _endpoint_source(destination), expect=generation)
         except OSError as exc:  # readers then show no fact row; the copy goes on
             _record_write_error(_FACT_TABLES, f"endpoint fingerprint: {type(exc).__name__}: {exc}")
     return {**state, "fingerprint": _refusal_digest(gate, path), "tags": sorted(gate.tags),
@@ -2669,19 +2724,19 @@ def _apply_ledger_pull(con: sqlite3.Connection, payload: Mapping[str, Any], *,
 
 def _one_exchange(cur, reads: Sequence[tuple[str, str, Sequence[Any]]], *,
                   prelude: str | None = None, on_prelude: Callable[[str], Any] | None = None) -> dict[str, list]:
-    """``reads`` in one simple query, so one round trip: the session bounds
-    (``provenance.SESSION_SETTINGS``, D3) and ``prelude`` (a single-value
-    read, kept on the session as ``khipu_prelude`` for ``hub_call``),
-    committed on their own so a later ROLLBACK cannot undo the bounds, then
-    a REPEATABLE READ transaction and each read, bound client side. Returns
-    each read's rows by name; the transaction stays open on ``conn``
-    (autocommit, so the caller's later statements run inside it and its
-    ``rollback`` ends it). The session is marked bounded, so a copy handed
-    it (``copy_facts``) does not set the bounds again. ``on_prelude`` gets
-    the prelude's value as soon as its result is in, before any later
-    statement's error is raised (D2), so a failed read still hands it over
-    without another exchange."""
-    from psycopg import ClientCursor, Connection, pq
+    """``reads`` in two simple queries, so two round trips. First the
+    session bounds (``provenance.SESSION_SETTINGS``, D3) and ``prelude`` (a
+    single-value read, kept on the session as ``khipu_prelude`` for
+    ``hub_call``), outside a transaction so a later ROLLBACK cannot undo the
+    bounds; ``on_prelude`` gets the prelude's value once that exchange is
+    complete, before the reads are sent (D2), so no later SQL or transport
+    failure can discard it. Then a REPEATABLE READ transaction and each
+    read, bound client side. Returns each read's rows by name; the
+    transaction stays open on ``conn`` (autocommit, so the caller's later
+    statements run inside it and its ``rollback`` ends it). The session is
+    marked bounded, so a copy handed it (``copy_facts``) does not set the
+    bounds again."""
+    from psycopg import ClientCursor, Connection
 
     from khipu.provenance import SESSION_SETTINGS
 
@@ -2695,22 +2750,17 @@ def _one_exchange(cur, reads: Sequence[tuple[str, str, Sequence[Any]]], *,
         return out
     conn.rollback()  # a schema probe may have opened a transaction; nothing is read yet
     conn.autocommit = True
-    # The statements before an explicit BEGIN form an implicit transaction
-    # that the BEGIN would absorb; the COMMIT ends it, settings included.
-    head = [*SESSION_SETTINGS, *([prelude] if prelude else []), "COMMIT", "BEGIN ISOLATION LEVEL REPEATABLE READ"]
-
-    class Batch(ClientCursor):
-        def _check_results(self, results):  # psycopg's check of every statement's result, before any is raised
-            if prelude and len(results) > len(SESSION_SETTINGS):
-                got = results[len(SESSION_SETTINGS)]
-                if got.status == pq.ExecStatus.TUPLES_OK and got.ntuples:
-                    value = bytes(got.get_value(0, 0) or b"").decode(conn.info.encoding)
-                    conn.khipu_prelude = {prelude: value}
-                    if on_prelude is not None:
-                        on_prelude(value)
-            super()._check_results(results)
-
-    with Batch(conn) as batch:
+    with ClientCursor(conn) as first:
+        first.execute("; ".join([*SESSION_SETTINGS, *([prelude] if prelude else [])]))
+        if prelude:
+            while first.nextset():
+                pass
+            value = str(first.fetchone()[0])
+            conn.khipu_prelude = {prelude: value}
+            if on_prelude is not None:
+                on_prelude(value)
+    head = ["BEGIN ISOLATION LEVEL REPEATABLE READ"]
+    with ClientCursor(conn) as batch:
         batch.execute("; ".join([*head, *(batch.mogrify(sql, params) for _name, sql, params in reads)]))
         results: list[list] = []
         while True:
@@ -2777,9 +2827,9 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
     acols = [c for c in ("alias", "project", "created_at", "source", "evidence") if c in alias_cols]
     if {"alias", "project"} <= alias_cols:
         reads.append(("aliases", f"SELECT {', '.join(acols)} FROM project_aliases ORDER BY alias", ()))
-    # D2: the incarnation is learned as its result arrives, before a later
-    # read's error (a lock held past its timeout) is raised, so a failed
-    # pull still hides another incarnation's facts with no second exchange.
+    # D2: the incarnation is learned in its own exchange before the reads
+    # are sent, so a failed pull (a lock held past its timeout, a dropped
+    # connection) still hides another incarnation's facts.
     got = _one_exchange(cur, reads, prelude=_INCARNATION_READ, on_prelude=_learn_incarnation)
     hub_now = _utc(got["now"][0][0]) or datetime.now(timezone.utc)
     cap = hub_now - timedelta(seconds=FRESHNESS_OVERLAP_S)
