@@ -71,6 +71,7 @@ CODE_WAIT_S = 20.0
 LINE_MAX = 1024
 READ_MAX = 64 * 1024
 KILL_GRACE_S = 2.0
+PROCESS_OBSERVE_S = 0.2
 
 # Where a Grok Build or Muse code line may send the owner. Not yet confirmed
 # against a real run (the guardrail run confirms both the hosts and the code's
@@ -438,7 +439,25 @@ def _matches(rec: dict, info: dict | None) -> bool:
 
 
 def _alive(rec: dict, ps) -> bool:
-    return _matches(rec, ps(rec.get("pid")))
+    """Retry an unusable observation briefly; observed death or reuse wins."""
+    end = None
+    while True:
+        info = ps(rec.get("pid"))
+        if info:
+            if str(info.get("stat") or "").startswith("Z"):
+                return False
+            # Even a partial observation can establish a different identity.
+            if any(isinstance(info.get(key), str) and info[key] and info[key] != rec.get(key)
+                   for key in ("lstart", "command")):
+                return False
+            if all(isinstance(info.get(key), str) and info[key] for key in ("stat", "lstart", "command")):
+                return _matches(rec, info)
+        if end is None:
+            end = time.monotonic() + PROCESS_OBSERVE_S
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
 
 
 def _getpgid(pid: int) -> int:
@@ -470,11 +489,33 @@ def _leader(rec: dict, pid: int, pgid: int, ps, getpgid) -> str | None:
     """None when ``pid`` is the recorded login and still leads group
     ``pgid``; otherwise ``gone``, ``stale`` or ``unverified`` (the check
     itself failed)."""
-    info = ps(pid)
-    if info is None or str(info.get("stat") or "").startswith("Z"):
-        return "gone"
-    if not _matches(rec, info):
-        return "stale"
+    end = None
+    while True:
+        info = ps(pid)
+        if info:
+            if str(info.get("stat") or "").startswith("Z"):
+                return "gone"
+            if any(isinstance(info.get(key), str) and info[key] and info[key] != rec.get(key)
+                   for key in ("lstart", "command")):
+                return "stale"
+            if all(isinstance(info.get(key), str) and info[key] for key in ("stat", "lstart", "command")):
+                if not _matches(rec, info):
+                    return "stale"
+                break
+        if end is None:
+            end = time.monotonic() + PROCESS_OBSERVE_S
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            # A missing ps record is inconclusive. The kernel can still prove
+            # this pid absent; a live or unreadable pid keeps its ownership.
+            try:
+                getpgid(pid)
+            except ProcessLookupError:
+                return "gone"
+            except OSError:
+                pass
+            return "unverified"
+        time.sleep(min(0.05, remaining))
     try:
         group = getpgid(pid)
     except ProcessLookupError:
@@ -549,10 +590,10 @@ def kill_if_ours(rec: dict, *, ps=None, killpg=None, getpgid=None, members=None)
 
 def _stop_and_end(rec: dict, *, ps=None, killpg=None) -> tuple[str, list[int]]:
     """``stop_group``, then end the attempt only once nothing of its group
-    is left. While a member lives the record stays: the attempt stays owned
-    (a new start is busy) and Stop again can still reach it."""
+    is left. While a member lives or the check is inconclusive the record
+    stays: a new start is busy and Stop again can still reach it."""
     result, left = stop_group(rec, ps=ps, killpg=killpg)
-    if not left:
+    if not left and result != "unverified":
         _end_attempt(rec)
     return result, left
 
@@ -572,9 +613,23 @@ def _owner_gone(rec: dict, ps) -> bool:
     owner = rec.get("owner")
     if not isinstance(owner, dict) or not isinstance(owner.get("pid"), int) or owner["pid"] <= 1:
         return False  # an owner never recorded: the deadline alone decides
-    info = ps(owner["pid"])
-    return not (info and not str(info.get("stat") or "").startswith("Z")
-                and info.get("lstart") == owner.get("lstart") and info.get("command") == owner.get("command"))
+    end = None
+    while True:
+        info = ps(owner["pid"])
+        if info:
+            if str(info.get("stat") or "").startswith("Z"):
+                return True
+            if any(isinstance(info.get(key), str) and info[key] and info[key] != owner.get(key)
+                   for key in ("lstart", "command")):
+                return True
+            if all(isinstance(info.get(key), str) and info[key] for key in ("stat", "lstart", "command")):
+                return False
+        if end is None:
+            end = time.monotonic() + PROCESS_OBSERVE_S
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False  # no proof that the app stopped owning this login
+        time.sleep(min(0.05, remaining))
 
 
 def _read_code(stream, cli: str, deadline: float) -> tuple[str, str] | None:
@@ -663,7 +718,8 @@ def _end_attempt(rec: dict) -> None:
 
 def reap(*, ps=None, killpg=None) -> dict:
     """End a leftover attempt: kill its group only if its process is still
-    the recorded one, and delete the record either way."""
+    the recorded one, retaining the record while a group survives or its
+    identity remains unverified."""
     fd = _lock()
     if fd is None:
         return {"ok": False, "error": E_BUSY}
@@ -736,8 +792,8 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
             current = now_ts < _deadline(old)
             if current and not again and _alive(old, ps) and not _owner_gone(old, ps):
                 return {"ok": False, "error": E_BUSY, "attempt": _public(old)}
-            _, left = _stop_and_end(old, ps=ps, killpg=killpg)
-            if left:
+            result, left = _stop_and_end(old, ps=ps, killpg=killpg)
+            if left or result == "unverified":
                 return {"ok": False, "error": E_BUSY, "attempt": _public(old), "left": left}
         binary = usage._command(cli)
         if not binary:
@@ -850,7 +906,7 @@ def status(attempt_id: str, *, ps=None, killpg=None, check=None, now=None) -> di
             if now_ts < _deadline(rec):
                 return {"ok": True, "attempt": _public(rec), "state": WAITING}
             result, left = _stop_and_end(rec, ps=ps, killpg=killpg)
-            if left:
+            if left or result == "unverified":
                 return {"ok": True, "attempt": _public(rec), "state": NOT_STOPPED, "stopped": result,
                         "left": left}
             # A finished attempt is an answer, not a refusal: ``ok: false`` is
@@ -872,6 +928,8 @@ def status(attempt_id: str, *, ps=None, killpg=None, check=None, now=None) -> di
             _mark_signed_in(rec["cli"], path)
         # The login ended; anything still in its group keeps the record.
         result, left = _stop_and_end(rec, ps=ps, killpg=killpg)
+        if result == "unverified":
+            return {"ok": True, "attempt": _public(rec), "state": NOT_STOPPED, "stopped": result, "left": left}
         return {"ok": True, "attempt": _public(rec), "state": state, **({"left": left} if left else {})}
     finally:
         usage._release(fd)
@@ -900,7 +958,7 @@ def cancel(attempt_id: str | None, *, remove_folder: bool = False, cli: str | No
             return {"ok": True, "state": CANCELLED, "stopped": None,
                     "folder_removed": False if in_use else remove_unused_folder(cli, folder)}
         result, left = _stop_and_end(rec, ps=ps, killpg=killpg)
-        if left:
+        if left or result == "unverified":
             # Not stopped: the record and the folder stay, and the app keeps
             # the dialog open with Stop again.
             return {"ok": False, "error": E_NOT_STOPPED, "attempt": _public(rec), "state": NOT_STOPPED,
