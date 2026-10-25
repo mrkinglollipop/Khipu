@@ -1941,6 +1941,11 @@ def queued_jobs() -> list[Path]:
 
 
 CLAIM_STALE_S = 900
+# Five failed extraction/delivery attempts, spaced 5/10/20/40 minutes apart,
+# then held for the owner's existing `outbox retry-dead` recovery action.
+CAPTURE_MAX_ATTEMPTS = 5
+CAPTURE_RETRY_BASE_S = 5 * 60
+CAPTURE_RETRY_CAP_S = 60 * 60
 
 
 def _part_index(job: dict) -> int | None:
@@ -1993,7 +1998,7 @@ def _claim_lock():
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _claim(job: Path) -> Path | None:
+def _claim(job: Path, *, retry_held: bool = False) -> Path | None:
     """Take exclusive ownership of a job by renaming it. rename() is atomic, so
     of two concurrent drains exactly one wins and the loser sees FileNotFound.
 
@@ -2012,8 +2017,14 @@ def _claim(job: Path) -> Path | None:
             return None
         except ValueError:
             contents = {}
-        if isinstance(contents, dict) and _has_earlier_sibling(contents):
-            return None
+        if isinstance(contents, dict):
+            if retry_held:
+                if contents.get("disposition") != "held":
+                    return None
+            elif (contents.get("disposition") == "held" or
+                  (_parse_ts(contents.get("next_attempt_at")) or 0) > time.time() or
+                  _has_earlier_sibling(contents)):
+                return None
         claimed = job.with_suffix(f".claimed.{os.getpid()}")
         try:
             start = _claim_process_start(os.getpid())
@@ -2061,21 +2072,23 @@ def _write_claim_owner(claimed: Path, owner: dict) -> None:
         tmp.unlink(missing_ok=True)
 
 
-def _release_unlocked(claimed: Path) -> None:
+def _release_unlocked(claimed: Path) -> bool:
     try:
         os.rename(claimed, claimed.with_suffix("").with_suffix(".json"))
     except OSError:
-        return
+        return False
     _claim_owner_path(claimed).unlink(missing_ok=True)
+    return True
 
 
-def _release(claimed: Path) -> None:
+def _release(claimed: Path) -> bool:
     """Put a job back for a later retry (extraction/capture failed)."""
     from khipu import memory_lock
 
     with memory_lock.shared(), _claim_lock() as acquired:
         if acquired:
-            _release_unlocked(claimed)
+            return _release_unlocked(claimed)
+    return False
 
 
 def _discard_claim(claimed: Path) -> None:
@@ -2109,13 +2122,89 @@ def _save_claimed_job(claimed: Path, job: dict) -> None:
             _discard_claim(claimed)
             raise JobForgotten(f"claim removed: {claimed.name}")
         try:
-            tmp.write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+            with tmp.open("w", encoding="utf-8") as stream:
+                json.dump(job, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(tmp, claimed)
+            fd = os.open(claimed.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         finally:
             try:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+def _capture_failure(claimed: Path, job: dict, error: str, out: dict) -> None:
+    """Checkpoint the retry before releasing; preserve every evidence field."""
+    from khipu import memory_lock
+
+    attempts = job.get("attempts", 0)
+    attempts = attempts if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0 else 0
+    attempts += 1
+    now = time.time()
+    job.update(attempts=attempts, last_error=error,
+               last_attempt_at=datetime.fromtimestamp(now, timezone.utc).isoformat())
+    if attempts >= CAPTURE_MAX_ATTEMPTS:
+        job["disposition"] = "held"
+        job.pop("next_attempt_at", None)
+    else:
+        delay = min(CAPTURE_RETRY_CAP_S, CAPTURE_RETRY_BASE_S * 2 ** (attempts - 1))
+        job["next_attempt_at"] = datetime.fromtimestamp(now + delay, timezone.utc).isoformat()
+    try:
+        with memory_lock.shared():
+            _save_claimed_job(claimed, job)
+            _release(claimed)
+        if job.get("disposition") == "held":
+            out["held"] = out.get("held", 0) + 1
+    except JobForgotten:
+        out["forgotten"] = out.get("forgotten", 0) + 1
+    except OSError as exc:
+        # Never put unchanged retry metadata straight back into paid work.
+        # Leave the exclusive claim intact for recovery after the writer exits.
+        _log(f"drain: retry checkpoint refused for {claimed.name}: {type(exc).__name__}")
+
+
+def held_jobs() -> list[Path]:
+    """Native dead letters stay in their queue, keeping later parts blocked."""
+    held = []
+    for path in queued_jobs():
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(job, dict) and job.get("disposition") == "held":
+                held.append(path)
+        except (OSError, ValueError):
+            continue
+    return held
+
+
+def retry_held() -> int:
+    """Owner recovery used by `outbox retry-dead`; never replay a forgotten job."""
+    from khipu import memory_lock
+
+    moved = 0
+    for path in held_jobs():
+        with memory_lock.shared():
+            claimed = _claim(path, retry_held=True)
+            if claimed is None:
+                continue
+            try:
+                job = json.loads(claimed.read_text(encoding="utf-8"))
+                job.pop("disposition", None)
+                job.pop("next_attempt_at", None)
+                job["attempts"] = 0
+                _save_claimed_job(claimed, job)
+                if _release(claimed):
+                    moved += 1
+            except JobForgotten:
+                continue
+            except (OSError, ValueError) as exc:
+                _log(f"retry-dead: native retry refused for {path.name}: {type(exc).__name__}")
+    return moved
 
 
 def _archive_empty(claimed: Path, job: dict) -> None:
@@ -3046,7 +3135,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 break
             except Exception as e:  # noqa: BLE001 — model/transport: keep the job, retry later
                 out["failed"] += 1
-                _release(jp)
+                _capture_failure(jp, job, f"extract: {type(e).__name__}: {e}", out)
                 _record_drain(harness, captured=False, error=f"extract: {type(e).__name__}: {e}")
                 _log(f"drain: extraction failed for {original.name}, kept: {e}")
                 continue
@@ -3071,7 +3160,6 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                     continue
                 except OSError as e:
                     out["failed"] += 1
-                    _release(jp)
                     _record_drain(harness, captured=False, error=f"empty checkpoint: {e}")
                     continue
                 _record_drain(harness, captured=False, empty=True)
@@ -3086,7 +3174,6 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 continue
             except OSError as e:
                 out["failed"] += 1
-                _release(jp)
                 _record_drain(harness, captured=False, error=f"extract checkpoint: {e}")
                 continue
         payload["session_id"] = f"{harness}:{job.get('session_id')}"
@@ -3153,10 +3240,22 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                     routing_directions.capture_scan(str(job["session_id"]), texts)
         except Exception as e:  # noqa: BLE001 — a direction scan never blocks capture
             _log(f"drain: routing direction scan skipped for {original.name}: {type(e).__name__}: {e}")
-        rc = capture(payload, mode=mode)
+        try:
+            rc = capture(payload, mode=mode)
+        except BudgetExhausted:
+            _release(jp)
+            out["synth_budget_exhausted"] = True
+            break
+        except Exception as e:  # noqa: BLE001 — retain the checkpointed payload
+            out["failed"] += 1
+            error = f"capture: {type(e).__name__}: {e}"
+            _capture_failure(jp, job, error, out)
+            _record_drain(harness, captured=False, error=error)
+            _log(f"drain: capture failed for {original.name}, kept: {type(e).__name__}")
+            continue
         if rc != 0:
             out["failed"] += 1
-            _release(jp)
+            _capture_failure(jp, job, f"capture rc={rc}", out)
             _record_drain(harness, captured=False, error=f"capture rc={rc}")
             _log(f"drain: capture rc={rc} for {original.name}; kept")
             continue
@@ -3202,6 +3301,8 @@ def _queue_by_harness() -> dict[str, dict]:
         ]
     except OSError:
         paths = []
+    records = []
+    held_windows: dict[str, int] = {}
     for p, claimed in paths:
         try:
             job = json.loads(p.read_text(encoding="utf-8"))
@@ -3209,6 +3310,11 @@ def _queue_by_harness() -> dict[str, dict]:
             job = {}
         if not isinstance(job, dict):
             job = {}
+        records.append((p, claimed, job))
+        if job.get("disposition") == "held" and job.get("window_id"):
+            window = str(job["window_id"])
+            held_windows[window] = min(held_windows.get(window, 1 << 30), _part_index(job) or 0)
+    for p, claimed, job in records:
         parts = p.name.split("-")
         h = str(job.get("harness") or (parts[1] if len(parts) > 2 else "aegis"))
         try:
@@ -3220,10 +3326,18 @@ def _queue_by_harness() -> dict[str, dict]:
         except OSError:
             # Gone between the listing and here: the claimant finished it.
             age = claim_age = 0
-        d = out.setdefault(h, {"depth": 0, "claimed_depth": 0, "dead_claims": 0,
+        d = out.setdefault(h, {"depth": 0, "held_depth": 0, "claimed_depth": 0, "dead_claims": 0,
                                "dead_claims_stale": 0,
+                               "waiting_depth": 0, "waiting_age_s": 0, "held_errors": [],
                                "oldest_age_s": 0, "oldest_job": None})
         d["depth"] += 1
+        if job.get("disposition") == "held":
+            d["held_depth"] += 1
+            d["held_errors"].append(job.get("last_error"))
+        elif not (str(job.get("window_id") or "") in held_windows and
+                  (_part_index(job) or 0) > held_windows[str(job["window_id"])]):
+            d["waiting_depth"] += 1
+            d["waiting_age_s"] = max(d["waiting_age_s"], age)
         if claimed:
             d["claimed_depth"] += 1
             if _claimant_gone(p):
@@ -3338,10 +3452,13 @@ def liveness(harness: str) -> dict:
     if beat.get("last_error") and err_at >= (_parse_ts(beat.get("last_queued_at")) or 0):
         reasons.append(f"hook error on last run: {str(beat['last_error'])[:120]}")
     if beat.get("last_drain_error") and \
-            (_parse_ts(beat.get("last_drain_error_at")) or 0) > (_parse_ts(beat.get("last_captured_at")) or 0):
+            (_parse_ts(beat.get("last_drain_error_at")) or 0) > (_parse_ts(beat.get("last_captured_at")) or 0) and \
+            beat["last_drain_error"] not in q.get("held_errors", []):
         reasons.append(f"last capture attempt failed: {str(beat['last_drain_error'])[:120]}")
-    if q["depth"] and (q.get("oldest_age_s") or 0) > QUEUE_STALE_S:
-        reasons.append(f"{q['depth']} job(s) waiting {q['oldest_age_s'] // 60} min — nothing is draining them")
+    # Held work (and its waiting siblings) is surfaced once by outbox.status's
+    # existing doctor dead-letter gate, with the owner's retry-dead action.
+    if q.get("waiting_depth") and (q.get("waiting_age_s") or 0) > QUEUE_STALE_S:
+        reasons.append(f"{q['waiting_depth']} job(s) waiting {q['waiting_age_s'] // 60} min — nothing is draining them")
     if q.get("dead_claims_stale"):
         reasons.append(
             f"{q['dead_claims_stale']} claimed job(s) abandoned for over "

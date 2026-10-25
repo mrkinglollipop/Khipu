@@ -37,6 +37,187 @@ def _write(path: Path, rows: list) -> Path:
     return path
 
 
+class PersistentCaptureRetryTest(unittest.TestCase):
+    """Real queue/checkpoints and fake providers/delivery only."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="capture-retry-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.now = time.time()
+        self.extract = mock.Mock(side_effect=RuntimeError("invalid capture schema"))
+        self.capture = mock.Mock(return_value=0)
+        for patch in (
+            mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": str(self.root / "capture"),
+                                        "KHIPU_DATA_DIR": str(self.root / "data"),
+                                        "KHIPU_OUTBOX": str(self.root / "outbox")}),
+            mock.patch.object(sc, "_claim_process_start", return_value="kernel:fake"),
+            mock.patch.object(sc.time, "time", side_effect=lambda: self.now),
+            mock.patch.object(sc, "land_transcript_images", return_value={}),
+            mock.patch("khipu.config.capture_mode", return_value="hub"),
+            mock.patch("khipu.extract.extract_memory", self.extract),
+            mock.patch("khipu.capture.capture", self.capture),
+            mock.patch("khipu.hub_snapshot.sync_decision_changes", return_value={"ok": True}),
+            mock.patch("khipu.routing_directions.capture_scan"),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def enqueue(self, part="1/2", **extra):
+        job = {"harness": "codex", "session_id": "fake-session", "event": "sessionend",
+               "ts": "2026-10-23T19:59:22Z", "window_id": "fake-window", "part": part,
+               "offset_before": 0 if part == "1/2" else 100,
+               "offset_after": 100 if part == "1/2" else 200,
+               "transcript": 'USER: Remember this decision.\n\nASSISTANT: Created `/tmp/fake-evidence.md`.',
+               "capture_note": "original owner note", "checkout": {"root": "/fake/repo"},
+               **extra}
+        return sc.enqueue(job), job
+
+    def test_failure_is_persistent_backed_off_and_held_until_existing_owner_retry(self):
+        from khipu import outbox
+
+        first, evidence = self.enqueue()
+        second, _ = self.enqueue("2/2")
+        for attempt in range(1, sc.CAPTURE_MAX_ATTEMPTS + 1):
+            out = sc.drain()
+            self.assertEqual(out["failed"], 1)
+            self.assertEqual(self.extract.call_count, attempt)
+            kept = json.loads(first.read_text())
+            self.assertEqual(kept["attempts"], attempt)
+            for key, value in evidence.items():
+                self.assertEqual(kept[key], value)
+            self.assertTrue(second.exists())
+            self.capture.assert_not_called()
+            if attempt < sc.CAPTURE_MAX_ATTEMPTS:
+                expected = min(sc.CAPTURE_RETRY_CAP_S, sc.CAPTURE_RETRY_BASE_S * 2 ** (attempt - 1))
+                self.assertAlmostEqual(sc._parse_ts(kept["next_attempt_at"]) - self.now, expected, places=4)
+                sc.drain()  # A new invocation cannot immediately re-spend the call.
+                self.assertEqual(self.extract.call_count, attempt)
+                self.now += expected
+        self.assertEqual(kept["disposition"], "held")
+        self.now += 10 * 24 * 3600
+        sc.drain()
+        self.assertEqual(self.extract.call_count, sc.CAPTURE_MAX_ATTEMPTS)
+        status = outbox.status()
+        self.assertEqual(status["dead"], 1)
+        self.assertEqual(status["native_held"], [first.name])
+        self.assertEqual(json.dumps(status).count(first.name), 1)
+        self.assertFalse(any("nothing is draining" in r for r in sc.liveness("codex")["reasons"]))
+        self.assertFalse(any("last capture attempt failed" in r for r in sc.liveness("codex")["reasons"]))
+        self.assertEqual(outbox.retry_dead()["native_moved"], 1)
+        requeued = json.loads(first.read_text())
+        self.assertEqual(requeued["attempts"], 0)
+        self.assertNotIn("disposition", requeued)
+        self.assertIsNone(sc._claim(second))  # Requeue alone does not release the sibling.
+        self.extract.side_effect = lambda *a, **kw: {"summary": "recovered", "topics": []}
+        out = sc.drain()
+        self.assertEqual(out["captured"], 2)
+        self.assertEqual([c.args[0]["part"] for c in self.capture.call_args_list], ["1/2", "2/2"])
+        self.assertEqual(sc.queued_jobs(), [])
+        self.assertEqual(outbox.status()["dead"], 0)
+
+    def test_delivery_failures_preserve_cached_payload_and_never_reextract(self):
+        from khipu import outbox
+
+        original_payload = {"summary": "cached summary", "decisions": ["kept"], "topics": []}
+        first, evidence = self.enqueue(extracted_payload=original_payload)
+        self.enqueue("2/2")
+        self.capture.return_value = 1
+        for attempt in range(sc.CAPTURE_MAX_ATTEMPTS):
+            sc.drain()
+            kept = json.loads(first.read_text())
+            self.assertEqual(kept["extracted_payload"], original_payload)
+            self.assertEqual(kept["transcript"], evidence["transcript"])
+            if "next_attempt_at" in kept:
+                self.now = sc._parse_ts(kept["next_attempt_at"])
+        self.extract.assert_not_called()
+        self.assertEqual(kept["disposition"], "held")
+        outbox.retry_dead()
+        self.capture.return_value = 0
+        # Stop after the recovered cached part so the next uncached sibling
+        # does not need extraction in this test.
+        self.assertEqual(sc.drain(limit=1)["captured"], 1)
+        self.extract.assert_not_called()
+        self.assertEqual(self.capture.call_args.args[0]["summary"], "cached summary")
+        self.assertIn("note", self.capture.call_args.args[0]["verbatim"])
+        self.assertTrue(self.capture.call_args.args[0]["deliverables"])
+
+    def test_delivery_exception_is_also_bounded(self):
+        first, _ = self.enqueue(extracted_payload={"summary": "cached"})
+        self.capture.side_effect = RuntimeError("delivery rejected")
+        self.assertEqual(sc.drain()["failed"], 1)
+        kept = json.loads(first.read_text())
+        self.assertEqual(kept["attempts"], 1)
+        self.assertIn("capture: RuntimeError", kept["last_error"])
+        sc.drain()
+        self.assertEqual(self.capture.call_count, 1)
+
+    def test_budget_exhaustion_does_not_consume_an_item_attempt(self):
+        from khipu.embed import BudgetExhausted
+
+        first, original = self.enqueue()
+        self.enqueue("2/2")
+        self.extract.side_effect = BudgetExhausted("daily cap")
+        with mock.patch("khipu.embed.budget_status", return_value={"calls": 1, "cap": 1}):
+            result = sc.drain()
+        self.assertTrue(result["synth_budget_exhausted"])
+        self.assertEqual(json.loads(first.read_text()), original)
+        self.assertEqual(result["failed"], 0)
+
+    def test_forget_during_failed_model_call_cannot_resurrect_retry_metadata(self):
+        from khipu import tombstones
+
+        first, evidence = self.enqueue()
+
+        def forgotten(*args, **kwargs):
+            tombstones.publish_payloads([sc.job_source_identity(evidence)])
+            raise RuntimeError("failed after forget")
+
+        self.extract.side_effect = forgotten
+        result = sc.drain()
+        self.assertEqual(result["forgotten"], 1)
+        self.assertFalse(first.exists())
+        self.assertEqual(list(sc.queue_dir().glob("*.claimed.*")), [])
+
+    def test_existing_owner_retry_refuses_forgotten_held_source(self):
+        from khipu import outbox, tombstones
+
+        first, evidence = self.enqueue(disposition="held", attempts=sc.CAPTURE_MAX_ATTEMPTS,
+                                       extracted_payload={"summary": "cached"})
+        tombstones.publish_payloads([sc.job_source_identity(evidence)])
+        self.assertEqual(outbox.retry_dead()["native_moved"], 0)
+        self.assertFalse(first.exists())
+        self.assertEqual(sc.queued_jobs(), [])
+        self.extract.assert_not_called()
+
+    def test_failed_retry_checkpoint_keeps_exclusive_claim_instead_of_releasing(self):
+        first, _ = self.enqueue()
+        with mock.patch.object(sc, "_save_claimed_job", side_effect=OSError("disk full")):
+            sc.drain()
+        self.assertFalse(first.exists())
+        self.assertEqual(len(list(sc.queue_dir().glob("*.claimed.*"))), 1)
+        sc.drain()
+        self.assertEqual(self.extract.call_count, 1)
+
+    def test_owner_retry_does_not_report_a_failed_release_as_moved(self):
+        from khipu import outbox
+
+        self.enqueue(disposition="held", attempts=sc.CAPTURE_MAX_ATTEMPTS)
+        with mock.patch.object(sc, "_release", return_value=False):
+            self.assertEqual(outbox.retry_dead()["native_moved"], 0)
+
+    def test_unrelated_stale_work_is_reported_beside_a_held_window(self):
+        self.enqueue(disposition="held", attempts=sc.CAPTURE_MAX_ATTEMPTS)
+        self.enqueue("2/2")
+        unrelated, _ = self.enqueue("1/1", window_id="different-window")
+        old = self.now - sc.QUEUE_STALE_S - 10
+        os.utime(unrelated, (old, old))
+        sc._write_beat("codex", {"at": sc._mint_ts()})
+        reasons = sc.liveness("codex")["reasons"]
+        self.assertEqual(len([r for r in reasons if "nothing is draining" in r]), 1)
+        self.assertTrue(any(r.startswith("1 job(s)") for r in reasons))
+
+
 class SynthCliExclusionTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
