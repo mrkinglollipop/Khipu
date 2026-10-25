@@ -32,7 +32,7 @@ from contextlib import contextmanager
 import psycopg
 import pytest
 
-from khipu import db, hub_snapshot as hs, offline_reads
+from khipu import db, hub_snapshot as hs, offline_reads, provenance
 from tests.fact_seed import announce
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.replica_copy import mark_ready, replica  # noqa: F401
@@ -172,6 +172,61 @@ def _rss() -> int:
         return int(statm.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
 
 
+class PhaseTimer:
+    """Where one thread's calls spend their time (measurement only): only
+    calls on the timed thread count, and only a name's outermost call, so
+    ``copy_facts(session=...)``, which calls itself, is timed once. The
+    copy lock's acquisition and hold and a publication's admission and hold
+    are recorded apart from the calls around them."""
+
+    def __init__(self) -> None:
+        self.phases: dict[str, float] = {}
+        self.thread: int | None = None
+        self._depth = threading.local()
+
+    def start(self) -> None:
+        self.phases.clear()
+        self.thread = threading.get_ident()
+
+    def stop(self) -> None:
+        self.thread = None
+
+    def mine(self) -> bool:
+        return threading.get_ident() == self.thread
+
+    def add(self, name: str, secs: float) -> None:
+        if self.mine():
+            self.phases[name] = round(self.phases.get(name, 0.0) + secs, 4)
+
+    def wrap(self, name, fn):
+        def run(*args, **kw):
+            depth = getattr(self._depth, name, 0)
+            setattr(self._depth, name, depth + 1)
+            started = time.monotonic()
+            try:
+                return fn(*args, **kw)
+            finally:
+                setattr(self._depth, name, depth)
+                if depth == 0:
+                    self.add(name, time.monotonic() - started)
+        return run
+
+    def held(self, name, real):
+        """``real``, a context manager, timed as ``name_wait`` until it
+        yields and ``name_held`` until it exits."""
+        @contextmanager
+        def run(*args, **kw):
+            started = time.monotonic()
+            with real(*args, **kw) as got:
+                entered = time.monotonic()
+                self.add(f"{name}_wait", entered - started)
+                try:
+                    yield got
+                finally:
+                    self.add(f"{name}_held", time.monotonic() - entered)
+        return run
+
+
 def _file_hash() -> tuple[str, int]:
     # Streamed, so the measured RSS is the product's, not a file-sized buffer.
     path = hs.snapshot_path()
@@ -251,21 +306,16 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
         for t in threads:
             t.start()
         changed, unchanged, unchanged_copy, wrote, unchanged_phases = [], [], [], [], []
-        # Where an unchanged pull's time goes (measurement only; the bounds are unchanged).
-        phases: dict[str, float] = {}
-
-        def timed(name, fn):
-            def run(*args, **kw):
-                started = time.monotonic()
-                try:
-                    return fn(*args, **kw)
-                finally:
-                    phases[name] = round(phases.get(name, 0.0) + time.monotonic() - started, 4)
-            return run
-
+        # Where an unchanged pull's time goes, on the pull's own thread
+        # (measurement only; the bounds are unchanged).
+        timer = PhaseTimer()
         for name in ("try_hub_connect", "_one_exchange", "_pull_apply", "_pull_finish", "copy_facts",
                      "_local_copy_state"):
-            monkeypatch.setattr(hs, name, timed(name, getattr(hs, name)))
+            monkeypatch.setattr(hs, name, timer.wrap(name, getattr(hs, name)))
+        # The copy's hub work (it waits on its worker from the pull's thread).
+        monkeypatch.setattr(provenance, "hub_call", timer.wrap("hub_call", provenance.hub_call))
+        monkeypatch.setattr(hs, "_fact_copy_lock", timer.held("copy_lock", hs._fact_copy_lock))
+        monkeypatch.setattr(hs, "_admitted", timer.held("publication", hs._admitted))
         try:
             for i in range(ROUNDS):
                 _capture(loop=None, decision=f"bench capture decision {i}")
@@ -278,11 +328,12 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
                 quiet.clear()
                 time.sleep(0.25)
                 before = _file_hash()
-                phases.clear()
+                timer.start()
                 started = time.monotonic()
                 out = hs.pull_changes(include_ledger=False)
                 unchanged.append(time.monotonic() - started)
-                unchanged_phases.append(dict(phases))
+                timer.stop()
+                unchanged_phases.append(dict(timer.phases))
                 unchanged_copy.append(out["facts"]["seconds"])
                 assert out["ok"] and out["facts"].get("skipped"), out
                 # A pull that re-read an episode (a deferred live patch's

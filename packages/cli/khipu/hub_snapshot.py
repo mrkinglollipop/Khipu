@@ -39,7 +39,7 @@ import uuid
 from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from khipu.text_pages import (
     PAGE_BYTES_DEFAULT,
@@ -1419,9 +1419,10 @@ def _con_path(con: sqlite3.Connection) -> Path | None:
 # readers show no fact row, and only a copy that began after it removes it.
 _ENDPOINT_CHANGES_DIR = "fact-endpoint-changes"
 # The saved endpoint's fingerprint (``_destination_of``, never the
-# password), recorded by every endpoint save and by each copy that resolved
-# the endpoint without an environment override, so readers never ask the
-# Keychain (``_reader_destination``).
+# password), its source and a revision (``_record_destination``), recorded
+# by every endpoint save and by each copy that resolved the endpoint without
+# an environment override, so readers never ask the Keychain
+# (``_reader_destination``).
 _DESTINATION_FILE = "fact-endpoint"
 # What a reader compares when no endpoint fingerprint is recorded; no stamp
 # names it, so no fact row shows.
@@ -1442,7 +1443,10 @@ def _reader_destination(replica: Path | None = None) -> str:
     environment's endpoint; with the Keychain off, the DSN files, as
     ``db.resolve_dsn`` reads them (through it when ``khipu.db`` is loaded;
     the prompt hook never imports the driver); otherwise the recorded
-    fingerprint (``_DESTINATION_FILE``), and ``_UNRESOLVED`` without one."""
+    endpoint (``_DESTINATION_FILE``): for one the DSN files gave, those
+    files as they read now, so an edit needs no save to count; for one the
+    Keychain gave, its recorded fingerprint (only an endpoint save changes
+    it, and records it). ``_UNRESOLVED`` without a record."""
     if dsn := _env_dsn():
         return _destination_of(dsn)
     from khipu.keychain import keychain_available
@@ -1452,41 +1456,83 @@ def _reader_destination(replica: Path | None = None) -> str:
             return _hub_destination()
         dsn = _saved_dsn(ask_keychain=False)
         return _destination_of(dsn) if dsn else "unconfigured"
-    try:
-        recorded = ((replica or snapshot_path()).parent / _DESTINATION_FILE).read_text(encoding="utf-8").strip()
-    except OSError:
+    record = _endpoint_record(replica or snapshot_path())
+    if record is None:
         return _UNRESOLVED
-    return recorded or _UNRESOLVED
+    if record["source"] == "file":
+        dsn = _file_dsn()
+        return _destination_of(dsn) if dsn else "unconfigured"
+    return record["destination"]
 
 
-def _record_destination(replica: Path, destination: str) -> None:
-    """Record the saved endpoint's fingerprint beside the replica (an
-    atomic file), unless it is already the one recorded."""
-    target = replica.parent / _DESTINATION_FILE
+def _endpoint_record(replica: Path) -> dict[str, Any] | None:
+    """The recorded endpoint (``_record_destination``); None when missing
+    or unreadable, or written before it carried a source and revision."""
+    try:
+        value = json.loads((replica.parent / _DESTINATION_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("destination"), str) \
+            or value.get("source") not in ("file", "keychain") or type(value.get("revision")) is not int:
+        return None
+    return value
+
+
+def _endpoint_source(destination: str) -> str:
+    """Where the resolved endpoint ``destination`` came from, as a reader
+    can check it without the Keychain: ``file`` when the DSN files name it
+    (or the Keychain is off), else ``keychain``."""
+    from khipu.keychain import keychain_available
+
+    if not keychain_available():
+        return "file"
+    dsn = _file_dsn()
+    return "file" if dsn and _destination_of(dsn) == destination else "keychain"
+
+
+def _record_destination(replica: Path, destination: str, source: str, *, expect: int | None = None) -> bool:
+    """Record the endpoint's fingerprint and source beside the replica (an
+    atomic file, written under an exclusive lock on its folder). An endpoint
+    save (``expect`` None) bumps the record's revision. A copy passes the
+    revision it read before resolving the endpoint, and writes nothing when
+    a save landed since (False), so a delayed copy never restores an older
+    endpoint over a newer one."""
+    import fcntl
+
     if not replica.parent.is_dir():
-        return
+        return False
+    target = replica.parent / _DESTINATION_FILE
+    lock = os.open(str(replica.parent), os.O_RDONLY)
     try:
-        if target.read_text(encoding="utf-8").strip() == destination:
-            return
-    except OSError:
-        pass
-    fd, name = tempfile.mkstemp(prefix="." + _DESTINATION_FILE + ".", dir=replica.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(destination + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(name, target)
-    except BaseException:
-        Path(name).unlink(missing_ok=True)
-        raise
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        held = _endpoint_record(replica)
+        revision = held["revision"] if held else 0
+        if expect is not None and revision != expect:
+            return False
+        record = {"destination": destination, "source": source,
+                  "revision": revision if expect is not None else revision + 1}
+        if record == held:
+            return True
+        fd, name = tempfile.mkstemp(prefix="." + _DESTINATION_FILE + ".", dir=replica.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, sort_keys=True) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(name, target)
+        except BaseException:
+            Path(name).unlink(missing_ok=True)
+            raise
+        return True
+    finally:
+        os.close(lock)
 
 
 def _saved_dsn(*, ask_keychain: bool) -> str | None:
     """``db.resolve_dsn``'s answer without the environment, the driver or
     its legacy-secret migration: the Keychain (legacy service too) when
-    ``ask_keychain``, the DSN file, the legacy file; ``None`` when none is
-    set."""
+    ``ask_keychain``, then the DSN files (``_file_dsn``); ``None`` when none
+    is set."""
     if ask_keychain:
         try:
             from khipu import keychain
@@ -1496,6 +1542,12 @@ def _saved_dsn(*, ask_keychain: bool) -> str | None:
                     return val
         except Exception:  # noqa: BLE001 - db.resolve_dsn falls through to the file too
             pass
+    return _file_dsn()
+
+
+def _file_dsn() -> str | None:
+    """The DSN files' answer as ``db.resolve_dsn`` reads them: the DSN file
+    (``KHIPU_DSN_FILE`` or the configured one), then the legacy file."""
     env = (os.environ.get("KHIPU_DSN_FILE") or "").strip() or (os.environ.get("ALZY_DSN_FILE") or "").strip()
     for path in (Path(env) if env else _configured_dsn_file(), _LEGACY_DSN_FILE):
         try:
@@ -1671,35 +1723,57 @@ def note_sent(tags: Sequence[str], deadline: float) -> None:
         _record_write_error(_FACT_TABLES, f"owner send listing: {type(exc).__name__}: {exc}")
 
 
+class EndpointChangeUnrecorded(RuntimeError):
+    """An endpoint save could hide the old endpoint's facts in no way."""
+
+
 def endpoint_changed() -> None:
     """A configuration write changed the hub endpoint (N3): its fingerprint
-    is recorded for readers (``_reader_destination``), then this Mac's stamp
-    is cleared and the revision bumped at once, before any copy."""
+    is recorded for readers (``_reader_destination``) with a new revision,
+    then this Mac's stamp is cleared and the revision bumped at once, before
+    any copy. A record that cannot be written is removed (readers then show
+    no fact row); when neither that nor the clearing lands, the save fails
+    closed: ``EndpointChangeUnrecorded``."""
     path = snapshot_path()
     dsn = _saved_dsn(ask_keychain=True)
+    destination = _destination_of(dsn) if dsn else "unconfigured"
     try:
-        _record_destination(path, _destination_of(dsn) if dsn else "unconfigured")
-    except OSError as exc:  # the clearing below still hides the old copy
+        recorded = _record_destination(path, destination, _endpoint_source(destination))
+    except OSError as exc:
         _record_write_error(_FACT_TABLES, f"endpoint fingerprint: {type(exc).__name__}: {exc}")
-    if path.is_file():
-        _hide_until_copy(path, "endpoint change")
+        try:
+            (path.parent / _DESTINATION_FILE).unlink(missing_ok=True)
+            recorded = True
+        except OSError:
+            recorded = False
+    if path.is_file() and not _hide_until_copy(path, "endpoint change") and not recorded:
+        raise EndpointChangeUnrecorded("the endpoint change could not be recorded beside the replica; "
+                                       "its facts may still show the old hub's (see the write errors)")
 
 
-def _hide_until_copy(path: Path, what: str) -> None:
+def _hide_until_copy(path: Path, what: str) -> bool:
     """Clear the stamp and bump the invalidation revision now. A durable
     marker is written first and removed only once the clearing commits, so
     a replica too busy to clear leaves facts hidden until a copy that began
-    after it (``_copy_once``)."""
+    after it (``_copy_once``); a marker that cannot be written does not stop
+    the clearing. False when neither marker nor clearing landed."""
     marker = path.parent / _ENDPOINT_CHANGES_DIR / uuid.uuid4().hex
+    marked = False
     try:
         marker.parent.mkdir(mode=0o700, exist_ok=True)
         marker.touch(mode=0o600)
+        marked = True
+    except OSError as exc:
+        _record_write_error(_FACT_TABLES, f"{what} marker: {type(exc).__name__}: {exc}")
+    try:
         with _admitted(path, time.monotonic() + 5) as (con, _gate):
             _invalidate_facts(con)
     except Exception as exc:  # noqa: BLE001 - the marker (or the endpoint check) still hides the old copy
         _record_write_error(_FACT_TABLES, f"{what}: {type(exc).__name__}: {exc}")
-        return
-    marker.unlink(missing_ok=True)
+        return marked
+    if marked:
+        marker.unlink(missing_ok=True)
+    return True
 
 
 def _learn_incarnation(incarnation: str | None) -> None:
@@ -1715,17 +1789,6 @@ def _learn_incarnation(incarnation: str | None) -> None:
         held = None
     if held is not None and held.get("incarnation") != str(incarnation):
         _hide_until_copy(path, "incarnation change")
-
-
-def _reread_incarnation(cur) -> str | None:
-    """The session's incarnation, read alone after a failed exchange; None
-    when the session cannot answer."""
-    try:
-        cur.connection.rollback()
-        cur.execute(_INCARNATION_READ)
-        return str(cur.fetchone()[0])
-    except Exception:  # noqa: BLE001 - a dead session taught this Mac nothing
-        return None
 
 
 def unsent_forgets(path: Path | None = None) -> dict[str, Any]:
@@ -1800,7 +1863,10 @@ def _copy_kept_rows(copy: sqlite3.Connection) -> None:
     row but those ``_fact_rows`` names, in the caller's transaction: tables
     (a virtual table's own tables with it, their rows copied as stored),
     then the rows, then indexes, triggers and views, so no trigger fires on
-    the copy. Retired fact tables are left out."""
+    the copy. Each row keeps its rowid, implicit ones too, so an FTS index
+    (keyed by rowid) still names its rows; an FTS index found out of step
+    with its content after the copy is rebuilt. Retired fact tables are
+    left out."""
     schema = copy.execute("SELECT type, name, tbl_name, sql FROM src.sqlite_master "
                           "WHERE sql IS NOT NULL ORDER BY rowid").fetchall()
     retired = set(_RETIRED_FACT_TABLES)
@@ -1818,16 +1884,30 @@ def _copy_kept_rows(copy: sqlite3.Connection) -> None:
     facts = _fact_rows()
     for name in tables:
         quoted = '"' + name.replace('"', '""') + '"'
-        cols = {r[1] for r in copy.execute(f"PRAGMA src.table_info({quoted})")}
+        cols = [r[1] for r in copy.execute(f"PRAGMA src.table_info({quoted})")]
         where, params, needs = facts.get(name, ("0", (), set()))
-        if not needs <= cols:
+        if not needs <= set(cols):
             where, params = "0", ()
+        try:
+            copy.execute(f"SELECT rowid FROM src.{quoted} LIMIT 0")
+            names = ["rowid"]
+        except sqlite3.OperationalError:  # WITHOUT ROWID
+            names = []
+        names += ['"' + c.replace('"', '""') + '"' for c in cols]
         copy.execute(f"DELETE FROM main.{quoted}")  # a virtual table's own rows, made with it
-        copy.execute(f"INSERT INTO main.{quoted} SELECT * FROM src.{quoted} WHERE ({where}) IS NOT 1", params)
+        copy.execute(f"INSERT INTO main.{quoted} ({', '.join(names)}) SELECT {', '.join(names)} "
+                     f"FROM src.{quoted} WHERE ({where}) IS NOT 1", params)
     if copy.execute("SELECT 1 FROM src.sqlite_master WHERE name = 'sqlite_sequence'").fetchone() \
             and copy.execute("SELECT 1 FROM main.sqlite_master WHERE name = 'sqlite_sequence'").fetchone():
         copy.execute("DELETE FROM main.sqlite_sequence")
         copy.execute("INSERT INTO main.sqlite_sequence SELECT * FROM src.sqlite_sequence")
+    for kind, name, table, sql in schema:
+        if kind == "table" and table not in retired and " fts5" in sql.lower().replace("\n", " ").replace("(", " "):
+            quoted = '"' + name.replace('"', '""') + '"'
+            try:
+                copy.execute(f"INSERT INTO main.{quoted}({quoted}, rank) VALUES ('integrity-check', 1)")
+            except sqlite3.DatabaseError:
+                copy.execute(f"INSERT INTO main.{quoted}({quoted}) VALUES ('rebuild')")
     for kind, name, table, sql in schema:
         if kind in ("index", "trigger", "view") and table not in retired:
             copy.execute(sql)
@@ -2170,12 +2250,15 @@ def _local_copy_state(path: Path) -> dict[str, Any]:
 
     state["held_vectors"] = held
     state["endpoint_changes"] = _endpoint_changes(path)
+    # Read before resolving: a save landing after it makes this record stale.
+    record = _endpoint_record(path)
     destination = _hub_destination()
     if _env_dsn() is None:
         # The saved endpoint itself: recorded for readers, which never ask
         # the Keychain (a Mac configured before any save records it here).
         try:
-            _record_destination(path, destination)
+            _record_destination(path, destination, _endpoint_source(destination),
+                                expect=record["revision"] if record else 0)
         except OSError as exc:  # readers then show no fact row; the copy goes on
             _record_write_error(_FACT_TABLES, f"endpoint fingerprint: {type(exc).__name__}: {exc}")
     return {**state, "fingerprint": _refusal_digest(gate, path), "tags": sorted(gate.tags),
@@ -2585,7 +2668,7 @@ def _apply_ledger_pull(con: sqlite3.Connection, payload: Mapping[str, Any], *,
 
 
 def _one_exchange(cur, reads: Sequence[tuple[str, str, Sequence[Any]]], *,
-                  prelude: str | None = None) -> dict[str, list]:
+                  prelude: str | None = None, on_prelude: Callable[[str], Any] | None = None) -> dict[str, list]:
     """``reads`` in one simple query, so one round trip: the session bounds
     (``provenance.SESSION_SETTINGS``, D3) and ``prelude`` (a single-value
     read, kept on the session as ``khipu_prelude`` for ``hub_call``),
@@ -2594,8 +2677,11 @@ def _one_exchange(cur, reads: Sequence[tuple[str, str, Sequence[Any]]], *,
     each read's rows by name; the transaction stays open on ``conn``
     (autocommit, so the caller's later statements run inside it and its
     ``rollback`` ends it). The session is marked bounded, so a copy handed
-    it (``copy_facts``) does not set the bounds again."""
-    from psycopg import ClientCursor, Connection
+    it (``copy_facts``) does not set the bounds again. ``on_prelude`` gets
+    the prelude's value as soon as its result is in, before any later
+    statement's error is raised (D2), so a failed read still hands it over
+    without another exchange."""
+    from psycopg import ClientCursor, Connection, pq
 
     from khipu.provenance import SESSION_SETTINGS
 
@@ -2612,7 +2698,19 @@ def _one_exchange(cur, reads: Sequence[tuple[str, str, Sequence[Any]]], *,
     # The statements before an explicit BEGIN form an implicit transaction
     # that the BEGIN would absorb; the COMMIT ends it, settings included.
     head = [*SESSION_SETTINGS, *([prelude] if prelude else []), "COMMIT", "BEGIN ISOLATION LEVEL REPEATABLE READ"]
-    with ClientCursor(conn) as batch:
+
+    class Batch(ClientCursor):
+        def _check_results(self, results):  # psycopg's check of every statement's result, before any is raised
+            if prelude and len(results) > len(SESSION_SETTINGS):
+                got = results[len(SESSION_SETTINGS)]
+                if got.status == pq.ExecStatus.TUPLES_OK and got.ntuples:
+                    value = bytes(got.get_value(0, 0) or b"").decode(conn.info.encoding)
+                    conn.khipu_prelude = {prelude: value}
+                    if on_prelude is not None:
+                        on_prelude(value)
+            super()._check_results(results)
+
+    with Batch(conn) as batch:
         batch.execute("; ".join([*head, *(batch.mogrify(sql, params) for _name, sql, params in reads)]))
         results: list[list] = []
         while True:
@@ -2620,8 +2718,6 @@ def _one_exchange(cur, reads: Sequence[tuple[str, str, Sequence[Any]]], *,
             if not batch.nextset():
                 break
     conn.khipu_bounded = True
-    if prelude:
-        conn.khipu_prelude = {prelude: results[len(SESSION_SETTINGS)][0][0]}
     return {name: rows for (name, _sql, _params), rows in zip(reads, results[len(head):])}
 
 
@@ -2681,17 +2777,10 @@ def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bo
     acols = [c for c in ("alias", "project", "created_at", "source", "evidence") if c in alias_cols]
     if {"alias", "project"} <= alias_cols:
         reads.append(("aliases", f"SELECT {', '.join(acols)} FROM project_aliases ORDER BY alias", ()))
-    try:
-        got = _one_exchange(cur, reads, prelude=_INCARNATION_READ)
-    except Exception:
-        # D2: the exchange's incarnation is lost with its error (a read a lock
-        # held past its timeout); read it alone, so a failed pull still hides
-        # another incarnation's facts.
-        _learn_incarnation(_reread_incarnation(cur))
-        raise
-    # Before anything else here can fail (D2).
-    _learn_incarnation((getattr(getattr(cur, "connection", None), "khipu_prelude", None) or {})
-                       .get(_INCARNATION_READ))
+    # D2: the incarnation is learned as its result arrives, before a later
+    # read's error (a lock held past its timeout) is raised, so a failed
+    # pull still hides another incarnation's facts with no second exchange.
+    got = _one_exchange(cur, reads, prelude=_INCARNATION_READ, on_prelude=_learn_incarnation)
     hub_now = _utc(got["now"][0][0]) or datetime.now(timezone.utc)
     cap = hub_now - timedelta(seconds=FRESHNESS_OVERLAP_S)
     fresh = [dict(zip([*cols, "changed_at"] if stamped else cols, r)) for r in got["fresh"]]
