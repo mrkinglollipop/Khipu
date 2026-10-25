@@ -70,7 +70,8 @@ import time
 import urllib.parse
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -2194,6 +2195,13 @@ def _checkpoint_retry(claimed: Path, job: dict, state: dict) -> None:
         _write_retry_state(claimed, state)
 
 
+def _iso_not_after(ts: float) -> str:
+    """ISO time truncated, never rounded, to the microsecond: a rounded-up
+    ``next_attempt_at`` would still read as future at the exact due time."""
+    micros = int(Fraction(ts) * 1_000_000 // 1)
+    return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=micros)).isoformat()
+
+
 def _capture_failure(claimed: Path, job: dict, error: str, out: dict, *, free_first: bool = False) -> None:
     """Checkpoint the retry beside the job before releasing it. ``free_first``
     retries a first failure at the next drain (a delivery that returned a
@@ -2211,7 +2219,7 @@ def _capture_failure(claimed: Path, job: dict, error: str, out: dict, *, free_fi
         state["disposition"] = "held"
     elif not (free_first and attempts == 1):
         delay = min(CAPTURE_RETRY_CAP_S, CAPTURE_RETRY_BASE_S * 2 ** (attempts - 1))
-        state["next_attempt_at"] = datetime.fromtimestamp(now + delay, timezone.utc).isoformat()
+        state["next_attempt_at"] = _iso_not_after(now + delay)
     try:
         with memory_lock.shared():
             _checkpoint_retry(claimed, job, state)

@@ -122,6 +122,19 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         self.assertEqual(sc.queued_jobs(), [])
         self.assertEqual(outbox.status()["dead"], 0)
 
+    def test_retry_is_due_at_the_exact_backoff_time_despite_microsecond_rounding(self):
+        # The clock's fraction is nearer the next microsecond than the one
+        # below, so a rounded timestamp would sit after the exact due time.
+        self.now = 1_800_000_000.1234568
+        first, _ = self.enqueue()
+        self.assertEqual(sc.drain()["failed"], 1)
+        due = self.now + sc.CAPTURE_RETRY_BASE_S
+        self.assertGreater(round(due * 1_000_000), due * 1_000_000)
+        self.assertLessEqual(sc._parse_ts(sc._retry_state(first)["next_attempt_at"]), due)
+        self.now = due
+        self.assertEqual(sc.drain()["failed"], 1)
+        self.assertEqual(self.extract.call_count, 2)
+
     def test_delivery_failures_preserve_cached_payload_and_never_reextract(self):
         from khipu import outbox
 
