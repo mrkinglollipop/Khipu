@@ -555,12 +555,21 @@ def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]
     holds (its own raw, or a capture merged into it; an origin or merged
     source receipt with that key counts as the key). An equal replay holds
     every item and is not listed; a held key is never proof on its own that
-    a distinct line's facts arrived (third Astra review #2). A key whose
-    episode is forgotten is not listed: that line is a forgotten source."""
+    a distinct line's facts arrived (third Astra review #2). A forgotten
+    line is not listed. On a hub with 0047's identity index that is a line
+    the refusal table names: a tombstoned episode at its key (a collateral
+    carrier) neither holds its facts nor forgets it, and before history is
+    indexed it makes the line wait in the outbox (design 6.1). Without the
+    index, a tombstone at the key is the forget."""
     want = [(obj, key) for obj, key in lines if _carries_fact_items(obj)]
     if not want:
         return []
+    from khipu.capture import _refusals_settled
     from khipu.capture_identity import sources_ready
+    from khipu.tombstones import hub_source_forgotten
+
+    settled = _refusals_settled(cur)
+    waiting: set[tuple[str, str]] = set()
 
     held: dict[tuple[str, str], set[str]] = {}
     forgotten: set[tuple[str, str]] = set()
@@ -584,12 +593,54 @@ def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]
         for row in cur.fetchall():
             key = (row[0], row[1])
             if row[2] is not None:
-                forgotten.add(key)
+                if settled is None:
+                    forgotten.add(key)
+                elif not settled:
+                    waiting.add(key)
+                continue
             items = held.setdefault(key, set())
             for at, name in enumerate((*_FACT_KEYS, *_FACT_KEYS), start=3):
                 items |= _fact_items({name: row[at]})
     return [obj for obj, key in want
-            if key not in forgotten and not _fact_items(_stored_form(obj)) <= held.get(key, set())]
+            if key not in forgotten
+            and (key in waiting or not _fact_items(_stored_form(obj)) <= held.get(key, set()))
+            and (settled is None or not hub_source_forgotten(cur, obj))]
+
+
+def _tombstone_only_keys(cur, keys: list[tuple[str, str]],
+                         missing: set[tuple[str, str]]) -> tuple[bool | None, set[tuple[str, str]]]:
+    """On a hub with 0047's identity index: whether its history is indexed,
+    and the keys only tombstoned episodes hold (the plain anti-join counts
+    them as present). ``(None, set())`` on a hub without the index, where a
+    tombstone is the forget."""
+    from khipu.capture import _refusals_settled
+    from khipu.drift import episodes_missing_in_pg
+
+    settled = _refusals_settled(cur)
+    if settled is None:
+        return None, set()
+    return settled, set(episodes_missing_in_pg(cur, keys, live_only=True)) - missing
+
+
+def _tombstone_only_line(cur, obj: dict[str, Any], settled: bool) -> bool:
+    """A line whose legacy key only tombstoned episodes hold. The refusal
+    table is the one authority (design 6.1), as in capture: a refused line
+    is skipped; an unrefused one (its key held by a collateral carrier) is
+    imported like a missing line once history is indexed (True), and before
+    that waits in the outbox with its owner unknown, whose drain lands it
+    through ``capture.write_pg`` once the index pass is done."""
+    from khipu.tombstones import hub_source_forgotten
+
+    if hub_source_forgotten(cur, obj):
+        return False
+    if settled:
+        return True
+    from khipu.outbox import enqueue
+
+    enqueue(obj, reason="recovery: matches a tombstoned episode before history is indexed",
+            origin=None)
+    _log("recovered line kept in the outbox: it matches a tombstone before history is indexed")
+    return False
 
 
 def _queue_conflict(obj: dict[str, Any]) -> None:
@@ -789,9 +840,13 @@ def sync_recent_episodes(memory_root: Path, *, tail_lines: int = 40) -> dict[str
     with memory_lock.shared(), connect() as conn:
         with conn.cursor() as cur:
             missing = set(episodes_missing_in_pg(cur, keys))
+            settled, tombstone_only = _tombstone_only_keys(cur, keys, missing)
             collided: list[tuple[dict[str, Any], tuple[str, str]]] = []
             for obj, key in zip(objs, keys):
-                if key not in missing:
+                if key in tombstone_only:
+                    if not _tombstone_only_line(cur, obj, bool(settled)):
+                        continue
+                elif key not in missing:
                     collided.append((obj, key))
                     continue
                 upserted: dict[str, Any] = {}
@@ -903,9 +958,13 @@ def reconcile_memory_root(memory_root: Path) -> dict[str, int]:
                             )
                             stats["episodes"] += 1
                 missing = set(episodes_missing_in_pg(cur, keys))
+                settled, tombstone_only = _tombstone_only_keys(cur, keys, missing)
                 collided: list[tuple[dict[str, Any], tuple[str, str]]] = []
                 for obj, key in zip(objs, keys):
-                    if key not in missing:
+                    if key in tombstone_only:
+                        if not _tombstone_only_line(cur, obj, bool(settled)):
+                            continue
+                    elif key not in missing:
                         collided.append((obj, key))
                         continue
                     upserted: dict[str, Any] = {}

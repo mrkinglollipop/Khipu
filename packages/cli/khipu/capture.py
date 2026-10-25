@@ -227,6 +227,7 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     first; the column match below stays as the pre-0027 path and for sources
     recorded before the key existed. ``live_only`` matches live episodes only."""
     from khipu.capture_identity import episode_for_source, source_key, sources_ready
+    from khipu.db import has_table
 
     live = " AND deleted_at IS NULL" if live_only else ""
     if sources_ready(cur) and _source_key_is_safe(payload):
@@ -236,6 +237,15 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
                         "ON e.id = s.episode_id AND e.deleted_at IS NULL WHERE s.source_key = %s",
                         (key,))
             row = cur.fetchone()
+            if row is None and has_table(cur, "episode_identities"):
+                # The source row stays on a collateral tombstone, so a live
+                # re-upload of the source was recorded under its episode key;
+                # the identity index still records the source's key on it
+                # (Astra 7A re-review #2).
+                cur.execute("SELECT i.episode_id FROM episode_identities i JOIN episodes e "
+                            "ON e.id = i.episode_id AND e.deleted_at IS NULL "
+                            "WHERE i.identity = %s ORDER BY i.episode_id LIMIT 1", (key,))
+                row = cur.fetchone()
             recorded = int(row[0]) if row else None
         else:
             recorded = episode_for_source(cur, key)

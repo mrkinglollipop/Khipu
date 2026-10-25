@@ -320,6 +320,13 @@ def test_r6_owner_separated_twins_forget_without_a_key_conflict(pg):
     assert _rows(pg, "SELECT deleted_at IS NOT NULL FROM episodes WHERE id = %s", (b,)) == [(True,)]
 
 
+# What a forget may be refused with and retried on (forget._FORGET_RETRY_SQLSTATES):
+# a deadlock, a serialization failure (an anchor forgotten meanwhile), or an
+# episode another forget holds (the claim gate's and the projector's NOWAIT).
+_FORGET_REFUSALS = (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure,
+                    psycopg.errors.LockNotAvailable)
+
+
 def test_two_forgets_racing_a_first_backfill_both_land(pg):
     """Two forgets in a project the backfill has not covered both run it;
     if they deadlock, the refused one changed nothing and its retry lands."""
@@ -336,7 +343,7 @@ def test_two_forgets_racing_a_first_backfill_both_land(pg):
                     conn.commit()
                 results.append((eid, out["soft_deleted"], attempt))
                 return
-            except psycopg.errors.DeadlockDetected:
+            except _FORGET_REFUSALS:
                 time.sleep(0.02 * attempt)
         results.append((eid, False, "gave up"))
 
@@ -353,21 +360,27 @@ def test_two_forgets_racing_a_first_backfill_both_land(pg):
 # ---- second review -----------------------------------------------------------------------
 
 
-def test_p2_1_concurrent_captures_and_forgets_lose_no_fact_step(pg):
+@pytest.mark.parametrize("backfilled", [True, False], ids=["warm", "cold"])
+def test_p2_1_concurrent_captures_and_forgets_lose_no_fact_step(pg, backfilled):
     """Captures restating one item, decision and deliverable race forgets of
     earlier captures. Every capture either commits with a claim on each fact
-    it derived or is deferred and retried; nothing fails open."""
+    it derived or is deferred and retried; nothing fails open. Warm: the
+    project's witness backfill has run (the nightly), and its seed is
+    forgotten so the forgets move anchors between the workers' episodes.
+    Cold: no backfill yet, so the first forgets run it."""
     from khipu import db
 
     errors: list = []
     landed: list[int] = []
     lock = threading.Lock()
     words = [CANON, ALT, CANON + " today", ALT + " today"]
-    # The steady state: the project's witness backfill has run (the nightly).
-    # Two forgets that both run a project's first backfill can deadlock; one
-    # is refused and retried (test_two_forgets_racing_a_first_backfill).
+    seed = _capture(loop=CANON, decision="Keep the release train weekly", title="the checklist") if backfilled else None
     with pg.connect() as conn:
         provenance.backfill(conn)
+        with conn.cursor() as cur:
+            assert provenance.backfilled(cur, PROJECT) is backfilled
+    if seed is not None:
+        _forget(pg, seed)
 
     def worker(n):
         for i in range(6):
@@ -399,7 +412,7 @@ def test_p2_1_concurrent_captures_and_forgets_lose_no_fact_step(pg):
                             forget.forget_episode(cur, victim, memory_root=pg.memory)
                             conn.commit()
                         break
-                    except (psycopg.errors.DeadlockDetected, psycopg.errors.SerializationFailure) as exc:
+                    except _FORGET_REFUSALS as exc:
                         attempt += 1
                         if time.monotonic() > deadline:
                             errors.append(("forget never landed", victim, attempt, repr(exc)))
@@ -420,6 +433,86 @@ def test_p2_1_concurrent_captures_and_forgets_lose_no_fact_step(pg):
         assert kinds == {"commitment", "decision", "deliverable"}, (eid, kinds)
     _assert_projection(pg)
     _assert_forgotten_unreadable(pg)
+
+
+@pytest.mark.parametrize("backfilled", [False, True], ids=["cold-claim-gate", "warm-anchor-fk"])
+def test_7a2_p2_3_a_forget_holding_facts_never_waits_on_another_episode(pg, monkeypatch, backfilled):
+    """Astra 7A re-review #3, both forced cycles. Forget A holds the shared
+    facts while forget B holds episode E2 FOR UPDATE. Cold: A's first witness
+    backfill claims onto E2 (the claim gate's lock). Warm: A's projection moves
+    the anchor onto E2 (the foreign key's KEY SHARE). Before the fix A waited
+    on E2 while B waited on A's facts: a deadlock. Now A is refused at once,
+    rolls back, and its retry from fresh reads lands after B."""
+    e1 = _capture(loop=CANON, decision="Keep the release train weekly", title="the checklist")
+    e2 = _capture(loop=CANON, decision="Keep the release train weekly", title="the checklist")
+    if backfilled:
+        with pg.connect() as conn:
+            provenance.backfill(conn)
+    with pg.connect() as conn, conn.cursor() as cur:
+        assert provenance.backfilled(cur, PROJECT) is backfilled
+    b = pg.connect()
+    b.execute("SET deadlock_timeout = '10s'")
+    b.execute("SELECT id FROM episodes WHERE id = %s FOR UPDATE", (e2,))
+    a_at_witness, release = threading.Event(), threading.Event()
+    results: dict = {}
+    original = provenance._witness_deliverables
+
+    def pause(cur, *args, **kwargs):
+        if threading.current_thread().name == "forget-a":
+            a_at_witness.set()
+            assert release.wait(5)
+        return original(cur, *args, **kwargs)
+
+    monkeypatch.setattr(provenance, "_witness_deliverables", pause)
+    a = pg.connect()
+    a.execute("SET deadlock_timeout = '100ms'")
+    a.commit()
+
+    def worker(name, conn, eid):
+        try:
+            with conn.cursor() as cur:
+                results[name] = forget.forget_episode(cur, eid, memory_root=pg.memory)
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - the refusal is the observation
+            results[name] = {"error": type(exc).__name__, "sqlstate": getattr(exc, "sqlstate", None),
+                             "detail": str(exc)}
+            conn.rollback()
+
+    ta = threading.Thread(target=worker, args=("a", a, e1), name="forget-a")
+    ta.start()
+    if not backfilled:
+        assert a_at_witness.wait(5)
+    else:
+        time.sleep(0.1)
+    tb = threading.Thread(target=worker, args=("b", b, e2), name="forget-b")
+    tb.start()
+    if not backfilled:
+        # B is queued behind A's fact locks before A's backfill reaches E2.
+        until = time.monotonic() + 5
+        with pg.connect() as observer:
+            while a.info.backend_pid not in observer.execute(
+                    "SELECT pg_blocking_pids(%s)", (b.info.backend_pid,)).fetchone()[0]:
+                assert time.monotonic() < until
+                time.sleep(0.01)
+    release.set()
+    ta.join(10)
+    tb.join(10)
+    assert not ta.is_alive() and not tb.is_alive()
+    refused = {n: r for n, r in results.items() if r.get("error")}
+    assert list(refused) == ["a"], results
+    assert refused["a"]["sqlstate"] in ("55P03", "40001"), results
+    assert results["b"]["ok"] and results["b"]["soft_deleted"], results
+    with a.cursor() as cur:
+        assert forget.forget_episode(cur, e1, memory_root=pg.memory)["ok"]
+    a.commit()
+    a.close()
+    b.close()
+    with pg.connect() as conn:
+        live = conn.execute("SELECT count(*) FROM episodes WHERE id IN (%s, %s) AND deleted_at IS NULL",
+                            (e1, e2)).fetchone()[0]
+    assert live == 0
+    _assert_projection(pg)
+    _assert_forgotten_unreadable(pg, {e1: {CANON}, e2: {CANON}})
 
 
 def test_p2_3_an_old_code_dedup_after_the_migration_is_refused(pg):

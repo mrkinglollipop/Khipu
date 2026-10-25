@@ -2025,13 +2025,17 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
                 "error": f"forget not started: {exc}"}
 
 
-# Two forgets that both run a project's first witness backfill can deadlock
-# (design section 4: each holds its facts, then the backfill's claim gate
-# takes FOR SHARE on other episodes). PostgreSQL refuses one; the refused
-# transaction changed nothing, so it is run again until a time budget runs
-# out (design section 4: time-bounded, not a count of attempts).
+# Two forgets that both run a project's first witness backfill, or that
+# move a shared fact's anchor onto each other's episode, would wait on each
+# other (each holds its facts, then needs the other's episode). The claim
+# gate and the projector take that episode NOWAIT instead, so the one that
+# meets the other's lock is refused (55P03, or 40001 for an anchor forgotten
+# meanwhile; a deadlock elsewhere is 40P01). The refused transaction changed
+# nothing, so it is run again from fresh reads until a time budget runs out
+# (design section 4: time-bounded, not a count of attempts).
 FORGET_RETRY_BUDGET_S = float(os.environ.get("KHIPU_FORGET_RETRY_BUDGET_S", "90"))
-_FORGET_RETRY_SQLSTATES = frozenset({"40P01", "40001"})  # deadlock, serialization
+# deadlock, serialization, lock not available
+_FORGET_RETRY_SQLSTATES = frozenset({"40P01", "40001", "55P03"})
 
 
 def _retryable(exc: BaseException) -> bool:

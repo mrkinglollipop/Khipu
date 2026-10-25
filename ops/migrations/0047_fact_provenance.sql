@@ -274,6 +274,24 @@ BEGIN
 END
 $fn$;
 
+-- A projection runs with its fact row locked, so it must never wait on an
+-- episode: a forget holding that episode FOR UPDATE may be waiting on this
+-- fact (Astra 7A re-review #3). Assigning a new anchor makes the foreign key
+-- take KEY SHARE on it, so the anchor is taken FOR SHARE NOWAIT first
+-- (contention: 55P03) and must still be live (a tombstone committed since the
+-- anchor was chosen: 40001). Either aborts the whole transaction, which its
+-- caller retries from fresh reads.
+CREATE OR REPLACE FUNCTION khipu_take_anchor(p_episode BIGINT)
+RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN
+    PERFORM 1 FROM episodes WHERE id = p_episode AND deleted_at IS NULL FOR SHARE NOWAIT;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'khipu: anchor episode % was forgotten during the projection', p_episode
+            USING ERRCODE = 'serialization_failure';
+    END IF;
+END
+$fn$;
+
 CREATE OR REPLACE FUNCTION khipu_project_fact(p_kind TEXT, p_id BIGINT)
 RETURNS TEXT LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -396,6 +414,9 @@ BEGIN
             v_check := NULL;
         END IF;
 
+        IF v_anchor IS NOT NULL AND v_anchor IS DISTINCT FROM c.opened_episode THEN
+            PERFORM khipu_take_anchor(v_anchor);
+        END IF;
         UPDATE commitments SET
             text = v_text, latest_text = v_latest, prs = v_prs, pr_check = v_check,
             opened_episode = v_anchor
@@ -440,6 +461,9 @@ BEGIN
           AND ((v_anchor IS NOT NULL AND fc.claimant = 'episode' AND fc.episode_id = v_anchor)
                OR (v_anchor IS NULL AND fc.claimant = 'owner'))
         ORDER BY fc.created_at, fc.value LIMIT 1;
+        IF v_anchor IS NOT NULL AND v_anchor IS DISTINCT FROM d.episode_id THEN
+            PERFORM khipu_take_anchor(v_anchor);
+        END IF;
         UPDATE decisions SET text = v_text, episode_id = v_anchor, rationale = v_rationale,
                              evidence = v_evidence
         WHERE id = p_id
@@ -473,6 +497,9 @@ BEGIN
     IF v_anchor IS NULL AND NOT v_owner THEN
         DELETE FROM deliverables WHERE id = p_id;
         RETURN 'deleted';
+    END IF;
+    IF v_anchor IS NOT NULL AND v_anchor IS DISTINCT FROM v.episode_id THEN
+        PERFORM khipu_take_anchor(v_anchor);
     END IF;
     UPDATE deliverables SET title = v_text, episode_id = v_anchor
     WHERE id = p_id AND (title IS DISTINCT FROM v_text OR episode_id IS DISTINCT FROM v_anchor);
@@ -608,7 +635,11 @@ DECLARE
     gone TIMESTAMPTZ;
 BEGIN
     IF NEW.episode_id IS NOT NULL THEN
-        SELECT deleted_at INTO gone FROM episodes WHERE id = NEW.episode_id FOR SHARE;
+        -- NOWAIT: a claim on another episode is written after fact locks
+        -- (the witness backfill, a restatement), so waiting here could close
+        -- a cycle with a forget holding that episode (Astra 7A re-review #3).
+        -- Contention aborts the transaction (55P03) for its caller to retry.
+        SELECT deleted_at INTO gone FROM episodes WHERE id = NEW.episode_id FOR SHARE NOWAIT;
         IF NOT FOUND OR gone IS NOT NULL THEN
             RAISE EXCEPTION 'khipu: episode % is forgotten or missing; it cannot claim % %',
                 NEW.episode_id, NEW.kind, NEW.fact_id
