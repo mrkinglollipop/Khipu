@@ -691,10 +691,11 @@ class HubTx:
     one way hub work gets something published locally, always between
     transactions."""
 
-    def __init__(self, conn, cur, deadline: float, channel):
+    def __init__(self, conn, cur, deadline: float, channel, prelude=None):
         self.conn, self.deadline = conn, deadline
         self.cur = BoundedCursor(cur, deadline)
         self.committing = False
+        self.prelude = prelude
         self._channel = channel
 
     def commit(self) -> None:
@@ -750,14 +751,18 @@ def _abandon(conn) -> None:
         pass
 
 
-def hub_call(work, *, deadline: float, connect=None, on_handoff=None):
+def hub_call(work, *, deadline: float, connect=None, on_handoff=None, prelude: str | None = None):
     """``work(tx)`` on a fresh hub connection, bounded by ``deadline``
     (section 6.4). ``connect`` takes ``connect_timeout`` (default
     ``khipu.db.connect``). Returns ``work``'s result or raises its error;
     :class:`NotDone` when the deadline came first or no step could start.
     At the deadline the worker is abandoned, never joined: a cancel is sent
     without waiting, the socket is shut down and the connection discarded,
-    and nothing it returns later is used."""
+    and nothing it returns later is used. ``prelude``: one parameterless
+    single-value SELECT run in the session-settings exchange, before
+    ``work`` (no extra round trip), its value ``tx.prelude``; a session
+    handed over bounded brings it from its own first exchange
+    (``khipu_prelude``)."""
     import queue
     import threading
     import time
@@ -788,18 +793,31 @@ def hub_call(work, *, deadline: float, connect=None, on_handoff=None):
                 # pull's read-only transaction itself.
                 from psycopg import pq
 
+                early = None
                 if not getattr(conn, "khipu_bounded", False):
                     idle = pq.TransactionStatus.IDLE
                     if getattr(getattr(conn, "info", None), "transaction_status", idle) != idle:
                         conn.commit()  # a connection handed over mid-transaction
                     conn.autocommit = True
                     with conn.cursor() as cur:
-                        cur.execute("; ".join(SESSION_SETTINGS))
+                        cur.execute("; ".join([*SESSION_SETTINGS, *([prelude] if prelude else [])]))
+                        if prelude:
+                            while cur.nextset():
+                                pass
+                            early = cur.fetchone()[0]
                     conn.autocommit = False
+                elif prelude:
+                    held = getattr(conn, "khipu_prelude", None) or {}
+                    if prelude in held:
+                        early = held[prelude]
+                    else:
+                        with conn.cursor() as cur:
+                            cur.execute(prelude)
+                            early = cur.fetchone()[0]
             except Exception as exc:  # noqa: BLE001 - a session without them is not used
                 raise NotDone(f"the hub session could not be bounded ({type(exc).__name__})") from exc
             with conn.cursor() as cur:
-                state["tx"] = HubTx(conn, cur, deadline, channel)
+                state["tx"] = HubTx(conn, cur, deadline, channel, early)
                 outcome["result"] = work(state["tx"])
         except BaseException as exc:  # noqa: BLE001 - handed to the caller
             outcome["error"] = exc

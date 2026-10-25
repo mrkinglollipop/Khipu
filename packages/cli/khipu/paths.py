@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import stat as stat_module
+import tempfile
 import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -270,6 +271,20 @@ def pycache_dir() -> Path:
     return Path.home() / "Library" / "Caches" / "Khipu" / "pycache"
 
 
+def export_scratch_dir() -> Path:
+    """Where a backup's replica export makes its scratch copy, which still
+    holds the fact rows (``hub_snapshot.export_replica_copy``): owner-only
+    and outside the data folder, so no backup walk ever reads it, the way
+    ``pycache_dir`` is."""
+    d = Path.home() / "Library" / "Caches" / "Khipu" / "export-scratch"
+    data = data_dir().expanduser().resolve()
+    if d.resolve() == data or data in d.resolve().parents:
+        d = Path(tempfile.gettempdir()) / f"khipu-export-scratch-{os.getuid()}"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    d.chmod(0o700)
+    return d
+
+
 def ensure_pycache_dir() -> Path:
     d = pycache_dir()
     d.mkdir(parents=True, exist_ok=True)
@@ -306,6 +321,7 @@ def backup_local(*, dest: Path) -> dict:
     count = 0
     replica = src / _SNAPSHOT_NAME
     staged: Path | None = None
+    _remove_crashed_export_scratch(src)
     try:
         with sensitive_writer(dest) as archive_file:
             with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -329,6 +345,10 @@ def backup_local(*, dest: Path) -> dict:
                         continue
                     if p.parent == src and (p.name == _SNAPSHOT_NAME
                                             or p.name.startswith(_SNAPSHOT_NAME + "-")):
+                        continue
+                    # Another refresh's or export's temporary replica, or a
+                    # sidecar of one, never went through the export.
+                    if p.parent == src and (_replica_temp((p.name,)) or _EXPORT_SCRATCH.match(p.name)):
                         continue
                     zf.write(p, arcname=str(p.relative_to(src)))
                     count += 1
@@ -408,6 +428,25 @@ def _skipped_name(parts: tuple[str, ...]) -> bool:
 
 
 _REPLICA_TEMP = re.compile(r"^\.hub_snapshot\..+\.sqlite(-.+)?$")
+# The scratch copy an export made beside the data folder's staged replica
+# before export_scratch_dir (``.<staged name>.facts-<pid>``), with its sidecars.
+_EXPORT_SCRATCH = re.compile(r"^\..+\.facts-(\d+)(-journal|-wal|-shm)?$")
+
+
+def _remove_crashed_export_scratch(src: Path) -> None:
+    """Delete the scratch copies (fact rows included) crashed exports left in
+    the data folder, those whose process is gone."""
+    for p in src.glob(".*.facts-*"):
+        found = _EXPORT_SCRATCH.match(p.name)
+        if not found or not p.is_file():
+            continue
+        try:
+            os.kill(int(found.group(1)), 0)
+            continue
+        except ProcessLookupError:
+            p.unlink(missing_ok=True)
+        except (PermissionError, OSError):
+            continue
 _WRITER_RECORDS = ".legacy_writers"  # khipu.writer_groups.DIR_NAME
 
 
