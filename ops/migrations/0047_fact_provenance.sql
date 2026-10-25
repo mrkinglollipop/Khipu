@@ -16,9 +16,8 @@
 --   fact_changes         one row per projection (via 'project'), and per
 --                        other decision/deliverable row write (via 'row'),
 --                        stamped with its transaction id: the commit gate
---                        below (via 'project' only) and the replica change
---                        stream (section 6). fact_changes_floor records how
---                        far the 30-day prune has removed rows.
+--                        below (via 'project' only); 'copy' rows are the
+--                        replica copy's change token (section 6.1).
 --   fact_gaps            a capture fact step that failed and was kept as a
 --                        gap (doctor reports it, the nightly re-runs it).
 --   provenance_projects  legacy witness backfill progress, per project
@@ -155,15 +154,7 @@ CREATE INDEX IF NOT EXISTS idx_fact_changes_xid ON fact_changes (xid);
 CREATE INDEX IF NOT EXISTS idx_fact_changes_at ON fact_changes (at);
 
 COMMENT ON TABLE fact_changes IS
-    'One row per khipu_project_fact() call (via project), and per other decision or deliverable row write (via row), stamped with its transaction id (0047). The fact gate requires a via-project row for every wording change; replicas read the table as their decisions and deliverables change stream (section 6). Rows older than 30 days are pruned (khipu.provenance.prune_changes).';
-
--- The replica stream's floor: the highest xid whose rows the prune removed.
--- A replica whose cursor is at or below it may have missed a change and asks
--- for a full dump. One row at most.
-CREATE TABLE IF NOT EXISTS fact_changes_floor (
-    one             BOOLEAN PRIMARY KEY DEFAULT true CHECK (one),
-    pruned_through  XID8 NOT NULL
-);
+    'One row per khipu_project_fact() call (via project), and per other decision or deliverable row write (via row), stamped with its transaction id (0047). The fact gate requires a via-project row for every wording change; via-copy rows are the replica copy''s change token (section 6.1). Rows older than 30 days are pruned (khipu.provenance.prune_changes).';
 
 CREATE TABLE IF NOT EXISTS fact_gaps (
     id           BIGSERIAL PRIMARY KEY,
@@ -1287,6 +1278,6 @@ CREATE TRIGGER khipu_episodes_copy_token
 INSERT INTO schema_migrations (version, note)
 VALUES (
     '0047_fact_provenance',
-    'Fact provenance: fact_claims, fact_changes (+ floor), fact_gaps, provenance_projects; legacy claims proven by the writer inventory (the rest legacy_unproven); initial projection by khipu_project_fact(); deferred gates refuse wording writes outside the projector and forgets of claimed episodes (SQLSTATE 08K01), and claims for forgotten episodes'
+    'Fact provenance: fact_claims, fact_changes, fact_gaps, provenance_projects; legacy claims proven by the writer inventory (the rest legacy_unproven); initial projection by khipu_project_fact(); deferred gates refuse wording writes outside the projector and forgets of claimed episodes (SQLSTATE 08K01), and claims for forgotten episodes'
 )
 ON CONFLICT (version) DO NOTHING;

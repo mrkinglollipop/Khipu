@@ -122,7 +122,7 @@ class RegistryTest(unittest.TestCase):
             patch = mock.patch(target, return_value=value)
             patch.start()
             self.addCleanup(patch.stop)
-        for target in ("khipu.decisions._mirror_to_snapshot", "khipu.decisions._stale_briefs"):
+        for target in ("khipu.decisions._stale_briefs",):
             patch = mock.patch(target)
             patch.start()
             self.addCleanup(patch.stop)

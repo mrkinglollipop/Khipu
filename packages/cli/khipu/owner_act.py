@@ -86,6 +86,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "direction.set": (("key", "value"), ()),
     "direction.undo": (("id",), ("holds",)),
     "forget.send": ((), ()),
+    "forget.here": (("id",), ()),
+    "forget.not_same": (("id",), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
@@ -377,6 +379,10 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["owner-direction", "undo", *_opts(v, "holds")], [v["id"]]
     if action == "forget.send":
         return ["episode", "forget-pending", "--send"], []
+    if action == "forget.here":
+        return ["episode", "forget-pending", f"--forget-here={v['id']}"], []
+    if action == "forget.not_same":
+        return ["episode", "forget-pending", f"--not-same={v['id']}"], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 

@@ -2808,21 +2808,35 @@ def cmd_episode(args: argparse.Namespace) -> int:
 
 
 def _cmd_episode_forget_pending(args: argparse.Namespace) -> int:
-    """`khipu episode forget-pending [--send]`: the forgets this Mac's replica
-    waits on before it shows facts again (design section 6, the wait rule),
-    and the owner's "Send N forgets to the hub" (``--send``: the app, a typed
-    yes, or owner direction ``forget.send``)."""
+    """`khipu episode forget-pending`: the forgets this Mac holds that the
+    hub lacks, which keep its facts hidden (design section 6.2), and the
+    owner's three actions on them (the app, a typed yes, or owner
+    direction): ``--send`` ("Send to the hub", ``forget.send``),
+    ``--forget-here ID`` ("Forget it here", ``forget.here``: an ordinary
+    forget of that hub episode) and ``--not-same ID`` ("Not the same
+    episode", ``forget.not_same``)."""
     from khipu import forget
 
-    if not args.send:
-        print(json.dumps(forget.pending_forgets(), default=str))
+    if args.send:
+        action, target = "forget.send", "hub"
+    elif args.forget_here is not None:
+        action, target = "forget.here", str(args.forget_here)
+    elif args.not_same is not None:
+        action, target = "forget.not_same", str(args.not_same)
+    else:
+        print(json.dumps(forget.unsent_forgets(), default=str))
         return 0
     from khipu import owner_direction
 
-    via = _owner_only(args, owner_direction.intent("forget.send", "hub"))
+    via = _owner_only(args, owner_direction.intent(action, target))
     if isinstance(via, int):
         return via
-    out = forget.send_pending()
+    if action == "forget.send":
+        out = forget.send_to_hub()
+    elif action == "forget.here":
+        out = forget.forget_everywhere(int(target))
+    else:
+        out = forget.not_same_episode(int(target))
     print(json.dumps(owner_direction.finish(out) or out, default=str))
     return 0 if out.get("ok") else 1
 
@@ -6007,9 +6021,14 @@ def build_parser() -> argparse.ArgumentParser:
     ep_forget = ep_sub.add_parser("forget", help="Soft-delete an episode and remove its vectors")
     ep_forget.add_argument("id", type=int)
     ep_pending = ep_sub.add_parser(
-        "forget-pending", help="Forgets this Mac's replica waits on the hub for; --send sends them")
-    ep_pending.add_argument("--send", action="store_true",
-                            help="Run the hub forget for each one (the owner's)")
+        "forget-pending", help="Forgets this Mac holds that the hub lacks, and the owner's actions on them")
+    ep_owner = ep_pending.add_mutually_exclusive_group()
+    ep_owner.add_argument("--send", action="store_true",
+                          help="Send the listed forgets to the hub (the owner's)")
+    ep_owner.add_argument("--forget-here", type=int, metavar="ID",
+                          help="Forget the listed hub episode ID here too (the owner's)")
+    ep_owner.add_argument("--not-same", type=int, metavar="ID",
+                          help="The hub's episode ID is not the one forgotten here (the owner's)")
     ep_pending.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     from khipu.owner_direction import add_owner_flags as _add_owner_flags
 

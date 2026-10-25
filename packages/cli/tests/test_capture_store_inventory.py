@@ -38,6 +38,7 @@ _REGISTRY = "the forgotten-source registry: identities and ids, never text"
 NOT_CAPTURE = {
     "session_capture._write_claim_owner": "PID and kernel process birth metadata only; no capture text",
     **dict.fromkeys(("hub_snapshot._acquire_refresh_lock", "hub_snapshot._purge_marker_lock",
+                     "hub_snapshot._fact_copy_lock",
                      "ledger._flock", "jobs._job_lock",
                      "memory_lock._take", "outbox._locked_outbox", "promote._lock",
                      "recall_prompt._session_lock", "routing._lock", "session_capture._beat_lock",
@@ -131,7 +132,7 @@ NOT_CAPTURE = {
                      "hub_snapshot._queue_missed_patch", "hub_snapshot._clear_missed_patches"),
                     _REPLICA_META),
     **dict.fromkeys(("tombstones._atomic_write", "tombstones._locked_registry",
-                     "tombstones.publish_identities", "tombstones.record_confirmations"), _REGISTRY),
+                     "tombstones.publish_identities", "tombstones.drop_episode_id"), _REGISTRY),
 }
 
 _NAMED = {"write_text", "write_bytes", "mkstemp", "mkdtemp", "NamedTemporaryFile",

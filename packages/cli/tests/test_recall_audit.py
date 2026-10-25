@@ -141,7 +141,7 @@ def test_decision_alias_supersession_through_mcp():
         def __exit__(self,*_): pass
         def cursor(self): return Cursor()
 
-    with patch.object(db,'connect',return_value=Conn()), patch.object(decisions,'_evidence_ready',return_value=False), patch.object(decisions,'_links_ready',return_value=False), patch.object(decisions,'_mirror_to_snapshot'), patch.object(decisions,'_stale_briefs'), patch.object(decisions,'_not_forgotten_clause',return_value=None), patch.object(owner_writes,'annotate',return_value={}), patch.object(owner_writes,'run',side_effect=lambda _tool,args,**_:srv._decisions_update_on_hub(args)), patch.object(owner_writes,'apply_on_hub',side_effect=lambda conn,cur,tool,args,write,echo:write()):
+    with patch.object(db,'connect',return_value=Conn()), patch.object(decisions,'_evidence_ready',return_value=False), patch.object(decisions,'_links_ready',return_value=False), patch.object(decisions,'_stale_briefs'), patch.object(decisions,'_not_forgotten_clause',return_value=None), patch.object(owner_writes,'annotate',return_value={}), patch.object(owner_writes,'run',side_effect=lambda _tool,args,**_:srv._decisions_update_on_hub(args)), patch.object(owner_writes,'apply_on_hub',side_effect=lambda conn,cur,tool,args,write,echo:write()):
         # Adapt PostgreSQL ANY without replacing the real alias resolver.
         original_execute=Cursor.execute
         def execute(self, sql, params=()):

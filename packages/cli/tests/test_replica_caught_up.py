@@ -118,7 +118,8 @@ def test_a_pull_that_found_nothing_new_still_counts(replica):  # noqa: F811
 
 def test_a_pull_with_a_failed_part_does_not_count(replica, monkeypatch):  # noqa: F811
     dump = _set_dump(3)
-    monkeypatch.setattr(hs, "sync_decision_changes", lambda: {"ok": False, "error": "hub connection lost"})
+    monkeypatch.setattr(hs, "_write_pulled_tables", lambda *a, **kw: {
+        "topics": {"ok": False, "error": "hub connection lost"}, "project_aliases": {"ok": True}})
     assert not hs.pull_changes()["ok"]
     assert hs.caught_up_at() == dump.isoformat()
     assert hs.snapshot_health()["age_seconds"] > 2 * 3600

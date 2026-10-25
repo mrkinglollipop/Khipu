@@ -777,7 +777,6 @@ class CascadeTest(unittest.TestCase):
         cur.rowcount = 1
         cur.fetchone.return_value = None
         with mock.patch.object(decisions, "_evidence_ready", return_value=True), \
-             mock.patch.object(decisions, "_mirror_to_snapshot"), \
              mock.patch("khipu.briefs.mark_stale_for_decision") as stale:
             decisions.retract(cur, 7, "wrong")
             decisions.unretract(cur, 8)
@@ -792,7 +791,6 @@ class CascadeTest(unittest.TestCase):
              mock.patch.object(decisions, "_chain_leads_to", return_value=False), \
              mock.patch.object(decisions, "_evidence_ready", return_value=False), \
              mock.patch.object(decisions, "_links_ready", return_value=False), \
-             mock.patch.object(decisions, "_mirror_to_snapshot"), \
              mock.patch("khipu.briefs.mark_stale_for_decision") as stale:
             self.assertTrue(decisions.supersede(cur, 1, 2))
             self.assertTrue(decisions.restore(cur, 1))
@@ -802,7 +800,6 @@ class CascadeTest(unittest.TestCase):
         cur = mock.MagicMock()
         cur.rowcount = 1
         with mock.patch.object(decisions, "_evidence_ready", return_value=True), \
-             mock.patch.object(decisions, "_mirror_to_snapshot"), \
              mock.patch("khipu.briefs._ready", side_effect=RuntimeError("boom")):
             self.assertTrue(decisions.retract(cur, 7, "wrong"))
 

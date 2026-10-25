@@ -1,73 +1,53 @@
+# ruff: noqa: F811 - pytest fixtures imported from test_provenance_forget and replica_copy
 """Expected invariant: a full refresh must not serve a source the registry refused.
 
-Since the owner ruling of 2026-10-24 (the wait rule, design section 6) a
-replica keeps no fact row until the hub shows every confirmed refusal's
-episode id tombstoned (a forgotten episode id confirms itself), and serves
-the live facts once the hub's forget has landed."""
-from datetime import datetime, timezone
-import sqlite3
-
-import pytest
-from khipu import hub_snapshot as hs, offline_reads, tombstones
-
-
-class FullHub:
-    def __init__(self, deleted=False):
-        self.data = {
-            'episodes': [{'id': 7, 'summary': 'FORGOTTEN source',
-                          'deleted_at': datetime.now(timezone.utc) if deleted else None},
-                         {'id': 8, 'summary': 'live source'}],
-            'commitments': [
-                {'id': 70, 'text': 'FORGOTTEN synthetic obligation', 'project': 'scratch',
-                 'opened_episode': 7, 'status': 'open', 'owner': 'user', 'kind': 'task'},
-                {'id': 80, 'text': 'live control obligation', 'project': 'scratch',
-                 'opened_episode': 8, 'status': 'open', 'owner': 'user', 'kind': 'task'}],
-        }
-    def __enter__(self): return self
-    def __exit__(self, *args): return False
-    def cursor(self): return self
-    def execute(self, sql, params=()):
-        if sql == 'SELECT now()':
-            self.rows = [(datetime.now(timezone.utc),)]
-            return
-        columns, table = sql[len('SELECT '):].split(' FROM ', 1)
-        table = table.split()[0]
-        rows = self.data.get(table, [])
-        # The wait rule's read: which confirmed ids the hub shows tombstoned.
-        if table == 'episodes' and 'deleted_at IS NOT NULL' in sql:
-            rows = [r for r in rows if r.get('deleted_at') is not None]
-        elif 'deleted_at IS NULL' in sql:
-            rows = [r for r in rows if r.get('deleted_at') is None]
-        if 'id = ANY(%s)' in sql:
-            rows = [r for r in rows if r.get('id') in params[0]]
-        cols = [c.strip().removeprefix('e.') for c in columns.split(', ')]
-        self.rows = [tuple(row.get(c) for c in cols) for row in rows]
-    def fetchone(self): return self.rows[0] if self.rows else None
-    def fetchall(self): return self.rows
+Since phase 7B (design section 6.2) the replica keeps a copy of the hub's
+facts: a forgotten episode id this Mac holds must be tombstoned (or absent)
+on the hub before a copy is published, and until then it is listed and no
+fact row shows; once the hub's forget lands, the live facts are served."""
+from khipu import hub_snapshot as hs, offline_reads, provenance, tombstones
+from tests.fact_seed import announce
+from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.replica_copy import replica  # noqa: F401
+from tests.test_provenance_forget import env, pg  # noqa: F401
 
 
-def test_full_refresh_scrubs_episode_but_serves_forgotten_commitment(tmp_path, monkeypatch):
-    monkeypatch.setenv('KHIPU_DATA_DIR', str(tmp_path / 'state'))
-    monkeypatch.setenv('KHIPU_TEST', '1')
-    import psycopg
-    monkeypatch.setattr(psycopg, 'connect', lambda *a, **kw: pytest.fail('Network forbidden'))
-    tombstones.publish_episode_ids({7})
-    columns = {'episodes': {'id', 'summary', 'deleted_at'},
-               'commitments': {'id', 'text', 'project', 'opened_episode', 'status', 'owner', 'kind'}}
-    monkeypatch.setattr(hs, '_pg_columns', lambda cur, table: columns.get(table, set()))
-    # The hub still holds episode 7 live: no fact row until it catches up.
-    monkeypatch.setattr(hs, 'try_hub_connect', lambda **kw: FullHub())
+def _seed(h):
+    with h.connect() as conn:
+        ids = []
+        for summary, words in (("FORGOTTEN source", "FORGOTTEN synthetic obligation"),
+                               ("live source", "live control obligation")):
+            announce(conn)  # each episode its own identity
+            eid = conn.execute(
+                "INSERT INTO episodes (ts, session_id, summary, raw, harness, project, transcript_range) "
+                "VALUES (now(), %s, %s, jsonb_build_object('summary', %s::text), 'codex', 'scratch', '0:1') "
+                "RETURNING id", (f"codex:{summary}", summary, summary)).fetchone()[0]
+            cid = conn.execute(
+                "INSERT INTO commitments (text, project, owner, kind, opened_episode, content_hash) "
+                "VALUES (%s, 'scratch', 'user', 'followup', %s, %s) RETURNING id", (words, eid, words)).fetchone()[0]
+            provenance.record_claim(conn.cursor(), "commitment", cid, "text", words, episode_id=eid)
+            provenance.project(conn.cursor(), "commitment", cid)
+            ids.append((eid, cid))
+    return ids
+
+
+def test_full_refresh_scrubs_episode_but_serves_forgotten_commitment(pg, replica):
+    replica(pg)
+    (forgotten, gone), (_live, kept) = _seed(pg)
+    tombstones.publish_episode_ids({forgotten})
+    # The hub still holds the episode live: listed, no fact row.
     result = hs.refresh()
     assert result['ok'] and result['counts']['forgotten_scrubbed'] == 1, result
-    with sqlite3.connect(hs.snapshot_path()) as con:
-        assert con.execute('SELECT id FROM episodes').fetchall() == [(8,)]
+    assert result['facts'].get('unsent') == 1, result['facts']
     waiting = offline_reads.owed('scratch', 'open', 20)
-    assert waiting is not None and waiting['results'] == [] and waiting['facts_rebuilding'], waiting
-    # The hub's forget lands: the live commitment is served, 70 never.
-    monkeypatch.setattr(hs, 'try_hub_connect', lambda **kw: FullHub(deleted=True))
+    assert waiting is not None and waiting['results'] == [] and waiting['facts_hidden'], waiting
+    # The hub's forget lands: the live commitment is served, the other never.
+    with pg.connect() as conn, conn.cursor() as cur:
+        identities = provenance.stored_identities(cur, [forgotten])[forgotten]
+        provenance.refuse(cur, identities, episode_id=forgotten, also=[forgotten])
+        conn.commit()
     result = hs.refresh()
-    assert result['ok'], result
+    assert result['ok'] and result['facts'].get('copied'), result
     served = offline_reads.owed('scratch', 'open', 20)
-    assert served is not None and any(r['id'] == 80 for r in served['results']), served
     ids = [r['id'] for r in served['results']]
-    assert ids == [80], 'full refresh must not serve forgotten commitment 70'
+    assert ids == [kept] and gone not in ids, 'full refresh must not serve the forgotten commitment'

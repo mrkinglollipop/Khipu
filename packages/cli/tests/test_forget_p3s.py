@@ -50,22 +50,31 @@ def test_replica_forget_removes_commitments_and_their_vectors(replica):
     assert _vectors(replica) == ["80"]
 
 
-def test_pulled_commitments_replace_drops_vectors_of_commitments_gone_from_the_hub(replica):
+def _copy(replica, commitments):
+    """The fact copy's publication of ``commitments`` (since phase 7B the
+    pull copies none itself, design 6.2): the hub still holds each held
+    vector of a copied commitment, as built."""
     cols = ["id", "text", "status", "opened_episode"]
-    parts = hs._write_pulled_tables(None, (cols, [(80, "live obligation", "open", 8)]), None, read_at=time.time())
-    assert parts["commitments"]["ok"], parts
+    with sqlite3.connect(replica) as con:
+        held = hs._held_commitment_vectors(con)
+        keys = {k: v for k, v in held.items() if k[1] in {str(r[0]) for r in commitments}}
+        read = {"commitments": (cols, commitments), "decisions": [], "deliverables": [],
+                "vector_keys": keys, "vectors": [], "incarnation": "i", "snapshot": "1:1:"}
+        return hs._write_copy(con, {"fingerprint": "f", "destination": "d", "held_vectors": held}, read)
+
+
+def test_a_copy_drops_vectors_of_commitments_gone_from_the_hub(replica):
+    _copy(replica, [(80, "live obligation", "open", 8)])
     assert _commitments(replica) == [80]
     assert _vectors(replica) == ["80"]
 
 
-def test_pulled_commitments_replace_keeps_a_standalone_commitments_vector(replica):
+def test_a_copy_keeps_a_standalone_commitments_vector(replica):
     with sqlite3.connect(replica) as con:
         con.execute("INSERT INTO commitments(id,text,status,opened_episode) VALUES (90,'solo','open',NULL)")
         con.execute("INSERT INTO memory_embeddings(profile,kind,ref,chunk_idx,chunk_text) "
                     "VALUES ('p','commitment','90',0,'solo')")
-    cols = ["id", "text", "status", "opened_episode"]
-    hs._write_pulled_tables(None, (cols, [(80, "live obligation", "open", 8), (90, "solo", "open", None)]), None,
-                            read_at=time.time())
+    _copy(replica, [(80, "live obligation", "open", 8), (90, "solo", "open", None)])
     assert _vectors(replica) == ["80", "90"]
 
 
@@ -80,7 +89,7 @@ def _topic(stamp):
 def test_recreated_topic_clears_marker_by_hub_time_despite_local_clock_ahead(replica):
     hub_at = datetime.now(timezone.utc) - timedelta(hours=2)  # hub clock far behind this Mac
     _purged(replica, hub_at)
-    parts = hs._write_pulled_tables([_topic(hub_at + timedelta(seconds=1))], None, None, read_at=time.time())
+    parts = hs._write_pulled_tables([_topic(hub_at + timedelta(seconds=1))], None, read_at=time.time())
     assert parts["topics"]["ok"], parts
     assert hs.topic_detail_snapshot("gone")["body"] == "NEW"
     assert "gone" not in hs._purged_topic_slugs(replica)
@@ -89,7 +98,7 @@ def test_recreated_topic_clears_marker_by_hub_time_despite_local_clock_ahead(rep
 def test_topic_not_newer_than_hub_purge_time_stays_hidden(replica):
     hub_at = datetime.now(timezone.utc) + timedelta(hours=2)  # hub clock ahead of this Mac
     _purged(replica, hub_at)
-    hs._write_pulled_tables([_topic(hub_at - timedelta(seconds=1))], None, None, read_at=time.time())
+    hs._write_pulled_tables([_topic(hub_at - timedelta(seconds=1))], None, read_at=time.time())
     assert hs.topic_detail_snapshot("gone") is None
     assert "gone" in hs._purged_topic_slugs(replica)
 
@@ -104,7 +113,7 @@ def test_marker_vanishing_mid_pull_does_not_raise(replica, monkeypatch):
         return out
 
     monkeypatch.setattr(hs, "_purged_topic_slugs", slugs_then_vanish)
-    parts = hs._write_pulled_tables([_topic(datetime.now(timezone.utc))], None, None, read_at=time.time())
+    parts = hs._write_pulled_tables([_topic(datetime.now(timezone.utc))], None, read_at=time.time())
     assert parts["topics"]["ok"], parts
     assert hs._purge_marker_time(replica, "gone") is None
 

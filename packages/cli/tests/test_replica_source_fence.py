@@ -1,7 +1,12 @@
 # ruff: noqa: F811 - pytest fixtures imported from test_provenance_forget
-"""The replica's one source fence (design section 6; second Astra review
-2026-10-23, findings 1 and 2): every import into the replica goes through
-``hub_snapshot._replica_write_gate`` and its ``_SourceFence``.
+"""The replica's episode fence and its one fact writer (design section 6.2;
+second Astra review 2026-10-23, findings 1 and 2).
+
+Every import of episodes and their vectors goes through
+``hub_snapshot._replica_write_gate`` and its ``_SourceFence``; every fact
+row (commitments, decisions, deliverables, commitment vectors) reaches the
+replica only through the fact copy (``copy_facts``: its lock, load rule
+and one publication transaction).
 
 The structural half enumerates every function that writes the replica's
 memory tables and every import entry point, and pins how each one is
@@ -23,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from khipu import capture, decisions, hub_snapshot as hs, tombstones
+from khipu import capture, hub_snapshot as hs, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import env, pg, PROJECT, _capture, _payload  # noqa: F401
 from tests.test_provenance_replica import hub_forget, replica, _replica, _replica_readers  # noqa: F401
@@ -34,39 +39,32 @@ TREE = ast.parse(SOURCE)
 
 # Every function in hub_snapshot.py that writes a replica memory table, and
 # why it is safe. "fenced" means it is only ever reached inside a
-# _replica_write_gate (checked below through the call graph).
+# _replica_write_gate; "copy" that it is only reached from the fact copy's
+# publication (checked below through the call graph).
 MEMORY_WRITERS = {
-    "_apply_fact_stream": "fenced: the fact stream (sync, pull)",
-    "_write_decision_rows": "fenced: decision rows, each through _admit_fact",
-    "_write_commitment_rows": "fenced: the pull's and the rebuild's commitments copy; the dump's builder",
-    "_write_deliverable_rows": "fenced: an episode patch's deliverables",
-    "_write_fact_deliverables": "fenced: deliverable rows, each through _admit_fact",
+    "_write_copy": "copy: the publication of a copy that passed the load rule",
+    "_write_decision_rows": "copy: decision rows",
+    "_write_commitment_rows": "copy: commitment rows",
+    "_write_fact_deliverables": "copy: deliverable rows",
+    "_insert_vector_row": "fenced or copy: a vector row its caller checked (never a fact vector outside the copy)",
+    "_drop_facts": "removes: a backup copy's and a restored replica's fact rows",
     "_upsert_episode_unfenced": "fenced: an episode patch (pull, capture, outbox replay)",
-    "_write_pulled_tables": "fenced: the pull's commitments, their vectors, topics and fact stream",
-    "upsert_embeddings": "fenced: vectors, by their episode's identities or their fact's wording",
-    "_load_facts": "fenced: the rebuild's whole fact state",
-    "_drop_fact_state": "fenced: the drop when the refusal set changes (only removes)",
-    "_drop_mismatched_commitment_vectors": "fenced: removes vectors whose wording is not shown",
-    "_insert_vector_row": "fenced: a vector row a fenced writer already checked",
+    "_write_pulled_tables": "fenced: the pull's topics and project aliases",
+    "upsert_embeddings": "fenced: vectors, by their episode's identities; never a fact vector",
     "_scrub_forgotten": "fenced: the fence's whole-replica check",
-    "_insert_decisions": "dump builder: a fresh file the dump checks (_fence_dumped_facts) and publishes",
-    "_insert_deliverables": "dump builder",
     "_insert_episodes": "dump builder",
-    "_insert_memory_embeddings": "dump builder",
+    "_insert_memory_embeddings": "dump builder: never a fact vector",
     "_apply_pending_erasures": "erasure: a forget, which only removes",
     "_erase_episode_commitments": "erasure",
     "forget_episode_in_snapshot": "erasure",
     "purge_topic_in_snapshot": "erasure: a topic purge",
 }
 DUMP_BUILDERS = {name for name, how in MEMORY_WRITERS.items() if how.startswith("dump builder")}
+COPY_WRITERS = {name for name, how in MEMORY_WRITERS.items() if how.startswith("copy")}
 
-# Every public way rows reach the replica, and the function in it that
+# Every public way episodes reach the replica, and the function in it that
 # opens the fenced write.
 IMPORT_PATHS = {
-    "sync_fact_changes": "_apply_fact_stream_locked",
-    "rebuild_facts": "rebuild_facts",
-    "apply_decision_changes": "apply_decision_changes",
-    "sync_decision_changes": "apply_decision_changes",
     "upsert_episode": "_upsert_episode_unfenced",
     "upsert_embeddings": "upsert_embeddings",
     "pull_changes": "_write_pulled_tables",
@@ -75,9 +73,10 @@ IMPORT_PATHS = {
     "scrub_forgotten_snapshot": "scrub_forgotten_snapshot",
 }
 # Every function that opens _replica_write_gate.
-GATE_OPENERS = {"_apply_fact_stream_locked", "rebuild_facts", "apply_decision_changes",
-                "_upsert_episode_unfenced", "upsert_embeddings", "_write_pulled_tables",
+GATE_OPENERS = {"_upsert_episode_unfenced", "upsert_embeddings", "_write_pulled_tables",
                 "_refresh_locked", "publish_imported_snapshot", "scrub_forgotten_snapshot"}
+# Every public way facts reach the replica: each one runs the copy.
+FACT_PATHS = {"pull_changes", "refresh", "sync_decision_changes", "scrub_forgotten_snapshot", "copy_facts"}
 
 _WRITE = re.compile(r"\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM)\s+(?:main\.)?"
                     r"(episodes|decisions|deliverables|commitments|memory_embeddings)\b", re.I)
@@ -116,74 +115,67 @@ def test_every_replica_memory_writer_is_enumerated():
     assert found == set(MEMORY_WRITERS), "a replica memory writer is not listed with how it is fenced"
 
 
+def _reaches(entry: str) -> set[str]:
+    fns, seen, todo = _functions(), set(), [entry]
+    while todo:
+        name = todo.pop()
+        if name in seen or name not in fns:
+            continue
+        seen.add(name)
+        todo.extend(_called(fns[name]))
+    return seen
+
+
 def test_every_import_path_opens_the_one_gate():
     fns = _functions()
     assert {name for name, fn in fns.items() if _opens_gate(fn)} == GATE_OPENERS
     for entry, opener in IMPORT_PATHS.items():
         assert opener in GATE_OPENERS
-        # The entry reaches its opener through hub_snapshot's own calls.
-        seen, todo = set(), [entry]
-        while todo:
-            name = todo.pop()
-            if name in seen or name not in fns:
-                continue
-            seen.add(name)
-            todo.extend(_called(fns[name]))
-        assert opener in seen, f"{entry} does not reach {opener}"
+        assert opener in _reaches(entry), f"{entry} does not reach {opener}"
+    for entry in FACT_PATHS:
+        assert "copy_facts" in _reaches(entry), f"{entry} does not run the fact copy"
 
 
-def test_every_fenced_writer_is_only_reached_inside_the_gate():
-    """A fenced writer is called only by a gate opener or by another fenced
-    writer (never from outside the mechanism), the dump builders only by the
-    dump, and the fact-table row writers always with the fence."""
-    fenced = {n for n, how in MEMORY_WRITERS.items() if how.startswith("fenced")}
+def test_fact_rows_have_one_writer_the_copys_publication():
+    """Fact rows are written only by ``_write_copy``, reached only from
+    ``_publish_copy`` inside the admitted publication, which checks the
+    registry fingerprint, the invalidation revision and the destination
+    first; the copy runs under ``fact-copy.lock``. Episode writers never
+    write a fact row; the dump writes none."""
     fns = _functions()
-    # The fence's own methods (drop, scrub) and the dump's in-place check run
-    # inside the gate that made the fence.
-    inside = {"drop_facts", "scrub", "_fence_dumped_facts", "_write_commitment_vectors"}
-    for name in fenced - GATE_OPENERS - {"_scrub_forgotten", "_drop_fact_state"}:
-        for caller in _callers(name):
-            assert caller in GATE_OPENERS | fenced | inside | {"upsert_episode", "_insert_commitments"}, \
-                (name, caller)
-    for name in DUMP_BUILDERS | {"_insert_commitments"}:
+    for name in COPY_WRITERS - {"_write_copy"}:
+        assert _callers(name) == {"_write_copy"}, (name, _callers(name))
+    assert _callers("_write_copy") == {"_publish_copy"}
+    assert _callers("_publish_copy") == {"_copy_once"}
+    assert _callers("_copy_once") == {"copy_facts"}
+    copy = ast.get_source_segment(SOURCE, fns["copy_facts"])
+    assert "_fact_copy_lock" in copy
+    publish = ast.get_source_segment(SOURCE, fns["_publish_copy"])
+    for check in ("_refusal_digest", "_revision", "_hub_destination", "missing", "unmet"):
+        assert check in publish, check
+    once = ast.get_source_segment(SOURCE, fns["_copy_once"])
+    assert once.count("_admitted(") >= 3  # the endpoint clear, the incarnation clear, the publication
+    for name in DUMP_BUILDERS:
         assert _callers(name) == {"_refresh_locked"}, name
     assert _callers("_upsert_episode_unfenced") == {"upsert_episode"}
     assert _callers("_scrub_forgotten") == {"scrub"}
-    # The backup export drops the facts of its own staged copy (a refused
-    # generation's rows never reach an archive), never the replica's.
-    assert _callers("_drop_fact_state") == {"drop_facts", "export_replica_copy"}
-    assert _callers("_fence_dumped_facts") == {"_refresh_locked"}
-    assert _callers("_write_commitment_vectors") <= fenced
-    # Production calls of the row writers pass the fence.
-    for writer, at in (("_write_decision_rows", 2), ("_write_commitment_rows", 3), ("_apply_fact_stream", 2)):
-        for caller in _callers(writer):
-            if caller == "_insert_commitments":
-                continue
-            for call in ast.walk(fns[caller]):
-                if isinstance(call, ast.Call) and getattr(call.func, "id", None) == writer:
-                    assert len(call.args) > at or any(k.arg == "fence" for k in call.keywords), (writer, caller)
-    # Episodes and their vectors are checked by every identity they carry;
-    # every fact import by the wait rule (owner ruling 2026-10-24).
+    assert _callers("_drop_facts") == {"export_replica_copy", "publish_imported_snapshot"}
     for name in ("_upsert_episode_unfenced", "upsert_embeddings"):
         assert "check" in _called(fns[name]), f"{name} does not check its episodes"
-    for name in ("apply_decision_changes", "_upsert_episode_unfenced", "_write_pulled_tables",
-                 "_apply_fact_stream", "_load_facts", "_fence_dumped_facts"):
-        assert "facts_confirmed" in _called(fns[name]), f"{name} skips the wait rule"
+    for name in ("_upsert_episode_unfenced", "_write_pulled_tables", "_refresh_locked", "upsert_embeddings"):
+        assert not COPY_WRITERS & _reaches(name), name
+    for kind in ("_insert_memory_embeddings", "upsert_embeddings", "_pull_apply"):
+        assert "_FACT_VECTOR_KINDS" in ast.get_source_segment(SOURCE, fns[kind]), kind
 
 
 def test_every_anchor_read_carries_every_identity():
     """Each episode import reads its episodes' identities from the hub in
-    its own snapshot, merged captures and source receipts included. Every
-    fact read carries the wait rule's hub read (``read_refusal_wait``),
-    which since the owner decision of 2026-10-24 compares ids only: the
-    registry's confirmed hub ids against the hub's tombstones, never an
-    identity."""
+    its own snapshot, merged captures and source receipts included. The fact
+    copy reads no identity: the hub matched every refusal (design 6.1), and
+    the copy checks only that each registry string is a hub refusal and
+    each bare id tombstoned or absent there."""
     fns = _functions()
-    assert {"_read_receipts", "read_anchor_identities", "read_refusal_wait"} <= _called(fns["_pull_apply"])
-    for reader in ("_read_fact_rows", "_read_all_facts", "_dump_fact_inputs", "sync_decision_changes"):
-        assert "read_refusal_wait" in _called(fns[reader]), reader
-    for module in ("decisions.py", "embed.py"):
-        assert "read_refusal_wait" in (PACKAGE / module).read_text(encoding="utf-8"), module
+    assert {"_read_receipts", "read_anchor_identities"} <= _called(fns["_pull_apply"])
     assert "_episode_refused" not in fns
     assert "_read_receipts" in _called(fns["read_anchor_identities"])
     assert "_anchor_identities" in _called(fns["read_anchor_identities"])
@@ -191,11 +183,10 @@ def test_every_anchor_read_carries_every_identity():
     assert "_anchor_identities" in _called(fns["_upsert_episode_unfenced"])
     body = ast.get_source_segment(SOURCE, fns["_anchor_identities"])
     assert "merged_from" in body and "receipts" in body
-    wait = ast.get_source_segment(SOURCE, fns["read_refusal_wait"])
-    assert "confirmed_ids" in wait and "unconfirmed" in wait and "deleted_at IS NOT NULL" in wait
-    for identity_read in ("episode_sources", "merged_from", "khipu_natural_source_key", "_anchor_identities",
-                          "refuses"):
-        assert identity_read not in wait, identity_read
+    copy = ast.get_source_segment(SOURCE, fns["_copy_read"]) + hs._COPY_CHECK_SQL
+    assert "forgotten_sources" in copy and "deleted_at IS NULL" in copy and "fact_copy_ready" in copy
+    for identity_read in ("episode_sources", "merged_from", "_anchor_identities", "refuses", "episode_identities"):
+        assert identity_read not in copy, identity_read
 
 
 # ---- behaviour: every path, one schedule ------------------------------------------
@@ -229,16 +220,25 @@ def _leaked() -> list[str]:
 
 @pytest.fixture
 def gate_spy(monkeypatch):
+    """Records each entry into the episode gate ("gate") and the copy lock
+    ("copy")."""
     opened: list[str] = []
-    real = hs._replica_write_gate
+    real_gate, real_copy = hs._replica_write_gate, hs._fact_copy_lock
 
     @contextmanager
-    def spy(*args, **kwargs):
+    def gate(*args, **kwargs):
         opened.append("gate")
-        with real(*args, **kwargs) as fence:
+        with real_gate(*args, **kwargs) as fence:
             yield fence
 
-    monkeypatch.setattr(hs, "_replica_write_gate", spy)
+    @contextmanager
+    def copy(*args, **kwargs):
+        opened.append("copy")
+        with real_copy(*args, **kwargs):
+            yield
+
+    monkeypatch.setattr(hs, "_replica_write_gate", gate)
+    monkeypatch.setattr(hs, "_fact_copy_lock", copy)
     return opened
 
 
@@ -247,34 +247,12 @@ def _vector_row(eid):
             "content_hash": "x", "embedding": [1.0, 0.0], "built_at": "2026-10-23T12:00:00+00:00"}
 
 
-IMPORTS = {
-    "sync_fact_changes": lambda pg, eid: hs.sync_fact_changes(),
-    "pull_changes": lambda pg, eid: hs.pull_changes(include_ledger=False),
-    "refresh": lambda pg, eid: hs.refresh(),
-}
-
-
-def _rebuild_facts(pg, eid):
-    return hs.rebuild_facts()
-
-
-def _decision_mirror(pg, eid):
-    with pg.connect() as conn, conn.cursor() as cur:
-        for (fid,) in cur.execute("SELECT id FROM decisions").fetchall():
-            decisions._mirror_to_snapshot(cur, fid)
-        conn.rollback()
-    return {"ok": True}
-
-
 def _episode_patch(pg, eid):
-    from khipu import deliverables
-
     with pg.connect() as conn, conn.cursor() as cur:
         row = cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (eid,)).fetchone()[0]
-        rows = deliverables.deliverables_for_episode(cur, eid)
         receipts = hs._read_receipts(cur, [eid]).get(eid, [])
         conn.rollback()
-    return hs.upsert_episode(row, [_vector_row(eid)], deliverable_rows=rows, receipts=receipts)
+    return hs.upsert_episode(row, [_vector_row(eid)], receipts=receipts)
 
 
 def _vectors(pg, eid):
@@ -284,16 +262,24 @@ def _vectors(pg, eid):
     return hs.upsert_embeddings([_vector_row(eid)], anchors=anchors)
 
 
-IMPORTS.update({"rebuild_facts": _rebuild_facts, "apply_decision_changes": _decision_mirror,
-                "upsert_episode": _episode_patch, "upsert_embeddings": _vectors})
+# Each path and the mechanism it must enter.
+IMPORTS = {
+    "copy_facts": (lambda pg, eid: hs.copy_facts(), {"copy"}),
+    "sync_decision_changes": (lambda pg, eid: hs.sync_decision_changes(), {"copy"}),
+    "pull_changes": (lambda pg, eid: hs.pull_changes(include_ledger=False), {"gate", "copy"}),
+    "refresh": (lambda pg, eid: hs.refresh(), {"gate", "copy"}),
+    "upsert_episode": (_episode_patch, {"gate"}),
+    "upsert_embeddings": (_vectors, {"gate"}),
+}
 
 
 @pytest.mark.parametrize("path", sorted(IMPORTS))
 def test_every_import_path_fences_a_forgotten_merged_source(pg, replica, gate_spy, path):
     """A live public episode gains a merged capture on the hub whose source
     this Mac forgets while the merge is open, before the replica's last
-    fenced write (so no registry change is left to trigger a scrub). Each
-    import path alone must refuse its words."""
+    write (so no registry change is left to trigger a scrub). Each import
+    path alone must refuse its words: the episode by the fence, the facts
+    because the hub lacks this Mac's refusal (the copy lists it)."""
     replica(pg)
     eid = _capture(loop=None)
     private = _private()
@@ -306,15 +292,17 @@ def test_every_import_path_fences_a_forgotten_merged_source(pg, replica, gate_sp
     with pg.connect() as conn:
         assert conn.execute("SELECT count(*) FROM decisions").fetchone() == (1,)
     gate_spy.clear()
-    IMPORTS[path](pg, eid)
-    assert gate_spy, f"{path} did not go through _replica_write_gate"
+    run, entered = IMPORTS[path]
+    run(pg, eid)
+    assert entered <= set(gate_spy), f"{path} did not go through {entered - set(gate_spy)}"
     assert _leaked() == [], path
 
 
 @pytest.mark.parametrize("path", ["publish_imported_snapshot", "scrub_forgotten_snapshot"])
 def test_imported_and_scrubbed_replicas_fence_a_merged_source(pg, replica, gate_spy, path, tmp_path):
     """A replica copy made before the source was forgotten holds its words;
-    the backup import and the scrub refuse them by the merged identity."""
+    the backup import drops every fact row of the copy it restores, and the
+    scrub refuses the episode by the merged identity."""
     replica(pg)
     eid = _capture(loop=None)
     private = _private()
@@ -331,7 +319,7 @@ def test_imported_and_scrubbed_replicas_fence_a_merged_source(pg, replica, gate_
         staged.unlink()
         out = hs.scrub_forgotten_snapshot()
     assert out["ok"], out
-    assert gate_spy
+    assert "gate" in gate_spy
     assert _leaked() == []
 
 
@@ -351,22 +339,33 @@ def test_identities_cover_merged_payloads_and_receipts():
 
 # ---- contributors: every path, multi-episode facts (third Astra review #1) --------
 
-def test_every_fact_writer_checks_each_row():
-    """Each writer of commitment, decision or deliverable rows passes every
-    row through the one anchor check (``_admit_fact``), under the wait rule
-    its caller applied. The per-row contributor admission was cut by the
-    owner ruling of 2026-10-24: no contributor state is read or kept."""
-    fns = _functions()
-    for writer in ("_write_commitment_rows", "_write_decision_rows", "_write_fact_deliverables"):
-        assert "_admit_fact" in _called(fns[writer]), writer
-    for writer in ("_apply_fact_stream", "_write_deliverable_rows", "_load_facts"):
-        assert "_write_fact_deliverables" in _called(fns[writer]), writer
-    assert {"_dump_fact_inputs", "_fence_dumped_facts"} <= _called(fns["_refresh_locked"])
+def test_the_retired_replica_mechanisms_are_gone():
+    """The rebuild rule, the wait rule and the incremental re-fence are
+    removed (design 6.6, "Removed"), with every table they kept."""
     fns_and_classes = {n.name for n in ast.walk(TREE) if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
     for retired in ("_fence_fact_wording", "_store_fact_sources", "_facts_sourced_by", "_ScrubGate",
                     "_index_identities", "apply_fact_rows", "read_fact_sources", "_fact_source_sql",
-                    "fact_source_episodes", "_commitment_anchors", "_dumped_identities", "supports"):
+                    "fact_source_episodes", "_commitment_anchors", "_dumped_identities", "supports",
+                    "sync_fact_changes", "rebuild_facts", "read_refusal_wait", "_admit_fact",
+                    "_fence_dumped_facts", "_apply_fact_stream", "_read_fact_stream", "_load_facts",
+                    "apply_decision_changes", "_write_deliverable_rows", "_patch_covers_stream"):
         assert retired not in fns_and_classes, retired
+    for name in ("facts_confirmed", "drop_facts", "wait_report"):
+        assert not hasattr(hs._SourceFence, name), name
+    for table in ("replica_anchor_sources", "replica_fact_sources", "replica_source_index",
+                  "replica_fence_applied"):
+        assert table in hs._RETIRED_FACT_TABLES
+    from khipu import forget, provenance
+
+    for name in ("confirm_from_hub", "pending_forgets", "send_pending"):
+        assert not hasattr(forget, name), name
+    for name in ("record_confirmations", "_union_confirmations"):
+        assert not hasattr(tombstones, name), name
+    assert "fact_changes_floor" not in ast.get_source_segment(
+        (PACKAGE / "provenance.py").read_text(encoding="utf-8"),
+        next(n for n in ast.walk(ast.parse((PACKAGE / "provenance.py").read_text(encoding="utf-8")))
+             if isinstance(n, ast.FunctionDef) and n.name == "prune_changes"))
+    assert provenance.prune_changes
 
 
 SHARED_DECISION = "Ship the shared release checklist"
@@ -374,30 +373,12 @@ SHARED_TITLE = "Shared release checklist"
 B_WORDS = "Review the deployment checklist before the release goes out"
 A_WORDS = "Review the deployment checklist before release"
 
-
-def _patch_with_confirm(pg, eid):
-    from khipu import deliverables
-
-    with pg.connect() as conn, conn.cursor() as cur:
-        # As embed_on_capture reads them: the xmin before the rows.
-        fact_xmin = hs._hub_snapshot_xmin(cur)
-        row = cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (eid,)).fetchone()[0]
-        confirm = hs.read_refusal_wait(cur)
-        rows = deliverables.deliverables_for_episode(cur, eid)
-        receipts = hs._read_receipts(cur, [eid]).get(eid, [])
-        conn.rollback()
-    return hs.upsert_episode(row, [], deliverable_rows=rows, receipts=receipts, fact_xmin=fact_xmin,
-                             confirm=confirm)
-
-
 CONTRIBUTOR_IMPORTS = {
-    "sync_fact_changes": (lambda pg, a: hs.sync_fact_changes(), {"decision", "deliverable"}),
+    "copy_facts": (lambda pg, a: hs.copy_facts(), {"commitment", "decision", "deliverable"}),
+    "sync_decision_changes": (lambda pg, a: hs.sync_decision_changes(), {"commitment", "decision", "deliverable"}),
     "pull_changes": (lambda pg, a: hs.pull_changes(include_ledger=False),
                      {"commitment", "decision", "deliverable"}),
     "refresh": (lambda pg, a: hs.refresh(), {"commitment", "decision", "deliverable"}),
-    "rebuild_facts": (_rebuild_facts, {"commitment", "decision", "deliverable"}),
-    "apply_decision_changes": (_decision_mirror, {"decision"}),
-    "upsert_episode": (_patch_with_confirm, {"deliverable"}),
 }
 
 
@@ -406,10 +387,9 @@ def test_every_import_path_keeps_and_fences_every_contributor(pg, replica, gate_
     """Two separate live episodes share each fact: B restates A's
     commitment (its latest_text) and repeats A's decision and deliverable
     word for word. This Mac has forgotten B's source; the hub is unchanged.
-    Under the wait rule (owner ruling 2026-10-24) each import path alone
-    writes no fact row while the hub still holds B live; once the hub's
-    forget re-projects the facts, the same path shows A's words and never
-    B's."""
+    Each fact path alone publishes no copy while the hub still holds B live
+    (the hub lacks this Mac's refusal); once the hub's forget re-projects
+    the facts, the same path shows A's words and never B's."""
     replica(pg)
     assert hs.refresh()["ok"]
     a = _capture(loop=A_WORDS, decision=SHARED_DECISION, title=SHARED_TITLE)
@@ -424,22 +404,21 @@ def test_every_import_path_keeps_and_fences_every_contributor(pg, replica, gate_
     tombstones.publish_payloads([bpayload])
     gate_spy.clear()
     run, kinds = CONTRIBUTOR_IMPORTS[path]
-    out = run(pg, a)
-    assert out.get("ok", True), out
-    assert gate_spy, f"{path} did not go through _replica_write_gate"
+    run(pg, a)
+    assert "copy" in gate_spy, f"{path} did not run the fact copy"
+
     def tables():
         return json.dumps([_replica("SELECT * FROM commitments"), _replica("SELECT * FROM decisions"),
                            _replica("SELECT * FROM deliverables")])
 
-    # Waiting: no fact row at all, B's words least of all.
+    # Listed: no fact row of this copy, B's words least of all.
     assert B_WORDS not in tables() and B_WORDS not in _replica_readers(), path
     assert SHARED_DECISION not in tables() and A_WORDS not in tables(), path
     # The hub catches up; the same path alone brings A's words back.
     hub_forget(pg, b)
     gate_spy.clear()
-    out = run(pg, a)
-    assert out.get("ok", True), out
-    assert gate_spy, path
+    run(pg, a)
+    assert "copy" in gate_spy, path
     assert B_WORDS not in tables() and B_WORDS not in _replica_readers(), path
     readers = _replica_readers()
     if "decision" in kinds:

@@ -283,7 +283,7 @@ def _stub_dump(monkeypatch):
         "id", "ts", "summary", "session_id", "harness", "transcript_range", "raw", "deleted_at",
     } if table == "episodes" else set())
     for name in ["topics", "topic_revisions", "nodes", "edges", "profiles",
-                 "memory_embeddings", "decisions", "deliverables", "ledger"]:
+                 "memory_embeddings", "ledger"]:
         monkeypatch.setattr(hs, "_insert_" + name, lambda *a: 0)
 
 

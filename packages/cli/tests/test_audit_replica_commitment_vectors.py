@@ -41,31 +41,31 @@ def test_delayed_commitment_vector_requires_live_open_parent(tmp_path, monkeypat
     with sqlite3.connect(path) as con:
         retained = con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment' ORDER BY ref").fetchall()
     assert ('70',) not in retained, 'delayed publication recreated a non-live commitment vector'
-    if state in ('forgotten', 'pending'):
-        # A forget changes the refusal set: the write drops the replica's
-        # fact state for a rebuild (design section 6) instead of patching
-        # it, so the live control's vector waits for that rebuild too.
-        assert hs.facts_rebuilding()
-    else:
-        assert retained == [('80',)], 'a live commitment vector was refused'
+    # Since phase 7B a fact vector comes only with the fact copy (design
+    # 6.2): no publication outside it writes one, the live control's either.
+    assert retained == []
 
 
 def test_open_standalone_commitment_keeps_its_vector(tmp_path, monkeypatch):
+    """The copy's vector check: an open commitment with no opening episode
+    keeps a vector built from its wording."""
     monkeypatch.setenv('KHIPU_DATA_DIR', str(tmp_path / 'state'))
     monkeypatch.setenv('KHIPU_KEYCHAIN', '0')
     import psycopg
     monkeypatch.setattr(psycopg, 'connect', lambda *a, **kw: pytest.fail('Network forbidden'))
     path = hs.snapshot_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    text = 'standalone synthetic obligation'
+    read = {"commitments": (["id", "text", "status", "opened_episode"], [(90, text, 'open', None)]),
+            "decisions": [], "deliverables": [], "incarnation": "1:1:1", "snapshot": "1:1:",
+            "vector_keys": {("synthetic", "90", 0): ("2026-10-23T00:00:00+00:00", _md5(text))},
+            "vectors": [dict(profile='synthetic', kind='commitment', ref='90', chunk_idx=0, chunk_text=text,
+                             embedding=[1.0, 0.0], built_at="2026-10-23T00:00:00+00:00",
+                             fact_wording=_md5(text))]}
     with sqlite3.connect(path) as con:
         hs._create_schema(con)
-        con.execute("INSERT INTO commitments(id,text,status,opened_episode) "
-                    "VALUES (90,'standalone synthetic obligation','open',NULL)")
-    result = hs.upsert_embeddings([
-        dict(profile='synthetic', kind='commitment', ref='90', chunk_idx=0,
-             chunk_text='standalone synthetic obligation', embedding=[1.0, 0.0],
-             fact_wording=_md5('standalone synthetic obligation'))])
-    assert result['ok'], result
+        counts = hs._write_copy(con, {"fingerprint": "f", "destination": "d", "held_vectors": {}}, read)
+    assert counts["vectors"] == 1, counts
     with sqlite3.connect(path) as con:
         retained = con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment'").fetchall()
     assert retained == [('90',)], 'an open standalone commitment is valid without an opening episode'

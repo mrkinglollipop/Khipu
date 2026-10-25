@@ -138,57 +138,6 @@ def state_of(row: dict[str, Any]) -> str:
     return "current"
 
 
-def _mirror_to_snapshot(cur, decision_id: int) -> None:
-    """Best-effort local-replica mirror for a decision write made on THIS
-    machine — "the decisions API calls it after a successful local write so
-    a correction made on this machine reaches the local lane at once"
-    (docs/plans/2026-09-27-memory-reasoning-scope.md, Phase 2 session B). A
-    correction made on a DIFFERENT machine reaches this replica instead via
-    ``hub_snapshot.sync_decision_changes``, called from the capture drain.
-    Never raises: the PG write this backs is already durable (or still
-    inside the caller's own open transaction, same-session-visible either
-    way) by the time this runs, so a mirror failure must never surface as
-    if the decision write itself failed."""
-    try:
-        cols = ["id", "project", "text", "decided_at", "episode_id", "superseded_by"]
-        if _evidence_ready(cur):
-            cols += [
-                "source_kind", "evidence", "superseded_at", "supersede_source",
-                "supersede_reason", "retracted_at", "retract_reason",
-            ]
-        cols.append("created_at")
-        cur.execute(f"SELECT {', '.join(cols)} FROM decisions WHERE id = %s", (decision_id,))
-        row = cur.fetchone()
-        if row is None:
-            return
-        payload = dict(zip(cols, row))
-        from khipu import hub_snapshot
-
-        if not hub_snapshot.snapshot_path().is_file():
-            return
-        # The wait rule's confirmation (the hub reflects every refusal this
-        # Mac knows), read with the row; in a savepoint, so a failed read
-        # never aborts the caller's transaction. This transaction holds the
-        # decision row, so a forget cannot re-project it in between.
-        # A savepoint only inside a transaction (an autocommit cursor has
-        # nothing to abort).
-        savepoint = not getattr(getattr(cur, "connection", None), "autocommit", False)
-        if savepoint:
-            cur.execute("SAVEPOINT decision_mirror_anchor")
-        try:
-            confirm = hub_snapshot.read_refusal_wait(cur)
-        except Exception:
-            if savepoint:
-                cur.execute("ROLLBACK TO SAVEPOINT decision_mirror_anchor")
-                cur.execute("RELEASE SAVEPOINT decision_mirror_anchor")
-            raise
-        if savepoint:
-            cur.execute("RELEASE SAVEPOINT decision_mirror_anchor")
-        hub_snapshot.apply_decision_changes([payload], confirm)
-    except Exception as exc:  # noqa: BLE001 — the PG write already succeeded; mirror is best-effort
-        _log(f"snapshot mirror for decision {decision_id} failed ({type(exc).__name__}: {exc})")
-
-
 def _stale_briefs(cur, decision_id: int) -> None:
     """A brief's claims were built under the decision states of the moment;
     any state change makes the briefs citing this decision's episode stale
@@ -717,7 +666,6 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
     if ok and _links_ready(cur):
         _record_applied_link(cur, old_id, new_id, source=source, reason=reason)
     if ok:
-        _mirror_to_snapshot(cur, old_id)
         _stale_briefs(cur, old_id)
     return ok
 
@@ -752,7 +700,6 @@ def restore(cur, decision_id: int) -> bool:
             (decision_id, new_id),
         )
     if ok:
-        _mirror_to_snapshot(cur, decision_id)
         _stale_briefs(cur, decision_id)
     return ok
 
@@ -772,7 +719,6 @@ def retract(cur, decision_id: int, reason: str | None = None) -> bool:
     )
     ok = cur.rowcount > 0
     if ok:
-        _mirror_to_snapshot(cur, decision_id)
         _stale_briefs(cur, decision_id)
     return ok
 
@@ -787,7 +733,6 @@ def unretract(cur, decision_id: int) -> bool:
     )
     ok = cur.rowcount > 0
     if ok:
-        _mirror_to_snapshot(cur, decision_id)
         _stale_briefs(cur, decision_id)
     return ok
 

@@ -6,7 +6,8 @@ bb0be6de.
 1. P1 a forgotten merged source bypasses the anchor fence, including
    through an already-held commitment anchor;
 2. P1 registry publication races between the source check and the
-   derivative commit, after which the stream skips repair;
+   derivative commit, after which the stream skips repair (since phase 7B:
+   between the fact copy's hub read and its commit);
 3. P2 concurrent gap replay duplicates a fact;
 4. P2 a prefix of failing gap groups starves every later one;
 5. P2 the writer gate refuses the current JSONL recovery writers.
@@ -112,9 +113,9 @@ def test_source_publication_after_anchor_check_cannot_race_derivative_write(pg, 
         assert hs.refresh()["ok"]
         assert _replica("SELECT id FROM episodes") == []
         conn.commit()
-    # Since the 2026-10-24 ruling the check is the wait rule's hub read
-    # (read_refusal_wait); the source is published right after it.
-    checked = hs.read_refusal_wait
+    # Since phase 7B the check is the fact copy's load rule (design 6.2):
+    # the source is published right after the copy's hub read.
+    checked = hs._copy_read
     intercepted = []
 
     def publish_after_check(*args, **kwargs):
@@ -124,15 +125,15 @@ def test_source_publication_after_anchor_check_cannot_race_derivative_write(pg, 
             tombstones.publish_payloads([payload])
         return result
 
-    monkeypatch.setattr(hs, "read_refusal_wait", publish_after_check)
-    out = hs.pull_changes(include_ledger=False) if kind == "commitment" else hs.sync_fact_changes()
-    assert out["ok"], out
+    monkeypatch.setattr(hs, "_copy_read", publish_after_check)
+    out = hs.pull_changes(include_ledger=False) if kind == "commitment" else hs.sync_decision_changes()
+    facts = out["facts"] if kind == "commitment" else out
+    assert not facts["ok"] and "registry changed" in facts["error"], out
     assert intercepted
     assert tombstones.is_forgotten(payload)
     assert marker not in _replica_readers(), "registry fence published before derivative commit was missed"
-    # The cursor moved past this fact's change: later public reads must not
-    # bring it back either.
-    assert hs.sync_fact_changes()["ok"]
+    # Later copies must not bring it back either: the hub lacks the refusal.
+    assert not hs.sync_decision_changes()["ok"]
     assert hs.pull_changes(include_ledger=False)["ok"]
     assert marker not in _replica_readers()
 

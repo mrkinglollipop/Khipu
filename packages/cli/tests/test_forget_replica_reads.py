@@ -136,8 +136,7 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
 
         zero = {name: mock.Mock(return_value=0) for name in (
             "_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges",
-            "_insert_profiles", "_insert_memory_embeddings", "_insert_decisions",
-            "_insert_deliverables")}
+            "_insert_profiles", "_insert_memory_embeddings")}
         time.sleep(0.01)  # a new mtime, as any real dump has
         with mock.patch.object(hs, "try_hub_connect", return_value=Pg()), \
                 mock.patch.object(hs, "_insert_episodes", side_effect=episodes), \

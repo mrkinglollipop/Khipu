@@ -36,15 +36,14 @@ def test_import_scrubs_episode_but_serves_its_forgotten_commitment(replica):
     assert result['ok'] and result['scrubbed'] == 1, result
     with sqlite3.connect(hs.snapshot_path()) as con:
         assert con.execute('SELECT id FROM episodes').fetchall() == [(8,)]
-        # A backup import drops the fact state and rebuilds it from the hub
-        # (design section 6, owner decision 2026-10-24); this test has no
-        # hub, so the replica stays rebuilding and serves no commitment.
+        # A restored replica carries no fact row (design 6.2): its facts come
+        # with the next copy from the hub; this test has no hub, so it
+        # serves no commitment.
         assert con.execute('SELECT id FROM commitments').fetchall() == []
         assert con.execute("SELECT ref FROM memory_embeddings WHERE kind='commitment'").fetchall() == []
-    assert result["facts"]["rebuilding"], result
-    # Public offline owed surface: the rebuilding state is said plainly.
+    # Public offline owed surface: the hidden state is said plainly.
     served = offline_reads.owed('scratch', 'open', 20)
-    assert served is not None and served.get("facts_rebuilding"), served
+    assert served is not None and served.get("facts_hidden"), served
     ids = [r['id'] for r in served['results']]
     print(f'import={result}; offline owed ids={ids}')
     assert 70 not in ids, 'privacy invariant: imported replica must not serve forgotten commitment 70'

@@ -683,7 +683,7 @@ def test_incremental_pull_carries_an_alias_add_and_an_alias_delete(replica):
     import time
 
     def sync(rows):
-        parts = hs._write_pulled_tables(None, None, (["alias", "project", "source", "evidence"], rows),
+        parts = hs._write_pulled_tables(None, (["alias", "project", "source", "evidence"], rows),
                                         read_at=time.time())
         assert parts["project_aliases"] == {"ok": True, "project_aliases": len(rows)}
 
@@ -704,9 +704,9 @@ def test_an_older_pull_never_replaces_newer_aliases(replica):
     import time
 
     now = time.time()
-    newer = hs._write_pulled_tables(None, None, (["alias", "project"], [("o/x", B)]), read_at=now)
+    newer = hs._write_pulled_tables(None, (["alias", "project"], [("o/x", B)]), read_at=now)
     assert newer["project_aliases"] == {"ok": True, "project_aliases": 1}
-    older = hs._write_pulled_tables(None, None, (["alias", "project"], []), read_at=now - 60)
+    older = hs._write_pulled_tables(None, (["alias", "project"], []), read_at=now - 60)
     assert older["project_aliases"]["skipped"]
     con = sqlite3.connect(str(replica))
     assert con.execute("SELECT alias, project FROM project_aliases").fetchall() == [("o/x", B)]

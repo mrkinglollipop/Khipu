@@ -41,9 +41,9 @@ def test_nonanchor_claimant_source_is_fenced(pg, replica, method):
     """A opens a commitment; a separate episode B deduplicates into it and
     supplies latest_text. The replica's registry then records B's source as
     forgotten (the hub is unchanged). B's words must leave the replica on
-    every write path; since the 2026-10-24 ruling (the wait rule) the replica
-    keeps no fact row until the hub's forget re-projects A's commitment, and
-    then shows A's own wording."""
+    every write path; since phase 7B (design 6.2) the replica shows no fact
+    row while the hub lacks that refusal, and once the hub's forget
+    re-projects A's commitment it shows A's own wording."""
     replica(pg)
     a = _capture(loop=CANON)
     bpayload = _payload(loop=ALT)
@@ -58,10 +58,9 @@ def test_nonanchor_claimant_source_is_fenced(pg, replica, method):
         out = (hs.pull_changes(include_ledger=False) if method == "pull" else hs.refresh()
                if method == "dump" else hs.scrub_forgotten_snapshot())
         assert out["ok"], out
-    rows = _replica("SELECT opened_episode, text, latest_text FROM commitments")
-    assert ALT not in str(rows), "forgotten claimant wording remained under a different anchor"
-    assert ALT not in _replica_readers()
-    assert rows == [] and hs.facts_rebuilding(), rows  # waiting for the hub
+    assert ALT not in _replica_readers(), "forgotten claimant wording remained under a different anchor"
+    # Listed: the hub lacks this Mac's refusal, so no fact row shows (design 6.2).
+    assert hs.facts_hidden()
     with pg.connect() as c:
         assert c.execute("SELECT latest_text FROM commitments").fetchall() == [(ALT,)]
     # The hub catches up: A's own wording returns, B's never.
@@ -261,18 +260,19 @@ def test_changed_registry_scrub_reads_only_matching_rows(tmp_path, monkeypatch):
     tombstones.publish_payloads([_unrelated(1)])
     assert hs.scrub_forgotten_snapshot()["ok"]
     tombstones.publish_payloads([_unrelated(2)])
-    batches = []
-    real = hs._stored_anchor_identities
+    checked = []
+    real = hs._anchor_identities
 
-    def counted(con, ids=None):
-        batches.append(len(ids) if ids is not None else None)
-        return real(con, ids)
+    def counted(row, receipts=()):
+        checked.append(row["id"])
+        return real(row, receipts)
 
-    monkeypatch.setattr(hs, "_stored_anchor_identities", counted)
+    monkeypatch.setattr(hs, "_anchor_identities", counted)
     with hs._replica_write_gate():
         pass
-    # Every read is a batch of at most _SCRUB_BATCH rows, never the whole table.
-    assert batches and None not in batches and max(batches) <= hs._SCRUB_BATCH, batches
+    # Every row is checked, in the scrub's batches (its memory bound is
+    # test_full_rescrub_memory_is_bounded).
+    assert sorted(checked) == list(range(1, 3_001)) and hs._SCRUB_BATCH <= 500
     with sqlite3.connect(hs.snapshot_path()) as c:
         assert c.execute("SELECT count(*) FROM episodes WHERE deleted_at IS NULL").fetchone() == (3_000,)
     # A change that names a held episode still erases exactly that one.

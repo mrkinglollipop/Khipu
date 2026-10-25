@@ -2102,8 +2102,6 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
         ts = payload.get("ts")
         if not summary or not ts:
             return False
-        deliverable_rows = None
-        fact_xmin = None
         receipts: list = []
         with connect() as conn:
             with conn.cursor() as cur:
@@ -2150,27 +2148,6 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                     [("episode", eid, i, c, _md5(c), v)
                      for i, (c, v) in enumerate(zip(chunks, vecs))],
                 )
-                from khipu import deliverables as _deliverables
-                from khipu.hub_snapshot import _hub_snapshot_xmin
-
-                # Read before the rows, so it never overstates their
-                # snapshot: the replica's fact-stream freshness rule.
-                try:
-                    fact_xmin = _hub_snapshot_xmin(cur)
-                except Exception:  # noqa: BLE001 — no xmin: the stream brings them
-                    fact_xmin = None
-                from khipu.hub_snapshot import read_refusal_wait
-
-                # The replica's wait rule, read before the rows; on a failed
-                # read the deliverables are left to the next pull.
-                cur.execute("SAVEPOINT embed_refusal_wait")
-                try:
-                    confirm = read_refusal_wait(cur)
-                except Exception:  # noqa: BLE001
-                    cur.execute("ROLLBACK TO SAVEPOINT embed_refusal_wait")
-                    confirm = None
-                cur.execute("RELEASE SAVEPOINT embed_refusal_wait")
-                deliverable_rows = _deliverables.deliverables_for_episode(cur, int(eid))
                 from khipu.hub_snapshot import _read_receipts
 
                 # The episode's retained source receipts, for the replica's
@@ -2203,10 +2180,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                 }
                 for i, (c, v, b) in enumerate(zip(chunks, vecs, _stamps(built, len(chunks))))
             ]
-            snap = upsert_episode(
-                episode_row, embedding_rows, deliverable_rows=deliverable_rows,
-                fact_xmin=fact_xmin, receipts=receipts, confirm=confirm,
-            )
+            snap = upsert_episode(episode_row, embedding_rows, receipts=receipts)
             if not snap.get("ok"):
                 _log(f"snapshot upsert skipped: {snap.get('error')}")
         except Exception as exc:  # noqa: BLE001 — fail-open, one log line

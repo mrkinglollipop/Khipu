@@ -132,13 +132,7 @@ def _identity_values(payload: dict[str, Any], *, redact: bool = True) -> tuple[s
 
 def _empty() -> dict[str, Any]:
     return {"version": 1, "source_keys": [], "payload_hashes": [], "legacy_identities": [],
-            "episode_ids": [], "confirmations": {}}
-
-
-def _confirmations_valid(value: Any) -> bool:
-    return isinstance(value, dict) and all(
-        isinstance(tag, str) and isinstance(ids, list) and all(type(i) is int for i in ids)
-        for tag, ids in value.items())
+            "episode_ids": []}
 
 
 def _validated(value: Any) -> dict[str, Any]:
@@ -148,10 +142,10 @@ def _validated(value: Any) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("version") == 1 and "episode_ids" not in value:
         # Registries written before forgotten episode ids were recorded.
         value = {**value, "episode_ids": []}
-    if isinstance(value, dict) and value.get("version") == 1 and "confirmations" not in value:
-        # Registries written before hub confirmations were recorded: every
-        # refusal in them is unconfirmed until the hub's record confirms it.
-        value = {**value, "confirmations": {}}
+    if isinstance(value, dict) and "confirmations" in value:
+        # The retired wait rule's hub confirmations (design section 6 at
+        # f3ab8344): the hub's refusal table is the one authority now.
+        value = {k: v for k, v in value.items() if k != "confirmations"}
     if (not isinstance(value, dict) or value.get("version") != 1
             or not isinstance(value.get("source_keys"), list)
             or not isinstance(value.get("payload_hashes"), list)
@@ -160,8 +154,7 @@ def _validated(value: Any) -> dict[str, Any]:
             or not all(isinstance(item, str) for item in value["payload_hashes"])
             or not all(isinstance(item, str) for item in value["legacy_identities"])
             or not isinstance(value.get("episode_ids"), list)
-            or not all(type(item) is int for item in value["episode_ids"])
-            or not _confirmations_valid(value.get("confirmations"))):
+            or not all(type(item) is int for item in value["episode_ids"])):
         raise RegistryError("tombstone registry is corrupt")
     return value
 
@@ -377,30 +370,6 @@ class Gate:
         forgotten episode id as ``e:<id>``."""
         return self.tags | frozenset(f"e:{i}" for i in self._value["episode_ids"])
 
-    def hub_ids(self, refusal: str) -> list[int] | None:
-        """The hub episode ids a hub forget tombstoned for ``refusal``,
-        recorded when the refusal was (``publish_forget``'s ``confirm``) or
-        by ``record_confirmations``; ``None`` while unconfirmed. A forgotten
-        episode id is confirmed by itself unless a record says otherwise."""
-        found = self._value["confirmations"].get(refusal)
-        if found is not None:
-            return list(found)
-        if refusal.startswith("e:"):
-            return [int(refusal[2:])]
-        return None
-
-    @property
-    def unconfirmed(self) -> list[str]:
-        """The refusals no hub forget has confirmed (learned from a backup,
-        or published before confirmations were recorded)."""
-        return sorted(r for r in self.refusals if self.hub_ids(r) is None)
-
-    @property
-    def confirmed_ids(self) -> frozenset[int]:
-        """Every hub episode id the confirmed refusals name: the replica's
-        wait rule needs the hub to show each tombstoned."""
-        return frozenset(i for r in self.refusals for i in (self.hub_ids(r) or ()))
-
 
 @contextmanager
 def write_gate() -> Iterator[Gate]:
@@ -512,17 +481,8 @@ def publish_sources(source_rows: list[dict[str, Any]] | None) -> None:
     publish_identities(keys, hashes)
 
 
-def publish_forget(source_rows: list[dict[str, Any]] | None,
-                   payloads: list[dict[str, Any]],
-                   legacy_identities: list[dict[str, Any]], *,
-                   confirm: set[int] | None = None, hub: set[str] = frozenset(),
-                   episode_ids: set[int] | None = None) -> None:
-    """Publish source snapshots plus pre-migration/raw payload forms together.
-    ``confirm``: the hub episode ids the same forget tombstones, recorded as
-    each published refusal's confirmation (the replica's wait rule).
-    ``hub``: the identities the hub forget refuses (``hub_form``), so this
-    registry refuses at least what the hub does; ``episode_ids`` too, in the
-    same atomic publication."""
+def _forget_identities(source_rows: list[dict[str, Any]] | None, payloads: list[dict[str, Any]],
+                       legacy_identities: list[dict[str, Any]]) -> tuple[set[str], set[str], set[str]]:
     keys = {str(row["source_key"]) for row in source_rows or [] if row.get("source_key")}
     hashes = {str(row["payload_sha256"]) for row in source_rows or [] if row.get("payload_sha256")}
     try:
@@ -538,15 +498,37 @@ def publish_forget(source_rows: list[dict[str, Any]] | None,
     legacy = ({f"{row['ts']}\x1f{row['summary_md5']}" for row in legacy_identities
                if isinstance(row.get("ts"), str) and isinstance(row.get("summary_md5"), str)}
               if not keys and not hashes else set())
+    return keys, hashes, legacy
+
+
+def forget_hub_forms(source_rows: list[dict[str, Any]] | None, payloads: list[dict[str, Any]],
+                     legacy_identities: list[dict[str, Any]]) -> set[str]:
+    """What ``publish_forget`` publishes for these sources, in hub form, so
+    the hub forget refuses every string the registry gains (the replica
+    copy's load rule needs each one to be a hub refusal, design 6.2)."""
+    keys, hashes, legacy = _forget_identities(source_rows, payloads, legacy_identities)
+    return keys | hashes | {"legacy:" + x for x in legacy}
+
+
+def publish_forget(source_rows: list[dict[str, Any]] | None,
+                   payloads: list[dict[str, Any]],
+                   legacy_identities: list[dict[str, Any]], *,
+                   hub: set[str] = frozenset(),
+                   episode_ids: set[int] | None = None) -> None:
+    """Publish source snapshots plus pre-migration/raw payload forms together.
+    ``hub``: the identities the hub forget refuses (``hub_form``), so this
+    registry refuses at least what the hub does; ``episode_ids`` too, in the
+    same atomic publication."""
+    keys, hashes, legacy = _forget_identities(source_rows, payloads, legacy_identities)
     for tag in set().union(*map(tags_for_hub, hub)):
         {"k": keys, "h": hashes, "l": legacy}[tag[0]].add(tag[2:])
-    publish_identities(keys, hashes, legacy, episode_ids=episode_ids, confirm=confirm)
+    publish_identities(keys, hashes, legacy, episode_ids=episode_ids)
 
 
-def publish_episode_ids(episode_ids: set[int], *, confirm: set[int] | None = None) -> None:
+def publish_episode_ids(episode_ids: set[int]) -> None:
     """Record forgotten episode ids. A backup can hold an episode under an
     older raw that no source identity matches; its import scrubs by id."""
-    publish_identities(set(), set(), episode_ids=episode_ids, confirm=confirm)
+    publish_identities(set(), set(), episode_ids=episode_ids)
 
 
 def forgotten_episode_ids() -> set[int]:
@@ -554,18 +536,9 @@ def forgotten_episode_ids() -> set[int]:
         return set(value["episode_ids"])
 
 
-def _union_confirmations(current: dict[str, list[int]], extra: dict[str, Any]) -> dict[str, list[int]]:
-    out = {tag: list(ids) for tag, ids in current.items()}
-    for tag, ids in extra.items():
-        out[tag] = sorted(set(out.get(tag, ())) | {int(i) for i in ids})
-    return out
-
-
 def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None = None,
-                       *, episode_ids: set[int] | None = None, confirm: set[int] | None = None,
-                       confirmations: dict[str, Any] | None = None) -> None:
-    """Add refusals. ``confirm``: hub episode ids confirming every refusal
-    added here; ``confirmations``: per-refusal ids (a backup's own)."""
+                       *, episode_ids: set[int] | None = None) -> None:
+    """Add refusals."""
     legacy = legacy or set()
     episode_ids = {int(i) for i in episode_ids or ()}
     if not keys and not hashes and not legacy and not episode_ids:
@@ -575,11 +548,6 @@ def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None
     # owner may publish; marker presence is enough to refuse, even if forged.
     if _marker_present():
         raise RegistryError("tombstone publication refused from borrowed writer scope")
-    added = dict(confirmations or {})
-    if confirm is not None:
-        tags = ({f"k:{k}" for k in keys} | {f"h:{h}" for h in hashes} | {f"l:{x}" for x in legacy}
-                | {f"e:{i}" for i in episode_ids})
-        added = _union_confirmations(added, {tag: confirm for tag in tags})
     with _locked_registry() as (path, current, _lease):
         next_value = {
             "version": 1,
@@ -587,27 +555,23 @@ def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None
             "payload_hashes": sorted(set(current["payload_hashes"]) | hashes),
             "legacy_identities": sorted(set(current["legacy_identities"]) | legacy),
             "episode_ids": sorted(set(current["episode_ids"]) | episode_ids),
-            "confirmations": _union_confirmations(current["confirmations"], added),
         }
         _atomic_write(path, next_value)
 
 
-def record_confirmations(confirmations: dict[str, Any], *, replace: bool = False) -> None:
-    """Record hub confirmations for refusals already in the registry: the hub
-    episode ids a hub forget tombstoned for each (``[]``: the hub, read in
-    full, holds no live episode carrying it). ``replace`` sets a refusal's
-    ids instead of adding to them (a confirmed id the hub no longer holds).
-    Adds no refusal."""
-    if not confirmations:
-        return
+def drop_episode_id(episode_id: int) -> bool:
+    """The owner's "Not the same episode" (design 6.2): remove one bare
+    episode id from this Mac's registry, when the hub's episode of that id
+    is not the one forgotten here (a replacement hub). Removes no identity
+    tag. Whether it was there."""
     if _marker_present():
         raise RegistryError("tombstone publication refused from borrowed writer scope")
     with _locked_registry() as (path, current, _lease):
-        merged = (({**current["confirmations"],
-                    **{t: sorted({int(i) for i in ids}) for t, ids in confirmations.items()}})
-                  if replace else _union_confirmations(current["confirmations"], confirmations))
-        if merged != current["confirmations"]:
-            _atomic_write(path, {**current, "confirmations": merged})
+        if int(episode_id) not in current["episode_ids"]:
+            return False
+        _atomic_write(path, {**current, "episode_ids": [i for i in current["episode_ids"]
+                                                        if i != int(episode_id)]})
+    return True
 
 
 def merge_registry(value: dict[str, Any]) -> None:
@@ -619,7 +583,7 @@ def merge_registry(value: dict[str, Any]) -> None:
     ids = set(incoming["episode_ids"])
     if not keys and not hashes and not legacy and not ids:
         return
-    publish_identities(keys, hashes, legacy, episode_ids=ids, confirmations=incoming["confirmations"])
+    publish_identities(keys, hashes, legacy, episode_ids=ids)
 
 
 def merge_registry_bytes(data: bytes) -> None:

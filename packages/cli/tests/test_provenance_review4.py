@@ -102,15 +102,21 @@ def test_catchup_delayed_publication_cannot_restore_forgotten_text(pg, replica):
 
 
 def test_a_current_vector_publication_is_kept(pg, replica):
-    """Control: a publication built from the wording the replica shows is
-    stored, so the wording check refuses only stale ones."""
+    """Control: a hub vector built from the wording the hub shows is copied,
+    so the wording check refuses only stale ones. Since phase 7B fact
+    vectors come only with the fact copy (design 6.2)."""
     replica(pg)
     _capture(loop=CANON)
-    assert hs.refresh()["ok"]
     with pg.connect() as c:
         cid, text = c.execute("SELECT id, text FROM commitments").fetchone()
+        profile, dim = c.execute("SELECT id, dim FROM embedding_profiles ORDER BY id LIMIT 1").fetchone()
+        c.execute("INSERT INTO memory_embeddings (profile, kind, ref, chunk_idx, chunk_text, content_hash, "
+                  "embedding) VALUES (%s, 'commitment', %s, 0, %s, md5(%s), %s)",
+                  (profile, str(cid), text, text, "[" + ",".join(["1"] + ["0"] * (dim - 1)) + "]"))
+    assert hs.refresh()["facts"]["vectors"] == 1
     rows = [{**r, "fact_wording": embed._md5(text)} for r in _delayed_vector(cid, text)]
-    assert hs.upsert_embeddings(rows)["embeddings"] == 1
+    out = hs.upsert_embeddings(rows)
+    assert out["ok"] and not out.get("embeddings"), out  # never a fact vector this way
     assert _replica("SELECT chunk_text FROM memory_embeddings WHERE kind = 'commitment'") == [(CANON,)]
 
 
@@ -126,13 +132,15 @@ def test_forget_nonanchor_erases_its_wording_immediately(pg, replica, prior_regi
     if prior_registry:
         unrelated = _payload(loop=None)
         tombstones.publish_payloads([unrelated])
-        # A forget the hub confirmed (it holds no carrier): the wait rule passes.
-        tombstones.record_confirmations({t: [] for t in tombstones.identity_strings(unrelated)})
+        # A forget the hub already refused (it holds no carrier).
+        with pg.connect() as c:
+            provenance.refuse(c.cursor(), sorted({tombstones.hub_form(t)
+                                                  for t in tombstones.identity_strings(unrelated)}))
     assert hs.refresh()["ok"]
     assert ALT in _replica_readers()
     result = forget.forget_everywhere(b, memory_root=pg.memory, gateway=False)
     before = _replica_readers()
-    gate_result = hs.sync_fact_changes()
+    gate_result = hs.sync_decision_changes()
     after = _replica_readers()
     remote = _readers(pg)
     assert result["ok"], result
@@ -226,9 +234,8 @@ def test_pr_and_owner_contributors_are_fenced_per_value(pg, replica):
     assert hs.refresh()["ok"]
     tombstones.publish_payloads([payload])
     assert hs.pull_changes(include_ledger=False)["ok"]
-    # The wait rule (2026-10-24 ruling): no fact row while the hub still
-    # holds the forgotten episode live.
-    assert _replica("SELECT text FROM commitments") == [] and hs.facts_rebuilding()
+    # No fact row shown while the hub lacks this Mac's refusal (design 6.2).
+    assert base not in _replica_readers() and hs.facts_hidden()
     with pg.connect() as c:
         assert c.execute("SELECT prs FROM commitments").fetchone()[0] == [7, 41]
     # The hub's forget re-projects per value: the owner's PR 7 stays.

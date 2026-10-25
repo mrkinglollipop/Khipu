@@ -1,23 +1,24 @@
 # ruff: noqa: F811 - pytest fixtures imported from test_provenance_forget
-"""Fact provenance, phase 4: the replica change stream.
+"""Fact provenance on a replica (phase 4, carried onto the fact copy of
+section 6.2 in phase 7B).
 
 Scope: docs/plans/2026-10-23-fact-provenance.md, sections 2 (I1 on a
-replica), 6 and 8 (phase 4). Every database is a hermetic one
-(tests/hermetic_pg.py) and every replica a temp file.
+replica), 6 and 8. Every database is a hermetic one (tests/hermetic_pg.py)
+and every replica a temp file.
 
 Ported review reproductions (jobs/2026-10-23/astra-mig/report.md):
 
 * first review #4: a decision change whose transaction started first and
   committed last fell behind the timestamp watermark forever. Here with
-  2,000 decisions, through the fact stream's snapshot-xmin cursor;
+  2,000 decisions, through the copy's exact skip;
 * first review #7: changes made on a hub in an intermediate state were never
   reached by an already-consumed replica cursor. 0047 is one file, so the
-  0045-only state cannot exist; its analog is a replica dumped before 0047,
-  which has no stream cursor. It asks for a full dump instead of guessing.
+  0045-only state cannot exist; its analog is a replica dumped before 0047:
+  it shows no fact row until the hub is ready, then copies it whole.
 
-Also: scrub-then-pull through the stream (the durable erasure registry fence
-of #356 holds for stream rows), the I1 replica variant, the prune floor, the
-local apply of ``forget_everywhere`` and the forget's bounded deadlock retry.
+Also: a source this Mac forgot stays out of the replica while the hub lacks
+its refusal (listed, facts hidden), the I1 replica variant, the local copy
+after ``forget_everywhere`` and the forget's bounded deadlock retry.
 """
 from __future__ import annotations
 
@@ -31,22 +32,12 @@ import pytest
 from khipu import db, forget, hub_snapshot as hs, offline_reads, provenance, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.fact_seed import announce
+from tests.replica_copy import mark_ready, replica  # noqa: F401
 from tests.test_provenance_forget import (  # noqa: F401
     ALT, CANON, PROJECT, _capture, _forget, _rows, env, pg,
 )
 
 DECISION = "Keep the release train weekly"
-
-
-@pytest.fixture
-def replica(monkeypatch, tmp_path):
-    """Point the replica code at the hermetic hub (``env`` already set
-    KHIPU_DATA_DIR to a temp dir and patched ``db.connect``)."""
-    def attach(h):
-        monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
-        monkeypatch.setattr(hs, "try_hub_connect", lambda **kw: h.connect())
-        return h
-    return attach
 
 
 def _replica(sql, params=()):
@@ -106,60 +97,40 @@ def test_r4_a_late_commit_with_an_earlier_transaction_is_never_skipped(pg, repli
                  "WHERE id <> %s", (ids[0],))
     fast.commit()
     first = _pull()
-    assert first["decisions"]["decisions"] == 1999, first
+    assert first["facts"].get("copied") and first["facts"]["decisions"] == 2000, first
     slow.commit()
     second = _pull()
-    assert second["decisions"]["decisions"] >= 1, second
+    assert second["facts"].get("copied"), second
     held = dict(_replica("SELECT id, retract_reason FROM decisions"))
     assert held[ids[0]] == "SLOW OWNER CHANGE"
     assert {held[i] for i in ids[1:]} == {"FAST OWNER CHANGE"}
-    # Nothing left behind: a third pull reads nothing new.
-    assert _pull()["decisions"]["decisions"] == 0
-
-
-def test_an_older_stream_read_never_replaces_a_newer_one(pg, replica):
-    replica(pg)
-    ids = _seed_decisions(pg, 2)
-    assert hs.refresh()["ok"]
-    with sqlite3.connect(hs.snapshot_path()) as con:
-        held = hs._held_fact_cursor(con)
-    with pg.connect() as conn:
-        conn.execute("UPDATE decisions SET retract_reason = 'newest' WHERE id = %s", (ids[0],))
-    assert hs.sync_fact_changes()["decisions"] == 1
-    stale = {"xmin": held, "decisions": [{"id": ids[0], "project": PROJECT, "text": "bulk decision 1",
-                                          "retract_reason": "stale"}],
-             "deliverables": [], "decisions_gone": [], "deliverables_gone": []}
-    with sqlite3.connect(hs.snapshot_path()) as con:
-        out = hs._apply_fact_stream(con, stale)
-        con.commit()
-    assert out.get("skipped"), out
-    assert _replica("SELECT retract_reason FROM decisions WHERE id = ?", (ids[0],)) == [("newest",)]
+    # Nothing left behind: a third pull has nothing to copy.
+    assert _pull()["facts"].get("skipped")
 
 
 # ---- first review #7: a replica dumped before 0047 -------------------------------
 
 
-def test_r7_a_replica_dumped_before_0047_asks_for_a_full_dump(env, replica):
-    replica(env)
+def test_r7_a_replica_dumped_before_0047_shows_no_fact_until_the_hub_is_ready(env, replica):
+    replica(env, ready=False)
     a = _capture(decision=DECISION)
     b = _capture(loop=ALT, decision=DECISION)
-    assert hs.refresh()["ok"]
-    assert _pull()["decisions"].get("ok")  # the old watermark, on the old schema
+    dumped = hs.refresh()
+    assert dumped["ok"] and dumped["facts"].get("not_ready"), dumped
+    assert _replica_readers().count(DECISION) == 0  # nothing guessed
     env.to_0047()
     _forget(env, a)
-    pulled = hs.pull_changes(include_ledger=False)
-    assert not pulled["ok"] and pulled.get("needs_dump"), pulled
-    assert _replica("SELECT episode_id FROM decisions") == [(a,)]  # nothing guessed
-    assert hs.refresh()["ok"]
-    _pull()
+    assert _pull()["facts"].get("not_ready")  # history not indexed yet
+    mark_ready(env)
+    assert _pull()["facts"].get("copied")
     assert _replica("SELECT episode_id, text FROM decisions") == [(b, DECISION)]
 
 
-# ---- scrub, then pull through the stream (#356's fence) --------------------------
+# ---- a source this Mac forgot, which the hub never refused ----------------------
 
 
 @pytest.mark.parametrize("kind", ["decision", "deliverable"])
-def test_a_scrubbed_source_stays_out_through_the_stream(pg, replica, kind):
+def test_a_source_forgotten_here_stays_out_while_the_hub_lacks_its_refusal(pg, replica, kind):
     replica(pg)
     payload = {"ts": "2026-10-20T12:00:00Z", "summary": "PRIVATE SOURCE", "harness": "codex",
                "session_id": "codex:prov4-forgotten-source", "transcript_range": "0:10"}
@@ -183,15 +154,19 @@ def test_a_scrubbed_source_stays_out_through_the_stream(pg, replica, kind):
         provenance.project(conn.cursor(), kind, fid)
     refreshed = hs.refresh()
     assert refreshed["ok"] and refreshed["counts"]["forgotten_scrubbed"] == 1, refreshed
-    # Another Mac touches the fact: it is in the stream now.
+    assert refreshed["facts"].get("unsent"), refreshed["facts"]
+    # Another Mac touches the fact: still listed, still out.
     with pg.connect() as conn:
         table = "decisions" if kind == "decision" else "deliverables"
         col = "retract_reason" if kind == "decision" else "url"
         conn.execute(f"UPDATE {table} SET {col} = 'touched' WHERE id = %s", (fid,))
-    _pull()
-    assert hs.sync_fact_changes()["ok"]
-    assert "PRIVATE" not in _replica_fact_text()
+    assert not _pull()["facts"]["ok"]
     assert "PRIVATE" not in _replica_readers()
+    assert forget.unsent_forgets()["count"] >= 1
+    # The owner sends it: the hub tombstones the carrier and the copy lands.
+    sent = forget.send_to_hub()
+    assert sent["ok"] and sent["facts"].get("copied"), sent
+    assert "PRIVATE" not in _replica_fact_text() and "PRIVATE" not in _replica_readers()
 
 
 # ---- I1 / I2 on a replica ----------------------------------------------------------
@@ -226,47 +201,18 @@ def test_forget_everywhere_applies_the_reprojected_facts_at_once(pg, replica):
     assert _replica("SELECT episode_id FROM decisions") == [(a,)]
     out = forget.forget_everywhere(a, memory_root=pg.memory, gateway=False)
     assert out["snapshot"]["ok"], out["snapshot"]
-    assert out["snapshot"]["facts"]["ok"], out["snapshot"]
-    # No pull: the replica already shows the decision and deliverable as B's.
+    # No pull: the forget copied this Mac's facts from the hub (6.2).
+    assert out["snapshot"]["facts"].get("copied"), out["snapshot"]
     assert _replica("SELECT episode_id, text FROM decisions") == [(b, DECISION)]
     assert _replica("SELECT episode_id, title FROM deliverables") == [(b, "The checklist v2")]
     assert "the checklist\"" not in _replica_readers()
-    # The forget rebuilt the replica's facts from the hub (design section 6,
-    # owner decision 2026-10-24): its cursor is that read's, so the next pull
-    # has nothing to bring and the replica still shows B's.
-    assert out["snapshot"]["facts"].get("rebuilt"), out["snapshot"]
-    assert _pull()["ok"]
+    # The next pull still shows B's.
+    assert _pull()["facts"]["ok"]
     assert _replica("SELECT episode_id, text FROM decisions") == [(b, DECISION)]
     assert _replica("SELECT episode_id, title FROM deliverables") == [(b, "The checklist v2")]
 
 
-# ---- the prune floor ----------------------------------------------------------------
-
-
-def test_a_cursor_below_the_prune_floor_asks_for_a_full_dump(pg, replica):
-    replica(pg)
-    ids = _seed_decisions(pg, 3)
-    assert hs.refresh()["ok"]
-    with sqlite3.connect(hs.snapshot_path()) as con:
-        cursor = hs._held_fact_cursor(con)
-    # Rows below the cursor only: the replica has read past them, no dump.
-    with pg.connect() as conn:
-        conn.execute("UPDATE fact_changes SET at = now() - interval '31 days' WHERE xid < %s::text::xid8",
-                     (str(cursor),))
-        out = provenance.prune_changes(conn)
-    assert out["pruned"] >= 3, out
-    _pull()
-    # A change after the cursor, then pruned: the replica may have missed it.
-    with pg.connect() as conn:
-        conn.execute("UPDATE decisions SET retract_reason = 'later' WHERE id = %s", (ids[0],))
-    with pg.connect() as conn:
-        conn.execute("UPDATE fact_changes SET at = now() - interval '31 days'")
-        assert provenance.prune_changes(conn)["pruned"] >= 1
-    pulled = hs.pull_changes(include_ledger=False)
-    assert not pulled["ok"] and pulled.get("needs_dump"), pulled
-    assert hs.refresh()["ok"]
-    _pull()
-    assert _replica("SELECT retract_reason FROM decisions WHERE id = ?", (ids[0],)) == [("later",)]
+# ---- the row trigger -----------------------------------------------------------------
 
 
 def test_the_stream_records_lifecycle_writes_but_the_gate_still_wants_the_projector(pg):

@@ -148,19 +148,22 @@ def rows(sql):
         return con.execute(sql).fetchall()
 
 
+# Commitments heal with the fact copy (design 6.2; tests/test_provenance_copy.py).
 @pytest.mark.parametrize("sql,expected", [
-    ("SELECT status FROM commitments WHERE id=1", [("closed",)]),
     ("SELECT body FROM topics WHERE slug='probe'", [("corrected",)])])
 def test_pull_heals_all_replica_surfaces(replica, sql, expected):
     assert hs.pull_changes()["ok"]
     assert rows(sql) == expected
 
 
-def test_failed_decision_sync_does_not_claim_success(replica, monkeypatch):
-    monkeypatch.setattr(hs, "sync_decision_changes", lambda: {"ok": False, "error": "hub connection lost"})
+def test_a_failed_fact_copy_is_reported_apart_from_the_memory_parts(replica, monkeypatch):
+    """Since phase 7B the pull's facts come with one copy (design 6.2),
+    reported as ``facts``; a failed copy keeps the last good one, so it is
+    no reason for the memory parts to fall back to a full dump."""
+    monkeypatch.setattr(hs, "copy_facts", lambda **kw: {"ok": False, "error": "hub connection lost"})
     out = hs.pull_changes()
-    assert not out["ok"], out
-    assert "decisions" in out["failed"], out
+    assert out["ok"] and out["facts"] == {"ok": False, "error": "hub connection lost"}, out
+    assert "facts" not in out.get("failed", []), out
 
 
 def test_pull_cannot_overwrite_newer_live_capture(replica, monkeypatch):
@@ -243,8 +246,7 @@ def test_nightly_job_and_capture_serialize_and_retry_missed_patch(replica, monke
 
     monkeypatch.setattr(hs, "_insert_episodes", insert_episodes)
     for name in ("_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges",
-                 "_insert_profiles", "_insert_memory_embeddings", "_insert_decisions",
-                 "_insert_deliverables", "_insert_commitments", "_insert_ledger"):
+                 "_insert_profiles", "_insert_memory_embeddings", "_insert_ledger"):
         monkeypatch.setattr(hs, name, lambda *a: 0)
     monkeypatch.setattr(rh, "_hub_reachable", lambda: (True, None))
     rh.set_setting("replica_refresh_after", 0)
@@ -301,32 +303,24 @@ def test_stale_pull_vector_cannot_replace_new_capture_vector(replica, monkeypatc
 
 
 def test_pulled_commitments_cannot_overwrite_newer_dump(replica, monkeypatch):
+    """Since phase 7B a pull writes no commitment row: commitments come only
+    with the fact copy, whose copies are serial (design 6.2), so no older
+    pull read can replace a newer dump's."""
+    import inspect
+
+    assert "commitments" not in inspect.signature(hs._write_pulled_tables).parameters
     real_write = hs._write_pulled_tables
 
-    def interleave(topics, commitments, aliases, **kw):
-        # A nightly dump finishes after the pull read the hub, before it writes.
-        def dump_commitments(cur, con):
-            con.execute("INSERT INTO commitments(id,text,status,opened_episode) "
+    def interleave(topics, aliases, **kw):
+        with sqlite3.connect(hs.snapshot_path()) as con:
+            con.execute("INSERT OR REPLACE INTO commitments(id,text,status,opened_episode) "
                         "VALUES (1,'updated by owner','open',1)")
-            return 1
-
-        def dump_episodes(cur, con):
-            con.execute("INSERT INTO episodes(id,summary) VALUES (1,'newer dump')")
-            return 1
-
-        monkeypatch.setattr(hs, "_insert_commitments", dump_commitments)
-        monkeypatch.setattr(hs, "_insert_episodes", dump_episodes)
-        for name in ("_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges",
-                     "_insert_profiles", "_insert_memory_embeddings", "_insert_decisions",
-                     "_insert_deliverables", "_insert_ledger"):
-            monkeypatch.setattr(hs, name, lambda *a: 0)
-        assert hs.refresh()["ok"]
-        return real_write(topics, commitments, aliases, **kw)
+        return real_write(topics, aliases, **kw)
 
     monkeypatch.setattr(hs, "_write_pulled_tables", interleave)
     assert hs.pull_changes()["ok"]
     got = rows("SELECT text,status FROM commitments WHERE id=1")
-    assert got == [("updated by owner", "open")], f"stale pull replaced newer nightly: {got}"
+    assert got == [("updated by owner", "open")], f"a pull replaced commitments: {got}"
 
 
 def test_foreign_in_place_capture_edit_arrives_within_refresh_window(replica, monkeypatch):
@@ -420,15 +414,13 @@ VECTOR_WRITERS = {
     ("hub_snapshot.py", "_scrub_forgotten"): "a forget, which always lands",
     ("hub_snapshot.py", "purge_topic_in_snapshot"): "a topic purge, which always lands",
     ("hub_snapshot.py", "_erase_episode_commitments"): "a forget, which always lands",
-    ("hub_snapshot.py", "_drop_fact_state"): "only removes: the drop when the refusal set changes",
-    ("hub_snapshot.py", "_drop_mismatched_commitment_vectors"): "only removes: a vector whose wording is not shown",
-    ("hub_snapshot.py", "_load_facts"): "the rebuild's whole fact state, read in one snapshot after read_at",
-    ("hub_snapshot.py", "_insert_vector_row"): "the row writer of callers that already applied the rule",
+    ("hub_snapshot.py", "_drop_facts"): "only removes: a backup copy's or a restored replica's fact rows",
+    ("hub_snapshot.py", "_write_copy"): "the fact copy's publication: copies are serial under fact-copy.lock",
+    ("hub_snapshot.py", "_insert_vector_row"): "the row writer of the fact copy's publication",
 }
 COMMITMENT_WRITERS = {
     ("hub_snapshot.py", "_scrub_forgotten"): "a forget always lands before replica publication",
-    ("hub_snapshot.py", "_write_pulled_tables"): "the rule itself, for the whole table: the pull lands here",
-    ("hub_snapshot.py", "_write_commitment_rows"): "the row writer shared by the dump, _write_pulled_tables and the rebuild (_load_facts) only",
+    ("hub_snapshot.py", "_write_commitment_rows"): "the fact copy's row writer only",
     ("hub_snapshot.py", "_erase_episode_commitments"): "a forget always lands",
 }
 # Functions in recall_prompt that answer from the replica: each builds the one
@@ -478,9 +470,7 @@ def test_every_replica_episode_writer_is_under_the_freshness_rule():
     calls = {fn.name: c for fn, _s, c in fns}
     for name in ("_upsert_episode_unfenced", "upsert_embeddings", "_write_pulled_tables"):
         assert {"_held_read_at", "_record_read_at"} <= calls[name], name
-    assert {name for name, c in calls.items() if "_write_commitment_rows" in c} == \
-        {"_insert_commitments", "_write_pulled_tables", "_load_facts"}
-    assert {"_record_read_at"} <= calls["_load_facts"]
+    assert {name for name, c in calls.items() if "_write_commitment_rows" in c} == {"_write_copy"}
     src = {fn.name: s for fn, s, _c in fns}
     assert "_ROWS_READ_FLOOR_KEY" in src["_refresh_locked"]
     pull = ast.parse(src["_pull_apply"].strip())
@@ -519,12 +509,11 @@ def test_every_stale_recall_answer_path_builds_the_one_marker():
     assert renderers == {"render_block"}
 
 
-def test_failed_part_is_named_and_unreachable_hub_is_waited_out(replica, monkeypatch):
-    monkeypatch.setattr(hs, "sync_decision_changes",
-                        lambda: {"ok": False, "error": "OperationalError: timeout", "hub_unreachable": True})
+def test_an_unreachable_hub_during_the_fact_copy_is_reported(replica, monkeypatch):
+    monkeypatch.setattr(hs, "copy_facts",
+                        lambda **kw: {"ok": False, "error": "OperationalError: timeout", "hub_unreachable": True})
     out = hs.pull_changes()
-    assert not out["ok"] and out["failed"] == ["decisions"] and out["hub_unreachable"], out
-    assert out["error"].startswith("decisions:"), out
-    monkeypatch.setattr(hs, "sync_decision_changes",
-                        lambda: {"ok": False, "not_applicable": True, "error": "hub decisions table not migrated"})
+    assert out["ok"] and out["facts"]["hub_unreachable"], out
+    monkeypatch.setattr(hs, "copy_facts",
+                        lambda **kw: {"ok": False, "not_ready": True, "error": "the hub is still indexing"})
     assert hs.pull_changes()["ok"]

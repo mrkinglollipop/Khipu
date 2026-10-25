@@ -111,8 +111,9 @@ def _take(mode: str, wait: float | None = None) -> Iterator[None]:
 
 
 @contextmanager
-def shared() -> Iterator[None]:
-    """Hold the lock for one local write. Re-entrant."""
+def shared(wait: float | None = None) -> Iterator[None]:
+    """Hold the lock for one local write. Re-entrant. Waits for a forget to
+    finish, for at most ``wait`` seconds when given."""
     if _HELD.get() is not None:
         yield
         return
@@ -124,7 +125,7 @@ def shared() -> Iterator[None]:
         finally:
             _HELD.reset(token)
         return
-    with _take("shared"):
+    with _take("shared", wait):
         yield
 
 

@@ -2,8 +2,8 @@
 
 The replica follows the standard snapshot contract (owner decision, Matt,
 2026-10-24; design section 6): a read that began before a forget completed
-may reflect pre-forget state; a read that begins after never does; the
-replica on disk keeps no refused row past the rebuild. Review 6's P1 (a
+may reflect pre-forget state; a read that begins after never does (since
+phase 7B, the copy after a forget rewrites the fact tables from the hub). Review 6's P1 (a
 materialized response keeps the rows its read saw) is accepted behaviour
 under that contract, so its tests assert the contract. The two P2s (an older
 rebuild erasing a newer ordinary pull; the explicit commitment backfill
@@ -11,6 +11,8 @@ writing a stale hub vector) failed on 498979ec."""
 from __future__ import annotations
 
 import json
+import threading
+import time
 from unittest import mock
 
 import pytest
@@ -48,7 +50,7 @@ def test_offline_reads_follow_the_snapshot_contract(pg, replica, reader):
         if not fired:
             fired.append(True)
             assert forget.forget_everywhere(eid, memory_root=pg.memory, gateway=False)["ok"]
-            assert not hs.facts_rebuilding()
+            assert not hs.facts_hidden()
         return real(*a, **kw)
 
     def read():
@@ -99,59 +101,65 @@ def test_prompt_thread_hits_after_a_forget_show_nothing(pg, replica):
     assert "Private thread decision" not in _raw_fact_text()
 
 
-def test_healthy_rebuild_cannot_overwrite_newer_normal_pull(pg, replica):
-    """Review 6 #2 (P2): an ordinary pull between a rebuild's hub read and
-    its load is a newer generation; the older read is discarded."""
-    replica(pg)
-    _capture(loop=CANON)
-    assert hs.refresh()["ok"]
-    real = hs._read_all_facts
-    fired = []
+def _older_copy_then(action):
+    """Run a copy whose hub read is followed, before it publishes, by
+    ``action`` (a newer capture and the copy it starts, on a thread)."""
+    real = hs._copy_read
+    fired: list = []
 
-    def interleave(cur):
-        read = real(cur)
-        if fired:
-            return read
-        fired.append(True)
-        _capture(loop=None, decision="new normal pull decision")
-        assert hs.pull_changes(include_ledger=False)["ok"]
-        assert "new normal pull decision" in _replica_readers()
-        return read
-
-    with mock.patch.object(hs, "_read_all_facts", interleave):
-        result = hs.rebuild_facts()
-    assert "new normal pull decision" in _replica_readers(), "older rebuild erased a newer normal pull"
-    assert result.get("superseded")
-
-
-def test_public_scrub_rebuild_cannot_regress_normal_pull(pg, replica):
-    """Review 6 #2 (P2), through the public scrub: another rebuild completes
-    after the scrub's drop, then an ordinary pull lands during the scrub's
-    own rebuild read."""
-    replica(pg)
-    _capture(loop=CANON)
-    assert hs.refresh()["ok"]
-    real_rebuild = hs.rebuild_facts
-    real_read = hs._read_all_facts
-    fired = []
-
-    def read_interleave(cur):
-        read = real_read(cur)
+    def interleave(tx, local):
+        read = real(tx, local)
         if not fired:
-            fired.append(True)
-            _capture(loop=None, decision="public scrub newest decision")
-            assert hs.pull_changes(include_ledger=False)["ok"]
-            assert "public scrub newest decision" in _replica_readers()
+            fired.append(action())
+            time.sleep(0.5)
         return read
 
-    def scheduled_rebuild(**kw):
-        assert real_rebuild(**kw)["rebuilt"]
-        with mock.patch.object(hs, "_read_all_facts", read_interleave):
-            return real_rebuild(**kw)
+    return mock.patch.object(hs, "_copy_read", interleave), fired
 
-    with mock.patch.object(hs, "rebuild_facts", scheduled_rebuild):
+
+def test_an_older_copy_cannot_overwrite_a_newer_normal_pull(pg, replica):
+    """Review 6 #2 (P2): an ordinary pull between an older copy's hub read
+    and its publication. Copies are serial (one lock from snapshot to
+    commit, design 6.2): the pull's copy reads after the older one
+    published, so the newest decision lands."""
+    replica(pg)
+    _capture(loop=CANON)
+    assert hs.refresh()["ok"]
+    results: dict = {}
+
+    def newer():
+        _capture(loop=None, decision="new normal pull decision")
+        thread = threading.Thread(target=lambda: results.update(pull=hs.pull_changes(include_ledger=False)))
+        thread.start()
+        return thread
+
+    patch, fired = _older_copy_then(newer)
+    with patch:
+        older = hs.copy_facts()
+        fired[0].join(60)
+    assert older["ok"] and results["pull"]["facts"].get("copied"), (older, results)
+    assert "new normal pull decision" in _replica_readers(), "older copy erased a newer normal pull"
+
+
+def test_public_scrub_copy_cannot_regress_normal_pull(pg, replica):
+    """Review 6 #2 (P2), through the public scrub: an ordinary pull lands
+    while the scrub's own copy is between its hub read and its publication."""
+    replica(pg)
+    _capture(loop=CANON)
+    assert hs.refresh()["ok"]
+    results: dict = {}
+
+    def newer():
+        _capture(loop=None, decision="public scrub newest decision")
+        thread = threading.Thread(target=lambda: results.update(pull=hs.pull_changes(include_ledger=False)))
+        thread.start()
+        return thread
+
+    patch, fired = _older_copy_then(newer)
+    with patch:
         out = hs.scrub_forgotten_snapshot()
-    assert out["ok"] and fired
+        fired[0].join(60)
+    assert out["ok"] and fired and results["pull"]["ok"], (out, results)
     assert "public scrub newest decision" in _replica_readers(), \
         "public scrub published older facts over successful normal pull"
 
@@ -189,11 +197,11 @@ def test_manual_commitment_backfill_does_not_restore_old_hub_chunks(pg, replica)
     assert CANON not in str(hubrows), "manual backfill restored old wording on the hub"
 
 
-def test_superseded_rebuild_takes_priority_over_a_patch_stream(pg, replica):
-    """The liveness edge (owner ruling 2026-10-24): a rebuild superseded
-    once is retried with priority, its hub read inside the replica gate, so
-    a patch arriving meanwhile queues behind it (deferred to the next pull)
-    instead of superseding it again."""
+def test_a_live_patch_during_a_copy_is_never_blocked(pg, replica):
+    """The liveness edge (owner ruling 2026-10-24), on the fact copy: a copy
+    holds no replica write lock while it reads the hub, so a live capture
+    patch from another process lands at once, and the copy still
+    publishes (a live episode patch is not an invalidation)."""
     import os
     import subprocess
     import sys
@@ -203,35 +211,26 @@ def test_superseded_rebuild_takes_priority_over_a_patch_stream(pg, replica):
     replica(pg)
     _capture(loop=CANON)
     assert hs.refresh()["ok"]
-    unrelated = _payload(loop=None)
-    tombstones.publish_payloads([unrelated])
-    # A forget the hub confirmed (it holds no carrier): the wait rule passes.
-    tombstones.record_confirmations({t: [] for t in tombstones.identity_strings(unrelated)})
-    with hs._replica_write_gate():
-        pass
-    assert hs.facts_rebuilding()
     with pg.connect() as c:
         row = c.execute("SELECT to_jsonb(e) FROM episodes e ORDER BY id DESC LIMIT 1").fetchone()[0]
     code = ("import json;from pathlib import Path;from khipu import tombstones, hub_snapshot as hs;"
             f"tombstones.registry_path=lambda:Path({str(tombstones.registry_path())!r});"
             f"print(json.dumps(hs.upsert_episode(json.loads({json.dumps(json.dumps(row, default=str))}), [])))")
     patches = []
-    real = hs._read_all_facts
+    real = hs._copy_read
 
-    def patch_stream(cur):
-        read = real(cur)
-        # A live capture patch lands while each rebuild read is in flight.
+    def patch_stream(tx, local):
+        read = real(tx, local)
         child = subprocess.run([sys.executable, "-c", code], env=os.environ.copy(),
                                capture_output=True, text=True, timeout=30)
         assert child.returncode == 0, child.stderr
         patches.append(json.loads(child.stdout.strip().splitlines()[-1]))
         return read
 
-    with mock.patch.object(hs, "_read_all_facts", patch_stream):
-        result = hs.rebuild_facts()
-    assert len(patches) == 2, patches
-    assert patches[0].get("ok"), patches  # the first patch superseded the plain rebuild
-    assert patches[1].get("deferred"), patches  # the second queued behind the priority one
-    assert result["rebuilt"] and result.get("priority") and result.get("superseded"), result
-    assert not hs.facts_rebuilding()
+    _capture(loop=None, decision="a decision the copy brings")
+    with mock.patch.object(hs, "_copy_read", patch_stream):
+        result = hs.copy_facts()
+    assert len(patches) == 1 and patches[0].get("ok") and not patches[0].get("deferred"), patches
+    assert result.get("copied"), result
+    assert not hs.facts_hidden()
     assert CANON in _replica_readers()

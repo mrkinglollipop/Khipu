@@ -390,7 +390,14 @@ def import_local(*, source: Path, merge: bool = True) -> dict:
     from khipu import memory_lock
 
     with memory_lock.shared():
-        return _import_local(source=source, merge=merge)
+        out = _import_local(source=source, merge=merge)
+    if (out.get("snapshot_scrub") or {}).get("imported"):
+        # A restored replica shows no fact row until a copy (design 6.2),
+        # taken after the memory lock: the copy lock is outermost.
+        from khipu import hub_snapshot
+
+        out["snapshot_scrub"]["facts"] = hub_snapshot.copy_facts()
+    return out
 
 
 def _skipped_name(parts: tuple[str, ...]) -> bool:

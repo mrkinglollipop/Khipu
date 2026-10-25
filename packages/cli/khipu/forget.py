@@ -303,7 +303,13 @@ def _forget_read(cur, episode_id: int, *, lock: bool, refusals: bool) -> dict[st
     if refusals:
         from khipu import provenance
 
-        read["hub"] = provenance.stored_identities(cur, [episode_id]).get(episode_id, set())
+        from khipu.tombstones import forget_hub_forms
+
+        # Every string the local registry gains is refused on the hub too, so
+        # the replica copy's load rule finds each one there (design 6.2).
+        read["hub"] = (provenance.stored_identities(cur, [episode_id]).get(episode_id, set())
+                       | forget_hub_forms(_registered_sources(read), read["tombstone_payloads"],
+                                          read["candidates"]))
     return read
 
 
@@ -311,13 +317,12 @@ def publish_local(read: dict[str, Any], episode_id: int, hub: set[str]) -> None:
     """Publish one forget's refusals in this Mac's registry, in one atomic
     write: every source the read names, the hub identities ``hub`` the hub
     forget refuses, and the episode id (a backup can hold the episode under
-    an older raw no identity matches; its import scrubs by id). Each refusal
-    is recorded with the episode id as its hub confirmation (the replica's
-    wait rule). ``RegistryError`` when it cannot be published."""
+    an older raw no identity matches; its import scrubs by id).
+    ``RegistryError`` when it cannot be published."""
     from khipu.tombstones import publish_forget
 
     publish_forget(_registered_sources(read), read["tombstone_payloads"], read["candidates"],
-                   confirm={int(episode_id)}, hub=set(hub), episode_ids={int(episode_id)})
+                   hub=set(hub), episode_ids={int(episode_id)})
 
 
 def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
@@ -2018,11 +2023,21 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
     deadline = time.monotonic() + FORGET_RETRY_BUDGET_S
     try:
         with memory_lock.exclusive(wait=FORGET_RETRY_BUDGET_S):
-            return _forget_everywhere(episode_id, memory_root=memory_root, gateway=gateway,
-                                      deadline=deadline)
+            out = _forget_everywhere(episode_id, memory_root=memory_root, gateway=gateway,
+                                     deadline=deadline)
     except memory_lock.MemoryLockError as exc:
         return {"ok": False, "id": episode_id, "complete": False,
                 "error": f"forget not started: {exc}"}
+    snapshot = out.get("snapshot")
+    if isinstance(snapshot, dict) and snapshot.get("ok") and not snapshot.get("skipped"):
+        # After the memory lock (the copy lock is outermost, design 6.2):
+        # this Mac's facts are copied from the hub now, not at its next
+        # pull. Readers showed none since the registry publication. A failed
+        # copy leaves them hidden until the next pull's copy.
+        from khipu.hub_snapshot import copy_facts
+
+        snapshot["facts"] = copy_facts()
+    return out
 
 
 # Two forgets that both run a project's first witness backfill, or that
@@ -2135,158 +2150,86 @@ def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None,
                 "error": f"forget not done: {exc}"}
 
 
-# ---- Hub confirmations of this Mac's refusals (design section 6, the wait rule) ----
+# ---- Forgets the hub lacks (design section 6.2, owner answer 1) ----------------
+#
+# Nothing is sent automatically. A registry string with no hub refusal (a
+# backup import, a forget whose hub step failed, a registry from before this
+# design) or a forgotten episode id whose hub episode is live is listed by
+# the fact copy, and this Mac shows no fact row while any is. The owner
+# sends the strings, and for each id either forgets that hub episode here or
+# says it is not the same episode.
+
+SEND_BATCH = 200
 
 
-def _hub_opener(connect: Any = None):
-    if connect is not None:
-        return connect
-    from khipu.hub_snapshot import HUB_CONNECT_TIMEOUT_S, try_hub_connect
+def unsent_forgets() -> dict[str, Any]:
+    """What the last fact copy listed: ``strings`` (registry identities the
+    hub has no refusal for) and ``ids`` (forgotten episode ids whose hub
+    episode is live, each with its summary); ``count`` in all, and whether
+    this Mac shows no fact row (``facts_hidden``)."""
+    from khipu import hub_snapshot
 
-    return lambda: try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S)
-
-
-def confirm_from_hub(connect: Any = None) -> dict[str, Any]:
-    """Confirm, by the hub's own forget record, refusals this Mac learned
-    before confirmations were recorded (rollout 5.4) or from a backup: a
-    source key or payload hash the hub's ``forgotten_sources`` lists is
-    confirmed with the episode id that record names. The wait rule still
-    needs the hub to show that id tombstoned. Anything the record does not
-    name stays unconfirmed (``send_pending``). Best effort; never raises."""
-    from khipu.tombstones import read_gate, record_confirmations
-
-    try:
-        gate = read_gate()
-        loose = [t for t in gate.unconfirmed if t.startswith(("k:", "h:"))]
-        if not loose:
-            return {"ok": True, "confirmed": 0}
-        from khipu.db import has_table
-
-        with _hub_opener(connect)() as conn, conn.cursor() as cur:
-            if not has_table(cur, "forgotten_sources"):
-                return {"ok": True, "confirmed": 0}
-            cur.execute("SELECT identity, episode_id FROM forgotten_sources "
-                        "WHERE identity = ANY(%s) AND episode_id IS NOT NULL",
-                        (sorted({t[2:] for t in loose}),))
-            by_identity: dict[str, set[int]] = {}
-            for identity, eid in cur.fetchall():
-                by_identity.setdefault(str(identity), set()).add(int(eid))
-        found = {t: sorted(by_identity[t[2:]]) for t in loose if t[2:] in by_identity}
-        record_confirmations(found)
-        return {"ok": True, "confirmed": len(found)}
-    except Exception as exc:  # noqa: BLE001 - unconfirmed refusals keep the replica waiting
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    out = hub_snapshot.unsent_forgets()
+    return {"ok": True, **out, "count": len(out["strings"]) + len(out["ids"]),
+            "facts_hidden": hub_snapshot.facts_hidden()}
 
 
-def pending_forgets(connect: Any = None) -> dict[str, Any]:
-    """The refusals this Mac's replica waits on before it shows facts
-    again: ``unconfirmed`` (no hub forget confirmed them) and ``waiting``
-    (confirmed hub ids the hub does not show tombstoned). ``count`` is the
-    number ``send_pending`` would send. With the hub away, ``waiting`` is
-    unknown (``hub_unreachable``)."""
-    from khipu.hub_snapshot import read_refusal_wait
-    from khipu.tombstones import RegistryError, read_gate
+def send_to_hub(*, connect: Any = None) -> dict[str, Any]:
+    """The owner's "Send to the hub": the hub refusal transaction
+    (``provenance.refuse``) on the hub forms of the listed strings, in
+    batches of at most ``SEND_BATCH``, each batch one transaction under one
+    deadline (section 6.4). A batch that fails or times out stops the send:
+    it and every later batch stay listed, the batches before it stay on the
+    hub. Then one fact copy lists what is left."""
+    from khipu import hub_snapshot, provenance
+    from khipu.tombstones import hub_form
 
-    confirm_from_hub(connect)
-    try:
-        gate = read_gate()
-    except RegistryError as exc:
-        return {"ok": False, "error": f"tombstone registry unavailable: {exc}"[:300]}
-    out: dict[str, Any] = {"ok": True, "unconfirmed": gate.unconfirmed, "waiting": []}
-    if not gate.empty:
+    tags = list(hub_snapshot.unsent_forgets()["strings"])
+    deadline = time.monotonic() + FORGET_RETRY_BUDGET_S
+    opener = connect or (lambda **kw: hub_snapshot.try_hub_connect(**kw))
+    sent, error, uncertain = 0, None, False
+    for start in range(0, len(tags), SEND_BATCH):
+        batch = tags[start:start + SEND_BATCH]
+        forms = sorted({form for tag in batch if (form := hub_form(tag))})
+
+        def work(tx, forms=forms):
+            out = provenance.refuse(tx.cur, forms)
+            tx.commit()
+            return out
+
         try:
-            with _hub_opener(connect)() as conn, conn.cursor() as cur:
-                out["waiting"] = read_refusal_wait(cur, gate)["waiting"]
-        except Exception as exc:  # noqa: BLE001 - reported, not raised
-            out.update(hub_unreachable=True, error=f"{type(exc).__name__}: {exc}"[:300])
-    out["count"] = len(out["unconfirmed"]) + len(out["waiting"])
-    return out
-
-
-def _live_carriers(cur, refusals: set[str]) -> dict[str, list[int]]:
-    """The live hub episodes carrying each of ``refusals``, by every source
-    identity a row represents (the replica's episode fence,
-    ``hub_snapshot._anchor_identities``), over the whole hub in pages.
-    ``RegistryError`` when a row's identity cannot be computed."""
-    from khipu import hub_snapshot as hs
-
-    cols = hs._anchor_cols(cur)
-    found: dict[str, list[int]] = {}
-    last = 0
-    while True:
-        cur.execute(f"SELECT {', '.join(cols)} FROM episodes WHERE id > %s AND deleted_at IS NULL "
-                    "ORDER BY id LIMIT 500", (last,))
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        if not rows:
-            return found
-        receipts = hs._read_receipts(cur, [int(r["id"]) for r in rows])
-        for row in rows:
-            eid = int(row["id"])
-            for refusal in refusals & hs._anchor_identities(row, receipts.get(eid, ())):
-                found.setdefault(refusal, []).append(eid)
-        last = int(rows[-1]["id"])
-
-
-def send_pending(*, memory_root: Path | None = None, connect: Any = None) -> dict[str, Any]:
-    """The owner's "Send N forgets to the hub": run the hub forget for every
-    refusal the replica waits on and record its confirmation. A confirmed id
-    the hub has not tombstoned is forgotten again (``forget_everywhere``,
-    which records it); a confirmed id the hub does not hold is dropped from
-    its refusals' confirmations (it supplies no wording there). Each
-    unconfirmed refusal is looked for in every live hub episode by every
-    identity it represents; each carrier is forgotten, then the refusal is
-    confirmed with their ids (none: the hub holds no live carrier) and its
-    source key or payload hash is recorded in the hub's ``forgotten_sources``,
-    so a later upload of it is refused there. Then the replica rebuilds."""
-    from khipu.hub_snapshot import rebuild_facts
-    from khipu.tombstones import RegistryError, publish_hub_forget, read_gate, record_confirmations
-
-    before = pending_forgets(connect)
-    if not before.get("ok") or before.get("hub_unreachable"):
-        return {**before, "ok": False, "sent": []}
-    opener = _hub_opener(connect)
-    sent: list[dict[str, Any]] = []
-    for eid in before["waiting"]:
-        out = forget_everywhere(eid, memory_root=memory_root)
-        if str(out.get("error") or "").startswith("no such episode"):
-            gate = read_gate()
-            record_confirmations({r: [i for i in gate.hub_ids(r) or () if i != eid]
-                                  for r in gate.refusals if eid in (gate.hub_ids(r) or ())}, replace=True)
-            sent.append({"id": eid, "hub": "not held"})
-        else:
-            sent.append({"id": eid, "hub": "forgotten" if out.get("soft_deleted") or out.get("ok")
-                         else "failed", **({"error": out["error"]} if out.get("error") else {})})
-    loose = set(before["unconfirmed"])
-    error = None
-    if loose:
-        try:
-            with opener() as conn, conn.cursor() as cur:
-                carriers = _live_carriers(cur, loose)
-        except RegistryError as exc:
-            carriers, error = None, f"a hub episode's identity could not be read: {exc}"[:300]
-        if carriers is not None:
-            forgotten: dict[int, bool] = {}
-            for eid in sorted({i for ids in carriers.values() for i in ids}):
-                out = forget_everywhere(eid, memory_root=memory_root)
-                forgotten[eid] = bool(out.get("soft_deleted"))
-                sent.append({"id": eid, "hub": "forgotten" if forgotten[eid] else "failed",
-                             **({"error": out["error"]} if out.get("error") else {})})
-            done = {r: carriers.get(r, []) for r in loose
-                    if all(forgotten.get(i) for i in carriers.get(r, []))}
-            with opener() as conn, conn.cursor() as cur:
-                publish_hub_forget(cur, None, [
-                    {"source_key" if r.startswith("k:") else "payload_sha256": r[2:]}
-                    for r in sorted(done) if r.startswith(("k:", "h:"))])
-                conn.commit()
-            record_confirmations(done)
-    out: dict[str, Any] = {"ok": False, "sent": sent, "facts": rebuild_facts(connect=connect)}
-    after = pending_forgets(connect)
-    out.update(pending=after.get("count"), unconfirmed=after.get("unconfirmed"),
-               waiting=after.get("waiting"))
+            provenance.hub_call(work, deadline=deadline, connect=opener)
+        except provenance.NotDone as exc:
+            error, uncertain = f"not sent: {exc}", exc.uncertain
+        except Exception as exc:  # noqa: BLE001 - reported; the batch stays listed
+            error = f"not sent: {type(exc).__name__}: {exc}"[:300]
+        if error:
+            break
+        sent += len(batch)
+    facts = hub_snapshot.copy_facts(connect=connect)
+    left = unsent_forgets()
+    out: dict[str, Any] = {"ok": error is None and left["count"] == 0, "sent": sent,
+                           "pending": left["count"], "facts": facts}
     if error:
-        out["error"] = error
-    out["ok"] = bool(after.get("ok")) and not after.get("hub_unreachable") and after.get("count") == 0
+        out.update(error=error, uncertain=uncertain)
     return out
+
+
+def not_same_episode(episode_id: int, *, connect: Any = None) -> dict[str, Any]:
+    """The owner's "Not the same episode": the hub's episode ``episode_id``
+    is not the one forgotten on this Mac (a replacement hub's unrelated
+    episode), so the id leaves this Mac's registry, logged; then one fact
+    copy. Only a listed id."""
+    from khipu import hub_snapshot, tombstones
+
+    if int(episode_id) not in {int(item.get("id")) for item in hub_snapshot.unsent_forgets()["ids"]}:
+        return {"ok": False, "id": episode_id, "error": f"episode {episode_id} is not listed as a forget the hub lacks"}
+    removed = tombstones.drop_episode_id(int(episode_id))
+    import sys
+
+    print(f"[khipu] owner: hub episode {episode_id} is not the episode forgotten here; "
+          "its id left this Mac's forget registry", file=sys.stderr, flush=True)
+    return {"ok": True, "id": episode_id, "removed": removed, "facts": hub_snapshot.copy_facts(connect=connect)}
 
 
 def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
@@ -2339,20 +2282,6 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         if (out["snapshot"].get("error") == "hub snapshot missing"
                 and not snapshot_path().exists()):
             out["snapshot"] = {"ok": True, "skipped": True, "reason": "no snapshot exists"}
-        if out["snapshot"].get("ok") and not out["snapshot"].get("skipped"):
-            # After the local tombstone and the registry publication: the
-            # forget changed the refusal set, so this Mac's replica drops its
-            # commitments, decisions and deliverables and re-reads them from
-            # the hub now, through the source fence, not at its next pull
-            # (design section 6, owner decision 2026-10-24). Readers show
-            # none of them until it lands. Best-effort: a failed rebuild
-            # leaves the replica rebuilding and its next pull does it.
-            from khipu.hub_snapshot import rebuild_facts
-
-            try:
-                out["snapshot"]["facts"] = rebuild_facts(connect=connect)
-            except Exception as exc:  # noqa: BLE001 - the hub forget committed
-                out["snapshot"]["facts"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
     except Exception as exc:  # noqa: BLE001 — the hub write already succeeded
         out["snapshot"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     if not out["snapshot"].get("ok"):

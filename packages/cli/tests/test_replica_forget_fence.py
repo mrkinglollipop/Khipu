@@ -29,8 +29,7 @@ _REPLICA_SIDE = ("con.execute", "open_snapshot(", "sqlite3.connect(", "_present(
 # Functions that read a linked table on the replica side without the fence:
 # (module, name) -> why.
 UNFENCED = {
-    ("hub_snapshot.py", "_insert_decisions"): "the dump's hub read; readers fence the rows it writes",
-    ("hub_snapshot.py", "_insert_deliverables"): "the dump's hub read, already without forgotten episodes",
+    ("hub_snapshot.py", "_write_copy"): "the copy's publication checks each vector against the rows it just wrote",
     ("hub_snapshot.py", "_lag_decisions"): "the freshness measurement compares every row with the hub by id",
     ("hub_snapshot.py", "_lag_deliverables"): "the freshness measurement compares every row with the hub by id",
 }
@@ -98,10 +97,10 @@ def replica(tmp_path, monkeypatch):
     con.commit()
     con.close()
     hs._queue_erasure(3)
-    # These rows stand for a replica fenced against the refusal set with
-    # episode 3's erasure queued: record that set's fingerprint, as the
-    # fenced write that queued it would (an unrecorded or older one shows
-    # no fact row, design section 6).
+    # These rows stand for a copy stamped against the registry with
+    # episode 3's erasure queued: record that fingerprint, as the copy that
+    # published them would (an unstamped replica shows no fact row, design
+    # section 6.2).
     with closing(sqlite3.connect(hs.snapshot_path())) as con, con:
         hs._meta_put(con, hs._FACT_DIGEST_KEY, hs._current_refusal_digest(hs.snapshot_path()))
     return tmp_path

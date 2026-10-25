@@ -99,7 +99,7 @@ STORES: tuple[Store, ...] = (
     Store("replica", "data folder hub_snapshot.sqlite",
           "episode rows, vectors, decisions, deliverables, topics and commitments", "replica",
           _w("hub_snapshot._refresh_locked", "hub_snapshot._replica_write_gate",
-             "hub_snapshot.sync_decision_changes", "hub_snapshot.ledger_write_snapshot",
+             "hub_snapshot._admitted", "hub_snapshot.ledger_write_snapshot",
              "hub_snapshot.forget_episode_in_snapshot",
              "hub_snapshot.publish_imported_snapshot", "hub_snapshot.purge_topic_in_snapshot",
              "hub_snapshot.ensure_edge_indexes", "hub_snapshot._write_pulled_tables",

@@ -1,13 +1,15 @@
 """Fifth Astra review's reproductions (jobs/2026-10-23/astra-prov5), ported:
-each failed on a717b6ec. The rebuild rule's boundaries: an unfingerprinted
-replica is unverified, the refusal set is read when SQL runs, a rebuild
-publishes only into the generation it was read for, closure-only lines are
-recovered, the hub binds a vector to its wording, a backup carries no fact
-row of a refused generation."""
+each failed on a717b6ec. Carried onto the fact copy (design 6.2) in phase
+7B: an unstamped replica shows no fact row, the registry is read when SQL
+runs, a copy read before a newer one never publishes over it, closure-only
+lines are recovered, the hub binds a vector to its wording, a backup carries
+no fact row."""
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -22,8 +24,8 @@ from tests.test_provenance_replica import _replica, _replica_readers, hub_forget
 
 
 def test_first_live_patch_does_not_certify_unchecked_legacy_facts(pg, replica):
-    """#1 (P1): a replica with no recorded fingerprint (written before the
-    rule) is unverified: its first fenced write drops and rebuilds."""
+    """#1 (P1): a replica with no stamp (written before the rule) shows no
+    fact row, and no episode write certifies it: only a copy does."""
     replica(pg)
     _capture(loop=CANON)
     private = _payload(loop=ALT)
@@ -32,22 +34,21 @@ def test_first_live_patch_does_not_certify_unchecked_legacy_facts(pg, replica):
     assert hs.refresh()["ok"]
     with sqlite3.connect(hs.snapshot_path()) as c:
         c.execute("DELETE FROM snapshot_meta WHERE key IN (?,?)", (hs._FACT_DIGEST_KEY, hs._SCRUB_DIGEST_KEY))
-    unverified = (hs._replica_fact_state(), json.dumps(offline_reads.owed(None, "open", 100), default=str))
+    unverified = (hs.facts_hidden(), json.dumps(offline_reads.owed(None, "open", 100), default=str))
     tombstones.publish_payloads([private])
     with pg.connect() as c:
         row = c.execute("SELECT to_jsonb(e) FROM episodes e WHERE id=%s", (live,)).fetchone()[0]
     assert hs.forget_episode_in_snapshot(private_id)["ok"]
     hs.upsert_episode(row, [])
-    assert hs.sync_fact_changes()["ok"]
+    assert not hs.copy_facts()["ok"]  # the hub lacks this Mac's refusal
     rows = offline_reads.owed(None, "open", 100)
     assert ALT not in json.dumps(rows, default=str), "first fenced write blessed unchecked legacy facts"
-    # The wait rule (2026-10-24 ruling): live wording returns once the hub's
-    # forget of the private episode lands.
+    # Live wording returns once the hub's forget of the private episode lands.
     hub_forget(pg, private_id)
-    assert hs.sync_fact_changes()["ok"]
+    assert hs.copy_facts().get("copied")
     assert CANON in _replica_readers() and ALT not in _replica_readers()
-    # Before the first write, the unfingerprinted replica served no fact row.
-    assert unverified[0] == "unverified" and ALT not in unverified[1]
+    # Before the first write, the unstamped replica served no fact row.
+    assert unverified[0] is True and ALT not in unverified[1]
 
 
 def test_reader_refusal_published_before_sql(pg, replica, monkeypatch):
@@ -80,11 +81,13 @@ def test_retained_vector_view_rechecks_registry(pg, replica):
     replica(pg)
     private = _payload(loop=CANON)
     capture.write_pg(private)
-    assert hs.refresh()["ok"]
-    cid = _replica("SELECT id FROM commitments")[0][0]
-    assert hs.upsert_embeddings([dict(profile="probe", kind="commitment", ref=str(cid), chunk_idx=0,
-                                      chunk_text=CANON, embedding=[1.0, 0.0], content_hash=embed._md5(CANON),
-                                      fact_wording=embed._md5(CANON))])["embeddings"] == 1
+    with pg.connect() as c:
+        cid = c.execute("SELECT id FROM commitments").fetchone()[0]
+        profile, dim = c.execute("SELECT id, dim FROM embedding_profiles ORDER BY id LIMIT 1").fetchone()
+        c.execute("INSERT INTO memory_embeddings (profile, kind, ref, chunk_idx, chunk_text, content_hash, "
+                  "embedding) VALUES (%s, 'commitment', %s, 0, %s, md5(%s), %s)",
+                  (profile, str(cid), CANON, CANON, "[" + ",".join(["1"] + ["0"] * (dim - 1)) + "]"))
+    assert hs.refresh()["facts"]["vectors"] == 1
     con = hs.open_snapshot()
     try:
         before = con.execute("SELECT chunk_text FROM memory_embeddings WHERE kind='commitment'").fetchall()
@@ -102,35 +105,34 @@ def test_retained_vector_view_rechecks_registry(pg, replica):
     assert not held, "reader view captured the old refusal digest"
 
 
-def test_older_rebuild_cannot_overwrite_newer_pull(pg, replica):
-    """#3 (P2): a rebuild whose read predates a newer load is discarded."""
+def test_an_older_copy_cannot_overwrite_a_newer_pull(pg, replica):
+    """#3 (P2): a copy whose hub read predates a newer pull's never publishes
+    over it. Copies are serial (one lock from snapshot to commit, 6.2), so
+    the pull's copy waits, reads after the older one published, and lands."""
     replica(pg)
     _capture(loop=CANON)
     assert hs.refresh()["ok"]
-    unrelated = _payload(loop=None)
-    tombstones.publish_payloads([unrelated])
-    # A forget the hub confirmed (it holds no carrier): the wait rule passes.
-    tombstones.record_confirmations({t: [] for t in tombstones.identity_strings(unrelated)})
-    with hs._replica_write_gate():
-        pass
-    assert hs.facts_rebuilding()
-    real = hs._read_all_facts
-    fired = []
+    real = hs._copy_read
+    fired, results = [], {}
 
-    def interleave(cur):
-        read = real(cur)
+    def interleave(tx, local):
+        read = real(tx, local)
         if fired:
             return read
         fired.append(True)
-        _capture(loop=None, decision="new decision after old rebuild snapshot")
-        assert hs.pull_changes(include_ledger=False)["ok"]
-        assert "new decision" in _replica_readers()
+        _capture(loop=None, decision="new decision after old copy snapshot")
+        pull = threading.Thread(target=lambda: results.update(pull=hs.pull_changes(include_ledger=False)))
+        pull.start()
+        results["thread"] = pull
+        time.sleep(0.5)
         return read
 
-    with mock.patch.object(hs, "_read_all_facts", interleave):
-        result = hs.rebuild_facts()
+    with mock.patch.object(hs, "_copy_read", interleave):
+        older = hs.copy_facts()
+        results["thread"].join(60)
+    assert older["ok"], older
+    assert results["pull"]["ok"] and results["pull"]["facts"].get("copied"), results
     assert "new decision" in _replica_readers()
-    assert result.get("superseded")
 
 
 @pytest.mark.parametrize("method", ["sync_recent_episodes", "reconcile_memory_root"])

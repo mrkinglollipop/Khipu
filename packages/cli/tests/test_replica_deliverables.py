@@ -243,10 +243,13 @@ class ReplicaReaderMatchesHubReaderTest(unittest.TestCase):
 
 
 class ExportTest(unittest.TestCase):
+    """The fact copy's read and write of deliverables (design 6.2); the dump
+    itself carries none since phase 7B."""
+
     def _export(self, cur: _FakeHubCursor) -> tuple[int, sqlite3.Connection]:
         con = sqlite3.connect(":memory:")
         hs._create_schema(con)
-        return hs._insert_deliverables(cur, con), con
+        return hs._write_fact_deliverables(con, hs._read_fact_rows(cur)["deliverables"]), con
 
     def test_rows_are_exported(self) -> None:
         rows = [_row(1, "khipu/decisions.py", episode=1), _row(2, "khipu/other.py", episode=2, day=3)]
@@ -288,7 +291,7 @@ class ExportTest(unittest.TestCase):
         con.close()
         self.assertEqual(n, 1)
 
-    def test_refresh_reports_the_count_and_writes_version_3(self) -> None:
+    def test_refresh_writes_version_3_without_deliverables(self) -> None:
         cur = _FakeHubCursor([_row(1, "khipu/decisions.py")])
 
         @contextmanager
@@ -309,7 +312,7 @@ class ExportTest(unittest.TestCase):
                 for name in (
                     "_insert_episodes", "_insert_topics", "_insert_topic_revisions",
                     "_insert_nodes", "_insert_edges", "_insert_profiles",
-                    "_insert_memory_embeddings", "_insert_decisions",
+                    "_insert_memory_embeddings",
                 )
             ]
             for p in patches:
@@ -321,10 +324,10 @@ class ExportTest(unittest.TestCase):
                     p.stop()
             self.assertTrue(out["ok"], out)
             self.assertEqual(out["schema_version"], hs.SNAPSHOT_SCHEMA_VERSION)
-            self.assertEqual(out["counts"]["deliverables"], 1)
+            self.assertNotIn("deliverables", out["counts"])  # they come with the fact copy
             con = sqlite3.connect(str(snap))
             try:
-                self.assertEqual(con.execute("SELECT COUNT(*) FROM deliverables").fetchone()[0], 1)
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM deliverables").fetchone()[0], 0)
                 self.assertEqual(
                     con.execute(
                         "SELECT value FROM snapshot_meta WHERE key = 'schema_version'"
@@ -460,15 +463,17 @@ class NoDriverOnTheReplicaPathTest(unittest.TestCase):
 
 
 class IncrementalWriteTest(unittest.TestCase):
-    """``upsert_episode`` carries the episode's deliverables in the same step."""
+    """Since phase 7B an episode patch carries no deliverable (design 6.2):
+    deliverables come only with the fact copy, and a patch leaves the held
+    ones as they are."""
 
     _EPISODE = {"id": 42, "ts": "2026-09-14T10:00:00+00:00", "summary": "built the registry",
                 "project": "acme/widget"}
 
-    def _upsert(self, data: Path, rows) -> dict:
+    def _upsert(self, data: Path) -> dict:
         with mock.patch.object(hs, "snapshot_path", return_value=data / hs.SNAPSHOT_NAME), \
                 mock.patch.object(hs, "meta_path", return_value=data / hs.META_NAME):
-            return hs.upsert_episode(dict(self._EPISODE), [], deliverable_rows=rows)
+            return hs.upsert_episode(dict(self._EPISODE), [])
 
     def _rows(self, data: Path) -> list[dict] | None:
         con = sqlite3.connect(str(data / hs.SNAPSHOT_NAME))
@@ -477,39 +482,15 @@ class IncrementalWriteTest(unittest.TestCase):
         finally:
             con.close()
 
-    def test_an_incremental_write_makes_the_line_findable(self) -> None:
-        data = _replica_file([])
-        out = self._upsert(data, [_row(5, "khipu/decisions.py", episode=42, day=14)])
+    def test_an_episode_patch_leaves_deliverables_untouched(self) -> None:
+        data = _replica_file([_row(1, "khipu/keep.py", episode=7), _row(5, "khipu/decisions.py", episode=42)])
+        out = self._upsert(data)
         self.assertTrue(out["ok"], out)
-        rows = self._rows(data)
-        assert rows is not None
-        self.assertEqual(
-            dl.line_from_rows(rows, ["decisions", "khipu"]),
-            "You produced khipu/decisions.py on 2026-09-14 (episode 42)",
-        )
-
-    def test_a_recapture_replaces_and_does_not_duplicate(self) -> None:
-        data = _replica_file([])
-        first = [_row(5, "khipu/decisions.py", episode=42), _row(6, "khipu/other.py", episode=42)]
-        self._upsert(data, first)
-        self._upsert(data, first)
-        self.assertEqual(sorted(r["id"] for r in self._rows(data) or []), [5, 6])
-        self._upsert(data, [_row(6, "khipu/other.py", episode=42)])
-        self.assertEqual([r["id"] for r in self._rows(data) or []], [6])
-
-    def test_other_episodes_rows_are_left_alone(self) -> None:
-        data = _replica_file([_row(1, "khipu/keep.py", episode=7)])
-        self._upsert(data, [_row(5, "khipu/decisions.py", episode=42)])
         self.assertEqual(sorted(r["id"] for r in self._rows(data) or []), [1, 5])
-
-    def test_no_rows_argument_leaves_deliverables_untouched(self) -> None:
-        data = _replica_file([_row(5, "khipu/decisions.py", episode=42)])
-        self._upsert(data, None)
-        self.assertEqual([r["id"] for r in self._rows(data) or []], [5])
 
     def test_a_v2_replica_is_left_untouched(self) -> None:
         data = _replica_file([], version=2)
-        out = self._upsert(data, [_row(5, "khipu/decisions.py", episode=42)])
+        out = self._upsert(data)
         self.assertTrue(out["ok"], out)
         con = sqlite3.connect(str(data / hs.SNAPSHOT_NAME))
         try:

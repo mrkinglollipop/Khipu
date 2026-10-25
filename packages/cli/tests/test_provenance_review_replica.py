@@ -61,8 +61,11 @@ def test_unseen_source_registry_fence_applies_before_fact_import(pg, replica, mo
         tombstones.publish_payloads([payload])
         slow.commit()
         # No episode in SQLite means no rejected numeric id has been learned.
-        out = hs.sync_fact_changes() if mode == "sync" else hs.pull_changes(include_ledger=False)
-        assert out["ok"], out
+        # The copy (design 6.2) lists the refusal the hub lacks instead.
+        out = hs.sync_decision_changes() if mode == "sync" else hs.pull_changes(include_ledger=False)
+        facts = out if mode == "sync" else out["facts"]
+        assert out["ok"] if mode == "pull" else not out["ok"], out
+        assert facts.get("unsent"), out
         first_read = _replica_readers()
         second = hs.pull_changes(include_ledger=False)
         assert second["ok"], second
@@ -70,8 +73,8 @@ def test_unseen_source_registry_fence_applies_before_fact_import(pg, replica, mo
               "first_exposed": marker in first_read, "second_ok": second["ok"],
               "second_exposed": marker in _replica_readers(), "episodes": _replica("SELECT id FROM episodes")})
         assert marker not in _replica_readers(), (
-            "Registry-forgotten source imported through the fact stream despite being absent "
-            "from the replica; no source-identity gate ran", out,
+            "Registry-forgotten source imported through the fact copy despite being absent "
+            "from the hub's refusals", out,
         )
     finally:
         slow.rollback()
@@ -104,8 +107,8 @@ def test_older_episode_patch_cannot_overwrite_newer_deliverable_stream_forever(p
                 tombstones, "publish_episode_ids"
             ):
                 _forget(pg, eid)
-            newer = hs.sync_fact_changes()
-            assert newer["ok"], newer
+            newer = hs.sync_decision_changes()
+            assert newer.get("copied"), newer
             assert _replica("SELECT episode_id, title FROM deliverables WHERE id = ?", (fid,)) == [
                 (kept, "The kept checklist")
             ]
@@ -115,11 +118,8 @@ def test_older_episode_patch_cannot_overwrite_newer_deliverable_stream_forever(p
     old_pull = hs.pull_changes(include_ledger=False)
     assert old_pull["ok"], old_pull
     assert interleaved
-    # The old pull writes its old per-episode deliverable under the forgotten
-    # anchor, then skips its stream because the independent sync advanced
-    # xmin. The next pull imports that anchor's tombstone and deletes the
-    # wrongly anchored row. B's episode is old and has not changed, and the
-    # stream cursor is already past the reparenting: live support is lost.
+    # An episode patch carries no fact row since phase 7B: the old pull
+    # writes only the episode, learns the tombstone and copies the facts.
     assert hs.pull_changes(include_ledger=False)["ok"]
     third = hs.pull_changes(include_ledger=False)
     assert third["ok"], third

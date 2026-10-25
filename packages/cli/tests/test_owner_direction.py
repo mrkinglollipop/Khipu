@@ -239,7 +239,7 @@ def test_every_change_by_direction_is_logged_with_an_undo(world):
     # forgets to the hub has none either: a forget is never undone (fact
     # provenance design, section 9), and an agent may forget without
     # direction at all (khipu_forget).
-    assert set(owner_direction._NO_UNDO_WHY) == {"ledger.import", "forget.send"}
+    assert set(owner_direction._NO_UNDO_WHY) == {"ledger.import", "forget.send", "forget.here", "forget.not_same"}
     routing._write({"type": "rule_add", "n": 1, "text": "never run the fast tier", "seeded": True,
                     "written_by": {"kind": "seed", "file": "rules.json"}, "via": "seed"})
     world.say()

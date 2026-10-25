@@ -203,11 +203,11 @@ class _Cur:
         return [(1, "kept", 10, datetime(2026, 10, 1, tzinfo=timezone.utc), "open")]
 
 
-def test_the_dump_asks_the_hub_to_leave_out_forgotten_commitments(home):
+def test_the_copy_asks_the_hub_to_leave_out_forgotten_commitments(home):
     con = sqlite3.connect(":memory:")
     hs._create_schema(con)
     cur = _Cur()
-    assert hs._insert_commitments(cur, con) == 1
+    assert hs._write_commitment_rows(con, *hs._hub_commitments(cur)) == 1
     assert "e.deleted_at IS NOT NULL" in cur.sql[-1]
     assert con.execute("SELECT id, text FROM commitments").fetchall() == [(1, "kept")]
 

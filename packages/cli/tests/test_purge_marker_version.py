@@ -54,7 +54,7 @@ def test_refresh_during_marker_read_keeps_newer_purge(replica, monkeypatch):
         return InterleavedRead(file) if path == marker else file
 
     monkeypatch.setattr(Path, "open", open_with_refresh)
-    result = hs._write_pulled_tables([_row(old + timedelta(seconds=10))], None, None,
+    result = hs._write_pulled_tables([_row(old + timedelta(seconds=10))], None,
                                      read_at=time.time())
     assert interleaved and result["topics"]["ok"], result
     assert marker.exists(), "a later local purge must survive recreation cleanup"
@@ -110,7 +110,7 @@ def test_purge_published_at_unlink_cannot_be_removed(replica, monkeypatch, clear
     monkeypatch.setattr(fcntl, "flock", observe_publication_lock)
     monkeypatch.setattr(Path, "unlink", unlink_with_purge)
     if clear_kind == "recreation":
-        result = hs._write_pulled_tables([_row(old + timedelta(seconds=10))], None, None,
+        result = hs._write_pulled_tables([_row(old + timedelta(seconds=10))], None,
                                          read_at=time.time())
         assert result["topics"]["ok"], result
     else:
@@ -148,7 +148,7 @@ def test_hub_clock_takes_precedence_over_local_marker_time(
     marker = hs._purged_topic_marker(replica, "race")
     os.utime(marker, (file_time, file_time))
     result = hs._write_pulled_tables([_row(hub + timedelta(seconds=incoming_seconds))],
-                                     None, None, read_at=time.time())
+                                     None, read_at=time.time())
     assert result["topics"]["ok"], result
     assert (hs.topic_detail_snapshot("race") is not None) is allowed
     assert marker.exists() is not allowed
