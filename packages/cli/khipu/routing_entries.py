@@ -194,6 +194,13 @@ def checked_level(value):
     return {"claim": value["claim"], "as_of": r._iso(start), "until": r._iso(end)}
 
 
+# Basic required keys for closed definitions, in their display order.
+# Providers additionally pass the richer routing_providers.checked schema.
+DEFINITION_REQUIRED_KEYS = {"provider": ("id", "label"),
+                            "account": ("id", "label", "provider"),
+                            "lane_map": ("runner", "lane", "account")}
+
+
 def checked_definition(name, value):
     """Closed facts carry no local binding or runner folder."""
     if name == "provider":
@@ -205,9 +212,7 @@ def checked_definition(name, value):
     fields = {"provider": {"id", "label", "family"},
               "account": {"id", "label", "provider", "family"},
               "lane_map": {"runner", "lane", "account"}}
-    required = {"provider": {"id", "label"}, "account": {"id", "label", "provider"},
-                "lane_map": {"runner", "lane", "account"}}
-    if name not in fields or set(value) - fields[name] or not required[name] <= set(value):
+    if name not in fields or set(value) - fields[name] or not set(DEFINITION_REQUIRED_KEYS[name]) <= set(value):
         return None
     if any(not isinstance(v, str) or not v.strip() or "/" in v or "\\" in v or "|" in v
            for k, v in value.items() if k != "label"):
