@@ -3242,7 +3242,16 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                     continue
                 except OSError as e:
                     out["failed"] += 1
-                    _capture_failure(jp, job, "empty checkpoint: OSError", out)
+                    # A saved "empty" checkpoint makes the retry free (no model
+                    # call); only a failed checkpoint backs off.
+                    try:
+                        saved = json.loads(jp.read_text(encoding="utf-8")).get("disposition")
+                    except (OSError, ValueError, AttributeError):
+                        saved = None
+                    if saved == "empty":
+                        _release(jp)
+                    else:
+                        _capture_failure(jp, job, "empty checkpoint: OSError", out)
                     _record_drain(harness, captured=False, error=f"empty checkpoint: {e}")
                     continue
                 _record_drain(harness, captured=False, empty=True)
