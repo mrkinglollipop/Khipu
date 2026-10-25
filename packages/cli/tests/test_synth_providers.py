@@ -753,7 +753,7 @@ def test_wrong_task_reply_from_a_cli_provider_falls_back_to_gemini_once():
     with mock.patch.object(extract, '_generate_claude_cli', return_value='not json'), \
          mock.patch.object(extract, '_key', side_effect=RuntimeError('no key')), \
          mock.patch.object(extract, '_generate_gemini') as gem, \
-         pytest.raises(RuntimeError, match='non-JSON'):
+         pytest.raises(RuntimeError, match='invalid JSON'):
         extract.extract_memory('USER: hi\nASSISTANT: hello', cwd='/p')
     assert gem.call_count == 0
 
@@ -772,7 +772,7 @@ def test_openrouter_invalid_capture_falls_back_only_when_gemini_key_resolves():
         mock.patch.object(extract, '_generate_openrouter', return_value='not json'),
         mock.patch.object(extract, '_key', side_effect=RuntimeError('no key')),
         mock.patch.object(extract, '_generate_gemini') as gem,
-        pytest.raises(RuntimeError, match='non-JSON'),
+        pytest.raises(RuntimeError, match='invalid JSON'),
     ):
         extract.extract_memory('USER: hi\nASSISTANT: done', cwd='/p')
     assert gem.call_count == 0
@@ -825,7 +825,7 @@ def test_synth_fallback_setting_off_keeps_the_failure_and_is_set_through_config(
     with mock.patch.object(extract, '_generate_claude_cli', return_value='not json'), \
          mock.patch.object(extract, '_key', return_value='fake'), \
          mock.patch.object(extract, '_generate_gemini') as gem, \
-         pytest.raises(RuntimeError, match='non-JSON'):
+         pytest.raises(RuntimeError, match='invalid JSON'):
         extract.extract_memory('USER: hi\nASSISTANT: hello', cwd='/p')
     assert gem.call_count == 0
     cfg.set_choice_setting('synth_fallback', None)

@@ -37,6 +37,7 @@ _REGISTRY = "the forgotten-source registry: identities and ids, never text"
 
 NOT_CAPTURE = {
     "session_capture._write_claim_owner": "PID and kernel process birth metadata only; no capture text",
+    "session_capture._write_retry_state": "attempt count, backoff time, held flag and an error kind only; no capture text",
     **dict.fromkeys(("hub_snapshot._acquire_refresh_lock", "hub_snapshot._purge_marker_lock",
                      "ledger._flock", "jobs._job_lock",
                      "memory_lock._take", "outbox._locked_outbox", "promote._lock",
