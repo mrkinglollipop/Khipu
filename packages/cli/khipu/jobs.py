@@ -775,6 +775,9 @@ def _provenance_backfill(conn) -> dict[str, Any]:
         # Fact steps a capture kept as gaps are re-run (invariant I4), after
         # the backfill and before tonight's rules read the facts.
         out["gaps"] = provenance.replay_gaps(conn)
+        # The hub refusals' identity index and duplicate sweep, until every
+        # episode from before 0047 is indexed (section 6.1).
+        out["index"] = provenance.index_identities(conn)
         # The replica stream's 30-day retention (section 6 of the design).
         out["changes"] = provenance.prune_changes(conn)
         return out

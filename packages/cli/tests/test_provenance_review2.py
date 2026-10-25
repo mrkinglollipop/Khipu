@@ -28,6 +28,7 @@ from khipu import capture, deliverables, hub_snapshot as hs, mirror, outbox, pro
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import env, pg, PROJECT, _capture, _payload  # noqa: F401
 from tests.test_provenance_replica import replica, _replica, _replica_readers  # noqa: F401
+from tests.fact_seed import announce
 
 
 def _seed_commitment(conn, eid, marker):
@@ -87,6 +88,7 @@ def test_source_publication_after_anchor_check_cannot_race_derivative_write(pg, 
                "transcript_range": "0:10", "project": PROJECT}
     marker = "PRIVATE-REGISTRY-CHECK-RACE"
     with pg.connect() as conn:
+        announce(conn)
         eid = conn.execute(
             "INSERT INTO episodes (ts,summary,raw,harness,session_id,transcript_range,project) "
             "VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s) RETURNING id",

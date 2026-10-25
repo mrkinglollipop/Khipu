@@ -26,6 +26,7 @@ import pytest
 
 from khipu import cli, commitments as co, config, db, owed_tidy, routing, work
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.fact_seed import announce
 from tests import fact_seed
 
 PROJECT = "acme/widget"
@@ -90,6 +91,7 @@ class Flood:
 
     def episode(self, *, parent: str | None = None, summary: str | None = None, at=None) -> int:
         with self.conn.cursor() as cur:
+            announce(cur)
             cur.execute("INSERT INTO episodes (ts, session_id, summary, raw, project, parent_session_id) "
                         "VALUES (%s, %s, %s, '{}'::jsonb, %s, %s) RETURNING id",
                         (at or BASE_AT, f"s-{self._n}", summary or f"episode {self._n}", PROJECT, parent))

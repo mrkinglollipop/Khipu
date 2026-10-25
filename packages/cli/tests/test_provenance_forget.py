@@ -40,6 +40,7 @@ import pytest
 
 from khipu import capture, close_rules, commitments as co, decisions, deliverables, forget, outbox, provenance
 from tests.hermetic_pg import chain_dir, hub, migration_sql, pg_cluster  # noqa: F401
+from tests.fact_seed import announce
 
 PROJECT = "acme/widget"
 BEFORE = "0044"
@@ -598,6 +599,7 @@ def test_a_forgotten_capture_is_no_close_rule_evidence(pg, monkeypatch):
     _capture(loop="Land PR #41 before release")
     with pg.connect() as conn:
         # Not a capture (that would run the capture-time rules on itself).
+        announce(conn)
         e = conn.execute("INSERT INTO episodes (ts, session_id, harness, summary, project, raw) "
                          "VALUES (now(), 'codex:merge', 'codex', 'Merge pull request #41 from acme/fix', %s, "
                          "'{}'::jsonb) RETURNING id", (PROJECT,)).fetchone()[0]

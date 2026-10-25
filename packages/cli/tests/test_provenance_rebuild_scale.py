@@ -25,6 +25,7 @@ from khipu import hub_snapshot as hs, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import PROJECT, env, pg  # noqa: F401
 from tests.test_provenance_replica import replica  # noqa: F401
+from tests.fact_seed import announce
 
 FACTS = int(os.environ.get("PROVENANCE_REBUILD_BENCH_FACTS", "5000"))
 
@@ -34,6 +35,7 @@ def _seed(h, n: int) -> int:
     commitments, decisions = (2 * n) // 5, (2 * n) // 5
     deliverables = n - commitments - decisions
     with h.connect() as conn:
+        announce(conn)
         conn.execute(
             "INSERT INTO episodes (ts, session_id, summary, raw, harness, project, transcript_range) "
             "SELECT now(), 'codex:bench-' || g, 'bench episode ' || g, "

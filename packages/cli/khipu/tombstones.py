@@ -506,10 +506,14 @@ def publish_sources(source_rows: list[dict[str, Any]] | None) -> None:
 def publish_forget(source_rows: list[dict[str, Any]] | None,
                    payloads: list[dict[str, Any]],
                    legacy_identities: list[dict[str, Any]], *,
-                   confirm: set[int] | None = None) -> None:
+                   confirm: set[int] | None = None, hub: set[str] = frozenset(),
+                   episode_ids: set[int] | None = None) -> None:
     """Publish source snapshots plus pre-migration/raw payload forms together.
     ``confirm``: the hub episode ids the same forget tombstones, recorded as
-    each published refusal's confirmation (the replica's wait rule)."""
+    each published refusal's confirmation (the replica's wait rule).
+    ``hub``: the identities the hub forget refuses (``hub_form``), so this
+    registry refuses at least what the hub does; ``episode_ids`` too, in the
+    same atomic publication."""
     keys = {str(row["source_key"]) for row in source_rows or [] if row.get("source_key")}
     hashes = {str(row["payload_sha256"]) for row in source_rows or [] if row.get("payload_sha256")}
     try:
@@ -525,7 +529,9 @@ def publish_forget(source_rows: list[dict[str, Any]] | None,
     legacy = ({f"{row['ts']}\x1f{row['summary_md5']}" for row in legacy_identities
                if isinstance(row.get("ts"), str) and isinstance(row.get("summary_md5"), str)}
               if not keys and not hashes else set())
-    publish_identities(keys, hashes, legacy, confirm=confirm)
+    for tag in set().union(*map(tags_for_hub, hub)):
+        {"k": keys, "h": hashes, "l": legacy}[tag[0]].add(tag[2:])
+    publish_identities(keys, hashes, legacy, episode_ids=episode_ids, confirm=confirm)
 
 
 def publish_episode_ids(episode_ids: set[int], *, confirm: set[int] | None = None) -> None:
@@ -611,6 +617,33 @@ def merge_registry_bytes(data: bytes) -> None:
     merge_registry(_parsed(data))
 
 
+def hub_form(tag: str) -> str | None:
+    """The one codec from a registry tag to the hub's ``forgotten_sources``
+    form (design 6.1): a source key or payload hash is its bare hex, a
+    legacy ts/summary alias is ``legacy:<ts> US <md5>`` (0047's
+    ``khipu_payload_legacy`` builds the same string). A bare episode id
+    (``e:``) is never a hub refusal: None."""
+    if tag.startswith(("k:", "h:")):
+        return tag[2:]
+    if tag.startswith("l:"):
+        return "legacy:" + tag[2:]
+    return None
+
+
+def tags_for_hub(identity: str) -> set[str]:
+    """The registry tags that refuse the same captures as a hub identity. A
+    bare hex string may be a source key or a payload hash: both."""
+    if identity.startswith("legacy:"):
+        return {"l:" + identity[len("legacy:"):]}
+    return {"k:" + identity, "h:" + identity}
+
+
+def hub_identity_set(payload: dict[str, Any], *, redact: bool = True) -> set[str]:
+    """Every identity ``payload`` is known by, in hub form."""
+    return {form for tag in identity_strings(payload, redact=redact)
+            if (form := hub_form(tag)) is not None}
+
+
 def _hub_identities(payload: dict[str, Any], source: dict[str, Any] | None) -> list[str]:
     from khipu.capture_identity import source_identity
 
@@ -633,9 +666,16 @@ class ForgottenSourceRefused(ForgottenSource):
     """The hub's 0030 trigger refused a write naming a forgotten source."""
 
 
+_TOMBSTONED_TARGET = "khipu_tombstoned_target"
+
+
 def is_forgotten_refusal(exc: BaseException) -> bool:
-    """Whether a database error is the 0030 triggers' refusal."""
-    return isinstance(exc, ForgottenSourceRefused) or _REFUSAL in str(exc)
+    """Whether a database error is the 0030 triggers' refusal, or 0047's
+    refusal to attach a new source to a tombstoned episode (D1), which every
+    writer handles the same way: not attached, never retried."""
+    constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+    return (isinstance(exc, ForgottenSourceRefused) or _REFUSAL in str(exc)
+            or constraint == _TOMBSTONED_TARGET or "khipu: tombstoned target" in str(exc))
 
 
 def announce_hub_identities(cur, payload: dict[str, Any],
@@ -652,7 +692,7 @@ def announce_hub_identities(cur, payload: dict[str, Any],
             return
     except Exception:  # noqa: BLE001 - a probe that cannot run (no real cursor) skips the announcement
         return
-    found = set(_hub_identities(payload, sources[0] if sources else None))
+    found = set(_hub_identities(payload, sources[0] if sources else None)) | hub_identity_set(payload)
     for source in sources:
         found.update(str(source[k]) for k in ("source_key", "payload_sha256")
                      if source and source.get(k))

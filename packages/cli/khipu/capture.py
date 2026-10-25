@@ -723,6 +723,9 @@ def _merge_into_episode(
     # the caller falls through to an insert the hub refuses the same way.
     savepoint = _savepoint(cur, "khipu_merge_write")
     try:
+        from khipu.tombstones import announce_hub_identities
+
+        announce_hub_identities(cur, payload, source)
         cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
         record_source(cur, target_id, "merged", source,
                       ts=payload.get("ts"), summary=payload.get("summary"))
@@ -1421,6 +1424,14 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
         if provenance.is_old_writer_refusal(exc):
             _log(f"capture refused by the fact gate ({type(exc).__name__}); the capture will be retried")
             raise FactStepDeferred(f"commit: refused unprojected write: {exc}") from exc
+        # A deadlock, serialization failure, lock or statement timeout raised
+        # anywhere in the transaction (a merge's target lock against a hub
+        # refusal, design 6.1, or at COMMIT): it rolled back whole, and the
+        # outbox retries it and never buries it.
+        reason = _fact_deferral(exc)
+        if reason is not None:
+            _log(f"capture deferred ({reason}); the capture will be retried")
+            raise FactStepDeferred(f"transaction: {reason}: {exc}") from exc
         raise
 
 

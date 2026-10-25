@@ -86,9 +86,13 @@ BEGIN
     LOOP
         BEGIN
             LOCK TABLE episodes IN ACCESS EXCLUSIVE MODE;
+            LOCK TABLE episode_sources IN ACCESS EXCLUSIVE MODE NOWAIT;
+            LOCK TABLE forgotten_sources IN ACCESS EXCLUSIVE MODE NOWAIT;
             LOCK TABLE commitments IN ACCESS EXCLUSIVE MODE NOWAIT;
             LOCK TABLE decisions IN ACCESS EXCLUSIVE MODE NOWAIT;
+            LOCK TABLE decision_links IN ACCESS EXCLUSIVE MODE NOWAIT;
             LOCK TABLE deliverables IN ACCESS EXCLUSIVE MODE NOWAIT;
+            LOCK TABLE memory_embeddings IN ACCESS EXCLUSIVE MODE NOWAIT;
             RETURN;
         EXCEPTION WHEN lock_not_available THEN
             IF clock_timestamp() >= deadline THEN
@@ -133,14 +137,18 @@ COMMENT ON TABLE fact_claims IS
 CREATE TABLE IF NOT EXISTS fact_changes (
     seq      BIGSERIAL PRIMARY KEY,
     xid      XID8 NOT NULL DEFAULT pg_current_xact_id(),
-    kind     TEXT NOT NULL CHECK (kind IN ('commitment', 'decision', 'deliverable')),
-    fact_id  BIGINT NOT NULL,
+    kind     TEXT CHECK (kind IN ('commitment', 'decision', 'deliverable')),
+    fact_id  BIGINT,
     -- 'project': khipu_project_fact() recorded it (the only kind the fact
     -- gate accepts). 'row': any other write to a decision or deliverable row
     -- (an owner's supersede, retract or confirm), recorded by
     -- khipu_fact_row_change() so replicas see lifecycle changes too.
-    via      TEXT NOT NULL DEFAULT 'project' CHECK (via IN ('project', 'row')),
-    at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    -- 'copy': the change token (section 6.1), one per transaction that wrote
+    -- a table a replica copy reads; it names no fact.
+    via      TEXT NOT NULL DEFAULT 'project' CHECK (via IN ('project', 'row', 'copy')),
+    at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT fact_changes_fact_check CHECK (
+        (via = 'copy') = (kind IS NULL) AND (kind IS NULL) = (fact_id IS NULL))
 );
 CREATE INDEX IF NOT EXISTS idx_fact_changes_fact_xid ON fact_changes (kind, fact_id, xid);
 CREATE INDEX IF NOT EXISTS idx_fact_changes_xid ON fact_changes (xid);
@@ -762,6 +770,445 @@ DROP TRIGGER IF EXISTS khipu_fact_claims_gate ON fact_claims;
 CREATE TRIGGER khipu_fact_claims_gate
     BEFORE INSERT ON fact_claims
     FOR EACH ROW EXECUTE FUNCTION khipu_claim_gate();
+
+-- ==== Hub refusals (section 6.1) ================================================
+--
+-- Every refusal is matched to episodes here, on the hub, in one transaction
+-- under the per-identity advisory lock 0030's triggers already take
+-- ('khipu-source:' || identity). An identity is bare hex (a source key or a
+-- payload hash, as 0030 stores them) or a legacy 'legacy:<ts> US
+-- md5(summary)' form (khipu.tombstones.hub_form is the Python side; a test
+-- pins the two).
+--
+--   episode_identities    every identity each episode carries. New writes
+--                         are recorded by the triggers below; history by
+--                         the index pass (khipu provenance index).
+--   fact_copy_ready       one row: 'indexing' until the pass has covered
+--                         every id up to target_id (the highest id at this
+--                         migration), then 'ready'. No replica copies
+--                         facts before 'ready'.
+--   forgotten_at_cutover  the episodes tombstoned at this migration: the
+--                         only ones whose every identity the pass refuses.
+--
+-- Refusal and carrier writes need READ COMMITTED (the checks after a lock
+-- need a fresh view). Rows of forgotten_sources, episode_identities and
+-- forgotten_at_cutover are never updated or removed, and an episode that has
+-- identity rows is never deleted.
+
+CREATE TABLE IF NOT EXISTS episode_identities (
+    identity    TEXT NOT NULL,
+    episode_id  BIGINT NOT NULL,
+    PRIMARY KEY (identity, episode_id)
+);
+CREATE INDEX IF NOT EXISTS idx_episode_identities_episode ON episode_identities (episode_id);
+
+CREATE TABLE IF NOT EXISTS fact_copy_ready (
+    one              BOOLEAN PRIMARY KEY DEFAULT true CHECK (one),
+    state            TEXT NOT NULL CHECK (state IN ('indexing', 'ready')),
+    target_id        BIGINT NOT NULL,
+    indexed_through  BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO fact_copy_ready (state, target_id)
+SELECT 'indexing', coalesce(max(id), 0) FROM episodes
+ON CONFLICT (one) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS forgotten_at_cutover (episode_id BIGINT PRIMARY KEY);
+INSERT INTO forgotten_at_cutover (episode_id)
+SELECT id FROM episodes WHERE deleted_at IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+CREATE OR REPLACE FUNCTION khipu_require_read_committed()
+RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'khipu: refusal and source writes need READ COMMITTED, not %',
+            current_setting('transaction_isolation')
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'khipu_read_committed';
+    END IF;
+END
+$fn$;
+
+-- Sorted, the order every refusal and source writer takes them.
+CREATE OR REPLACE FUNCTION khipu_lock_identities(identities TEXT[])
+RETURNS void LANGUAGE plpgsql AS $fn$
+DECLARE
+    k TEXT;
+BEGIN
+    FOR k IN SELECT DISTINCT x FROM unnest(identities) AS t(x)
+             WHERE x IS NOT NULL AND x <> '' ORDER BY x
+    LOOP
+        PERFORM pg_advisory_xact_lock(hashtextextended('khipu-source:' || k, 0));
+    END LOOP;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_payload_legacy(p JSONB)
+RETURNS TEXT LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT CASE WHEN jsonb_typeof(p -> 'ts') = 'string' AND jsonb_typeof(p -> 'summary') = 'string'
+                THEN 'legacy:' || (p ->> 'ts') || chr(31) || md5(p ->> 'summary') END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_announced()
+RETURNS TEXT[] LANGUAGE sql STABLE AS $fn$
+    SELECT coalesce(string_to_array(
+        nullif(current_setting('khipu.source_identities', true), ''), ','), ARRAY[]::TEXT[])
+$fn$;
+
+-- The identities SQL can compute from an episode row: its natural key and
+-- the legacy form of its raw. The writer announces the rest.
+CREATE OR REPLACE FUNCTION khipu_row_identities(
+    p_raw JSONB, p_harness TEXT, p_session TEXT, p_range TEXT, p_window TEXT)
+RETURNS TEXT[] LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT array_remove(ARRAY[
+        khipu_natural_source_key(coalesce(p_harness, p_raw ->> 'harness'), p_session,
+            coalesce(p_range, p_raw ->> 'transcript_range'),
+            coalesce(p_window, p_raw ->> 'window_id'), p_raw ->> 'part'),
+        khipu_payload_legacy(p_raw)], NULL)
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_receipt_identities(entry JSONB)
+RETURNS TEXT[] LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT array_remove(ARRAY[
+        nullif(entry ->> 'source_id', ''),
+        khipu_natural_source_key(
+            entry -> 'payload' ->> 'harness',
+            coalesce(entry -> 'payload' ->> 'session_id', entry ->> 'session_id'),
+            entry -> 'payload' ->> 'transcript_range',
+            entry -> 'payload' ->> 'window_id',
+            entry -> 'payload' ->> 'part'),
+        khipu_payload_legacy(entry -> 'payload')], NULL)
+$fn$;
+
+-- The receipts an update adds to raw.merged_from.
+CREATE OR REPLACE FUNCTION khipu_new_receipts(old_raw JSONB, new_raw JSONB)
+RETURNS SETOF JSONB LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT entry FROM jsonb_array_elements(
+        CASE WHEN jsonb_typeof(new_raw -> 'merged_from') = 'array'
+             THEN new_raw -> 'merged_from' ELSE '[]'::jsonb END) AS t(entry)
+    WHERE jsonb_typeof(entry) = 'object'
+      AND NOT (CASE WHEN jsonb_typeof(old_raw -> 'merged_from') = 'array'
+                    THEN old_raw -> 'merged_from' ELSE '[]'::jsonb END) @> jsonb_build_array(entry)
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_record_identities(p_episode BIGINT, identities TEXT[])
+RETURNS void LANGUAGE sql AS $fn$
+    INSERT INTO episode_identities (identity, episode_id)
+    SELECT DISTINCT x, p_episode FROM unnest(identities) AS t(x)
+    WHERE x IS NOT NULL AND x <> '' ORDER BY 1
+    ON CONFLICT DO NOTHING
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_refuse_unannounced()
+RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF cardinality(khipu_announced()) = 0 THEN
+        RAISE EXCEPTION 'khipu: an episode write must announce its source identities (khipu.source_identities)'
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'khipu_unannounced';
+    END IF;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_refuse_tombstoned(p_episode BIGINT)
+RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN
+    RAISE EXCEPTION 'khipu: tombstoned target: episode % is forgotten; no new source attaches to it', p_episode
+        USING ERRCODE = 'check_violation', CONSTRAINT = 'khipu_tombstoned_target';
+END
+$fn$;
+
+-- 0030's episode insert check, now READ COMMITTED, announced, and with the
+-- legacy form of the row's raw.
+CREATE OR REPLACE FUNCTION khipu_episodes_forgotten_insert()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    PERFORM khipu_require_read_committed();
+    PERFORM khipu_refuse_unannounced();
+    PERFORM khipu_refuse_forgotten(
+        khipu_row_identities(NEW.raw, NEW.harness, NEW.session_id, NEW.transcript_range, NEW.window_id)
+        || khipu_announced());
+    RETURN NEW;
+END
+$fn$;
+
+-- 0030's update check, plus: a merge (a receipt added to raw.merged_from)
+-- is READ COMMITTED, announced, never into a tombstoned episode (D1: under
+-- READ COMMITTED a merge queued behind the forget sees its tombstone here),
+-- and refused for a forgotten legacy form too.
+CREATE OR REPLACE FUNCTION khipu_episodes_forgotten_update()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+DECLARE
+    found TEXT[] := ARRAY[]::TEXT[];
+    entry JSONB;
+    n INTEGER := 0;
+BEGIN
+    IF OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL THEN
+        RAISE EXCEPTION 'khipu: forgotten episode % cannot be restored', OLD.id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF (NEW.raw -> 'merged_from') IS DISTINCT FROM (OLD.raw -> 'merged_from') THEN
+        FOR entry IN SELECT khipu_new_receipts(OLD.raw, NEW.raw) LOOP
+            n := n + 1;
+            found := found || khipu_receipt_identities(entry);
+        END LOOP;
+        IF n > 0 THEN
+            PERFORM khipu_require_read_committed();
+            IF OLD.deleted_at IS NOT NULL THEN
+                PERFORM khipu_refuse_tombstoned(OLD.id);
+            END IF;
+            PERFORM khipu_refuse_unannounced();
+            PERFORM khipu_refuse_forgotten(found || khipu_announced());
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_episodes_identities_insert()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    PERFORM khipu_record_identities(NEW.id,
+        khipu_row_identities(NEW.raw, NEW.harness, NEW.session_id, NEW.transcript_range, NEW.window_id)
+        || khipu_announced());
+    RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_episodes_identities_merge()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+DECLARE
+    found TEXT[] := ARRAY[]::TEXT[];
+    entry JSONB;
+BEGIN
+    FOR entry IN SELECT khipu_new_receipts(OLD.raw, NEW.raw) LOOP
+        found := found || khipu_receipt_identities(entry);
+    END LOOP;
+    IF cardinality(found) > 0 THEN
+        PERFORM khipu_record_identities(NEW.id, found || khipu_announced());
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_episodes_delete_gate()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF EXISTS (SELECT 1 FROM episode_identities WHERE episode_id = OLD.id) THEN
+        RAISE EXCEPTION 'khipu: episode % carries source identities and cannot be deleted', OLD.id
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'khipu_identity_rows';
+    END IF;
+    RETURN OLD;
+END
+$fn$;
+
+-- 0030's source row check, plus the episode's row lock after the identity
+-- locks (N5: no source commits into an episode a forget holds) and D1.
+CREATE OR REPLACE FUNCTION khipu_episode_sources_forgotten()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+DECLARE
+    gone TIMESTAMPTZ;
+BEGIN
+    PERFORM khipu_require_read_committed();
+    PERFORM khipu_refuse_forgotten(ARRAY[NEW.source_key, NEW.payload_sha256]);
+    SELECT deleted_at INTO gone FROM episodes WHERE id = NEW.episode_id FOR SHARE;
+    IF gone IS NOT NULL THEN
+        PERFORM khipu_refuse_tombstoned(NEW.episode_id);
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_episode_sources_identities()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    PERFORM khipu_record_identities(NEW.episode_id, ARRAY[NEW.source_key, NEW.payload_sha256]);
+    RETURN NULL;
+END
+$fn$;
+
+-- D1's one exception: the index pass (khipu.provenance_index on) records
+-- the identities a pre-migration tombstoned episode's stored payloads hold.
+CREATE OR REPLACE FUNCTION khipu_episode_identities_insert()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+DECLARE
+    gone TIMESTAMPTZ;
+BEGIN
+    PERFORM khipu_require_read_committed();
+    PERFORM khipu_lock_identities(ARRAY[NEW.identity]);
+    SELECT deleted_at INTO gone FROM episodes WHERE id = NEW.episode_id FOR SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'khipu: no episode %', NEW.episode_id USING ERRCODE = 'foreign_key_violation';
+    END IF;
+    IF gone IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM episode_identities
+                       WHERE identity = NEW.identity AND episode_id = NEW.episode_id)
+       AND NOT (coalesce(current_setting('khipu.provenance_index', true), '') = 'on'
+                AND NEW.episode_id <= (SELECT target_id FROM fact_copy_ready)) THEN
+        PERFORM khipu_refuse_tombstoned(NEW.episode_id);
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_forgotten_sources_insert()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    PERFORM khipu_require_read_committed();
+    PERFORM khipu_lock_identities(ARRAY[NEW.identity]);
+    RETURN NEW;
+END
+$fn$;
+
+-- The carrier gate (deferred to COMMIT): no live episode recorded under a
+-- refused identity. With the identity locks, a refusal and a carrier of the
+-- same identity are never both uncommitted: the second waits for the first.
+CREATE OR REPLACE FUNCTION khipu_carrier_gate_refusal()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF EXISTS (SELECT 1 FROM episode_identities ei
+               JOIN episodes e ON e.id = ei.episode_id AND e.deleted_at IS NULL
+               WHERE ei.identity = NEW.identity) THEN
+        RAISE EXCEPTION 'khipu: forgotten source % is still carried by a live episode', NEW.identity
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'khipu_live_carrier';
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_carrier_gate_identity()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF EXISTS (SELECT 1 FROM forgotten_sources WHERE identity = NEW.identity)
+       AND EXISTS (SELECT 1 FROM episodes WHERE id = NEW.episode_id AND deleted_at IS NULL) THEN
+        RAISE EXCEPTION 'khipu: live episode % carries forgotten source %', NEW.episode_id, NEW.identity
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'khipu_live_carrier';
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_refuse_change()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    RAISE EXCEPTION 'khipu: % on % is refused (%)', TG_OP, TG_TABLE_NAME, TG_ARGV[0]
+        USING ERRCODE = 'check_violation', CONSTRAINT = 'khipu_append_only';
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION khipu_copy_ready_gate()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF NEW.state = 'ready' AND NEW.indexed_through < NEW.target_id THEN
+        RAISE EXCEPTION 'khipu: copies cannot be ready before the index pass covers episode % (it is at %)',
+            NEW.target_id, NEW.indexed_through
+            USING ERRCODE = 'check_violation', CONSTRAINT = 'khipu_not_indexed';
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+-- The change token: one fact_changes row (via 'copy') per transaction that
+-- writes a table a replica copy reads; its xid marks the change.
+CREATE OR REPLACE FUNCTION khipu_copy_token()
+RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM fact_changes WHERE xid = pg_current_xact_id() AND via = 'copy') THEN
+        INSERT INTO fact_changes (via) VALUES ('copy');
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS khipu_episodes_identities_insert ON episodes;
+CREATE TRIGGER khipu_episodes_identities_insert
+    AFTER INSERT ON episodes
+    FOR EACH ROW EXECUTE FUNCTION khipu_episodes_identities_insert();
+
+DROP TRIGGER IF EXISTS khipu_episodes_identities_merge ON episodes;
+CREATE TRIGGER khipu_episodes_identities_merge
+    AFTER UPDATE OF raw ON episodes
+    FOR EACH ROW
+    WHEN ((OLD.raw -> 'merged_from') IS DISTINCT FROM (NEW.raw -> 'merged_from'))
+    EXECUTE FUNCTION khipu_episodes_identities_merge();
+
+DROP TRIGGER IF EXISTS khipu_episodes_delete_gate ON episodes;
+CREATE TRIGGER khipu_episodes_delete_gate
+    BEFORE DELETE ON episodes
+    FOR EACH ROW EXECUTE FUNCTION khipu_episodes_delete_gate();
+
+DROP TRIGGER IF EXISTS khipu_episode_sources_identities ON episode_sources;
+CREATE TRIGGER khipu_episode_sources_identities
+    AFTER INSERT ON episode_sources
+    FOR EACH ROW EXECUTE FUNCTION khipu_episode_sources_identities();
+
+DROP TRIGGER IF EXISTS khipu_episode_identities_insert ON episode_identities;
+CREATE TRIGGER khipu_episode_identities_insert
+    BEFORE INSERT ON episode_identities
+    FOR EACH ROW EXECUTE FUNCTION khipu_episode_identities_insert();
+
+DROP TRIGGER IF EXISTS khipu_forgotten_sources_insert ON forgotten_sources;
+CREATE TRIGGER khipu_forgotten_sources_insert
+    BEFORE INSERT ON forgotten_sources
+    FOR EACH ROW EXECUTE FUNCTION khipu_forgotten_sources_insert();
+
+DROP TRIGGER IF EXISTS khipu_forgotten_sources_carrier ON forgotten_sources;
+CREATE CONSTRAINT TRIGGER khipu_forgotten_sources_carrier
+    AFTER INSERT ON forgotten_sources DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION khipu_carrier_gate_refusal();
+
+DROP TRIGGER IF EXISTS khipu_episode_identities_carrier ON episode_identities;
+CREATE CONSTRAINT TRIGGER khipu_episode_identities_carrier
+    AFTER INSERT ON episode_identities DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION khipu_carrier_gate_identity();
+
+DROP TRIGGER IF EXISTS khipu_forgotten_sources_append_only ON forgotten_sources;
+CREATE TRIGGER khipu_forgotten_sources_append_only
+    BEFORE UPDATE OR DELETE ON forgotten_sources
+    FOR EACH ROW EXECUTE FUNCTION khipu_refuse_change('a refusal is never changed or removed');
+
+DROP TRIGGER IF EXISTS khipu_episode_identities_append_only ON episode_identities;
+CREATE TRIGGER khipu_episode_identities_append_only
+    BEFORE UPDATE OR DELETE ON episode_identities
+    FOR EACH ROW EXECUTE FUNCTION khipu_refuse_change('an episode keeps every identity it carried');
+
+DROP TRIGGER IF EXISTS khipu_fact_copy_ready_gate ON fact_copy_ready;
+CREATE TRIGGER khipu_fact_copy_ready_gate
+    BEFORE UPDATE ON fact_copy_ready
+    FOR EACH ROW EXECUTE FUNCTION khipu_copy_ready_gate();
+
+DROP TRIGGER IF EXISTS khipu_fact_copy_ready_keep ON fact_copy_ready;
+CREATE TRIGGER khipu_fact_copy_ready_keep
+    BEFORE DELETE ON fact_copy_ready
+    FOR EACH ROW EXECUTE FUNCTION khipu_refuse_change('the readiness row is never removed');
+
+-- After the fill above, in this transaction: the frozen set takes no change.
+DROP TRIGGER IF EXISTS khipu_forgotten_at_cutover_frozen ON forgotten_at_cutover;
+CREATE TRIGGER khipu_forgotten_at_cutover_frozen
+    BEFORE INSERT OR UPDATE OR DELETE ON forgotten_at_cutover
+    FOR EACH ROW EXECUTE FUNCTION khipu_refuse_change('the forgets at the cutover are frozen');
+
+DO $$
+DECLARE
+    t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['forgotten_sources', 'episode_identities', 'forgotten_at_cutover', 'fact_copy_ready'] LOOP
+        EXECUTE format('DROP TRIGGER IF EXISTS khipu_%s_truncate ON %I', t, t);
+        EXECUTE format('CREATE TRIGGER khipu_%s_truncate BEFORE TRUNCATE ON %I '
+                       'FOR EACH STATEMENT EXECUTE FUNCTION khipu_refuse_change(%L)',
+                       t, t, 'never truncated');
+    END LOOP;
+    FOREACH t IN ARRAY ARRAY['commitments', 'decisions', 'decision_links', 'deliverables',
+                             'memory_embeddings', 'forgotten_sources'] LOOP
+        EXECUTE format('DROP TRIGGER IF EXISTS khipu_%s_copy_token ON %I', t, t);
+        EXECUTE format('CREATE TRIGGER khipu_%s_copy_token AFTER INSERT OR UPDATE OR DELETE OR TRUNCATE '
+                       'ON %I FOR EACH STATEMENT EXECUTE FUNCTION khipu_copy_token()', t, t);
+    END LOOP;
+END
+$$;
+
+DROP TRIGGER IF EXISTS khipu_episodes_copy_token ON episodes;
+CREATE TRIGGER khipu_episodes_copy_token
+    AFTER UPDATE OF deleted_at ON episodes
+    FOR EACH STATEMENT EXECUTE FUNCTION khipu_copy_token();
 
 INSERT INTO schema_migrations (version, note)
 VALUES (

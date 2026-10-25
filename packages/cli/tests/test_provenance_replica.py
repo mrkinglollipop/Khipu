@@ -30,6 +30,7 @@ import pytest
 
 from khipu import db, forget, hub_snapshot as hs, offline_reads, provenance, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.fact_seed import announce
 from tests.test_provenance_forget import (  # noqa: F401
     ALT, CANON, PROJECT, _capture, _forget, _rows, env, pg,
 )
@@ -77,6 +78,7 @@ def _pull():
 
 def _seed_decisions(h, n):  # noqa: F811
     with h.connect() as conn:
+        announce(conn)
         eid = conn.execute(
             "INSERT INTO episodes (ts, session_id, summary, raw, harness, project, transcript_range) "
             "VALUES (now(), 'codex:prov4-bulk', 'bulk', '{}'::jsonb, 'codex', %s, '0:1') RETURNING id",
@@ -163,6 +165,7 @@ def test_a_scrubbed_source_stays_out_through_the_stream(pg, replica, kind):
                "session_id": "codex:prov4-forgotten-source", "transcript_range": "0:10"}
     tombstones.publish_payloads([payload])
     with pg.connect() as conn:
+        announce(conn)
         eid = conn.execute(
             "INSERT INTO episodes (ts, summary, raw, session_id, harness, transcript_range, project) "
             "VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s) RETURNING id",
@@ -305,8 +308,10 @@ def test_forget_retries_a_deadlock_within_its_time_budget(pg, monkeypatch):
     monkeypatch.setattr(forget, "forget_episode",
                         lambda cur, eid, **kw: (calls.append(eid), (_ for _ in ()).throw(
                             psycopg.errors.DeadlockDetected("deadlock detected")))[1])
-    # Time-bounded (design section 4): retried until the budget is spent.
-    monkeypatch.setattr(forget, "FORGET_RETRY_BUDGET_S", 0.2)
+    # Time-bounded (design section 4): retried until the budget is spent. The
+    # budget leaves room for the connect floor (6.4: no connect starts with
+    # less than 2 s).
+    monkeypatch.setattr(forget, "FORGET_RETRY_BUDGET_S", 2.5)
     with pytest.raises(psycopg.errors.DeadlockDetected):
         forget._forget_on_hub(db.connect, b, memory_root=pg.memory)
     assert len(calls) >= 2, calls

@@ -31,7 +31,7 @@ WRITERS = {
     ("commitments", "set_status"): "the owner's own close, reopen or snooze",
     ("commitments", "reassign"): "the owner's own move",
     ("commitments", "stale_sql"): "aging after weeks of silence, only for the rows mark_stale's owner guard lets by",
-    ("forget", "forget_episode"): "the owner's own forget",
+    ("forget", "tombstone_on_hub"): "the owner's own forget (and the carriers it refuses)",
     ("owed_tidy", "_put"): "the owner's own undo or redo of a batch, behind the owner gate",
     ("hygiene", None): "the restore recipe in a backup's RESTORE.md, text only",
 }

@@ -116,6 +116,16 @@ def _provenance_ready(cur) -> bool:
         return False
 
 
+def _refusals_ready(cur) -> bool:
+    """Whether the hub matches refusals itself (0047's identity index)."""
+    try:
+        from khipu.db import has_table
+
+        return has_table(cur, "episode_identities")
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
 _FACT_TABLES = (("commitment", "commitments"), ("decision", "decisions"), ("deliverable", "deliverables"))
 
 
@@ -195,108 +205,17 @@ def _briefs_ready(cur) -> bool:
         return False
 
 
-def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> dict[str, Any]:
-    """The hub half. Caller commits. Returns the counts and the (ts, summary
-    md5) identity the legacy file uses, or ``{"ok": False}`` when unknown.
-    With ``memory_root`` the legacy lines themselves are hashed too, so a line
-    another episode holds only by payload hash is recognised as shared."""
-    # The row lock first: a merge takes the same lock, so none can commit
-    # into this episode between the reads below and the tombstone.
-    cur.execute("SELECT ts, summary, session_id FROM episodes WHERE id = %s FOR UPDATE",
-                (episode_id,))
-    row = cur.fetchone()
-    if row is None:
-        return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
-    ts, summary, session_id = row
-    live = {
-        "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
-        "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest(),
-    }
-    # Publish before _candidate_hashes reads any local legacy line. This is the
-    # one privacy linearization point shared by every local writer; raw keeps
-    # pre-0027 episodes covered when no source rows exist yet. Each publish is
-    # followed by a re-read: a source that reached this episode without the
-    # row lock (a fail-open source row, an older writer) is fenced before the
-    # forget can report itself complete.
-    from khipu.tombstones import RegistryError, publish_episode_ids, publish_forget
-
-    read = _read_forget_sources(cur, episode_id, live)
-    registry_error: str | None = None
-    # Each refusal is recorded with this episode's id as its hub
-    # confirmation, in the same publication: the replica's wait rule imports
-    # facts only once the hub shows that id tombstoned (design section 6), so
-    # a confirmation whose transaction then rolls back keeps it waiting.
-    confirm = {int(episode_id)}
-    try:
-        for _round in range(_PUBLISH_ROUNDS):
-            publish_forget(_registered_sources(read), read["tombstone_payloads"],
-                           read["candidates"], confirm=confirm)
-            again = _read_forget_sources(cur, episode_id, live)
-            grown = bool(_read_identities(again) - _read_identities(read))
-            read = again
-            if not grown:
-                break
-        else:
-            registry_error = ("the episode's sources kept changing while it was being "
-                              "forgotten; run the forget again")
-        # The id too: a backup can hold this episode under an older raw whose
-        # hash no published identity matches, and its import scrubs by id.
-        publish_episode_ids({episode_id}, confirm=confirm)
-    except RegistryError as exc:
-        # Keep the hub tombstone/cascade semantics intact, but absolutely do
-        # not touch a local store when the writer fence could not be published.
-        registry_error = str(exc)
-    raw = read["raw"]
-    sources = read["sources"]
-    source_rows = read["source_rows"]
-    candidates = read["candidates"]
-    has_merged_sources = read["has_merged_sources"]
-    unidentified_sources = read["unidentified_sources"]
-    # A legacy line another episode also holds is evidence of that episode.
-    # Erasing it would lose that episode's line, so it stays and the forget
-    # reports itself incomplete. The live identity gets no exemption: an edit
-    # frees a legacy key, so another episode's original line can match it.
-    held = _held_elsewhere(cur, episode_id, candidates, sources=sources)
-    # Another episode can hold a line by payload hash alone: a source row whose
-    # legacy identity was never recorded, or a merge receipt without its payload.
-    hashes = _candidate_hashes(candidates, source_rows or [], raw,
-                              None if registry_error else memory_root)
-    owned = _owned_elsewhere(cur, episode_id, set().union(*hashes), sources=sources)
-    shared = [i in held or bool(h & owned) for i, h in zip(candidates, hashes)]
-    shared_identities = [i for i, s in zip(candidates, shared) if s]
-    legacy_identities = [i for i, s in zip(candidates, shared) if not s]
-    owner_sessions = sorted({str(src["session_id"])
-                             for src in [*(source_rows or []), *read["column_sources"],
-                                         *read["tombstone_payloads"]]
-                             if src.get("session_id")} | set(read["source_sessions"])
-                            | ({session_id} if session_id else set()))
-    owner_sessions_error = None
-    cur.execute("SAVEPOINT owner_word_ownership")
-    try:
-        owner_sessions_shared = _owner_sessions_held_elsewhere(
-            cur, episode_id, owner_sessions, sources=sources)
-    except Exception as exc:  # noqa: BLE001 - uncertainty must preserve the live owner's words
-        cur.execute("ROLLBACK TO SAVEPOINT owner_word_ownership")
-        owner_sessions_shared = owner_sessions
-        owner_sessions_error = f"owner-word ownership could not be checked ({type(exc).__name__})"
-    finally:
-        cur.execute("RELEASE SAVEPOINT owner_word_ownership")
-    from khipu.tombstones import publish_hub_forget
-
+def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
+    """Tombstone one episode (its row already locked) and cascade: its
+    vectors, its fact claims (each fact re-projected, or retired as the
+    pre-provenance cascade did on a hub without 0047), and the briefs it
+    sourced. Idempotent on an episode already tombstoned. ``refuse()`` and
+    the index pass run it on every carrier they tombstone."""
     cur.execute(
         "UPDATE episodes SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL",
         (episode_id,),
     )
     soft_deleted = cur.rowcount > 0
-    # Same transaction as the tombstone: a writer on any Mac, or on code that
-    # predates the local registry, is refused by the 0030 triggers. After the
-    # tombstone, not before: while 0030 is being applied the UPDATE above
-    # waits on its table lock, and only once it returns is forgotten_sources
-    # visible to this transaction. Before it, the identities would be
-    # silently skipped; the migration's own backfill covers a forget that
-    # committed before it.
-    publish_hub_forget(cur, episode_id, [*(source_rows or []), *read["column_sources"],
-                                         *_payload_identities(read["tombstone_payloads"])])
     cur.execute(
         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
         (str(episode_id),),
@@ -349,14 +268,7 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
             ([episode_id],),
         )
         briefs_staled = cur.rowcount
-
     return {
-        "ok": True,
-        "id": episode_id,
-        "session_id": session_id,
-        "owner_sessions": owner_sessions,
-        "owner_sessions_shared": owner_sessions_shared,
-        "owner_sessions_error": owner_sessions_error,
         "soft_deleted": soft_deleted,
         "embeddings_removed": embeddings_removed,
         "commitments_closed": commitments_closed,
@@ -369,6 +281,170 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None) -> 
         # writes their new rows into this Mac's replica at once (section 6).
         "changed_facts": (provenance_out or {}).get("changed_facts", []),
         "provenance_backfill": (provenance_out or {}).get("backfill"),
+    }
+
+
+def _forget_read(cur, episode_id: int, *, lock: bool, refusals: bool) -> dict[str, Any] | None:
+    """The episode's identity and every source a forget publishes, as the
+    hub holds them now; ``lock`` takes its row FOR UPDATE first (a merge
+    takes the same lock). ``hub``: every identity it carries (section 6.1)."""
+    cur.execute("SELECT ts, summary, session_id FROM episodes WHERE id = %s"
+                + (" FOR UPDATE" if lock else ""), (episode_id,))
+    row = cur.fetchone()
+    if row is None:
+        return None
+    ts, summary, session_id = row
+    live = {
+        "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        "summary_md5": hashlib.md5((summary or "").encode("utf-8")).hexdigest(),
+    }
+    read = _read_forget_sources(cur, episode_id, live)
+    read.update(live=live, session_id=session_id, hub=set())
+    if refusals:
+        from khipu import provenance
+
+        read["hub"] = provenance.stored_identities(cur, [episode_id]).get(episode_id, set())
+    return read
+
+
+def publish_local(read: dict[str, Any], episode_id: int, hub: set[str]) -> None:
+    """Publish one forget's refusals in this Mac's registry, in one atomic
+    write: every source the read names, the hub identities ``hub`` the hub
+    forget refuses, and the episode id (a backup can hold the episode under
+    an older raw no identity matches; its import scrubs by id). Each refusal
+    is recorded with the episode id as its hub confirmation (the replica's
+    wait rule). ``RegistryError`` when it cannot be published."""
+    from khipu.tombstones import publish_forget
+
+    publish_forget(_registered_sources(read), read["tombstone_payloads"], read["candidates"],
+                   confirm={int(episode_id)}, hub=set(hub), episode_ids={int(episode_id)})
+
+
+def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
+                   known: set[str] | None = None) -> dict[str, Any]:
+    """The hub half. Caller commits. Returns the counts and the (ts, summary
+    md5) identity the legacy file uses, or ``{"ok": False}`` when unknown.
+    With ``memory_root`` the legacy lines themselves are hashed too, so a line
+    another episode holds only by payload hash is recognised as shared.
+
+    On a hub with 0047's identity index this is ``provenance.refuse()`` over
+    every identity the episode carries (section 6.1, N5): the identity locks
+    for ``known`` first, then the episode's row, then its identity set is
+    read again under that lock. A set that grew returns ``{"grown": ...}``
+    with nothing written: the caller rolls back, publishes the grown set in
+    this Mac's registry and starts again with it (``_forget_on_hub``).
+    ``known=None`` (a caller in its own transaction) publishes what the hub
+    holds first and goes on with that set."""
+    from khipu.tombstones import RegistryError
+
+    registry_error: str | None = None
+    refusals = _refusals_ready(cur)
+    if refusals:
+        if known is None:
+            first = _forget_read(cur, episode_id, lock=False, refusals=True)
+            if first is None:
+                return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+            known = set(first["hub"])
+            try:
+                publish_local(first, episode_id, known)
+            except RegistryError as exc:
+                registry_error = str(exc)
+        cur.execute("SELECT khipu_lock_identities(%s::text[])", (sorted(known),))
+        read = _forget_read(cur, episode_id, lock=True, refusals=True)
+        if read is None:
+            return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+        if not read["hub"] <= known:
+            return {"ok": False, "id": episode_id, "grown": sorted(known | read["hub"]),
+                    "read": read, "registry_error": registry_error}
+    else:
+        read = _forget_read(cur, episode_id, lock=True, refusals=False)
+        if read is None:
+            return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+        # Publish before _candidate_hashes reads any local legacy line. Each
+        # publish is followed by a re-read: a source that reached this
+        # episode without the row lock is fenced before the forget can report
+        # itself complete. A hub without 0047's index keeps main's path.
+        try:
+            for _round in range(_PUBLISH_ROUNDS):
+                publish_local(read, episode_id, set())
+                again = {**read, **_read_forget_sources(cur, episode_id, read["live"])}
+                grown = bool(_read_identities(again) - _read_identities(read))
+                read = again
+                if not grown:
+                    break
+            else:
+                registry_error = ("the episode's sources kept changing while it was being "
+                                  "forgotten; run the forget again")
+        except RegistryError as exc:
+            # Keep the hub tombstone/cascade semantics intact, but absolutely do
+            # not touch a local store when the writer fence could not be published.
+            registry_error = str(exc)
+    live = read["live"]
+    session_id = read["session_id"]
+    raw = read["raw"]
+    sources = read["sources"]
+    source_rows = read["source_rows"]
+    candidates = read["candidates"]
+    has_merged_sources = read["has_merged_sources"]
+    unidentified_sources = read["unidentified_sources"]
+    # A legacy line another episode also holds is evidence of that episode.
+    # Erasing it would lose that episode's line, so it stays and the forget
+    # reports itself incomplete. The live identity gets no exemption: an edit
+    # frees a legacy key, so another episode's original line can match it.
+    held = _held_elsewhere(cur, episode_id, candidates, sources=sources)
+    # Another episode can hold a line by payload hash alone: a source row whose
+    # legacy identity was never recorded, or a merge receipt without its payload.
+    hashes = _candidate_hashes(candidates, source_rows or [], raw,
+                              None if registry_error else memory_root)
+    owned = _owned_elsewhere(cur, episode_id, set().union(*hashes), sources=sources)
+    shared = [i in held or bool(h & owned) for i, h in zip(candidates, hashes)]
+    shared_identities = [i for i, s in zip(candidates, shared) if s]
+    legacy_identities = [i for i, s in zip(candidates, shared) if not s]
+    owner_sessions = sorted({str(src["session_id"])
+                             for src in [*(source_rows or []), *read["column_sources"],
+                                         *read["tombstone_payloads"]]
+                             if src.get("session_id")} | set(read["source_sessions"])
+                            | ({session_id} if session_id else set()))
+    owner_sessions_error = None
+    cur.execute("SAVEPOINT owner_word_ownership")
+    try:
+        owner_sessions_shared = _owner_sessions_held_elsewhere(
+            cur, episode_id, owner_sessions, sources=sources)
+    except Exception as exc:  # noqa: BLE001 - uncertainty must preserve the live owner's words
+        cur.execute("ROLLBACK TO SAVEPOINT owner_word_ownership")
+        owner_sessions_shared = owner_sessions
+        owner_sessions_error = f"owner-word ownership could not be checked ({type(exc).__name__})"
+    finally:
+        cur.execute("RELEASE SAVEPOINT owner_word_ownership")
+    carriers: list[int] = []
+    if refusals:
+        # Section 6.1: the refusal set is every identity the episode carries;
+        # every live carrier is tombstoned with it in this transaction. The
+        # episode itself is tombstoned whether or not the index holds it yet.
+        from khipu import provenance
+
+        hub_out = provenance.refuse(cur, read["hub"], episode_id=episode_id, also=[episode_id])
+        own = hub_out["cascades"].pop(episode_id, None) or tombstone_on_hub(cur, episode_id)
+        carriers = sorted(hub_out["cascades"])
+    else:
+        from khipu.tombstones import publish_hub_forget
+
+        own = tombstone_on_hub(cur, episode_id)
+        # Same transaction as the tombstone: a writer on any Mac, or on code
+        # that predates the local registry, is refused by the 0030 triggers.
+        publish_hub_forget(cur, episode_id, [*(source_rows or []), *read["column_sources"],
+                                             *_payload_identities(read["tombstone_payloads"])])
+
+    return {
+        "ok": True,
+        "id": episode_id,
+        "session_id": session_id,
+        "owner_sessions": owner_sessions,
+        "owner_sessions_shared": owner_sessions_shared,
+        "owner_sessions_error": owner_sessions_error,
+        **own,
+        # Other live episodes carrying one of its identities, tombstoned with it.
+        "carriers": carriers,
         "graph": "topic nodes are shared across episodes; none removed",
         "identity": live,
         "legacy_identities": legacy_identities,
@@ -1949,29 +2025,80 @@ def _retryable(exc: BaseException) -> bool:
 
 
 def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None) -> dict[str, Any]:
-    """The hub transaction, retried on a deadlock or serialization failure
-    until ``FORGET_RETRY_BUDGET_S`` has passed since the first attempt, with
-    a short growing pause (at most a second). Each attempt is a fresh
-    connection and transaction; the local fence it publishes first is
-    idempotent."""
+    """The hub forget under one deadline, ``FORGET_RETRY_BUDGET_S`` from its
+    start (section 6.4), on a worker (``provenance.hub_call``) abandoned at
+    the deadline. On one connection: read the episode's identity set, roll
+    back, hand it to this thread to publish in the local registry (only
+    while the deadline allows, the registry lock waited for no longer than
+    the time left), then the refusal transaction (``forget_episode``). A set
+    that grew under the locks (N5) is handed over and published the same
+    way before the next attempt. A deadlock or serialization failure is
+    retried after a short growing pause; an attempt that could not start
+    before the deadline is not started, and the last failure is raised."""
     import random
 
+    from khipu import provenance, tombstones
+
     deadline = time.monotonic() + FORGET_RETRY_BUDGET_S
-    attempt = 0
-    while True:
+
+    def publish(value):
+        read, hub = value
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise provenance.NotDone("the deadline passed before the registry was published")
         try:
-            with connect() as conn:
-                with conn.cursor() as cur:
-                    out = forget_episode(cur, episode_id, memory_root=memory_root)
-                conn.commit()
-            if attempt:
-                out["deadlock_retries"] = attempt
-            return out
-        except Exception as exc:  # noqa: BLE001 - only a retryable refusal is retried
-            if not _retryable(exc) or time.monotonic() >= deadline:
-                raise
-            attempt += 1
-            time.sleep(min(1.0, 0.05 * attempt) + random.uniform(0, 0.05))
+            with tombstones.lock_wait(left):
+                publish_local(read, episode_id, hub)
+        except tombstones.RegistryBusy as exc:
+            raise provenance.NotDone("the tombstone registry was busy until the deadline") from exc
+        except tombstones.RegistryError as exc:
+            raise provenance.NotDone(f"the tombstone registry was not published: {exc}") from exc
+
+    def work(tx):
+        known: set[str] | None = None
+        attempt = 0
+        last: BaseException | None = None
+        while True:
+            if time.monotonic() >= deadline:
+                if last is not None:
+                    raise last
+                raise provenance.NotDone("the deadline passed")
+            try:
+                if known is None and _refusals_ready(tx.cur):
+                    read = _forget_read(tx.cur, episode_id, lock=False, refusals=True)
+                    tx.rollback()
+                    if read is None:
+                        return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+                    known = set(read["hub"])
+                    tx.handoff((read, known))
+                out = forget_episode(tx.cur, episode_id, memory_root=memory_root, known=known)
+                if out.get("grown") is not None:
+                    tx.rollback()
+                    known = set(out["grown"])
+                    tx.handoff((out["read"], known))
+                    continue
+                if out.get("ok"):
+                    tx.commit()
+                else:
+                    tx.rollback()
+                if attempt:
+                    out["deadlock_retries"] = attempt
+                return out
+            except Exception as exc:  # noqa: BLE001 - only a retryable refusal is retried
+                if not _retryable(exc):
+                    raise
+                tx.rollback()
+                last = exc
+                attempt += 1
+                time.sleep(min(1.0, 0.05 * attempt + random.uniform(0, 0.05),
+                               max(0.0, deadline - time.monotonic())))
+
+    try:
+        return provenance.hub_call(work, deadline=deadline, on_handoff=publish,
+                                   connect=lambda **kw: connect(**kw))
+    except provenance.NotDone as exc:
+        return {"ok": False, "id": episode_id, "complete": False, "uncertain": exc.uncertain,
+                "error": f"forget not done: {exc}"}
 
 
 # ---- Hub confirmations of this Mac's refusals (design section 6, the wait rule) ----

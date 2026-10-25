@@ -20,6 +20,7 @@ import pytest
 
 from khipu import hub_errors, provenance
 from tests.hermetic_pg import chain_dir, hub, pg_cluster  # noqa: F401
+from tests.fact_seed import announce
 
 PACKAGE = Path(__file__).resolve().parents[1] / "khipu"
 REPO = Path(__file__).resolve().parents[3]
@@ -58,6 +59,7 @@ def _migrate_0047(hub):  # noqa: F811
 
 
 def _episode(cur, summary="ep", *, forgotten=False) -> int:
+    announce(cur)
     cur.execute("INSERT INTO episodes (ts, summary) VALUES (now(), %s) RETURNING id", (summary,))
     eid = cur.fetchone()[0]
     if forgotten:

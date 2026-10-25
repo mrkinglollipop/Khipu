@@ -27,6 +27,7 @@ from khipu.capture_identity import episode_key, source_key
 from tests.hermetic_pg import Hub, chain_dir, hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import ALT, CANON, _capture, _payload, _rows, env, pg  # noqa: F401
 from tests.test_provenance_replica import _replica, _replica_readers, replica  # noqa: F401
+from tests.fact_seed import announce
 
 
 def _import(method):
@@ -101,6 +102,7 @@ def test_legacy_merged_payload_refusal_waits_until_sent(pg, replica, method):  #
     merged = {"ts": "2026-10-20T10:00:00Z", "summary": "legacy merged source without range"}
     with pg.connect() as c:
         provenance.declare_writer(c.cursor())
+        announce(c)
         c.execute("UPDATE episodes SET raw = jsonb_set(raw, '{merged_from}', %s::jsonb) WHERE id = %s",
                   (json.dumps([{"payload": merged}]), b))
     assert hs.refresh()["ok"]
@@ -304,14 +306,15 @@ def test_pr_restatements_do_not_deadlock_a_production_forget(pg, monkeypatch):  
         return original_claim(cur, cid, eid, *args, **kw)
 
     def signal_after_episode_lock(cur, eid):
-        if threading.current_thread() is threading.main_thread():
+        # The forget runs on provenance.hub_call's worker (design 6.4).
+        if threading.current_thread().name != "scheduled-capture":
             current["episode_locked"].set()
         return original_forget(cur, eid)
 
     monkeypatch.setattr(co, "_claim_restatement", pause_after_fact_lock)
     monkeypatch.setattr(forget, "_forget_claims", signal_after_episode_lock)
 
-    def next_forget_connection():
+    def next_forget_connection(**kw):
         for t in threads:
             t.join(10)
         current.update(fact_locked=threading.Event(), episode_locked=threading.Event())
@@ -366,11 +369,21 @@ def test_forget_retry_is_time_bounded(pg, monkeypatch):  # noqa: F811
         def cursor(self):
             return self
 
+        def execute(self, *a, **kw):
+            pass
+
         def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
             pass
 
     monkeypatch.setattr(forget, "forget_episode", deadlock)
     with pytest.raises(psycopg.errors.DeadlockDetected):
-        forget._forget_on_hub(_Conn, b, memory_root=pg.memory)
-    # Attempts at 0, 3, 6, 9 and 12 s; after the one at 12 s the budget is spent.
-    assert len(calls) == 5
+        forget._forget_on_hub(lambda **kw: _Conn(), b, memory_root=pg.memory)
+    # Attempts at 0, 3, 6 and 9 s; the next would start at 12 s, past the
+    # budget, so it is not started (design 6.4) and the last failure is raised.
+    assert len(calls) == 4

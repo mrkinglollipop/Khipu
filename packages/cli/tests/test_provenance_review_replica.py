@@ -16,6 +16,7 @@ from khipu import hub_snapshot as hs, provenance, tombstones
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_provenance_forget import env, pg, PROJECT  # noqa: F401
 from tests.test_provenance_replica import replica, _replica, _replica_readers  # noqa: F401
+from tests.fact_seed import announce
 
 
 @pytest.mark.parametrize("kind", ["decision", "deliverable"])
@@ -30,6 +31,7 @@ def test_unseen_source_registry_fence_applies_before_fact_import(pg, replica, mo
     }
     slow = pg.connect()
     try:
+        announce(slow)
         eid = slow.execute(
             "INSERT INTO episodes (ts, summary, raw, session_id, harness, transcript_range, project) "
             "VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s) RETURNING id",
@@ -141,6 +143,7 @@ def test_unseen_source_registry_fence_applies_to_pulled_commitments(pg, replica,
     marker = "PRIVATE-commitment-WORDS"
     slow = pg.connect()
     try:
+        announce(slow)
         eid = slow.execute(
             "INSERT INTO episodes (ts, summary, raw, session_id, harness, transcript_range, project) "
             "VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s) RETURNING id",

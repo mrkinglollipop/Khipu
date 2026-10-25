@@ -15,6 +15,7 @@ assertions stay as they were.
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Iterable
 
 from khipu import provenance
@@ -86,3 +87,15 @@ def adopt_all(cur, kind: str = "commitment") -> None:
     table = {"commitment": "commitments", "decision": "decisions", "deliverable": "deliverables"}[kind]
     cur.execute(f"SELECT id FROM {table} ORDER BY id")
     adopt(cur, kind, [r[0] for r in cur.fetchall()])
+
+
+def announce(cur, *identities: str) -> None:
+    """Announce source identities for an episode a test writes or merges
+    with raw SQL, as a writer does (0047 refuses an episode write that
+    announces none): a fresh identity of its own unless ``identities`` are
+    given. Transaction-local, like the writer's (for the session on an
+    autocommit connection, until the next announcement); a hub without 0047
+    ignores it."""
+    conn = getattr(cur, "connection", cur)
+    cur.execute("SELECT set_config('khipu.source_identities', %s, %s)",
+                (",".join(identities or (uuid.uuid4().hex,)), not getattr(conn, "autocommit", False)))

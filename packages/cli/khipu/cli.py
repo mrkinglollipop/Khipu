@@ -2830,12 +2830,17 @@ def _cmd_episode_forget_pending(args: argparse.Namespace) -> int:
 def cmd_provenance(args: argparse.Namespace) -> int:
     """`khipu provenance backfill`: fact provenance's legacy witness backfill
     (docs/plans/2026-10-23-fact-provenance.md, section 4) over every project
-    not yet covered. The nightly runs it too until all are."""
+    not yet covered. `khipu provenance index [--dry-run]`: the hub refusals'
+    identity index and duplicate sweep (section 6.1); the dry run counts what
+    the sweep would tombstone. The nightly runs both until they are done."""
     from khipu import provenance
     from khipu.db import connect
 
     with connect() as conn:
-        out = provenance.backfill(conn)
+        if args.provenance_cmd == "index":
+            out = provenance.index_identities(conn, dry_run=bool(getattr(args, "dry_run", False)))
+        else:
+            out = provenance.backfill(conn)
     print(json.dumps(out, default=str))
     return 0 if out.get("ok") else 1
 
@@ -6017,6 +6022,8 @@ def build_parser() -> argparse.ArgumentParser:
     pv = sub.add_parser("provenance", help="Fact provenance maintenance (migration 0047)")
     pv_sub = pv.add_subparsers(dest="provenance_cmd", required=True)
     pv_sub.add_parser("backfill", help="Prove legacy restaters' claims, project by project")
+    pv_index = pv_sub.add_parser("index", help="Index episodes' source identities and sweep refused carriers")
+    pv_index.add_argument("--dry-run", action="store_true", help="Only count what the sweep would tombstone")
     pv.set_defaults(func=cmd_provenance)
 
     tp = sub.add_parser("topic", help="Topic maintenance (memory reliability W5.6)")

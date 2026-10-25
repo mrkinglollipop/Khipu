@@ -525,6 +525,7 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
 # batches key; its assertions are the reviewer's.
 
 import copy  # noqa: E402
+from tests.fact_seed import announce  # noqa: E402
 
 
 
@@ -696,6 +697,7 @@ def test_similar_items_of_two_owners_both_stay_linked_on_the_hub(owed):
 
     # One transaction, as capture runs these writers in (the fact gate checks at COMMIT).
     with owed.transaction(), owed.cursor() as cur:
+        announce(cur)
         cur.execute("INSERT INTO episodes (ts, summary, raw) VALUES (now(), 's', '{}'::jsonb) RETURNING id")
         ep = int(cur.fetchone()[0])
         base = {"project": PROJECT, "session_id": "claude_code:host-1"}

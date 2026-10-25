@@ -612,14 +612,21 @@ def prune_changes(conn, *, keep_days: int = CHANGES_KEEP_DAYS) -> dict[str, Any]
     (commits). A replica whose stream cursor is at or below the floor may
     have missed a change and asks for a full dump. The fact gate only ever
     looks at the current transaction's rows, so pruning old ones never
-    affects a writer. A hub without 0047 has nothing to prune."""
+    affects a writer. A hub without 0047 has nothing to prune.
+
+    Only an xid prefix goes: the rows below the lowest xid of the rows kept
+    (section 6.1, change token), so ``min(xid)`` says no older row was
+    removed."""
     with conn.cursor() as cur:
         if not ready(cur):
             conn.rollback()
             return {"ok": True, "skipped": "the hub has no fact provenance yet (migration 0047)"}
         cur.execute(
-            "WITH gone AS (DELETE FROM fact_changes WHERE at < now() - make_interval(days => %s) "
-            "RETURNING xid) SELECT count(*), max(xid::text::numeric) FROM gone",
+            "WITH keep AS (SELECT min(xid::text::numeric) AS x FROM fact_changes "
+            "              WHERE at >= now() - make_interval(days => %s)), "
+            "gone AS (DELETE FROM fact_changes WHERE xid::text::numeric < "
+            "         coalesce((SELECT x FROM keep), 'Infinity'::numeric) RETURNING xid) "
+            "SELECT count(*), max(xid::text::numeric) FROM gone",
             (int(keep_days),),
         )
         removed, through = cur.fetchone()
@@ -632,6 +639,402 @@ def prune_changes(conn, *, keep_days: int = CHANGES_KEEP_DAYS) -> dict[str, Any]
             )
     conn.commit()
     return {"ok": True, "pruned": int(removed or 0)}
+
+
+# ---- One operation deadline (section 6.4) ------------------------------------------
+#
+# A forget, an owner send and a copy each fix one monotonic deadline. Every
+# statement and the COMMIT run under statement_timeout and lock_timeout set
+# to the time left; the hub work runs on a daemon thread that the caller
+# abandons at the deadline (best-effort cancel, socket shut down, connection
+# discarded), so a stalled network cannot hold the caller. The worker never
+# writes locally: the caller publishes only a result it received in time.
+
+CONNECT_FLOOR_S = 2.0
+CANCEL_TIMEOUT_S = 5.0
+# D3: an abandoned transaction's locks end on the server within 10 s of its
+# last statement; every statement already ends by its statement_timeout.
+SESSION_SETTINGS = ("SET idle_in_transaction_session_timeout = '10s'",
+                    "SET tcp_user_timeout = 10000")
+
+
+class NotDone(RuntimeError):
+    """The hub work did not finish before the deadline (or could not start).
+    ``uncertain``: a COMMIT was sent and its outcome is unknown."""
+
+    def __init__(self, message: str, *, uncertain: bool = False):
+        super().__init__(message)
+        self.uncertain = uncertain
+
+
+def remaining_ms(deadline: float) -> int:
+    import time
+
+    ms = int((deadline - time.monotonic()) * 1000)
+    if ms <= 0:
+        raise NotDone("the operation's deadline passed")
+    return ms
+
+
+class BoundedCursor:
+    """A cursor whose every statement runs under the time left."""
+
+    def __init__(self, cur, deadline: float):
+        self._cur, self._deadline = cur, deadline
+
+    def bound(self) -> None:
+        ms = str(remaining_ms(self._deadline))
+        self._cur.execute("SELECT set_config('statement_timeout', %s, true), "
+                          "set_config('lock_timeout', %s, true)", (ms, ms))
+
+    def execute(self, query, params=None, **kw):
+        self.bound()
+        return self._cur.execute(query, params, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class HubTx:
+    """The worker's connection: ``cur`` is bounded, ``commit`` too.
+    ``handoff(value)`` runs the caller's ``on_handoff(value)`` on the
+    caller's thread and returns its result (its error is raised here): the
+    one way hub work gets something published locally, always between
+    transactions."""
+
+    def __init__(self, conn, cur, deadline: float, channel):
+        self.conn, self.deadline = conn, deadline
+        self.cur = BoundedCursor(cur, deadline)
+        self.committing = False
+        self._channel = channel
+
+    def commit(self) -> None:
+        self.cur.bound()
+        self.committing = True
+        self.conn.commit()
+        self.committing = False
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
+    def handoff(self, value):
+        import threading
+
+        reply: dict[str, Any] = {"done": threading.Event()}
+        self._channel.put(("handoff", value, reply))
+        reply["done"].wait()
+        if "error" in reply:
+            raise reply["error"]
+        return reply.get("result")
+
+
+def _abandon(conn) -> None:
+    import os
+    import socket
+    import threading
+
+    def cancel():
+        # The non-blocking cancel (libpq 17+): the blocking one holds the
+        # interpreter while a stalled network withholds its reply.
+        try:
+            conn.cancel_safe(timeout=CANCEL_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - best effort; never waited for
+            pass
+
+    threading.Thread(target=cancel, daemon=True, name="khipu-hub-cancel").start()
+    try:
+        sock = socket.socket(fileno=os.dup(conn.fileno()))
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        finally:
+            sock.close()
+    except Exception:  # noqa: BLE001 - already closed or never connected
+        pass
+
+
+def hub_call(work, *, deadline: float, connect=None, on_handoff=None):
+    """``work(tx)`` on a fresh hub connection, bounded by ``deadline``
+    (section 6.4). ``connect`` takes ``connect_timeout`` (default
+    ``khipu.db.connect``). Returns ``work``'s result or raises its error;
+    :class:`NotDone` when the deadline came first or no step could start.
+    At the deadline the worker is abandoned, never joined: a cancel is sent
+    without waiting, the socket is shut down and the connection discarded,
+    and nothing it returns later is used."""
+    import queue
+    import threading
+    import time
+
+    channel: queue.Queue = queue.Queue()
+    guard = threading.Lock()
+    state: dict[str, Any] = {"conn": None, "tx": None, "abandoned": False}
+
+    def run():
+        conn = None
+        outcome: dict[str, Any] = {}
+        try:
+            secs = deadline - time.monotonic()
+            if secs < CONNECT_FLOOR_S:
+                raise NotDone("too little time left to connect to the hub")
+            if connect is None:
+                from khipu.db import connect as opener
+            else:
+                opener = connect
+            conn = opener(connect_timeout=int(secs))
+            with guard:
+                state["conn"] = conn
+            try:
+                with conn.cursor() as cur:
+                    for setting in SESSION_SETTINGS:
+                        cur.execute(setting)
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001 - a session without them is not used
+                raise NotDone(f"the hub session could not be bounded ({type(exc).__name__})") from exc
+            with conn.cursor() as cur:
+                state["tx"] = HubTx(conn, cur, deadline, channel)
+                outcome["result"] = work(state["tx"])
+        except BaseException as exc:  # noqa: BLE001 - handed to the caller
+            outcome["error"] = exc
+        finally:
+            with guard:
+                if conn is not None and not state["abandoned"]:
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            channel.put(("finished", outcome, None))
+
+    threading.Thread(target=run, daemon=True, name="khipu-hub-call").start()
+    while True:
+        try:
+            kind, value, reply = channel.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            with guard:
+                state["abandoned"] = True
+                if state["conn"] is not None:
+                    _abandon(state["conn"])
+            tx = state["tx"]
+            raise NotDone("the hub did not answer before the deadline",
+                          uncertain=bool(tx is not None and tx.committing)) from None
+        if kind == "finished":
+            if "error" in value:
+                raise value["error"]
+            return value["result"]
+        try:
+            if on_handoff is None:
+                raise NotDone("nothing receives this hub work's handoff")
+            reply["result"] = on_handoff(value)
+        except BaseException as exc:
+            # Not admitted: the worker, between transactions, stops too.
+            reply["error"] = exc
+            reply["done"].set()
+            raise
+        reply["done"].set()
+
+
+# ---- Hub refusals and the identity index (section 6.1) -----------------------------
+
+INDEX_BATCH = 500
+INDEX_SETTING = "khipu.provenance_index"
+
+
+def refusals_ready(cur) -> bool:
+    """Whether the hub has 0047's identity index (``episode_identities``)."""
+    cur.execute("SELECT to_regclass('public.episode_identities') IS NOT NULL")
+    row = cur.fetchone()
+    return bool(row) and row[0] is True
+
+
+def stored_identities(cur, episode_ids) -> dict[int, set[str]]:
+    """Every identity each episode carries, in hub form, from what the hub
+    stores: the registry's own functions over its raw and each merged
+    payload, each receipt's id, the natural key and legacy form 0047's
+    triggers compute from the row, its source rows, and the identity rows
+    already recorded. Missing episodes are absent from the result."""
+    from khipu.tombstones import hub_identity_set
+
+    ids = sorted({int(i) for i in episode_ids})
+    if not ids:
+        return {}
+    cur.execute(
+        "SELECT id, raw, khipu_row_identities(raw, harness, session_id, transcript_range, window_id) "
+        "FROM episodes WHERE id = ANY(%s)", (ids,))
+    out: dict[int, set[str]] = {}
+    for eid, raw, row_ids in cur.fetchall():
+        found = set(row_ids or [])
+        if isinstance(raw, dict):
+            found |= hub_identity_set(raw, redact=True)
+            for entry in raw.get("merged_from") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if isinstance(entry.get("source_id"), str) and entry["source_id"]:
+                    found.add(entry["source_id"])
+                if isinstance(entry.get("payload"), dict):
+                    found |= hub_identity_set(entry["payload"], redact=True)
+        out[int(eid)] = found
+    cur.execute("SELECT r.episode_id, r.receipt_ids FROM (SELECT episode_id, "
+                "array_remove(array_agg(source_key) || array_agg(payload_sha256), NULL) AS receipt_ids "
+                "FROM episode_sources WHERE episode_id = ANY(%s) GROUP BY episode_id) r", (ids,))
+    for eid, found in cur.fetchall():
+        if int(eid) in out:
+            out[int(eid)].update(found or [])
+    cur.execute("SELECT episode_id, identity FROM episode_identities WHERE episode_id = ANY(%s)", (ids,))
+    for eid, identity in cur.fetchall():
+        if int(eid) in out:
+            out[int(eid)].add(identity)
+    return out
+
+
+def refuse(cur, identities, *, episode_id: int | None = None, also=()) -> dict[str, Any]:
+    """The refusal transaction (section 6.1), in the caller's READ COMMITTED
+    transaction; the caller commits. Takes the identity locks sorted,
+    records the refusals, then locks every live episode recorded under them
+    (and ``also``) in id order and tombstones each: its claims go, its facts
+    are re-projected, its vectors and briefs follow, as a forget does. The
+    refusal set is exactly ``identities``: a carrier's other identities are
+    not refused. Returns the refused identities and the cascade of each
+    episode it tombstoned."""
+    from khipu import forget
+
+    refused = sorted({str(i) for i in identities if i})
+    cur.execute("SELECT khipu_lock_identities(%s::text[])", (refused,))
+    if refused:
+        cur.execute("INSERT INTO forgotten_sources (identity, episode_id) "
+                    "SELECT x, %s FROM unnest(%s::text[]) AS t(x) ORDER BY x ON CONFLICT DO NOTHING",
+                    (episode_id, refused))
+    cur.execute("SELECT DISTINCT episode_id FROM episode_identities WHERE identity = ANY(%s)", (refused,))
+    carriers = {int(r[0]) for r in cur.fetchall()} | {int(i) for i in also}
+    cur.execute("SELECT id FROM episodes WHERE id = ANY(%s) AND deleted_at IS NULL ORDER BY id FOR UPDATE",
+                (sorted(carriers),))
+    live = [int(r[0]) for r in cur.fetchall()]
+    return {"refused": refused, "tombstoned": live,
+            "cascades": {eid: forget.tombstone_on_hub(cur, eid) for eid in live}}
+
+
+def _copy_ready(cur) -> tuple[str, int, int] | None:
+    cur.execute("SELECT to_regclass('public.fact_copy_ready') IS NOT NULL")
+    if not cur.fetchone()[0]:
+        return None
+    cur.execute("SELECT state, target_id, indexed_through FROM fact_copy_ready FOR UPDATE")
+    row = cur.fetchone()
+    return (str(row[0]), int(row[1]), int(row[2])) if row else None
+
+
+def _index_batch(cur, through: int, target: int, batch: int) -> dict[str, Any]:
+    """One batch of the index pass, in the caller's transaction."""
+    cur.execute("SELECT id FROM episodes WHERE id > %s AND id <= %s ORDER BY id LIMIT %s",
+                (through, target, batch))
+    ids = [int(r[0]) for r in cur.fetchall()]
+    idents = stored_identities(cur, ids)
+    every = sorted(set().union(*idents.values())) if idents else []
+    cur.execute("SELECT khipu_lock_identities(%s::text[])", (every,))
+    cur.execute("SELECT id FROM episodes WHERE id = ANY(%s) ORDER BY id FOR UPDATE", (ids,))
+    cur.execute("SELECT set_config(%s, 'on', true)", (INDEX_SETTING,))
+    rows = sorted((k, eid) for eid, found in idents.items() for k in found)
+    if rows:
+        cur.execute("INSERT INTO episode_identities (identity, episode_id) "
+                    "SELECT * FROM unnest(%s::text[], %s::bigint[]) ON CONFLICT DO NOTHING",
+                    ([k for k, _ in rows], [e for _, e in rows]))
+    # The frozen set of forgets the owner asked for before this design: the
+    # only episodes whose every identity becomes a refusal.
+    cur.execute("SELECT episode_id FROM forgotten_at_cutover WHERE episode_id = ANY(%s)", (ids,))
+    cutover = sorted(int(r[0]) for r in cur.fetchall())
+    refuse_rows = sorted({(k, eid) for eid in cutover for k in idents.get(eid, ())})
+    if refuse_rows:
+        cur.execute("INSERT INTO forgotten_sources (identity, episode_id) "
+                    "SELECT * FROM unnest(%s::text[], %s::bigint[]) ON CONFLICT DO NOTHING",
+                    ([k for k, _ in refuse_rows], [e for _, e in refuse_rows]))
+    # The duplicate sweep: every live episode now recorded under a refusal.
+    cur.execute("SELECT DISTINCT ei.episode_id FROM episode_identities ei "
+                "JOIN forgotten_sources f ON f.identity = ei.identity "
+                "JOIN episodes e ON e.id = ei.episode_id AND e.deleted_at IS NULL "
+                "WHERE ei.identity = ANY(%s)", (every,))
+    carriers = sorted(int(r[0]) for r in cur.fetchall())
+    from khipu import forget
+
+    cur.execute("SELECT id FROM episodes WHERE id = ANY(%s) AND deleted_at IS NULL ORDER BY id FOR UPDATE",
+                (carriers,))
+    swept = [int(r[0]) for r in cur.fetchall()]
+    for eid in swept:
+        forget.tombstone_on_hub(cur, eid)
+    last = ids[-1] if ids else target
+    cur.execute("UPDATE fact_copy_ready SET indexed_through = %s", (last,))
+    return {"indexed": len(ids), "refused": len(refuse_rows), "tombstoned": swept, "through": last}
+
+
+def index_identities(conn, *, batch: int = INDEX_BATCH, dry_run: bool = False) -> dict[str, Any]:
+    """``khipu provenance index`` (section 6.1): index every episode up to
+    ``fact_copy_ready.target_id`` in batches of ``batch`` ids, one
+    transaction each (an aborted batch advances nothing and is redone), then
+    mark copies ready. ``dry_run`` only counts the live episodes the sweep
+    would tombstone. A hub without the index has nothing to do."""
+    if dry_run:
+        return _index_dry_run(conn)
+    out: dict[str, Any] = {"ok": True, "batches": 0, "indexed": 0, "refused": 0, "tombstoned": []}
+    while True:
+        try:
+            with conn.cursor() as cur:
+                state = _copy_ready(cur)
+                if state is None:
+                    conn.rollback()
+                    return {**out, "skipped": "the hub has no identity index yet (migration 0047)"}
+                name, target, through = state
+                if through >= target:
+                    if name != "ready":
+                        cur.execute("UPDATE fact_copy_ready SET state = 'ready'")
+                    conn.commit()
+                    return {**out, "state": "ready", "indexed_through": through, "target_id": target}
+                done = _index_batch(cur, through, target, batch)
+            conn.commit()
+        except Exception as exc:  # noqa: BLE001 - the batch rolled back; the next run redoes it
+            conn.rollback()
+            return {**out, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+        out["batches"] += 1
+        out["indexed"] += done["indexed"]
+        out["refused"] += done["refused"]
+        out["tombstoned"] += done["tombstoned"]
+
+
+def _index_dry_run(conn) -> dict[str, Any]:
+    """The live episodes the index pass would tombstone, from the same
+    frozen set and the same identities, read without locks: an episode the
+    pass has yet to index by what it stores, every other by its rows."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.fact_copy_ready') IS NOT NULL")
+        if not cur.fetchone()[0]:
+            conn.rollback()
+            return {"ok": True, "would_tombstone": 0, "skipped": "no identity index yet (migration 0047)"}
+        cur.execute("SELECT target_id, indexed_through FROM fact_copy_ready")
+        target, through = (int(x) for x in cur.fetchone())
+
+        def identities(ids: list[int]) -> dict[int, set[str]]:
+            pending = [i for i in ids if through < i <= target]
+            found = stored_identities(cur, pending)
+            cur.execute("SELECT episode_id, identity FROM episode_identities WHERE episode_id = ANY(%s)",
+                        ([i for i in ids if i not in found],))
+            for eid, identity in cur.fetchall():
+                found.setdefault(int(eid), set()).add(identity)
+            return found
+
+        cur.execute("SELECT identity FROM forgotten_sources")
+        refused = {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT episode_id FROM forgotten_at_cutover WHERE episode_id > %s ORDER BY episode_id",
+                    (through,))
+        cutover = [int(r[0]) for r in cur.fetchall()]
+        for start in range(0, len(cutover), INDEX_BATCH):
+            for found in identities(cutover[start:start + INDEX_BATCH]).values():
+                refused |= found
+        hits: list[int] = []
+        last = 0
+        while True:
+            cur.execute("SELECT id FROM episodes WHERE id > %s AND deleted_at IS NULL ORDER BY id LIMIT %s",
+                        (last, INDEX_BATCH))
+            ids = [int(r[0]) for r in cur.fetchall()]
+            if not ids:
+                break
+            hits += sorted(eid for eid, found in identities(ids).items() if found & refused)
+            last = ids[-1]
+    conn.rollback()
+    return {"ok": True, "would_tombstone": len(hits), "episodes": hits}
 
 
 # ---- Doctor (section 8, phase 5) -------------------------------------------------

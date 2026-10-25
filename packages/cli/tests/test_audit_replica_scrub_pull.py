@@ -6,6 +6,7 @@ import pytest
 from tests import fact_seed
 from tests.hermetic_pg import hub, pg_cluster
 from khipu import db, hub_snapshot as hs, offline_reads, tombstones
+from tests.fact_seed import announce
 
 
 @pytest.mark.parametrize('refresh_first', [True, False])
@@ -25,6 +26,7 @@ def test_pull_cannot_restore_derivatives_of_scrubbed_source(hub, tmp_path, monke
     if not refresh_first:
         assert hs.refresh()['ok']
     with hub.connect() as con:
+        announce(con)
         eid = con.execute("INSERT INTO episodes(ts,summary,raw,session_id,harness,transcript_range) "
                           "VALUES (%s,%s,%s::jsonb,%s,%s,%s) RETURNING id",
                           (payload['ts'], payload['summary'], json.dumps(payload),

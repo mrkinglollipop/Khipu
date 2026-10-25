@@ -10,6 +10,7 @@ import pytest
 
 from khipu import close_rules as cr, commitments as co, db, hub_snapshot as hs
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.fact_seed import announce
 
 
 def test_close_restatement_preserves_each_repository_pr(hub):
@@ -21,6 +22,7 @@ def test_close_restatement_preserves_each_repository_pr(hub):
              base + ' once https://github.com/other/repo/pull/41 merges']
     with conn.cursor() as cur:
         for idx, text in enumerate(words):
+            announce(cur)
             cur.execute("INSERT INTO episodes (ts, summary, raw, project, session_id) "
                         "VALUES (now(), %s, '{}'::jsonb, 'acme/widget', 'owed-fake') RETURNING id", (f'fake {idx}',))
             eid = cur.fetchone()[0]
@@ -251,6 +253,7 @@ def test_close_foreign_only_requirement_does_not_invent_own_repository_pr(hub):
     base = 'Prepare the deployment release checklist for the next version'
     with conn.cursor() as cur:
         for idx, text in enumerate((base, base + ' once https://github.com/other/repo/pull/41 merges', base)):
+            announce(cur)
             cur.execute("INSERT INTO episodes (ts, summary, raw, project, session_id) "
                         "VALUES (now(), %s, '{}'::jsonb, 'acme/widget', 'owed-fake') RETURNING id", (str(idx),))
             eid = cur.fetchone()[0]
