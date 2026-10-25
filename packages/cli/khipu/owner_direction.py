@@ -76,7 +76,7 @@ ACTIONS: frozenset[str] = frozenset({
     "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
     "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
-    "route.priority.set", "route.priority.confirm",
+    "route.priority.set", "route.priority.amend", "route.priority.confirm",
     "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm",
     "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
@@ -1634,7 +1634,8 @@ def _undo_cap(line: dict, via: str) -> dict:
                                kind=previous["kind"], pct=previous.get("pct"), slack=previous.get("slack"),
                                usd=previous.get("usd"), days=previous.get("days"), n=previous.get("n"),
                                revision=previous.get("revision"), purpose=previous.get("purpose", "job"),
-                               tier=previous.get("tier"), sensitive_only=previous.get("sensitive_only"), via=via)
+                               tier=previous.get("tier"), sensitive_only=previous.get("sensitive_only"),
+                               until=previous.get("until"), via=via)
     return routing.remove_cap(line["target"], window=facts.get("window"),
                               kind=facts.get("kind"), purpose=facts.get("purpose", "job"), via=via)
 
@@ -1669,6 +1670,7 @@ _UNDO = {
     "route.hold.add": _undo_hold_add,
     "route.hold.end": _undo_hold_end,
     "route.priority.set": _undo_priority,
+    "route.priority.amend": _undo_priority,
     "route.priority.confirm": _undo_priority,
     "route.priority.undo": _undo_priority,
     "route.priority.clear": _undo_priority,
@@ -1909,7 +1911,7 @@ def undo(line_id: str, via: str, *, holds: dict | None = None) -> dict:
 
 def _run_inverse(line, inverse, via, holds, line_id):
     if line["action"] in {"route.rule.confirm", "route.rule.edit", "route.rule.retire",
-                           "route.rule.undo", "route.rule.dismiss", "route.priority.set", "route.priority.confirm",
+                           "route.rule.undo", "route.rule.dismiss", "route.priority.set", "route.priority.amend", "route.priority.confirm",
                            "route.priority.undo", "route.priority.clear"}:
         out = inverse(line, via, holds)
     else:

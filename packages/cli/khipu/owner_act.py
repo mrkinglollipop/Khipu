@@ -35,9 +35,11 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.dismiss": (("rule",), ()),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
-    "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only")),
+    "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only", "until")),
     "route.cap.remove": (("account", "kind"), ("window", "purpose")),
     "route.priority.set": (("entries",), ("until", "expect", "holds")),
+    # One account's entry only: ``append`` words to its role or ``role`` in its place (one of the two).
+    "route.priority.amend": (("account", "expect"), ("append", "role", "until")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
@@ -292,7 +294,11 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "hold"], ["end", v["hold"]]
     if action.startswith("route.cap."):
         return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "slack", "usd", "days", "n",
-                                             "revision", "purpose", "tier", "sensitive_only")], [v["account"]]
+                                             "revision", "purpose", "tier", "sensitive_only", "until")], [v["account"]]
+    if action == "route.priority.amend":
+        if ("append" in v) == ("role" in v):
+            raise _bad("route.priority.amend takes append (words added to the role) or role (its new words), one of the two")
+        return ["route", "priority", "amend", *_opts(v, "append", "role", "until", "expect")], [v["account"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":

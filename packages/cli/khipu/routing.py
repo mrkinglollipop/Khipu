@@ -3836,6 +3836,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # written_at). Kept beside the cap, never inside it, so projections
     # that copy a cap do not change.
     pace_cap_at: dict[tuple, str] = {}
+    # Each slot's caps in the order set: (cap, its end or None, confirmed at).
+    pace_cap_layers: dict[tuple, list[tuple]] = {}
     cap_proposals: list[dict] = []
     observed = entry_model.observations(events, cfg)
     runner_status = {r["name"]: r for r in (sources or {}).get("runners") or []}
@@ -3895,20 +3897,21 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 slot = window if scoped else ""
                 if kind == "cap_remove":
                     if owner_cap:
-                        pace_caps.pop((account, slot, cap_kind, purpose), None)
-                        pace_cap_at.pop((account, slot, cap_kind, purpose), None)
+                        pace_cap_layers.pop((account, slot, cap_kind, purpose), None)
                     continue
                 cap = routing_pace.checked_cap({k: event.get(k) for k in
                                                 ("kind", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only")
                                                 if k in event})
                 if cap is not None:
                     if owner_cap:
-                        pace_caps[(account, slot, cap["kind"], purpose)] = dict(cap, window=window if scoped else None)
-                        confirmed = _parse(event.get("written_at"))
-                        if confirmed is not None:
-                            pace_cap_at[(account, slot, cap["kind"], purpose)] = _iso(confirmed)
-                        else:
-                            pace_cap_at.pop((account, slot, cap["kind"], purpose), None)
+                        slot_key = (account, slot, cap["kind"], purpose)
+                        ends = _parse(event.get("until"))
+                        layer = (dict(cap, window=window if scoped else None, **({"until": _iso(ends)} if ends else {})),
+                                 ends, _iso(_parse(event.get("written_at"))) if _parse(event.get("written_at")) else None)
+                        # A cap with an end sits over the cap it replaced, which
+                        # applies again once the end passes; a cap with none
+                        # replaces every layer beneath it.
+                        pace_cap_layers[slot_key] = ([*pace_cap_layers.get(slot_key, []), layer] if ends else [layer])
                     else:
                         # A conversation's cap is a proposal, never a fact.
                         cap_proposals.append(dict(cap, account=account,
@@ -4311,6 +4314,13 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     entries.sort(key=lambda e: (_STATE_ORDER.get(e["state"], 9), e["label"].casefold()))
     from khipu import routing_pace as _pace
 
+    # A cap whose end has passed is absent: the newest layer still in force applies.
+    for slot_key, layers in pace_cap_layers.items():
+        live = next((layer for layer in reversed(layers) if layer[1] is None or layer[1] > now), None)
+        if live is not None:
+            pace_caps[slot_key] = live[0]
+            if live[2] is not None:
+                pace_cap_at[slot_key] = live[2]
     for entry in entries:
         windows = sorted({w for (a, w) in pace_samples if a == entry["key"]}
                          | {w for (a, w, _k2, _purpose) in pace_caps if a == entry["key"] and w})
@@ -4473,6 +4483,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     times += [p["until"] for p in owner["pauses"].values() if p["until"] is not None]
     times += [_parse(h["until"]) for h in active_holds if h["until"]]
     times += reminders
+    times += [layer[1] for layers in pace_cap_layers.values() for layer in layers if layer[1] is not None]
     times += [_parse(e["level"]["until"]) for e in (priority_out or {}).get("entries", []) if e.get("level")]
     # Each end in the priority (and in the one a pending request replaced,
     # which Undo brings back) is a change the clock makes.
@@ -5812,7 +5823,7 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
         kind = cap.get("kind")
         purpose = cap.get("purpose", "job")
         base = {"kind": kind, "revision": cap.get("revision"), "window": cap.get("window"), "purpose": purpose,
-                **{k: cap[k] for k in ("tier", "sensitive_only") if k in cap}}
+                **{k: cap[k] for k in ("tier", "sensitive_only", "until") if k in cap}}
         if confirmations:
             base["confirmed_at"] = (entry.get("cap_confirmed") or {}).get(
                 f"{cap.get('window') or ''}|{kind}" + ("|check" if purpose == "check" else ""))
@@ -6772,16 +6783,30 @@ def _checked_cap_or_raise(kind, fields: dict, revision, *, window):
     return cap
 
 
+def _cap_end(until, now: datetime | None) -> str | None:
+    """A cap's optional end as a time in the future, or None for a cap with none."""
+    if until is None or not str(until).strip():
+        return None
+    now = now or _now()
+    end = parse_until(str(until), now)
+    if end <= now:
+        raise RouteError("a cap's end must be in the future")
+    return _iso(end)
+
+
 def set_cap(account: str, *, window: str | None = None, kind: str, pct=None, slack=None, usd=None,
             days=None, n=None, revision: str | None = None, via: str,
-            purpose: str = "job", tier=None, sensitive_only=None, now: datetime | None = None) -> dict:
+            purpose: str = "job", tier=None, sensitive_only=None, until=None, now: datetime | None = None) -> dict:
     """Owner-only: confirm a cap as a structured fact, never from prose.
-    A runner's numbers are never read here; they only judge the cap later."""
+    A runner's numbers are never read here; they only judge the cap later.
+    With ``until`` the cap stops applying then, and the cap it replaced
+    applies again."""
     cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n, "purpose": purpose,
                                     "tier": tier, "sensitive_only": sensitive_only},
                                 revision, window=window)
     key = _resolve_account_key(account)
-    event = {"type": "cap_set", "account": key, **cap}
+    end = _cap_end(until, now)
+    event = {"type": "cap_set", "account": key, **cap, **({"until": end} if end else {})}
     if cap["kind"] in ("share", "per_day", "pace_target"):
         event["window"] = window
     return dict(_owner_write(event, via), account=key)
@@ -7005,6 +7030,80 @@ def clear_priority(*, via: str, now: datetime | None = None, expect=None) -> dic
         _check_priority(expect, now)
         _held_priority(now)
         return _owner_write({"type": "priority_clear"}, via)
+
+
+def _amended_priority(account, *, append, role, until, now: datetime, conversation: bool) -> tuple[list[dict], str | None]:
+    """(the priority's entries with the one account's changed, the priority's
+    own end), read from the priority in effect now. Every other entry is
+    carried over as it stands, never re-read from its words, so it stays as
+    the owner left it; an entry whose end has already passed is no longer in
+    effect and goes with the rewrite, as it would with any set."""
+    if (append is None) == (role is None):
+        raise RouteError("amend takes the words to add (append) or the role's new words (role), one of the two")
+    held = _held_priority(now)
+    known = accounts()
+    key = _account_for_a_conversation(account, known) if conversation else _resolve_account_key(account, known)
+    rows = []
+    found = False
+    for item in held["entries"]:
+        row = {"account": item["account"], "label": item["label"], "role": item.get("role"), "until": item.get("until")}
+        if item.get("level"):
+            row["level"] = dict(item["level"])
+        if item["account"] == key:
+            found = True
+            words = _one_line(append if append is not None else role)
+            if not words:
+                raise RouteError("the words to " + ("add" if append is not None else "set") + " are empty")
+            words = _clean(words, 0) if conversation else words
+            row["role"] = f"{row['role']} {words}" if append is not None and row["role"] else words
+            if until is not None and str(until).strip():
+                end = parse_until(str(until), now)
+                if end <= now:
+                    raise RouteError("the entry's end must be in the future")
+                row["until"] = _iso(end)
+        rows.append(row)
+    if not found:
+        raise RouteError(f"{_label_of(key, known)} is not in the priority; set the priority to add an account")
+    return rows, held.get("until")
+
+
+def amend_priority(account, *, append=None, role=None, until=None, via: str, now: datetime | None = None,
+                   expect=None) -> dict:
+    """The owner's change to one account's entry in the priority (words added
+    to its role, or its role replaced, and optionally its end), confirmed at
+    once like ``set_priority``. Every other entry is left as it is.
+    ``expect`` is required, as for a set."""
+    _needs_version(expect)
+    now = now or _now()
+    with _lock():
+        _check_priority(expect, now)
+        rows, whole = _amended_priority(account, append=append, role=role, until=until, now=now, conversation=False)
+        out = _owner_write({"type": "priority_set", "entries": rows, "until": whole}, via)
+    return dict(out, entries=[e["label"] for e in rows])
+
+
+def request_priority_amend(account, *, append=None, role=None, until=None, owner_request: str | None = None,
+                           author: dict | None = None, via: str = "mcp", now: datetime | None = None, expect=None,
+                           base: str | None = None) -> dict:
+    """A conversation's change to one account's entry, at the owner's
+    request: live at once and unconfirmed, as ``request_priority``."""
+    if not isinstance(base, str) or not base.strip():
+        raise RouteError("base must be the owner revision the request was prepared against")
+    now = now or _now()
+    request_words = _one_line(owner_request)
+    if not request_words:
+        raise RouteError("describe the owner's request in one line")
+    by = dict(author or conversation_author())
+    if by.get("kind") != "conversation":
+        by = conversation_author()
+    with _lock():
+        _check_priority(expect, now)
+        rows, whole = _amended_priority(account, append=append, role=role, until=until, now=now, conversation=True)
+        observed = _observed_base("priority", base=base, expect=expect)
+        written, view = _write({"type": "priority_set", "entries": rows, "until": whole, "pending": True,
+                                "base": observed,
+                                "owner_request": _clean(request_words, 0), "written_by": by, "via": via})
+    return dict(_done(written, view), entries=[e["label"] for e in rows])
 
 
 # ---- the rule 12 tier table (slice 10) ---------------------------------------------------
@@ -10559,10 +10658,18 @@ def _priority_cli(args, now: datetime) -> int:
             print(priority_line(held, now, view=view, facts=plan_facts(view, now)) if held else "No priority set.")
         _record_read(view, priority=True)
         return 0
+    if action == "amend" and len(args.accounts or []) != 1:
+        raise RouteError("priority amend takes the one account whose entry changes")
     if getattr(args, "at_owner_request", None) is not None:
+        if action == "amend":
+            _print_json(request_priority_amend(
+                args.accounts[0], append=args.append, role=args.role, until=args.until,
+                owner_request=args.at_owner_request, author=conversation_author(), via="cli", now=now,
+                expect=getattr(args, "expect", None), base=getattr(args, "base", None)))
+            return 0
         if action != "set":
-            raise RouteError("--at-owner-request is only for priority set: confirming, undoing and clearing are "
-                             "the owner's")
+            raise RouteError("--at-owner-request is only for priority set or amend: confirming, undoing and "
+                             "clearing are the owner's")
         _print_json(request_priority(_priority_entries_arg(args), until=args.until,
                                      owner_request=args.at_owner_request, author=conversation_author(),
                                      via="cli", now=now, expect=getattr(args, "expect", None),
@@ -10578,6 +10685,9 @@ def _priority_cli(args, now: datetime) -> int:
     if action == "set":
         out = set_priority(_priority_entries_arg(args), until=args.until, via=via, now=now, expect=expect,
                            holds=_holds_arg(args))
+    elif action == "amend":
+        out = amend_priority(args.accounts[0], append=args.append, role=args.role, until=args.until, via=via,
+                             now=now, expect=expect)
     elif action == "confirm":
         out = confirm_priority(via=via, now=now, expect=expect, holds=_holds_arg(args))
     elif action == "undo":
@@ -10660,6 +10770,10 @@ def _priority_intent(args, action: str) -> dict | None:
     names each account it orders."""
     from khipu import owner_direction
 
+    if action == "amend":
+        return owner_direction.intent("route.priority.amend", _resolve_account_key(args.accounts[0]),
+                                      facts={k: v for k, v in (("append", args.append), ("role", args.role),
+                                                               ("until", args.until)) if v is not None})
     if action != "set":
         return owner_direction.intent(f"route.priority.{action}", "priority")
     entries = _priority_entries_arg(args)
@@ -10696,6 +10810,8 @@ def _route_intent(cmd: str, args) -> dict | None:
                     if getattr(args, k, None) is not None}}
         if getattr(args, "purpose", "job") != "job":
             facts["purpose"] = args.purpose
+        if getattr(args, "until", None):
+            facts["until"] = args.until
         return owner_direction.intent(f"route.cap.{args.action}", _resolve_account_key(args.account),
                                       facts=facts)
     if cmd in ("pause", "lift", "clear"):
@@ -10904,8 +11020,10 @@ def run_cli(args) -> int:
                               slack=getattr(args, "slack", None), usd=getattr(args, "usd", None),
                               days=getattr(args, "days", None), n=getattr(args, "n", None),
                               revision=args.revision, purpose=args.purpose, tier=args.tier,
-                              sensitive_only=args.sensitive_only, via=via)
+                              sensitive_only=args.sensitive_only, until=getattr(args, "until", None), via=via)
             else:
+                if getattr(args, "until", None):
+                    raise RouteError("a cap's end is set with the cap; removing a cap takes none")
                 out = remove_cap(args.account, window=args.window, kind=args.kind, purpose=args.purpose, via=via)
         elif cmd == "definition":
             out = set_definition(args.definition, want["facts"]["value"], via=via)
