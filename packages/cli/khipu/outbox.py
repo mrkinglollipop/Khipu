@@ -324,7 +324,11 @@ def retry_dead() -> dict[str, Any]:
             except RegistryError as exc:
                 _log(f"retry-dead refused for {jp.name}: {exc}")
                 continue
-    return {"moved": moved, "quarantined": quarantined, "pending": len(jobs())}
+    from khipu.session_capture import retry_held
+
+    native_moved = retry_held()
+    return {"moved": moved + native_moved, "native_moved": native_moved,
+            "quarantined": quarantined, "pending": len(jobs())}
 
 
 def jobs() -> list[Path]:
@@ -370,14 +374,17 @@ def status() -> dict[str, Any]:
             offline += 1
     quarantined = len(list(quarantine_dir().glob("*.json"))) if quarantine_dir().is_dir() else 0
     # Existing doctor callers use ``dead`` to detect work that cannot replay.
-    dead = len(dead_jobs()) + quarantined
+    from khipu.session_capture import held_jobs
+
+    native_held = [p.name for p in held_jobs()]
+    dead = len(dead_jobs()) + quarantined + len(native_held)
     # Every waiting capture is waiting only because the hub could not be
     # reached: the promotion gate does not refuse a candidate on that.
     offline_only = (bool(js) and offline == len(js) and not unreadable
                     and not dead and not evidence_conflicts)
     result = {"dir": str(outbox_dir()), "pending": len(js), "oldest_age_s": oldest_age,
             "oldest_job": oldest_job, "unreadable": unreadable,
-            "dead": dead, "quarantined": quarantined,
+            "dead": dead, "quarantined": quarantined, "native_held": native_held,
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
             "evidence_conflicts": evidence_conflicts}
     if evidence_conflicts:
@@ -547,7 +554,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                         _log(f"retry state refused for {jp.name}: {registry_error}")
                     if unreachable:
                         out["stopped_early"] = True
-                        _log(f"PG unreachable ({name}); leaving remaining jobs queued")
+                        _log(f"PG unreachable for {jp.name} ({name}); leaving remaining jobs queued")
                         break
                     _log(f"replay failed for {jp.name}: {name}: {e}")
                     continue

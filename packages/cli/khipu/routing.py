@@ -3633,7 +3633,11 @@ def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
             continue
         if any(a["account"] == key for a in active):
             continue  # an account named twice keeps its first place
-        configured = in_settings.get(key, key in known_keys if known_keys else not key.partition("|")[2] and not none)
+        # Tracking includes owner-defined accounts without a usage reader.
+        # Only legacy login keys get the default-login fallback; an absent
+        # stable definition is no longer tracked even with no known accounts.
+        configured = key in known_keys or in_settings.get(
+            key, not known_keys and "|" in key and not key.partition("|")[2] and not none)
         active.append({"account": key, "label": label, "role": item.get("role"), "until": item.get("until"),
                        "in_settings": bool(configured)})
         level = entry_model.checked_level(item.get("level"))
@@ -7683,16 +7687,21 @@ def _priority_items(entries: list[dict], now: datetime, *, theirs: bool, view: d
         holds = _account_holds(view, item["account"])
         if holds:
             text += f" (contradicts active hold {holds[0]['id']}; end it: {_end_hold_route(holds[0])})"
+        said = []
+        entry = by_key.get(item["account"])
         if facts is not None:
-            said = []
-            entry = by_key.get(item["account"])
             if entry is not None:
                 said.append(_state_fact(entry, now, relative))
             fact = facts.get(item["account"])
             if fact is not None and (fact.get("readable") or entry is not None):
                 said.append(used_words(fact, now))
-            if said:
-                text += f" ({'; '.join(said)})"
+        if item.get("in_settings", True) and entry is not None and entry.get("configured") is False \
+                and (entry.get("note") or [None])[0] != "untracked":
+            setup = entry.get("usage_setup")
+            if setup and not any(setup in words for words in said):
+                said.append(setup)
+        if said:
+            text += f" ({'; '.join(said)})"
         out.append(text)
     return out
 
@@ -10676,7 +10685,8 @@ def _route_intent(cmd: str, args) -> dict | None:
             raise RouteError("--value must be a JSON definition") from None
         value = entry_model.checked_definition(args.definition, value)
         if value is None:
-            raise RouteError("invalid definition; provider facts require id, label and family")
+            required = ", ".join(entry_model.DEFINITION_REQUIRED_KEYS[args.definition])
+            raise RouteError(f"invalid {args.definition} definition; required keys: {required}")
         target = value.get("id") or value["runner"] + ":" + value["lane"]
         return owner_direction.intent("route.definition.set", target,
                                       facts={"definition": args.definition, "value": value})

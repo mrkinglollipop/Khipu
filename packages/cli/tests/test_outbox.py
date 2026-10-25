@@ -39,6 +39,21 @@ class OutboxUnitTest(unittest.TestCase):
     def tearDown(self):
         self.env.stop()
 
+    def test_pg_unreachable_log_identifies_exact_item_and_exception_class(self):
+        jp = outbox.enqueue({"ts": "2026-10-25T06:02:10Z", "summary": "fake evidence"})
+
+        class ConnectionTimeout(Exception):
+            pass
+
+        with mock.patch("khipu.capture.write_pg", side_effect=ConnectionTimeout("fake timeout")), \
+                mock.patch.object(outbox, "_log") as log:
+            result = outbox.drain()
+        self.assertTrue(result["stopped_early"])
+        message = next(c.args[0] for c in log.call_args_list if "PG unreachable" in c.args[0])
+        self.assertIn(jp.name, message)
+        self.assertIn("ConnectionTimeout", message)
+        self.assertTrue(jp.exists())
+
     def test_enqueue_is_idempotent_by_identity_and_status_counts(self):
         p = {"ts": "2026-08-17T18:00:00Z", "summary": "hello", "topics": []}
         a = outbox.enqueue(p, reason="test")

@@ -1992,6 +1992,12 @@ def _native_job_remainder(session_id: str | None,
                                 f"({type(exc).__name__}), so it was kept")
                         else:
                             removed += 1
+                            # Its retry state must not outlive it: a later job
+                            # at this path would inherit the hold or backoff.
+                            try:
+                                sc._retry_state_path(path).unlink(missing_ok=True)
+                            except OSError:
+                                pass
                 loc = {"place": entry["place"], "path": str(path), "state": state}
                 if why:
                     loc["why"] = why
