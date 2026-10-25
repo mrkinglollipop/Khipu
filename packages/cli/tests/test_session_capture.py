@@ -95,7 +95,7 @@ class PersistentCaptureRetryTest(unittest.TestCase):
                 self.assertEqual(self.extract.call_count, attempt)
                 self.now += expected
         self.assertEqual(kept["disposition"], "held")
-        self.now += 10 * 24 * 3600
+        self.now += sc.CAPTURE_HELD_COOLDOWN_S // 2
         sc.drain()
         self.assertEqual(self.extract.call_count, sc.CAPTURE_MAX_ATTEMPTS)
         status = outbox.status()
@@ -198,6 +198,50 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         self.assertEqual(len(list(sc.queue_dir().glob("*.claimed.*"))), 1)
         sc.drain()
         self.assertEqual(self.extract.call_count, 1)
+
+    def test_held_capture_is_retried_once_per_cooldown_without_the_owner(self):
+        first, _ = self.enqueue("1/1")
+        for _ in range(sc.CAPTURE_MAX_ATTEMPTS):
+            sc.drain()
+            kept = json.loads(first.read_text())
+            if "next_attempt_at" in kept:
+                self.now = sc._parse_ts(kept["next_attempt_at"])
+        self.assertEqual(kept["disposition"], "held")
+        calls = self.extract.call_count
+        sc.drain()
+        self.assertEqual(self.extract.call_count, calls)
+        self.now += sc.CAPTURE_HELD_COOLDOWN_S
+        sc.drain()
+        sc.drain()
+        self.assertEqual(self.extract.call_count, calls + 1)
+        self.assertEqual(json.loads(first.read_text())["disposition"], "held")
+        self.extract.side_effect = lambda *a, **kw: {"summary": "recovered", "topics": []}
+        self.now += sc.CAPTURE_HELD_COOLDOWN_S
+        self.assertEqual(sc.drain()["captured"], 1)
+
+    def test_extract_checkpoint_failure_releases_the_claim(self):
+        first, _ = self.enqueue("1/1")
+        self.extract.side_effect = lambda *a, **kw: {"summary": "s", "topics": []}
+        with mock.patch.object(sc, "_save_claimed_job", side_effect=OSError("disk full")):
+            self.assertEqual(sc.drain()["failed"], 1)
+        self.assertTrue(first.exists())
+        self.assertEqual(list(sc.queue_dir().glob("*.claimed.*")), [])
+
+    def test_empty_checkpoint_failure_releases_the_claim(self):
+        first, _ = self.enqueue("1/1", capture_note="")
+        self.extract.side_effect = lambda *a, **kw: None
+        with mock.patch.object(sc, "_archive_empty", side_effect=OSError("disk full")):
+            self.assertEqual(sc.drain()["failed"], 1)
+        self.assertTrue(first.exists())
+        self.assertEqual(list(sc.queue_dir().glob("*.claimed.*")), [])
+
+    def test_failure_record_keeps_only_the_extracted_payload(self):
+        first, _ = self.enqueue("1/1")
+        extracted = {"summary": "fresh", "topics": []}
+        self.extract.side_effect = lambda *a, **kw: dict(extracted)
+        self.capture.return_value = 1
+        sc.drain()
+        self.assertEqual(json.loads(first.read_text())["extracted_payload"], extracted)
 
     def test_owner_retry_does_not_report_a_failed_release_as_moved(self):
         from khipu import outbox

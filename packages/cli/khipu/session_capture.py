@@ -1946,6 +1946,9 @@ CLAIM_STALE_S = 900
 CAPTURE_MAX_ATTEMPTS = 5
 CAPTURE_RETRY_BASE_S = 5 * 60
 CAPTURE_RETRY_CAP_S = 60 * 60
+# A held capture is retried automatically once per this cool-down (about once
+# per nightly), with one attempt left, so a poison item costs one call per cycle.
+CAPTURE_HELD_COOLDOWN_S = 20 * 3600
 
 
 def _part_index(job: dict) -> int | None:
@@ -2169,25 +2172,30 @@ def _capture_failure(claimed: Path, job: dict, error: str, out: dict) -> None:
         _log(f"drain: retry checkpoint refused for {claimed.name}: {type(exc).__name__}")
 
 
-def held_jobs() -> list[Path]:
-    """Native dead letters stay in their queue, keeping later parts blocked."""
+def held_jobs(min_age_s: float | None = None) -> list[Path]:
+    """Native dead letters stay in their queue, keeping later parts blocked.
+    ``min_age_s`` keeps only those whose last attempt is at least that old."""
     held = []
     for path in queued_jobs():
         try:
             job = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(job, dict) and job.get("disposition") == "held":
-                held.append(path)
+                age = _age(job.get("last_attempt_at"))
+                if min_age_s is None or age is None or age >= min_age_s:
+                    held.append(path)
         except (OSError, ValueError):
             continue
     return held
 
 
-def retry_held() -> int:
-    """Owner recovery used by `outbox retry-dead`; never replay a forgotten job."""
+def retry_held(*, auto: bool = False) -> int:
+    """Owner recovery used by `outbox retry-dead`; never replay a forgotten job.
+    ``auto`` is the slow drain-driven retry: only held jobs past the cool-down,
+    each left one attempt so another failure re-holds it."""
     from khipu import memory_lock
 
     moved = 0
-    for path in held_jobs():
+    for path in held_jobs(CAPTURE_HELD_COOLDOWN_S if auto else None):
         with memory_lock.shared():
             claimed = _claim(path, retry_held=True)
             if claimed is None:
@@ -2196,7 +2204,7 @@ def retry_held() -> int:
                 job = json.loads(claimed.read_text(encoding="utf-8"))
                 job.pop("disposition", None)
                 job.pop("next_attempt_at", None)
-                job["attempts"] = 0
+                job["attempts"] = CAPTURE_MAX_ATTEMPTS - 1 if auto else 0
                 _save_claimed_job(claimed, job)
                 if _release(claimed):
                     moved += 1
@@ -3021,6 +3029,11 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
     deadline = time.monotonic() + max(0, time_budget_s) if time_budget_s is not None else None
     sweep_out = sweep_idle(dry_run=dry_run) if sweep else None
     reclaimed = _reclaim_stale()
+    if not dry_run:
+        try:
+            retry_held(auto=True)
+        except Exception as exc:  # noqa: BLE001 — a thaw problem never blocks the drain
+            _log(f"drain: held-capture retry skipped ({type(exc).__name__}: {exc})")
     jobs = queued_jobs()
     out = {"jobs": len(jobs), "captured": 0, "empty": 0, "failed": 0, "skipped_claimed": 0}
     if sweep_out is not None:
@@ -3160,13 +3173,16 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                     continue
                 except OSError as e:
                     out["failed"] += 1
+                    _release(jp)
                     _record_drain(harness, captured=False, error=f"empty checkpoint: {e}")
                     continue
                 _record_drain(harness, captured=False, empty=True)
             out["empty"] += 1
             continue
         if not isinstance(cached, dict):
-            job["extracted_payload"] = payload
+            # A copy: the delivery fields added below must not ride into a
+            # later failure record.
+            job["extracted_payload"] = dict(payload)
             try:
                 _save_claimed_job(jp, job)
             except JobForgotten:
@@ -3174,6 +3190,7 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
                 continue
             except OSError as e:
                 out["failed"] += 1
+                _release(jp)
                 _record_drain(harness, captured=False, error=f"extract checkpoint: {e}")
                 continue
         payload["session_id"] = f"{harness}:{job.get('session_id')}"
