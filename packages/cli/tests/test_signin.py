@@ -361,6 +361,81 @@ def test_status_waits_while_the_login_runs(box):
     assert res["state"] == signin.WAITING and _attempt_file().exists()
 
 
+@pytest.mark.parametrize("missing", [None, {}, {"stat": "S", "lstart": LSTART}])
+def test_status_reobserves_one_failed_process_observation_without_ending_login(box, missing):
+    out = signin.start("claude", _folder(), **box.kw())
+    before = _attempt_file().read_bytes()
+    observed, checked = [], []
+
+    def ps(pid):
+        observed.append(pid)
+        return missing if len(observed) == 1 else box.ps(pid)
+
+    res = signin.status(out["attempt"]["id"], ps=ps, killpg=box.killpg,
+                        check=lambda *a: checked.append(a) or signin.NOT_SIGNED_IN)
+    assert res["state"] == signin.WAITING and res["ok"] is True
+    assert observed == [1_000_001, 1_000_001]
+    assert checked == [] and box.killed == []
+    assert _attempt_file().read_bytes() == before
+    assert (box.home / ".claude-client").is_dir()
+
+
+@pytest.mark.parametrize("change", [{"stat": "Z"},
+                                    {"stat": "Z", "lstart": None, "command": None},
+                                    {"lstart": "Fri Oct 16 09:00:00 2026"},
+                                    {"lstart": "Fri Oct 16 09:00:00 2026", "command": None},
+                                    {"command": "/usr/bin/python3 something else"},
+                                    {"command": "/fake/bin/claude auth status --json"}])
+def test_status_never_retries_an_observed_zombie_or_reused_pid(box, monkeypatch, change):
+    out = signin.start("claude", _folder(), **box.kw())
+    box.table[1_000_001].update(change)
+    checked = []
+    monkeypatch.setattr(time, "sleep", lambda *a: pytest.fail("observed death or reuse is conclusive"))
+    res = signin.status(out["attempt"]["id"], ps=box.ps, killpg=box.killpg,
+                        check=lambda *a: checked.append(a) or signin.NOT_SIGNED_IN)
+    assert res["state"] == signin.NOT_SIGNED_IN
+    assert len(checked) == 1 and box.killed == []
+    assert not _attempt_file().exists()
+
+
+@pytest.mark.parametrize("change", [{"stat": "Z"}, {"lstart": "Fri Oct 16 09:00:00 2026"}])
+def test_status_rejects_death_or_pid_reuse_after_a_missing_observation(box, monkeypatch, change):
+    out = signin.start("claude", _folder(), **box.kw())
+    box.table[1_000_001].update(change)
+    observed, checked, slept = [], [], []
+    monkeypatch.setattr(time, "sleep", lambda delay: slept.append(delay))
+
+    def ps(pid):
+        observed.append(pid)
+        return None if len(observed) == 1 else box.ps(pid)
+
+    res = signin.status(out["attempt"]["id"], ps=ps, killpg=box.killpg,
+                        check=lambda *a: checked.append(a) or signin.NOT_SIGNED_IN)
+    assert res["state"] == signin.NOT_SIGNED_IN
+    assert observed == [1_000_001] * 3 and len(slept) == 1
+    assert len(checked) == 1 and box.killed == []
+    assert not _attempt_file().exists()
+
+
+def test_status_bounds_persistent_missing_observations_and_finishes_a_dead_login(box, monkeypatch):
+    out = signin.start("claude", _folder(), **box.kw())
+    box.end(1_000_001)
+    clock, observed, checked = [0.0], [], []
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+
+    def ps(pid):
+        observed.append(pid)
+        return box.ps(pid)
+
+    res = signin.status(out["attempt"]["id"], ps=ps, killpg=box.killpg,
+                        check=lambda *a: checked.append(a) or signin.NOT_SIGNED_IN)
+    assert res["state"] == signin.NOT_SIGNED_IN
+    assert 0 < clock[0] <= 0.5 and 2 < len(observed) <= 8
+    assert len(checked) == 1 and box.killed == []
+    assert not _attempt_file().exists()
+
+
 # ---- the code line ------------------------------------------------------------------------------
 
 
@@ -721,7 +796,12 @@ def test_a_real_fake_login_is_waited_for_and_cancel_leaves_nothing_running(box, 
     out = signin.start("claude", _folder())
     try:
         assert out["ok"], out
-        assert any(str(script) in line for line in _listing())
+        end = time.monotonic() + 3
+        listed = any(str(script) in line for line in _listing())
+        while not listed and time.monotonic() < end:
+            time.sleep(0.05)
+            listed = any(str(script) in line for line in _listing())
+        assert listed
         assert signin.status(out["attempt"]["id"])["state"] == signin.WAITING
         assert signin.running()
         res = signin.cancel(out["attempt"]["id"])

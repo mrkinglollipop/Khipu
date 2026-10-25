@@ -71,6 +71,7 @@ CODE_WAIT_S = 20.0
 LINE_MAX = 1024
 READ_MAX = 64 * 1024
 KILL_GRACE_S = 2.0
+PROCESS_OBSERVE_S = 0.2
 
 # Where a Grok Build or Muse code line may send the owner. Not yet confirmed
 # against a real run (the guardrail run confirms both the hosts and the code's
@@ -438,7 +439,25 @@ def _matches(rec: dict, info: dict | None) -> bool:
 
 
 def _alive(rec: dict, ps) -> bool:
-    return _matches(rec, ps(rec.get("pid")))
+    """Retry an unusable observation briefly; observed death or reuse wins."""
+    end = None
+    while True:
+        info = ps(rec.get("pid"))
+        if info:
+            if str(info.get("stat") or "").startswith("Z"):
+                return False
+            # Even a partial observation can establish a different identity.
+            if any(isinstance(info.get(key), str) and info[key] and info[key] != rec.get(key)
+                   for key in ("lstart", "command")):
+                return False
+            if all(isinstance(info.get(key), str) and info[key] for key in ("stat", "lstart", "command")):
+                return _matches(rec, info)
+        if end is None:
+            end = time.monotonic() + PROCESS_OBSERVE_S
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
 
 
 def _getpgid(pid: int) -> int:
