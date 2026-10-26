@@ -676,13 +676,24 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     # The scan report refreshes before the hub write, not after it, so a
     # reconcile with no hub reachable still refreshes it.
     _refresh_scan_report()
+    from khipu import offline
     from khipu.db import connect
     from khipu.mirror import _upsert_topic
 
+    # Bound waits on a held topics row: a stuck lock must not stall the night.
+    # hub_statement_timeout 0 means "unlimited" for interactive reads; reconcile
+    # still needs a finite bound (same default as the setting when unset).
+    timeout_s = float(offline.setting("hub_statement_timeout") or 0)
+    if timeout_s <= 0:
+        timeout_s = 30.0
     new_files_state = dict(files_state)
     written_plan: list[dict[str, Any]] = []
-    with connect() as conn:
+    with connect(statement_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "SELECT set_config('lock_timeout', %s, false)",
+                (f"{int(timeout_s * 1000)}ms",),
+            )
             for item in plan:
                 try:
                     with getattr(conn, "transaction", nullcontext)():
