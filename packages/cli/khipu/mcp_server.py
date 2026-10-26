@@ -539,6 +539,19 @@ TOOLS: list[dict] = [
                         "slice off of. Omit only when there truly is no repo context."
                     ),
                 },
+                "open_loops": {
+                    "type": "array",
+                    "description": "Follow-ups still open: text, or {text, kind}. Owner is "
+                                   "derived from the text; a declared owner is ignored.",
+                },
+                "closed_loops": {
+                    "type": "array",
+                    "description": "Items finished this session: text, or {text}. Matched by "
+                                   "text; a commitment_id is ignored.",
+                },
+                "deliverables": {"type": "array"},
+                "decision_details": {"type": "array"},
+                "verbatim": {"type": "object"},
             },
             "required": ["summary"],
         },
@@ -1746,12 +1759,21 @@ def _tool_capture(args: dict) -> dict:
     from khipu.capture import capture, load_payload
     from khipu.commitments import _payload_event, SESSION_END_EVENTS
 
-    # A session end is the hook's to declare: close_session_plan then closes
-    # that session's open items, which a tool caller must not trigger for a
-    # session_id it names. Structured facts (open_loops, ...) stay accepted.
-    args = {k: v for k, v in args.items() if k != "event"}
-    if _payload_event(args) in SESSION_END_EVENTS:
+    # Only declared keys pass. A session end is the hook's to declare
+    # (close_session_plan would close the open items of a session_id the
+    # caller names), and lineage, owners, decision authors and commitment ids
+    # are the hook's and the owner's to set, never a tool caller's.
+    schema = next(t["inputSchema"] for t in TOOLS if t["name"] == "khipu_capture")
+    args = {k: v for k, v in args.items() if k in schema["properties"]}
+    scope = str(args.get("scope") or "").lower()
+    if _payload_event(args) in SESSION_END_EVENTS or "sessionend" in scope:
         args["scope"] = "general"
+    for key, dropped in (("open_loops", {"owner", "owner_label"}),
+                         ("closed_loops", {"commitment_id"}),
+                         ("decision_details", {"by"})):
+        if isinstance(args.get(key), list):
+            args[key] = [{k: v for k, v in item.items() if k not in dropped}
+                         if isinstance(item, dict) else item for item in args[key]]
     # load_payload validates + mints ts; capture() routes by mode (hub → PG only).
     payload = load_payload(json.dumps({k: v for k, v in args.items() if v is not None}))
     # PG-row-only, exactly as khipu.probe does it: the legacy file leg prints

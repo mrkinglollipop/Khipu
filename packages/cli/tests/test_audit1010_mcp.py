@@ -90,7 +90,10 @@ class IngressTest(unittest.TestCase):
             out = srv.handle_message(request("khipu_capture", args))
         self.assertFalse(out["result"]["isError"], out)
         payload = capture.call_args.args[0]
-        for key, value in args.items():
+        # A declared owner and a commitment id are ignored from tool callers.
+        expected = {**args, "open_loops": ["Verify the next release", {"text": "Review the report"}],
+                    "closed_loops": [{"text": "Completed the audit"}]}
+        for key, value in expected.items():
             self.assertEqual(payload[key], value)
         schema = next(t["inputSchema"] for t in srv.TOOLS if t["name"] == "khipu_capture")
         self.assertTrue(schema.get("additionalProperties", True))

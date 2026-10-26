@@ -206,6 +206,7 @@ def resolve_voyage_key(*, key_file: Path | None = None) -> str:
     raise RuntimeError(
         "No Voyage key. Set it in the app (Settings -> Secrets), pipe it to "
         "`khipu secrets --set voyage_api_key`, or export VOYAGE_API_KEY."
+        + key_file_refusal(path)
     )
 
 
@@ -224,6 +225,7 @@ def resolve_gemini_key(*, key_file: Path | None = None) -> str:
     raise RuntimeError(
         "No Gemini key. Set it in the app (Settings → Secrets), pipe it to "
         "`khipu secrets --set gemini_api_key`, or export GEMINI_API_KEY."
+        + key_file_refusal(path)
     )
 
 
@@ -294,7 +296,7 @@ def _resolve_provider_key(provider: str, *, key_file: Path | None = None) -> str
     if key:
         return key
     raise RuntimeError(f"No {provider.title()} key. Pipe it to `khipu secrets --set "
-                       f"{provider}_api_key`, or export {env_name}.")
+                       f"{provider}_api_key`, or export {env_name}." + key_file_refusal(path))
 
 
 def resolve_anthropic_key(*, key_file: Path | None = None) -> str:
@@ -320,32 +322,54 @@ def read_owner_only_key_file(path: Path) -> str | None:
     symlink and must be a regular file this user owns that no group or other
     user can read or write, so a planted link or a shared file can never
     become an Authorization header."""
+    return _read_key_file(path)[0]
+
+
+def key_file_refusal(path: Path | None) -> str:
+    """A sentence naming a configured key file and why it was not used, or ""
+    when there is no file or it would be read. Never includes the file's text."""
+    if path is None:
+        return ""
+    key, reason = _read_key_file(path)
+    return "" if key else f" The key file {path} was not used: {reason}."
+
+
+def _read_key_file(path: Path) -> tuple[str | None, str]:
+    import errno
     import stat
     from khipu.paths import open_trusted_directory
 
     try:
         parent_fd = open_trusted_directory(path.parent)
-        try:
-            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
-        finally:
-            os.close(parent_fd)
+    except FileNotFoundError:
+        return None, "its folder does not exist"
     except OSError:
-        return None
+        return None, ("a folder on its path is a symlink or writable by a group or other "
+                      "users (chmod go-w that folder, or move the file)")
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None, "it does not exist"
+    except OSError as exc:
+        return None, ("it is a symlink" if exc.errno == errno.ELOOP
+                      else f"it cannot be opened ({exc.strerror})")
+    finally:
+        os.close(parent_fd)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            return None
+            return None, "it must be a regular file you own with mode 0600"
         raw = os.read(fd, 4097)
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"it cannot be read ({exc.strerror})"
     finally:
         os.close(fd)
     if len(raw) > 4096:
-        return None
+        return None, "it is larger than 4096 bytes"
     try:
-        return raw.decode("utf-8").strip() or None
+        return (raw.decode("utf-8").strip() or None), "it is empty"
     except UnicodeError:
-        return None
+        return None, "it is not UTF-8 text"
 
 
 def resolve_deepseek_key(*, key_file: Path | None = None) -> str:
@@ -365,7 +389,7 @@ def resolve_deepseek_key(*, key_file: Path | None = None) -> str:
     if key:
         return key
     raise RuntimeError("No DeepSeek key. Pipe it to `khipu secrets --set deepseek_api_key`, "
-                       "or export DEEPSEEK_API_KEY.")
+                       "or export DEEPSEEK_API_KEY." + key_file_refusal(path))
 
 
 def dsn_file_health(path: Path | None = None) -> dict:

@@ -96,3 +96,24 @@ def test_owner_only_key_file_is_still_read(monkeypatch, tmp_path):
     path.write_text("owner-only-key\n")
     os.chmod(path, 0o600)
     assert keychain.resolve_gemini_key(key_file=path) == "owner-only-key"
+
+
+@pytest.mark.parametrize("provider", ["gemini", "voyage", "anthropic", "deepseek"])
+def test_a_refused_key_file_is_named_with_its_reason(monkeypatch, tmp_path, provider):
+    monkeypatch.setenv("KHIPU_KEYCHAIN", "0")
+    for var in ("GEMINI_API_KEY", "VOYAGE_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o775)
+    path = shared / "key.txt"
+    path.write_text("owner-only-key\n")
+    os.chmod(path, 0o600)
+    fn = {"gemini": keychain.resolve_gemini_key, "voyage": keychain.resolve_voyage_key,
+          "anthropic": keychain.resolve_anthropic_key,
+          "deepseek": keychain.resolve_deepseek_key}[provider]
+    with pytest.raises(RuntimeError) as err:
+        fn(key_file=path)
+    message = str(err.value)
+    assert str(path) in message and "group" in message, message
+    assert "owner-only-key" not in message
