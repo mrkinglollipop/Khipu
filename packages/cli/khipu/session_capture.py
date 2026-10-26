@@ -2482,6 +2482,9 @@ def _heartbeat_unlocked(harness: str, out: dict) -> None:
     liveness needs. `verify` reads this instead of assuming dispatch — the
     assumption that hid a silent failure once."""
     beat = _read_beat(harness)
+    # Read-time marker for corrupt JSON — never persist it, or a healthy write
+    # would keep liveness red forever.
+    beat.pop("_heartbeat_unreadable", None)
     # Per-run fields are replaced wholesale: a "no transcript" run must not
     # inherit the previous run's new_turns/queued and look like it captured.
     for k in ("event", "session_id", "due", "reason", "new_turns", "new_chars", "queued", "error",
@@ -2541,6 +2544,7 @@ def last_dispatch(harness: str = "aegis") -> dict | None:
 
 def _record_drain_unlocked(harness: str, *, captured: bool, error: str | None = None, empty: bool = False) -> None:
     beat = _read_beat(harness)
+    beat.pop("_heartbeat_unreadable", None)
     now = _mint_ts()
     if captured:
         beat["last_captured_at"] = now

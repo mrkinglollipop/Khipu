@@ -68,3 +68,39 @@ class CorruptHeartbeatTest(unittest.TestCase):
             path.write_text("{")
             out = sc.liveness("cursor")
             self.assertFalse(out.get("ok") and out.get("seen") is False and not out.get("reasons"), out)
+
+    def test_healthy_heartbeat_clears_unreadable_marker(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {"KHIPU_CAPTURE_HOME": td}):
+            path = sc.dispatch_path("cursor")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{")
+            self.assertTrue(
+                any("heartbeat unreadable" in r for r in sc.liveness("cursor").get("reasons") or []),
+                sc.liveness("cursor"),
+            )
+            sc._heartbeat(
+                "cursor",
+                {"at": sc._mint_ts(), "event": "stop", "session_id": "s1", "due": False, "new_turns": 0},
+            )
+            beat = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("_heartbeat_unreadable", beat, beat)
+            out = sc.liveness("cursor")
+            self.assertTrue(out.get("ok"), out)
+            self.assertFalse(any("heartbeat unreadable" in r for r in out.get("reasons") or []), out)
+
+
+class AegisUserMemoryUninstallTest(_Home):
+    def test_uninstall_leaves_user_authored_identical_memory_block(self):
+        import tomllib
+
+        token = integ.gateway_token_file()
+        token.parent.mkdir(parents=True, exist_ok=True)
+        token.write_text("not-a-real-token\n")
+        (self.home / ".grok").mkdir()
+        (self.home / ".grok" / "config.toml").write_text(
+            '[other]\nkey = 1\n\n[memory]\nbackend = "khipu"\nenabled = true\n'
+        )
+        integ.install("aegis")
+        integ.uninstall("aegis")
+        after = tomllib.loads((self.home / ".grok" / "config.toml").read_text())
+        self.assertEqual((after.get("memory") or {}).get("backend"), "khipu", after)
