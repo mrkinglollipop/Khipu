@@ -1239,6 +1239,8 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 if payload.get("project"):
                     from khipu.identity import _resolve_project_alias
 
+                    # Clients must not supply typed_project; only this path sets it.
+                    payload.pop("typed_project", None)
                     # Alias enrichment is optional. Keep its failure inside a
                     # caller-owned savepoint so even a lookup that raises before
                     # recovering its own savepoint cannot abort the capture.

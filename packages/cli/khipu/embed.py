@@ -2556,7 +2556,10 @@ class _SearchFilters:
             out["kf_project"] = f"%{_escape_like(self.project)}%"
             aliases = [p for p in self.projects if p != self.project]
             if aliases:
-                out["kf_project_aliases"] = aliases
+                # Lowercased to match lower(proj) in episode_sql (and the
+                # Python post-filter); stored names are usually exact but
+                # case must not diverge from the fallback path.
+                out["kf_project_aliases"] = [p.lower() for p in aliases]
         if self.session_id:
             out["kf_session"] = f"{_escape_like(self.session_id)}%"
         if self.harness:
@@ -2580,7 +2583,7 @@ class _SearchFilters:
             typed = proj + " ILIKE %(kf_project)s ESCAPE '" + chr(92) + "'"
             aliases = [p for p in self.projects if p != self.project]
             if aliases:
-                parts.append(f"({typed} OR {proj} = ANY(%(kf_project_aliases)s))")
+                parts.append(f"({typed} OR lower({proj}) = ANY(%(kf_project_aliases)s))")
             else:
                 parts.append(typed)
         if self.session_id:

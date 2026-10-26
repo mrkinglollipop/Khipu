@@ -50,6 +50,26 @@ def test_removing_an_alias_leaves_captures_under_the_name_they_were_made_with(cu
     assert [r[0] for r in cur.fetchall()] == [ALPHA], "capture rewrote the project to the alias target; undo cannot restore it"
 
 
+def test_undo_after_a_second_rename_restores_the_typed_capture(cur):
+    """P2: after o/a→o/b then o/b→o/c, episode stays under o/b; undo of o/a
+    must match the whole group, not only the newest canonical."""
+    from khipu import capture
+
+    a, b, c = "owner/a", "owner/b", "owner/c"
+    identity.record_rename(cur, a, b, source="checkout", evidence=None)
+    cur.connection.commit()
+    capture.write_pg({"ts": "2026-10-19T12:02:00Z", "summary": "unique zebrafish note two",
+                      "project": a, "harness": "claude_code", "session_id": "claude_code:s2",
+                      "transcript_range": "0:1"})
+    identity.record_rename(cur, b, c, source="checkout", evidence=None)
+    cur.connection.commit()
+    out = identity.remove_project_alias(cur, a)
+    cur.connection.commit()
+    assert out.get("ok") and out.get("episodes_restored") == 1, out
+    cur.execute("SELECT project, raw->>'typed_project' FROM episodes")
+    assert cur.fetchall() == [(a, a)]
+
+
 def test_close_rules_see_open_items_stored_under_an_alias_of_the_captured_project(cur):
     from khipu import close_rules
 
