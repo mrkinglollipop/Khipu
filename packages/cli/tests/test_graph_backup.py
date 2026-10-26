@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -188,6 +189,7 @@ class DestRemoteTest(unittest.TestCase):
             set_graph_backup_remote("just-a-bucket")
 
 
+@mock.patch.dict(os.environ, {"KHIPU_GRAPH_BACKUP_BWLIMIT": ""})
 class DestRemoteSafetyTest(unittest.TestCase):
     """A destination must be a named rclone remote: never a local path, never
     flag-shaped, from whichever source it resolved."""
@@ -289,7 +291,7 @@ class DestRemoteSafetyTest(unittest.TestCase):
             by_verb.setdefault(argv[1], []).append(argv)
         self.assertEqual(
             by_verb["copyto"][0],
-            ["rclone", "copyto", "--", str(snap), f"r2:khipu-backups/khipu-graph/{snap.name}"],
+            ["rclone", "copyto", "--bwlimit", "2M", "--", str(snap), f"r2:khipu-backups/khipu-graph/{snap.name}"],
         )
         self.assertEqual(by_verb["lsf"][0], ["rclone", "lsf", "--", "r2:khipu-backups/khipu-graph/"])
         self.assertTrue(by_verb["deletefile"])
@@ -297,6 +299,7 @@ class DestRemoteSafetyTest(unittest.TestCase):
             self.assertEqual(argv[:3], ["rclone", "deletefile", "--"])
 
 
+@mock.patch.dict(os.environ, {"KHIPU_GRAPH_BACKUP_BWLIMIT": ""})
 class RunOffsiteTest(unittest.TestCase):
     @staticmethod
     def _snapshot(path):
@@ -348,9 +351,9 @@ class RunOffsiteTest(unittest.TestCase):
             copy_calls = [c for c in calls if len(c) > 1 and c[1] == "copyto"]
             self.assertEqual(len(copy_calls), 1)
             argv = copy_calls[0]
-            self.assertEqual(argv[2], "--")
-            self.assertEqual(argv[3], str(snap))
-            self.assertTrue(argv[4].startswith("r2:khipu-backups/khipu-graph/"))
+            self.assertEqual(argv[2:5], ["--bwlimit", "2M", "--"])
+            self.assertEqual(argv[5], str(snap))
+            self.assertTrue(argv[6].startswith("r2:khipu-backups/khipu-graph/"))
             joined = " ".join(argv)
             self.assertNotIn(str(live.resolve()), joined)
 
@@ -430,6 +433,7 @@ class ScratchDrillTest(unittest.TestCase):
             )
 
 
+@mock.patch.dict(os.environ, {"KHIPU_GRAPH_BACKUP_BWLIMIT": ""})
 class OffsiteTimeoutTest(unittest.TestCase):
     def _timeout_for(self, size_bytes: int) -> int:
         with tempfile.TemporaryDirectory() as td:
@@ -476,6 +480,117 @@ class OffsiteTimeoutTest(unittest.TestCase):
         ):
             graph_backup.run_offsite()
         self.assertEqual(3600 + 2 * 600, timeouts["copyto"])
+
+
+class IntegrityTimeoutScalingTest(unittest.TestCase):
+    def test_default_timeout_scales_and_is_bounded(self):
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td, "graph-fixture.sqlite")
+            for size, expected in ((1, 60), (1024**3, 60),
+                                   (3 * 1024**3 + 1, 181), (20 * 1024**3, 900)):
+                with self.subTest(size=size):
+                    with snap.open("wb") as stream:
+                        stream.truncate(size)
+                    with mock.patch.object(graph_backup.subprocess, "run",
+                                           return_value=mock.Mock(returncode=0, stdout="ok")) as run:
+                        self.assertEqual(graph_backup._integrity_check(snap), "ok")
+                    self.assertEqual(run.call_args.kwargs["timeout"], expected)
+
+    def test_explicit_timeout_remains_exact_and_timeout_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td, "graph-fixture.sqlite")
+            with snap.open("wb") as stream:
+                stream.truncate(4 * 1024**3)
+            with mock.patch.object(graph_backup.subprocess, "run",
+                                   side_effect=subprocess.TimeoutExpired("fixture", 7)) as run:
+                self.assertEqual(graph_backup._integrity_check(snap, timeout=7), "timeout after 7s")
+            self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
+    def test_unreadable_size_uses_floor_and_preserves_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td, "missing.sqlite")
+            with mock.patch.object(graph_backup.subprocess, "run",
+                                   side_effect=OSError("fixture launch failed")) as run:
+                self.assertEqual(graph_backup._integrity_check(snap),
+                                 "snapshot integrity check failed to start")
+            self.assertEqual(run.call_args.kwargs["timeout"], 60)
+
+    def test_invalid_size_uses_floor_and_preserves_failure(self):
+        for size in (mock.Mock(), mock.MagicMock(), None, "1024", -1):
+            with self.subTest(size=size):
+                snap = mock.Mock()
+                snap.stat.return_value.st_size = size
+                with mock.patch.object(graph_backup.subprocess, "run",
+                                       return_value=mock.Mock(returncode=1, stdout="", stderr="")) as run:
+                    self.assertEqual(graph_backup._integrity_check(snap),
+                                     "snapshot integrity check failed")
+                self.assertEqual(run.call_args.kwargs["timeout"], 60)
+
+    def test_scaled_timeout_is_reported_without_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td, "graph-fixture.sqlite")
+            with snap.open("wb") as stream:
+                stream.truncate(4 * 1024**3)
+            with mock.patch.object(graph_backup.subprocess, "run",
+                                   side_effect=subprocess.TimeoutExpired("fixture", 240)):
+                self.assertEqual(graph_backup._integrity_check(snap), "timeout after 240s")
+
+
+class OffsiteBandwidthTest(unittest.TestCase):
+    def _run(self, bwlimit, *, size=3 * 1024**3, failure=None, integrity="ok"):
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td, "graph-fixture.sqlite")
+            with snap.open("wb") as stream:
+                stream.truncate(size)
+            env = {"KHIPU_GRAPH_BACKUP_BWLIMIT": bwlimit}
+            with (
+                mock.patch.dict(os.environ, env),
+                mock.patch.object(graph_backup, "latest_snapshot", return_value=snap),
+                mock.patch.object(graph_backup, "_integrity_check", return_value=integrity),
+                mock.patch.object(graph_backup, "_required_graph_tables", return_value=None),
+                mock.patch.object(graph_backup, "_live_graph", return_value=Path(td, "live.sqlite")),
+                mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"),
+                mock.patch.object(graph_backup, "has_r2_remote", return_value=True),
+                mock.patch.object(graph_backup, "_prune_remote_snapshots", return_value=[]),
+                mock.patch.object(graph_backup.subprocess, "run", side_effect=failure,
+                                  return_value=mock.Mock(returncode=0, stdout="", stderr="")) as run,
+                mock.patch("khipu.ops_events.record", return_value={"ok": True}) as record,
+            ):
+                out = graph_backup.run_offsite(dest_remote="r2:fixture/graph")
+            return out, run, record
+
+    def test_default_and_configured_caps_precede_operand_separator(self):
+        for configured, expected in (("", "2M"), ("1M", "1M"), ("512K", "512K")):
+            with self.subTest(cap=configured):
+                out, run, _ = self._run(configured)
+                self.assertTrue(out["ok"], out)
+                argv = run.call_args.args[0]
+                self.assertEqual(argv[2:5], ["--bwlimit", expected, "--"])
+                self.assertGreaterEqual(run.call_args.kwargs["timeout"],
+                                        7740 if configured == "512K" else 4800)
+
+    def test_invalid_and_too_slow_caps_fail_before_transfer(self):
+        for cap in ("0", "-1M", "unlimited", "1M:2M", "256K"):
+            with self.subTest(cap=cap):
+                out, run, record = self._run(cap)
+                self.assertFalse(out["ok"], out)
+                self.assertIn("bandwidth", out["reason"])
+                run.assert_not_called()
+                self.assertEqual(record.call_args.args[1], "fail")
+
+    def test_copy_timeout_names_elapsed_budget_and_preserves_failure_receipt(self):
+        out, _, record = self._run("2M", failure=subprocess.TimeoutExpired("fixture", 4800))
+        self.assertFalse(out["ok"])
+        self.assertIn("timeout", out["reason"])
+        self.assertEqual(out["timeout_seconds"], 4800)
+        self.assertEqual(record.call_args.args[1], "fail")
+
+    def test_integrity_timeout_never_uploads_or_records_success(self):
+        out, run, record = self._run("2M", integrity="timeout after 180s")
+        self.assertFalse(out["ok"])
+        self.assertIn("integrity", out["reason"])
+        run.assert_not_called()
+        self.assertEqual(record.call_args.args[1], "fail")
 
 
 if __name__ == "__main__":

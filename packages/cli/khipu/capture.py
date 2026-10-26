@@ -1182,7 +1182,37 @@ def run_fact_steps(cur, payload: dict[str, Any], episode_id: int) -> None:
         _log(f"deliverables step failed ({type(exc).__name__}: {exc})")
 
 
-def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
+def _legacy_comma_projection(original: Any, incoming: dict[str, Any]) -> bool:
+    """Prove only the diagnosed legacy decision join/split and identity loss.
+
+    The file format lost source identity. ``write_pg`` also injects empty
+    tags and a null scope into its local copy before storing raw, while the
+    legacy writer receives the pre-copy input. Only those exact absent
+    defaults are ignored. Preferences, unknown keys, order and every supplied
+    value must match. Server merge receipts are not alternate proof.
+    """
+    from khipu.capture_identity import SOURCE_FIELDS, payload_sha256
+
+    if not isinstance(original, dict):
+        return False
+    decisions = original.get("decisions")
+    if not isinstance(decisions, list) or not all(isinstance(d, str) for d in decisions):
+        return False
+    projected = dict(original)
+    for key in SOURCE_FIELDS:
+        if key not in incoming:
+            projected.pop(key, None)
+    if "tags" not in incoming and projected.get("tags") == []:
+        projected.pop("tags")
+    if "scope" not in incoming and projected.get("scope") is None:
+        projected.pop("scope", None)
+    projected["decisions"] = [s.strip() for s in ", ".join(decisions).split(",") if s.strip()]
+    # Canonical JSON equality also distinguishes bool/int and int/float;
+    # Python's container equality would accept those changed field values.
+    return payload_sha256(projected) == payload_sha256(incoming)
+
+
+def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
     Returns ``episode_id`` (the row this capture landed on: inserted, merged
@@ -1241,6 +1271,36 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                 cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
                 if hub_source_forgotten(cur, payload, source):
                     return _forgotten_result(cur, payload, source)
+                if legacy_projection:
+                    # Only explicitly identified, unknown-owner file recovery
+                    # opts in. Prove against the untouched input before dedup,
+                    # enrichment, claims or fact steps can mutate the hub.
+                    cur.execute("SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s "
+                                "ORDER BY deleted_at IS NOT NULL, id DESC LIMIT 1",
+                                (payload["ts"], _md5_hex(payload["summary"])))
+                    existing = cur.fetchone()
+                    if existing:
+                        existing_id = int(existing[0])
+                        cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (existing_id,))
+                        row = cur.fetchone()
+                        target = row[0] if row else {}
+                        original = target.get("raw") if target else None
+                        if target and not target.get("deleted_at"):
+                            if _legacy_comma_projection(original, payload):
+                                return {
+                                    "episode_inserted": False, "topics_written": 0,
+                                    "episode_id": existing_id, "source_key": source["source_key"],
+                                    "dedup": {"action": "skip", "matched_via": "legacy_comma_projection"},
+                                    "legacy_projection_duplicate": {
+                                        "payload": original, "episode_id": existing_id,
+                                        "original_payload_sha256": payload_sha256(original),
+                                        "queued_payload_sha256": source["payload_sha256"],
+                                    },
+                                }
+                            if not isinstance(original, dict) or payload_sha256(original) != source["payload_sha256"]:
+                                raise CaptureEvidenceConflict(
+                                    f"legacy episode key conflicts with distinct evidence on episode {existing_id}; "
+                                    "incoming capture retained for owner resolution")
                 _inherit_project(cur, payload)
                 _observe_checkout(cur, payload)
                 if payload.get("project"):

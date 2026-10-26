@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 
 
-def record(kind: str, status: str, detail: dict | None = None) -> dict:
+def record(
+    kind: str, status: str, detail: dict | None = None, *,
+    statement_timeout_s: float | None = None, connect_timeout: int | None = None,
+) -> dict:
     kind = (kind or "").strip()
     status = (status or "").strip()
     if not kind or status not in {"ok", "fail", "mismatch"}:
@@ -13,7 +16,12 @@ def record(kind: str, status: str, detail: dict | None = None) -> dict:
     payload = detail if isinstance(detail, dict) else {}
     from khipu.db import connect
 
-    with connect() as conn, conn.cursor() as cur:
+    deadlines = {}
+    if statement_timeout_s is not None:
+        deadlines["statement_timeout_s"] = statement_timeout_s
+    if connect_timeout is not None:
+        deadlines["connect_timeout"] = connect_timeout
+    with connect(**deadlines) as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO ops_events (kind, status, detail) VALUES (%s, %s, %s::jsonb) "
             "RETURNING id, created_at",

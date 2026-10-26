@@ -61,7 +61,7 @@ def test_replica_checks_column_identity_when_raw_lacks_it(tmp_path, monkeypatch,
     assert live == [], f'{writer} restored forgotten column source: {result}; rows={live}'
 
 
-def test_refresh_waits_for_forget_before_it_reads_the_hub(tmp_path, monkeypatch):
+def test_a_refresh_reading_during_a_forget_publishes_no_forgotten_row(tmp_path, monkeypatch):
     root = tmp_path / 'memory'
     root.mkdir()
     fo.write_lines(root, [P])
@@ -110,24 +110,29 @@ def test_refresh_waits_for_forget_before_it_reads_the_hub(tmp_path, monkeypatch)
 
     def scan_after_replica_scan(*args, **kwargs):
         # Every earlier replica check is complete. A concurrent process
-        # starts its refresh while forget still holds the exclusive lock:
-        # it must wait for the forget before it reads anything.
+        # starts its refresh while forget still holds the exclusive lock: its
+        # hub read takes no memory lock (a stalled hub never holds a forget
+        # up), so it reads the row the forget is erasing.
         thread.start()
-        assert not dumping.wait(0.5), 'refresh dumped while forget held the memory lock'
+        assert dumping.wait(5), 'the refresh waited on the memory lock to read the hub'
         return original_scan(*args, **kwargs)
 
     monkeypatch.setattr(forget, '_native_job_remainder', scan_after_replica_scan)
     try:
         result = forget.forget_everywhere(1, memory_root=root)
         assert result.get('complete'), result
-        assert not dumping.is_set()
-        # Only now may the refresh read, and its publication scrubs the row.
-        assert dumping.wait(5)
     finally:
+        # The dump read the row before the forget; its publication, under
+        # the memory lock, applies the queued erasure and scrubs the source.
         release.set()
         thread.join(10)
     assert not errors, errors
     assert results['refresh']['ok'], results
+    con = sqlite3.connect(hs.snapshot_path())
+    try:
+        assert con.execute('SELECT count(*) FROM episodes WHERE id = 1 AND deleted_at IS NULL').fetchone() == (0,)
+    finally:
+        con.close()
     con = sqlite3.connect(hs.snapshot_path())
     try:
         live = con.execute('SELECT id FROM episodes WHERE id=1 AND deleted_at IS NULL').fetchall()
