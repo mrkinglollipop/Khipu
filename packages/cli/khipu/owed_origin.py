@@ -168,8 +168,15 @@ def command(args):
         if isinstance(gate, int):
             return gate
     try:
-        with connect(statement_timeout_s=offline.setting("hub_statement_timeout"),
-                     record_reachability=bool(args.confirm or args.request)) as conn:
+        writing = bool(args.confirm or args.request)
+        if writing:
+            statement_timeout = offline.setting("hub_statement_timeout")
+        else:
+            from khipu.config import read_config_unsettled
+
+            statement_timeout = offline.settings(config=read_config_unsettled())["hub_statement_timeout"]
+        with connect(statement_timeout_s=statement_timeout,
+                     record_reachability=writing) as conn:
             with conn.cursor() as cur:
                 if args.confirm:
                     out = _confirm(cur, args.confirm, gate)

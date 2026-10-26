@@ -66,9 +66,9 @@ def resolve_dsn(*, migrate_legacy: bool = True) -> str:
         # Never block connect on Keychain flakiness — fall through to file.
         pass
     try:
-        from khipu.paths import dsn_file
+        from khipu.paths import credential_dir, dsn_file
 
-        configured = dsn_file()
+        configured = dsn_file() if migrate_legacy else credential_dir() / "dsn"
     except Exception:
         configured = Path(_env("KHIPU_DSN_FILE", "ALZY_DSN_FILE") or str(DEFAULT_DSN_FILE))
     path = Path(_env("KHIPU_DSN_FILE", "ALZY_DSN_FILE") or str(configured))
@@ -83,7 +83,7 @@ def resolve_dsn(*, migrate_legacy: bool = True) -> str:
     )
 
 
-def conninfo_with_local_root_cert(dsn: str) -> str:
+def conninfo_with_local_root_cert(dsn: str, *, create_data_dir: bool = True) -> str:
     """Keyword conninfo for libpq, with this Mac's ``root.crt`` forced in.
 
     Stored DSNs are ``postgres://`` URIs. Putting ``sslrootcert=/Users/…``
@@ -96,20 +96,28 @@ def conninfo_with_local_root_cert(dsn: str) -> str:
     Keychain/file URI so password parsers that split on ``://`` still work.
     """
     params = {key: val for key, val in conninfo_to_dict(dsn).items() if val is not None}
-    from khipu.paths import root_cert_file
+    from khipu.paths import credential_dir, root_cert_file
 
-    cert = root_cert_file()
+    cert = root_cert_file() if create_data_dir else credential_dir() / "root.crt"
     if cert.is_file():
         params["sslrootcert"] = str(cert.resolve())
     return make_conninfo(**params)
 
 
-def _keepalive_kwargs() -> dict:
+def _keepalive_kwargs(*, read_only: bool = False) -> dict:
     """TCP keepalives so a connection a network change silenced is given up
     after ``hub_dead_connection_after`` seconds, not the system's hours."""
     from khipu import offline
 
-    after = int(offline.setting("hub_dead_connection_after") or 0)
+    if read_only:
+        from khipu.config import read_config_unsettled
+
+        # load_config may finish a pending account write. A preview reads the
+        # document as stored without initiating that recovery.
+        setting = offline.settings(config=read_config_unsettled())["hub_dead_connection_after"]
+    else:
+        setting = offline.setting("hub_dead_connection_after")
+    after = int(setting or 0)
     if after <= 0:
         return {}
     return {
@@ -134,10 +142,11 @@ def connect(*, autocommit: bool = False, statement_timeout_s: float | None = Non
     """Bound connection setup; SQL timeouts belong to the operation's caller
     (``statement_timeout_s`` is how a caller asks for one, ``connect_timeout``
     one bounded by its own deadline). Read-only callers can disable local
-    reachability-memo writes and legacy-secret migration with
+    reachability-memo writes, directory creation and local recovery with
     ``record_reachability=False``."""
     dsn = resolve_dsn() if record_reachability else resolve_dsn(migrate_legacy=False)
-    conninfo = conninfo_with_local_root_cert(dsn)
+    conninfo = (conninfo_with_local_root_cert(dsn) if record_reachability
+                else conninfo_with_local_root_cert(dsn, create_data_dir=False))
     if statement_timeout_s is not None and statement_timeout_s > 0:
         conninfo = _with_statement_timeout(conninfo, statement_timeout_s)
     from khipu import hub_reach
@@ -149,7 +158,7 @@ def connect(*, autocommit: bool = False, statement_timeout_s: float | None = Non
             conninfo,
             autocommit=autocommit,
             connect_timeout=CONNECT_TIMEOUT_SECONDS if connect_timeout is None else connect_timeout,
-            **_keepalive_kwargs(),
+            **_keepalive_kwargs(read_only=not record_reachability),
         )
     except psycopg.OperationalError as exc:
         if record_reachability:
