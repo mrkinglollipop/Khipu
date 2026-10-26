@@ -1311,7 +1311,8 @@ class CliTest(_Base):
             {k: out[k] for k in ("embedded", "failed", "remaining", "profile")},
             {"embedded": 1, "failed": 0, "remaining": 0, "profile": TINY.id})
         idx = Path(self.tmp.name) / "i.sqlite"
-        _make_index(idx, [("n", 0, "A/x.txt", "chunk", _blob(1, 0, 0, 0), "voyage-t", 4)])
+        # Matching scan text so the import is ok (conflict used to exit 0 anyway).
+        _make_index(idx, [("n", 0, "A/x.txt", "some text", _blob(1, 0, 0, 0), "voyage-t", 4)])
         rc, out = self.run_cli(library_cmd="import", name="lib1", path=str(idx), strip_prefix="", profile=None)
         self.assertEqual(rc, 0)
         self.assertTrue({"read", "imported", "skipped_corrupt", "unmapped", "documents",

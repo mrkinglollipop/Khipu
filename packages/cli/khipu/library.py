@@ -576,7 +576,11 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
                 "their vectors would be deleted; nothing was changed. "
                 f"Run `khipu library scan {name} --allow-rebuild` to proceed"
             )
-        walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
+        # too_large: file still exists but was skipped — do not treat as deleted
+        # (same fail-safe as traversal_error / unreadable).
+        walk_incomplete = bool(
+            skipped.get("traversal_error") or skipped.get("unreadable") or skipped.get("too_large")
+        )
         gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
         if gone and not seen:
             conn.rollback()
@@ -616,7 +620,9 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
             if pending >= SCAN_COMMIT_EVERY:
                 conn.commit()
                 pending = 0
-        walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
+        walk_incomplete = bool(
+            skipped.get("traversal_error") or skipped.get("unreadable") or skipped.get("too_large")
+        )
         if walk_incomplete:
             gone = []
         if gone:
@@ -973,6 +979,9 @@ def _map_path(source_file: str, prefix: str, roots: tuple[str, ...]) -> str | No
     sf = source_file.replace("\\", "/")
     if prefix and sf.startswith(prefix):
         sf = sf[len(prefix):]
+        # "corpus" (no trailing slash) must not leave "/Author/..." looking absolute.
+        if not prefix.endswith("/") and sf.startswith("/"):
+            sf = sf[1:]
     if sf.startswith("/"):
         for base in roots:
             b = base.rstrip("/") + "/"
@@ -1121,16 +1130,29 @@ def import_index(
                     stats["unmapped"] += 1
                     continue
                 clean = _clean(text)
-                if (doc_id in prior_chunks and prior_chunks[doc_id].get(idx) != clean):
-                    stats["skipped_conflict"] += 1
-                    continue
+                priors = prior_chunks.get(doc_id)
+                if priors is not None:
+                    if idx in priors:
+                        if priors[idx] != clean:
+                            stats["skipped_conflict"] += 1
+                            continue
+                    else:
+                        # Missing index: allow only when the doc was itself imported
+                        # (resume a partial import); conflict for scan-owned docs.
+                        prior_hash = existing.get(rel, (None, ""))[1] or ""
+                        if not str(prior_hash).startswith(IMPORTED_HASH_PREFIX):
+                            stats["skipped_conflict"] += 1
+                            continue
                 if spec.id not in used:
                     bulk.defer(spec.id, None)  # rows unknown up front
                 used[spec.id] = spec
                 digest = _md5(clean)
                 touched.setdefault(doc_id, set()).add(idx)
-                if doc_id not in prior_chunks:
+                if priors is None:
                     chunk_rows.append((doc_id, idx, clean, digest))
+                elif idx not in priors:
+                    chunk_rows.append((doc_id, idx, clean, digest))
+                    priors[idx] = clean
                 emb_rows.append((spec.id, doc_id, idx, embed._vec_literal(vec), digest))
                 stats["imported"] += 1
                 if len(emb_rows) >= batch:
@@ -1143,8 +1165,9 @@ def import_index(
                 )
             conn.commit()
     ids = sorted(used)
+    ok = not stats["skipped_conflict"] and not (stats["read"] > 0 and stats["imported"] == 0)
     out: dict[str, Any] = {
-        "ok": not stats["skipped_conflict"], "source": name, **stats, "documents": len(touched),
+        "ok": ok, "source": name, **stats, "documents": len(touched),
         "profile": ids[0] if ids else (profile or None), "profiles": ids,
         "source_profile": src.profile,
         "imported_documents": sum(1 for rel in doc_ids if rel not in existing),
