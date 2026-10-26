@@ -366,3 +366,37 @@ def test_canonical_reordered_journal_is_reused_without_rewrite(world):
     assert outbox.drain().get("resolved") == 1
     assert dst.read_bytes() == before
     assert not path.exists()
+
+
+def test_forget_tombstones_nested_projection_when_deleting_exact_outbox(world, tmp_path, monkeypatch):
+    """Exact-match outbox delete must fence every nested payload (re-check P2)."""
+    from khipu import db, forget
+    from tests import test_forget_ownership as fo
+
+    queue()
+    assert outbox.drain().get("resolved") == 1
+    root = tmp_path / "memory"
+    root.mkdir()
+    fo.write_lines(root, [dict(ORIGINAL), projection()])
+    world_state = {
+        "episodes": {1: dict(ORIGINAL, id=1, ts=fo.BASE, raw=dict(ORIGINAL), deleted=False)},
+        "sources": [fo.ForgetOwnershipTest._source(None, 1, dict(ORIGINAL))],
+        "sources_enabled": True,
+    }
+    monkeypatch.setattr(db, "connect", lambda *a, **kw: fo._Conn(fo._WorldCur(world_state)))
+    result = forget.forget_everywhere(1, memory_root=root)
+    assert result.get("complete") is True, result
+    assert result.get("remaining") == [], result
+    assert not list(outbox.resolved_dir().glob("*.json"))
+    assert not tombstones.read_gate().allows(projection()), (
+        "projection nested in deleted resolution archive stayed allowed"
+    )
+
+
+def test_status_survives_deeply_nested_dead_job(world):
+    """Held-conflict scan must not crash doctor on RecursionError (re-check P3)."""
+    outbox.dead_dir().mkdir(parents=True)
+    (outbox.dead_dir() / "deep.json").write_text(
+        '{"payload":{},"queued_evidence":' + "[" * 100000 + "]" * 100000 + "}"
+    )
+    outbox.status()

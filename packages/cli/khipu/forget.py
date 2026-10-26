@@ -1393,6 +1393,13 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                                "episode, so it was kept")
                     elif match == "exact":
                         try:
+                            from khipu import tombstones
+
+                            # Fence every nested identity before the file goes:
+                            # a resolution archive's queued_evidence may be a
+                            # lossy projection that is not itself an exact
+                            # source-row match.
+                            tombstones.publish_payloads(entry["payloads"])
                             path.unlink()
                         except FileNotFoundError:
                             continue

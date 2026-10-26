@@ -499,7 +499,7 @@ def status() -> dict[str, Any]:
         try:
             if _read_job(jp).get("evidence_conflict"):
                 held_conflicts.append(jp.name)
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, RecursionError):
             pass  # dead still names unreadable held work
     evidence_conflicts += len(held_conflicts)
     resolved = len(list(resolved_dir().glob("*.json"))) if resolved_dir().is_dir() else 0
