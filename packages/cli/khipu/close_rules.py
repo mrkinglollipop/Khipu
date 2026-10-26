@@ -573,7 +573,8 @@ def _open_items(cur, project: str | None, *, commitment_id: int | None = None,
     """The open items the rules read, each with its ``owner`` as
     ``commitments.row_owner`` reads it (the owner guard's input)."""
     from khipu.commitments import (
-        _future_trigger_ready, _lineage_columns_ready, _reassigned_column_ready, has_future_trigger, row_owner,
+        _future_trigger_ready, _lineage_columns_ready, _reassigned_column_ready, _seen_columns_ready,
+        has_future_trigger, row_owner,
     )
 
     where = "status = 'open' AND project IS NOT NULL"
@@ -592,6 +593,8 @@ def _open_items(cur, project: str | None, *, commitment_id: int | None = None,
         extra.append("owner_reassigned_at")
     if _lineage_columns_ready(cur):
         extra.append("latest_text")
+    if _seen_columns_ready(cur):
+        extra.append("last_seen_at")
     cur.execute(
         "SELECT id, text, project, kind, opened_episode, opened_at, prs, reopened_rule_keys, pr_check, "
         f"settle_suggestion, {', '.join(extra)} FROM commitments WHERE {where} AND {_not_forgotten_clause(cur)} "
@@ -838,7 +841,8 @@ def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | No
             report["suggested"] += 1
 
 
-def run(cur, *, payload: dict[str, Any] | None = None, episode_id: int | None = None) -> dict[str, Any]:
+def run(cur, *, payload: dict[str, Any] | None = None, episode_id: int | None = None,
+        github_enabled: bool = True) -> dict[str, Any]:
     """Run the PR and decision rules. With ``payload`` (a capture), over its
     project's open items with that capture as the later evidence; without,
     over every open item (the nightly). Returns the counts and, when GitHub
@@ -853,7 +857,7 @@ def run(cur, *, payload: dict[str, Any] | None = None, episode_id: int | None = 
     report: dict[str, Any] = {"ok": True, "closed_pr": 0, "closed_decision": 0, "suggested": 0,
                               "kept_open_reopened": 0}
     items = _open_items(cur, project)
-    github = GitHub()
+    github = GitHub() if github_enabled else _FrozenGitHub()
     _pr_rule(cur, items, report, payload=payload, episode_id=episode_id, github=github)
     _decision_rule(cur, items, report, episode_id=episode_id if payload is not None else None)
     report["github_asked"] = github.asked
@@ -870,6 +874,8 @@ class _FrozenGitHub:
     def __init__(self) -> None:
         self.results: dict[EvidenceKey, tuple[str | None, str | None]] = {}
         self.records: dict[EvidenceKey, dict[str, Any]] = {}
+        self.asked = 0
+        self.unavailable = NOT_ASKED
 
     def state(self, repo: str | None, number: int) -> tuple[str | None, str | None]:
         return self.results.get((repo, number), (None, NOT_ASKED))
@@ -886,20 +892,47 @@ def run_nightly() -> dict[str, Any]:
     callers retain their cursor-based APIs.
     """
     from khipu.db import connect
+    from khipu.provenance import retryable_db_error
 
     report: dict[str, Any] = {"ok": True, "closed_pr": 0, "closed_decision": 0, "suggested": 0,
-                              "kept_open_reopened": 0}
-    with connect() as conn:
-        with conn.cursor() as cur:
-            if not ready(cur):
-                return {"ok": True, "skipped": "the hub has no close-rule columns yet (migration 0034)"}
-            candidates = _open_items(cur, None)
+                              "kept_open_reopened": 0, "failed": 0}
+
+    def failed(exc: Exception, phase: str, **context: Any) -> None:
+        reason = f"{type(exc).__name__}: {exc}"
+        transient = retryable_db_error(exc)
+        report.setdefault("errors", []).append({"phase": phase, "transient": transient,
+                                                "reason": reason, **context})
+        if transient:
+            report["deferred_transient"] = report.get("deferred_transient", 0) + 1
+        else:
+            report["failed"] += 1
+            report["ok"] = False
+            report.setdefault("reason", reason)
+
+    try:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if not ready(cur):
+                    return {"ok": True, "skipped": "the hub has no close-rule columns yet (migration 0034)"}
+                candidates = _open_items(cur, None)
+            conn.commit()
             sources = {}
             for project in dict.fromkeys(item["project"] for item in candidates):
                 rows = [item for item in candidates if item["project"] == project]
-                sources[project] = [_ledger_states(cur, project), _episode_states(
-                    cur, project, min(int(item["opened_episode"] or 0) for item in rows))]
-        conn.commit()
+                try:
+                    with conn.cursor() as cur:
+                        gathered = [_ledger_states(cur, project), _episode_states(
+                            cur, project, min(int(item["opened_episode"] or 0) for item in rows))]
+                    conn.commit()
+                    sources[project] = gathered
+                except Exception as exc:  # noqa: BLE001 — other projects can still complete
+                    failed(exc, "gather", project=project)
+                    conn.rollback()
+    except Exception as exc:  # noqa: BLE001 — a retryable gather defers without writes
+        failed(exc, "gather")
+        return report
+
+    candidates = [item for item in candidates if item["project"] in sources]
 
     github = GitHub()
     frozen = _FrozenGitHub()
@@ -921,7 +954,6 @@ def run_nightly() -> dict[str, Any]:
                 if state is not None:
                     frozen.records[key] = _record(state, datetime.now(timezone.utc), "github")
 
-    report["failed"] = 0
     for candidate in candidates:
         # Publish counts only after the whole candidate transaction committed:
         # a later rule or COMMIT can still roll back an earlier close.
@@ -938,9 +970,7 @@ def run_nightly() -> dict[str, Any]:
                         _decision_rule(cur, current, applied, episode_id=None)
                 conn.commit()
         except Exception as exc:  # noqa: BLE001 — one poisoned row must not block later rows
-            report["failed"] += 1
-            report["ok"] = False
-            report.setdefault("reason", f"{type(exc).__name__}: {exc}")
+            failed(exc, "apply", commitment_id=candidate["id"])
             continue
         for key, count in applied.items():
             report[key] = report.get(key, 0) + count

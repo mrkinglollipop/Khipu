@@ -147,6 +147,22 @@ def is_old_writer_refusal(exc: BaseException) -> bool:
         or getattr(exc, "sqlstate", None) == OLD_WRITER_SQLSTATE
 
 
+def retryable_db_error(exc: BaseException) -> bool:
+    """Explicit DB outages/contention; schema and provenance refusals are fatal."""
+    import psycopg
+
+    from khipu import hub_errors
+
+    if is_old_writer_refusal(exc):
+        return False
+    state = getattr(getattr(exc, "diag", None), "sqlstate", None) or getattr(exc, "sqlstate", None)
+    if state is not None:
+        return state in {"08000", "08001", "08003", "08006", "08007",
+                         "40001", "40P01", "55P03", "57014", "57P01", "57P02", "57P03"}
+    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)) \
+        and hub_errors.unreachable_error(exc)
+
+
 # ---- Legacy witness backfill (section 4) ----------------------------------------
 #
 # Migration 0047 attributes only what the writer inventory proves. A legacy
@@ -469,7 +485,9 @@ def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
     elif name == "close rules":
         from khipu import close_rules
 
-        close_rules.run(cur, payload=payload, episode_id=episode_id)
+        # Replay owns episode/gap locks. Missing GitHub evidence is gathered
+        # by the subsequent connection-owning nightly pass, outside SQL.
+        close_rules.run(cur, payload=payload, episode_id=episode_id, github_enabled=False)
     elif name == "deliverables":
         from khipu import deliverables
 
@@ -590,6 +608,11 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 — the gap stays open for the next night
             conn.rollback()
             out["failed"] += 1
+            transient = retryable_db_error(exc)
+            if "reason" not in out or (out.get("transient", False) and not transient):
+                out["reason"] = f"{type(exc).__name__}: {exc}"[:300]
+            out["transient"] = out.get("transient", True) and transient
+            out["ok"] = False
             try:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -1014,7 +1037,8 @@ def index_identities(conn, *, batch: int = INDEX_BATCH, dry_run: bool = False) -
             conn.commit()
         except Exception as exc:  # noqa: BLE001 - the batch rolled back; the next run redoes it
             conn.rollback()
-            return {**out, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+            return {**out, "ok": False, "transient": retryable_db_error(exc),
+                    "error": f"{type(exc).__name__}: {exc}"[:300]}
         out["batches"] += 1
         out["indexed"] += done["indexed"]
         out["refused"] += done["refused"]
