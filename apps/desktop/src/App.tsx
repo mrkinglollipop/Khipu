@@ -293,7 +293,7 @@ const SEARCH_MODES: {
   {
     mode: "semantic",
     label: "By meaning",
-    hint: "Vector similarity only. The words need not appear in the text.",
+    hint: "Vector similarity and word overlap. The words need not appear in the text.",
     placeholder: "describe what you are looking for",
   },
   {
@@ -4236,6 +4236,7 @@ export default function App() {
             <PlansCard
               state={plans}
               routing={routingForPlans}
+              onRoutingChanged={() => routing.load(true)}
               noneTracked={noneTracked}
               onAddAccount={() => setAddAccountSignal((n) => n + 1)}
               onOpenAccounts={() => {

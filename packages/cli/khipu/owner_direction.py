@@ -957,7 +957,9 @@ def finish(result: dict | None, **extra) -> dict | None:
         incomplete = True
     if not refused:
         _name_in_push(want, stamp, line, pend.get("stamped"))
-    if stamp.get("auth") == "direction" and isinstance(result, dict) and not refused:
+    # The app needs the id too: its Undo runs on exactly this line, never on one
+    # picked out of the log afterwards.
+    if stamp.get("auth") in ("direction", "app") and isinstance(result, dict) and not refused:
         out = dict(result, owner_action=line["id"])
         if incomplete:
             out["record_incomplete"] = _INCOMPLETE

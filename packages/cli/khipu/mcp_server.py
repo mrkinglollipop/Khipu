@@ -18,8 +18,9 @@ Tools:
   - ``khipu_usage``   — plan headroom per subscription CLI (local only; the
     gateway answers ``available: false``)
   - ``khipu_route``: the routing record: which accounts are open, by whom
-    and since when (local only until the cloud copy; the gateway answers
-    ``available: false``). Khipu reports; it never picks or ranks.
+    and since when (local full record; on the HTTPS gateway, the closed
+    published cloud copy when enabled — ``since`` is local-only). Khipu
+    reports; it never picks or ranks.
   - ``khipu_route_report``: a conversation's report or hold; the author is
     set by Khipu, and the owner's changes are refused.
   - ``khipu_route_rule``: a conversation may record the owner's requested
@@ -801,7 +802,7 @@ TOOLS: list[dict] = [
         "name": "khipu_route",
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
-            "The routing record on this Mac: which accounts are open, limited "
+            "The routing record: which accounts are open, limited "
             "(until when, and whether that time is the CLI's own or a guess), "
             "paused by the owner, down or unknown, who said so and how long "
             "ago; the owner's standing rules and note, word for word; holds, "
@@ -809,14 +810,18 @@ TOOLS: list[dict] = [
             "`khipu_route_report action=end_hold hold_id=...`; an owner hold "
             "is ended only by the owner); provider facts (models_allowed, models_never and use); "
             "and job runner lanes not matched to an account, with candidates. "
-            "Read it before you hand work to another account or model. "
+            "Locally this is the full record; through the HTTPS gateway it is "
+            "the closed published cloud copy when enabled (otherwise "
+            "`{available: false}`). Read it before you hand work to another "
+            "account or model. "
             "`view` (optional): `summary` for a compact read (per-account state "
             "and pace, priority, clipped rules and holds, plus omitted section "
             "names), or one section name (`accounts`, `priority`, `rules`, "
             "`holds`, `note`, `proposals`) for that section in full; omit "
             "`view` for the full record. Do not combine `view` with `since`. "
             "`since` (a version, or epoch:version, as an earlier answer gave "
-            "it) answers only what changed after it; `account` narrows to one "
+            "it) answers only what changed after it and is local-only — the "
+            "gateway refuses `since`; `account` narrows to one "
             "account. The answer carries `routing_changes` (a batch issued to "
             "this conversation's `mcp` component) and `delivery`; pass `ack` "
             "with that batch once you have read it, and only with your own "
@@ -1459,7 +1464,8 @@ def _tool_status_light(args: dict) -> dict:
 
 
 ROUTING_GATEWAY_REASON = (
-    "the routing record lives on the Mac that runs the accounts; the HTTPS gateway has no copy yet. "
+    "routing writes, advice and live plan usage stay on the Mac that runs the accounts; "
+    "this tool is not available through the HTTPS gateway. "
     "Use the local khipu MCP server or `khipu route`."
 )
 

@@ -299,6 +299,11 @@ def main() -> int:
                 text=True,
                 timeout=600,
             )
+            # Retry diagnostics are safe to retain even when the mirror recovers;
+            # other stderr can contain connection details.
+            for line in (proc.stderr or "").splitlines():
+                if line.startswith("graph mirror connect:"):
+                    log(f"  {line}")
             if proc.returncode == 0:
                 skipped = _mirror_skip_reason(proc)
                 log(f"  khipu graph mirror skipped: {skipped}" if skipped

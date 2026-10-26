@@ -2002,6 +2002,74 @@ fn route_hold_end_argv(id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// What `route cap set|remove` takes, as the webview sends it. Every field is
+/// checked in `route_cap_argv`; the CLI checks them again against the kind.
+#[derive(serde::Deserialize, Debug, Default)]
+struct RouteCapArgs {
+    kind: String,
+    window: Option<String>,
+    pct: Option<f64>,
+    slack: Option<f64>,
+    usd: Option<f64>,
+    days: Option<f64>,
+    n: Option<u32>,
+    purpose: Option<String>,
+    tier: Option<String>,
+    sensitive_only: Option<bool>,
+}
+
+/// `route cap --from-app [--kind=K ...] -- set|remove ACCOUNT`. Numbers are
+/// formatted here, never passed through as the webview's text, so no value can
+/// become a flag; a field the kind does not use is the CLI's to refuse.
+fn route_cap_argv(action: &str, account: &str, cap: &RouteCapArgs) -> Result<Vec<String>, String> {
+    if !matches!(action, "set" | "remove") {
+        return Err(format!("not a change to a cap: {action:?}"));
+    }
+    if !matches!(cap.kind.as_str(), "share" | "per_day" | "pace_target" | "spend" | "concurrency") {
+        return Err(format!("not a kind of cap: {:?}", cap.kind));
+    }
+    let mut argv = route_base("cap");
+    argv.push(format!("--kind={}", cap.kind));
+    if let Some(w) = cap.window.as_deref() {
+        if !matches!(w, "weekly" | "five_hour") {
+            return Err(format!("a cap's window is the week or the five hours, not {w:?}"));
+        }
+        argv.push(format!("--window={w}"));
+    }
+    if let Some(p) = cap.purpose.as_deref() {
+        if !matches!(p, "job" | "check") {
+            return Err(format!("a cap is for jobs or checks, not {p:?}"));
+        }
+        argv.push(format!("--purpose={p}"));
+    }
+    if action == "set" {
+        for (flag, value) in [("pct", cap.pct), ("slack", cap.slack), ("usd", cap.usd), ("days", cap.days)] {
+            if let Some(v) = value {
+                if !v.is_finite() || !(0.0..=1e9).contains(&v) {
+                    return Err(format!("{flag} is out of range for a cap"));
+                }
+                argv.push(format!("--{flag}={v}"));
+            }
+        }
+        if let Some(n) = cap.n {
+            argv.push(format!("--n={n}"));
+        }
+        if let Some(t) = cap.tier.as_deref() {
+            if !matches!(t, "opus" | "sonnet" | "haiku") {
+                return Err(format!("a cap's tier is opus, sonnet or haiku, not {t:?}"));
+            }
+            argv.push(format!("--tier={t}"));
+        }
+        match cap.sensitive_only {
+            Some(true) => argv.push("--sensitive-only".to_string()),
+            Some(false) => argv.push("--no-sensitive-only".to_string()),
+            None => {}
+        }
+    }
+    argv.extend(["--".to_string(), action.to_string(), checked_route_account(account)?]);
+    Ok(argv)
+}
+
 fn route_definition_argv(definition: &str, value: &Value) -> Result<Vec<String>, String> {
     if !matches!(definition, "provider" | "account" | "lane_map") || !value.is_object() {
         return Err("choose a provider, account or lane definition".to_string());
@@ -2027,6 +2095,18 @@ struct PriorityEntry {
     account: String,
     role: Option<String>,
     until: Option<String>,
+    /// The level the owner worded into the role, kept as read (claim and its
+    /// two times) so a whole-list write by the app never drops another
+    /// account's level.
+    #[serde(default)]
+    level: Option<PriorityLevel>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+struct PriorityLevel {
+    claim: String,
+    as_of: String,
+    until: String,
 }
 
 /// `route priority --from-app [--entries=JSON] [--until=T] -- ACTION`. The
@@ -2077,6 +2157,13 @@ fn route_priority_argv_expect(
             }
             if let Some(t) = e.until.as_deref().filter(|t| !t.trim().is_empty()) {
                 item.insert("until".to_string(), Value::String(checked_route_until(t)?));
+            }
+            if let Some(level) = &e.level {
+                let mut l = serde_json::Map::new();
+                l.insert("claim".to_string(), Value::String(checked_route_words(&level.claim, false)?));
+                l.insert("as_of".to_string(), Value::String(checked_route_until(&level.as_of)?));
+                l.insert("until".to_string(), Value::String(checked_route_until(&level.until)?));
+                item.insert("level".to_string(), Value::Object(l));
             }
             clean.push(Value::Object(item));
         }
@@ -2651,6 +2738,11 @@ async fn khipu_route_hold_add(
     op: Option<String>,
 ) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_hold_add_argv(&text, &reason, &scope, account.as_deref(), until.as_deref())?, op.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_route_cap(action: String, account: String, cap: RouteCapArgs, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_cap_argv(&action, &account, &cap)?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -5163,6 +5255,7 @@ pub fn run() {
             khipu_route_rule,
             khipu_route_hold_add,
             khipu_route_hold_end,
+            khipu_route_cap,
             khipu_route_priority,
             khipu_route_definition,
             khipu_work_view,
@@ -5897,6 +5990,44 @@ mod settings_command_tests {
             route_hold_end_argv("h1a2b3c4").unwrap(),
             v(&["route", "hold", "--from-app", "--", "end", "h1a2b3c4"])
         );
+    }
+
+    #[test]
+    fn a_cap_write_is_a_fixed_argv_with_checked_numbers() {
+        let pace = RouteCapArgs {
+            kind: "pace_target".into(),
+            window: Some("weekly".into()),
+            pct: Some(100.0),
+            slack: Some(5.0),
+            purpose: Some("check".into()),
+            tier: Some("sonnet".into()),
+            sensitive_only: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            route_cap_argv("set", "codex|", &pace).unwrap(),
+            v(&["route", "cap", "--from-app", "--kind=pace_target", "--window=weekly", "--purpose=check",
+                "--pct=100", "--slack=5", "--tier=sonnet", "--sensitive-only", "--", "set", "codex|"])
+        );
+        let gone = RouteCapArgs { kind: "share".into(), window: Some("five_hour".into()), ..Default::default() };
+        assert_eq!(
+            route_cap_argv("remove", "codex|", &gone).unwrap(),
+            v(&["route", "cap", "--from-app", "--kind=share", "--window=five_hour", "--", "remove", "codex|"])
+        );
+        let at_most = RouteCapArgs { kind: "concurrency".into(), n: Some(2), ..Default::default() };
+        assert!(route_cap_argv("set", "codex|", &at_most).unwrap().contains(&"--n=2".to_string()));
+        for bad in [
+            RouteCapArgs { kind: "--all".into(), ..Default::default() },
+            RouteCapArgs { kind: "share".into(), window: Some("daily".into()), ..Default::default() },
+            RouteCapArgs { kind: "share".into(), pct: Some(f64::NAN), ..Default::default() },
+            RouteCapArgs { kind: "share".into(), pct: Some(-1.0), ..Default::default() },
+            RouteCapArgs { kind: "pace_target".into(), tier: Some("--x".into()), ..Default::default() },
+            RouteCapArgs { kind: "pace_target".into(), purpose: Some("x".into()), ..Default::default() },
+        ] {
+            assert!(route_cap_argv("set", "codex|", &bad).is_err(), "{bad:?}");
+        }
+        assert!(route_cap_argv("drop", "codex|", &at_most).is_err());
+        assert!(route_cap_argv("set", "-x", &at_most).is_err());
     }
 
     #[test]
@@ -7070,7 +7201,26 @@ mod priority_and_sign_in_tests {
     }
 
     fn entry(account: &str, role: Option<&str>, until: Option<&str>) -> PriorityEntry {
-        PriorityEntry { account: account.into(), role: role.map(Into::into), until: until.map(Into::into) }
+        PriorityEntry { account: account.into(), role: role.map(Into::into), until: until.map(Into::into), level: None }
+    }
+
+    #[test]
+    fn a_priority_entrys_level_survives_a_whole_list_write() {
+        let mut with_level = entry("Codex", Some("builds"), None);
+        with_level.level = Some(PriorityLevel {
+            claim: "Opus is limited today".into(),
+            as_of: "2026-10-26T12:00:00Z".into(),
+            until: "2026-10-27T12:00:00Z".into(),
+        });
+        let argv = route_priority_argv("set", &[with_level, entry("Claude", None, None)], None, None).unwrap();
+        let json = argv.iter().find_map(|a| a.strip_prefix("--entries=")).unwrap();
+        let parsed: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed[0]["level"]["claim"], "Opus is limited today");
+        assert_eq!(parsed[0]["level"]["until"], "2026-10-27T12:00:00Z");
+        assert!(parsed[1].get("level").is_none());
+        let mut bad = entry("Codex", None, None);
+        bad.level = Some(PriorityLevel { claim: "x".into(), as_of: "--all".into(), until: "2026-10-27T12:00:00Z".into() });
+        assert!(route_priority_argv("set", &[bad], None, None).is_err());
     }
 
     #[test]

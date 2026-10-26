@@ -1255,11 +1255,18 @@ def _offsite_if_due() -> None:
     from khipu import graph_backup
 
     try:
-        last_ok = graph_backup._last_ok_time("graph_snapshot_offsite")
+        last_ok = graph_backup._last_ok_time(
+            "graph_snapshot_offsite",
+            statement_timeout_s=graph_backup.OFFSITE_RECEIPT_STATEMENT_TIMEOUT_SECONDS,
+            connect_timeout=graph_backup.OFFSITE_RECEIPT_CONNECT_TIMEOUT_SECONDS,
+            raise_on_error=True,
+        )
         now = datetime.now(timezone.utc)
         if not graph_backup.offsite_due(last_ok=last_ok, now=now):
             return
         out = graph_backup.run_offsite()
+    except graph_backup.OffsiteReceiptReadError as exc:
+        out = {"ok": False, "reason": str(exc)}
     except Exception as exc:  # noqa: BLE001
         out = {"ok": False, "reason": str(exc)}
     try:

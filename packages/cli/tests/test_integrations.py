@@ -236,6 +236,275 @@ class AegisPackTest(_TempHomeCase):
         self.assertEqual(integ.status("aegis")["prompt_recall"], "missing")
 
 
+class GrokBuildPackTest(_TempHomeCase):
+    def _seed(self):
+        (self.home / ".grok").mkdir()
+        integ.AEGIS_TOML.write_text(
+            'model = "grok"\n\n[mcp_servers.other]\ncommand = "other"\nenabled = true\n'
+        )
+        project = self.home / "project"
+        project.mkdir()
+        (project / "AGENTS.md").write_text("# Project rules\n\nKeep the existing instruction.\n")
+        return project
+
+    def _trust(self, project: Path, home: Path | None = None):
+        grok_home = home or self.home / ".grok"
+        grok_home.mkdir(parents=True, exist_ok=True)
+        (grok_home / "trusted_folders.toml").write_text(
+            f"[folders.{json.dumps(str(project.resolve()))}]\ntrusted = true\n"
+        )
+
+    def test_install_uninstall_preserves_project_rules_and_foreign_config(self):
+        project = self._seed()
+        self._trust(project)
+        out = integ.install("grok_build", project=str(project))
+        self.assertTrue(out["changes"], out)
+        config = tomllib.loads(integ.AEGIS_TOML.read_text())
+        self.assertEqual(config["mcp_servers"]["other"]["command"], "other")
+        self.assertEqual(config["mcp_servers"][integ.GROK_BUILD_MCP_SERVER]["command"], integ.mcp_launcher())
+        for event in ("Stop", "PreCompact", "SessionEnd"):
+            handler = config["hooks"][event][0]["hooks"][0]
+            self.assertIn("khipu-grok-build-capture", handler["command"])
+            self.assertEqual(handler["env"], {"KHIPU_HARNESS": "grok_build"})
+        agents = (project / "AGENTS.md").read_text()
+        self.assertIn("Keep the existing instruction.", agents)
+        self.assertIn(integ._GROK_BUILD_AGENTS_START, agents)
+        status = integ.status("grok_build", project=str(project))
+        self.assertTrue(status["installed"], status)
+        self.assertEqual(status["recall_rule"], "installed")
+        self.assertEqual(integ.install("grok_build", project=str(project))["changes"], [])
+
+        removed = integ.uninstall("grok_build", project=str(project))
+        self.assertTrue(removed["changes"])
+        config = tomllib.loads(integ.AEGIS_TOML.read_text())
+        self.assertEqual(config["mcp_servers"], {"other": {"command": "other", "enabled": True}})
+        self.assertNotIn("hooks", config)
+        agents = (project / "AGENTS.md").read_text()
+        self.assertIn("Keep the existing instruction.", agents)
+        self.assertNotIn(integ._GROK_BUILD_AGENTS_START, agents)
+
+    def test_requires_an_existing_project_without_writing_config(self):
+        self._seed()
+        before = integ.AEGIS_TOML.read_text()
+        out = integ.install("grok_build")
+        self.assertFalse(out["ok"])
+        self.assertIn("requires --project", out["error"])
+        self.assertEqual(integ.AEGIS_TOML.read_text(), before)
+
+    def test_untrusted_or_modified_project_rule_is_not_reported_installed(self):
+        project = self._seed()
+        integ.install("grok_build", project=str(project))
+        self.assertEqual(integ.status("grok_build", project=str(project))["recall_rule"], "untrusted")
+        self._trust(project)
+        agents = project / "AGENTS.md"
+        agents.write_text(agents.read_text().replace("khipu_search", "other_search"))
+        self.assertEqual(integ.status("grok_build", project=str(project))["recall_rule"], "missing")
+
+    def test_disabled_grok_mcp_is_not_reported_installed(self):
+        project = self._seed()
+        self._trust(project)
+        integ.install("grok_build", project=str(project))
+        integ.AEGIS_TOML.write_text(integ.AEGIS_TOML.read_text().replace("enabled = true", "enabled = false"))
+        status = integ.status("grok_build", project=str(project))
+        self.assertFalse(status["mcp"])
+        self.assertFalse(status["installed"])
+
+    def test_grok_mcp_span_ignores_multiline_fake_headers_and_stops_at_its_marker(self):
+        text = (
+            'note = """\n[mcp_servers.khipu_grok_build]\n# khipu-grok-build-pack: managed block\n"""\n\n'
+            '["mcp_servers"."khipu_grok_build"]\ncommand = "owned"\nenabled = true\n\n'
+            '# khipu-grok-build-pack: managed block — do not edit by hand\n'
+            '[[hooks.Stop]]\n'
+        )
+        found = integ._toml_table_block(
+            text, "mcp_servers.khipu_grok_build",
+            boundary_markers=(integ._GROK_BUILD_HOOK_MARK.rstrip(),),
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found[2], '["mcp_servers"."khipu_grok_build"]\ncommand = "owned"\nenabled = true\n\n')
+
+    def test_custom_grok_home_leaves_the_default_config_unchanged(self):
+        project = self._seed()
+        default_before = integ.AEGIS_TOML.read_bytes()
+        custom_home = self.home / "custom-grok-home"
+        custom_home.mkdir()
+        custom_config = custom_home / "config.toml"
+        custom_config.write_text('model = "grok"\n')
+        self._trust(project, custom_home)
+        with mock.patch.dict(os.environ, {"GROK_HOME": str(custom_home)}):
+            out = integ.install("grok_build", project=str(project))
+            self.assertTrue(out["changes"], out)
+            self.assertTrue(integ.status("grok_build", project=str(project))["installed"])
+        self.assertEqual(integ.AEGIS_TOML.read_bytes(), default_before)
+        self.assertIn(integ.GROK_BUILD_MCP_SERVER, tomllib.loads(custom_config.read_text())["mcp_servers"])
+
+    def test_refuses_aegis_capture_conflict_without_mutation(self):
+        project = self._seed()
+        integ.install("aegis")
+        before = integ.AEGIS_TOML.read_bytes()
+        out = integ.install("grok_build", project=str(project))
+        self.assertFalse(out["ok"])
+        self.assertIn("Aegis", out["error"])
+        self.assertEqual(integ.AEGIS_TOML.read_bytes(), before)
+        self.assertFalse((project / "AGENTS.md").read_text().count(integ._GROK_BUILD_AGENTS_START))
+
+    def test_aegis_only_install_remains_healthy_for_aegis(self):
+        self._seed()
+        integ.install("aegis")
+        status = integ.status("aegis")
+        self.assertTrue(status["installed"], status)
+        self.assertFalse(integ.status("grok_build", project=str(self.home / "project"))["conflict"])
+
+    def test_aegis_refuses_a_grok_build_capture_conflict_without_mutation(self):
+        project = self._seed()
+        integ.install("grok_build", project=str(project))
+        before = integ.AEGIS_TOML.read_bytes()
+        out = integ.install("aegis")
+        self.assertFalse(out["ok"])
+        self.assertIn("Grok Build", out["error"])
+        self.assertEqual(integ.AEGIS_TOML.read_bytes(), before)
+
+    def test_uninstall_preserves_a_foreign_same_named_mcp_table(self):
+        project = self._seed()
+        integ.AEGIS_TOML.write_text(
+            'model = "grok"\n\n[mcp_servers.khipu_grok_build]\ncommand = "foreign"\n'
+        )
+        before = integ.AEGIS_TOML.read_bytes()
+        out = integ.uninstall("grok_build", project=str(project))
+        self.assertEqual(out["changes"], [])
+        self.assertEqual(integ.AEGIS_TOML.read_bytes(), before)
+
+    def test_native_probe_runs_the_installed_grok_launcher_with_acp_rows(self):
+        project = self._seed()
+        integ.install("grok_build", project=str(project))
+        with mock.patch.dict(os.environ, {"KHIPU_ROOT": str(integ._root())}):
+            out = integ._probe_native_extract(integ.grok_build_capture_hook(), "grok_build")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["harness_seen"], "grok_build")
+
+    def test_verify_reports_configured_recall_without_claiming_provider_compliance(self):
+        project = self._seed()
+        self._trust(project)
+        integ.install("grok_build", project=str(project))
+        with mock.patch.object(integ, "_probe_mcp", return_value={"ok": True}), \
+                mock.patch.object(integ, "_probe_native_extract", return_value={"ok": True}), \
+                mock.patch.object(integ, "_runtime", return_value={"ok": True}):
+            out = integ.verify("grok_build", project=str(project))
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(out["components"]["recall_instruction"]["ok"])
+        self.assertIn("not asserted", out["components"]["recall_instruction"]["note"])
+
+    def _write_native_grok_build_hooks(self, include_mcp: bool = True):
+        """Grok-rewritten form: no pack comments, env as a sibling table."""
+        shim = integ.grok_build_capture_hook()
+        mcp = integ.mcp_launcher()
+        parts = ['model = "grok"\n']
+        if include_mcp:
+            parts.append(
+                f"[mcp_servers.{integ.GROK_BUILD_MCP_SERVER}]\n"
+                f'command = "{mcp}"\n'
+                "enabled = true\n"
+                "startup_timeout_sec = 30\n\n"
+            )
+        for event in ("Stop", "PreCompact", "SessionEnd"):
+            parts.append(
+                f"[[hooks.{event}]]\n"
+                f"[[hooks.{event}.hooks]]\n"
+                'type = "command"\n'
+                f'command = "{shim}"\n'
+                "timeout = 15\n"
+                f"[hooks.{event}.hooks.env]\n"
+                'KHIPU_HARNESS = "grok_build"\n\n'
+            )
+        integ.AEGIS_TOML.write_text("".join(parts))
+
+    def test_uninstall_removes_native_hooks_after_grok_drops_pack_markers(self):
+        project = self._seed()
+        self._write_native_grok_build_hooks()
+        self.assertTrue(integ._grok_build_capture_events(integ.AEGIS_TOML.read_text()))
+        self.assertIsNone(integ._GROK_BUILD_HOOK_RE.search(integ.AEGIS_TOML.read_text()))
+        out = integ.uninstall("grok_build", project=str(project))
+        self.assertTrue(out["changes"], out)
+        text = integ.AEGIS_TOML.read_text()
+        self.assertFalse(integ._grok_build_capture_events(text), text)
+        self.assertNotIn("khipu-grok-build-capture", text)
+        self.assertNotIn("hooks", tomllib.loads(text))
+
+    def test_install_clears_native_hooks_instead_of_refusing_unmanaged(self):
+        project = self._seed()
+        self._trust(project)
+        self._write_native_grok_build_hooks()
+        out = integ.install("grok_build", project=str(project))
+        self.assertNotEqual(out.get("error"), "unmanaged Grok Build capture hooks exist; refusing to duplicate them", out)
+        self.assertTrue(out.get("ok", True), out)
+        self.assertTrue(integ.status("grok_build", project=str(project))["installed"])
+
+    def test_install_all_without_project_skips_grok_build(self):
+        import io
+        from contextlib import redirect_stdout
+
+        from khipu import cli
+
+        self._seed()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.cmd_integrations(cli.build_parser().parse_args(
+                ["integrations", "install", "all", "--dry-run", "--no-verify"]))
+        results = json.loads(buf.getvalue())
+        skipped = [r for r in results if r.get("harness") == "grok_build"]
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertEqual(len(skipped), 1, results)
+        self.assertEqual(skipped[0].get("skipped"), "needs --project")
+        self.assertNotEqual(skipped[0].get("ok"), False)
+
+    def test_verify_all_without_project_skips_grok_build(self):
+        import io
+        from contextlib import redirect_stdout
+
+        from khipu import cli
+
+        self._seed()
+        buf = io.StringIO()
+        with redirect_stdout(buf), \
+                mock.patch.object(integ, "verify", side_effect=lambda h, **kw: {
+                    "harness": h, "detected": False, "ok": True, "components": {}}):
+            rc = cli.cmd_integrations(cli.build_parser().parse_args(
+                ["integrations", "verify", "all"]))
+        results = json.loads(buf.getvalue())
+        skipped = [r for r in results if r.get("harness") == "grok_build"]
+        self.assertEqual(rc, 0, results)
+        self.assertEqual(len(skipped), 1, results)
+        self.assertEqual(skipped[0].get("skipped"), "needs --project")
+
+    def test_uninstall_deletes_empty_agents_and_reports_left_block_without_project(self):
+        project = self._seed()
+        agents = project / "AGENTS.md"
+        agents.write_text("")  # install into empty file
+        integ.install("grok_build", project=str(project))
+        text = agents.read_text()
+        self.assertTrue(text.startswith(integ._GROK_BUILD_AGENTS_START), repr(text[:80]))
+        integ.uninstall("grok_build", project=str(project))
+        self.assertFalse(agents.exists(), "empty AGENTS.md should be deleted")
+
+        project2 = self.home / "project2"
+        project2.mkdir()
+        (project2 / "AGENTS.md").write_text("# keep\n")
+        integ.install("grok_build", project=str(project2))
+        out = integ.uninstall("grok_build")
+        self.assertIn("AGENTS.md", out.get("note", ""), out)
+        self.assertIn(integ._GROK_BUILD_AGENTS_START, (project2 / "AGENTS.md").read_text())
+
+    def test_agents_path_reuses_existing_case_from_directory_listing(self):
+        project = self.home / "cased-project"
+        project.mkdir()
+        with mock.patch("os.listdir", return_value=["Agents.md", "README.md"]) as listing:
+            path = integ._grok_build_agents_path(str(project))
+        listing.assert_called()
+        self.assertEqual(path, project / "Agents.md")
+        with mock.patch("os.listdir", return_value=["readme.md"]):
+            self.assertEqual(integ._grok_build_agents_path(str(project)), project / "AGENTS.md")
+
+
 class ProbeTest(_TempHomeCase):
     def setUp(self):
         super().setUp()

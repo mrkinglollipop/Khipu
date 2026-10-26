@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -30,9 +32,16 @@ def resolve_dest_remote() -> str:
 
 OFFSITE_MAX_AGE_DAYS = 8
 INTEGRITY_TIMEOUT_SECONDS = 60
+INTEGRITY_TIMEOUT_CEILING_SECONDS = 15 * 60
 OFFSITE_TIMEOUT_FLOOR_SECONDS = 3600
 OFFSITE_SECONDS_PER_GB = 600
 OFFSITE_TIMEOUT_CEILING_SECONDS = 4 * 3600
+OFFSITE_RECEIPT_CONNECT_TIMEOUT_SECONDS = 5
+OFFSITE_RECEIPT_STATEMENT_TIMEOUT_SECONDS = 5
+
+
+class OffsiteReceiptReadError(RuntimeError):
+    """Safe failure message for the scheduled offsite receipt lookup."""
 
 
 def _utcnow() -> datetime:
@@ -181,11 +190,19 @@ def drill_due(*, last_ok: datetime | None, now: datetime, period_days: int = 8) 
     return (now - last_ok).total_seconds() >= period_days * 86400
 
 
-def _latest_ops_event(kind: str) -> dict | None:
+def _latest_ops_event(
+    kind: str, *, statement_timeout_s: float | None = None,
+    connect_timeout: int | None = None, raise_on_error: bool = False,
+) -> dict | None:
     from khipu.db import connect
 
+    deadlines = {}
+    if statement_timeout_s is not None:
+        deadlines["statement_timeout_s"] = statement_timeout_s
+    if connect_timeout is not None:
+        deadlines["connect_timeout"] = connect_timeout
     try:
-        with connect() as conn, conn.cursor() as cur:
+        with connect(**deadlines) as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT status, detail, created_at, now() - created_at
@@ -197,7 +214,17 @@ def _latest_ops_event(kind: str) -> dict | None:
                 (kind,),
             )
             row = cur.fetchone()
-    except Exception:
+    except Exception as exc:
+        if raise_on_error:
+            import psycopg
+
+            if isinstance(exc, (psycopg.errors.QueryCanceled, psycopg.errors.ConnectionTimeout)):
+                reason = "offsite receipt read timed out"
+            elif isinstance(exc, psycopg.OperationalError):
+                reason = "offsite receipt read connection failed"
+            else:
+                reason = "offsite receipt read failed"
+            raise OffsiteReceiptReadError(reason) from None
         return None
     if not row:
         return None
@@ -210,8 +237,18 @@ def _latest_ops_event(kind: str) -> dict | None:
     }
 
 
-def _last_ok_time(kind: str) -> datetime | None:
-    ev = _latest_ops_event(kind)
+def _last_ok_time(
+    kind: str, *, statement_timeout_s: float | None = None,
+    connect_timeout: int | None = None, raise_on_error: bool = False,
+) -> datetime | None:
+    options = {}
+    if statement_timeout_s is not None:
+        options["statement_timeout_s"] = statement_timeout_s
+    if connect_timeout is not None:
+        options["connect_timeout"] = connect_timeout
+    if raise_on_error:
+        options["raise_on_error"] = True
+    ev = _latest_ops_event(kind, **options)
     if not ev or ev.get("status") != "ok" or ev.get("created_at") is None:
         return None
     created = ev["created_at"]
@@ -261,7 +298,26 @@ def has_r2_remote(*, rclone_bin: str = "rclone") -> bool:
     return False
 
 
-def _offsite_timeout(path: Path) -> int:
+def _bandwidth_limit() -> tuple[str, int]:
+    """KHIPU_GRAPH_BACKUP_BWLIMIT: positive integer K/M/G bytes/s (binary).
+
+    Timetables, unlimited rates, and separate upload/download rates are not
+    supported: a scalar lets us budget the upload before starting it.
+    """
+    raw = (os.environ.get("KHIPU_GRAPH_BACKUP_BWLIMIT") or "").strip() or "2M"
+    match = re.fullmatch(r"([1-9][0-9]*)([KMG])", raw, re.IGNORECASE)
+    if match is None:
+        raise ValueError("offsite bandwidth must be a positive integer followed by K, M, or G")
+    suffix = match[2].upper()
+    return f"{match[1]}{suffix}", int(match[1]) * 1024 ** ("KMG".index(suffix) + 1)
+
+
+def _transfer_allowance(size: int, bytes_per_second: int) -> int:
+    # Allow 25% above ideal transfer time plus a minute for connection/setup.
+    return (size * 5 + bytes_per_second * 4 - 1) // (bytes_per_second * 4) + 60
+
+
+def _offsite_timeout(path: Path, *, bytes_per_second: int = 2 * 1024**2) -> int:
     """Seconds allowed for the offsite upload of ``path``.
 
     A flat hour timed out on a multi-GB snapshot. Budget an hour, plus ten
@@ -274,10 +330,20 @@ def _offsite_timeout(path: Path) -> int:
         return OFFSITE_TIMEOUT_FLOOR_SECONDS
     extra_gb = max(0.0, size / 1024**3 - 1)
     scaled = OFFSITE_TIMEOUT_FLOOR_SECONDS + int(extra_gb * OFFSITE_SECONDS_PER_GB)
-    return min(OFFSITE_TIMEOUT_CEILING_SECONDS, scaled)
+    return min(OFFSITE_TIMEOUT_CEILING_SECONDS,
+               max(scaled, _transfer_allowance(size, bytes_per_second)))
 
 
-def _integrity_check(path: Path, *, timeout: int = INTEGRITY_TIMEOUT_SECONDS) -> str:
+def _integrity_check(path: Path, *, timeout: int | None = None) -> str:
+    if timeout is None:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if not isinstance(size, int) or size < 0:
+            size = 0
+        timeout = min(INTEGRITY_TIMEOUT_CEILING_SECONDS,
+                      max(INTEGRITY_TIMEOUT_SECONDS, math.ceil(size * 60 / 1024**3)))
     script = (
         "import sqlite3, sys; "
         f"c=sqlite3.connect({str(path)!r}); "
@@ -499,9 +565,21 @@ def run_offsite(
 
     detail = {key: value for key, value in out.items() if key != "ok"}
     try:
-        event = ops_events.record("graph_snapshot_offsite", "ok" if out["ok"] else "fail", detail)
-    except Exception:  # noqa: BLE001
-        return {**out, "ok": False, "ops_error": "offsite ops_events insert failed"}
+        event = ops_events.record(
+            "graph_snapshot_offsite", "ok" if out["ok"] else "fail", detail,
+            statement_timeout_s=OFFSITE_RECEIPT_STATEMENT_TIMEOUT_SECONDS,
+            connect_timeout=OFFSITE_RECEIPT_CONNECT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        import psycopg
+
+        if isinstance(exc, (psycopg.errors.QueryCanceled, psycopg.errors.ConnectionTimeout)):
+            error = "offsite ops_events insert timed out"
+        elif isinstance(exc, psycopg.OperationalError):
+            error = "offsite ops_events insert connection failed"
+        else:
+            error = "offsite ops_events insert failed"
+        return {**out, "ok": False, "ops_error": error}
     return {**out, "event": event}
 
 
@@ -514,6 +592,10 @@ def _run_offsite(*, dest_remote: str | None, keep: int, rclone_bin: str) -> dict
         )
     except ValueError:
         return {"ok": False, "reason": "offsite destination must be a named rclone remote"}
+    try:
+        bwlimit, bytes_per_second = _bandwidth_limit()
+    except ValueError as exc:
+        return {"ok": False, "reason": str(exc)}
     resolved = resolve_rclone(rclone_bin)
     if resolved is None:
         return {
@@ -537,10 +619,15 @@ def _run_offsite(*, dest_remote: str | None, keep: int, rclone_bin: str) -> dict
     if snap is None:
         return {"ok": False, "reason": "no snapshot found"}
     try:
-        if snap.stat().st_size <= 0:
+        size = snap.stat().st_size
+        if size <= 0:
             return {"ok": False, "reason": "latest snapshot is empty", "path": str(snap)}
     except OSError:
         return {"ok": False, "reason": "snapshot stat failed", "path": str(snap)}
+    if _transfer_allowance(size, bytes_per_second) > OFFSITE_TIMEOUT_CEILING_SECONDS:
+        return {"ok": False,
+                "reason": "offsite bandwidth needs more than the 4h upload budget",
+                "path": str(snap), "bwlimit": bwlimit}
     integrity = _integrity_check(snap)
     if integrity.lower() != "ok":
         return {
@@ -561,15 +648,20 @@ def _run_offsite(*, dest_remote: str | None, keep: int, rclone_bin: str) -> dict
         return {"ok": False, "reason": "refusing to upload live graph.sqlite"}
 
     dest = f"{dest_remote.rstrip('/')}/{snap.name}"
-    argv = [rclone_bin, "copyto", "--", str(snap), dest]
+    argv = [rclone_bin, "copyto", "--bwlimit", bwlimit, "--", str(snap), dest]
     if str(live) in argv:
         return {"ok": False, "reason": "live graph path must not appear in rclone argv"}
 
+    timeout = _offsite_timeout(snap, bytes_per_second=bytes_per_second)
     try:
         r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=_offsite_timeout(snap)
+            argv, capture_output=True, text=True, timeout=timeout
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": f"offsite copy timeout after {timeout}s",
+                "path": str(snap), "dest": dest, "timeout_seconds": timeout,
+                "bwlimit": bwlimit}
+    except OSError:
         detail = {"path": str(snap), "dest": dest, "error": "offsite copy failed to run"}
         return {"ok": False, "reason": "offsite copy failed to run", **detail}
 

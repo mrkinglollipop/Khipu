@@ -55,7 +55,7 @@ from typing import Any
 
 from khipu.lines import split_lines
 
-LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis")
+LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build")
 
 # What a forget keeps, said plainly in every result. Nothing deletes a
 # forgotten episode's row: there is no purge command and no restore command.
@@ -1200,7 +1200,7 @@ def _outbox_entries() -> list[dict[str, Any]]:
     beside them, with its bytes and payload or the error reading it. The
     caller holds the outbox lock: every writer writes its temp under it, so a
     temp seen here was left by a crash."""
-    from khipu.capture_stores import outbox_folders
+    from khipu.capture_stores import outbox_folders, outbox_payloads
 
     entries: list[dict[str, Any]] = []
     for directory in outbox_folders():
@@ -1220,13 +1220,11 @@ def _outbox_entries() -> list[dict[str, Any]]:
             try:
                 entry["data"] = path.read_bytes()
                 envelope = json.loads(entry["data"])
-                payload = envelope.get("payload") if isinstance(envelope, dict) else None
-                if not isinstance(payload, dict):
-                    raise ValueError("job payload is not an object")
-                entry["payload"] = payload
+                entry["payloads"] = outbox_payloads(envelope)
+                entry["payload"] = envelope["payload"]
             except FileNotFoundError:
                 continue  # drained or renamed since the listing
-            except (OSError, ValueError, TypeError) as exc:
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
                 entry["error"] = type(exc).__name__
             entries.append(entry)
     return entries
@@ -1255,11 +1253,13 @@ def _classify_entries(entries: list[dict[str, Any]],
         if "payload" not in entry:
             continue
         try:
-            match = _source_match(entry["payload"], source_rows)
-            exact = match == "exact"
-            entry["match"] = match
-            entry["hashes"] = _job_hashes(entry["payload"]) if exact else set()
-            entry["ident"] = _job_identity(entry["payload"]) if exact else None
+            matches = [(payload, _source_match(payload, source_rows))
+                       for payload in entry["payloads"]]
+            exact = [payload for payload, match in matches if match == "exact"]
+            entry["match"] = ("exact" if exact else "identity"
+                              if any(match == "identity" for _, match in matches) else None)
+            entry["hashes"] = set().union(*(_job_hashes(payload) for payload in exact))
+            entry["idents"] = [ident for payload in exact if (ident := _job_identity(payload))]
         except (UnicodeError, ValueError, TypeError) as exc:
             entry.pop("payload")
             entry["error"] = type(exc).__name__
@@ -1320,7 +1320,8 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                     continue
                 # Without a session id there is no way to tell this job from
                 # the forgotten episode's capture, so any retained job counts.
-                if not session_id or entry["payload"].get("session_id") == session_id:
+                if not session_id or any(payload.get("session_id") == session_id
+                                         for payload in entry["payloads"]):
                     # A job keeps the bare reason callers already match on; a
                     # temp is named, since nothing else lists it.
                     remaining.append(reason if place == "outbox job" else f"{reason}; {path}")
@@ -1337,10 +1338,11 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
         # First pass: which jobs are exact copies, and so whose ownership to ask.
         with _locked_outbox():
             first = _outbox_entries()
+        first_data = {entry["path"]: entry.get("data") for entry in first}
         _classify_entries(first, source_rows)
         exact = [e for e in first if e.get("match") == "exact"]
         asked: set[str] = set().union(*(e["hashes"] for e in exact))
-        asked_idents = [e["ident"] for e in exact if e["ident"]]
+        asked_idents = [ident for entry in exact for ident in entry["idents"]]
         owners: tuple[set[str], set[tuple[str, Any]]] | None = None
         owner_error = ""
         if episode_id is None:
@@ -1368,8 +1370,9 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                     why = (f"queued capture job {path} could not be read ({entry['error']}), "
                            "so it was kept")
                 else:
-                    match, hashes, ident = entry["match"], entry["hashes"], entry["ident"]
-                    key = (ident["summary_md5"], _instant(ident["ts"])) if ident else None
+                    match, hashes = entry["match"], entry["hashes"]
+                    keys = {(ident["summary_md5"], _instant(ident["ts"]))
+                            for ident in entry["idents"]}
                     if match == "identity":
                         state = "copy remains"
                         why = (f"queued capture job {path} matches this episode only by time "
@@ -1379,16 +1382,24 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                         why = (f"queued capture job {path} could not be checked against other "
                                f"episodes ({owner_error}), so it was kept")
                     elif match == "exact" and (not hashes <= asked
-                                               or (key is not None and key not in asked_keys)):
+                                               or not keys <= asked_keys
+                                               or entry["data"] != first_data.get(path)):
                         state = "copy remains"
                         why = (f"queued capture job {path} changed while the forget ran, "
                                "so it was kept")
-                    elif match == "exact" and (hashes & owners[0] or key in owners[1]):
+                    elif match == "exact" and (hashes & owners[0] or keys & owners[1]):
                         state = "copy remains"
                         why = (f"queued capture job {path} is also held by another live "
                                "episode, so it was kept")
                     elif match == "exact":
                         try:
+                            from khipu import tombstones
+
+                            # Fence every nested identity before the file goes:
+                            # a resolution archive's queued_evidence may be a
+                            # lossy projection that is not itself an exact
+                            # source-row match.
+                            tombstones.publish_payloads(entry["payloads"])
                             path.unlink()
                         except FileNotFoundError:
                             continue
