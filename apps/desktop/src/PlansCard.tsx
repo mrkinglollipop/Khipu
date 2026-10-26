@@ -670,6 +670,12 @@ export function planPauses(view: RouteView | null | undefined, now: Date = new D
   return out;
 }
 
+/** What identifies an account across reads: its routing key, else its CLI,
+ *  login folder and name. Never its position in the list. */
+function accountIdentity(row: UsageAccount): string {
+  return row.key ?? `${row.harness ?? ""}|${row.home ?? ""}|${row.account ?? ""}`;
+}
+
 function accountName(row: UsageAccount): string {
   return row.account || row.harness || "Account";
 }
@@ -751,11 +757,15 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
   const failedAge = fmtAgoSince(errorAt);
   // The sheet remembers which account it shows, never the row it was opened
   // with, so Refresh plan (a new report) changes what the sheet reads.
-  const detail = useDetailHost<{ key: string | null; idx: number }>();
-  const openRow = detail.target
-    ? accounts.find((r) => detail.target?.key != null && r.key === detail.target.key) ??
-      (detail.target.key == null ? accounts[detail.target.idx] : undefined)
-    : undefined;
+  const detail = useDetailHost<string>();
+  const openRow = detail.target ? accounts.find((r) => accountIdentity(r) === detail.target) : undefined;
+  // An account that can't be matched any more ends the sheet for good, so it
+  // does not reopen if an account with that identity returns later.
+  const closeDetail = detail.close;
+  const hasTarget = detail.target != null;
+  useEffect(() => {
+    if (hasTarget && !openRow) closeDetail();
+  }, [hasTarget, openRow, closeDetail]);
   return (
     <div className="card plans-card">
       <div className="card-head">
@@ -802,7 +812,7 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
       ) : (
         accounts.map((row, i) => (
           <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now}
-            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} onOpen={() => detail.open({ key: row.key ?? null, idx: i })} />
+            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} onOpen={() => detail.open(accountIdentity(row))} />
         ))
       )}
       {openRow ? (

@@ -327,6 +327,50 @@ describe("review round 2", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
+  it("matches an account without a key by its identity, never by position", () => {
+    const keyless = (account: string, used: number): UsageReport => {
+      const r = usage();
+      r.accounts = [{ ...r.accounts![0], key: null, account, windows: [{ name: "weekly", used_pct: used, resets_at: "2026-03-10T14:59:00Z" }] }];
+      return r;
+    };
+    const { rerender } = render(<PlansCard state={plansState(keyless("Alpha", 80))} routing={route()} />);
+    const open = screen.getByRole("button", { name: /^Alpha Max/ });
+    open.focus();
+    fireEvent.click(open);
+    expect(within(screen.getByRole("dialog")).getByText("20% left")).toBeInTheDocument();
+    // Same position, different account: the sheet must not switch to it.
+    rerender(<PlansCard state={plansState(keyless("Omega", 10))} routing={route()} />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByText("90% left")).toBeNull();
+  });
+
+  it("stays closed when the account comes back, and focus returns to the row", async () => {
+    const { rerender } = render(<PlansCard state={plansState(usage())} routing={route()} />);
+    const open = screen.getByRole("button", { name: /^Gamma Lite/ });
+    open.focus();
+    fireEvent.click(open);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    const gone = usage();
+    gone.accounts = gone.accounts!.filter((r) => r.key !== "glm|");
+    rerender(<PlansCard state={plansState(gone)} routing={route()} />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    rerender(<PlansCard state={plansState(usage())} routing={route()} />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // The row is the same DOM node on a keyless swap, so focus can return to it.
+    const keyless = (account: string): UsageReport => {
+      const r = usage();
+      r.accounts = [{ ...r.accounts![0], key: null, account }];
+      return r;
+    };
+    rerender(<PlansCard state={plansState(keyless("Alpha"))} routing={route()} />);
+    const row = screen.getByRole("button", { name: /^Alpha Max/ });
+    row.focus();
+    fireEvent.click(row);
+    rerender(<PlansCard state={plansState(keyless("Omega"))} routing={route()} />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: /^Omega Max/ })));
+  });
+
   it("says the real cause of a failed capture, and the summariser sentence only for non-JSON", () => {
     expect(captureCauseWords("last capture attempt failed: provider down")).toBe("The last session couldn't be saved: provider down");
     expect(captureCauseWords("last capture attempt failed: extract: HTTPError 429; 1 job(s) waiting 90 min — nothing is draining them")).toBe(
