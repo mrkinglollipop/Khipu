@@ -137,7 +137,7 @@ button.wk-job-title {
 /* Rail badge */
 .nav-badge { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; min-width: 1.4rem; justify-content: center; padding: 0 6px; height: 18px; border-radius: 9px; background: var(--accent-soft); color: var(--accent); font-size: var(--t-xs); font-weight: 600; font-variant-numeric: tabular-nums; flex: none; }
 .nav-badge .bdot { width: 6px; height: 6px; border-radius: 3px; background: var(--err); }
-.nav-badge.quiet { background: var(--surface-2); color: var(--muted); }
+.nav-badge.quiet { background: var(--surface-2); color: var(--text-2); }
 
 /* Ledger parts of a board */
 .card .row.wk-goal { display: grid; grid-template-columns: minmax(0, 1fr) minmax(8rem, 12rem) auto; column-gap: var(--s3); align-items: center; }
