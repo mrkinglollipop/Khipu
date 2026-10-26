@@ -50,7 +50,7 @@ function usage(): UsageReport {
         ] },
       { ...base, key: "glm|", harness: "glm", account: "Gamma", plan: "lite",
         windows: [{ name: "weekly", used_pct: 96, resets_at: "2026-03-10T00:36:00Z" }] },
-      { ...base, key: "muse|", harness: "muse", account: "Delta", plan: "27681631238169137", source: "turn",
+      { ...base, key: "muse|", harness: "muse", account: "Delta", plan: "40000000000000002", source: "turn",
         observed_at: READ_AT, windows: [{ name: "weekly", used_pct: 2, resets_at: "2026-03-15T23:00:00Z" }] },
     ] as UsageAccount[],
   };
@@ -65,7 +65,7 @@ function route(): RouteView {
         pace: [{ window: "weekly", trailing_h: 24, rate_pct_per_h: 0.3, plan: { verdict: "underpacing", unused_at_reset_pct: 16 } }],
         cap_statuses: [
           { kind: "pace_target", purpose: "job", slack: 0, allowance_pct: 11.1, used_pct: 37, confirmed_at: "2026-03-02T15:00:00Z" },
-          { kind: "spend", cap_usd: 35, days: 7, usd: 1.89 },
+          { kind: "spend", cap_usd: 50, days: 7, usd: 4.2 },
         ],
         advice: { verdict: "hold_back", caps: [{ kind: "pace_target", why: "26 points ahead of even plus 0. Clears in 1 d 21 h." }] },
         lead_advice: { verdict: "go" } },
@@ -80,7 +80,7 @@ function route(): RouteView {
     priority: {
       entries: [
         { account: "claude|", label: "Alpha", role: "First choice for builds.", until: null, in_settings: true,
-          exceptions: [{ text: "Reviews may run 15 points ahead of an even pace.", until: "2026-03-10T20:30:00Z", at: "2026-03-08T15:00:00Z" }] },
+          exceptions: [{ text: "Reviews may run 10 points ahead of an even pace.", until: "2026-03-10T20:30:00Z", at: "2026-03-08T15:00:00Z" }] },
         { account: "glm|", label: "Gamma", role: "Overflow only.", until: null, in_settings: true },
       ],
       pending: false, confirmed: true, version: "p1",
@@ -98,7 +98,7 @@ const routingState = (data: RouteView, load = vi.fn(async () => undefined)): Rou
 describe("plain words", () => {
   it("never prints an id or a lower-case word as a plan", () => {
     expect(planWord("max")).toBe("Max");
-    expect(planWord("27681631238169137")).toBe("");
+    expect(planWord("40000000000000002")).toBe("");
     expect(planWord(null)).toBe("");
   });
 
@@ -176,9 +176,9 @@ describe("detail data", () => {
       now: "An even pace allows 11.1% by now; 37% is used.",
       ends: "Yours since Mar 2 · no end",
     });
-    expect(d.caps[1].title).toBe("At most $35 per rolling 7 days");
+    expect(d.caps[1].title).toBe("At most $50 per rolling 7 days");
     expect(d.exceptions).toEqual([{
-      text: "Reviews may run 15 points ahead of an even pace.",
+      text: "Reviews may run 10 points ahead of an even pace.",
       ends: "Ends tomorrow 4:30 PM",
       by: "you said so Mar 8",
     }]);
@@ -206,7 +206,7 @@ describe("Plans rows open the Plan detail", () => {
     const open = screen.getByRole("button", { name: /^Alpha Max: 20% of its week left, .* Open usage details$/ });
     expect(screen.getByRole("button", { name: /^Gamma Lite: 4% of its week left/ })).toBeInTheDocument();
     // An id is never printed as a plan.
-    expect(screen.queryByText(/27681631238169137/)).toBeNull();
+    expect(screen.queryByText(/40000000000000002/)).toBeNull();
     open.focus();
     fireEvent.click(open);
     const dialog = screen.getByRole("dialog");
@@ -262,7 +262,7 @@ describe("Routing rows and priority names open the Routing detail", () => {
       expect(view.getByRole("heading", { name: h })).toBeInTheDocument();
     }
     expect(view.getByRole("heading", { name: "Your words for this account · 1st of 2" })).toBeInTheDocument();
-    expect(view.getByText("Reviews may run 15 points ahead of an even pace.")).toBeInTheDocument();
+    expect(view.getByText("Reviews may run 10 points ahead of an even pace.")).toBeInTheDocument();
     expect(view.getByText("Ends tomorrow 4:30 PM")).toBeInTheDocument();
     expect(view.getByText("First choice for builds.")).toBeInTheDocument();
     // The routing view is not the plan view.
