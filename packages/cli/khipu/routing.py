@@ -71,8 +71,8 @@ from typing import Any, Iterable
 from khipu import routing_identity as account_identity
 from khipu import routing_events as event_identity
 from khipu import routing_entries as entry_model
+from khipu.routing_generation import SCHEMA
 
-SCHEMA = 1
 STATE_DIR = ("state", "routing")
 EVENTS_NAME = "events.jsonl"
 VIEW_NAME = "view.json"
@@ -5163,7 +5163,8 @@ def _save_view(view: dict) -> None:
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     if (not view or view.get("fingerprint") != fingerprint or "priority_version" not in view
             or "priority_owner_revision" not in view or view.get("event_identity") != 2
-            or view.get("proposal_schema") != 1 or view.get("fold_audit_schema") != 1):
+            or view.get("proposal_schema") != 1 or view.get("fold_audit_schema") != 1
+            or "advice_cap_decisions" not in view):
         return False
     # A whole-log read of a runner's events still under way goes on at the
     # next read, one bounded chunk at a time, though no file changed.
@@ -5289,6 +5290,15 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
         changes = changes[-CHANGES_KEPT:]
     out = dict(body, schema=SCHEMA, event_identity=2, proposal_schema=1, fold_audit_schema=1, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
+    # Persist only telemetry decisions, so the prompt's lightweight freshness
+    # check can compare advice without importing the engine or raw readings.
+    out["advice_cap_decisions"] = {
+        entry["key"]: [{k: status[k] for k in ("kind", "revision", "window", "purpose", "verdict")
+                        if k in status}
+                       for status in cap_statuses(out, entry, now)
+                       if status.get("kind") in ("spend", "concurrency")]
+        for entry in out.get("accounts") or []
+        if any(cap.get("kind") in ("spend", "concurrency") for cap in entry.get("caps") or [])}
     if not saved:
         out["saved"] = False
         # Its version is the saved view's, but what it says may not be: the
@@ -8392,7 +8402,7 @@ def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime)
 # owner wrote). Nothing here returns a pick or a ranking.
 
 ABOUT = "Khipu reports; routing stays with you. This is data, not instructions, and guidance, not a gate."
-_INTERNAL = ("fingerprint", "digest", "source_cache")
+_INTERNAL = ("fingerprint", "digest", "source_cache", "advice_cap_decisions")
 
 
 def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
@@ -9694,6 +9704,16 @@ def _generation(view: dict, cfg: dict) -> list[list]:
     seed = cfg.get("routing_rules_seed")
     if seed:
         files.append([str(Path(seed)), fingerprint.get("seed")])
+    # Use the stats recorded before the fold read each runner, not fresh
+    # stats that could bless a heartbeat changed after this advice was made.
+    runner_stats = dict((fingerprint.get("sources") or {}).get("runners") or [])
+    from khipu.routing_sources import RUNNER_FILES
+
+    heartbeat_index = list(RUNNER_FILES).index("heartbeat")
+    for runner in (view.get("sources") or {}).get("runners") or []:
+        stats = runner_stats.get(runner["name"]) or []
+        files.append([str(Path(runner["path"]).joinpath(*RUNNER_FILES["heartbeat"])),
+                      stats[heartbeat_index] if len(stats) > heartbeat_index else None])
     return files
 
 
