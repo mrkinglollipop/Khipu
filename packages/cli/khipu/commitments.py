@@ -1774,7 +1774,9 @@ def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: 
     """Keep a refused close on the owner's item as a "Looks done" suggestion
     (``settle_suggestion``) with its rule, reason and evidence, for him to
     close. Evidence he already reopened against (``reopened_rule_keys``) is
-    never suggested again, and the same key is not rewritten."""
+    never suggested again, and the same key is not rewritten unless the old
+    one quotes a decision without its source episode (readers hide that one,
+    :func:`settle_suggestion_sql`). A PR suggestion has no episode to name."""
     if not _close_columns_ready(cur):
         return False
     doc = {"looks_done": True, "rule": rule, "reason": str(reason or "")[:300], "key": key,
@@ -1783,7 +1785,8 @@ def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: 
         "UPDATE commitments SET settle_suggestion = %s::jsonb WHERE id = %s AND status = 'open' "
         "AND NOT (%s = ANY(reopened_rule_keys)) "
         "AND (settle_suggestion IS NULL OR settle_suggestion->>'key' IS DISTINCT FROM %s "
-        "OR settle_suggestion->>'episode' IS NULL)",
+        "OR (settle_suggestion->>'episode' IS NULL AND (settle_suggestion->>'decision_id' IS NOT NULL "
+        "OR settle_suggestion->'evidence'->>'decision_id' IS NOT NULL)))",
         (json.dumps(doc, default=str), commitment_id, key, key),
     )
     return cur.rowcount > 0
