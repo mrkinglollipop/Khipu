@@ -774,8 +774,9 @@ def land_transcript_images(
 # and an exact copy is dropped: nothing is lost.
 SEEN_TEXT_MAX = 60_000
 # Short messages ("ok", "yes", "continue") recur legitimately across a session
-# and must keep counting as turns; only messages at least this long are
-# fingerprinted. A re-emitted short copy costs nothing to summarise again.
+# and must keep counting as turns when they stand alone. Fingerprints still
+# cover them so a re-emitted copy after a proven long head can be dropped
+# without eating a genuine new short turn that was never captured.
 FINGERPRINT_MIN_CHARS = 40
 
 
@@ -791,10 +792,10 @@ def remember_seen(st: dict, fresh: list[str]) -> None:
 
 
 def _fingerprints_for_msgs(msgs: list[tuple[str, str]]) -> list[str]:
-    """Fingerprints for messages long enough to enter ``seen_text``."""
+    """Fingerprints for user/assistant messages that enter ``seen_text``."""
     out: list[str] = []
     for role, text in msgs:
-        if role in ("user", "assistant") and len(text) >= FINGERPRINT_MIN_CHARS:
+        if role in ("user", "assistant") and text:
             out.append(text_fingerprint(role, text))
     return out
 
@@ -897,8 +898,9 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     checkpoints = checkpoints[replay_end:]
     last_user_counted = False   # the open user block already holds a real turn
     head_open = True            # every message so far was an already-seen copy
-    # After a leading already-seen long turn, tool markers and short copies in
-    # the same re-emitted prefix are not new turns (compaction appends them).
+    # After a leading already-seen long turn, short lines whose exact text was
+    # already captured are copies (compaction re-emits them). Tool markers and
+    # short lines that were never seen stay: position alone is not proof.
     skipping_copies = False
     for (d, role, text, line_end), checkpoint in zip(items, checkpoints):
         real = False
@@ -911,14 +913,11 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             if stand_in is not None:
                 text = stand_in
         if role == "tool":
-            if head_open and skipping_copies:
-                dropped += 1
-                if stats is not None:
-                    stats["skip_to"] = line_end
-                    stats["skip_prefix"] = checkpoint
-                continue
+            # Tools are never fingerprinted; keep them. A copy-run stays open
+            # so a following short line can still match an earlier fingerprint.
             msgs.append(("tool", text))
-            head_open = False
+            if not skipping_copies:
+                head_open = False
             continue
         streamed = isinstance(d.get("params"), dict)
         if known is not None and not streamed and len(text) >= FINGERPRINT_MIN_CHARS:
@@ -936,14 +935,20 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                 continue
             known.add(fp)
             fresh.append(fp)
-        elif (head_open and skipping_copies and not streamed
-              and len(text) < FINGERPRINT_MIN_CHARS):
-            dropped += 1
-            dropped_chars += len(text)
-            if stats is not None:
-                stats["skip_to"] = line_end
-                stats["skip_prefix"] = checkpoint
-            continue
+            skipping_copies = False
+        elif known is not None and not streamed and len(text) < FINGERPRINT_MIN_CHARS:
+            fp = text_fingerprint(role, text)
+            if head_open and skipping_copies and fp in known:
+                dropped += 1
+                dropped_chars += len(text)
+                if stats is not None:
+                    stats["skip_to"] = line_end
+                    stats["skip_prefix"] = checkpoint
+                continue
+            if fp not in known:
+                known.add(fp)
+                fresh.append(fp)
+            skipping_copies = False
         if head_open and d.get("isCompactSummary") and stats is not None:
             # Claude Code's own summary sits ahead of the copies it re-emits;
             # it leaves the head open and rides along (``carry``) when the

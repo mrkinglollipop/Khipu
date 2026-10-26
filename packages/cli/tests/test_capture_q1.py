@@ -91,10 +91,35 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
             tp = Path(td) / "t.jsonl"
             _write(tp, [_user(long_u), tool] + tail)
             _, offset, _ = sc.read_window(tp, 0)
+            # True copies: long + every short line from the earlier window.
             seen = [sc.text_fingerprint("user", long_u)]
+            for i in range(5):
+                seen.append(sc.text_fingerprint("user", f"short copy {i} xxxxxxxxxxxxx"))
+                seen.append(sc.text_fingerprint("assistant", f"short reply {i} yyyyyyyyyy"))
             _write(tp, [_user(long_u), tool] + tail + [_user(long_u), tool] + tail)
             _, _, turns = sc.read_window(tp, offset, seen=seen, stats={})
             self.assertEqual(turns, 0, f"the re-emitted copy counted {turns} new user turns")
+
+    def test_genuine_short_turns_after_seen_long_are_kept(self):
+        """A seen long head must not eat new short turns and tool markers."""
+        long_u = "A long already captured user question that is clearly over forty characters"
+        tool = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/x"}}]}}
+        rows = [_user(long_u), tool, _user("yes, go ahead"), _assistant("done"),
+                tool, _user("now push it")]
+        with tempfile.TemporaryDirectory() as td:
+            tp = Path(td) / "t.jsonl"
+            _write(tp, rows)
+            stats: dict = {}
+            msgs, _, turns = sc.read_window(
+                tp, 0, seen=[sc.text_fingerprint("user", long_u)], stats=stats)
+            self.assertEqual(turns, 2, f"genuine short turns were lost; turns={turns} msgs={msgs}")
+            texts = [t for _, t in msgs]
+            self.assertIn("yes, go ahead", texts)
+            self.assertIn("done", texts)
+            self.assertIn("now push it", texts)
+            self.assertGreaterEqual(sum(1 for r, _ in msgs if r == "tool"), 2)
+            self.assertEqual(stats.get("deduped_msgs"), 1, stats)
 
 
 class SubagentLineageTest(unittest.TestCase):
