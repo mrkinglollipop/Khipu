@@ -6,7 +6,7 @@ from contextlib import redirect_stdout
 import pytest
 
 from khipu import cli, commitments, db, owner_act, routing
-from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.hermetic_pg import hub, pg_cluster, chain_dir  # noqa: F401
 from tests.fact_seed import adopt, announce
 
 
@@ -16,6 +16,10 @@ def origin_db(hub, monkeypatch, tmp_path):
     monkeypatch.setenv("KHIPU_USER_ALIASES", "owner")
     commitments.reset_user_patterns()
     conn = hub.connect()
+    # Real ordering: protected ownership metadata exists before the historical
+    # correction boundary. Seeds below model captures within that interval.
+    hub.migrate(directory=chain_dir(tmp_path, "0035"), conn=conn)
+    conn.commit()
     hub.migrate(conn=conn)
     conn.commit()
     db._TABLE_COLUMNS_CACHE.clear()
@@ -32,9 +36,14 @@ def seed(conn, *, parent="session-parent", project="example/widget", **over):
         cur.execute("INSERT INTO episodes (ts, session_id, parent_session_id, summary, raw) "
                     "VALUES (now(), md5(random()::text), %s, 'Synthetic capture', '{}'::jsonb) RETURNING id", (parent,))
         episode = cur.fetchone()[0]
+        cur.execute("SELECT a.applied_at + (b.applied_at - a.applied_at) / 2 "
+                    "FROM schema_migrations a, schema_migrations b "
+                    "WHERE a.version = '0035_commitment_owner_reassigned' "
+                    "AND b.version = '0049_commitment_origin_requests'")
+        historical_opened = cur.fetchone()[0]
         cur.execute("INSERT INTO commitments (project, text, owner, kind, opened_episode, opened_at, "
                     "content_hash) VALUES (%s, 'Should the synthetic fixture use a queue?', 'user', "
-                    "'question', %s, '2020-01-01', %s) RETURNING id", (project, episode, str(episode)))
+                    "'question', %s, %s, %s) RETURNING id", (project, episode, historical_opened, str(episode)))
         cid = cur.fetchone()[0]
         adopt(cur, "commitment", cid)
         # Stand in for a historical row present before migration 0049's
@@ -46,6 +55,10 @@ def seed(conn, *, parent="session-parent", project="example/widget", **over):
             if name == "latest_text":
                 adopt(cur, "commitment", cid)
     return cid
+
+
+def allow_app(monkeypatch):
+    monkeypatch.setattr(routing, "_caller", lambda: {"app": True, "chain": ["app"], "where": "/Applications"})
 
 
 def command(*args):
@@ -71,14 +84,14 @@ def test_preview_request_confirm_and_undo(origin_db, monkeypatch):
     assert rc == 0 and request["state"] == "pending"
     request_id = request["request"]
     rc, refused = command("--confirm", request_id, "--owner-direction")
-    assert rc != 0 and refused["code"] == "owner_confirmation_required"
+    assert rc != 0 and refused["code"] == "no_recorded_turn"
     rc, refused = command("--confirm", request_id, "--from-app")
     assert rc != 0
     with origin_db.cursor() as cur:
         cur.execute("SELECT owner, origin FROM commitments WHERE id = %s", (cid,))
         assert cur.fetchone() == ("user", "conversation")
-    monkeypatch.setattr(routing, "typed_yes", lambda prompt: True)
-    rc, applied = command("--confirm", request_id)
+    allow_app(monkeypatch)
+    rc, applied = command("--confirm", request_id, "--from-app")
     assert rc == 0 and applied["changed"] == 1
     assert applied["state"] == "applied"
     from khipu import owed_tidy, owner_direction
@@ -89,7 +102,7 @@ def test_preview_request_confirm_and_undo(origin_db, monkeypatch):
     with origin_db.cursor() as cur:
         cur.execute("SELECT owner, origin FROM commitments WHERE id = %s", (cid,))
         assert cur.fetchone() == ("user", "conversation")
-    assert command("--confirm", request_id)[1]["changed"] == 0
+    assert command("--confirm", request_id, "--from-app")[1]["changed"] == 0
 
 
 def test_owner_act_reaches_request_path_without_app_flag(monkeypatch):
@@ -123,8 +136,8 @@ def test_changes_after_preview_are_skipped_and_other_projects_apply_atomically(o
     with origin_db.transaction(), origin_db.cursor() as cur:
         commitments.set_status(cur, first, "closed", by="app")
         commitments.set_status(cur, first, "open", by="app")
-    monkeypatch.setattr(routing, "typed_yes", lambda prompt: True)
-    _, applied = command("--confirm", pending["request"])
+    allow_app(monkeypatch)
+    _, applied = command("--confirm", pending["request"], "--from-app")
     assert applied["changed"] == 2 and applied["skipped"] == [first]
     assert len(applied["batches"]) == 2
     from khipu import owner_direction
@@ -138,8 +151,8 @@ def test_changes_after_preview_are_skipped_and_other_projects_apply_atomically(o
 def test_owner_touch_after_correction_prevents_undo(origin_db, monkeypatch):
     cid = seed(origin_db)
     _, pending = command("--request")
-    monkeypatch.setattr(routing, "typed_yes", lambda prompt: True)
-    _, applied = command("--confirm", pending["request"])
+    allow_app(monkeypatch)
+    _, applied = command("--confirm", pending["request"], "--from-app")
     with origin_db.transaction(), origin_db.cursor() as cur:
         # Same-value edits must still be retained as owner choices.
         cur.execute("UPDATE commitments SET due_after = NULL WHERE id = %s", (cid,))
@@ -152,7 +165,7 @@ def test_application_rolls_back_all_projects_on_failure(origin_db, monkeypatch):
     first = seed(origin_db)
     seed(origin_db, project="example/other")
     _, pending = command("--request")
-    monkeypatch.setattr(routing, "typed_yes", lambda prompt: True)
+    allow_app(monkeypatch)
     original = commitments.reassign
     calls = []
     def fail_second(*args, **kwargs):
@@ -162,7 +175,7 @@ def test_application_rolls_back_all_projects_on_failure(origin_db, monkeypatch):
         return original(*args, **kwargs)
     monkeypatch.setattr(commitments, "reassign", fail_second)
     with pytest.raises(RuntimeError, match="Synthetic failure"):
-        command("--confirm", pending["request"])
+        command("--confirm", pending["request"], "--from-app")
     with origin_db.cursor() as cur:
         cur.execute("SELECT owner, origin FROM commitments WHERE id = %s", (first,))
         assert cur.fetchone() == ("user", "conversation")
@@ -172,12 +185,12 @@ def test_application_rolls_back_all_projects_on_failure(origin_db, monkeypatch):
         assert cur.fetchone()[0] == 0
 
 
-def test_mcp_cannot_confirm_even_with_owner_direction(origin_db):
+def test_mcp_cannot_confirm_without_recorded_owner_prompt(origin_db):
     seed(origin_db)
     ok, request = owner_act.act("owed.correct_job_origin", {})
     assert ok and request["state"] == "pending"
     ok, refused = owner_act.act("owed.correct_job_origin.confirm", {"request": request["request"]})
-    assert not ok and refused["code"] == "owner_confirmation_required"
+    assert not ok and refused["code"] == "no_recorded_turn"
 
 
 def test_ambiguous_witness_or_owner_claim_is_excluded(origin_db):
@@ -204,8 +217,8 @@ def test_lineage_change_after_request_does_not_apply(origin_db, monkeypatch):
     with origin_db.transaction(), origin_db.cursor() as cur:
         cur.execute("UPDATE episodes SET parent_session_id = NULL WHERE id = "
                     "(SELECT opened_episode FROM commitments WHERE id = %s)", (cid,))
-    monkeypatch.setattr(routing, "typed_yes", lambda prompt: True)
-    _, result = command("--confirm", pending["request"])
+    allow_app(monkeypatch)
+    _, result = command("--confirm", pending["request"], "--from-app")
     assert result["changed"] == 0 and result["skipped"] == [cid]
 
 

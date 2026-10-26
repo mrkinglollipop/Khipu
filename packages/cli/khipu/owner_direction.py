@@ -123,9 +123,6 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     (``latest_window_h``, 6 hours by default), and whose hook ran above this call. A background job, a
     dispatched job or a conversation nobody has typed in lately is refused.
     Nothing here reads what the owner said, and nothing calls a model."""
-    if action == "owed.correct_job_origin.confirm":
-        raise DirectionRefused("owner_confirmation_required",
-                               "Job-origin correction needs confirmation in the app or a yes typed on a terminal.")
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
@@ -1223,7 +1220,8 @@ def _before(want: dict):
         return {"batches": []}
     if action == "owed.tidy":
         facts = want.get("facts") or {}
-        return {"project": target, "change": facts.get("change"), "batch": facts.get("batch")}
+        return {"project": target, "change": facts.get("change"), "batch": facts.get("batch"),
+                **({"ids": facts["ids"]} if facts.get("ids") is not None else {})}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
     if action == "direction.acknowledge":
@@ -1621,7 +1619,7 @@ def _undo_owed_tidy(line, via):
         raise ValueError("Khipu has no record of which batch this clean-up wrote, so it can't undo it")
     if _b(line).get("change") == "undo":
         out = owed_tidy.redo(batch, project=line["target"], owner_gate=_by(via),
-                             write_id=_inverse_write_id(line, batch))
+                             ids=_b(line).get("ids"), write_id=_inverse_write_id(line, batch))
         counted = {"reapplied": int(out.get("reapplied") or 0)}
     else:
         out = owed_tidy.undo(batch, project=line["target"], owner_gate=_by(via),

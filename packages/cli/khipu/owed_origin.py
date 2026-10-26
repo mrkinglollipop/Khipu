@@ -1,8 +1,8 @@
-"""Read-only historical lineage preview; requests need an app/terminal confirmation.
+"""Read-only historical lineage preview; app or prompt-bound owner confirmation.
 
 The request stores the exact reviewed set. Confirmation rechecks it under locks
 and never expands it. Corrections use the existing per-project undo batches in
-one transaction. No model, provider, automatic tidy or direction can apply one.
+one transaction. No model, provider or automatic tidy can apply one without owner authorization.
 """
 from __future__ import annotations
 
@@ -32,22 +32,25 @@ def _rows(cur, project=None, *, ids=None, lock=False):
     # parent. A conversation restatement or an unproven/owner claim is a veto.
     cur.execute(
         "SELECT to_jsonb(c), e.session_id, e.parent_session_id, e.deleted_at, "
-        "(SELECT applied_at FROM schema_migrations WHERE version = '0033_commitment_owner'), "
+        "(SELECT applied_at FROM schema_migrations WHERE version = '0035_commitment_owner_reassigned'), "
+        "(SELECT applied_at FROM schema_migrations WHERE version = '0049_commitment_origin_requests'), "
         "EXISTS (SELECT 1 FROM fact_claims f WHERE f.kind = 'commitment' AND f.fact_id = c.id), "
         "EXISTS (SELECT 1 FROM fact_claims f LEFT JOIN episodes w ON w.id = f.episode_id "
         "WHERE f.kind = 'commitment' AND f.fact_id = c.id AND "
         "(f.claimant != 'episode' OR w.id IS NULL OR w.deleted_at IS NOT NULL "
         "OR NULLIF(btrim(w.parent_session_id), '') IS NULL "
-        "OR w.parent_session_id IS DISTINCT FROM e.parent_session_id)) "
+        "OR w.parent_session_id IS DISTINCT FROM e.parent_session_id "
+        "OR EXISTS (SELECT 1 FROM episodes peer WHERE peer.session_id = w.session_id "
+        "AND peer.parent_session_id IS DISTINCT FROM w.parent_session_id))) "
         "OR EXISTS (SELECT 1 FROM episodes peer WHERE peer.session_id = e.session_id "
         "AND peer.parent_session_id IS DISTINCT FROM e.parent_session_id), "
         "EXISTS (SELECT 1 FROM commitment_tidy_items t WHERE t.commitment_id = c.id) "
         "FROM commitments c LEFT JOIN episodes e ON e.id = c.opened_episode WHERE "
         + " AND ".join(where) + " ORDER BY c.id" + (" FOR UPDATE OF c" if lock else ""), tuple(params))
     rows = []
-    for row, session, parent, deleted, cutoff, claims, conflict, history in cur.fetchall():
+    for row, session, parent, deleted, ownership_floor, cutoff, claims, conflict, history in cur.fetchall():
         row.update(lineage=parent, session=session, episode_deleted=deleted,
-                   migration_at=cutoff, has_claims=claims, conflicting_claims=conflict, history=history)
+                   ownership_floor=ownership_floor, migration_at=cutoff, has_claims=claims, conflicting_claims=conflict, history=history)
         rows.append(row)
     return rows
 
@@ -71,8 +74,10 @@ def _proposal(row):
     if any(row.get(key) for key in protected):
         return None
     opened, cutoff = co._as_utc(row.get("opened_at")), co._as_utc(row.get("migration_at"))
+    ownership_floor = co._as_utc(row.get("ownership_floor"))
     seen = co._as_utc(row.get("last_seen_at"))
-    if not opened or not cutoff or opened > cutoff or (seen and seen > opened):
+    if (not opened or not cutoff or not ownership_floor or opened < ownership_floor
+            or opened > cutoff or (seen and seen > opened)):
         return None
     owner, label = co.resolve_owner_and_label(
         row.get("text") or "", kind=row.get("kind"), declared="user", origin="job",
@@ -87,8 +92,12 @@ def _fingerprint(row):
 
 
 def preview(cur, project=None):
-    items, kinds, projects = [], {}, {}
+    items, kinds, projects, unestablished = [], {}, {}, 0
     for row in _rows(cur, project):
+        opened = co._as_utc(row.get("opened_at"))
+        floor = co._as_utc(row.get("ownership_floor"))
+        if not opened or not floor or opened < floor:
+            unestablished += 1
         after = _proposal(row)
         if after is None:
             continue
@@ -99,12 +108,13 @@ def preview(cur, project=None):
                       "text": row["text"], "after": after, "fingerprint": _fingerprint(row)})
     return {"format": "khipu-job-origin-preview", "version": 1,
             "counts": {"total": len(items), "by_kind": kinds, "by_project": projects},
+            "quarantined": {"ownership_unestablished": unestablished},
             "sample": items[:20], "items": items}
 
 
 def _confirm(cur, request_id, gate):
-    if gate not in ("app", "terminal"):
-        raise ValueError("Only an app or terminal owner confirmation can apply a correction")
+    if gate not in ("app", "direction"):
+        raise ValueError("Only verified app or prompt-bound owner authorization can apply a correction")
     cur.execute("SELECT state, preview, result FROM commitment_origin_requests WHERE id = %s FOR UPDATE",
                 (request_id,))
     found = cur.fetchone()
@@ -148,17 +158,18 @@ def command(args):
 
     want = owner_direction.intent("owed.correct_job_origin.confirm", args.confirm or "")
     if args.confirm:
-        # A fresh owner turn authorizes a request only, never its application.
-        if args.by_direction:
+        # A machine can manufacture a TTY and feed it yes. Only the existing
+        # verified app or prompt-bound direction machinery authorizes this.
+        if not args.from_app and not args.by_direction:
             print(json.dumps({"ok": False, "code": "owner_confirmation_required",
-                              "error": "The request stays pending until the owner confirms in the app or types yes on a terminal"}))
+                              "error": "The request stays pending until the owner confirms in the verified app or directs confirmation from a recorded owner prompt"}))
             return 2
         gate = cli._owner_only(args, want)
         if isinstance(gate, int):
             return gate
-        gate = "terminal" if gate == "cli" else gate
     try:
-        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+        with connect(statement_timeout_s=offline.setting("hub_statement_timeout"),
+                     record_reachability=bool(args.confirm or args.request)) as conn:
             with conn.cursor() as cur:
                 if args.confirm:
                     out = _confirm(cur, args.confirm, gate)

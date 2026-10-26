@@ -32,7 +32,7 @@ _MIGRATION_LOCK = threading.Lock()
 
 
 @secret_result("database_url")
-def resolve_dsn() -> str:
+def resolve_dsn(*, migrate_legacy: bool = True) -> str:
     """Order: KHIPU_/ALZY_ DATABASE_URL → Keychain → data_dir/dsn."""
     global _MIGRATION_DONE
 
@@ -46,13 +46,20 @@ def resolve_dsn() -> str:
 
         # The migration copies legacy files into the live config dir; an
         # isolated run (the promotion gate) only reads.
-        if not _MIGRATION_DONE and isolated_dir() is None:
+        if migrate_legacy and not _MIGRATION_DONE and isolated_dir() is None:
             # doctor connects from several threads at once; one migrates.
             with _MIGRATION_LOCK:
                 if not _MIGRATION_DONE:
                     migrate_legacy_secrets()
                     _MIGRATION_DONE = True
-        kc = get_dsn()
+        if migrate_legacy:
+            kc = get_dsn()
+        else:
+            # get_dsn itself copies a legacy Keychain item on read. Preview
+            # must only read, including when that is the configured secret.
+            from khipu.keychain import DSN_ACCOUNT, LEGACY_SERVICE, get_password
+
+            kc = get_password(DSN_ACCOUNT) or get_password(DSN_ACCOUNT, service=LEGACY_SERVICE)
         if kc:
             return kc
     except Exception:
@@ -123,11 +130,14 @@ def _with_statement_timeout(conninfo: str, seconds: float) -> str:
 
 
 def connect(*, autocommit: bool = False, statement_timeout_s: float | None = None,
-            connect_timeout: int | None = None):
+            connect_timeout: int | None = None, record_reachability: bool = True):
     """Bound connection setup; SQL timeouts belong to the operation's caller
     (``statement_timeout_s`` is how a caller asks for one, ``connect_timeout``
-    one bounded by its own deadline)."""
-    conninfo = conninfo_with_local_root_cert(resolve_dsn())
+    one bounded by its own deadline). Read-only callers can disable local
+    reachability-memo writes and legacy-secret migration with
+    ``record_reachability=False``."""
+    dsn = resolve_dsn() if record_reachability else resolve_dsn(migrate_legacy=False)
+    conninfo = conninfo_with_local_root_cert(dsn)
     if statement_timeout_s is not None and statement_timeout_s > 0:
         conninfo = _with_statement_timeout(conninfo, statement_timeout_s)
     from khipu import hub_reach
@@ -142,9 +152,11 @@ def connect(*, autocommit: bool = False, statement_timeout_s: float | None = Non
             **_keepalive_kwargs(),
         )
     except psycopg.OperationalError as exc:
-        hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+        if record_reachability:
+            hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
         raise
-    hub_reach.note_reachable()
+    if record_reachability:
+        hub_reach.note_reachable()
     return conn
 
 
