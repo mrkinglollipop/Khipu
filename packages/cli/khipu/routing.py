@@ -7114,7 +7114,9 @@ def restore_cap_layers(account: str, *, window: str | None, kind: str, purpose: 
                      and (e.get("written_by") or {}).get("kind") == "owner"
                      and (e.get("cap_kind") or e.get("kind")) == kind and e.get("purpose", "job") == purpose
                      and (not scoped or e.get("window") == window)), None)
-        target = f"cap:{event_identity.revision(last) if last else 'none'}"
+        # By the stored line's own id: a cap's ``revision`` is the caller's
+        # and a newer cap may reuse it.
+        target = f"cap:{(last.get('id') or last.get('_seq')) if last else 'none'}"
         written, view = _write_batch(owner_lines(events, via), target=target)
     return dict(_done(written[-1], view), account=key)
 
@@ -7537,8 +7539,14 @@ def restore_priority(stored: dict, *, via: str, holds: dict | None = None, now: 
             base = {"type": "priority_clear"}
         request = {"type": "priority_set", "entries": rows, "until": stored.get("until"), "pending": True,
                    "owner_request": words, "written_by": dict(author), "via": stored.get("via") or "mcp"}
+        # The last stored priority write's own id, not the clock-dependent
+        # priority_version (a proposal's seven-day expiry moves that with no
+        # write): only a write in between refuses an interrupted retry.
+        last = next((e for e in reversed(_in_write_order(read_events()[0]))
+                     if e.get("type") in ("priority_set", "priority_confirm", "priority_undo", "priority_clear",
+                                          "priority_drop")), None)
         written, view = _write_batch([*owner_lines([base], via), request],
-                                     target=read_view(now).get("priority_version"))
+                                     target=f"priority:{(last.get('id') or last.get('_seq')) if last else 'none'}")
         return _done(written[-1], view)
 
 
