@@ -1500,10 +1500,21 @@ def _match_score(a: str, b: str) -> float:
     """Best of Jaccard and substring/containment (fix 4) — used for the
     explicit ``done: <text>`` close, which has no similarity config of its
     own but must still match the CLOSED text against candidate commitment
-    text rather than closing an arbitrary open row."""
+    text rather than closing an arbitrary open row.
+
+    Near-dup and relay treat containment as identity only when the longer
+    side adds no tokens (token cover) or the strings are nearly the same
+    length; a shorter phrase inside a longer distinct one is not a match.
+    Explicit ``done:`` still allows asymmetric containment in
+    :func:`completion_match`."""
     al, bl = a.strip().lower(), b.strip().lower()
     if al and bl and (al in bl or bl in al):
-        return 1.0
+        shorter, longer = (al, bl) if len(al) <= len(bl) else (bl, al)
+        short_toks = set(re.findall(r"[a-z0-9]+", shorter))
+        long_toks = set(re.findall(r"[a-z0-9]+", longer))
+        if long_toks <= short_toks or len(shorter) / max(len(longer), 1) >= 0.9:
+            return 1.0
+        return 0.0
     return _jaccard(a, b)
 
 
@@ -1575,8 +1586,16 @@ def completion_match(text: str, row_text: str, *, kind: str, threshold: float,
     if not exact and len(tokens) < 3:
         return 0.0, "", False
     # Ordinary completion must preserve the full lexical evidence;
-    # substring containment is reserved for an explicit done statement.
-    text_score = _match_score(text, row_text) if kind == "done" else _jaccard(completion, target)
+    # substring containment is reserved for an explicit done statement
+    # (including asymmetric containment the near-dup bar rejects).
+    if kind == "done":
+        al, bl = text.strip().lower(), row_text.strip().lower()
+        if al and bl and (al in bl or bl in al):
+            text_score = 1.0
+        else:
+            text_score = _match_score(text, row_text)
+    else:
+        text_score = _jaccard(completion, target)
     covers = set(re.findall(r"[\w./-]+", target)) <= tokens
     score = 0.0
     via = ""

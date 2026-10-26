@@ -80,6 +80,10 @@ _PR_NUMBER_RE = re.compile(rf"\b{_PR_WORD}\s*#?\s*(\d{{1,7}})\b", re.I)
 # A PR list runs to the end of its clause, however long: a list cut short
 # would let an item close while a later PR it names is still open.
 _PR_LIST_RE = re.compile(rf"\b{_PR_WORD}\b([^.;:\n]*)", re.I)
+# Only #N tokens joined by commas / "and" / "&" immediately after the PR word
+# count as a list — not a later "issue #44" in the same clause.
+_PR_LIST_HASH_RUN_RE = re.compile(
+    r"\A\s*(#\d{1,7}(?:\s*(?:,|&|and)\s*#\d{1,7})*)", re.I)
 _HASH_RE = re.compile(r"(?<![\w&])#(\d{1,7})\b")
 _PULL_LINK_RE = re.compile(r"github\.com/([A-Za-z0-9][\w.-]*/[\w.-]+?)/pull/(\d{1,7})\b", re.I)
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
@@ -94,7 +98,8 @@ _GH_LINE_RE = re.compile(
     r"(?:([A-Za-z0-9][\w.-]*/[\w.-]+))?#(\d{1,7})\b")
 _GH_WORD_STATE = {"closed": "closed", "reopened": "open"}
 _DECIDE_RE = re.compile(r"\bdecid(?:e|es|ing|ed)\b|\bdecision\b", re.I)
-_NAMES_ITEM_RE = re.compile(r"\b(?:commitment|owed\s+item|item|question)\s*#?\s*(\d{1,12})\b", re.I)
+# Bare "item N" / "question N" are ordinary prose; only commitment / owed item.
+_NAMES_ITEM_RE = re.compile(r"\b(?:commitment|owed\s+item)\s*#?\s*(\d{1,12})\b", re.I)
 
 
 def _log(msg: str) -> None:
@@ -102,6 +107,15 @@ def _log(msg: str) -> None:
 
 
 # ---- PR numbers -------------------------------------------------------------
+
+
+def _pr_list_hash_hits(tail: str, base: int) -> list[tuple[int, int]]:
+    """``#N`` positions in a comma/"and"/"&" list at the start of ``tail``."""
+    run = _PR_LIST_HASH_RUN_RE.match(tail or "")
+    if not run:
+        return []
+    chunk = run.group(1)
+    return [(base + run.start(1) + h.start(1), int(h.group(1))) for h in _HASH_RE.finditer(chunk)]
 
 
 def parse_prs(text: str) -> list[int]:
@@ -114,8 +128,7 @@ def parse_prs(text: str) -> list[int]:
     for m in _PR_NUMBER_RE.finditer(text):
         found.append((m.start(1), int(m.group(1))))
     for m in _PR_LIST_RE.finditer(text):
-        for h in _HASH_RE.finditer(m.group(1)):
-            found.append((m.start(1) + h.start(1), int(h.group(1))))
+        found.extend(_pr_list_hash_hits(m.group(1), m.start(1)))
     for m in _PULL_LINK_RE.finditer(text):
         found.append((m.start(2), int(m.group(2))))
     out: list[int] = []
@@ -141,8 +154,8 @@ def pr_refs(text: str, project_repo: str | None) -> list[tuple[str | None, int]]
     for m in _PR_NUMBER_RE.finditer(text):
         found.append((m.start(1), project, int(m.group(1))))
     for m in _PR_LIST_RE.finditer(text):
-        for h in _HASH_RE.finditer(m.group(1)):
-            found.append((m.start(1) + h.start(1), project, int(h.group(1))))
+        for pos, n in _pr_list_hash_hits(m.group(1), m.start(1)):
+            found.append((pos, project, n))
     for m in _PULL_LINK_RE.finditer(text):
         found.append((m.start(2), _repo(m.group(1)), int(m.group(2))))
     out: list[tuple[str | None, int]] = []
