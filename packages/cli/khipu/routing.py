@@ -7109,8 +7109,13 @@ def restore_cap_layers(account: str, *, window: str | None, kind: str, purpose: 
         from khipu import routing_pace
 
         scoped = kind in routing_pace.WINDOW_CAP_KINDS
-        last = next((e for e in reversed(_in_write_order(read_events()[0]))
-                     if e.get("type") in ("cap_set", "cap_remove") and e.get("account") == key
+        # Accounts as the fold reads them: a moved login's old key forwards
+        # to the account it moved to, so a cap written under either key is a
+        # write to this slot.
+        forward, ordered = forward_events(_in_write_order(read_events()[0]), {a["key"] for a in accounts()})
+        mine = _forwarded(key, forward)
+        last = next((e for e in reversed(ordered)
+                     if e.get("type") in ("cap_set", "cap_remove") and _forwarded(e.get("account"), forward) == mine
                      and (e.get("written_by") or {}).get("kind") == "owner"
                      and (e.get("cap_kind") or e.get("kind")) == kind and e.get("purpose", "job") == purpose
                      and (not scoped or e.get("window") == window)), None)
