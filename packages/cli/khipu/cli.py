@@ -4735,6 +4735,12 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     if args.gateway_token_cmd == "status":
         print(json.dumps(integ.gateway_token_file_status(), indent=2))
         return 0
+    if args.gateway_token_cmd == "copy":
+        # The key goes Keychain/file -> clipboard inside this process; the
+        # answer is only whether it worked, never the key.
+        result = integ.copy_gateway_token()
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 2
     if args.gateway_token_cmd == "set":
         if args.from_env is not None:
             token = os.environ.get(args.from_env, "")
@@ -6853,6 +6859,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gwt_sub.add_parser(
         "status", help="exists / mode / bytes only — never the token"
+    )
+    gwt_sub.add_parser(
+        "copy",
+        help="Copy the saved key to the clipboard and clear it after 60 s (never prints it)",
     )
     gw.set_defaults(func=cmd_gateway)
 

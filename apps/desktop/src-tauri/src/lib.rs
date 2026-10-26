@@ -737,6 +737,14 @@ const JOBS_STATUS_ARGV: &[&str] = &["jobs", "status"];
 const RECALL_STATUS_ARGV: &[&str] = &["recall", "status"];
 const GATEWAY_TOKEN_STATUS_ARGV: &[&str] = &["gateway", "token", "status"];
 const GATEWAY_TOKEN_SET_ARGV: &[&str] = &["gateway", "token", "set"];
+/// Guides -> Grok Bot -> "Copy gateway key". The CLI copies the key to the
+/// clipboard itself and prints only whether it worked, so no key text ever
+/// passes through this process or the webview. App-only: never an owner
+/// action, never an MCP tool.
+const GATEWAY_TOKEN_COPY_ARGV: &[&str] = &["gateway", "token", "copy"];
+/// Guides -> "Start here": the recent search log, read only to see whether an
+/// agent has asked Khipu anything yet.
+const RECALL_LOG_ARGV: &[&str] = &["recall", "log", "--tail", "200"];
 /// Settings -> Capture -> summariser ceiling: read every scope's calls and cap,
 /// and give back the full synth ceiling for the rest of today. Fixed argv, so
 /// the webview cannot reach `--cap`, `--unlimited` or another scope here (the
@@ -3617,6 +3625,16 @@ async fn khipu_gateway_token_set(value: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn khipu_gateway_token_copy() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(GATEWAY_TOKEN_COPY_ARGV)).await
+}
+
+#[tauri::command]
+async fn khipu_recall_log() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(RECALL_LOG_ARGV)).await
+}
+
+#[tauri::command]
 async fn khipu_embed_status(profile: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(embed_status_argv(profile.as_deref())?).await
 }
@@ -5298,6 +5316,8 @@ pub fn run() {
             khipu_recall_status,
             khipu_gateway_token_status,
             khipu_gateway_token_set,
+            khipu_gateway_token_copy,
+            khipu_recall_log,
             khipu_embed_status,
             khipu_embed_activate,
             khipu_embed_profiles_list,
@@ -5816,6 +5836,8 @@ mod settings_command_tests {
         assert_eq!(fixed_argv(RECALL_STATUS_ARGV), v(&["recall", "status"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_STATUS_ARGV), v(&["gateway", "token", "status"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_SET_ARGV), v(&["gateway", "token", "set"]));
+        assert_eq!(fixed_argv(GATEWAY_TOKEN_COPY_ARGV), v(&["gateway", "token", "copy"]));
+        assert_eq!(fixed_argv(RECALL_LOG_ARGV), v(&["recall", "log", "--tail", "200"]));
         assert_eq!(fixed_argv(BUDGET_STATUS_ARGV), v(&["budget", "status"]));
         assert_eq!(fixed_argv(BUDGET_LIFT_SYNTH_TODAY_ARGV), v(&["budget", "lift", "synth", "--today"]));
     }
