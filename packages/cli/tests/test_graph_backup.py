@@ -515,6 +515,17 @@ class IntegrityTimeoutScalingTest(unittest.TestCase):
                                  "snapshot integrity check failed to start")
             self.assertEqual(run.call_args.kwargs["timeout"], 60)
 
+    def test_invalid_size_uses_floor_and_preserves_failure(self):
+        for size in (mock.Mock(), mock.MagicMock(), None, "1024", -1):
+            with self.subTest(size=size):
+                snap = mock.Mock()
+                snap.stat.return_value.st_size = size
+                with mock.patch.object(graph_backup.subprocess, "run",
+                                       return_value=mock.Mock(returncode=1, stdout="", stderr="")) as run:
+                    self.assertEqual(graph_backup._integrity_check(snap),
+                                     "snapshot integrity check failed")
+                self.assertEqual(run.call_args.kwargs["timeout"], 60)
+
     def test_scaled_timeout_is_reported_without_success(self):
         with tempfile.TemporaryDirectory() as td:
             snap = Path(td, "graph-fixture.sqlite")

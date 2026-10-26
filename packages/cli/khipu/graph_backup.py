@@ -340,6 +340,8 @@ def _integrity_check(path: Path, *, timeout: int | None = None) -> str:
             size = path.stat().st_size
         except OSError:
             size = 0
+        if not isinstance(size, int) or size < 0:
+            size = 0
         timeout = min(INTEGRITY_TIMEOUT_CEILING_SECONDS,
                       max(INTEGRITY_TIMEOUT_SECONDS, math.ceil(size * 60 / 1024**3)))
     script = (
