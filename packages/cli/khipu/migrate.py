@@ -243,6 +243,14 @@ def _literal_trgm_indexes_ready(cur) -> bool:
         found = {r[0] for r in cur.fetchall()}
         return _LITERAL_TRGM_INDEXES <= found
     except Exception:  # noqa: BLE001 — a failed probe must not invent pending
+        # Catalog errors abort the transaction on a real psycopg connection;
+        # clear it so the caller's next statement is not InFailedSqlTransaction.
+        try:
+            conn = getattr(cur, "connection", None)
+            if conn is not None:
+                conn.rollback()
+        except Exception:  # noqa: BLE001 — rollback is best-effort
+            pass
         return True
 
 
@@ -401,6 +409,12 @@ def _run_migrations(conn, *, dry_run: bool, directory: Path | None,
     result["notes"] = lock_notes(held)
     if held:
         _save_lock_notes(held, result["notes"])
+    # Mid-process callers (MCP, gateway, embed schema flags) must not keep a
+    # pre-migrate column set after this run applied new columns.
+    if result["ran"]:
+        from khipu import db as _db
+
+        _db._TABLE_COLUMNS_CACHE.clear()
     return result
 
 

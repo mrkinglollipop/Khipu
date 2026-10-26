@@ -2454,12 +2454,18 @@ def _episode_schema_flags(cur) -> dict[str, bool]:
     from khipu import db
 
     cols = db.table_columns(cur, "episodes")
-    return {
+    flags = {
         "project": "project" in cols,
         "deleted_at": "deleted_at" in cols,
         "harness": "harness" in cols,
         "parent_session_id": "parent_session_id" in cols,
     }
+    # Same rule as has_columns: only a complete yes is cached. A process that
+    # probed before 0008/0010 must see those columns after migrate, not after
+    # a restart.
+    if not all(flags.values()):
+        db._TABLE_COLUMNS_CACHE.pop("episodes", None)
+    return flags
 
 
 def _aware(ts):

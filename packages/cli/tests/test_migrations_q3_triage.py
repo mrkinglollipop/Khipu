@@ -80,3 +80,69 @@ def test_commitment_columns_probe_sees_a_migration_applied_after_the_first_probe
         )
     finally:
         db._TABLE_COLUMNS_CACHE.clear()
+
+
+def test_episode_schema_flags_see_columns_added_after_the_first_probe():
+    """Long-lived process: table_columns cached a pre-0008/0010 episodes shape."""
+    from khipu import embed
+
+    db._TABLE_COLUMNS_CACHE.clear()
+    before = {"id", "summary", "session_id"}
+    after = before | {"project", "deleted_at", "harness", "parent_session_id"}
+
+    class Cur:
+        cols = before
+
+        def execute(self, sql, params=()):
+            self._r = [(c,) for c in Cur.cols]
+
+        def fetchall(self):
+            return self._r
+
+    cur = Cur()
+    first = embed._episode_schema_flags(cur)
+    assert first == {
+        "project": False,
+        "deleted_at": False,
+        "harness": False,
+        "parent_session_id": False,
+    }
+    Cur.cols = after
+    try:
+        second = embed._episode_schema_flags(cur)
+        assert second == {
+            "project": True,
+            "deleted_at": True,
+            "harness": True,
+            "parent_session_id": True,
+        }, f"stale episode column cache after migrate: {second}"
+    finally:
+        db._TABLE_COLUMNS_CACHE.clear()
+
+
+def test_literal_trgm_ready_probe_rolls_back_on_error():
+    """A failed catalog probe must not leave the caller's transaction aborted."""
+
+    class Conn:
+        def __init__(self):
+            self.rolled_back = False
+
+        def rollback(self):
+            self.rolled_back = True
+
+    class Cur:
+        def __init__(self, conn):
+            self.connection = conn
+
+        def execute(self, sql, params=()):
+            raise RuntimeError("catalog unavailable")
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return []
+
+    conn = Conn()
+    assert migrate._literal_trgm_indexes_ready(Cur(conn)) is True
+    assert conn.rolled_back is True, "probe exception left the transaction aborted"
