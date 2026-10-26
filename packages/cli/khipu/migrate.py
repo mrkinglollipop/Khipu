@@ -219,10 +219,46 @@ def applied(cur) -> set[str]:
     return {r[0] for r in cur.fetchall()}
 
 
+# Indexes 0015_literal_trgm creates when pg_trgm is present. Kept here (not
+# imported from embed) so plan/run stay free of the embed import cycle.
+_LITERAL_TRGM_INDEXES = frozenset({
+    "idx_episodes_summary_trgm", "idx_topics_title_trgm",
+    "idx_topics_body_trgm", "idx_nodes_name_trgm",
+})
+_LITERAL_TRGM_VERSION = "0015_literal_trgm"
+
+
+def _literal_trgm_indexes_ready(cur) -> bool:
+    """True when a re-run of 0015 has nothing useful to do: pg_trgm is absent
+    (0015 correctly no-op'd) or all four trigram indexes exist. A check that
+    cannot answer is treated as ready so plan never invents pending work."""
+    try:
+        cur.execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'")
+        if not cur.fetchone():
+            return True
+        cur.execute(
+            "SELECT indexname FROM pg_indexes WHERE indexname = ANY(%s)",
+            (sorted(_LITERAL_TRGM_INDEXES),),
+        )
+        found = {r[0] for r in cur.fetchall()}
+        return _LITERAL_TRGM_INDEXES <= found
+    except Exception:  # noqa: BLE001 — a failed probe must not invent pending
+        return True
+
+
 def plan(cur, directory: Path | None = None) -> dict:
     files = available(directory)
     done = applied(cur)
     pending = [(v, p) for v, p in files if v not in done]
+    # 0015 records itself even when it skipped the indexes (no pg_trgm yet).
+    # Doctor's literal_trgm_ok remedy is "run khipu migrate"; re-offer 0015
+    # once the extension exists so CREATE INDEX IF NOT EXISTS can finish.
+    paths = {v: p for v, p in files}
+    if (_LITERAL_TRGM_VERSION in done
+            and _LITERAL_TRGM_VERSION in paths
+            and _LITERAL_TRGM_VERSION not in {v for v, _ in pending}
+            and not _literal_trgm_indexes_ready(cur)):
+        pending.append((_LITERAL_TRGM_VERSION, paths[_LITERAL_TRGM_VERSION]))
     return {
         "available": [v for v, _ in files],
         "applied": sorted(done & {v for v, _ in files}),
