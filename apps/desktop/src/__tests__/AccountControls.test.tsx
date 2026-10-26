@@ -365,6 +365,21 @@ describe("how Khipu reads a plan (Plan detail)", () => {
     expect(onChanged).toHaveBeenCalled();
   });
 
+  it("offers the host to a provider already marked http-quota that lacks one", () => {
+    const missing = view({ accounts: [kimi], definitions: { providers: { kimi: { id: "kimi", label: "Kimi", family: "Moonshot", probe: "http-quota" } } } } as Partial<RouteView>);
+    render(<PlanDetailSheet row={kimiRow} view={missing} now={NOW} onClose={() => {}} />);
+    expect(screen.getByRole("button", { name: "Set up reading…" })).toBeInTheDocument();
+  });
+
+  it("offers no host for DeepSeek, whose reader ignores one and needs its key", () => {
+    const row = { harness: "deepseek", key: "deepseek:main", account: "DeepSeek", plan: null, windows: [], ok: false, error: "no_key", home: null } as unknown as UsageAccount;
+    const ds: RouteAccount = { key: "deepseek:main", label: "DeepSeek", harness: "deepseek", state: "unknown", configured: true,
+      usage_setup: "store its API key with `khipu secrets --set deepseek_api_key` or the `deepseek_key_file` setting" };
+    const v = view({ accounts: [ds], definitions: { providers: { deepseek: { id: "deepseek", label: "DeepSeek", family: "DeepSeek", probe: "none" } } } } as Partial<RouteView>);
+    render(<PlanDetailSheet row={row} view={v} now={NOW} onClose={() => {}} />);
+    expect(screen.queryByRole("button", { name: "Set up reading…" })).toBeNull();
+  });
+
   it("offers nothing to set up for a plan that already has its reader", () => {
     const set = view({ accounts: [{ ...kimi, usage_setup: undefined }], definitions: { providers: { kimi: { id: "kimi", label: "Kimi", family: "Moonshot", probe: "http-quota", host: "api.example.com" } } } } as Partial<RouteView>);
     render(<PlanDetailSheet row={kimiRow} view={set} now={NOW} onClose={() => {}} />);

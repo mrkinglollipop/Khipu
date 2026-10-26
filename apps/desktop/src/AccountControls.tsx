@@ -755,7 +755,12 @@ export function ReadingControls({ account, row, view, onChanged }: {
     await onChanged?.();
   });
   const provider = account ? view?.definitions?.providers?.[account.harness] : undefined;
-  const needsReader = !!account && account.configured !== false && !!account.usage_setup && !!provider && provider.probe !== "http-quota";
+  // A quota host is the generic HTTP reader's missing piece. DeepSeek has its own
+  // reader that ignores a host and needs its key, so its guidance stays as the CLI
+  // words it; a provider already marked http-quota is offered the host it lacks.
+  const hostless = provider?.probe !== "http-quota" || !provider.host;
+  const needsReader = !!account && account.configured !== false && !!account.usage_setup && !!provider
+    && account.harness !== "deepseek" && hostless;
   const canReplaceKey = row.harness === "glm" && (row.error === "no_key" || row.error === "key_rejected");
   if (!needsReader && !canReplaceKey) return null;
   return (
