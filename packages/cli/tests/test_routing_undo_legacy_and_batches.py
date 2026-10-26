@@ -87,22 +87,22 @@ def test_a_legacy_priority_undo_over_a_conversations_request_is_refused(directio
     assert [e["role"] for e in held["entries"]] == ["owner's own"]
 
 
-def test_a_legacy_priority_undo_of_the_owners_own_still_works(direction_world, monkeypatch):
+def test_a_legacy_priority_undo_is_refused_even_for_the_owners_own(direction_world, monkeypatch):
+    # Round 5: no snapshot without the provenance mark is restored, the
+    # owner's own included; refusing is the accepted cost.
     _owner_priority()
     _legacy(monkeypatch, _old_priority)
     ok, out = _act(direction_world, "route.priority.clear", {"expect": routing.priority_version()})
-    assert ok, out
-    held = routing.read_view()["priority"]
-    assert held["pending"] is False and [e["role"] for e in held["entries"]] == ["reviews", "audits"]
+    assert not ok and owner_direction.LEGACY_PROVENANCE in str(out)
+    assert routing.read_view()["priority"] is None
 
 
-def test_a_legacy_hold_undo_recovers_the_conversation_from_the_holds_line(direction_world, monkeypatch):
+def test_a_legacy_hold_undo_is_refused(direction_world, monkeypatch):
     hold = routing.add_hold("wait for Grok", reason="keep", scope="account", account="Grok", author=ME, via="mcp")
     _legacy(monkeypatch, lambda want, out: {k: out[k] for k in ("text", "reason", "scope", "until")})
     ok, out = _act(direction_world, "route.hold.end", {"hold": hold["entity"]})
-    assert ok, out
-    (back,) = [h for h in routing.read_view()["holds"] if h["text"] == "wait for Grok"]
-    assert back["owner"] is False and back["written_by"]["kind"] == "conversation"
+    assert not ok and owner_direction.LEGACY_PROVENANCE in str(out)
+    assert not [h for h in routing.read_view()["holds"] if h["text"] == "wait for Grok"]
 
 
 def _pending_edit():

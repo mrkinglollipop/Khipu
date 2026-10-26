@@ -2609,18 +2609,31 @@ def _split_txns(events: list[dict], held: str | None = None) -> tuple[list[dict]
     if held is not None:
         done |= {t for t, b in begun.items() if t not in ends and b.get("list_after") == held}
     kept = [e for e in events if e.get("type") != ACCOUNT_TXN and (e.get("txn") is None or e["txn"] in done)]
-    # A restore batch (``_write_batch``) counts only when all its lines are
-    # down: a short write leaves none of it in effect.
-    sizes: dict[str, int] = {}
-    for e in kept:
-        if e.get("batch"):
-            sizes[e["batch"]] = sizes.get(e["batch"], 0) + 1
-    kept = [e for e in kept if not e.get("batch") or sizes[e["batch"]] == e.get("batch_n")]
+    kept = _complete_batches(kept)
     open_ = [(b, [e for e in events if e.get("txn") == t and e.get("type") != ACCOUNT_TXN])
              for t, b in begun.items() if t not in ends]
     for i, event in enumerate(kept):
         event["_seq"] = i
     return kept, open_
+
+
+def _batches_complete(events: list[dict]) -> set[str]:
+    """The restore batches (``_write_batch``) whose lines are all present:
+    every member agrees on one size and that many members are there. A
+    group whose members disagree on the size is incomplete as a whole."""
+    groups: dict[str, list] = {}
+    for e in events:
+        if e.get("batch"):
+            groups.setdefault(e["batch"], []).append(e.get("batch_n"))
+    return {b for b, sizes in groups.items()
+            if len(set(sizes)) == 1 and isinstance(sizes[0], int) and sizes[0] == len(sizes)}
+
+
+def _complete_batches(events: list[dict]) -> list[dict]:
+    """``events`` without any line of an incomplete restore batch: a short
+    write leaves none of it in effect."""
+    done = _batches_complete(events)
+    return [e for e in events if not e.get("batch") or e["batch"] in done]
 
 
 def read_events() -> tuple[list[dict], int]:
@@ -3754,7 +3767,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     model."""
     lane_map = cfg.get("routing_lane_map") or {}
     stale_after = cfg["routing_stale_after"]
-    events = list(events) if events_ordered else _in_write_order(events)
+    # Every reader goes through here: no part of a restore batch counts
+    # unless the whole batch does.
+    events = _complete_batches(list(events) if events_ordered else _in_write_order(events))
     from khipu import routing_replication
 
     events = [routing_replication.proposal(e, cfg) for e in events]
@@ -6076,18 +6091,24 @@ def _write_batch(events: list[dict]) -> tuple[list[dict], dict]:
     finds a complete earlier attempt returns it; one that finds only a
     partial attempt writes a new, complete one under fresh ops."""
     events = [dict(e) for e in events]
-    if len(events) < 2:
-        return _write_many(events)
-    base = events[0].get("op") or _OP.get()
+    base = events[0].get("op") or _OP.get() if events else None
     with _lock():
         if base:
-            attempts: dict[str, list[dict]] = {}
-            for row in _read_all_events(author_check=False)[0]:
-                if row.get("batch") and str(row.get("op") or "").startswith(f"{base}:"):
-                    attempts.setdefault(row["batch"], []).append(row)
-            done = next((rows for rows in attempts.values() if len(rows) == rows[0].get("batch_n")), None)
-            if done is not None:
+            # A completed earlier attempt of this operation, whatever shape
+            # it took (one line, or a whole batch): the retry is already
+            # applied and never writes again over what came after it. This
+            # check comes before the one-line path, whose retry may regenerate
+            # fewer lines than the first attempt wrote.
+            observed = _read_all_events(author_check=False)[0]
+            complete = _batches_complete(observed)
+            mine = [r for r in observed if r.get("op") == base or str(r.get("op") or "").startswith(f"{base}:")]
+            done = [r for r in mine if not r.get("batch")] or next(
+                ([r for r in mine if r.get("batch") == b] for b in dict.fromkeys(r.get("batch") for r in mine)
+                 if b in complete), [])
+            if done:
                 return ([{k: v for k, v in r.items() if not k.startswith("_")} for r in done], read_view())
+        if len(events) < 2:
+            return _write_many(events)
         batch = event_identity.uuid7()
         for i, event in enumerate(events):
             event.update(batch=batch, batch_n=len(events),
