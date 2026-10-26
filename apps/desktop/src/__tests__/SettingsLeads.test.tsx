@@ -1,9 +1,9 @@
 // Grok 2026-10-26 settings-audit leads. Each test FAILS if the lead is real.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { IntegrationsPanel } from "../IntegrationsPanel";
 import type { RecallProbeStatus, StatusRow } from "../IntegrationsPanel";
-import { PlansSettingsCard, usePlanUsage } from "../PlansCard";
+import { PlansSettingsCard, UsageAccountsField, usePlanUsage } from "../PlansCard";
 import type { UsageReport } from "../PlansCard";
 import { FinderBottom, FinderTop, useAccountsFinder } from "../FoundAccounts";
 
@@ -98,6 +98,58 @@ describe.each([{ rereadFails: false }, { rereadFails: true }])("Plans settings a
     const showsNewAccount = !!screen.queryByText("Claude work");
     const alerts = screen.queryAllByRole("alert");
     expect(showsNewAccount || alerts.length > 0, "saved account is not shown and no error is raised").toBe(true);
+  });
+});
+
+describe("Plans settings save re-read", () => {
+  it("does not claim the re-read failed when a newer reload supersedes it", async () => {
+    let saved = false;
+    const pending: Array<(raw: string) => void> = [];
+    const onChanged = vi.fn();
+    const body = (withWork: boolean) =>
+      JSON.stringify({
+        usage_accounts: {
+          value: null,
+          source: "default",
+          version: "av1",
+          accounts: [
+            { label: "Claude", harness: "claude", home: null },
+            ...(withWork ? [{ label: "Claude work", harness: "claude", home: "~/.claude-work" }] : []),
+          ],
+        },
+      });
+    const { invoke } = await import("@tauri-apps/api/core");
+    vi.mocked(invoke).mockImplementation((async (cmd: string) => {
+      if (cmd === "khipu_config_show") {
+        if (!saved) return body(false);
+        return new Promise<string>((resolve) => pending.push(resolve));
+      }
+      if (cmd === "khipu_config_set") {
+        saved = true;
+        return JSON.stringify({ ok: true });
+      }
+      throw new Error(`unexpected ${cmd}`);
+    }) as never);
+
+    const { rerender } = render(<UsageAccountsField active onChanged={onChanged} />);
+    await waitFor(() => expect(screen.getByLabelText("Name")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Claude work" } });
+    fireEvent.change(screen.getByLabelText("Login folder"), { target: { value: "~/.claude-work" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add" }));
+    await waitFor(() => expect(saved).toBe(true));
+    await waitFor(() => expect(pending).toHaveLength(1));
+    // A newer reload (active flip) while the save's re-read is still in flight.
+    rerender(<UsageAccountsField active={false} onChanged={onChanged} />);
+    rerender(<UsageAccountsField active onChanged={onChanged} />);
+    await waitFor(() => expect(pending).toHaveLength(2));
+    await act(async () => pending[1](body(true)));
+    await act(async () => pending[0](body(true)));
+    await waitFor(() => expect(screen.getByText("Claude work")).toBeTruthy());
+    expect(
+      screen.queryByText(/Could not re-read the account list/),
+      "superseded reload was treated as a failed re-read",
+    ).toBeNull();
+    expect(onChanged).toHaveBeenCalled();
   });
 });
 

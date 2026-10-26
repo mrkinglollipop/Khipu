@@ -81,6 +81,11 @@ export async function callCli<T = Record<string, unknown>>(
   return parseCliResponse<T>(raw);
 }
 
+/** Outcome of one `reload` call. `error` is set only when this request failed;
+ *  a superseded request returns `{ data: null, error: null }` so callers do not
+ *  treat a winning newer reload as a read failure. */
+export type ReloadResult<T> = { data: T | null; error: string | null };
+
 /** Load one read-only command's JSON while `active`, and expose `reload` for
  *  the re-read after a write. */
 export function useCliState<T>(command: string, active: boolean) {
@@ -89,19 +94,19 @@ export function useCliState<T>(command: string, active: boolean) {
   const [loading, setLoading] = useState(false);
   const latestReload = useRef(0);
 
-  const reload = useCallback(async (): Promise<T | null> => {
+  const reload = useCallback(async (): Promise<ReloadResult<T>> => {
     const request = ++latestReload.current;
     setLoading(true);
     const res = await callCli<T>(command);
-    if (latestReload.current !== request) return null;
+    if (latestReload.current !== request) return { data: null, error: null };
     setLoading(false);
     if (res.ok) {
       setData(res.data);
       setError(null);
-      return res.data;
+      return { data: res.data, error: null };
     }
     setError(res.error);
-    return null;
+    return { data: null, error: res.error };
   }, [command]);
 
   useEffect(() => {

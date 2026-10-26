@@ -1288,9 +1288,13 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       if (problem.field) (problem.field === "name" ? nameRef : homeRef).current?.focus();
       return false;
     }
-    if (fresh == null) {
+    // `fresh.error` is set only on a real read failure; a superseded reload
+    // returns error: null even when data is null (see useCliState.reload).
+    if (fresh.error != null) {
       setErr("Could not re-read the account list after saving. Close and reopen this section to try again.");
       setClash(null);
+      // Save already landed; parent still needs to know the list changed.
+      void onChanged?.();
       return true;
     }
     void onChanged?.();
