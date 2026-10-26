@@ -143,3 +143,23 @@ describe("the quota host", () => {
     }
   });
 });
+
+describe("changing a cap never relaxes what it did not change", () => {
+  it("keeps an even-pace cap's own target when only the slack changes", () => {
+    const cap: CapStatus = { kind: "pace_target", purpose: "job", window: "weekly", pct: 65, slack: 5 };
+    const draft = { ...draftFromCap(cap), slack: "8" };
+    expect(capSetArgs(draft)).toEqual({ cap: { kind: "pace_target", window: "weekly", pct: 65, slack: 8, purpose: "job" } });
+  });
+
+  it("starts a new even-pace cap at 100 and never borrows the share percent typed before", () => {
+    expect(capSetArgs({ ...emptyCapDraft(), sentence: "pace_target", pct: "95" })).toEqual({
+      cap: { kind: "pace_target", window: "weekly", pct: 100, slack: 0, purpose: "job" },
+    });
+    expect(draftFromCap({ kind: "pace_target", window: "weekly", slack: 2 }).target).toBe("100");
+  });
+
+  it("keeps a per-day cap on its own window", () => {
+    const draft = draftFromCap({ kind: "per_day", window: "five_hour", pct: 30 });
+    expect(capSetArgs(draft)).toEqual({ cap: { kind: "per_day", window: "five_hour", pct: 30 } });
+  });
+});

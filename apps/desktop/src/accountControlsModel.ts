@@ -26,6 +26,8 @@ export type CapDraft = {
   sentence: CapSentence;
   window: "weekly" | "five_hour";
   pct: string;
+  /** An even-pace cap's target, kept as the cap has it (a new one starts at 100). */
+  target: string;
   slack: string;
   purpose: "job" | "check";
   tier: "" | "opus" | "sonnet" | "haiku";
@@ -40,6 +42,7 @@ export function emptyCapDraft(): CapDraft {
     sentence: "share",
     window: "weekly",
     pct: "",
+    target: "100",
     slack: "0",
     purpose: "job",
     tier: "",
@@ -63,6 +66,7 @@ export function draftFromCap(c: CapStatus): CapDraft {
     sentence,
     window: c.window === "five_hour" ? "five_hour" : "weekly",
     pct: sentence === "pace_target" ? "" : text(c.pct),
+    target: sentence === "pace_target" && typeof c.pct === "number" ? text(c.pct) : "100",
     slack: sentence === "pace_target" ? text(c.slack ?? 0) : "0",
     purpose: c.purpose === "check" ? "check" : "job",
     tier: c.tier ?? "",
@@ -101,13 +105,15 @@ export function capSetArgs(d: CapDraft): { cap: CapArgs } | { error: string } {
     case "per_day": {
       const pct = number(d.pct);
       if (pct == null || pct <= 0 || pct > 100) return { error: "A percent from 1 to 100." };
-      // A per-day cap is a share of the week; the CLI wants the window named.
-      return { cap: { kind: d.sentence, window: d.sentence === "per_day" ? "weekly" : d.window, pct } };
+      // The window stays the cap's own (a new per-day cap starts on the week).
+      return { cap: { kind: d.sentence, window: d.window, pct } };
     }
     case "pace_target": {
       const slack = number(d.slack);
       if (slack == null || slack < 0 || slack > 100) return { error: "Points ahead of an even pace, from 0 to 100." };
-      const cap: CapArgs = { kind: "pace_target", window: d.window, pct: 100, slack, purpose: d.purpose };
+      const target = number(d.target);
+      if (target == null || target <= 0 || target > 100) return { error: "A target from 1 to 100." };
+      const cap: CapArgs = { kind: "pace_target", window: d.window, pct: target, slack, purpose: d.purpose };
       if (d.purpose === "check") {
         if (d.tier) cap.tier = d.tier;
         if (d.sensitiveOnly) cap.sensitive_only = true;

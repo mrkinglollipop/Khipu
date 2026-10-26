@@ -526,3 +526,17 @@ describe("review round 2: identity, stale versions, levels, keys", () => {
     expect(screen.getByLabelText("New GLM key")).toHaveValue("made-up-key-value");
   });
 });
+
+describe("review round 3: a changed cap keeps what it did not change", () => {
+  it("saves a 65% even-pace cap with its 65% target when only the slack changes", async () => {
+    const a: RouteAccount = { ...codex, cap_statuses: [{ kind: "pace_target", purpose: "job", window: "weekly", pct: 65, slack: 5 }] };
+    const { dialog } = sheet(view({ accounts: [a, claude] } as Partial<RouteView>), a);
+    const caps = section(dialog, "Your caps");
+    fireEvent.click(caps.getByRole("button", { name: /^Change the cap:/ }));
+    fireEvent.change(caps.getByLabelText("Points ahead of an even pace allowed"), { target: { value: "8" } });
+    fireEvent.click(caps.getByRole("button", { name: "Save cap" }));
+    await waitFor(() => expect(calls("khipu_route_cap")).toEqual([
+      { action: "set", account: "codex|", cap: { kind: "pace_target", window: "weekly", pct: 65, slack: 8, purpose: "job" } },
+    ]));
+  });
+});
