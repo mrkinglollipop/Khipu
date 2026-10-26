@@ -359,7 +359,7 @@ def sync_from_sqlite(
                 conn.commit()
     stats["seconds"] = round(time.time() - t0, 1)
     if not dry_run:
-        stats["drift"] = graph_drift(path)
+        stats["drift"] = graph_drift(path, excuse_pending=False)
     return stats
 
 
@@ -399,8 +399,14 @@ def is_graph_producer() -> bool:
     return False
 
 
-def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str, Any]:
-    """Compare graphify rows with PG by identity and normalized content."""
+def graph_drift(
+    sqlite_path: Path | None = None, *, sample: int = 5, excuse_pending: bool = True
+) -> dict[str, Any]:
+    """Compare graphify rows with PG by identity and normalized content.
+
+    ``excuse_pending`` lets a difference that appeared after the last good
+    nightly mirror read as ok (doctor's view). The sync itself turns it off:
+    drift left right after a mirror ran is that mirror's failure."""
     from khipu.db import connect
     from khipu import sources as sources_mod
 
@@ -592,7 +598,7 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
         missing_nodes or extra_nodes or missing_edges or extra_edges
         or node_content_drift or edge_content_drift
     )
-    if not out["ok"] and _changed_since_last_mirror(path):
+    if not out["ok"] and excuse_pending and _changed_since_last_mirror(path):
         out["ok"] = True
         out["pending"] = (
             "graph.sqlite changed after the last nightly mirror, which succeeded; "

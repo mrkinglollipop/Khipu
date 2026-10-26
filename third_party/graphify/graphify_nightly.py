@@ -183,6 +183,34 @@ def _should_skip_build(resolved: Path | None) -> tuple[bool, str]:
     return False, ""
 
 
+def _mirror_reason(proc: subprocess.CompletedProcess) -> str:
+    """One-line reason for a failed graph-sync.
+
+    graph-sync prints indented JSON on stdout, so the last output line is just
+    a closing brace; read the error or the nonzero drift counts instead.
+    """
+    try:
+        body = json.loads(proc.stdout or "")
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        drift = body.get("drift") if isinstance(body.get("drift"), dict) else body
+        if drift.get("error"):
+            return str(drift["error"])
+        counts = [
+            f"{key}={value}"
+            for key, value in drift.items()
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value
+            and (key.startswith(("nodes_", "edges_")))
+        ]
+        if counts:
+            return "drift left after sync: " + ", ".join(counts)
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return tail[-1] if tail else "failed"
+
+
 def main() -> int:
     log("nightly graph refresh starting")
     resolved_override = (os.environ.get("KHIPU_GRAPH_SOURCES_RESOLVED") or "").strip()
@@ -265,9 +293,8 @@ def main() -> int:
             if proc.returncode == 0:
                 log("  khipu graph mirror ok")
             else:
-                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
                 mirror_failure = (
-                    f"graph mirror rc={proc.returncode}: {tail[-1] if tail else 'failed'}"
+                    f"graph mirror rc={proc.returncode}: {_mirror_reason(proc)}"
                 )
         except (OSError, subprocess.SubprocessError) as exc:
             mirror_failure = f"graph mirror did not run: {exc}"

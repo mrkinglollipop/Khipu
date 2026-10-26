@@ -384,22 +384,36 @@ def _run_nightly_with_mirror(tmp_path, monkeypatch, mirror, root_set=True):
     return g, mirror_calls
 
 
-@pytest.mark.parametrize('failure', ['rc', 'timeout', 'oserror'])
-def test_failed_graph_mirror_fails_the_nightly(tmp_path, monkeypatch, capsys, failure):
+@pytest.mark.parametrize('failure,reason', [
+    ('stderr', 'connection timeout expired'),
+    ('json_error', 'graph.sqlite not found on the machine that builds it'),
+    ('json_drift', 'nodes_content_drift=7, edges_missing_in_pg=2'),
+    ('timeout', 'timed out'),
+    ('oserror', 'synthetic spawn failure'),
+])
+def test_failed_graph_mirror_fails_the_nightly(tmp_path, monkeypatch, capsys, failure, reason):
     import subprocess
+    drift = {'ok': False, 'nodes_content_drift': 7, 'edges_content_drift': 0,
+             'edges_missing_in_pg': 2, 'sqlite_nodes': 100}
     def mirror():
         if failure == 'timeout':
             raise subprocess.TimeoutExpired('graph-sync', 600)
         if failure == 'oserror':
             raise OSError('synthetic spawn failure')
-        return subprocess.CompletedProcess([], 1, '', 'connection timeout expired')
+        if failure == 'json_error':
+            return subprocess.CompletedProcess(
+                [], 2, json.dumps({'ok': False, 'error': reason}, indent=2), '')
+        if failure == 'json_drift':
+            return subprocess.CompletedProcess(
+                [], 2, json.dumps({'seconds': 1.0, 'drift': drift}, indent=2), '')
+        return subprocess.CompletedProcess([], 1, '', reason)
     g, calls = _run_nightly_with_mirror(tmp_path, monkeypatch, mirror)
     assert g.main() != 0
     assert len(calls) == 1
-    out = capsys.readouterr().out
-    assert 'nightly FAILED' in out
-    assert 'graph mirror' in out
-    assert 'nightly complete' not in out
+    failed = [line for line in capsys.readouterr().out.splitlines() if 'nightly FAILED' in line]
+    assert len(failed) == 1
+    assert reason in failed[0]
+    assert not failed[0].rstrip().endswith('}')
 
 
 def test_failed_mirror_is_reported_as_a_failed_graph_job(tmp_path, monkeypatch):

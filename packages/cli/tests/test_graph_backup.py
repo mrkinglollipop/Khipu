@@ -444,7 +444,7 @@ class OffsiteTimeoutTest(unittest.TestCase):
 
     def test_timeout_grows_ten_minutes_per_gb_above_the_first(self):
         self.assertEqual(3600 + 600, self._timeout_for(2 * 1024**3))
-        self.assertGreater(self._timeout_for(int(3.9 * 1024**3)), 3600)
+        self.assertEqual(3600 + 1500, self._timeout_for(7 * 1024**3 // 2))
 
     def test_timeout_is_capped_at_four_hours(self):
         self.assertEqual(4 * 3600, self._timeout_for(100 * 1024**3))
