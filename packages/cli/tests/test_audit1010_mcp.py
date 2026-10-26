@@ -283,6 +283,15 @@ class MutationTest(unittest.TestCase):
                     srv._tool_forget({"id": 7})
                 forget.assert_not_called()
 
+    def test_forget_rejects_grok_build_episode_on_the_gateway(self):
+        with mock.patch.object(srv, "_via_https_gateway", return_value=True), \
+                mock.patch("khipu.db.connect", return_value=_Connection(("grok_build:session-1",))), \
+                mock.patch("khipu.forget.forget_everywhere") as forget:
+            with self.assertRaises(ValueError) as raised:
+                srv._tool_forget({"id": 7})
+            self.assertIn("grok_build", str(raised.exception))
+            forget.assert_not_called()
+
     def test_partial_forget_exposes_diagnostics_as_tool_error(self):
         failed = {"ok": False, "id": 7, "complete": False, "partial": ["outbox"],
                   "error": "forget incomplete; remaining stores: outbox",

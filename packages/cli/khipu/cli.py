@@ -4670,6 +4670,12 @@ def cmd_integrations(args: argparse.Namespace) -> int:
     # `integrations status` lists (its `homes[].path`); without it every home
     # Khipu found is acted on.
     home = getattr(args, "home", None)
+    skipped: list[dict] = []
+    # grok_build needs --project; an `all` run without it must not fail the pack.
+    if (args.harness == "all" and not project and "grok_build" in targets
+            and args.integ_cmd in ("install", "verify")):
+        targets = [h for h in targets if h != "grok_build"]
+        skipped.append({"harness": "grok_build", "skipped": "needs --project", "ok": True})
     if home is not None:
         try:
             if args.harness != "claude_code":
@@ -4694,23 +4700,25 @@ def cmd_integrations(args: argparse.Namespace) -> int:
         print(json.dumps([_status(h) for h in targets], indent=2))
         return 0
     if args.integ_cmd == "verify":
-        results = [_verify(h) for h in targets]
+        results = [_verify(h) for h in targets] + skipped
         synth_check = integ.verify_synth_provider()
         if synth_check is not None:
             for result in results:
+                if result.get("skipped"):
+                    continue
                 result.setdefault("components", {})["synth_provider"] = synth_check
                 result["ok"] = result.get("ok", not result["detected"]) and synth_check["ok"]
         print(json.dumps(results, indent=2))
-        return 0 if all(r.get("ok", not r["detected"]) for r in results) else 2
+        return 0 if all(r.get("ok", not r.get("detected", False)) for r in results) else 2
     fn = integ.install if args.integ_cmd == "install" else integ.uninstall
-    results = [fn(h, dry_run=args.dry_run, project=project, home=home) for h in targets]
+    results = [fn(h, dry_run=args.dry_run, project=project, home=home) for h in targets] + skipped
     print(json.dumps(results, indent=2))
     if not all(r.get("ok", True) and not r.get("aborted", False) for r in results):
         return 1
     if args.integ_cmd == "install" and not args.dry_run and not args.no_verify:
-        verified = [_verify(h) for h in targets]
+        verified = [_verify(h) for h in targets] + skipped
         print(json.dumps({"verify": verified}, indent=2))
-        return 0 if all(v.get("ok", not v["detected"]) for v in verified) else 2
+        return 0 if all(v.get("ok", not v.get("detected", False)) for v in verified) else 2
     return 0
 
 
@@ -6579,7 +6587,7 @@ def build_parser() -> argparse.ArgumentParser:
             "harness",
             nargs="?",
             default="all",
-            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_bot"),
+            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot"),
         )
         if name in ("install", "uninstall"):
             sp.add_argument("--dry-run", action="store_true")
@@ -6592,7 +6600,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("install", "uninstall", "status", "verify"):
             sp.add_argument(
                 "--project",
-                help="Cursor / Grok Bot: repo dir for .cursor/rules/khipu.mdc and .cursor/mcp.json",
+                help="Cursor / Grok Build / Grok Bot: repo dir for that pack's recall and MCP files",
             )
         if name == "install":
             sp.add_argument("--no-verify", action="store_true")

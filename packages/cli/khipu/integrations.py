@@ -76,6 +76,7 @@ import subprocess
 import tempfile
 import time
 import tomllib
+import urllib.parse
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -84,7 +85,7 @@ from typing import Any
 from khipu import claude_homes as _homes
 from khipu import wire
 
-HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_bot")
+HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot")
 HOME = Path.home()
 
 
@@ -131,8 +132,8 @@ _INSTALL_WRITE_DEPTH = 0
 @contextlib.contextmanager
 def _installing(*, dry: bool = False):
     """The only context in which ``_shim()`` may touch a launcher symlink at
-    all. Entered exclusively by ``install()``, for the four LOCAL harness
-    packs (claude_code, cursor, aegis, codex) — never by status, verify,
+    all. Entered exclusively by ``install()``, for the five LOCAL harness
+    packs (claude_code, cursor, aegis, codex, grok_build) — never by status, verify,
     doctor, uninstall or any probe.
 
     The links under ~/.config/khipu/bin decide which code every installed
@@ -215,7 +216,8 @@ def _shim(name: str) -> str:
 
 LAUNCHER_NAMES = (
     "khipu-mcp", "khipu-stop-hook", "khipu-recall-hook",
-    "khipu-prompt-recall", "khipu-aegis-capture", "khipu-delegation-hook",
+    "khipu-prompt-recall", "khipu-aegis-capture", "khipu-grok-build-capture",
+    "khipu-delegation-hook",
 )
 
 
@@ -260,6 +262,7 @@ _PACK_LAUNCHERS: dict[str, tuple[str, ...]] = {
     "aegis": ("khipu-mcp", "khipu-aegis-capture"),
     "codex": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
               "khipu-delegation-hook"),
+    "grok_build": ("khipu-mcp", "khipu-grok-build-capture"),
 }
 
 
@@ -399,6 +402,11 @@ def recall_hook_cursor() -> str:
 
 def aegis_capture_hook() -> str:
     return _shim("khipu-aegis-capture")
+
+
+def grok_build_capture_hook() -> str:
+    """Grok Build's own capture launcher, never the Aegis compatibility one."""
+    return _shim("khipu-grok-build-capture")
 
 
 def _launcher_path_is_legacy(value: str, name: str) -> bool:
@@ -1186,8 +1194,13 @@ def _validate_toml(path: Path, text: str) -> None:
         raise ConfigUnreadable(f"{path} is not valid TOML ({exc}); refusing to overwrite it") from exc
 
 
-def _toml_table_block(text: str, table: str) -> tuple[int, int, str] | None:
-    """Return a table span, accepting equivalent quoted/whitespace headers."""
+def _toml_table_block(text: str, table: str, *, boundary_markers: tuple[str, ...] = ()) -> tuple[int, int, str] | None:
+    """Return a table span, accepting equivalent quoted/whitespace headers.
+
+    ``boundary_markers`` are managed comments between this table and its next
+    TOML header. They are checked with the same parseable-prefix guard as a
+    header, so a marker-looking line in a multiline value is never a boundary.
+    """
     keys = table.split(".")
     key_patterns = [rf"(?:{re.escape(key)}|\"{re.escape(key)}\"|'{re.escape(key)}')"
                     for key in keys]
@@ -1203,12 +1216,17 @@ def _toml_table_block(text: str, table: str) -> tuple[int, int, str] | None:
         (candidate for candidate in _TOML_HEADER_RE.finditer(text, match.end())
          if _toml_prefix_is_valid(text, candidate.start())), None
     )
-    managed_re = re.compile(r"(?m)^[ \t]*# khipu-pack: managed block")
-    managed = next(
-        (candidate for candidate in managed_re.finditer(text, match.end())
-         if _toml_prefix_is_valid(text, candidate.start())), None
-    )
-    boundaries = [candidate.start() for candidate in (following, managed)
+    markers = ("# khipu-pack: managed block", *boundary_markers)
+    managed = []
+    for marker in markers:
+        managed_re = re.compile(rf"(?m)^[ \t]*{re.escape(marker)}")
+        candidate = next(
+            (c for c in managed_re.finditer(text, match.end())
+             if _toml_prefix_is_valid(text, c.start())), None
+        )
+        if candidate is not None:
+            managed.append(candidate)
+    boundaries = [candidate.start() for candidate in (following, *managed)
                   if candidate is not None]
     end = min(boundaries) if boundaries else len(text)
     return match.start(), end, text[match.start():end]
@@ -1405,6 +1423,10 @@ def _aegis_install(dry: bool) -> dict:
         return out
     text = AEGIS_TOML.read_text(encoding="utf-8")
     _validate_toml(AEGIS_TOML, text)
+    if _grok_build_capture_events(text):
+        out.update(ok=False, error=("Grok Build Khipu capture hooks already own ~/.grok/config.toml; "
+                                    "refusing duplicate or misattributed Aegis capture"))
+        return out
     mcp_block, hook_block = _aegis_blocks()
     new = text
     # Every .sub() below passes a LAMBDA, not the replacement string: re.sub
@@ -1588,6 +1610,420 @@ def _aegis_status() -> dict:
         "khipu-mcp": _toml_mcp_command(text),
         "khipu-aegis-capture": _aegis_capture_command(text),
     }))
+    return out
+
+
+# ---- Grok Build (shares Grok's TOML, but never Aegis's identity) -------------
+
+# Grok Build 1.0.52 shares ~/.grok/config.toml with the existing Aegis pack.
+# A Grok event cannot tell those two Khipu packs apart after both are installed,
+# so coexistence would queue the same transcript twice under different harness
+# identities. Refuse before writing in that case; do not "fix" Aegis for it.
+GROK_BUILD_MCP_SERVER = "khipu_grok_build"
+_GROK_BUILD_HOOK_MARK = "# khipu-grok-build-pack: managed block — do not edit by hand\n"
+_GROK_BUILD_HOOK_RE = re.compile(
+    r"(?ms)^# khipu-grok-build-pack: managed block — do not edit by hand\n.*?"
+    r"# khipu-grok-build-pack: end\n"
+)
+_GROK_BUILD_NATIVE_HOOK_HEADER_RE = re.compile(
+    r"^[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*"
+    r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\.[ \t]*hooks[ \t]*\]\]"
+    r"[ \t]*(?:#.*)?$"
+)
+_GROK_BUILD_NATIVE_GROUP_HEADER_RE = re.compile(
+    r"^[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*"
+    r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\]\][ \t]*(?:#.*)?$"
+)
+_GROK_BUILD_AGENTS_START = "<!-- khipu-grok-build: recall instructions -->"
+_GROK_BUILD_AGENTS_END = "<!-- khipu-grok-build: end -->"
+_GROK_BUILD_AGENTS_RE = re.compile(
+    rf"(?ms)^{re.escape(_GROK_BUILD_AGENTS_START)}\n.*?^{re.escape(_GROK_BUILD_AGENTS_END)}\n?"
+)
+_GROK_BUILD_RECALL_TEXT = (
+    "Khipu memory is available through the `khipu_*` MCP tools. On the first substantive "
+    "user prompt, call `khipu_status` with `prompt` set to that prompt; inspect its "
+    "`prior_work` and named-topic results before acting. For a decision, constraint, prior "
+    "implementation, or unresolved work that may have occurred outside this conversation, "
+    "call `khipu_search`, then call `khipu_get` on the relevant result. Treat memory as "
+    "evidence that may be superseded; do not invent a result when search finds none."
+)
+
+
+def _is_our_grok_build_capture(cmd: Any) -> bool:
+    return _is_launcher_command(cmd, "khipu-grok-build-capture")
+
+
+def _native_grok_build_hook_is_ours(block: str) -> bool:
+    try:
+        data = tomllib.loads(block)
+    except tomllib.TOMLDecodeError:
+        return False
+    for event in ("Stop", "PreCompact", "SessionEnd"):
+        group = (data.get("hooks") or {}).get(event) or {}
+        for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
+            if (isinstance(hook, dict) and _is_our_grok_build_capture(hook.get("command"))
+                    and isinstance(hook.get("env"), dict)
+                    and hook["env"].get("KHIPU_HARNESS") == "grok_build"):
+                return True
+    return False
+
+
+def _remove_native_grok_build_hooks(text: str) -> str:
+    """Remove owned inner hook entries after Grok drops the pack comment markers."""
+    headers = list(_TOML_HEADER_RE.finditer(text))
+    managed_spans = [(match.start(), match.end()) for match in _GROK_BUILD_HOOK_RE.finditer(text)]
+    removed: list[tuple[int, int]] = []
+    for index, header in enumerate(headers):
+        if any(start <= header.start() < end for start, end in managed_spans):
+            continue
+        owned_header = _GROK_BUILD_NATIVE_HOOK_HEADER_RE.match(header.group(0))
+        if owned_header is None:
+            continue
+        end_index = index + 1
+        if end_index < len(headers):
+            event = owned_header.group("event")
+            env_header = re.compile(
+                rf"^[ \t]*\[[ \t]*hooks[ \t]*\.[ \t]*{event}[ \t]*\."
+                r"[ \t]*hooks[ \t]*\.[ \t]*env[ \t]*\][ \t]*(?:#.*)?$"
+            )
+            if env_header.match(headers[end_index].group(0)):
+                end_index += 1
+        end = headers[end_index].start() if end_index < len(headers) else len(text)
+        end = min([end] + [start for start, _stop in managed_spans
+                           if header.start() < start < end])
+        if _native_grok_build_hook_is_ours(text[header.start():end]):
+            removed.append((header.start(), end))
+    if not removed:
+        return text
+    owned = list(removed)
+    for index, header in enumerate(headers):
+        if any(start <= header.start() < end for start, end in managed_spans):
+            continue
+        parent = _GROK_BUILD_NATIVE_GROUP_HEADER_RE.match(header.group(0))
+        if parent is None:
+            continue
+        prefix = f"hooks.{parent.group('event')}."
+        children = []
+        for child in headers[index + 1:]:
+            if (any(start <= child.start() < end for start, end in managed_spans)
+                    or not _toml_header_path(child.group(0)).startswith(prefix)):
+                break
+            children.append(child)
+        if not children or not all(any(start <= child.start() < end for start, end in owned)
+                                   for child in children):
+            continue
+        end = min([children[0].start()] + [start for start, _stop in managed_spans
+                                           if header.start() < start < children[0].start()])
+        if not text[header.end():end].strip():
+            removed.append((header.start(), end))
+    removed.sort()
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in removed:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _grok_build_detected() -> bool:
+    config = _grok_build_toml()
+    return config.parent.is_dir() and config.is_file()
+
+
+def _grok_build_home() -> Path:
+    """Grok Build honors GROK_HOME; fall back to the existing shared default."""
+    configured = os.environ.get("GROK_HOME")
+    return Path(configured).expanduser() if configured else AEGIS_TOML.parent
+
+
+def _grok_build_toml() -> Path:
+    return _grok_build_home() / "config.toml"
+
+
+def _grok_build_project_trusted(project: str | None) -> bool:
+    if not project:
+        return False
+    trust = _grok_build_home() / "trusted_folders.toml"
+    try:
+        folders = tomllib.loads(trust.read_text(encoding="utf-8")).get("folders", {})
+        entry = folders.get(str(Path(project).resolve())) if isinstance(folders, dict) else None
+        return isinstance(entry, dict) and entry.get("trusted") is True
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+
+
+def _grok_build_blocks() -> tuple[str, str]:
+    mcp = (
+        f"[mcp_servers.{GROK_BUILD_MCP_SERVER}]\n"
+        f'command = {json.dumps(mcp_launcher(), ensure_ascii=False)}\n'
+        "enabled = true\n"
+        "startup_timeout_sec = 30\n"
+    )
+    hooks = _GROK_BUILD_HOOK_MARK
+    for ev in ("Stop", "PreCompact", "SessionEnd"):
+        hooks += (
+            f"[[hooks.{ev}]]\n"
+            f"  [[hooks.{ev}.hooks]]\n"
+            '  type = "command"\n'
+            f'  command = {json.dumps(grok_build_capture_hook(), ensure_ascii=False)}\n'
+            "  timeout = 15\n"
+            '  env = { KHIPU_HARNESS = "grok_build" }\n'
+        )
+    return mcp, hooks + "# khipu-grok-build-pack: end\n"
+
+
+def _replace_grok_build_mcp(text: str, block: str) -> str:
+    """Replace this MCP table without swallowing the adjacent hook marker."""
+    found = _toml_table_block(
+        text, f"mcp_servers.{GROK_BUILD_MCP_SERVER}",
+        boundary_markers=(_GROK_BUILD_HOOK_MARK.rstrip(),),
+    )
+    if found is None:
+        return text.rstrip("\n") + "\n\n" + block
+    start, end, old = found
+    # Keep the existing separator before the hook marker. The block itself
+    # ends in one newline; the marker normally needs the second blank line.
+    trailing_newlines = old[len(old.rstrip("\n")):]
+    replacement = block.rstrip("\n") + trailing_newlines
+    return text if old == replacement else text[:start] + replacement + text[end:]
+
+
+def _remove_grok_build_mcp(text: str) -> str:
+    found = _toml_table_block(
+        text, f"mcp_servers.{GROK_BUILD_MCP_SERVER}",
+        boundary_markers=(_GROK_BUILD_HOOK_MARK.rstrip(),),
+    )
+    return text if found is None else text[:found[0]] + text[found[1]:]
+
+
+def _grok_build_capture_events(text: str) -> set[str]:
+    """The Grok Build capture events parsed from a valid Grok TOML file."""
+    found: set[str] = set()
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return found
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    for event in ("Stop", "PreCompact", "SessionEnd"):
+        for group in (hooks.get(event) or []) if isinstance(hooks, dict) else []:
+            for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                env = hook.get("env") if isinstance(hook, dict) and isinstance(hook.get("env"), dict) else {}
+                if isinstance(hook, dict) and _is_our_grok_build_capture(hook.get("command")) \
+                        and env.get("KHIPU_HARNESS") == "grok_build":
+                    found.add(event)
+                    break
+    return found
+
+
+def _grok_build_capture_command(text: str) -> str | None:
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return None
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    for group in (hooks.get("Stop") or []) if isinstance(hooks, dict) else []:
+        for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
+            if isinstance(hook, dict) and _is_our_grok_build_capture(hook.get("command")):
+                return hook.get("command")
+    return None
+
+
+def _grok_build_agents_path(project: str | None) -> Path | None:
+    """Reuse AGENTS.md / Agents.md / agents.md when a project already has one."""
+    if not project:
+        return None
+    root = Path(project).expanduser()
+    try:
+        for name in os.listdir(root):
+            if name.lower() == "agents.md":
+                return root / name
+    except OSError:
+        pass
+    return root / "AGENTS.md"
+
+
+def _grok_build_agents_block() -> str:
+    return (
+        f"{_GROK_BUILD_AGENTS_START}\n"
+        f"{_GROK_BUILD_RECALL_TEXT}\n"
+        f"{_GROK_BUILD_AGENTS_END}\n"
+    )
+
+
+def _grok_build_recall_installed(path: Path | None) -> bool:
+    if path is None or not path.is_file():
+        return False
+    try:
+        matches = list(_GROK_BUILD_AGENTS_RE.finditer(path.read_text(encoding="utf-8")))
+        return len(matches) == 1 and _GROK_BUILD_RECALL_TEXT in matches[0].group(0)
+    except OSError:
+        return False
+
+
+def _replace_grok_build_agents(text: str) -> str:
+    block = _grok_build_agents_block()
+    matches = list(_GROK_BUILD_AGENTS_RE.finditer(text))
+    if not matches:
+        if _GROK_BUILD_AGENTS_START in text or _GROK_BUILD_AGENTS_END in text:
+            raise ConfigUnreadable("AGENTS.md has an incomplete Khipu Grok Build block; refusing to overwrite it")
+        if not text.strip():
+            return block
+        return text.rstrip("\n") + "\n\n" + block
+    first = True
+
+    def one(_match):
+        nonlocal first
+        if first:
+            first = False
+            return block
+        return ""
+
+    return _GROK_BUILD_AGENTS_RE.sub(one, text)
+
+
+def _remove_grok_build_agents(text: str) -> str:
+    if _GROK_BUILD_AGENTS_RE.search(text) is None:
+        return text
+    new = _GROK_BUILD_AGENTS_RE.sub("", text).strip()
+    return f"{new}\n" if new else ""
+
+
+def _grok_build_install(dry: bool, project: str | None = None) -> dict:
+    out: dict[str, Any] = {"harness": "grok_build", "detected": _grok_build_detected(), "changes": []}
+    if not out["detected"]:
+        return out
+    agents = _grok_build_agents_path(project)
+    if agents is None or not agents.parent.is_dir():
+        out.update(ok=False, error="grok_build requires --project pointing to an existing repository")
+        return out
+    config = _grok_build_toml()
+    text = config.read_text(encoding="utf-8")
+    _validate_toml(config, text)
+    if _aegis_capture_events(text):
+        out.update(ok=False, error=("Aegis Khipu capture hooks already own ~/.grok/config.toml; "
+                                    "refusing duplicate or misattributed Grok Build capture"))
+        return out
+    without_native = _remove_native_grok_build_hooks(text)
+    native_cleared = without_native != text
+    if native_cleared:
+        text = without_native
+    if _grok_build_capture_events(text) and _GROK_BUILD_HOOK_RE.search(text) is None:
+        out.update(ok=False, error="unmanaged Grok Build capture hooks exist; refusing to duplicate them")
+        return out
+    try:
+        existing = tomllib.loads(text).get("mcp_servers", {}).get(GROK_BUILD_MCP_SERVER)
+    except tomllib.TOMLDecodeError:
+        existing = None
+    if isinstance(existing, dict) and not _is_launcher_command(existing.get("command"), "khipu-mcp"):
+        out.update(ok=False, error=f"[mcp_servers.{GROK_BUILD_MCP_SERVER}] is not Khipu-owned")
+        return out
+    if native_cleared:
+        out["changes"].append(f"{config}: remove normalized native Grok Build hooks")
+    agents_text = agents.read_text(encoding="utf-8") if agents.is_file() else ""
+    new_agents = _replace_grok_build_agents(agents_text)
+    mcp_block, hook_block = _grok_build_blocks()
+    original = config.read_text(encoding="utf-8")
+    new = _replace_grok_build_mcp(text, mcp_block)
+    if new != text:
+        out["changes"].append(f"{config}: add [mcp_servers.{GROK_BUILD_MCP_SERVER}]")
+    blocks = list(_GROK_BUILD_HOOK_RE.finditer(new))
+    if not blocks:
+        new = new.rstrip("\n") + "\n\n" + hook_block
+        out["changes"].append(f"{config}: add Grok Build capture hooks")
+    elif len(blocks) != 1 or blocks[0].group(0) != hook_block:
+        first = True
+
+        def one(_match):
+            nonlocal first
+            if first:
+                first = False
+                return hook_block
+            return ""
+
+        new = _GROK_BUILD_HOOK_RE.sub(one, new)
+        out["changes"].append(f"{config}: replace Grok Build capture hooks")
+    if new_agents != agents_text:
+        out["changes"].append(f"{agents}: add Grok Build recall instructions")
+    if dry:
+        return out
+    if new != original:
+        out.setdefault("backups", []).append(_backup(config))
+        _write_toml(config, new)
+    if new_agents != agents_text:
+        if agents.is_file():
+            out.setdefault("backups", []).append(_backup(agents))
+        agents.write_text(new_agents, encoding="utf-8")
+    return out
+
+
+def _grok_build_uninstall(dry: bool, project: str | None = None) -> dict:
+    out: dict[str, Any] = {"harness": "grok_build", "changes": []}
+    config = _grok_build_toml()
+    if config.is_file():
+        text = config.read_text(encoding="utf-8")
+        _validate_toml(config, text)
+        data = tomllib.loads(text)
+        existing = (data.get("mcp_servers") or {}).get(GROK_BUILD_MCP_SERVER) if isinstance(data, dict) else None
+        new = (_remove_grok_build_mcp(text)
+               if isinstance(existing, dict) and _is_launcher_command(existing.get("command"), "khipu-mcp")
+               else text)
+        if new != text:
+            out["changes"].append(f"{config}: remove [mcp_servers.{GROK_BUILD_MCP_SERVER}]")
+        new2 = _remove_native_grok_build_hooks(_GROK_BUILD_HOOK_RE.sub("", new))
+        if new2 != new:
+            out["changes"].append(f"{config}: remove Grok Build capture hooks")
+        if new2 != text and not dry:
+            out.setdefault("backups", []).append(_backup(config))
+            _write_toml(config, new2.rstrip("\n") + "\n")
+    agents = _grok_build_agents_path(project)
+    if agents is None:
+        out["note"] = ("AGENTS.md recall block left in place; pass --project to remove it")
+    elif agents.is_file():
+        text = agents.read_text(encoding="utf-8")
+        new = _remove_grok_build_agents(text)
+        if new != text:
+            out["changes"].append(f"{agents}: remove Grok Build recall instructions")
+            if not dry:
+                out.setdefault("backups", []).append(_backup(agents))
+                if not new.strip():
+                    agents.unlink()
+                else:
+                    agents.write_text(new, encoding="utf-8")
+    return out
+
+
+def _grok_build_status(project: str | None = None) -> dict:
+    config = _grok_build_toml()
+    text = config.read_text(encoding="utf-8") if config.is_file() else ""
+    events = _grok_build_capture_events(text)
+    try:
+        data = tomllib.loads(text) if text else {}
+    except tomllib.TOMLDecodeError:
+        data = {}
+    mcp = ((data.get("mcp_servers") or {}).get(GROK_BUILD_MCP_SERVER) or {}) if isinstance(data, dict) else {}
+    command = mcp.get("command") if isinstance(mcp, dict) else None
+    enabled = mcp.get("enabled") is True if isinstance(mcp, dict) else False
+    agents = _grok_build_agents_path(project)
+    recall = "project_required" if agents is None else "missing"
+    if _grok_build_recall_installed(agents):
+        recall = "installed" if _grok_build_project_trusted(project) else "untrusted"
+    conflict = bool(_aegis_capture_events(text)) and bool(events)
+    out = {
+        "harness": "grok_build", "detected": _grok_build_detected(),
+        "mcp": command == mcp_launcher() and enabled, "hook_stop": "Stop" in events,
+        "hook_precompact": "PreCompact" in events, "hook_sessionend": "SessionEnd" in events,
+        "recall_rule": recall, "extract": "installed" if {"Stop", "PreCompact", "SessionEnd"} <= events else "missing",
+        "project": project, "config": str(config), "conflict": conflict,
+    }
+    if conflict:
+        out["error"] = "Aegis and Grok Build capture hooks are both configured"
+    out.update(_pack_launchers("grok_build", {
+        "khipu-mcp": command,
+        "khipu-grok-build-capture": _grok_build_capture_command(text),
+    }))
+    out["installed"] = bool(out["mcp"] and out["extract"] == "installed"
+                            and recall == "installed" and not conflict)
     return out
 
 
@@ -2347,8 +2783,8 @@ def _probe_extract(command: str) -> dict:
 
 
 def _probe_native_extract(command: str, harness: str) -> dict:
-    """Fire the stop hook (shell-run) with a synthetic Claude-shaped PreCompact
-    envelope and a synthetic transcript in that harness's own format: it must
+    """Fire the installed hook (shell-run) with a harness-native PreCompact
+    envelope and transcript: it must
     parse it, count the turn, decide the window is due, and leave exactly ONE
     job on disk plus a heartbeat — under a throwaway capture home, so the probe
     never touches the real queue. Then a dry drain must extract nothing (no
@@ -2371,6 +2807,19 @@ def _probe_native_extract(command: str, harness: str) -> dict:
                         {"type": "event_msg", "payload": {"type": "agent_message", "message": "ack " * 40}}]
                 envl = {"hook_event_name": "PreCompact", "session_id": "khipu-verify", "cwd": td,
                         "transcript_path": str(tp)}
+            elif harness == "grok_build":
+                tp = (Path(td) / ".grok" / "sessions" / urllib.parse.quote(td, safe="")
+                      / "khipu-verify" / "updates.jsonl")
+                rows = [
+                    {"method": "session/update", "params": {"update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": "probe: " + "x" * 300}}}},
+                    {"method": "session/update", "params": {"update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "ack " * 40}}}},
+                ]
+                envl = {"hookEventName": "PreCompact", "sessionId": "khipu-verify", "cwd": td,
+                        "transcriptPath": str(tp)}
             else:
                 rows = [{"type": "user", "message": {"role": "user", "content": "probe: " + "x" * 300}},
                         {"type": "assistant", "message": {"role": "assistant",
@@ -2386,6 +2835,8 @@ def _probe_native_extract(command: str, harness: str) -> dict:
             # the queued probe job on disk for the assertion.
             env.update(KHIPU_CAPTURE_HOME=str(khome), KHIPU_CAPTURE_NO_DRAIN="1",
                        KHIPU_MEMORY_ROOT=str(Path(td) / "mem"))
+            if harness == "grok_build":
+                env["KHIPU_HARNESS"] = "grok_build"
             p = subprocess.run(command, shell=True, input=json.dumps(envl), capture_output=True,
                                encoding="utf-8", timeout=60, env=env)
             queued = list((khome / "queue").glob("*.json"))
@@ -2630,7 +3081,7 @@ def verify(harness: str, *, project: str | None = None, home: str | None = None)
     pack is verified in every home that has Khipu; homes without it are listed
     under ``not_installed_homes``."""
     _claude_only_home(harness, home)
-    st = status(harness, project=project) if harness == "grok_bot" else status(harness)
+    st = status(harness, project=project) if harness in ("grok_bot", "grok_build") else status(harness)
     left_out: list[str] | None = None
     if harness == "claude_code":
         st, left_out = _claude_verify_scope(st, home)
@@ -2659,6 +3110,23 @@ def verify(harness: str, *, project: str | None = None, home: str | None = None)
         except Exception as e:  # noqa: BLE001
             out["components"]["recall_probe"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         out["ok"] = all(c.get("ok") for c in out["components"].values())
+        return out
+    if harness == "grok_build":
+        if st.get("conflict"):
+            out["components"]["install"] = {"ok": False, "error": st.get("error", "capture conflict")}
+        out["components"]["mcp"] = (_probe_mcp(mcp_launcher()) if st.get("mcp")
+                                      else {"ok": False, "error": "not installed"})
+        hook = (_probe_native_extract(grok_build_capture_hook(), "grok_build")
+                if st.get("extract") == "installed" else {"ok": False, "error": "not installed"})
+        out["components"]["hook"] = hook
+        out["components"]["extract"] = dict(hook)
+        out["components"]["recall_instruction"] = {
+            "ok": st.get("recall_rule") == "installed",
+            "configured": st.get("recall_rule"),
+            "note": "AGENTS.md loading is offline-inspected; provider compliance is not asserted",
+        }
+        out["runtime"] = _runtime("grok_build")
+        out["ok"] = all(c.get("ok") for c in out["components"].values()) and out["runtime"].get("ok", True)
         return out
     if st["mcp"]:
         out["components"]["mcp"] = _probe_mcp(mcp_launcher())
@@ -2770,9 +3238,12 @@ def verify(harness: str, *, project: str | None = None, home: str | None = None)
 
 # ---- dispatch -----------------------------------------------------------------
 
-_INSTALL = {"claude_code": _claude_install, "cursor": _cursor_install, "aegis": _aegis_install, "codex": _codex_install}
-_UNINSTALL = {"claude_code": _claude_uninstall, "cursor": _cursor_uninstall, "aegis": _aegis_uninstall, "codex": _codex_uninstall}
-_STATUS = {"claude_code": _claude_status, "cursor": _cursor_status, "aegis": _aegis_status, "codex": _codex_status}
+_INSTALL = {"claude_code": _claude_install, "cursor": _cursor_install, "aegis": _aegis_install,
+            "codex": _codex_install, "grok_build": _grok_build_install}
+_UNINSTALL = {"claude_code": _claude_uninstall, "cursor": _cursor_uninstall, "aegis": _aegis_uninstall,
+              "codex": _codex_uninstall, "grok_build": _grok_build_uninstall}
+_STATUS = {"claude_code": _claude_status, "cursor": _cursor_status, "aegis": _aegis_status,
+           "codex": _codex_status, "grok_build": _grok_build_status}
 
 
 def _guarded(harness: str, fn, *args):
@@ -2799,7 +3270,7 @@ def install(harness: str, *, dry_run: bool = False, project: str | None = None,
         # grok_bot has no local shim (gateway/URL-based pack) — never enters
         # _installing(), matching "nothing else" in _installing()'s docstring.
         return _guarded(harness, _grok_bot_install, dry_run, project)
-    # Only the four LOCAL harness installs may touch a launcher symlink at
+    # Only the five LOCAL harness installs may touch a launcher symlink at
     # all — this is the one place _installing() is entered. dry_run
     # carries through so a dry run runs _shim() in PLAN mode, not WRITE.
     with _installing(dry=dry_run):
@@ -2807,6 +3278,8 @@ def install(harness: str, *, dry_run: bool = False, project: str | None = None,
             return _guarded(harness, _cursor_install, dry_run, project)
         if harness == "claude_code":
             return _guarded(harness, _claude_install, dry_run, home)
+        if harness == "grok_build":
+            return _guarded(harness, _grok_build_install, dry_run, project)
         return _guarded(harness, _INSTALL[harness], dry_run)
 
 
@@ -2820,6 +3293,8 @@ def uninstall(harness: str, *, dry_run: bool = False, project: str | None = None
         return _guarded(harness, _cursor_uninstall, dry_run, project)
     if harness == "grok_bot":
         return _guarded(harness, _grok_bot_uninstall, dry_run, project)
+    if harness == "grok_build":
+        return _guarded(harness, _grok_build_uninstall, dry_run, project)
     return _guarded(harness, _UNINSTALL[harness], dry_run)
 
 
@@ -2847,6 +3322,8 @@ def _last_beat_at(harness: str) -> str | None:
 def status(harness: str, *, project: str | None = None) -> dict:
     if harness == "grok_bot":
         out = _guarded(harness, _grok_bot_status, project)
+    elif harness == "grok_build":
+        out = _guarded(harness, _grok_build_status, project)
     else:
         out = _guarded(harness, _STATUS[harness])
     if isinstance(out, dict) and "last_beat_at" not in out:
@@ -2879,7 +3356,8 @@ def _launcher_health_body() -> dict:
         for root in (_launcher_root(s["target"]),) if root is not None
     }
     consistent = len(roots) <= 1
-    ok = all(status(h).get("launcher_ok", True) for h in ("claude_code", "cursor", "aegis", "codex"))
+    ok = all(status(h).get("launcher_ok", True)
+             for h in ("claude_code", "cursor", "aegis", "codex", "grok_build"))
     out = {"states": states, "consistent": consistent, "ok": ok}
     if not consistent:
         out["warning"] = (
