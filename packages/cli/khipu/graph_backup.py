@@ -36,6 +36,12 @@ INTEGRITY_TIMEOUT_CEILING_SECONDS = 15 * 60
 OFFSITE_TIMEOUT_FLOOR_SECONDS = 3600
 OFFSITE_SECONDS_PER_GB = 600
 OFFSITE_TIMEOUT_CEILING_SECONDS = 4 * 3600
+OFFSITE_RECEIPT_CONNECT_TIMEOUT_SECONDS = 5
+OFFSITE_RECEIPT_STATEMENT_TIMEOUT_SECONDS = 5
+
+
+class OffsiteReceiptReadError(RuntimeError):
+    """Safe failure message for the scheduled offsite receipt lookup."""
 
 
 def _utcnow() -> datetime:
@@ -184,11 +190,19 @@ def drill_due(*, last_ok: datetime | None, now: datetime, period_days: int = 8) 
     return (now - last_ok).total_seconds() >= period_days * 86400
 
 
-def _latest_ops_event(kind: str) -> dict | None:
+def _latest_ops_event(
+    kind: str, *, statement_timeout_s: float | None = None,
+    connect_timeout: int | None = None, raise_on_error: bool = False,
+) -> dict | None:
     from khipu.db import connect
 
+    deadlines = {}
+    if statement_timeout_s is not None:
+        deadlines["statement_timeout_s"] = statement_timeout_s
+    if connect_timeout is not None:
+        deadlines["connect_timeout"] = connect_timeout
     try:
-        with connect() as conn, conn.cursor() as cur:
+        with connect(**deadlines) as conn, conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT status, detail, created_at, now() - created_at
@@ -200,7 +214,17 @@ def _latest_ops_event(kind: str) -> dict | None:
                 (kind,),
             )
             row = cur.fetchone()
-    except Exception:
+    except Exception as exc:
+        if raise_on_error:
+            import psycopg
+
+            if isinstance(exc, (psycopg.errors.QueryCanceled, psycopg.errors.ConnectionTimeout)):
+                reason = "offsite receipt read timed out"
+            elif isinstance(exc, psycopg.OperationalError):
+                reason = "offsite receipt read connection failed"
+            else:
+                reason = "offsite receipt read failed"
+            raise OffsiteReceiptReadError(reason) from None
         return None
     if not row:
         return None
@@ -213,8 +237,18 @@ def _latest_ops_event(kind: str) -> dict | None:
     }
 
 
-def _last_ok_time(kind: str) -> datetime | None:
-    ev = _latest_ops_event(kind)
+def _last_ok_time(
+    kind: str, *, statement_timeout_s: float | None = None,
+    connect_timeout: int | None = None, raise_on_error: bool = False,
+) -> datetime | None:
+    options = {}
+    if statement_timeout_s is not None:
+        options["statement_timeout_s"] = statement_timeout_s
+    if connect_timeout is not None:
+        options["connect_timeout"] = connect_timeout
+    if raise_on_error:
+        options["raise_on_error"] = True
+    ev = _latest_ops_event(kind, **options)
     if not ev or ev.get("status") != "ok" or ev.get("created_at") is None:
         return None
     created = ev["created_at"]
@@ -529,9 +563,21 @@ def run_offsite(
 
     detail = {key: value for key, value in out.items() if key != "ok"}
     try:
-        event = ops_events.record("graph_snapshot_offsite", "ok" if out["ok"] else "fail", detail)
-    except Exception:  # noqa: BLE001
-        return {**out, "ok": False, "ops_error": "offsite ops_events insert failed"}
+        event = ops_events.record(
+            "graph_snapshot_offsite", "ok" if out["ok"] else "fail", detail,
+            statement_timeout_s=OFFSITE_RECEIPT_STATEMENT_TIMEOUT_SECONDS,
+            connect_timeout=OFFSITE_RECEIPT_CONNECT_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001
+        import psycopg
+
+        if isinstance(exc, (psycopg.errors.QueryCanceled, psycopg.errors.ConnectionTimeout)):
+            error = "offsite ops_events insert timed out"
+        elif isinstance(exc, psycopg.OperationalError):
+            error = "offsite ops_events insert connection failed"
+        else:
+            error = "offsite ops_events insert failed"
+        return {**out, "ok": False, "ops_error": error}
     return {**out, "event": event}
 
 
