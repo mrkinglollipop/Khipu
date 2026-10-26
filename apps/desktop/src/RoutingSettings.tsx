@@ -2704,11 +2704,12 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
 
       <div className="section-body">
         <h2 className="sub-title">Live conversations <span className="meta">{liveLabel}</span></h2>
-        {ownerRows ? (
-          ownerRows.length ? (
+        {ownerRows && ownerRows.length ? (
             <div className="mrows" role="list" aria-label="Live conversations">
               {ownerRows.map((row, index) => {
-                const state = identityWords({ identity: "", component: "", status: row.status ?? "unknown", owed: row.owed ?? undefined, reasons: row.reasons, missing: row.missing }, tellingOff);
+                const state = healthError
+                  ? { text: "Can't be checked", detail: undefined as string | undefined, tone: undefined as "ok" | "warn" | "err" | undefined }
+                  : identityWords({ identity: "", component: "", status: row.status ?? "unknown", owed: row.owed ?? undefined, reasons: row.reasons, missing: row.missing }, tellingOff);
                 return (
                   <div key={`owner-delivery-${index}`} className="mrow delivery" role="listitem">
                     <span><span className="name">{row.label}</span><br /><span className="src">{[deliveryHarnessName(row.harness), deliveryComponentWord(row.component)].filter(Boolean).join(" · ")}</span></span>
@@ -2719,12 +2720,6 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
                 );
               })}
             </div>
-          ) : (
-            <div className="empty">
-              <b>No live conversations</b>
-              <span>No delivery identity has a recent delivery point.</span>
-            </div>
-          )
         ) : identities.length ? (
           <div className="mrows" role="list" aria-label="Live conversations">
             {identities.map((row, index) => {
@@ -5038,6 +5033,11 @@ export function RoutingSettings({
       {config.error && !config.data ? (
         <p className="set-error" role="alert">
           Could not read the settings: {config.error}
+        </p>
+      ) : null}
+      {config.error && config.data ? (
+        <p className="set-error" role="alert">
+          Saved, but couldn&apos;t re-read the settings: {config.error}
         </p>
       ) : null}
     </div>
