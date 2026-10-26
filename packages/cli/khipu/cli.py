@@ -6576,7 +6576,7 @@ def build_parser() -> argparse.ArgumentParser:
             "harness",
             nargs="?",
             default="all",
-            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_bot"),
+            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot"),
         )
         if name in ("install", "uninstall"):
             sp.add_argument("--dry-run", action="store_true")
@@ -6589,7 +6589,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("install", "uninstall", "status", "verify"):
             sp.add_argument(
                 "--project",
-                help="Cursor / Grok Bot: repo dir for .cursor/rules/khipu.mdc and .cursor/mcp.json",
+                help="Cursor / Grok Build / Grok Bot: repo dir for that pack's recall and MCP files",
             )
         if name == "install":
             sp.add_argument("--no-verify", action="store_true")

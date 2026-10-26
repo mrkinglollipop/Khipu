@@ -86,7 +86,7 @@ from khipu.lines import split_lines
 from khipu.t3 import cache_thread, is_helper_session
 from khipu.turn_text import INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine  # noqa: F401
 
-HARNESSES = ("claude_code", "cursor", "codex", "aegis")
+HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build")
 
 
 def _env_int(new: str, old: str, default: str) -> str:
@@ -357,10 +357,11 @@ def transcript_path(env: dict, harness: str = "", *, synth_sessions: set[str] | 
         return Path(str(p))
     sid = session_id(env)
     cwd = session_cwd(env)
-    # Aegis omits the pointer only when updates.jsonl does not exist yet; the
-    # session dir is ~/.grok/sessions/<percent-encoded cwd>/<sessionId>/.
-    if cwd and sid and harness in ("aegis", ""):
-        cand = Path.home() / ".grok" / "sessions" / urllib.parse.quote(str(cwd), safe="") / str(sid) / "updates.jsonl"
+    # Grok omits the pointer only when updates.jsonl does not exist yet; the
+    # session dir is $GROK_HOME/sessions/<percent-encoded cwd>/<sessionId>/.
+    if cwd and sid and harness in ("aegis", "grok_build", ""):
+        grok_home = Path(os.environ.get("GROK_HOME") or str(Path.home() / ".grok"))
+        cand = grok_home / "sessions" / urllib.parse.quote(str(cwd), safe="") / str(sid) / "updates.jsonl"
         if cand.is_file():
             return cand
     # Cursor keeps one JSONL per conversation under its per-project tree.
@@ -1055,8 +1056,9 @@ def save_state(harness: str, sid: str, st: dict, *, preserve_mtime: bool = False
 
 # The login folder a conversation ran under (settings clarity phase 9,
 # discovery source 2): the value of its CLI's folder variable in the hook's own
-# environment, and nothing else. Grok Build is captured as ``aegis``.
-LOGIN_HOME_VARS = {"claude_code": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "aegis": "GROK_HOME"}
+# environment, and nothing else. Grok-native packs use the same Grok home.
+LOGIN_HOME_VARS = {"claude_code": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME",
+                   "aegis": "GROK_HOME", "grok_build": "GROK_HOME"}
 LOGIN_HOME_FIELD = "login_home"
 # Cleared from a session's state this long after its ``seen_ts``; discovery
 # counts conversations over 7 days, so nothing that counts is lost.
@@ -1572,13 +1574,13 @@ def _transcript_project_matches(harness: str, tpath: Any, cwd: str) -> bool:
     directory encoded in its transcript path name the caller's directory?
     Only where the encoding can be checked exactly: Claude Code's project
     directory is the working directory with every non-alphanumeric character
-    replaced by '-', Aegis's session directory is the percent-encoded working
-    directory. The other harnesses give no such handle, so no match."""
+    replaced by '-', and Grok's session directory is the percent-encoded
+    working directory. The other harnesses give no such handle, so no match."""
     try:
         parts = Path(str(tpath)).parts
         if harness == "claude_code":
             return _dir_after(parts, "projects") == re.sub(r"[^A-Za-z0-9]", "-", str(Path(cwd).resolve()))
-        if harness == "aegis":
+        if harness in ("aegis", "grok_build"):
             enc = _dir_after(parts, "sessions")
             return enc is not None and _same_dir(urllib.parse.unquote(enc), cwd)
     except (OSError, RuntimeError, ValueError):

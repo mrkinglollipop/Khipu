@@ -1,0 +1,28 @@
+#!/bin/sh
+# khipu-grok-build-capture — Grok Build's native session capture hook.
+#
+# Grok Build shares ~/.grok with Aegis, but its Khipu hook identity must never
+# be Aegis. The installer gives this command KHIPU_HARNESS=grok_build; any
+# compatibility import or hand-run invocation without that exact marker is a
+# no-op so it cannot steal another harness's session.
+if [ "${KHIPU_HARNESS:-}" != "grok_build" ]; then
+  cat >/dev/null 2>&1
+  exit 0
+fi
+SELF="$0"
+HOPS=0
+while [ -L "$SELF" ] && [ "$HOPS" -lt 40 ]; do
+  LINK=$(readlink "$SELF")
+  case "$LINK" in /*) SELF="$LINK" ;; *) SELF="$(dirname "$SELF")/$LINK" ;; esac
+  HOPS=$((HOPS + 1))
+done
+SELF_DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+ROOT="${KHIPU_ROOT:-$(cd "$SELF_DIR/../../.." 2>/dev/null && pwd)}"
+PYTHONPATH="$ROOT/packages/cli:$ROOT/.python_libs${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+PYTHONDONTWRITEBYTECODE=1
+export PYTHONDONTWRITEBYTECODE
+PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
+[ -x "$PY" ] || PY="python3"
+"$PY" -m khipu.session_capture --harness grok_build "$@" 2>/dev/null || true
+exit 0
