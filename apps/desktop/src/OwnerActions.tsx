@@ -194,6 +194,12 @@ export function actionWords(a: OwnerAction): string {
       return "Turned owner direction on";
     case "direction.acknowledge":
       return "Acknowledged the tamper alarm";
+    case "forget.send":
+      return "Sent this Mac's forgets the hub lacked to the hub";
+    case "forget.here":
+      return `Forgot hub episode ${t}, already forgotten on this Mac`;
+    case "forget.not_same":
+      return `Marked hub episode ${t} as not the one forgotten on this Mac`;
     case "direction.set": {
       if (t.startsWith("trust ")) return `Trusted ${frontEndWords(t.slice(6))}`;
       if (t.startsWith("untrust ")) return `Stopped trusting ${frontEndWords(t.slice(8))}`;

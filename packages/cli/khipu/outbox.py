@@ -108,10 +108,26 @@ def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str
     return job["payload"] == payload and {k: job[k] for k in ("origin",) if k in job} == stamp
 
 
-def enqueue(payload: dict[str, Any], *, reason: str = "") -> Path:
+_STAMP = object()
+
+
+def enqueue(payload: dict[str, Any], *, reason: str = "", origin: Any = _STAMP) -> Path:
     """Durably queue a capture; acknowledge an existing file only for equal
-    content and equal origin. A full disk is raised in plain words."""
-    stamp = _queued_origin()
+    content and equal origin. A full disk is raised in plain words.
+
+    ``origin``: the owner the replay writes the row as. By default it is
+    stamped now from the request context; a writer that does not know who
+    made the capture passes ``None`` (unknown, which no drainer claims), as
+    the file recovery writers do for a line they could not land (a synced
+    file can hold another machine's captures; third Astra review #3)."""
+    if origin is _STAMP:
+        stamp = _queued_origin()
+    else:
+        from khipu.request_context import valid_origin
+
+        if not valid_origin(origin):
+            raise ValueError(f"not a queued origin: {origin!r}")
+        stamp = {"origin": origin}
     # Only the envelope says who owns a queued capture; the caller's own claim
     # is dropped here as write_pg drops it.
     payload = {k: v for k, v in payload.items() if k != "origin"}
@@ -410,7 +426,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
             js = js[:limit]
         out["jobs"] = len(js)
         from khipu import memory_lock
-        from khipu.capture import CaptureEvidenceConflict, ClaimDeferred, write_pg
+        from khipu.capture import CaptureEvidenceConflict, ClaimDeferred, FactStepDeferred, write_pg
         from khipu.embed import embed_on_capture
         from khipu.request_context import replaying
         from khipu.tombstones import RegistryError, write_guard
@@ -503,7 +519,15 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                     # only record of the owner: retried, never buried.
                     job["claim_deferred"] = isinstance(e, ClaimDeferred)
                     job["evidence_conflict"] = isinstance(e, CaptureEvidenceConflict)
-                    deferred = job["claim_deferred"] or job["evidence_conflict"]
+                    # A fact step that met a lock or timeout error, or the
+                    # hub's fact gate: the transaction rolled back whole and
+                    # a retry lands it with its claims; never buried.
+                    job["fact_deferred"] = isinstance(e, FactStepDeferred)
+                    if job["fact_deferred"]:
+                        job["deferral_reason"] = str(e)[:200]
+                    else:
+                        job.pop("deferral_reason", None)
+                    deferred = job["claim_deferred"] or job["evidence_conflict"] or job["fact_deferred"]
                     if deferred:
                         unreachable = False
                         out["deferred"] = out.get("deferred", 0) + 1

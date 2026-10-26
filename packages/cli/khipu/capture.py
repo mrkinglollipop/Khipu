@@ -114,6 +114,76 @@ class ClaimDeferred(RuntimeError):
     the queued owner, the only ownership evidence, would be discarded."""
 
 
+class FactStepDeferred(RuntimeError):
+    """A fact step (commitments, decisions, deliverables, and the close and
+    reversal steps that lock the same rows) met a transient lock or timeout
+    error, or the hub refused an unprojected wording write (SQLSTATE 08K01,
+    fact provenance migration 0047). The whole capture transaction rolls
+    back and the outbox retries the job; it is never buried, because a
+    partial commit would lose the item's claims (fact-provenance scope,
+    invariant I4)."""
+
+
+# The errors a fact step defers on rather than failing open (scope 3.4): a
+# deadlock, a serialization failure, a lock timeout and a statement timeout.
+# By class name and SQLSTATE, so a test double needs no psycopg import.
+_FACT_DEFERRAL_CLASSES = frozenset({
+    "DeadlockDetected", "SerializationFailure", "LockNotAvailable", "QueryCanceled",
+})
+_FACT_DEFERRAL_SQLSTATES = frozenset({"40P01", "40001", "55P03", "57014"})
+
+
+def _fact_deferral(exc: BaseException) -> str | None:
+    """The deferral reason for a fact-step error, or None when it fails open."""
+    from khipu import provenance
+
+    if isinstance(exc, FactStepDeferred):
+        return str(exc)
+    if provenance.is_old_writer_refusal(exc):
+        return f"refused unprojected write ({type(exc).__name__})"
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    state = getattr(getattr(exc, "diag", None), "sqlstate", None) or getattr(exc, "sqlstate", None)
+    if names & _FACT_DEFERRAL_CLASSES or state in _FACT_DEFERRAL_SQLSTATES:
+        return type(exc).__name__
+    return None
+
+
+def _defer_if_transient(exc: BaseException, step: str) -> None:
+    """Raise :class:`FactStepDeferred` for an error the outbox must retry."""
+    reason = _fact_deferral(exc)
+    if reason is not None:
+        _log(f"{step} step deferred ({reason}); the capture will be retried")
+        raise FactStepDeferred(f"{step}: {reason}: {exc}") from exc
+
+
+def _record_fact_gap(cur, episode_id: int | None, step: str, exc: BaseException, *,
+                     source_id: str | None = None) -> None:
+    """After a fact step failed open (its savepoint rolled back), record the
+    gap in the same transaction, so doctor reports it and the nightly
+    re-runs it (invariant I4). Only on a hub with migration 0047; a gap that
+    cannot be recorded defers the whole capture instead of losing the items."""
+    if episode_id is None:
+        return
+    from khipu import provenance
+
+    try:
+        ready = provenance.ready(cur)
+    except Exception:  # noqa: BLE001 — a failed probe is not a hub with the table
+        ready = False
+    if not ready:
+        return
+    try:
+        cur.execute(
+            "INSERT INTO fact_gaps (episode_id, step, error, source_id) VALUES (%s, %s, %s, %s)",
+            (episode_id, step, f"{type(exc).__name__}: {str(exc)[:500]}", source_id),
+        )
+        # A recorded gap is this writer's participation (0047's writer gate):
+        # the step's own declaration rolled back with its savepoint.
+        provenance.declare_writer(cur)
+    except Exception as gap_exc:  # noqa: BLE001 — classified: the capture is retried
+        raise FactStepDeferred(f"{step}: fact gap not recorded ({type(gap_exc).__name__})") from gap_exc
+
+
 class CaptureEvidenceConflict(RuntimeError):
     """A legacy uniqueness collision would discard distinct incoming evidence.
 
@@ -123,16 +193,18 @@ class CaptureEvidenceConflict(RuntimeError):
 
 
 def _receipt_match(cur, payload: dict[str, Any],
-                   source: dict[str, Any] | None) -> tuple[int, str] | None:
+                   source: dict[str, Any] | None, *,
+                   live_only: bool = False) -> tuple[int, str] | None:
     """The episode this capture was already merged into, and how that merge
     matched: identity only when its receipt says so."""
+    live = " AND deleted_at IS NULL" if live_only else ""
     receipts = _receipts(payload, source)
     for match in (MATCH_IDENTITY, None):
         for receipt_id in receipts:
             entry = {"source_id": receipt_id}
             if match:
                 entry["match"] = match
-            cur.execute("SELECT id FROM episodes WHERE raw @> %s::jsonb LIMIT 1",
+            cur.execute(f"SELECT id FROM episodes WHERE raw @> %s::jsonb{live} LIMIT 1",
                         (json.dumps({"merged_from": [entry]}),))
             row = cur.fetchone()
             if row:
@@ -141,7 +213,8 @@ def _receipt_match(cur, payload: dict[str, Any],
 
 
 def _dedup_exact_window(cur, payload: dict[str, Any], *,
-                        source: dict[str, Any] | None = None) -> int | None:
+                        source: dict[str, Any] | None = None,
+                        live_only: bool = False) -> int | None:
     """K3: every sibling PART of one split window shares the same (harness,
     session_id, transcript_range) — that alone would match the FIRST part
     inserted and silently skip every part after it as an "exact window"
@@ -152,11 +225,30 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
 
     A hub with episode_sources (0027) answers by the capture's source key
     first; the column match below stays as the pre-0027 path and for sources
-    recorded before the key existed."""
+    recorded before the key existed. ``live_only`` matches live episodes only."""
     from khipu.capture_identity import episode_for_source, source_key, sources_ready
+    from khipu.db import has_table
 
+    live = " AND deleted_at IS NULL" if live_only else ""
     if sources_ready(cur) and _source_key_is_safe(payload):
-        recorded = episode_for_source(cur, source["source_key"] if source else source_key(payload))
+        key = source["source_key"] if source else source_key(payload)
+        if live_only:
+            cur.execute("SELECT s.episode_id FROM episode_sources s JOIN episodes e "
+                        "ON e.id = s.episode_id AND e.deleted_at IS NULL WHERE s.source_key = %s",
+                        (key,))
+            row = cur.fetchone()
+            if row is None and has_table(cur, "episode_identities"):
+                # The source row stays on a collateral tombstone, so a live
+                # re-upload of the source was recorded under its episode key;
+                # the identity index still records the source's key on it
+                # (Astra 7A re-review #2).
+                cur.execute("SELECT i.episode_id FROM episode_identities i JOIN episodes e "
+                            "ON e.id = i.episode_id AND e.deleted_at IS NULL "
+                            "WHERE i.identity = %s ORDER BY i.episode_id LIMIT 1", (key,))
+                row = cur.fetchone()
+            recorded = int(row[0]) if row else None
+        else:
+            recorded = episode_for_source(cur, key)
         if recorded is not None:
             return recorded
     harness = payload.get("harness")
@@ -175,14 +267,14 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
         if has_window_col:
             cur.execute(
                 "SELECT id FROM episodes WHERE harness = %s AND session_id = %s "
-                "AND transcript_range = %s AND window_id = %s AND raw->>'part' = %s LIMIT 1",
+                f"AND transcript_range = %s AND window_id = %s AND raw->>'part' = %s{live} LIMIT 1",
                 (harness, session_id, tr, window_id, payload.get("part")),
             )
             row = cur.fetchone()
             return int(row[0]) if row else None
     cur.execute(
         "SELECT id FROM episodes WHERE harness = %s AND session_id = %s "
-        "AND transcript_range = %s LIMIT 1",
+        f"AND transcript_range = %s{live} LIMIT 1",
         (harness, session_id, tr),
     )
     row = cur.fetchone()
@@ -653,6 +745,9 @@ def _merge_into_episode(
     # the caller falls through to an insert the hub refuses the same way.
     savepoint = _savepoint(cur, "khipu_merge_write")
     try:
+        from khipu.tombstones import announce_hub_identities
+
+        announce_hub_identities(cur, payload, source)
         cur.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id = %s", params)
         record_source(cur, target_id, "merged", source,
                       ts=payload.get("ts"), summary=payload.get("summary"))
@@ -678,10 +773,13 @@ def _merge_into_episode(
         commitments.auto_close(cur, payload, target_id)
         commitments.close_session_plan(cur, payload, target_id)
     except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        _defer_if_transient(exc, "commitments")
         try:
             cur.execute("ROLLBACK TO SAVEPOINT capture_merge_commitments")
         except Exception:  # noqa: BLE001
             pass
+        else:
+            _record_fact_gap(cur, target_id, "merge commitments", exc, source_id=source_id)
         _log(f"merge commitments step failed ({type(exc).__name__}: {exc})")
 
     # O2: the merged capture's own decision strings belong to the target
@@ -695,10 +793,13 @@ def _merge_into_episode(
 
         _decisions.insert_decisions_from_episode(cur, payload, target_id)
     except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        _defer_if_transient(exc, "decisions")
         try:
             cur.execute("ROLLBACK TO SAVEPOINT capture_merge_decisions")
         except Exception:  # noqa: BLE001
             pass
+        else:
+            _record_fact_gap(cur, target_id, "merge decisions", exc, source_id=source_id)
         _log(f"merge decisions step failed ({type(exc).__name__}: {exc})")
 
     # Phase 2, session C: conservative reversal detection reads the row
@@ -713,10 +814,13 @@ def _merge_into_episode(
 
         _decisions.detect_reversals_from_episode(cur, payload, target_id)
     except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        _defer_if_transient(exc, "decision detection")
         try:
             cur.execute("ROLLBACK TO SAVEPOINT capture_merge_decision_detection")
         except Exception:  # noqa: BLE001
             pass
+        else:
+            _record_fact_gap(cur, target_id, "merge decision detection", exc, source_id=source_id)
         _log(f"merge decision detection step failed ({type(exc).__name__}: {exc})")
 
     # Owed close rules (slice 2): this capture's project, with this capture
@@ -730,10 +834,13 @@ def _merge_into_episode(
 
         close_rules.run(cur, payload=payload, episode_id=target_id)
     except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        _defer_if_transient(exc, "close rules")
         try:
             cur.execute("ROLLBACK TO SAVEPOINT capture_merge_close_rules")
         except Exception:  # noqa: BLE001
             pass
+        else:
+            _record_fact_gap(cur, target_id, "merge close rules", exc, source_id=source_id)
         _log(f"merge close rules step failed ({type(exc).__name__}: {exc})")
 
     # O4: same posture for the merged capture's own deliverables.
@@ -746,10 +853,13 @@ def _merge_into_episode(
 
         _deliverables.insert_deliverables_from_episode(cur, payload, target_id)
     except Exception as exc:  # noqa: BLE001 — the merged row stays; fail-open
+        _defer_if_transient(exc, "deliverables")
         try:
             cur.execute("ROLLBACK TO SAVEPOINT capture_merge_deliverables")
         except Exception:  # noqa: BLE001
             pass
+        else:
+            _record_fact_gap(cur, target_id, "merge deliverables", exc, source_id=source_id)
         _log(f"merge deliverables step failed ({type(exc).__name__}: {exc})")
 
     return True
@@ -773,19 +883,21 @@ def _reembed_merged_episode(ts: Any, summary: Any, merged: dict[str, Any], *,
 
 
 def dedup_before_insert(cur, payload: dict[str, Any], *,
-                        source: dict[str, Any] | None = None) -> dict[str, Any]:
+                        source: dict[str, Any] | None = None,
+                        live_only: bool = False) -> dict[str, Any]:
     """W1.4: {'action': 'skip'|'merge'|'none', ...}. Never raises — any
     failure in the similarity path degrades to 'none' (a normal insert).
-    ``source`` is write_pg's pre-enrichment source identity snapshot."""
+    ``source`` is write_pg's pre-enrichment source identity snapshot.
+    ``live_only`` ignores tombstoned episodes."""
     from khipu.config import float_setting
 
-    receipt = _receipt_match(cur, payload, source)
+    receipt = _receipt_match(cur, payload, source, live_only=live_only)
     if receipt is not None:
         receipt_id, match = receipt
         _log(f"dedup: merge receipt on episode {receipt_id} ({match}); skipping insert")
         return {"action": "skip", "matched_episode": receipt_id,
                 "matched_via": "receipt", "match": match}
-    exact_id = _dedup_exact_window(cur, payload, source=source)
+    exact_id = _dedup_exact_window(cur, payload, source=source, live_only=live_only)
     if exact_id is not None:
         _log(f"dedup: exact window match episode {exact_id} — skipping insert")
         return {"action": "skip", "matched_episode": exact_id, "matched_via": "exact_window",
@@ -956,6 +1068,19 @@ def _claim_unowned_episode(cur, episode_id: int | None, origin: str | None) -> N
                 (origin, episode_id))
 
 
+def _refusals_settled(cur) -> bool | None:
+    """None on a hub without 0047's identity index, where a tombstone is the
+    forget. Otherwise whether its history is indexed, so the refusal table
+    alone says what is forgotten (section 6.1)."""
+    from khipu.db import has_table
+
+    if not has_table(cur, "fact_copy_ready"):
+        return None
+    cur.execute("SELECT indexed_through >= target_id FROM fact_copy_ready")
+    row = cur.fetchone()
+    return bool(row and row[0])
+
+
 def _forgotten_result(cur, payload: dict[str, Any], source: dict[str, Any], *,
                       dedup: dict[str, Any] | None = None) -> dict[str, Any]:
     """The terminal outcome for a forgotten source: nothing written. The id
@@ -971,6 +1096,83 @@ def _forgotten_result(cur, payload: dict[str, Any], source: dict[str, Any], *,
         "dedup": dedup or {"action": "none"},
         "forgotten_source": True,
     }
+
+
+def run_fact_steps(cur, payload: dict[str, Any], episode_id: int) -> None:
+    """The fact steps of a newly inserted capture, each in its own
+    savepoint: commitments, decisions, reversal detection, close rules and
+    deliverables. A transient or old-writer error raises
+    :class:`FactStepDeferred` (the whole transaction must roll back and be
+    retried); any other error rolls its step back and records a
+    ``fact_gaps`` row (invariant I4). ``write_pg`` runs them for a capture,
+    and the file recovery writers (``mirror.sync_recent_episodes``,
+    ``mirror.reconcile_memory_root``) for a file line they import, so the
+    episode commits with its claims (0047's writer gate)."""
+    cur.execute("SAVEPOINT capture_commitments")
+    try:
+        from khipu import commitments
+
+        commitments.open_from_episode(cur, payload, episode_id)
+        commitments.auto_close(cur, payload, episode_id)
+        commitments.close_session_plan(cur, payload, episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "commitments")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
+        _record_fact_gap(cur, episode_id, "commitments", exc)
+        _log(f"commitments step failed ({type(exc).__name__}: {exc})")
+
+    # O2: each string in payload['decisions'] becomes a row.
+    cur.execute("SAVEPOINT capture_decisions")
+    try:
+        from khipu import decisions as _decisions
+
+        _decisions.insert_decisions_from_episode(cur, payload, episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "decisions")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_decisions")
+        _record_fact_gap(cur, episode_id, "decisions", exc)
+        _log(f"decisions step failed ({type(exc).__name__}: {exc})")
+
+    # Phase 2, session C: conservative reversal detection over
+    # the rows the step above just inserted — its own
+    # SAVEPOINT, same fail-open posture as every neighbour
+    # here, so a detection failure can never take the
+    # episode (or the decisions just written) down with it.
+    cur.execute("SAVEPOINT capture_decision_detection")
+    try:
+        from khipu import decisions as _decisions
+
+        _decisions.detect_reversals_from_episode(cur, payload, episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "decision detection")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_decision_detection")
+        _record_fact_gap(cur, episode_id, "decision detection", exc)
+        _log(f"decision detection step failed ({type(exc).__name__}: {exc})")
+
+    # Owed close rules (slice 2): PR and decision closes for
+    # this capture's project, after the decisions they read.
+    cur.execute("SAVEPOINT capture_close_rules")
+    try:
+        from khipu import close_rules
+
+        close_rules.run(cur, payload=payload, episode_id=episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "close rules")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_close_rules")
+        _record_fact_gap(cur, episode_id, "close rules", exc)
+        _log(f"close rules step failed ({type(exc).__name__}: {exc})")
+
+    # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
+    cur.execute("SAVEPOINT capture_deliverables")
+    try:
+        from khipu import deliverables as _deliverables
+
+        _deliverables.insert_deliverables_from_episode(cur, payload, episode_id)
+    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
+        _defer_if_transient(exc, "deliverables")
+        cur.execute("ROLLBACK TO SAVEPOINT capture_deliverables")
+        _record_fact_gap(cur, episode_id, "deliverables", exc)
+        _log(f"deliverables step failed ({type(exc).__name__}: {exc})")
 
 
 def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1012,295 +1214,282 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
 
     # Shared for the whole transaction, through its commit: a forget on this
     # Mac either finished before it began or starts after it committed.
-    with memory_lock.shared(), connect() as conn:
-        with conn.cursor() as cur:
-            from khipu.tombstones import hub_source_forgotten
+    # The hub refuses an unprojected wording write at COMMIT (SQLSTATE
+    # 08K01, fact provenance): the transaction rolled back whole, and the
+    # retry re-reads readiness (positive-only, never cached as no).
+    from khipu import provenance
 
-            # Lock source ownership before looking it up, through commit. Two
-            # independent extractors may produce different summaries for the
-            # same natural window; both must not insert from an empty lookup.
-            # Collisions of this 64-bit advisory key only serialize extra work.
-            lock_key = int(source["source_key"][:16], 16)
-            if lock_key >= 1 << 63:
-                lock_key -= 1 << 64
-            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
-            if hub_source_forgotten(cur, payload, source):
-                return _forgotten_result(cur, payload, source)
-            _inherit_project(cur, payload)
-            _observe_checkout(cur, payload)
-            if payload.get("project"):
-                from khipu.identity import _resolve_project_alias
+    try:
+        with memory_lock.shared(), connect() as conn:
+            with conn.cursor() as cur:
+                from khipu.tombstones import hub_source_forgotten
 
-                # Alias enrichment is optional. Keep its failure inside a
-                # caller-owned savepoint so even a lookup that raises before
-                # recovering its own savepoint cannot abort the capture.
-                cur.execute("SAVEPOINT capture_project_alias")
-                try:
-                    canonical = _resolve_project_alias(cur, payload["project"])
-                except Exception as exc:  # noqa: BLE001 — optional enrichment, never abort the caller
-                    cur.execute("ROLLBACK TO SAVEPOINT capture_project_alias")
-                    cur.execute("RELEASE SAVEPOINT capture_project_alias")
-                    _log(f"project alias lookup failed ({type(exc).__name__}); keeping original project")
-                else:
-                    cur.execute("RELEASE SAVEPOINT capture_project_alias")
-                    payload["project"] = canonical or payload["project"]
-            _note_project_root(cur, payload)
-            dedup = dedup_before_insert(cur, payload, source=source)
-            if dedup["action"] in ("skip", "merge"):
-                # ``episode_sources`` deliberately retains the source key on
-                # a tombstoned row: a delayed outbox replay must find that
-                # tombstone instead of treating the missing live row as an
-                # invitation to insert it again. It is a terminal outcome,
-                # not an ordinary dedup skip, so callers can avoid every
-                # secondary persistence leg (legacy file, mirror, vectors).
-                cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
-                            (dedup.get("matched_episode"),))
-                matched = cur.fetchone()
-                target = matched[0] if matched else {}
-                if isinstance(target, dict) and target.get("deleted_at"):
+                # Lock source ownership before looking it up, through commit. Two
+                # independent extractors may produce different summaries for the
+                # same natural window; both must not insert from an empty lookup.
+                # Collisions of this 64-bit advisory key only serialize extra work.
+                lock_key = int(source["source_key"][:16], 16)
+                if lock_key >= 1 << 63:
+                    lock_key -= 1 << 64
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+                if hub_source_forgotten(cur, payload, source):
+                    return _forgotten_result(cur, payload, source)
+                _inherit_project(cur, payload)
+                _observe_checkout(cur, payload)
+                if payload.get("project"):
+                    from khipu.identity import _resolve_project_alias
+
+                    # Alias enrichment is optional. Keep its failure inside a
+                    # caller-owned savepoint so even a lookup that raises before
+                    # recovering its own savepoint cannot abort the capture.
+                    cur.execute("SAVEPOINT capture_project_alias")
+                    try:
+                        canonical = _resolve_project_alias(cur, payload["project"])
+                    except Exception as exc:  # noqa: BLE001 — optional enrichment, never abort the caller
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_project_alias")
+                        cur.execute("RELEASE SAVEPOINT capture_project_alias")
+                        _log(f"project alias lookup failed ({type(exc).__name__}); keeping original project")
+                    else:
+                        cur.execute("RELEASE SAVEPOINT capture_project_alias")
+                        payload["project"] = canonical or payload["project"]
+                _note_project_root(cur, payload)
+                dedup = dedup_before_insert(cur, payload, source=source)
+                if dedup["action"] in ("skip", "merge"):
+                    # ``episode_sources`` deliberately retains the source key on
+                    # a tombstoned row: a delayed outbox replay must find that
+                    # tombstone instead of treating the missing live row as an
+                    # invitation to insert it again. It is a terminal outcome,
+                    # not an ordinary dedup skip, so callers can avoid every
+                    # secondary persistence leg (legacy file, mirror, vectors).
+                    # On a hub with 0047's index the refusal table checked above
+                    # is the one authority instead: a tombstone left by another
+                    # capture's forget (a collateral carrier) does not forget
+                    # this one, so it is matched against live episodes only.
+                    cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
+                                (dedup.get("matched_episode"),))
+                    matched = cur.fetchone()
+                    target = matched[0] if matched else {}
+                    settled = (_refusals_settled(cur)
+                               if isinstance(target, dict) and target.get("deleted_at") else None)
+                    if settled is False:
+                        raise FactStepDeferred("history is not indexed yet; the capture matches "
+                                               "a tombstoned episode and waits")
+                    if settled:
+                        dedup = dedup_before_insert(cur, payload, source=source, live_only=True)
+                        target = {}
+                if dedup["action"] in ("skip", "merge"):
+                    if isinstance(target, dict) and target.get("deleted_at"):
+                        conn.commit()
+                        return {
+                            "episode_inserted": False,
+                            "topics_written": 0,
+                            "episode_id": dedup.get("matched_episode"),
+                            "source_key": source["source_key"],
+                            "dedup": dedup,
+                            "forgotten_source": True,
+                        }
+                    # The job is done once this returns (the outbox deletes it),
+                    # so this is the last chance to record its trusted owner. Only
+                    # an identity match (an exact window, a window_id, or a receipt
+                    # of an identity merge) claims; origin is used for
+                    # authorization, so a cosine or Jaccard resemblance, or a
+                    # receipt of one, must never transfer ownership. A required
+                    # claim that fails defers the write so the job is retried; one
+                    # that is not required never blocks it.
+                    if dedup.get("match") == MATCH_IDENTITY:
+                        cur.execute("SAVEPOINT capture_claim")
+                        try:
+                            _claim_unowned_episode(cur, dedup.get("matched_episode"),
+                                                   _stamp_origin(cur))
+                        except Exception as exc:  # noqa: BLE001 - classified below
+                            cur.execute("ROLLBACK TO SAVEPOINT capture_claim")
+                            _log(f"origin claim failed ({type(exc).__name__}: {exc})")
+                            if _claim_required():
+                                raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
+                        else:
+                            cur.execute("RELEASE SAVEPOINT capture_claim")
                     conn.commit()
+                    if dedup["action"] == "merge":
+                        _refresh_merged_episode(cur, dedup["matched_episode"])
                     return {
                         "episode_inserted": False,
                         "topics_written": 0,
                         "episode_id": dedup.get("matched_episode"),
                         "source_key": source["source_key"],
                         "dedup": dedup,
-                        "forgotten_source": True,
                     }
-                # The job is done once this returns (the outbox deletes it),
-                # so this is the last chance to record its trusted owner. Only
-                # an identity match (an exact window, a window_id, or a receipt
-                # of an identity merge) claims; origin is used for
-                # authorization, so a cosine or Jaccard resemblance, or a
-                # receipt of one, must never transfer ownership. A required
-                # claim that fails defers the write so the job is retried; one
-                # that is not required never blocks it.
-                if dedup.get("match") == MATCH_IDENTITY:
-                    cur.execute("SAVEPOINT capture_claim")
-                    try:
-                        _claim_unowned_episode(cur, dedup.get("matched_episode"),
-                                               _stamp_origin(cur))
-                    except Exception as exc:  # noqa: BLE001 - classified below
-                        cur.execute("ROLLBACK TO SAVEPOINT capture_claim")
-                        _log(f"origin claim failed ({type(exc).__name__}: {exc})")
-                        if _claim_required():
-                            raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
-                    else:
-                        cur.execute("RELEASE SAVEPOINT capture_claim")
-                conn.commit()
-                if dedup["action"] == "merge":
-                    _refresh_merged_episode(cur, dedup["matched_episode"])
-                return {
-                    "episode_inserted": False,
-                    "topics_written": 0,
-                    "episode_id": dedup.get("matched_episode"),
-                    "source_key": source["source_key"],
-                    "dedup": dedup,
-                }
 
-            # W5.1: classify capture topics into topic-slugs vs noise-tags
-            # (khipu.hygiene.classify_topics — see its docstring for the
-            # actual rule). Gated on topic_aliases + episodes.tags existing
-            # (migration 0010) and wrapped in its own SAVEPOINT, same as the
-            # topic-graph and commitments steps below: a missing table here
-            # used to raise mid-transaction and leave PG in
-            # InFailedSqlTransaction, silently failing the episode insert
-            # and every step after it, on every pre-migration hub.
-            from khipu import hygiene
-            from khipu.db import has_columns
+                # W5.1: classify capture topics into topic-slugs vs noise-tags
+                # (khipu.hygiene.classify_topics — see its docstring for the
+                # actual rule). Gated on topic_aliases + episodes.tags existing
+                # (migration 0010) and wrapped in its own SAVEPOINT, same as the
+                # topic-graph and commitments steps below: a missing table here
+                # used to raise mid-transaction and leave PG in
+                # InFailedSqlTransaction, silently failing the episode insert
+                # and every step after it, on every pre-migration hub.
+                from khipu import hygiene
+                from khipu.db import has_columns
 
-            hygiene_ready = has_columns(cur, "episodes", "tags") and has_columns(
-                cur, "topic_aliases", "alias", "slug"
-            )
-            if hygiene_ready:
-                cur.execute("SAVEPOINT capture_hygiene")
-                try:
-                    resolved_topics, tags, topics_unresolved = hygiene.classify_topics(
-                        cur, payload.get("topics") or []
-                    )
-                except Exception as exc:  # noqa: BLE001 — degrade, never abort the write
-                    resolved_topics, tags, topics_unresolved = list(payload.get("topics") or []), [], True
-                    cur.execute("ROLLBACK TO SAVEPOINT capture_hygiene")
-                    _log(f"topic hygiene classify raised ({type(exc).__name__}: {exc})")
-                else:
-                    if topics_unresolved:
-                        # classify_topics caught its own PG error and degraded in
-                        # Python, but a caught exception does not reset PG's
-                        # SERVER-side aborted-transaction state — roll back to
-                        # the savepoint to clear it before anything else runs.
-                        cur.execute("ROLLBACK TO SAVEPOINT capture_hygiene")
-                        _log("topic hygiene classify degraded; rolled back to savepoint")
-                    else:
-                        cur.execute("RELEASE SAVEPOINT capture_hygiene")
-            else:
-                # Pre-migration hub: skip classification outright rather than
-                # attempt it and abort the write — every non-blank topic
-                # passes through unchanged, same as today's un-migrated
-                # behaviour, no tags minted (nothing to classify against).
-                seen: set[str] = set()
-                resolved_topics = []
-                for t in payload.get("topics") or []:
-                    s = str(t or "").strip().lower()
-                    if s and s not in seen:
-                        seen.add(s)
-                        resolved_topics.append(s)
-                tags, topics_unresolved = [], False
-            payload = dict(payload)
-            payload["topics"] = resolved_topics
-            payload["tags"] = list(dict.fromkeys([*(payload.get("tags") or []), *tags]))
-            if topics_unresolved:
-                payload["topics_unresolved"] = True
-            # K6: scope is a free-text FALLBACK, not a project — normalise it
-            # at write so a worktree path or a run-on sentence never lands in
-            # the column every NULL-project reader (search, the pushed
-            # slice) falls back to.
-            from khipu.identity import normalize_scope
-
-            payload["scope"] = normalize_scope(payload.get("scope"))
-
-            origin = _stamp_origin(cur)
-            upserted: dict[str, Any] = {}
-            inserted = _upsert_episode(cur, payload, source=source, out=upserted, origin=origin)
-            if upserted.get("forgotten_source"):
-                return _forgotten_result(cur, payload, source, dedup=dedup)
-            episode_id = upserted.get("episode_id")
-            if not inserted:
-                # The insert hit the legacy unique key, so the row holding that
-                # key is where this capture landed (the key stays unique until
-                # phase 3 moves uniqueness to the source).
-                cur.execute(
-                    "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
-                    (payload["ts"], _md5_hex(payload["summary"])),
+                hygiene_ready = has_columns(cur, "episodes", "tags") and has_columns(
+                    cur, "topic_aliases", "alias", "slug"
                 )
-                existing = cur.fetchone()
-                episode_id = int(existing[0]) if existing else None
-                cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
-                            (episode_id,))
-                row = cur.fetchone()
-                target = row[0] if row else {}
-                # Legacy backfills can have only an episode key and no payload
-                # hash, so source dedup misses them even on an exact replay.
-                if target.get("deleted_at"):
-                    conn.commit()
-                    return {
-                        "episode_inserted": False,
-                        "topics_written": 0,
-                        "episode_id": episode_id,
-                        "source_key": source["source_key"],
-                        "dedup": dedup,
-                        "forgotten_source": True,
-                    }
+                if hygiene_ready:
+                    cur.execute("SAVEPOINT capture_hygiene")
+                    try:
+                        resolved_topics, tags, topics_unresolved = hygiene.classify_topics(
+                            cur, payload.get("topics") or []
+                        )
+                    except Exception as exc:  # noqa: BLE001 — degrade, never abort the write
+                        resolved_topics, tags, topics_unresolved = list(payload.get("topics") or []), [], True
+                        cur.execute("ROLLBACK TO SAVEPOINT capture_hygiene")
+                        _log(f"topic hygiene classify raised ({type(exc).__name__}: {exc})")
+                    else:
+                        if topics_unresolved:
+                            # classify_topics caught its own PG error and degraded in
+                            # Python, but a caught exception does not reset PG's
+                            # SERVER-side aborted-transaction state — roll back to
+                            # the savepoint to clear it before anything else runs.
+                            cur.execute("ROLLBACK TO SAVEPOINT capture_hygiene")
+                            _log("topic hygiene classify degraded; rolled back to savepoint")
+                        else:
+                            cur.execute("RELEASE SAVEPOINT capture_hygiene")
+                else:
+                    # Pre-migration hub: skip classification outright rather than
+                    # attempt it and abort the write — every non-blank topic
+                    # passes through unchanged, same as today's un-migrated
+                    # behaviour, no tags minted (nothing to classify against).
+                    seen: set[str] = set()
+                    resolved_topics = []
+                    for t in payload.get("topics") or []:
+                        s = str(t or "").strip().lower()
+                        if s and s not in seen:
+                            seen.add(s)
+                            resolved_topics.append(s)
+                    tags, topics_unresolved = [], False
+                payload = dict(payload)
+                payload["topics"] = resolved_topics
+                payload["tags"] = list(dict.fromkeys([*(payload.get("tags") or []), *tags]))
+                if topics_unresolved:
+                    payload["topics_unresolved"] = True
+                # K6: scope is a free-text FALLBACK, not a project — normalise it
+                # at write so a worktree path or a run-on sentence never lands in
+                # the column every NULL-project reader (search, the pushed
+                # slice) falls back to.
+                from khipu.identity import normalize_scope
+
+                payload["scope"] = normalize_scope(payload.get("scope"))
+
+                origin = _stamp_origin(cur)
+                upserted: dict[str, Any] = {}
+                inserted = _upsert_episode(cur, payload, source=source, out=upserted, origin=origin)
+                if upserted.get("forgotten_source"):
+                    return _forgotten_result(cur, payload, source, dedup=dedup)
+                episode_id = upserted.get("episode_id")
+                if not inserted:
+                    # The insert hit the legacy unique key, so the row holding that
+                    # key is where this capture landed (the key stays unique until
+                    # phase 3 moves uniqueness to the source).
+                    cur.execute(
+                        "SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s "
+                        "ORDER BY deleted_at IS NOT NULL, id DESC LIMIT 1",
+                        (payload["ts"], _md5_hex(payload["summary"])),
+                    )
+                    existing = cur.fetchone()
+                    episode_id = int(existing[0]) if existing else None
+                    cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s",
+                                (episode_id,))
+                    row = cur.fetchone()
+                    target = row[0] if row else {}
+                    # Legacy backfills can have only an episode key and no payload
+                    # hash, so source dedup misses them even on an exact replay.
+                    # With 0047's index only a tombstone of a hub whose history
+                    # is not indexed yet holds the key (the insert trigger
+                    # skipped the row): the capture waits for the pass.
+                    if target.get("deleted_at") and _refusals_settled(cur) is not None:
+                        raise FactStepDeferred("history is not indexed yet; the capture's legacy "
+                                               "key is held by a tombstone and waits")
+                    if target.get("deleted_at"):
+                        conn.commit()
+                        return {
+                            "episode_inserted": False,
+                            "topics_written": 0,
+                            "episode_id": episode_id,
+                            "source_key": source["source_key"],
+                            "dedup": dedup,
+                            "forgotten_source": True,
+                        }
+                    try:
+                        _claim_unowned_episode(cur, episode_id, origin)
+                    except Exception as exc:  # noqa: BLE001 - only a required claim runs SQL
+                        raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
+                    stored_raw = target.get("raw") or {}
+                    # Known immutable sources/receipts were already matched above.
+                    # At this legacy collision, only matching canonical raw content can
+                    # prove another replay. Enrichment can make that proof absent;
+                    # retaining an unproven capture is safer than discarding fields
+                    # omitted from an ever-incomplete evidence allowlist.
+                    if not target or payload_sha256(stored_raw) != source["payload_sha256"]:
+                        raise CaptureEvidenceConflict(
+                            f"legacy episode key conflicts with distinct evidence on episode {episode_id}; "
+                            "incoming capture retained for resolution")
+                from khipu.config import path_setting
+                from khipu.topic_graph import persist_capture_graph
+
+                cur.execute("SAVEPOINT capture_graph")
                 try:
-                    _claim_unowned_episode(cur, episode_id, origin)
-                except Exception as exc:  # noqa: BLE001 - only a required claim runs SQL
-                    raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
-                stored_raw = target.get("raw") or {}
-                # Known immutable sources/receipts were already matched above.
-                # At this legacy collision, only matching canonical raw content can
-                # prove another replay. Enrichment can make that proof absent;
-                # retaining an unproven capture is safer than discarding fields
-                # omitted from an ever-incomplete evidence allowlist.
-                if not target or payload_sha256(stored_raw) != source["payload_sha256"]:
-                    raise CaptureEvidenceConflict(
-                        f"legacy episode key conflicts with distinct evidence on episode {episode_id}; "
-                        "incoming capture retained for resolution")
-            from khipu.config import path_setting
-            from khipu.topic_graph import persist_capture_graph
+                    persist_capture_graph(cur, payload)
+                except Exception as exc:  # noqa: BLE001 — episode row stays; graph is additive
+                    cur.execute("ROLLBACK TO SAVEPOINT capture_graph")
+                    _log(f"topic graph mint failed ({type(exc).__name__}: {exc})")
 
-            cur.execute("SAVEPOINT capture_graph")
-            try:
-                persist_capture_graph(cur, payload)
-            except Exception as exc:  # noqa: BLE001 — episode row stays; graph is additive
-                cur.execute("ROLLBACK TO SAVEPOINT capture_graph")
-                _log(f"topic graph mint failed ({type(exc).__name__}: {exc})")
+                if inserted:
+                    if episode_id is not None:
+                        run_fact_steps(cur, payload, episode_id)
 
-            if inserted:
-                if episode_id is not None:
-                    cur.execute("SAVEPOINT capture_commitments")
-                    try:
-                        from khipu import commitments
-
-                        commitments.open_from_episode(cur, payload, episode_id)
-                        commitments.auto_close(cur, payload, episode_id)
-                        commitments.close_session_plan(cur, payload, episode_id)
-                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                        cur.execute("ROLLBACK TO SAVEPOINT capture_commitments")
-                        _log(f"commitments step failed ({type(exc).__name__}: {exc})")
-
-                    # O2: each string in payload['decisions'] becomes a row.
-                    cur.execute("SAVEPOINT capture_decisions")
-                    try:
-                        from khipu import decisions as _decisions
-
-                        _decisions.insert_decisions_from_episode(cur, payload, episode_id)
-                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                        cur.execute("ROLLBACK TO SAVEPOINT capture_decisions")
-                        _log(f"decisions step failed ({type(exc).__name__}: {exc})")
-
-                    # Phase 2, session C: conservative reversal detection over
-                    # the rows the step above just inserted — its own
-                    # SAVEPOINT, same fail-open posture as every neighbour
-                    # here, so a detection failure can never take the
-                    # episode (or the decisions just written) down with it.
-                    cur.execute("SAVEPOINT capture_decision_detection")
-                    try:
-                        from khipu import decisions as _decisions
-
-                        _decisions.detect_reversals_from_episode(cur, payload, episode_id)
-                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                        cur.execute("ROLLBACK TO SAVEPOINT capture_decision_detection")
-                        _log(f"decision detection step failed ({type(exc).__name__}: {exc})")
-
-                    # Owed close rules (slice 2): PR and decision closes for
-                    # this capture's project, after the decisions they read.
-                    cur.execute("SAVEPOINT capture_close_rules")
-                    try:
-                        from khipu import close_rules
-
-                        close_rules.run(cur, payload=payload, episode_id=episode_id)
-                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                        cur.execute("ROLLBACK TO SAVEPOINT capture_close_rules")
-                        _log(f"close rules step failed ({type(exc).__name__}: {exc})")
-
-                    # O4: files/PR-issue-URLs/release tags from payload['deliverables'].
-                    cur.execute("SAVEPOINT capture_deliverables")
-                    try:
-                        from khipu import deliverables as _deliverables
-
-                        _deliverables.insert_deliverables_from_episode(cur, payload, episode_id)
-                    except Exception as exc:  # noqa: BLE001 — episode row stays; fail-open
-                        cur.execute("ROLLBACK TO SAVEPOINT capture_deliverables")
-                        _log(f"deliverables step failed ({type(exc).__name__}: {exc})")
-
-            memory_root = path_setting("memory_root")
-            # In dual mode capture_v2 has not run yet, so topic pages named in the
-            # payload may not exist on disk; upsert whatever is already there and let
-            # the nightly reconcile / capture_v2's file write catch the rest.
-            # No file wiki configured (hub-only install): the episode is the
-            # whole capture; there are no topic files to fold in.
-            for tp in (payload.get("topic_pages") or []) if memory_root else []:
-                slug = (tp.get("slug") or "").strip() if isinstance(tp, dict) else ""
-                if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
-                    continue
-                topics_root = (memory_root / "topics").resolve()
-                path = (topics_root / f"{slug}.md").resolve()
-                if not path.is_relative_to(topics_root):
-                    continue
-                parsed = parse_topic_file(path)
-                if parsed:
-                    _redact_capture_values(parsed)
-                if parsed and _upsert_topic(
-                    cur, parsed, str(path), source="capture", note="khipu capture"
-                ):
-                    topics_written += 1
-        conn.commit()
-    return {
-        "episode_inserted": inserted,
-        "topics_written": topics_written,
-        "episode_id": episode_id,
-        "source_key": source["source_key"],
-        "dedup": dedup,
-    }
+                memory_root = path_setting("memory_root")
+                # In dual mode capture_v2 has not run yet, so topic pages named in the
+                # payload may not exist on disk; upsert whatever is already there and let
+                # the nightly reconcile / capture_v2's file write catch the rest.
+                # No file wiki configured (hub-only install): the episode is the
+                # whole capture; there are no topic files to fold in.
+                for tp in (payload.get("topic_pages") or []) if memory_root else []:
+                    slug = (tp.get("slug") or "").strip() if isinstance(tp, dict) else ""
+                    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
+                        continue
+                    topics_root = (memory_root / "topics").resolve()
+                    path = (topics_root / f"{slug}.md").resolve()
+                    if not path.is_relative_to(topics_root):
+                        continue
+                    parsed = parse_topic_file(path)
+                    if parsed:
+                        _redact_capture_values(parsed)
+                    if parsed and _upsert_topic(
+                        cur, parsed, str(path), source="capture", note="khipu capture"
+                    ):
+                        topics_written += 1
+            conn.commit()
+        return {
+            "episode_inserted": inserted,
+            "topics_written": topics_written,
+            "episode_id": episode_id,
+            "source_key": source["source_key"],
+            "dedup": dedup,
+        }
+    except FactStepDeferred:
+        raise
+    except Exception as exc:
+        if provenance.is_old_writer_refusal(exc):
+            _log(f"capture refused by the fact gate ({type(exc).__name__}); the capture will be retried")
+            raise FactStepDeferred(f"commit: refused unprojected write: {exc}") from exc
+        # A deadlock, serialization failure, lock or statement timeout raised
+        # anywhere in the transaction (a merge's target lock against a hub
+        # refusal, design 6.1, or at COMMIT): it rolled back whole, and the
+        # outbox retries it and never buries it.
+        reason = _fact_deferral(exc)
+        if reason is not None:
+            _log(f"capture deferred ({reason}); the capture will be retried")
+            raise FactStepDeferred(f"transaction: {reason}: {exc}") from exc
+        raise
 
 
 def _group_alive(pgid: int) -> bool:

@@ -21,6 +21,7 @@ import pytest
 
 from khipu import close_rules, commitments as co, hygiene, owed_tidy, routing, work
 from tests.hermetic_pg import hub, migration_sql, pg_cluster  # noqa: F401
+from tests import fact_seed
 from tests.test_commitments import _no_cosine
 from tests.test_owed_close_rules import (
     BASE, JOB, PROJECT, _REAL_SETTINGS, _episode, _fake_gh, _migrated, _open, _row, _runner,
@@ -196,6 +197,7 @@ def test_a_tidy_plan_made_before_a_restatement_added_a_pr_does_not_close(hub, mo
         # The production restatement writes.
         cur.execute("UPDATE commitments SET prs = '{12,13}', latest_text = %s WHERE id = %s",
                     ("The builder will land PR #12 and PR #13 before the release", theirs))
+        fact_seed.adopt(cur, "commitment", theirs)
     conn.commit()
     monkeypatch.setattr(routing, "_caller", lambda: {"app": True, "chain": ["Khipu"]})
     result = owed_tidy.apply(plan)

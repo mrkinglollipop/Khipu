@@ -243,6 +243,9 @@ class _Conn:
     def commit(self):
         pass
 
+    def rollback(self):
+        pass
+
 
 def run_forget(world: dict, eid: int, root: Path, connect=None) -> dict:
     """forget_everywhere on one episode of ``world`` with ``root`` as the

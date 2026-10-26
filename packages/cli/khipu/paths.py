@@ -304,13 +304,36 @@ def backup_local(*, dest: Path) -> dict:
         dest = dest / f"khipu-local-{stamp}.zip"
     dest.parent.mkdir(parents=True, exist_ok=True)
     count = 0
+    replica = src / _SNAPSHOT_NAME
+    staged: Path | None = None
+    _remove_crashed_export_scratch(src)
     try:
         with sensitive_writer(dest) as archive_file:
             with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                if replica.is_file():
+                    # The replica goes in as a checked copy, never its live
+                    # file or journal: a copy whose fact rows belong to a
+                    # refused generation carries none (hub_snapshot.
+                    # export_replica_copy).
+                    from khipu import hub_snapshot
+
+                    staged = hub_snapshot.staging_path()
+                    hub_snapshot.export_replica_copy(replica, staged)
+                    zf.write(staged, arcname=_SNAPSHOT_NAME)
+                    count += 1
                 for p in src.rglob("*"):
                     if not p.is_file():
                         continue
                     if p.name == POINTER_NAME and src == DEFAULT_DIR:
+                        continue
+                    if staged is not None and p == staged:
+                        continue
+                    if p.parent == src and (p.name == _SNAPSHOT_NAME
+                                            or p.name.startswith(_SNAPSHOT_NAME + "-")):
+                        continue
+                    # Another refresh's or export's temporary replica, or a
+                    # sidecar of one, never went through the export.
+                    if p.parent == src and (_replica_temp((p.name,)) or _EXPORT_SCRATCH.match(p.name)):
                         continue
                     zf.write(p, arcname=str(p.relative_to(src)))
                     count += 1
@@ -323,6 +346,9 @@ def backup_local(*, dest: Path) -> dict:
         dest.unlink(missing_ok=True)
         return {"ok": False, "error": f"the backup could not be written: {describe_os_error(exc)}",
                 "archive": str(dest), "source": str(src)}
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
     return {"ok": True, "archive": str(dest), "files": count, "source": str(src)}
 
 
@@ -369,7 +395,14 @@ def import_local(*, source: Path, merge: bool = True) -> dict:
     from khipu import memory_lock
 
     with memory_lock.shared():
-        return _import_local(source=source, merge=merge)
+        out = _import_local(source=source, merge=merge)
+    if (out.get("snapshot_scrub") or {}).get("imported"):
+        # A restored replica shows no fact row until a copy (design 6.2),
+        # taken after the memory lock: the copy lock is outermost.
+        from khipu import hub_snapshot
+
+        out["snapshot_scrub"]["facts"] = hub_snapshot.copy_facts()
+    return out
 
 
 def _skipped_name(parts: tuple[str, ...]) -> bool:
@@ -380,6 +413,27 @@ def _skipped_name(parts: tuple[str, ...]) -> bool:
 
 
 _REPLICA_TEMP = re.compile(r"^\.hub_snapshot\..+\.sqlite(-.+)?$")
+# The scratch copy (fact rows included) an earlier export made beside its
+# staged replica, ``.<staged name>.facts-<pid>`` where the staged name is
+# ``staging_path``'s ``.hub_snapshot.<8 mkstemp characters>.sqlite``, with
+# its sidecars. Exactly that name: any other file is the owner's.
+_EXPORT_SCRATCH = re.compile(r"^\.\.hub_snapshot\.[a-z0-9_]{8}\.sqlite\.facts-(\d+)(-journal|-wal|-shm)?$")
+
+
+def _remove_crashed_export_scratch(src: Path) -> None:
+    """Delete the scratch copies crashed earlier exports left in the data
+    folder, those whose process is gone."""
+    for p in src.glob("..hub_snapshot.*.sqlite.facts-*"):
+        found = _EXPORT_SCRATCH.match(p.name)
+        if not found or not p.is_file():
+            continue
+        try:
+            os.kill(int(found.group(1)), 0)
+            continue
+        except ProcessLookupError:
+            p.unlink(missing_ok=True)
+        except (PermissionError, OSError):
+            continue
 _WRITER_RECORDS = ".legacy_writers"  # khipu.writer_groups.DIR_NAME
 
 

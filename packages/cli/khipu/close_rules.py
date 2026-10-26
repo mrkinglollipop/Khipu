@@ -200,15 +200,50 @@ def backfill_prs(cur, *, batch: int = BACKFILL_BATCH) -> int:
     batches. Returns the count filled; 0 on a hub without the column."""
     if not ready(cur):
         return 0
+    from khipu.commitments import _provenance_ready
+
+    prov = _provenance_ready(cur)
     filled = 0
     while True:
         cur.execute("SELECT id, text FROM commitments WHERE prs IS NULL ORDER BY id LIMIT %s", (batch,))
         rows = cur.fetchall()
         for cid, text in rows:
-            cur.execute("UPDATE commitments SET prs = %s WHERE id = %s", (parse_prs(text), cid))
+            if prov:
+                # Fact provenance (0047): the numbers are the text claimant's
+                # claims, the row is marked parsed, the projection writes prs.
+                from khipu import provenance
+
+                claim_text_prs(cur, cid)
+                cur.execute("UPDATE commitments SET prs = '{}' WHERE id = %s AND prs IS NULL", (cid,))
+                provenance.project(cur, "commitment", cid)
+            else:
+                cur.execute("UPDATE commitments SET prs = %s WHERE id = %s", (parse_prs(text), cid))
             filled += 1
         if len(rows) < batch:
             return filled
+
+
+def claim_text_prs(cur, commitment_id: int) -> int:
+    """The PR numbers a commitment's own text names, claimed by whoever
+    claims that text (its live anchor, else the owner): what
+    :func:`backfill_prs` stores for a row whose ``prs`` was never parsed
+    (NULL). Records claims only; the caller projects. Returns the count."""
+    from khipu import provenance
+
+    cur.execute(
+        "SELECT c.text, fc.claimant, fc.episode_id FROM commitments c "
+        "JOIN fact_claims fc ON fc.kind = 'commitment' AND fc.fact_id = c.id AND fc.field = 'text' "
+        "AND fc.value = c.text LEFT JOIN episodes e ON e.id = fc.episode_id "
+        "WHERE c.id = %s AND (fc.claimant = 'owner' OR (fc.claimant = 'episode' AND e.deleted_at IS NULL "
+        "AND e.id IS NOT NULL)) ORDER BY fc.created_at, fc.id LIMIT 1",
+        (commitment_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return 0
+    text, claimant, by = row
+    return sum(provenance.record_claim(cur, "commitment", commitment_id, "pr", n, episode_id=by, claimant=claimant)
+               for n in parse_prs(text))
 
 
 # ---- where a PR's fate comes from ---------------------------------------------
@@ -647,7 +682,12 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
                 records[label] = {k: v for k, v in rec.items() if k != "episode"}
                 if rec.get("episode") is not None:
                     capture_episodes.append(int(rec["episode"]))
-            if not waiting and found:
+            # A PR value only legacy data names (0047's needs_owner): nobody
+            # can show the item needs only these, so the owner closes it.
+            needs_owner = _needs_owner(item)
+            if needs_owner and not waiting and found:
+                report["needs_owner"] = report.get("needs_owner", 0) + 1
+            if not waiting and found and not needs_owner:
                 key = "pr:" + ",".join(f"{label}={state}" for label, (state, _) in found.items())
                 if key in (item["reopened"] or []):
                     report["kept_open_reopened"] += 1
@@ -665,6 +705,8 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
                      "waiting": waiting}
             if (item["pr_check"] or {}).get("refs"):
                 check["refs"] = item["pr_check"]["refs"]
+            if needs_owner:
+                check["needs_owner"] = True
             if sink is None and check != item["pr_check"]:
                 cur.execute("UPDATE commitments SET pr_check = %s::jsonb WHERE id = %s",
                             (json.dumps(check), item["id"]))
@@ -674,6 +716,14 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
                 # or added by a restatement): it no longer looks done.
                 cur.execute("UPDATE commitments SET settle_suggestion = NULL WHERE id = %s AND status = 'open'",
                             (item["id"],))
+
+
+def _needs_owner(item: dict) -> bool:
+    """Whether the projection marked the item ``pr_check.needs_owner``
+    (migration 0047: a legacy PR value no live claim holds). No rule closes
+    such an item; the owner does."""
+    check = item.get("pr_check")
+    return isinstance(check, dict) and check.get("needs_owner") is True
 
 
 def _is_decide_item(item: dict) -> bool:
@@ -720,7 +770,7 @@ def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | No
     from khipu.config import float_setting
     from khipu.db import has_columns
 
-    eligible = [i for i in items if not i.get("closed") and _is_decide_item(i)]
+    eligible = [i for i in items if not i.get("closed") and _is_decide_item(i) and not _needs_owner(i)]
     if not eligible:
         return
     threshold = float_setting("commitment_close_similarity")

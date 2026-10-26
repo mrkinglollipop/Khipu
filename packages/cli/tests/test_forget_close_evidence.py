@@ -2,6 +2,7 @@ import json
 import pytest
 from khipu import commitments, close_rules, config, db, forget
 from tests.hermetic_pg import hub, pg_cluster
+from tests.fact_seed import announce
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path,monkeypatch):
@@ -18,6 +19,7 @@ def test_forgotten_pr_evidence_cannot_close_kept_commitment(hub,tmp_path,field):
     def episode(n,summary):
         p={'ts':f'2026-10-2{n}T09:00:00Z','summary':summary,'project':'audit/forgotten-evidence',
            'harness':'codex','session_id':f'codex:separate-{n}','transcript_range':'0:100'}
+        announce(cur)
         cur.execute('INSERT INTO episodes (ts,summary,project,harness,session_id,transcript_range,raw) VALUES (%s::timestamptz,%s,%s,%s,%s,%s,%s::jsonb) RETURNING id',
                     (p['ts'],summary,p['project'],p['harness'],p['session_id'],p['transcript_range'],json.dumps(p)))
         return cur.fetchone()[0],p

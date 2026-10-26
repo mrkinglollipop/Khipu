@@ -635,6 +635,9 @@ def _doctor_start_workers(pool, args, mem, sample_drift) -> dict:
     from khipu.migrate import doctor_check as _schema_check
 
     workers["schema"] = pool.submit(_schema_check)
+    from khipu.provenance import doctor_check as _provenance_check
+
+    workers["provenance"] = pool.submit(_provenance_check)
     return workers
 
 
@@ -896,6 +899,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     if not hub_ok and schema.get("error"):
         schema = {**schema, "ok": True, "skipped": "the database did not answer"}
     schema_ok = bool(schema.get("ok"))
+    # Fact provenance (docs/plans/2026-10-23-fact-provenance.md, phase 5): 0047
+    # on the hub or not, open fact_gaps, section 4's limit count. Visibility
+    # only: a hub without 0047 is a state, not red, and it never gates `ok`.
+    fact_provenance = workers["provenance"].result()
+    if not hub_ok and fact_provenance.get("error"):
+        fact_provenance = {"ok": True, "warnings": [], "skipped": "the database did not answer"}
     liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
     if not gw_liveness.get("ok", True):
         liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
@@ -1011,6 +1020,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "owner_actions_log": owner_actions_log_block,
         "ledger": ledger_block,
         "schema_migrations": schema,
+        "fact_provenance": fact_provenance,
         "work": work_block,
         "promotion": _promotion_block(),
         # Warnings that never gate `ok` (plans nearly used up; routing; ledger; work; schema).
@@ -1018,7 +1028,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + list(owner_direction_block.get("warnings") or [])
                      + list(owner_actions_log_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
-                     + list(schema.get("warnings") or []) + _disk_space_warnings(local)
+                     + list(schema.get("warnings") or [])
+                     + list(fact_provenance.get("warnings") or []) + _disk_space_warnings(local)
                      + _replica_schema_warnings(local)),
         "not_configured": not_configured,
         "ok": (
@@ -2776,6 +2787,8 @@ def cmd_episode(args: argparse.Namespace) -> int:
     episode_cmd = getattr(args, "episode_cmd", None)
     if episode_cmd == "edit":
         return _cmd_episode_edit(args)
+    if episode_cmd == "forget-pending":
+        return _cmd_episode_forget_pending(args)
     if episode_cmd != "forget":
         print(json.dumps({
             "ok": False,
@@ -2792,6 +2805,58 @@ def cmd_episode(args: argparse.Namespace) -> int:
     legacy_reason = str((out.get("legacy_file") or {}).get("reason") or "")
     legacy_ok = not legacy_reason.startswith("unreadable:")
     return 0 if out.get("ok") and snapshot_ok and legacy_ok else 1
+
+
+def _cmd_episode_forget_pending(args: argparse.Namespace) -> int:
+    """`khipu episode forget-pending`: the forgets this Mac holds that the
+    hub lacks, which keep its facts hidden (design section 6.2), and the
+    owner's three actions on them (the app, a typed yes, or owner
+    direction): ``--send`` ("Send to the hub", ``forget.send``),
+    ``--forget-here ID`` ("Forget it here", ``forget.here``: an ordinary
+    forget of that hub episode) and ``--not-same ID`` ("Not the same
+    episode", ``forget.not_same``)."""
+    from khipu import forget
+
+    if args.send:
+        action, target = "forget.send", "hub"
+    elif args.forget_here is not None:
+        action, target = "forget.here", str(args.forget_here)
+    elif args.not_same is not None:
+        action, target = "forget.not_same", str(args.not_same)
+    else:
+        print(json.dumps(forget.unsent_forgets(), default=str))
+        return 0
+    from khipu import owner_direction
+
+    via = _owner_only(args, owner_direction.intent(action, target))
+    if isinstance(via, int):
+        return via
+    if action == "forget.send":
+        out = forget.send_to_hub()
+    elif action == "forget.here":
+        out = forget.forget_everywhere(int(target))
+    else:
+        out = forget.not_same_episode(int(target))
+    print(json.dumps(owner_direction.finish(out) or out, default=str))
+    return 0 if out.get("ok") else 1
+
+
+def cmd_provenance(args: argparse.Namespace) -> int:
+    """`khipu provenance backfill`: fact provenance's legacy witness backfill
+    (docs/plans/2026-10-23-fact-provenance.md, section 4) over every project
+    not yet covered. `khipu provenance index [--dry-run]`: the hub refusals'
+    identity index and duplicate sweep (section 6.1); the dry run counts what
+    the sweep would tombstone. The nightly runs both until they are done."""
+    from khipu import provenance
+    from khipu.db import connect
+
+    with connect() as conn:
+        if args.provenance_cmd == "index":
+            out = provenance.index_identities(conn, dry_run=bool(getattr(args, "dry_run", False)))
+        else:
+            out = provenance.backfill(conn)
+    print(json.dumps(out, default=str))
+    return 0 if out.get("ok") else 1
 
 
 def cmd_topic(args: argparse.Namespace) -> int:
@@ -5955,10 +6020,30 @@ def build_parser() -> argparse.ArgumentParser:
     ep_sub = ep.add_subparsers(dest="episode_cmd", required=True)
     ep_forget = ep_sub.add_parser("forget", help="Soft-delete an episode and remove its vectors")
     ep_forget.add_argument("id", type=int)
+    ep_pending = ep_sub.add_parser(
+        "forget-pending", help="Forgets this Mac holds that the hub lacks, and the owner's actions on them")
+    ep_owner = ep_pending.add_mutually_exclusive_group()
+    ep_owner.add_argument("--send", action="store_true",
+                          help="Send the listed forgets to the hub (the owner's)")
+    ep_owner.add_argument("--forget-here", type=int, metavar="ID",
+                          help="Forget the listed hub episode ID here too (the owner's)")
+    ep_owner.add_argument("--not-same", type=int, metavar="ID",
+                          help="The hub's episode ID is not the one forgotten here (the owner's)")
+    ep_pending.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    from khipu.owner_direction import add_owner_flags as _add_owner_flags
+
+    _add_owner_flags(ep_pending)
     ep_edit = ep_sub.add_parser("edit", help="Correct an episode's summary and re-embed it")
     ep_edit.add_argument("id", type=int)
     ep_edit.add_argument("--summary", required=True, help="Replacement summary text")
     ep.set_defaults(func=cmd_episode)
+
+    pv = sub.add_parser("provenance", help="Fact provenance maintenance (migration 0047)")
+    pv_sub = pv.add_subparsers(dest="provenance_cmd", required=True)
+    pv_sub.add_parser("backfill", help="Prove legacy restaters' claims, project by project")
+    pv_index = pv_sub.add_parser("index", help="Index episodes' source identities and sweep refused carriers")
+    pv_index.add_argument("--dry-run", action="store_true", help="Only count what the sweep would tombstone")
+    pv.set_defaults(func=cmd_provenance)
 
     tp = sub.add_parser("topic", help="Topic maintenance (memory reliability W5.6)")
     tp_sub = tp.add_subparsers(dest="topic_cmd", required=True)

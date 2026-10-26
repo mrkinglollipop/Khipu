@@ -7,6 +7,7 @@ from contextlib import contextmanager
 
 import pytest
 
+from tests.fact_seed import adopt, announce
 from tests.hermetic_pg import hub, pg_cluster
 from khipu import db, decisions, forget, mcp_server
 from khipu.request_context import gateway_request
@@ -31,6 +32,7 @@ def test_conflicts_hide_a_forgotten_decision(hub, monkeypatch, tmp_path, gateway
         payload = {"ts": "2026-10-22T00:00:00Z", "summary": name,
                    "harness": "codex", "session_id": "codex:audit-" + name,
                    "transcript_range": "0:10"}
+        announce(cur)
         cur.execute("INSERT INTO episodes (ts, session_id, harness, summary, raw, transcript_range) "
                     "VALUES (%s::timestamptz,%s,%s,%s,%s::jsonb,%s) RETURNING id",
                     (payload["ts"], payload["session_id"], payload["harness"],
@@ -41,6 +43,7 @@ def test_conflicts_hide_a_forgotten_decision(hub, monkeypatch, tmp_path, gateway
         cur.execute("INSERT INTO decisions (text, decided_at, episode_id) "
                     "VALUES (%s, now(), %s) RETURNING id", (text, eid))
         decision_ids.append(cur.fetchone()[0])
+    adopt(cur, "decision", decision_ids)  # setup: the seeded rows' claims (0047 fact gate)
     for old, new in ((decision_ids[1], decision_ids[0]) if reverse else (decision_ids[0], decision_ids[1]),
                      (decision_ids[1], decision_ids[2])):
         cur.execute("INSERT INTO decision_links (old_id,new_id,kind,state,reason) "

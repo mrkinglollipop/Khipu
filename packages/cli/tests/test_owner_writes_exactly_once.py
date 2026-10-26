@@ -16,6 +16,7 @@ from khipu import db
 from khipu import mcp_server as srv
 from khipu import owner_writes as ow
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests import fact_seed
 
 
 @pytest.fixture
@@ -222,6 +223,7 @@ def _seed(pg) -> int:
     with pg.connect() as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO commitments (text, content_hash) VALUES ('scratch owed', 'h1') RETURNING id")
         cid = cur.fetchone()[0]
+        fact_seed.adopt(cur, "commitment", cid)
         conn.commit()
     return cid
 
@@ -320,6 +322,7 @@ def test_a_decision_update_records_its_id_with_the_write(real_hub):
     with real_hub.connect() as conn, conn.cursor() as cur:
         cur.execute("INSERT INTO decisions (text) VALUES ('scratch decision') RETURNING id")
         did = cur.fetchone()[0]
+        fact_seed.adopt(cur, "decision", did)
         conn.commit()
     args = {"id": did, "action": "retract", "reason": "scratch", "write_id": "scratch-decision"}
     assert srv._decisions_update_on_hub(args)["ok"]

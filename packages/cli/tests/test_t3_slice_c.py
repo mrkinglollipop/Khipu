@@ -15,6 +15,7 @@ import pytest
 from khipu import capture, embed, hub_snapshot as hs, mcp_server as mcp
 from khipu import recall_prompt as rp, session_capture as sc, t3
 from tests.fixtures.t3 import THREAD, handoff_wrapper
+from tests.replica_copy import certify
 
 
 @pytest.fixture
@@ -190,6 +191,7 @@ def replica(tmp_path, monkeypatch):
     path = tmp_path / 'replica.sqlite'
     con = sqlite3.connect(path)
     hs._create_schema(con)
+    certify(con)
     for i in range(1, 101):
         raw = json.dumps({'t3_thread_id':THREAD if i <= 2 else 'other', 'via':'t3' if i != 2 else 'fixture'})
         if i == 3: raw = '{bad'

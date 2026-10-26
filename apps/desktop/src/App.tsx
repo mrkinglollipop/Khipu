@@ -66,6 +66,7 @@ import { OwedChangeDialog, OwedSelectionBar, OwedTidyDialog, owedChange } from "
 import type { OwedOwner } from "./OwedBulk";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { OwnerActions } from "./OwnerActions";
+import { PendingForgets } from "./PendingForgets";
 import { ProjectsSettings, askedCount } from "./ProjectsSettings";
 import { requireCliSuccess, requireMigrationSuccess, useCliState } from "./settingsCli";
 import type { ProjectsList } from "./ProjectsSettings";
@@ -4512,6 +4513,7 @@ export default function App() {
             </button>
           </PanelHeader>
           <div className="panel-body wide">
+            {tab === "activity" ? <PendingForgets run={runKhipu} refreshKey={activityRawKey} /> : null}
             <div className="inline">
               <input
                 className="activity-filter"

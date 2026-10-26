@@ -15,6 +15,7 @@ Every write here is called from the same SAVEPOINT-guarded capture step
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Sequence
 
 VALID_KINDS = ("file", "pr", "issue", "release")
@@ -38,6 +39,50 @@ def _deliverables_ready(cur) -> bool:
         return False
 
 
+def _provenance_ready(cur) -> bool:
+    """Whether the hub records fact claims (migration 0047); positive-only,
+    and a failed probe reads as not ready (the hub's commit gate then
+    refuses the unprojected write, so it is retried)."""
+    try:
+        from khipu import provenance
+
+        return provenance.ready(cur)
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+def _claim(cur, deliverable_id: int, episode_id: int, title: str | None) -> None:
+    """The episode's claim on a deliverable: its title, or, with none, a
+    support claim with no wording. Then the projection."""
+    from khipu import provenance
+
+    if title:
+        provenance.record_claim(cur, "deliverable", deliverable_id, "title", title, episode_id=episode_id)
+    else:
+        provenance.record_claim(cur, "deliverable", deliverable_id, "support", "", episode_id=episode_id)
+    provenance.project(cur, "deliverable", deliverable_id)
+
+
+def _dedup_identity(project: Any, kind: str, path: str | None, url: str | None, title: str | None) -> str:
+    """The key ``insert_deliverables_from_episode`` deduplicates on: (project,
+    kind, path, url), and the title for an item with neither path nor URL."""
+    parts = [project, kind, path, url, title if not path and not url else None]
+    return json.dumps(parts, ensure_ascii=False)
+
+
+def _claim_identities(cur, project: Any, items: list[tuple[str, str | None, str | None, str | None]]) -> None:
+    """Serialize the creation of each deliverable identity this capture
+    carries with any other transaction carrying it (another capture, or a
+    gap replay of a different group), so two can never both find it absent
+    and both insert (fourth Astra review #4): a transaction-level lock per
+    identity, held to the commit, taken in sorted order after the episode's
+    own lock and before any fact row (the lock order of section 3.4). A
+    different identity never waits; there is no global lock."""
+    keys = sorted({_dedup_identity(project, *item) for item in items})
+    for key in keys:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", ("khipu.deliverable:" + key,))
+
+
 def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     """One row per item in ``payload['deliverables']`` (the shape
     ``khipu.extract.extract_deliverables`` returns). Dedup: the same
@@ -49,7 +94,13 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
     if not _deliverables_ready(cur):
         return 0
     project = payload.get("project")
+    prov = _provenance_ready(cur)
+    if prov:
+        from khipu import provenance
+
+        provenance.declare_writer(cur)  # 0047's writer gate (scope 3.1)
     inserted = 0
+    wanted = []
     for raw in items:
         if not isinstance(raw, dict):
             continue
@@ -61,23 +112,34 @@ def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: i
         title = str(raw.get("title") or "").strip() or None
         if not path and not url and not title:
             continue
+        wanted.append((kind, path, url, title))
+    if prov:
+        _claim_identities(cur, project, wanted)
+    for kind, path, url, title in wanted:
         title_clause = "AND title IS NOT DISTINCT FROM %s " if not path and not url else ""
         params = (project, kind, path, url, title) if title_clause else (project, kind, path, url)
         cur.execute(
             "SELECT id FROM deliverables WHERE project IS NOT DISTINCT FROM %s "
             "AND kind = %s AND path IS NOT DISTINCT FROM %s AND url IS NOT DISTINCT FROM %s "
-            + title_clause + "LIMIT 1",
+            + title_clause + ("ORDER BY id LIMIT 1 FOR UPDATE" if prov else "LIMIT 1"),
             params,
         )
-        if cur.fetchone():
+        found = cur.fetchone()
+        if found:
+            if prov:
+                # Fact provenance (0047): the repeat is this episode's claim
+                # on the deliverable already on file.
+                _claim(cur, int(found[0]), episode_id, title)
             continue
         cur.execute(
             "INSERT INTO deliverables (project, kind, path, url, title, episode_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
+            "VALUES (%s, %s, %s, %s, %s, %s)" + (" RETURNING id" if prov else ""),
             (project, kind, path, url, title, episode_id),
         )
         if cur.rowcount > 0:
             inserted += 1
+            if prov:
+                _claim(cur, int(cur.fetchone()[0]), episode_id, title)
     if inserted:
         _log(f"recorded {inserted} deliverable(s) for episode {episode_id} (project={project!r})")
     return inserted

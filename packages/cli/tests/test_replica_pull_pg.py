@@ -14,6 +14,7 @@ import pytest
 
 from khipu import db, hub_snapshot as hs
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.fact_seed import announce
 
 VEC = "[" + ",".join(["0.25"] * 768) + "]"
 
@@ -51,6 +52,7 @@ def add_episode(conn, profile: str, name: str, *, vector: bool = True) -> int:
     payload = {"ts": "2026-10-16T09:00:00Z", "summary": f"scratch {name}", "harness": "codex",
                "session_id": f"codex:{name}", "transcript_range": "0:10"}
     cur = conn.cursor()
+    announce(cur)
     cur.execute(
         "INSERT INTO episodes (ts, session_id, summary, raw, harness, transcript_range) "
         "VALUES (%s::timestamptz, %s, %s, %s::jsonb, %s, %s) RETURNING id",

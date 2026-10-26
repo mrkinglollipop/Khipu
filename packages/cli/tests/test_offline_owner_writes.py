@@ -16,6 +16,7 @@ from khipu import cli, db
 from khipu import hub_snapshot as hs
 from khipu import mcp_server as srv
 from khipu import offline_reads, owner_writes
+from tests.replica_copy import certify
 from tests.test_owner_writes_exactly_once import tx_hub  # noqa: F401
 
 DOWN = psycopg.OperationalError("connection timeout expired")
@@ -47,6 +48,7 @@ def hub_down(monkeypatch):
 def replica(home):
     con = sqlite3.connect(hs.snapshot_path())
     hs._create_schema(con)
+    certify(con)
     con.executemany("INSERT INTO episodes (id, summary, deleted_at) VALUES (?, 's', ?)",
                     [(1, None), (2, "2026-10-02T00:00:00Z")])
     con.executemany(
@@ -86,6 +88,7 @@ def test_owed_with_no_replica_keeps_the_hub_error(home, hub_down):
 def test_owed_from_a_replica_without_the_table_keeps_the_hub_error(home, hub_down):
     con = sqlite3.connect(hs.snapshot_path())
     hs._create_schema(con, version=5)
+    certify(con)
     con.commit()
     con.close()
     assert offline_reads.owed(None, "open", 10) is None
@@ -203,11 +206,12 @@ class _Cur:
         return [(1, "kept", 10, datetime(2026, 10, 1, tzinfo=timezone.utc), "open")]
 
 
-def test_the_dump_asks_the_hub_to_leave_out_forgotten_commitments(home):
+def test_the_copy_asks_the_hub_to_leave_out_forgotten_commitments(home):
     con = sqlite3.connect(":memory:")
     hs._create_schema(con)
+    certify(con)
     cur = _Cur()
-    assert hs._insert_commitments(cur, con) == 1
+    assert hs._write_commitment_rows(con, *hs._hub_commitments(cur)) == 1
     assert "e.deleted_at IS NOT NULL" in cur.sql[-1]
     assert con.execute("SELECT id, text FROM commitments").fetchall() == [(1, "kept")]
 

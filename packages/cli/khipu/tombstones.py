@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import json
 import os
+import sys
 import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -27,6 +28,48 @@ class RegistryError(RuntimeError):
 
 class ForgottenSource(RegistryError):
     """A writer attempted to persist a source that was already forgotten."""
+
+
+class RegistryBusy(RegistryError):
+    """Another writer held the registry lock past this caller's wait. Nothing
+    was checked or written; the caller retries or defers its write (third
+    Astra review #5: a held replica write must never block a capture)."""
+
+
+# How long a writer waits for the registry lock before ``RegistryBusy``. The
+# longest holder is a replica write (a pull, or a dump's scrub), bounded by
+# its own work. A reader never waits: it reads the file, which every
+# publication replaces atomically.
+REGISTRY_WAIT_S = float(os.environ.get("KHIPU_REGISTRY_WAIT_S", "30"))
+_LOCK_POLL_S = 0.02
+_WAIT: ContextVar[float | None] = ContextVar("khipu_tombstone_lock_wait", default=None)
+
+
+@contextmanager
+def lock_wait(seconds: float) -> Iterator[None]:
+    """Wait at most ``seconds`` for the registry lock inside this context
+    (a foreground writer that would rather defer than wait long)."""
+    token = _WAIT.set(max(0.0, float(seconds)))
+    try:
+        yield
+    finally:
+        _WAIT.reset(token)
+
+
+def _flock_bounded(fd: int) -> None:
+    """``LOCK_EX`` on ``fd`` within this context's wait, else ``RegistryBusy``."""
+    import time
+
+    wait = _WAIT.get()
+    deadline = time.monotonic() + (REGISTRY_WAIT_S if wait is None else wait)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise RegistryBusy("tombstone registry busy: another writer holds it") from None
+            time.sleep(_LOCK_POLL_S)
 
 
 _HANDOFF_ENV = ("KHIPU_TOMBSTONE_LOCK_FD", "KHIPU_TOMBSTONE_LOCK_DEV",
@@ -99,6 +142,10 @@ def _validated(value: Any) -> dict[str, Any]:
     if isinstance(value, dict) and value.get("version") == 1 and "episode_ids" not in value:
         # Registries written before forgotten episode ids were recorded.
         value = {**value, "episode_ids": []}
+    if isinstance(value, dict) and "confirmations" in value:
+        # The retired wait rule's hub confirmations (design section 6 at
+        # f3ab8344): the hub's refusal table is the one authority now.
+        value = {k: v for k, v in value.items() if k != "confirmations"}
     if (not isinstance(value, dict) or value.get("version") != 1
             or not isinstance(value.get("source_keys"), list)
             or not isinstance(value.get("payload_hashes"), list)
@@ -141,11 +188,6 @@ def _atomic_write(path: Path, value: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(name, path)
-        directory = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
     except OSError as exc:
         raise RegistryError(f"tombstone registry publish failed: {type(exc).__name__}") from exc
     finally:
@@ -153,6 +195,19 @@ def _atomic_write(path: Path, value: dict[str, Any]) -> None:
             os.unlink(name)
         except FileNotFoundError:
             pass
+    # The replace is the publication: every reader already sees the new
+    # registry, so a failed directory fsync after it cannot report the
+    # registry unpublished. Only its survival of a power loss is uncertain.
+    try:
+        directory = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        print(f"[khipu] tombstone registry published; its directory fsync failed "
+              f"({type(exc).__name__}), so its durability across a power loss is uncertain",
+              file=sys.stderr, flush=True)
 
 
 def _marker_present() -> bool:
@@ -206,7 +261,7 @@ def _locked_registry() -> Iterator[tuple[Path, dict[str, Any], _LockLease]]:
             if lease is None:
                 fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
                 os.fchmod(fd, 0o600)
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                _flock_bounded(fd)
                 lease = _LockLease(fd, path, lock_path, borrowed=False)
             value = _read(path)
         except RegistryError:
@@ -238,11 +293,55 @@ def _known(value: dict[str, Any], payload: dict[str, Any], *, redact: bool = Tru
                 or legacy in set(value["legacy_identities"]))
 
 
+def identity_strings(payload: dict[str, Any], *, redact: bool = True) -> set[str]:
+    """Every registry identity ``payload`` is known by, as tagged strings
+    (``k:`` source key, ``h:`` payload hash, ``l:`` legacy ts/summary), so a
+    caller can keep them and check them later without the payload: the
+    replica's source fence stores them per anchor episode. ``redact=False``
+    for a payload a writer already redacted before storing it (see
+    ``Gate.allows_stored``). ``RegistryError`` when it has no identity."""
+    try:
+        keys, hashes = _identity_values(payload, redact=redact)
+    except RegistryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - identity uncertainty must block writes
+        raise RegistryError(f"tombstone identity failed: {type(exc).__name__}") from exc
+    from khipu.wire import clean_text
+
+    out = {f"k:{k}" for k in keys} | {f"h:{h}" for h in hashes}
+    ts, summary = payload.get("ts"), payload.get("summary")
+    if isinstance(ts, str) and isinstance(summary, str):
+        out.add(f"l:{clean_text(ts)}\x1f{hashlib.md5(clean_text(summary).encode('utf-8')).hexdigest()}")
+    return out
+
+
 class Gate:
     """One registry snapshot, valid while its ``write_gate`` is open."""
 
     def __init__(self, value: dict[str, Any]):
         self._value = value
+        self._tagged: frozenset[str] | None = None
+
+    @property
+    def tags(self) -> frozenset[str]:
+        """Every forgotten source identity, as the tags ``refuses`` matches."""
+        if self._tagged is None:
+            self._tagged = frozenset(
+                [f"k:{k}" for k in self._value["source_keys"]]
+                + [f"h:{h}" for h in self._value["payload_hashes"]]
+                + [f"l:{x}" for x in self._value["legacy_identities"]])
+        return self._tagged
+
+    def refuses(self, identities: Any) -> bool:
+        """Whether any of ``identities`` (``identity_strings`` tags, or a
+        source receipt's ``k:``/``h:`` tag) names a forgotten source."""
+        return not self.tags.isdisjoint(identities)
+
+    @property
+    def digest(self) -> str:
+        """The registry content's fingerprint: equal digests, equal answers."""
+        return hashlib.sha256(json.dumps(self._value, sort_keys=True, separators=(",", ":"))
+                              .encode("utf-8")).hexdigest()
 
     def allows(self, payload: dict[str, Any]) -> bool:
         """False for a forgotten source; ``RegistryError`` when unknowable."""
@@ -264,6 +363,12 @@ class Gate:
     def episode_ids(self) -> frozenset[int]:
         """Episode ids a forget erased on this Mac or in an imported backup."""
         return frozenset(self._value["episode_ids"])
+
+    @property
+    def refusals(self) -> frozenset[str]:
+        """Every refusal the registry holds: the identity tags and each
+        forgotten episode id as ``e:<id>``."""
+        return self.tags | frozenset(f"e:{i}" for i in self._value["episode_ids"])
 
 
 @contextmanager
@@ -300,17 +405,41 @@ def write_guard(payload: dict[str, Any], *also: dict[str, Any]) -> Iterator[bool
         yield all(gate.allows(p) for p in (payload, *also))
 
 
+def _read_unlocked() -> dict[str, Any]:
+    """The registry as published, without its lock. Every publication
+    replaces the file atomically (``_atomic_write``), so a read sees one
+    whole version: the one before a publication in flight, as if it had
+    read just before that publisher took the lock. A reader holds nothing
+    afterwards, so it needs no exclusion; a writer still takes the lock
+    from its check through its write. Same refusals as the locked read."""
+    try:
+        path = registry_path()
+        if path.is_symlink():
+            raise RegistryError("tombstone registry must not be a symlink")
+        # A handed-down lock is still validated: a forged or stale one is
+        # refused here exactly as on the locked path (nonblocking).
+        _borrowed_lease(path, path.parent / f".{path.stem}.lock")
+        return _read(path)
+    except RegistryError:
+        raise
+    except OSError as exc:
+        raise RegistryError(f"tombstone registry unavailable: {type(exc).__name__}") from exc
+
+
 def read_gate() -> Gate:
     """One registry snapshot for a reader that writes nothing (a search
-    deciding which pending captures it may show). ``RegistryError`` when the
-    registry cannot be read: the reader must then show none of them."""
-    with _locked_registry() as (_path, value, _lease):
-        return Gate(copy.deepcopy(value))
+    deciding which pending captures it may show, a hub write's local source
+    check). It never waits on a writer's lock (third Astra review #5).
+    ``RegistryError`` when the registry cannot be read: the reader must then
+    show none of them."""
+    return Gate(_read_unlocked())
 
 
 def is_forgotten(payload: dict[str, Any]) -> bool:
-    with _locked_registry() as (_path, value, _lease):
-        return _known(value, payload)
+    """Whether this Mac's registry names ``payload``. A read: never waits
+    on a writer's lock (a capture's hub write must not block on a replica
+    write; the hub fences its own writes, 0030)."""
+    return _known(_read_unlocked(), payload)
 
 
 def subprocess_lock_handoff() -> tuple[dict[str, str], tuple[int, ...]]:
@@ -352,10 +481,8 @@ def publish_sources(source_rows: list[dict[str, Any]] | None) -> None:
     publish_identities(keys, hashes)
 
 
-def publish_forget(source_rows: list[dict[str, Any]] | None,
-                   payloads: list[dict[str, Any]],
-                   legacy_identities: list[dict[str, Any]]) -> None:
-    """Publish source snapshots plus pre-migration/raw payload forms together."""
+def _forget_identities(source_rows: list[dict[str, Any]] | None, payloads: list[dict[str, Any]],
+                       legacy_identities: list[dict[str, Any]]) -> tuple[set[str], set[str], set[str]]:
     keys = {str(row["source_key"]) for row in source_rows or [] if row.get("source_key")}
     hashes = {str(row["payload_sha256"]) for row in source_rows or [] if row.get("payload_sha256")}
     try:
@@ -371,7 +498,22 @@ def publish_forget(source_rows: list[dict[str, Any]] | None,
     legacy = ({f"{row['ts']}\x1f{row['summary_md5']}" for row in legacy_identities
                if isinstance(row.get("ts"), str) and isinstance(row.get("summary_md5"), str)}
               if not keys and not hashes else set())
-    publish_identities(keys, hashes, legacy)
+    return keys, hashes, legacy
+
+
+def publish_forget(source_rows: list[dict[str, Any]] | None,
+                   payloads: list[dict[str, Any]],
+                   legacy_identities: list[dict[str, Any]], *,
+                   hub: set[str] = frozenset(),
+                   episode_ids: set[int] | None = None) -> None:
+    """Publish source snapshots plus pre-migration/raw payload forms together.
+    ``hub``: the identities the hub forget refuses (``hub_form``), so this
+    registry refuses at least what the hub does; ``episode_ids`` too, in the
+    same atomic publication."""
+    keys, hashes, legacy = _forget_identities(source_rows, payloads, legacy_identities)
+    for tag in set().union(*map(tags_for_hub, hub)):
+        {"k": keys, "h": hashes, "l": legacy}[tag[0]].add(tag[2:])
+    publish_identities(keys, hashes, legacy, episode_ids=episode_ids)
 
 
 def publish_episode_ids(episode_ids: set[int]) -> None:
@@ -387,6 +529,7 @@ def forgotten_episode_ids() -> set[int]:
 
 def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None = None,
                        *, episode_ids: set[int] | None = None) -> None:
+    """Add refusals."""
     legacy = legacy or set()
     episode_ids = {int(i) for i in episode_ids or ()}
     if not keys and not hashes and not legacy and not episode_ids:
@@ -407,6 +550,21 @@ def publish_identities(keys: set[str], hashes: set[str], legacy: set[str] | None
         _atomic_write(path, next_value)
 
 
+def drop_episode_id(episode_id: int) -> bool:
+    """The owner's "Not the same episode" (design 6.2): remove one bare
+    episode id from this Mac's registry, when the hub's episode of that id
+    is not the one forgotten here (a replacement hub). Removes no identity
+    tag. Whether it was there."""
+    if _marker_present():
+        raise RegistryError("tombstone publication refused from borrowed writer scope")
+    with _locked_registry() as (path, current, _lease):
+        if int(episode_id) not in current["episode_ids"]:
+            return False
+        _atomic_write(path, {**current, "episode_ids": [i for i in current["episode_ids"]
+                                                        if i != int(episode_id)]})
+    return True
+
+
 def merge_registry(value: dict[str, Any]) -> None:
     """Union another registry (a backup's) into this one; never replace it."""
     incoming = _validated(value)
@@ -421,6 +579,33 @@ def merge_registry(value: dict[str, Any]) -> None:
 
 def merge_registry_bytes(data: bytes) -> None:
     merge_registry(_parsed(data))
+
+
+def hub_form(tag: str) -> str | None:
+    """The one codec from a registry tag to the hub's ``forgotten_sources``
+    form (design 6.1): a source key or payload hash is its bare hex, a
+    legacy ts/summary alias is ``legacy:<ts> US <md5>`` (0047's
+    ``khipu_payload_legacy`` builds the same string). A bare episode id
+    (``e:``) is never a hub refusal: None."""
+    if tag.startswith(("k:", "h:")):
+        return tag[2:]
+    if tag.startswith("l:"):
+        return "legacy:" + tag[2:]
+    return None
+
+
+def tags_for_hub(identity: str) -> set[str]:
+    """The registry tags that refuse the same captures as a hub identity. A
+    bare hex string may be a source key or a payload hash: both."""
+    if identity.startswith("legacy:"):
+        return {"l:" + identity[len("legacy:"):]}
+    return {"k:" + identity, "h:" + identity}
+
+
+def hub_identity_set(payload: dict[str, Any], *, redact: bool = True) -> set[str]:
+    """Every identity ``payload`` is known by, in hub form."""
+    return {form for tag in identity_strings(payload, redact=redact)
+            if (form := hub_form(tag)) is not None}
 
 
 def _hub_identities(payload: dict[str, Any], source: dict[str, Any] | None) -> list[str]:
@@ -445,9 +630,16 @@ class ForgottenSourceRefused(ForgottenSource):
     """The hub's 0030 trigger refused a write naming a forgotten source."""
 
 
+_TOMBSTONED_TARGET = "khipu_tombstoned_target"
+
+
 def is_forgotten_refusal(exc: BaseException) -> bool:
-    """Whether a database error is the 0030 triggers' refusal."""
-    return isinstance(exc, ForgottenSourceRefused) or _REFUSAL in str(exc)
+    """Whether a database error is the 0030 triggers' refusal, or 0047's
+    refusal to attach a new source to a tombstoned episode (D1), which every
+    writer handles the same way: not attached, never retried."""
+    constraint = getattr(getattr(exc, "diag", None), "constraint_name", None)
+    return (isinstance(exc, ForgottenSourceRefused) or _REFUSAL in str(exc)
+            or constraint == _TOMBSTONED_TARGET or "khipu: tombstoned target" in str(exc))
 
 
 def announce_hub_identities(cur, payload: dict[str, Any],
@@ -464,7 +656,7 @@ def announce_hub_identities(cur, payload: dict[str, Any],
             return
     except Exception:  # noqa: BLE001 - a probe that cannot run (no real cursor) skips the announcement
         return
-    found = set(_hub_identities(payload, sources[0] if sources else None))
+    found = set(_hub_identities(payload, sources[0] if sources else None)) | hub_identity_set(payload)
     for source in sources:
         found.update(str(source[k]) for k in ("source_key", "payload_sha256")
                      if source and source.get(k))

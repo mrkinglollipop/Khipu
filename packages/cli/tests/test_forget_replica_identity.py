@@ -96,8 +96,7 @@ def test_refresh_waits_for_forget_before_it_reads_the_hub(tmp_path, monkeypatch)
     monkeypatch.setattr(hs, '_pg_columns', lambda *a: {'id', 'ts', 'summary', 'raw', 'deleted_at'})
     monkeypatch.setattr(hs, '_insert_topics', pause_after_actual_episode_insert)
     for name in ('_insert_topic_revisions', '_insert_nodes', '_insert_edges',
-                 '_insert_profiles', '_insert_memory_embeddings', '_insert_decisions',
-                 '_insert_deliverables', '_insert_ledger'):
+                 '_insert_profiles', '_insert_memory_embeddings', '_insert_ledger'):
         monkeypatch.setattr(hs, name, lambda *a: 0)
 
     def refresh():

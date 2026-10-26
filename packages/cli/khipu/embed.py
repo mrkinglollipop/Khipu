@@ -1345,7 +1345,8 @@ def topic_text(slug: str, title: str | None, body: str | None) -> str:
 
 
 def _iter_sources(
-    cur, *, kind: str | None = None, refs: list[str] | None = None
+    cur, *, kind: str | None = None, refs: list[str] | None = None,
+    commitment_wording: dict[str, str] | None = None,
 ) -> Iterable[tuple[str, str, str, str]]:
     """Yield (kind, ref, text, title) for every embeddable row.
 
@@ -1407,6 +1408,10 @@ def _iter_sources(
         for cid, ctext in cur.fetchall():
             text = (ctext or "").strip()
             if text:
+                if commitment_wording is not None:
+                    # The md5 of the hub text as read, for the publication
+                    # lock's wording check (_lock_live_embedding_refs).
+                    commitment_wording[str(cid)] = _md5(ctext or "")
                 yield "commitment", str(cid), text, ""
 
 
@@ -1447,11 +1452,16 @@ def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tup
     return out
 
 
-def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]]) -> set[tuple[str, str]]:
+def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]], *,
+                              commitment_wording: Iterable[str] | None = None) -> set[tuple[str, str]]:
     """Lock sources until the caller commits their vectors.
 
     Provider calls happen before this check. Forget/purge either wins first
     and excludes the source, or waits for the vectors and then removes them.
+    ``commitment_wording``: the md5s of the commitment texts that were
+    embedded; a commitment whose locked row no longer carries one of them (a
+    forget re-pointed it to another wording while the provider ran) is not
+    live, so its old vector is never written (fifth Astra review #5).
     """
     from khipu.db import has_columns
 
@@ -1489,10 +1499,12 @@ def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]]) -> set[tuple
     if commitment_ids:
         # Recheck after the provider and parent locks, retaining both row locks
         # until the vector commit. A changed parent is retried by a later sweep.
+        wording = sorted(set(commitment_wording)) if commitment_wording is not None else None
         cur.execute(
             "SELECT id, opened_episode FROM commitments WHERE id = ANY(%s) AND status = 'open' "
-            "ORDER BY id FOR SHARE",
-            (commitment_ids,),
+            + ("AND md5(text) = ANY(%s) " if wording is not None else "")
+            + "ORDER BY id FOR SHARE",
+            (commitment_ids, wording) if wording is not None else (commitment_ids,),
         )
         live_refs.update(
             ("commitment", str(cid)) for cid, eid in cur.fetchall()
@@ -1889,7 +1901,8 @@ def backfill(
             valid_idx: dict[tuple[str, str], set[int]] = {}
             needed_by_ref: dict[tuple[str, str], int] = {}
             queued_by_ref: dict[tuple[str, str], int] = {}
-            for k, ref, text, title in _iter_sources(cur, kind=kind):
+            wording: dict[str, str] = {}
+            for k, ref, text, title in _iter_sources(cur, kind=kind, commitment_wording=wording):
                 stats["scanned"] += 1
                 chunks = _chunks_for(k, text)
                 source_key = (k, ref)
@@ -1964,7 +1977,12 @@ def backfill(
                         if start + BATCH < len(todo):
                             time.sleep(BACKFILL_PAUSE_S)
                         continue
-                    live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
+                    # Commitment vectors are bound to the wording embedded
+                    # (sixth Astra review #3, as the catch-up).
+                    batch_wording = [wording[r] for k, r, *_ in batch if k == "commitment" and r in wording]
+                    live_refs = _lock_live_embedding_refs(
+                        cur, ((k, r) for k, r, *_ in batch),
+                        commitment_wording=batch_wording or None)
                     writable = [row for row in batch if row[:2] in live_refs]
                     _upsert_chunks(
                         cur, profile,
@@ -2084,7 +2102,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
         ts = payload.get("ts")
         if not summary or not ts:
             return False
-        deliverable_rows = None
+        receipts: list = []
         with connect() as conn:
             with conn.cursor() as cur:
                 profile = _active_profile(cur)
@@ -2130,9 +2148,17 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                     [("episode", eid, i, c, _md5(c), v)
                      for i, (c, v) in enumerate(zip(chunks, vecs))],
                 )
-                from khipu import deliverables as _deliverables
+                from khipu.hub_snapshot import _read_receipts
 
-                deliverable_rows = _deliverables.deliverables_for_episode(cur, int(eid))
+                # The episode's retained source receipts, for the replica's
+                # source fence. Fail-open: the row's own identities remain.
+                cur.execute("SAVEPOINT embed_receipts")
+                try:
+                    receipts = _read_receipts(cur, [int(eid)]).get(int(eid), [])
+                except Exception:  # noqa: BLE001
+                    cur.execute("ROLLBACK TO SAVEPOINT embed_receipts")
+                    receipts = []
+                cur.execute("RELEASE SAVEPOINT embed_receipts")
             conn.commit()
         _log(f"embed-on-capture ok episode={eid} chunks={len(chunks)} profile={profile}")
         # W2.4: keep the sqlite hub replica current without a full dump, so a
@@ -2154,9 +2180,7 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                 }
                 for i, (c, v, b) in enumerate(zip(chunks, vecs, _stamps(built, len(chunks))))
             ]
-            snap = upsert_episode(
-                episode_row, embedding_rows, deliverable_rows=deliverable_rows
-            )
+            snap = upsert_episode(episode_row, embedding_rows, receipts=receipts)
             if not snap.get("ok"):
                 _log(f"snapshot upsert skipped: {snap.get('error')}")
         except Exception as exc:  # noqa: BLE001 — fail-open, one log line
@@ -3673,11 +3697,29 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     "AND ref = %s AND NOT (chunk_idx = ANY(%s))", (profile, ref, indices),
                 )
             if episode_replacements:
+                from khipu.hub_snapshot import read_anchor_identities, upsert_embeddings
+
+                # Each episode's source identities, for the replica's source
+                # fence: vectors carry the episode's text. Read in a
+                # savepoint before the commit; without them nothing is
+                # written to the replica here, and the next pull brings it.
+                anchors = None
+                cur.execute("SAVEPOINT embed_anchor_read")
+                try:
+                    anchors = read_anchor_identities(
+                        cur, [int(r) for r in episode_replacements if str(r).isdigit()])
+                except Exception as exc:  # noqa: BLE001
+                    cur.execute("ROLLBACK TO SAVEPOINT embed_anchor_read")
+                    _log(f"episode snapshot anchors unread: {type(exc).__name__}: {exc}")
+                cur.execute("RELEASE SAVEPOINT embed_anchor_read")
                 conn.commit()
                 try:
-                    from khipu.hub_snapshot import upsert_embeddings
+                    if anchors is None:
+                        raise RuntimeError("no anchor identities")
                     upsert_embeddings(episode_snapshot_rows, replace_refs=[
-                        (profile, "episode", ref) for ref in episode_replacements])
+                        (profile, "episode", ref) for ref in episode_replacements],
+                        anchors={int(r): anchors.get(int(r), frozenset())
+                                 for r in episode_replacements if str(r).isdigit()})
                 except Exception as exc:  # noqa: BLE001 — replica cannot roll back the hub commit
                     _log(f"episode snapshot upsert failed: {type(exc).__name__}: {exc}")
 
@@ -3710,7 +3752,12 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 chunks = chunk_text(text)
                 api = _api_texts(profile, [("", c) for c in chunks])
                 vecs = embed_batch(api, profile=profile)
-                if ("commitment", str(cid)) not in _lock_live_embedding_refs(cur, [("commitment", str(cid))]):
+                # Bound to the wording embedded: a forget that changed it
+                # while the provider ran leaves these vectors unwritten, and
+                # the next catch-up embeds the new wording. The projector
+                # deletes vectors on any later change (section 3.2).
+                if ("commitment", str(cid)) not in _lock_live_embedding_refs(
+                        cur, [("commitment", str(cid))], commitment_wording=[_md5(ctext or "")]):
                     conn.commit()
                     continue
                 rows = [("commitment", str(cid), i, c, _md5(c), v)
@@ -3719,9 +3766,15 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 conn.commit()
                 out["commitments_embedded"] += 1
                 out["commitments_chunks"] += len(rows)
+                # The wording the vectors were built from, read with the
+                # commitment: the replica stores them only against that
+                # wording (hub_snapshot._commitment_vector_ok), so a
+                # publication delayed past a forget or a re-projection is
+                # dropped (fourth Astra review #1).
                 snapshot_rows.extend(
                     {"profile": profile, "kind": "commitment", "ref": str(cid), "chunk_idx": i,
-                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": b}
+                     "chunk_text": c, "content_hash": _md5(c), "embedding": v, "built_at": b,
+                     "fact_wording": _md5(ctext or "")}
                     for i, (c, v, b) in enumerate(zip(chunks, vecs, _stamps(built, len(rows))))
                 )
             if snapshot_rows:

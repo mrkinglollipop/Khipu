@@ -739,66 +739,6 @@ class ValidityScratchTest(unittest.TestCase):
         self.assertEqual(row["decisions_superseded"], 1)  # old
         self.assertEqual(row["decisions_retracted"], 1)  # retracted
 
-    def test_supersede_mirrors_to_the_local_replica_at_once(self):
-        """decisions.supersede's best-effort _mirror_to_snapshot: a
-        correction made on THIS machine reaches a real sqlite replica
-        without waiting for sync_decision_changes."""
-        from khipu import decisions as de
-        from khipu import hub_snapshot as hs
-
-        old = self._seed("mirror case old")
-        new = self._seed("mirror case new")
-        with tempfile.TemporaryDirectory() as tmp:
-            snap = Path(tmp) / "hub_snapshot.sqlite"
-            con = sqlite3.connect(str(snap))
-            hs._create_schema(con)
-            con.commit()
-            con.close()
-            meta_file = Path(tmp) / "meta.json"
-            meta_file.write_text("{}", encoding="utf-8")
-            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                    mock.patch.object(hs, "meta_path", return_value=meta_file):
-                self.assertTrue(de.supersede(self.cur, old, new, reason="mirrored"))
-                self.conn.commit()
-                con2 = sqlite3.connect(str(snap))
-                row = con2.execute(
-                    "SELECT superseded_by FROM decisions WHERE id = ?", (old,)
-                ).fetchone()
-        self.assertEqual(row[0], new)
-
-    def test_sync_decision_changes_pulls_a_hub_supersession_into_the_replica(self):
-        """"Corrections made elsewhere": a supersession already committed on
-        the hub (no local mirror call involved) reaches a fresh replica via
-        sync_decision_changes alone."""
-        from khipu import decisions as de
-        from khipu import hub_snapshot as hs
-
-        old = self._seed("sync case old")
-        new = self._seed("sync case new")
-        self.assertTrue(de.supersede(self.cur, old, new, reason="synced from elsewhere"))
-        self.conn.commit()
-
-        with tempfile.TemporaryDirectory() as tmp:
-            snap = Path(tmp) / "hub_snapshot.sqlite"
-            con = sqlite3.connect(str(snap))
-            hs._create_schema(con)
-            con.commit()
-            con.close()
-            meta_file = Path(tmp) / "meta.json"
-            meta_file.write_text("{}", encoding="utf-8")
-            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                    mock.patch.object(hs, "meta_path", return_value=meta_file), \
-                    mock.patch.object(hs, "try_hub_connect", side_effect=_direct_connect):
-                out = hs.sync_decision_changes()
-                self.assertTrue(out["ok"])
-                self.assertGreaterEqual(out["decisions"], 2)  # at least old + new
-                con2 = sqlite3.connect(str(snap))
-                row = con2.execute(
-                    "SELECT superseded_by FROM decisions WHERE id = ?", (old,)
-                ).fetchone()
-        self.assertEqual(row[0], new)
-
-
 class GraphCandidatesScratchTest(unittest.TestCase):
     """Phase 3, session A: khipu.graph_candidates.hub_candidates against
     real Postgres — the one place this suite exercises the JSONB-aware

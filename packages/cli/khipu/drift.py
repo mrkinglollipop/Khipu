@@ -98,7 +98,8 @@ def _legacy_drift_errors(memory_root: Path) -> list[str]:
     return errors
 
 
-def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def episodes_missing_in_pg(cur, keys: list[tuple[str, str]], *,
+                           live_only: bool = False) -> list[tuple[str, str]]:
     """File-episode keys with no PG row — the directional drift signal.
 
     P2b replaced count-delta drift (pg - file) with this check: PG legitimately
@@ -113,6 +114,10 @@ def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, 
     written: a merge or an edit rewrites the live summary, and matching on it
     alone re-inserted the original line as a new episode (ARCH-10). Without
     the table this is exactly the pre-0027 query.
+
+    ``live_only`` counts only live episodes and the source rows of live ones:
+    file recovery's view on a hub where the refusal table, not a tombstone,
+    says what is forgotten (design 6.1).
     """
     if not keys:
         return []
@@ -123,7 +128,10 @@ def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, 
         sources_sql = """
             AND NOT EXISTS (
                 SELECT 1 FROM episode_sources s
-                WHERE s.ts = v.ts::timestamptz AND s.summary_md5 = v.md
+                WHERE s.ts = v.ts::timestamptz AND s.summary_md5 = v.md""" + (
+                """
+                  AND EXISTS (SELECT 1 FROM episodes l
+                              WHERE l.id = s.episode_id AND l.deleted_at IS NULL)""" if live_only else "") + """
             )"""
     missing: list[tuple[str, str]] = []
     # Two arrays per statement, not a VALUES list of 500 pairs: the server
@@ -138,7 +146,8 @@ def episodes_missing_in_pg(cur, keys: list[tuple[str, str]]) -> list[tuple[str, 
             SELECT v.ts, v.md FROM unnest(%s::text[], %s::text[]) WITH ORDINALITY AS v(ts, md, ord)
             WHERE NOT EXISTS (
                 SELECT 1 FROM episodes e
-                WHERE e.ts = v.ts::timestamptz AND md5(e.summary) = v.md
+                WHERE e.ts = v.ts::timestamptz AND md5(e.summary) = v.md""" + (
+                " AND e.deleted_at IS NULL" if live_only else "") + """
             )""" + sources_sql + """
             ORDER BY v.ord
             """,

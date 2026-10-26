@@ -122,9 +122,11 @@ def _with_statement_timeout(conninfo: str, seconds: float) -> str:
     return make_conninfo(**params)
 
 
-def connect(*, autocommit: bool = False, statement_timeout_s: float | None = None):
+def connect(*, autocommit: bool = False, statement_timeout_s: float | None = None,
+            connect_timeout: int | None = None):
     """Bound connection setup; SQL timeouts belong to the operation's caller
-    (``statement_timeout_s`` is how a caller asks for one)."""
+    (``statement_timeout_s`` is how a caller asks for one, ``connect_timeout``
+    one bounded by its own deadline)."""
     conninfo = conninfo_with_local_root_cert(resolve_dsn())
     if statement_timeout_s is not None and statement_timeout_s > 0:
         conninfo = _with_statement_timeout(conninfo, statement_timeout_s)
@@ -136,7 +138,7 @@ def connect(*, autocommit: bool = False, statement_timeout_s: float | None = Non
         conn = psycopg.connect(
             conninfo,
             autocommit=autocommit,
-            connect_timeout=CONNECT_TIMEOUT_SECONDS,
+            connect_timeout=CONNECT_TIMEOUT_SECONDS if connect_timeout is None else connect_timeout,
             **_keepalive_kwargs(),
         )
     except psycopg.OperationalError as exc:

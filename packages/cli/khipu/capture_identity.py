@@ -143,6 +143,17 @@ def _insert_source(cur, key: str, episode_id: int, role: str, ident: dict[str, A
     return cur.rowcount > 0
 
 
+# A deadlock, serialization failure, lock or statement timeout: the caller's
+# transaction boundary defers the whole capture (design 6.1), so a source
+# row write never swallows one.
+TRANSIENT_SQLSTATES = frozenset({"40P01", "40001", "55P03", "57014"})
+
+
+def is_transient(exc: BaseException) -> bool:
+    state = getattr(getattr(exc, "diag", None), "sqlstate", None) or getattr(exc, "sqlstate", None)
+    return state in TRANSIENT_SQLSTATES
+
+
 def record_source(cur, episode_id: int, role: str, ident: dict[str, Any], *,
                   ts: Any = None, summary: Any = None) -> str | None:
     """Write one episode_sources row in the caller's transaction. Returns the
@@ -155,9 +166,10 @@ def record_source(cur, episode_id: int, role: str, ident: dict[str, Any], *,
     the same rule the 0027 backfill applies, so every episode keeps an origin
     row. A merged source already recorded keeps its first row.
 
-    The one failure that is not fail-open is the hub refusing a forgotten
-    source (0030): ``ForgottenSourceRefused`` reaches the caller, which must
-    roll back the episode write it made this row for."""
+    The failures that are not fail-open: the hub refusing a forgotten
+    source (0030), as ``ForgottenSourceRefused``, which the caller answers by
+    rolling back the episode write it made this row for; and a transient
+    error (``is_transient``), raised as is for the caller to defer."""
     import sys
 
     from khipu.tombstones import ForgottenSourceRefused, is_forgotten_refusal
@@ -194,6 +206,8 @@ def record_source(cur, episode_id: int, role: str, ident: dict[str, Any], *,
             pass
         if is_forgotten_refusal(exc):
             raise ForgottenSourceRefused(str(exc)) from exc
+        if is_transient(exc):
+            raise
         print(f"[khipu-capture] source row not recorded ({type(exc).__name__}: {exc})",
               file=sys.stderr, flush=True)
         return None

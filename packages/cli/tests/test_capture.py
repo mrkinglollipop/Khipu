@@ -439,6 +439,9 @@ class _FakeConn:
     def commit(self):
         self.commits += 1
 
+    def rollback(self):
+        pass
+
     def __enter__(self):
         return self
 
