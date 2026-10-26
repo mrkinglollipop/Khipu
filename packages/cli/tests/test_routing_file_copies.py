@@ -237,7 +237,7 @@ def test_report_stays_cached_until_explicit_refresh_when_a_file_changes(scanned)
     assert routing_scan_report.report()["hits"]
     (scanned.root / ".claude" / "CLAUDE.md").write_text("# Global\nclean now\n",
                                                         encoding="utf-8")
-    report = routing_scan_report.report()
+    report = routing_scan_report.report(now=scanned.now)
     assert report["status"] == "checked"
     assert any(h["file"] == "~/.claude/CLAUDE.md" for h in report["hits"])
     report = routing_scan_report.refresh(now=scanned.now)

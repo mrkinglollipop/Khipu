@@ -39,6 +39,8 @@ def safety(path: Path, home: Path) -> str | None:
     for component in reversed((path, *path.parents)):
         try:
             info = component.lstat()
+        except FileNotFoundError:
+            return "missing"
         except OSError:
             return "unreadable"
         if stat.S_ISLNK(info.st_mode):

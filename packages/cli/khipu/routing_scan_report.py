@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -45,6 +46,9 @@ DISCOVERY_DEADLINE_SECONDS = 2.0
 REFRESH_BUDGET_SECONDS = 5.0
 _MAX_CANDIDATES = 10_000
 MAX_REPORT_BYTES = 4_000_000
+# Notes reconciliation runs nightly. A snapshot is current for less than one
+# day; the read path only ages stored evidence and never revisits scan inputs.
+REPORT_MAX_AGE_SECONDS = 24 * 60 * 60
 
 NOT_CHECKED: dict[str, Any] = {"status": "not_checked", "scanned_at": None,
                                "files_checked": 0, "hits": [], "hits_total": 0,
@@ -150,22 +154,39 @@ def _discover() -> dict[str, Any]:
     out: list[list[str]] = []
     skipped: list[dict[str, str]] = []
     seen: set[Path] = set()
+    capped = False
 
     def safe(path: Path) -> bool:
         reason = safety(path, home)
-        if reason and reason != "unreadable":
+        if reason and reason != "missing":
             skipped.append({"file": display_path(path, home, roots), "reason": reason})
         return reason is None
 
     def add(path: Path) -> None:
-        if len(out) < _MAX_CANDIDATES and path not in seen:
-            seen.add(path)
-            out.append([str(path), display_path(path, home, roots)])
+        nonlocal capped
+        if path in seen:
+            return
+        seen.add(path)
+        if len(out) >= _MAX_CANDIDATES:
+            if not capped:
+                skipped.append({"file": "candidate discovery", "reason": "candidate_limit"})
+                capped = True
+            return
+        out.append([str(path), display_path(path, home, roots)])
 
     def children(root: Path) -> list[Path]:
-        if not safe(root) or not root.is_dir():
+        if not safe(root):
             return []
-        return sorted(root.iterdir())
+        try:
+            if not stat.S_ISDIR(root.stat().st_mode):
+                skipped.append({"file": display_path(root, home, roots), "reason": "not_directory"})
+                return []
+            return sorted(root.iterdir())
+        except FileNotFoundError:
+            return []
+        except OSError:
+            skipped.append({"file": display_path(root, home, roots), "reason": "unreadable"})
+            return []
 
     def notes_in(root: Path) -> None:
         for path in children(root):
@@ -182,9 +203,10 @@ def _discover() -> dict[str, Any]:
     for project in children(notes.claude_projects_root()):
         notes_in(project / "memory")
     notes_in(notes.codex_memories_root())
-    if safe(home / ".cursor" / "projects"):
-        for root in notes.cursor_memory_roots():
-            notes_in(root)
+    # Enumerate the same Cursor */memory inventory ourselves: glob/is_dir in
+    # its general notes helper suppress access errors and can follow aliases.
+    for project in children(home / ".cursor" / "projects"):
+        notes_in(project / "memory")
     for root in notes.aegis_memory_roots():
         notes_in(root)
     return {"entries": out, "skipped": skipped}
@@ -249,6 +271,9 @@ def refresh(now: datetime | None = None) -> dict[str, Any]:
                                  min(FILE_DEADLINE_SECONDS, remaining))
         reason = status if status != "ok" else result.get("reason")
         if reason:
+            if reason == "missing":
+                # Approved global/project files and note roots are optional.
+                continue
             if reason == "too_large":
                 too_large.append(display)
             else:
@@ -268,7 +293,7 @@ def refresh(now: datetime | None = None) -> dict[str, Any]:
               "more_not_shown": hits_total - len(hits), "too_large": too_large,
               "skipped": skipped}
     _write_report(report)
-    return _public(report)
+    return _public(report, now)
 
 
 def _write_report(report: dict[str, Any]) -> None:
@@ -306,7 +331,7 @@ def _write_report(report: dict[str, Any]) -> None:
             pass
 
 
-def _public(data: dict[str, Any]) -> dict[str, Any]:
+def _public(data: dict[str, Any], now: datetime | None = None) -> dict[str, Any]:
     """The report as readers may see it: no signature map, counts as
     stored, damaged fields read as the not-checked state."""
     hits = []
@@ -330,7 +355,7 @@ def _public(data: dict[str, Any]) -> dict[str, Any]:
         more = max(0, hits_total - len(hits))
     too_large = data.get("too_large")
     skipped = data.get("skipped", [])
-    return {"status": "checked",
+    result = {"status": "checked",
             "scanned_at": data.get("scanned_at") if isinstance(data.get("scanned_at"), str) else None,
             "files_checked": files_checked if isinstance(files_checked, int)
             and not isinstance(files_checked, bool) else 0,
@@ -344,13 +369,28 @@ def _public(data: dict[str, Any]) -> dict[str, Any]:
                         and isinstance(item.get("file"), str)
                         and isinstance(item.get("reason"), str)]
             if isinstance(skipped, list) else []}
+    if result["skipped"] or result["too_large"]:
+        result["status"] = "incomplete"
+    try:
+        scanned_at = datetime.fromisoformat(result["scanned_at"])
+        observed_at = now or datetime.now(timezone.utc)
+        if scanned_at.utcoffset() is None or observed_at.utcoffset() is None:
+            raise ValueError("timestamp has no timezone")
+        age = (observed_at - scanned_at).total_seconds()
+        if not 0 <= age < REPORT_MAX_AGE_SECONDS:
+            result["status"] = "stale"
+    except (TypeError, ValueError, OverflowError):
+        result["status"] = "stale"
+    return result
 
 
 def _read_raw() -> dict[str, Any] | None:
     from khipu.routing_scan_io import bounded, read_file
 
-    path, home = store_path(), Path.home()
-    status, result = bounded(lambda: read_file(path, home, MAX_REPORT_BYTES), FILE_DEADLINE_SECONDS)
+    # Resolving data_dir can stat/read its pointer and expand a home alias.
+    # These operations belong to the same deadline as the cache read itself.
+    status, result = bounded(
+        lambda: read_file(store_path(), Path.home(), MAX_REPORT_BYTES), FILE_DEADLINE_SECONDS)
     if status != "ok" or "text" not in result:
         return None
     try:
@@ -363,11 +403,12 @@ def _read_raw() -> dict[str, Any] | None:
     return data
 
 
-def report() -> dict[str, Any]:
+def report(now: datetime | None = None) -> dict[str, Any]:
     """Read only the bounded owner-local cache; never discover/stat scan inputs.
 
-    Freshness belongs to explicit refresh and scheduled notes reconciliation.
+    A nightly snapshot expires at 24 hours; invalid or future timestamps are
+    stale too. Stale and incomplete snapshots retain all recorded evidence.
     Missing, unreadable, timed-out or damaged caches read as not checked.
     """
     data = _read_raw()
-    return dict(NOT_CHECKED) if data is None else _public(data)
+    return dict(NOT_CHECKED) if data is None else _public(data, now)

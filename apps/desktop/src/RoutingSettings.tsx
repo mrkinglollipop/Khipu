@@ -33,7 +33,7 @@ import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, ro
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import { paceModel } from "./routingPace";
 import type { PaceTrend, PaceWindow } from "./routingPace";
-import { checksModel } from "./routingChecks";
+import { checksModel, fileCopySkipWords } from "./routingChecks";
 import { endedWords, holdChoiceIds, holdChoiceTargets, proposalsModel } from "./routingProposals";
 import type { ProposalRow } from "./routingProposals";
 import {
@@ -3731,34 +3731,50 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
       ) : null}
       {model.fileCopies ? (
         <div className="section-body">
-          <h2 className="sub-title">Routing written in files{model.fileCopies.status === "checked" ? <span className="meta">{model.fileCopies.hits_total} found</span> : null}</h2>
-          {model.fileCopies.status !== "checked" ? (
+          <h2 className="sub-title">Routing written in files{model.fileCopies.status !== "not_checked" ? <span className="meta">{model.fileCopies.hits_total} found</span> : null}</h2>
+          {model.fileCopies.status === "not_checked" ? (
             <div className="empty">
               <b>Khipu hasn't looked at your files yet</b>
               <span>Nothing is known about copies until the first look. It reads only, and never edits a file.</span>
             </div>
-          ) : model.fileCopies.hits.length ? (
+          ) : (
             <>
-              <p className="set-help">Conversations are told Khipu's record wins over these.</p>
-              <div className="mrows" role="list" aria-label="Copies of routing found in files">
-                {model.fileCopies.hits.map((h) => row({
-                  key: `copy:${h.file}:${h.line}`,
-                  title: `${h.file} line ${h.line}`,
-                  sub: `“${h.quote}”`,
-                }))}
-              </div>
-              {model.fileCopies.more_not_shown ? (
-                <p className="set-help">{model.fileCopies.more_not_shown} more not shown.</p>
+              <p className="set-help">
+                Files last looked at{model.fileCopies.scanned_at && whenLocal(model.fileCopies.scanned_at, now)
+                  ? ` ${whenLocal(model.fileCopies.scanned_at, now)}` : " at an unknown time"}: {model.fileCopies.files_checked} files, {model.fileCopies.hits_total} {model.fileCopies.hits_total === 1 ? "copy" : "copies"}.
+              </p>
+              {model.fileCopies.status === "stale" ? (
+                <p className="set-help">Scan is out of date. These are retained results from the last look.</p>
+              ) : null}
+              {model.fileCopies.status === "incomplete" || model.fileCopies.skipped.length || model.fileCopies.too_large.length ? (
+                <p className="set-help">Scan incomplete. Some files were not read.</p>
+              ) : null}
+              {model.fileCopies.hits.length ? (
+                <>
+                  <p className="set-help">Conversations are told Khipu's record wins over these.</p>
+                  <div className="mrows" role="list" aria-label="Copies of routing found in files">
+                    {model.fileCopies.hits.map((h) => row({
+                      key: `copy:${h.file}:${h.line}`,
+                      title: `${h.file} line ${h.line}`,
+                      sub: `“${h.quote}”`,
+                    }))}
+                  </div>
+                  {model.fileCopies.more_not_shown ? (
+                    <p className="set-help">{model.fileCopies.more_not_shown} more not shown.</p>
+                  ) : null}
+                </>
               ) : null}
               {model.fileCopies.too_large.length ? (
                 <p className="set-help">Too large to read: {model.fileCopies.too_large.join(", ")}.</p>
               ) : null}
+              {model.fileCopies.skipped.length ? (
+                <ul className="set-help" aria-label="Files not checked">
+                  {model.fileCopies.skipped.map((skip, index) => (
+                    <li key={`${skip.file}:${skip.reason}:${index}`}>{skip.file}: {fileCopySkipWords(skip)}</li>
+                  ))}
+                </ul>
+              ) : null}
             </>
-          ) : (
-            <p className="set-help">
-              Files last looked at{model.fileCopies.scanned_at ? ` ${whenLocal(model.fileCopies.scanned_at, now)}` : ""}: {model.fileCopies.files_checked} files, 0 copies.
-              {model.fileCopies.too_large.length ? ` Too large to read: ${model.fileCopies.too_large.join(", ")}.` : ""}
-            </p>
           )}
         </div>
       ) : null}
