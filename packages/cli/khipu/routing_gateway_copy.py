@@ -37,7 +37,8 @@ FIELDS = {
     "rules": set("id n text pending confirmed revision".split()),
     "note": {"text", "at"},
     "priority": set("entries until pending revision line".split()),
-    "entries": {"account", "label", "role", "until", "level"},
+    "entries": {"account", "label", "role", "until", "level", "exceptions"},
+    "exceptions": {"text", "until"},
     "level": {"claim", "as_of", "until"},
     "pace": set(routing._GATEWAY_PACE_FIELDS) | {"plan", "share_cap", "day_cap"},
     "plan": set(routing._GATEWAY_PLAN_FIELDS),
@@ -660,6 +661,15 @@ def answer(*, identity, account=None, ack="", now=None, hub=None):
         ids = {a["id"] for a in selected}
         body["accounts"] = selected
         body["holds"] = [h for h in body["holds"] if h["scope"].get("kind") == "all" or h["scope"].get("account") in ids]
+    # A priority exception is served only before its end, whenever the copy
+    # was published: one that ended since is dropped at read time.
+    for entry in (body.get("priority") or {}).get("entries") or []:
+        live = [x for x in entry.get("exceptions") or []
+                if (routing._parse(x.get("until")) or now) > now]
+        if live:
+            entry["exceptions"] = live
+        else:
+            entry.pop("exceptions", None)
     as_of = routing._parse(row["published_at"])
     stale = bool(row["stale_after"] and (now - as_of).total_seconds() > row["stale_after"])
     body.update(as_of=row["published_at"], stale=stale)

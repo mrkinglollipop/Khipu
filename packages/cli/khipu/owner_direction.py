@@ -813,6 +813,40 @@ def record_setting_before(key: str, data: dict) -> None:
              "state": "pending", "before": before})
 
 
+# Actions whose undo restores what the snapshot read: it is read again under
+# the routing lock, just before the action's own line is written, so a write
+# between the check and the change can never become the state Undo restores.
+_SNAPSHOT_UNDER_LOCK = ("route.priority.", "route.cap.", "route.hold.end", "route.rule.edit", "route.rule.undo",
+                        "route.rule.retire", "route.rule.dismiss", "route.rule.confirm")
+
+
+def record_routing_before(events: list[dict]) -> None:
+    """Called by the routing writer with the routing lock held, before it
+    appends ``events``: when they are this owner action's own lines, record
+    the snapshot as it stands now (a ``state`` line, as for a setting)."""
+    pend = _PENDING.get()
+    if not pend or pend.get("snapshot_locked") or not isinstance(pend.get("line"), dict):
+        return
+    action, line_id = pend["intent"]["action"], pend["line"]["id"]
+    if not action.startswith(_SNAPSHOT_UNDER_LOCK):
+        return
+    if not any(str(e.get("op") or "") == line_id or str(e.get("op") or "").startswith(f"{line_id}:") for e in events):
+        return
+    pend["snapshot_locked"] = True  # set first: reading the view may write (a seed import)
+    try:
+        before = _before(pend["intent"])
+        if before is _NO_UNDO or before is _UNREADABLE:
+            return
+        _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line_id,
+                 "state": "pending", "before": before})
+        pend["before"] = before
+    except Exception:
+        # As for a setting: a direction's change waits for its Undo to be
+        # recorded; the owner's own change from the app is never held up.
+        if pend["stamp"].get("auth") == "direction":
+            raise
+
+
 def record_owner_write(tool: str, args: dict) -> None:
     """Keep the hub identity before sending, even if its COMMIT reply is lost."""
     pend = _PENDING.get()
@@ -1081,7 +1115,7 @@ def _before(want: dict):
 
         prior = next((c for c in entry.get("caps") or [] if same_slot(c)), None)
         layers = [c for c in entry.get("cap_layers") or [] if same_slot(c)]
-        return {"cap": prior, "layers": layers or ([prior] if prior else [])}
+        return {"cap": prior, "layers": layers or ([prior] if prior else []), "provenance": 1}
     if action == "route.pause":
         entry = _entry(target)
         paused = entry.get("state") == routing.PAUSED
@@ -1516,7 +1550,7 @@ def _retire_rule(n_of):
 LEGACY_PROVENANCE = "this change was saved before Khipu recorded who wrote it; set it again instead"
 
 
-_PROVENANCE_FAMILIES = ("route.priority.", "route.rule.", "route.hold.")
+_PROVENANCE_FAMILIES = ("route.priority.", "route.rule.", "route.hold.", "route.cap.")
 
 
 def _require_provenance(line: dict) -> None:

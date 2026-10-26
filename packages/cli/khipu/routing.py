@@ -1834,6 +1834,8 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
             return mapped(value)
         if not isinstance(value, str) or not value:
             return None
+        if shape == "id":
+            return value if _typed_id(value) else None
         # Generated identifiers are deliberately high entropy. Only these exact
         # typed shapes bypass the free-text secret heuristic; paths never do.
         if shape in ("id", "revision_id", "mac_id") and re.fullmatch(
@@ -2191,7 +2193,8 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
                 "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
-                "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal", "batch")
+                "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal", "batch",
+                "batch_target")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",
@@ -2290,6 +2293,18 @@ EXCEPTION_MOST = 16  # live and stored exceptions one entry can hold
 EXCEPTION_WORDS_MOST = 500  # characters one exception's words may hold
 
 
+_TYPED_UUID = re.compile(
+    r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac)-)?"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+
+def _typed_id(value) -> bool:
+    """The typed ``id`` check every replicated identifier passes: a generated
+    id, or a short safe token that is not secret- or path-shaped."""
+    return isinstance(value, str) and bool(value) and bool(
+        _TYPED_UUID.fullmatch(value) or (not _dangerous(value) and _SAFE_ID.fullmatch(value)))
+
+
 def _checked_exceptions(raw) -> list[dict] | None:
     """An entry's exceptions as Khipu writes them (``id``, the owner's
     ``text``, the ``until`` that is required, and when, by whom and from what
@@ -2300,7 +2315,7 @@ def _checked_exceptions(raw) -> list[dict] | None:
         return None
     out = []
     for item in raw:
-        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"] \
+        if not isinstance(item, dict) or not _typed_id(item.get("id")) \
                 or not isinstance(item.get("text"), str) or not item["text"].strip():
             return None
         until = _log_time(item["until"]) if isinstance(item.get("until"), str) else None
@@ -6083,7 +6098,7 @@ def _operation_body(event: dict) -> dict:
     return body
 
 
-def _write_batch(events: list[dict]) -> tuple[list[dict], dict]:
+def _write_batch(events: list[dict], *, target: str | None = None) -> tuple[list[dict], dict]:
     """Append a restore's lines as one batch: each carries the batch's id and
     size, and readers count them only when every line is present
     (``_split_txns``), so a short write leaves the record as it was, never
@@ -6107,12 +6122,21 @@ def _write_batch(events: list[dict]) -> tuple[list[dict], dict]:
                  if b in complete), [])
             if done:
                 return ([{k: v for k, v in r.items() if not k.startswith("_")} for r in done], read_view())
+            # Only a partial earlier attempt: the retry may finish it only
+            # while what it restores is as that attempt found it (``target``,
+            # the revision it was made against); otherwise a newer owner
+            # choice came in between, and it is refused, never written over.
+            seen = {r.get("batch_target") for r in mine if r.get("batch")}
+            if seen and seen != {target}:
+                raise RouteError("this was changed after the interrupted undo began; undo again from the newer "
+                                 "change if you still want it")
         if len(events) < 2:
             return _write_many(events)
         batch = event_identity.uuid7()
         for i, event in enumerate(events):
             event.update(batch=batch, batch_n=len(events),
-                         op=f"{base}:{batch}:{i}" if base else f"{batch}:{i}")
+                         op=f"{base}:{batch}:{i}" if base else f"{batch}:{i}",
+                         **({"batch_target": target} if target else {}))
         return _write_many(events)
 
 
@@ -6167,6 +6191,10 @@ def _write_many(events: list[dict]) -> tuple[list[dict], dict]:
                     _require_confirmation(event, append_at)
                     _require_hold_choices(event, append_at)
                     event.update(stamp)
+                from khipu import owner_direction
+
+                # An owner action's undo snapshot, read again under this lock.
+                owner_direction.record_routing_before(fresh)
                 _append_locked(*fresh)
             events = [dict(_checked(_scrub(event)) or event) for event in results]
             appended = True
@@ -6788,10 +6816,28 @@ def restore_rule(n, *, via: str, now: datetime | None = None, holds: dict | None
         entity, number = rule_reference(n)
         if any(r["entity"] == entity for r in read_view(now)["rules"]):
             raise RouteError(f"standing rule {n} is in effect")
+        _refuse_unadopted_proposal(entity, n)
         words = _rule_words(entity)
         choices = _undo_hold_choices(holds, words=words, now=now) if _undo_default_holds else holds
         return dict(_owner_write({"type": "rule_restore", "n": number, "entity": entity, "target": entity,
                                  **({"holds": choices} if choices is not None else {})}, via), n=number)
+
+
+def _refuse_unadopted_proposal(entity: str, n) -> None:
+    """A rule a conversation proposed and the owner never adopted (confirmed,
+    or replaced with his own words) is that conversation's: restoring it
+    would make its words read as the owner's, so it is refused."""
+    rows = [e for e in _in_write_order(read_events()[0])
+            if str(e.get("type", "")).startswith("rule_") and event_identity.entity(e) == entity]
+    origin = next((e for e in rows if e.get("type") == "rule_add"), None)
+    if origin is None or not origin.get("pending"):
+        return
+    if any((e.get("written_by") or {}).get("kind") in (None, "owner")
+           and (e.get("type") == "rule_confirm" or (e.get("type") == "rule_edit" and not e.get("pending")))
+           for e in rows):
+        return
+    raise RouteError(f"standing rule {n} was a conversation's proposal you never confirmed, so it can't come back "
+                     "as yours; ask for it to be proposed again, or add it as your own rule")
 
 
 def rule_reference(n) -> tuple[str, int | None]:
@@ -6889,6 +6935,7 @@ def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = N
     with _lock():
         if retired:
             entity, number = rule_reference(n)
+            _refuse_unadopted_proposal(entity, n)
             target = {"n": number, "entity": entity, "target": entity}
             lines = owner_lines([{"type": "rule_restore", **target,
                                   "holds": _undo_hold_choices(holds, words=prior, now=now)}], via)
@@ -6910,7 +6957,8 @@ def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = N
                          if isinstance(request.get("prior_confirmed"), bool) else {}),
                       "owner_request": request.get("owner_request") or "the owner requested this change",
                       "written_by": dict(author), "via": request.get("via") or "mcp"})
-        written, view = _write_batch(lines)
+        written, view = _write_batch(lines, target=f"rule:{target['entity']}:"
+                                     + ("retired" if retired else str(rule["owner_revision"])))
     return dict(_done(written[-1], view), n=number)
 
 
@@ -7046,7 +7094,14 @@ def restore_cap_layers(account: str, *, window: str | None, kind: str, purpose: 
                                      n=cap.get("n"), revision=cap.get("revision"),
                                      purpose=cap.get("purpose", purpose), tier=cap.get("tier"),
                                      sensitive_only=cap.get("sensitive_only"), until=cap.get("until"), now=now))
-    written, view = _write_batch(owner_lines(events, via))
+    with _lock():
+        # The slot as this restore finds it: a retry of an interrupted one
+        # is refused once it changed (``_write_batch``).
+        entry = next((a for a in read_view(now)["accounts"] if a["key"] == key), {})
+        slot = [c for c in entry.get("cap_layers") or [] if c.get("kind") == kind
+                and c.get("purpose", "job") == purpose and (window is None or c.get("window") in (None, window))]
+        target = "cap:" + hashlib.sha256(json.dumps(slot, sort_keys=True, default=str).encode()).hexdigest()[:16]
+        written, view = _write_batch(owner_lines(events, via), target=target)
     return dict(_done(written[-1], view), account=key)
 
 
@@ -7116,8 +7171,6 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
             if exceptions is None:
                 raise RouteError(f"priority entry {i}: exceptions take id, text, until and at, each id once, "
                                  f"at most {EXCEPTION_MOST} of them")
-            if any(len(_one_line(x["text"])) > EXCEPTION_WORDS_MOST for x in exceptions):
-                raise RouteError(f"priority entry {i}: an exception holds at most {EXCEPTION_WORDS_MOST} characters")
             live = [x for x in exceptions if (_parse(x["until"]) or now) > now]
             if conversation:
                 # A conversation's exceptions are its own, whatever the caller
@@ -7125,6 +7178,10 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
                 taken: set[str] = set()
                 live = [dict(x, id=_exception_id(taken), text=_clean(_one_line(x["text"]), 0), at=_iso(now),
                              by=by, source=source) for x in live]
+            # Measured on the words as they will be stored, not a collapsed
+            # copy of them.
+            if any(len(x["text"]) > EXCEPTION_WORDS_MOST for x in [*exceptions, *live]):
+                raise RouteError(f"priority entry {i}: an exception holds at most {EXCEPTION_WORDS_MOST} characters")
             if live:
                 out[-1]["exceptions"] = live
     return out
@@ -7143,7 +7200,10 @@ def _check_role_budget(rows: list[dict], now: datetime) -> None:
     """Refuse a priority whose role is over ``ROLE_BUDGET`` and longer than
     the role it has now (a role already over may stay as it is or shrink), so
     time-bound words go where they lapse on their own."""
-    held = {e["account"]: len(e.get("role") or "") for e in (read_view(now).get("priority") or {}).get("entries") or []}
+    # Against the roles as stored (an ended entry's included), so carrying an
+    # entry over unchanged never reads as growing it from nothing.
+    held = {e["account"]: len(e.get("role") or "")
+            for e in (read_view(now).get("priority_stored") or {}).get("entries") or []}
     for row in rows:
         size = len(row.get("role") or "")
         if size > ROLE_BUDGET and size > held.get(row["account"], 0):
@@ -7408,7 +7468,7 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
 
 
 def amend_priority(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
-                   via: str, now: datetime | None = None, expect=None) -> dict:
+                   via: str, now: datetime | None = None, expect=None, holds: dict | None = None) -> dict:
     """The owner's change to one account's entry in the priority (words added
     to its role, or its role replaced, and optionally its end; or an
     exception that lapses on its own, or the end of one), confirmed at once
@@ -7427,7 +7487,10 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
                                               end_exception=end_exception, now=now, conversation=False,
                                               by="owner", source=str(via))
         _check_role_budget(rows, now)
-        out = _owner_write({"type": "priority_set", "entries": rows, "until": whole}, via)
+        # ``holds``: end or keep for each hold on an account it names, as a
+        # set takes them (``_require_hold_choices``).
+        out = _owner_write({"type": "priority_set", "entries": rows, "until": whole,
+                            **({"holds": holds} if holds is not None else {})}, via)
     return dict(out, entries=[e["label"] for e in rows], **done)
 
 
@@ -7460,7 +7523,8 @@ def restore_priority(stored: dict, *, via: str, holds: dict | None = None, now: 
             base = {"type": "priority_clear"}
         request = {"type": "priority_set", "entries": rows, "until": stored.get("until"), "pending": True,
                    "owner_request": words, "written_by": dict(author), "via": stored.get("via") or "mcp"}
-        written, view = _write_batch([*owner_lines([base], via), request])
+        written, view = _write_batch([*owner_lines([base], via), request],
+                                     target=read_view(now).get("priority_version"))
         return _done(written[-1], view)
 
 
@@ -9617,24 +9681,35 @@ def gateway_projection(view: dict | None = None, *, now: datetime | None = None,
                        "role": entry.get("role"), "until": entry.get("until")}
                 if isinstance(entry.get("level"), dict):
                     row["level"] = _pick(entry["level"], ("claim", "as_of", "until"), author=False)
+                # Each with its end, so a gateway read filters it by the
+                # clock (``routing_gateway_copy.answer``); never baked into
+                # the line, which the hub keeps until the next publish.
+                exceptions = [{"text": x["text"], "until": x["until"]} for x in entry.get("exceptions") or []
+                              if isinstance(x, dict) and x.get("text") and x.get("until")]
+                if exceptions:
+                    row["exceptions"] = exceptions
                 out_rows.append(row)
             return out_rows
+
+        def plain_line(held: dict) -> str:
+            return priority_line(dict(held, entries=[{k: v for k, v in e.items() if k != "exceptions"}
+                                                     for e in held.get("entries") or []], pending=False),
+                                 now, view=view, facts=facts)
 
         if priority and priority.get("pending"):
             replaced = priority.get("replaced")
             if replaced:
                 raw = (view.get("priority") or {}).get("replaced") or {}
-                line = priority_line({"entries": raw.get("entries") or [], "until": raw.get("until"),
-                                      "pending": False}, now, view=view, facts=facts)
                 out["priority"] = {"entries": entry_rows(replaced.get("entries") or []),
                                    "until": replaced.get("until"), "pending": False,
                                    "revision": priority.get("owner_revision") or priority.get("version"),
-                                   "line": line}
+                                   "line": plain_line({"entries": raw.get("entries") or [],
+                                                       "until": raw.get("until")})}
         elif priority and not priority.get("proposal_withheld"):
             out["priority"] = {"entries": entry_rows(priority.get("entries") or []),
                                "until": priority.get("until"), "pending": False,
                                "revision": priority.get("owner_revision") or priority.get("version"),
-                               "line": priority.get("line")}
+                               "line": plain_line(view["priority"])}
     return out
 
 
@@ -11116,7 +11191,8 @@ def _priority_cli(args, now: datetime) -> int:
     elif action == "amend":
         out = amend_priority(args.accounts[0], append=args.append, role=args.role, until=args.until,
                              exception=getattr(args, "exception", None),
-                             end_exception=getattr(args, "end_exception", None), via=via, now=now, expect=expect)
+                             end_exception=getattr(args, "end_exception", None), via=via, now=now, expect=expect,
+                             holds=_holds_arg(args))
     elif action == "confirm":
         out = confirm_priority(via=via, now=now, expect=expect, holds=_holds_arg(args))
     elif action == "undo":
@@ -11204,7 +11280,8 @@ def _priority_intent(args, action: str) -> dict | None:
                                       facts={k: v for k, v in (("append", args.append), ("role", args.role),
                                                                ("until", args.until),
                                                                ("exception", getattr(args, "exception", None)),
-                                                               ("end_exception", getattr(args, "end_exception", None)))
+                                                               ("end_exception", getattr(args, "end_exception", None)),
+                                                               ("holds", _holds_arg(args)))
                                              if v is not None})
     if action != "set":
         return owner_direction.intent(f"route.priority.{action}", "priority")

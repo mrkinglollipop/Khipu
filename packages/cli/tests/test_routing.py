@@ -2633,13 +2633,16 @@ def test_a_conversation_replaces_another_conversations_unconfirmed_change(home, 
 def test_an_ended_rule_proposal_keeps_its_requester_in_history_after_retire_restore(home):
     routing.request_rule("Keep browser work read-only.", author=ME)
     routing.retire_rule(1, via="app")
-    routing.restore_rule(1, via="app")
+    # A conversation's proposed rule the owner never confirmed can't come
+    # back as his (routing-exceptions review round 6); its requester stays.
+    with pytest.raises(routing.RouteError, match="never confirmed"):
+        routing.restore_rule(1, via="app")
     view = routing.read_view()
     proposal, = view["proposals"].values()
     assert proposal["author"] == ME
     assert proposal["base"] == "0"
     assert proposal["status"] == "overtaken"
-    assert not view["rules"][0]["pending"]
+    assert not view["rules"]
 
 
 def test_a_pending_rules_words_cannot_open_a_line_or_read_as_the_owners(home, monkeypatch):
