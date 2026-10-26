@@ -101,11 +101,12 @@ def test_an_older_copys_baked_in_allowance_is_withheld_past_valid_until(directio
 def test_a_cap_restore_retry_survives_a_layer_expiring_on_its_own(direction_world, monkeypatch):
     now = routing._now()
     routing.set_cap("Codex", window="weekly", kind="share", pct=40, revision="base", via="app", now=now)
-    routing.set_cap("Codex", window="weekly", kind="share", pct=50, revision="timed",
-                    until=routing._iso(now + timedelta(hours=1)), via="app", now=now)
     layers = [dict(c) for c in next(a for a in routing.read_view(now)["accounts"] if a["label"] == "Codex")
               ["cap_layers"]]
-    routing.set_cap("Codex", window="weekly", kind="share", pct=70, revision="undone", via="app", now=now)
+    # The change being undone is itself timed: the slot's layers change with
+    # the clock alone once it ends.
+    routing.set_cap("Codex", window="weekly", kind="share", pct=70, revision="undone",
+                    until=routing._iso(now + timedelta(hours=1)), via="app", now=now)
     _interrupted(monkeypatch, lambda: routing.restore_cap_layers("Codex", window="weekly", kind="share",
                                                                   layers=layers, via="app", now=now))
     later = now + timedelta(hours=2)  # the timed layer ended on its own; nobody wrote
