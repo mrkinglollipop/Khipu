@@ -183,6 +183,43 @@ def _should_skip_build(resolved: Path | None) -> tuple[bool, str]:
     return False, ""
 
 
+def _mirror_skip_reason(proc: subprocess.CompletedProcess) -> str:
+    """Why a successful graph-sync did nothing, or '' when it mirrored."""
+    try:
+        body = json.loads(proc.stdout or "")
+    except ValueError:
+        return ""
+    return str(body.get("skipped") or "") if isinstance(body, dict) else ""
+
+
+def _mirror_reason(proc: subprocess.CompletedProcess) -> str:
+    """One-line reason for a failed graph-sync.
+
+    graph-sync prints indented JSON on stdout, so the last output line is just
+    a closing brace; read the error or the nonzero drift counts instead.
+    """
+    try:
+        body = json.loads(proc.stdout or "")
+    except ValueError:
+        body = None
+    if isinstance(body, dict):
+        drift = body.get("drift") if isinstance(body.get("drift"), dict) else body
+        if drift.get("error"):
+            return str(drift["error"])
+        counts = [
+            f"{key}={value}"
+            for key, value in drift.items()
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value
+            and (key.startswith(("nodes_", "edges_")))
+        ]
+        if counts:
+            return "drift left after sync: " + ", ".join(counts)
+    tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return tail[-1] if tail else "failed"
+
+
 def main() -> int:
     log("nightly graph refresh starting")
     resolved_override = (os.environ.get("KHIPU_GRAPH_SOURCES_RESOLVED") or "").strip()
@@ -247,6 +284,11 @@ def main() -> int:
     elif rc != 0:
         log("  edge-embed step did not fully succeed")
 
+    # With no Khipu root the mirror is intentionally off (exit 0). A machine
+    # that is not the graph producer makes graph-sync exit 0 by itself, so any
+    # nonzero exit or failure to run here is a real failure: the rebuilt graph
+    # would otherwise show up only as drift the next day.
+    mirror_failure: str | None = None
     if _khipu_root() is not None:
         log("step: khipu graph mirror")
         try:
@@ -258,17 +300,26 @@ def main() -> int:
                 timeout=600,
             )
             if proc.returncode == 0:
-                log("  khipu graph mirror ok")
+                skipped = _mirror_skip_reason(proc)
+                log(f"  khipu graph mirror skipped: {skipped}" if skipped
+                    else "  khipu graph mirror ok")
             else:
-                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-                log(f"  khipu graph mirror rc={proc.returncode}: {tail[-1] if tail else 'failed'}")
-        except OSError as exc:
-            log(f"  khipu graph mirror skipped (non-fatal): {exc}")
+                mirror_failure = (
+                    f"graph mirror rc={proc.returncode}: {_mirror_reason(proc)}"
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            mirror_failure = f"graph mirror did not run: {exc}"
 
     if embed_failures:
         detail = "; ".join(f"{label} rc={rc}" for label, rc in embed_failures)
+        if mirror_failure:
+            detail += f"; {mirror_failure}"
         log(f"nightly FAILED — {detail}")
         return embed_failures[0][1]
+
+    if mirror_failure:
+        log(f"nightly FAILED — {mirror_failure}")
+        return 2
 
     log("nightly complete — graph refreshed")
     return 0

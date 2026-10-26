@@ -430,5 +430,53 @@ class ScratchDrillTest(unittest.TestCase):
             )
 
 
+class OffsiteTimeoutTest(unittest.TestCase):
+    def _timeout_for(self, size_bytes: int) -> int:
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td, "graph-20260819T000000Z.sqlite")
+            with open(snap, "wb") as f:
+                f.truncate(size_bytes)  # sparse: no real disk used
+            return graph_backup._offsite_timeout(snap)
+
+    def test_small_file_gets_the_floor(self):
+        self.assertEqual(3600, self._timeout_for(10 * 1024**2))
+        self.assertEqual(3600, self._timeout_for(1024**3))
+
+    def test_timeout_grows_ten_minutes_per_gb_above_the_first(self):
+        self.assertEqual(3600 + 600, self._timeout_for(2 * 1024**3))
+        self.assertEqual(3600 + 1500, self._timeout_for(7 * 1024**3 // 2))
+
+    def test_timeout_is_capped_at_four_hours(self):
+        self.assertEqual(4 * 3600, self._timeout_for(100 * 1024**3))
+
+    def test_run_offsite_passes_the_scaled_timeout_to_rclone(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        snap = d / "graph-20260819T000000Z.sqlite"
+        with open(snap, "wb") as f:
+            f.truncate(3 * 1024**3)
+        live = d / "live-graph.sqlite"
+        live.write_bytes(b"live")
+        timeouts = {}
+
+        def fake_run(argv, **kwargs):
+            timeouts[argv[1]] = kwargs.get("timeout")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with (
+            mock.patch.object(graph_backup, "latest_snapshot", return_value=snap),
+            mock.patch.object(graph_backup, "_integrity_check", return_value="ok"),
+            mock.patch.object(graph_backup, "_required_graph_tables", return_value=None),
+            mock.patch.object(graph_backup, "_live_graph", return_value=live),
+            mock.patch.object(graph_backup, "resolve_rclone", return_value="rclone"),
+            mock.patch.object(graph_backup, "has_r2_remote", return_value=True),
+            mock.patch("khipu.graph_backup.subprocess.run", side_effect=fake_run),
+            mock.patch("khipu.ops_events.record", return_value={"ok": True, "id": 1}),
+        ):
+            graph_backup.run_offsite()
+        self.assertEqual(3600 + 2 * 600, timeouts["copyto"])
+
+
 if __name__ == "__main__":
     unittest.main()
