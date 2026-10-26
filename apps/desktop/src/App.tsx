@@ -4236,6 +4236,7 @@ export default function App() {
             <PlansCard
               state={plans}
               routing={routingForPlans}
+              onRoutingChanged={() => routing.load(true)}
               noneTracked={noneTracked}
               onAddAccount={() => setAddAccountSignal((n) => n + 1)}
               onOpenAccounts={() => {
