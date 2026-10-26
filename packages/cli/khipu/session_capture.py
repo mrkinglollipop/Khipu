@@ -2418,14 +2418,19 @@ def _read_beat(harness: str) -> dict:
     try:
         d = json.loads(dispatch_path(harness).read_text(encoding="utf-8"))
         return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
+    except OSError:
         pass
+    except ValueError:
+        # Corrupt on-disk beat must not look like "hook never ran" to liveness.
+        return {"_heartbeat_unreadable": True}
     if harness == "aegis":   # heartbeat layout before 2026-08-17 pm: one file, Aegis only
         try:
             d = json.loads((khipu_home() / "last-dispatch.json").read_text(encoding="utf-8"))
             return d if isinstance(d, dict) else {}
-        except (OSError, ValueError):
+        except OSError:
             pass
+        except ValueError:
+            return {"_heartbeat_unreadable": True}
     return {}
 
 
@@ -2477,6 +2482,9 @@ def _heartbeat_unlocked(harness: str, out: dict) -> None:
     liveness needs. `verify` reads this instead of assuming dispatch — the
     assumption that hid a silent failure once."""
     beat = _read_beat(harness)
+    # Read-time marker for corrupt JSON — never persist it, or a healthy write
+    # would keep liveness red forever.
+    beat.pop("_heartbeat_unreadable", None)
     # Per-run fields are replaced wholesale: a "no transcript" run must not
     # inherit the previous run's new_turns/queued and look like it captured.
     for k in ("event", "session_id", "due", "reason", "new_turns", "new_chars", "queued", "error",
@@ -2536,6 +2544,7 @@ def last_dispatch(harness: str = "aegis") -> dict | None:
 
 def _record_drain_unlocked(harness: str, *, captured: bool, error: str | None = None, empty: bool = False) -> None:
     beat = _read_beat(harness)
+    beat.pop("_heartbeat_unreadable", None)
     now = _mint_ts()
     if captured:
         beat["last_captured_at"] = now
@@ -3550,6 +3559,10 @@ def liveness(harness: str) -> dict:
     q = _queue_by_harness().get(harness, {"depth": 0, "dead_claims": 0,
                                                  "oldest_age_s": None, "oldest_job": None})
     reasons: list[str] = []
+    if beat.get("_heartbeat_unreadable"):
+        return {"harness": harness, "ok": False, "seen": True,
+                "reasons": ["heartbeat unreadable"], "warnings": [],
+                "queue_depth": q["depth"], "queue_oldest_age_s": q.get("oldest_age_s")}
     if not beat:
         return {"harness": harness, "ok": True, "seen": False, "reasons": [],
                 "queue_depth": 0, "note": "no real session has run the hook yet"}
