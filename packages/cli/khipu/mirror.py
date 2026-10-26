@@ -647,8 +647,9 @@ def _queue_conflict(obj: dict[str, Any]) -> None:
     """Keep a recovered line whose legacy key holds different facts as
     durable work: queued in the outbox with its owner unknown. Its drain
     lands it through ``capture.write_pg``, whose legacy-key collision keeps
-    it queued as an ``evidence_conflict`` (never buried; ``khipu outbox
-    status`` and doctor count it) unless capture's dedup lands its facts."""
+    it queued as an ``evidence_conflict`` then held after bounded retries
+    (``khipu outbox status`` and doctor count both), unless strict legacy
+    projection proof resolves it with a durable evidence record."""
     from khipu.outbox import enqueue
 
     enqueue(obj, reason="recovery: the legacy key holds different facts", origin=None)

@@ -205,11 +205,39 @@ def quarantine_dir() -> Path:
     return outbox_dir() / "quarantine"
 
 
+def resolved_dir() -> Path:
+    return outbox_dir() / "resolved"
+
+
 def dead_jobs() -> list[Path]:
     d = dead_dir()
     if not d.is_dir():
         return []
     return sorted(p for p in d.glob("*.json") if p.is_file())
+
+
+def _transition_destination(preferred: Path, job: dict[str, Any]) -> Path:
+    """Choose without overwriting different evidence; caller holds the lock.
+
+    Hash the complete envelope about to move, including retry history, rather
+    than its legacy episode identity. Reuse requires canonical JSON equality;
+    an unreadable occupant is different evidence too.
+    """
+    canonical = json.dumps(job, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+    def equal(path: Path) -> bool:
+        try:
+            value = json.loads(path.read_bytes())
+            return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")) == canonical
+        except (OSError, ValueError, TypeError):
+            return False
+
+    if not preferred.exists() or equal(preferred):
+        return preferred
+    alternate = preferred.parent / (hashlib.sha256(canonical.encode("utf-8")).hexdigest() + ".json")
+    if alternate.exists() and not equal(alternate):
+        raise FileExistsError(f"outbox transition conflicts with existing evidence: {alternate.name}")
+    return alternate
 
 
 def _bury(jp: Path, job: dict[str, Any]) -> None:
@@ -220,7 +248,13 @@ def _bury(jp: Path, job: dict[str, Any]) -> None:
     it; ``khipu outbox retry-dead`` puts it back after the cause is fixed."""
     dead_dir().mkdir(parents=True, exist_ok=True)
     job["buried_at"] = datetime.now(timezone.utc).isoformat()
-    _atomic_write(dead_dir() / jp.name, job)
+    if job.get("evidence_conflict"):
+        job["hold_reason"] = ("Distinct capture evidence requires owner reconciliation with the hub; "
+                              "automatic retries exhausted. Evidence is retained here. "
+                              "Retry dead jobs after resolving the difference.")
+    destination = _transition_destination(dead_dir() / jp.name, job)
+    if not destination.exists():
+        _atomic_write(destination, job)
     jp.unlink(missing_ok=True)
     _log(f"buried {jp.name} after {job.get('attempts')} attempts: {job.get('last_error')}")
 
@@ -318,7 +352,10 @@ def retry_dead() -> dict[str, Any]:
                             continue
                         job["attempts"] = 0
                         job.pop("buried_at", None)
-                        _atomic_write(d / jp.name, job)
+                        job.pop("hold_reason", None)
+                        destination = _transition_destination(d / jp.name, job)
+                        if not destination.exists():
+                            _atomic_write(destination, job)
                         jp.unlink(missing_ok=True)
                         moved += 1
             except RegistryError as exc:
@@ -373,6 +410,15 @@ def status() -> dict[str, Any]:
         if unreachable_text(str(job.get("last_error") or job.get("reason") or "")):
             offline += 1
     quarantined = len(list(quarantine_dir().glob("*.json"))) if quarantine_dir().is_dir() else 0
+    held_conflicts = []
+    for jp in dead_jobs():
+        try:
+            if _read_job(jp).get("evidence_conflict"):
+                held_conflicts.append(jp.name)
+        except (OSError, ValueError, TypeError):
+            pass  # dead still names unreadable held work
+    evidence_conflicts += len(held_conflicts)
+    resolved = len(list(resolved_dir().glob("*.json"))) if resolved_dir().is_dir() else 0
     # Existing doctor callers use ``dead`` to detect work that cannot replay.
     from khipu.session_capture import held_jobs
 
@@ -386,7 +432,9 @@ def status() -> dict[str, Any]:
             "oldest_job": oldest_job, "unreadable": unreadable,
             "dead": dead, "quarantined": quarantined, "native_held": native_held,
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
-            "evidence_conflicts": evidence_conflicts}
+            "evidence_conflicts": evidence_conflicts,
+            "held_conflicts": len(held_conflicts), "held_conflict_jobs": held_conflicts,
+            "resolved": resolved}
     if evidence_conflicts:
         result["fix"] = ("Inspect the conflicting evidence in the local outbox and hub; "
                          "owner reconciliation is required before these jobs can replay.")
@@ -500,7 +548,11 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                             out["forgotten"] = out.get("forgotten", 0) + 1
                             continue
                     with owner:
-                        stats = write_pg(payload)
+                        if (job.get("reason") == "recovery: the legacy key holds different facts"
+                                and "origin" in job and job["origin"] is None):
+                            stats = write_pg(payload, legacy_projection=True)
+                        else:
+                            stats = write_pg(payload)
                 except RegistryError as e:
                     # A corrupt or unavailable registry is a privacy failure, not
                     # a retryable reason to overwrite a queued job.
@@ -527,8 +579,8 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                         job["deferral_reason"] = str(e)[:200]
                     else:
                         job.pop("deferral_reason", None)
-                    deferred = job["claim_deferred"] or job["evidence_conflict"] or job["fact_deferred"]
-                    if deferred:
+                    deferred = job["claim_deferred"] or job["fact_deferred"]
+                    if deferred or job["evidence_conflict"]:
                         unreachable = False
                         out["deferred"] = out.get("deferred", 0) + 1
                     try:
@@ -557,6 +609,59 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                         _log(f"PG unreachable for {jp.name} ({name}); leaving remaining jobs queued")
                         break
                     _log(f"replay failed for {jp.name}: {name}: {e}")
+                    continue
+                proof = stats.get("legacy_projection_duplicate")
+                if proof:
+                    original = proof["payload"]
+                    try:
+                        # The original identity is stronger than the lossy
+                        # queued identity. Fence it at the last write boundary;
+                        # otherwise a forget after proof could revive its copy.
+                        with write_guard(original) as allowed:
+                            with _locked_outbox():
+                                if not jp.exists() or jp.read_bytes() != snapshot:
+                                    continue
+                                if not allowed:
+                                    jp.unlink()
+                                    out["forgotten"] = out.get("forgotten", 0) + 1
+                                    continue
+                                resolved_dir().mkdir(parents=True, exist_ok=True)
+                                # Full snapshot identity preserves distinct job
+                                # histories and reuses one record after a crash
+                                # between publication and queue removal.
+                                record_path = resolved_dir() / (hashlib.sha256(snapshot).hexdigest() + ".json")
+                                resolution = {
+                                    "kind": "legacy_comma_projection",
+                                    "episode_id": proof["episode_id"],
+                                    "original_payload_sha256": proof["original_payload_sha256"],
+                                    "queued_payload_sha256": proof["queued_payload_sha256"],
+                                }
+                                if not record_path.exists():
+                                    _atomic_write(record_path, {
+                                        "payload": original, "queued_evidence": job,
+                                        "resolution": {
+                                            **resolution,
+                                            "resolved_at": datetime.now(timezone.utc).isoformat(),
+                                        },
+                                    })
+                                else:
+                                    record = json.loads(record_path.read_bytes())
+                                    saved_resolution = record.get("resolution") or {}
+                                    if (record.get("queued_evidence") != job or record.get("payload") != original
+                                            or not isinstance(saved_resolution, dict)
+                                            or any(saved_resolution.get(k) != v for k, v in resolution.items())
+                                            or not saved_resolution.get("resolved_at")):
+                                        raise ValueError("resolution record conflicts with queued evidence")
+                                jp.unlink()
+                        out["resolved"] = out.get("resolved", 0) + 1
+                    except RegistryError as exc:
+                        out["failed"] += 1
+                        out["registry_blocked"] = out.get("registry_blocked", 0) + 1
+                        _log(f"resolution refused for {jp.name}: {exc}")
+                    except (OSError, ValueError, TypeError) as exc:
+                        out["failed"] += 1
+                        out["resolution_failed"] = out.get("resolution_failed", 0) + 1
+                        _log(f"resolution retained in queue for {jp.name}: {type(exc).__name__}")
                     continue
                 if stats.get("episode_inserted"):
                     try:

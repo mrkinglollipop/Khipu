@@ -86,11 +86,11 @@ STORES: tuple[Store, ...] = (
     Store("native empty archive", "capture home empty/: *.json, *.error",
           "transcript text of empty windows or quarantined malformed jobs, with parse reasons", "native jobs",
           _w("session_capture._archive_claimed", "session_capture._quarantine_claim")),
-    Store("outbox job", "outbox/, outbox/dead/, outbox/quarantine/: *.json and .*.tmp",
-          "whole capture payloads waiting for the hub", "outbox",
+    Store("outbox job", "outbox/, outbox/dead/, outbox/quarantine/, outbox/resolved/: *.json and .*.tmp",
+          "whole capture payloads waiting for the hub and resolved legacy evidence", "outbox",
           _w("outbox._atomic_write", "outbox._bury", "outbox._quarantine", "outbox.drain",
              "outbox.enqueue", "outbox.retry_dead"),
-          Restore(("outbox/*.json", "outbox/dead/*.json", "outbox/quarantine/*.json"),
+          Restore(("outbox/*.json", "outbox/dead/*.json", "outbox/quarantine/*.json", "outbox/resolved/*.json"),
                   "queued job")),
     Store("legacy log", "memory root: episodes*.jsonl, their .bak copies, .khipu-forget-backups/, "
           "and .tmp files beside them",
@@ -275,6 +275,6 @@ def native_job_folders() -> list[tuple[str, Path]]:
 
 def outbox_folders() -> list[Path]:
     """The folders forget's outbox scan reads."""
-    from khipu.outbox import dead_dir, outbox_dir, quarantine_dir
+    from khipu.outbox import dead_dir, outbox_dir, quarantine_dir, resolved_dir
 
-    return [outbox_dir(), dead_dir(), quarantine_dir()]
+    return [outbox_dir(), dead_dir(), quarantine_dir(), resolved_dir()]
