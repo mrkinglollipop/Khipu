@@ -42,6 +42,7 @@ from typing import Any
 import fcntl
 
 from khipu.hub_errors import unreachable_error, unreachable_text
+from khipu.capture_stores import outbox_payloads
 
 
 def _log(msg: str) -> None:
@@ -104,14 +105,70 @@ def _queued_origin() -> dict[str, Any]:
         return {"origin": None}
 
 
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
 def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str, Any]) -> bool:
-    return job["payload"] == payload and {k: job[k] for k in ("origin",) if k in job} == stamp
+    return (_canonical(job["payload"]) == _canonical(payload)
+            and _canonical({k: job[k] for k in ("origin",) if k in job}) == _canonical(stamp))
+
+
+def _validate_resolution(record: Any) -> None:
+    """Validate archived content itself, never trust its saved hash claims."""
+    from khipu.capture_identity import payload_sha256
+    from khipu.capture import _legacy_comma_projection
+
+    outbox_payloads(record)
+    resolution = record.get("resolution")
+    queued = record.get("queued_evidence")
+    if (not isinstance(resolution, dict) or not isinstance(queued, dict)
+            or resolution.get("kind") != "legacy_comma_projection"
+            or type(resolution.get("episode_id")) is not int or resolution["episode_id"] <= 0
+            or not isinstance(resolution.get("resolved_at"), str) or not resolution["resolved_at"]
+            or resolution.get("original_payload_sha256") != payload_sha256(record["payload"])
+            or resolution.get("queued_payload_sha256") != payload_sha256(queued["payload"])):
+        raise ValueError("resolution record conflicts with archived evidence")
+    from khipu.request_context import valid_origin
+
+    attempts = queued.get("attempts", 0)
+    if (type(attempts) is not int or attempts < 0
+            or ("origin" in queued and not valid_origin(queued["origin"]))
+            or queued.get("reason") != "recovery: the legacy key holds different facts"
+            or "origin" not in queued or queued["origin"] is not None
+            or not _legacy_comma_projection(record["payload"], queued["payload"])):
+        raise ValueError("resolution queued envelope is invalid")
+    _canonical(record)
+
+
+def _recovery_terminal(payload: dict[str, Any], stamp: dict[str, Any]) -> Path | None:
+    """A file sweep cannot restart held retries or recreate resolved history.
+
+    Called under the outbox lock. Direct capture enqueue and explicit owner
+    retry remain able to create/move separate histories.
+    """
+    for path in dead_jobs():
+        try:
+            if _same_evidence(_read_job(path), payload, stamp):
+                return path
+        except (OSError, ValueError, TypeError, RecursionError):
+            continue
+    for path in sorted(resolved_dir().glob("*.json")):
+        try:
+            record = json.loads(path.read_bytes())
+            _validate_resolution(record)
+            if _same_evidence(record["queued_evidence"], payload, stamp):
+                return path
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            continue
+    return None
 
 
 _STAMP = object()
 
 
-def enqueue(payload: dict[str, Any], *, reason: str = "", origin: Any = _STAMP) -> Path:
+def enqueue(payload: dict[str, Any], *, reason: str = "", origin: Any = _STAMP,
+            recovery: bool = False) -> Path:
     """Durably queue a capture; acknowledge an existing file only for equal
     content and equal origin. A full disk is raised in plain words.
 
@@ -119,7 +176,9 @@ def enqueue(payload: dict[str, Any], *, reason: str = "", origin: Any = _STAMP) 
     stamped now from the request context; a writer that does not know who
     made the capture passes ``None`` (unknown, which no drainer claims), as
     the file recovery writers do for a line they could not land (a synced
-    file can hold another machine's captures; third Astra review #3)."""
+    file can hold another machine's captures; third Astra review #3).
+    ``recovery`` acknowledges matching held/resolved evidence durably rather
+    than restarting its retry history on every sweep."""
     if origin is _STAMP:
         stamp = _queued_origin()
     else:
@@ -139,6 +198,8 @@ def enqueue(payload: dict[str, Any], *, reason: str = "", origin: Any = _STAMP) 
         if not allowed:
             raise ForgottenSource("queued payload belongs to a forgotten source")
         with _locked_outbox() as d:
+            if recovery and (terminal := _recovery_terminal(payload, stamp)) is not None:
+                return terminal
             evidence = {"payload": payload, **stamp} if stamp else payload
             digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,
                                               separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -248,7 +309,11 @@ def _bury(jp: Path, job: dict[str, Any]) -> None:
     it; ``khipu outbox retry-dead`` puts it back after the cause is fixed."""
     dead_dir().mkdir(parents=True, exist_ok=True)
     job["buried_at"] = datetime.now(timezone.utc).isoformat()
-    if job.get("evidence_conflict"):
+    if job.get("resolution_failure"):
+        job["hold_reason"] = ("Resolution evidence could not be archived; automatic retries exhausted. "
+                              "Both original and queued evidence are retained here. Owner must "
+                              "inspect the journal conflict or storage failure before retry-dead.")
+    elif job.get("evidence_conflict"):
         job["hold_reason"] = ("Distinct capture evidence requires owner reconciliation with the hub; "
                               "automatic retries exhausted. Evidence is retained here. "
                               "Retry dead jobs after resolving the difference.")
@@ -266,6 +331,7 @@ def _read_job(jp: Path) -> dict[str, Any]:
         raise ValueError("job envelope is not an object")
     if not isinstance(job.get("payload"), dict):
         raise ValueError("job payload is not an object")
+    outbox_payloads(job)
     attempts = job.get("attempts", 0)
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
         raise ValueError("job attempts is not a non-negative integer")
@@ -275,6 +341,28 @@ def _read_job(jp: Path) -> dict[str, Any]:
     if "origin" in job and not valid_origin(job["origin"]):
         raise ValueError("job origin is not a queued origin")
     return job
+
+
+def _quarantine_payloads(snapshot: bytes) -> tuple[list[dict[str, Any]], bool]:
+    """Known identities and whether malformed nested evidence prevents a move.
+
+    Still walk valid children of a malformed parent. Unknown nested shapes
+    stay in place unless a known forgotten identity requires removal.
+    """
+    try:
+        envelope = json.loads(snapshot)
+        payloads = outbox_payloads(envelope, strict=False)
+        try:
+            outbox_payloads(envelope)
+        except ValueError:
+            nested = isinstance(envelope, dict) and any(
+                key in envelope for key in ("queued_evidence", "resolution_evidence", "resolution"))
+            return payloads, nested
+        return payloads, False
+    except RecursionError:
+        return [], True
+    except (ValueError, TypeError):
+        return [], False
 
 
 def _quarantine(jp: Path, error: Exception) -> Path:
@@ -312,38 +400,33 @@ def retry_dead() -> dict[str, Any]:
         # One memory-lock hold per job, from its read to its move, taken
         # before the outbox lock like every writer's.
         with memory_lock.shared():
+            snapshot = b""
             try:
                 with _locked_outbox():
                     snapshot = jp.read_bytes()
                     job = _read_job(jp)
-            except (OSError, ValueError, TypeError) as exc:
-                identifiable = None
-                try:
-                    envelope = json.loads(snapshot)
-                    if isinstance(envelope, dict) and isinstance(envelope.get("payload"), dict):
-                        identifiable = envelope["payload"]
-                except (UnboundLocalError, ValueError, TypeError):
-                    pass
-                if identifiable is None:
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
+                identifiable, uncheckable = _quarantine_payloads(snapshot)
+                if not identifiable:
                     with _locked_outbox():
-                        if jp.exists():
+                        if jp.exists() and not uncheckable:
                             _quarantine(jp, exc)
                             quarantined += 1
                     continue
                 try:
-                    with write_guard(identifiable) as allowed:
+                    with write_guard(*identifiable) as allowed:
                         with _locked_outbox():
                             if jp.exists() and jp.read_bytes() == snapshot:
-                                if allowed:
+                                if allowed and not uncheckable:
                                     _quarantine(jp, exc)
                                     quarantined += 1
-                                else:
+                                elif not allowed:
                                     jp.unlink()
                 except RegistryError as registry_error:
                     _log(f"retry-dead quarantine refused for {jp.name}: {registry_error}")
                 continue
             try:
-                with write_guard(job["payload"]) as allowed:
+                with write_guard(*outbox_payloads(job)) as allowed:
                     with _locked_outbox() as d:
                         if not jp.exists() or jp.read_bytes() != snapshot:
                             continue
@@ -392,11 +475,12 @@ def status() -> dict[str, Any]:
             job = json.loads(jp.read_bytes())
             if not isinstance(job, dict):
                 raise ValueError("job envelope is not an object")
+            outbox_payloads(job)
             q = job.get("queued_at")
             if not isinstance(q, str):
                 raise ValueError("queued_at is not a string")
             age = int((now - datetime.fromisoformat(q)).total_seconds()) if q else None
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, RecursionError):
             unreadable += 1
             continue
         attempts = job.get("attempts", 0)
@@ -487,8 +571,9 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                     out["time_budget_exhausted"] = True
                     break
                 payload: dict[str, Any] | None = None
-                identifiable: dict[str, Any] | None = None
+                identifiable: list[dict[str, Any]] = []
                 read_error: Exception | None = None
+                snapshot = b""
                 with _locked_outbox():
                     if not jp.exists():
                         continue
@@ -496,33 +581,33 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                         snapshot = jp.read_bytes()
                         job = _read_job(jp)
                         payload = json.loads(json.dumps(job["payload"]))
-                    except (OSError, ValueError, TypeError) as e:
+                    except (OSError, ValueError, TypeError, RecursionError) as e:
                         read_error = e
                         # A malformed envelope can still expose an identifiable
                         # payload (for example a bad attempts field). Do not move
                         # such a forgotten source into quarantine after forget's
                         # scan: registry then outbox is the universal ordering.
-                        try:
-                            envelope = json.loads(snapshot)
-                            if isinstance(envelope, dict) and isinstance(envelope.get("payload"), dict):
-                                identifiable = envelope["payload"]
-                        except (UnboundLocalError, ValueError, TypeError):
-                            pass
-                        if identifiable is None:
-                            _quarantine(jp, read_error or ValueError("unreadable job"))
-                            out["quarantined"] = out.get("quarantined", 0) + 1
+                        identifiable, uncheckable = _quarantine_payloads(snapshot)
+                        if not identifiable:
+                            if uncheckable:
+                                out["unreadable"] = out.get("unreadable", 0) + 1
+                            else:
+                                _quarantine(jp, read_error or ValueError("unreadable job"))
+                                out["quarantined"] = out.get("quarantined", 0) + 1
                             continue
-                if identifiable is not None:
+                if identifiable:
                     try:
-                        with write_guard(identifiable) as allowed:
+                        with write_guard(*identifiable) as allowed:
                             with _locked_outbox():
                                 if jp.exists() and jp.read_bytes() == snapshot:
                                     if not allowed:
                                         jp.unlink()
                                         out["forgotten"] = out.get("forgotten", 0) + 1
-                                    else:
+                                    elif not uncheckable:
                                         _quarantine(jp, read_error or ValueError("unreadable job"))
                                         out["quarantined"] = out.get("quarantined", 0) + 1
+                                    else:
+                                        out["unreadable"] = out.get("unreadable", 0) + 1
                     except RegistryError as registry_error:
                         out["registry_blocked"] = out.get("registry_blocked", 0) + 1
                         _log(f"quarantine refused for {jp.name}: {registry_error}")
@@ -537,7 +622,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                     # its own tombstoned-source protection and may do slow I/O;
                     # holding the local flock here would make enqueue wait for a
                     # replay. The final retry/bury write below is fenced again.
-                    with write_guard(payload) as allowed:
+                    with write_guard(*outbox_payloads(job)) as allowed:
                         if not allowed:
                             with _locked_outbox():
                                 try:
@@ -587,7 +672,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                         # Recheck under the same registry lock at the actual
                         # retry/bury write boundary; otherwise a forget between a
                         # failed replay and this atomic replace could resurrect it.
-                        with write_guard(payload) as allowed:
+                        with write_guard(*outbox_payloads(job)) as allowed:
                             with _locked_outbox():
                                 try:
                                     if jp.read_bytes() == snapshot:
@@ -613,11 +698,32 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                 proof = stats.get("legacy_projection_duplicate")
                 if proof:
                     original = proof["payload"]
+                    resolution = {
+                        "kind": "legacy_comma_projection",
+                        "episode_id": proof["episode_id"],
+                        "original_payload_sha256": proof["original_payload_sha256"],
+                        "queued_payload_sha256": proof["queued_payload_sha256"],
+                    }
+                    # Immutable evidence and filename survive retry bookkeeping
+                    # changes, including a crash after archive publication.
+                    candidate = {
+                        "payload": original, "queued_evidence": json.loads(snapshot),
+                        "resolution": {**resolution, "resolved_at": datetime.now(timezone.utc).isoformat()},
+                    }
+                    record = job.get("resolution_evidence", candidate)
+                    record_id = job.get("resolution_record_sha256", hashlib.sha256(snapshot).hexdigest())
                     try:
-                        # The original identity is stronger than the lossy
-                        # queued identity. Fence it at the last write boundary;
-                        # otherwise a forget after proof could revive its copy.
-                        with write_guard(original) as allowed:
+                        _validate_resolution(record)
+                        if (not isinstance(record_id, str) or not re.fullmatch(r"[0-9a-f]{64}", record_id)
+                                or _canonical(record["payload"]) != _canonical(original)
+                                or not _same_evidence(record["queued_evidence"], payload,
+                                                      {k: job[k] for k in ("origin",) if k in job})
+                                or any(_canonical(record["resolution"].get(k)) != _canonical(v)
+                                       for k, v in resolution.items())):
+                            raise ValueError("pending resolution conflicts with current proof")
+                        # Both source identities are fenced through publication,
+                        # queue removal, and any subsequent failure-state write.
+                        with write_guard(original, *outbox_payloads(job)) as allowed:
                             with _locked_outbox():
                                 if not jp.exists() or jp.read_bytes() != snapshot:
                                     continue
@@ -626,31 +732,20 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                                     out["forgotten"] = out.get("forgotten", 0) + 1
                                     continue
                                 resolved_dir().mkdir(parents=True, exist_ok=True)
-                                # Full snapshot identity preserves distinct job
-                                # histories and reuses one record after a crash
-                                # between publication and queue removal.
-                                record_path = resolved_dir() / (hashlib.sha256(snapshot).hexdigest() + ".json")
-                                resolution = {
-                                    "kind": "legacy_comma_projection",
-                                    "episode_id": proof["episode_id"],
-                                    "original_payload_sha256": proof["original_payload_sha256"],
-                                    "queued_payload_sha256": proof["queued_payload_sha256"],
-                                }
+                                record_path = resolved_dir() / (record_id + ".json")
                                 if not record_path.exists():
-                                    _atomic_write(record_path, {
-                                        "payload": original, "queued_evidence": job,
-                                        "resolution": {
-                                            **resolution,
-                                            "resolved_at": datetime.now(timezone.utc).isoformat(),
-                                        },
-                                    })
+                                    _atomic_write(record_path, record)
                                 else:
-                                    record = json.loads(record_path.read_bytes())
-                                    saved_resolution = record.get("resolution") or {}
-                                    if (record.get("queued_evidence") != job or record.get("payload") != original
-                                            or not isinstance(saved_resolution, dict)
-                                            or any(saved_resolution.get(k) != v for k, v in resolution.items())
-                                            or not saved_resolution.get("resolved_at")):
+                                    saved = json.loads(record_path.read_bytes())
+                                    _validate_resolution(saved)
+                                    # The archived timestamp may predate this
+                                    # attempt; every evidence and proof field
+                                    # must otherwise match canonical JSON.
+                                    expected = {**record, "resolution": {
+                                        **record["resolution"],
+                                        "resolved_at": saved["resolution"]["resolved_at"],
+                                    }}
+                                    if _canonical(saved) != _canonical(expected):
                                         raise ValueError("resolution record conflicts with queued evidence")
                                 jp.unlink()
                         out["resolved"] = out.get("resolved", 0) + 1
@@ -658,10 +753,37 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                         out["failed"] += 1
                         out["registry_blocked"] = out.get("registry_blocked", 0) + 1
                         _log(f"resolution refused for {jp.name}: {exc}")
-                    except (OSError, ValueError, TypeError) as exc:
+                    except (OSError, ValueError, TypeError, KeyError) as exc:
                         out["failed"] += 1
                         out["resolution_failed"] = out.get("resolution_failed", 0) + 1
-                        _log(f"resolution retained in queue for {jp.name}: {type(exc).__name__}")
+                        job["attempts"] += 1
+                        job["last_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                        job["last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+                        job["evidence_conflict"] = True
+                        job["resolution_failure"] = True
+                        job.setdefault("resolution_evidence", record)
+                        job.setdefault("resolution_record_sha256", record_id)
+                        try:
+                            with write_guard(original, *outbox_payloads(job)) as allowed:
+                                with _locked_outbox():
+                                    if not jp.exists() or jp.read_bytes() != snapshot:
+                                        continue
+                                    if not allowed:
+                                        jp.unlink()
+                                        out["forgotten"] = out.get("forgotten", 0) + 1
+                                    elif job["attempts"] >= MAX_ATTEMPTS:
+                                        _bury(jp, job)
+                                        out["buried"] = out.get("buried", 0) + 1
+                                    else:
+                                        _atomic_write(jp, job)
+                        except RegistryError as registry_error:
+                            out["registry_blocked"] = out.get("registry_blocked", 0) + 1
+                            _log(f"resolution retry state refused for {jp.name}: {registry_error}")
+                        except (OSError, ValueError, TypeError) as state_error:
+                            out["retry_state_failed"] = out.get("retry_state_failed", 0) + 1
+                            _log(f"resolution retry state could not be saved for {jp.name}: "
+                                 f"{type(state_error).__name__}")
+                        _log(f"resolution retained for {jp.name}: {type(exc).__name__}")
                     continue
                 if stats.get("episode_inserted"):
                     try:

@@ -30,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
+from typing import Any
 
 # The scans forget runs, by the name a store gives.
 FORGET_SCANS = ("native jobs", "outbox", "legacy logs", "replica", "replica temps",
@@ -278,3 +279,37 @@ def outbox_folders() -> list[Path]:
     from khipu.outbox import dead_dir, outbox_dir, quarantine_dir, resolved_dir
 
     return [outbox_dir(), dead_dir(), quarantine_dir(), resolved_dir()]
+
+
+def outbox_payloads(envelope: Any, *, strict: bool = True) -> list[dict[str, Any]]:
+    """All identities carried by a job or resolution archive.
+
+    A resolution contains the original source and the lossy queued source;
+    failed publication retains that same record under ``resolution_evidence``.
+    Malformed nested records are never admitted by restore/replay. The lenient
+    form is only for fencing known identities before quarantining bad bytes.
+    """
+    payloads = []
+    pending = [envelope]
+    seen = set()
+    while pending:
+        value = pending.pop()
+        if not isinstance(value, dict):
+            if strict:
+                raise ValueError("outbox evidence payload is not an object")
+            continue
+        if id(value) in seen:
+            raise ValueError("outbox evidence contains a cycle")
+        seen.add(id(value))
+        if isinstance(value.get("payload"), dict):
+            payloads.append(value["payload"])
+        elif strict:
+            raise ValueError("outbox evidence payload is not an object")
+        if "resolution" in value and (not isinstance(value["resolution"], dict)
+                                      or "queued_evidence" not in value):
+            if strict:
+                raise ValueError("outbox resolution lacks queued evidence")
+        for key in ("queued_evidence", "resolution_evidence"):
+            if key in value:
+                pending.append(value[key])
+    return payloads

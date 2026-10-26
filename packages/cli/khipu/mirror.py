@@ -638,7 +638,7 @@ def _tombstone_only_line(cur, obj: dict[str, Any], settled: bool) -> bool:
     from khipu.outbox import enqueue
 
     enqueue(obj, reason="recovery: matches a tombstoned episode before history is indexed",
-            origin=None)
+            origin=None, recovery=True)
     _log("recovered line kept in the outbox: it matches a tombstone before history is indexed")
     return False
 
@@ -652,7 +652,7 @@ def _queue_conflict(obj: dict[str, Any]) -> None:
     projection proof resolves it with a durable evidence record."""
     from khipu.outbox import enqueue
 
-    enqueue(obj, reason="recovery: the legacy key holds different facts", origin=None)
+    enqueue(obj, reason="recovery: the legacy key holds different facts", origin=None, recovery=True)
     _log("recovered line kept in the outbox: its legacy key holds different facts")
 
 
@@ -685,7 +685,7 @@ def _line_deferred(cur, obj: dict[str, Any], exc: BaseException) -> bool:
     # A synced file can hold another machine's captures: the queued line
     # keeps the unknown owner a direct recovery leaves (origin NULL), never
     # the recovering caller's (third Astra review #3).
-    enqueue(obj, reason=f"recovery fact step deferred: {exc}"[:200], origin=None)
+    enqueue(obj, reason=f"recovery fact step deferred: {exc}"[:200], origin=None, recovery=True)
     _log(f"recovered line deferred to the outbox ({exc})")
     return True
 

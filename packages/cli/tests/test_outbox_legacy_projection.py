@@ -212,7 +212,7 @@ def test_transient_deferrals_stay_pending_at_retry_limit(world, monkeypatch, exc
     assert path.exists() and not outbox.dead_jobs()
 
 
-def test_failed_resolution_journal_keeps_original_queue(world, monkeypatch):
+def test_failed_resolution_journal_retains_both_evidence_and_attempt(world, monkeypatch):
     path = queue()
     before = path.read_bytes()
     atomic = outbox._atomic_write
@@ -225,7 +225,11 @@ def test_failed_resolution_journal_keeps_original_queue(world, monkeypatch):
     monkeypatch.setattr(outbox, "_atomic_write", fail_record)
     report = outbox.drain()
     assert report.get("resolution_failed") == 1, report
-    assert path.read_bytes() == before
+    retained = json.loads(path.read_bytes())
+    assert retained["payload"] == json.loads(before)["payload"]
+    assert retained["attempts"] == 1
+    assert retained["resolution_evidence"]["payload"] == ORIGINAL
+    assert retained["resolution_evidence"]["queued_evidence"] == json.loads(before)
     assert not list((outbox.outbox_dir() / "resolved").glob("*.json"))
 
 
