@@ -2265,6 +2265,13 @@ def _thaw_held(path: Path, *, auto: bool) -> bool:
             return False
         try:
             state = _retry_state(claimed)
+            if auto:
+                # Another drain may have retried and renewed this hold after
+                # held_jobs checked its age but before we won the claim.
+                age = _age(state.get("last_attempt_at"))
+                if age is not None and age < CAPTURE_HELD_COOLDOWN_S:
+                    _release(claimed)
+                    return False
             state.pop("disposition", None)
             state.pop("next_attempt_at", None)
             state["attempts"] = CAPTURE_MAX_ATTEMPTS - 1 if auto else 0
