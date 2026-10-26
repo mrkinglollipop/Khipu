@@ -3,6 +3,8 @@ import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Dialog, Tag } from "./ui";
 import { GatewayTokenCard } from "./SettingsControls";
+import { HowThisWorks } from "./HowThisWorks";
+import type { GuideId } from "./guidesModel";
 import { fmtAgo } from "./time";
 import type { Tone } from "./ui";
 
@@ -258,6 +260,46 @@ const WHERE: Record<HarnessId, string> = {
 /** Check-line marks. `ok`/`err`/`warn` are verdicts; `off` is "nothing to do
  *  here, by design" and must never read as either. */
 type Mark = "ok" | "warn" | "err" | "off";
+
+/** The short explanation behind each card's "How this works" link. */
+const HOW: Record<HarnessId, { title: string; items: Array<{ term: string; text: string }> }> = {
+  claude_code: {
+    title: "How Claude Code connects",
+    items: [
+      { term: "Install, then restart", text: "Install adds Khipu's hooks to each Claude folder. Claude Code loads them when it starts." },
+      { term: "What the checks mean", text: "'Capture hook' turns green after a real session has run it. 'Verified' is a full round trip." },
+    ],
+  },
+  codex: {
+    title: "How Codex connects",
+    items: [
+      { term: "Codex asks first", text: "After Install, Codex asks you to review the new hooks. Approve Khipu's inside Codex." },
+      { term: "What the checks mean", text: "The card turns green by itself once a session has run the hook." },
+    ],
+  },
+  cursor: {
+    title: "How Cursor connects",
+    items: [
+      { term: "Install covers the global hooks", text: "Each project also needs a memory rule so Cursor recalls at the start." },
+      { term: "What the checks mean", text: "The card turns green by itself once a session has run the hook." },
+    ],
+  },
+  aegis: {
+    title: "How Aegis connects",
+    items: [
+      { term: "A queue this Mac drains", text: "Aegis's sandbox saves through a queue, and this Mac sends it on." },
+      { term: "The gateway key", text: "Aegis reaches your gateway with the key saved on this page." },
+    ],
+  },
+  grok_bot: {
+    title: "How Grok Bot connects",
+    items: [
+      { term: "Nothing is installed on this Mac", text: "Grok Bot runs in Cursor's cloud. You connect it in Cursor's website, with your gateway address and a secret key." },
+      { term: "What the checks mean", text: "'Gateway answered this Mac' means your gateway is up and accepts your key. It doesn't prove Grok Bot itself got through." },
+      { term: "Saving is up to Grok Bot", text: "There's no automatic saving in the cloud. Grok Bot saves when it calls the memory tool." },
+    ],
+  },
+};
 
 function CheckMark({ mark }: { mark: Mark }) {
   const cls = `ck ${mark}`;
@@ -666,6 +708,7 @@ export function IntegrationsPanel({
   t3 = null,
   refreshHealth,
   onSearchT3Captures = () => {},
+  onOpenGuide = () => {},
   onAnotherMac,
 }: {
   runKhipu: (args: string[]) => Promise<string>;
@@ -683,6 +726,8 @@ export function IntegrationsPanel({
   refreshHealth: () => Promise<string | null | void> | void;
   /** Opens Recall with the exact `via:t3` origin filter applied. */
   onSearchT3Captures?: () => void;
+  /** Opens a setup guide in Guides (Grok Bot opens at its first open step). */
+  onOpenGuide?: (id: GuideId) => void;
   onAnotherMac: () => void;
 }) {
   const [rows, setRows] = useState<StatusRow[] | null>(null);
@@ -1269,8 +1314,8 @@ export function IntegrationsPanel({
                 </div>
               ) : r.harness === "grok_bot" ? (
                 <div className="note wrap" title={WHERE[r.harness]}>
-                  One install per repo Grok Bot works in; the token lives in Cursor
-                  cloud secrets, never in the repo.
+                  Nothing is installed on this Mac. You connect Grok Bot once in
+                  Cursor's website, with your gateway address and a secret key.
                 </div>
               ) : !r.detected ? (
                 <div className="note">Config folder not found — nothing to install.</div>
@@ -1287,10 +1332,15 @@ export function IntegrationsPanel({
               <div className="hacts">
                 {r.detected ? (
                   <>
+                    {r.harness === "grok_bot" ? (
+                      <button type="button" className="primary sm" onClick={() => onOpenGuide("grok_bot")}>
+                        Set up…
+                      </button>
+                    ) : (
                     <button
                       type="button"
                       className={notRecording || !installed ? "primary sm" : "sm"}
-                      disabled={busy != null || r.harness === "grok_bot"}
+                      disabled={busy != null}
                       onClick={() => void act(r.harness, "install")}
                     >
                       {busy === `install:${r.harness}` ? (
@@ -1302,6 +1352,7 @@ export function IntegrationsPanel({
                           ? "Reinstall hook"
                           : "Reinstall"}
                     </button>
+                    )}
                     <button
                       type="button"
                       className="sm"
@@ -1311,7 +1362,7 @@ export function IntegrationsPanel({
                       {busy === `verify:${r.harness}` ? (
                         <Loader2 size={14} className="spin" aria-hidden />
                       ) : null}
-                      {r.harness === "grok_bot" ? "Probe gateway" : "Verify"}
+                      {r.harness === "grok_bot" ? "Check the gateway" : "Verify"}
                     </button>
                     {homes.length > 0 ? null : (
                       <button
@@ -1334,6 +1385,13 @@ export function IntegrationsPanel({
                 ) : (
                   <span className="meta">Nothing to install here.</span>
                 )}
+              </div>
+              <div className="gd-how-row">
+                <HowThisWorks
+                  title={HOW[r.harness].title}
+                  items={HOW[r.harness].items}
+                  onOpenGuide={() => onOpenGuide(r.harness)}
+                />
               </div>
             </div>
           );
