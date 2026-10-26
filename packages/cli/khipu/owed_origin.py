@@ -92,24 +92,27 @@ def _fingerprint(row):
 
 
 def preview(cur, project=None):
-    items, kinds, projects, unestablished = [], {}, {}, 0
-    for row in _rows(cur, project):
-        opened = co._as_utc(row.get("opened_at"))
-        floor = co._as_utc(row.get("ownership_floor"))
-        if not opened or not floor or opened < floor:
-            unestablished += 1
-        after = _proposal(row)
-        if after is None:
-            continue
-        kind, name = row["kind"], row.get("project") or ""
-        kinds[kind] = kinds.get(kind, 0) + 1
-        projects[name] = projects.get(name, 0) + 1
-        items.append({"id": row["id"], "project": row.get("project"), "kind": kind,
-                      "text": row["text"], "after": after, "fingerprint": _fingerprint(row)})
-    return {"format": "khipu-job-origin-preview", "version": 1,
-            "counts": {"total": len(items), "by_kind": kinds, "by_project": projects},
-            "quarantined": {"ownership_unestablished": unestablished},
-            "sample": items[:20], "items": items}
+    from khipu.config import read_only_config
+
+    with read_only_config():
+        items, kinds, projects, unestablished = [], {}, {}, 0
+        for row in _rows(cur, project):
+            opened = co._as_utc(row.get("opened_at"))
+            floor = co._as_utc(row.get("ownership_floor"))
+            if not opened or not floor or opened < floor:
+                unestablished += 1
+            after = _proposal(row)
+            if after is None:
+                continue
+            kind, name = row["kind"], row.get("project") or ""
+            kinds[kind] = kinds.get(kind, 0) + 1
+            projects[name] = projects.get(name, 0) + 1
+            items.append({"id": row["id"], "project": row.get("project"), "kind": kind,
+                          "text": row["text"], "after": after, "fingerprint": _fingerprint(row)})
+        return {"format": "khipu-job-origin-preview", "version": 1,
+                "counts": {"total": len(items), "by_kind": kinds, "by_project": projects},
+                "quarantined": {"ownership_unestablished": unestablished},
+                "sample": items[:20], "items": items}
 
 
 def _confirm(cur, request_id, gate):

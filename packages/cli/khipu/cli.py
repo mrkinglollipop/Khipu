@@ -38,10 +38,11 @@ def _memory_root_default() -> str | None:
     so a fresh install (no legacy file wiki) gets None rather than a path that
     exists only on the machine this was first written on.
     """
-    from khipu.config import path_setting
+    from khipu.config import path_setting, read_only_config
 
-    v = path_setting("memory_root")
-    return str(v) if v else None
+    with read_only_config():
+        v = path_setting("memory_root")
+        return str(v) if v else None
 
 
 def _require_memory_root(args: argparse.Namespace) -> Path | None:
