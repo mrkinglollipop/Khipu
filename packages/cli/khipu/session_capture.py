@@ -839,29 +839,48 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         parsed.extend((d, role, text, min(line_end, end)) for role, text in _parse_line(d))
     # Deduplicate only paired representations of the same turn (adjacent in
     # order, ignoring tools), never a later repeat that reuses the same text.
+    # Index event_msg turns by (role, text, turn-ordinal) so matching is O(n).
     def _turn_role(role: str) -> str | None:
         bare = role[6:] if role.startswith("codex:") else role
         return bare if bare in ("user", "assistant") else None
 
+    turn_ord: list[int | None] = [None] * len(parsed)
+    n_turns = 0
+    for i, (_, role, _, _) in enumerate(parsed):
+        if _turn_role(role) is not None:
+            turn_ord[i] = n_turns
+            n_turns += 1
+    event_at: dict[tuple[str, str, int], list[int]] = {}
+    for j, (d2, role2, text2, _) in enumerate(parsed):
+        if d2.get("type") != "event_msg" or turn_ord[j] is None:
+            continue
+        tr = _turn_role(role2)
+        if tr is None:
+            continue
+        event_at.setdefault((tr, text2.strip(), turn_ord[j]), []).append(j)
     drop_idx: set[int] = set()
     used_event: set[int] = set()
     for i, (d, role, text, _) in enumerate(parsed):
-        if not role.startswith("codex:"):
+        if not role.startswith("codex:") or turn_ord[i] is None:
             continue
-        key = (_turn_role(role), text.strip())
-        if key[0] is None:
+        key_role = _turn_role(role)
+        if key_role is None:
             continue
-        for j, (d2, role2, text2, _) in enumerate(parsed):
-            if j in used_event or d2.get("type") != "event_msg":
-                continue
-            if (_turn_role(role2), text2.strip()) != key:
-                continue
-            lo, hi = (i, j) if i < j else (j, i)
-            if any(_turn_role(parsed[k][1]) for k in range(lo + 1, hi)):
-                continue
+        text_key = text.strip()
+        o = turn_ord[i]
+        if o is None:
+            continue
+        match: int | None = None
+        for adj in (o - 1, o + 1):
+            for j in event_at.get((key_role, text_key, adj), ()):
+                if j not in used_event:
+                    match = j
+                    break
+            if match is not None:
+                break
+        if match is not None:
             drop_idx.add(i)
-            used_event.add(j)
-            break
+            used_event.add(match)
     items: list[tuple[dict, str, str, int]] = []
     for i, (d, role, text, line_end) in enumerate(parsed):
         if i in drop_idx:
@@ -953,6 +972,19 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     return msgs, end, users
 
 
+def _prefix_tail_digest(path: Path, offset: int, n: int = 4096) -> str | None:
+    """Cheap sentinel for the bytes just before ``offset`` (same-inode rewrites)."""
+    if offset <= 0:
+        return None
+    n = min(n, offset)
+    try:
+        with path.open("rb") as f:
+            f.seek(offset - n)
+            return hashlib.sha256(f.read(n)).hexdigest()
+    except OSError:
+        return None
+
+
 def _reset_transcript_offset(st: dict, path: Path) -> None:
     """Byte offsets belong to a particular file, unlike text fingerprints."""
     info = path.stat()
@@ -967,14 +999,22 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
         prior: dict = {}
         read_window(path, 0, stats=prior, end_offset=int(st["offset"]))
         st["transcript_prefix"] = prior.get("prefix")
+        st["transcript_prefix_tail"] = _prefix_tail_digest(path, int(st["offset"]))
     # Same inode, same path, larger file: an in-place rewrite keeps the old
     # offset but the bytes before it are new. Prefix mismatch → start over.
+    # Gate the full re-parse on a cheap tail digest; append-only growth leaves
+    # the head bytes unchanged.
     if (not reset and st.get("transcript_prefix") and int(st.get("offset", 0)) > 0
             and st.get("transcript_identity") == identity):
-        prior = {}
-        read_window(path, 0, stats=prior, end_offset=int(st["offset"]))
-        if prior.get("prefix") != st.get("transcript_prefix"):
-            reset = True
+        offset = int(st["offset"])
+        tail = _prefix_tail_digest(path, offset)
+        if tail is None or tail != st.get("transcript_prefix_tail"):
+            prior = {}
+            read_window(path, 0, stats=prior, end_offset=offset)
+            if prior.get("prefix") != st.get("transcript_prefix"):
+                reset = True
+            elif tail is not None:
+                st["transcript_prefix_tail"] = tail
     if reset:
         # A reset can reuse an earlier 0:N range. Namespace every later window
         # by this file generation so fresh text is not an exact-window replay.
@@ -986,6 +1026,7 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
         st["offset"] = 0
         if st.get("transcript_prefix"):
             st["replay_prefix"] = st.pop("transcript_prefix")
+        st.pop("transcript_prefix_tail", None)
         st.pop("carry", None)
         st.pop("sweep_checked_mtime", None)
     st["transcript_identity"] = identity

@@ -1,9 +1,11 @@
 """Capture leads (Grok triage 2026-10-26). Confirmed regressions only."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +17,33 @@ def _write(path: Path, rows: list) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
     return path
+
+
+def _tail_digest(path: Path, offset: int, n: int = 4096) -> str:
+    n = min(n, offset)
+    with path.open("rb") as f:
+        f.seek(offset - n)
+        return hashlib.sha256(f.read(n)).hexdigest()
+
+
+def _response_user(text: str) -> dict:
+    return {"type": "response_item", "payload": {
+        "type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": text}]}}
+
+
+def _response_assistant(text: str) -> dict:
+    return {"type": "response_item", "payload": {
+        "type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": text}]}}
+
+
+def _event_user(text: str) -> dict:
+    return {"type": "event_msg", "payload": {"type": "user_message", "message": text}}
+
+
+def _event_assistant(text: str) -> dict:
+    return {"type": "event_msg", "payload": {"type": "agent_message", "message": text}}
 
 
 class RewriteSameInodeTest(unittest.TestCase):
@@ -34,6 +63,7 @@ class RewriteSameInodeTest(unittest.TestCase):
             prior: dict = {}
             sc.read_window(p, 0, stats=prior, end_offset=offset)
             st["transcript_prefix"] = prior.get("prefix")
+            st["transcript_prefix_tail"] = _tail_digest(p, offset)
             with p.open("w") as f:  # same inode, truncated and rewritten, larger than the offset
                 for i in range(200, 330):
                     f.write(json.dumps(line(i)) + "\n")
@@ -42,6 +72,30 @@ class RewriteSameInodeTest(unittest.TestCase):
             sc._reset_transcript_offset(st, p)
             self.assertEqual(st["offset"], 0, "rewritten head (before old offset) will never be read")
 
+    def test_unchanged_head_skips_full_prefix_reread(self):
+        """P2: append-only growth must not re-parse the whole captured prefix."""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "t.jsonl"
+            line = lambda i: {"type": "user", "message": {"role": "user", "content": f"turn {i} " + "a" * 60}}
+            _write(p, [line(i) for i in range(40)])
+            offset = p.stat().st_size
+            info = p.stat()
+            prior: dict = {}
+            sc.read_window(p, 0, stats=prior, end_offset=offset)
+            st = {
+                "transcript_path": str(p),
+                "transcript_identity": [info.st_dev, info.st_ino],
+                "offset": offset,
+                "transcript_prefix": prior.get("prefix"),
+                "transcript_prefix_tail": _tail_digest(p, offset),
+            }
+            with p.open("a") as f:
+                f.write(json.dumps(line(99)) + "\n")
+            with mock.patch.object(sc, "read_window", wraps=sc.read_window) as rw:
+                sc._reset_transcript_offset(st, p)
+            self.assertEqual(st["offset"], offset)
+            self.assertEqual(rw.call_count, 0, "unchanged head must not re-parse the prefix")
+
 
 class CodexMixedRepeatTest(unittest.TestCase):
     """A later response_item with the same text as an earlier event_msg is kept."""
@@ -49,16 +103,42 @@ class CodexMixedRepeatTest(unittest.TestCase):
     def test_repeated_user_text_in_mixed_file_is_kept(self):
         with tempfile.TemporaryDirectory() as td:
             tp = _write(Path(td) / "r.jsonl", [
-                {"type": "event_msg", "payload": {"type": "user_message", "message": "ship the capture fix today"}},
-                {"type": "event_msg", "payload": {"type": "agent_message", "message": "done"}},
-                {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [
-                    {"type": "input_text", "text": "ship the capture fix today"}]}},
-                {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [
-                    {"type": "output_text", "text": "done again"}]}},
+                _event_user("ship the capture fix today"),
+                _event_assistant("done"),
+                _response_user("ship the capture fix today"),
+                _response_assistant("done again"),
             ])
             msgs, _, _ = sc.read_window(tp, 0)
             self.assertEqual([m for m in msgs if m[0] == "user"],
                              [("user", "ship the capture fix today")] * 2, msgs)
+
+    def test_unpaired_response_beside_a_pair_is_kept(self):
+        """P3: response-only turn next to a real event/response pair stays."""
+        with tempfile.TemporaryDirectory() as td:
+            tp = _write(Path(td) / "r.jsonl", [
+                _event_user("paired"),
+                _response_user("paired"),
+                _response_assistant("ack"),
+                _response_user("solo later"),
+                _response_assistant("solo ack"),
+            ])
+            msgs, _, _ = sc.read_window(tp, 0)
+            users = [m for m in msgs if m[0] == "user"]
+            self.assertEqual(users, [("user", "paired"), ("user", "solo later")], msgs)
+
+    def test_long_response_only_window_stays_linear(self):
+        """P1: response_item-only Codex windows must not be quadratic."""
+        with tempfile.TemporaryDirectory() as td:
+            rows = []
+            for i in range(2000):
+                rows.append(_response_user(f"user turn {i} " + "x" * 40))
+                rows.append(_response_assistant(f"assistant turn {i} " + "y" * 40))
+            tp = _write(Path(td) / "long.jsonl", rows)
+            t0 = time.perf_counter()
+            msgs, _, _ = sc.read_window(tp, 0)
+            elapsed = time.perf_counter() - t0
+            self.assertEqual(len(msgs), 4000)
+            self.assertLess(elapsed, 1.5, f"read_window took {elapsed:.2f}s on 4000 response_item lines")
 
 
 class SubagentLineageTest(unittest.TestCase):
