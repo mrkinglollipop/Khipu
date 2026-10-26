@@ -67,13 +67,26 @@ def resolve_dsn() -> str:
     path = Path(_env("KHIPU_DSN_FILE", "ALZY_DSN_FILE") or str(configured))
     if path.is_file():
         return path.read_text(encoding="utf-8").strip()
-    if LEGACY_DSN_FILE.is_file():
+    if LEGACY_DSN_FILE.is_file() and not _explicit_dsn_location():
         return LEGACY_DSN_FILE.read_text(encoding="utf-8").strip()
     raise RuntimeError(
         "No Khipu DSN. Set KHIPU_DATABASE_URL, store in Keychain "
         "(pipe it to `khipu secrets --set database_url`), or create "
         f"{path} (chmod 600). See packages/cli/README.md"
     )
+
+
+def _explicit_dsn_location() -> bool:
+    """Whether KHIPU_DATA_DIR or KHIPU_DSN_FILE names where the DSN lives: then
+    a missing file there means no DSN, never the old ~/.config/alzy one."""
+    if _env("KHIPU_DSN_FILE", "ALZY_DSN_FILE"):
+        return True
+    try:
+        from khipu.paths import _env_override
+
+        return _env_override() is not None
+    except Exception:
+        return False
 
 
 def conninfo_with_local_root_cert(dsn: str) -> str:

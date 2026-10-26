@@ -846,7 +846,13 @@ def _import_local(*, source: Path, merge: bool) -> dict:
             if registry is not None:
                 tombstones.merge_registry_bytes(registry.read_bytes())
             with tombstones.write_gate() as gate:
-                for scrub, staged, _dest, rel in candidates:
+                for scrub, staged, dest, rel in candidates:
+                    if rel in SENSITIVE_FILENAMES and dest.exists():
+                        # A backup may bring credentials to a Mac that has
+                        # none, never swap this Mac's hub or gateway for its own.
+                        not_restored.append({"path": rel, "why": (
+                            "this Mac already has its own; a restore never replaces credentials")})
+                        continue
                     if scrub == "job":
                         refusal = _job_refusal(staged.read_bytes(), gate)
                         if refusal == "forgotten":

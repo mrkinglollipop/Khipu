@@ -4045,7 +4045,7 @@ def cmd_db(args: argparse.Namespace) -> int:
     """khipu db preflight|connect|move|status — the setup pipeline's CLI face
     (see docs/plans/2026-09-05-setup-that-cannot-strand-you.md). Every
     subcommand prints JSON and never the password."""
-    from khipu.setup import connect_database, host_kind, mask_dsn
+    from khipu.setup import connect_database, host_kind, mask_dsn, redact_dsn_text
 
     def _missing_dsn(flag: str, env_name: str) -> int:
         print(
@@ -4134,7 +4134,7 @@ def cmd_db(args: argparse.Namespace) -> int:
                     out["topics"] = cur.fetchone()[0]
         except Exception as exc:  # noqa: BLE001
             out["ok"] = False
-            out["error"] = f"{type(exc).__name__}: {exc}"
+            out["error"] = f"{type(exc).__name__}: {redact_dsn_text(str(exc), dsn)}"
         print(json.dumps(out, indent=2))
         return 0 if out.get("ok") else 1
 
