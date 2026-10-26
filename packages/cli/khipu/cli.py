@@ -2108,7 +2108,13 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
               JOIN edges e ON e.src = w.node_id OR e.dst = w.node_id
               WHERE w.hops < %(max_hops)s
             )
-            SELECT node_id, via, type, hops FROM walk
+            SELECT node_id, via, type, hops FROM (
+              SELECT DISTINCT ON (node_id)
+                node_id, via, type, hops
+              FROM walk
+              WHERE NOT (node_id = ANY(%(ids)s))
+              ORDER BY node_id, hops ASC
+            ) d
             ORDER BY hops ASC, node_id ASC
             LIMIT %(lim)s
             """,
