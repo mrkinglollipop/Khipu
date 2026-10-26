@@ -644,6 +644,28 @@ class EmbedRecentMissingBatchIsolationTest(unittest.TestCase):
             out = em.embed_recent_missing(limit=5)
         self.assertIsInstance(out, dict)
 
+    def test_stop_hook_catchup_stops_on_network_error_after_retries(self):
+        """An outage after retries must end the pass — not burn daily budget
+        across every remaining commitment (5× retries × N refs)."""
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def _embed(api, profile=None, **kw):
+            calls["n"] += 1
+            raise RuntimeError("embed network error after 4 retries: URLError: timed out")
+
+        cur = _CatchupCursor([(1, "one"), (2, "two"), (3, "three")])
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch", side_effect=_embed):
+            with self.assertRaises(RuntimeError) as ctx:
+                em.embed_recent_missing(limit=10)
+        self.assertIn("network error after", str(ctx.exception))
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(cur.inserts, [])
+
 
 class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
     """fix 5c: the hook's bounded embed catch-up (embed_recent_missing) also

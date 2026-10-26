@@ -483,7 +483,7 @@ class ScanTest(_Base):
             with self.assertRaises(library.LibraryError) as ctx:
                 library.scan(self.hub, "lib1")
         rollback.assert_called_once()
-        self.assertIn("30 embedded documents would be rebuilt out of 30", str(ctx.exception))
+        self.assertIn("30 embedded documents would be rebuilt or removed out of 30", str(ctx.exception))
         self.assertIn("vectors would be deleted", str(ctx.exception))
         self.assertIn("nothing was changed", str(ctx.exception))
         self.assertIn("khipu library scan lib1 --allow-rebuild", str(ctx.exception))
@@ -519,6 +519,31 @@ class ScanTest(_Base):
             self.hub.chunks[key] = ("broken", "bad")
         with self.assertRaisesRegex(library.LibraryError, "31 embedded documents.*300"):
             library.scan(self.hub, "lib1")
+
+    def test_gone_plus_rebuild_share_one_mass_vector_loss_limit(self):
+        """99 renamed + 99 content-changed must not slip past two separate 10% gates."""
+        n = 1000
+        for i in range(n):
+            self.write(f"keep/doc{i:04}.txt", f"text {i}")
+        library.scan(self.hub, "lib1")
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[(TINY.id, doc, idx)] = ("[1,0,0,0]", digest)
+        for i in range(99):
+            old = self.root / f"keep/doc{i:04}.txt"
+            new = self.root / f"moved/doc{i:04}.txt"
+            new.parent.mkdir(exist_ok=True)
+            old.rename(new)
+        for i in range(99, 198):
+            self.write(f"keep/doc{i:04}.txt", f"changed {i}")
+        before = copy.deepcopy((self.hub.docs, self.hub.chunks, self.hub.embs))
+        with mock.patch.object(self.hub, "rollback") as rollback:
+            with self.assertRaises(library.LibraryError) as ctx:
+                library.scan(self.hub, "lib1")
+        rollback.assert_called_once()
+        msg = str(ctx.exception)
+        self.assertIn("198 embedded documents", msg)
+        self.assertIn("--allow-rebuild", msg)
+        self.assertEqual((self.hub.docs, self.hub.chunks, self.hub.embs), before)
 
     def test_file_unreadable_between_scan_phases_is_skipped_without_deletion(self):
         path = self.write("existing.txt", "old text")

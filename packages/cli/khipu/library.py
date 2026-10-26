@@ -568,14 +568,6 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
             if prior and prior[0] in embedded_ids:
                 rebuild_embedded += 1
         embedded_docs = len(embedded_ids)
-        if (not allow_rebuild and rebuild_embedded > max(
-                MASS_REBUILD_MIN_DOCS, MASS_REBUILD_MAX_FRACTION * embedded_docs)):
-            conn.rollback()
-            raise LibraryError(
-                f"{rebuild_embedded} embedded documents would be rebuilt out of {embedded_docs}; "
-                "their vectors would be deleted; nothing was changed. "
-                f"Run `khipu library scan {name} --allow-rebuild` to proceed"
-            )
         walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
         gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
         if gone and not seen:
@@ -586,11 +578,13 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
                 "folder was emptied on purpose)"
             )
         gone_embedded = sum(1 for doc_id in gone if doc_id in embedded_ids)
-        if (not allow_rebuild and gone_embedded > max(
+        vector_loss = rebuild_embedded + gone_embedded
+        if (not allow_rebuild and vector_loss > max(
                 MASS_REBUILD_MIN_DOCS, MASS_REBUILD_MAX_FRACTION * embedded_docs)):
             conn.rollback()
             raise LibraryError(
-                f"{gone_embedded} embedded documents would be removed out of {embedded_docs}; "
+                f"{vector_loss} embedded documents would be rebuilt or removed "
+                f"out of {embedded_docs}; "
                 "their vectors would be deleted; nothing was changed. "
                 f"Run `khipu library scan {name} --allow-rebuild` to proceed"
             )

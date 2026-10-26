@@ -98,15 +98,36 @@ class ValidateSpecTest(unittest.TestCase):
             self.ok(endpoint="https://example.com")
 
     def test_voyage_profile_with_a_width_the_model_cannot_return_is_refused(self):
-        """voyage-3 is fixed-width (1024); a 768 profile would pay then discard."""
-        with self.assertRaises(ValueError):
-            profiles.validate_spec(
-                "voyage-3@768", provider="voyage", model="voyage-3", dim=768)
+        """voyage-3 is fixed-width (1024); a 768 profile would pay then discard.
+        Width is gated on add, not validate_spec (existing active profiles must load)."""
+        spec = profiles.validate_spec(
+            "voyage-3@768", provider="voyage", model="voyage-3", dim=768)
+        with self.assertRaises(ValueError) as ctx:
+            profiles.add_profile(FakeCur(), spec)
+        self.assertIn("1024", str(ctx.exception))
+
+    def test_voyage_lite_native_512_is_accepted_and_wrong_1024_is_refused_on_add(self):
+        """voyage-3-lite returns 512 natively; @1024 would pay then discard."""
+        ok = profiles.validate_spec(
+            "voyage-3-lite@512", provider="voyage", model="voyage-3-lite", dim=512)
+        self.assertEqual(ok.dim, 512)
+        self.assertTrue(profiles.add_profile(FakeCur(), ok)["created"])
+        wrong = profiles.validate_spec(
+            "voyage-3-lite@1024", provider="voyage", model="voyage-3-lite", dim=1024)
+        with self.assertRaises(ValueError) as ctx:
+            profiles.add_profile(FakeCur(), wrong)
+        self.assertIn("512", str(ctx.exception))
+
+    def test_voyage_code_2_native_1536_is_accepted_on_add(self):
+        spec = profiles.validate_spec(
+            "voyage-code-2@1536", provider="voyage", model="voyage-code-2", dim=1536)
+        self.assertTrue(profiles.add_profile(FakeCur(), spec)["created"])
 
     def test_voyage_flex_model_may_use_a_non_default_width(self):
         spec = profiles.validate_spec(
             "voyage-3.5@512", provider="voyage", model="voyage-3.5", dim=512)
         self.assertEqual(spec.dim, 512)
+        self.assertTrue(profiles.add_profile(FakeCur(), spec)["created"])
 
 
 class EndpointTest(unittest.TestCase):

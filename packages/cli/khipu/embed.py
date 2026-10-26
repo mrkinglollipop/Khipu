@@ -3683,7 +3683,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 try:
                     vecs = embed_batch(api, profile=profile)
                 except RuntimeError as exc:
-                    if "budget exhausted" in str(exc):
+                    msg = str(exc)
+                    if "budget exhausted" in msg or "network error after" in msg:
                         raise
                     # One batch the provider rejects must not abort commitments
                     # or topics; those refs stay missing for the next run.
@@ -3771,7 +3772,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 try:
                     vecs = embed_batch(api, profile=profile)
                 except RuntimeError as exc:
-                    if "budget exhausted" in str(exc):
+                    msg = str(exc)
+                    if "budget exhausted" in msg or "network error after" in msg:
                         raise
                     _log(f"commitment embed catch-up: {cid}: {type(exc).__name__}: {exc}")
                     continue
