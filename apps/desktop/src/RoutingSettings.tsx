@@ -28,6 +28,7 @@ import type { FeaturesShape } from "./settingsCli";
 import { PlanBlock, RefreshButton, UsageAccountsField, planPauses, planStatus } from "./PlansCard";
 import type { PlanUsageState, UsageAccount, UsageReport } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
+import { RoutingDetailSheet, useDetailHost } from "./AccountDetail";
 import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import { paceModel } from "./routingPace";
@@ -1195,6 +1196,7 @@ function AccountLine({
   const st = accountState(a, now);
   const fact = data.plan_facts?.[a.key];
   const { week, pace } = a.configured !== false ? accountWeek(fact, now, plan, staleAfterS) : { week: null, pace: null };
+  const detail = useDetailHost<true>();
   return (
     <div role="listitem">
       <div className="fold route-aline" data-open={open}>
@@ -1231,6 +1233,13 @@ function AccountLine({
             suppressResetReadFailure={suppressResetReadFailure}>
             {plan ? <PlanBlock row={plan} now={now} pause={pause} onSignedIn={onSignedIn} /> : null}
           </AccountRow>
+          <button type="button" className="sm" aria-haspopup="dialog" aria-label={`See routing details for ${a.label}`}
+            onClick={() => detail.open(true)}>
+            See routing details
+          </button>
+          {detail.target ? (
+            <RoutingDetailSheet account={a} view={data} plans={plan} now={now} onClose={detail.close} />
+          ) : null}
         </div>
       </div>
     </div>

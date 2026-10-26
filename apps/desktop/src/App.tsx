@@ -44,11 +44,12 @@ import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { buildAttention, harnessLabel, promotionAttention, routingAttention, type Attention } from "./doctorAttention";
-import { HealthReportRows } from "./healthRows";
+import { HealthReportRows, TILE_HEALTH_KEYS, healthKeysForAttention } from "./healthRows";
 import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
 import { KeysCard } from "./KeysCard";
 import { PlansCard, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
+import { toastWords } from "./humanWords";
 import { RoutingSettings } from "./RoutingSettings";
 import { WorkSettings } from "./WorkSettings";
 import { useRouting } from "./routing";
@@ -1030,9 +1031,7 @@ function ReadFailed({ what, onRetry }: { what: string; onRetry: () => void }) {
 /** A Python traceback in a toast is its last non-empty line (the exception);
  *  the full text stays in the toast's title. */
 function toastLine(text: string): string {
-  if (!text.includes("Traceback (most recent call last)")) return text;
-  const lines = text.split("\n").filter((l) => l.trim() !== "");
-  return (lines[lines.length - 1] ?? text).trim();
+  return toastWords(text);
 }
 
 type Tone = "ok" | "warn" | "err" | "neutral";
@@ -1539,6 +1538,30 @@ export default function App() {
   // Bumped by an attention item with no fix action, and by "Details": opens
   // Home's one disclosure instead of dead-ending.
   const [homeAdvancedKey, setHomeAdvancedKey] = useState(0);
+  // The health rows a tile or callout was opened for: opens the disclosure,
+  // scrolls to the first row it names and marks them for a few seconds.
+  const [healthFocus, setHealthFocus] = useState<{ keys: readonly string[]; n: number } | null>(null);
+  const openHealth = useCallback((keys: readonly string[]) => {
+    setHomeAdvancedKey((k) => k + 1);
+    setHealthFocus((f) => ({ keys, n: (f?.n ?? 0) + 1 }));
+  }, []);
+  useEffect(() => {
+    if (!healthFocus) return;
+    let marked: Element[] = [];
+    const frame = requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        marked = healthFocus.keys.flatMap((k) => Array.from(document.querySelectorAll(`[data-health-key="${k}"]`)));
+        marked.forEach((el) => el.classList.add("health-hl"));
+        marked[0]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+      }),
+    );
+    const done = window.setTimeout(() => marked.forEach((el) => el.classList.remove("health-hl")), 4000);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.clearTimeout(done);
+      marked.forEach((el) => el.classList.remove("health-hl"));
+    };
+  }, [healthFocus]);
   const [owedFetchedAt, setOwedFetchedAt] = useState<Partial<Record<OwedStatus, number>>>({});
   const [nodeId, setNodeId] = useState("");
   const [hops, setHops] = useState(1);
@@ -4159,7 +4182,7 @@ export default function App() {
                       <button
                         type="button"
                         className="sm"
-                        onClick={() => setHomeAdvancedKey((k) => k + 1)}
+                        onClick={() => openHealth(healthKeysForAttention(a.key))}
                       >
                         Details
                       </button>
@@ -4223,7 +4246,15 @@ export default function App() {
               }}
             />
 
-            <RoutingCard state={routing} plans={plans.data} />
+            <RoutingCard
+              state={routing}
+              plans={plans.data}
+              onOpenAccounts={() => {
+                setSettingsSection("routing");
+                setTab("settings");
+                revealSettingsGroup("accounts");
+              }}
+            />
 
             <div className="tiles">
               <Tile
@@ -4241,12 +4272,16 @@ export default function App() {
                     : undefined
                 }
                 tone={dbReachable === false ? "err" : "neutral"}
+                onOpen={() => openHealth(TILE_HEALTH_KEYS.database)}
+                openLabel="Database: show its health checks"
               />
               <Tile
                 label="Recording"
                 value={recordingValue}
                 sub={recordingSub}
                 tone={harnessRed.length > 0 ? "err" : "neutral"}
+                onOpen={() => openHealth(TILE_HEALTH_KEYS.recording)}
+                openLabel="Recording: show its health checks"
               />
               <Tile
                 label="Search index"
@@ -4265,6 +4300,8 @@ export default function App() {
                     : undefined
                 }
                 tone={coverage && (coverage.missing > 0 || coverage.stale > 0) ? "warn" : "neutral"}
+                onOpen={() => openHealth(TILE_HEALTH_KEYS.search)}
+                openLabel="Search index: show its health checks"
               />
               <Tile
                 label="Backups"
@@ -4277,6 +4314,8 @@ export default function App() {
                 }
                 sub={backupSub || undefined}
                 tone={backupHealth?.ok === false ? "err" : "neutral"}
+                onOpen={() => openHealth(TILE_HEALTH_KEYS.backups)}
+                openLabel="Backups: show its health checks"
               />
             </div>
 
@@ -4366,9 +4405,6 @@ export default function App() {
                         </ListRow>
                       );
                     })}
-                    <ListRow>
-                      <span className="meta">Ages are counted from when this Mac read the list.</span>
-                    </ListRow>
                   </>
                 )}
               </div>

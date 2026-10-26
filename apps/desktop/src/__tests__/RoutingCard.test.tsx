@@ -146,7 +146,7 @@ describe("Home Routing card, the main mock", () => {
     const data = mainView();
     data.rules = [{ n: 1, text: "Keep deployment work local.", pending: true, pending_kind: "added", confirmed: false }];
     render(<RoutingCard state={stateOf(data)} plans={PLANS} />);
-    expect(screen.getByText(/1 standing rule, shown first to every conversation/)).toHaveTextContent("1 not confirmed yet");
+    expect(screen.getByText(/1 standing rule/)).toHaveTextContent("1 not confirmed yet");
   });
 
   it("shows each account in the Plans order with its state, who said so and when", () => {
@@ -163,7 +163,7 @@ describe("Home Routing card, the main mock", () => {
     expect(rowFor("Claude second")).toHaveTextContent(
       "From Claude's own message, seen by your Project A job runner 27 min ago");
     expect(rowFor("Codex")).toHaveTextContent("Open");
-    expect(rowFor("Codex")).toHaveTextContent("Read from Codex 4 min ago · 58% of its week used");
+    expect(rowFor("Codex")).toHaveTextContent("Read from Codex 4 min ago · 42% of its week left");
     expect(rowFor("Grok Build")).toHaveTextContent("Paused by you until Fri 9:00 AM");
     expect(rowFor("Grok Build")).toHaveTextContent("Set by you yesterday at 6:05 PM");
     // A conversation's report is a guess, and Muse can't be checked.
@@ -213,10 +213,10 @@ describe("Home Routing card, the main mock", () => {
     expect(screen.getByText(/Oct 13, shown word for word after your rules/)).toBeInTheDocument();
     expect(screen.getByText("“We don't need cursor. Just grok. Secondary account for Claude too until that's canceled.”"))
       .toBeInTheDocument();
-    const summary = screen.getByText(/7 standing rules, shown first to every conversation/);
+    const summary = screen.getByText(/7 standing rules/);
     expect(summary.closest("details")).not.toHaveAttribute("open");
     expect(summary).toHaveTextContent("6 not confirmed yet");
-    expect(screen.getByText("Khipu reports this; your agents decide where work goes.")).toBeInTheDocument();
+    expect(screen.queryByText("Khipu reports this; your agents decide where work goes.")).toBeNull();
   });
 
   it("pairs Plans rows with accounts by key, never by a reused name (review P2)", () => {

@@ -7,6 +7,8 @@
    Routing. Khipu reports this; agents decide where work goes. */
 
 import { useId, useState } from "react";
+import { ChevronRight } from "lucide-react";
+import { useRoutingDetail } from "./AccountDetail";
 import { Disclosure, EmptyState, ListRow, Tag } from "./ui";
 import type { UsageReport } from "./PlansCard";
 import { tightestWindow } from "./PlansCard";
@@ -21,7 +23,6 @@ import {
   modelDisagreementWords,
   holdWords,
   notRefreshedWords,
-  priorityHeadline,
   priorityPendingWords,
   whenLocal,
   windowWords,
@@ -60,7 +61,7 @@ function AccountRow({
   a,
   now,
   plans,
-  reportDefault, onCheck, checking, checkResult,
+  reportDefault, onCheck, checking, checkResult, onOpen,
 }: {
   a: RouteAccount;
   now: Date;
@@ -69,6 +70,7 @@ function AccountRow({
   onCheck: (key: string) => void;
   checking: string | null;
   checkResult: { account: string; text: string; error: boolean } | null;
+  onOpen: (key: string) => void;
 }) {
   const st = accountState(a, now);
   const src = accountSource(a, now, accountClassification(a) === "open" ? planFigure(a, plans, now) : null, reportDefault);
@@ -76,8 +78,13 @@ function AccountRow({
   // "Sources disagree about X (Opus)" points at one of these notes.
   const notes = [disagreementWords(a, now), ...modelDisagreementWords(a, now)].filter((d): d is string => !!d);
   return (
-    <div className="row route-row" role="listitem">
-      <span className="ellip">{a.label}</span>
+    <div className="row route-row rowlink" role="listitem">
+      <span className="ellip">
+        <button type="button" className="rowlink-btn" aria-haspopup="dialog" onClick={() => onOpen(a.key)}
+          aria-label={`${a.label}: ${st.text}. Open routing details`}>
+          {a.label}
+        </button>
+      </span>
       <span className="route-state">
         <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
         {st.text}
@@ -100,13 +107,14 @@ function AccountRow({
           {checkResult?.account === a.key ? <span className={checkResult.error ? "set-error" : "route-src"} role="status">{checkResult.text}</span> : null}
         </span>
       ) : null}
+      <ChevronRight size={16} className="rowlink-chev" aria-hidden />
     </div>
   );
 }
 
 /** The owner's priority at the top of the card, in his order. One a
  *  conversation set at his request carries its mark and Confirm or Undo. */
-function PriorityRow({ p, view, now, reload }: { p: RoutePriority; view: RouteView; now: Date; reload: () => Promise<void> }) {
+function PriorityRow({ p, view, now, reload, onOpen }: { p: RoutePriority; view: RouteView; now: Date; reload: () => Promise<void>; onOpen: (key: string) => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [holdIds, setHoldIds] = useState<string[] | null>(null);
@@ -136,7 +144,20 @@ function PriorityRow({ p, view, now, reload }: { p: RoutePriority; view: RouteVi
   };
   return (
     <ListRow className="route-priority">
-      <span className="route-state">{priorityHeadline(p, now)}</span>
+      <span className="route-state route-prio">
+        Priority:{" "}
+        {p.entries.map((e, i) => (
+          <span key={e.account}>
+            {i > 0 ? ", then " : ""}
+            <button type="button" className="link route-prio-name" aria-haspopup="dialog"
+              aria-label={`${e.label}: your words for this account`} onClick={() => onOpen(e.account)}>
+              {e.label}
+            </button>
+            {e.until ? ` until ${whenLocal(e.until, now)}` : ""}
+          </span>
+        ))}
+        {p.until ? ` (all of it until ${whenLocal(p.until, now)})` : ""}
+      </span>
       {p.pending ? (
         <>
           <span className="route-note">
@@ -197,7 +218,17 @@ function plural(n: number, one: string, many: string): string {
 
 /** The account rows with their Check now, as the Home Routing card shows
  *  them. The Work tab's Accounts card reuses this list, never a copy. */
-export function AccountRows({ state, plans, now }: { state: RoutingState; plans?: UsageReport | null; now: Date }) {
+export function AccountRows({ state, plans, now, onOpen, onOpenSettings }: {
+  state: RoutingState;
+  plans?: UsageReport | null;
+  now: Date;
+  /** The caller's own detail host (Home shares one with the priority line);
+   *  without it the list hosts its own sheet. */
+  onOpen?: (key: string) => void;
+  onOpenSettings?: () => void;
+}) {
+  const own = useRoutingDetail({ state, plans, onOpenSettings });
+  const open = onOpen ?? ((key: string) => own.open(key));
   const [checking, setChecking] = useState<string | null>(null);
   const [checkResult, setCheckResult] = useState<{ account: string; text: string; error: boolean } | null>(null);
   const data = state.data;
@@ -223,15 +254,21 @@ export function AccountRows({ state, plans, now }: { state: RoutingState; plans?
     <div role="list" aria-label="Accounts">
       {accounts.map((a) => (
         <AccountRow key={a.key} a={a} now={now} plans={plans} reportDefault={data?.report_default_limit}
-          onCheck={check} checking={checking} checkResult={checkResult} />
+          onCheck={check} checking={checking} checkResult={checkResult} onOpen={open} />
       ))}
+      {onOpen ? null : own.node}
     </div>
   );
 }
 
-export function RoutingCard({ state, plans }: { state: RoutingState; plans?: UsageReport | null }) {
+export function RoutingCard({ state, plans, onOpenAccounts }: {
+  state: RoutingState;
+  plans?: UsageReport | null;
+  onOpenAccounts?: () => void;
+}) {
   const { data, error, loading } = state;
   const holdsId = useId();
+  const detail = useRoutingDetail({ state, plans, onOpenSettings: onOpenAccounts });
   const now = new Date();
   const head = <div className="card-head">Routing</div>;
   if (data == null) {
@@ -283,8 +320,9 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
           {error ? <span className="route-src">{error}</span> : null}
         </ListRow>
       ) : null}
-      {data.priority ? <PriorityRow p={data.priority} view={data} now={now} reload={() => state.load(true)} /> : null}
-      <AccountRows state={state} plans={plans} now={now} />
+      {data.priority ? <PriorityRow p={data.priority} view={data} now={now} reload={() => state.load(true)} onOpen={(key) => detail.open(key, true)} /> : null}
+      <AccountRows state={state} plans={plans} now={now} onOpen={(key) => detail.open(key)} />
+      {detail.node}
       {holds.length ? (
         <div className="route-sub">
           <h2 className="route-sub-head" id={holdsId}>
@@ -329,7 +367,7 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
           <Disclosure
             label={
               <>
-                {plural(rules.length, "standing rule", "standing rules")}, shown first to every conversation
+                {plural(rules.length, "standing rule", "standing rules")}
                 {toConfirm ? <Tag>{`${toConfirm} not confirmed yet`}</Tag> : null}
                 {broken.length ? (
                   <Tag tone="warn" dot>
@@ -359,9 +397,6 @@ export function RoutingCard({ state, plans }: { state: RoutingState; plans?: Usa
           </Disclosure>
         </div>
       ) : null}
-      <ListRow className="route-foot">
-        <span className="meta">Khipu reports this; your agents decide where work goes.</span>
-      </ListRow>
     </div>
   );
 }

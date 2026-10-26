@@ -21,6 +21,9 @@ import { fmtAgoSince } from "./time";
 import type { Attention } from "./doctorAttention";
 import { accountState } from "./routing";
 import type { RouteView } from "./routing";
+import { planWord } from "./humanWords";
+import { PlanDetailSheet, useDetailHost } from "./AccountDetail";
+import { nearlyGoneWords } from "./accountDetail";
 
 export type UsageWindow = {
   name?: string;
@@ -179,8 +182,8 @@ export function windowLabel(w: UsageWindow): string {
 /** "Codex Pro", "Claude main Max", "Grok SuperGrok Heavy". */
 export function planName(row: UsageAccount): string {
   const label = row.account || row.harness || "Account";
-  const plan = (row.plan || "").trim();
-  return plan ? `${label} ${plan.charAt(0).toUpperCase()}${plan.slice(1)}` : label;
+  const plan = planWord(row.plan);
+  return plan ? `${label} ${plan}` : label;
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -430,7 +433,7 @@ export function liveWords(row: UsageAccount): { text: string; live: boolean; che
   if (!(row.windows ?? []).some((w) => pctOf(w) != null)) {
     return { text: age ? `Checked ${age}, no figures yet` : "Checked, no figures yet", live: false, checked: true };
   }
-  return { text: age ? `Live: read ${age}` : "Live", live: true };
+  return { text: age ? `Read ${age}` : "Read just now", live: true };
 }
 
 /** The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
@@ -513,7 +516,7 @@ export function SignInControl({ row, onSignedIn }: { row: UsageAccount; onSigned
   );
 }
 
-function Meter({ pct, label, tone, dim }: { pct: number; label: string; tone: "err" | "warn" | null; dim?: boolean }) {
+export function Meter({ pct, label, tone, dim }: { pct: number; label: string; tone: "err" | "warn" | null; dim?: boolean }) {
   const width = Math.min(100, Math.max(0, pct));
   return (
     <span
@@ -649,7 +652,7 @@ export function planStatus(row: UsageAccount, now: Date = new Date()): PlanStatu
     return { figures, say, tone: "grey", code };
   }
   if (row.observed_at) {
-    return { figures, say: age ? `as of its last turn, ${age}` : "as of its last turn", tone: "grey", code };
+    return { figures, say: age ? `Read from its last reply, ${age}` : "Read from its last reply", tone: "grey", code };
   }
   if (row.stale && age) return { figures, say: `figures from ${age}`, tone: "grey", code };
   return { figures, say: null, tone: null, code };
@@ -683,26 +686,35 @@ function StatusPhrase({ status }: { status: PlanStatus }) {
 
 /** One account on Home: its tightest window still in force as a bar, and at
  *  most one status phrase, after the pause when the owner paused it. */
-function PlanRow({ row, now, pause, onSignedIn }: {
-  row: UsageAccount; now: Date; pause?: string; onSignedIn?: () => Promise<unknown> | void;
+function PlanRow({ row, now, pause, onSignedIn, onOpen }: {
+  row: UsageAccount; now: Date; pause?: string; onSignedIn?: () => Promise<unknown> | void; onOpen?: () => void;
 }) {
   const status = planStatus(row, now);
   const w = tightestWindow(row, now);
   const p = w ? pctOf(w) : null;
   const reset = w ? resetPhrase(w.resets_at, now) : null;
   const dim = status.figures === "kept";
+  const nearly = nearlyGoneWords(row, now);
   const tail = (
     <>
       {pause ? <Tag>{pause}</Tag> : null}
+      {nearly ? <span className="plan-say"><span className="hdot warn" aria-hidden="true" />{nearly}</span> : null}
       <StatusPhrase status={status} />
       <SignInControl row={row} onSignedIn={onSignedIn} />
     </>
   );
+  const plan = planWord(row.plan);
+  const left = p != null ? roundPct(Math.max(0, 100 - p)) : null;
+  const label = `${accountName(row)}${plan ? ` ${plan}` : ""}${left != null && w ? `: ${fmtPct(left)} of its ${windowLabel(w)} left${reset ? `, ${reset}` : ""}` : ""}. Open usage details`;
   return (
-    <ListRow className="plan-row">
+    <ListRow className="plan-row rowlink">
+      {/* The whole row opens the detail: the name is the button and its
+          ::after covers the row; the sign-in control stays above it. */}
       <span className="plan-name ellip">
-        {accountName(row)}
-        {row.plan ? <span className="meta"> {row.plan}</span> : null}
+        <button type="button" className="rowlink-btn" onClick={onOpen} aria-label={label} aria-haspopup="dialog">
+          {accountName(row)}
+          {plan ? <span className="meta"> {plan}</span> : null}
+        </button>
       </span>
       {w && p != null ? (
         <>
@@ -717,6 +729,7 @@ function PlanRow({ row, now, pause, onSignedIn }: {
       ) : (
         <span className="plan-none">{tail}</span>
       )}
+      <ChevronRight size={16} className="rowlink-chev" aria-hidden />
     </ListRow>
   );
 }
@@ -736,6 +749,7 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
   const now = new Date();
   const pauses = planPauses(routing, now);
   const failedAge = fmtAgoSince(errorAt);
+  const detail = useDetailHost<UsageAccount>();
   return (
     <div className="card plans-card">
       <div className="card-head">
@@ -782,9 +796,20 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
       ) : (
         accounts.map((row, i) => (
           <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now}
-            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} />
+            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} onOpen={() => detail.open(row)} />
         ))
       )}
+      {detail.target ? (
+        <PlanDetailSheet
+          row={detail.target}
+          view={routing}
+          now={now}
+          onClose={detail.close}
+          onRefresh={() => void refresh()}
+          refreshing={refreshing || loading}
+          onOpenSettings={onOpenAccounts}
+        />
+      ) : null}
     </div>
   );
 }
@@ -838,7 +863,7 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
     <section className={status.tone === "warn" ? "plan-block warn" : "plan-block"} role="group" aria-label={name}>
       <h2 className="plan-block-head">
         {name}
-        {row.plan ? <span className="meta">{`${row.plan.charAt(0).toUpperCase()}${row.plan.slice(1)} plan`}</span> : null}
+        {planWord(row.plan) ? <span className="meta">{`${planWord(row.plan)} plan`}</span> : null}
       </h2>
       {pause ? (
         <div className="plan-paused">
@@ -877,7 +902,7 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
       <div className="plan-reads">
         {status.figures === "live" && !row.observed_at && !row.stale ? (
           <Tag tone="ok" dot>
-            {triedAge ? `Live: read ${triedAge}` : "Live"}
+            {triedAge ? `Read ${triedAge}` : "Read just now"}
           </Tag>
         ) : row.source === "rollout" && windows.length && !fail?.includes("last turn") ? (
           // Codex's session-file fallback, kept for tracked accounts only (decision
