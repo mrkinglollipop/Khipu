@@ -192,7 +192,7 @@ def _voyage_key_file() -> Path | None:
 
 
 def resolve_voyage_key(*, key_file: Path | None = None) -> str:
-    """Order: VOYAGE_API_KEY -> Keychain -> optional key file (never print)."""
+    """Order: VOYAGE_API_KEY -> Keychain -> optional owner-only key file (never print)."""
     env = (os.environ.get("VOYAGE_API_KEY") or "").strip()
     if env:
         return env
@@ -200,10 +200,9 @@ def resolve_voyage_key(*, key_file: Path | None = None) -> str:
     if kc:
         return kc
     path = key_file or _voyage_key_file()
-    if path is not None and path.is_file():
-        key = path.read_text(encoding="utf-8").strip()
-        if key:
-            return key
+    key = read_owner_only_key_file(path) if path is not None else None
+    if key:
+        return key
     raise RuntimeError(
         "No Voyage key. Set it in the app (Settings -> Secrets), pipe it to "
         "`khipu secrets --set voyage_api_key`, or export VOYAGE_API_KEY."
@@ -211,7 +210,7 @@ def resolve_voyage_key(*, key_file: Path | None = None) -> str:
 
 
 def resolve_gemini_key(*, key_file: Path | None = None) -> str:
-    """Order: GEMINI_API_KEY → Keychain → optional key file (never print)."""
+    """Order: GEMINI_API_KEY → Keychain → optional owner-only key file (never print)."""
     env = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if env:
         return env
@@ -219,10 +218,9 @@ def resolve_gemini_key(*, key_file: Path | None = None) -> str:
     if kc:
         return kc
     path = key_file or _gemini_key_file()
-    if path is not None and path.is_file():
-        key = path.read_text(encoding="utf-8").strip()
-        if key:
-            return key
+    key = read_owner_only_key_file(path) if path is not None else None
+    if key:
+        return key
     raise RuntimeError(
         "No Gemini key. Set it in the app (Settings → Secrets), pipe it to "
         "`khipu secrets --set gemini_api_key`, or export GEMINI_API_KEY."
@@ -292,10 +290,9 @@ def _resolve_provider_key(provider: str, *, key_file: Path | None = None) -> str
     if key:
         return key
     path = key_file or path_setting(f"{provider}_key_file")
-    if path is not None and path.is_file():
-        key = path.read_text(encoding="utf-8").strip()
-        if key:
-            return key
+    key = read_owner_only_key_file(path) if path is not None else None
+    if key:
+        return key
     raise RuntimeError(f"No {provider.title()} key. Pipe it to `khipu secrets --set "
                        f"{provider}_api_key`, or export {env_name}.")
 
@@ -438,10 +435,7 @@ def secrets_status() -> dict:
     provider_files = {provider: path_setting(f"{provider}_key_file")
                       for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")}
     def file_has_key(path):
-        try:
-            return bool(path and path.is_file() and path.read_text(encoding="utf-8").strip())
-        except (OSError, UnicodeError):
-            return False
+        return bool(path and read_owner_only_key_file(path))
     active_dir = data_dir()
     dsn_in_keychain = bool(get_dsn())
     dsn_on_disk = (active_dir / "dsn").is_file() or (CONFIG_DIR / "dsn").is_file() \

@@ -1744,7 +1744,14 @@ def _tool_capture(args: dict) -> dict:
             "write through MCP."
         )
     from khipu.capture import capture, load_payload
+    from khipu.commitments import _payload_event, SESSION_END_EVENTS
 
+    # A session end is the hook's to declare: close_session_plan then closes
+    # that session's open items, which a tool caller must not trigger for a
+    # session_id it names. Structured facts (open_loops, ...) stay accepted.
+    args = {k: v for k, v in args.items() if k != "event"}
+    if _payload_event(args) in SESSION_END_EVENTS:
+        args["scope"] = "general"
     # load_payload validates + mints ts; capture() routes by mode (hub → PG only).
     payload = load_payload(json.dumps({k: v for k, v in args.items() if v is not None}))
     # PG-row-only, exactly as khipu.probe does it: the legacy file leg prints
