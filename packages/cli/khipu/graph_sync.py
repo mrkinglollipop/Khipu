@@ -156,6 +156,11 @@ def sync_from_sqlite(
     Returns counts plus the post-sync drift so a caller can assert zero."""
     from khipu.db import connect
 
+    if not is_graph_producer():
+        # PG is read-only for the graph on this machine: nothing to mirror, and
+        # an unreachable database must not fail a job that never needed it.
+        reason = "not the graph producer; PG is read-only for the graph here"
+        return {"ok": True, "skipped": reason, "drift": {"ok": True, "skipped": reason}}
     path = Path(sqlite_path) if sqlite_path else _default_sqlite()
     if not path.is_file():
         raise FileNotFoundError(f"graph.sqlite not found: {path}")

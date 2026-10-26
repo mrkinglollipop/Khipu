@@ -433,6 +433,17 @@ def test_failed_mirror_is_reported_as_a_failed_graph_job(tmp_path, monkeypatch):
     assert jobs._read_job_state('graph_build')['exit'] != 0
 
 
+def test_non_producer_mirror_skip_is_logged_and_exits_zero(tmp_path, monkeypatch, capsys):
+    import subprocess
+    skipped = json.dumps({'ok': True, 'skipped': 'not the graph producer; PG is read-only'})
+    g, calls = _run_nightly_with_mirror(
+        tmp_path, monkeypatch, lambda: subprocess.CompletedProcess([], 0, skipped, ''))
+    assert g.main() == 0
+    out = capsys.readouterr().out
+    assert 'graph mirror skipped: not the graph producer' in out
+    assert 'graph mirror ok' not in out
+
+
 @pytest.mark.parametrize('root_set', [True, False])
 def test_clean_or_disabled_mirror_keeps_exit_zero(tmp_path, monkeypatch, capsys, root_set):
     import subprocess

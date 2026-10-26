@@ -183,6 +183,15 @@ def _should_skip_build(resolved: Path | None) -> tuple[bool, str]:
     return False, ""
 
 
+def _mirror_skip_reason(proc: subprocess.CompletedProcess) -> str:
+    """Why a successful graph-sync did nothing, or '' when it mirrored."""
+    try:
+        body = json.loads(proc.stdout or "")
+    except ValueError:
+        return ""
+    return str(body.get("skipped") or "") if isinstance(body, dict) else ""
+
+
 def _mirror_reason(proc: subprocess.CompletedProcess) -> str:
     """One-line reason for a failed graph-sync.
 
@@ -291,7 +300,9 @@ def main() -> int:
                 timeout=600,
             )
             if proc.returncode == 0:
-                log("  khipu graph mirror ok")
+                skipped = _mirror_skip_reason(proc)
+                log(f"  khipu graph mirror skipped: {skipped}" if skipped
+                    else "  khipu graph mirror ok")
             else:
                 mirror_failure = (
                     f"graph mirror rc={proc.returncode}: {_mirror_reason(proc)}"
