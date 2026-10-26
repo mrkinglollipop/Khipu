@@ -928,20 +928,29 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     # message whose API message id was captured with this same text (a new
     # reply gets a new id); it is a machine notification; or it is next to
     # such a proven copy in a run of seen messages. A lone repeat is a turn.
+    # A re-emission copies each earlier message once, so a text repeated
+    # inside one replay span ends it: that repeat, and what follows, is new.
     seen_flags: dict[int, bool] = {}
     proven: set[int] = set()
+    breaks: set[int] = set()
     if known is not None:
         running = set(known)
         replay = False
+        span: set[str] = set()
         for i, entry in enumerate(entries):
             d, role, fp = entry[0], entry[1], entry[7]
             if d.get("isCompactSummary"):
                 replay = True
+                span = set()
                 continue
             if fp is None:
                 continue
             seen = fp in running
             seen_flags[i] = seen
+            if replay and fp in span:
+                replay = False
+                breaks.add(i)
+            span.add(fp)
             ident = _message_identity(d, role, fp)
             if seen and (replay or not entry[5] and role != "assistant"
                          or (ident is not None and ident in running)):
@@ -959,7 +968,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             continue
         for step in (-1, 1):
             p = pos + step
-            while 0 <= p < len(printed) and seen_flags[printed[p]]:
+            while 0 <= p < len(printed) and seen_flags[printed[p]] and printed[p] not in breaks:
                 copied.add(printed[p])
                 p += step
     last_user_counted = False   # the open user block already holds a real turn

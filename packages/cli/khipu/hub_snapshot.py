@@ -5067,10 +5067,13 @@ def upsert_embeddings(
             version = time.time() if read_at is None else float(read_at)
             refs = {(str(p), str(k), str(r)) for p, k, r in replace_refs}
             refs |= {(str(e.get("profile")), str(e.get("kind")), str(e.get("ref"))) for e in embedding_rows}
-            # An episode's vectors are also as new as the episode row written with them.
+            # An episode's or topic's vectors are also as new as the source row
+            # held beside them: vectors read before that row was are built from
+            # an older body, with or without ``topic_rows`` in this call.
             newer = {(p, k, r) for p, k, r in refs
                      if max(_held_read_at(con, "vectors", _vector_key(p, k, r)),
-                            _held_read_at(con, "episodes", r) if k == "episode" else 0.0) > version
+                            _held_read_at(con, "episodes", r) if k == "episode" else
+                            _held_read_at(con, "topics", r) if k == "topic" else 0.0) > version
                      or (k == "topic" and r in stale_topics)}
             for profile, kind, ref in replace_refs:
                 if (str(profile), str(kind), str(ref)) in newer or kind in _FACT_VECTOR_KINDS:

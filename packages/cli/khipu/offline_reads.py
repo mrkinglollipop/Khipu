@@ -57,11 +57,10 @@ def owed_canonical(project: str | None) -> str | None:
 def _cited_forgotten(con, rows: list[dict[str, Any]]) -> set[Any]:
     """Ids of ``rows`` whose ``settle_suggestion`` cites, as its evidence, an
     episode the replica holds forgotten or queued for erasure, or a decision
-    of one: that suggestion quotes forgotten words, so it is not shown
+    of one, or cites a decision without naming its source episode: that
+    suggestion quotes forgotten (or unverifiable) words, so it is not shown
     (``commitments.settle_suggestion_sql`` on the hub)."""
     rejected = hub_snapshot._rejected_episode_ids(con)
-    if not rejected:
-        return set()
     has_decisions = {"id", "episode_id"} <= hub_snapshot._snapshot_table_columns(con, "decisions")
     out: set[Any] = set()
     for row in rows:
@@ -74,6 +73,12 @@ def _cited_forgotten(con, rows: list[dict[str, Any]]) -> set[Any]:
         evidence = doc.get("evidence") if isinstance(doc.get("evidence"), dict) else {}
         cited = {doc.get("decision_id"), evidence.get("decision_id")} - {None}
         episodes = {doc.get("episode")} - {None}
+        if cited and not episodes:
+            # Quotes a decision without naming its source episode: unverifiable.
+            out.add(row.get("id"))
+            continue
+        if not rejected:
+            continue
         if cited and has_decisions:
             marks = ", ".join("?" * len(cited))
             episodes |= {r[0] for r in con.execute(

@@ -1723,7 +1723,8 @@ def settle_suggestion_sql(cur, table: str = "commitments") -> str:
     """``settle_suggestion`` as a hub reader may return it: NULL when the
     suggestion cites a forgotten episode, or a decision of one, as its
     evidence (the forget clears those, ``forget._clear_cited_suggestions``;
-    this holds for a row written meanwhile or by older code)."""
+    this holds for a row written meanwhile or by older code), or cites a
+    decision without naming its source episode."""
     col = f"{table}.settle_suggestion"
     try:
         from khipu.db import has_columns
@@ -1737,7 +1738,13 @@ def settle_suggestion_sql(cur, table: str = "commitments") -> str:
     if decisions:
         cited += (f" OR fe.id IN (SELECT d.episode_id FROM decisions d WHERE d.id::text IN "
                   f"({col}->>'decision_id', {col}->'evidence'->>'decision_id'))")
-    return (f"CASE WHEN EXISTS (SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND ({cited})) "
+    # A suggestion quoting a decision names the episode its text came from
+    # (``episode``); one without it cannot be checked, as the decision may
+    # have moved to another source since, so it is not shown.
+    unsourced = (f"({col}->>'decision_id' IS NOT NULL OR {col}->'evidence'->>'decision_id' IS NOT NULL) "
+                 f"AND {col}->>'episode' IS NULL")
+    return (f"CASE WHEN {unsourced} THEN NULL "
+            f"WHEN EXISTS (SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND ({cited})) "
             f"THEN NULL ELSE {col} END")
 
 
@@ -1754,7 +1761,8 @@ def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: 
     cur.execute(
         "UPDATE commitments SET settle_suggestion = %s::jsonb WHERE id = %s AND status = 'open' "
         "AND NOT (%s = ANY(reopened_rule_keys)) "
-        "AND (settle_suggestion IS NULL OR settle_suggestion->>'key' IS DISTINCT FROM %s)",
+        "AND (settle_suggestion IS NULL OR settle_suggestion->>'key' IS DISTINCT FROM %s "
+        "OR settle_suggestion->>'episode' IS NULL)",
         (json.dumps(doc, default=str), commitment_id, key, key),
     )
     return cur.rowcount > 0
