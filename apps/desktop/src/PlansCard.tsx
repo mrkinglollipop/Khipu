@@ -742,9 +742,11 @@ function PlanRow({ row, now, pause, onSignedIn, onOpen }: {
 
 /** Home → Plans: one row per account, the tightest window of each. `routing`
  *  is the routing record when it was read, for the pauses. */
-export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false, onAddAccount }: {
+export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false, onAddAccount, onRoutingChanged }: {
   state: PlanUsageState;
   routing?: RouteView | null;
+  /** Reads the routing record again after a change in the Plan detail. */
+  onRoutingChanged?: () => Promise<unknown> | void;
   onOpenAccounts?: () => void;
   /** The owner stopped tracking every account ("Read no accounts", phase 9). */
   noneTracked?: boolean;
@@ -824,6 +826,7 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
           onRefresh={() => void refresh()}
           refreshing={refreshing || loading}
           onOpenSettings={onOpenAccounts}
+          onChanged={onRoutingChanged}
         />
       ) : null}
     </div>

@@ -496,6 +496,8 @@ export type RouteProvider = {
   family: string;
   login?: string;
   probe?: string;
+  /** Where an http-quota provider's usage is read (set from the Plan detail). */
+  host?: string;
   lane_names?: string[];
   models_allowed?: string[];
   models_never?: string[];
