@@ -3283,7 +3283,9 @@ def cmd_activity(args: argparse.Namespace) -> int:
     from khipu.activity import activity_payload, episode_detail
 
     if args.show is not None:
-        row = episode_detail(args.show)
+        from khipu.tombstones import episode_hidden
+
+        row = None if episode_hidden(args.show) else episode_detail(args.show)
         if row is None:
             print(f"error: episode {args.show} not found", file=sys.stderr)
             return 1
@@ -3397,7 +3399,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         if not ident.isdigit():
             print(json.dumps({"ok": False, "error": "episode id must be digits"}))
             return 2
-        row = episode_detail(int(ident))
+        from khipu.tombstones import episode_hidden
+
+        row = None if episode_hidden(ident) else episode_detail(int(ident))
     else:
         from khipu.text_pages import page_args
 

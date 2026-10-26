@@ -1242,6 +1242,9 @@ def _tool_search(args: dict) -> dict:
             since=since, until=until, project=project, session_id=session_id,
             harness=harness, t3_thread=t3_thread, via=via, tz=tz,
         )
+    from khipu.tombstones import without_hidden_episodes
+
+    payload["results"] = without_hidden_episodes(payload.get("results") or [])
     query_log.log_query(
         query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
@@ -1291,15 +1294,9 @@ def _tool_get(args: dict) -> dict:
     if inferred is None:
         inferred = "episode" if ident.isdigit() else "topic"
     if inferred == "episode" and ident.isdigit():
-        from khipu.tombstones import read_gate
+        from khipu.tombstones import episode_hidden
 
-        # A forget this Mac holds that the hub lacks leaves the hub row live;
-        # its text reaches a caller only through the owner's forget.list.
-        try:
-            forgotten = int(ident) in read_gate().episode_ids
-        except Exception:  # noqa: BLE001 - an unreadable registry shows no episode
-            forgotten = True
-        if forgotten:
+        if episode_hidden(ident):
             raise ValueError(f"episode not found: {ident}")
 
     hub_failed = False

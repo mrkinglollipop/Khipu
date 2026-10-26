@@ -128,3 +128,72 @@ def test_cli_forget_pending_keeps_summaries_for_the_app_and_the_owner(monkeypatc
     assert "SECRET FORGOTTEN SUMMARY" in _cli_list(monkeypatch, capsys, "--from-app", app=True)
     monkeypatch.setattr(owner_direction, "check", mock.Mock(return_value={"auth": "direction"}))
     assert "SECRET FORGOTTEN SUMMARY" in _cli_list(monkeypatch, capsys)
+
+
+# ---- khipu get / khipu activity --show: the CLI reads are gated like khipu_get --------
+
+
+def _cli_show(argv: list[str], capsys) -> str:
+    from khipu import cli
+
+    args = cli.build_parser().parse_args(argv)
+    with mock.patch("khipu.activity.episode_detail", return_value=dict(ROW)):
+        args.func(args)
+    captured = capsys.readouterr()
+    return captured.out + captured.err
+
+
+def test_cli_get_and_activity_show_hide_a_forgotten_episode(monkeypatch, capsys):
+    monkeypatch.setattr("khipu.tombstones.read_gate", lambda: _gate([7]))
+    for argv in (["get", "7"], ["activity", "--show", "7"]):
+        assert "SECRET" not in _cli_show(argv, capsys), argv
+
+
+def test_cli_get_and_activity_show_fail_closed_on_an_unreadable_registry(monkeypatch, capsys):
+    from khipu import tombstones
+
+    def broken():
+        raise tombstones.RegistryError("unreadable")
+
+    monkeypatch.setattr("khipu.tombstones.read_gate", broken)
+    for argv in (["get", "7"], ["activity", "--show", "7"]):
+        assert "SECRET" not in _cli_show(argv, capsys), argv
+
+
+def test_cli_get_and_activity_show_still_print_an_episode_nobody_forgot(monkeypatch, capsys):
+    monkeypatch.setattr("khipu.tombstones.read_gate", lambda: _gate([8]))
+    for argv in (["get", "7"], ["activity", "--show", "7"]):
+        assert "SECRET FORGOTTEN SUMMARY" in _cli_show(argv, capsys), argv
+
+
+# ---- khipu_search: hub hits for a forgotten episode are dropped -----------------------
+
+
+HITS = {"query": "q", "mode": "hybrid", "results": [
+    {"kind": "episode", "id": "7", "snippet": "SECRET FORGOTTEN SUMMARY"},
+    {"kind": "episode", "id": 9, "snippet": "kept episode"},
+    {"kind": "topic", "id": "khipu", "snippet": "kept topic"}]}
+
+
+def _search() -> dict:
+    with mock.patch("khipu.embed.hybrid_search", return_value=json.loads(json.dumps(HITS))), \
+            mock.patch("khipu.query_log.log_query"):
+        out = _call("khipu_search", {"query": "q"})
+    return json.loads(out["content"][0]["text"])
+
+
+def test_khipu_search_drops_a_forgotten_episode_hit(monkeypatch):
+    monkeypatch.setattr("khipu.tombstones.read_gate", lambda: _gate([7]))
+    reply = _search()
+    assert "SECRET" not in json.dumps(reply)
+    assert [r["id"] for r in reply["results"]] == [9, "khipu"]
+
+
+def test_khipu_search_drops_hub_episode_hits_when_the_registry_is_unreadable(monkeypatch):
+    from khipu import tombstones
+
+    def broken():
+        raise tombstones.RegistryError("unreadable")
+
+    monkeypatch.setattr("khipu.tombstones.read_gate", broken)
+    assert [r["id"] for r in _search()["results"]] == ["khipu"]
