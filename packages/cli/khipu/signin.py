@@ -438,8 +438,8 @@ def _matches(rec: dict, info: dict | None) -> bool:
         and command.endswith(" " + " ".join(tail))
 
 
-def _alive(rec: dict, ps) -> bool:
-    """Retry an unusable observation briefly; observed death or reuse wins."""
+def _alive(rec: dict, ps) -> bool | None:
+    """True for our live login, False for death/reuse, None if unverified."""
     end = None
     while True:
         info = ps(rec.get("pid"))
@@ -456,7 +456,15 @@ def _alive(rec: dict, ps) -> bool:
             end = time.monotonic() + PROCESS_OBSERVE_S
         remaining = end - time.monotonic()
         if remaining <= 0:
-            return False
+            # ps can fail for a live process. Only kernel-confirmed absence
+            # can turn an inconclusive observation into proof of death.
+            try:
+                _getpgid(rec.get("pid"))
+            except ProcessLookupError:
+                return False
+            except OSError:
+                pass
+            return None
         time.sleep(min(0.05, remaining))
 
 
@@ -628,6 +636,12 @@ def _owner_gone(rec: dict, ps) -> bool:
             end = time.monotonic() + PROCESS_OBSERVE_S
         remaining = end - time.monotonic()
         if remaining <= 0:
+            try:
+                _getpgid(owner["pid"])
+            except ProcessLookupError:
+                return True
+            except OSError:
+                pass
             return False  # no proof that the app stopped owning this login
         time.sleep(min(0.05, remaining))
 
@@ -734,9 +748,9 @@ def reap(*, ps=None, killpg=None) -> dict:
 
 
 def running(*, ps=None) -> bool:
-    """True while a sign-in Khipu started is still running (discovery waits)."""
+    """Reserve discovery while a login is live or its liveness is unknown."""
     rec = _attempt()
-    return rec is not None and _alive(rec, ps or proc_info)
+    return rec is not None and _alive(rec, ps or proc_info) is not False
 
 
 def start(cli: str, folder: str | None = None, *, again: bool = False, popen=None, ps=None,
@@ -790,8 +804,10 @@ def start(cli: str, folder: str | None = None, *, again: bool = False, popen=Non
         if old is not None:
             now_ts = time.time() if now is None else now
             current = now_ts < _deadline(old)
-            if current and not again and _alive(old, ps) and not _owner_gone(old, ps):
-                return {"ok": False, "error": E_BUSY, "attempt": _public(old)}
+            if current and not again:
+                alive = _alive(old, ps)
+                if alive is None or (alive and not _owner_gone(old, ps)):
+                    return {"ok": False, "error": E_BUSY, "attempt": _public(old)}
             result, left = _stop_and_end(old, ps=ps, killpg=killpg)
             if left or result == "unverified":
                 return {"ok": False, "error": E_BUSY, "attempt": _public(old), "left": left}
@@ -902,7 +918,13 @@ def status(attempt_id: str, *, ps=None, killpg=None, check=None, now=None) -> di
         if rec is None or rec.get("id") != attempt_id:
             return {"ok": False, "error": E_NO_ATTEMPT}
         now_ts = time.time() if now is None else now
-        if _alive(rec, ps):
+        alive = _alive(rec, ps)
+        if alive is None:
+            if now_ts < _deadline(rec):
+                return {"ok": True, "attempt": _public(rec), "state": WAITING}
+            return {"ok": True, "attempt": _public(rec), "state": NOT_STOPPED,
+                    "stopped": "unverified", "left": []}
+        if alive:
             if now_ts < _deadline(rec):
                 return {"ok": True, "attempt": _public(rec), "state": WAITING}
             result, left = _stop_and_end(rec, ps=ps, killpg=killpg)

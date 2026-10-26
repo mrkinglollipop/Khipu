@@ -380,6 +380,78 @@ def test_status_reobserves_one_failed_process_observation_without_ending_login(b
     assert (box.home / ".claude-client").is_dir()
 
 
+def _failed_window_then_recovery(box, monkeypatch):
+    clock, observed = [0.0], []
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+
+    def ps(pid):
+        if pid == 1_000_001 and len(observed) < 5:
+            observed.append(pid)
+            return None
+        return box.ps(pid)
+
+    return ps
+
+
+def test_status_does_not_kill_live_login_when_observation_recovers_after_retry_window(box, monkeypatch):
+    first = signin.start("claude", _folder(), now=NOW, **box.kw())
+    before, checked = _attempt_file().read_bytes(), []
+    ps = _failed_window_then_recovery(box, monkeypatch)
+    out = signin.status(first["attempt"]["id"], now=NOW + 1, ps=ps, killpg=box.killpg,
+                        check=lambda *a: checked.append(a) or signin.NOT_SIGNED_IN)
+    assert (out["state"], box.killed, checked, _attempt_file().exists()) == (
+        signin.WAITING, [], [], True
+    )
+    assert _attempt_file().read_bytes() == before
+
+
+def test_start_does_not_replace_live_attempt_when_observation_recovers_after_retry_window(box, monkeypatch):
+    folder = _folder()
+    first = signin.start("claude", folder, now=NOW, **box.kw())
+    before = _attempt_file().read_bytes()
+    ps = _failed_window_then_recovery(box, monkeypatch)
+    out = signin.start("claude", folder, now=NOW + 1, ps=ps, popen=box.popen, killpg=box.killpg)
+    assert (out.get("error"), box.killed, len(box.calls)) == (signin.E_BUSY, [], 1), out
+    assert _attempt_file().read_bytes() == before
+    assert out["attempt"]["id"] == first["attempt"]["id"]
+
+
+@pytest.mark.parametrize("missing", [None, {}, {"stat": "S", "lstart": LSTART}])
+@pytest.mark.parametrize("kernel_error", [None, PermissionError, OSError])
+def test_unknown_login_liveness_reserves_ownership_without_finishing(box, monkeypatch, missing, kernel_error):
+    folder = _folder()
+    first = signin.start("claude", folder, now=NOW, **box.kw())
+    before = _attempt_file().read_bytes()
+    rec = json.loads(before)
+    clock, kernel_checks = [0.0], []
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+
+    def getpgid(pid):
+        kernel_checks.append(pid)
+        if kernel_error:
+            raise kernel_error(pid)
+        return box.getpgid(pid)
+
+    monkeypatch.setattr(signin, "_getpgid", getpgid)
+    ps = lambda pid: missing if pid == rec["pid"] else box.ps(pid)
+    assert signin._alive(rec, ps) is None
+    assert 0 < clock[0] <= signin.PROCESS_OBSERVE_S + 1e-9
+    assert signin.running(ps=ps) is True
+    busy = signin.start("claude", folder, now=NOW + 1, ps=ps, popen=box.popen, killpg=box.killpg)
+    assert busy["error"] == signin.E_BUSY and busy["attempt"]["id"] == first["attempt"]["id"]
+    for now, expected in ((NOW + 1, signin.WAITING), (rec["deadline"], signin.NOT_STOPPED)):
+        out = signin.status(first["attempt"]["id"], now=now, ps=ps, killpg=box.killpg,
+                            check=lambda *a: pytest.fail("unknown liveness cannot finish sign-in"))
+        assert out["state"] == expected
+        if expected == signin.NOT_STOPPED:
+            assert out["stopped"] == "unverified"
+    assert kernel_checks == [rec["pid"]] * 5
+    assert box.killed == [] and len(box.calls) == 1
+    assert _attempt_file().read_bytes() == before
+
+
 @pytest.mark.parametrize("change", [{"stat": "Z"},
                                     {"stat": "Z", "lstart": None, "command": None},
                                     {"lstart": "Fri Oct 16 09:00:00 2026"},
@@ -592,8 +664,8 @@ def test_cancel_keeps_an_unverified_leader_reachable_for_stop_again(box, monkeyp
     assert not _attempt_file().exists()
 
 
-@pytest.mark.parametrize("expired", [True, False])
-def test_status_keeps_an_unverified_attempt_in_stop_again_state(box, monkeypatch, expired):
+@pytest.mark.parametrize("expired,expected", [(True, signin.NOT_STOPPED), (False, signin.WAITING)])
+def test_status_keeps_unverified_ownership_while_waiting_or_unable_to_stop(box, monkeypatch, expired, expected):
     out = signin.start("claude", _folder(), now=NOW, **box.kw())
     before = _attempt_file().read_bytes()
     clock, observed = [0.0], []
@@ -606,9 +678,14 @@ def test_status_keeps_an_unverified_attempt_in_stop_again_state(box, monkeypatch
         return box.ps(pid) if expired and len(observed) == 1 else None
 
     res = signin.status(out["attempt"]["id"], now=NOW + signin.wait_s() + 1 if expired else NOW + 1,
-                        ps=ps, killpg=box.killpg, check=lambda *a: signin.NOT_SIGNED_IN)
-    assert res["ok"] and res["state"] == signin.NOT_STOPPED
-    assert res["stopped"] == "unverified" and res["left"] == []
+                        ps=ps, killpg=box.killpg,
+                        check=lambda *a: pytest.fail("unverified ownership cannot finish sign-in"))
+    assert res["ok"] and res["state"] == expected
+    if expired:
+        assert res["stopped"] == "unverified" and res["left"] == []
+    else:
+        assert "stopped" not in res and "left" not in res
+    assert 0 < clock[0] <= signin.PROCESS_OBSERVE_S + 1e-9
     assert box.killed == [] and _attempt_file().read_bytes() == before
 
 
@@ -667,6 +744,42 @@ def test_start_bounds_missing_owner_observations_and_stays_busy(box, monkeypatch
     assert len(observed) > 1 and all(0 < delay <= 0.05 for delay in slept)
     assert len(box.calls) == 1 and box.killed == []
     assert json.loads(_attempt_file().read_text())["id"] == first["attempt"]["id"]
+
+
+def test_start_reaps_before_deadline_after_owner_was_reaped_by_kernel(box, monkeypatch):
+    folder = _folder()
+    first = signin.start("claude", folder, now=NOW, **box.kw())
+    box.end(os.getppid())  # Reaped owners have no ps record, unlike zombies.
+    clock = [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    out = signin.start("claude", folder, now=NOW + 1, **box.kw())
+    assert out["ok"] is True, out
+    assert out["attempt"]["id"] != first["attempt"]["id"]
+    assert len(box.calls) == 2
+
+
+@pytest.mark.parametrize("kernel_error", [PermissionError, OSError])
+def test_missing_owner_with_kernel_error_cannot_authorize_replacement(box, monkeypatch, kernel_error):
+    folder = _folder()
+    first = signin.start("claude", folder, now=NOW, **box.kw())
+    before = _attempt_file().read_bytes()
+    clock, kernel_checks = [0.0], []
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+
+    def getpgid(pid):
+        kernel_checks.append(pid)
+        raise kernel_error(pid)
+
+    monkeypatch.setattr(signin, "_getpgid", getpgid)
+    ps = lambda pid: None if pid == os.getppid() else box.ps(pid)
+    out = signin.start("claude", folder, now=NOW + 1, ps=ps, popen=box.popen, killpg=box.killpg)
+    assert out["error"] == signin.E_BUSY and out["attempt"]["id"] == first["attempt"]["id"]
+    assert 0 < clock[0] <= signin.PROCESS_OBSERVE_S + 1e-9
+    assert kernel_checks == [os.getppid()]
+    assert box.killed == [] and len(box.calls) == 1
+    assert _attempt_file().read_bytes() == before
 
 
 @pytest.mark.parametrize("absent", [True, False])
