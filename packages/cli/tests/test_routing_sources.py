@@ -379,7 +379,8 @@ def _snapshot(folder: Path) -> dict:
 def _args(**kw):
     import argparse
 
-    base = {"route_cmd": None, "json": False, "since": None, "summary": False, "brief": False, "view_account": None}
+    base = {"route_cmd": None, "json": False, "since": None, "summary": False, "brief": False,
+            "view_account": None, "view": None}
     base.update(kw)
     return argparse.Namespace(**base)
 

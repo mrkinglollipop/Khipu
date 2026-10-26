@@ -8934,6 +8934,81 @@ def _for_a_conversation():
         raise RouteError(_FAILED) from None
 
 
+# Compact / section projections for ``khipu_route`` / ``khipu route --view``.
+# The default (no view) answer is untouched; callers attach delivery after.
+ROUTE_VIEW_CHOICES = ("summary", "accounts", "priority", "rules", "holds", "note", "proposals")
+_ROUTE_SUMMARY_KEYS = ("accounts", "priority", "rules", "holds")
+_ROUTE_VIEW_CLIP = 120
+
+
+def project_route_view(answer: dict, view: str) -> dict:
+    """Project a full route JSON answer to ``summary`` or one named section.
+
+    Delivery fields (``routing_changes``, ``delivery``) are not part of this
+    projection — MCP attaches them after, unchanged from the full path.
+    """
+    if not isinstance(view, str):
+        raise ValueError("view must be text")
+    mode = view.strip().lower()
+    if mode not in ROUTE_VIEW_CHOICES:
+        raise ValueError("view must be one of " + ", ".join(ROUTE_VIEW_CHOICES))
+    if mode != "summary":
+        return {mode: answer.get(mode)}
+
+    accounts = []
+    for row in answer.get("accounts") or []:
+        if not isinstance(row, dict):
+            continue
+        paces = []
+        for pace in row.get("pace") or []:
+            if not isinstance(pace, dict):
+                continue
+            plan = pace.get("plan") if isinstance(pace.get("plan"), dict) else {}
+            paces.append({"window": pace.get("window"), "used_pct": pace.get("used_pct"),
+                          "cycle_resets_at": pace.get("cycle_resets_at"),
+                          "plan": {"verdict": plan.get("verdict")}})
+        accounts.append({"label": row.get("label"), "state": row.get("state"),
+                         "until": row.get("until"), "pace": paces})
+
+    priority = answer.get("priority")
+    priority_out = None
+    if isinstance(priority, dict):
+        entries = []
+        for entry in priority.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            account = entry.get("account")
+            if account is None:
+                account = entry.get("label") or entry.get("id")
+            entries.append({"account": account, "role": entry.get("role"),
+                            "until": entry.get("until")})
+        priority_out = {"entries": entries, "version": priority.get("version"),
+                        "pending": priority.get("pending"),
+                        "confirmed": priority.get("confirmed")}
+
+    rules = []
+    for rule in answer.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        text = rule.get("text")
+        rules.append({"id": rule.get("entity") if rule.get("entity") is not None else rule.get("n"),
+                      "text": text[:_ROUTE_VIEW_CLIP] if isinstance(text, str) else text})
+
+    holds = []
+    for hold in answer.get("holds") or []:
+        if not isinstance(hold, dict):
+            continue
+        scope = hold.get("scope") if isinstance(hold.get("scope"), dict) else {}
+        text = hold.get("text")
+        holds.append({"id": hold.get("id"), "account": scope.get("account"),
+                      "until": hold.get("until"),
+                      "text": text[:_ROUTE_VIEW_CLIP] if isinstance(text, str) else text})
+
+    body = {"accounts": accounts, "priority": priority_out, "rules": rules, "holds": holds}
+    body["omitted"] = sorted(key for key in answer if key not in _ROUTE_SUMMARY_KEYS)
+    return body
+
+
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
                       lock_wait: float | None = CONVERSATION_LOCK_BUDGET, view: dict | None = None) -> dict:
     """What MCP ``khipu_route`` answers (``_conversation_view``), read
@@ -10775,6 +10850,7 @@ def run_cli(args) -> int:
         if cmd is None:
             view = read_view(now)
             account = _resolve_account_key(args.view_account) if getattr(args, "view_account", None) else None
+            mode = getattr(args, "view", None)
             if args.since is not None:
                 version, epoch = _parse_since(args.since)
                 out = since(version, view, now=now, epoch=epoch)
@@ -10797,8 +10873,11 @@ def run_cli(args) -> int:
                     from khipu import recall_prompt
                     recall_prompt.mark_routing_notices(session, text["notices"])
                 return 0
-            if args.json:
-                _print_json(public_view(view, now, account))
+            if args.json or mode:
+                out = public_view(view, now, account)
+                if mode:
+                    out = project_route_view(out, mode)
+                _print_json(out)
             else:
                 _print_view(view, now, account)
             _record_read(view, rules=True, priority=True)

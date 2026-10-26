@@ -810,6 +810,11 @@ TOOLS: list[dict] = [
             "is ended only by the owner); provider facts (models_allowed, models_never and use); "
             "and job runner lanes not matched to an account, with candidates. "
             "Read it before you hand work to another account or model. "
+            "`view` (optional): `summary` for a compact read (per-account state "
+            "and pace, priority, clipped rules and holds, plus omitted section "
+            "names), or one section name (`accounts`, `priority`, `rules`, "
+            "`holds`, `note`, `proposals`) for that section in full; omit "
+            "`view` for the full record. "
             "`since` (a version, or epoch:version, as an earlier answer gave "
             "it) answers only what changed after it; `account` narrows to one "
             "account. The answer carries `routing_changes` (a batch issued to "
@@ -832,6 +837,9 @@ TOOLS: list[dict] = [
                 "since": {"type": ["string", "integer"],
                           "description": "Only what changed after this version (integer V, string V or epoch:V)"},
                 "account": {"type": "string", "description": "One account: its label or its id, as khipu_route lists them"},
+                "view": {"type": "string",
+                         "enum": ["summary", "accounts", "priority", "rules", "holds", "note", "proposals"],
+                         "description": "summary: compact record; or one section name for that section in full; omit for the full record"},
                 "session_id": {"type": "string",
                                "description": "This conversation's own session id when its environment names none; "
                                               "a descendant uses the canonical root as its prefix (claude:<id>/child, codex:<id>/child)"},
@@ -2648,6 +2656,9 @@ def _tool_route_projected(args: dict) -> dict:
     since = args.get("since")
     if since is not None and (isinstance(since, bool) or not isinstance(since, (str, int))):
         raise ValueError("since must be a version number, or epoch:version")
+    mode = args.get("view")
+    if mode is not None and not isinstance(mode, str):
+        raise ValueError("view must be text")
     for key in ("session_id", "ack"):
         if args.get(key) is not None and not isinstance(args[key], str):
             raise ValueError(f"{key} must be text")
@@ -2673,6 +2684,8 @@ def _tool_route_projected(args: dict) -> dict:
                                          "the batch stays where it was."})
     try:
         out = routing.conversation_view(since_version=since, account=account or None, now=now, view=view)
+        if mode:
+            out = routing.project_route_view(out, mode)
     except ValueError as exc:
         # A refusal still carries this caller's routing changes, scrubbed
         # with the error at the dispatch boundary like any other addition.

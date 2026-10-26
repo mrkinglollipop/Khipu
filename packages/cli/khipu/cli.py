@@ -5815,6 +5815,11 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--summary", action="store_true", help="The summary a conversation gets at its start")
     rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
     rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")
+    rt.add_argument(
+        "--view", default=None, metavar="NAME",
+        choices=("summary", "accounts", "priority", "rules", "holds", "note", "proposals"),
+        help="JSON only: summary (compact) or one section name for that section in full; omit for the full record",
+    )
     rt.set_defaults(func=cmd_route, route_cmd=None)
     # Writes always print JSON; --json is accepted after any of them too, so a
     # script that adds it to every khipu call doesn't lose its write. SUPPRESS
