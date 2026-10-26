@@ -112,14 +112,17 @@ def episode_detail(episode_id: int) -> dict | None:
 
 
 def topic_detail(slug: str, *, offset: int = 0,
-                 max_bytes: int = PAGE_BYTES_DEFAULT) -> dict | None:
+                 max_bytes: int = PAGE_BYTES_DEFAULT,
+                 wiki: bool = False) -> dict | None:
     """One page of a topic for MCP ``khipu_get`` and ``khipu get``: the body
     from UTF-8 byte ``offset``, at most ``max_bytes`` of it, with the topic's
     identity and paging fields on every page (``text_pages.page_utf8``).
     When briefs are on and a current brief exists for the slug, that brief
-    body is what is paged — same text reflect offers under ``topic:<slug>``.
-    Otherwise only the page's bytes leave the database. Tombstones are not
-    found."""
+    body is what is paged — same text reflect offers under ``topic:<slug>`` —
+    unless ``wiki`` is true, which always returns the raw topic page.
+    A brief page sets ``source`` to ``"brief"`` and ``content_hash`` to the
+    brief id so ``(content_hash, updated_at)`` paging guards catch a
+    brief↔wiki flip. Tombstones are not found."""
     slug = (slug or "").strip()
     if not slug:
         return None
@@ -127,16 +130,20 @@ def topic_detail(slug: str, *, offset: int = 0,
     with connect() as conn:
         with conn.cursor() as cur:
             brief_raw = None
-            try:
-                from khipu import briefs, features
+            brief_id = None
+            if not wiki:
+                try:
+                    from khipu import briefs, features
 
-                if features.enabled("briefs"):
-                    brief = briefs.read_brief(cur, slug)
-                    if (brief.get("found") and brief.get("state") == "current"
-                            and (brief.get("body") or "").strip()):
-                        brief_raw = brief["body"].encode("utf-8")
-            except Exception:  # noqa: BLE001 — fall through to the wiki page
-                brief_raw = None
+                    if features.enabled("briefs"):
+                        brief = briefs.read_brief(cur, slug)
+                        if (brief.get("found") and brief.get("state") == "current"
+                                and (brief.get("body") or "").strip()):
+                            brief_raw = brief["body"].encode("utf-8")
+                            brief_id = brief.get("brief_id")
+                except Exception:  # noqa: BLE001 — fall through to the wiki page
+                    brief_raw = None
+                    brief_id = None
             if brief_raw is not None:
                 cur.execute(
                     """
@@ -165,7 +172,10 @@ def topic_detail(slug: str, *, offset: int = 0,
                     "updated_at": r[4].isoformat() if r[4] else None,
                     "links": r[5],
                     "source_path": r[6],
-                    "content_hash": r[7],
+                    # Brief id, not the wiki hash: mixed brief/wiki pages must
+                    # fail the (content_hash, updated_at) paging guard.
+                    "content_hash": str(brief_id) if brief_id is not None else r[7],
+                    "source": "brief",
                     **page,
                 }
             cur.execute(

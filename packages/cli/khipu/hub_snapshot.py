@@ -6869,7 +6869,12 @@ def _decision_states_for_episode_snapshot(
     con: sqlite3.Connection, episode_id: int
 ) -> dict[str, Any]:
     """Replica twin of ``decisions.decision_states_for_episode`` for rows
-    owned by this episode id. Empty/zeroed when the table is absent."""
+    owned by this episode id only. Unlike the hub path
+    (``briefs._decision_rows`` / ``decision_states_for_episode``), this does
+    not attach decisions by normalized text within the project and dedupe
+    window — a restatement whose row lives on an earlier episode therefore
+    still has empty ``decision_states`` when the hub is down. Empty/zeroed
+    when the table is absent."""
     empty = {
         "decision_states": [],
         "validity": {"current": 0, "superseded": 0, "retracted": 0},

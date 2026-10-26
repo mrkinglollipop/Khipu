@@ -337,7 +337,9 @@ TOOLS: list[dict] = [
             "slug, title, updated_at, content_hash, body_total_bytes, "
             "body_offset, body_next_offset and complete; while complete is "
             "false, call again with offset set to body_next_offset to read the "
-            "rest. Media: path/sha256/mime. Library ids "
+            "rest. When briefs are on and a current brief exists, the body is "
+            "that brief (source='brief', content_hash=brief id) unless wiki is "
+            "true. Media: path/sha256/mime. Library ids "
             "(library:<name>:<doc>#<chunk>): the chunk text, its document "
             "(title, author, tags, rel_path, root) and the previous/next chunk "
             "text so you can read around a hit; library:<name>:<doc> returns the "
@@ -378,6 +380,13 @@ TOOLS: list[dict] = [
                         "Topics only: largest page body in UTF-8 bytes "
                         f"(default {PAGE_BYTES_DEFAULT}, at most {PAGE_BYTES_MAX}). "
                         "A page never splits a character."
+                    ),
+                },
+                "wiki": {
+                    "type": "boolean",
+                    "description": (
+                        "Topics only: when true, return the raw wiki page even "
+                        "if a current brief exists (default false)."
                     ),
                 },
             },
@@ -1269,6 +1278,7 @@ def _tool_get(args: dict) -> dict:
     if kind not in (None, "episode", "topic", "media", "library"):
         raise ValueError("kind must be 'episode', 'topic', 'media', or 'library'")
     offset, max_bytes = page_args(args.get("offset"), args.get("max_bytes"))
+    wiki = bool(args.get("wiki"))
     _ensure_path()
     from khipu import library_search
 
@@ -1318,7 +1328,7 @@ def _tool_get(args: dict) -> dict:
                 row.update(decision_states_for_episode(int(ident)))
                 return _detail_response("episode", row)
         if inferred == "topic":
-            row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+            row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
             if row is None and kind is None:
                 media = media_detail(ident)
                 if media is not None:

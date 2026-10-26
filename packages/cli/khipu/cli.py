@@ -3400,9 +3400,10 @@ def cmd_get(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
+        wiki = bool(getattr(args, "wiki", False))
         if getattr(args, "all", False):
-            return _get_topic_all(ident, offset, max_bytes)
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+            return _get_topic_all(ident, offset, max_bytes, wiki=wiki)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
@@ -3416,7 +3417,8 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
-def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
+def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
+                   wiki: bool = False) -> int:
     """`khipu get <topic> --all`: follow body_next_offset and write the body
     from ``offset`` to the end on stdout, raw, one page at a time. Stops with
     an error if the topic changes between pages (content_hash or updated_at),
@@ -3425,7 +3427,7 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
 
     first = None
     while True:
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
         if row is None:
             print(json.dumps({"ok": False, "error": f"topic not found: {ident}"}),
                   file=sys.stderr)
@@ -6294,6 +6296,10 @@ def build_parser() -> argparse.ArgumentParser:
     gt.add_argument(
         "--all", action="store_true",
         help="Topics: write the whole body (from --offset) to stdout, page by page",
+    )
+    gt.add_argument(
+        "--wiki", action="store_true",
+        help="Topics: return the raw wiki page even when a current brief exists",
     )
     gt.set_defaults(func=cmd_get)
 
