@@ -1946,7 +1946,11 @@ def cmd_library(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
     print(json.dumps(out, indent=2, default=str))
-    return _backfill_exit_code(out) if cmd == "backfill" else 0
+    if cmd == "backfill":
+        return _backfill_exit_code(out)
+    if cmd == "import" and out.get("ok") is False:
+        return 1
+    return 0
 
 
 def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
