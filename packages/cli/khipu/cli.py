@@ -2824,7 +2824,14 @@ def _cmd_episode_forget_pending(args: argparse.Namespace) -> int:
     elif args.not_same is not None:
         action, target = "forget.not_same", str(args.not_same)
     else:
-        print(json.dumps(forget.unsent_forgets(), default=str))
+        from khipu import owner_act, routing
+
+        out = forget.unsent_forgets()
+        # Summaries are forgotten episodes' text: only the app itself or a
+        # conversation the owner typed in sees them.
+        if not ((args.from_app and routing._caller()["app"]) or owner_act.owner_turn()):
+            out = owner_act.without_summaries(out)
+        print(json.dumps(out, default=str))
         return 0
     from khipu import owner_direction
 

@@ -1012,8 +1012,8 @@ TOOLS: list[dict] = [
             "setting, a ledger row, several of the owner's Owed items at once "
             "(owed.change: \"close those\"), apply or undo an Owed clean-up "
             "(owed.tidy, after showing the owner the plan's summary), resolve the forgets this "
-            "Mac holds that the hub lacks (forget.list reads them, each listed episode id with its "
-            "hub summary, and changes nothing; forget.send; forget.here or forget.not_same with "
+            "Mac holds that the hub lacks (forget.list reads them, each listed episode id, with its "
+            "hub summary only in a conversation the owner typed in, and changes nothing; forget.send; forget.here or forget.not_same with "
             "{\"id\": N} for a listed episode id), or confirm a request that is "
             "waiting for the owner. Submit the exact action and its arguments; it applies "
             "at once. Khipu accepts it only from a conversation the owner has "
@@ -1290,6 +1290,17 @@ def _tool_get(args: dict) -> dict:
     inferred = kind
     if inferred is None:
         inferred = "episode" if ident.isdigit() else "topic"
+    if inferred == "episode" and ident.isdigit():
+        from khipu.tombstones import read_gate
+
+        # A forget this Mac holds that the hub lacks leaves the hub row live;
+        # its text reaches a caller only through the owner's forget.list.
+        try:
+            forgotten = int(ident) in read_gate().episode_ids
+        except Exception:  # noqa: BLE001 - an unreadable registry shows no episode
+            forgotten = True
+        if forgotten:
+            raise ValueError(f"episode not found: {ident}")
 
     hub_failed = False
     try:
