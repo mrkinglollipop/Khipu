@@ -11,6 +11,7 @@ import {
   checkedHost,
   draftFromCap,
   emptyCapDraft,
+  matchingCapIndex,
   movedBy,
   ownerActionId,
   priorityItems,
@@ -75,6 +76,20 @@ describe("what a cap form sends", () => {
     expect(capSentence({ kind: "share", window: "weekly", pct: 95 })).toBe("At most 95% of the week");
     expect(capSentence({ kind: "pace_target", purpose: "check", slack: 5 })).toBe("Checks: up to 5 points over an even pace");
     expect(capSentence({ kind: "concurrency", cap_n: 2 })).toBe("At most 2 jobs at once");
+  });
+
+  it("finds the existing cap a new set would replace (same kind, window, purpose)", () => {
+    const caps: CapStatus[] = [
+      { kind: "share", window: "weekly", pct: 50 },
+      { kind: "pace_target", purpose: "job", window: "weekly", pct: 100, slack: 0 },
+      { kind: "concurrency", cap_n: 2 },
+    ];
+    expect(matchingCapIndex(caps, { kind: "share", window: "weekly", pct: 30 })).toBe(0);
+    expect(matchingCapIndex(caps, { kind: "share", window: "five_hour", pct: 30 })).toBe(-1);
+    expect(matchingCapIndex(caps, { kind: "pace_target", window: "weekly", pct: 100, slack: 5, purpose: "job" })).toBe(1);
+    expect(matchingCapIndex(caps, { kind: "pace_target", window: "weekly", pct: 100, slack: 5, purpose: "check" })).toBe(-1);
+    expect(matchingCapIndex(caps, { kind: "concurrency", n: 4 })).toBe(2);
+    expect(matchingCapIndex(caps, { kind: "spend", usd: 10, days: 7 })).toBe(-1);
   });
 });
 

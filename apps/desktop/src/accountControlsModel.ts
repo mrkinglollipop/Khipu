@@ -144,6 +144,22 @@ export function capRemoveArgs(c: CapStatus): CapArgs {
   return cap;
 }
 
+/** Index of an existing cap a set would replace (one slot per kind/window/purpose), or -1. */
+export function matchingCapIndex(caps: CapStatus[], cap: CapArgs): number {
+  return caps.findIndex((c) => {
+    if (c.kind !== cap.kind) return false;
+    if (cap.kind === "share" || cap.kind === "per_day" || cap.kind === "pace_target") {
+      const win = c.window === "five_hour" ? "five_hour" : "weekly";
+      if (win !== (cap.window ?? "weekly")) return false;
+    }
+    if (cap.kind === "pace_target") {
+      const purpose = c.purpose === "check" ? "check" : "job";
+      if (purpose !== (cap.purpose ?? "job")) return false;
+    }
+    return true;
+  });
+}
+
 /** A cap as one plain sentence, for the Undo bar and the remove line. */
 export function capSentence(c: CapStatus): string {
   const who = c.purpose === "check" ? "Checks" : "Jobs";

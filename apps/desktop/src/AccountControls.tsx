@@ -41,6 +41,7 @@ import {
   checkedHost,
   draftFromCap,
   emptyCapDraft,
+  matchingCapIndex,
   movedBy,
   ownerActionId,
   withAccountLast,
@@ -397,7 +398,15 @@ export function HoldControls({ ctl, a, view, now }: { ctl: Controls; a: RouteAcc
 // Caps
 // ---------------------------------------------------------------------------
 
-function CapForm({ a, cap, ctl, back, onClose }: { a: RouteAccount; cap: CapStatus | null; ctl: Controls; back: Back; onClose: () => void }) {
+function CapForm({ a, cap, ctl, back, onClose, onOpenExisting }: {
+  a: RouteAccount;
+  cap: CapStatus | null;
+  ctl: Controls;
+  back: Back;
+  onClose: () => void;
+  /** When adding, open the matching existing Change form instead of replacing it. */
+  onOpenExisting?: (i: number) => void;
+}) {
   const { w, change } = ctl;
   const base = useId().replace(/:/g, "");
   const [d, setD] = useState<CapDraft>(() => (cap ? draftFromCap(cap) : emptyCapDraft()));
@@ -412,6 +421,13 @@ function CapForm({ a, cap, ctl, back, onClose }: { a: RouteAccount; cap: CapStat
     if ("error" in out) {
       w.fail(id, out.error);
       return;
+    }
+    if (!editing && onOpenExisting) {
+      const i = matchingCapIndex(a.cap_statuses ?? [], out.cap);
+      if (i >= 0) {
+        onOpenExisting(i);
+        return;
+      }
     }
     const ok = await change({
       section: "caps",
@@ -564,7 +580,7 @@ export function CapControls({ ctl, a, rows }: { ctl: Controls; a: RouteAccount; 
         <p className="meta">No caps set.</p>
       )}
       {editing === "new" ? (
-        <CapForm a={a} cap={null} ctl={ctl} back={back} onClose={() => close("new")} />
+        <CapForm a={a} cap={null} ctl={ctl} back={back} onClose={() => close("new")} onOpenExisting={(i) => setEditing(i)} />
       ) : (
         <div className="toolbar">
           <button ref={addBtn} type="button" className="sm" onClick={() => setEditing("new")}>
@@ -600,6 +616,10 @@ function WordsForm({ a, view, ctl, now, onClose }: { a: RouteAccount; view: Rout
   const id = `words:${a.key}`;
   const moveId = `move:${a.key}`;
   const removeId = `remove:${a.key}`;
+  // After a Move write re-reads, props update while this closure is still open;
+  // keep the latest list/version so a successful move can reset the starting point.
+  const viewNow = useRef({ entries, version: expect, until: p?.until ?? null });
+  viewNow.current = { entries, version: expect, until: p?.until ?? null };
   const save = (items: ReturnType<typeof withRole>, writeId: string, text: string, back?: Back) =>
     change({ section: "words", writeId, command: "khipu_route_priority",
       args: { action: "set", entries: items, until: p?.until ?? null, expect }, owner: "route.priority.set", text, attempt: eok.attempt, back });
@@ -619,9 +639,11 @@ function WordsForm({ a, view, ctl, now, onClose }: { a: RouteAccount; view: Rout
     w.fail(id, null);
     area.current?.focus();
   };
-  const move = (by: -1 | 1) => {
+  const move = async (by: -1 | 1) => {
     const items = movedBy(entries, a.key, by);
-    if (items) void save(items, moveId, `${a.label} moved ${by < 0 ? "up" : "down"} in your priority.`);
+    if (!items) return;
+    const ok = await save(items, moveId, `${a.label} moved ${by < 0 ? "up" : "down"} in your priority.`);
+    if (ok) setStarted(viewNow.current);
   };
   async function remove() {
     const rest = withoutAccount(entries, a.key);

@@ -162,7 +162,9 @@ describe("caps", () => {
     const { dialog } = sheet();
     const caps = section(dialog, "Your caps");
     fireEvent.click(caps.getByRole("button", { name: "Add a cap…" }));
-    fireEvent.change(caps.getByLabelText("Percent"), { target: { value: "80" } });
+    // Concurrency: a free slot (share of the week is already set on Codex).
+    fireEvent.change(caps.getByLabelText("What kind of cap"), { target: { value: "concurrency" } });
+    fireEvent.change(caps.getByLabelText("Jobs at once"), { target: { value: "2" } });
     fireEvent.click(caps.getByRole("button", { name: "Save cap" }));
     fireEvent.click(await caps.findByRole("button", { name: "Undo" }));
     expect(await caps.findByRole("alert")).toHaveTextContent("Can't undo: a newer change touched the same cap");
@@ -465,7 +467,9 @@ describe("review round 2: identity, stale versions, levels, keys", () => {
     const { dialog } = sheet();
     const caps = section(dialog, "Your caps");
     fireEvent.click(caps.getByRole("button", { name: "Add a cap…" }));
-    fireEvent.change(caps.getByLabelText("Percent"), { target: { value: "80" } });
+    // Concurrency: a free slot (share of the week is already set on Codex).
+    fireEvent.change(caps.getByLabelText("What kind of cap"), { target: { value: "concurrency" } });
+    fireEvent.change(caps.getByLabelText("Jobs at once"), { target: { value: "2" } });
     fireEvent.click(caps.getByRole("button", { name: "Save cap" }));
     await caps.findByRole("status");
     expect(caps.queryByRole("button", { name: "Undo" })).toBeNull();
@@ -553,5 +557,61 @@ describe("review round 3: a changed cap keeps what it did not change", () => {
     await waitFor(() => expect(calls("khipu_route_cap")).toEqual([
       { action: "set", account: "codex|", cap: { kind: "pace_target", window: "weekly", pct: 65, slack: 8, purpose: "job" } },
     ]));
+  });
+});
+
+describe("review round 4: move baseline and matching Add a cap", () => {
+  it("after Move up from Change…, Save still writes the words draft (own move is not stale)", async () => {
+    // Codex starts second so Move up is enabled; the re-read bumps the version.
+    let current = view({
+      priority: {
+        entries: [
+          { account: "claude|", label: "Claude", role: "design and judgement", until: null },
+          { account: "codex|", label: "Codex", role: "builds first", until: null },
+        ],
+        version: "p1",
+      },
+    } as Partial<RouteView>);
+    const onChanged = vi.fn(async () => {
+      current = view({
+        priority: {
+          entries: [
+            { account: "codex|", label: "Codex", role: "builds first", until: null },
+            { account: "claude|", label: "Claude", role: "design and judgement", until: null },
+          ],
+          version: "p2",
+        },
+      } as Partial<RouteView>);
+      rerender(<RoutingDetailSheet account={codex} view={current} now={NOW} onClose={() => {}} onChanged={onChanged} />);
+    });
+    const { rerender } = render(<RoutingDetailSheet account={codex} view={current} now={NOW} onClose={() => {}} onChanged={onChanged} />);
+    const words = section(screen.getByRole("dialog"), "Your words for this account");
+    fireEvent.click(words.getByRole("button", { name: "Change…" }));
+    fireEvent.change(words.getByLabelText("Your words for Codex"), { target: { value: "my draft after move" } });
+    fireEvent.click(words.getByRole("button", { name: "Move Codex up" }));
+    await waitFor(() => expect(calls("khipu_route_priority")).toHaveLength(1));
+    expect(words.queryByRole("alert")).toBeNull();
+    fireEvent.click(words.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("khipu_route_priority")).toHaveLength(2));
+    expect(calls("khipu_route_priority")[1]).toMatchObject({
+      action: "set",
+      expect: "p2",
+      entries: [
+        { account: "codex|", role: "my draft after move" },
+        { account: "claude|", role: "design and judgement" },
+      ],
+    });
+  });
+
+  it("Add a cap… that matches an existing slot opens that cap's Change form instead of replacing it", async () => {
+    const { dialog } = sheet();
+    const caps = section(dialog, "Your caps");
+    fireEvent.click(caps.getByRole("button", { name: "Add a cap…" }));
+    fireEvent.change(caps.getByLabelText("Percent"), { target: { value: "30" } });
+    fireEvent.click(caps.getByRole("button", { name: "Save cap" }));
+    expect(calls("khipu_route_cap")).toEqual([]);
+    expect(caps.getByLabelText("Percent")).toHaveValue(95);
+    expect(caps.getByLabelText("What kind of cap")).toBeDisabled();
+    expect(caps.getByRole("form", { name: "Change a cap for Codex" })).toBeInTheDocument();
   });
 });
