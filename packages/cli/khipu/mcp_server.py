@@ -814,7 +814,7 @@ TOOLS: list[dict] = [
             "and pace, priority, clipped rules and holds, plus omitted section "
             "names), or one section name (`accounts`, `priority`, `rules`, "
             "`holds`, `note`, `proposals`) for that section in full; omit "
-            "`view` for the full record. "
+            "`view` for the full record. Do not combine `view` with `since`. "
             "`since` (a version, or epoch:version, as an earlier answer gave "
             "it) answers only what changed after it; `account` narrows to one "
             "account. The answer carries `routing_changes` (a batch issued to "
@@ -2659,6 +2659,9 @@ def _tool_route_projected(args: dict) -> dict:
     mode = args.get("view")
     if mode is not None and not isinstance(mode, str):
         raise ValueError("view must be text")
+    if since is not None and mode is not None and str(mode).strip():
+        raise ValueError("view cannot be combined with since; omit view for a since answer, "
+                         "or omit since for a view projection")
     for key in ("session_id", "ack"):
         if args.get(key) is not None and not isinstance(args[key], str):
             raise ValueError(f"{key} must be text")

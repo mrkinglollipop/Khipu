@@ -240,3 +240,77 @@ def test_invalid_view_is_refused(home):
     error, body = _call("khipu_route", {"view": "telemetry"})
     assert error
     assert body.get("code") == "bad_args" or "view" in body.get("error", "").lower()
+
+
+def test_since_plus_view_is_refused_in_mcp_and_cli(home, capsys):
+    """P2: view on a since answer silently projected wrong shape; refuse instead."""
+    routing.add_rule("Standing rule so the record has a version.", via="app")
+    error, body = _call("khipu_route", {"since": "0", "view": "summary"})
+    assert error
+    err = (body.get("error") or "").lower()
+    assert "since" in err and "view" in err
+    assert "omitted" not in body and "entities" not in body
+    error, body = _call("khipu_route", {"since": 0, "view": "rules"})
+    assert error and "since" in (body.get("error") or "").lower()
+    assert cli.main(["route", "--since", "0", "--view", "summary"]) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert refused.get("ok") is False and "since" in refused.get("error", "").lower()
+    assert cli.main(["route", "--since", "0", "--json", "--view", "rules"]) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert refused.get("ok") is False and "view" in refused.get("error", "").lower()
+
+
+def test_summary_of_a_very_large_record_stays_under_16kb():
+    """P2: list counts and ids must be capped, not only text clip length."""
+    long = "x" * 4000
+    long_id = "rule:" + ("i" * 200)
+    accounts = []
+    for i in range(6):
+        accounts.append({
+            "label": f"Account-{i}-" + long[:80], "state": "limited",
+            "until": "2026-10-14T20:00:00." + ("9" * 80) + "Z",
+            "pace": [
+                {"window": f"w{j}", "used_pct": float(j), "cycle_resets_at": "2026-10-14T20:00:00Z",
+                 "plan": {"verdict": "on_pace", "detail": long}}
+                for j in range(3)
+            ],
+        })
+    rules = [{"entity": f"{long_id}{i}", "n": i, "text": f"Standing rule {i}: " + long}
+             for i in range(200)]
+    holds = [{"id": f"hold-{i}-" + ("h" * 200), "scope": {"kind": "account", "account": f"acct-{i}"},
+              "until": "2026-10-15T00:00:00." + ("8" * 80) + "Z",
+              "text": "hold words " + long} for i in range(100)]
+    fat = {
+        "schema": 1, "epoch": "e1", "version": 9, "generated_at": "2026-10-14T15:00:00Z",
+        "accounts": accounts,
+        "priority": {"entries": [{"label": f"Account-{i}", "id": f"id-{i}-" + ("p" * 200),
+                                  "role": f"role-{i}-" + long[:200], "until": "until-" + ("u" * 200)}
+                                 for i in range(40)],
+                     "version": "p3", "pending": False, "confirmed": True},
+        "rules": rules, "holds": holds,
+        "note": {"text": long}, "proposals": [], "providers": [], "about": routing.ABOUT,
+    }
+    assert len(json.dumps(fat, separators=(",", ":"))) > 16000
+    compact = routing.project_route_view(fat, "summary")
+    blob = json.dumps(compact, separators=(",", ":")).encode("utf-8")
+    assert len(blob) < 16000, len(blob)
+    assert any(isinstance(r, dict) and r.get("more") for r in compact["rules"])
+    assert any(isinstance(h, dict) and h.get("more") for h in compact["holds"])
+    for rule in compact["rules"]:
+        if "id" in rule and isinstance(rule["id"], str):
+            assert len(rule["id"]) <= 120
+    for hold in compact["holds"]:
+        if "id" in hold and isinstance(hold["id"], str):
+            assert len(hold["id"]) <= 120
+        if "until" in hold and isinstance(hold["until"], str):
+            assert len(hold["until"]) <= 120
+
+
+def test_cli_view_refused_with_summary_or_brief(home, capsys):
+    """P3: --view must not be quietly ignored on --summary/--brief paths."""
+    assert cli.main(["route", "--summary", "--view", "rules"]) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert refused.get("ok") is False and "view" in refused.get("error", "").lower()
+    assert cli.main(["route", "--brief", "--view", "summary"]) == 2
+    refused = json.loads(capsys.readouterr().out)
+    assert refused.get("ok") is False and "view" in refused.get("error", "").lower()

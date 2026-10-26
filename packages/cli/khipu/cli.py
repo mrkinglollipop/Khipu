@@ -5818,7 +5818,8 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument(
         "--view", default=None, metavar="NAME",
         choices=("summary", "accounts", "priority", "rules", "holds", "note", "proposals"),
-        help="JSON only: summary (compact) or one section name for that section in full; omit for the full record",
+        help="JSON only: summary (compact) or one section name for that section in full; "
+             "omit for the full record; not with --summary, --brief, or --since",
     )
     rt.set_defaults(func=cmd_route, route_cmd=None)
     # Writes always print JSON; --json is accepted after any of them too, so a
