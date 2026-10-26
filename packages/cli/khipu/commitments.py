@@ -2029,11 +2029,14 @@ def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
     """Open commitments opened by an episode of THIS session.
 
     Joined through ``episodes`` rather than a new column so rows written
-    before this change are covered too.
+    before this change are covered too. ``latest_text`` is included when
+    migration lineage columns exist so a restatement's future-trigger wording
+    is visible to :func:`close_session_plan`.
     """
+    latest = ", c.latest_text" if _lineage_columns_ready(cur) else ""
     cur.execute(
         f"""
-        SELECT c.id, c.text, c.kind, c.owner
+        SELECT c.id, c.text, c.kind, c.owner{latest}
         FROM commitments c
         JOIN episodes e ON e.id = c.opened_episode
         WHERE c.status = 'open' AND e.session_id = %s
@@ -2041,10 +2044,13 @@ def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
         """,
         (session_id,),
     )
-    return [
-        {"id": r[0], "text": r[1], "kind": r[2], "owner": r[3]}
-        for r in cur.fetchall()
-    ]
+    rows = []
+    for r in cur.fetchall():
+        item = {"id": r[0], "text": r[1], "kind": r[2], "owner": r[3]}
+        if latest:
+            item["latest_text"] = r[4]
+        rows.append(item)
+    return rows
 
 
 def _is_user_owed(row: dict[str, Any]) -> bool:
@@ -2090,7 +2096,10 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         return 0
     closed = 0
     for row in rows:
-        trigger = has_future_trigger(row["text"])
+        # Restatements store newer wording in latest_text; a folded
+        # "… next session" must keep the row open through sessionend.
+        trigger = (has_future_trigger(row["text"] or "")
+                   or has_future_trigger(row.get("latest_text") or ""))
         owner, _label = row_owner(row, future_trigger=trigger)
         # Only the assistant's own items die with its session: the user's,
         # and an agent's (a job's item for its orchestrator), outlive it.

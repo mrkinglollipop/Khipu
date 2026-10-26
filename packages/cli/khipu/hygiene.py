@@ -907,11 +907,29 @@ _SESSION_END_EVENTS_SQL = "('sessionend', 'session_end', 'session-end', 'session
 
 def _select_open_with_session(cur, *, project: str | None, limit: int | None,
                               hours: int) -> list[dict[str, Any]]:
+    from khipu.db import has_columns
+
     clauses = ["c.status = 'open'"]
     params: list[Any] = []
     if project:
         clauses.append("c.project = %s")
         params.append(project)
+    # A restatement bumps last_seen_at; while that touch is still inside the
+    # session-ended window the opening session alone must not retire the row
+    # (a live session may have folded into it).
+    if has_columns(cur, "commitments", "last_seen_at"):
+        recent_sql = (
+            f"(c.last_seen_at IS NOT NULL AND c.last_seen_at >= now() - "
+            f"interval '{int(hours)} hours') AS recently_restated"
+        )
+    else:
+        recent_sql = "false AS recently_restated"
+    latest_sql = (
+        "c.latest_text" if has_columns(cur, "commitments", "latest_text")
+        else "NULL::text AS latest_text"
+    )
+    # Only a sessionend that lands at or after the row was opened ends it —
+    # an earlier sessionend in the same session_id must not close a later open.
     sql = f"""
         SELECT c.id, c.text, c.project, c.kind, c.owner, c.opened_at, e.session_id,
                (SELECT max(e2.ts) FROM episodes e2 WHERE e2.session_id = e.session_id) AS last_ts,
@@ -921,9 +939,12 @@ def _select_open_with_session(cur, *, project: str | None, limit: int | None,
                EXISTS (
                  SELECT 1 FROM episodes e3
                  WHERE e3.session_id = e.session_id
+                   AND e3.ts >= c.opened_at
                    AND (lower(COALESCE(e3.raw->>'event', '')) IN {_SESSION_END_EVENTS_SQL}
                         OR strpos(lower(COALESCE(e3.scope, '')), 'sessionend') > 0)
-               ) AS end_event
+               ) AS end_event,
+               {recent_sql},
+               {latest_sql}
         FROM commitments c
         LEFT JOIN episodes e ON e.id = c.opened_episode
         WHERE {' AND '.join(clauses)}
@@ -934,7 +955,7 @@ def _select_open_with_session(cur, *, project: str | None, limit: int | None,
         params.append(int(limit))
     cur.execute(sql, tuple(params))
     cols = ("id", "text", "project", "kind", "owner", "opened_at", "session_id",
-            "last_ts", "aged", "end_event")
+            "last_ts", "aged", "end_event", "recently_restated", "latest_text")
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
@@ -982,9 +1003,13 @@ def run_session_ended_pass(
     counts = {"keep": 0, "close": 0, "drop": 0}
     for row in rows:
         text = row["text"] or ""
-        trigger = has_future_trigger(text)
+        latest = row.get("latest_text") or ""
+        # A restatement that adds a cross-session trigger lands in latest_text;
+        # the opening text alone must not decide.
+        trigger = has_future_trigger(text) or has_future_trigger(latest)
         owner, _label = row_owner(row, future_trigger=trigger)
-        ended = bool(row.get("aged")) or bool(row.get("end_event"))
+        ended = ((bool(row.get("aged")) or bool(row.get("end_event")))
+                 and not bool(row.get("recently_restated")))
         if owner == "user":
             verdict, reason = "keep", "user-owed"
         elif owner == "agent":
@@ -1025,9 +1050,13 @@ def run_session_ended_pass(
                 cur.execute("UPDATE commitments SET future_trigger = %s WHERE id = %s",
                             (item["future_trigger"], cid))
             if item["verdict"] == "close":
+                # Same key shape as commitments.close_session_plan so a manual
+                # reopen (reopened_rule_keys) blocks the nightly re-close.
+                sid = str(item.get("session_id") or "").strip()
+                key = f"session-ended:{sid}" if sid else "hygiene:session-ended"
                 applied += int(co.close_by_rule(
                     cur, cid, rule="session-ended", reason="session-ended",
-                    key="hygiene:session-ended", evidence={"rule": "hygiene-session-ended"}))
+                    key=key, evidence={"rule": "hygiene-session-ended", "session_id": sid or None}))
             elif item["verdict"] == "drop":
                 applied += int(co.close_by_rule(
                     cur, cid, rule="drop", status="dropped",
