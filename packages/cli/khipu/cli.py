@@ -5496,7 +5496,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--limit", type=int, default=50)
     g.set_defaults(func=cmd_graph)
 
-    r = sub.add_parser("regen-memory", help="Write MEMORY.md from PG topics")
+    r = sub.add_parser(
+        "regen-memory",
+        help="Write MEMORY.from-khipu.md from PG topics (or live MEMORY.md with --index)",
+    )
     r.add_argument(
         "--out",
         default=None,  # resolved against memory_root at run time
