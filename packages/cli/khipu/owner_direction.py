@@ -1093,8 +1093,15 @@ def _before(want: dict):
     if action in ("route.note.set", "route.note.end"):
         note = routing.read_view().get("note")
         return {"text": note["text"] if note else None}
-    if action in ("route.rule.edit", "route.rule.undo"):
-        return {"text": _rule_now(target).get("text")}
+    if action in ("route.rule.edit", "route.rule.undo", "route.rule.retire", "route.rule.dismiss"):
+        rule = _rule_now(target)
+        out = {"text": rule.get("text")} if action in ("route.rule.edit", "route.rule.undo") else {}
+        if rule.get("pending"):
+            # A conversation's pending proposal: its stored line, so undo
+            # puts it back as that conversation's, never as the owner's words.
+            out.update(pending_kind=rule.get("pending_kind"),
+                       request=routing.pending_rule_line(rule["entity"]))
+        return out
     if action == "route.rule.add":
         # The new rule's number is known only after, so its line's id is
         # chosen now: Undo finds that line even if the finish was never
@@ -1112,17 +1119,18 @@ def _before(want: dict):
         if hold is None:
             return None
         return {"text": hold.get("text"), "reason": hold.get("reason"), "scope": hold.get("scope"),
-                "until": hold.get("until")}
+                "until": hold.get("until"), "owner": bool(hold.get("owner")), "written_by": hold.get("written_by"),
+                "via": hold.get("via")}
     if action.startswith("route.priority."):
         # The stored line, never the folded view: undo puts back entries the
         # view leaves out, and an entry whose end has passed since never
-        # refuses it. A confirm's undo puts back what the request replaced.
+        # refuses it. A conversation's pending request keeps its author, its
+        # words and the priority it replaced, so undo returns it pending.
         stored = routing.read_view().get("priority_stored")
-        if action == "route.priority.confirm":
-            stored = (stored or {}).get("replaced")
         if not stored:
             return {"entries": None, "until": None, "stored": True}
-        return {"entries": [dict(e) for e in stored["entries"]], "until": stored.get("until"), "stored": True}
+        return {**{k: stored.get(k) for k in ("until", "pending", "written_by", "via", "owner_request", "replaced")},
+                "entries": [dict(e) for e in stored["entries"]], "stored": True}
     if action.startswith("route.tier_table."):
         held = routing.read_view().get("tier_table")
         return {"tiers": dict(held["tiers"]) if held else None}
@@ -1299,6 +1307,16 @@ def _undo_hold_end(line, via):
     before = line.get("before") or {}
     scope = before.get("scope") or {}
     kind = scope.get("kind")
+    # A conversation's hold comes back as that conversation's (its limits
+    # included); only the owner's own hold comes back as his. A line from
+    # before authors were kept keeps the old behaviour.
+    author = before.get("written_by")
+    if "owner" in before and not before["owner"]:
+        if not isinstance(author, dict) or author.get("kind") != "conversation":
+            raise ValueError("Khipu can't tell which conversation wrote this hold, so it can't undo its end")
+        return routing.add_hold(before.get("text") or "", reason=before.get("reason") or "other", scope=kind,
+                                account=scope.get("account"), until=before.get("until"), owner=False,
+                                author=dict(author), via=before.get("via") or "mcp")
     return routing.add_hold(before.get("text") or "", reason=before.get("reason") or "other", scope=kind,
                             account=scope.get("account"), until=before.get("until"), owner=True, via=via)
 
@@ -1475,6 +1493,9 @@ def _undo_note_end(line, via):
 def _undo_rule_words(line, via, holds=None):
     from khipu import routing
 
+    back = _pending_rule_back(line, via, holds)
+    if back is not None:
+        return back
     words = _b(line).get("text") or ""
     return routing.edit_rule(line["target"], words, via=via, holds=_undo_holds(line, holds),
                              _undo_default_holds=True)
@@ -1488,9 +1509,30 @@ def _retire_rule(n_of):
     return run
 
 
+def _pending_rule_back(line, via, holds):
+    """None when the change was not over a conversation's pending rule
+    proposal; otherwise that proposal put back as the conversation's."""
+    from khipu import routing
+
+    before = _b(line)
+    if before.get("pending_kind") == "added":
+        # Restoring would make the conversation's proposed rule read as the
+        # owner's; it has to be proposed again.
+        raise ValueError("this was a conversation's proposed rule; Khipu won't bring it back as yours, "
+                         "so ask the conversation to propose it again")
+    if before.get("pending_kind") == "changed":
+        return routing.restore_rule_request(line["target"], before.get("request") or {}, via=via,
+                                            holds=_undo_holds(line, holds),
+                                            retired=line["action"] == "route.rule.retire")
+    return None
+
+
 def _undo_restore_rule(line, via, holds=None):
     from khipu import routing
 
+    back = _pending_rule_back(line, via, holds)
+    if back is not None:
+        return back
     return routing.restore_rule(line["target"], via=via, holds=_undo_holds(line, holds),
                                 _undo_default_holds=True)
 

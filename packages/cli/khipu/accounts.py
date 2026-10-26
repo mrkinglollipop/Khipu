@@ -990,9 +990,11 @@ def _stop_events(view: dict, keys: list[str], *, keep_priority: bool, keep_pause
             kept = [dict(e) for e in stored.get("entries") or [] if e["account"] not in keys] if stored else [
                 {"account": e["account"], "label": e["label"], "role": e.get("role"), "until": e.get("until"),
                  **({"level": dict(e["level"])} if e.get("level") else {})} for e in rest]
+            # Set or clear by the stored rows kept: an entry the view no
+            # longer shows is still the owner's and must not be cleared away.
             events.append({"type": "priority_set", "until": stored.get("until", held.get("until")),
                            "entries": kept}
-                          if rest else {"type": "priority_clear"})
+                          if kept else {"type": "priority_clear"})
             done["priority"] = "removed"
     for key in keys:
         entry = next((a for a in view["accounts"] if a["key"] == key), None)

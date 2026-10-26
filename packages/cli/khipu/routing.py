@@ -4600,6 +4600,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             "priority_stored": None if priority is None else {
                 "entries": [dict(e) for e in priority["entries"]], "until": _iso(priority["until"]),
                 "pending": bool(priority["pending"]),
+                # Whose line it is: an undo puts a conversation's request back
+                # as that conversation's, pending, never as the owner's.
+                "written_by": priority.get("written_by"), "via": priority.get("via"),
+                "owner_request": priority.get("owner_request"),
                 # The owner's priority a pending request replaced, as stored
                 # (what undoing a confirm puts back); None when there was none.
                 "replaced": None if not (priority["pending"] and priority.get("prior")) else {
@@ -6792,6 +6796,60 @@ def undo_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
     return dict(_owner_write({"type": "rule_undo", **_rule_target(rule)}, via), n=rule["n"])
 
 
+def pending_rule_line(entity: str) -> dict | None:
+    """The stored line of a rule's pending conversation edit (its words,
+    the owner's words it would replace, its author and the request), for an
+    undo to put back as that conversation's; None for a proposed addition or
+    when there is none."""
+    events, _bad = read_events()
+    rows = [e for e in _in_write_order(events)
+            if e.get("type") == "rule_edit" and e.get("pending") and event_identity.entity(e) == entity]
+    if not rows:
+        return None
+    last = rows[-1]
+    return {k: last.get(k) for k in ("text", "prior_text", "prior_confirmed", "owner_request", "written_by", "via")}
+
+
+def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = None,
+                         holds: dict | None = None, retired: bool = False) -> dict:
+    """Undo of an owner change over a conversation's pending rule edit: the
+    owner's words it would replace (as his, when they are not already the
+    rule's; a ``retired`` rule is restored first, which brings those words
+    back), then the edit over them, pending, with its author and request,
+    in one append. Never the conversation's words as the owner's."""
+    author = (request or {}).get("written_by")
+    prior = (request or {}).get("prior_text")
+    if not isinstance(author, dict) or author.get("kind") != "conversation" \
+            or not isinstance(request.get("text"), str) or not isinstance(prior, str):
+        raise RouteError("the rule request to restore doesn't name its conversation, words and the words it replaced")
+    with _lock():
+        if retired:
+            entity, number = rule_reference(n)
+            target = {"n": number, "entity": entity, "target": entity}
+            lines = owner_lines([{"type": "rule_restore", **target,
+                                  "holds": _undo_hold_choices(holds, words=prior, now=now)}], via)
+        else:
+            rule = _rule(n, now)
+            target = _rule_target(rule)
+            number = rule["n"]
+            lines = []
+            if rule["text"] != prior:
+                lines += owner_lines([{"type": "rule_edit", **target, "text": prior,
+                                       "holds": _undo_hold_choices(holds, words=prior, now=now)}], via)
+        # Based on the owner revision it now sits on: the owner line just
+        # above, when there is one (its id is its revision), else the rule's.
+        base = lines[-1]["id"] if lines else target.get("base")
+        lines.append({"type": "rule_edit", **{k: v for k, v in target.items() if k != "base"},
+                      **({"base": base} if base else {}), "text": request["text"], "pending": True,
+                      "prior_text": prior,
+                      **({"prior_confirmed": request["prior_confirmed"]}
+                         if isinstance(request.get("prior_confirmed"), bool) else {}),
+                      "owner_request": request.get("owner_request") or "the owner requested this change",
+                      "written_by": dict(author), "via": request.get("via") or "mcp"})
+        written, view = _write_many(lines)
+    return dict(_done(written[-1], view), n=number)
+
+
 def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
     rule = _rule(n, now)
     if not rule.get("pending"):
@@ -7310,17 +7368,36 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
 
 
 def restore_priority(stored: dict, *, via: str, holds: dict | None = None, now: datetime | None = None) -> dict:
-    """Undo of an amend: the priority's stored line as it was before, entry
-    for entry (ended entries, levels not yet started and all), never re-read
-    through a set's checks, which would refuse or drop some of them."""
+    """Undo of a priority change: the priority's stored line as it was
+    before, entry for entry (ended entries, levels not yet started and all),
+    never re-read through a set's checks, which would refuse or drop some of
+    them. A conversation's pending request comes back as it was: the
+    priority it replaced as the owner's, then the request over it, pending,
+    with its author and words, in one append."""
     now = now or _now()
     rows = _checked_entries("priority_set", stored.get("entries"))
     if not rows:
         raise RouteError("the stored priority to restore can't be read")
     with _lock():
-        choices = _undo_hold_choices(holds, entries=rows, now=now)
-        return _owner_write({"type": "priority_set", "entries": rows, "until": stored.get("until"),
-                             "holds": choices}, via)
+        if not stored.get("pending"):
+            choices = _undo_hold_choices(holds, entries=rows, now=now)
+            return _owner_write({"type": "priority_set", "entries": rows, "until": stored.get("until"),
+                                 "holds": choices}, via)
+        author = stored.get("written_by")
+        words = _one_line(stored.get("owner_request"))
+        if not isinstance(author, dict) or author.get("kind") != "conversation" or not words:
+            raise RouteError("the request to restore doesn't name its conversation and words")
+        replaced = stored.get("replaced") or {}
+        prior = _checked_entries("priority_set", replaced.get("entries")) if replaced.get("entries") else None
+        if prior:
+            base = {"type": "priority_set", "entries": prior, "until": replaced.get("until"),
+                    "holds": _undo_hold_choices(holds, entries=prior, now=now)}
+        else:
+            base = {"type": "priority_clear"}
+        request = {"type": "priority_set", "entries": rows, "until": stored.get("until"), "pending": True,
+                   "owner_request": words, "written_by": dict(author), "via": stored.get("via") or "mcp"}
+        written, view = _write_many([*owner_lines([base], via), request])
+        return _done(written[-1], view)
 
 
 def request_priority_amend(account, *, append=None, role=None, until=None, exception=None, end_exception=None,

@@ -130,7 +130,7 @@ def test_undo_of_a_clear_restores_a_level_not_yet_started(direction_world):
     assert [e.get("level") for e in _stored()] == [e.get("level") for e in before]
 
 
-def test_undo_of_a_confirm_restores_the_stored_priority_it_replaced(direction_world):
+def test_undo_of_a_confirm_returns_the_request_pending_over_the_stored_priority_it_replaced(direction_world):
     before = _with_level()
     base = routing.conversation_view()["priority_owner_revision"]
     routing.request_priority([{"account": "Codex", "role": "something else"}], owner_request="Matt asked",
@@ -141,7 +141,9 @@ def test_undo_of_a_confirm_restores_the_stored_priority_it_replaced(direction_wo
     direction_world.say("undo that")
     ok, undone = owner_act.act("direction.undo", {"id": applied["owner_action"]})
     assert ok, undone
-    assert [(e["account"], e["role"], e.get("level")) for e in _stored()] == [
+    stored = routing.read_view()["priority_stored"]
+    assert stored["pending"] is True and stored["written_by"]["kind"] == "conversation"
+    assert [(e["account"], e["role"], e.get("level")) for e in stored["replaced"]["entries"]] == [
         (e["account"], e["role"], e.get("level")) for e in before]
 
 
