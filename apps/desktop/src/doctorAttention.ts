@@ -96,8 +96,16 @@ export function buildAttention(parsed: Record<string, unknown>): {
       }
       // Reinstall only helps a missing/broken hook. Drain failures, a stale
       // queue, or a last capture error need drain / reconnect — not reinstall.
-      const hookish = /hook\b/i.test(why) && !/last capture attempt failed|nothing is draining|waiting \d+ min|abandoned for over/i.test(why);
-      const drainish = /last capture attempt failed|nothing is draining|waiting \d+ min|abandoned for over|drain/i.test(why);
+      // Classify each reason on its own so a drain-type phrase in one reason
+      // does not hide a real hook failure in another (and bare "drain" in a
+      // hook error message is not treated as a drain failure).
+      const reasons = lv.harnesses?.[h]?.reasons ?? [];
+      const drainishOne = (r: string) =>
+        /last capture attempt failed|nothing is draining|waiting \d+ min|abandoned for over/i.test(r);
+      const hookishOne = (r: string) =>
+        (/hook\b/i.test(r) || /cadence not firing/i.test(r)) && !drainishOne(r);
+      const hookish = reasons.some(hookishOne);
+      const drainish = reasons.some(drainishOne) && !hookish;
       items.push({
         key: `liveness:${h}`,
         tone: "err",

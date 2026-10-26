@@ -28,6 +28,50 @@ describe("doctor attention wording", () => {
     expect(item, "liveness item").toBeDefined();
     expect(item!.fix?.kind).not.toBe("reinstall-hook");
   });
+
+  it("mixed hook + drain reasons still offer Reinstall hook", () => {
+    const { items } = buildAttention({
+      capture_liveness: {
+        ok: false,
+        red: ["claude_code"],
+        harnesses: {
+          claude_code: {
+            reasons: ["hook error on last run: boom", "last capture attempt failed: x"],
+          },
+        },
+      },
+    });
+    const item = items.find((i) => i.key === "liveness:claude_code");
+    expect(item, "liveness item").toBeDefined();
+    expect(item!.fix?.kind).toBe("reinstall-hook");
+  });
+
+  it("a hook error that mentions drain is still fixed with Reinstall hook", () => {
+    const { items } = buildAttention({
+      capture_liveness: {
+        ok: false,
+        red: ["claude_code"],
+        harnesses: { claude_code: { reasons: ["hook error on last run: drain lock held"] } },
+      },
+    });
+    const item = items.find((i) => i.key === "liveness:claude_code");
+    expect(item, "liveness item").toBeDefined();
+    expect(item!.fix?.kind).toBe("reinstall-hook");
+    expect(item!.cause).not.toMatch(/reinstalling the hook will not clear/i);
+  });
+
+  it("cadence not firing still offers Reinstall hook", () => {
+    const { items } = buildAttention({
+      capture_liveness: {
+        ok: false,
+        red: ["claude_code"],
+        harnesses: { claude_code: { reasons: ["5 turn(s) over 121 min without a capture being due — cadence not firing"] } },
+      },
+    });
+    const item = items.find((i) => i.key === "liveness:claude_code");
+    expect(item, "liveness item").toBeDefined();
+    expect(item!.fix?.kind).toBe("reinstall-hook");
+  });
 });
 
 describe("health rows for checks that did not run", () => {
