@@ -151,7 +151,11 @@ def test_preview_never_writes_reachability_memo(origin_db, hub, monkeypatch, fai
 def test_tidy_partial_undo_keeps_ids_in_inverse_metadata():
     want = owner_direction.intent('owed.tidy', 'example/widget', facts={
         'change': 'undo', 'batch': 'synthetic-batch', 'ids': [4, 8]})
-    assert owner_direction._before(want)['ids'] == [4, 8]
+    # A requested selector is not proof that those items were restored.
+    # The transaction replaces the initially safe inverse scope only after
+    # each successful restore; retain the owner's request independently.
+    assert owner_direction._before(want)['ids'] == []
+    assert want['facts']['ids'] == [4, 8]
 
 
 def test_tidy_partial_undo_inverse_replays_only_selected_ids(monkeypatch):

@@ -791,6 +791,28 @@ def record_owed_batch(batch: str) -> None:
     pend["before"] = before
 
 
+def record_owed_undo_scope(batch: str, ids: list[int]) -> None:
+    """Write the exact successful inverse scope before the hub can commit.
+
+    The writer starts with an empty scope and replaces it after successful
+    restores. Requested selectors remain in the action's facts, never its
+    inverse. A logging failure must propagate and roll back the hub write.
+    """
+    pend = _PENDING.get()
+    if not pend or pend["intent"]["action"] != "owed.tidy":
+        return
+    facts = pend["intent"].get("facts") or {}
+    if facts.get("change") != "undo" or facts.get("batch") != batch:
+        return
+    line = pend.get("line")
+    if line is None:
+        raise OSError("the owner action must be recorded before its undo can be written")
+    before = dict(pend.get("before") or {}, ids=list(ids))
+    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+             "state": "pending", "before": before})
+    pend["before"] = before
+
+
 def record_setting_before(key: str, data: dict) -> None:
     """Record the exact replaced state while the setter holds both locks."""
     from khipu import routing
@@ -1221,7 +1243,7 @@ def _before(want: dict):
     if action == "owed.tidy":
         facts = want.get("facts") or {}
         return {"project": target, "change": facts.get("change"), "batch": facts.get("batch"),
-                **({"ids": facts["ids"]} if facts.get("ids") is not None else {})}
+                **({"ids": []} if facts.get("change") == "undo" else {})}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
     if action == "direction.acknowledge":
@@ -1618,6 +1640,8 @@ def _undo_owed_tidy(line, via):
     if not batch:
         raise ValueError("Khipu has no record of which batch this clean-up wrote, so it can't undo it")
     if _b(line).get("change") == "undo":
+        if _b(line).get("ids") == []:
+            return {"ok": True, "reapplied": 0, "left_alone": []}
         out = owed_tidy.redo(batch, project=line["target"], owner_gate=_by(via),
                              ids=_b(line).get("ids"), write_id=_inverse_write_id(line, batch))
         counted = {"reapplied": int(out.get("reapplied") or 0)}

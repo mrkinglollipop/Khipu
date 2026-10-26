@@ -800,7 +800,11 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 conn.rollback()
                 return {"ok": False, "restored": 0, "batch": batch, "needs_owner": mine,
                         "error": co.BULK_OWNER_REFUSAL}
+            from khipu import owner_direction
+
+            owner_direction.record_owed_undo_scope(batch, [])
             restored = 0
+            restored_ids = []
             lineage_ready = co._lineage_columns_ready(cur)
             redo_from = _redo_states(cur, batch)
             for cid, action, prior in todo:
@@ -814,11 +818,13 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 redo_from[str(cid)] = {"state": undone_from,
                                        "fingerprint": fingerprint(_select(cur, project, ids=[cid])[cid])}
                 restored += 1
+                restored_ids.append(cid)
             report = {"restored": restored, "left_alone": left_alone, "owner_gate": gate}
             cur.execute("UPDATE commitment_tidy_batches SET undone_at = CASE WHEN EXISTS "
                         "(SELECT 1 FROM commitment_tidy_items WHERE batch_id = %s AND undone_at IS NULL) "
                         "THEN NULL ELSE now() END, undo_report = %s::jsonb "
                         "WHERE id = %s", (batch, json.dumps(dict(report, redo=redo_from), default=str), batch))
+            owner_direction.record_owed_undo_scope(batch, restored_ids)
     _log(f"{batch}: undo restored {restored}, left alone {len(left_alone)}")
     return {"ok": True, "batch": batch, "project": project or "", **report}
 
