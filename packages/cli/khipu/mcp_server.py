@@ -951,7 +951,9 @@ TOOLS: list[dict] = [
             "replaced shown beside it, until the owner confirms or undoes it "
             "in Settings -> Routing. Khipu keeps his order as given and never "
             "reorders it. This tool cannot confirm, undo or clear a priority. "
-            "To change one account's entry only, use khipu_owner_act route.priority.amend, never this full rewrite."
+            "To change one account's entry only, give account (with append or role, and expect, the "
+            "priority's version as read) in place of entries: every other entry stays exactly as it is. "
+            "When the owner directed it himself, khipu_owner_act route.priority.amend applies it at once."
         ),
         "inputSchema": {
             "type": "object",
@@ -971,7 +973,14 @@ TOOLS: list[dict] = [
                         "required": ["account"],
                     },
                 },
-                "until": {"type": "string", "description": "When the whole priority ends (a time, or 3d)"},
+                "until": {"type": "string", "description": "When the whole priority ends (a time, or 3d); "
+                                                           "with account, when that entry ends"},
+                "account": {"type": "string", "description": "In place of entries: the one account whose entry "
+                                                             "changes (its label or its id)"},
+                "append": {"type": "string", "description": "With account: words added to its role"},
+                "role": {"type": "string", "description": "With account: its new role, in place of the old one"},
+                "expect": {"type": "string", "description": "With account: the priority's version as read "
+                                                            "(version, as khipu_route lists it)"},
                 "base": {"type": "string", "minLength": 1, "maxLength": 256,
                          "description": "The priority's owner revision (owner_revision, as khipu_route lists "
                                         "it) when this request was prepared; a request delivered after the "
@@ -979,7 +988,7 @@ TOOLS: list[dict] = [
                 "owner_request": {"type": "string",
                                   "description": "This conversation's one-line words describing the owner's request"},
             },
-            "required": ["entries", "owner_request", "base"],
+            "required": ["owner_request", "base"],
         },
     },
     {
@@ -2775,20 +2784,34 @@ def _tool_route_priority(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request", "base"}:
-        raise ValueError("khipu_route_priority takes entries, owner_request and optional until")
+    amend_keys = {"account", "append", "role", "expect"}
+    if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request", "base", *amend_keys}:
+        raise ValueError("khipu_route_priority takes entries (or account with append or role, and expect), "
+                         "owner_request, base and optional until")
     base = args.get("base")
     if not isinstance(base, str) or not base.strip():
         raise routing.RouteError("base must be the owner revision the request was prepared against")
-    entries = args.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("entries must be the owner's accounts, in his order")
     owner_request = args.get("owner_request")
     if not isinstance(owner_request, str) or not owner_request.strip() or "\n" in owner_request or "\r" in owner_request:
         raise ValueError("owner_request must be one line of text")
     until = args.get("until")
     if until is not None and not isinstance(until, str):
         raise ValueError("until must be text")
+    if "account" in args:
+        # One account's entry, at the owner's request: the conversation path
+        # of route.priority.amend, unconfirmed like any request.
+        if "entries" in args:
+            raise ValueError("give entries (the whole priority) or account (one entry), not both")
+        if any(not isinstance(args.get(k), str) for k in ("account", "expect")) \
+                or any(k in args and not isinstance(args[k], str) for k in ("append", "role")):
+            raise ValueError("account, expect, append and role must be text")
+        return routing.conversation_priority_amend(args["account"], append=args.get("append"), role=args.get("role"),
+                                                   until=until, owner_request=owner_request,
+                                                   author=routing.conversation_author(), expect=args["expect"],
+                                                   base=base)
+    entries = args.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("entries must be the owner's accounts, in his order")
     return routing.conversation_priority(entries, until=until, owner_request=owner_request,
                                          author=routing.conversation_author(), base=base)
 

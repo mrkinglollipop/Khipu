@@ -1072,12 +1072,14 @@ def _before(want: dict):
     if action in ("route.cap.set", "route.cap.remove"):
         facts = want.get("facts") or {}
         entry = _entry(target)
-        prior = next((c for c in entry.get("caps") or []
-                      if c.get("kind") == facts.get("kind")
-                      and c.get("purpose", "job") == facts.get("purpose", "job")
-                      and (c.get("kind") in ("spend", "concurrency")
-                           or c.get("window") == facts.get("window"))), None)
-        return {"cap": prior}
+
+        def same_slot(c: dict) -> bool:
+            return (c.get("kind") == facts.get("kind") and c.get("purpose", "job") == facts.get("purpose", "job")
+                    and (c.get("kind") in ("spend", "concurrency") or c.get("window") == facts.get("window")))
+
+        prior = next((c for c in entry.get("caps") or [] if same_slot(c)), None)
+        layers = [c for c in entry.get("cap_layers") or [] if same_slot(c)]
+        return {"cap": prior, "layers": layers or ([prior] if prior else [])}
     if action == "route.pause":
         entry = _entry(target)
         paused = entry.get("state") == routing.PAUSED
@@ -1110,7 +1112,11 @@ def _before(want: dict):
         return {"text": hold.get("text"), "reason": hold.get("reason"), "scope": hold.get("scope"),
                 "until": hold.get("until")}
     if action.startswith("route.priority."):
-        held = routing.read_view().get("priority")
+        view = routing.read_view()
+        held = view.get("priority")
+        if action == "route.priority.amend" and view.get("priority_stored"):
+            stored = view["priority_stored"]
+            return {"entries": [dict(e) for e in stored["entries"]], "until": stored.get("until"), "stored": True}
         if action == "route.priority.confirm":
             replaced = (held or {}).get("replaced")
             return {"entries": _priority_rows(replaced), "until": (replaced or {}).get("until")}
@@ -1518,7 +1524,11 @@ def _added_rule(line) -> str | int:
 
 
 def _undo_priority(line, via, holds=None):
+    from khipu import routing
+
     before = _b(line)
+    if before.get("stored") and before.get("entries"):
+        return routing.restore_priority(before, via=via, holds=_undo_holds(line, holds))
     return _set_priority_back(before, via, _undo_holds(line, holds),
                               _undo_default_holds=True)
 
@@ -1628,16 +1638,14 @@ def _undo_cap(line: dict, via: str) -> dict:
     from khipu import routing
 
     facts = line.get("facts") or {}
-    previous = (line.get("before") or {}).get("cap")
-    if previous is not None:
-        return routing.set_cap(line["target"], window=facts.get("window") or previous.get("window"),
-                               kind=previous["kind"], pct=previous.get("pct"), slack=previous.get("slack"),
-                               usd=previous.get("usd"), days=previous.get("days"), n=previous.get("n"),
-                               revision=previous.get("revision"), purpose=previous.get("purpose", "job"),
-                               tier=previous.get("tier"), sensitive_only=previous.get("sensitive_only"),
-                               until=previous.get("until"), via=via)
-    return routing.remove_cap(line["target"], window=facts.get("window"),
-                              kind=facts.get("kind"), purpose=facts.get("purpose", "job"), via=via)
+    before = line.get("before") or {}
+    previous = before.get("cap")
+    layers = before.get("layers") if "layers" in before else ([previous] if previous else [])
+    # Clear the slot, then put back each layer it held: a cap set over the
+    # undone one would leave the undone one beneath it.
+    return routing.restore_cap_layers(line["target"], window=facts.get("window") or (previous or {}).get("window"),
+                                      kind=facts.get("kind") or (previous or {}).get("kind"),
+                                      purpose=facts.get("purpose", "job"), layers=layers, via=via)
 
 
 def _undo_definition(line: dict, via: str) -> dict:

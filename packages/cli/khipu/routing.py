@@ -4333,6 +4333,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                 if a == entry["key"]]
         if mine:
             entry["caps"] = [dict(c) for c in mine]
+            # Every layer still in force, oldest first per slot: what an undo
+            # of a cap change puts back, not only the one that applies now.
+            entry["cap_layers"] = [dict(layer[0]) for (a, _w, _k2, _purpose), layers in sorted(
+                pace_cap_layers.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2], kv[0][3] != "job"))
+                if a == entry["key"] for layer in layers if layer[1] is None or layer[1] > now]
             entry["cap_confirmed"] = {f"{w or ''}|{k}" + ("|check" if purpose == "check" else ""): at
                                       for (a, w, k, purpose), at in pace_cap_at.items()
                                       if a == entry["key"]}
@@ -4540,6 +4545,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             "definitions": definitions,
             "priority": priority_out, "priority_version": priority_version, "priority_ended": priority_ended,
             "priority_owner_revision": priority_owner_revision,
+            # The held priority as its line stored it (every entry, ended,
+            # not yet started or not shown included): what an amend rewrites
+            # and an undo restores, never the folded entries above.
+            "priority_stored": None if priority is None else {
+                "entries": [dict(e) for e in priority["entries"]], "until": _iso(priority["until"]),
+                "pending": bool(priority["pending"])},
             "lane_repairs": _lane_repairs(lane_map, known), "forwards": {**forward, **stable_forwards},
             "unmatched": lanes, "outside_app": outside_app,
             "unchecked": unchecked, "seed": seed, "sources": sources,
@@ -5157,7 +5168,8 @@ def _save_view(view: dict) -> None:
 
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     if (not view or view.get("fingerprint") != fingerprint or "priority_version" not in view
-            or "priority_owner_revision" not in view or view.get("event_identity") != 2
+            or "priority_owner_revision" not in view or "priority_stored" not in view
+            or view.get("event_identity") != 2
             or view.get("proposal_schema") != 1 or view.get("fold_audit_schema") != 1):
         return False
     # A whole-log read of a runner's events still under way goes on at the
@@ -6801,19 +6813,26 @@ def set_cap(account: str, *, window: str | None = None, kind: str, pct=None, sla
     A runner's numbers are never read here; they only judge the cap later.
     With ``until`` the cap stops applying then, and the cap it replaced
     applies again."""
+    key = _resolve_account_key(account)
+    event = _cap_set_event(key, window=window, kind=kind, pct=pct, slack=slack, usd=usd, days=days, n=n,
+                           revision=revision, purpose=purpose, tier=tier, sensitive_only=sensitive_only,
+                           until=until, now=now)
+    return dict(_owner_write(event, via), account=key)
+
+
+def _cap_set_event(key: str, *, window, kind, pct=None, slack=None, usd=None, days=None, n=None, revision=None,
+                   purpose="job", tier=None, sensitive_only=None, until=None, now: datetime | None = None) -> dict:
     cap = _checked_cap_or_raise(kind, {"pct": pct, "slack": slack, "usd": usd, "days": days, "n": n, "purpose": purpose,
                                     "tier": tier, "sensitive_only": sensitive_only},
                                 revision, window=window)
-    key = _resolve_account_key(account)
     end = _cap_end(until, now)
     event = {"type": "cap_set", "account": key, **cap, **({"until": end} if end else {})}
     if cap["kind"] in ("share", "per_day", "pace_target"):
         event["window"] = window
-    return dict(_owner_write(event, via), account=key)
+    return event
 
 
-def remove_cap(account: str, *, window: str | None = None, kind: str, via: str, purpose: str = "job",
-               now: datetime | None = None) -> dict:
+def _cap_remove_event(key: str, *, window, kind, purpose="job") -> dict:
     from khipu import routing_pace
 
     if kind not in routing_pace.CAP_KINDS:
@@ -6823,11 +6842,36 @@ def remove_cap(account: str, *, window: str | None = None, kind: str, via: str, 
         raise RouteError(error)
     if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
         raise RouteError("window must be weekly or five_hour")
-    key = _resolve_account_key(account)
     event = {"type": "cap_remove", "account": key, "cap_kind": kind, "purpose": purpose}
     if kind in routing_pace.WINDOW_CAP_KINDS:
         event["window"] = window
-    return dict(_owner_write(event, via), account=key)
+    return event
+
+
+def remove_cap(account: str, *, window: str | None = None, kind: str, via: str, purpose: str = "job",
+               now: datetime | None = None) -> dict:
+    key = _resolve_account_key(account)
+    return dict(_owner_write(_cap_remove_event(key, window=window, kind=kind, purpose=purpose), via), account=key)
+
+
+def restore_cap_layers(account: str, *, window: str | None, kind: str, purpose: str = "job", layers: list[dict],
+                       via: str, now: datetime | None = None) -> dict:
+    """Undo of a cap change: clear the slot, then set each layer it held
+    before, oldest first, in one append. A layer whose end has passed is
+    left out: it no longer applied, and setting it again would revive it."""
+    now = now or _now()
+    key = _resolve_account_key(account)
+    events = [_cap_remove_event(key, window=window, kind=kind, purpose=purpose)]
+    for cap in layers:
+        if cap.get("until") and (_parse(cap["until"]) or now) <= now:
+            continue
+        events.append(_cap_set_event(key, window=window or cap.get("window"), kind=cap["kind"], pct=cap.get("pct"),
+                                     slack=cap.get("slack"), usd=cap.get("usd"), days=cap.get("days"),
+                                     n=cap.get("n"), revision=cap.get("revision"),
+                                     purpose=cap.get("purpose", purpose), tier=cap.get("tier"),
+                                     sensitive_only=cap.get("sensitive_only"), until=cap.get("until"), now=now))
+    written, view = _write_many(owner_lines(events, via))
+    return dict(_done(written[-1], view), account=key)
 
 
 def request_cap(account: str, *, window: str | None = None, kind: str, pct=None, slack=None, usd=None,
@@ -7034,22 +7078,27 @@ def clear_priority(*, via: str, now: datetime | None = None, expect=None) -> dic
 
 def _amended_priority(account, *, append, role, until, now: datetime, conversation: bool) -> tuple[list[dict], str | None]:
     """(the priority's entries with the one account's changed, the priority's
-    own end), read from the priority in effect now. Every other entry is
-    carried over as it stands, never re-read from its words, so it stays as
-    the owner left it; an entry whose end has already passed is no longer in
-    effect and goes with the rewrite, as it would with any set."""
+    own end), read from the held priority's stored line, not its folded view:
+    every other entry (an ended one, a level not yet started, one the view
+    leaves out) is carried over exactly as stored. The caller holds the
+    routing lock."""
     if (append is None) == (role is None):
         raise RouteError("amend takes the words to add (append) or the role's new words (role), one of the two")
-    held = _held_priority(now)
+    view = read_view(now)
+    held, stored = view.get("priority"), view.get("priority_stored")
+    if held is None or stored is None:
+        raise RouteError("there is no priority set")
     known = accounts()
     key = _account_for_a_conversation(account, known) if conversation else _resolve_account_key(account, known)
+    if not any(e["account"] == key for e in held["entries"]):
+        raise RouteError(f"{_label_of(key, known)} is not in the priority; set the priority to add an account")
     rows = []
     found = False
-    for item in held["entries"]:
-        row = {"account": item["account"], "label": item["label"], "role": item.get("role"), "until": item.get("until")}
+    for item in stored["entries"]:
+        row = dict(item)
         if item.get("level"):
             row["level"] = dict(item["level"])
-        if item["account"] == key:
+        if item["account"] == key and not found:
             found = True
             words = _one_line(append if append is not None else role)
             if not words:
@@ -7064,7 +7113,7 @@ def _amended_priority(account, *, append, role, until, now: datetime, conversati
         rows.append(row)
     if not found:
         raise RouteError(f"{_label_of(key, known)} is not in the priority; set the priority to add an account")
-    return rows, held.get("until")
+    return rows, stored.get("until")
 
 
 def amend_priority(account, *, append=None, role=None, until=None, via: str, now: datetime | None = None,
@@ -7077,9 +7126,28 @@ def amend_priority(account, *, append=None, role=None, until=None, via: str, now
     now = now or _now()
     with _lock():
         _check_priority(expect, now)
+        if (read_view(now).get("priority") or {}).get("pending"):
+            # An owner write would confirm every entry of the conversation's
+            # request, which the owner never saw: he confirms or undoes it first.
+            raise RouteError("the priority is a conversation's request still waiting for you: confirm or undo it "
+                             "before amending it")
         rows, whole = _amended_priority(account, append=append, role=role, until=until, now=now, conversation=False)
         out = _owner_write({"type": "priority_set", "entries": rows, "until": whole}, via)
     return dict(out, entries=[e["label"] for e in rows])
+
+
+def restore_priority(stored: dict, *, via: str, holds: dict | None = None, now: datetime | None = None) -> dict:
+    """Undo of an amend: the priority's stored line as it was before, entry
+    for entry (ended entries, levels not yet started and all), never re-read
+    through a set's checks, which would refuse or drop some of them."""
+    now = now or _now()
+    rows = _checked_entries("priority_set", stored.get("entries"))
+    if not rows:
+        raise RouteError("the stored priority to restore can't be read")
+    with _lock():
+        choices = _undo_hold_choices(holds, entries=rows, now=now)
+        return _owner_write({"type": "priority_set", "entries": rows, "until": stored.get("until"),
+                             "holds": choices}, via)
 
 
 def request_priority_amend(account, *, append=None, role=None, until=None, owner_request: str | None = None,
@@ -9366,12 +9434,35 @@ def conversation_priority(entries, *, until=None, owner_request: str, author: di
                                             now=now, expect=expect, base=base)
         except LockBusy:
             raise RouteError("Khipu's routing record is busy; try again in a moment") from None
-        view = read_view(now)
-        held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
-        out = {k: written[k] for k in _WRITE_FIELDS if k in written}
-        out["priority"] = held
-        out["about"] = ABOUT
-        return _for_agents(out, view)
+        return _conversation_priority_answer(written, now)
+
+
+def _conversation_priority_answer(written: dict, now: datetime | None) -> dict:
+    view = read_view(now)
+    held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
+    out = {k: written[k] for k in _WRITE_FIELDS if k in written}
+    out["priority"] = held
+    out["about"] = ABOUT
+    return _for_agents(out, view)
+
+
+def conversation_priority_amend(account, *, append=None, role=None, until=None, owner_request: str, author: dict,
+                                expect, base: str, now: datetime | None = None,
+                                lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+    """What MCP ``khipu_route_priority`` writes for one account's entry
+    (``request_priority_amend``), answered as ``conversation_priority``."""
+    by = dict(author or {})
+    if by.get("harness") in (None, "", SHELL):
+        by["harness"] = UNKNOWN_HARNESS
+    with _for_a_conversation(), lock_budget(lock_wait):
+        try:
+            with _lock():
+                written = request_priority_amend(account, append=append, role=role, until=until,
+                                                 owner_request=owner_request, author=by, via="mcp", now=now,
+                                                 expect=expect, base=base)
+        except LockBusy:
+            raise RouteError("Khipu's routing record is busy; try again in a moment") from None
+        return _conversation_priority_answer(written, now)
 
 
 
