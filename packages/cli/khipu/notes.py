@@ -39,6 +39,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -688,13 +689,26 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         timeout_s = 30.0
     new_files_state = dict(files_state)
     written_plan: list[dict[str, Any]] = []
+    # Cap the whole write loop so N stuck locks cannot each burn timeout_s.
+    deadline = time.monotonic() + timeout_s
     with connect(statement_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT set_config('lock_timeout', %s, false)",
                 (f"{int(timeout_s * 1000)}ms",),
             )
-            for item in plan:
+            # Session-level lock_timeout survives; commit so the connection is
+            # idle again — otherwise every conn.transaction() below is only a
+            # savepoint and nothing lands until the final commit.
+            conn.commit()
+            for i, item in enumerate(plan):
+                if time.monotonic() >= deadline:
+                    for left in plan[i:]:
+                        out["errors"].append({
+                            "path": left["path"],
+                            "error": "DeadlineExceeded: reconcile overall budget exhausted",
+                        })
+                    break
                 try:
                     with getattr(conn, "transaction", nullcontext)():
                         _upsert_topic(
@@ -716,6 +730,12 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
             # a stale bookmark or a stale search hit still resolves).
             failed_slugs = {item["parsed"]["slug"] for item in plan if item not in written_plan}
             for redirect in collision_report["redirects"]:
+                if time.monotonic() >= deadline:
+                    out["errors"].append({
+                        "path": redirect["old_slug"],
+                        "error": "DeadlineExceeded: reconcile overall budget exhausted",
+                    })
+                    continue
                 if failed_slugs.intersection(redirect["new_slugs"]):
                     continue
                 try:
