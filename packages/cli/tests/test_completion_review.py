@@ -351,6 +351,46 @@ def test_index_schema_failure_survives_rollback_disconnect(harness, monkeypatch,
     assert prepared and all(conn not in failed_connections for conn in prepared)
 
 
+@pytest.mark.parametrize('disconnect', [False, True], ids=['rollback-ok', 'rollback-disconnect'])
+@pytest.mark.parametrize('receipt_error', [
+    psycopg.errors.SerializationFailure, psycopg.errors.UndefinedColumn,
+], ids=['transient-receipt', 'fatal-receipt'])
+@pytest.mark.parametrize('replay_error', [
+    psycopg.errors.SerializationFailure, psycopg.errors.UndefinedColumn,
+], ids=['transient-replay', 'fatal-replay'])
+def test_replay_receipt_write_failure_classifies_before_rollback(
+        harness, monkeypatch, tmp_path, replay_error, receipt_error, disconnect):
+    receipts = _install_nightly_cleanup(monkeypatch, tmp_path)
+    _install_gap(harness, monkeypatch)
+    monkeypatch.setattr(provenance, 'index_identities', lambda conn: {'ok': True})
+    monkeypatch.setattr(provenance, '_gap_step', Mock(side_effect=
+        replay_error('synthetic replay failure')))
+    original = Cursor.execute
+    errors = []
+    def execute(cur, sql, params=()):
+        if sql.startswith('UPDATE fact_gaps') and str(params[0]).startswith('replay failed:'):
+            errors.append(receipt_error.__name__)
+            if disconnect:
+                cur.conn.close()
+            raise receipt_error('synthetic receipt failure')
+        return original(cur, sql, params)
+    monkeypatch.setattr(Cursor, 'execute', execute)
+    fatal = psycopg.errors.UndefinedColumn in (replay_error, receipt_error)
+    rc = jobs.run_nightly()
+    assert errors == [receipt_error.__name__]
+    assert (rc != 0) is fatal, receipts
+    out = receipts[0]
+    assert out['ok'] is False
+    assert out['transient'] is not fatal
+    assert out['gaps']['failed'] == 1
+    reason = ('UndefinedColumn: synthetic receipt failure'
+              if replay_error is psycopg.errors.SerializationFailure and fatal
+              else f'{replay_error.__name__}: synthetic replay failure')
+    assert out['reason'] == reason
+    assert out['gaps']['reason'] == reason
+    assert out.get('connection_unusable', False) is disconnect
+
+
 def test_replay_receipt_write_rollback_failure_keeps_original_failure(harness, monkeypatch, tmp_path):
     receipts = _install_nightly_cleanup(monkeypatch, tmp_path)
     _install_two_gap_groups(harness, monkeypatch)

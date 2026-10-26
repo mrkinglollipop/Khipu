@@ -636,7 +636,11 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
                         "UPDATE fact_gaps SET resolution = %s, attempts = attempts + 1 WHERE id = ANY(%s)",
                         (f"replay failed: {type(exc).__name__}: {exc}"[:500], ids))
                 conn.commit()
-            except Exception:  # noqa: BLE001 — counted above; nothing else to keep
+            except Exception as receipt_exc:  # noqa: BLE001 — classify before rollback can fail
+                receipt_transient = retryable_db_error(receipt_exc)
+                if out["transient"] and not receipt_transient:
+                    out["reason"] = f"{type(receipt_exc).__name__}: {receipt_exc}"[:300]
+                out["transient"] = out["transient"] and receipt_transient
                 if not _rollback_cleanup(conn, out):
                     return out
     return out
