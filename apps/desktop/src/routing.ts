@@ -496,6 +496,8 @@ export type RouteProvider = {
   family: string;
   login?: string;
   probe?: string;
+  /** Where an http-quota provider's usage is read (set from the Plan detail). */
+  host?: string;
   lane_names?: string[];
   models_allowed?: string[];
   models_never?: string[];
@@ -615,6 +617,7 @@ export type RouteView = {
     hits_total?: number;
     more_not_shown?: number;
     too_large?: string[];
+    skipped?: { file: string; reason: string; message?: string }[];
   };
   /** Open owed directions, projected for this Mac's owner only (slice 19a). */
   unreached_directions?: {

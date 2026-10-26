@@ -96,6 +96,7 @@ type GapSample = {
 };
 
 type ImportReceipt = {
+  ok?: boolean;
   read: number;
   imported: number;
   skipped_corrupt: number;
@@ -1389,15 +1390,19 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
             stripPrefix: strip || null,
             profile: null,
           });
-          if (res.ok) {
+          const d: ImportReceipt | null = res.ok
+            ? res.data
+            : res.refusal && typeof res.refusal.read === "number"
+              ? (res.refusal as ImportReceipt)
+              : null;
+          if (d) {
             setError(key, null);
-            const d = res.data;
             const unreadable = (d.skipped_bad_vector ?? 0) + (d.skipped_bad_row ?? 0);
             setReceipts((prev) => ({
               ...prev,
               [key]: {
                 title: "Imported an index",
-                tone: d.imported > 0 ? "ok" : "warn",
+                tone: d.ok !== false && d.imported > 0 ? "ok" : "warn",
                 lines: [
                   <span key="r">Read <b>{num(d.read)}</b> rows</span>,
                   <span key="s1">·</span>,
@@ -1414,7 +1419,7 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
               },
             }));
           } else {
-            setError(key, res.error);
+            setError(key, res.ok ? "Khipu refused." : res.error);
           }
           await loadAll();
           setBusy(null);

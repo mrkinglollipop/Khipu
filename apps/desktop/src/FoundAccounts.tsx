@@ -22,6 +22,7 @@ import type { ReactNode } from "react";
 import { ChevronRight, Loader2 } from "lucide-react";
 import { Tag } from "./ui";
 import { callCli } from "./settingsCli";
+import { plainError } from "./humanWords";
 import {
   COMING,
   LIST_MOVED,
@@ -1368,7 +1369,16 @@ export function useAccountsFinder(
       const res = await saveCliSetting(key, v);
       if (!res.ok) {
         console.error(`khipu config ${key} refused:`, res.error);
-        setMessage(key === "node_folder" ? "That folder has no node program Khipu can run." : "That file isn't a program Khipu can run.");
+        const err = String(res.error ?? "");
+        const pathProblem =
+          /must be an executable file|must be a folder holding an executable node/i.test(err);
+        setMessage(
+          pathProblem
+            ? key === "node_folder"
+              ? "That folder has no node program Khipu can run."
+              : "That file isn't a program Khipu can run."
+            : plainError(err),
+        );
         return;
       }
       setMessage(v ? "Saved. Khipu uses it from the next check." : "Cleared. Khipu looks for it by itself again.");

@@ -601,7 +601,27 @@ class HarnessInferenceTest(unittest.TestCase):
         self.assertEqual(sc.infer_harness({"transcript_path": "/u/.codex/sessions/r.jsonl"}, {}), "codex")
         self.assertEqual(sc.infer_harness({}, {"GROK_HOOK_EVENT": "stop"}), "aegis")
         self.assertEqual(sc.infer_harness({}, {"KHIPU_HARNESS": "aegis", "CLAUDE_PROJECT_DIR": "/x"}), "aegis")
+        self.assertEqual(sc.infer_harness({}, {"KHIPU_HARNESS": "grok_build", "GROK_HOOK_EVENT": "stop"}), "grok_build")
         self.assertEqual(sc.infer_harness({}, {}), "unknown")
+
+    def test_grok_build_finds_the_grok_updates_transcript_without_a_payload_pointer(self):
+        with tempfile.TemporaryDirectory() as td:
+            cwd, sid = "/made-up/project", "grok-session"
+            path = Path(td) / ".grok" / "sessions" / sc.urllib.parse.quote(cwd, safe="") / sid / "updates.jsonl"
+            _write(path, [])
+            with mock.patch.object(Path, "home", return_value=Path(td)), \
+                    mock.patch.dict(os.environ, {"GROK_HOME": str(Path(td) / ".grok")}):
+                self.assertEqual(sc.transcript_path({"cwd": cwd, "session_id": sid}, "grok_build"), path)
+
+    def test_grok_build_uses_custom_grok_home_for_transcript_and_project_match(self):
+        with tempfile.TemporaryDirectory() as td:
+            cwd, sid = "/made-up/project", "grok-session"
+            custom_home = Path(td) / "custom-grok"
+            path = custom_home / "sessions" / sc.urllib.parse.quote(cwd, safe="") / sid / "updates.jsonl"
+            _write(path, [])
+            with mock.patch.dict(os.environ, {"GROK_HOME": str(custom_home)}):
+                self.assertEqual(sc.transcript_path({"cwd": cwd, "session_id": sid}, "grok_build"), path)
+            self.assertTrue(sc._transcript_project_matches("grok_build", path, cwd))
 
     def test_cursor_and_claude_payload_shapes_drive_the_hook(self):
         with tempfile.TemporaryDirectory() as td, _home(td):

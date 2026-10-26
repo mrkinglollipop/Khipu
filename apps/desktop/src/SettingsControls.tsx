@@ -482,7 +482,7 @@ export function OfflineWaitsCard({ active }: { active: boolean }) {
 // Another Mac: gateway_url.
 // ---------------------------------------------------------------------------
 
-export function GatewayUrlCard({ active }: { active: boolean }) {
+export function GatewayUrlCard({ active, onSaved }: { active: boolean; onSaved?: () => void }) {
   const cfg = useCliState<ConfigShape>("khipu_config_show", active);
   const c = cfg.data;
   const effective = c?.gateway_url ?? "";
@@ -512,7 +512,11 @@ export function GatewayUrlCard({ active }: { active: boolean }) {
               ) : null}
             </>
           }
-          onSave={(v) => writeConfig("gateway_url", v, cfg.reload)}
+          onSave={async (v) => {
+            const err = await writeConfig("gateway_url", v, cfg.reload);
+            if (err == null) onSaved?.();
+            return err;
+          }}
         />
         {cfg.error && !c ? (
           <p className="set-error" role="alert">
@@ -908,13 +912,13 @@ export function JobsCard({ active }: { active: boolean }) {
 
 type TokenStatus = { path?: string; exists?: boolean; mode?: string; bytes?: number };
 
-export function GatewayTokenCard({ active }: { active: boolean }) {
+export function GatewayTokenCard({ active, onSaved }: { active: boolean; onSaved?: () => void }) {
   const status = useCliState<TokenStatus>("khipu_gateway_token_status", active);
   const s = status.data;
   return (
     <div className="section-card">
       <div className="section-head">
-        Gateway token
+        Gateway key
         <span className="spacer" />
         {s ? (
           s.exists ? (
@@ -940,7 +944,7 @@ export function GatewayTokenCard({ active }: { active: boolean }) {
           clearOnSave
           help={
             <>
-              Aegis, a harness on this Mac, reads this token from a file to reach your gateway. Once saved, the token is never shown here again.
+              Aegis, Grok Bot and the gateway check on this Mac read this key to reach your gateway. Once saved, the key is never shown here again.
               {s?.path ? (
                 <>
                   {" "}
@@ -953,6 +957,7 @@ export function GatewayTokenCard({ active }: { active: boolean }) {
           onSave={async (v) => {
             const res = await callCli("khipu_gateway_token_set", { value: v });
             await status.reload();
+            if (res.ok) onSaved?.();
             return res.ok ? null : res.error;
           }}
         />

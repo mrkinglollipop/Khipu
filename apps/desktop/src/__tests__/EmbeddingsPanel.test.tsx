@@ -109,6 +109,7 @@ let estimateChunks: number;
 let estimatePrice: number | null;
 let testKeyResponse: ((args: Args) => Promise<string>) | null;
 let secretWriteFailure: string | null;
+let importPayload: Record<string, unknown> | null;
 
 beforeEach(() => {
   calls.length = 0;
@@ -117,6 +118,7 @@ beforeEach(() => {
   estimatePrice = 0;
   testKeyResponse = null;
   secretWriteFailure = null;
+  importPayload = null;
   refuse = {};
   profiles = [gemini(), voyage(), nomic()];
   libraries = [biblical()];
@@ -186,16 +188,18 @@ beforeEach(() => {
       case "khipu_library_scan":
         return JSON.stringify({ ok: true, added: 3, updated: 0, removed: 0, unchanged: 0, skipped: 1, documents: 3, chunks: 40 });
       case "khipu_library_import":
-        return JSON.stringify({
-          ok: true,
-          read: 329859,
-          imported: 329224,
-          skipped_corrupt: 635,
-          skipped_bad_vector: 0,
-          skipped_bad_row: 0,
-          unmapped: 0,
-          documents: 5340,
-        });
+        return JSON.stringify(
+          importPayload ?? {
+            ok: true,
+            read: 329859,
+            imported: 329224,
+            skipped_corrupt: 635,
+            skipped_bad_vector: 0,
+            skipped_bad_row: 0,
+            unmapped: 0,
+            documents: 5340,
+          },
+        );
       case "khipu_library_set_profile":
         libraries = libraries.map((l) => (l.name === args?.name ? { ...l, profile: String(args?.profile) } : l));
         return JSON.stringify({ ok: true, name: args?.name, profile: args?.profile });
@@ -620,6 +624,30 @@ describe("libraries", () => {
     expect(receipt).toHaveTextContent("Imported 329,224");
     expect(receipt).toHaveTextContent("Skipped 635 corrupt");
     expect(receipt).toHaveTextContent("0 with no matching file");
+    expect(within(receipt).getByText("Done")).toBeInTheDocument();
+  });
+
+  it("marks an import Partial when ok is false even if some rows imported", async () => {
+    importPayload = {
+      ok: false,
+      read: 10,
+      imported: 4,
+      skipped_corrupt: 0,
+      skipped_bad_vector: 0,
+      skipped_bad_row: 0,
+      skipped_conflict: 6,
+      unmapped: 0,
+      documents: 2,
+    };
+    render(<EmbeddingsPanel active />);
+    const l = await screen.findByRole("group", { name: "Library biblical" });
+    fireEvent.click(within(l).getByRole("button", { name: "Import an index" }));
+    const dlg = await screen.findByRole("dialog", { name: "Import an index into biblical" });
+    fireEvent.change(within(dlg).getByLabelText("Index file"), { target: { value: "/Users/me/partial.sqlite" } });
+    fireEvent.click(within(dlg).getByRole("button", { name: "Import" }));
+    const receipt = await within(l).findByRole("group", { name: "Receipt" });
+    expect(receipt).toHaveTextContent("Imported 4");
+    expect(within(receipt).getByText("Partial")).toBeInTheDocument();
   });
 
   it("confirms before removing a library and names what goes", async () => {
