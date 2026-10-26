@@ -2095,6 +2095,18 @@ struct PriorityEntry {
     account: String,
     role: Option<String>,
     until: Option<String>,
+    /// The level the owner worded into the role, kept as read (claim and its
+    /// two times) so a whole-list write by the app never drops another
+    /// account's level.
+    #[serde(default)]
+    level: Option<PriorityLevel>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+struct PriorityLevel {
+    claim: String,
+    as_of: String,
+    until: String,
 }
 
 /// `route priority --from-app [--entries=JSON] [--until=T] -- ACTION`. The
@@ -2145,6 +2157,13 @@ fn route_priority_argv_expect(
             }
             if let Some(t) = e.until.as_deref().filter(|t| !t.trim().is_empty()) {
                 item.insert("until".to_string(), Value::String(checked_route_until(t)?));
+            }
+            if let Some(level) = &e.level {
+                let mut l = serde_json::Map::new();
+                l.insert("claim".to_string(), Value::String(checked_route_words(&level.claim, false)?));
+                l.insert("as_of".to_string(), Value::String(checked_route_until(&level.as_of)?));
+                l.insert("until".to_string(), Value::String(checked_route_until(&level.until)?));
+                item.insert("level".to_string(), Value::Object(l));
             }
             clean.push(Value::Object(item));
         }
@@ -7182,7 +7201,26 @@ mod priority_and_sign_in_tests {
     }
 
     fn entry(account: &str, role: Option<&str>, until: Option<&str>) -> PriorityEntry {
-        PriorityEntry { account: account.into(), role: role.map(Into::into), until: until.map(Into::into) }
+        PriorityEntry { account: account.into(), role: role.map(Into::into), until: until.map(Into::into), level: None }
+    }
+
+    #[test]
+    fn a_priority_entrys_level_survives_a_whole_list_write() {
+        let mut with_level = entry("Codex", Some("builds"), None);
+        with_level.level = Some(PriorityLevel {
+            claim: "Opus is limited today".into(),
+            as_of: "2026-10-26T12:00:00Z".into(),
+            until: "2026-10-27T12:00:00Z".into(),
+        });
+        let argv = route_priority_argv("set", &[with_level, entry("Claude", None, None)], None, None).unwrap();
+        let json = argv.iter().find_map(|a| a.strip_prefix("--entries=")).unwrap();
+        let parsed: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed[0]["level"]["claim"], "Opus is limited today");
+        assert_eq!(parsed[0]["level"]["until"], "2026-10-27T12:00:00Z");
+        assert!(parsed[1].get("level").is_none());
+        let mut bad = entry("Codex", None, None);
+        bad.level = Some(PriorityLevel { claim: "x".into(), as_of: "--all".into(), until: "2026-10-27T12:00:00Z".into() });
+        assert!(route_priority_argv("set", &[bad], None, None).is_err());
     }
 
     #[test]

@@ -31,6 +31,8 @@ import type { PlanUsageState, UsageAccount, UsageReport } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
 import { PlanDetailSheet, RoutingDetailSheet, useDetailHost } from "./AccountDetail";
 import { AccountsRequestBand } from "./AccountControls";
+import { priorityItems } from "./accountControlsModel";
+import type { PriorityItem } from "./accountControlsModel";
 import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import { paceModel } from "./routingPace";
@@ -82,7 +84,6 @@ import type {
   RouteHold,
   RouteModel,
   RoutePriority,
-  RoutePriorityEntry,
   RouteReport,
   RouteRule,
   RouteRunner,
@@ -156,6 +157,9 @@ export type Writer = {
   /** The error under `id` as it stands now, readable in the same tick a
    *  write's promise settles (the state above lands a render later). */
   errorOf: (id: string) => string | undefined;
+  /** The CLI's answer to the last write under `id` that went through, read in
+   *  the same tick its promise settles; undefined after a refusal. */
+  dataOf: (id: string) => unknown;
 };
 
 export function useWriter(reread: () => Promise<unknown>): Writer {
@@ -181,6 +185,7 @@ export function useWriter(reread: () => Promise<unknown>): Writer {
     if (usable(to) && to !== at) to.focus();
   });
   const errorsNow = useRef<Record<string, string>>({});
+  const dataNow = useRef<Record<string, unknown>>({});
   const fail = (id: string, message: string | null) => {
     if (message) errorsNow.current[id] = message;
     else delete errorsNow.current[id];
@@ -207,6 +212,9 @@ export function useWriter(reread: () => Promise<unknown>): Writer {
         } else {
           const res = await callCli(command, command.startsWith("khipu_route_") && command !== "khipu_route_check"
             ? { ...built, op } : built);
+          // Kept before the re-read, which can take a while, and cleared on a refusal.
+          if (res.ok) dataNow.current[id] = res.data;
+          else delete dataNow.current[id];
           await (after ?? reread)();
           fail(
             id,
@@ -239,7 +247,7 @@ export function useWriter(reread: () => Promise<unknown>): Writer {
     queue.current = job.catch(() => undefined);
     return job;
   };
-  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, results, run, fail, errorOf: (id: string) => errorsNow.current[id] };
+  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, results, run, fail, errorOf: (id: string) => errorsNow.current[id], dataOf: (id: string) => dataNow.current[id] };
 }
 
 /** One routing setting's value as `khipu config` reports it now, read just
@@ -655,12 +663,6 @@ function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteVie
 // order shown; Khipu keeps it as sent and never reorders it.
 // ---------------------------------------------------------------------------
 
-type PriorityItem = { account: string; role: string | null; until: string | null };
-
-/** The list as the CLI takes it back: account key, role and end only. */
-function priorityItems(entries: RoutePriorityEntry[]): PriorityItem[] {
-  return entries.map((e) => ({ account: e.account, role: e.role ?? null, until: e.until ?? null }));
-}
 
 /** "until Sat 3:00 PM", or "no end". */
 function endText(until: string | null | undefined, now: Date): string {

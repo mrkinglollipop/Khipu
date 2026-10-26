@@ -162,10 +162,21 @@ export function capSentence(c: CapStatus): string {
 // The priority, one account changed
 // ---------------------------------------------------------------------------
 
-export type PriorityItem = { account: string; role: string | null; until: string | null };
+export type PriorityLevel = { claim: string; as_of: string; until: string };
+export type PriorityItem = { account: string; role: string | null; until: string | null; level?: PriorityLevel };
 
+/** The list as the CLI takes it back. A level (the owner's worded claim with its
+ *  two times) rides along only when it is whole, so a whole-list write never
+ *  drops another account's. */
 export function priorityItems(entries: RoutePriorityEntry[]): PriorityItem[] {
-  return entries.map((e) => ({ account: e.account, role: e.role ?? null, until: e.until ?? null }));
+  return entries.map((e) => {
+    const item: PriorityItem = { account: e.account, role: e.role ?? null, until: e.until ?? null };
+    const l = e.level;
+    if (l && typeof l.claim === "string" && typeof l.as_of === "string" && typeof l.until === "string") {
+      item.level = { claim: l.claim, as_of: l.as_of, until: l.until };
+    }
+    return item;
+  });
 }
 
 /** The list with this account's words changed (blank: no words). */
@@ -198,38 +209,14 @@ export function charactersWords(words: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Undo: find the owner-action line a write just made
+// Undo: the id the write itself returned
 // ---------------------------------------------------------------------------
 
-export type LoggedAction = {
-  id: string;
-  action: string;
-  target?: string;
-  auth?: string;
-  state?: string | null;
-  no_undo?: string;
-};
-
-/** The write returns no owner-action id for a change made in the app (only a
- *  direction's does), so the line is found in the log: the newest line of this
- *  action that was not there before the write, made in the app and still
- *  open to undo. `before` is the ids seen before the write; null when that
- *  read failed, which accepts the newest matching app line. */
-export function findNewAction(after: LoggedAction[], before: Set<string> | null, action: string, target?: string): LoggedAction | null {
-  const fresh = after.filter(
-    (a) =>
-      a.action === action &&
-      a.auth === "app" &&
-      !a.no_undo &&
-      a.state !== "undone" &&
-      a.state !== "failed" &&
-      (before == null || !before.has(a.id)),
-  );
-  if (target) {
-    const named = fresh.find((a) => a.target === target);
-    if (named) return named;
-  }
-  return fresh[0] ?? null;
+/** The owner-action id a write's own answer carries (`owner_action`, 8 lowercase
+ *  hex). Anything else, or no id, is no identity: the caller shows no Undo. */
+export function ownerActionId(answer: unknown): string | null {
+  const id = answer && typeof answer === "object" ? (answer as { owner_action?: unknown }).owner_action : null;
+  return typeof id === "string" && /^[0-9a-f]{8}$/.test(id) ? id : null;
 }
 
 // ---------------------------------------------------------------------------

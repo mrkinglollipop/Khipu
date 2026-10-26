@@ -4,10 +4,9 @@
    same writer, so a change made here is one owner-action line like any other.
 
    A change that can be taken back applies at once and leaves an Undo bar in
-   its own section. The app's own writes return no owner-action id (only a
-   direction's do), so the Undo finds the line the write just made in the
-   owner-actions log (`findNewAction`) and runs `owner-direction undo` on that
-   id; when the log can't be read, the bar says so instead of guessing. */
+   its own section. The write's own answer carries the id of the owner-action
+   line it made (`owner_action`), and Undo runs `owner-direction undo` on
+   exactly that id; an answer without one gets a bar with no Undo. */
 
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
@@ -42,13 +41,13 @@ import {
   checkedHost,
   draftFromCap,
   emptyCapDraft,
-  findNewAction,
   movedBy,
+  ownerActionId,
   withAccountLast,
   withRole,
   withoutAccount,
 } from "./accountControlsModel";
-import type { CapDraft, CapSentence, LoggedAction } from "./accountControlsModel";
+import type { CapDraft, CapSentence } from "./accountControlsModel";
 
 // ---------------------------------------------------------------------------
 // The writer with Undo
@@ -72,7 +71,7 @@ type Change = {
   writeId: string;
   command: string;
   args: Record<string, unknown>;
-  /** The owner action this write makes, as the log names it. */
+  /** The owner action this write makes, as the log names it (for readers; Undo uses the returned id). */
   owner: string;
   target?: string;
   /** What the Undo bar says was done. */
@@ -81,11 +80,6 @@ type Change = {
   /** A write that may be refused until held or paused accounts are answered. */
   attempt?: Attempt;
 };
-
-async function loggedActions(): Promise<LoggedAction[] | null> {
-  const res = await callCli<{ actions?: LoggedAction[] }>("khipu_owner_direction_actions");
-  return res.ok && Array.isArray(res.data.actions) ? res.data.actions : null;
-}
 
 export function useAccountControls(reread: () => Promise<unknown>) {
   const w = useWriter(reread);
@@ -102,17 +96,13 @@ export function useAccountControls(reread: () => Promise<unknown>) {
     // A button keeps focus and shows a spinner while its write runs (aria-busy,
     // never disabled), so a second click on it is ignored here.
     if (w.isBusy(o.writeId)) return false;
-    const seen = await loggedActions();
-    const before = seen ? new Set(seen.map((a) => a.id)) : null;
-    const finish = async () => {
-      const after = before ? await loggedActions() : null;
-      const found = before && after ? findNewAction(after, before, o.owner, o.target) : null;
-      setBar({ section: o.section, text: o.text, id: found?.id ?? null, seq: ++seq.current });
-    };
+    // Undo runs on the id this very write returned. An answer without one gives
+    // the bar no Undo (it says where to take the change back instead).
+    const finish = () => setBar({ section: o.section, text: o.text, id: ownerActionId(w.dataOf(o.writeId)), seq: ++seq.current });
     const ok = o.attempt
-      ? await o.attempt(o.writeId, o.command, o.args, null, o.back, () => void finish())
+      ? await o.attempt(o.writeId, o.command, o.args, null, o.back, finish)
       : await w.run(o.writeId, o.command, o.args, null, o.back);
-    if (ok) await finish();
+    if (ok) finish();
     return ok;
   };
 
@@ -602,6 +592,11 @@ function WordsForm({ a, view, ctl, now, onClose }: { a: RouteAccount; view: Rout
   useEffect(() => area.current?.focus(), []);
   const base = useId().replace(/:/g, "");
   const expect = p?.version ?? view.priority_version ?? null;
+  // The list and version the draft started from, taken together. If the priority
+  // moves while the form is open, the draft is never sent under the newer version
+  // (that would overwrite whoever changed it); the owner reconciles first.
+  const [started, setStarted] = useState({ entries, version: expect, until: p?.until ?? null });
+  const moved = started.version !== expect;
   const id = `words:${a.key}`;
   const moveId = `move:${a.key}`;
   const removeId = `remove:${a.key}`;
@@ -610,9 +605,20 @@ function WordsForm({ a, view, ctl, now, onClose }: { a: RouteAccount; view: Rout
       args: { action: "set", entries: items, until: p?.until ?? null, expect }, owner: "route.priority.set", text, attempt: eok.attempt, back });
   async function submit(e: FormEvent) {
     e.preventDefault();
-    const ok = await save(withRole(entries, a.key, role), id, `Your words for ${a.label} are saved.`);
+    if (moved) {
+      w.fail(id, "Your priority changed after you opened this, so your draft was not saved.");
+      return;
+    }
+    const ok = await change({ section: "words", writeId: id, command: "khipu_route_priority",
+      args: { action: "set", entries: withRole(started.entries, a.key, role), until: started.until, expect: started.version },
+      owner: "route.priority.set", text: `Your words for ${a.label} are saved.`, attempt: eok.attempt });
     if (ok) onClose();
   }
+  const seeNewer = () => {
+    setStarted({ entries, version: expect, until: p?.until ?? null });
+    w.fail(id, null);
+    area.current?.focus();
+  };
   const move = (by: -1 | 1) => {
     const items = movedBy(entries, a.key, by);
     if (items) void save(items, moveId, `${a.label} moved ${by < 0 ? "up" : "down"} in your priority.`);
@@ -626,12 +632,21 @@ function WordsForm({ a, view, ctl, now, onClose }: { a: RouteAccount; view: Rout
     if (ok) onClose();
   }
   return (
-    <form className="route-pause" aria-label={`Change your words for ${a.label}`} onSubmit={submit} onKeyDown={escapeCloses(onClose)}>
+    <form className="route-pause" aria-label={`Change your words for ${a.label}`} onSubmit={submit}
+      onKeyDown={(e) => { if (!removing) escapeCloses(onClose)(e); }}>
       <div className="route-field wide">
         <label htmlFor={`${base}-words`}>Your words for {a.label}</label>
         <textarea id={`${base}-words`} ref={area} rows={5} value={role} aria-describedby={`${base}-count`} onChange={(e) => setRole(e.target.value)} />
         <span className="meta" id={`${base}-count`}>{charactersWords(role)}</span>
       </div>
+      {moved ? (
+        <p className="set-error" role="alert">
+          Your priority changed after you opened this. Your draft is kept below.{" "}
+          <button type="button" className="sm" onClick={seeNewer}>
+            Use my draft on the newer version
+          </button>
+        </p>
+      ) : null}
       <div className="toolbar">
         <span className="meta">Place in your priority: {i + 1} of {entries.length}</span>
         <button type="button" className="sm" disabled={i <= 0 || w.anyBusy} aria-label={`Move ${a.label} up`} onClick={() => move(-1)}>
@@ -780,7 +795,7 @@ function SetUpReading({ w, account, provider }: { w: Writer; account: RouteAccou
           Set up reading…
         </button>
       ) : (
-        <form className="route-pause" aria-label={`Set up reading for ${name}`} onKeyDown={escapeCloses(() => { setOpen(false); setAsking(null); })}
+        <form className="route-pause" aria-label={`Set up reading for ${name}`} onKeyDown={(e) => { if (!asking) escapeCloses(() => { setOpen(false); })(e); }}
           onSubmit={(e) => {
             e.preventDefault();
             const out = checkedHost(host);
@@ -836,13 +851,19 @@ function ReplaceKey({ row, onChanged }: { row: UsageAccount; onChanged?: () => P
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const keyInput = useRef<HTMLInputElement>(null);
   const base = useId().replace(/:/g, "");
   const name = row.account || "GLM";
   async function send() {
     setBusy(true);
     setError(null);
+    // The value leaves the page's state the moment it is handed over, not when
+    // the write and the re-read have both finished.
+    const handed = value;
+    setValue("");
+    setAsking(false);
     try {
-      const raw = await invoke<string>("set_khipu_secret", { account: "glm_api_key", value });
+      const raw = await invoke<string>("set_khipu_secret", { account: "glm_api_key", value: handed });
       let failed: string | null = null;
       try {
         const parsed = JSON.parse(raw) as { ok?: boolean; error?: string };
@@ -859,8 +880,6 @@ function ReplaceKey({ row, onChanged }: { row: UsageAccount; onChanged?: () => P
     } catch (e) {
       setError(typeof e === "string" ? e : "Khipu couldn't store the key.");
     } finally {
-      setValue("");
-      setAsking(false);
       setBusy(false);
     }
   }
@@ -872,18 +891,19 @@ function ReplaceKey({ row, onChanged }: { row: UsageAccount; onChanged?: () => P
           Replace the key…
         </button>
       ) : (
-        <form className="route-pause" aria-label={`Replace the ${name} key`} onKeyDown={escapeCloses(() => { setOpen(false); setValue(""); setAsking(false); })}
+        <form className="route-pause" aria-label={`Replace the ${name} key`}
+          onKeyDown={(e) => { if (!asking) escapeCloses(() => { setOpen(false); setValue(""); })(e); }}
           onSubmit={(e) => { e.preventDefault(); if (value.trim()) setAsking(true); }}>
           <div className="toolbar">
             <span className="route-field">
               <label htmlFor={`${base}-key`}>New {name} key</label>
-              <input id={`${base}-key`} type="password" autoComplete="off" spellCheck={false} value={value} onChange={(e) => setValue(e.target.value)} />
+              <input id={`${base}-key`} ref={keyInput} type="password" autoComplete="off" spellCheck={false} value={value} onChange={(e) => setValue(e.target.value)} />
             </span>
           </div>
           <p className="set-help">Stored in this Mac's Keychain. Khipu never shows it to a model or prints it.</p>
           {error ? <p className="set-error" role="alert">{error}</p> : null}
           {asking ? (
-            <ConfirmGroup label={`Replace the ${name} key?`} onClose={() => setAsking(false)} back={() => null}>
+            <ConfirmGroup label={`Replace the ${name} key?`} onClose={() => setAsking(false)} back={() => keyInput.current}>
               <b>Replace the {name} key?</b>
               <span>The old one is removed from the Keychain.</span>
               <div className="toolbar">

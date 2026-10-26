@@ -21,24 +21,27 @@ vi.mock("@tauri-apps/api/core", () => ({
 // Mon 2026-03-09, 3:00 PM in New York.
 const NOW = new Date("2026-03-09T19:00:00Z");
 
-type Line = { id: string; action: string; auth: string; target?: string };
-let log: Line[];
 let answers: Record<string, unknown | ((args: Record<string, unknown>) => unknown)>;
-/** A write that also lands a line in the owner-actions log, as the CLI does. */
-let lands: Record<string, string>;
+/** The owner-action id each write answers with, as the CLI returns it; null
+ *  makes a write answer without one. */
+let nextId: string | null;
+const OWNER_WRITES = ["khipu_route_cap", "khipu_route_pause", "khipu_route_lift", "khipu_route_clear", "khipu_route_priority", "khipu_route_hold_add", "khipu_route_hold_end"];
+let issued: string[];
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(NOW);
-  log = [{ id: "old00001", action: "route.cap.set", auth: "app" }];
   answers = {};
-  lands = { khipu_route_cap: "route.cap.set", khipu_route_pause: "route.pause", khipu_route_priority: "route.priority.set", khipu_route_hold_add: "route.hold.add", khipu_route_hold_end: "route.hold.end" };
+  issued = [];
+  nextId = "a1b2c3d4";
   invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
-    if (cmd === "khipu_owner_direction_actions") return JSON.stringify({ ok: true, actions: [...log].reverse() });
     const a = answers[cmd];
     const out = typeof a === "function" ? await (a as (x: Record<string, unknown>) => unknown)(args ?? {}) : a ?? { ok: true };
     const refused = out && typeof out === "object" && (out as { ok?: boolean }).ok === false;
-    if (!refused && lands[cmd]) log.push({ id: `new${log.length}`.padEnd(8, "0"), action: (args as { action?: string })?.action === "remove" ? "route.cap.remove" : lands[cmd], auth: "app" });
+    if (!refused && OWNER_WRITES.includes(cmd) && nextId) {
+      issued.push(nextId);
+      return JSON.stringify({ ...(out as object), owner_action: nextId });
+    }
     return typeof out === "string" ? out : JSON.stringify(out);
   });
 });
@@ -107,7 +110,9 @@ describe("caps", () => {
     expect(undo).toHaveFocus();
     expect(onChanged).toHaveBeenCalled();
     fireEvent.click(undo);
-    await waitFor(() => expect(calls("khipu_owner_direction_undo")).toEqual([{ id: "new10000" }]));
+    await waitFor(() => expect(calls("khipu_owner_direction_undo")).toEqual([{ id: "a1b2c3d4" }]));
+    // The log is never searched for a line to undo.
+    expect(calls("khipu_owner_direction_actions")).toEqual([]);
     expect(await caps.findByText("Undone.")).toBeInTheDocument();
     expect(caps.queryByRole("button", { name: "Undo" })).toBeNull();
   });
@@ -140,8 +145,8 @@ describe("caps", () => {
     expect(caps.getByRole("button", { name: "Undo" })).toBeInTheDocument();
   });
 
-  it("says so when the log can't be read: the change stands, with where to take it back", async () => {
-    invokeMock.mockImplementation(async (cmd: string) => (cmd === "khipu_owner_direction_actions" ? JSON.stringify({ ok: false, error: "no log" }) : JSON.stringify({ ok: true })));
+  it("shows no Undo when the write's answer names no owner action, and says where to take it back", async () => {
+    nextId = null;
     const { dialog } = sheet();
     const caps = section(dialog, "Your caps");
     fireEvent.click(caps.getByRole("button", { name: "Add a cap…" }));
@@ -422,5 +427,102 @@ describe("a conversation's change to the accounts", () => {
     });
     await waitFor(() => expect(calls("khipu_accounts_request")).toEqual([{ action: "undo", expect: "v7" }]));
     expect(await screen.findByRole("alert")).toHaveTextContent("Khipu didn't make that change");
+  });
+});
+
+describe("review round 2: identity, stale versions, levels, keys", () => {
+  it("undoes exactly the id each write returned, so two holds never cross", async () => {
+    const { dialog } = sheet();
+    const holds = section(dialog, "Exceptions in force");
+    nextId = "11111111";
+    fireEvent.click(holds.getByRole("button", { name: "Hold Codex…" }));
+    fireEvent.change(holds.getByLabelText("What conversations should know"), { target: { value: "first" } });
+    fireEvent.click(holds.getByRole("button", { name: "Add hold" }));
+    await holds.findByRole("button", { name: "Undo" });
+    // Another hold (any account) lands meanwhile; this bar still belongs to the first.
+    nextId = "22222222";
+    fireEvent.click(holds.getByRole("button", { name: "Undo" }));
+    await waitFor(() => expect(calls("khipu_owner_direction_undo")).toEqual([{ id: "11111111" }]));
+  });
+
+  it("shows no Undo when the answer's id is not an owner-action id", async () => {
+    nextId = "not-an-id";
+    const { dialog } = sheet();
+    const caps = section(dialog, "Your caps");
+    fireEvent.click(caps.getByRole("button", { name: "Add a cap…" }));
+    fireEvent.change(caps.getByLabelText("Percent"), { target: { value: "80" } });
+    fireEvent.click(caps.getByRole("button", { name: "Save cap" }));
+    await caps.findByRole("status");
+    expect(caps.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
+  it("never sends an old draft under a newer version, until the owner chooses to", async () => {
+    const onChanged = vi.fn();
+    const { rerender } = render(<RoutingDetailSheet account={codex} view={view()} now={NOW} onClose={() => {}} onChanged={onChanged} />);
+    const words = section(screen.getByRole("dialog"), "Your words for this account");
+    fireEvent.click(words.getByRole("button", { name: "Change…" }));
+    fireEvent.change(words.getByLabelText("Your words for Codex"), { target: { value: "my draft" } });
+    // A conversation edits the priority meanwhile: the page reads version p2.
+    const newer = view();
+    newer.priority = { entries: [
+      { account: "codex|", label: "Codex", role: "their newer words", until: null },
+      { account: "claude|", label: "Claude", role: "design and judgement", until: null },
+    ], version: "p2" };
+    rerender(<RoutingDetailSheet account={codex} view={newer} now={NOW} onClose={() => {}} onChanged={onChanged} />);
+    expect(await words.findByRole("alert")).toHaveTextContent("Your priority changed after you opened this");
+    fireEvent.click(words.getByRole("button", { name: "Save" }));
+    expect(calls("khipu_route_priority")).toEqual([]);
+    expect(words.getByLabelText("Your words for Codex")).toHaveValue("my draft");
+    fireEvent.click(words.getByRole("button", { name: "Use my draft on the newer version" }));
+    fireEvent.click(words.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("khipu_route_priority")).toHaveLength(1));
+    expect(calls("khipu_route_priority")[0]).toMatchObject({ action: "set", expect: "p2",
+      entries: [{ account: "codex|", role: "my draft" }, { account: "claude|", role: "design and judgement" }] });
+  });
+
+  it("keeps another account's level when it rewrites the whole list", async () => {
+    const level = { claim: "Opus is limited today", as_of: "2026-03-09T12:00:00Z", until: "2026-03-10T12:00:00Z" };
+    const v = view();
+    v.priority = { ...v.priority!, entries: [
+      { account: "codex|", label: "Codex", role: "builds first", until: null },
+      { account: "claude|", label: "Claude", role: "design", until: null, level },
+    ] };
+    const { dialog } = sheet(v);
+    const words = section(dialog, "Your words for this account");
+    fireEvent.click(words.getByRole("button", { name: "Change…" }));
+    fireEvent.click(words.getByRole("button", { name: "Move Codex down" }));
+    await waitFor(() => expect(calls("khipu_route_priority")).toHaveLength(1));
+    expect(calls("khipu_route_priority")[0].entries).toEqual([
+      { account: "claude|", role: "design", until: null, level },
+      { account: "codex|", role: "builds first", until: null },
+    ]);
+  });
+
+  it("empties the key field the moment the value is handed over, while the write is still pending", async () => {
+    let finish: (v: string) => void = () => {};
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "set_khipu_secret" ? new Promise<string>((r) => { finish = r; }) : Promise.resolve(JSON.stringify({ ok: true })));
+    const glmRow = { harness: "glm", key: "glm|", account: "GLM", plan: null, windows: [], ok: false, error: "key_rejected", home: null } as unknown as UsageAccount;
+    render(<PlanDetailSheet row={glmRow} view={view({ accounts: [{ key: "glm|", label: "GLM", harness: "glm", state: "unknown" }] } as Partial<RouteView>)} now={NOW} onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Replace the key…" }));
+    fireEvent.change(screen.getByLabelText("New GLM key"), { target: { value: "made-up-key-value" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.click(within(screen.getByRole("group", { name: "Replace the GLM key?" })).getByRole("button", { name: "Replace the key" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_khipu_secret", { account: "glm_api_key", value: "made-up-key-value" }));
+    expect(screen.getByLabelText("New GLM key")).toHaveValue("");
+    finish(JSON.stringify({ ok: true }));
+    await screen.findByText(/The key is replaced/);
+  });
+
+  it("Keep the old key returns focus to the key field, and Escape closes only the question", () => {
+    const glmRow = { harness: "glm", key: "glm|", account: "GLM", plan: null, windows: [], ok: false, error: "no_key", home: null } as unknown as UsageAccount;
+    render(<PlanDetailSheet row={glmRow} view={view({ accounts: [{ key: "glm|", label: "GLM", harness: "glm", state: "unknown" }] } as Partial<RouteView>)} now={NOW} onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Replace the key…" }));
+    const field = screen.getByLabelText("New GLM key");
+    fireEvent.change(field, { target: { value: "made-up-key-value" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    fireEvent.keyDown(screen.getByRole("group", { name: "Replace the GLM key?" }), { key: "Escape" });
+    expect(screen.queryByRole("group", { name: "Replace the GLM key?" })).toBeNull();
+    expect(screen.getByLabelText("New GLM key")).toHaveValue("made-up-key-value");
   });
 });

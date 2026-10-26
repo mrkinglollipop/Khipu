@@ -11,13 +11,13 @@ import {
   checkedHost,
   draftFromCap,
   emptyCapDraft,
-  findNewAction,
   movedBy,
+  ownerActionId,
+  priorityItems,
   withAccountLast,
   withRole,
   withoutAccount,
 } from "../accountControlsModel";
-import type { LoggedAction } from "../accountControlsModel";
 import type { CapStatus, RoutePriorityEntry } from "../routing";
 
 const entry = (account: string, role: string | null = null, until: string | null = null): RoutePriorityEntry =>
@@ -111,25 +111,23 @@ describe("the priority with one account changed", () => {
   });
 });
 
-describe("finding the line a write just made", () => {
-  const line = (id: string, action: string, extra: Partial<LoggedAction> = {}): LoggedAction => ({ id, action, auth: "app", ...extra });
-
-  it("takes the newest app line of this action that was not there before", () => {
-    const after = [line("n2", "route.pause", { target: "b|" }), line("n1", "route.pause", { target: "a|" }), line("old", "route.pause", { target: "a|" })];
-    expect(findNewAction(after, new Set(["old"]), "route.pause", "a|")?.id).toBe("n1");
-    expect(findNewAction(after, new Set(["old"]), "route.pause")?.id).toBe("n2");
+describe("the owner-action id a write returned", () => {
+  it("takes only a whole 8-character hex id from the write's own answer", () => {
+    expect(ownerActionId({ ok: true, owner_action: "a1b2c3d4" })).toBe("a1b2c3d4");
+    for (const bad of [null, undefined, "a1b2c3d4", {}, { owner_action: "" }, { owner_action: "A1B2C3D4" }, { owner_action: "a1b2c3" }, { owner_action: 12345678 }]) {
+      expect(ownerActionId(bad)).toBeNull();
+    }
   });
 
-  it("never picks an old line, another action, a direction's line, an undone or no-undo line", () => {
-    const after = [
-      line("seen", "route.cap.set"),
-      line("other", "route.cap.remove"),
-      line("dir", "route.cap.set", { auth: "direction" }),
-      line("undone", "route.cap.set", { state: "undone" }),
-      line("failed", "route.cap.set", { state: "failed" }),
-      line("noundo", "route.cap.set", { no_undo: "cannot" }),
-    ];
-    expect(findNewAction(after, new Set(["seen"]), "route.cap.set")).toBeNull();
+  it("keeps a whole level on every entry through the list helpers, and drops a broken one", () => {
+    const level = { claim: "Opus is limited", as_of: "2026-10-26T12:00:00Z", until: "2026-10-27T12:00:00Z" };
+    const list = [{ ...entry("a|", "x"), level }, entry("b|", "y"), { ...entry("c|"), level: { claim: "no times" } }] as RoutePriorityEntry[];
+    expect(priorityItems(list)[0].level).toEqual(level);
+    expect(movedBy(list, "b|", -1)?.[0].level).toBeUndefined();
+    expect(movedBy(list, "b|", -1)?.[1].level).toEqual(level);
+    expect(withRole(list, "b|", "z")[0].level).toEqual(level);
+    expect(withoutAccount(list, "b|")[0].level).toEqual(level);
+    expect(priorityItems(list)[2]).not.toHaveProperty("level");
   });
 });
 
