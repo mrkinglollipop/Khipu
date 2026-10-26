@@ -266,6 +266,120 @@ def test_nested_cleanup_failure_must_fail_nightly(harness, monkeypatch, tmp_path
     assert jobs.run_nightly() != 0
 
 
+def _install_nightly_cleanup(monkeypatch, tmp_path):
+    monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path)
+    monkeypatch.setattr(jobs, '_run_script', lambda *a, **kw: 0)
+    for name in ('_drain_sessions', '_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
+                 '_mark_stale_commitments', '_hygiene_commitments', '_ledger_nightly',
+                 '_project_renames_sweep', '_refresh_snapshot', '_briefs_build_if_on'):
+        monkeypatch.setattr(jobs, name, lambda: {'ok': True})
+    monkeypatch.setattr(close_rules.GitHub, 'state', lambda *a: ('merged', None))
+    monkeypatch.setattr(provenance, 'backfill', lambda conn: {'ok': True})
+    monkeypatch.setattr(provenance, 'prune_changes', lambda conn: {'ok': True})
+    receipts = []
+    def backfill(conn):
+        out = _REAL_PROVENANCE_BACKFILL(conn)
+        receipts.append(out)
+        return out
+    monkeypatch.setattr(jobs, '_provenance_backfill', backfill)
+    return receipts
+
+
+def _install_two_gap_groups(harness, monkeypatch):
+    _install_gap(harness, monkeypatch)
+    original = Cursor.execute
+    def execute(cur, sql, params=()):
+        original(cur, sql, params)
+        if 'FROM fact_gaps' in sql and 'array_agg' in sql:
+            cur.rows = [(2, 'close rules', None, [99]), (3, 'close rules', None, [100])]
+        elif sql.startswith('SELECT id FROM fact_gaps'):
+            cur.rows = [(params[0][0],)]
+    monkeypatch.setattr(Cursor, 'execute', execute)
+
+
+def test_replay_fatal_then_dropped_connection_keeps_failure(harness, monkeypatch, tmp_path):
+    receipts = _install_nightly_cleanup(monkeypatch, tmp_path)
+    _install_two_gap_groups(harness, monkeypatch)
+    index = Mock(return_value={'ok': True})
+    prune = Mock(return_value={'ok': True})
+    monkeypatch.setattr(provenance, 'index_identities', index)
+    monkeypatch.setattr(provenance, 'prune_changes', prune)
+    seen = []
+    def step(cur, name, payload, episode):
+        seen.append(episode)
+        if episode == 2:
+            raise psycopg.errors.UndefinedColumn('fatal schema error in replay')
+        cur.conn.close()
+        raise psycopg.errors.ConnectionFailure('connection lost on second group')
+    monkeypatch.setattr(provenance, '_gap_step', step)
+    assert jobs.run_nightly() != 0, 'fatal first replay failure was erased by later disconnection'
+    assert seen == [2, 3]
+    assert receipts[0]['transient'] is False
+    assert 'UndefinedColumn: fatal schema error in replay' in receipts[0]['reason']
+    assert receipts[0]['gaps']['failed'] == 2
+    assert receipts[0]['connection_unusable'] is True
+    index.assert_not_called()
+    prune.assert_not_called()
+
+
+def test_index_schema_failure_survives_rollback_disconnect(harness, monkeypatch, tmp_path):
+    receipts = _install_nightly_cleanup(monkeypatch, tmp_path)
+    monkeypatch.setattr(provenance, 'replay_gaps', lambda conn: {'ok': True})
+    prune = Mock(return_value={'ok': True})
+    monkeypatch.setattr(provenance, 'prune_changes', prune)
+    seen = []
+    failed_connections = []
+    def copy_ready(cur):
+        seen.append('UndefinedColumn')
+        failed_connections.append(cur.conn)
+        cur.conn.close()
+        raise psycopg.errors.UndefinedColumn('fatal schema error in index')
+    monkeypatch.setattr(provenance, '_copy_ready', copy_ready)
+    prepared = []
+    def prepare(cur):
+        assert not cur.conn.closed
+        prepared.append(cur.conn)
+        return 0
+    monkeypatch.setattr(close_rules, 'backfill_prs', prepare)
+    assert jobs.run_nightly() != 0, 'fatal index failure was erased by rollback disconnection'
+    assert seen == ['UndefinedColumn']
+    assert receipts[0]['transient'] is False
+    assert 'UndefinedColumn: fatal schema error in index' in receipts[0]['reason']
+    assert receipts[0]['index']['transient'] is False
+    assert receipts[0]['connection_unusable'] is True
+    prune.assert_not_called()
+    assert prepared and all(conn not in failed_connections for conn in prepared)
+
+
+def test_replay_receipt_write_rollback_failure_keeps_original_failure(harness, monkeypatch, tmp_path):
+    receipts = _install_nightly_cleanup(monkeypatch, tmp_path)
+    _install_two_gap_groups(harness, monkeypatch)
+    index = Mock(return_value={'ok': True})
+    prune = Mock(return_value={'ok': True})
+    monkeypatch.setattr(provenance, 'index_identities', index)
+    monkeypatch.setattr(provenance, 'prune_changes', prune)
+    seen = []
+    def step(cur, name, payload, episode):
+        seen.append(episode)
+        raise psycopg.errors.UndefinedColumn('fatal schema error before receipt')
+    monkeypatch.setattr(provenance, '_gap_step', step)
+    original = Cursor.execute
+    def execute(cur, sql, params=()):
+        if sql.startswith('UPDATE fact_gaps') and str(params[0]).startswith('replay failed:'):
+            cur.conn.close()
+            raise psycopg.errors.ConnectionFailure('connection lost writing failure receipt')
+        original(cur, sql, params)
+    monkeypatch.setattr(Cursor, 'execute', execute)
+    assert jobs.run_nightly() != 0, 'fatal replay failure was erased by receipt rollback disconnection'
+    assert seen == [2], 'replay continued using the connection after rollback failed'
+    assert receipts[0]['transient'] is False
+    assert 'UndefinedColumn: fatal schema error before receipt' in receipts[0]['reason']
+    assert receipts[0]['gaps']['failed'] == 1
+    assert receipts[0]['connection_unusable'] is True
+    index.assert_not_called()
+    prune.assert_not_called()
+
+
 @pytest.mark.parametrize('phase', ['network', 'second_apply'])
 def test_interruption_is_retryable_without_losing_committed_rows(harness, monkeypatch, phase):
     harness.rows[2] = {**item(), 'id': 2}

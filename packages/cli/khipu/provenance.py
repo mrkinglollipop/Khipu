@@ -163,6 +163,22 @@ def retryable_db_error(exc: BaseException) -> bool:
         and hub_errors.unreachable_error(exc)
 
 
+def _rollback_cleanup(conn, out: dict[str, Any]) -> bool:
+    """Retire a failed connection without replacing the recorded failure."""
+    try:
+        conn.rollback()
+        if not getattr(conn, "closed", False):
+            return True
+    except Exception:  # noqa: BLE001 — the original failure owns classification
+        pass
+    out["connection_unusable"] = True
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001 — retain the receipt even if close fails
+        pass
+    return False
+
+
 # ---- Legacy witness backfill (section 4) ----------------------------------------
 #
 # Migration 0047 attributes only what the writer inventory proves. A legacy
@@ -606,13 +622,14 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
                         ("unreplayable: the merged capture is not in the episode's raw", ids))
             conn.commit()
         except Exception as exc:  # noqa: BLE001 — the gap stays open for the next night
-            conn.rollback()
             out["failed"] += 1
             transient = retryable_db_error(exc)
             if "reason" not in out or (out.get("transient", False) and not transient):
                 out["reason"] = f"{type(exc).__name__}: {exc}"[:300]
             out["transient"] = out.get("transient", True) and transient
             out["ok"] = False
+            if not _rollback_cleanup(conn, out):
+                return out
             try:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -620,7 +637,8 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
                         (f"replay failed: {type(exc).__name__}: {exc}"[:500], ids))
                 conn.commit()
             except Exception:  # noqa: BLE001 — counted above; nothing else to keep
-                conn.rollback()
+                if not _rollback_cleanup(conn, out):
+                    return out
     return out
 
 
@@ -1036,9 +1054,10 @@ def index_identities(conn, *, batch: int = INDEX_BATCH, dry_run: bool = False) -
                 done = _index_batch(cur, through, target, batch)
             conn.commit()
         except Exception as exc:  # noqa: BLE001 - the batch rolled back; the next run redoes it
-            conn.rollback()
-            return {**out, "ok": False, "transient": retryable_db_error(exc),
-                    "error": f"{type(exc).__name__}: {exc}"[:300]}
+            out.update(ok=False, transient=retryable_db_error(exc),
+                       error=f"{type(exc).__name__}: {exc}"[:300])
+            _rollback_cleanup(conn, out)
+            return out
         out["batches"] += 1
         out["indexed"] += done["indexed"]
         out["refused"] += done["refused"]

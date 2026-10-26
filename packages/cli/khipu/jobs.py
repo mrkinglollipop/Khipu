@@ -807,9 +807,15 @@ def _provenance_backfill(conn) -> dict[str, Any]:
         # Fact steps a capture kept as gaps are re-run (invariant I4), after
         # the backfill and before tonight's rules read the facts.
         out["gaps"] = provenance.replay_gaps(conn)
+        if out["gaps"].get("connection_unusable", False):
+            out["connection_unusable"] = True
+            return _provenance_outcome(out)
         # The hub refusals' identity index and duplicate sweep, until every
         # episode from before 0047 is indexed (section 6.1).
         out["index"] = provenance.index_identities(conn)
+        if out["index"].get("connection_unusable", False):
+            out["connection_unusable"] = True
+            return _provenance_outcome(out)
         # The replica stream's 30-day retention (section 6 of the design).
         out["changes"] = provenance.prune_changes(conn)
     except Exception as exc:  # noqa: BLE001 — the rules still run after a backfill failure
@@ -847,7 +853,7 @@ def _commitment_close_rules() -> dict[str, Any]:
                 # 2026-10-23 design): a legacy restater proven tonight counts
                 # for tonight's rules (its PR refs clear needs_owner).
                 witness = _provenance_outcome(_provenance_backfill(conn))
-                reconnect = witness.get("transient", False) and witness.get("connection_unusable", False)
+                reconnect = witness.get("connection_unusable", False)
                 if reconnect:
                     # A dropped connection cannot run preparation or commit on
                     # context exit. Retire it; the next phase gets one fresh try.
