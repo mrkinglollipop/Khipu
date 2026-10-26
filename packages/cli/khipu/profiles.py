@@ -36,6 +36,12 @@ _LOOPBACK = ("localhost", "127.0.0.1", "::1")
 # pgvector's HNSW index on vector(n) tops out at 2000 dimensions.
 MAX_INDEXED_DIM = 2000
 
+# Voyage fixed-width models always return 1024; only the flex family accepts
+# output_dimension. Refuse other widths up front so a paid call is never
+# discarded for width (mirrors khipu.embed._VOYAGE_FLEX_PREFIXES).
+VOYAGE_DEFAULT_DIM = 1024
+_VOYAGE_FLEX_PREFIXES = ("voyage-3-large", "voyage-3.5", "voyage-4", "voyage-code-3")
+
 
 @dataclass(frozen=True)
 class ProfileSpec:
@@ -192,6 +198,16 @@ def validate_spec(
     elif endpoint:
         raise ValueError(
             f"provider {provider} has a fixed endpoint; --endpoint is for openai-compatible"
+        )
+    if (
+        provider == "voyage"
+        and int(dim) != VOYAGE_DEFAULT_DIM
+        and not model.startswith(_VOYAGE_FLEX_PREFIXES)
+    ):
+        raise ValueError(
+            f"voyage model {model!r} returns {VOYAGE_DEFAULT_DIM} dimensions; "
+            f"use {VOYAGE_DEFAULT_DIM} or a flexible model "
+            f"({', '.join(_VOYAGE_FLEX_PREFIXES)})"
         )
     return ProfileSpec(profile_id, provider, model, int(dim), normalize, endpoint or None)
 

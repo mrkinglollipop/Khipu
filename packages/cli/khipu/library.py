@@ -585,6 +585,15 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
                 "indexed; refusing to delete them all (use `khipu library remove` if the "
                 "folder was emptied on purpose)"
             )
+        gone_embedded = sum(1 for doc_id in gone if doc_id in embedded_ids)
+        if (not allow_rebuild and gone_embedded > max(
+                MASS_REBUILD_MIN_DOCS, MASS_REBUILD_MAX_FRACTION * embedded_docs)):
+            conn.rollback()
+            raise LibraryError(
+                f"{gone_embedded} embedded documents would be removed out of {embedded_docs}; "
+                "their vectors would be deleted; nothing was changed. "
+                f"Run `khipu library scan {name} --allow-rebuild` to proceed"
+            )
         for rel, decision in plan:
             if decision.startswith("keep"):
                 continue
@@ -927,7 +936,9 @@ def _decode_vector(raw: Any) -> list[float] | None:
             return None
     else:
         return None
-    return vec if math.isfinite(sum(vec)) else None
+    if not math.isfinite(sum(vec)) or not any(v != 0.0 for v in vec):
+        return None
+    return vec
 
 
 def _infer_provider(model: str) -> str:

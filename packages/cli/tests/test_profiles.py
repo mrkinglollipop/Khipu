@@ -97,6 +97,17 @@ class ValidateSpecTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.ok(endpoint="https://example.com")
 
+    def test_voyage_profile_with_a_width_the_model_cannot_return_is_refused(self):
+        """voyage-3 is fixed-width (1024); a 768 profile would pay then discard."""
+        with self.assertRaises(ValueError):
+            profiles.validate_spec(
+                "voyage-3@768", provider="voyage", model="voyage-3", dim=768)
+
+    def test_voyage_flex_model_may_use_a_non_default_width(self):
+        spec = profiles.validate_spec(
+            "voyage-3.5@512", provider="voyage", model="voyage-3.5", dim=512)
+        self.assertEqual(spec.dim, 512)
+
 
 class EndpointTest(unittest.TestCase):
     def test_https_is_accepted_and_canonicalised(self):
