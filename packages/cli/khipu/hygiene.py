@@ -928,8 +928,10 @@ def _select_open_with_session(cur, *, project: str | None, limit: int | None,
         "c.latest_text" if has_columns(cur, "commitments", "latest_text")
         else "NULL::text AS latest_text"
     )
-    # Only a sessionend that lands at or after the row was opened ends it —
-    # an earlier sessionend in the same session_id must not close a later open.
+    # Only a sessionend at or after the opener episode's ts ends the row —
+    # compare to e.ts (not c.opened_at): opened_at is now() at insert, so a
+    # late-ingested earlier-stamped sessionend would otherwise never match.
+    # An earlier sessionend in the same session_id must not close a later open.
     sql = f"""
         SELECT c.id, c.text, c.project, c.kind, c.owner, c.opened_at, e.session_id,
                (SELECT max(e2.ts) FROM episodes e2 WHERE e2.session_id = e.session_id) AS last_ts,
@@ -939,7 +941,7 @@ def _select_open_with_session(cur, *, project: str | None, limit: int | None,
                EXISTS (
                  SELECT 1 FROM episodes e3
                  WHERE e3.session_id = e.session_id
-                   AND e3.ts >= c.opened_at
+                   AND e3.ts >= e.ts
                    AND (lower(COALESCE(e3.raw->>'event', '')) IN {_SESSION_END_EVENTS_SQL}
                         OR strpos(lower(COALESCE(e3.scope, '')), 'sessionend') > 0)
                ) AS end_event,

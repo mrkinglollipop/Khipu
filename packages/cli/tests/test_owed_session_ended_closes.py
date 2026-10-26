@@ -78,6 +78,21 @@ def test_restatement_from_a_live_session_keeps_the_row_open_through_the_nightly_
     assert _status(cur, cid)[1] == "open", _status(cur, cid)
 
 
+def test_restatement_from_a_live_session_survives_the_opening_sessions_sessionend(cur):
+    """S1 opened it; S2 (live) restates it. S1's sessionend must not close it."""
+    e1 = _episode(cur, S1, hours_ago=1)
+    e2 = _episode(cur, S2, hours_ago=0)
+    assert _open(cur, S1, TEXT, e1) == 1
+    assert _open(cur, S2, TEXT, e2) == 0, "the restatement folds into the open row"
+    cur.execute("SELECT id, seen_count FROM commitments")
+    cid, seen = cur.fetchone()
+    assert seen == 2, "restatement must bump seen_count"
+    end = _episode(cur, S1, hours_ago=0, event="sessionend")
+    assert co.close_session_plan(
+        cur, {"session_id": S1, "event": "sessionend", "project": PROJECT}, end) == 0
+    assert _status(cur, cid)[1] == "open", _status(cur, cid)
+
+
 def test_a_restatement_that_adds_next_session_is_not_closed_with_the_session(cur):
     """Folded 'next session' wording must protect the row at sessionend."""
     e1 = _episode(cur, S1, hours_ago=1)
@@ -113,6 +128,21 @@ def test_a_sessionend_episode_does_not_close_items_opened_after_it(cur):
     cid = cur.fetchone()[0]
     hygiene.run_session_ended_pass(cur, apply=True, project=PROJECT)
     assert _status(cur, cid)[1] == "open", _status(cur, cid)
+
+
+def test_a_late_ingested_sessionend_still_closes_when_after_the_opener_episode(cur):
+    """sessionend.ts before opened_at but after opener e.ts must still end it."""
+    opener = _episode(cur, S1, hours_ago=2)
+    assert _open(cur, S1, TEXT, opener) == 1
+    cur.execute("SELECT id FROM commitments")
+    cid = cur.fetchone()[0]
+    # Simulate insert lag: opened_at is now, while a sessionend stamped
+    # between opener.ts and now lands afterwards.
+    cur.execute("UPDATE commitments SET opened_at = now() WHERE id = %s", (cid,))
+    _episode(cur, S1, hours_ago=1, event="sessionend")
+    hygiene.run_session_ended_pass(cur, apply=True, project=PROJECT)
+    assert _status(cur, cid)[1] == "closed", _status(cur, cid)
+    assert _status(cur, cid)[2] == "session-ended"
 
 
 def test_a_row_opened_with_next_session_wording_survives_sessionend(cur):
