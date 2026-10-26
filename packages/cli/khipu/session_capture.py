@@ -282,9 +282,13 @@ def infer_harness(env: dict, osenv: dict | None = None) -> str:
     tp = str(_get(env, "transcriptPath", "transcript_path", default="") or "")
     if "conversation_id" in env or "workspace_roots" in env or "/.cursor/" in tp:
         return "cursor"
+    # Path evidence before env-only Codex markers: a Claude session started
+    # inside Codex inherits CODEX_HOME but still writes under a Claude home.
+    if "/.claude/" in tp or _in_claude_home(tp, osenv):
+        return "claude_code"
     if "/.codex/" in tp or osenv.get("CODEX_HOME") or osenv.get("CODEX_SANDBOX"):
         return "codex"
-    if "/.claude/" in tp or osenv.get("CLAUDE_PROJECT_DIR") or _in_claude_home(tp, osenv):
+    if osenv.get("CLAUDE_PROJECT_DIR"):
         return "claude_code"
     return "unknown"
 
@@ -786,6 +790,15 @@ def remember_seen(st: dict, fresh: list[str]) -> None:
         st["seen_text"] = (list(st.get("seen_text") or []) + fresh)[-SEEN_TEXT_MAX:]
 
 
+def _fingerprints_for_msgs(msgs: list[tuple[str, str]]) -> list[str]:
+    """Fingerprints for messages long enough to enter ``seen_text``."""
+    out: list[str] = []
+    for role, text in msgs:
+        if role in ("user", "assistant") and len(text) >= FINGERPRINT_MIN_CHARS:
+            out.append(text_fingerprint(role, text))
+    return out
+
+
 def read_window(path: Path, offset: int, *, seen: Any = None,
                 stats: dict | None = None, prefix: dict | None = None,
                 replay_prefix: dict | None = None,
@@ -884,6 +897,9 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     checkpoints = checkpoints[replay_end:]
     last_user_counted = False   # the open user block already holds a real turn
     head_open = True            # every message so far was an already-seen copy
+    # After a leading already-seen long turn, tool markers and short copies in
+    # the same re-emitted prefix are not new turns (compaction appends them).
+    skipping_copies = False
     for (d, role, text, line_end), checkpoint in zip(items, checkpoints):
         real = False
         if role == "user":
@@ -895,6 +911,12 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             if stand_in is not None:
                 text = stand_in
         if role == "tool":
+            if head_open and skipping_copies:
+                dropped += 1
+                if stats is not None:
+                    stats["skip_to"] = line_end
+                    stats["skip_prefix"] = checkpoint
+                continue
             msgs.append(("tool", text))
             head_open = False
             continue
@@ -906,12 +928,22 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             if fp in known:
                 dropped += 1
                 dropped_chars += len(text)
-                if head_open and stats is not None:
-                    stats["skip_to"] = line_end
-                    stats["skip_prefix"] = checkpoint
+                if head_open:
+                    skipping_copies = True
+                    if stats is not None:
+                        stats["skip_to"] = line_end
+                        stats["skip_prefix"] = checkpoint
                 continue
             known.add(fp)
             fresh.append(fp)
+        elif (head_open and skipping_copies and not streamed
+              and len(text) < FINGERPRINT_MIN_CHARS):
+            dropped += 1
+            dropped_chars += len(text)
+            if stats is not None:
+                stats["skip_to"] = line_end
+                stats["skip_prefix"] = checkpoint
+            continue
         if head_open and d.get("isCompactSummary") and stats is not None:
             # Claude Code's own summary sits ahead of the copies it re-emits;
             # it leaves the head open and rides along (``carry``) when the
@@ -2858,11 +2890,17 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 if due:
                     st["transcript_prefix"] = dedupe.get("prefix")
                     st.pop("replay_prefix", None)
+                    # Carry was stepped past on a not-due run and never entered
+                    # ``fresh``; fingerprint it now that it joins the capture.
+                    fresh_seen = list(dedupe.get("fresh") or [])
+                    for fp in _fingerprints_for_msgs(carried):
+                        if fp not in fresh_seen:
+                            fresh_seen.append(fp)
                     queued_names = _enqueue_window(
                         harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
                         cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
                         new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
-                        capture_note=capture_note, fresh_seen=dedupe.get("fresh"),
+                        capture_note=capture_note, fresh_seen=fresh_seen,
                         capture_request_id=_capture_request_id(capture_now) if capture_now is not None else "",
                     )
                     out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
@@ -3057,11 +3095,15 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                             st.pop("carry", None)  # now part of msgs
                             st["transcript_prefix"] = dedupe.get("prefix")
                             st.pop("replay_prefix", None)
+                            fresh_seen = list(dedupe.get("fresh") or [])
+                            for fp in _fingerprints_for_msgs(carried):
+                                if fp not in fresh_seen:
+                                    fresh_seen.append(fp)
                             names = _enqueue_window(
                                 harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
                                 event="idle_sweep", path=path, st=st, msgs=msgs,
                                 new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
-                                preserve_mtime=True, fresh_seen=dedupe.get("fresh"),
+                                preserve_mtime=True, fresh_seen=fresh_seen,
                             )
                             out["jobs"] += len(names)
                             _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "
