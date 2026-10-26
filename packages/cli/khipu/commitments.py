@@ -1066,7 +1066,10 @@ def _near_duplicate_open(cur, scope: str | None, text: str, *,
         return None
     best_id, best_score = None, 0.0
     for row in rows:
-        score = _match_score(text, row["text"])
+        # Score the original wording and any restatement: a later capture that
+        # adds another repo's PR must match the current words, not only the
+        # first open (asymmetric containment no longer equates base ⊂ URL).
+        score = _row_near_dup_score(text, row)
         if score >= NEAR_DUP_MIN_SCORE and score > best_score:
             best_id, best_score = row["id"], score
     if best_id is not None:
@@ -1300,7 +1303,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                     _keep_pr_refs(cur, existing, labels)
             continue
         linked = [r["id"] for r in others
-                  if r["id"] == exact or _match_score(norm["text"], r["text"]) >= NEAR_DUP_MIN_SCORE]
+                  if r["id"] == exact or _row_near_dup_score(norm["text"], r) >= NEAR_DUP_MIN_SCORE]
         closed_relays: list[int] = []
         for rid in relay_ids:
             # Closed before the insert: an identical text shares the open
@@ -1420,6 +1423,17 @@ def _keep_pr_refs(cur, commitment_id: int, labels: list[str]) -> None:
                     (json.dumps({**check, "refs": refs + new}), commitment_id))
 
 
+def _row_near_dup_score(text: str, row: dict[str, Any]) -> float:
+    """Near-dup score against a row's opening text and, when present, its
+    latest restatement — so a third wording that drifts from the original
+    but tracks the current phrasing still folds into the same item."""
+    score = _match_score(text, row["text"])
+    latest = row.get("latest_text")
+    if latest and latest != row["text"]:
+        score = max(score, _match_score(text, latest))
+    return score
+
+
 def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
                    job_rows: list[dict[str, Any]]) -> list[int]:
     """Open job items this conversation item restates: the exact text, or
@@ -1428,7 +1442,7 @@ def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
     :func:`_near_duplicate_open` uses)."""
     if exact is not None and any(r["id"] == exact for r in job_rows):
         return [exact]
-    hits = [r["id"] for r in job_rows if _match_score(text, r["text"]) >= NEAR_DUP_MIN_SCORE]
+    hits = [r["id"] for r in job_rows if _row_near_dup_score(text, r) >= NEAR_DUP_MIN_SCORE]
     if hits:
         return hits
     best = _near_duplicate_open(cur, scope, text, rows=job_rows)
@@ -1443,6 +1457,9 @@ def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None 
     (its resolved ``owner`` and ``owner_label`` replace the stored ones)."""
     lineage, params = _lineage_clause(cur, payload or {"project": scope}, episode_id)
     cols = ["id", "text"] + (["origin"] if with_origin else [])
+    # Near-dup / relay need latest_text even when owner columns are unused.
+    if _lineage_columns_ready(cur):
+        cols.append("latest_text")
     if with_owner:
         cols += ["owner", "kind"]
         if _owner_columns_ready(cur):
@@ -1451,8 +1468,6 @@ def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None 
             cols.append("owner_reassigned_at")
         if _close_columns_ready(cur):
             cols += ["prs", "pr_check"]
-        if _lineage_columns_ready(cur):
-            cols.append("latest_text")
     cur.execute(
         f"SELECT {', '.join(cols)} FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
         f"AND {lineage} AND {_not_forgotten_clause(cur)}",
