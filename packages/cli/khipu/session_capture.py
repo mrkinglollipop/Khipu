@@ -973,14 +973,20 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
 
 
 def _prefix_tail_digest(path: Path, offset: int, n: int = 4096) -> str | None:
-    """Cheap sentinel for the bytes just before ``offset`` (same-inode rewrites)."""
+    """Cheap sentinel for head + tail of ``[0, offset)`` (same-inode rewrites)."""
     if offset <= 0:
         return None
-    n = min(n, offset)
     try:
         with path.open("rb") as f:
-            f.seek(offset - n)
-            return hashlib.sha256(f.read(n)).hexdigest()
+            head_n = min(n, offset)
+            head = f.read(head_n)
+            if offset > n:
+                f.seek(offset - n)
+                tail = f.read(n)
+            else:
+                # Whole prefix already covered by head.
+                tail = b""
+            return hashlib.sha256(head + b"|" + tail).hexdigest()
     except OSError:
         return None
 
@@ -2922,6 +2928,7 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                         timespec="seconds").replace("+00:00", "Z") if last else out["at"]
                 if due:
                     st["transcript_prefix"] = dedupe.get("prefix")
+                    st["transcript_prefix_tail"] = _prefix_tail_digest(path, new_off)
                     st.pop("replay_prefix", None)
                     queued_names = _enqueue_window(
                         harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
@@ -2943,6 +2950,7 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                     if int(dedupe.get("skip_to") or 0) > int(st.get("offset", 0)):
                         st["offset"] = dedupe["skip_to"]
                         st["transcript_prefix"] = dedupe.get("skip_prefix")
+                        st["transcript_prefix_tail"] = _prefix_tail_digest(path, int(st["offset"]))
                         st.pop("replay_prefix", None)
                         carried += dedupe.get("carry") or []
                     if carried:
@@ -3109,6 +3117,8 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                                     st["offset"] = max(offset, int(dedupe.get("skip_to") or 0))
                                     if st["offset"] > offset:
                                         st["transcript_prefix"] = dedupe.get("skip_prefix")
+                                        st["transcript_prefix_tail"] = _prefix_tail_digest(
+                                            path, int(st["offset"]))
                                         st.pop("replay_prefix", None)
                                 save_state(harness, track_sid, st, preserve_mtime=True)
                             continue
@@ -3121,6 +3131,7 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                         else:
                             st.pop("carry", None)  # now part of msgs
                             st["transcript_prefix"] = dedupe.get("prefix")
+                            st["transcript_prefix_tail"] = _prefix_tail_digest(path, new_off)
                             st.pop("replay_prefix", None)
                             names = _enqueue_window(
                                 harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,

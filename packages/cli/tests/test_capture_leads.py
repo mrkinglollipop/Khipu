@@ -1,7 +1,6 @@
 """Capture leads (Grok triage 2026-10-26). Confirmed regressions only."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -20,10 +19,10 @@ def _write(path: Path, rows: list) -> Path:
 
 
 def _tail_digest(path: Path, offset: int, n: int = 4096) -> str:
-    n = min(n, offset)
-    with path.open("rb") as f:
-        f.seek(offset - n)
-        return hashlib.sha256(f.read(n)).hexdigest()
+    """Match ``session_capture._prefix_tail_digest`` (head + tail of prefix)."""
+    dig = sc._prefix_tail_digest(path, offset, n=n)
+    assert dig is not None
+    return dig
 
 
 def _response_user(text: str) -> dict:
@@ -95,6 +94,39 @@ class RewriteSameInodeTest(unittest.TestCase):
                 sc._reset_transcript_offset(st, p)
             self.assertEqual(st["offset"], offset)
             self.assertEqual(rw.call_count, 0, "unchanged head must not re-parse the prefix")
+
+    def test_due_advance_refreshes_prefix_tail_so_next_hook_skips(self):
+        """P2: after a due capture advances the offset, the next append-only reset
+        must not re-parse the whole captured prefix."""
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(
+                os.environ, {"KHIPU_CAPTURE_HOME": str(Path(td) / "kh"), "HOME": td,
+                             "KHIPU_KEYCHAIN": "0"}), \
+                mock.patch.object(sc, "_claim_process_start", return_value="kernel:fake"):
+            p = Path(td) / "t.jsonl"
+            line = lambda i: {"type": "user", "message": {"role": "user",
+                                                          "content": f"turn {i} " + "a" * 80}}
+            _write(p, [line(i) for i in range(8)])
+            env = json.dumps({"session_id": "adv-1", "hook_event_name": "SessionEnd",
+                              "cwd": td, "transcript_path": str(p)})
+            out = sc.hook_main(env, "claude_code")
+            self.assertTrue(out.get("due"), out)
+            st = sc.load_state("claude_code", "adv-1")
+            offset = int(st["offset"])
+            self.assertGreater(offset, 0)
+            self.assertEqual(st.get("transcript_prefix_tail"),
+                             sc._prefix_tail_digest(p, offset),
+                             "due path must store a tail digest for the new offset")
+            with p.open("a") as f:
+                f.write(json.dumps(line(99)) + "\n")
+            with mock.patch.object(sc, "read_window", wraps=sc.read_window) as rw:
+                sc._reset_transcript_offset(st, p)
+            prefix_rereads = [
+                c for c in rw.call_args_list
+                if (c.kwargs.get("end_offset") is not None
+                    or (len(c.args) >= 2 and c.args[1] == 0 and "end_offset" in c.kwargs))
+            ]
+            self.assertEqual(prefix_rereads, [],
+                             "stale prefix_tail after advance forces a full prefix re-read")
 
 
 class CodexMixedRepeatTest(unittest.TestCase):
