@@ -215,7 +215,7 @@ export function WorkView(props: WorkViewProps) {
   const firstRun = view.projects.length === 0 && view.waiting.length === 0;
   const waitingBy = new Map<string, number>();
   for (const w of view.waiting) {
-    if (w.project) waitingBy.set(w.project, (waitingBy.get(w.project) ?? 0) + 1);
+    if (w.project && !w.quiet) waitingBy.set(w.project, (waitingBy.get(w.project) ?? 0) + 1);
   }
 
   return (
@@ -362,9 +362,9 @@ function WaitingCard({
     }
     return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   }, [items, view]);
-  const blocking = items.filter((w) => w.blocking).length;
+  const { waiting, blocking, quiet = 0 } = view.counts;
   const shown = items.filter((w) =>
-    filter === "all" ? true : filter === "blocking" ? w.blocking : nameOf(w) === filter.slice(2),
+    filter === "all" ? true : filter === "blocking" ? w.blocking && !w.quiet : nameOf(w) === filter.slice(2),
   );
   const visible = all ? shown : shown.slice(0, WAIT_FIRST);
 
@@ -430,7 +430,7 @@ function WaitingCard({
         {items.length ? (
           <span className="meta">
             {" "}
-            {items.length.toLocaleString()} across {plural(groups.length, "project")}
+            {quiet ? `${waiting.toLocaleString()} waiting · ${quiet.toLocaleString()} quiet` : waiting.toLocaleString()} across {plural(groups.length, "project")}
             {blocking ? ` · ${blocking.toLocaleString()} blocking` : ""}
           </span>
         ) : null}
@@ -484,7 +484,7 @@ function WaitingCard({
                 <div key={item.key ?? `withheld-${i}`} className="row wk-wait" role="listitem">
                   <span className="wk-wait-main">
                     <span className="wk-wait-line">
-                      {item.blocking ? <Tag tone="err">Blocking</Tag> : null}
+                      {item.quiet ? <Tag>Quiet</Tag> : item.blocking ? <Tag tone="err">Blocking</Tag> : null}
                       <span className={item.title == null ? "wk-wait-text t2" : "wk-wait-text"}>
                         {item.title ?? WITHHELD.title}
                       </span>

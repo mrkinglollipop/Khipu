@@ -137,6 +137,8 @@ export type WaitItem = {
   evidence?: string | null;
   link?: string | null;
   blocking: boolean;
+  /** Old standalone commitments remain visible without counting as active work. */
+  quiet?: boolean;
   also_owed?: string | null;
   looks_like?: { id: string | null; title: string | null } | null;
   /** The item has a project, but the view withheld its name. */
@@ -178,6 +180,7 @@ export function usableRowId(id: string | null | undefined): id is string {
 
 export type WorkCounts = {
   waiting: number;
+  quiet?: number;
   blocking: number;
   running: number;
   flagged: number;
@@ -706,7 +709,7 @@ export function useWork(active: boolean, enabled = true) {
 export type WorkState = ReturnType<typeof useWork>;
 
 /** The rail badge's name for a screen reader: a bare number says nothing. */
-export function badgeLabel(waiting: number, blocking: number): string {
+export function badgeLabel(waiting: number, blocking: number, quiet = 0): string {
   const head = `${waiting.toLocaleString()} waiting on you`;
-  return blocking ? `${head}, ${blocking.toLocaleString()} blocking` : head;
+  return `${head}${blocking ? `, ${blocking.toLocaleString()} blocking` : ""}${quiet ? `, ${quiet.toLocaleString()} quiet` : ""}`;
 }
