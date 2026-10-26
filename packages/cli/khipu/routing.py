@@ -1004,6 +1004,7 @@ def accounts() -> list[dict]:
         # _inputs() starts with the explicit account list, never PATH/key
         # discovery. Use that same definition source here: otherwise a
         # source reader can see provider| while its fold sees provider:main.
+        # Definitions hide defaults from all readers (including discovery); explicit usage_accounts bindings remain.
         if not explicit and account["harness"] in defined_providers:
             continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],

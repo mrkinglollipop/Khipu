@@ -812,8 +812,8 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
             return  # a folder holding only worktrees is not offered
         evidence_home = path
         suggestion = _suggested_link(cli, path, settings, link_targets)
-        provider_pointed = bool(settings and settings["host"])
-        if cli == "claude" and settings and settings["provider"] == GLM \
+        provider_pointed = bool(settings and settings["host"]) or zai_home(path)
+        if cli == "claude" and (bool(settings and settings["provider"] == GLM) or zai_home(path)) \
                 and not any(t["provider"] == GLM for t in link_targets):
             cli, path = GLM, None  # one GLM login, whatever folder ran it
         ident = identity(path) if path is not None else MUSE_IDENTITY

@@ -1445,6 +1445,28 @@ def test_a_claude_home_pointing_at_zai_is_offered_as_glm_and_the_token_never_sho
     assert all(TOKEN_SENTINEL not in channel for channel in channels)
 
 
+@pytest.mark.parametrize("folder_name", [".claude-glm", ".claude-glm-orbit"])
+def test_a_name_only_glm_home_without_link_targets_keeps_its_token_login(mac, capsys, folder_name):
+    mac.install("claude")
+    _accounts()
+    folder = mac.folder(folder_name)
+    _settings(folder, {"env": {"ANTHROPIC_AUTH_TOKEN": TOKEN_SENTINEL}})
+    assert not any(t["provider"] == "glm" for t in discover._link_targets())
+
+    out = discover.discover(at=NOW)
+    glm = [c for c in out["candidates"] if c["cli"] == "glm"]
+    assert len(glm) == 1
+    assert glm[0]["state"] == "signed_in"
+    assert glm[0]["default"] is True and glm[0]["offer_on_home"] is True
+    assert glm[0]["path"] is None
+    assert glm[0]["login_evidence"] == ["settings_token"]
+    assert not [call for call in mac.calls("claude") if call[0] == str(folder)]
+    captured = capsys.readouterr()
+    channels = [json.dumps(out), discover.store_file().read_text(), captured.out, captured.err,
+                json.dumps(mac.calls("claude"))]
+    assert all(TOKEN_SENTINEL not in channel for channel in channels)
+
+
 def test_a_folder_holding_only_worktrees_is_not_offered(mac):
     box = mac.folder(".claude-box")
     (box / "worktrees").mkdir()

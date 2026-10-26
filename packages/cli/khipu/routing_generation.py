@@ -18,6 +18,10 @@ def revision(view: dict) -> str:
     Effective entities cover owner, account and source changes. Pace verdicts
     can also change on the clock without moving the routing version.
     """
+    # Deliberately exclude cap_proposals, machine_holds, tier_table,
+    # priority_ended and proposal seven-day expiry from this whitelist.
+    # Source edits are protected by file stats; clock-only changes outside
+    # the whitelist do not invalidate a buffered answer.
     decisions = {}
     for account in view.get("accounts") or []:
         windows = []
