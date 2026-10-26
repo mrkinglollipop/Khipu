@@ -54,6 +54,39 @@ def owed_canonical(project: str | None) -> str | None:
         con.close()
 
 
+def _cited_forgotten(con, rows: list[dict[str, Any]]) -> set[Any]:
+    """Ids of ``rows`` whose ``settle_suggestion`` cites, as its evidence, an
+    episode the replica holds forgotten or queued for erasure, or a decision
+    of one: that suggestion quotes forgotten words, so it is not shown
+    (``commitments.settle_suggestion_sql`` on the hub)."""
+    rejected = hub_snapshot._rejected_episode_ids(con)
+    if not rejected:
+        return set()
+    has_decisions = {"id", "episode_id"} <= hub_snapshot._snapshot_table_columns(con, "decisions")
+    out: set[Any] = set()
+    for row in rows:
+        try:
+            doc = json.loads(row.get("settle_suggestion") or "null")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        evidence = doc.get("evidence") if isinstance(doc.get("evidence"), dict) else {}
+        cited = {doc.get("decision_id"), evidence.get("decision_id")} - {None}
+        episodes = {doc.get("episode")} - {None}
+        if cited and has_decisions:
+            marks = ", ".join("?" * len(cited))
+            episodes |= {r[0] for r in con.execute(
+                f"SELECT episode_id FROM decisions WHERE CAST(id AS TEXT) IN ({marks})",
+                [str(c) for c in cited])}
+        try:
+            if {int(e) for e in episodes if e is not None} & rejected:
+                out.add(row.get("id"))
+        except (TypeError, ValueError):
+            out.add(row.get("id"))
+    return out
+
+
 def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
     """The replica's raw commitment rows of one scope (owners not yet
     resolved), for ``owed`` and the paged read (``commitments.page_owed``)."""
@@ -73,6 +106,7 @@ def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
             params.extend(group)
         sql += hub_snapshot.forget_fence_sql(con, "commitments", "opened_episode")
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
+        gone = _cited_forgotten(con, rows)
         if canonical:
             for row in rows:
                 if row.get("project"):
@@ -99,6 +133,8 @@ def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
                 row[col] = None
             if col == "linked_ids" and row[col] is None:
                 row[col] = []
+        if row.get("id") in gone:
+            row["settle_suggestion"] = None
         row["future_trigger"] = bool(row.get("future_trigger"))
         row["stale"] = True
     return rows

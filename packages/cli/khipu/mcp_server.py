@@ -2242,7 +2242,17 @@ def _tool_forget(args: dict) -> dict:
     from khipu.forget import KEPT, LOCAL_HARNESSES, forget_everywhere, plain_summary
     from khipu.db import connect
 
+    owner = None
     if _via_https_gateway():
+        from khipu.request_context import gateway_label
+
+        label = gateway_label()
+        if not label:
+            raise ValueError("a gateway forget needs the calling token's label")
+        # The authorization itself is forget_everywhere's, against the row's
+        # server-stamped origin inside the hub transaction; this read only
+        # turns a local capture away with directions before any work starts.
+        owner = f"gateway:{label}"
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT session_id FROM episodes WHERE id = %s", (eid,))
@@ -2258,7 +2268,7 @@ def _tool_forget(args: dict) -> dict:
     from khipu.hub_snapshot import hub_connection_failed
 
     try:
-        out = forget_everywhere(eid)
+        out = forget_everywhere(eid) if owner is None else forget_everywhere(eid, owner=owner)
     except Exception as exc:  # noqa: BLE001
         if not hub_connection_failed(exc):
             raise

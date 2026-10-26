@@ -33,6 +33,7 @@ UNFENCED = {
     ("hub_snapshot.py", "_write_copy"): "the copy's publication checks each vector against the rows it just wrote",
     ("hub_snapshot.py", "_lag_decisions"): "the freshness measurement compares every row with the hub by id",
     ("hub_snapshot.py", "_lag_deliverables"): "the freshness measurement compares every row with the hub by id",
+    ("offline_reads.py", "_cited_forgotten"): "it looks up decisions only to find the forgotten ones a suggestion cites",
 }
 # The readers the fence is known to guard: a scan that stops seeing them is broken.
 KNOWN = {("hub_snapshot.py", "decision_counts_snapshot"), ("hub_snapshot.py", "recent_deliverables_snapshot"),

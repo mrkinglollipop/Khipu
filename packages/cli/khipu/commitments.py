@@ -1719,6 +1719,28 @@ def _owner_unchanged(cur, row: dict[str, Any]) -> tuple[str, tuple]:
     return sql, tuple(params)
 
 
+def settle_suggestion_sql(cur, table: str = "commitments") -> str:
+    """``settle_suggestion`` as a hub reader may return it: NULL when the
+    suggestion cites a forgotten episode, or a decision of one, as its
+    evidence (the forget clears those, ``forget._clear_cited_suggestions``;
+    this holds for a row written meanwhile or by older code)."""
+    col = f"{table}.settle_suggestion"
+    try:
+        from khipu.db import has_columns
+
+        if not has_columns(cur, "episodes", "deleted_at"):
+            return col
+        decisions = has_columns(cur, "decisions", "episode_id")
+    except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
+        return col
+    cited = f"fe.id::text = {col}->>'episode'"
+    if decisions:
+        cited += (f" OR fe.id IN (SELECT d.episode_id FROM decisions d WHERE d.id::text IN "
+                  f"({col}->>'decision_id', {col}->'evidence'->>'decision_id'))")
+    return (f"CASE WHEN EXISTS (SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND ({cited})) "
+            f"THEN NULL ELSE {col} END")
+
+
 def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: str,
                        evidence: dict | None = None, episode: int | None = None) -> bool:
     """Keep a refused close on the owner's item as a "Looks done" suggestion
@@ -2193,9 +2215,10 @@ def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str |
     if _lineage_columns_ready(cur):
         select_cols += ["owner_reassigned_by", "owner_reassign_reason", "owner_prior", "owner_prior_label",
                         "linked_ids", "latest_text"]
+    exprs = [settle_suggestion_sql(cur) if c == "settle_suggestion" else c for c in select_cols]
     cur.execute(
         f"""
-        SELECT {', '.join(select_cols)}
+        SELECT {', '.join(exprs)}
         FROM commitments
         WHERE {' AND '.join(clauses)}
         ORDER BY opened_at DESC, id DESC
