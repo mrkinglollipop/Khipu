@@ -80,10 +80,13 @@ _PR_NUMBER_RE = re.compile(rf"\b{_PR_WORD}\s*#?\s*(\d{{1,7}})\b", re.I)
 # A PR list runs to the end of its clause, however long: a list cut short
 # would let an item close while a later PR it names is still open.
 _PR_LIST_RE = re.compile(rf"\b{_PR_WORD}\b([^.;:\n]*)", re.I)
-# Only #N tokens joined by commas / "and" / "&" immediately after the PR word
-# count as a list — not a later "issue #44" in the same clause.
+# A PR-number run immediately after the PR word: optional leading "(", bare or
+# #N items, joined by ",", "&", "and", "/", or "plus". A later "issue #44" in
+# the same clause is not part of the run.
 _PR_LIST_HASH_RUN_RE = re.compile(
-    r"\A\s*(#\d{1,7}(?:\s*(?:,|&|and)\s*#\d{1,7})*)", re.I)
+    r"\A\s*\(?\s*(#?\d{1,7}(?:\s*\(?\s*(?:,|&|and|/|plus)\s*\)?\s*#?\d{1,7})*)",
+    re.I)
+_PR_LIST_ITEM_RE = re.compile(r"#?(\d{1,7})")
 _HASH_RE = re.compile(r"(?<![\w&])#(\d{1,7})\b")
 _PULL_LINK_RE = re.compile(r"github\.com/([A-Za-z0-9][\w.-]*/[\w.-]+?)/pull/(\d{1,7})\b", re.I)
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
@@ -110,12 +113,13 @@ def _log(msg: str) -> None:
 
 
 def _pr_list_hash_hits(tail: str, base: int) -> list[tuple[int, int]]:
-    """``#N`` positions in a comma/"and"/"&" list at the start of ``tail``."""
+    """Bare or ``#N`` positions in a PR list run at the start of ``tail``."""
     run = _PR_LIST_HASH_RUN_RE.match(tail or "")
     if not run:
         return []
     chunk = run.group(1)
-    return [(base + run.start(1) + h.start(1), int(h.group(1))) for h in _HASH_RE.finditer(chunk)]
+    return [(base + run.start(1) + m.start(1), int(m.group(1)))
+            for m in _PR_LIST_ITEM_RE.finditer(chunk)]
 
 
 def parse_prs(text: str) -> list[int]:

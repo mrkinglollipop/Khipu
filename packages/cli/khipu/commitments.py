@@ -1512,9 +1512,11 @@ def _match_score(a: str, b: str) -> float:
         shorter, longer = (al, bl) if len(al) <= len(bl) else (bl, al)
         short_toks = set(re.findall(r"[a-z0-9]+", shorter))
         long_toks = set(re.findall(r"[a-z0-9]+", longer))
+        # Token cover or near-equal length → identity. Otherwise Jaccard still
+        # scores paraphrases ("…seal fix" / "…seal fix or waits"); do not
+        # zero out and skip the fallback.
         if long_toks <= short_toks or len(shorter) / max(len(longer), 1) >= 0.9:
             return 1.0
-        return 0.0
     return _jaccard(a, b)
 
 
