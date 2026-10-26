@@ -365,12 +365,12 @@ def _job_refusal(data: bytes, gate) -> str | None:
     treated as allowed, since it can still hold a forgotten source's text."""
     try:
         value = json.loads(data.decode("utf-8"))
-    except (UnicodeError, ValueError):
-        return "unreadable"
-    if not isinstance(value, dict) or not isinstance(value.get("payload"), dict):
+    except (UnicodeError, ValueError, RecursionError):
         return "unreadable"
     try:
-        allowed = gate.allows(value["payload"])
+        from khipu.capture_stores import outbox_payloads
+
+        allowed = all(gate.allows(payload) for payload in outbox_payloads(value))
     except Exception:  # noqa: BLE001 (a job the gate cannot judge is not restored)
         return "unreadable"
     return None if allowed else "forgotten"

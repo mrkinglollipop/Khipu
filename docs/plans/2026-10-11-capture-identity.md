@@ -433,7 +433,7 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 |---|---|---|---|
 | native capture job | capture home `queue/`: `*.json`, `*.claimed.<pid>`, `*.tmp`, `.extract-*.tmp` | transcript text, and the extracted episode once checkpointed | scan "native jobs" |
 | native empty archive | capture home `empty/`: `*.json` | transcript text of a window that yielded no episode | scan "native jobs" |
-| outbox job | `outbox/`, `outbox/dead/`, `outbox/quarantine/`: `*.json` and `.*.tmp` | whole capture payloads waiting for the hub | scan "outbox" |
+| outbox job | `outbox/`, `outbox/dead/`, `outbox/quarantine/`, `outbox/resolved/`: `*.json` and `.*.tmp` | whole capture payloads waiting for the hub and resolved legacy evidence | scan "outbox" |
 | legacy log | memory root: `episodes*.jsonl`, their `.bak` copies, `.khipu-forget-backups/`, `.tmp` files beside them | one capture per line, summary text | scan "legacy logs" |
 | replica | data folder `hub_snapshot.sqlite` | episode rows, vectors, decisions and deliverables | scan "replica" |
 | replica temp | data folder `.hub_snapshot.<random>.sqlite` and its journal and WAL | a refresh dump or a staged backup replica | scan "replica temps" |
