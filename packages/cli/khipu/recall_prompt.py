@@ -1545,14 +1545,15 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
 
 def _routing_generation_current(files) -> bool:
     """Whether every file a routing answer was read from
-    (``routing._generation``: ``[[path, stat], ...]``) still has the stat it
-    had then. An answer can sit in the pipe while the search runs, and the
-    record can change meanwhile; one read from an older generation is never
-    delivered. A stat each, never a wait."""
+    (``routing._generation``) still has its stat or, for a rewritten view,
+    the same semantic routing revision. An answer can sit in the pipe while
+    search runs; telemetry-only saves must not suppress its delivery."""
     if not isinstance(files, list):
         return False
     for item in files:
-        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+        if not (isinstance(item, list) and len(item) in (2, 3) and isinstance(item[0], str)):
+            return False
+        if len(item) == 3 and not isinstance(item[2], str):
             return False
         try:
             st = os.stat(item[0])
@@ -1560,7 +1561,12 @@ def _routing_generation_current(files) -> bool:
         except OSError:
             now = None
         if now != item[1]:
-            return False
+            if len(item) != 3:
+                return False
+            from khipu.routing_generation import matches
+
+            if not matches(item[0], item[2]):
+                return False
     return True
 
 

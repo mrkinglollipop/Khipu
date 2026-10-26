@@ -5097,9 +5097,9 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
 
 def _digest(view: dict) -> str:
     """The sha256 of the view as JSON, its own ``digest`` left out."""
-    body = {k: v for k, v in view.items() if k != "digest"}
-    text = json.dumps(body, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode("ascii")).hexdigest()
+    from khipu.routing_generation import digest
+
+    return digest(view)
 
 
 def _load_view() -> dict | None:
@@ -9664,16 +9664,15 @@ def _prompt_view(now: datetime, on_fold=None) -> dict:
 def _generation(view: dict, cfg: dict) -> list[list]:
     """The record generation ``view`` stands on: each file it was read
     from, with the stat it had then (the log, the config and the rules seed
-    as its fold saw them, and view.json as this thread read or saved it).
-    The hook takes a buffered answer only while every one of them still has
-    that stat (``recall_prompt._routing_generation_current``): a stat each,
-    never a wait. A source change reaches a prompt through view.json, once a
-    fold saved it."""
+    as its fold saw them). The view also carries a semantic revision, so
+    telemetry-only saves do not withdraw an answer. A source or clock-driven
+    routing change still invalidates it when the next fold saves the view."""
     from khipu.config import config_file
+    from khipu.routing_generation import revision
 
     fingerprint = view.get("fingerprint") if isinstance(view.get("fingerprint"), dict) else {}
     files = [[str(events_file()), fingerprint.get("events")], [str(config_file()), fingerprint.get("config")],
-             [str(view_file()), getattr(_view_seen, "stat", None)],
+             [str(view_file()), getattr(_view_seen, "stat", None), revision(view)],
              [str(routing_dir() / "remote.jsonl"), (fingerprint.get("replication") or (None, None))[0]],
              [str(routing_dir() / "replication.json"), (fingerprint.get("replication") or (None, None))[1]]]
     seed = cfg.get("routing_rules_seed")
