@@ -568,7 +568,8 @@ def _close(cur, cid: int, *, rule: str, reason: str, key: str, evidence: dict,
     return close_by_rule(cur, cid, rule=rule, reason=reason, key=key, evidence=evidence, episode=episode)
 
 
-def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
+def _open_items(cur, project: str | None, *, commitment_id: int | None = None,
+                lock: bool = False) -> list[dict[str, Any]]:
     """The open items the rules read, each with its ``owner`` as
     ``commitments.row_owner`` reads it (the owner guard's input)."""
     from khipu.commitments import (
@@ -580,6 +581,9 @@ def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
     if project is not None:
         where += " AND project = %s"
         params = (project,)
+    if commitment_id is not None:
+        where += " AND id = %s"
+        params += (commitment_id,)
     # The owner columns (migration 0033) come before the close columns (0034).
     extra = ["owner", "origin", "owner_label"]
     if _future_trigger_ready(cur):
@@ -591,7 +595,7 @@ def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
     cur.execute(
         "SELECT id, text, project, kind, opened_episode, opened_at, prs, reopened_rule_keys, pr_check, "
         f"settle_suggestion, {', '.join(extra)} FROM commitments WHERE {where} AND {_not_forgotten_clause(cur)} "
-        "ORDER BY id",
+        "ORDER BY id" + (" FOR UPDATE" if lock else ""),
         params,
     )
     cols = ("id", "text", "project", "kind", "opened_episode", "opened_at", "prs", "reopened",
@@ -599,6 +603,7 @@ def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
     out = []
     for r in cur.fetchall():
         item = dict(zip(cols, r))
+        item["stored_owner"] = item.get("owner")
         trigger = has_future_trigger(item.get("text") or "") or bool(item.get("future_trigger"))
         item["owner"], item["owner_label"] = row_owner(item, future_trigger=trigger)
         out.append(item)
@@ -663,7 +668,10 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
             capture_episodes: list[int] = []
             for ref in item_refs(item, repo):
                 label = ref_label(ref, repo)
-                rec = _newest_for(ref, repo, opened, [runner, ledger, capture, later])
+                sources = [runner, ledger, capture, later]
+                if isinstance(github, _FrozenGitHub):
+                    sources.append(github.records)
+                rec = _newest_for(ref, repo, opened, sources)
                 if rec is None or rec["state"] not in DONE_STATES:
                     if asked_for is not None and ref[1] not in asked_for:
                         waiting[label] = before.get(label) or (
@@ -674,9 +682,16 @@ def _pr_rule(cur, items: list[dict], report: dict, *, payload: dict | None, epis
                         waiting[label] = (f"still open ({SOURCE_WORDS[rec['source']]}); {why}" if rec
                                           else why or "GitHub could not say")
                         continue
-                    rec = _record(state, datetime.now(timezone.utc), "github")
-                    if state not in DONE_STATES:
-                        waiting[label] = "still open on GitHub"
+                    # A nightly result was observed before this transaction.
+                    # Never give it a new timestamp that could defeat a newer
+                    # SQL record of a reopened PR.
+                    gh_record = (github.records[_key(ref, repo)] if isinstance(github, _FrozenGitHub)
+                                 else _record(state, datetime.now(timezone.utc), "github"))
+                    if not isinstance(github, _FrozenGitHub) or _newer(gh_record, rec):
+                        rec = gh_record
+                    if rec["state"] not in DONE_STATES:
+                        waiting[label] = ("still open on GitHub" if rec["source"] == "github" else
+                                          f"still open ({SOURCE_WORDS[rec['source']]})")
                         continue
                 found[label] = (rec["state"], rec["source"])
                 records[label] = {k: v for k, v in rec.items() if k != "episode"}
@@ -845,6 +860,79 @@ def run(cur, *, payload: dict[str, Any] | None = None, episode_id: int | None = 
     report["github"] = github.unavailable
     if report["closed_pr"] or report["closed_decision"]:
         _log(f"closed {report['closed_pr']} by pull request, {report['closed_decision']} by decision")
+    return report
+
+
+class _FrozenGitHub:
+    """One night's observations, including misses. Looking up an unasked PR
+    is a waiting diagnostic, never a new network request under the row lock."""
+
+    def __init__(self) -> None:
+        self.results: dict[EvidenceKey, tuple[str | None, str | None]] = {}
+        self.records: dict[EvidenceKey, dict[str, Any]] = {}
+
+    def state(self, repo: str | None, number: int) -> tuple[str | None, str | None]:
+        return self.results.get((repo, number), (None, NOT_ASKED))
+
+
+def run_nightly() -> dict[str, Any]:
+    """Gather, check GitHub with no connection open, then apply one locked
+    candidate per transaction. A candidate changed during the network wait
+    is deferred to the next night, including changes to suggestions, owner,
+    wording, PR requirements and reopen history. Unchanged rows are evaluated
+    again against fresh SQL evidence; no proposed write survives the wait.
+
+    This connection-owning entry point is nightly-only. Capture and planner
+    callers retain their cursor-based APIs.
+    """
+    from khipu.db import connect
+
+    report: dict[str, Any] = {"ok": True, "closed_pr": 0, "closed_decision": 0, "suggested": 0,
+                              "kept_open_reopened": 0}
+    with connect() as conn:
+        with conn.cursor() as cur:
+            if not ready(cur):
+                return {"ok": True, "skipped": "the hub has no close-rule columns yet (migration 0034)"}
+            candidates = _open_items(cur, None)
+            sources = {}
+            for project in dict.fromkeys(item["project"] for item in candidates):
+                rows = [item for item in candidates if item["project"] == project]
+                sources[project] = [_ledger_states(cur, project), _episode_states(
+                    cur, project, min(int(item["opened_episode"] or 0) for item in rows))]
+        conn.commit()
+
+    github = GitHub()
+    frozen = _FrozenGitHub()
+    for project, sql_sources in sources.items():
+        try:
+            runner = _runner_states(project)
+        except Exception as exc:  # noqa: BLE001 — same optional source as the cursor API
+            _log(f"runner summary skipped ({type(exc).__name__})")
+            runner = {}
+        repo = _project_repo(project)
+        for item in (item for item in candidates if item["project"] == project):
+            for ref in item_refs(item, repo):
+                rec = _newest_for(ref, repo, int(item["opened_episode"] or 0), [runner, *sql_sources])
+                key = _key(ref, repo)
+                if (rec is not None and rec["state"] in DONE_STATES) or key in frozen.results:
+                    continue
+                state, why = github.state(*key)
+                frozen.results[key] = (state, why)
+                if state is not None:
+                    frozen.records[key] = _record(state, datetime.now(timezone.utc), "github")
+
+    for candidate in candidates:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                current = _open_items(cur, None, commitment_id=candidate["id"], lock=True)
+                if not current or current[0] != candidate:
+                    report["deferred_changed"] = report.get("deferred_changed", 0) + 1
+                    continue
+                _pr_rule(cur, current, report, payload=None, episode_id=None, github=frozen)
+                _decision_rule(cur, current, report, episode_id=None)
+            conn.commit()
+    report["github_asked"] = github.asked
+    report["github"] = github.unavailable
     return report
 
 

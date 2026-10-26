@@ -55,6 +55,7 @@ class JobsRunTest(unittest.TestCase):
              mock.patch.object(jobs.subprocess, "Popen", side_effect=_driver_process(run_fn)) as run_mock, \
              mock.patch("khipu.session_capture.drain", return_value={"failed": 0}), \
              mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
+             mock.patch.object(jobs, "_commitment_close_rules", return_value={"ok": True}), \
              mock.patch("khipu.embed.prune_query_cache", return_value=0):
             # The nightly's own embed sweep and cache prune reach the hub;
             # they are unit-tested below and never run for real here.
