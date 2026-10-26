@@ -23,6 +23,19 @@ class OversizeTest(_Base):
         self.assertIn("a.txt", {d["rel_path"] for d in self.hub.docs.values()},
                       f"oversize file's document was deleted with its vectors: {out}")
 
+    def test_a_permanently_oversize_file_does_not_block_sibling_deletion(self):
+        self.add()
+        self.write("big.txt", "small")
+        gone = self.write("gone.txt", "bye")
+        library.scan(self.hub, "lib1")
+        gone.unlink()
+        with mock.patch.object(library, "MAX_FILE_BYTES", 40):
+            self.write("big.txt", "x" * 50)
+            out = library.scan(self.hub, "lib1")
+        self.assertEqual(out.get("removed"), 1, f"oversize blocked deletions: {out}")
+        self.assertEqual(set(self.docs_by_rel()), {"big.txt"})
+        self.assertTrue(out.get("ok"), f"too_large alone must not mark the scan incomplete: {out}")
+
 
 class PartialImportTest(_Base):
     def _jsonl(self, name, idxs):

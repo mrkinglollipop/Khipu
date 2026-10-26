@@ -211,10 +211,14 @@ def _under(path_real: str, root_real: str) -> bool:
     return path_real == root_real or path_real.startswith(root_real.rstrip(os.sep) + os.sep)
 
 
-def _iter_files(root: Path, skipped: dict[str, int]) -> Iterator[tuple[str, Path, os.stat_result]]:
+def _iter_files(
+    root: Path, skipped: dict[str, int], *, keep: set[str] | None = None,
+) -> Iterator[tuple[str, Path, os.stat_result]]:
     """(rel_posix, path, stat) for every eligible file under ``root``: .txt and
     .md, no dotfiles or hidden directories, no symlink that leaves the root,
-    nothing over MAX_FILE_BYTES (counted in ``skipped``, not yielded)."""
+    nothing over MAX_FILE_BYTES (counted in ``skipped``, not yielded).
+    Oversized paths are added to ``keep`` so a scan still treats them as
+    present without blocking deletion of other vanished files."""
     root_real = os.path.realpath(root)
 
     def skip(why: str) -> None:
@@ -242,6 +246,8 @@ def _iter_files(root: Path, skipped: dict[str, int]) -> Iterator[tuple[str, Path
                 continue
             if st.st_size > MAX_FILE_BYTES:
                 skip("too_large")
+                if keep is not None:
+                    keep.add(p.relative_to(root).as_posix())
                 continue
             yield p.relative_to(root).as_posix(), p, st
 
@@ -534,7 +540,7 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
         plan: list[tuple[str, str]] = []
         added = updated = unchanged = imported_kept = pending = 0
         rebuild_embedded = 0
-        for rel, path, _st in _iter_files(root, skipped):
+        for rel, path, _st in _iter_files(root, skipped, keep=seen):
             seen.add(rel)
             try:
                 data = path.read_bytes()
@@ -576,10 +582,10 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
                 "their vectors would be deleted; nothing was changed. "
                 f"Run `khipu library scan {name} --allow-rebuild` to proceed"
             )
-        # too_large: file still exists but was skipped — do not treat as deleted
-        # (same fail-safe as traversal_error / unreadable).
+        # too_large paths are in ``seen`` (via _iter_files keep=); only
+        # traversal_error / unreadable freeze deletions for the whole walk.
         walk_incomplete = bool(
-            skipped.get("traversal_error") or skipped.get("unreadable") or skipped.get("too_large")
+            skipped.get("traversal_error") or skipped.get("unreadable")
         )
         gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
         if gone and not seen:
@@ -621,7 +627,7 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
                 conn.commit()
                 pending = 0
         walk_incomplete = bool(
-            skipped.get("traversal_error") or skipped.get("unreadable") or skipped.get("too_large")
+            skipped.get("traversal_error") or skipped.get("unreadable")
         )
         if walk_incomplete:
             gone = []

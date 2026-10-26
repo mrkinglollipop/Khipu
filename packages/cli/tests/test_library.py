@@ -1317,6 +1317,12 @@ class CliTest(_Base):
         self.assertEqual(rc, 0)
         self.assertTrue({"read", "imported", "skipped_corrupt", "unmapped", "documents",
                          "profile"} <= set(out))
+        bad = Path(self.tmp.name) / "bad.sqlite"
+        _make_index(bad, [("n", 0, "Ghost/Gone.txt", "nope", _blob(1, 0, 0, 0), "voyage-t", 4)])
+        rc, out = self.run_cli(library_cmd="import", name="lib1", path=str(bad), strip_prefix="", profile=None)
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["imported"], 0)
         self.assertEqual(self.run_cli(library_cmd="disable", name="lib1")[1], {"ok": True, "name": "lib1", "enabled": False})
         self.assertEqual(self.run_cli(library_cmd="enable", name="lib1")[1], {"ok": True, "name": "lib1", "enabled": True})
         rc, out = self.run_cli(library_cmd="remove", name="lib1", yes=True)
