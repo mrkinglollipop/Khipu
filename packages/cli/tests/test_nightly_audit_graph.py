@@ -366,3 +366,65 @@ def test_explicit_empty_sources_export_respects_registry(tmp_path, monkeypatch,
         assert resolved.read_text() == original
         assert not sources.sources_file().exists()
         assert g._should_skip_build(resolved) == (True, "no_sources")
+
+
+def _run_nightly_with_mirror(tmp_path, monkeypatch, mirror, root_set=True):
+    g = load('graphify_nightly')
+    resolved = tmp_path / 'sources.json'
+    resolved.write_text(json.dumps({'code_roots': ['synthetic']}))
+    monkeypatch.setattr(g, '_export_sources', lambda env: resolved)
+    monkeypatch.setattr(g, '_khipu_root', lambda: tmp_path if root_set else None)
+    monkeypatch.setattr(g, '_log_path', lambda: tmp_path / 'nightly.log')
+    monkeypatch.setattr(g, 'run_step', lambda *a, **kw: 0)
+    mirror_calls = []
+    def run(argv, **kw):
+        mirror_calls.append(argv)
+        return mirror()
+    monkeypatch.setattr(g.subprocess, 'run', run)
+    return g, mirror_calls
+
+
+@pytest.mark.parametrize('failure', ['rc', 'timeout', 'oserror'])
+def test_failed_graph_mirror_fails_the_nightly(tmp_path, monkeypatch, capsys, failure):
+    import subprocess
+    def mirror():
+        if failure == 'timeout':
+            raise subprocess.TimeoutExpired('graph-sync', 600)
+        if failure == 'oserror':
+            raise OSError('synthetic spawn failure')
+        return subprocess.CompletedProcess([], 1, '', 'connection timeout expired')
+    g, calls = _run_nightly_with_mirror(tmp_path, monkeypatch, mirror)
+    assert g.main() != 0
+    assert len(calls) == 1
+    out = capsys.readouterr().out
+    assert 'nightly FAILED' in out
+    assert 'graph mirror' in out
+    assert 'nightly complete' not in out
+
+
+def test_failed_mirror_is_reported_as_a_failed_graph_job(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from khipu import jobs
+    g, _ = _run_nightly_with_mirror(
+        tmp_path, monkeypatch,
+        lambda: subprocess.CompletedProcess([], 1, '', 'connection timeout expired'))
+    monkeypatch.setattr(jobs, 'GRAPHIFY_NIGHTLY', GRAPH / 'graphify_nightly.py')
+    monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path / 'data')
+    monkeypatch.setattr(jobs, '_log_paths', lambda stem: (tmp_path / 'out.log', tmp_path / 'err.log'))
+    monkeypatch.setattr(jobs, '_offsite_if_due', lambda: None)
+    monkeypatch.setattr(jobs.subprocess, 'Popen',
+        lambda argv, **kw: SimpleNamespace(wait=lambda *, timeout: g.main()))
+    assert jobs.run_graph_build() != 0
+    assert jobs._read_job_state('graph_build')['exit'] != 0
+
+
+@pytest.mark.parametrize('root_set', [True, False])
+def test_clean_or_disabled_mirror_keeps_exit_zero(tmp_path, monkeypatch, capsys, root_set):
+    import subprocess
+    g, calls = _run_nightly_with_mirror(
+        tmp_path, monkeypatch,
+        lambda: subprocess.CompletedProcess([], 0, '{}', ''), root_set=root_set)
+    assert g.main() == 0
+    assert len(calls) == (1 if root_set else 0)
+    assert 'nightly complete' in capsys.readouterr().out

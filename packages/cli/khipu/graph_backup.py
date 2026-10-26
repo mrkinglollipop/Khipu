@@ -30,6 +30,9 @@ def resolve_dest_remote() -> str:
 
 OFFSITE_MAX_AGE_DAYS = 8
 INTEGRITY_TIMEOUT_SECONDS = 60
+OFFSITE_TIMEOUT_FLOOR_SECONDS = 3600
+OFFSITE_SECONDS_PER_GB = 600
+OFFSITE_TIMEOUT_CEILING_SECONDS = 4 * 3600
 
 
 def _utcnow() -> datetime:
@@ -256,6 +259,22 @@ def has_r2_remote(*, rclone_bin: str = "rclone") -> bool:
         if remote == "r2:" or remote.startswith("r2:"):
             return True
     return False
+
+
+def _offsite_timeout(path: Path) -> int:
+    """Seconds allowed for the offsite upload of ``path``.
+
+    A flat hour timed out on a multi-GB snapshot. Budget an hour, plus ten
+    minutes for each GB beyond the first (a ~2 MB/s floor on the link), capped
+    at four hours so a hung transfer still ends before the next graph job.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return OFFSITE_TIMEOUT_FLOOR_SECONDS
+    extra_gb = max(0.0, size / 1024**3 - 1)
+    scaled = OFFSITE_TIMEOUT_FLOOR_SECONDS + int(extra_gb * OFFSITE_SECONDS_PER_GB)
+    return min(OFFSITE_TIMEOUT_CEILING_SECONDS, scaled)
 
 
 def _integrity_check(path: Path, *, timeout: int = INTEGRITY_TIMEOUT_SECONDS) -> str:
@@ -547,7 +566,9 @@ def _run_offsite(*, dest_remote: str | None, keep: int, rclone_bin: str) -> dict
         return {"ok": False, "reason": "live graph path must not appear in rclone argv"}
 
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=3600)
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=_offsite_timeout(snap)
+        )
     except (OSError, subprocess.TimeoutExpired):
         detail = {"path": str(snap), "dest": dest, "error": "offsite copy failed to run"}
         return {"ok": False, "reason": "offsite copy failed to run", **detail}

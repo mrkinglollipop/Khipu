@@ -247,6 +247,11 @@ def main() -> int:
     elif rc != 0:
         log("  edge-embed step did not fully succeed")
 
+    # With no Khipu root the mirror is intentionally off (exit 0). A machine
+    # that is not the graph producer makes graph-sync exit 0 by itself, so any
+    # nonzero exit or failure to run here is a real failure: the rebuilt graph
+    # would otherwise show up only as drift the next day.
+    mirror_failure: str | None = None
     if _khipu_root() is not None:
         log("step: khipu graph mirror")
         try:
@@ -261,14 +266,22 @@ def main() -> int:
                 log("  khipu graph mirror ok")
             else:
                 tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-                log(f"  khipu graph mirror rc={proc.returncode}: {tail[-1] if tail else 'failed'}")
-        except OSError as exc:
-            log(f"  khipu graph mirror skipped (non-fatal): {exc}")
+                mirror_failure = (
+                    f"graph mirror rc={proc.returncode}: {tail[-1] if tail else 'failed'}"
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            mirror_failure = f"graph mirror did not run: {exc}"
 
     if embed_failures:
         detail = "; ".join(f"{label} rc={rc}" for label, rc in embed_failures)
+        if mirror_failure:
+            detail += f"; {mirror_failure}"
         log(f"nightly FAILED — {detail}")
         return embed_failures[0][1]
+
+    if mirror_failure:
+        log(f"nightly FAILED — {mirror_failure}")
+        return 2
 
     log("nightly complete — graph refreshed")
     return 0
