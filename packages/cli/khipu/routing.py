@@ -984,17 +984,32 @@ def parse_limit_message(text: str, now: datetime, seen: datetime | None = None) 
 
 def accounts() -> list[dict]:
     """The accounts plan usage reads (``usage_accounts``, or every installed
-    CLI with its default login), keyed as the usage cache keys them."""
-    from khipu import usage
+    CLI with its default login), plus the owner's account definitions.
 
+    Definitions use the same durable login bindings as the fold. An
+    installed CLI is only a fallback for providers without definitions;
+    its availability must never rebind an owner's account identity.
+    """
+    from khipu import usage
+    from khipu.config import load_config
+
+    config = load_config()
+    definitions, entry_cache = _entry_definitions()
+    defined_providers = {a["provider"] for a in definitions["accounts"].values()}
+    explicit = isinstance(config.get("usage_accounts"), list)
     out = []
     for account in usage.configured_accounts():
         if account.get("invalid"):
             continue
+        # _inputs() starts with the explicit account list, never PATH/key
+        # discovery. Use that same definition source here: otherwise a
+        # source reader can see provider| while its fold sees provider:main.
+        if not explicit and account["harness"] in defined_providers:
+            continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
                     "home": account.get("home"),
                     **({"label_source": account["label_source"]} if "label_source" in account else {})})
-    return _definition_accounts(out)
+    return _definition_accounts(out, config=config, definitions=definitions, entry_cache=entry_cache)
 
 
 _ENTRY_INPUTS: dict[tuple, dict] = {}
