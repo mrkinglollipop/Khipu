@@ -94,14 +94,24 @@ export function buildAttention(parsed: Record<string, unknown>): {
         });
         continue;
       }
+      // Reinstall only helps a missing/broken hook. Drain failures, a stale
+      // queue, or a last capture error need drain / reconnect — not reinstall.
+      const hookish = /hook\b/i.test(why) && !/last capture attempt failed|nothing is draining|waiting \d+ min|abandoned for over/i.test(why);
+      const drainish = /last capture attempt failed|nothing is draining|waiting \d+ min|abandoned for over|drain/i.test(why);
       items.push({
         key: `liveness:${h}`,
         tone: "err",
         title: `${harnessLabel(h)} has stopped recording sessions`,
         cause: why
-          ? `${captureCauseWords(why)}. Reinstalling the hook puts it back without losing the session.`
+          ? drainish
+            ? `${captureCauseWords(why)}. After the database answers, run \`khipu sessions drain\` (or wait for the queue drain); reinstalling the hook will not clear this.`
+            : hookish
+              ? `${captureCauseWords(why)}. Reinstalling the hook puts it back without losing the session.`
+              : `${captureCauseWords(why)}.`
           : "Its capture hook is no longer reporting. Reinstalling the hook puts it back without losing the session.",
-        fix: { label: "Reinstall hook", kind: "reinstall-hook" },
+        ...(hookish || !why
+          ? { fix: { label: "Reinstall hook" as const, kind: "reinstall-hook" as const } }
+          : {}),
         harness: h,
       });
     }
@@ -146,12 +156,15 @@ export function buildAttention(parsed: Record<string, unknown>): {
 
   if ((parsed as { outbox_ok?: boolean }).outbox_ok === false) {
     issues.push("Captures waiting to sync");
+    const box = (parsed as { outbox?: { pending?: number; dead?: number } }).outbox;
+    const deadOnly = (box?.dead ?? 0) > 0 && (box?.pending ?? 0) === 0;
     items.push({
       key: "outbox",
       tone: "warn",
       title: "Some captures are still waiting to reach the database",
-      cause:
-        "They were recorded while the database was unreachable and are queued on this Mac. After reconnecting, run `khipu outbox drain` to deliver them; nothing is lost meanwhile.",
+      cause: deadOnly
+        ? "Buried jobs sit outside the normal queue. After the cause is fixed, run `khipu outbox retry-dead` to put them back; a plain drain cannot move them."
+        : "They were recorded while the database was unreachable and are queued on this Mac. After reconnecting, run `khipu outbox drain` to deliver them; nothing is lost meanwhile.",
     });
   }
 

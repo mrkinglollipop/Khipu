@@ -51,10 +51,11 @@ class NightlyStepHealthTest(unittest.TestCase):
             self.assertTrue(out[key]["ok"], key)
             self.assertTrue(out[key]["skipped"], key)
             self.assertEqual(out[key]["reason"], "not checked yet — the nightly runs at 02:05")
-        self.assertEqual(
-            jobs.skipped_step_names(out),
-            ["notes_reconcile", "embed_provider", "commitments_hygiene", "mark_stale"],
-        )
+        skipped = jobs.skipped_step_names(out)
+        for name in ("notes_reconcile", "embed_provider", "commitments_hygiene", "mark_stale"):
+            self.assertIn(name, skipped)
+        # briefs disabled → applicable:false, also greyed via the same list
+        self.assertIn("briefs_build", skipped)
 
     def test_a_stale_recording_over_36h_old_is_red_even_if_it_was_ok(self):
         """A nightly that stopped running altogether must not hide behind a

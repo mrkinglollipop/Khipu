@@ -238,7 +238,10 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
     outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
-    if not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
+    # Dead letters sit outside drain(); only retry-dead moves them back.
+    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0:
+        outbox["fix"] = "run `khipu outbox retry-dead`"
+    elif not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
         outbox["fix"] = "run `khipu sessions drain`"
     # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
     # of a failure (hook error, drain failure, stale queue, cadence never
@@ -271,6 +274,8 @@ def _doctor_local_checks(mem: Path | None) -> dict:
             "error": f"{type(e).__name__}: {e}",
             "reasons": ["check failed"],
         }
+    if git_sync.get("applicable") is False:
+        not_configured.append("git_sync")
     try:
         secrets = secrets_status()
     except Exception as e:  # noqa: BLE001 — malformed local diagnostics must not crash doctor
@@ -898,6 +903,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     schema = workers["schema"].result()
     if not hub_ok and schema.get("error"):
         schema = {**schema, "ok": True, "skipped": "the database did not answer"}
+    if schema.get("skipped"):
+        not_configured.append("schema_migrations")
     schema_ok = bool(schema.get("ok"))
     # Fact provenance (docs/plans/2026-10-23-fact-provenance.md, phase 5): 0047
     # on the hub or not, open fact_gaps, section 4's limit count. Visibility
