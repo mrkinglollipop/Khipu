@@ -207,8 +207,10 @@ def set_data_dir(path: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
-    # Seed essentials from previous locations when empty.
-    for name in ("dsn", "root.crt"):
+    # Seed the hub certificate from previous locations when empty. Never the
+    # DSN: the app can name any folder here, and the hub credentials would
+    # land wherever it pointed.
+    for name in ("root.crt",):
         dst = target / name
         if dst.is_file():
             continue
@@ -216,8 +218,6 @@ def set_data_dir(path: Path) -> Path:
             src = src_root / name
             if src.is_file() and src.resolve() != dst:
                 shutil.copy2(src, dst)
-                if name == "dsn":
-                    dst.chmod(0o600)
                 break
     return target
 
@@ -325,6 +325,10 @@ def backup_local(*, dest: Path) -> dict:
                     if not p.is_file():
                         continue
                     if p.name == POINTER_NAME and src == DEFAULT_DIR:
+                        continue
+                    # The archive goes wherever the caller names; the hub DSN
+                    # and gateway token never leave this Mac in it.
+                    if p.name in SENSITIVE_FILENAMES:
                         continue
                     if staged is not None and p == staged:
                         continue

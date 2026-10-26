@@ -85,3 +85,77 @@ class DbStatusErrorTextTest(unittest.TestCase):
             rc = cli.cmd_db(Namespace(db_cmd="status"))
         self.assertEqual(rc, 1)
         self.assertNotIn(SECRET, buf.getvalue())
+
+
+class BackupCarriesNoCredentialsTest(unittest.TestCase):
+    def test_backup_archive_leaves_out_the_dsn_and_gateway_token(self):
+        from khipu import paths
+
+        with tempfile.TemporaryDirectory() as td:
+            data = Path(td) / "data"
+            data.mkdir()
+            (data / "dsn").write_text(f"postgres://u:{SECRET}@h/d\n")
+            (data / "gateway-token").write_text(SECRET)
+            (data / "root.crt").write_text("cert")
+            with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(data)}):
+                out = paths.backup_local(dest=Path(td) / "out")
+            with zipfile.ZipFile(out["archive"]) as zf:
+                self.assertEqual(zf.namelist(), ["root.crt"])
+
+
+class DataDirPointerDoesNotSeedDsnTest(unittest.TestCase):
+    def test_setting_the_data_dir_copies_the_cert_but_not_the_dsn(self):
+        from khipu import paths
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            default, legacy, chosen = root / "khipu", root / "alzy", root / "chosen"
+            default.mkdir()
+            (default / "dsn").write_text(f"postgres://u:{SECRET}@h/d\n")
+            (default / "root.crt").write_text("cert")
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {}))
+                for name in ("KHIPU_ISOLATED_DIR", "KHIPU_DATA_DIR", "ALZY_DATA_DIR"):
+                    os.environ.pop(name, None)
+                stack.enter_context(mock.patch.object(paths, "DEFAULT_DIR", default))
+                stack.enter_context(mock.patch.object(paths, "LEGACY_DIR", legacy))
+                paths.set_data_dir(chosen)
+            self.assertFalse((chosen / "dsn").exists(), "dsn copied into the chosen folder")
+            self.assertEqual((chosen / "root.crt").read_text(), "cert")
+
+
+class SnapshotLegacyDsnFallbackTest(unittest.TestCase):
+    def test_file_dsn_ignores_the_legacy_file_past_an_explicit_data_dir(self):
+        from khipu import hub_snapshot
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "legacy-dsn").write_text("postgres://legacy-user:pw@legacy-host/legacy\n")
+            empty = root / "empty"
+            empty.mkdir()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {"KHIPU_KEYCHAIN": "0", "KHIPU_DATA_DIR": str(empty)}))
+                for name in ("KHIPU_ISOLATED_DIR", "KHIPU_DSN_FILE", "ALZY_DSN_FILE"):
+                    os.environ.pop(name, None)
+                stack.enter_context(mock.patch.object(hub_snapshot, "_LEGACY_DSN_FILE", root / "legacy-dsn"))
+                self.assertIsNone(hub_snapshot._file_dsn())
+
+
+class LegacyMigrationPastExplicitDataDirTest(unittest.TestCase):
+    def test_a_read_does_not_copy_the_legacy_dsn_into_the_config_dir(self):
+        from khipu import keychain
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            legacy_cfg, cfg, data = root / "alzy", root / "khipu", root / "data"
+            legacy_cfg.mkdir()
+            data.mkdir()
+            (legacy_cfg / "dsn").write_text("postgres://legacy-user:pw@legacy-host/legacy\n")
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {"KHIPU_KEYCHAIN": "0", "KHIPU_DATA_DIR": str(data)}))
+                for name in ("KHIPU_ISOLATED_DIR", "KHIPU_DSN_FILE", "ALZY_DSN_FILE"):
+                    os.environ.pop(name, None)
+                stack.enter_context(mock.patch.object(keychain, "CONFIG_DIR", cfg))
+                stack.enter_context(mock.patch.object(keychain, "LEGACY_CONFIG_DIR", legacy_cfg))
+                keychain.migrate_legacy_secrets()
+            self.assertFalse((cfg / "dsn").exists(), "legacy dsn copied into the config dir")
