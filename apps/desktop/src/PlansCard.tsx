@@ -1345,7 +1345,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       ) : null}
       {cfg.error && status ? (
         <p className="set-error" role="alert">
-          Saved, but couldn&apos;t re-read the account list: {cfg.error}
+          Couldn&apos;t refresh; showing the last value: {cfg.error}
         </p>
       ) : null}
       {entries.length ? (

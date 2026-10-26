@@ -276,7 +276,7 @@ export function OptionalFeatures({ active }: { active: boolean }) {
       ) : null}
       {features.error && features.data ? (
         <p className="set-error" role="alert">
-          Saved, but couldn&apos;t re-read the switches: {features.error}
+          Couldn&apos;t refresh; showing the last value: {features.error}
         </p>
       ) : null}
 

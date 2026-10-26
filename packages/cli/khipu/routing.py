@@ -8478,10 +8478,8 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     # ``delivery_rows: null`` (not ``[]``) so the UI does not say "nobody live".
     from khipu import routing_delivery_rows
 
-    try:
-        delivery = routing_delivery_rows.delivery_data(view, now, cfg)
-    except Exception as exc:  # noqa: BLE001 - delivery evidence never breaks the view
-        delivery = {"rows": None, "macs": [], "recipients": {}, "error": str(exc) or "unreadable"}
+    # delivery_data never raises: a damaged source becomes rows=None inside it.
+    delivery = routing_delivery_rows.delivery_data(view, now, cfg)
     out["delivery_rows"] = delivery["rows"]
     out["delivery_macs"] = delivery.get("macs") or []
     recipients = delivery.get("recipients") or {}

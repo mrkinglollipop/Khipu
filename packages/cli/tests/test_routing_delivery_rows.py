@@ -372,4 +372,5 @@ def test_delivery_rows_distinguishes_a_damaged_read_from_no_live_conversations(m
 
     monkeypatch.setattr(rdr, "_delivery_data", boom)
     damaged = rdr.delivery_data(None, datetime.now(timezone.utc), {})
-    assert damaged.get("error") or damaged.get("unreadable") or damaged["rows"] is None, damaged
+    assert damaged["rows"] is None, damaged
+    assert "error" not in damaged, damaged

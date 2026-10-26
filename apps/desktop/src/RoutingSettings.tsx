@@ -2704,7 +2704,12 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
 
       <div className="section-body">
         <h2 className="sub-title">Live conversations <span className="meta">{liveLabel}</span></h2>
-        {ownerRows && ownerRows.length ? (
+        {data?.delivery_rows === null ? (
+          <div className="empty">
+            <b>Can&apos;t be checked</b>
+            <span>Khipu could not read live delivery rows.</span>
+          </div>
+        ) : ownerRows && ownerRows.length ? (
             <div className="mrows" role="list" aria-label="Live conversations">
               {ownerRows.map((row, index) => {
                 const state = healthError
@@ -2720,6 +2725,11 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
                 );
               })}
             </div>
+        ) : Array.isArray(data?.delivery_rows) ? (
+          <div className="empty">
+            <b>No live conversations</b>
+            <span>No delivery identity has a recent delivery point.</span>
+          </div>
         ) : identities.length ? (
           <div className="mrows" role="list" aria-label="Live conversations">
             {identities.map((row, index) => {
@@ -5037,7 +5047,7 @@ export function RoutingSettings({
       ) : null}
       {config.error && config.data ? (
         <p className="set-error" role="alert">
-          Saved, but couldn&apos;t re-read the settings: {config.error}
+          Couldn&apos;t refresh; showing the last value: {config.error}
         </p>
       ) : null}
     </div>
