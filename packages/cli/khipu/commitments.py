@@ -1748,6 +1748,27 @@ def settle_suggestion_sql(cur, table: str = "commitments") -> str:
             f"THEN NULL ELSE {col} END")
 
 
+def close_reason_sql(cur, table: str = "commitments") -> str:
+    """``close_reason`` as a hub reader may return it: 'forgotten' when the
+    close was made by a forgotten episode or cites a decision of one (the
+    forget rewrites those, ``forget._clear_cited_closes``; this holds for a
+    row written meanwhile or by older code)."""
+    col = f"{table}.close_reason"
+    try:
+        from khipu.db import has_columns
+
+        if not has_columns(cur, "episodes", "deleted_at"):
+            return col
+        cited = f"fe.id = {table}.closed_episode"
+        if has_columns(cur, "decisions", "episode_id") and has_columns(cur, "commitments", "close_evidence"):
+            cited += (f" OR fe.id IN (SELECT d.episode_id FROM decisions d "
+                      f"WHERE d.id::text = {table}.close_evidence->>'decision_id')")
+    except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
+        return col
+    return (f"CASE WHEN EXISTS (SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND ({cited})) "
+            f"THEN 'forgotten' ELSE {col} END")
+
+
 def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: str,
                        evidence: dict | None = None, episode: int | None = None) -> bool:
     """Keep a refused close on the owner's item as a "Looks done" suggestion
@@ -2223,7 +2244,8 @@ def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str |
     if _lineage_columns_ready(cur):
         select_cols += ["owner_reassigned_by", "owner_reassign_reason", "owner_prior", "owner_prior_label",
                         "linked_ids", "latest_text"]
-    exprs = [settle_suggestion_sql(cur) if c == "settle_suggestion" else c for c in select_cols]
+    exprs = [settle_suggestion_sql(cur) if c == "settle_suggestion"
+             else f"{close_reason_sql(cur)} AS close_reason" if c == "close_reason" else c for c in select_cols]
     cur.execute(
         f"""
         SELECT {', '.join(exprs)}

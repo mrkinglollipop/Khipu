@@ -232,6 +232,30 @@ def _clear_cited_suggestions(cur, episode_id: int) -> int:
     return cur.rowcount
 
 
+def _clear_cited_closes(cur, episode_id: int) -> int:
+    """Replace ``close_reason`` with 'forgotten' and drop ``close_evidence``
+    on every commitment the episode closed, or closed citing a decision the
+    episode wrote or claimed: a rule close quotes that evidence's words. The
+    commitment stays closed."""
+    try:
+        from khipu.db import has_columns, has_table
+
+        evidence = has_columns(cur, "commitments", "close_evidence")
+        claimed = ("UNION SELECT fact_id FROM fact_claims WHERE kind = 'decision' AND episode_id = %(e)s "
+                   if has_table(cur, "fact_claims") else "")
+        decisions = (f"SELECT id FROM decisions WHERE episode_id = %(e)s {claimed}"
+                     if has_columns(cur, "decisions", "episode_id") else None)
+    except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
+        evidence, decisions = False, None
+    cited = "closed_episode = %(e)s"
+    if evidence and decisions:
+        cited += f" OR close_evidence->>'decision_id' IN (SELECT id::text FROM ({decisions}) d)"
+    cur.execute(f"UPDATE commitments SET close_reason = 'forgotten'"
+                f"{', close_evidence = NULL' if evidence else ''} WHERE ({cited}) "
+                "AND close_reason IS DISTINCT FROM 'forgotten'", {"e": episode_id})
+    return cur.rowcount
+
+
 def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
     """Tombstone one episode (its row already locked) and cascade: its
     vectors, its fact claims (each fact re-projected, or retired as the
@@ -251,6 +275,7 @@ def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
     # Before the claims go: a decision the episode claimed may keep another
     # claimant's wording, but a suggestion quoting it may quote this one's.
     suggestions_cleared = _clear_cited_suggestions(cur, episode_id)
+    closes_cleared = _clear_cited_closes(cur, episode_id)
     provenance_out = None
     if _provenance_ready(cur):
         # Fact provenance (0047): the episode's claims go and each fact it
@@ -307,6 +332,7 @@ def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
         "decisions_retracted": decisions_retracted,
         "briefs_staled": briefs_staled,
         "suggestions_cleared": suggestions_cleared,
+        "closes_cleared": closes_cleared,
         "facts_reprojected": (provenance_out or {}).get("facts_reprojected", 0),
         # (kind, id) of every fact the forget re-projected: forget_everywhere
         # writes their new rows into this Mac's replica at once (section 6).

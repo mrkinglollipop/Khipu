@@ -4198,10 +4198,11 @@ def _hub_commitments(cur) -> tuple[list[str], list[Any]] | None:
     if not {"id", "text", "status"} <= hub_cols:
         return None
     cols = [c for c in _COMMITMENT_COLS if c in hub_cols]
-    from khipu.commitments import settle_suggestion_sql
+    from khipu.commitments import close_reason_sql, settle_suggestion_sql
 
-    # A suggestion quoting a forgotten episode's evidence never reaches the replica.
-    sel = ", ".join(settle_suggestion_sql(cur) if c == "settle_suggestion" else c for c in cols)
+    # A suggestion or close reason quoting a forgotten episode's evidence never reaches the replica.
+    sel = ", ".join(settle_suggestion_sql(cur) if c == "settle_suggestion"
+                    else close_reason_sql(cur) if c == "close_reason" else c for c in cols)
     where = ""
     if "opened_episode" in cols and "deleted_at" in _pg_columns(cur, "episodes"):
         where = (
