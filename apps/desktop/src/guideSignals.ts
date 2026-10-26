@@ -3,7 +3,7 @@
    "Check the gateway" answer, and whether an agent has asked Khipu anything.
    Every value is read from Khipu; nothing is a "mark done" click. */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { callCli, useCliState } from "./settingsCli";
 import type { ConfigShape } from "./settingsCli";
 import {
@@ -118,24 +118,30 @@ export function useGuideSignals(refreshKey: unknown) {
     void reloadPrefs();
   }, [refreshKey, reloadCfg, reloadToken, reloadLog, reloadPrefs]);
 
-  const updatePrefs = useCallback((patch: Partial<GuidesPrefs>) => {
-    setPrefsState((prev) => {
-      const next = { ...prev, ...patch };
-      void callCli("khipu_guides_prefs_set", { json: prefsJson(next) });
-      return next;
-    });
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
+
+  // Write outside the setState updater and return the save so callers (e.g.
+  // afterSettingSaved) can await it before reloading.
+  const updatePrefs = useCallback(async (patch: Partial<GuidesPrefs>) => {
+    const next = { ...prefsRef.current, ...patch };
+    prefsRef.current = next;
+    setPrefsState(next);
+    await callCli("khipu_guides_prefs_set", { json: prefsJson(next) });
   }, []);
 
   const gatewayUrl = cfg.data?.gateway_url ?? "";
   const keySaved = token.data ? token.data.exists === true : null;
 
   // Drop a check that no longer matches the saved address (step 5 must go stale).
+  // Skip until config has loaded — gatewayUrl is "" before then, which is not
+  // a real address change and must not erase a saved check.
   useEffect(() => {
+    if (cfg.data == null) return;
     if (prefs.grokCheck && liveGrokCheck(prefs.grokCheck, gatewayUrl) == null) {
-      updatePrefs({ grokCheck: null });
+      void updatePrefs({ grokCheck: null });
     }
-  }, [gatewayUrl, prefs.grokCheck, updatePrefs]);
-
+  }, [cfg.data, gatewayUrl, prefs.grokCheck, updatePrefs]);
   const grok: GrokBotProgress = useMemo(
     () => grokBotProgress({ gatewayUrl, keySaved, check: prefs.grokCheck, ack: prefs.grokAck }),
     [gatewayUrl, keySaved, prefs.grokCheck, prefs.grokAck],

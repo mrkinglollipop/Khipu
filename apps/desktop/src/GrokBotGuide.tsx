@@ -177,7 +177,10 @@ export function GrokBotGuide({
     setChecking(true);
     try {
       const result = await runGatewayCheck(runKhipu);
-      updatePrefs({ grokCheck: { ...result, address: gatewayUrl.trim() } });
+      // Prefer the just-saved address from config; render-time gatewayUrl can lag.
+      const cfgRes = await callCli<{ gateway_url?: string | null }>("khipu_config_show");
+      const address = (cfgRes.ok ? cfgRes.data?.gateway_url : null) ?? gatewayUrl;
+      await updatePrefs({ grokCheck: { ...result, address: String(address ?? "").trim() } });
     } finally {
       setChecking(false);
     }
@@ -185,8 +188,11 @@ export function GrokBotGuide({
 
   const afterSettingSaved = () => {
     // Address or key changed: any prior gateway check is about the old setup.
-    updatePrefs({ grokCheck: null });
-    void reload();
+    // Await the wipe so reload cannot re-read the old check from disk.
+    void (async () => {
+      await updatePrefs({ grokCheck: null });
+      await reload();
+    })();
   };
 
   const ack = (step: 3 | 4) => {

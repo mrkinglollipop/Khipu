@@ -190,6 +190,48 @@ describe("Grok Bot guide", () => {
     await waitFor(() => expect(JSON.parse(prefsStore).grokCheck).toMatchObject({ ok: true, address: ADDRESS }));
   });
 
+  it("keeps a saved gateway check while config is still loading", async () => {
+    // Prefs can arrive before config; gatewayUrl is "" until then. The stale-check
+    // effect must not treat that empty URL as "address changed" and erase the check.
+    let releaseCfg!: (v: string) => void;
+    const cfgHeld = new Promise<string>((resolve) => {
+      releaseCfg = resolve;
+    });
+    prefsStore = JSON.stringify({
+      hintHidden: false,
+      startHidden: false,
+      setUpSeen: false,
+      grokAck: 0,
+      grokCheck: { ok: true, at: 1_700_000_000_000, address: ADDRESS },
+    });
+    const base = vi.mocked(invoke).getMockImplementation()!;
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      if (cmd === "khipu_config_show") return cfgHeld;
+      return base(cmd, args);
+    });
+
+    function Probe() {
+      const s = useGuideSignals("t");
+      return (
+        <div
+          data-testid="probe"
+          data-check={s.prefs.grokCheck?.ok === true ? "kept" : "gone"}
+          data-url={s.gatewayUrl}
+        />
+      );
+    }
+    render(<Probe />);
+
+    await waitFor(() => expect(screen.getByTestId("probe")).toHaveAttribute("data-check", "kept"));
+    // Still waiting on config — disk must not have been wiped.
+    expect(JSON.parse(prefsStore).grokCheck).toMatchObject({ ok: true, address: ADDRESS });
+
+    releaseCfg(JSON.stringify({ gateway_url: ADDRESS, config: { gateway_url: ADDRESS } }));
+    await waitFor(() => expect(screen.getByTestId("probe")).toHaveAttribute("data-url", ADDRESS));
+    expect(screen.getByTestId("probe")).toHaveAttribute("data-check", "kept");
+    expect(JSON.parse(prefsStore).grokCheck).toMatchObject({ ok: true, address: ADDRESS });
+  });
+
   it("maps a refused key and an unreachable gateway to their troubleshooting words", async () => {
     const refused = await runGatewayCheck(async () =>
       JSON.stringify([{ detected: true, components: { mcp: { ok: false, http_status: 401, error: "HTTP 401: Unauthorized" } } }]),
