@@ -579,8 +579,8 @@ describe("Found rows", () => {
     expect(screen.getByText("Found")).toBeInTheDocument();
     expect(screen.getByText("Signed in (Pro). 4 of your conversations this week ran on it. Found 20 min ago.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Track the Claude account at ~/.claude-client" })).toBeInTheDocument();
-    expect(screen.getByText("Found, not checked")).toBeInTheDocument();
-    expect(screen.getByText(/no conversation has used it, so Khipu has not asked Codex about it yet/)).toBeInTheDocument();
+    expect(screen.getByText("New folder")).toBeInTheDocument();
+    expect(screen.getByText(/Looks like a Codex login\. Khipu found it by its folder name only\./)).toBeInTheDocument();
     const check = screen.getByRole("button", { name: "Check the Codex login at ~/.codex-work" });
     expect(check).toHaveAccessibleDescription("Check asks Codex whether this login is signed in. Codex may create a settings file in that folder when it is asked.");
     expect(screen.getByText("Couldn't check")).toBeInTheDocument();

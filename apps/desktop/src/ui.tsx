@@ -15,7 +15,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode, RefObject } from "react";
-import { ChevronRight } from "lucide-react";
+import { ChevronRight, X } from "lucide-react";
 
 export type Tone = "ok" | "warn" | "err" | "accent" | "neutral";
 
@@ -96,6 +96,7 @@ export function Dialog({
   onCancel,
   onClose,
   initialFocusRef,
+  onBackdropClick,
   children,
 }: {
   open: boolean;
@@ -103,6 +104,8 @@ export function Dialog({
   ariaLabelledBy?: string;
   /** Escape or a backdrop dismissal. */
   onCancel: () => void;
+  /** A click on the backdrop itself (the dialog element, not its content). */
+  onBackdropClick?: () => void;
   /** The native `close` event, however it was closed. */
   onClose?: () => void;
   initialFocusRef?: RefObject<HTMLElement | null>;
@@ -139,9 +142,49 @@ export function Dialog({
       role={open ? "dialog" : undefined}
       aria-labelledby={ariaLabelledBy}
       onClose={onClose}
+      onClick={onBackdropClick ? (e) => { if (e.target === e.currentTarget) onBackdropClick(); } : undefined}
     >
       {children}
     </dialog>
+  );
+}
+
+/** A right-hand detail panel over the page: the same modal dialog as every
+ *  other (focus trap, Escape, inert background), laid out as a sheet. The
+ *  caller's `onClose` runs on Escape, the backdrop and the close button, and
+ *  puts focus back on whatever opened it. */
+export function Sheet({
+  title,
+  subtitle,
+  titleId,
+  onClose,
+  footer,
+  children,
+}: {
+  title: ReactNode;
+  subtitle?: ReactNode;
+  titleId: string;
+  onClose: () => void;
+  footer?: ReactNode;
+  children?: ReactNode;
+}) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+  return (
+    <Dialog open className="sheet-dialog" ariaLabelledBy={titleId} onCancel={onClose} onBackdropClick={onClose} initialFocusRef={closeRef}>
+      <div className="sheet">
+        <div className="sheet-head">
+          <div className="sheet-title">
+            <h2 id={titleId}>{title}</h2>
+            {subtitle ? <div className="sheet-sub">{subtitle}</div> : null}
+          </div>
+          <button ref={closeRef} type="button" className="sheet-close" onClick={onClose} aria-label="Close details">
+            <X size={18} aria-hidden />
+          </button>
+        </div>
+        <div className="sheet-body">{children}</div>
+        {footer ? <div className="sheet-foot">{footer}</div> : null}
+      </div>
+    </Dialog>
   );
 }
 
@@ -171,18 +214,31 @@ export function Tile({
   value,
   sub,
   tone = "neutral",
+  onOpen,
+  openLabel,
 }: {
   label: string;
   value: ReactNode;
   sub?: ReactNode;
   tone?: "neutral" | "err" | "warn";
+  /** Makes the whole tile a button that opens the tile's details. */
+  onOpen?: () => void;
+  openLabel?: string;
 }) {
-  return (
-    <div className={tone === "neutral" ? "tile" : `tile ${tone}`}>
+  const cls = tone === "neutral" ? "tile" : `tile ${tone}`;
+  const body = (
+    <>
       <div className="label">{label}</div>
       <div className="value">{value}</div>
       {sub ? <div className="sub">{sub}</div> : null}
-    </div>
+    </>
+  );
+  if (!onOpen) return <div className={cls}>{body}</div>;
+  return (
+    <button type="button" className={`${cls} tile-btn`} onClick={onOpen} aria-label={openLabel ?? `${label}: open details`}>
+      {body}
+      <ChevronRight size={16} className="tile-chev" aria-hidden />
+    </button>
   );
 }
 

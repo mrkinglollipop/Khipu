@@ -22,6 +22,7 @@ import {
 import type { RouteView } from "./routing";
 import { fmtAgo, fmtAgoSince } from "./time";
 import { shortProject } from "./work";
+import { captureCauseWords, plainError, waitedWords } from "./humanWords";
 
 /** A named red check, in plain words, with at most one fix. Callers render
  *  one callout per entry; `fix` is omitted where the app has no honest fix to
@@ -98,7 +99,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         tone: "err",
         title: `${harnessLabel(h)} has stopped recording sessions`,
         cause: why
-          ? `${why}. Reinstalling the hook puts it back without losing the session.`
+          ? `${captureCauseWords(why)}. Reinstalling the hook puts it back without losing the session.`
           : "Its capture hook is no longer reporting. Reinstalling the hook puts it back without losing the session.",
         fix: { label: "Reinstall hook", kind: "reinstall-hook" },
         harness: h,
@@ -276,7 +277,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
   for (const [key, title] of Object.entries(NIGHTLY_STEP_TITLE)) {
     const step = nightlySteps?.[key];
     if (step && step.ok === false) {
-      const why = step.error || "see the nightly log";
+      const why = step.error ? plainError(step.error) : "see the nightly log";
       issues.push(`${title}: ${why}`);
       items.push({
         key: key.replace(/_ok$/, ""),
@@ -289,13 +290,15 @@ export function buildAttention(parsed: Record<string, unknown>): {
 
   if ((parsed as { topics_embed_lag_ok?: boolean }).topics_embed_lag_ok === false) {
     const lag = (parsed as { topics_embed_lag?: { lag_minutes?: number } }).topics_embed_lag;
-    const mins = lag?.lag_minutes ?? 0;
-    issues.push(`Topic search index ${mins} min behind`);
+    // A missing count is not zero: the body must never say "0 minutes" under
+    // a title about waiting over an hour.
+    const waited = waitedWords(lag?.lag_minutes);
+    issues.push(waited ? `Topic search index ${lag?.lag_minutes} min behind` : "Topic search index behind");
     items.push({
       key: "topics_embed_lag",
       tone: "warn",
-      title: "A note has waited over an hour to become findable by meaning",
-      cause: `The oldest unembedded topic has waited ${mins} minutes. It is still findable by its exact words meanwhile.`,
+      title: waited ? "A note has waited over an hour to become findable by meaning" : "A note is waiting to become findable by meaning",
+      cause: `${waited ? `The oldest one has waited ${waited}. ` : ""}It is still findable by its exact words meanwhile.`,
     });
   }
 
@@ -443,7 +446,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
     // behind the database between rebuilds shows on the health row instead.
     const why =
       snap.reason === "snapshot_refresh_failed"
-        ? `The last full rebuild failed${snap.refresh_error?.error ? `: ${snap.refresh_error.error}` : ""}.`
+        ? `The last full rebuild failed${snap.refresh_error?.error ? `: ${plainError(snap.refresh_error.error)}` : ""}.`
         : snap.reason === "snapshot_refresh_overdue"
           ? `The nightly job rebuilds it in full and last did so ${fmtAgo(snap.age_seconds)}.`
           : snap.reason === "snapshot_missing"
@@ -469,7 +472,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         ? `Its updates have failed for over 30 minutes${ledgerCopy.last_error?.error ? `: ${ledgerCopy.last_error.error}` : ""}.`
         : ledgerCopy.state === "old"
           ? `It last caught up ${fmtAgo(ledgerCopy.age_seconds)} while the database answers.`
-          : `Khipu could not check it${ledgerCopy.error ? `: ${ledgerCopy.error}` : ""}.`;
+          : `Khipu could not check it${ledgerCopy.error ? `: ${plainError(ledgerCopy.error)}` : ""}.`;
     items.push({
       key: "ledger_copy",
       tone: "warn",

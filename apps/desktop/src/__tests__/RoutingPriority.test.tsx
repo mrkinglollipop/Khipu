@@ -86,7 +86,7 @@ function calls(cmd: string) {
 
 describe("each account says whether Khipu can read it", () => {
   it("words every state in plain words", () => {
-    expect(liveWords(row({}))).toEqual({ text: "Live: read 2 min ago", live: true });
+    expect(liveWords(row({}))).toEqual({ text: "Read 2 min ago", live: true });
     expect(liveWords(row({ ok: false, error: "no_plan_limits" })).text).toBe("Signed in, but its plan figures can't be read");
     expect(liveWords(row({ ok: false, error: "not_signed_in" })).text).toBe("Not signed in");
     expect(liveWords(row({ ok: false, error: "not_installed" })).text).toBe("CLI not installed");
@@ -134,7 +134,7 @@ describe("each account says whether Khipu can read it", () => {
     render(<PlansSettingsCard state={state} active />);
     fireEvent.click(within(screen.getByRole("group", { name: "Claude second" })).getByRole("button", { name: "Sign Claude second in again" }));
     await waitFor(() => expect(calls("khipu_account_sign_in")).toEqual([{ harness: "claude", home: "~/.claude-second" }]));
-    await screen.findByText("Signed in. Live: read just now.");
+    await screen.findByText("Signed in. Read just now.");
     expect(state.reread).toHaveBeenCalledTimes(1);
     fireEvent.click(within(screen.getByRole("group", { name: "Claude" })).getByRole("button", { name: "Sign Claude in again" }));
     await waitFor(() => expect(calls("khipu_account_sign_in")[1]).toEqual({ harness: "claude", home: null }));
@@ -194,7 +194,8 @@ function stateOf(data: RouteView, load = vi.fn(async () => undefined)): RoutingS
 describe("the priority on Home", () => {
   it("shows the owner's order at the top in local time", () => {
     render(<RoutingCard state={stateOf(view())} />);
-    expect(screen.getByText("Priority: Claude second until Sat 3:00 PM, then Codex, then Claude")).toBeTruthy();
+    const prio = document.querySelector(".route-prio");
+    expect(prio?.textContent).toBe("Priority: Claude second until Sat 3:00 PM, then Codex, then Claude");
     expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
   });
 
@@ -312,7 +313,7 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(screen.getByText("No priority set. Conversations hear the accounts in their usual order.")).toBeTruthy();
     const accounts = screen.getByRole("list", { name: "Accounts" });
     const second = within(accounts).getAllByRole("listitem").find((li) => li.textContent?.startsWith("Claude second"))!;
-    expect(second).toHaveTextContent("88% of its week left, resets Sat 2:00 PM: about 1.7% an hour to use it all (a lot left, little time)");
+    expect(second).toHaveTextContent("88% of its week left, resets Sat 2:00 PM: using it all would take about 1.7% an hour");
     const grok = within(accounts).getAllByRole("listitem").find((li) => li.textContent?.startsWith("Grok"))!;
     expect(grok).toHaveTextContent("Plan figures can't be read: sign in again");
     const sw = screen.getByRole("switch", { name: "With no priority set, list accounts by how soon their allowance runs out unused" });

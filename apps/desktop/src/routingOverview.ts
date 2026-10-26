@@ -8,6 +8,7 @@
 
 import { accountClassification, brokenRules, deliveryConversationLabels, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
 import type { PlanFact, RouteDeliveryHealth, RouteProvider, RouteView } from "./routing";
+import { almostPrefix } from "./humanWords";
 import { proposalsModel } from "./routingProposals";
 import { checksLine, checksModel } from "./routingChecks";
 import { paceModel } from "./routingPace";
@@ -562,9 +563,9 @@ export function accountWeek(
       pace: "These figures may be out of date, so no pace is given",
     };
   }
-  const week = `${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
+  const week = `${almostPrefix(fact.left_pct)}${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
   if (!fact.left_pct || fact.left_pct <= 0) return { week, pace: "Nothing left to use until then" };
-  return { week, pace: `About ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour to use it all (${fact.words})` };
+  return { week, pace: `Using it all would take about ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour` };
 }
 
 const ACCOUNT_TAG: Record<string, string> = {

@@ -1208,6 +1208,31 @@ describe("Settings -> Routing: checking for resets", () => {
     expect(await within(row("Accounts", "Claude main")).findByRole("status")).toHaveTextContent("not checked: the Mac was busy");
   });
 
+  it("re-reads the record after Check now in the routing detail, so the state line is not left old", async () => {
+    const v = view();
+    v.accounts![0]!.reset_check = { status: "cannot_check", reason: "this account can't be checked without using a turn" };
+    answers.khipu_route_view = v;
+    answers.khipu_route_check = { ok: true, reason: "not checked: the Mac was busy" };
+    await page();
+    await screen.findByLabelText("First retry in seconds");
+    fireEvent.click(within(row("Accounts", "Claude main")).getByRole("button", { name: /See routing details/ }));
+    const dialog = screen.getByRole("dialog");
+    const stateLine = () => dialog.querySelector(".sheet-state")!;
+    expect(stateLine()).toHaveTextContent(/Limit reached/);
+    // The check finds the account open: the next read of the record says so.
+    const after = view();
+    after.accounts![0]!.state = "open";
+    after.accounts![0]!.until = null;
+    answers.khipu_route_view = after;
+    const before = calls("khipu_route_view").length;
+    fireEvent.click(within(dialog).getByRole("button", { name: "Check now" }));
+    await waitFor(() => expect(calls("khipu_route_check")).toEqual([{ account: "claude|" }]));
+    await waitFor(() => expect(calls("khipu_route_view").length).toBeGreaterThan(before));
+    // What the sheet displays changes, not just what was fetched.
+    await waitFor(() => expect(stateLine()).toHaveTextContent("Open"));
+    expect(stateLine()).not.toHaveTextContent(/Limit reached/);
+  });
+
   it("words the busy-Mac row and offers no wait, no attempts and no retries (fix round 1, F7)", async () => {
     expect(limitWords(3, "attempts")).toBe("3 attempts");
     expect(limitWords(1, "attempts")).toBe("1 attempt");

@@ -290,12 +290,12 @@ export function FoundRows({
           const owner = c.state === "not_checked";
           return (
             <div key={c.id} className="aa-found" role="listitem">
-              <Tag>Found, not checked</Tag>
+              <Tag tone="accent">New folder</Tag>
               <span className="aa-ft">
                 <b>{loginTitle(c)}</b>
                 <span className="t2">
                   {owner
-                    ? `Its folder name looks like a ${cliName(c.cli)} login; no conversation has used it, so Khipu has not asked ${cliName(c.cli)} about it yet.`
+                    ? `Looks like a ${cliName(c.cli)} login. Khipu found it by its folder name only.`
                     : "Khipu checks it on its next look."}
                 </span>
                 {owner ? (

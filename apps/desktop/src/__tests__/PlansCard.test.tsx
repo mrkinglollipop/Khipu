@@ -332,7 +332,7 @@ describe("PlansCard on Home", () => {
     const codex = within(rowFor("Codex"));
     expect(codex.getByText("Can't read it now; figures from 2 days ago")).toBeTruthy();
     expect(codex.getByRole("meter").classList.contains("dim")).toBe(true);
-    expect(within(rowFor("Muse")).getByText("as of its last turn, 2 h ago")).toBeTruthy();
+    expect(within(rowFor("Muse")).getByText("Read from its last reply, 2 h ago")).toBeTruthy();
   });
 
   it("Refresh calls the refresh command, spins while it runs, then shows the new figures", async () => {
@@ -540,7 +540,7 @@ describe("PlansSettingsCard", () => {
     const c = within(claude);
     for (const label of ["five-hour", "week", "Fable week"]) expect(c.getByText(label)).toBeTruthy();
     expect(c.getAllByText(/^resets /)).toHaveLength(3);
-    expect(c.getByText(/^Live: read .* ago$/)).toBeTruthy();
+    expect(c.getByText(/^Read .* ago$/)).toBeTruthy();
     const muse = within(screen.getByRole("group", { name: "Muse" }));
     expect(muse.getByText(MUSE_NO_TURN)).toBeTruthy();
     expect(muse.queryByText(/Live/)).toBeNull();
@@ -1175,7 +1175,7 @@ describe("one status phrase per account (settings clarity, phase 2)", () => {
     expect(said("Signed out")).toEqual(["Not signed in"]);
     expect(within(rowFor("Signed out")).getByRole("button", { name: "Sign Signed out in again" })).toBeTruthy();
     expect(said("Muse")).toEqual([MUSE_NO_TURN]);
-    expect(said("Muse two")).toEqual(["as of its last turn, 2 h ago"]);
+    expect(said("Muse two")).toEqual(["Read from its last reply, 2 h ago"]);
     expect(screen.queryByText(/Live/)).toBeNull();
     expect(screen.queryByText(/The last read failed/)).toBeNull();
   });

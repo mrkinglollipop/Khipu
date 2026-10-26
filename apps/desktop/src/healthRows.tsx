@@ -511,6 +511,37 @@ const ATTENTION_KEY_FOR_OK: Record<string, string> = {
   git_sync_ok: "git_sync",
 };
 
+/** The health-report rows a Home callout (by its attention key) is about,
+ *  so its Details button can show that row instead of the whole report. */
+export function healthKeysForAttention(attentionKey: string): string[] {
+  if (attentionKey.startsWith("liveness:")) return ["capture_liveness_ok"];
+  if (attentionKey.startsWith("routing")) return ["routing", "routing_delivery_ok"];
+  if (attentionKey.startsWith("work:")) return ["work"];
+  if (attentionKey.startsWith("plans")) return ["plans"];
+  // A queued promotion has no health row; markHealthRows then shows the
+  // whole report instead of highlighting nothing.
+  if (attentionKey === "promotion") return [];
+  const fromOk = Object.entries(ATTENTION_KEY_FOR_OK).find(([, v]) => v === attentionKey)?.[0];
+  return [fromOk ?? `${attentionKey}_ok`];
+}
+
+/** The rows each Home tile summarises. */
+export const TILE_HEALTH_KEYS = {
+  database: ["hub_ok", "hub_snapshot_ok", "schema_migrations_ok"],
+  recording: ["capture_liveness_ok", "outbox_ok"],
+  search: ["embed_coverage_ok", "index_freshness_ok", "topics_embed_lag_ok", "degraded_rate_ok", "drift_ok"],
+  backups: ["backup_ok", "graph_backup_ok", "graph_offsite_ok"],
+} as const;
+
+/** Marks the rendered rows for `keys` (the whole report when none render) and
+ *  returns them, first in page order, so the caller can scroll to it. */
+export function markHealthRows(root: ParentNode, keys: readonly string[]): Element[] {
+  const rows = keys.flatMap((k) => Array.from(root.querySelectorAll(`[data-health-key="${k}"]`)));
+  const marked = rows.length ? rows : Array.from(root.querySelectorAll("[data-health-report]"));
+  marked.forEach((el) => el.classList.add("health-hl"));
+  return marked;
+}
+
 function findAttention(okKey: string, attention: Attention[]): Attention[] {
   if (okKey === "capture_liveness_ok") {
     return attention.filter((a) => a.key.startsWith("liveness:"));
@@ -548,13 +579,14 @@ export function HealthReportRows({
 }) {
   const rows = healthRows(parsed, plans, routing);
   return (
-    <div className="rows">
+    <div className="rows" data-health-report>
       {rows.map((row) => {
         if (row.status === "ok") {
           const text = [row.detail, row.note].filter(Boolean).join("; ");
           return (
-            <div key={row.key} className="row-item">
-              <Check size={16} strokeWidth={1.75} aria-hidden className="ok" />
+            <div key={row.key} className="row-item" data-health-key={row.key}>
+              <Check
+                size={16} strokeWidth={1.75} aria-hidden className="ok" />
               <span className="row-main">{row.label}</span>
               {text ? <span className="row-meta wrap">{text}</span> : null}
             </div>
@@ -562,7 +594,7 @@ export function HealthReportRows({
         }
         if (row.status === "skipped") {
           return (
-            <div key={row.key} className="row-item">
+            <div key={row.key} className="row-item" data-health-key={row.key}>
               <CircleMinus
                 size={16}
                 strokeWidth={1.75}
@@ -592,7 +624,7 @@ export function HealthReportRows({
               ? `${sentence} ${row.detail}`
               : sentence;
         return (
-          <div key={row.key} className="row-item">
+          <div key={row.key} className="row-item" data-health-key={row.key}>
             <TriangleAlert
               size={16}
               strokeWidth={1.75}

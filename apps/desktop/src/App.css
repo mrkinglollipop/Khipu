@@ -3462,3 +3462,77 @@ input.switch:disabled {
 .welcome .acct-switch{width:100%;border:1px solid var(--border);border-radius:var(--r-sm)}
 .welcome .callout{width:100%}
 @media (max-width:760px){.acct-row{grid-template-columns:auto minmax(0,1fr)}.acct-read{grid-column:2}}
+
+/* Clickable Home rows and the detail sheets (clickable-home). A row's name is
+   the button; its ::after covers the whole row so a click anywhere opens the
+   detail, while the row's own controls (sign-in, Check now) sit above it. */
+.card .row.rowlink { position: relative; padding-right: calc(var(--s4) + 20px); }
+.rowlink-btn { all: unset; cursor: pointer; font: inherit; color: inherit; font-weight: 600; min-width: 0; }
+.rowlink-btn::after { content: ""; position: absolute; inset: 0; }
+.rowlink-btn:focus-visible { outline: none; }
+.card .row.rowlink:has(.rowlink-btn:focus-visible) { outline: 2px solid var(--ring); outline-offset: -2px; }
+.rowlink button:not(.rowlink-btn), .rowlink a { position: relative; z-index: 1; }
+.rowlink-chev { position: absolute; right: var(--s3); top: 50%; transform: translateY(-50%); color: var(--muted); }
+@media (hover: hover) and (pointer: fine) {
+  .card .row.rowlink:hover { background: var(--surface-2); }
+  .card .row.rowlink:hover .rowlink-chev { color: var(--text); }
+}
+.route-prio-name { font-weight: 600; padding: 0; margin: 0; }
+
+.tile-btn { all: unset; box-sizing: border-box; position: relative; cursor: pointer; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--s3) var(--s4); display: flex; flex-direction: column; gap: 6px; min-width: 0; text-align: left; }
+.tile-btn.err { border-color: color-mix(in srgb, var(--err) 50%, transparent); }
+.tile-btn.warn { border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+.tile-btn:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.tile-chev { position: absolute; right: var(--s3); top: var(--s3); color: var(--muted); }
+@media (hover: hover) and (pointer: fine) { .tile-btn:hover { background: var(--surface-2); border-color: var(--border-strong); } }
+.row-item.health-hl, .rows.health-hl { background: var(--accent-soft); border-radius: var(--r-sm); transition: background 0.4s; }
+
+.route-state.route-prio { display: block; }
+dialog.sheet-dialog { position: fixed; inset: 0 0 0 auto; z-index: 50; margin: 0 0 0 auto; padding: 0; border: 0; border-left: 1px solid var(--border-strong); background: var(--surface); color: var(--text); width: min(480px, 100vw); max-width: none; height: 100vh; max-height: none; box-shadow: var(--shadow-md); }
+.sheet { display: flex; flex-direction: column; height: 100%; }
+.sheet-head { display: flex; align-items: flex-start; gap: var(--s2); padding: var(--s4) var(--s5) var(--s3); border-bottom: 1px solid var(--border); }
+.sheet-title { flex: 1; min-width: 0; }
+.sheet-title h2 { margin: 0; font-size: var(--t-xl); font-weight: 650; letter-spacing: -0.01em; }
+.sheet-plan { color: var(--muted); font-weight: 400; font-size: var(--t-lg); }
+.sheet-sub { margin-top: 2px; font-size: var(--t-sm); color: var(--muted); }
+.sheet-state { display: inline-flex; align-items: center; gap: 6px; }
+.sheet-state b { color: var(--text); font-weight: 600; }
+.sheet-close { all: unset; cursor: pointer; padding: 4px; border-radius: var(--r-sm); color: var(--muted); display: inline-flex; }
+.sheet-close:hover { background: var(--surface-2); color: var(--text); }
+.sheet-close:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.sheet-body { flex: 1; overflow-y: auto; padding: var(--s4) var(--s5) var(--s5); }
+.sheet-foot { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); padding: var(--s3) var(--s5); border-top: 1px solid var(--border); }
+.sheet-foot .spacer { flex: 1; }
+.sheet-sec { margin-bottom: var(--s5); }
+.sheet-sec:last-child { margin-bottom: 0; }
+.sheet-sec h3 { margin: 0 0 var(--s2); font-size: var(--t-sm); text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); font-weight: 600; }
+.sheet-sec p { margin: 0; }
+.sheet-p { color: var(--text-2); }
+.sheet-note { margin-top: 6px; }
+.sheet-wins, .sheet-lines, .sheet-hist { list-style: none; margin: 0; padding: 0; }
+.sheet-wins li { display: grid; grid-template-columns: 1fr auto; gap: 2px var(--s3); padding: 6px 0; border-bottom: 1px solid var(--border); }
+.sheet-wins li:last-child { border-bottom: 0; }
+.sheet-wins .nm { font-weight: 500; }
+.sheet-wins .rt { color: var(--muted); font-size: var(--t-sm); text-align: right; }
+.sheet-wins .left { color: var(--text); font-variant-numeric: tabular-nums; }
+.sheet-wins .left.warn { color: var(--warn); }
+.sheet-wins .left.err { color: var(--err); }
+.sheet-wins .plan-meter { grid-column: 1 / -1; }
+.sheet-lines li { padding: 5px 0; border-bottom: 1px solid var(--border); color: var(--text-2); }
+.sheet-lines li:last-child { border-bottom: 0; }
+.sheet-facts { margin: 0; }
+.sheet-facts > div { display: grid; grid-template-columns: 116px 1fr; gap: var(--s3); padding: 5px 0; border-bottom: 1px solid var(--border); }
+.sheet-facts > div:last-child { border-bottom: 0; }
+.sheet-facts dt { color: var(--muted); font-size: var(--t-sm); }
+.sheet-facts dd { margin: 0; }
+.sheet-item { padding: var(--s2) var(--s3); border: 1px solid var(--border); border-radius: var(--r-sm); margin-bottom: var(--s2); background: var(--bg); }
+.sheet-item.warn { border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+.sheet-item b { font-weight: 500; }
+.sheet-item .end { display: block; color: var(--text-2); font-size: var(--t-sm); margin-top: 2px; }
+.sheet-item .end strong { color: var(--text); font-weight: 600; }
+.sheet-quote { margin: 0 0 var(--s1); padding: var(--s2) var(--s3); border-left: 3px solid var(--border-strong); color: var(--text-2); font-size: var(--t-sm); overflow-wrap: anywhere; }
+.sheet-quote.clamp { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.sheet-hist li { display: grid; grid-template-columns: 118px 1fr; gap: var(--s3); padding: 6px 0; border-bottom: 1px solid var(--border); font-size: var(--t-sm); }
+.sheet-hist li:last-child { border-bottom: 0; }
+.sheet-hist .t { color: var(--muted); }
+.sheet-gap { font-size: var(--t-sm); color: var(--muted); }
