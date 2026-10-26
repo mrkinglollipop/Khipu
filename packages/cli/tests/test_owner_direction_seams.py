@@ -139,6 +139,7 @@ def test_tidy_undo_survives_lost_finish(monkeypatch, change):
         result = owed_tidy.apply({"format": owed_tidy.PLAN_FORMAT, "version": owed_tidy.PLAN_VERSION,
                                   "project": "p", "items": []}, owner_gate="direction")
     else:
+        owner_direction.record_owed_undo_scope(batch, [1, 2])
         result = {"ok": True, "batch": batch}
     _lose_finish(monkeypatch)
     assert owner_direction.finish(result)["record_incomplete"]
