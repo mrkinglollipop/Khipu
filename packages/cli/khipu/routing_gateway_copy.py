@@ -672,6 +672,14 @@ def answer(*, identity, account=None, ack="", now=None, hub=None):
             entry.pop("exceptions", None)
     as_of = routing._parse(row["published_at"])
     stale = bool(row["stale_after"] and (now - as_of).total_seconds() > row["stale_after"])
+    # Past the copy's own valid_until something in it has ended (an
+    # exception baked into an older priority line, among others): the copy
+    # is stale whatever its age, and its priority is withheld until the Mac
+    # publishes again.
+    valid_until = routing._parse(body.get("valid_until"))
+    if valid_until is not None and now >= valid_until:
+        stale = True
+        body.pop("priority", None)
     body.update(as_of=row["published_at"], stale=stale)
     if stale:
         body["stale_message"] = "this Mac has not reported since " + as_of.strftime("%H:%MZ")

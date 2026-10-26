@@ -6957,8 +6957,16 @@ def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = N
                          if isinstance(request.get("prior_confirmed"), bool) else {}),
                       "owner_request": request.get("owner_request") or "the owner requested this change",
                       "written_by": dict(author), "via": request.get("via") or "mcp"})
-        written, view = _write_batch(lines, target=f"rule:{target['entity']}:"
-                                     + ("retired" if retired else str(rule["owner_revision"])))
+        # A retired rule's latest owner line (its retire, or a restore, edit
+        # or retire after it): a change in between refuses the retry.
+        if retired:
+            owned = [e for e in _in_write_order(read_events()[0])
+                     if str(e.get("type", "")).startswith("rule_") and event_identity.entity(e) == target["entity"]
+                     and not e.get("pending") and (e.get("written_by") or {}).get("kind") in (None, "owner")]
+            revision = f"retired:{event_identity.revision(owned[-1]) if owned else 'none'}"
+        else:
+            revision = str(rule["owner_revision"])
+        written, view = _write_batch(lines, target=f"rule:{target['entity']}:{revision}")
     return dict(_done(written[-1], view), n=number)
 
 
@@ -7095,12 +7103,18 @@ def restore_cap_layers(account: str, *, window: str | None, kind: str, purpose: 
                                      purpose=cap.get("purpose", purpose), tier=cap.get("tier"),
                                      sensitive_only=cap.get("sensitive_only"), until=cap.get("until"), now=now))
     with _lock():
-        # The slot as this restore finds it: a retry of an interrupted one
-        # is refused once it changed (``_write_batch``).
-        entry = next((a for a in read_view(now)["accounts"] if a["key"] == key), {})
-        slot = [c for c in entry.get("cap_layers") or [] if c.get("kind") == kind
-                and c.get("purpose", "job") == purpose and (window is None or c.get("window") in (None, window))]
-        target = "cap:" + hashlib.sha256(json.dumps(slot, sort_keys=True, default=str).encode()).hexdigest()[:16]
+        # The slot's latest stored change (never its clock-filtered layers,
+        # which a natural expiry changes): a retry of an interrupted restore
+        # is refused only once a write touched the slot (``_write_batch``).
+        from khipu import routing_pace
+
+        scoped = kind in routing_pace.WINDOW_CAP_KINDS
+        last = next((e for e in reversed(_in_write_order(read_events()[0]))
+                     if e.get("type") in ("cap_set", "cap_remove") and e.get("account") == key
+                     and (e.get("written_by") or {}).get("kind") == "owner"
+                     and (e.get("cap_kind") or e.get("kind")) == kind and e.get("purpose", "job") == purpose
+                     and (not scoped or e.get("window") == window)), None)
+        target = f"cap:{event_identity.revision(last) if last else 'none'}"
         written, view = _write_batch(owner_lines(events, via), target=target)
     return dict(_done(written[-1], view), account=key)
 
