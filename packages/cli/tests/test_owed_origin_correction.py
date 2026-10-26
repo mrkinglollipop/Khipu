@@ -5,9 +5,12 @@ from contextlib import redirect_stdout
 
 import pytest
 
-from khipu import cli, commitments, db, owner_act, routing
+from khipu import cli, commitments, db, owner_act, owed_origin, routing
 from tests.hermetic_pg import hub, pg_cluster, chain_dir  # noqa: F401
 from tests.fact_seed import adopt, announce
+
+
+_SYNTHETIC_OWNERSHIP_PROOFS = set()
 
 
 @pytest.fixture
@@ -15,6 +18,11 @@ def origin_db(hub, monkeypatch, tmp_path):
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("KHIPU_USER_ALIASES", "owner")
     commitments.reset_user_patterns()
+    _SYNTHETIC_OWNERSHIP_PROOFS.clear()
+    # Test-only certificates exercise correction lifecycle independently of the
+    # fail-closed historical policy. Real legacy rows have no such evidence.
+    monkeypatch.setattr(owed_origin, "_ownership_established",
+                        lambda row: row["id"] in _SYNTHETIC_OWNERSHIP_PROOFS)
     conn = hub.connect()
     # Real ordering: protected ownership metadata exists before the historical
     # correction boundary. Seeds below model captures within that interval.
@@ -54,6 +62,7 @@ def seed(conn, *, parent="session-parent", project="example/widget", **over):
             cur.execute(f"UPDATE commitments SET {name} = %s WHERE id = %s", (value, cid))
             if name == "latest_text":
                 adopt(cur, "commitment", cid)
+    _SYNTHETIC_OWNERSHIP_PROOFS.add(cid)
     return cid
 
 
@@ -97,7 +106,7 @@ def test_preview_request_confirm_and_undo(origin_db, monkeypatch):
     from khipu import owed_tidy, owner_direction
     line = next(a for a in owner_direction.actions() if a["action"] == "owed.correct_job_origin.confirm")
     assert line["before"]["batches"] == applied["batches"]
-    assert owed_tidy.undo(applied["batches"][0], owner_gate="terminal")["restored"] == 1
+    assert owed_tidy.undo(applied["batches"][0], owner_gate="app")["restored"] == 1
     assert owed_tidy.redo(applied["batches"][0], owner_gate="direction")["code"] == "owner_confirmation_required"
     with origin_db.cursor() as cur:
         cur.execute("SELECT owner, origin FROM commitments WHERE id = %s", (cid,))
@@ -142,7 +151,7 @@ def test_changes_after_preview_are_skipped_and_other_projects_apply_atomically(o
     assert len(applied["batches"]) == 2
     from khipu import owner_direction
     line = next(a for a in owner_direction.actions() if a["action"] == "owed.correct_job_origin.confirm")
-    assert owner_direction.undo(line["id"], "cli")["restored"] == 2
+    assert owner_direction.undo(line["id"], "app")["restored"] == 2
     with origin_db.cursor() as cur:
         cur.execute("SELECT owner, origin FROM commitments WHERE id = ANY(%s)", ([first, second, third],))
         assert cur.fetchall() == [("user", "conversation")] * 3
@@ -157,7 +166,7 @@ def test_owner_touch_after_correction_prevents_undo(origin_db, monkeypatch):
         # Same-value edits must still be retained as owner choices.
         cur.execute("UPDATE commitments SET due_after = NULL WHERE id = %s", (cid,))
     from khipu import owed_tidy
-    result = owed_tidy.undo(applied["batches"][0], owner_gate="terminal")
+    result = owed_tidy.undo(applied["batches"][0], owner_gate="app")
     assert result["restored"] == 0 and result["left_alone"][0]["id"] == cid
 
 

@@ -384,6 +384,8 @@ def untrusted_front_end(turns_: list[dict], conf: dict | None = None) -> str | N
 def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
     """Whether a recorded turn can carry the owner's words now, and why not."""
     conf = conf or settings()
+    if turn.get("entrypoint") in MACHINE_ENTRYPOINTS:
+        return False, "a machine entrypoint can never authorize owner changes"
     if turn.get("machine"):
         return False, "a message the harness wrote, not a typed turn"
     if turn.get("wrapped"):

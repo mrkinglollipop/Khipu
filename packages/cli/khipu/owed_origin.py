@@ -55,6 +55,17 @@ def _rows(cur, project=None, *, ids=None, lock=False):
     return rows
 
 
+def _ownership_established(row):
+    """Positive per-row proof is required, and legacy rows have none.
+
+    Migration times and null reassignment metadata cannot establish that all
+    writers recorded ownership choices (long-lived writers cached schemas).
+    No current historical certificate proves untouched ownership, so quarantine
+    every historical row. Never manufacture proof by backfilling this policy.
+    """
+    return False
+
+
 def _proposal(row):
     if (row.get("status") != "open" or row.get("owner") != "user"
             or row.get("origin") != "conversation" or not row.get("has_claims")
@@ -76,7 +87,7 @@ def _proposal(row):
     opened, cutoff = co._as_utc(row.get("opened_at")), co._as_utc(row.get("migration_at"))
     ownership_floor = co._as_utc(row.get("ownership_floor"))
     seen = co._as_utc(row.get("last_seen_at"))
-    if (not opened or not cutoff or not ownership_floor or opened < ownership_floor
+    if (not _ownership_established(row) or not opened or not cutoff or not ownership_floor or opened < ownership_floor
             or opened > cutoff or (seen and seen > opened)):
         return None
     owner, label = co.resolve_owner_and_label(
@@ -99,7 +110,7 @@ def preview(cur, project=None):
         for row in _rows(cur, project):
             opened = co._as_utc(row.get("opened_at"))
             floor = co._as_utc(row.get("ownership_floor"))
-            if not opened or not floor or opened < floor:
+            if not _ownership_established(row) or not opened or not floor or opened < floor:
                 unestablished += 1
             after = _proposal(row)
             if after is None:
@@ -125,7 +136,14 @@ def _confirm(cur, request_id, gate):
         return {"ok": False, "error": "No such job-origin request; nothing was changed"}
     state, doc, result = found
     if state != "pending":
-        return {"ok": True, "state": state, "changed": 0, "already_applied": True}
+        if state == "applied" and isinstance(result, dict):
+            # Retain the durable inverse scope in this retry's action too.
+            from khipu import owner_direction
+            for batch in result.get("batches", []):
+                owner_direction.record_owed_batch(batch)
+            return {**result, "changed": 0, "already_applied": True}
+        return {"ok": False, "state": state, "changed": 0,
+                "error": "The request has no recoverable applied result; nothing was changed"}
     planned = {it["id"]: it for it in doc["items"]}
     # Freeze lineage, claim and migration witnesses while rechecking and
     # writing. These locks precede the commitment locks, as forget does.

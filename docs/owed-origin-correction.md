@@ -34,18 +34,21 @@ including the opener, is excluded when another capture of that session gives
 contradictory parent lineage. Missing, conflicting, owner,
 or unproven witnesses exclude the item. Recorded edits, reassignment, snoozes,
 closures, reopen evidence, restatements, and prior clean-up history exclude it
-conservatively. Eligible historical rows must have opened during the protected
-interval from migration 0035 (ownership metadata coverage) through migration
-0049 (the correction boundary). All pre-0035 rows are quarantined because an
-unrecorded owner assignment cannot be ruled out; null later metadata is not
-proof of untouched ownership. Preview reports this count under
-`quarantined.ownership_unestablished`. Some untouched items therefore remain
-for manual review. Previously stored previews are revalidated against this
-policy and cannot apply an older, unproven candidate.
+conservatively. Historical eligibility requires positive per-row proof that ownership was
+untouched. Migration dates and null reassignment fields cannot provide this:
+a long-lived writer can retain pre-migration schema metadata and omit evidence.
+No current historical row has a supported certificate, so all historical
+candidates are quarantined for manual review. No migration backfills trust.
+Preview reports this under `quarantined.ownership_unestablished`; old stored
+previews are revalidated and cannot bypass this floor. Synthetic lifecycle
+tests inject explicit test-only per-row evidence to exercise confirmation and
+Undo; that evidence is never available to the production command.
 
 Each correction retains its prior state in the existing per-project clean-up
 batches. Undo is available through Owner actions or `owed tidy --undo=BATCH`
-with the matching project and owner gate. Add `--ids=ID,ID` to restore selected
+with the matching project and verified app or prompt-bound owner gate.
+A terminal confirmation cannot authorize correction Undo. Ordinary clean-up
+Undo retains its existing terminal compatibility. Add `--ids=ID,ID` to restore selected
 commitments; unselected items remain corrected and can be undone later. The
 owner-directed `owed.tidy` action accepts the same selection as an `ids` list
 alongside `project` and `batch`. Later edits are left alone.
@@ -61,3 +64,14 @@ marks quiet rows, and excludes them from its active Blocking filter.
 
 See the [fix verification record](research/2026-10-26-owed-origin-fix-verification.md)
 for regression evidence and the remaining rendered-verification limitation.
+
+Machine entrypoints never count as owner turns, even when older configuration
+lists them as trusted. Authorization-setting changes (including their Undo)
+require the verified app or an already eligible, recent owner prompt; terminal
+confirmation cannot widen the window or grant trust.
+
+If the correction COMMIT reply is lost, the action reconciles against the
+durable request and retains its exact batch IDs. A confirmation retry returns
+those IDs without changing rows again. An unavailable outcome stays
+unconfirmed, and Undo waits for durable resolution. A confirmed rollback is
+reported as failed rather than an applied correction.

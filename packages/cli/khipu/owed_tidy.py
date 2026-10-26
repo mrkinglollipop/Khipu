@@ -771,17 +771,27 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 if {int(r[0]) for r in cur.fetchall()} != set(selected):
                     return {"ok": False, "restored": 0, "batch": batch,
                             "error": "ids must name still-applied items in this batch; nothing was changed"}
-            if write_id:
-                from khipu import owner_writes
-
-                if not owner_writes.record_on_hub(cur, "owner_undo", {"write_id": write_id}):
-                    return {"ok": True, "batch": batch, "restored": 0, "already_applied": True}
             project = found[0] or None
             cur.execute("SELECT commitment_id, action, prior, after_fingerprint FROM commitment_tidy_items "
                         "WHERE batch_id = %s AND undone_at IS NULL ORDER BY commitment_id", (batch,))
             entries = [(int(c), a, p if isinstance(p, dict) else json.loads(p), fp) for c, a, p, fp in cur.fetchall()]
             if selected is not None:
                 entries = [entry for entry in entries if entry[0] in selected]
+            if any("origin_correction_stamp" in prior for _, _, prior, _ in entries):
+                if owner_gate not in ("app", "direction"):
+                    from khipu import routing
+                    if owner_gate is None and routing._caller()["app"]:
+                        owner_gate = "app"
+                    else:
+                        return {"ok": False, "restored": 0, "batch": batch,
+                                "needs_owner": [cid for cid, _, _, _ in entries],
+                                "code": "owner_confirmation_required",
+                                "error": "Correction Undo requires verified app or prompt-bound owner direction"}
+            if write_id:
+                from khipu import owner_writes
+
+                if not owner_writes.record_on_hub(cur, "owner_undo", {"write_id": write_id}):
+                    return {"ok": True, "batch": batch, "restored": 0, "already_applied": True}
             rows = _select(cur, project, ids=[e[0] for e in entries], lock=True)
             left_alone, todo = [], []
             for cid, action, prior, fp in entries:
