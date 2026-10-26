@@ -387,14 +387,23 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
 
 
 def _forget_list() -> dict:
-    from khipu import forget
+    from khipu import forget, owner_direction
 
-    return forget.unsent_forgets()
+    out = forget.unsent_forgets()
+    try:
+        # The summary is a forgotten episode's text: only the owner's own
+        # conversation, choosing forget.here or forget.not_same, may see it.
+        owner_direction.check("forget.here")
+    except Exception:  # noqa: BLE001 - any doubt keeps the text back
+        out = dict(out, ids=[{"id": item.get("id")} for item in out.get("ids") or []])
+    return out
 
 
-# Actions that only read, answered without the owner-direction check: the
-# forgets this Mac holds that the hub lacks (design 6.2), each bare id with
-# its hub summary, so the owner can choose forget.here or forget.not_same.
+# Actions that only read, answered without refusing: the forgets this Mac
+# holds that the hub lacks (design 6.2), each bare id, with its hub summary
+# only when the owner-direction check passes, so the owner can choose
+# forget.here or forget.not_same. The app reads its list through
+# ``khipu episode forget-pending`` instead.
 _READS = {"forget.list": _forget_list}
 
 
