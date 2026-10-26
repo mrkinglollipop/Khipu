@@ -240,11 +240,22 @@ def parent_session_id(env: dict, osenv: dict | None = None, *, harness: str = ""
     host_id = (osenv.get("CLAUDE_CODE_HOST_SESSION_ID") or "").strip()
     if host_id and host_id != sid:
         return f"claude_code:{host_id}"
-    return str(_get(
+    return canonical_session_ref(str(_get(
         env, "parentSessionId", "parent_session_id",
         "agentSessionId", "agent_session_id", "parentId", "parent_id",
         default="",
-    ) or "")
+    ) or ""), harness)
+
+
+def canonical_session_ref(value: str, harness: str) -> str:
+    """A session id in the form episodes store it (``<harness>:<native id>``,
+    as ``drain`` writes ``session_id``), so lineage matches the parent's own
+    episode exactly. A hook payload names the parent by its native id; one
+    already namespaced by a capture harness is kept as it is."""
+    value = (value or "").strip()
+    if not value or not harness or value.split(":", 1)[0] in HARNESSES:
+        return value
+    return f"{harness}:{value}"
 
 
 def capture_origin(env: dict, osenv: dict | None = None, *, harness: str = "", sid: str = "") -> str:
@@ -882,8 +893,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             stats.update(skip_to=items[replay_end - 1][3], skip_prefix=checkpoints[replay_end - 1])
     items = items[replay_end:]
     checkpoints = checkpoints[replay_end:]
-    last_user_counted = False   # the open user block already holds a real turn
-    head_open = True            # every message so far was an already-seen copy
+    entries: list[tuple[dict, str, str, int, Any, bool, bool, str | None]] = []
     for (d, role, text, line_end), checkpoint in zip(items, checkpoints):
         real = False
         if role == "user":
@@ -894,24 +904,51 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             real = stand_in is None
             if stand_in is not None:
                 text = stand_in
+        streamed = isinstance(d.get("params"), dict)
+        # ACP chunks are fragments of one message (" the", "\n"), never whole
+        # messages, so they are not fingerprinted; nor are tool markers.
+        fp = (text_fingerprint(role, text) if known is not None and role != "tool" and not streamed
+              and len(text) >= FINGERPRINT_MIN_CHARS else None)
+        entries.append((d, role, text, line_end, checkpoint, real, streamed, fp))
+    # A re-emission copies a run of messages; a person repeating an earlier
+    # instruction writes one, and a new answer follows it. So the person's
+    # own message (a real user turn) whose fingerprint was seen is dropped
+    # only when the fingerprinted message next to it (before or after) was
+    # seen too: a proven copied run, never a lone repeat. A seen assistant
+    # reply or machine notification is a copy on its own.
+    seen_flags: dict[int, bool] = {}
+    if known is not None:
+        running = set(known)
+        for i, entry in enumerate(entries):
+            if entry[7] is not None:
+                seen_flags[i] = entry[7] in running
+                running.add(entry[7])
+    printed = sorted(seen_flags)
+    copied: set[int] = set()
+    for pos, i in enumerate(printed):
+        if not seen_flags[i]:
+            continue
+        neighbours = [printed[p] for p in (pos - 1, pos + 1) if 0 <= p < len(printed)]
+        if not entries[i][5] or any(seen_flags[n] for n in neighbours):
+            copied.add(i)
+    last_user_counted = False   # the open user block already holds a real turn
+    head_open = True            # every message so far was an already-seen copy
+    for i, (d, role, text, line_end, checkpoint, real, streamed, fp) in enumerate(entries):
         if role == "tool":
             msgs.append(("tool", text))
             head_open = False
             continue
-        streamed = isinstance(d.get("params"), dict)
-        if known is not None and not streamed and len(text) >= FINGERPRINT_MIN_CHARS:
-            # ACP chunks are fragments of one message (" the", "\n"), never
-            # whole messages, so they are not fingerprinted.
-            fp = text_fingerprint(role, text)
-            if fp in known:
+        if fp is not None:
+            if i in copied:
                 dropped += 1
                 dropped_chars += len(text)
                 if head_open and stats is not None:
                     stats["skip_to"] = line_end
                     stats["skip_prefix"] = checkpoint
                 continue
-            known.add(fp)
-            fresh.append(fp)
+            if fp not in known:
+                known.add(fp)
+                fresh.append(fp)
         if head_open and d.get("isCompactSummary") and stats is not None:
             # Claude Code's own summary sits ahead of the copies it re-emits;
             # it leaves the head open and rides along (``carry``) when the
@@ -936,13 +973,59 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     return msgs, end, users
 
 
+# The bytes either side of a checkpoint that must still be there for its
+# offset to mean anything: the file's start and the run just before the offset.
+ANCHOR_BYTES = 64 * 1024
+
+
+def _transcript_anchor(path: Path, offset: int) -> str | None:
+    """A digest of the transcript's first and last ``ANCHOR_BYTES`` before
+    ``offset``, or None when they cannot be read (or the file is shorter)."""
+    span = min(int(offset), ANCHOR_BYTES)
+    try:
+        with path.open("rb") as f:
+            head = f.read(span)
+            f.seek(max(0, int(offset) - ANCHOR_BYTES))
+            tail = f.read(span)
+    except OSError:
+        return None
+    if len(head) < span or len(tail) < span:
+        return None
+    return hashlib.sha256(b"%d\0" % int(offset) + head + b"\0" + tail).hexdigest()
+
+
+def _record_anchor(st: dict) -> None:
+    """Remember what the transcript holds before the saved offset, so a file
+    rewritten in place (same path, same inode, a size at least the offset)
+    is recognised as new content instead of read on from the old offset."""
+    path, offset = st.get("transcript_path"), int(st.get("offset", 0) or 0)
+    held = st.get("transcript_anchor")
+    if not path or offset <= 0:
+        st.pop("transcript_anchor", None)
+        return
+    if isinstance(held, dict) and held.get("offset") == offset:
+        return
+    digest = _transcript_anchor(Path(path), offset)
+    if digest is None:
+        st.pop("transcript_anchor", None)
+    else:
+        st["transcript_anchor"] = {"offset": offset, "digest": digest}
+
+
 def _reset_transcript_offset(st: dict, path: Path) -> None:
-    """Byte offsets belong to a particular file, unlike text fingerprints."""
+    """Byte offsets belong to a particular file, unlike text fingerprints,
+    and to the content it held when the offset was saved: a rewrite in place
+    keeps the path, the inode and possibly the size, so the bytes before the
+    offset are checked too (``transcript_anchor``)."""
     info = path.stat()
     identity = [info.st_dev, info.st_ino]
+    anchor = st.get("transcript_anchor")
+    offset = int(st.get("offset", 0))
+    rewritten = (isinstance(anchor, dict) and anchor.get("offset") == offset and offset > 0
+                 and offset <= info.st_size and _transcript_anchor(path, offset) != anchor.get("digest"))
     reset = ((st.get("transcript_path") and st["transcript_path"] != str(path))
             or st.get("transcript_identity") not in (None, identity)
-            or int(st.get("offset", 0)) > info.st_size)
+            or offset > info.st_size or rewritten)
     if (not reset and not st.get("transcript_prefix") and not st.get("replay_prefix")
             and int(st.get("offset", 0)) > 0 and st.get("transcript_identity") == identity):
         # Upgrade existing offsets while the original file is still present.
@@ -959,6 +1042,7 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
             [st.get("transcript_generation"), identity, str(path)],
             separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
         st["offset"] = 0
+        st.pop("transcript_anchor", None)
         if st.get("transcript_prefix"):
             st["replay_prefix"] = st.pop("transcript_prefix")
         st.pop("carry", None)
@@ -1044,6 +1128,7 @@ def load_state(harness: str, sid: str) -> dict:
 
 
 def save_state(harness: str, sid: str, st: dict, *, preserve_mtime: bool = False) -> None:
+    _record_anchor(st)
     p = _state_file(harness, sid)
     p.parent.mkdir(parents=True, exist_ok=True)
     previous = p.stat() if preserve_mtime else None
@@ -2842,7 +2927,7 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                 if session_cwd(env):
                     st["cwd"] = session_cwd(env)
                 st["session_id"] = track_sid if is_subagent_stop else sid
-                st["parent_session_id"] = sid if is_subagent_stop else (
+                st["parent_session_id"] = canonical_session_ref(sid, harness) if is_subagent_stop else (
                     parent_session_id(env, harness=harness, sid=sid) or None)
                 # A subagent is its parent's job; otherwise the session's markers decide.
                 st["origin"] = "job" if is_subagent_stop else capture_origin(
@@ -3298,7 +3383,9 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         payload["project"] = job.get("project")
         if job.get("checkout"):
             payload["checkout"] = job["checkout"]
-        payload["parent_session_id"] = job.get("parent_session_id")
+        # A job queued before lineage was namespaced carries the native id.
+        payload["parent_session_id"] = canonical_session_ref(job.get("parent_session_id") or "",
+                                                             harness) or None
         if _job_origin(job) == "job" and not job.get("parent_session_id"):
             # Not `origin`: that key is the episode's server-stamped owner and
             # capture drops it from every payload.
