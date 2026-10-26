@@ -1707,6 +1707,8 @@ _COMMON_FIELDS: dict[str, Any] = {
     "base": "revision_id", "proposal": "id", "op": "id", "revision": "revision_id",
     "written_at": "time", "via": "via", "kind": _KIND_CODES,
     "expires_at": "time",
+    # A restore's lines (``_write_batch``): counted only when all are present.
+    "batch": "id", "batch_n": "int",
 }
 _OBSERVATION_FIELDS: dict[str, Any] = {
     "account": "account", "runner": "name", "lane": "name",
@@ -2189,10 +2191,11 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "owner_request", "prior_text", "auth", "auth_chain", "txn", "list_before", "list_after",
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
                 "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
-                "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal")
+                "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal", "batch")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at")
-_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err")
+_WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",
+                 "batch_n")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
                   "observed", "observed_turn", "session_logs", "silent", "unmatched")
@@ -2606,6 +2609,13 @@ def _split_txns(events: list[dict], held: str | None = None) -> tuple[list[dict]
     if held is not None:
         done |= {t for t, b in begun.items() if t not in ends and b.get("list_after") == held}
     kept = [e for e in events if e.get("type") != ACCOUNT_TXN and (e.get("txn") is None or e["txn"] in done)]
+    # A restore batch (``_write_batch``) counts only when all its lines are
+    # down: a short write leaves none of it in effect.
+    sizes: dict[str, int] = {}
+    for e in kept:
+        if e.get("batch"):
+            sizes[e["batch"]] = sizes.get(e["batch"], 0) + 1
+    kept = [e for e in kept if not e.get("batch") or sizes[e["batch"]] == e.get("batch_n")]
     open_ = [(b, [e for e in events if e.get("txn") == t and e.get("type") != ACCOUNT_TXN])
              for t, b in begun.items() if t not in ends]
     for i, event in enumerate(kept):
@@ -6058,6 +6068,33 @@ def _operation_body(event: dict) -> dict:
     return body
 
 
+def _write_batch(events: list[dict]) -> tuple[list[dict], dict]:
+    """Append a restore's lines as one batch: each carries the batch's id and
+    size, and readers count them only when every line is present
+    (``_split_txns``), so a short write leaves the record as it was, never
+    half restored. A retry of the same restore (the first line's op) that
+    finds a complete earlier attempt returns it; one that finds only a
+    partial attempt writes a new, complete one under fresh ops."""
+    events = [dict(e) for e in events]
+    if len(events) < 2:
+        return _write_many(events)
+    base = events[0].get("op") or _OP.get()
+    with _lock():
+        if base:
+            attempts: dict[str, list[dict]] = {}
+            for row in _read_all_events(author_check=False)[0]:
+                if row.get("batch") and str(row.get("op") or "").startswith(f"{base}:"):
+                    attempts.setdefault(row["batch"], []).append(row)
+            done = next((rows for rows in attempts.values() if len(rows) == rows[0].get("batch_n")), None)
+            if done is not None:
+                return ([{k: v for k, v in r.items() if not k.startswith("_")} for r in done], read_view())
+        batch = event_identity.uuid7()
+        for i, event in enumerate(events):
+            event.update(batch=batch, batch_n=len(events),
+                         op=f"{base}:{batch}:{i}" if base else f"{batch}:{i}")
+        return _write_many(events)
+
+
 def _write_many(events: list[dict]) -> tuple[list[dict], dict]:
     """Append one outcome's events atomically and refold.
 
@@ -6800,14 +6837,20 @@ def pending_rule_line(entity: str) -> dict | None:
     """The stored line of a rule's pending conversation edit (its words,
     the owner's words it would replace, its author and the request), for an
     undo to put back as that conversation's; None for a proposed addition or
-    when there is none."""
-    events, _bad = read_events()
-    rows = [e for e in _in_write_order(events)
-            if e.get("type") == "rule_edit" and e.get("pending") and event_identity.entity(e) == entity]
-    if not rows:
+    when there is none. The line is the rule's live proposal, found by its
+    proposal id: a later request that was crossed or replaced never stands
+    in for it."""
+    live = next((key for key, p in (read_view().get("proposals") or {}).items()
+                 if p.get("kind") == "rule" and p.get("entity") == entity and p.get("status") == "live"), None)
+    if live is None:
         return None
-    last = rows[-1]
-    return {k: last.get(k) for k in ("text", "prior_text", "prior_confirmed", "owner_request", "written_by", "via")}
+    events, _bad = read_events()
+    rows = [e for e in events if e.get("type") == "rule_edit" and e.get("pending")
+            and event_identity.entity(e) == entity and (e.get("proposal") or e.get("id")) == live]
+    if len(rows) != 1:
+        return None
+    line = rows[0]
+    return {k: line.get(k) for k in ("text", "prior_text", "prior_confirmed", "owner_request", "written_by", "via")}
 
 
 def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = None,
@@ -6846,7 +6889,7 @@ def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = N
                          if isinstance(request.get("prior_confirmed"), bool) else {}),
                       "owner_request": request.get("owner_request") or "the owner requested this change",
                       "written_by": dict(author), "via": request.get("via") or "mcp"})
-        written, view = _write_many(lines)
+        written, view = _write_batch(lines)
     return dict(_done(written[-1], view), n=number)
 
 
@@ -6982,7 +7025,7 @@ def restore_cap_layers(account: str, *, window: str | None, kind: str, purpose: 
                                      n=cap.get("n"), revision=cap.get("revision"),
                                      purpose=cap.get("purpose", purpose), tier=cap.get("tier"),
                                      sensitive_only=cap.get("sensitive_only"), until=cap.get("until"), now=now))
-    written, view = _write_many(owner_lines(events, via))
+    written, view = _write_batch(owner_lines(events, via))
     return dict(_done(written[-1], view), account=key)
 
 
@@ -7396,7 +7439,7 @@ def restore_priority(stored: dict, *, via: str, holds: dict | None = None, now: 
             base = {"type": "priority_clear"}
         request = {"type": "priority_set", "entries": rows, "until": stored.get("until"), "pending": True,
                    "owner_request": words, "written_by": dict(author), "via": stored.get("via") or "mcp"}
-        written, view = _write_many([*owner_lines([base], via), request])
+        written, view = _write_batch([*owner_lines([base], via), request])
         return _done(written[-1], view)
 
 

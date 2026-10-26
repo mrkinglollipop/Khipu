@@ -1095,7 +1095,10 @@ def _before(want: dict):
         return {"text": note["text"] if note else None}
     if action in ("route.rule.edit", "route.rule.undo", "route.rule.retire", "route.rule.dismiss"):
         rule = _rule_now(target)
+        # ``provenance``: this snapshot says whose words it holds; an undo of
+        # one without it checks the record first (``_legacy_rule_check``).
         out = {"text": rule.get("text")} if action in ("route.rule.edit", "route.rule.undo") else {}
+        out["provenance"] = 1
         if rule.get("pending"):
             # A conversation's pending proposal: its stored line, so undo
             # puts it back as that conversation's, never as the owner's words.
@@ -1120,7 +1123,7 @@ def _before(want: dict):
             return None
         return {"text": hold.get("text"), "reason": hold.get("reason"), "scope": hold.get("scope"),
                 "until": hold.get("until"), "owner": bool(hold.get("owner")), "written_by": hold.get("written_by"),
-                "via": hold.get("via")}
+                "via": hold.get("via"), "provenance": 1}
     if action.startswith("route.priority."):
         # The stored line, never the folded view: undo puts back entries the
         # view leaves out, and an entry whose end has passed since never
@@ -1128,9 +1131,9 @@ def _before(want: dict):
         # words and the priority it replaced, so undo returns it pending.
         stored = routing.read_view().get("priority_stored")
         if not stored:
-            return {"entries": None, "until": None, "stored": True}
+            return {"entries": None, "until": None, "stored": True, "provenance": 1}
         return {**{k: stored.get(k) for k in ("until", "pending", "written_by", "via", "owner_request", "replaced")},
-                "entries": [dict(e) for e in stored["entries"]], "stored": True}
+                "entries": [dict(e) for e in stored["entries"]], "stored": True, "provenance": 1}
     if action.startswith("route.tier_table."):
         held = routing.read_view().get("tier_table")
         return {"tiers": dict(held["tiers"]) if held else None}
@@ -1304,12 +1307,23 @@ def _undo_pause(line, via):
 def _undo_hold_end(line, via):
     from khipu import routing
 
-    before = line.get("before") or {}
+    before = dict(line.get("before") or {})
+    if not before.get("provenance"):
+        # Saved before holds kept their author: take it from the hold's own
+        # line, or refuse when that line can't be found for certain.
+        events, _bad = routing.read_events()
+        from khipu import routing_events as event_identity
+
+        made = [e for e in events if e.get("type") == "hold"
+                and line["target"] in (e.get("entity"), e.get("id"), event_identity.entity(e))]
+        if len(made) != 1:
+            raise ValueError(LEGACY_PROVENANCE)
+        before.update(owner=bool(made[0].get("owner")), written_by=made[0].get("written_by"),
+                      via=made[0].get("via"))
     scope = before.get("scope") or {}
     kind = scope.get("kind")
     # A conversation's hold comes back as that conversation's (its limits
-    # included); only the owner's own hold comes back as his. A line from
-    # before authors were kept keeps the old behaviour.
+    # included); only the owner's own hold comes back as his.
     author = before.get("written_by")
     if "owner" in before and not before["owner"]:
         if not isinstance(author, dict) or author.get("kind") != "conversation":
@@ -1493,6 +1507,7 @@ def _undo_note_end(line, via):
 def _undo_rule_words(line, via, holds=None):
     from khipu import routing
 
+    _legacy_rule_check(line)
     back = _pending_rule_back(line, via, holds)
     if back is not None:
         return back
@@ -1507,6 +1522,58 @@ def _retire_rule(n_of):
 
         return routing.retire_rule(n_of(line), via=via)
     return run
+
+
+LEGACY_PROVENANCE = "this change was saved before Khipu recorded who wrote it; set it again instead"
+
+
+def _action_index(line: dict, events: list[dict]) -> int | None:
+    """Where the action's own routing line sits in ``events``, by the id its
+    result recorded or the op it was written under; None when neither is
+    found (or more than one line claims it)."""
+    written = (line.get("after") or {}).get("id")
+    found = [i for i, e in enumerate(events)
+             if (written and e.get("id") == written) or (line.get("id") and e.get("op") == line.get("id"))]
+    return found[0] if len(set(found)) == 1 else None
+
+
+def _owners_before(line: dict, mine, settles) -> None:
+    """For an undo whose snapshot predates provenance: refuse unless the
+    record shows that what the snapshot holds was the owner's. Walking back
+    from the action's own line over the lines ``mine`` selects, a pending
+    (conversation) line met before one that ``settles`` the state means the
+    snapshot may hold a conversation's words; so does not finding the line."""
+    from khipu import routing
+
+    events, _bad = routing.read_events()
+    at = _action_index(line, events)
+    if at is None:
+        raise ValueError(LEGACY_PROVENANCE)
+    for event in reversed(events[:at]):
+        if not mine(event):
+            continue
+        if event.get("pending") or (event.get("written_by") or {}).get("kind") not in (None, "owner"):
+            raise ValueError(LEGACY_PROVENANCE)
+        if settles(event):
+            return
+
+
+_PRIORITY_LINES = ("priority_set", "priority_confirm", "priority_undo", "priority_clear", "priority_drop")
+_RULE_SETTLES = ("rule_add", "rule_edit", "rule_confirm", "rule_undo", "rule_dismiss", "rule_retire", "rule_restore")
+
+
+def _legacy_rule_check(line: dict) -> None:
+    from khipu import routing
+    from khipu import routing_events as event_identity
+
+    if _b(line).get("provenance"):
+        return
+    try:
+        entity, _n = routing.rule_reference(line["target"])
+    except routing.RouteError:
+        raise ValueError(LEGACY_PROVENANCE) from None
+    _owners_before(line, lambda e: str(e.get("type", "")).startswith("rule_") and event_identity.entity(e) == entity,
+                   lambda e: e.get("type") in _RULE_SETTLES)
 
 
 def _pending_rule_back(line, via, holds):
@@ -1530,6 +1597,7 @@ def _pending_rule_back(line, via, holds):
 def _undo_restore_rule(line, via, holds=None):
     from khipu import routing
 
+    _legacy_rule_check(line)
     back = _pending_rule_back(line, via, holds)
     if back is not None:
         return back
@@ -1571,6 +1639,12 @@ def _undo_priority(line, via, holds=None):
     from khipu import routing
 
     before = _b(line)
+    if not before.get("provenance") and line["action"] != "route.priority.confirm":
+        # A snapshot from before provenance was kept: restore it as the
+        # owner's only when the record shows the priority it holds was his.
+        # (An old confirm's snapshot is the owner's priority it replaced.)
+        _owners_before(line, lambda e: e.get("type") in _PRIORITY_LINES,
+                       lambda e: e.get("type") in _PRIORITY_LINES)
     if before.get("stored") and before.get("entries"):
         return routing.restore_priority(before, via=via, holds=_undo_holds(line, holds))
     return _set_priority_back(before, via, _undo_holds(line, holds),
