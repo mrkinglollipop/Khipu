@@ -151,3 +151,73 @@ protected conftest still has blob `c0d94190f0bd708671c42028b3f40d037fdad13a`.
 No command set TMPDIR. No live database or service, real Khipu configuration,
 real Documents directory, API Keys or portfolio data was accessed. No rendered
 verification, push, release or deployment was performed in this fix round.
+
+## Astra third recheck: forgotten request wording (2026-10-26)
+
+Baseline: `b5975601`. The recheck's sole open source finding was the pending
+request reader returning stored wording after an episode had been forgotten.
+This round changes only the correction reader/storage, its hub-forget cleanup,
+the focused regressions, and these two existing documentation files.
+
+- Pending request previews are reconstructed from currently visible rows with
+  matching row and proposal hashes. Their samples and counts are rebuilt;
+  legacy display fields, cached wording, and unknown fields are never echoed.
+  Missing or changed provenance excludes the item. An unavailable check returns
+  a generic error with no requests and no exception payload.
+- New durable requests contain only IDs and row/proposal hashes. Confirmation
+  retains exact-review binding for both legacy and reference-only requests.
+- Hub forgetting strips wording from legacy pending and applied requests in
+  the same transaction. Confirmation acquires its witness-table locks before
+  its request lock, matching forgetting's order. A missing request table is
+  optional on old schemas; an existing malformed table fails the forget.
+- Regression coverage inspects correction/Undo results, stored request and
+  Undo records, owner-action records, and captured output after forgetting.
+  Correction Undo does not restore the forgotten item.
+
+Evidence is under `/tmp/.codex_origin_r4_evidence/`:
+
+- `red.log`: **11 failed** on unchanged production code, including the exact
+  legacy-preview disclosure, surviving-witness reprojection, retained request
+  wording, malformed legacy documents, and unavailable visibility checks.
+- `green.log`: **51 passed**, covering the initial eleven regressions, the
+  correction lifecycle, preview paths, and the original forget unit tests.
+- An independent read-only Astra review found a stale absent-table schema
+  cache could bypass legacy cleanup across migration 0049. `cache-red.log`
+  reproduces that additional regression (**1 failed**) before the readiness
+  repair. Scrubbing now refreshes missing-table discovery through `has_table`.
+  The review otherwise supported the preview/storage and lock-order changes;
+  `independent-review.md` records its coverage and the root response.
+- Exact hermetic commands are retained alongside each log, including
+  `root-command.txt` and the 48-file list in `root-selectors.json`. All runs
+  use disposable HOME/cache paths and the existing conftest with a direct
+  local subprocess timeout of 600 seconds. No command supplied TMPDIR.
+
+The initial implementation worker returned a model-capacity error before doing
+any work. Root performed the repair; the separate reviewer made no edits and
+ran no tests. No routing service lookup was attempted under the no-services
+constraint. The protected conftest remains blob
+`c0d94190f0bd708671c42028b3f40d037fdad13a`. No real service, live database,
+real user configuration, Documents, API Keys, or portfolio data was accessed.
+Rendered quiet-work verification remains unverified from the earlier round;
+this round makes no UI changes.
+
+### Third recheck root integration result
+
+The final direct hermetic gate passed all 48 selected files:
+
+```text
+915 passed, 11 skipped, 10 subtests passed in 236.70s (0:03:56)
+```
+
+`root.log` contains the successful exit result. The twelve new regressions
+all passed on the final source, including the stale-table-cache repair. The
+initial eleven cases used three runs (RED, focused GREEN, final root); the
+additional cache case used two (its RED node and final root). Other focused
+GREEN files used two runs; the remaining root selectors used one. No oracle
+was repeated after the final gate, and no production source changed afterward.
+The selected scope covers all Owed tests, owner-direction/owner-turn tests,
+owner Undo/audit tests, forget regressions, capture/embed forget serialization,
+and the Owed MCP adapter. This was not the entire repository test suite.
+
+Final scope review and `git diff --check` passed. The change is committed
+locally with the Codex co-author trailer; no push or deployment was performed.

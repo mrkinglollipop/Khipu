@@ -15,7 +15,12 @@ recovery while retaining the configured values.
 `khipu owed correct-job-origin --request` stores that preview as a pending
 request. The CLI with `--owner-direction`, and MCP `khipu_owner_act` action
 `owed.correct_job_origin` with optional `project`, request it without applying it.
-`--requests` reads pending previews.
+`--requests` reads pending previews. Requests retain only item IDs and hashes
+of the reviewed row and proposal. Displayed wording, samples, and counts are
+rebuilt from currently visible, unchanged rows with the same eligible
+provenance. Legacy stored wording and extra fields are never returned. An
+unavailable visibility check returns an empty error result. Forgetting also
+strips wording from legacy request records, including already applied ones.
 
 The owner confirms from a recent, recorded owner prompt with
 `khipu owed correct-job-origin --confirm=REQUEST --owner-direction`, or MCP

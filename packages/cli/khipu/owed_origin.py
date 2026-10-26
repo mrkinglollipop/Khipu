@@ -102,11 +102,87 @@ def _fingerprint(row):
     return hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()
 
 
+def _request_references(doc):
+    """Keep exact review bindings without retaining wording or display metadata."""
+    entries = doc.get("items") if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        return []
+    refs, seen = [], set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        cid, fingerprint = entry.get("id"), entry.get("fingerprint")
+        if type(cid) is not int or cid <= 0 or cid in seen:
+            continue
+        proposal = entry.get("proposal_fingerprint")
+        if proposal is None and isinstance(entry.get("after"), dict):
+            proposal = _fingerprint(entry["after"])
+        if any(not isinstance(value, str) or len(value) != 64
+               or any(char not in "0123456789abcdef" for char in value)
+               for value in (fingerprint, proposal)):
+            continue
+        seen.add(cid)
+        refs.append({"id": cid, "fingerprint": fingerprint, "proposal_fingerprint": proposal})
+    return refs
+
+
+def _request_document(doc):
+    return {"format": "khipu-job-origin-preview", "version": 2,
+            "items": _request_references(doc)}
+
+
+def scrub_request_previews(cur):
+    """Forget also removes wording from pre-reference request records."""
+    from khipu.db import has_columns, has_table
+
+    if not has_table(cur, "commitment_origin_requests"):
+        return
+    if not has_columns(cur, "commitment_origin_requests", "id", "preview"):
+        raise ValueError("Job-origin request records cannot be safely scrubbed")
+    cur.execute("SELECT id, preview FROM commitment_origin_requests ORDER BY id FOR UPDATE")
+    for rid, doc in cur.fetchall():
+        safe = _request_document(doc)
+        if doc != safe:
+            cur.execute("UPDATE commitment_origin_requests SET preview = %s::jsonb WHERE id = %s",
+                        (json.dumps(safe), rid))
+
+
+def _preview_document(items, unestablished=0):
+    kinds, projects = {}, {}
+    for item in items:
+        kind, project = item["kind"], item.get("project") or ""
+        kinds[kind] = kinds.get(kind, 0) + 1
+        projects[project] = projects.get(project, 0) + 1
+    return {"format": "khipu-job-origin-preview", "version": 1,
+            "counts": {"total": len(items), "by_kind": kinds, "by_project": projects},
+            "quarantined": {"ownership_unestablished": unestablished},
+            "sample": items[:20], "items": items}
+
+
+def _preview_item(row, after):
+    return {"id": row["id"], "project": row.get("project"), "kind": row["kind"],
+            "text": row["text"], "after": after, "fingerprint": _fingerprint(row)}
+
+
+def _pending_preview(cur, doc):
+    refs = _request_references(doc)
+    rows = {row["id"]: row for row in _rows(cur, ids=[ref["id"] for ref in refs])} if refs else {}
+    items = []
+    for ref in refs:
+        row = rows.get(ref["id"])
+        if row is None or _fingerprint(row) != ref["fingerprint"]:
+            continue
+        after = _proposal(row)
+        if after is not None and _fingerprint(after) == ref["proposal_fingerprint"]:
+            items.append(_preview_item(row, after))
+    return _preview_document(items)
+
+
 def preview(cur, project=None):
     from khipu.config import read_only_config
 
     with read_only_config():
-        items, kinds, projects, unestablished = [], {}, {}, 0
+        items, unestablished = [], 0
         for row in _rows(cur, project):
             opened = co._as_utc(row.get("opened_at"))
             floor = co._as_utc(row.get("ownership_floor"))
@@ -115,20 +191,15 @@ def preview(cur, project=None):
             after = _proposal(row)
             if after is None:
                 continue
-            kind, name = row["kind"], row.get("project") or ""
-            kinds[kind] = kinds.get(kind, 0) + 1
-            projects[name] = projects.get(name, 0) + 1
-            items.append({"id": row["id"], "project": row.get("project"), "kind": kind,
-                          "text": row["text"], "after": after, "fingerprint": _fingerprint(row)})
-        return {"format": "khipu-job-origin-preview", "version": 1,
-                "counts": {"total": len(items), "by_kind": kinds, "by_project": projects},
-                "quarantined": {"ownership_unestablished": unestablished},
-                "sample": items[:20], "items": items}
+            items.append(_preview_item(row, after))
+        return _preview_document(items, unestablished)
 
 
 def _confirm(cur, request_id, gate):
     if gate not in ("app", "direction"):
         raise ValueError("Only verified app or prompt-bound owner authorization can apply a correction")
+    # Forget locks episodes before scrubbing legacy request records.
+    cur.execute("LOCK TABLE episodes, fact_claims, schema_migrations IN SHARE MODE")
     cur.execute("SELECT state, preview, result FROM commitment_origin_requests WHERE id = %s FOR UPDATE",
                 (request_id,))
     found = cur.fetchone()
@@ -144,21 +215,22 @@ def _confirm(cur, request_id, gate):
             return {**result, "changed": 0, "already_applied": True}
         return {"ok": False, "state": state, "changed": 0,
                 "error": "The request has no recoverable applied result; nothing was changed"}
-    planned = {it["id"]: it for it in doc["items"]}
+    planned = {it["id"]: it for it in _request_references(doc)}
     # Freeze lineage, claim and migration witnesses while rechecking and
     # writing. These locks precede the commitment locks, as forget does.
-    cur.execute("LOCK TABLE episodes, fact_claims, schema_migrations IN SHARE MODE")
     rows = {r["id"]: r for r in _rows(cur, ids=list(planned), lock=True)}
     live, skipped = [], []
     for cid, item in planned.items():
         row = rows.get(cid)
-        if row is None or _proposal(row) != item["after"] or _fingerprint(row) != item["fingerprint"]:
+        after = _proposal(row) if row is not None else None
+        if (after is None or _fingerprint(after) != item["proposal_fingerprint"]
+                or _fingerprint(row) != item["fingerprint"]):
             skipped.append(cid)
         else:
             live.append(cid)
 
     def change(cid):
-        after = planned[cid]["after"]
+        after = _proposal(rows[cid])
         cur.execute("UPDATE commitments SET origin = 'job' WHERE id = %s", (cid,))
         return co.reassign(cur, cid, after["owner"], after["owner_label"],
                            by="job-origin correction", reason="Opening capture and all witnesses prove job lineage")
@@ -202,8 +274,14 @@ def command(args):
                 if args.confirm:
                     out = _confirm(cur, args.confirm, gate)
                 elif args.requests:
+                    cur.execute("SET TRANSACTION READ ONLY")
                     cur.execute("SELECT id, preview FROM commitment_origin_requests WHERE state = 'pending' ORDER BY requested_at")
-                    out = {"ok": True, "requests": [{"request": rid, **doc} for rid, doc in cur.fetchall()]}
+                    stored = cur.fetchall()
+                    from khipu.config import read_only_config
+
+                    with read_only_config():
+                        out = {"ok": True, "requests": [
+                            {"request": rid, **_pending_preview(cur, doc)} for rid, doc in stored]}
                 else:
                     if not args.request:
                         cur.execute("SET TRANSACTION READ ONLY")
@@ -211,8 +289,16 @@ def command(args):
                     if args.request:
                         rid = "origin-" + secrets.token_hex(12)
                         cur.execute("INSERT INTO commitment_origin_requests (id, preview) VALUES (%s, %s::jsonb)",
-                                    (rid, json.dumps(out, default=str)))
+                                    (rid, json.dumps(_request_document(out))))
                         out = {"ok": True, "request": rid, "state": "pending", **out}
+    except Exception:
+        if args.requests:
+            out = {"ok": False, "code": "visibility_unavailable", "requests": [],
+                   "error": "Pending previews could not be checked against current provenance"}
+        else:
+            if args.confirm:
+                owner_direction._abandon()
+            raise
     except BaseException:
         if args.confirm:
             owner_direction._abandon()
