@@ -2418,14 +2418,19 @@ def _read_beat(harness: str) -> dict:
     try:
         d = json.loads(dispatch_path(harness).read_text(encoding="utf-8"))
         return d if isinstance(d, dict) else {}
-    except (OSError, ValueError):
+    except OSError:
         pass
+    except ValueError:
+        # Corrupt on-disk beat must not look like "hook never ran" to liveness.
+        return {"_heartbeat_unreadable": True}
     if harness == "aegis":   # heartbeat layout before 2026-08-17 pm: one file, Aegis only
         try:
             d = json.loads((khipu_home() / "last-dispatch.json").read_text(encoding="utf-8"))
             return d if isinstance(d, dict) else {}
-        except (OSError, ValueError):
+        except OSError:
             pass
+        except ValueError:
+            return {"_heartbeat_unreadable": True}
     return {}
 
 
@@ -3550,6 +3555,10 @@ def liveness(harness: str) -> dict:
     q = _queue_by_harness().get(harness, {"depth": 0, "dead_claims": 0,
                                                  "oldest_age_s": None, "oldest_job": None})
     reasons: list[str] = []
+    if beat.get("_heartbeat_unreadable"):
+        return {"harness": harness, "ok": False, "seen": True,
+                "reasons": ["heartbeat unreadable"], "warnings": [],
+                "queue_depth": q["depth"], "queue_oldest_age_s": q.get("oldest_age_s")}
     if not beat:
         return {"harness": harness, "ok": True, "seen": False, "reasons": [],
                 "queue_depth": 0, "note": "no real session has run the hook yet"}

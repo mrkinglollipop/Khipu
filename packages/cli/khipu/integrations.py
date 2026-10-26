@@ -1093,6 +1093,10 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
         if not dry:
             out.setdefault("backups", []).append(_backup(rp))
             rp.unlink()
+    # --project only drops the repo rule; global MCP/hooks stay for the
+    # account-wide pack (and for `uninstall cursor` with no --project).
+    if project is not None:
+        return out
     d = _load_json(CURSOR_MCP)
     if "khipu" in d.get("mcpServers", {}):
         out["changes"].append(f"{CURSOR_MCP}: remove mcpServers.khipu")
@@ -1513,6 +1517,17 @@ def _aegis_uninstall(dry: bool) -> dict:
     new2 = _remove_native_aegis_hooks(_AEGIS_HOOK_RE.sub("", new))
     if new2 != new:
         out["changes"].append(f"{AEGIS_TOML}: remove khipu hooks block")
+    # [memory.khipu] is pack-owned. [memory] is Aegis's backend choice — only
+    # strip it when it still equals the block install wrote (leave a user's
+    # own backend / extra keys alone).
+    stripped_khipu = _remove_toml_table(new2, "memory.khipu")
+    if stripped_khipu != new2:
+        out["changes"].append(f"{AEGIS_TOML}: remove [memory.khipu]")
+        new2 = stripped_khipu
+    mem = _AEGIS_MEMORY_RE.search(new2)
+    if mem is not None and mem.group(0).strip() == _aegis_memory_block().strip():
+        new2 = new2[:mem.start()] + new2[mem.end():]
+        out["changes"].append(f"{AEGIS_TOML}: remove [memory] (install-owned)")
     if new2 != text and not dry:
         new2 = new2.rstrip("\n") + "\n"
         _validate_toml(AEGIS_TOML, new2)
