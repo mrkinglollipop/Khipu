@@ -888,6 +888,33 @@ export function IntegrationsPanel({
             for (const v of list) next[v.harness] = v;
             return next;
           });
+          // A failing Verify clears the auto-Verified tag and its Install
+          // timestamp: otherwise the recall-probe effect flips Verified back on.
+          const failed = list.filter((v) => v.ok === false).map((v) => v.harness);
+          if (failed.length) {
+            setAutoVerified((prev) => {
+              let changed = false;
+              const next = { ...prev };
+              for (const h of failed) {
+                if (next[h]) {
+                  next[h] = false;
+                  changed = true;
+                }
+              }
+              return changed ? next : prev;
+            });
+            setInstalledAt((prev) => {
+              let changed = false;
+              const next = { ...prev };
+              for (const h of failed) {
+                if (next[h] != null) {
+                  delete next[h];
+                  changed = true;
+                }
+              }
+              return changed ? next : prev;
+            });
+          }
           return;
         }
         // Uninstall reports a pack that stopped in the JSON, not in the exit code.
