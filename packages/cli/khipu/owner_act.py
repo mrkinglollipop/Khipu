@@ -74,7 +74,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "owed.change": (("ids", "change", "why"), ("to", "label")),
     # The clean-up: ``plan`` (a file from ``khipu owed tidy --plan-out``, shown
     # to the owner first) to apply, or ``batch`` to undo; one, not both.
-    "owed.tidy": (("project",), ("plan", "batch")),
+    "owed.tidy": (("project",), ("plan", "batch", "ids")),
     "owed.correct_job_origin": ((), ("project",)),
     "owed.correct_job_origin.confirm": (("request",), ()),
     "project.alias_add": (("alias", "canonical"), ()),
@@ -354,8 +354,11 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "owed.tidy":
         if ("plan" in v) == ("batch" in v):
             raise _bad("owed.tidy names the plan to apply or the batch to undo, one of the two")
+        if "ids" in v and "batch" not in v:
+            raise _bad("owed.tidy ids select items to undo and require a batch")
         return ["owed", "tidy", *_opts(v, "project"), f"--apply={v['plan']}" if "plan" in v
-                else f"--undo={v['batch']}"], []
+                else f"--undo={v['batch']}", *([f"--ids={','.join(str(c) for c in v['ids'])}"]
+                                             if "ids" in v else [])], []
     if action in ("work.same", "work.not_same"):
         return ["work", verb.replace("_", "-")], [v["row"], v["commitment"]]
     if action.startswith("project."):

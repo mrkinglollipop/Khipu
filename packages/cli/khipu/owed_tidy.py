@@ -728,15 +728,30 @@ def batch_project(batch: str) -> str | None:
     return None if found is None else str(found[0])
 
 
+def _undo_selection(ids: list[int] | None) -> list[int] | None:
+    if ids is None:
+        return None
+    if not isinstance(ids, list) or not ids or any(type(cid) is not int or cid <= 0 for cid in ids):
+        raise ValueError("ids must be a nonempty list of whole numbers above 0")
+    return sorted(set(ids))
+
+
 def undo(batch: str, *, project: str | None = None, owner_gate: str | None = None,
+         ids: list[int] | None = None,
          write_id: str | None = None) -> dict[str, Any]:
     """Undo one applied batch (see the module docstring). With ``project``,
     a batch of another project is refused before anything changes.
     ``owner_gate`` is how the owner gate already passed for this Undo (the
-    owner-actions log's Undo of a bulk change made by direction)."""
+    owner-actions log's Undo of a bulk change made by direction). ``ids``
+    restricts the inverse to selected, still-applied members of this batch;
+    omitted, it retains the whole-batch behavior."""
     from khipu import commitments as co, offline
     from khipu.db import connect
 
+    try:
+        selected = _undo_selection(ids)
+    except ValueError as exc:
+        return {"ok": False, "restored": 0, "error": str(exc) + "; nothing was changed"}
     batch = str(batch or "").strip()
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
@@ -750,6 +765,12 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 return {"ok": False, "restored": 0, "batch": batch, "project": found[0],
                         "error": f"batch {batch!r} is for project {found[0]!r}, not {project!r}; "
                                  "nothing was changed"}
+            if selected is not None:
+                cur.execute("SELECT commitment_id FROM commitment_tidy_items WHERE batch_id = %s "
+                            "AND undone_at IS NULL AND commitment_id = ANY(%s)", (batch, selected))
+                if {int(r[0]) for r in cur.fetchall()} != set(selected):
+                    return {"ok": False, "restored": 0, "batch": batch,
+                            "error": "ids must name still-applied items in this batch; nothing was changed"}
             if write_id:
                 from khipu import owner_writes
 
@@ -759,6 +780,8 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
             cur.execute("SELECT commitment_id, action, prior, after_fingerprint FROM commitment_tidy_items "
                         "WHERE batch_id = %s AND undone_at IS NULL ORDER BY commitment_id", (batch,))
             entries = [(int(c), a, p if isinstance(p, dict) else json.loads(p), fp) for c, a, p, fp in cur.fetchall()]
+            if selected is not None:
+                entries = [entry for entry in entries if entry[0] in selected]
             rows = _select(cur, project, ids=[e[0] for e in entries], lock=True)
             left_alone, todo = [], []
             for cid, action, prior, fp in entries:
@@ -792,8 +815,10 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                                        "fingerprint": fingerprint(_select(cur, project, ids=[cid])[cid])}
                 restored += 1
             report = {"restored": restored, "left_alone": left_alone, "owner_gate": gate}
-            cur.execute("UPDATE commitment_tidy_batches SET undone_at = now(), undo_report = %s::jsonb "
-                        "WHERE id = %s", (json.dumps(dict(report, redo=redo_from), default=str), batch))
+            cur.execute("UPDATE commitment_tidy_batches SET undone_at = CASE WHEN EXISTS "
+                        "(SELECT 1 FROM commitment_tidy_items WHERE batch_id = %s AND undone_at IS NULL) "
+                        "THEN NULL ELSE now() END, undo_report = %s::jsonb "
+                        "WHERE id = %s", (batch, json.dumps(dict(report, redo=redo_from), default=str), batch))
     _log(f"{batch}: undo restored {restored}, left alone {len(left_alone)}")
     return {"ok": True, "batch": batch, "project": project or "", **report}
 
@@ -843,6 +868,7 @@ def _redo_states(cur, batch: str) -> dict:
 
 
 def redo(batch: str, *, project: str | None = None, owner_gate: str | None = None,
+         ids: list[int] | None = None,
          write_id: str | None = None) -> dict[str, Any]:
     """Put an undone batch's changes back: each item ``undo`` restored and
     that has not changed since gets the state it had before that undo; an
@@ -851,6 +877,10 @@ def redo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
     from khipu import commitments as co, offline
     from khipu.db import connect
 
+    try:
+        selected = _undo_selection(ids)
+    except ValueError as exc:
+        return {"ok": False, "reapplied": 0, "error": str(exc) + "; nothing was changed"}
     batch = str(batch or "").strip()
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
@@ -882,6 +912,12 @@ def redo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
             cur.execute("SELECT commitment_id FROM commitment_tidy_items WHERE batch_id = %s "
                         "AND undone_at IS NOT NULL ORDER BY commitment_id", (batch,))
             ids = [int(r[0]) for r in cur.fetchall() if str(r[0]) in redo_from]
+            if selected is not None:
+                if not set(selected).issubset(ids):
+                    conn.rollback()
+                    return {"ok": False, "reapplied": 0, "batch": batch,
+                            "error": "ids must name undone items in this batch; nothing was changed"}
+                ids = selected
             rows = _select(cur, project, ids=ids, lock=True)
             left_alone, todo = [], []
             for cid in ids:
