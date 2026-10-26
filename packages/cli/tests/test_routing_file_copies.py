@@ -192,6 +192,7 @@ def test_owner_local_file_copies_never_reach_other_surfaces(scanned, monkeypatch
 
 
 def test_scan_reads_exactly_the_approved_set(scanned, monkeypatch):
+    import os
     import sys
 
     home = scanned.root
@@ -203,17 +204,25 @@ def test_scan_reads_exactly_the_approved_set(scanned, monkeypatch):
         home / ".claude" / "projects" / "synthetic-slug" / "memory" / "note.md",
     }
     assert set(routing_scan_report.candidate_files()) == expected
-    opened = []
+    # Audit hooks are inherited by scan workers. Persist observations to this
+    # disposable file so the exact opened set is checked across processes.
+    audit_path = home / "scan-audit.jsonl"
+    active = [True]
 
     def hook(event, args):
-        if event == "open" and args and isinstance(args[0], str) and args[0].endswith(".md"):
-            opened.append(args[0])
+        if active[0] and event == "open" and args and isinstance(args[0], str) and args[0].endswith(".md"):
+            fd = os.open(audit_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, (json.dumps(args[0]) + "\n").encode())
+            finally:
+                os.close(fd)
 
     sys.addaudithook(hook)
     try:
         routing_scan_report.refresh(now=scanned.now)
     finally:
-        pass
+        active[0] = False
+    opened = [json.loads(line) for line in audit_path.read_text().splitlines()]
     assert {p for p in opened if p.endswith(".md")} == {str(p) for p in expected}
     files = {h["file"] for h in routing_scan_report.report()["hits"]}
     assert f"{PROJECT_FILE}/AGENTS.md" in files
@@ -223,13 +232,15 @@ def test_scan_reads_exactly_the_approved_set(scanned, monkeypatch):
                    for h in routing_scan_report.report()["hits"])
 
 
-def test_report_refreshes_on_read_when_a_scanned_file_changes(scanned):
+def test_report_stays_cached_until_explicit_refresh_when_a_file_changes(scanned):
     routing_scan_report.refresh(now=scanned.now)
     assert routing_scan_report.report()["hits"]
     (scanned.root / ".claude" / "CLAUDE.md").write_text("# Global\nclean now\n",
                                                         encoding="utf-8")
     report = routing_scan_report.report()
     assert report["status"] == "checked"
+    assert any(h["file"] == "~/.claude/CLAUDE.md" for h in report["hits"])
+    report = routing_scan_report.refresh(now=scanned.now)
     assert not any(h["file"] == "~/.claude/CLAUDE.md" for h in report["hits"])
 
 

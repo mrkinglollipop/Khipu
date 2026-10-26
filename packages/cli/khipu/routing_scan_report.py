@@ -14,9 +14,10 @@ knows as a project, resolved from Khipu's own project/repo records
 (the ``repo_root`` values recorded on its episodes, read from the
 local hub snapshot — never by walking the filesystem); and the memory
 notes Khipu imports (``notes._iter_note_file_candidates``). Nothing
-else. Reads are bounded: a file over ``MAX_FILE_BYTES`` is marked too
-large to read instead of being opened whole, and hits are capped per
-file and in total, with the rest counted as not shown.
+else. Explicit/scheduled refreshes isolate discovery and each file in
+deadline-limited workers, skip protected/cloud/dataless paths, cap reads
+at ``MAX_FILE_BYTES + 1`` and cap hits per file and in total. Routing
+readers use only the stored report and never test candidate freshness.
 
 The report lives on this Mac only; it must never ride a push, a child
 page, an MCP conversation view, a replication record, doctor output, a
@@ -27,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +40,11 @@ MAX_FILE_BYTES = 1_000_000
 MAX_HITS_PER_FILE = 50
 MAX_HITS_TOTAL = 500
 _MAX_PROJECT_ROOTS = 500
+FILE_DEADLINE_SECONDS = 0.25
+DISCOVERY_DEADLINE_SECONDS = 2.0
+REFRESH_BUDGET_SECONDS = 5.0
+_MAX_CANDIDATES = 10_000
+MAX_REPORT_BYTES = 4_000_000
 
 NOT_CHECKED: dict[str, Any] = {"status": "not_checked", "scanned_at": None,
                                "files_checked": 0, "hits": [], "hits_total": 0,
@@ -87,17 +94,9 @@ def known_project_roots() -> list[Path]:
             con.close()
     except Exception:  # noqa: BLE001 — known roots are best-effort evidence
         return []
-    out: list[Path] = []
-    for (raw,) in rows:
-        if not isinstance(raw, str) or not raw.strip():
-            continue
-        root = Path(raw)
-        try:
-            if root.is_dir():
-                out.append(root)
-        except OSError:
-            continue
-    return out
+    # These are recorded identities, not claims that roots exist. All filesystem
+    # validation happens in the bounded discovery/read workers, never here.
+    return [Path(raw) for (raw,) in rows if isinstance(raw, str) and raw.strip()]
 
 
 def display_path(path: Path, home: Path | None = None,
@@ -141,89 +140,133 @@ def _clip(text: str) -> str:
     return text if len(text) <= _QUOTE_MAX else text[: _QUOTE_MAX - 1].rstrip() + "…"
 
 
-def candidate_entries() -> list[tuple[Path, str]]:
-    """The approved scan set as ``(path, display)`` pairs, no wider."""
+def _discover() -> dict[str, Any]:
+    """Enumerate only approved roots; reject protected aliases before traversal."""
     from khipu import notes
+    from khipu.routing_scan_io import safety
 
     home = Path.home()
     roots = known_project_roots()
-    out: list[tuple[Path, str]] = []
+    out: list[list[str]] = []
+    skipped: list[dict[str, str]] = []
     seen: set[Path] = set()
 
+    def safe(path: Path) -> bool:
+        reason = safety(path, home)
+        if reason and reason != "unreadable":
+            skipped.append({"file": display_path(path, home, roots), "reason": reason})
+        return reason is None
+
     def add(path: Path) -> None:
-        if path not in seen:
+        if len(out) < _MAX_CANDIDATES and path not in seen:
             seen.add(path)
-            out.append((path, display_path(path, home, roots)))
+            out.append([str(path), display_path(path, home, roots)])
+
+    def children(root: Path) -> list[Path]:
+        if not safe(root) or not root.is_dir():
+            return []
+        return sorted(root.iterdir())
+
+    def notes_in(root: Path) -> None:
+        for path in children(root):
+            if path.name.endswith(".md") and path.name not in {"MEMORY.md", "_overflow_index.md"}:
+                add(path)
 
     for path in global_files(home):
-        if path.is_file():
-            add(path)
+        add(path)
     for root in roots:
         for name in ("CLAUDE.md", "AGENTS.md"):
-            path = root / name
-            if path.is_file():
-                add(path)
-    for path, _harness, _slug in notes._iter_note_file_candidates():
-        add(path)
-    return out
+            add(root / name)
+    # Same approved note inventory as notes._iter_note_file_candidates, with
+    # safety checked before each directory traversal (including custom roots).
+    for project in children(notes.claude_projects_root()):
+        notes_in(project / "memory")
+    notes_in(notes.codex_memories_root())
+    if safe(home / ".cursor" / "projects"):
+        for root in notes.cursor_memory_roots():
+            notes_in(root)
+    for root in notes.aegis_memory_roots():
+        notes_in(root)
+    return {"entries": out, "skipped": skipped}
+
+
+def candidate_entries() -> list[tuple[Path, str]]:
+    """Approved candidates; refresh invokes this only in a deadline worker."""
+    data = _discover()
+    return [(Path(path), display) for path, display in data["entries"]]
 
 
 def candidate_files() -> list[Path]:
-    """The approved scan set (see ``candidate_entries``)."""
     return [path for path, _display in candidate_entries()]
 
 
-def _signatures(entries: list[tuple[Path, str]]) -> dict[str, list[int]]:
-    """``{path: [mtime_ns, size]}`` for every candidate that stats."""
-    out: dict[str, list[int]] = {}
-    for path, _display in entries:
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        out[str(path)] = [st.st_mtime_ns, st.st_size]
-    return out
+def _discovery_result() -> dict[str, Any]:
+    # Preserve the public candidate hook used by callers, while retaining skip
+    # reasons from production discovery without process-global mutable state.
+    if candidate_entries is _DEFAULT_CANDIDATE_ENTRIES:
+        return _discover()
+    return {"entries": [[str(path), display] for path, display in candidate_entries()], "skipped": []}
+
+
+_DEFAULT_CANDIDATE_ENTRIES = candidate_entries
 
 
 def refresh(now: datetime | None = None) -> dict[str, Any]:
-    """Scan every candidate file once and keep the report on this Mac.
+    """Explicit/scheduled owner-local refresh, bounded for cloud/filesystem stalls.
 
-    A file that cannot be read is skipped, never fatal; a file over the
-    size cap is named too large instead of read. The scan reads only,
-    and never edits a scanned file."""
+    Protected/cloud paths are conservatively skipped even if previously read.
+    The report records skips; readers retain this snapshot until the next pass.
+    """
     from khipu.routing_scanner import scan_text
+    from khipu.routing_scan_io import bounded, protected, read_file
 
     now = now or datetime.now(timezone.utc)
-    entries = candidate_entries()
+    end = time.monotonic() + REFRESH_BUDGET_SECONDS
+    status, discovered = bounded(_discovery_result,
+        min(DISCOVERY_DEADLINE_SECONDS, max(0, end - time.monotonic())))
+    skipped = [] if status != "ok" else discovered["skipped"]
+    entries = [] if status != "ok" else discovered["entries"]
+    if status != "ok":
+        skipped.append({"file": "candidate discovery", "reason": status})
     hits: list[dict[str, Any]] = []
     too_large: list[str] = []
-    hits_total = 0
-    files_checked = 0
-    for path, display in entries:
-        try:
-            if path.stat().st_size > MAX_FILE_BYTES:
+    hits_total = files_checked = 0
+    home = Path.home()
+    seen: set[str] = set()
+    for raw, display in entries:
+        if raw in seen:
+            continue
+        seen.add(raw)
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            skipped.append({"file": "remaining candidates", "reason": "refresh_budget"})
+            break
+        path = Path(raw)
+        if protected(path, home):
+            skipped.append({"file": display, "reason": "protected_path"})
+            continue
+        status, result = bounded(lambda: read_file(path, home, MAX_FILE_BYTES),
+                                 min(FILE_DEADLINE_SECONDS, remaining))
+        reason = status if status != "ok" else result.get("reason")
+        if reason:
+            if reason == "too_large":
                 too_large.append(display)
-                continue
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            else:
+                skipped.append({"file": display, "reason": reason})
             continue
         files_checked += 1
-        claims = scan_text(str(path), text)
+        claims = scan_text(raw, result["text"])
         hits_total += len(claims)
-        kept = 0
-        for claim in claims:
-            if kept >= MAX_HITS_PER_FILE or len(hits) >= MAX_HITS_TOTAL:
+        for claim in claims[:MAX_HITS_PER_FILE]:
+            if len(hits) >= MAX_HITS_TOTAL:
                 break
             hits.append({"file": display, "line": claim["line"],
                          "quote": _clip(claim["words"]), "superseded": True})
-            kept += 1
     hits.sort(key=lambda h: (h["file"], h["line"]))
     report = {"status": "checked", "scanned_at": now.isoformat(),
-              "files_checked": files_checked, "hits": hits,
-              "hits_total": hits_total,
-              "more_not_shown": hits_total - len(hits),
-              "too_large": too_large,
-              "file_sigs": _signatures(entries)}
+              "files_checked": files_checked, "hits": hits, "hits_total": hits_total,
+              "more_not_shown": hits_total - len(hits), "too_large": too_large,
+              "skipped": skipped}
     _write_report(report)
     return _public(report)
 
@@ -286,19 +329,33 @@ def _public(data: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(more, int) or isinstance(more, bool):
         more = max(0, hits_total - len(hits))
     too_large = data.get("too_large")
+    skipped = data.get("skipped", [])
     return {"status": "checked",
             "scanned_at": data.get("scanned_at") if isinstance(data.get("scanned_at"), str) else None,
             "files_checked": files_checked if isinstance(files_checked, int)
             and not isinstance(files_checked, bool) else 0,
             "hits": hits, "hits_total": hits_total, "more_not_shown": more,
             "too_large": [t for t in too_large if isinstance(t, str)]
-            if isinstance(too_large, list) else []}
+            if isinstance(too_large, list) else [],
+            "skipped": [{"file": item["file"], "reason": item["reason"],
+                         **({"message": "Couldn't read in time."}
+                            if item["reason"] == "timeout" else {})}
+                        for item in skipped if isinstance(item, dict)
+                        and isinstance(item.get("file"), str)
+                        and isinstance(item.get("reason"), str)]
+            if isinstance(skipped, list) else []}
 
 
 def _read_raw() -> dict[str, Any] | None:
+    from khipu.routing_scan_io import bounded, read_file
+
+    path, home = store_path(), Path.home()
+    status, result = bounded(lambda: read_file(path, home, MAX_REPORT_BYTES), FILE_DEADLINE_SECONDS)
+    if status != "ok" or "text" not in result:
+        return None
     try:
-        data = json.loads(store_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(result["text"])
+    except ValueError:
         return None
     if not isinstance(data, dict) or data.get("status") != "checked" \
             or not isinstance(data.get("hits"), list):
@@ -307,23 +364,10 @@ def _read_raw() -> dict[str, Any] | None:
 
 
 def report() -> dict[str, Any]:
-    """The kept report, or the not-looked-at-yet state. A missing or
-    damaged report reads as not checked, never as an error — and is
-    never auto-rescanned here. A valid report whose scanned files have
-    changed (mtime or size, a new candidate, or a removed one) is
-    refreshed first: one bounded stat per candidate on this read path
-    (``route --json`` / ``public_view``), never on a per-prompt path,
-    and with no hub needed."""
+    """Read only the bounded owner-local cache; never discover/stat scan inputs.
+
+    Freshness belongs to explicit refresh and scheduled notes reconciliation.
+    Missing, unreadable, timed-out or damaged caches read as not checked.
+    """
     data = _read_raw()
-    if data is None:
-        return {"status": "not_checked", "scanned_at": None, "files_checked": 0,
-                "hits": [], "hits_total": 0, "more_not_shown": 0, "too_large": []}
-    public = _public(data)
-    if public["status"] != "checked":
-        return public
-    try:
-        if _signatures(candidate_entries()) != data.get("file_sigs"):
-            return refresh()
-    except Exception:  # noqa: BLE001 — a stale check must not break the read
-        pass
-    return public
+    return dict(NOT_CHECKED) if data is None else _public(data)
