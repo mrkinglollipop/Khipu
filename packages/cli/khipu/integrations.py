@@ -2414,13 +2414,19 @@ def set_gateway_token(token: str) -> Path:
 
 
 def gateway_token_file_status() -> dict:
-    """Presence-only status — exists / mode / bytes. Never the token itself."""
+    """Presence-only status — exists / mode / bytes. Never the token itself.
+
+    A key that lives only in the Keychain (or env) still counts as saved: Copy
+    can reach it, so the guide must not show "No key saved" for that Mac.
+    """
     path = gateway_token_file()
-    if not path.is_file():
-        return {"path": str(path), "exists": False}
-    st = path.stat()
-    return {"path": str(path), "exists": True,
-            "mode": oct(st.st_mode & 0o777), "bytes": st.st_size}
+    if path.is_file():
+        st = path.stat()
+        return {"path": str(path), "exists": True,
+                "mode": oct(st.st_mode & 0o777), "bytes": st.st_size}
+    if _gateway_token():
+        return {"path": str(path), "exists": True}
+    return {"path": str(path), "exists": False}
 
 
 def _gateway_token() -> str:

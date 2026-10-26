@@ -21,10 +21,13 @@ const SETTINGS = { mcpServers: { "khipu-cloud": { url: `${ADDRESS}/mcp`, headers
 type World = { address: string; keySaved: boolean; copy: { ok: boolean; error?: string }; verify: unknown };
 let world: World;
 const calls: Array<{ cmd: string; args?: unknown }> = [];
+/** App-setting stand-in for guides prefs (data_dir file in production). */
+let prefsStore = "{}";
 
 beforeEach(() => {
   world = { address: ADDRESS, keySaved: true, copy: { ok: true }, verify: [{ harness: "grok_bot", detected: true, components: { mcp: { ok: true } } }] };
   calls.length = 0;
+  prefsStore = "{}";
   const store = new Map<string, string>();
   vi.stubGlobal("localStorage", {
     getItem: (k: string) => store.get(k) ?? null,
@@ -42,7 +45,18 @@ beforeEach(() => {
       case "khipu_recall_log":
         return JSON.stringify([]);
       case "khipu_gateway_token_copy":
-        return JSON.stringify(world.copy.ok ? { ok: true, clear_after_s: 60 } : { ok: false, error: world.copy.error });
+        // Deliberately put a lookalike in a field a leaky UI might render.
+        return JSON.stringify(
+          world.copy.ok
+            ? { ok: true, clear_after_s: 60, token: KEY_LOOKALIKE }
+            : { ok: false, error: world.copy.error, token: KEY_LOOKALIKE },
+        );
+      case "khipu_guides_prefs_get":
+        return prefsStore;
+      case "khipu_guides_prefs_set": {
+        prefsStore = String((args as { json?: string })?.json ?? "{}");
+        return prefsStore;
+      }
       case "khipu_gateway_token_set":
         world.keySaved = true;
         return JSON.stringify({ ok: true, exists: true });
@@ -94,8 +108,8 @@ describe("Guides page", () => {
     expect(await screen.findByText("Connect your agents")).toBeInTheDocument();
     expect(screen.getByText("Keep it safe")).toBeInTheDocument();
     expect(screen.getByText("0 of 4 done")).toBeInTheDocument();
-    // Address and key are saved, so Grok Bot reads "2 of 5 steps".
-    expect(await screen.findByText("2 of 5 steps")).toBeInTheDocument();
+    // Address and key alone (shared with Aegis) do not mean Grok Bot setup started.
+    expect(await screen.findByRole("button", { name: /Grok Bot/ })).toHaveTextContent("Not set up");
 
     fireEvent.change(screen.getByLabelText("Search guides"), { target: { value: "backup" } });
     expect(screen.getByText("Backups and copies on this Mac")).toBeInTheDocument();
@@ -108,7 +122,7 @@ describe("Guides page", () => {
     render(<Harness runKhipu={makeRunKhipu()} />);
     fireEvent.click(await screen.findByRole("button", { name: "Hide" }));
     expect(screen.queryByText("Start here")).not.toBeInTheDocument();
-    expect(JSON.parse(window.localStorage.getItem("khipu.guides.v1") ?? "{}")).toMatchObject({ startHidden: true, hintHidden: true });
+    await waitFor(() => expect(JSON.parse(prefsStore)).toMatchObject({ startHidden: true, hintHidden: true }));
     fireEvent.click(screen.getByRole("button", { name: "Show setup steps again" }));
     expect(screen.getByText("Start here")).toBeInTheDocument();
   });
@@ -173,7 +187,7 @@ describe("Grok Bot guide", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Check the gateway" }));
     expect(await screen.findByText(/Gateway answered and accepted the key/)).toBeInTheDocument();
     expect(run).toHaveBeenCalledWith(["integrations", "verify", "grok_bot"]);
-    expect(JSON.parse(window.localStorage.getItem("khipu.guides.v1") ?? "{}").grokCheck).toMatchObject({ ok: true });
+    await waitFor(() => expect(JSON.parse(prefsStore).grokCheck).toMatchObject({ ok: true, address: ADDRESS }));
   });
 
   it("maps a refused key and an unreachable gateway to their troubleshooting words", async () => {
@@ -187,6 +201,7 @@ describe("Grok Bot guide", () => {
     expect(gatewayCheckWords(silent)?.text).toMatch(/didn't answer/);
     const nothing = await runGatewayCheck(async () => JSON.stringify([{ detected: false }]));
     expect(nothing.ok).toBe(false);
+    expect(gatewayCheckWords(nothing)?.text).toMatch(/no gateway address/);
   });
 
   it("lists what it can and can't do, and says per-app keys and the 'reached Khipu' line are coming", async () => {

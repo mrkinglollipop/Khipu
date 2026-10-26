@@ -7,9 +7,12 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { callCli, useCliState } from "./settingsCli";
 import type { ConfigShape } from "./settingsCli";
 import {
+  DEFAULT_PREFS,
   grokBotProgress,
-  readPrefs,
-  writePrefs,
+  LEGACY_STORE_KEY,
+  liveGrokCheck,
+  parsePrefs,
+  prefsJson,
 } from "./guidesModel";
 import type { GrokBotProgress, GuidesPrefs } from "./guidesModel";
 
@@ -24,9 +27,23 @@ export function gatewayCheckWords(check: GuidesPrefs["grokCheck"]): { tone: "ok"
     return { tone: "err", text: "The gateway refused the key. The key in Cursor must match the one on your gateway." };
   }
   if (check.status == null) {
-    return { tone: "err", text: check.error?.startsWith("no gateway") ? "There is no gateway key saved on this Mac yet. Save it in step 2." : "The gateway didn't answer. The address may be wrong, or the server is down." };
+    const err = check.error ?? "";
+    // Address-missing must win over the broader "no gateway…" key message.
+    if (err.startsWith("no gateway address")) {
+      return { tone: "err", text: "There is no gateway address saved yet. Save it in step 1." };
+    }
+    if (err.startsWith("no gateway")) {
+      return { tone: "err", text: "There is no gateway key saved on this Mac yet. Save it in step 2." };
+    }
+    return { tone: "err", text: "The gateway didn't answer. The address may be wrong, or the server is down." };
   }
   return { tone: "err", text: `The gateway answered with an error (${check.status}).` };
+}
+
+/** A search log harness that means an agent asked — not this app or the doctor. */
+export function isAgentRecallHarness(harness: string | undefined): boolean {
+  const h = (harness ?? "").trim();
+  return h !== "" && h !== "doctor" && h !== "desktop";
 }
 
 type McpComponent = { ok?: boolean; error?: string; http_status?: number | null };
@@ -54,13 +71,33 @@ export async function runGatewayCheck(
   }
 }
 
+async function loadPrefsFromApp(): Promise<GuidesPrefs> {
+  const res = await callCli<Record<string, unknown>>("khipu_guides_prefs_get");
+  if (res.ok && res.data && typeof res.data === "object" && Object.keys(res.data).length > 0) {
+    return parsePrefs(res.data);
+  }
+  // One-shot migrate from the old webview store so a hide survives the move.
+  try {
+    const legacy = window.localStorage.getItem(LEGACY_STORE_KEY);
+    if (legacy) {
+      const parsed = parsePrefs(legacy);
+      await callCli("khipu_guides_prefs_set", { json: prefsJson(parsed) });
+      window.localStorage.removeItem(LEGACY_STORE_KEY);
+      return parsed;
+    }
+  } catch {
+    /* private mode / missing localStorage */
+  }
+  return DEFAULT_PREFS;
+}
+
 export function useGuideSignals(refreshKey: unknown) {
   // `active` stays false: the effect below owns the loading, keyed on where
   // the user is, so a screen change re-reads once, not twice.
   const cfg = useCliState<ConfigShape>("khipu_config_show", false);
   const token = useCliState<TokenStatus>("khipu_gateway_token_status", false);
   const [log, setLog] = useState<LogEntry[] | null>(null);
-  const [prefs, setPrefsState] = useState<GuidesPrefs>(readPrefs);
+  const [prefs, setPrefsState] = useState<GuidesPrefs>(DEFAULT_PREFS);
 
   const reloadCfg = cfg.reload;
   const reloadToken = token.reload;
@@ -69,17 +106,22 @@ export function useGuideSignals(refreshKey: unknown) {
     if (res.ok && Array.isArray(res.data)) setLog(res.data);
   }, []);
 
+  const reloadPrefs = useCallback(async () => {
+    setPrefsState(await loadPrefsFromApp());
+  }, []);
+
   // Re-read whenever the user comes back to a screen that shows these.
   useEffect(() => {
     void reloadCfg();
     void reloadToken();
     void reloadLog();
-  }, [refreshKey, reloadCfg, reloadToken, reloadLog]);
+    void reloadPrefs();
+  }, [refreshKey, reloadCfg, reloadToken, reloadLog, reloadPrefs]);
 
   const updatePrefs = useCallback((patch: Partial<GuidesPrefs>) => {
     setPrefsState((prev) => {
       const next = { ...prev, ...patch };
-      writePrefs(next);
+      void callCli("khipu_guides_prefs_set", { json: prefsJson(next) });
       return next;
     });
   }, []);
@@ -87,14 +129,21 @@ export function useGuideSignals(refreshKey: unknown) {
   const gatewayUrl = cfg.data?.gateway_url ?? "";
   const keySaved = token.data ? token.data.exists === true : null;
 
+  // Drop a check that no longer matches the saved address (step 5 must go stale).
+  useEffect(() => {
+    if (prefs.grokCheck && liveGrokCheck(prefs.grokCheck, gatewayUrl) == null) {
+      updatePrefs({ grokCheck: null });
+    }
+  }, [gatewayUrl, prefs.grokCheck, updatePrefs]);
+
   const grok: GrokBotProgress = useMemo(
     () => grokBotProgress({ gatewayUrl, keySaved, check: prefs.grokCheck, ack: prefs.grokAck }),
     [gatewayUrl, keySaved, prefs.grokCheck, prefs.grokAck],
   );
 
   // The search log carries a harness label for each call. The doctor's own
-  // probes are Khipu talking to itself, so they do not count as an agent.
-  const agentAsked = (log ?? []).some((e) => typeof e.harness === "string" && e.harness !== "" && e.harness !== "doctor");
+  // probes and this app's Recall searches (KHIPU_HARNESS=desktop) do not count.
+  const agentAsked = (log ?? []).some((e) => isAgentRecallHarness(e.harness));
 
   return {
     prefs,
@@ -104,7 +153,7 @@ export function useGuideSignals(refreshKey: unknown) {
     grok,
     agentAsked,
     reload: useCallback(async () => {
-      await Promise.all([reloadCfg(), reloadToken(), reloadLog()]);
-    }, [reloadCfg, reloadToken, reloadLog]),
+      await Promise.all([reloadCfg(), reloadToken(), reloadLog(), reloadPrefs()]);
+    }, [reloadCfg, reloadToken, reloadLog, reloadPrefs]),
   };
 }

@@ -130,6 +130,13 @@ export function GrokBotGuide({
     }
   }, [startStep]);
 
+  // "Set up…" pins a step; once that step finishes, follow live progress again.
+  useEffect(() => {
+    if (pickedStep == null) return;
+    const s = grok.steps[pickedStep - 1];
+    if (s && (s.done || s.acknowledged)) setFocusStep(null);
+  }, [pickedStep, grok.steps]);
+
   // Cursor's pages are outside Khipu. When the window comes back into focus,
   // read Khipu's own state again so a finished step shows without a click.
   const { reload } = signals;
@@ -170,10 +177,16 @@ export function GrokBotGuide({
     setChecking(true);
     try {
       const result = await runGatewayCheck(runKhipu);
-      updatePrefs({ grokCheck: result });
+      updatePrefs({ grokCheck: { ...result, address: gatewayUrl.trim() } });
     } finally {
       setChecking(false);
     }
+  };
+
+  const afterSettingSaved = () => {
+    // Address or key changed: any prior gateway check is about the old setup.
+    updatePrefs({ grokCheck: null });
+    void reload();
   };
 
   const ack = (step: 3 | 4) => {
@@ -182,8 +195,9 @@ export function GrokBotGuide({
     window.requestAnimationFrame(() => document.getElementById(`gd-s${step + 1}`)?.scrollIntoView?.({ block: "nearest" }));
   };
 
-  const words = gatewayCheckWords(prefs.grokCheck);
-  const checkedAgo = prefs.grokCheck ? fmtAgo(Math.max(0, (Date.now() - prefs.grokCheck.at) / 1000)) : "";
+  const liveCheck = prefs.grokCheck?.address === gatewayUrl.trim() ? prefs.grokCheck : null;
+  const words = gatewayCheckWords(liveCheck);
+  const checkedAgo = liveCheck ? fmtAgo(Math.max(0, (Date.now() - liveCheck.at) / 1000)) : "";
 
   return (
     <div className="gd-guide">
@@ -206,12 +220,12 @@ export function GrokBotGuide({
         <ol className="gd-steps">
           <Step n={1} title="Have a gateway address" state={stateOf(1)}>
             <p>The gateway is the one part of Khipu that's open to the internet. Cloud agents talk to it; your database stays private.</p>
-            <GatewayUrlCard active onSaved={() => void reload()} />
+            <GatewayUrlCard active onSaved={afterSettingSaved} />
             <Success done={grok.steps[0].done}>
               {grok.steps[0].done ? (
                 <>
                   <b>An https address is saved.</b> It's the same setting as Settings → Another Mac → Gateway address.
-                  {prefs.grokCheck?.ok ? ` The gateway answered this Mac ${checkedAgo}.` : " Step 5 checks that it answers."}
+                  {liveCheck?.ok ? ` The gateway answered this Mac ${checkedAgo}.` : " Step 5 checks that it answers."}
                 </>
               ) : (
                 <>
@@ -244,7 +258,7 @@ export function GrokBotGuide({
               {grok.steps[1].done ? null : (
                 <>
                   <p className="meta gd-tight">No key is saved on this Mac yet. Paste the one from your gateway once; Khipu keeps it and never shows it again.</p>
-                  <GatewayTokenCard active onSaved={() => void reload()} />
+                  <GatewayTokenCard active onSaved={afterSettingSaved} />
                 </>
               )}
             </div>
@@ -396,10 +410,20 @@ export function GrokBotGuide({
         <h6>Steps</h6>
         <ol>
           {["Gateway address", "Copy the key", "Add the secret", "Point Cursor at Khipu", "Check it works"].map((label, i) => {
-            const st = stateOf((i + 1) as 1 | 2 | 3 | 4 | 5);
+            const n = i + 1;
+            const st = stateOf(n as 1 | 2 | 3 | 4 | 5);
             return (
               <li key={label} className={st}>
-                <button type="button" className="link" onClick={() => setFocusStep(i + 1)}>{label}</button>
+                <button
+                  type="button"
+                  className="link"
+                  onClick={() => {
+                    setFocusStep(n);
+                    window.requestAnimationFrame(() => document.getElementById(`gd-s${n}`)?.scrollIntoView?.({ block: "nearest" }));
+                  }}
+                >
+                  {label}
+                </button>
               </li>
             );
           })}

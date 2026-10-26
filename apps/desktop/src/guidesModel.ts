@@ -80,11 +80,22 @@ export function filterGuides(query: string): GuideMeta[] {
 
 // ---------------------------------------------------------------------------
 // What is remembered on this install (a hidden hint, a step acknowledged).
-// localStorage can be unavailable (private mode); every read and write is
-// guarded, and the app still works without it.
+// Stored as an app setting in the data dir (survives a webview reset), not
+// in localStorage. parsePrefs / prefsJson are pure so tests and the CLI
+// writer share one shape.
 // ---------------------------------------------------------------------------
 
-const STORE_KEY = "khipu.guides.v1";
+/** Legacy webview key; read once to migrate into the app setting. */
+export const LEGACY_STORE_KEY = "khipu.guides.v1";
+
+export type GrokCheck = {
+  ok: boolean;
+  at: number;
+  error?: string;
+  status?: number | null;
+  /** Address that was saved when this check ran; stale when it no longer matches. */
+  address?: string;
+};
 
 export type GuidesPrefs = {
   /** The Home hint was closed with ×. */
@@ -96,7 +107,7 @@ export type GuidesPrefs = {
   /** Highest Grok Bot step the user said they did outside Khipu (0, 3 or 4). */
   grokAck: 0 | 3 | 4;
   /** The last "Check the gateway" answer for Grok Bot. */
-  grokCheck: { ok: boolean; at: number; error?: string; status?: number | null } | null;
+  grokCheck: GrokCheck | null;
 };
 
 export const DEFAULT_PREFS: GuidesPrefs = {
@@ -107,11 +118,10 @@ export const DEFAULT_PREFS: GuidesPrefs = {
   grokCheck: null,
 };
 
-export function readPrefs(): GuidesPrefs {
+export function parsePrefs(raw: unknown): GuidesPrefs {
   try {
-    const raw = window.localStorage.getItem(STORE_KEY);
-    if (!raw) return DEFAULT_PREFS;
-    const p = JSON.parse(raw) as Partial<GuidesPrefs>;
+    const p = (typeof raw === "string" ? JSON.parse(raw) : raw) as Partial<GuidesPrefs> | null;
+    if (!p || typeof p !== "object") return DEFAULT_PREFS;
     const chk = p.grokCheck;
     return {
       hintHidden: p.hintHidden === true,
@@ -120,7 +130,13 @@ export function readPrefs(): GuidesPrefs {
       grokAck: p.grokAck === 3 || p.grokAck === 4 ? p.grokAck : 0,
       grokCheck:
         chk && typeof chk.ok === "boolean" && typeof chk.at === "number"
-          ? { ok: chk.ok, at: chk.at, error: typeof chk.error === "string" ? chk.error : undefined, status: typeof chk.status === "number" ? chk.status : null }
+          ? {
+              ok: chk.ok,
+              at: chk.at,
+              error: typeof chk.error === "string" ? chk.error : undefined,
+              status: typeof chk.status === "number" ? chk.status : null,
+              address: typeof chk.address === "string" ? chk.address : undefined,
+            }
           : null,
     };
   } catch {
@@ -128,12 +144,33 @@ export function readPrefs(): GuidesPrefs {
   }
 }
 
+export function prefsJson(prefs: GuidesPrefs): string {
+  return JSON.stringify(prefs);
+}
+
+/** @deprecated Prefer the app-setting load in useGuideSignals; kept for tests. */
+export function readPrefs(): GuidesPrefs {
+  try {
+    return parsePrefs(window.localStorage.getItem(LEGACY_STORE_KEY));
+  } catch {
+    return DEFAULT_PREFS;
+  }
+}
+
+/** @deprecated Prefer the app-setting save in useGuideSignals; kept for tests. */
 export function writePrefs(next: GuidesPrefs): void {
   try {
-    window.localStorage.setItem(STORE_KEY, JSON.stringify(next));
+    window.localStorage.setItem(LEGACY_STORE_KEY, prefsJson(next));
   } catch {
     /* the state simply isn't remembered */
   }
+}
+
+/** A gateway check only counts while it still matches the saved address. */
+export function liveGrokCheck(check: GuidesPrefs["grokCheck"], gatewayUrl: string): GuidesPrefs["grokCheck"] {
+  if (!check) return null;
+  if (typeof check.address !== "string" || check.address !== gatewayUrl.trim()) return null;
+  return check;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,9 +211,10 @@ export function isHttpsAddress(url: string): boolean {
 }
 
 export function grokBotProgress(s: GrokBotSignals): GrokBotProgress {
+  const check = liveGrokCheck(s.check, s.gatewayUrl);
   const s1 = isHttpsAddress(s.gatewayUrl);
   const s2 = s.keySaved === true;
-  const s5 = s.check?.ok === true;
+  const s5 = check?.ok === true;
   const steps: GrokBotStep[] = [
     { n: 1, done: s1, acknowledged: false },
     { n: 2, done: s2, acknowledged: false },
@@ -186,11 +224,15 @@ export function grokBotProgress(s: GrokBotSignals): GrokBotProgress {
   ];
   const passed = steps.filter((x) => x.done || x.acknowledged).length;
   const firstOpen = steps.find((x) => !x.done && !x.acknowledged);
+  // An https address (and even a key) is shared with Aegis / Another Mac;
+  // Grok Bot setup has started only once the user ack'd a Cursor step or ran
+  // a gateway check against the current address.
+  const started = s.ack > 0 || check != null;
   return {
     steps,
     passed,
     current: (firstOpen?.n ?? 5) as GrokBotProgress["current"],
-    started: passed > 0,
+    started,
     finished: passed === 5,
   };
 }

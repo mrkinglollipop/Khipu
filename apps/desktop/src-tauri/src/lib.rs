@@ -3629,6 +3629,65 @@ async fn khipu_gateway_token_copy() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(GATEWAY_TOKEN_COPY_ARGV)).await
 }
 
+/// Guides prefs (hint hide, Start-here hide, Grok ack/check) live next to
+/// config.json so they survive a webview reset — an app setting, not
+/// localStorage (guides-scope §3).
+const GUIDES_PREFS_FILE: &str = "guides-prefs.json";
+
+fn guides_prefs_path() -> Result<PathBuf, String> {
+    Ok(khipu_data_dir()?.join(GUIDES_PREFS_FILE))
+}
+
+#[tauri::command]
+fn khipu_guides_prefs_get() -> Result<String, String> {
+    let path = guides_prefs_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Ok(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("{}".to_string()),
+        Err(e) => Err(format!("could not read guides prefs: {e}")),
+    }
+}
+
+#[tauri::command]
+fn khipu_guides_prefs_set(json: String) -> Result<String, String> {
+    let parsed: Value = serde_json::from_str(&json)
+        .map_err(|_| "guides prefs must be a JSON object".to_string())?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "guides prefs must be a JSON object".to_string())?;
+    // Allowlist: never accept a secret-shaped field from the webview.
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "hintHidden" | "startHidden" | "setUpSeen" | "grokAck" | "grokCheck"
+        ) {
+            return Err(format!("unknown guides prefs key: {key}"));
+        }
+    }
+    if let Some(chk) = obj.get("grokCheck") {
+        if !chk.is_null() {
+            let c = chk
+                .as_object()
+                .ok_or_else(|| "grokCheck must be an object or null".to_string())?;
+            for key in c.keys() {
+                if !matches!(key.as_str(), "ok" | "at" | "error" | "status" | "address") {
+                    return Err(format!("unknown grokCheck field: {key}"));
+                }
+            }
+            if c.contains_key("token") || c.contains_key("key") || c.contains_key("secret") {
+                return Err("guides prefs must not carry a key".to_string());
+            }
+        }
+    }
+    let path = guides_prefs_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("could not make the data folder: {e}"))?;
+    }
+    let body = serde_json::to_string(&parsed).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &body).map_err(|e| format!("could not save guides prefs: {e}"))?;
+    Ok(body)
+}
+
 #[tauri::command]
 async fn khipu_recall_log() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(RECALL_LOG_ARGV)).await
@@ -4702,6 +4761,16 @@ const ALLOWED_SUBCOMMANDS: &[&str] = &[
 /// return immediately; the UI must not block on `.output()`.
 const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "graph-build", "monthly"];
 
+/// Env the desktop runner adds for selected CLI verbs. Search from Recall must
+/// not look like an agent in the query log (guides "Ask your agent" tick).
+fn desktop_cli_env(args: &[String]) -> Vec<(String, String)> {
+    if args.first().map(String::as_str) == Some("search") {
+        vec![("KHIPU_HARNESS".to_string(), "desktop".to_string())]
+    } else {
+        vec![]
+    }
+}
+
 #[tauri::command]
 async fn run_khipu(args: Vec<String>) -> Result<String, String> {
     let sub = args.first().cloned().unwrap_or_default();
@@ -4709,7 +4778,12 @@ async fn run_khipu(args: Vec<String>) -> Result<String, String> {
         eprintln!("[khipu] refused CLI subcommand from the UI: {sub:?}");
         return Err(format!("subcommand not permitted from the app: {sub:?}"));
     }
-    run_khipu_cli_async(args).await
+    let extra = desktop_cli_env(&args);
+    if extra.is_empty() {
+        run_khipu_cli_async(args).await
+    } else {
+        run_khipu_cli_with_env_async(args, extra).await
+    }
 }
 
 #[tauri::command]
@@ -5317,6 +5391,8 @@ pub fn run() {
             khipu_gateway_token_status,
             khipu_gateway_token_set,
             khipu_gateway_token_copy,
+            khipu_guides_prefs_get,
+            khipu_guides_prefs_set,
             khipu_recall_log,
             khipu_embed_status,
             khipu_embed_activate,
@@ -5748,7 +5824,15 @@ mod db_command_tests {
 
 #[cfg(test)]
 mod run_khipu_guard_tests {
-    use super::ALLOWED_SUBCOMMANDS;
+    use super::{desktop_cli_env, ALLOWED_SUBCOMMANDS};
+
+    #[test]
+    fn search_from_the_app_is_labelled_desktop_not_mcp() {
+        let search = desktop_cli_env(&["search".into(), "--".into(), "q".into()]);
+        assert_eq!(search, vec![("KHIPU_HARNESS".into(), "desktop".into())]);
+        assert!(desktop_cli_env(&["doctor".into()]).is_empty());
+        assert!(desktop_cli_env(&["integrations".into(), "verify".into(), "grok_bot".into()]).is_empty());
+    }
 
     #[test]
     fn every_subcommand_the_ui_calls_is_allowed() {

@@ -60,9 +60,20 @@ class GatewayTokenFileTest(_TempHomeAndDataDirCase):
         self.assertNotIn(secret, json.dumps(status))
 
     def test_status_reports_absence_without_creating_anything(self):
-        status = integ.gateway_token_file_status()
+        with mock.patch.dict(os.environ, {"KHIPU_GATEWAY_TOKEN": ""}, clear=False), \
+             mock.patch("khipu.keychain.get_password", return_value=""):
+            status = integ.gateway_token_file_status()
         self.assertEqual(status, {"path": str(self.data_dir / "gateway-token"), "exists": False})
         self.assertFalse((self.data_dir / "gateway-token").exists())
+
+    def test_status_sees_a_keychain_only_key_without_echoing_it(self):
+        secret = "keychain-only-gateway-token"
+        with mock.patch.dict(os.environ, {"KHIPU_GATEWAY_TOKEN": ""}, clear=False), \
+             mock.patch("khipu.keychain.get_password", return_value=secret):
+            status = integ.gateway_token_file_status()
+        self.assertTrue(status["exists"])
+        self.assertFalse((self.data_dir / "gateway-token").exists())
+        self.assertNotIn(secret, json.dumps(status))
 
     def test_set_is_umask_safe(self):
         """A permissive umask must not weaken the file below 0600 — the explicit
