@@ -23,7 +23,7 @@ import { accountState } from "./routing";
 import type { RouteView } from "./routing";
 import { planWord } from "./humanWords";
 import { PlanDetailSheet, useDetailHost } from "./AccountDetail";
-import { nearlyGoneWords } from "./accountDetail";
+import { nearlyGoneWords } from "./accountDetailModel";
 
 export type UsageWindow = {
   name?: string;
@@ -749,7 +749,13 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
   const now = new Date();
   const pauses = planPauses(routing, now);
   const failedAge = fmtAgoSince(errorAt);
-  const detail = useDetailHost<UsageAccount>();
+  // The sheet remembers which account it shows, never the row it was opened
+  // with, so Refresh plan (a new report) changes what the sheet reads.
+  const detail = useDetailHost<{ key: string | null; idx: number }>();
+  const openRow = detail.target
+    ? accounts.find((r) => detail.target?.key != null && r.key === detail.target.key) ??
+      (detail.target.key == null ? accounts[detail.target.idx] : undefined)
+    : undefined;
   return (
     <div className="card plans-card">
       <div className="card-head">
@@ -796,12 +802,12 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
       ) : (
         accounts.map((row, i) => (
           <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now}
-            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} onOpen={() => detail.open(row)} />
+            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} onOpen={() => detail.open({ key: row.key ?? null, idx: i })} />
         ))
       )}
-      {detail.target ? (
+      {openRow ? (
         <PlanDetailSheet
-          row={detail.target}
+          row={openRow}
           view={routing}
           now={now}
           onClose={detail.close}

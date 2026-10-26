@@ -518,6 +518,9 @@ export function healthKeysForAttention(attentionKey: string): string[] {
   if (attentionKey.startsWith("routing")) return ["routing", "routing_delivery_ok"];
   if (attentionKey.startsWith("work:")) return ["work"];
   if (attentionKey.startsWith("plans")) return ["plans"];
+  // A queued promotion has no health row; markHealthRows then shows the
+  // whole report instead of highlighting nothing.
+  if (attentionKey === "promotion") return [];
   const fromOk = Object.entries(ATTENTION_KEY_FOR_OK).find(([, v]) => v === attentionKey)?.[0];
   return [fromOk ?? `${attentionKey}_ok`];
 }
@@ -529,6 +532,15 @@ export const TILE_HEALTH_KEYS = {
   search: ["embed_coverage_ok", "index_freshness_ok", "topics_embed_lag_ok", "degraded_rate_ok", "drift_ok"],
   backups: ["backup_ok", "graph_backup_ok", "graph_offsite_ok"],
 } as const;
+
+/** Marks the rendered rows for `keys` (the whole report when none render) and
+ *  returns them, first in page order, so the caller can scroll to it. */
+export function markHealthRows(root: ParentNode, keys: readonly string[]): Element[] {
+  const rows = keys.flatMap((k) => Array.from(root.querySelectorAll(`[data-health-key="${k}"]`)));
+  const marked = rows.length ? rows : Array.from(root.querySelectorAll("[data-health-report]"));
+  marked.forEach((el) => el.classList.add("health-hl"));
+  return marked;
+}
 
 function findAttention(okKey: string, attention: Attention[]): Attention[] {
   if (okKey === "capture_liveness_ok") {
@@ -567,7 +579,7 @@ export function HealthReportRows({
 }) {
   const rows = healthRows(parsed, plans, routing);
   return (
-    <div className="rows">
+    <div className="rows" data-health-report>
       {rows.map((row) => {
         if (row.status === "ok") {
           const text = [row.detail, row.note].filter(Boolean).join("; ");

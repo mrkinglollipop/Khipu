@@ -54,7 +54,9 @@ const CONNECTION_TIMEOUT = "Khipu couldn't reach the database just now (it took 
 export function plainError(text: string): string {
   const raw = (text ?? "").trim();
   if (!raw) return raw;
-  if (/connection timeout expired|timeout expired/i.test(raw)) return CONNECTION_TIMEOUT;
+  // Only the database driver's own phrases: a bare "timeout expired" can be a
+  // lock, a model call or anything else.
+  if (/connection timeout expired/i.test(raw)) return CONNECTION_TIMEOUT;
   const layout = /\(layout (\d+); this version uses (\d+)\)/.exec(raw);
   if (layout) {
     return Number(layout[1]) > Number(layout[2])
@@ -64,7 +66,7 @@ export function plainError(text: string): string {
   if (/model returned non-JSON/i.test(raw)) {
     return "The summariser sent back something Khipu couldn't read.";
   }
-  if (/connection refused|could not connect|connection reset/i.test(raw)) {
+  if (/connection refused/i.test(raw)) {
     return "Khipu couldn't reach the database. It tries again at the next refresh.";
   }
   if (raw.includes("Traceback (most recent call last)")) {
@@ -83,10 +85,17 @@ export function captureCauseWords(why: string): string {
     .map((p) => p.trim())
     .filter(Boolean);
   const out: string[] = [];
-  let failed = false;
   for (const part of parts) {
-    if (/^last capture attempt failed/i.test(part)) {
-      failed = true;
+    const failure = /^last capture attempt failed:?\s*(.*)$/is.exec(part);
+    if (failure) {
+      const what = failure[1].trim();
+      // Only a summariser reply that wasn't JSON gets the summariser sentence;
+      // any other cause (provider down, a rate limit) is said as it is.
+      out.push(
+        /non-JSON/i.test(what) || !what
+          ? "The last session couldn't be saved: the summariser sent back something Khipu couldn't read"
+          : `The last session couldn't be saved: ${plainError(what.replace(/^extract:\s*/i, ""))}`,
+      );
       continue;
     }
     const waiting = /^(\d+) job\(s\) waiting (\d+) min/i.exec(part);
@@ -98,7 +107,6 @@ export function captureCauseWords(why: string): string {
     }
     out.push(plainError(part));
   }
-  if (failed) out.unshift("The last session couldn't be saved: the summariser sent back something Khipu couldn't read");
   return out.join(". ");
 }
 

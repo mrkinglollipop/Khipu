@@ -44,7 +44,7 @@ import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { buildAttention, harnessLabel, promotionAttention, routingAttention, type Attention } from "./doctorAttention";
-import { HealthReportRows, TILE_HEALTH_KEYS, healthKeysForAttention } from "./healthRows";
+import { HealthReportRows, TILE_HEALTH_KEYS, healthKeysForAttention, markHealthRows } from "./healthRows";
 import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
 import { KeysCard } from "./KeysCard";
 import { PlansCard, usePlanAttention, usePlanUsage } from "./PlansCard";
@@ -1550,8 +1550,7 @@ export default function App() {
     let marked: Element[] = [];
     const frame = requestAnimationFrame(() =>
       requestAnimationFrame(() => {
-        marked = healthFocus.keys.flatMap((k) => Array.from(document.querySelectorAll(`[data-health-key="${k}"]`)));
-        marked.forEach((el) => el.classList.add("health-hl"));
+        marked = markHealthRows(document, healthFocus.keys);
         marked[0]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
       }),
     );

@@ -163,7 +163,7 @@ export function planDetail(row: UsageAccount, view: RouteView | null | undefined
   // The Home row shows one window; say why when it is not the week.
   const live = liveWindows(row, now);
   if (tight && live.length > 1 && windowLabel(tight) !== "week") {
-    credits.unshift(`Home shows the ${windowLabel(tight)} window because it is the fuller one.`);
+    credits.unshift(`Home shows the ${windowLabel(tight)} window because it is the closest to its limit.`);
   }
   return {
     name: row.account || row.harness || "Account",
@@ -212,6 +212,8 @@ export type RoutingDetail = {
   /** The oldest change the record still keeps, for "nothing since" lines. */
   historyFrom: string | null;
   gaps: string[];
+  /** The account has an entry but the record stores no exception list. */
+  exceptionsUnknown: boolean;
 };
 
 function purposeWord(purpose: string | undefined): string {
@@ -345,7 +347,11 @@ export function routingDetail(a: RouteAccount, view: RouteView, plans: UsageAcco
   const hist = accountChanges(view, a.key, now);
   const oldest = (view.changes ?? [])[0]?.at ?? null;
   const gaps: string[] = [];
-  if (!entry?.exceptions) gaps.push("Exceptions with end times show here once Khipu stores them as rows; until then they are only inside your words below.");
+  // Exceptions only exist inside an entry's words. No entry: there are none.
+  // An entry with no stored list: they may sit in its words, so say that
+  // instead of "None."
+  const exceptionsUnknown = !!entry && !Array.isArray(entry.exceptions);
+  if (exceptionsUnknown) gaps.push("Exceptions with end times show here once Khipu stores them as rows; until then they are only inside your words below.");
   if (caps.length && (a.cap_statuses ?? []).some((c) => !c.until && c.kind !== "share" && c.kind !== "per_day")) {
     gaps.push("A cap has no end of its own yet: it lasts until you remove it.");
   }
@@ -365,5 +371,6 @@ export function routingDetail(a: RouteAccount, view: RouteView, plans: UsageAcco
     limits: hist.limits,
     historyFrom: oldest ? dayOnly(oldest) : null,
     gaps,
+    exceptionsUnknown,
   };
 }

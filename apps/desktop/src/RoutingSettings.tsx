@@ -1175,6 +1175,7 @@ function AccountLine({
   staleAfterS,
   w,
   now,
+  reread,
   finder,
 }: {
   a: RouteAccount;
@@ -1188,6 +1189,7 @@ function AccountLine({
   staleAfterS: number;
   w: Writer;
   now: Date;
+  reread: () => Promise<unknown>;
   finder?: AccountsFinder | null;
 }) {
   const key = `account:${a.key}`;
@@ -1238,7 +1240,7 @@ function AccountLine({
             See routing details
           </button>
           {detail.target ? (
-            <RoutingDetailSheet account={a} view={data} plans={plan} now={now} onClose={detail.close} />
+            <RoutingDetailSheet account={a} view={data} plans={plan} now={now} onClose={detail.close} onChanged={reread} />
           ) : null}
         </div>
       </div>
@@ -1338,6 +1340,7 @@ function AccountsSection({
   staleAfterS,
   w,
   now,
+  reread,
   finder,
 }: {
   data: RouteView;
@@ -1349,6 +1352,7 @@ function AccountsSection({
   active: boolean;
   w: Writer;
   now: Date;
+  reread: () => Promise<unknown>;
   finder?: AccountsFinder | null;
 }) {
   const plans = plansState?.data ?? null;
@@ -1423,7 +1427,7 @@ function AccountsSection({
                 <AccountLine key={a.key} a={a} data={data} plan={rows.find((r) => r.key != null && r.key === a.key)}
                   suppressResetReadFailure={planReadFailure(rows.find((r) => r.key != null && r.key === a.key))}
                   pause={pauses.get(a.key)} onSignedIn={plansState?.reread} tags={accountTags(problems, a.key)}
-                  folds={folds} staleAfterS={staleAfterS} w={w} now={now} finder={finder} />
+                  folds={folds} staleAfterS={staleAfterS} w={w} now={now} reread={reread} finder={finder} />
               ))}
             </div>
           ) : (
@@ -5052,7 +5056,7 @@ export function RoutingSettings({
   const body: Record<GroupKey, ReactNode> = {
     accounts: data ? (
       <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} lists={lists} active={active}
-        staleAfterS={staleAfterSeconds(settings)} w={w} now={now}
+        staleAfterS={staleAfterSeconds(settings)} w={w} now={now} reread={rereadRoute}
         finder={finder} />
     ) : (
       unread

@@ -2,14 +2,14 @@
    Settings): a Plan detail for a Plans row and a Routing detail for a Routing
    row or a priority name. They are different views on purpose: the plan view
    is about use and how Khipu knows it, the routing view about who may take
-   work and on whose word. See accountDetail.ts for the data. */
+   work and on whose word. See accountDetailModel.ts for the data. */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Sheet, Tag } from "./ui";
 import { Meter, fmtPct } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
 import type { RouteAccount, RoutingState, RouteView } from "./routing";
-import { planDetail, routingDetail } from "./accountDetail";
+import { planDetail, routingDetail } from "./accountDetailModel";
 import { callCli } from "./settingsCli";
 import { plainError } from "./humanWords";
 
@@ -100,7 +100,12 @@ export function PlanDetailSheet({
                 <li key={w.name}>
                   <span className="nm">{w.name}</span>
                   <span className="rt">
-                    <b className={`left ${w.tone ?? ""}`}>{fmtPct(w.left)} left</b> · {w.resets}
+                    {w.stale ? (
+                      <b className="left">Figure is from before the reset</b>
+                    ) : (
+                      <b className={`left ${w.tone ?? ""}`}>{fmtPct(w.left)} left</b>
+                    )}{" "}
+                    · {w.resets}
                   </span>
                   <Meter pct={w.used} label={`${d.name} ${w.name}`} tone={w.tone} dim={w.stale} />
                 </li>
@@ -213,6 +218,8 @@ export function RoutingDetailSheet({
                 </div>
               ))}
             </>
+          ) : d.exceptionsUnknown ? (
+            <p className="meta">Not stored as rows yet. Any exception is inside your words below.</p>
           ) : (
             <p className="meta">None.</p>
           )}

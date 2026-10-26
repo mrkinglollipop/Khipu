@@ -14,7 +14,7 @@ import { paceWords } from "../routing";
 import { Tile } from "../ui";
 import { buildAttention } from "../doctorAttention";
 import { TILE_HEALTH_KEYS, healthKeysForAttention } from "../healthRows";
-import { activityLines, capRow, cleanWhy, nearlyGoneWords, planDetail, routingDetail } from "../accountDetail";
+import { activityLines, capRow, cleanWhy, nearlyGoneWords, planDetail, routingDetail } from "../accountDetailModel";
 import { captureCauseWords, longSpan, planWord, plainError, toastWords, waitedWords } from "../humanWords";
 
 const invokeMock = vi.fn();
@@ -270,12 +270,25 @@ describe("Routing rows and priority names open the Routing detail", () => {
     expect(view.queryByRole("heading", { name: "How much is left" })).toBeNull();
   });
 
-  it("shows no exceptions, not a guess, when the record has none", () => {
-    render(<RoutingCard state={routingState(route())} plans={usage()} />);
+  it("says 'None.' only for an empty list, and the gap when the record stores no list", () => {
+    const data = route();
+    // Gamma has words but no stored list; Zeta is not in the priority at all.
+    data.accounts!.push({ key: "zeta|", label: "Zeta", harness: "claude", state: "open", configured: true });
+    data.priority!.entries.push({ account: "eta|", label: "Eta", role: "Spare.", until: null, in_settings: true, exceptions: [] });
+    data.accounts!.push({ key: "eta|", label: "Eta", harness: "claude", state: "open", configured: true });
+    render(<RoutingCard state={routingState(data)} plans={usage()} />);
+    const sectionOf = () => within(screen.getByRole("dialog")).getByRole("heading", { name: "Exceptions in force" }).parentElement!;
     fireEvent.click(screen.getByRole("button", { name: /^Gamma: Open/ }));
-    const view = within(screen.getByRole("dialog"));
-    expect(view.getByRole("heading", { name: "Exceptions in force" }).parentElement).toHaveTextContent("None.");
-    expect(view.getByText(/Not in your priority|Overflow only\./)).toBeInTheDocument();
+    expect(sectionOf()).not.toHaveTextContent("None.");
+    expect(sectionOf()).toHaveTextContent("Not stored as rows yet");
+    expect(within(screen.getByRole("dialog")).getByText("Overflow only.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close details" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Zeta: Open/ }));
+    expect(sectionOf()).toHaveTextContent("None.");
+    expect(screen.getByRole("dialog")).not.toHaveTextContent("Not shown yet");
+    fireEvent.click(screen.getByRole("button", { name: "Close details" }));
+    fireEvent.click(screen.getByRole("button", { name: /^Eta: Open/ }));
+    expect(sectionOf()).toHaveTextContent("None.");
   });
 
   it("opens from a priority name at the owner's words, and Escape returns focus", async () => {
@@ -289,6 +302,100 @@ describe("Routing rows and priority names open the Routing detail", () => {
     expect(scroll).toHaveBeenCalled();
     fireEvent(screen.getByRole("dialog"), new Event("cancel", { cancelable: true }));
     await waitFor(() => expect(document.activeElement).toBe(name));
+  });
+});
+
+describe("review round 2", () => {
+  it("the Plan detail follows the live report: Refresh plan changes what it shows", () => {
+    const { rerender } = render(<PlansCard state={plansState(usage())} routing={route()} />);
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha Max/ }));
+    expect(within(screen.getByRole("dialog")).getByText("20% left")).toBeInTheDocument();
+    const next = usage();
+    next.accounts![0].windows![1].used_pct = 50;
+    rerender(<PlansCard state={plansState(next)} routing={route()} />);
+    const dialog = within(screen.getByRole("dialog"));
+    expect(dialog.getByText("50% left")).toBeInTheDocument();
+    expect(dialog.queryByText("20% left")).toBeNull();
+  });
+
+  it("closes the Plan detail when its account leaves the report", () => {
+    const { rerender } = render(<PlansCard state={plansState(usage())} routing={route()} />);
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha Max/ }));
+    const gone = usage();
+    gone.accounts = gone.accounts!.slice(1);
+    rerender(<PlansCard state={plansState(gone)} routing={route()} />);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("says the real cause of a failed capture, and the summariser sentence only for non-JSON", () => {
+    expect(captureCauseWords("last capture attempt failed: provider down")).toBe("The last session couldn't be saved: provider down");
+    expect(captureCauseWords("last capture attempt failed: extract: HTTPError 429; 1 job(s) waiting 90 min — nothing is draining them")).toBe(
+      "The last session couldn't be saved: HTTPError 429. A session is waiting to be saved; it has waited 90 minutes");
+    expect(captureCauseWords("last capture attempt failed: capture rc=1")).toContain("capture rc=1");
+    expect(captureCauseWords("last capture attempt failed: extract: model returned non-JSON: 'x'")).toContain("summariser sent back");
+    const out = buildAttention({
+      capture_liveness: { ok: false, red: ["claude_code"], harnesses: { claude_code: { reasons: ["last capture attempt failed: provider down"] } } },
+    });
+    expect(out.items[0].cause).toContain("provider down");
+    expect(out.items[0].cause).not.toContain("summariser");
+  });
+
+  it("calls only the database's own timeout a database problem", () => {
+    expect(plainError("lock timeout expired")).toBe("lock timeout expired");
+    expect(plainError("could not connect to the model host")).toBe("could not connect to the model host");
+    expect(plainError("connection timeout expired")).toContain("couldn't reach the database");
+    expect(toastWords("khipu exited 1: error: lock timeout expired")).toBe(
+      "Khipu couldn't finish that. Try again in a moment; the details are in the tooltip.");
+  });
+
+  it("does not print a left figure for a window that has reset since it was read", () => {
+    const report = usage();
+    // Weekly reset passed 5 minutes ago; the 80% was counted before it.
+    report.accounts![0].windows![1].resets_at = "2026-03-09T18:55:00Z";
+    render(<PlansCard state={plansState(report)} routing={route()} />);
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha Max/ }));
+    const dialog = within(screen.getByRole("dialog"));
+    expect(dialog.getByText("Figure is from before the reset")).toBeInTheDocument();
+    expect(dialog.queryByText("20% left")).toBeNull();
+    expect(dialog.getByText("92% left")).toBeInTheDocument();
+  });
+
+  it("says the non-week window is shown because it is the closest to its limit", () => {
+    const row = usage().accounts![0];
+    row.windows![0].used_pct = 90;
+    row.windows![1].used_pct = 10;
+    const d = planDetail(row, route(), NOW);
+    expect(d.credits).toEqual(["Home shows the five-hour window because it is the closest to its limit."]);
+  });
+
+  it("every attention item's Details marks a rendered row, the whole report when it has none", async () => {
+    const { HealthReportRows, markHealthRows } = await import("../healthRows");
+    const { promotionAttention } = await import("../doctorAttention");
+    const parsed = {
+      hub_ok: true,
+      backup_ok: false,
+      topics_embed_lag_ok: false, topics_embed_lag: {},
+      capture_liveness_ok: false,
+      capture_liveness: { ok: false, red: ["claude_code"], harnesses: { claude_code: { reasons: ["x"] } } },
+      promotion: { queued: { queued_at: "2026-03-09T18:00:00Z" } },
+    } as Record<string, unknown>;
+    const items = [...buildAttention(parsed).items, ...promotionAttention(parsed)];
+    expect(items.map((i) => i.key)).toEqual(expect.arrayContaining(["backup", "topics_embed_lag", "liveness:claude_code", "promotion"]));
+    render(<HealthReportRows parsed={parsed} attention={items} />);
+    for (const item of items) {
+      const marked = markHealthRows(document, healthKeysForAttention(item.key));
+      expect(marked.length, item.key).toBeGreaterThan(0);
+      marked.forEach((el) => expect(el.classList.contains("health-hl")).toBe(true));
+      if (item.key === "promotion") expect(marked[0].hasAttribute("data-health-report")).toBe(true);
+      else expect(marked.every((el) => el.hasAttribute("data-health-key"))).toBe(true);
+    }
+  });
+
+  it("a tile's rows are rendered and marked", async () => {
+    const { HealthReportRows, markHealthRows } = await import("../healthRows");
+    render(<HealthReportRows parsed={{ backup_ok: false, graph_backup_ok: true, graph_offsite_ok: true }} attention={[]} />);
+    const marked = markHealthRows(document, TILE_HEALTH_KEYS.backups);
+    expect(marked.map((el) => el.getAttribute("data-health-key")).sort()).toEqual(["backup_ok", "graph_backup_ok", "graph_offsite_ok"]);
   });
 });
 

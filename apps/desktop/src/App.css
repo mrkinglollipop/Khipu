@@ -3485,7 +3485,7 @@ input.switch:disabled {
 .tile-btn:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .tile-chev { position: absolute; right: var(--s3); top: var(--s3); color: var(--muted); }
 @media (hover: hover) and (pointer: fine) { .tile-btn:hover { background: var(--surface-2); border-color: var(--border-strong); } }
-.row-item.health-hl { background: var(--accent-soft); border-radius: var(--r-sm); transition: background 0.4s; }
+.row-item.health-hl, .rows.health-hl { background: var(--accent-soft); border-radius: var(--r-sm); transition: background 0.4s; }
 
 .route-state.route-prio { display: block; }
 dialog.sheet-dialog { position: fixed; inset: 0 0 0 auto; z-index: 50; margin: 0 0 0 auto; padding: 0; border: 0; border-left: 1px solid var(--border-strong); background: var(--surface); color: var(--text); width: min(480px, 100vw); max-width: none; height: 100vh; max-height: none; box-shadow: var(--shadow-md); }
