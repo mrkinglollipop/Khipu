@@ -5036,12 +5036,24 @@ def upsert_embeddings(
             # A catch-up that read a topic before it was purged must not put
             # it back: its hub write may have committed before the purge.
             purged = _purged_topic_slugs(path)
+            topic_version = time.time() if read_at is None else float(read_at)
+            stale_topics: set[str] = set()
             for row in topic_rows:
                 if row["slug"] in purged:
                     continue
                 row = _topic_routing_metadata(row)
-                old = con.execute("SELECT deleted_at FROM topics WHERE slug = ?", (row["slug"],)).fetchone()
+                old = con.execute("SELECT deleted_at, updated_at FROM topics WHERE slug = ?",
+                                  (row["slug"],)).fetchone()
                 if old and old[0] is not None:
+                    continue
+                # The freshness rule, as for a pull: a topic read before the
+                # copy the replica holds (an embed that read its source, then
+                # waited on the provider) never replaces it.
+                held, incoming = (_utc(old[1]) if old else None), _utc(row.get("updated_at"))
+                if (_held_read_at(con, "topics", row["slug"]) > topic_version
+                        or (held and incoming and held > incoming)):
+                    # Its vectors were built from that older body too.
+                    stale_topics.add(str(row["slug"]))
                     continue
                 cols = [c for c in _TOPIC_COLS if c in topic_cols and c in row]
                 vals = [_json_text(row[c]) if c in ("links", "frontmatter") else
@@ -5051,15 +5063,15 @@ def upsert_embeddings(
                     "ON CONFLICT(slug) DO UPDATE SET " + ", ".join(f"{c}=excluded.{c}" for c in cols if c != "slug"),
                     vals,
                 )
-                _record_read_at(con, "topics", row["slug"],
-                                time.time() if read_at is None else float(read_at))
+                _record_read_at(con, "topics", row["slug"], topic_version)
             version = time.time() if read_at is None else float(read_at)
             refs = {(str(p), str(k), str(r)) for p, k, r in replace_refs}
             refs |= {(str(e.get("profile")), str(e.get("kind")), str(e.get("ref"))) for e in embedding_rows}
             # An episode's vectors are also as new as the episode row written with them.
             newer = {(p, k, r) for p, k, r in refs
                      if max(_held_read_at(con, "vectors", _vector_key(p, k, r)),
-                            _held_read_at(con, "episodes", r) if k == "episode" else 0.0) > version}
+                            _held_read_at(con, "episodes", r) if k == "episode" else 0.0) > version
+                     or (k == "topic" and r in stale_topics)}
             for profile, kind, ref in replace_refs:
                 if (str(profile), str(kind), str(ref)) in newer or kind in _FACT_VECTOR_KINDS:
                     continue

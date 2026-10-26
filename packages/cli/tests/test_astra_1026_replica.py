@@ -120,3 +120,34 @@ def test_snapshot_connections_bound_every_statement(monkeypatch):
     assert hs.try_hub_connect(connect_timeout=30) is sentinel
     assert captured["connect_timeout"] == 30
     assert "statement_timeout=" in captured["conninfo"], captured
+
+
+def test_an_older_topic_read_never_replaces_a_newer_one(replica):  # noqa: F811
+    """Re-check round 1 (prior finding 9): an embed that read its topic before
+    a newer copy landed keeps the newer body and its vectors."""
+    vec = [0.1] * 4
+
+    def vector(body, at):
+        return {"profile": "p", "kind": "topic", "ref": "probe", "chunk_idx": 0, "chunk_text": body,
+                "content_hash": body, "embedding": vec, "built_at": at}
+
+    assert hs.upsert_embeddings([vector("NEW", "2026-10-26T10:00:00Z")],
+                                topic_rows=[{"slug": "probe", "body": "NEW"}],
+                                replace_refs=[("p", "topic", "probe")], read_at=200)["ok"]
+    assert hs.upsert_embeddings([vector("OLD", "2026-10-25T10:00:00Z")],
+                                topic_rows=[{"slug": "probe", "body": "OLD"}],
+                                replace_refs=[("p", "topic", "probe")], read_at=100)["ok"]
+    import sqlite3
+
+    with sqlite3.connect(hs.snapshot_path()) as con:
+        assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ("NEW",)
+        assert con.execute("SELECT chunk_text FROM memory_embeddings WHERE kind='topic' AND ref='probe'"
+                           ).fetchall() == [("NEW",)]
+
+
+def test_an_older_updated_at_never_replaces_a_newer_topic(replica):  # noqa: F811
+    assert hs.upsert_embeddings([], topic_rows=[{"slug": "probe", "body": "NEW",
+                                                 "updated_at": "2026-10-26T10:00:00Z"}], read_at=100)["ok"]
+    assert hs.upsert_embeddings([], topic_rows=[{"slug": "probe", "body": "OLD",
+                                                 "updated_at": "2026-10-25T10:00:00Z"}], read_at=200)["ok"]
+    assert hs.topic_detail_snapshot("probe")["body"] == "NEW"

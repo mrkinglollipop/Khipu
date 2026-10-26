@@ -146,7 +146,10 @@ def test_reemitted_conversation_after_compaction_is_still_dropped(monkeypatch, t
              row("assistant", "Here is the migration plan. " + "a" * 220)]
     write(p, first)
     assert invoke(p, tmp_path)["due"]
+    compact = {"type": "user", "isCompactSummary": True,
+               "message": {"role": "user", "content": "This session is being continued. " + "s" * 80}}
     with p.open("a") as f:
+        f.write(json.dumps(compact) + "\n")
         for r in first:
             f.write(json.dumps(r) + "\n")
         f.write(json.dumps(row("user", "Now apply step one of that plan please.")) + "\n")
@@ -169,3 +172,74 @@ def test_subagentstop_parent_uses_the_parent_episodes_namespaced_id(monkeypatch,
     assert result["due"], result
     job = jobs()[0]
     assert job["parent_session_id"] == "claude_code:parent-native-id", job
+
+
+def test_equal_length_rewrite_inside_a_large_transcript_is_read_again(monkeypatch, tmp_path):
+    """Re-check round 1: the content check covers every byte already read,
+    not only the head and the bytes just before the offset."""
+    fake_hook(monkeypatch, tmp_path)
+    p = tmp_path / "large.jsonl"
+    rows = [row("user", "Head question " + "a" * 70000), row("assistant", "Head answer " + "b" * 70000),
+            row("user", "MIDDLE OLD REQUIREMENT " + "c" * 250), row("assistant", "Middle answer " + "d" * 250),
+            row("user", "Tail question " + "e" * 70000), row("assistant", "Tail answer " + "f" * 70000)]
+    write(p, rows)
+    assert invoke(p, tmp_path)["due"]
+    old_size = p.stat().st_size
+    rows[2] = row("user", "MIDDLE NEW REQUIREMENT " + "g" * 250)
+    write(p, rows)
+    assert p.stat().st_size == old_size
+    result = invoke(p, tmp_path)
+    assert result["due"], result
+    assert any("MIDDLE NEW REQUIREMENT" in j["transcript"] for j in jobs())
+
+
+def test_an_appended_transcript_keeps_its_checkpoint(monkeypatch, tmp_path):
+    fake_hook(monkeypatch, tmp_path)
+    p = tmp_path / "session.jsonl"
+    write(p, [row("user", "first question " + "a" * 230), row("assistant", "first answer " + "b" * 230)])
+    assert invoke(p, tmp_path)["due"]
+    with p.open("a") as f:
+        f.write(json.dumps(row("user", "second question " + "c" * 230)) + "\n")
+        f.write(json.dumps(row("assistant", "second answer " + "d" * 230)) + "\n")
+    assert invoke(p, tmp_path)["due"]
+    later = [j for j in jobs() if "second question" in j["transcript"]]
+    assert len(later) == 1 and "first question" not in later[0]["transcript"]
+
+
+def test_a_repeated_instruction_and_identical_reply_are_new_turns(monkeypatch, tmp_path):
+    """Re-check round 1: identical text with new message identities and no
+    compaction ahead of it is a new exchange, not a replay."""
+    fake_hook(monkeypatch, tmp_path)
+    p = tmp_path / "repeated.jsonl"
+    instruction = "Review the release patch and fix every correctness issue before merging it."
+    answer = "There are no new findings in this review. " + "a" * 220
+    initial = [row("user", instruction), row("assistant", answer)]
+    initial[0]["uuid"], initial[1]["uuid"] = "turn1", "turn2"
+    write(p, initial)
+    assert invoke(p, tmp_path)["due"]
+    fresh = [row("user", instruction), row("assistant", answer)]
+    fresh[0]["uuid"], fresh[1]["uuid"] = "turn3", "turn4"
+    with p.open("a") as f:
+        for record in fresh:
+            f.write(json.dumps(record) + "\n")
+    result = invoke(p, tmp_path)
+    assert result["new_turns"] == 1, result
+
+
+def test_a_copied_reply_with_its_captured_message_id_is_dropped(monkeypatch, tmp_path):
+    """Without a compaction summary, an assistant copy that carries the API
+    message id it was captured with is proof of a copy; the instruction
+    beside it in the copied run goes with it."""
+    fake_hook(monkeypatch, tmp_path)
+    p = tmp_path / "copied.jsonl"
+    instruction = "Review the release patch and fix every correctness issue before merging it."
+    reply = {"type": "assistant", "message": {"id": "msg_1", "role": "assistant",
+                                              "content": "No new findings in this review. " + "a" * 220}}
+    write(p, [row("user", instruction), reply])
+    assert invoke(p, tmp_path)["due"]
+    with p.open("a") as f:
+        for record in (row("user", instruction), reply,
+                       row("user", "Now ship it please, after a final check of the notes.")):
+            f.write(json.dumps(record) + "\n")
+    result = invoke(p, tmp_path)
+    assert result["new_turns"] == 1 and result["deduped_msgs"] == 2, result

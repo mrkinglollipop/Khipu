@@ -790,6 +790,17 @@ def text_fingerprint(role: str, text: str) -> str:
     return hashlib.sha1(f"{role}\n{text}".encode("utf-8")).hexdigest()[:16]
 
 
+def _message_identity(d: dict, role: str, fp: str) -> str | None:
+    """An assistant message's API id with its text's fingerprint, kept in
+    ``seen_text`` beside the fingerprints: a re-emitted copy carries the same
+    id and text, a new reply a new id."""
+    message = d.get("message") if isinstance(d.get("message"), dict) else {}
+    mid = message.get("id")
+    if role != "assistant" or not isinstance(mid, str) or not mid:
+        return None
+    return "id:" + hashlib.sha1(f"{mid}\n{fp}".encode("utf-8")).hexdigest()[:16]
+
+
 def remember_seen(st: dict, fresh: list[str]) -> None:
     """Append ``fresh`` fingerprints to the state's ``seen_text`` (newest last),
     bounded at SEEN_TEXT_MAX."""
@@ -910,27 +921,47 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         fp = (text_fingerprint(role, text) if known is not None and role != "tool" and not streamed
               and len(text) >= FINGERPRINT_MIN_CHARS else None)
         entries.append((d, role, text, line_end, checkpoint, real, streamed, fp))
-    # A re-emission copies a run of messages; a person repeating an earlier
-    # instruction writes one, and a new answer follows it. So the person's
-    # own message (a real user turn) whose fingerprint was seen is dropped
-    # only when the fingerprinted message next to it (before or after) was
-    # seen too: a proven copied run, never a lone repeat. A seen assistant
-    # reply or machine notification is a copy on its own.
+    # Text alone cannot tell a re-emitted copy from a person repeating
+    # themselves (or an identical reply to it), so a seen message is dropped
+    # only on proof that it is a copy: it follows the compaction summary that
+    # heads a re-emission, with nothing new between them; it is an assistant
+    # message whose API message id was captured with this same text (a new
+    # reply gets a new id); it is a machine notification; or it is next to
+    # such a proven copy in a run of seen messages. A lone repeat is a turn.
     seen_flags: dict[int, bool] = {}
+    proven: set[int] = set()
     if known is not None:
         running = set(known)
+        replay = False
         for i, entry in enumerate(entries):
-            if entry[7] is not None:
-                seen_flags[i] = entry[7] in running
-                running.add(entry[7])
+            d, role, fp = entry[0], entry[1], entry[7]
+            if d.get("isCompactSummary"):
+                replay = True
+                continue
+            if fp is None:
+                continue
+            seen = fp in running
+            seen_flags[i] = seen
+            ident = _message_identity(d, role, fp)
+            if seen and (replay or not entry[5] and role != "assistant"
+                         or (ident is not None and ident in running)):
+                proven.add(i)
+            elif not seen:
+                replay = False
+            running.add(fp)
+            if ident is not None:
+                running.add(ident)
     printed = sorted(seen_flags)
-    copied: set[int] = set()
+    copied: set[int] = set(proven)
     for pos, i in enumerate(printed):
-        if not seen_flags[i]:
+        # Spread along a run of seen messages from each proven copy.
+        if i not in proven:
             continue
-        neighbours = [printed[p] for p in (pos - 1, pos + 1) if 0 <= p < len(printed)]
-        if not entries[i][5] or any(seen_flags[n] for n in neighbours):
-            copied.add(i)
+        for step in (-1, 1):
+            p = pos + step
+            while 0 <= p < len(printed) and seen_flags[printed[p]]:
+                copied.add(printed[p])
+                p += step
     last_user_counted = False   # the open user block already holds a real turn
     head_open = True            # every message so far was an already-seen copy
     for i, (d, role, text, line_end, checkpoint, real, streamed, fp) in enumerate(entries):
@@ -949,6 +980,10 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             if fp not in known:
                 known.add(fp)
                 fresh.append(fp)
+            ident = _message_identity(d, role, fp)
+            if ident is not None and ident not in known:
+                known.add(ident)
+                fresh.append(ident)
         if head_open and d.get("isCompactSummary") and stats is not None:
             # Claude Code's own summary sits ahead of the copies it re-emits;
             # it leaves the head open and rides along (``carry``) when the
@@ -973,43 +1008,81 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     return msgs, end, users
 
 
-# The bytes either side of a checkpoint that must still be there for its
-# offset to mean anything: the file's start and the run just before the offset.
-ANCHOR_BYTES = 64 * 1024
+_ANCHOR_CHUNK = 1 << 20
 
 
-def _transcript_anchor(path: Path, offset: int) -> str | None:
-    """A digest of the transcript's first and last ``ANCHOR_BYTES`` before
-    ``offset``, or None when they cannot be read (or the file is shorter)."""
-    span = min(int(offset), ANCHOR_BYTES)
+def _prefix_hasher(path: Path, offset: int, hasher: Any = None, start: int = 0) -> Any:
+    """``hasher`` (a new sha256 by default) extended with the transcript's
+    bytes ``[start, offset)``, or None when they cannot all be read."""
+    h = hasher if hasher is not None else hashlib.sha256()
+    left = int(offset) - int(start)
     try:
         with path.open("rb") as f:
-            head = f.read(span)
-            f.seek(max(0, int(offset) - ANCHOR_BYTES))
-            tail = f.read(span)
+            f.seek(int(start))
+            while left > 0:
+                chunk = f.read(min(_ANCHOR_CHUNK, left))
+                if not chunk:
+                    return None
+                h.update(chunk)
+                left -= len(chunk)
     except OSError:
         return None
-    if len(head) < span or len(tail) < span:
+    return h
+
+
+def _stat_key(path: Path) -> list[int] | None:
+    try:
+        info = path.stat()
+    except OSError:
         return None
-    return hashlib.sha256(b"%d\0" % int(offset) + head + b"\0" + tail).hexdigest()
+    return [info.st_size, info.st_mtime_ns]
 
 
 def _record_anchor(st: dict) -> None:
-    """Remember what the transcript holds before the saved offset, so a file
-    rewritten in place (same path, same inode, a size at least the offset)
-    is recognised as new content instead of read on from the old offset."""
+    """Remember a digest of every byte the transcript held before the saved
+    offset, with the file's size and mtime then, so a file rewritten in place
+    (same path and inode, a size at least the offset) anywhere in what was
+    already read is recognised as new content instead of read on from the
+    old offset. The prefix validated at this run's start is extended rather
+    than read again (``_anchor_hasher``, never saved)."""
+    carried = st.pop("_anchor_hasher", None)
     path, offset = st.get("transcript_path"), int(st.get("offset", 0) or 0)
     held = st.get("transcript_anchor")
     if not path or offset <= 0:
         st.pop("transcript_anchor", None)
         return
-    if isinstance(held, dict) and held.get("offset") == offset:
+    if isinstance(held, dict) and held.get("offset") == offset and held.get("stat"):
+        if carried is not None and carried[0] == offset:
+            # Validated whole this run: an append since moved only the stat.
+            held["stat"] = _stat_key(Path(path)) or held["stat"]
         return
-    digest = _transcript_anchor(Path(path), offset)
-    if digest is None:
+    path = Path(path)
+    stat = _stat_key(path)
+    if carried is not None and carried[0] <= offset:
+        h = _prefix_hasher(path, offset, carried[1].copy(), carried[0])
+    else:
+        h = _prefix_hasher(path, offset)
+    if h is None or stat is None:
         st.pop("transcript_anchor", None)
     else:
-        st["transcript_anchor"] = {"offset": offset, "digest": digest}
+        st["transcript_anchor"] = {"offset": offset, "digest": h.hexdigest(), "stat": stat}
+
+
+def _prefix_rewritten(st: dict, path: Path, offset: int) -> bool:
+    """Whether the bytes before ``offset`` differ from those the checkpoint
+    recorded. A file unchanged since (same size and mtime) is not read; any
+    other is hashed whole up to the offset, and a match is kept for
+    ``_record_anchor`` to extend."""
+    anchor = st.get("transcript_anchor")
+    if not (isinstance(anchor, dict) and anchor.get("offset") == offset and offset > 0):
+        return False
+    if anchor.get("stat") and anchor["stat"] == _stat_key(path):
+        return False
+    h = _prefix_hasher(path, offset)
+    if h is None or h.hexdigest() != anchor.get("digest"):
+        return True
+    st["_anchor_hasher"] = (offset, h)
+    return False
 
 
 def _reset_transcript_offset(st: dict, path: Path) -> None:
@@ -1019,10 +1092,8 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
     offset are checked too (``transcript_anchor``)."""
     info = path.stat()
     identity = [info.st_dev, info.st_ino]
-    anchor = st.get("transcript_anchor")
     offset = int(st.get("offset", 0))
-    rewritten = (isinstance(anchor, dict) and anchor.get("offset") == offset and offset > 0
-                 and offset <= info.st_size and _transcript_anchor(path, offset) != anchor.get("digest"))
+    rewritten = offset <= info.st_size and _prefix_rewritten(st, path, offset)
     reset = ((st.get("transcript_path") and st["transcript_path"] != str(path))
             or st.get("transcript_identity") not in (None, identity)
             or offset > info.st_size or rewritten)
@@ -1043,6 +1114,7 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
             separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
         st["offset"] = 0
         st.pop("transcript_anchor", None)
+        st.pop("_anchor_hasher", None)
         if st.get("transcript_prefix"):
             st["replay_prefix"] = st.pop("transcript_prefix")
         st.pop("carry", None)
