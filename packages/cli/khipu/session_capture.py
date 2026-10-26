@@ -929,7 +929,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     # reply gets a new id); it is a machine notification; or it is next to
     # such a proven copy in a run of seen messages. A lone repeat is a turn.
     # A text repeated inside one replay span ends it (that repeat, and what
-    # follows, is new) unless the next message is an assistant reply whose id
+    # follows, is new) unless the next assistant reply is one whose id
     # was captured with this same text: then the old history itself held the
     # repeat and the re-emission is still copying it.
     seen_flags: dict[int, bool] = {}
@@ -950,7 +950,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             seen = fp in running
             seen_flags[i] = seen
             if replay and fp in span:
-                after = next((e for e in entries[i + 1:] if e[7] is not None), None)
+                after = next((e for e in entries[i + 1:] if e[7] is not None and e[1] == "assistant"), None)
                 after_ident = after and _message_identity(after[0], after[1], after[7])
                 if after_ident is None or after_ident not in running:
                     replay = False

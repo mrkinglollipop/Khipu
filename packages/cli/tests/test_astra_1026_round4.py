@@ -72,3 +72,26 @@ def test_reader_hides_a_close_reason_the_forget_missed(pg):
         dumped = hs._hub_commitments(cur)
     assert [c["close_reason"] for c in closed] == ["forgotten"], closed
     assert "aubergine" not in json.dumps(dumped, default=str), dumped
+
+
+def test_reemitted_repeat_followed_by_another_request_is_not_recaptured(tmp_path):
+    # User X, reply A, user X, user Y, reply B: the repeat is followed by a
+    # user message, not the reply that proves the old history held it.
+    p = tmp_path / "transcript.jsonl"
+    instruction = "Run the full migration checklist again and report every failure you see."
+    follow_up = "Also list which of those failures block tonight's deploy, with owners."
+    first_reply = row("assistant", "First pass: two failures. " + "a" * 100)
+    first_reply["message"]["id"] = "msg_1"
+    second_reply = row("assistant", "Second pass: one blocker. " + "b" * 100)
+    second_reply["message"]["id"] = "msg_2"
+    history = [row("user", instruction), first_reply, row("user", instruction), row("user", follow_up), second_reply]
+    write(p, history)
+    stats = {}
+    _, offset, _ = sc.read_window(p, 0, seen=(), stats=stats)
+    compact = {"type": "user", "isCompactSummary": True,
+               "message": {"role": "user", "content": "This session is being continued. " + "s" * 80}}
+    with p.open("a") as f:
+        for entry in [compact, *history]:
+            f.write(json.dumps(entry) + "\n")
+    messages, _, _ = sc.read_window(p, offset, seen=stats["fresh"])
+    assert not any(instruction in t or follow_up in t or "pass:" in t for _, t in messages), messages
