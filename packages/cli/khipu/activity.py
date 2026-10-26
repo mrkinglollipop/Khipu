@@ -116,13 +116,58 @@ def topic_detail(slug: str, *, offset: int = 0,
     """One page of a topic for MCP ``khipu_get`` and ``khipu get``: the body
     from UTF-8 byte ``offset``, at most ``max_bytes`` of it, with the topic's
     identity and paging fields on every page (``text_pages.page_utf8``).
-    Only the page's bytes leave the database. Tombstones are not found."""
+    When briefs are on and a current brief exists for the slug, that brief
+    body is what is paged — same text reflect offers under ``topic:<slug>``.
+    Otherwise only the page's bytes leave the database. Tombstones are not
+    found."""
     slug = (slug or "").strip()
     if not slug:
         return None
     offset, max_bytes = page_args(offset, max_bytes)
     with connect() as conn:
         with conn.cursor() as cur:
+            brief_raw = None
+            try:
+                from khipu import briefs, features
+
+                if features.enabled("briefs"):
+                    brief = briefs.read_brief(cur, slug)
+                    if (brief.get("found") and brief.get("state") == "current"
+                            and (brief.get("body") or "").strip()):
+                        brief_raw = brief["body"].encode("utf-8")
+            except Exception:  # noqa: BLE001 — fall through to the wiki page
+                brief_raw = None
+            if brief_raw is not None:
+                cur.execute(
+                    """
+                    SELECT t.slug, t.title, t.status, t.created_at, t.updated_at,
+                           t.links, t.source_path, t.content_hash
+                    FROM topics t
+                    WHERE t.slug = %s AND t.deleted_at IS NULL
+                    """,
+                    (slug,),
+                )
+                r = cur.fetchone()
+                if not r:
+                    return None
+                page = page_utf8(
+                    brief_raw[offset:offset + fetch_bytes(max_bytes)],
+                    offset,
+                    max_bytes,
+                    len(brief_raw),
+                )
+                return {
+                    "id": r[0],
+                    "slug": r[0],
+                    "title": r[1],
+                    "status": r[2],
+                    "created_at": r[3].isoformat() if r[3] else None,
+                    "updated_at": r[4].isoformat() if r[4] else None,
+                    "links": r[5],
+                    "source_path": r[6],
+                    "content_hash": r[7],
+                    **page,
+                }
             cur.execute(
                 """
                 SELECT t.slug, t.title,

@@ -1310,11 +1310,9 @@ def _tool_get(args: dict) -> dict:
                 inferred = "topic"
             else:
                 row = dict(row)
-                # Additive (Phase 2A): decision_states (one entry per decision
-                # this episode produced) + validity (current/superseded/
-                # retracted counts). Hub path only — the sqlite replica has no
-                # decisions table, so the stale-fallback payload below stays
-                # exactly as it was.
+                # Additive (Phase 2A): decision_states + validity. The stale
+                # fallback attaches the same fields from the replica's
+                # decisions table inside episode_detail_snapshot.
                 from khipu.decisions import decision_states_for_episode
 
                 row.update(decision_states_for_episode(int(ident)))
