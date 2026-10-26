@@ -984,10 +984,14 @@ def _stop_events(view: dict, keys: list[str], *, keep_priority: bool, keep_pause
             events += [{"type": "priority_drop", "account": key} for key in keys]
             done["priority"] = "removed"
         else:
-            events.append({"type": "priority_set", "until": held.get("until"),
-                           "entries": [{"account": e["account"], "label": e["label"], "role": e.get("role"),
-                                        "until": e.get("until"),
-                                        **({"level": dict(e["level"])} if e.get("level") else {})} for e in rest]}
+            # The other entries as stored, not as the view folds them: an
+            # ended one, a level not yet started and exceptions stay.
+            stored = view.get("priority_stored") or {}
+            kept = [dict(e) for e in stored.get("entries") or [] if e["account"] not in keys] if stored else [
+                {"account": e["account"], "label": e["label"], "role": e.get("role"), "until": e.get("until"),
+                 **({"level": dict(e["level"])} if e.get("level") else {})} for e in rest]
+            events.append({"type": "priority_set", "until": stored.get("until", held.get("until")),
+                           "entries": kept}
                           if rest else {"type": "priority_clear"})
             done["priority"] = "removed"
     for key in keys:

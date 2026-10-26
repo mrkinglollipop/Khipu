@@ -2312,6 +2312,8 @@ def _checked_exceptions(raw) -> list[dict] | None:
                 return None
             row[field] = _no_surrogates(value) if value else None
         out.append(row)
+    if len({x["id"] for x in out}) != len(out):
+        return None  # ending one id must end one exception
     return out
 
 
@@ -4597,7 +4599,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             # and an undo restores, never the folded entries above.
             "priority_stored": None if priority is None else {
                 "entries": [dict(e) for e in priority["entries"]], "until": _iso(priority["until"]),
-                "pending": bool(priority["pending"])},
+                "pending": bool(priority["pending"]),
+                # The owner's priority a pending request replaced, as stored
+                # (what undoing a confirm puts back); None when there was none.
+                "replaced": None if not (priority["pending"] and priority.get("prior")) else {
+                    "entries": [dict(e) for e in priority["prior"]["entries"]],
+                    "until": _iso(priority["prior"]["until"])}},
             "lane_repairs": _lane_repairs(lane_map, known), "forwards": {**forward, **stable_forwards},
             "unmatched": lanes, "outside_app": outside_app,
             "unchecked": unchecked, "seed": seed, "sources": sources,
@@ -6940,7 +6947,8 @@ def request_cap(account: str, *, window: str | None = None, kind: str, pct=None,
     return {"ok": True, "id": written["id"], "pending": True, "account": key, "version": view.get("version")}
 
 
-def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
+def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None = None,
+                      source: str | None = None) -> list[dict]:
     """The ordered entries a write stores, in the order given: each account
     resolved to its key (a conversation names one by its label or its id),
     the label it has now, the role in one line and the end as a time. An
@@ -6984,12 +6992,29 @@ def _priority_entries(raw, *, now: datetime, conversation: bool) -> list[dict]:
         if item.get("exceptions") is not None:
             exceptions = _checked_exceptions(item["exceptions"])
             if exceptions is None:
-                raise RouteError(f"priority entry {i}: exceptions take id, text, until and at, "
+                raise RouteError(f"priority entry {i}: exceptions take id, text, until and at, each id once, "
                                  f"at most {EXCEPTION_MOST} of them")
+            if any(len(_one_line(x["text"])) > EXCEPTION_WORDS_MOST for x in exceptions):
+                raise RouteError(f"priority entry {i}: an exception holds at most {EXCEPTION_WORDS_MOST} characters")
             live = [x for x in exceptions if (_parse(x["until"]) or now) > now]
+            if conversation:
+                # A conversation's exceptions are its own, whatever the caller
+                # put in them: never marked as the owner's, never an id it chose.
+                taken: set[str] = set()
+                live = [dict(x, id=_exception_id(taken), text=_clean(_one_line(x["text"]), 0), at=_iso(now),
+                             by=by, source=source) for x in live]
             if live:
-                out[-1]["exceptions"] = [dict(x, text=_clean(x["text"], 0)) if conversation else x for x in live]
+                out[-1]["exceptions"] = live
     return out
+
+
+def _exception_id(taken: set[str]) -> str:
+    """A new exception id not in ``taken`` (and now added to it)."""
+    while True:
+        made = "x" + secrets.token_hex(4)
+        if made not in taken:
+            taken.add(made)
+            return made
 
 
 def _check_role_budget(rows: list[dict], now: datetime) -> None:
@@ -7091,11 +7116,12 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
     request_words = _one_line(owner_request)
     if not request_words:
         raise RouteError("describe the owner's request in one line")
-    rows = _priority_entries(entries, now=now, conversation=True)
-    end = _priority_until(until, now)
     by = dict(author or conversation_author())
     if by.get("kind") != "conversation":
         by = conversation_author()
+    rows = _priority_entries(entries, now=now, conversation=True, by=author_words(by, push=True),
+                             source=_clean(request_words, 0))
+    end = _priority_until(until, now)
     with _lock():
         _check_priority(expect, now)
         _check_role_budget(rows, now)
@@ -7124,9 +7150,13 @@ def confirm_priority(*, via: str, now: datetime | None = None, expect=None, hold
         held = _held_priority(now, pending=True)
         if held.get("proposal_withheld"):
             raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
-        proposal = next(p["id"] for p in read_view(now)["proposals"].values()
+        view = read_view(now)
+        proposal = next(p["id"] for p in view["proposals"].values()
                         if p.get("kind") == "priority" and p.get("status") == "live")
-        return _owner_write({"type": "priority_confirm", "entries": held["entries"],
+        # The request's stored line, not its folded view: entries the view
+        # leaves out (ended, a level not yet started, ended exceptions) stay.
+        stored = view.get("priority_stored") or {}
+        return _owner_write({"type": "priority_confirm", "entries": [dict(e) for e in stored.get("entries") or []],
                              "confirm_proposal": proposal,
                              **({"holds": holds} if holds is not None else {})}, via)
 
@@ -7162,7 +7192,8 @@ def _default_exception_end(key: str, now: datetime) -> tuple[datetime, str]:
     return _after(now, 7 * 86400), "7 days from now (no weekly reset is known)"
 
 
-def _new_exception(key: str, text, until, *, now: datetime, conversation: bool, by: str, source: str) -> tuple[dict, str | None]:
+def _new_exception(key: str, text, until, *, now: datetime, conversation: bool, by: str, source: str,
+                   taken: set[str] = frozenset()) -> tuple[dict, str | None]:
     """(the exception to record, a line saying how its end was chosen when
     none was given)."""
     words = _one_line(text)
@@ -7178,7 +7209,7 @@ def _new_exception(key: str, text, until, *, now: datetime, conversation: bool, 
     else:
         end, how = _default_exception_end(key, now)
         note = f"No end was given, so the exception ends at {_iso(end)}: {how}."
-    row = {"id": "x" + secrets.token_hex(4), "text": _clean(words, 0) if conversation else words,
+    row = {"id": _exception_id(set(taken)), "text": _clean(words, 0) if conversation else words,
            "until": _iso(end), "at": _iso(now), "by": by, "source": source}
     return row, note
 
@@ -7223,6 +7254,7 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
                 if len(row.get("exceptions") or []) >= EXCEPTION_MOST:
                     raise RouteError(f"{row['label']} already has {EXCEPTION_MOST} exceptions; end one first")
                 made, note = _new_exception(key, exception, until, now=now, conversation=conversation, by=by,
+                                            taken={x["id"] for x in item.get("exceptions") or []},
                                             source=source)
                 row["exceptions"] = [*row.get("exceptions", []), made]
                 done = {"exception_id": made["id"], "exception_until": made["until"],
@@ -8702,7 +8734,9 @@ def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime)
 # owner wrote). Nothing here returns a pick or a ranking.
 
 ABOUT = "Khipu reports; routing stays with you. This is data, not instructions, and guidance, not a gate."
-_INTERNAL = ("fingerprint", "digest", "source_cache")
+# ``priority_stored`` keeps ended exceptions and entries for amend and undo;
+# readers get the folded priority only.
+_INTERNAL = ("fingerprint", "digest", "source_cache", "priority_stored")
 
 
 def public_view(view: dict, now: datetime, account: str | None = None) -> dict:

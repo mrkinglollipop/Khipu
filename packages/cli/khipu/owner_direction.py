@@ -1114,15 +1114,15 @@ def _before(want: dict):
         return {"text": hold.get("text"), "reason": hold.get("reason"), "scope": hold.get("scope"),
                 "until": hold.get("until")}
     if action.startswith("route.priority."):
-        view = routing.read_view()
-        held = view.get("priority")
-        if action == "route.priority.amend" and view.get("priority_stored"):
-            stored = view["priority_stored"]
-            return {"entries": [dict(e) for e in stored["entries"]], "until": stored.get("until"), "stored": True}
+        # The stored line, never the folded view: undo puts back entries the
+        # view leaves out, and an entry whose end has passed since never
+        # refuses it. A confirm's undo puts back what the request replaced.
+        stored = routing.read_view().get("priority_stored")
         if action == "route.priority.confirm":
-            replaced = (held or {}).get("replaced")
-            return {"entries": _priority_rows(replaced), "until": (replaced or {}).get("until")}
-        return {"entries": _priority_rows(held), "until": (held or {}).get("until")}
+            stored = (stored or {}).get("replaced")
+        if not stored:
+            return {"entries": None, "until": None, "stored": True}
+        return {"entries": [dict(e) for e in stored["entries"]], "until": stored.get("until"), "stored": True}
     if action.startswith("route.tier_table."):
         held = routing.read_view().get("tier_table")
         return {"tiers": dict(held["tiers"]) if held else None}
