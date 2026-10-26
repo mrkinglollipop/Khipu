@@ -1244,14 +1244,19 @@ def write_pg(payload: dict[str, Any]) -> dict[str, Any]:
                     # recovering its own savepoint cannot abort the capture.
                     cur.execute("SAVEPOINT capture_project_alias")
                     try:
-                        canonical = _resolve_project_alias(cur, payload["project"])
+                        typed = payload["project"]
+                        canonical = _resolve_project_alias(cur, typed)
                     except Exception as exc:  # noqa: BLE001 — optional enrichment, never abort the caller
                         cur.execute("ROLLBACK TO SAVEPOINT capture_project_alias")
                         cur.execute("RELEASE SAVEPOINT capture_project_alias")
                         _log(f"project alias lookup failed ({type(exc).__name__}); keeping original project")
                     else:
                         cur.execute("RELEASE SAVEPOINT capture_project_alias")
-                        payload["project"] = canonical or payload["project"]
+                        # Keep the typed name in raw so alias remove can restore
+                        # episodes that landed under the canonical (Q3 projects).
+                        if canonical and canonical != typed:
+                            payload["typed_project"] = typed
+                            payload["project"] = canonical
                 _note_project_root(cur, payload)
                 dedup = dedup_before_insert(cur, payload, source=source)
                 if dedup["action"] in ("skip", "merge"):
