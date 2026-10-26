@@ -615,6 +615,7 @@ export type RouteView = {
     hits_total?: number;
     more_not_shown?: number;
     too_large?: string[];
+    skipped?: { file: string; reason: string; message?: string }[];
   };
   /** Open owed directions, projected for this Mac's owner only (slice 19a). */
   unreached_directions?: {

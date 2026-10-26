@@ -28,7 +28,27 @@ export type FileCopiesModel = {
   hits_total: number;
   more_not_shown: number;
   too_large: string[];
+  skipped: { file: string; reason: string; message?: string }[];
 };
+
+/** Owner-visible reasons are retained even for empty or expired snapshots. */
+export function fileCopySkipWords(skip: FileCopiesModel["skipped"][number]): string {
+  if (skip.message) return skip.message;
+  const reasons: Record<string, string> = {
+    timeout: "Couldn't read in time.",
+    protected_path: "Protected path; not read.",
+    symlink: "Symbolic link; not read.",
+    dataless: "File is not available locally; not read.",
+    unreadable: "Couldn't read this path.",
+    not_regular: "Not a regular file.",
+    not_directory: "Not a directory.",
+    candidate_limit: "Candidate limit reached; some files were not checked.",
+    refresh_budget: "Scan time limit reached; remaining files were not checked.",
+    worker_limit: "Reader limit reached; not checked.",
+    unavailable: "Bounded reader unavailable; not checked.",
+  };
+  return reasons[skip.reason] ?? skip.reason.replace(/_/g, " ");
+}
 
 export type ChecksModel = {
   mismatches: ChecksRow[];
@@ -284,11 +304,13 @@ export function checksModel(view: RouteView | null, now: Date): ChecksModel {
   });
   const copies = view.routing_file_copies;
   const fileCopies: FileCopiesModel | null = copies
-    ? { status: copies.status, scanned_at: copies.scanned_at ?? null,
+    ? { status: copies.status === "checked" && (copies.skipped?.length || copies.too_large?.length)
+          ? "incomplete" : copies.status,
+        scanned_at: copies.scanned_at ?? null,
         files_checked: copies.files_checked ?? 0, hits: copies.hits ?? [],
         hits_total: copies.hits_total ?? copies.hits?.length ?? 0,
         more_not_shown: copies.more_not_shown ?? 0,
-        too_large: copies.too_large ?? [] }
+        too_large: copies.too_large ?? [], skipped: copies.skipped ?? [] }
     : null;
   let table: ChecksModel["table"] = null;
   const tiers = view.tier_table?.tiers;
@@ -312,6 +334,8 @@ export function checksLine(view: RouteView | null, now: Date): string {
   if (model.contradictions.length) parts.push(plural(model.contradictions.length, "contradiction", "contradictions"));
   if (model.upkeep.length) parts.push(`${plural(model.upkeep.length, "rule", "rules")} to look at`);
   if (model.fileCopies?.hits_total) parts.push(`${plural(model.fileCopies.hits_total, "copy", "copies")} in files`);
+  if (model.fileCopies?.status === "stale") parts.push("File scan out of date");
+  if (model.fileCopies?.status === "incomplete") parts.push("File scan incomplete");
   if (model.unreached.length) parts.push(`${plural(model.unreached.length, "direction", "directions")} not in Khipu`);
   if (parts.length) return parts.join(" · ");
   if (model.fileCopies && model.fileCopies.status !== "checked") return "Files not looked at yet";

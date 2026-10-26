@@ -1573,6 +1573,43 @@ describe("Settings -> Routing: checks and copies", () => {
     expect(within(group).queryByRole("button", { name: /look now/i })).toBeNull();
   });
 
+  it.each(["checked", "incomplete", "stale"])("shows scan evidence and time for %s reports with hits", async (status) => {
+    Object.assign(answers.khipu_route_view = view(), { routing_file_copies: {
+      status, scanned_at: "2026-10-14T15:30:00Z", files_checked: 1,
+      hits: [{ file: "Repo/AGENTS.md", line: 1, quote: "Prefer Codex first", superseded: true }],
+      skipped: [{ file: "~/Documents/notes", reason: "protected_path" },
+        { file: "Repo/slow.md", reason: "timeout", message: "Couldn't read in time." }],
+      too_large: ["Repo/big.md"],
+    } });
+    await page();
+    const group = screen.getByRole("region", { name: "Checks and copies" });
+    expect(within(group).getByRole("list", { name: "Copies of routing found in files" })).toHaveTextContent("Prefer Codex first");
+    expect(group).toHaveTextContent(/Files last looked at.*11:30 AM/);
+    expect(group).toHaveTextContent("~/Documents/notes");
+    expect(group).toHaveTextContent(/protected/i);
+    expect(group).toHaveTextContent("Couldn't read in time.");
+    expect(group).toHaveTextContent("Too large to read: Repo/big.md.");
+    expect(group).not.toHaveTextContent("Khipu hasn't looked at your files yet");
+    if (status === "stale") expect(group).toHaveTextContent(/out of date/i);
+    if (status === "incomplete") expect(group).toHaveTextContent(/incomplete/i);
+  });
+
+  it.each(["incomplete", "stale"])("explains %s scans with no hits", async (status) => {
+    Object.assign(answers.khipu_route_view = view(), { routing_file_copies: {
+      status, scanned_at: "2026-10-14T15:30:00Z", files_checked: 0, hits: [],
+      skipped: [{ file: "candidate discovery", reason: "candidate_limit" }],
+    } });
+    await page();
+    const group = screen.getByRole("region", { name: "Checks and copies" });
+    expect(group).toHaveTextContent(/Files last looked at.*11:30 AM/);
+    expect(group).toHaveTextContent(/candidate limit/i);
+    expect(group).not.toHaveTextContent("Khipu hasn't looked at your files yet");
+    expect(group).not.toHaveTextContent("Nothing to fix");
+    const summary = document.querySelector('[data-settings-group="checks"]');
+    expect(summary).toHaveTextContent(status === "stale" ? /out of date/i : /incomplete/i);
+    expect(summary).not.toHaveTextContent("Files not looked at yet");
+  });
+
   const TIERS = {
     scope: "opus", mock: "opus", ruling: "opus", "hard-security": "opus", "failed-fix": "opus",
     build: "sonnet", "fix-round": "sonnet", tests: "sonnet", docs: "sonnet", synthesis: "sonnet",
