@@ -60,7 +60,6 @@ import pytest
 # several tests bind sockets under temporary folders.
 TEMP_ROOT = tempfile.mkdtemp(prefix="kt-")
 atexit.register(shutil.rmtree, TEMP_ROOT, ignore_errors=True)
-os.environ["TMPDIR"] = TEMP_ROOT
 tempfile.tempdir = TEMP_ROOT
 
 if os.environ.get("KHIPU_LIVE_TESTS") != "1":

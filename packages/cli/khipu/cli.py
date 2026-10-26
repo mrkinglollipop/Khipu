@@ -5737,6 +5737,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Always include stale, snapshot_refreshed_at and waiting_to_sync with the page",
     )
     owed_sub = owed.add_subparsers(dest="owed_cmd")
+    from khipu import owed_origin
+
+    owed_origin.add_parser(owed_sub)
     tidy = owed_sub.add_parser(
         "tidy", help="Plan the one-time clean-up of a project's Owed list; apply or undo a plan")
     tidy.add_argument("--project", required=True)

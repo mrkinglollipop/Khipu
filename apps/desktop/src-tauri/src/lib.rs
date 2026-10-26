@@ -3065,6 +3065,26 @@ async fn khipu_owed_tidy_undo(project: String, batch: String) -> Result<String, 
     run_khipu_cli_async(owed_tidy_undo_argv(&project, &batch)?).await
 }
 
+#[tauri::command]
+async fn khipu_owed_origin_preview() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(&["owed", "correct-job-origin"])).await
+}
+
+#[tauri::command]
+async fn khipu_owed_origin_requests() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(&["owed", "correct-job-origin", "--requests"])).await
+}
+
+#[tauri::command]
+async fn khipu_owed_origin_confirm(request: String) -> Result<String, String> {
+    let suffix = request.strip_prefix("origin-").unwrap_or("");
+    if suffix.len() != 24 || !suffix.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err("that is not a job-origin request Khipu knows".to_string());
+    }
+    run_khipu_cli_async(vec!["owed".into(), "correct-job-origin".into(),
+                            format!("--confirm={request}"), "--from-app".into()]).await
+}
+
 fn ledger_projects_argv() -> Vec<String> {
     vec!["ledger".to_string(), "projects".to_string(), "--json".to_string()]
 }
@@ -5180,6 +5200,9 @@ pub fn run() {
             khipu_owed_tidy_plan,
             khipu_owed_tidy_apply,
             khipu_owed_tidy_undo,
+            khipu_owed_origin_preview,
+            khipu_owed_origin_requests,
+            khipu_owed_origin_confirm,
             khipu_ledger_projects,
             khipu_ledger_project_set,
             khipu_work_hidden,

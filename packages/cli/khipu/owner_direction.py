@@ -73,6 +73,7 @@ class DirectionRefused(Exception):
 # its log line is ``_UNDO``.
 
 ACTIONS: frozenset[str] = frozenset({
+    "owed.correct_job_origin", "owed.correct_job_origin.confirm",
     "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
     "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
@@ -122,6 +123,9 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     (``latest_window_h``, 6 hours by default), and whose hook ran above this call. A background job, a
     dispatched job or a conversation nobody has typed in lately is refused.
     Nothing here reads what the owner said, and nothing calls a model."""
+    if action == "owed.correct_job_origin.confirm":
+        raise DirectionRefused("owner_confirmation_required",
+                               "Job-origin correction needs confirmation in the app or a yes typed on a terminal.")
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
@@ -775,13 +779,13 @@ def pending_direction() -> dict | None:
 def record_owed_batch(batch: str) -> None:
     """Persist a batch's identity before its transaction can change items."""
     pend = _PENDING.get()
-    if not pend or pend["intent"]["action"] not in ("owed.change", "owed.tidy"):
+    if not pend or pend["intent"]["action"] not in ("owed.change", "owed.tidy", "owed.correct_job_origin.confirm"):
         return
     line = pend.get("line")
     if line is None:
         raise OSError("the owner action must be recorded before its batch can be written")
     before = dict(pend["before"]) if isinstance(pend.get("before"), dict) else {}
-    if pend["intent"]["action"] == "owed.change":
+    if pend["intent"]["action"] in ("owed.change", "owed.correct_job_origin.confirm"):
         before["batches"] = [*(before.get("batches") or []), batch]
     else:
         before["batch"] = batch
@@ -993,6 +997,8 @@ _PUSH_WORDS = {
     "accounts.decline": "Stopped offering an account", "accounts.offer_again": "Offered an account again",
     "accounts.auto_track": "Changed whether new accounts are tracked",
     "owed.tidy": "Applied or undid an Owed list clean-up",
+    "owed.correct_job_origin": "Requested historical job-origin corrections",
+    "owed.correct_job_origin.confirm": "Confirmed historical job-origin corrections",
     "forget.send": "Sent this Mac's forgets the hub lacked to the hub",
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
@@ -1213,6 +1219,8 @@ def _before(want: dict):
         except Exception:  # noqa: BLE001 - what Khipu can't read now can't be put back
             return _UNREADABLE
         return _UNREADABLE if mine is None else {"owners_items": mine}
+    if action == "owed.correct_job_origin.confirm":
+        return {"batches": []}
     if action == "owed.tidy":
         facts = want.get("facts") or {}
         return {"project": target, "change": facts.get("change"), "batch": facts.get("batch")}
@@ -1713,6 +1721,7 @@ _UNDO = {
     "project.separate": _undo_project_group,
     "owed.change": _undo_owed_change,
     "owed.tidy": _undo_owed_tidy,
+    "owed.correct_job_origin.confirm": _undo_owed_change,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,
@@ -1803,7 +1812,7 @@ def _inverse_write_id(line: dict, batch: str) -> str:
 
 def _hub_inverse_writes(line: dict) -> list[dict]:
     before, result = line.get("before") or {}, line.get("result") or {}
-    if line.get("action") == "owed.change":
+    if line.get("action") in ("owed.change", "owed.correct_job_origin.confirm"):
         batches = before.get("batches") or result.get("batches") or []
     elif line.get("action") == "owed.tidy":
         batch = before.get("batch") or result.get("batch")

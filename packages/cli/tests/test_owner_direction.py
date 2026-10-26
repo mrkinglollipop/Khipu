@@ -273,6 +273,14 @@ def test_widening_the_check_and_turning_it_on_are_ordinary_changes(world):
 def test_every_action_passes_from_a_recent_owner_turn_and_is_refused_without_one(world, action):
     session = f"s-{action}"
     world.be(session)
+    if action == "owed.correct_job_origin.confirm":
+        # Historical ownership correction is deliberately stricter than
+        # ordinary direction: even a fresh owner turn cannot apply it.
+        world.say(session=session)
+        with pytest.raises(owner_direction.DirectionRefused) as err:
+            owner_direction.check(action)
+        assert err.value.code == "owner_confirmation_required"
+        return
     with pytest.raises(owner_direction.DirectionRefused) as err:
         owner_direction.check(action)
     assert err.value.code == "no_recorded_turn", action

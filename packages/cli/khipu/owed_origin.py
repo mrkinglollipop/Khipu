@@ -1,0 +1,198 @@
+"""Read-only historical lineage preview; requests need an app/terminal confirmation.
+
+The request stores the exact reviewed set. Confirmation rechecks it under locks
+and never expands it. Corrections use the existing per-project undo batches in
+one transaction. No model, provider, automatic tidy or direction can apply one.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import secrets
+
+from khipu import commitments as co, owed_tidy
+
+
+def _rows(cur, project=None, *, ids=None, lock=False):
+    from khipu.db import has_columns
+
+    if not has_columns(cur, "commitments", "origin_reviewed_at"):
+        raise ValueError("Job-origin correction needs migration 0049; nothing was changed")
+    where, params = [co._not_forgotten_clause(cur).replace("commitments.", "c.")], []
+    if project is not None:
+        where.append("c.project IS NOT DISTINCT FROM %s")
+        params.append(project)
+    if ids is not None:
+        where.append("c.id = ANY(%s)")
+        params.append(ids)
+    else:
+        where.extend(["c.status = 'open'", "c.owner = 'user'", "c.origin = 'conversation'"])
+    # Every surviving wording witness must agree with the opening job's
+    # parent. A conversation restatement or an unproven/owner claim is a veto.
+    cur.execute(
+        "SELECT to_jsonb(c), e.session_id, e.parent_session_id, e.deleted_at, "
+        "(SELECT applied_at FROM schema_migrations WHERE version = '0033_commitment_owner'), "
+        "EXISTS (SELECT 1 FROM fact_claims f WHERE f.kind = 'commitment' AND f.fact_id = c.id), "
+        "EXISTS (SELECT 1 FROM fact_claims f LEFT JOIN episodes w ON w.id = f.episode_id "
+        "WHERE f.kind = 'commitment' AND f.fact_id = c.id AND "
+        "(f.claimant != 'episode' OR w.id IS NULL OR w.deleted_at IS NOT NULL "
+        "OR NULLIF(btrim(w.parent_session_id), '') IS NULL "
+        "OR w.parent_session_id IS DISTINCT FROM e.parent_session_id)) "
+        "OR EXISTS (SELECT 1 FROM episodes peer WHERE peer.session_id = e.session_id "
+        "AND peer.parent_session_id IS DISTINCT FROM e.parent_session_id), "
+        "EXISTS (SELECT 1 FROM commitment_tidy_items t WHERE t.commitment_id = c.id) "
+        "FROM commitments c LEFT JOIN episodes e ON e.id = c.opened_episode WHERE "
+        + " AND ".join(where) + " ORDER BY c.id" + (" FOR UPDATE OF c" if lock else ""), tuple(params))
+    rows = []
+    for row, session, parent, deleted, cutoff, claims, conflict, history in cur.fetchall():
+        row.update(lineage=parent, session=session, episode_deleted=deleted,
+                   migration_at=cutoff, has_claims=claims, conflicting_claims=conflict, history=history)
+        rows.append(row)
+    return rows
+
+
+def _proposal(row):
+    if (row.get("status") != "open" or row.get("owner") != "user"
+            or row.get("origin") != "conversation" or not row.get("has_claims")
+            or row.get("conflicting_claims") or row.get("history")
+            or row.get("episode_deleted") is not None):
+        return None
+    parent, session = row.get("lineage"), row.get("session")
+    if (not isinstance(parent, str) or not parent.strip() or parent != parent.strip()
+            or not session or parent == session):
+        return None
+    # Evidence of a hand change, or insufficient evidence to rule one out,
+    # keeps the item with its current owner. Even expired snoozes are kept.
+    protected = ("origin_reviewed_at", "owner_reassigned_at", "owner_reassigned_by",
+                 "owner_reassign_reason", "owner_prior", "owner_prior_label", "due_after",
+                 "closed_at", "closed_episode", "close_reason", "closed_by", "close_rule_key",
+                 "reopened_rule_keys", "latest_text", "tidy_batch")
+    if any(row.get(key) for key in protected):
+        return None
+    opened, cutoff = co._as_utc(row.get("opened_at")), co._as_utc(row.get("migration_at"))
+    seen = co._as_utc(row.get("last_seen_at"))
+    if not opened or not cutoff or opened > cutoff or (seen and seen > opened):
+        return None
+    owner, label = co.resolve_owner_and_label(
+        row.get("text") or "", kind=row.get("kind"), declared="user", origin="job",
+        future_trigger=bool(row.get("future_trigger")) or co.has_future_trigger(row.get("text") or ""))
+    if owner != "agent":
+        return None
+    return {"owner": owner, "owner_label": label, "origin": "job"}
+
+
+def _fingerprint(row):
+    return hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def preview(cur, project=None):
+    items, kinds, projects = [], {}, {}
+    for row in _rows(cur, project):
+        after = _proposal(row)
+        if after is None:
+            continue
+        kind, name = row["kind"], row.get("project") or ""
+        kinds[kind] = kinds.get(kind, 0) + 1
+        projects[name] = projects.get(name, 0) + 1
+        items.append({"id": row["id"], "project": row.get("project"), "kind": kind,
+                      "text": row["text"], "after": after, "fingerprint": _fingerprint(row)})
+    return {"format": "khipu-job-origin-preview", "version": 1,
+            "counts": {"total": len(items), "by_kind": kinds, "by_project": projects},
+            "sample": items[:20], "items": items}
+
+
+def _confirm(cur, request_id, gate):
+    if gate not in ("app", "terminal"):
+        raise ValueError("Only an app or terminal owner confirmation can apply a correction")
+    cur.execute("SELECT state, preview, result FROM commitment_origin_requests WHERE id = %s FOR UPDATE",
+                (request_id,))
+    found = cur.fetchone()
+    if found is None:
+        return {"ok": False, "error": "No such job-origin request; nothing was changed"}
+    state, doc, result = found
+    if state != "pending":
+        return {"ok": True, "state": state, "changed": 0, "already_applied": True}
+    planned = {it["id"]: it for it in doc["items"]}
+    # Freeze lineage, claim and migration witnesses while rechecking and
+    # writing. These locks precede the commitment locks, as forget does.
+    cur.execute("LOCK TABLE episodes, fact_claims, schema_migrations IN SHARE MODE")
+    rows = {r["id"]: r for r in _rows(cur, ids=list(planned), lock=True)}
+    live, skipped = [], []
+    for cid, item in planned.items():
+        row = rows.get(cid)
+        if row is None or _proposal(row) != item["after"] or _fingerprint(row) != item["fingerprint"]:
+            skipped.append(cid)
+        else:
+            live.append(cid)
+
+    def change(cid):
+        after = planned[cid]["after"]
+        cur.execute("UPDATE commitments SET origin = 'job' WHERE id = %s", (cid,))
+        return co.reassign(cur, cid, after["owner"], after["owner_label"],
+                           by="job-origin correction", reason="Opening capture and all witnesses prove job lineage")
+
+    changed, batches = owed_tidy.bulk_batch(
+        cur, live, "reassign", change, reason="Owner-confirmed historical job-origin correction",
+        gate=gate, origin_correction=True)
+    result = {"ok": True, "request": request_id, "state": "applied",
+              "changed": sum(changed.values()), "batches": batches, "skipped": skipped}
+    cur.execute("UPDATE commitment_origin_requests SET state = 'applied', result = %s::jsonb WHERE id = %s",
+                (json.dumps(result), request_id))
+    return result
+
+
+def command(args):
+    from khipu import cli, offline, owner_direction
+    from khipu.db import connect
+
+    want = owner_direction.intent("owed.correct_job_origin.confirm", args.confirm or "")
+    if args.confirm:
+        # A fresh owner turn authorizes a request only, never its application.
+        if args.by_direction:
+            print(json.dumps({"ok": False, "code": "owner_confirmation_required",
+                              "error": "The request stays pending until the owner confirms in the app or types yes on a terminal"}))
+            return 2
+        gate = cli._owner_only(args, want)
+        if isinstance(gate, int):
+            return gate
+        gate = "terminal" if gate == "cli" else gate
+    try:
+        with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+            with conn.cursor() as cur:
+                if args.confirm:
+                    out = _confirm(cur, args.confirm, gate)
+                elif args.requests:
+                    cur.execute("SELECT id, preview FROM commitment_origin_requests WHERE state = 'pending' ORDER BY requested_at")
+                    out = {"ok": True, "requests": [{"request": rid, **doc} for rid, doc in cur.fetchall()]}
+                else:
+                    if not args.request:
+                        cur.execute("SET TRANSACTION READ ONLY")
+                    out = preview(cur, args.project)
+                    if args.request:
+                        rid = "origin-" + secrets.token_hex(12)
+                        cur.execute("INSERT INTO commitment_origin_requests (id, preview) VALUES (%s, %s::jsonb)",
+                                    (rid, json.dumps(out, default=str)))
+                        out = {"ok": True, "request": rid, "state": "pending", **out}
+    except BaseException:
+        if args.confirm:
+            owner_direction._abandon()
+        raise
+    if args.confirm:
+        out = owner_direction.finish(out) or out
+    print(json.dumps(out, default=str))
+    return 0 if out.get("ok", True) else 1
+
+
+def add_parser(sub):
+    from khipu import owner_direction
+
+    parser = sub.add_parser("correct-job-origin", help="Preview historical job-origin corrections; request owner confirmation")
+    parser.add_argument("--project")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--request", action="store_true", help="Keep this preview pending for the owner")
+    mode.add_argument("--confirm", metavar="REQUEST", help="Owner: apply a pending preview in one transaction")
+    mode.add_argument("--requests", action="store_true", help="Read pending previews")
+    parser.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    owner_direction.add_owner_flags(parser)
+    parser.set_defaults(func=command)

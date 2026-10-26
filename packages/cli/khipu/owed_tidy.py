@@ -138,7 +138,7 @@ def _select(cur, project: str, *, ids: list[int] | None = None, lock: bool = Fal
 
     have = table_columns(cur, "commitments")
     wanted = ("id", "project", "opened_episode", "opened_at", "future_trigger", *FINGERPRINT_FIELDS,
-              *LINEAGE_FIELDS)
+              *LINEAGE_FIELDS, "origin_reviewed_at")
     cols = [c for c in wanted if c in have]
     lineage = "NULL"
     if has_columns(cur, "episodes", "parent_session_id"):
@@ -663,7 +663,7 @@ BULK_PRIOR_FIELDS = (*PRIOR_FIELDS, "due_after")
 
 
 def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
-               gate: str | None) -> tuple[dict[int, bool], list[str]]:
+               gate: str | None, origin_correction: bool = False) -> tuple[dict[int, bool], list[str]]:
     """Apply ``change(cid) -> bool`` (a close, reopen, snooze or reassign) to
     ``ids`` as undoable batches, one per project, in the caller's
     transaction. Every bulk action keeps the same record: the batch, and per
@@ -697,11 +697,14 @@ def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
                 continue
             cur.execute("UPDATE commitments SET tidy_batch = %s WHERE id = %s", (batch, cid))
             after = _select(cur, project, ids=[cid])[cid]
+            prior = {f: _plain(row.get(f)) for f in BULK_PRIOR_FIELDS}
+            if origin_correction:
+                prior["origin_correction_stamp"] = _plain(after.get("origin_reviewed_at"))
             cur.execute(
                 "INSERT INTO commitment_tidy_items (batch_id, commitment_id, action, reason, prior, "
                 "after_fingerprint) VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
                 (batch, cid, action, reason[:400],
-                 json.dumps({f: _plain(row.get(f)) for f in BULK_PRIOR_FIELDS}, default=str), fingerprint(after)))
+                 json.dumps(prior, default=str), fingerprint(after)))
             changed[cid] = True
             count += 1
         cur.execute("UPDATE commitment_tidy_batches SET counts = %s::jsonb WHERE id = %s",
@@ -762,7 +765,9 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 row = rows.get(cid)
                 if row is None:
                     left_alone.append({"id": cid, "why": "no longer on the hub, or forgotten"})
-                elif fingerprint(row) != fp:
+                elif (fingerprint(row) != fp or
+                      ("origin_correction_stamp" in prior and
+                       _plain(row.get("origin_reviewed_at")) != prior["origin_correction_stamp"])):
                     left_alone.append({"id": cid, "why": "changed after the clean-up"})
                 else:
                     todo.append((cid, action, prior))
@@ -866,6 +871,14 @@ def redo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                     return {"ok": True, "batch": batch, "reapplied": 0, "already_applied": True}
             project = found[0] or None
             redo_from = _redo_states(cur, batch)
+            # A generic Undo-of-Undo must not provide a second application
+            # path around the historical correction's explicit owner gate.
+            cur.execute("SELECT EXISTS (SELECT 1 FROM commitment_tidy_items "
+                        "WHERE batch_id = %s AND prior ? 'origin_correction_stamp')", (batch,))
+            if cur.fetchone()[0]:
+                conn.rollback()
+                return {"ok": False, "reapplied": 0, "code": "owner_confirmation_required",
+                        "error": "Historical job-origin corrections cannot be replayed through a clean-up Undo"}
             cur.execute("SELECT commitment_id FROM commitment_tidy_items WHERE batch_id = %s "
                         "AND undone_at IS NOT NULL ORDER BY commitment_id", (batch,))
             ids = [int(r[0]) for r in cur.fetchall() if str(r[0]) in redo_from]
