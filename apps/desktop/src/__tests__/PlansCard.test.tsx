@@ -224,12 +224,12 @@ describe("PlansCard on Home", () => {
     await waitFor(() => expect(screen.getByText("Muse")).toBeTruthy());
     expect(calls[0]).toEqual(["khipu_usage_status", undefined]);
     for (const name of ["Claude", "Codex", "Grok", "Muse"]) expect(rowFor(name)).toBeTruthy();
-    // Claude's tightest is the Fable week at 34%, not the five-hour window.
+    // Claude's tightest is the Fable week at 34% used, with 66% remaining.
     const claude = within(rowFor("Claude"));
-    expect(claude.getByText("34%")).toBeTruthy();
+    expect(claude.getByText("66% left")).toBeTruthy();
     expect(claude.getByText(/Fable week/)).toBeTruthy();
     expect(claude.getByRole("meter").getAttribute("aria-valuenow")).toBe("34");
-    expect(within(rowFor("Grok")).getByText("43.5%")).toBeTruthy();
+    expect(within(rowFor("Grok")).getByText("56.5% left")).toBeTruthy();
     expect(within(rowFor("Codex")).getByText(`week · resets ${fmtResetLocal(CODEX_RESET, NOW)}`)).toBeTruthy();
     expect(screen.getAllByRole("meter")).toHaveLength(3);
   });
@@ -250,7 +250,7 @@ describe("PlansCard on Home", () => {
     render(<Home />);
     await waitFor(() => expect(screen.getByText("GLM")).toBeTruthy());
     const glm = within(rowFor("GLM"));
-    expect(glm.getByText("25%")).toBeTruthy();
+    expect(glm.getByText("75% left")).toBeTruthy();
     expect(glm.getByRole("meter").getAttribute("aria-valuenow")).toBe("25");
     expect(glm.queryByText(/Sign in/)).toBeNull();
   });
@@ -266,16 +266,30 @@ describe("PlansCard on Home", () => {
     expect(usageErrorPhrase("no_key")).toBe("no GLM key stored");
   });
 
+  it("shows fresh plans by what remains and keeps the existing almost-used-up warning", async () => {
+    status = withCodexAt(83);
+    const { unmount } = render(<Home />);
+    await waitFor(() => expect(within(rowFor("Codex")).getByText("17% left")).toBeTruthy());
+    expect(within(rowFor("Codex")).queryByText("83%")).toBeNull();
+    expect(within(rowFor("Codex")).getByRole("meter")).toHaveAttribute("aria-valuenow", "83");
+    expect(within(rowFor("Codex")).getByRole("meter")).toHaveAttribute("aria-valuetext", "83% used");
+    unmount();
+    status = withCodexAt(94);
+    render(<Home />);
+    await waitFor(() => expect(within(rowFor("Codex")).getByText("6% left")).toBeTruthy());
+    expect(within(rowFor("Codex")).getByText(/^Almost used up: 6% left/)).toBeTruthy();
+  });
+
   it("warns at 75% and alerts at 90%", async () => {
     status = withCodexAt(80);
     const { unmount } = render(<Home />);
-    await waitFor(() => expect(screen.getByText("80%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("20% left")).toBeTruthy());
     expect(within(rowFor("Codex")).getByRole("meter").className).toBe("plan-meter warn");
     expect(within(rowFor("Grok")).getByRole("meter").className).toBe("plan-meter");
     unmount();
     status = withCodexAt(94);
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("94%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("6% left")).toBeTruthy());
     expect(within(rowFor("Codex")).getByRole("meter").className).toBe("plan-meter err");
   });
 
@@ -337,7 +351,7 @@ describe("PlansCard on Home", () => {
 
   it("Refresh calls the refresh command, spins while it runs, then shows the new figures", async () => {
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("60% left")).toBeTruthy());
     const button = screen.getByRole("button", { name: "Refresh" });
     fireEvent.click(button);
     await waitFor(() => expect(button.getAttribute("aria-busy")).toBe("true"));
@@ -345,13 +359,13 @@ describe("PlansCard on Home", () => {
     expect(button.querySelector(".spin")).toBeTruthy();
     expect(calls.find(([c]) => c === "khipu_usage_refresh")).toEqual(["khipu_usage_refresh", undefined]);
     await act(async () => release("khipu_usage_refresh"));
-    await waitFor(() => expect(screen.getByText("94%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("6% left")).toBeTruthy());
     expect(button.getAttribute("aria-busy")).toBeNull();
   });
 
   it("a load asked for during a refresh never replaces the refresh's figures", async () => {
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("60% left")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
     await waitFor(() => expect(pending.khipu_usage_refresh).toHaveLength(1));
     // The Home header's Refresh, or coming back to Home, calls load().
@@ -360,8 +374,8 @@ describe("PlansCard on Home", () => {
     });
     expect(usageCalls()).toEqual(["khipu_usage_status", "khipu_usage_refresh"]);
     await act(async () => release("khipu_usage_refresh"));
-    await waitFor(() => expect(screen.getByText("94%")).toBeTruthy());
-    expect(screen.queryByText("40%")).toBeNull();
+    await waitFor(() => expect(screen.getByText("6% left")).toBeTruthy());
+    expect(screen.queryByText("60% left")).toBeNull();
   });
 
   it("starts one read at a time: loads share it and a refresh follows it", async () => {
@@ -379,7 +393,7 @@ describe("PlansCard on Home", () => {
     await act(async () => release("khipu_usage_status"));
     await waitFor(() => expect(usageCalls()).toEqual(["khipu_usage_status", "khipu_usage_refresh"]));
     await act(async () => release("khipu_usage_refresh"));
-    await waitFor(() => expect(screen.getByText("94%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("6% left")).toBeTruthy());
     expect(usageCalls()).toEqual(["khipu_usage_status", "khipu_usage_refresh"]);
   });
 
@@ -443,7 +457,7 @@ describe("tightest window and the 90% alert", () => {
   it("the callout and the card give the same reset for one window", async () => {
     status = withCodexAt(94);
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("94%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("6% left")).toBeTruthy());
     const reset = fmtResetLocal(CODEX_RESET, NOW)!;
     expect(within(rowFor("Codex")).getByText(`week · resets ${reset}`)).toBeTruthy();
     expect(planAttention(status, NOW)[0].cause).toContain(`resets ${reset}.`);
@@ -1202,7 +1216,7 @@ describe("one status phrase per account (settings clarity, phase 2)", () => {
 
   it("says in the card's head when the whole last read failed, with no loose footer", async () => {
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("60% left")).toBeTruthy());
     invokeMock.mockImplementation(async () => {
       throw "khipu exited 1";
     });
@@ -1211,7 +1225,7 @@ describe("one status phrase per account (settings clarity, phase 2)", () => {
       await exposed!.reread();
     });
     expect(screen.getByText(/^Last read failed .*; showing earlier figures$/)).toBeTruthy();
-    expect(screen.getByText("40%")).toBeTruthy();
+    expect(screen.getByText("60% left")).toBeTruthy();
     expect(screen.queryByText(/these figures are from the read before it/)).toBeNull();
     spy.mockRestore();
   });

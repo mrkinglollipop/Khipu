@@ -341,7 +341,7 @@ describe("review round 2", () => {
     // Same position, different account: the sheet must not switch to it.
     rerender(<PlansCard state={plansState(keyless("Omega", 10))} routing={route()} />);
     expect(screen.queryByRole("dialog")).toBeNull();
-    expect(screen.queryByText("90% left")).toBeNull();
+    expect(screen.getByText("90% left")).toBeInTheDocument();
   });
 
   it("stays closed when the account comes back, and focus returns to the row", async () => {

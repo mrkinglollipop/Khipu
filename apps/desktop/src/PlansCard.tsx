@@ -725,7 +725,7 @@ function PlanRow({ row, now, pause, onSignedIn, onOpen }: {
       {w && p != null ? (
         <>
           <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={meterTone(p)} dim={dim} />
-          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{fmtPct(p)}</span>
+          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{status.figures === "live" ? `${fmtPct(left!)} left` : fmtPct(p)}</span>
           <span className="plan-when meta">
             {windowLabel(w)}
             {reset ? ` · ${reset}` : ""}
