@@ -8,9 +8,12 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
+import psycopg
 import pytest
 
-from khipu import close_rules, commitments, db, jobs
+from khipu import close_rules, commitments, db, jobs, provenance
+
+_REAL_PROVENANCE_BACKFILL = jobs._provenance_backfill
 
 NOW = datetime.now(timezone.utc)
 
@@ -41,7 +44,12 @@ class Database:
         self.events.append('connect')
         try:
             yield conn
-            conn.commit()
+            if not conn.closed:
+                conn.commit()
+        except Exception:
+            if not conn.closed:
+                conn.rollback()
+            raise
         finally:
             conn.end()
             self.events.append('close')
@@ -51,17 +59,39 @@ class Connection:
     def __init__(self, database):
         self.db = database
         self.active = False
+        self.snapshot = None
+        self.write_start = 0
+        self.closed = False
 
     def cursor(self):
+        if self.closed:
+            raise psycopg.InterfaceError('the connection is closed')
         return Cursor(self)
 
     def commit(self):
+        if self.closed:
+            raise psycopg.InterfaceError('the connection is closed')
+        self.snapshot = None
         self.end()
         self.db.events.append('commit')
 
     def rollback(self):
+        if self.closed:
+            raise psycopg.InterfaceError('the connection is closed')
+        if self.snapshot is not None:
+            self.db.rows = self.snapshot
+            del self.db.writes[self.write_start:]
+            self.snapshot = None
         self.end()
         self.db.events.append('rollback')
+
+    def close(self):
+        if self.snapshot is not None:
+            self.db.rows = self.snapshot
+            del self.db.writes[self.write_start:]
+            self.snapshot = None
+        self.closed = True
+        self.end()
 
     def end(self):
         if self.active:
@@ -84,6 +114,8 @@ class Cursor:
     def execute(self, sql, params=()):
         database = self.conn.db
         if not self.conn.active:
+            self.conn.snapshot = copy.deepcopy(database.rows)
+            self.conn.write_start = len(database.writes)
             database.active += 1
             self.conn.active = True
         self.rows = []
@@ -246,6 +278,133 @@ def test_apply_failure_is_failed_completion_receipt(harness, monkeypatch):
     out = jobs._commitment_close_rules()
     assert out['ok'] is False
     assert 'synthetic apply failure' in out['reason']
+
+
+@pytest.mark.parametrize('fail_at', ['lock', 'later_rule', 'commit'])
+def test_failed_candidate_rolls_back_counts_and_later_candidate_closes(harness, monkeypatch, fail_at):
+    harness.rows[2] = {**item(), 'id': 2}
+    monkeypatch.setattr(close_rules.GitHub, 'state', lambda *a: ('merged', None))
+    if fail_at == 'lock':
+        original = close_rules._open_items
+        def open_items(cur, project, **kwargs):
+            if kwargs.get('commitment_id') == 1:
+                raise RuntimeError('synthetic first candidate failure')
+            return original(cur, project, **kwargs)
+        monkeypatch.setattr(close_rules, '_open_items', open_items)
+    elif fail_at == 'later_rule':
+        original = close_rules._decision_rule
+        def decision_rule(cur, items, report, **kwargs):
+            if items[0]['id'] == 1:
+                assert report['closed_pr'] == 1
+                raise RuntimeError('synthetic first candidate failure')
+            return original(cur, items, report, **kwargs)
+        monkeypatch.setattr(close_rules, '_decision_rule', decision_rule)
+    else:
+        original = Connection.commit
+        def commit(conn):
+            if conn.snapshot is not None and conn.db.rows[1]['status'] == 'closed':
+                raise RuntimeError('synthetic first candidate failure')
+            return original(conn)
+        monkeypatch.setattr(Connection, 'commit', commit)
+    out = jobs._commitment_close_rules()
+    assert out['ok'] is False
+    assert out['failed'] == 1
+    assert out['closed_pr'] == 1 and out['closed_decision'] == 0 and out['suggested'] == 0
+    assert 'synthetic first candidate failure' in out['reason']
+    assert harness.rows[1]['status'] == 'open'
+    assert harness.rows[2]['status'] == 'closed'
+    assert ('lock', [2]) in harness.events
+
+
+def test_first_candidate_reason_survives_later_candidate_and_provenance_failure(harness, monkeypatch):
+    harness.rows[2] = {**item(), 'id': 2}
+    original = close_rules._open_items
+    def open_items(cur, project, **kwargs):
+        if kwargs.get('commitment_id'):
+            raise RuntimeError(f"synthetic candidate {kwargs['commitment_id']} failure")
+        return original(cur, project, **kwargs)
+    monkeypatch.setattr(close_rules, '_open_items', open_items)
+    monkeypatch.setattr(close_rules.GitHub, 'state', lambda *a: ('merged', None))
+    monkeypatch.setattr(jobs, '_provenance_backfill', _REAL_PROVENANCE_BACKFILL)
+    monkeypatch.setattr(provenance, 'backfill', Mock(side_effect=ValueError('synthetic provenance failure')))
+    out = jobs._commitment_close_rules()
+    assert out['ok'] is False and out['failed'] == 2
+    assert out['reason'] == 'RuntimeError: synthetic candidate 1 failure'
+    assert out['provenance']['transient'] is False
+    assert 'synthetic provenance failure' in out['provenance']['reason']
+
+
+@pytest.mark.parametrize('error, transient', [
+    (psycopg.OperationalError('synthetic dropped connection'), True),
+    (psycopg.InterfaceError('the connection is closed'), True),
+    (psycopg.errors.ConnectionFailure('synthetic dropped connection'), True),
+    (psycopg.errors.SerializationFailure('synthetic serialization retry'), True),
+    (psycopg.errors.DeadlockDetected('synthetic deadlock'), True),
+    (psycopg.errors.LockNotAvailable('synthetic lock timeout'), True),
+    (psycopg.errors.QueryCanceled('synthetic statement timeout'), True),
+    (psycopg.errors.UndefinedColumn('synthetic schema error'), False),
+    (psycopg.errors.CheckViolation('synthetic invalid fact'), False),
+    (psycopg.Error('synthetic unclassified database error'), False),
+    (ValueError('synthetic invalid provenance'), False),
+])
+def test_real_provenance_helper_classifies_errors_without_hiding_receipt(harness, monkeypatch, error, transient):
+    monkeypatch.setattr(jobs, '_provenance_backfill', _REAL_PROVENANCE_BACKFILL)
+    backfill = Mock(side_effect=error)
+    monkeypatch.setattr(provenance, 'backfill', backfill)
+    monkeypatch.setattr(close_rules.GitHub, 'state', lambda *a: ('merged', None))
+    out = jobs._commitment_close_rules()
+    backfill.assert_called_once()
+    assert out['ok'] is transient
+    assert out['closed_pr'] == 1
+    assert out['provenance']['ok'] is False
+    assert out['provenance']['transient'] is transient
+    assert str(error) in out['provenance']['reason']
+    assert 'rollback' in harness.events
+    if not transient:
+        assert str(error) in out['reason']
+
+
+
+@pytest.mark.parametrize('drop_kind', ['closed', 'rollback_failed'])
+@pytest.mark.parametrize('preparation_fails', [False, True])
+def test_unusable_transient_witness_uses_one_fresh_preparation_connection(
+        harness, monkeypatch, drop_kind, preparation_fails):
+    monkeypatch.setattr(jobs, '_provenance_backfill', _REAL_PROVENANCE_BACKFILL)
+    broken = []
+    def backfill(conn):
+        broken.append(conn)
+        if drop_kind == 'closed':
+            conn.close()
+        else:
+            def rollback():
+                raise psycopg.OperationalError('synthetic rollback connection failure')
+            conn.rollback = rollback
+        raise psycopg.OperationalError('synthetic witness connection failure')
+    monkeypatch.setattr(provenance, 'backfill', backfill)
+    preparations = []
+    def backfill_prs(cur):
+        assert cur.conn is not broken[0]
+        assert not cur.conn.closed
+        preparations.append(cur.conn)
+        if preparation_fails:
+            raise ValueError('synthetic later preparation failure')
+        return 4
+    monkeypatch.setattr(close_rules, 'backfill_prs', backfill_prs)
+    monkeypatch.setattr(close_rules.GitHub, 'state', lambda *a: ('merged', None))
+    out = jobs._commitment_close_rules()
+    assert len(broken) == len(preparations) == 1
+    assert broken[0].closed
+    assert out['provenance']['ok'] is False
+    assert out['provenance']['transient'] is True
+    assert out['provenance']['connection_unusable'] is True
+    assert 'synthetic witness connection failure' in out['provenance']['reason']
+    if preparation_fails:
+        assert out['ok'] is False
+        assert 'synthetic later preparation failure' in out['reason']
+        assert harness.rows[1]['status'] == 'open'
+    else:
+        assert out['ok'] is True and out['backfilled'] == 4 and out['closed_pr'] == 1
+        assert harness.rows[1]['status'] == 'closed'
 
 
 def test_provenance_failure_is_not_buried_under_success(harness, monkeypatch):

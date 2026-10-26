@@ -452,11 +452,49 @@ def test_the_nightly_backfills_then_runs_the_rules(monkeypatch):
 
     monkeypatch.setattr(db, "connect", lambda **kw: Conn())
     monkeypatch.setattr(close_rules, "backfill_prs", lambda cur: calls.append("backfill") or 4)
-    monkeypatch.setattr(close_rules, "run", lambda cur, **kw: calls.append("run") or {"ok": True, "closed_pr": 1})
+    monkeypatch.setattr(jobs, "_provenance_backfill", lambda conn: {"ok": True})
+    def run_nightly():
+        assert calls == ["backfill", "commit"]
+        return {"ok": True, "closed_pr": 1}
+    monkeypatch.setattr(close_rules, "run_nightly", run_nightly)
     monkeypatch.setattr(jobs, "_nightly_log", lambda msg: None)
     out = jobs._commitment_close_rules()
     assert out["ok"] and out["backfilled"] == 4 and out["closed_pr"] == 1
-    assert calls == ["backfill", "commit", "run", "commit"]
+    assert calls == ["backfill", "commit"]
+
+
+def test_nightly_real_provenance_writer_refusal_is_fatal(hub, monkeypatch):  # noqa: F811
+    import psycopg
+
+    from khipu import db, jobs, provenance
+
+    conn = _migrated(hub)
+    with conn.cursor() as cur:
+        cid = _open(cur, "Finish the release checklist for pull request #41")
+    conn.commit()
+    refused = []
+    def backfill(connection):
+        with connection.cursor() as cur:
+            cur.execute("UPDATE commitments SET latest_text = 'unprojected' WHERE id = %s", (cid,))
+        try:
+            connection.commit()
+        except psycopg.OperationalError as exc:
+            refused.append(exc)
+            raise
+        pytest.fail("the provenance gate accepted an unprojected write")
+    monkeypatch.setattr(provenance, "backfill", backfill)
+    monkeypatch.setattr(db, "connect", lambda: conn)
+    monkeypatch.setattr(close_rules, "backfill_prs", lambda cur: 0)
+    monkeypatch.setattr(close_rules, "run_nightly", lambda: {"ok": True, "closed_pr": 0})
+    monkeypatch.setattr(jobs, "_nightly_log", lambda *a: None)
+    out = jobs._commitment_close_rules()
+    assert len(refused) == 1
+    assert type(refused[0]) is psycopg.OperationalError
+    assert provenance.is_old_writer_refusal(refused[0])
+    assert out["ok"] is False
+    assert out["provenance"]["ok"] is False
+    assert out["provenance"]["transient"] is False
+    assert provenance.OLD_WRITER_MESSAGE in out["reason"]
 
 
 @pytest.mark.parametrize("from_app, by", [(True, "you, in the app"), (False, "a conversation")])

@@ -764,11 +764,29 @@ def _mark_stale_commitments() -> dict[str, Any]:
     return out
 
 
+def _transient_provenance_error(exc: BaseException) -> bool:
+    """Retryable DB outages/contention, never a provenance or schema refusal."""
+    import psycopg
+
+    from khipu import hub_errors, provenance
+
+    if provenance.is_old_writer_refusal(exc):
+        return False
+    state = getattr(getattr(exc, "diag", None), "sqlstate", None) or getattr(exc, "sqlstate", None)
+    if state is not None:
+        # Explicit standard connection/transaction/lock/timeout states only.
+        # In particular, class 08 also contains Khipu's real 08K01 refusal.
+        return state in {"08000", "08001", "08003", "08006", "08007",
+                         "40001", "40P01", "55P03", "57014", "57P01", "57P02", "57P03"}
+    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)) \
+        and hub_errors.unreachable_error(exc)
+
+
 def _provenance_backfill(conn) -> dict[str, Any]:
     """``khipu provenance backfill`` inside the nightly's close-rules step,
     until every project is covered, then the 30-day prune of the replica
-    change stream (``fact_changes``). Fail-open: an error is reported and the
-    rules still run."""
+    change stream (``fact_changes``). Errors remain visible and the rules
+    still run; only transient database errors are nonfatal to the nightly."""
     try:
         from khipu import provenance
 
@@ -782,12 +800,17 @@ def _provenance_backfill(conn) -> dict[str, Any]:
         # The replica stream's 30-day retention (section 6 of the design).
         out["changes"] = provenance.prune_changes(conn)
         return out
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+    except Exception as exc:  # noqa: BLE001 — the rules still run after a backfill failure
+        rollback_failed = False
         try:
             conn.rollback()
         except Exception:  # noqa: BLE001
-            pass
-        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+            rollback_failed = True
+        out = {"ok": False, "transient": _transient_provenance_error(exc),
+               "reason": f"{type(exc).__name__}: {exc}"[:300]}
+        if rollback_failed or getattr(conn, "closed", False):
+            out["connection_unusable"] = True
+        return out
 
 
 def _commitment_close_rules() -> dict[str, Any]:
@@ -797,6 +820,7 @@ def _commitment_close_rules() -> dict[str, Any]:
     (``close_rules.run_nightly``). Before mark_stale, so an item whose PR merged
     closes as done rather than aging out. Failure is recorded without blocking
     the remaining steps, and makes a successful driver's nightly nonzero."""
+    witness: dict[str, Any] | None = None
     try:
         from khipu import close_rules
         from khipu.db import connect
@@ -806,16 +830,29 @@ def _commitment_close_rules() -> dict[str, Any]:
             # 2026-10-23 design): a legacy restater proven tonight counts
             # for tonight's rules (its PR refs clear needs_owner).
             witness = _provenance_backfill(conn)
-            with conn.cursor() as cur:
-                filled = close_rules.backfill_prs(cur)
-            conn.commit()
+            reconnect = witness.get("transient", False) and witness.get("connection_unusable", False)
+            if reconnect:
+                # A dropped connection cannot run preparation or commit on
+                # context exit. Retire it; the next phase gets one fresh try.
+                conn.close()
+            else:
+                with conn.cursor() as cur:
+                    filled = close_rules.backfill_prs(cur)
+                conn.commit()
+        if reconnect:
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    filled = close_rules.backfill_prs(cur)
+                conn.commit()
         report = close_rules.run_nightly()
         out = {**report, "backfilled": int(filled), "provenance": witness}
-        if not witness.get("ok", True):
+        if not witness.get("ok", True) and not witness.get("transient", False):
             out["ok"] = False
-            out["reason"] = witness.get("reason") or witness.get("error") or "provenance backfill failed"
+            out.setdefault("reason", witness.get("reason") or witness.get("error") or "provenance backfill failed")
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if witness is not None:
+            out["provenance"] = witness
     _nightly_log(f"commitments-close-rules: {json.dumps(out, default=str)[:300]}")
     return out
 

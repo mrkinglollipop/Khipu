@@ -921,16 +921,29 @@ def run_nightly() -> dict[str, Any]:
                 if state is not None:
                     frozen.records[key] = _record(state, datetime.now(timezone.utc), "github")
 
+    report["failed"] = 0
     for candidate in candidates:
-        with connect() as conn:
-            with conn.cursor() as cur:
-                current = _open_items(cur, None, commitment_id=candidate["id"], lock=True)
-                if not current or current[0] != candidate:
-                    report["deferred_changed"] = report.get("deferred_changed", 0) + 1
-                    continue
-                _pr_rule(cur, current, report, payload=None, episode_id=None, github=frozen)
-                _decision_rule(cur, current, report, episode_id=None)
-            conn.commit()
+        # Publish counts only after the whole candidate transaction committed:
+        # a later rule or COMMIT can still roll back an earlier close.
+        applied = {"closed_pr": 0, "closed_decision": 0, "suggested": 0,
+                   "kept_open_reopened": 0, "deferred_changed": 0}
+        try:
+            with connect() as conn:
+                with conn.cursor() as cur:
+                    current = _open_items(cur, None, commitment_id=candidate["id"], lock=True)
+                    if not current or current[0] != candidate:
+                        applied["deferred_changed"] = 1
+                    else:
+                        _pr_rule(cur, current, applied, payload=None, episode_id=None, github=frozen)
+                        _decision_rule(cur, current, applied, episode_id=None)
+                conn.commit()
+        except Exception as exc:  # noqa: BLE001 — one poisoned row must not block later rows
+            report["failed"] += 1
+            report["ok"] = False
+            report.setdefault("reason", f"{type(exc).__name__}: {exc}")
+            continue
+        for key, count in applied.items():
+            report[key] = report.get(key, 0) + count
     report["github_asked"] = github.asked
     report["github"] = github.unavailable
     return report
