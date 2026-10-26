@@ -394,6 +394,116 @@ class GrokBuildPackTest(_TempHomeCase):
         self.assertTrue(out["components"]["recall_instruction"]["ok"])
         self.assertIn("not asserted", out["components"]["recall_instruction"]["note"])
 
+    def _write_native_grok_build_hooks(self, include_mcp: bool = True):
+        """Grok-rewritten form: no pack comments, env as a sibling table."""
+        shim = integ.grok_build_capture_hook()
+        mcp = integ.mcp_launcher()
+        parts = ['model = "grok"\n']
+        if include_mcp:
+            parts.append(
+                f"[mcp_servers.{integ.GROK_BUILD_MCP_SERVER}]\n"
+                f'command = "{mcp}"\n'
+                "enabled = true\n"
+                "startup_timeout_sec = 30\n\n"
+            )
+        for event in ("Stop", "PreCompact", "SessionEnd"):
+            parts.append(
+                f"[[hooks.{event}]]\n"
+                f"[[hooks.{event}.hooks]]\n"
+                'type = "command"\n'
+                f'command = "{shim}"\n'
+                "timeout = 15\n"
+                f"[hooks.{event}.hooks.env]\n"
+                'KHIPU_HARNESS = "grok_build"\n\n'
+            )
+        integ.AEGIS_TOML.write_text("".join(parts))
+
+    def test_uninstall_removes_native_hooks_after_grok_drops_pack_markers(self):
+        project = self._seed()
+        self._write_native_grok_build_hooks()
+        self.assertTrue(integ._grok_build_capture_events(integ.AEGIS_TOML.read_text()))
+        self.assertIsNone(integ._GROK_BUILD_HOOK_RE.search(integ.AEGIS_TOML.read_text()))
+        out = integ.uninstall("grok_build", project=str(project))
+        self.assertTrue(out["changes"], out)
+        text = integ.AEGIS_TOML.read_text()
+        self.assertFalse(integ._grok_build_capture_events(text), text)
+        self.assertNotIn("khipu-grok-build-capture", text)
+        self.assertNotIn("hooks", tomllib.loads(text))
+
+    def test_install_clears_native_hooks_instead_of_refusing_unmanaged(self):
+        project = self._seed()
+        self._trust(project)
+        self._write_native_grok_build_hooks()
+        out = integ.install("grok_build", project=str(project))
+        self.assertNotEqual(out.get("error"), "unmanaged Grok Build capture hooks exist; refusing to duplicate them", out)
+        self.assertTrue(out.get("ok", True), out)
+        self.assertTrue(integ.status("grok_build", project=str(project))["installed"])
+
+    def test_install_all_without_project_skips_grok_build(self):
+        import io
+        from contextlib import redirect_stdout
+
+        from khipu import cli
+
+        self._seed()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.cmd_integrations(cli.build_parser().parse_args(
+                ["integrations", "install", "all", "--dry-run", "--no-verify"]))
+        results = json.loads(buf.getvalue())
+        skipped = [r for r in results if r.get("harness") == "grok_build"]
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertEqual(len(skipped), 1, results)
+        self.assertEqual(skipped[0].get("skipped"), "needs --project")
+        self.assertNotEqual(skipped[0].get("ok"), False)
+
+    def test_verify_all_without_project_skips_grok_build(self):
+        import io
+        from contextlib import redirect_stdout
+
+        from khipu import cli
+
+        self._seed()
+        buf = io.StringIO()
+        with redirect_stdout(buf), \
+                mock.patch.object(integ, "verify", side_effect=lambda h, **kw: {
+                    "harness": h, "detected": False, "ok": True, "components": {}}):
+            rc = cli.cmd_integrations(cli.build_parser().parse_args(
+                ["integrations", "verify", "all"]))
+        results = json.loads(buf.getvalue())
+        skipped = [r for r in results if r.get("harness") == "grok_build"]
+        self.assertEqual(rc, 0, results)
+        self.assertEqual(len(skipped), 1, results)
+        self.assertEqual(skipped[0].get("skipped"), "needs --project")
+
+    def test_uninstall_deletes_empty_agents_and_reports_left_block_without_project(self):
+        project = self._seed()
+        agents = project / "AGENTS.md"
+        agents.write_text("")  # install into empty file
+        integ.install("grok_build", project=str(project))
+        text = agents.read_text()
+        self.assertTrue(text.startswith(integ._GROK_BUILD_AGENTS_START), repr(text[:80]))
+        integ.uninstall("grok_build", project=str(project))
+        self.assertFalse(agents.exists(), "empty AGENTS.md should be deleted")
+
+        project2 = self.home / "project2"
+        project2.mkdir()
+        (project2 / "AGENTS.md").write_text("# keep\n")
+        integ.install("grok_build", project=str(project2))
+        out = integ.uninstall("grok_build")
+        self.assertIn("AGENTS.md", out.get("note", ""), out)
+        self.assertIn(integ._GROK_BUILD_AGENTS_START, (project2 / "AGENTS.md").read_text())
+
+    def test_agents_path_reuses_existing_case_from_directory_listing(self):
+        project = self.home / "cased-project"
+        project.mkdir()
+        with mock.patch("os.listdir", return_value=["Agents.md", "README.md"]) as listing:
+            path = integ._grok_build_agents_path(str(project))
+        listing.assert_called()
+        self.assertEqual(path, project / "Agents.md")
+        with mock.patch("os.listdir", return_value=["readme.md"]):
+            self.assertEqual(integ._grok_build_agents_path(str(project)), project / "AGENTS.md")
+
 
 class ProbeTest(_TempHomeCase):
     def setUp(self):

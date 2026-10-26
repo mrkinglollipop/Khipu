@@ -1625,6 +1625,15 @@ _GROK_BUILD_HOOK_RE = re.compile(
     r"(?ms)^# khipu-grok-build-pack: managed block — do not edit by hand\n.*?"
     r"# khipu-grok-build-pack: end\n"
 )
+_GROK_BUILD_NATIVE_HOOK_HEADER_RE = re.compile(
+    r"^[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*"
+    r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\.[ \t]*hooks[ \t]*\]\]"
+    r"[ \t]*(?:#.*)?$"
+)
+_GROK_BUILD_NATIVE_GROUP_HEADER_RE = re.compile(
+    r"^[ \t]*\[\[[ \t]*hooks[ \t]*\.[ \t]*"
+    r"(?P<event>Stop|PreCompact|SessionEnd)[ \t]*\]\][ \t]*(?:#.*)?$"
+)
 _GROK_BUILD_AGENTS_START = "<!-- khipu-grok-build: recall instructions -->"
 _GROK_BUILD_AGENTS_END = "<!-- khipu-grok-build: end -->"
 _GROK_BUILD_AGENTS_RE = re.compile(
@@ -1642,6 +1651,79 @@ _GROK_BUILD_RECALL_TEXT = (
 
 def _is_our_grok_build_capture(cmd: Any) -> bool:
     return _is_launcher_command(cmd, "khipu-grok-build-capture")
+
+
+def _native_grok_build_hook_is_ours(block: str) -> bool:
+    try:
+        data = tomllib.loads(block)
+    except tomllib.TOMLDecodeError:
+        return False
+    for event in ("Stop", "PreCompact", "SessionEnd"):
+        group = (data.get("hooks") or {}).get(event) or {}
+        for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
+            if (isinstance(hook, dict) and _is_our_grok_build_capture(hook.get("command"))
+                    and isinstance(hook.get("env"), dict)
+                    and hook["env"].get("KHIPU_HARNESS") == "grok_build"):
+                return True
+    return False
+
+
+def _remove_native_grok_build_hooks(text: str) -> str:
+    """Remove owned inner hook entries after Grok drops the pack comment markers."""
+    headers = list(_TOML_HEADER_RE.finditer(text))
+    managed_spans = [(match.start(), match.end()) for match in _GROK_BUILD_HOOK_RE.finditer(text)]
+    removed: list[tuple[int, int]] = []
+    for index, header in enumerate(headers):
+        if any(start <= header.start() < end for start, end in managed_spans):
+            continue
+        owned_header = _GROK_BUILD_NATIVE_HOOK_HEADER_RE.match(header.group(0))
+        if owned_header is None:
+            continue
+        end_index = index + 1
+        if end_index < len(headers):
+            event = owned_header.group("event")
+            env_header = re.compile(
+                rf"^[ \t]*\[[ \t]*hooks[ \t]*\.[ \t]*{event}[ \t]*\."
+                r"[ \t]*hooks[ \t]*\.[ \t]*env[ \t]*\][ \t]*(?:#.*)?$"
+            )
+            if env_header.match(headers[end_index].group(0)):
+                end_index += 1
+        end = headers[end_index].start() if end_index < len(headers) else len(text)
+        end = min([end] + [start for start, _stop in managed_spans
+                           if header.start() < start < end])
+        if _native_grok_build_hook_is_ours(text[header.start():end]):
+            removed.append((header.start(), end))
+    if not removed:
+        return text
+    owned = list(removed)
+    for index, header in enumerate(headers):
+        if any(start <= header.start() < end for start, end in managed_spans):
+            continue
+        parent = _GROK_BUILD_NATIVE_GROUP_HEADER_RE.match(header.group(0))
+        if parent is None:
+            continue
+        prefix = f"hooks.{parent.group('event')}."
+        children = []
+        for child in headers[index + 1:]:
+            if (any(start <= child.start() < end for start, end in managed_spans)
+                    or not _toml_header_path(child.group(0)).startswith(prefix)):
+                break
+            children.append(child)
+        if not children or not all(any(start <= child.start() < end for start, end in owned)
+                                   for child in children):
+            continue
+        end = min([children[0].start()] + [start for start, _stop in managed_spans
+                                           if header.start() < start < children[0].start()])
+        if not text[header.end():end].strip():
+            removed.append((header.start(), end))
+    removed.sort()
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in removed:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def _grok_build_detected() -> bool:
@@ -1748,7 +1830,17 @@ def _grok_build_capture_command(text: str) -> str | None:
 
 
 def _grok_build_agents_path(project: str | None) -> Path | None:
-    return Path(project).expanduser() / "AGENTS.md" if project else None
+    """Reuse AGENTS.md / Agents.md / agents.md when a project already has one."""
+    if not project:
+        return None
+    root = Path(project).expanduser()
+    try:
+        for name in os.listdir(root):
+            if name.lower() == "agents.md":
+                return root / name
+    except OSError:
+        pass
+    return root / "AGENTS.md"
 
 
 def _grok_build_agents_block() -> str:
@@ -1775,6 +1867,8 @@ def _replace_grok_build_agents(text: str) -> str:
     if not matches:
         if _GROK_BUILD_AGENTS_START in text or _GROK_BUILD_AGENTS_END in text:
             raise ConfigUnreadable("AGENTS.md has an incomplete Khipu Grok Build block; refusing to overwrite it")
+        if not text.strip():
+            return block
         return text.rstrip("\n") + "\n\n" + block
     first = True
 
@@ -1791,7 +1885,8 @@ def _replace_grok_build_agents(text: str) -> str:
 def _remove_grok_build_agents(text: str) -> str:
     if _GROK_BUILD_AGENTS_RE.search(text) is None:
         return text
-    return _GROK_BUILD_AGENTS_RE.sub("", text).rstrip("\n") + ("\n" if text else "")
+    new = _GROK_BUILD_AGENTS_RE.sub("", text).strip()
+    return f"{new}\n" if new else ""
 
 
 def _grok_build_install(dry: bool, project: str | None = None) -> dict:
@@ -1809,6 +1904,10 @@ def _grok_build_install(dry: bool, project: str | None = None) -> dict:
         out.update(ok=False, error=("Aegis Khipu capture hooks already own ~/.grok/config.toml; "
                                     "refusing duplicate or misattributed Grok Build capture"))
         return out
+    without_native = _remove_native_grok_build_hooks(text)
+    native_cleared = without_native != text
+    if native_cleared:
+        text = without_native
     if _grok_build_capture_events(text) and _GROK_BUILD_HOOK_RE.search(text) is None:
         out.update(ok=False, error="unmanaged Grok Build capture hooks exist; refusing to duplicate them")
         return out
@@ -1819,9 +1918,12 @@ def _grok_build_install(dry: bool, project: str | None = None) -> dict:
     if isinstance(existing, dict) and not _is_launcher_command(existing.get("command"), "khipu-mcp"):
         out.update(ok=False, error=f"[mcp_servers.{GROK_BUILD_MCP_SERVER}] is not Khipu-owned")
         return out
+    if native_cleared:
+        out["changes"].append(f"{config}: remove normalized native Grok Build hooks")
     agents_text = agents.read_text(encoding="utf-8") if agents.is_file() else ""
     new_agents = _replace_grok_build_agents(agents_text)
     mcp_block, hook_block = _grok_build_blocks()
+    original = config.read_text(encoding="utf-8")
     new = _replace_grok_build_mcp(text, mcp_block)
     if new != text:
         out["changes"].append(f"{config}: add [mcp_servers.{GROK_BUILD_MCP_SERVER}]")
@@ -1845,7 +1947,7 @@ def _grok_build_install(dry: bool, project: str | None = None) -> dict:
         out["changes"].append(f"{agents}: add Grok Build recall instructions")
     if dry:
         return out
-    if new != text:
+    if new != original:
         out.setdefault("backups", []).append(_backup(config))
         _write_toml(config, new)
     if new_agents != agents_text:
@@ -1868,22 +1970,26 @@ def _grok_build_uninstall(dry: bool, project: str | None = None) -> dict:
                else text)
         if new != text:
             out["changes"].append(f"{config}: remove [mcp_servers.{GROK_BUILD_MCP_SERVER}]")
-        new2 = (_GROK_BUILD_HOOK_RE.sub("", new)
-                if _grok_build_capture_events(new) else new)
+        new2 = _remove_native_grok_build_hooks(_GROK_BUILD_HOOK_RE.sub("", new))
         if new2 != new:
             out["changes"].append(f"{config}: remove Grok Build capture hooks")
         if new2 != text and not dry:
             out.setdefault("backups", []).append(_backup(config))
             _write_toml(config, new2.rstrip("\n") + "\n")
     agents = _grok_build_agents_path(project)
-    if agents is not None and agents.is_file():
+    if agents is None:
+        out["note"] = ("AGENTS.md recall block left in place; pass --project to remove it")
+    elif agents.is_file():
         text = agents.read_text(encoding="utf-8")
         new = _remove_grok_build_agents(text)
         if new != text:
             out["changes"].append(f"{agents}: remove Grok Build recall instructions")
             if not dry:
                 out.setdefault("backups", []).append(_backup(agents))
-                agents.write_text(new, encoding="utf-8")
+                if not new.strip():
+                    agents.unlink()
+                else:
+                    agents.write_text(new, encoding="utf-8")
     return out
 
 
