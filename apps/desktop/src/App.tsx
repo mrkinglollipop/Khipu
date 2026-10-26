@@ -293,7 +293,7 @@ const SEARCH_MODES: {
   {
     mode: "semantic",
     label: "By meaning",
-    hint: "Vector similarity only. The words need not appear in the text.",
+    hint: "Vector similarity and word overlap. The words need not appear in the text.",
     placeholder: "describe what you are looking for",
   },
   {
