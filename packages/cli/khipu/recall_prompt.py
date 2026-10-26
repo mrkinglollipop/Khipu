@@ -1546,10 +1546,13 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
 def _routing_generation_current(files) -> bool:
     """Whether every file a routing answer was read from
     (``routing._generation``) still has its stat or, for a rewritten view,
-    the same semantic routing revision. An answer can sit in the pipe while
-    search runs; telemetry-only saves must not suppress its delivery."""
+    the same semantic routing revision. Changed heartbeats require an
+    equivalent view folded from their current stats. An answer can sit in
+    the pipe while search runs; telemetry-only saves must not suppress it."""
     if not isinstance(files, list):
         return False
+    changed = {}
+    views = []
     for item in files:
         if not (isinstance(item, list) and len(item) in (2, 3) and isinstance(item[0], str)):
             return False
@@ -1560,12 +1563,17 @@ def _routing_generation_current(files) -> bool:
             now = [st.st_mtime_ns, st.st_size, st.st_ino]
         except OSError:
             now = None
-        if now != item[1]:
-            if len(item) != 3:
-                return False
+        if len(item) == 3:
+            views.append((item, now != item[1]))
+        elif now != item[1]:
+            changed[item[0]] = now
+    if changed and not views:
+        return False
+    for item, rewritten in views:
+        if rewritten or changed:
             from khipu.routing_generation import matches
 
-            if not matches(item[0], item[2]):
+            if not matches(item[0], item[2], heartbeats=changed):
                 return False
     return True
 

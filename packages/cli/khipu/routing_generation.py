@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 
 # Shared with the engine's loader; semantic fallback accepts the same format.
@@ -63,7 +64,7 @@ def revision(view: dict) -> str:
                    "advice_cap_decisions": view.get("advice_cap_decisions")})
 
 
-def matches(path: str, expected: str) -> bool:
+def matches(path: str, expected: str, *, heartbeats: dict | None = None) -> bool:
     """Read a changed view once; damaged or concurrently replaced views fail closed."""
     try:
         with open(path, encoding="utf-8") as fh:
@@ -73,8 +74,32 @@ def matches(path: str, expected: str) -> bool:
         if (before.st_mtime_ns, before.st_size, before.st_ino) != (
                 after.st_mtime_ns, after.st_size, after.st_ino):
             return False
-        return (isinstance(view, dict) and view.get("schema") == SCHEMA
+        if not (isinstance(view, dict) and view.get("schema") == SCHEMA
                 and view.get("digest") == digest(view)
-                and revision(view) == expected)
-    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                and revision(view) == expected):
+            return False
+        if heartbeats:
+            from khipu.routing_sources import RUNNER_FILES
+
+            index = list(RUNNER_FILES).index("heartbeat")
+            fingerprints = dict(view["fingerprint"]["sources"]["runners"])
+            recorded = {
+                str(Path(runner["path"]).joinpath(*RUNNER_FILES["heartbeat"])):
+                    fingerprints[runner["name"]][index]
+                for runner in view["sources"]["runners"]
+            }
+            for heartbeat, observed in heartbeats.items():
+                # Only a fold that read this exact heartbeat can establish
+                # equivalence; other changed inputs always invalidate it.
+                if heartbeat not in recorded or recorded[heartbeat] != observed:
+                    return False
+                try:
+                    current = os.stat(heartbeat)
+                    stat = [current.st_mtime_ns, current.st_size, current.st_ino]
+                except OSError:
+                    stat = None
+                if stat != observed:
+                    return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError):
         return False

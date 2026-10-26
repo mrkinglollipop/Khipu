@@ -81,6 +81,11 @@ def test_runner_change_invalidates_generation_before_refold(mac, kind):
 @pytest.mark.parametrize("kind", ["concurrency", "spend"])
 def test_same_verdict_telemetry_keeps_semantic_revision(mac, kind):
     folder, before = _seed_cap(mac, kind)
+    generation = routing._generation(before, routing.settings())
+    buffered = routing._advice_push_adjust({"kind": "none"}, before, NOW, "review", "main")
+    assert "go (" in buffered["text"]
+    buffered.update(version=before["version"], epoch=before["epoch"],
+                    generation=generation, done=time.monotonic())
     _update_runner(folder, kind, 1)
     routing._poll_refold(NOW)
     after = routing._load_view()
@@ -88,6 +93,51 @@ def test_same_verdict_telemetry_keeps_semantic_revision(mac, kind):
     assert routing_advice.account_advice(after, after["accounts"][0], NOW)["verdict"] == "go"
     assert routing_generation.revision(before) == routing_generation.revision(after)
     assert routing_generation.matches(str(routing.view_file()), routing_generation.revision(before))
+    at, writer = _fake_reader([(0.0, json.dumps(buffered).encode() + b"\n")])
+    writer.join(5)
+    assert at.collect() == buffered
+    assert recall_prompt._routing_generation_current(generation)
+
+
+@pytest.mark.parametrize("kind", ["concurrency", "spend"])
+def test_harmless_telemetry_without_refold_still_invalidates_delivery(mac, kind):
+    folder, before = _seed_cap(mac, kind)
+    generation = routing._generation(before, routing.settings())
+    _update_runner(folder, kind, 1)
+    assert not recall_prompt._routing_generation_current(generation)
+
+
+@pytest.mark.parametrize("kind", ["concurrency", "spend"])
+@pytest.mark.parametrize("damage", ["schema", "digest", "missing_fingerprint", "old_fingerprint",
+                                   "new_heartbeat", "events", "config"])
+def test_heartbeat_fallback_requires_valid_current_replacement(mac, kind, damage):
+    folder, before = _seed_cap(mac, kind)
+    generation = routing._generation(before, routing.settings())
+    _update_runner(folder, kind, 1)
+    routing._poll_refold(NOW)
+    after = routing._load_view()
+    assert routing_generation.revision(before) == routing_generation.revision(after)
+    if damage == "new_heartbeat":
+        # Even equivalent telemetry needs a fold that has actually read it.
+        _update_runner(folder, kind, 1)
+    elif damage in {"events", "config"}:
+        # Semantic fallback is limited to heartbeats; other input edits
+        # cannot be excused by a view that predates them.
+        index = 0 if damage == "events" else 1
+        with open(generation[index][0], "a", encoding="utf-8") as fh:
+            fh.write("\n")
+    else:
+        if damage == "schema":
+            after["schema"] = 999
+        elif damage == "missing_fingerprint":
+            after["fingerprint"].pop("sources")
+        elif damage == "old_fingerprint":
+            after["fingerprint"] = before["fingerprint"]
+        routing._save_view(after)
+        if damage == "digest":
+            after["digest"] = "invalid"
+            routing.view_file().write_text(json.dumps(after))
+    assert not recall_prompt._routing_generation_current(generation)
 
 
 def _forecast(replay, name="plan", minutes=120):
