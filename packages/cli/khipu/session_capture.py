@@ -837,19 +837,37 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         if not isinstance(d, dict) or d.get("isMeta"):
             continue
         parsed.extend((d, role, text, min(line_end, end)) for role, text in _parse_line(d))
-    # Deduplicate only paired representations, never unrelated response-only
-    # turns or repeated messages from a single representation.
-    from collections import Counter
+    # Deduplicate only paired representations of the same turn (adjacent in
+    # order, ignoring tools), never a later repeat that reuses the same text.
+    def _turn_role(role: str) -> str | None:
+        bare = role[6:] if role.startswith("codex:") else role
+        return bare if bare in ("user", "assistant") else None
 
-    event_copies = Counter((r, t.strip()) for d, r, t, _ in parsed
-                           if r in ("user", "assistant") and d.get("type") == "event_msg")
+    drop_idx: set[int] = set()
+    used_event: set[int] = set()
+    for i, (d, role, text, _) in enumerate(parsed):
+        if not role.startswith("codex:"):
+            continue
+        key = (_turn_role(role), text.strip())
+        if key[0] is None:
+            continue
+        for j, (d2, role2, text2, _) in enumerate(parsed):
+            if j in used_event or d2.get("type") != "event_msg":
+                continue
+            if (_turn_role(role2), text2.strip()) != key:
+                continue
+            lo, hi = (i, j) if i < j else (j, i)
+            if any(_turn_role(parsed[k][1]) for k in range(lo + 1, hi)):
+                continue
+            drop_idx.add(i)
+            used_event.add(j)
+            break
     items: list[tuple[dict, str, str, int]] = []
-    for d, role, text, line_end in parsed:
+    for i, (d, role, text, line_end) in enumerate(parsed):
+        if i in drop_idx:
+            continue
         if role.startswith("codex:"):
             role = role[6:]
-            if event_copies[(role, text.strip())]:
-                event_copies[(role, text.strip())] -= 1
-                continue
         # ACP chunks include meaningful standalone spaces and newlines. Clean
         # the assembled turn once, instead of stripping individual fragments.
         if (isinstance(d.get("params"), dict) and items and items[-1][1] == role
@@ -949,6 +967,14 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
         prior: dict = {}
         read_window(path, 0, stats=prior, end_offset=int(st["offset"]))
         st["transcript_prefix"] = prior.get("prefix")
+    # Same inode, same path, larger file: an in-place rewrite keeps the old
+    # offset but the bytes before it are new. Prefix mismatch → start over.
+    if (not reset and st.get("transcript_prefix") and int(st.get("offset", 0)) > 0
+            and st.get("transcript_identity") == identity):
+        prior = {}
+        read_window(path, 0, stats=prior, end_offset=int(st["offset"]))
+        if prior.get("prefix") != st.get("transcript_prefix"):
+            reset = True
     if reset:
         # A reset can reuse an earlier 0:N range. Namespace every later window
         # by this file generation so fresh text is not an exact-window replay.

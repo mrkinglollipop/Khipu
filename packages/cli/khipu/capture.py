@@ -473,19 +473,26 @@ def _inherit_project(cur, payload: dict[str, Any]) -> None:
     parent = payload.get("parent_session_id")
     if not parent:
         return
+    # SubagentStop stores a bare parent id; parent episodes are harness:id.
+    harness = str(payload.get("harness") or "").strip()
+    if not harness:
+        sid = str(payload.get("session_id") or "")
+        if ":" in sid:
+            harness = sid.split(":", 1)[0]
+    prefixed = f"{harness}:{parent}" if harness and ":" not in str(parent) else parent
     try:
         cur.execute(
             """
             SELECT project, repo_root
             FROM episodes
-            WHERE (parent_session_id = %s OR session_id = %s)
+            WHERE (parent_session_id = %s OR session_id IN (%s, %s))
               AND deleted_at IS NULL
               AND project IS NOT NULL
               AND ts >= now() - interval '24 hours'
             ORDER BY ts DESC
             LIMIT 1
             """,
-            (parent, parent),
+            (parent, parent, prefixed),
         )
         row = cur.fetchone()
     except Exception:  # noqa: BLE001 — inheritance is best-effort, never blocks a write
