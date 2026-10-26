@@ -5836,6 +5836,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="set: the accounts in your order (or --entries); amend: the one account")
     rprio.add_argument("--append", default=None, metavar="TEXT", help="amend: words added to the account's role")
     rprio.add_argument("--role", default=None, metavar="TEXT", help="amend: the account's new role, in place of its old one")
+    rprio.add_argument("--exception", default=None, metavar="TEXT",
+                       help="amend: a direction with an end, in your words; --until is its end (default: the account's "
+                            "next weekly reset, else 7 days). It lapses on its own")
+    rprio.add_argument("--end-exception", default=None, metavar="ID", dest="end_exception",
+                       help="amend: end one exception early (its id is in the amend result and `route priority --json`)")
     rprio.add_argument("--entries", default=None, metavar="JSON",
                        help='set: [{"account": "...", "role": "your words", "until": "T"}, ...] in your order')
     rprio.add_argument("--until", default=None, metavar="T", help="set: when the whole priority ends")

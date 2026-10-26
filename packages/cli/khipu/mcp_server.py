@@ -951,9 +951,11 @@ TOOLS: list[dict] = [
             "replaced shown beside it, until the owner confirms or undoes it "
             "in Settings -> Routing. Khipu keeps his order as given and never "
             "reorders it. This tool cannot confirm, undo or clear a priority. "
-            "To change one account's entry only, give account (with append or role, and expect, the "
-            "priority's version as read) in place of entries: every other entry stays exactly as it is. "
-            "When the owner directed it himself, khipu_owner_act route.priority.amend applies it at once."
+            "To change one account's entry only, give account (with append, role, exception or end_exception, "
+            "and expect, the priority's version as read) in place of entries: every other entry stays exactly "
+            "as it is. When the owner directed it himself, khipu_owner_act route.priority.amend applies it at once. "
+            "A direction with an end (\"until tomorrow 20:30Z\") is an exception, never role text: a role holds "
+            "at most 2,000 characters, and a longer one is refused."
         ),
         "inputSchema": {
             "type": "object",
@@ -974,11 +976,17 @@ TOOLS: list[dict] = [
                     },
                 },
                 "until": {"type": "string", "description": "When the whole priority ends (a time, or 3d); "
-                                                           "with account, when that entry ends"},
+                                                           "with account, when that entry ends, or with "
+                                                           "exception, when the exception ends"},
                 "account": {"type": "string", "description": "In place of entries: the one account whose entry "
                                                              "changes (its label or its id)"},
                 "append": {"type": "string", "description": "With account: words added to its role"},
                 "role": {"type": "string", "description": "With account: its new role, in place of the old one"},
+                "exception": {"type": "string", "description": "With account: a direction with an end, in the "
+                                                               "owner's words; until is its end (none: the "
+                                                               "account's next weekly reset, else 7 days). It "
+                                                               "lapses on its own"},
+                "end_exception": {"type": "string", "description": "With account: the id of an exception to end early"},
                 "expect": {"type": "string", "description": "With account: the priority's version as read "
                                                             "(version, as khipu_route lists it)"},
                 "base": {"type": "string", "minLength": 1, "maxLength": 256,
@@ -1031,7 +1039,10 @@ TOOLS: list[dict] = [
             "next routing block, and can be undone from Settings, Owner "
             "actions, or by asking for direction.undo with its id. "
             "For one account's priority entry use route.priority.amend (account, expect, append or role, "
-            "optional until), not route.priority.set, which rewrites every account; "
+            "optional until), not route.priority.set, which rewrites every account. Any direction with an end "
+            "goes in route.priority.amend exception (the direction as the owner gave it) with until, which lapses "
+            "on its own "
+            "(no until: the account's next weekly reset, else 7 days); end_exception ends one early; "
             "route.cap.set takes an optional until, after which the cap stops applying."
         ),
         "inputSchema": {
@@ -2784,7 +2795,7 @@ def _tool_route_priority(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    amend_keys = {"account", "append", "role", "expect"}
+    amend_keys = {"account", "append", "role", "exception", "end_exception", "expect"}
     if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request", "base", *amend_keys}:
         raise ValueError("khipu_route_priority takes entries (or account with append or role, and expect), "
                          "owner_request, base and optional until")
@@ -2803,9 +2814,12 @@ def _tool_route_priority(args: dict) -> dict:
         if "entries" in args:
             raise ValueError("give entries (the whole priority) or account (one entry), not both")
         if any(not isinstance(args.get(k), str) for k in ("account", "expect")) \
-                or any(k in args and not isinstance(args[k], str) for k in ("append", "role")):
-            raise ValueError("account, expect, append and role must be text")
+                or any(k in args and not isinstance(args[k], str) for k in ("append", "role", "exception",
+                                                                            "end_exception")):
+            raise ValueError("account, expect, append, role, exception and end_exception must be text")
         return routing.conversation_priority_amend(args["account"], append=args.get("append"), role=args.get("role"),
+                                                   exception=args.get("exception"),
+                                                   end_exception=args.get("end_exception"),
                                                    until=until, owner_request=owner_request,
                                                    author=routing.conversation_author(), expect=args["expect"],
                                                    base=base)

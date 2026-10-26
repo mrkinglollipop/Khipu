@@ -39,7 +39,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.cap.remove": (("account", "kind"), ("window", "purpose")),
     "route.priority.set": (("entries",), ("until", "expect", "holds")),
     # One account's entry only: ``append`` words to its role or ``role`` in its place (one of the two).
-    "route.priority.amend": (("account", "expect"), ("append", "role", "until")),
+    # ``exception`` (with ``until`` as its end) adds a direction that lapses on its own; ``end_exception`` ends one.
+    "route.priority.amend": (("account", "expect"), ("append", "role", "until", "exception", "end_exception")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
@@ -296,9 +297,11 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "slack", "usd", "days", "n",
                                              "revision", "purpose", "tier", "sensitive_only", "until")], [v["account"]]
     if action == "route.priority.amend":
-        if ("append" in v) == ("role" in v):
-            raise _bad("route.priority.amend takes append (words added to the role) or role (its new words), one of the two")
-        return ["route", "priority", "amend", *_opts(v, "append", "role", "until", "expect")], [v["account"]]
+        if sum(k in v for k in ("append", "role", "exception", "end_exception")) != 1:
+            raise _bad("route.priority.amend takes append (words added to the role), role (its new words), "
+                       "exception (a direction with an end, with until) or end_exception (an exception's id), one of the four")
+        return ["route", "priority", "amend",
+                *_opts(v, "append", "role", "until", "exception", "end_exception", "expect")], [v["account"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":
