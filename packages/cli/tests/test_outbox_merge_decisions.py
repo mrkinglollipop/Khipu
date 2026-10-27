@@ -116,6 +116,10 @@ def _handles_decisions_sql(cur):
         if s.startswith("SELECT khipu_project_fact(%s, %s)"):
             cur._result = [("projected",)]
             return
+        if s == outbox_preferences._DECISION_MAX_SQL:
+            cur.calls.append((s, params))
+            cur._result = [(max(cur.decisions, default=0),)]
+            return
         if s == " ".join(outbox_preferences._DECISION_IDS_SQL.split()):
             cur.calls.append((s, params))
             cur._result = [(d["id"], d["text"]) for d in sorted(cur.decisions.values(), key=lambda d: d["id"])
@@ -342,6 +346,73 @@ def test_undo_refuses_an_episode_whose_created_row_changed(held, tmp_path, monke
     others = [d for d in cur.decisions.values() if d["episode_id"] == 4]
     assert others and all(d["retracted_at"] is not None for d in others)
     assert undone["decisions_retracted"] == [i for i in out["decision_ids_created"] if i != ship["id"]]
+
+
+def _reanchoring_projection(cur):
+    """0047's projection, enough to re-anchor: a decision with no episode
+    takes its first live episode text claimant as its episode."""
+    base = cur.execute
+
+    def execute(sql, params=None):
+        if " ".join(sql.split()).startswith("SELECT khipu_project_fact(%s, %s)"):
+            d = cur.decisions.get(params[1])
+            claimants = [c[5] for c in cur.fact_claims if c[:3] == ("decision", params[1], "text")
+                         and c[4] == "episode" and cur.episodes[c[5]].get("deleted_at") is None]
+            if d is not None and d["episode_id"] is None and claimants:
+                d["episode_id"] = claimants[0]
+            cur._result = [("projected",)]
+            return
+        return base(sql, params)
+
+    cur.execute = execute
+
+
+def test_an_owner_decision_the_writer_dedups_onto_is_never_counted_as_created(held, tmp_path, monkeypatch):
+    cur, _paths = held
+    _reanchoring_projection(cur)
+    # The owner's own decision (no episode), which the import's claim re-anchors to episode 2.
+    cur.decisions[401] = {"id": 401, "project": "khipu", "text": "Ship the import", "episode_id": None,
+                          "session_id": None, "decided_at": HUB["ts"], "superseded_by": None,
+                          "retracted_at": None, "retract_reason": None}
+    cur.fact_claims.append(("decision", 401, "text", "Ship the import", "owner", None))
+    before2 = deepcopy(cur.episodes[2])
+    _direction(tmp_path, monkeypatch)
+    rc, out = _run("--include-decisions", "--apply", "--owner-direction")
+    assert rc == 0 and 2 in out["episode_ids"], out
+    assert cur.decisions[401]["episode_id"] == 2  # the re-anchor happened
+    assert 401 not in out["decision_ids_created"] and out["decisions_deduped"] == 2, out
+    rc, undone = _run("--undo", out["owner_action"], "--owner-direction")
+    assert rc == 0 and 2 not in undone["left_alone"] and undone["decisions_changed"] == [], undone
+    assert cur.decisions[401]["retracted_at"] is None and 401 not in undone["decisions_retracted"]
+    assert cur.episodes[2] == before2
+
+
+def test_a_line_forgotten_under_the_lock_lends_no_decision_details(held, tmp_path, monkeypatch):
+    cur, _paths = held
+    _queue(_line(2, decisions=["Ship the import", *LINE_DECISIONS], people=["Someone the hub lacks"],
+                 decision_details=[{"text": "Ship the import", "rationale": "Forgotten rationale"}]))
+    payloads = []
+    real = decisions.insert_decisions_from_episode
+    monkeypatch.setattr(decisions, "insert_decisions_from_episode",
+                        lambda c, p, e: payloads.append(deepcopy(p)) or real(c, p, e))
+    # The line with details is forgotten by source after planning, before the row lock.
+    forgotten = []
+    real_fence = tombstones.hub_source_forgotten
+    monkeypatch.setattr(tombstones, "hub_source_forgotten",
+                        lambda c, view, source=None: bool(forgotten and "decision_details" in view)
+                        or real_fence(c, view, source))
+    execute = cur.execute
+
+    def spy(sql, params=None):
+        if " ".join(sql.split()).startswith("SELECT id, deleted_at, raw, preferences, topics, tags, decisions"):
+            forgotten.append(True)
+        return execute(sql, params)
+
+    cur.execute = spy
+    _direction(tmp_path, monkeypatch)
+    rc, out = _run("--include-decisions", "--apply", "--owner-direction")
+    assert rc == 0 and 2 in out["episode_ids"], out
+    assert payloads and not any("Forgotten rationale" in json.dumps(p) for p in payloads), payloads
 
 
 def test_a_failed_writer_skips_the_episode_and_keeps_its_lines(held, tmp_path, monkeypatch):

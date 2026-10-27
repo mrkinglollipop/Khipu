@@ -87,6 +87,7 @@ _CONTENT_LOCK_SQL = ("SELECT id, deleted_at, raw, preferences, topics, tags FROM
 _DECISIONS_LOCK_SQL = ("SELECT id, deleted_at, raw, preferences, topics, tags, decisions, project, session_id, ts "
                        "FROM episodes WHERE id = ANY(%s) ORDER BY id FOR UPDATE")
 _DECISION_IDS_SQL = "SELECT id, text FROM decisions WHERE episode_id = %s ORDER BY id"
+_DECISION_MAX_SQL = "SELECT coalesce(max(id), 0) FROM decisions"
 _DECISION_ROWS_SQL = ("SELECT id, text, episode_id, superseded_by, retracted_at FROM decisions "
                       "WHERE id = ANY(%s) ORDER BY id FOR UPDATE")
 
@@ -983,6 +984,12 @@ def _write_decisions(cur, row: tuple, spec: dict[str, Any], lines: list[dict[str
     payload = _decision_payload(row, spec["added"], lines)
     cur.execute(_DECISION_IDS_SQL, (eid,))
     before = {int(r[0]) for r in cur.fetchall()}
+    # A row the writer creates takes an id above every row on file now. A
+    # duplicate it claims instead keeps its own, lower id, even when the claim
+    # re-anchors it to this episode (0047: an owner's decision takes its first
+    # live episode claimant), so it is never counted as created.
+    cur.execute(_DECISION_MAX_SQL)
+    ceiling = int(cur.fetchone()[0] or 0)
     cur.execute("SAVEPOINT outbox_decisions")
     try:
         decisions.insert_decisions_from_episode(cur, payload, eid)
@@ -994,7 +1001,7 @@ def _write_decisions(cur, row: tuple, spec: dict[str, Any], lines: list[dict[str
     cur.execute(_DECISION_IDS_SQL, (eid,))
     asked = {normalize_text(decisions._redacted_value(t)) for t in spec["added"]}
     created = [{"id": int(i), "text": t} for i, t in cur.fetchall()
-               if int(i) not in before and normalize_text(t or "") in asked]
+               if int(i) not in before and int(i) > ceiling and normalize_text(t or "") in asked]
     made = {normalize_text(c["text"]) for c in created}
     spec["created"] = created
     spec["deduped"] = [t for t in spec["added"] if normalize_text(decisions._redacted_value(t)) not in made]
@@ -1071,7 +1078,9 @@ def apply(*, record, record_resolutions, record_committed=None, include_content:
                                 line for line in lines if not hub_source_forgotten(cur, line["view"])]
                             entry, resolve = _merge_episode(cur, tuple(r[:width]), live, place)
                             spec = ((entry or {}).get("content") or {}).get("decisions")
-                            if spec and not _write_decisions(cur, tuple(r[:width]), spec, lines):
+                            # Decision details come from the live lines only:
+                            # a line forgotten under the lock lends nothing.
+                            if spec and not _write_decisions(cur, tuple(r[:width]), spec, live):
                                 # Nothing of this episode is written or
                                 # resolved: its lines stay held.
                                 decisions_failed.append(int(r[0]))
