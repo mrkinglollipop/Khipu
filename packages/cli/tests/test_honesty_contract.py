@@ -27,7 +27,11 @@ class NightlyStepHealthTest(unittest.TestCase):
 
         with mock.patch.object(jobs, "_is_index_sync_host", return_value=False):
             out = jobs.nightly_step_health()
-        for key in ("notes_reconcile_ok", "embed_provider_ok", "commitments_hygiene_ok", "mark_stale_ok"):
+        for key in (
+            "notes_reconcile_ok", "embed_provider_ok", "query_cache_prune_ok",
+            "commitments_close_rules_ok", "commitments_hygiene_ok", "mark_stale_ok",
+            "ledger_ok",
+        ):
             self.assertTrue(out[key]["ok"])
             self.assertFalse(out[key]["applicable"])
 
@@ -47,12 +51,20 @@ class NightlyStepHealthTest(unittest.TestCase):
                         "last_exit_ts": None,
                     }):
                 out = jobs.nightly_step_health()
-        for key in ("notes_reconcile_ok", "embed_provider_ok", "commitments_hygiene_ok", "mark_stale_ok"):
+        for key in (
+            "notes_reconcile_ok", "embed_provider_ok", "query_cache_prune_ok",
+            "commitments_close_rules_ok", "commitments_hygiene_ok", "mark_stale_ok",
+            "ledger_ok",
+        ):
             self.assertTrue(out[key]["ok"], key)
             self.assertTrue(out[key]["skipped"], key)
             self.assertEqual(out[key]["reason"], "not checked yet — the nightly runs at 02:05")
         skipped = jobs.skipped_step_names(out)
-        for name in ("notes_reconcile", "embed_provider", "commitments_hygiene", "mark_stale"):
+        for name in (
+            "notes_reconcile", "embed_provider", "query_cache_prune",
+            "commitments_close_rules", "commitments_hygiene", "mark_stale",
+            "ledger",
+        ):
             self.assertIn(name, skipped)
         # briefs disabled → applicable:false, also greyed via the same list
         self.assertIn("briefs_build", skipped)

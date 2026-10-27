@@ -212,9 +212,13 @@ def status(*, now: float | None = None) -> dict[str, Any]:
             note = str(hb.get("note") or hb.get("outcome") or "")[:160]
             out["reasons"].append(f"last sync exited {rc}: {note}" if note else f"last sync exited {rc}")
         out["nightly_log_age_s"] = int(now - nightly_ran) if nightly_ran else None
-        if ts and nightly_ran and nightly_ran - ts > NIGHTLY_SLACK_S:
+        from khipu.jobs import nightly_consolidate_ts
+
+        # The sync runs inside the consolidate driver; later steps keep logging.
+        consolidated = nightly_consolidate_ts(nightly_ran, slack_s=NIGHTLY_SLACK_S)
+        if ts and consolidated and consolidated - ts > NIGHTLY_SLACK_S:
             out["reasons"].append(
-                f"the nightly ran {int((nightly_ran - ts) // 60)} min after the last recorded sync "
+                f"the nightly ran {int((consolidated - ts) // 60)} min after the last recorded sync "
                 "— it ran and the sync did not record a result"
             )
         rp = hb.get("repo")
