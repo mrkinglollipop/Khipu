@@ -298,7 +298,8 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         crossing = _crosses_within_hour(entry, now) if purpose in ("job", "check") else []
         if holding:
             verdict = "hold_back"
-            reason = "; ".join(f"{s['kind']} {s['verdict']}" for s in holding)
+            reason = "; ".join(f"{s['kind']} {s['verdict']}" + (f" (cap ends {s['until']})" if s.get("until") else "")
+                               for s in holding)
         # Measured DeepSeek spend, including filling history, is judged
         # normally. Only unavailable or untrusted reads keep the cap unknown.
         elif entry.get("harness") == "deepseek" and any(

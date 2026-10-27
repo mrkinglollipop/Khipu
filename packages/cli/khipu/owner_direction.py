@@ -76,7 +76,7 @@ ACTIONS: frozenset[str] = frozenset({
     "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
     "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
-    "route.priority.set", "route.priority.confirm",
+    "route.priority.set", "route.priority.amend", "route.priority.confirm",
     "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm",
     "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
@@ -859,6 +859,40 @@ def record_setting_before(key: str, data: dict) -> None:
              "state": "pending", "before": before})
 
 
+# Actions whose undo restores what the snapshot read: it is read again under
+# the routing lock, just before the action's own line is written, so a write
+# between the check and the change can never become the state Undo restores.
+_SNAPSHOT_UNDER_LOCK = ("route.priority.", "route.cap.", "route.hold.end", "route.rule.edit", "route.rule.undo",
+                        "route.rule.retire", "route.rule.dismiss", "route.rule.confirm")
+
+
+def record_routing_before(events: list[dict]) -> None:
+    """Called by the routing writer with the routing lock held, before it
+    appends ``events``: when they are this owner action's own lines, record
+    the snapshot as it stands now (a ``state`` line, as for a setting)."""
+    pend = _PENDING.get()
+    if not pend or pend.get("snapshot_locked") or not isinstance(pend.get("line"), dict):
+        return
+    action, line_id = pend["intent"]["action"], pend["line"]["id"]
+    if not action.startswith(_SNAPSHOT_UNDER_LOCK):
+        return
+    if not any(str(e.get("op") or "") == line_id or str(e.get("op") or "").startswith(f"{line_id}:") for e in events):
+        return
+    pend["snapshot_locked"] = True  # set first: reading the view may write (a seed import)
+    try:
+        before = _before(pend["intent"])
+        if before is _NO_UNDO or before is _UNREADABLE:
+            return
+        _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line_id,
+                 "state": "pending", "before": before})
+        pend["before"] = before
+    except Exception:
+        # As for a setting: a direction's change waits for its Undo to be
+        # recorded; the owner's own change from the app is never held up.
+        if pend["stamp"].get("auth") == "direction":
+            raise
+
+
 def record_owner_write(tool: str, args: dict) -> None:
     """Keep the hub identity before sending, even if its COMMIT reply is lost."""
     pend = _PENDING.get()
@@ -1116,7 +1150,9 @@ def _priority_rows(held: dict | None) -> list[dict] | None:
     if not held:
         return None
     return [{"account": e["account"], "role": e.get("role"), "until": e.get("until"),
-             **({"level": dict(e["level"])} if e.get("level") else {})} for e in held["entries"]]
+             **({"level": dict(e["level"])} if e.get("level") else {}),
+             **({"exceptions": [dict(x) for x in e["exceptions"]]} if e.get("exceptions") else {})}
+            for e in held["entries"]]
 
 
 def _before(want: dict):
@@ -1138,12 +1174,14 @@ def _before(want: dict):
     if action in ("route.cap.set", "route.cap.remove"):
         facts = want.get("facts") or {}
         entry = _entry(target)
-        prior = next((c for c in entry.get("caps") or []
-                      if c.get("kind") == facts.get("kind")
-                      and c.get("purpose", "job") == facts.get("purpose", "job")
-                      and (c.get("kind") in ("spend", "concurrency")
-                           or c.get("window") == facts.get("window"))), None)
-        return {"cap": prior}
+
+        def same_slot(c: dict) -> bool:
+            return (c.get("kind") == facts.get("kind") and c.get("purpose", "job") == facts.get("purpose", "job")
+                    and (c.get("kind") in ("spend", "concurrency") or c.get("window") == facts.get("window")))
+
+        prior = next((c for c in entry.get("caps") or [] if same_slot(c)), None)
+        layers = [c for c in entry.get("cap_layers") or [] if same_slot(c)]
+        return {"cap": prior, "layers": layers or ([prior] if prior else []), "provenance": 1}
     if action == "route.pause":
         entry = _entry(target)
         paused = entry.get("state") == routing.PAUSED
@@ -1155,32 +1193,49 @@ def _before(want: dict):
     if action in ("route.note.set", "route.note.end"):
         note = routing.read_view().get("note")
         return {"text": note["text"] if note else None}
-    if action in ("route.rule.edit", "route.rule.undo"):
-        return {"text": _rule_now(target).get("text")}
+    if action in ("route.rule.edit", "route.rule.undo", "route.rule.retire", "route.rule.dismiss"):
+        rule = _rule_now(target)
+        # ``provenance``: this snapshot says whose words it holds; an undo of
+        # one without it is refused (``_require_provenance``).
+        out = {"text": rule.get("text")} if action in ("route.rule.edit", "route.rule.undo") else {}
+        out["provenance"] = 1
+        if rule.get("pending"):
+            # A conversation's pending proposal: its stored line, so undo
+            # puts it back as that conversation's, never as the owner's words.
+            out.update(pending_kind=rule.get("pending_kind"),
+                       request=routing.pending_rule_line(rule["entity"]))
+        return out
     if action == "route.rule.add":
         # The new rule's number is known only after, so its line's id is
         # chosen now: Undo finds that line even if the finish was never
         # written, whatever else was added meanwhile.
-        return {"event": routing._new_id("o")}
+        return {"event": routing._new_id("o"), "provenance": 1}
     if action == "route.hold.add":
-        return {"hold": routing._new_id("h")}
+        return {"hold": routing._new_id("h"), "provenance": 1}
+    if action == "route.rule.restore":
+        return {"provenance": 1}
     if action == "route.rule.confirm":
         rule = _rule_now(target)
         if not rule.get("pending"):
             return {"seeded": True}
-        return {"pending_kind": rule.get("pending_kind"), "prior_text": rule.get("prior_text")}
+        return {"pending_kind": rule.get("pending_kind"), "prior_text": rule.get("prior_text"), "provenance": 1}
     if action == "route.hold.end":
         hold = next((h for h in routing.read_view()["holds"] if h["id"] == target), None)
         if hold is None:
             return None
         return {"text": hold.get("text"), "reason": hold.get("reason"), "scope": hold.get("scope"),
-                "until": hold.get("until")}
+                "until": hold.get("until"), "owner": bool(hold.get("owner")), "written_by": hold.get("written_by"),
+                "via": hold.get("via"), "provenance": 1}
     if action.startswith("route.priority."):
-        held = routing.read_view().get("priority")
-        if action == "route.priority.confirm":
-            replaced = (held or {}).get("replaced")
-            return {"entries": _priority_rows(replaced), "until": (replaced or {}).get("until")}
-        return {"entries": _priority_rows(held), "until": (held or {}).get("until")}
+        # The stored line, never the folded view: undo puts back entries the
+        # view leaves out, and an entry whose end has passed since never
+        # refuses it. A conversation's pending request keeps its author, its
+        # words and the priority it replaced, so undo returns it pending.
+        stored = routing.read_view().get("priority_stored")
+        if not stored:
+            return {"entries": None, "until": None, "stored": True, "provenance": 1}
+        return {**{k: stored.get(k) for k in ("until", "pending", "written_by", "via", "owner_request", "replaced")},
+                "entries": [dict(e) for e in stored["entries"]], "stored": True, "provenance": 1}
     if action.startswith("route.tier_table."):
         held = routing.read_view().get("tier_table")
         return {"tiers": dict(held["tiers"]) if held else None}
@@ -1358,9 +1413,18 @@ def _undo_pause(line, via):
 def _undo_hold_end(line, via):
     from khipu import routing
 
-    before = line.get("before") or {}
+    before = dict(line.get("before") or {})
     scope = before.get("scope") or {}
     kind = scope.get("kind")
+    # A conversation's hold comes back as that conversation's (its limits
+    # included); only the owner's own hold comes back as his.
+    author = before.get("written_by")
+    if "owner" in before and not before["owner"]:
+        if not isinstance(author, dict) or author.get("kind") != "conversation":
+            raise ValueError("Khipu can't tell which conversation wrote this hold, so it can't undo its end")
+        return routing.add_hold(before.get("text") or "", reason=before.get("reason") or "other", scope=kind,
+                                account=scope.get("account"), until=before.get("until"), owner=False,
+                                author=dict(author), via=before.get("via") or "mcp")
     return routing.add_hold(before.get("text") or "", reason=before.get("reason") or "other", scope=kind,
                             account=scope.get("account"), until=before.get("until"), owner=True, via=via)
 
@@ -1537,6 +1601,9 @@ def _undo_note_end(line, via):
 def _undo_rule_words(line, via, holds=None):
     from khipu import routing
 
+    back = _pending_rule_back(line, via, holds)
+    if back is not None:
+        return back
     words = _b(line).get("text") or ""
     return routing.edit_rule(line["target"], words, via=via, holds=_undo_holds(line, holds),
                              _undo_default_holds=True)
@@ -1550,9 +1617,48 @@ def _retire_rule(n_of):
     return run
 
 
+LEGACY_PROVENANCE = "this change was saved before Khipu recorded who wrote it; set it again instead"
+
+
+_PROVENANCE_FAMILIES = ("route.priority.", "route.rule.", "route.hold.", "route.cap.")
+
+
+def _require_provenance(line: dict) -> None:
+    """Every priority, rule and hold undo needs a snapshot that says whose
+    words it holds (``provenance``). One saved before Khipu recorded that is
+    refused, never guessed at: refusing is the accepted cost."""
+    before = _b(line)
+    # Provable from the snapshot itself: confirming a seeded rule restores
+    # no words on undo, only marks the seed unconfirmed again.
+    owners_only = line["action"] == "route.rule.confirm" and before == {"seeded": True}
+    if line["action"].startswith(_PROVENANCE_FAMILIES) and not before.get("provenance") and not owners_only:
+        raise ValueError(LEGACY_PROVENANCE)
+
+
+def _pending_rule_back(line, via, holds):
+    """None when the change was not over a conversation's pending rule
+    proposal; otherwise that proposal put back as the conversation's."""
+    from khipu import routing
+
+    before = _b(line)
+    if before.get("pending_kind") == "added":
+        # Restoring would make the conversation's proposed rule read as the
+        # owner's; it has to be proposed again.
+        raise ValueError("this was a conversation's proposed rule; Khipu won't bring it back as yours, "
+                         "so ask the conversation to propose it again")
+    if before.get("pending_kind") == "changed":
+        return routing.restore_rule_request(line["target"], before.get("request") or {}, via=via,
+                                            holds=_undo_holds(line, holds),
+                                            retired=line["action"] == "route.rule.retire")
+    return None
+
+
 def _undo_restore_rule(line, via, holds=None):
     from khipu import routing
 
+    back = _pending_rule_back(line, via, holds)
+    if back is not None:
+        return back
     return routing.restore_rule(line["target"], via=via, holds=_undo_holds(line, holds),
                                 _undo_default_holds=True)
 
@@ -1588,7 +1694,11 @@ def _added_rule(line) -> str | int:
 
 
 def _undo_priority(line, via, holds=None):
+    from khipu import routing
+
     before = _b(line)
+    if before.get("stored") and before.get("entries"):
+        return routing.restore_priority(before, via=via, holds=_undo_holds(line, holds))
     return _set_priority_back(before, via, _undo_holds(line, holds),
                               _undo_default_holds=True)
 
@@ -1719,15 +1829,14 @@ def _undo_cap(line: dict, via: str) -> dict:
     from khipu import routing
 
     facts = line.get("facts") or {}
-    previous = (line.get("before") or {}).get("cap")
-    if previous is not None:
-        return routing.set_cap(line["target"], window=facts.get("window") or previous.get("window"),
-                               kind=previous["kind"], pct=previous.get("pct"), slack=previous.get("slack"),
-                               usd=previous.get("usd"), days=previous.get("days"), n=previous.get("n"),
-                               revision=previous.get("revision"), purpose=previous.get("purpose", "job"),
-                               tier=previous.get("tier"), sensitive_only=previous.get("sensitive_only"), via=via)
-    return routing.remove_cap(line["target"], window=facts.get("window"),
-                              kind=facts.get("kind"), purpose=facts.get("purpose", "job"), via=via)
+    before = line.get("before") or {}
+    previous = before.get("cap")
+    layers = before.get("layers") if "layers" in before else ([previous] if previous else [])
+    # Clear the slot, then put back each layer it held: a cap set over the
+    # undone one would leave the undone one beneath it.
+    return routing.restore_cap_layers(line["target"], window=facts.get("window") or (previous or {}).get("window"),
+                                      kind=facts.get("kind") or (previous or {}).get("kind"),
+                                      purpose=facts.get("purpose", "job"), layers=layers, via=via)
 
 
 def _undo_definition(line: dict, via: str) -> dict:
@@ -1760,6 +1869,7 @@ _UNDO = {
     "route.hold.add": _undo_hold_add,
     "route.hold.end": _undo_hold_end,
     "route.priority.set": _undo_priority,
+    "route.priority.amend": _undo_priority,
     "route.priority.confirm": _undo_priority,
     "route.priority.undo": _undo_priority,
     "route.priority.clear": _undo_priority,
@@ -2009,8 +2119,9 @@ def _undo(line_id: str, via: str, holds: dict | None) -> dict:
 
 
 def _run_inverse(line, inverse, via, holds, line_id):
+    _require_provenance(line)
     if line["action"] in {"route.rule.confirm", "route.rule.edit", "route.rule.retire",
-                           "route.rule.undo", "route.rule.dismiss", "route.priority.set", "route.priority.confirm",
+                           "route.rule.undo", "route.rule.dismiss", "route.priority.set", "route.priority.amend", "route.priority.confirm",
                            "route.priority.undo", "route.priority.clear"}:
         out = inverse(line, via, holds)
     else:

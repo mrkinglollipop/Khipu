@@ -6027,9 +6027,19 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Give up after S seconds (or 30m, 2h; 0 checks once); default: no end")
     rprio = rt_sub.add_parser(
         "priority", parents=[rt_json],
-        help="The owner's priority: show it; set, confirm, undo or clear it (asks for a typed confirmation)")
-    rprio.add_argument("action", nargs="?", default="show", choices=("show", "set", "confirm", "undo", "clear"))
-    rprio.add_argument("accounts", nargs="*", help="set: the accounts in your order (or --entries)")
+        help="The owner's priority: show it; set, amend one account's entry, confirm, undo or clear it "
+             "(asks for a typed confirmation)")
+    rprio.add_argument("action", nargs="?", default="show",
+                       choices=("show", "set", "amend", "confirm", "undo", "clear"))
+    rprio.add_argument("accounts", nargs="*",
+                       help="set: the accounts in your order (or --entries); amend: the one account")
+    rprio.add_argument("--append", default=None, metavar="TEXT", help="amend: words added to the account's role")
+    rprio.add_argument("--role", default=None, metavar="TEXT", help="amend: the account's new role, in place of its old one")
+    rprio.add_argument("--exception", default=None, metavar="TEXT",
+                       help="amend: a direction with an end, in your words; --until is its end (default: the account's "
+                            "next weekly reset, else 7 days). It lapses on its own")
+    rprio.add_argument("--end-exception", default=None, metavar="ID", dest="end_exception",
+                       help="amend: end one exception early (its id is in the amend result and `route priority --json`)")
     rprio.add_argument("--entries", default=None, metavar="JSON",
                        help='set: [{"account": "...", "role": "your words", "until": "T"}, ...] in your order')
     rprio.add_argument("--until", default=None, metavar="T", help="set: when the whole priority ends")
@@ -6088,6 +6098,8 @@ def build_parser() -> argparse.ArgumentParser:
     rcap.add_argument("--tier", default=None, choices=("opus", "sonnet", "haiku"), help="Check allowance: this tier only")
     rcap.add_argument("--sensitive-only", action=argparse.BooleanOptionalAction, default=None,
                       help="Check allowance: only caller-declared sensitive code")
+    rcap.add_argument("--until", default=None, metavar="T",
+                      help="set: when the cap stops applying (a time, or 2d, 30h); the cap it replaced applies again")
     rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rcap)
     radv = rt_sub.add_parser("advise", parents=[rt_json],
