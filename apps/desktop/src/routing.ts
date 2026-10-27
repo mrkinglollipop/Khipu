@@ -606,7 +606,8 @@ export type RouteView = {
   rule_hygiene?: RouteHygiene[];
   /** Live delivery rows, other Macs and per-change recipients, projected
    *  for this Mac's owner only (survey rows 8-11). */
-  delivery_rows?: RouteDeliveryRow[];
+  /** Null means the CLI could not build rows (damaged read); empty means nobody live. */
+  delivery_rows?: RouteDeliveryRow[] | null;
   delivery_macs?: RouteDeliveryMac[];
   /** Routing copies found in files, for this Mac's owner only (slice 13/15d). */
   routing_file_copies?: {
