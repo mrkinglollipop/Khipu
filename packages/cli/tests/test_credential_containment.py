@@ -22,6 +22,15 @@ class PreflightErrorTextTest(unittest.TestCase):
         out = connect_database(f"postgres://u:{SECRET}%zz@h/d", store=False, install_jobs=False, prove=False)
         self.assertNotIn(SECRET, json.dumps(out), json.dumps(out)[:300])
 
+    def test_raw_at_in_password_does_not_leak_its_tail_in_the_host(self):
+        from khipu.setup import explain_connection_error
+
+        dsn = "postgres://khipu:Tr0ub@dor99@nohost.invalid/db"
+        exc = RuntimeError("failed to resolve host 'dor99@nohost.invalid': nodename nor servname provided")
+        _, detail, _ = explain_connection_error(exc, dsn)
+        self.assertNotIn("dor99", detail)
+        self.assertNotIn("Tr0ub", detail)
+
 
 class RestoreKeepsCurrentCredentialsTest(unittest.TestCase):
     def _restore(self, merge: bool) -> str:

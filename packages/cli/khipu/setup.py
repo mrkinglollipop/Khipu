@@ -86,7 +86,16 @@ def _dsn_passwords(dsn: str) -> set[str]:
     except ValueError:
         raw = None
     if raw:
+        # urlsplit splits userinfo at the last "@", libpq at the first, so a
+        # raw "@" in the password leaves its tail in libpq's host name.
         found.add(raw)
+        found.update(raw.split("@"))
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+
+        found.add(str(conninfo_to_dict(dsn).get("password") or ""))
+    except Exception:
+        pass
     for m in re.finditer(r"(?i)\bpassword\s*=\s*('(?:[^'\\]|\\.)*'?|[^\s&]+)", dsn or ""):
         found.add(m.group(1).strip("'"))
     found |= {unquote(p) for p in found}
