@@ -266,30 +266,26 @@ def _prove_prs(cur, fact_id: int, episode_id: int, words: str, project: str | No
     return added
 
 
-def _only_clause(column: str, only: list[int] | None) -> tuple[str, tuple]:
-    """The SQL filter (and its parameter) restricting a witness query to the
-    facts a targeted backfill covers; empty for a whole-project backfill."""
-    if only is None:
-        return "", ()
-    return f"AND {column} = ANY(%s) ", (only,)
-
-
 def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]], counts: dict,
                          only: list[int] | None = None) -> set[int]:
     """Claims for open-loop values that exactly equal a text or restatement
-    value on a commitment in the project (retired facts excluded)."""
+    value on a commitment in the project (retired facts excluded).
+
+    ``only`` limits the facts that receive claims, never the rows read: the
+    own-fact rule below must see every fact so a targeted pass decides
+    exactly as the whole pass would."""
     if not items:
         return set()
     values = sorted({v for _e, v in items})
-    clause, extra = _only_clause("c.id", only)
     cur.execute(
         "SELECT fc.fact_id, fc.value, fc.field, fc.episode_id FROM commitments c "
         "JOIN fact_claims fc ON fc.kind = 'commitment' AND fc.fact_id = c.id "
         "WHERE c.project IS NOT DISTINCT FROM %s AND fc.field IN ('text', 'restatement') "
-        "AND fc.value = ANY(%s) " + clause
-        + "AND NOT (c.status = 'closed' AND c.close_reason IS NOT DISTINCT FROM 'forgotten')",
-        (project, values, *extra),
+        "AND fc.value = ANY(%s) "
+        "AND NOT (c.status = 'closed' AND c.close_reason IS NOT DISTINCT FROM 'forgotten')",
+        (project, values),
     )
+    covered = None if only is None else set(only)
     by_value: dict[str, list[tuple[int, str, int | None]]] = {}
     for fid, value, field, by in cur.fetchall():
         by_value.setdefault(value, []).append((int(fid), field, by))
@@ -303,6 +299,8 @@ def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]],
         # after 0047 claimed it): it supports that one only.
         own = sorted({fid for fid, _field, by in rows if by == eid})
         for fid in own or sorted({fid for fid, _f, _b in rows}):
+            if covered is not None and fid not in covered:
+                continue
             added = 0
             if not own:
                 added += record_claim(cur, "commitment", fid, "restatement", value, episode_id=eid)
@@ -318,14 +316,15 @@ def _witness_decisions(cur, project: str | None, items: list[tuple[int, str]], c
     if not items:
         return set()
     values = sorted({v for _e, v in items})
-    clause, extra = _only_clause("d.id", only)
+    # As for commitments: read every fact, restrict only the claims written.
     cur.execute(
         "SELECT fc.fact_id, fc.value, fc.episode_id FROM decisions d "
         "JOIN fact_claims fc ON fc.kind = 'decision' AND fc.fact_id = d.id AND fc.field = 'text' "
-        "WHERE d.project IS NOT DISTINCT FROM %s AND fc.value = ANY(%s) " + clause
-        + "AND d.retract_reason IS DISTINCT FROM 'forgotten'",
-        (project, values, *extra),
+        "WHERE d.project IS NOT DISTINCT FROM %s AND fc.value = ANY(%s) "
+        "AND d.retract_reason IS DISTINCT FROM 'forgotten'",
+        (project, values),
     )
+    covered = None if only is None else set(only)
     by_value: dict[str, list[tuple[int, int | None]]] = {}
     for fid, value, by in cur.fetchall():
         by_value.setdefault(value, []).append((int(fid), by))
@@ -335,6 +334,8 @@ def _witness_decisions(cur, project: str | None, items: list[tuple[int, str]], c
         if any(by == eid for _fid, by in rows):
             continue
         for fid in sorted({fid for fid, _b in rows}):
+            if covered is not None and fid not in covered:
+                continue
             if record_claim(cur, "decision", fid, "text", value, episode_id=eid):
                 counts["claims"] += 1
                 touched.add(fid)
