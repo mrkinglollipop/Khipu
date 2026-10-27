@@ -293,9 +293,13 @@ def infer_harness(env: dict, osenv: dict | None = None) -> str:
     tp = str(_get(env, "transcriptPath", "transcript_path", default="") or "")
     if "conversation_id" in env or "workspace_roots" in env or "/.cursor/" in tp:
         return "cursor"
+    # Path evidence before env-only Codex markers: a Claude session started
+    # inside Codex inherits CODEX_HOME but still writes under a Claude home.
+    if "/.claude/" in tp or _in_claude_home(tp, osenv):
+        return "claude_code"
     if "/.codex/" in tp or osenv.get("CODEX_HOME") or osenv.get("CODEX_SANDBOX"):
         return "codex"
-    if "/.claude/" in tp or osenv.get("CLAUDE_PROJECT_DIR") or _in_claude_home(tp, osenv):
+    if osenv.get("CLAUDE_PROJECT_DIR"):
         return "claude_code"
     return "unknown"
 
@@ -781,8 +785,9 @@ def land_transcript_images(
 # and an exact copy is dropped: nothing is lost.
 SEEN_TEXT_MAX = 60_000
 # Short messages ("ok", "yes", "continue") recur legitimately across a session
-# and must keep counting as turns; only messages at least this long are
-# fingerprinted. A re-emitted short copy costs nothing to summarise again.
+# and must keep counting as turns when they stand alone. Fingerprints still
+# cover them so a re-emitted copy after a proven long head can be dropped
+# without eating a genuine new short turn that was never captured.
 FINGERPRINT_MIN_CHARS = 40
 
 
@@ -806,6 +811,15 @@ def remember_seen(st: dict, fresh: list[str]) -> None:
     bounded at SEEN_TEXT_MAX."""
     if fresh:
         st["seen_text"] = (list(st.get("seen_text") or []) + fresh)[-SEEN_TEXT_MAX:]
+
+
+def _fingerprints_for_msgs(msgs: list[tuple[str, str]]) -> list[str]:
+    """Fingerprints for user/assistant messages that enter ``seen_text``."""
+    out: list[str] = []
+    for role, text in msgs:
+        if role in ("user", "assistant") and text:
+            out.append(text_fingerprint(role, text))
+    return out
 
 
 def read_window(path: Path, offset: int, *, seen: Any = None,
@@ -941,6 +955,9 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             stats.update(skip_to=items[replay_end - 1][3], skip_prefix=checkpoints[replay_end - 1])
     items = items[replay_end:]
     checkpoints = checkpoints[replay_end:]
+    # Short lines recur legitimately, so only the ordered ``replay_prefix`` digest
+    # (above) may drop them; a text match never does.
+    skip_frozen = False         # a kept tool marker pins skip_to before it
     entries: list[tuple[dict, str, str, int, Any, bool, bool, str | None]] = []
     for (d, role, text, line_end), checkpoint in zip(items, checkpoints):
         real = False
@@ -976,6 +993,13 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         running = set(known)
         replay = False
         span: set[str] = set()
+        # A re-emission copies the old history in its original order, so a
+        # seen line that sits earlier in that history than a copy already
+        # proven is a repeat typed afterwards, not part of the replay.
+        order: dict[str, int] = {}
+        for n, item in enumerate(seen or ()):
+            order.setdefault(item, n)
+        replay_pos = -1
         for i, entry in enumerate(entries):
             d, role, fp = entry[0], entry[1], entry[7]
             if d.get("isCompactSummary"):
@@ -986,6 +1010,10 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                 continue
             seen = fp in running
             seen_flags[i] = seen
+            pos = order.get(fp, -1)
+            out_of_order = replay and seen and fp not in span and 0 <= pos < replay_pos
+            if out_of_order:
+                breaks.add(i)
             if replay and fp in span:
                 after = next((e for e in entries[i + 1:] if e[7] is not None and e[1] == "assistant"), None)
                 after_ident = after and _message_identity(after[0], after[1], after[7])
@@ -994,9 +1022,11 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                     breaks.add(i)
             span.add(fp)
             ident = _message_identity(d, role, fp)
-            if seen and (replay or not entry[5] and role != "assistant"
+            if seen and ((replay and not out_of_order) or not entry[5] and role != "assistant"
                          or (ident is not None and ident in running)):
                 proven.add(i)
+                if replay and pos > replay_pos:
+                    replay_pos = pos
             elif not seen:
                 replay = False
             running.add(fp)
@@ -1017,16 +1047,19 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     head_open = True            # every message so far was an already-seen copy
     for i, (d, role, text, line_end, checkpoint, real, streamed, fp) in enumerate(entries):
         if role == "tool":
+            # Tools are never fingerprinted; keep them.
             msgs.append(("tool", text))
+            skip_frozen = True
             head_open = False
             continue
         if fp is not None:
             if i in copied:
                 dropped += 1
                 dropped_chars += len(text)
-                if head_open and stats is not None:
-                    stats["skip_to"] = line_end
-                    stats["skip_prefix"] = checkpoint
+                if head_open:
+                    if stats is not None and not skip_frozen:
+                        stats["skip_to"] = line_end
+                        stats["skip_prefix"] = checkpoint
                 continue
             if fp not in known:
                 known.add(fp)
@@ -1035,6 +1068,10 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             if ident is not None and ident not in known:
                 known.add(ident)
                 fresh.append(ident)
+        elif known is not None and not streamed and len(text) < FINGERPRINT_MIN_CHARS:
+            fp = text_fingerprint(role, text)
+            known.add(fp)
+            fresh.append(fp)
         if head_open and d.get("isCompactSummary") and stats is not None:
             # Claude Code's own summary sits ahead of the copies it re-emits;
             # it leaves the head open and rides along (``carry``) when the
@@ -3113,11 +3150,17 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
                     st["transcript_prefix"] = dedupe.get("prefix")
                     st["transcript_prefix_tail"] = _prefix_tail_digest(path, new_off)
                     st.pop("replay_prefix", None)
+                    # Carry was stepped past on a not-due run and never entered
+                    # ``fresh``; fingerprint it now that it joins the capture.
+                    fresh_seen = list(dedupe.get("fresh") or [])
+                    for fp in _fingerprints_for_msgs(carried):
+                        if fp not in fresh_seen:
+                            fresh_seen.append(fp)
                     queued_names = _enqueue_window(
                         harness=harness, sid=track_sid if is_subagent_stop else sid, track_sid=track_sid,
                         cwd=session_cwd(env), event=event, path=path, st=st, msgs=msgs,
                         new_off=new_off, turns=turns, job_parent=st["parent_session_id"],
-                        capture_note=capture_note, fresh_seen=dedupe.get("fresh"),
+                        capture_note=capture_note, fresh_seen=fresh_seen,
                         capture_request_id=_capture_request_id(capture_now) if capture_now is not None else "",
                     )
                     out["queued"] = queued_names[0] if len(queued_names) == 1 else queued_names
@@ -3232,7 +3275,8 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                 offset = int(st.get("offset", 0))
                 replaced = st.get("transcript_identity") not in (
                     None, [info.st_dev, info.st_ino])
-                if offset == info.st_size and not replaced:
+                if offset == info.st_size and not replaced \
+                        and not _prefix_rewritten(st, path, offset):
                     skip("nothing_unread")
                     continue
                 cwd = str(st.get("cwd") or "")
@@ -3316,11 +3360,15 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                             st["transcript_prefix"] = dedupe.get("prefix")
                             st["transcript_prefix_tail"] = _prefix_tail_digest(path, new_off)
                             st.pop("replay_prefix", None)
+                            fresh_seen = list(dedupe.get("fresh") or [])
+                            for fp in _fingerprints_for_msgs(carried):
+                                if fp not in fresh_seen:
+                                    fresh_seen.append(fp)
                             names = _enqueue_window(
                                 harness=harness, sid=sid, track_sid=track_sid, cwd=cwd,
                                 event="idle_sweep", path=path, st=st, msgs=msgs,
                                 new_off=new_off, turns=turns, job_parent=st.get("parent_session_id"),
-                                preserve_mtime=True, fresh_seen=dedupe.get("fresh"),
+                                preserve_mtime=True, fresh_seen=fresh_seen,
                             )
                             out["jobs"] += len(names)
                             _log(f"sweep {harness}:{sid}: queued {len(names)} part(s) "

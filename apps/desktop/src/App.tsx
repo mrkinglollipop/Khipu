@@ -3666,8 +3666,8 @@ export default function App() {
     agentAsked: guideSignals.agentAsked,
   };
   const guideStartItems = buildStartItems(guideStartSignals);
-  const guideProblems = (liveness?.red ?? []).length;
-  const guideRowStates = guideStates({ ...guideStartSignals, grok: guideSignals.grok, problems: guideProblems });
+  const guideProblems = liveness ? (liveness.red ?? []).length : null;
+  const guideRowStates = guideStates({ ...guideStartSignals, grok: guideSignals.grok, problems: guideProblems, t3: t3Gap });
   const guidesBadge = railBadge(guideSignals.grok, guideProblems);
   const homeHint = hintState(guideStartItems, guideSignals.prefs);
 

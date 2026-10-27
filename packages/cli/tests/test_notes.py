@@ -192,6 +192,9 @@ class _FakeTopicsCursor:
     def execute(self, sql, params=None):
         s = " ".join(sql.split())
         params = params or ()
+        if s.startswith("SELECT set_config("):
+            self._result = [("ok",)]
+            return
         if s.startswith("SELECT content_hash FROM topics WHERE slug"):
             (slug,) = params
             row = self.topics.get(slug)

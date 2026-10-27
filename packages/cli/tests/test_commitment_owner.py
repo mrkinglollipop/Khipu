@@ -716,7 +716,7 @@ class _RelayCursor(_OwnerCursor):
                            close_rule_key=key)
             return
         if s.startswith("UPDATE commitments SET status = %s"):
-            status, reason, by, cid = params
+            status, reason, by, *_suggestion_reason, cid = params
             self.rows[cid].update(status=status, close_reason=reason, closed_by=by, close_rule_key=None)
             self.rowcount = 1
             return

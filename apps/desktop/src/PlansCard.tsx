@@ -1352,6 +1352,11 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
           Could not read the account list. Close and reopen this section to try again.
         </p>
       ) : null}
+      {cfg.error && status ? (
+        <p className="set-error" role="alert">
+          Couldn&apos;t refresh; showing the last value: {cfg.error}
+        </p>
+      ) : null}
       {entries.length ? (
         <div className="rows" role="list" aria-labelledby={`${id}-head`}>
           {entries.map((e, i) => (

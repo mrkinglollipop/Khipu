@@ -6913,7 +6913,10 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
     """A forgotten (soft-deleted) episode is not found here (B3 in
     docs/research/hindsight-plan-review-2026-09-28.md), same as the hub path
     (``activity.episode_detail``) — the replica's ``episodes`` schema always
-    carries ``deleted_at`` (``_create_schema``), so no gating is needed here."""
+    carries ``deleted_at`` (``_create_schema``), so no gating is needed here.
+    When the replica carries a ``decisions`` table, also attach
+    ``decision_states`` / ``validity`` so hub-down ``khipu_get`` matches the
+    live path."""
     con = open_snapshot()
     row = con.execute(
         """
@@ -6926,7 +6929,7 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
     if not row:
         return None
     topics = json.loads(row[6] or "[]")
-    return {
+    out = {
         "id": row[0],
         "ts": row[1],
         "ingested_at": row[2],
@@ -6939,6 +6942,56 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
         "preferences": json.loads(row[9] or "[]"),
         "edges": json.loads(row[10] or "[]"),
     }
+    out.update(_decision_states_for_episode_snapshot(con, episode_id))
+    return out
+
+
+def _decision_states_for_episode_snapshot(
+    con: sqlite3.Connection, episode_id: int
+) -> dict[str, Any]:
+    """Replica twin of ``decisions.decision_states_for_episode`` for rows
+    owned by this episode id only. Unlike the hub path
+    (``briefs._decision_rows`` / ``decision_states_for_episode``), this does
+    not attach decisions by normalized text within the project and dedupe
+    window — a restatement whose row lives on an earlier episode therefore
+    still has empty ``decision_states`` when the hub is down. Empty/zeroed
+    when the table is absent."""
+    empty = {
+        "decision_states": [],
+        "validity": {"current": 0, "superseded": 0, "retracted": 0},
+    }
+    cols = _snapshot_table_columns(con, "decisions")
+    if not cols or "episode_id" not in cols:
+        return empty
+    select = ["id", "text", "superseded_by"]
+    has_retract = "retracted_at" in cols
+    if has_retract:
+        select.append("retracted_at")
+    fence = forget_fence_sql(con, "decisions", "episode_id")
+    try:
+        rows = con.execute(
+            f"SELECT {', '.join(select)} FROM decisions WHERE episode_id = ?{fence} ORDER BY id",
+            (episode_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return empty
+    from khipu.decisions import state_of
+
+    states = []
+    counts = {"current": 0, "superseded": 0, "retracted": 0}
+    for row in rows:
+        payload = {"id": row[0], "text": row[1], "superseded_by": row[2]}
+        if has_retract:
+            payload["retracted_at"] = row[3]
+        state = state_of(payload)
+        counts[state] += 1
+        states.append({
+            "id": payload["id"],
+            "text": payload["text"],
+            "state": state,
+            "superseded_by": payload.get("superseded_by"),
+        })
+    return {"decision_states": states, "validity": counts}
 
 
 def topic_detail_snapshot(slug: str, *, offset: int = 0,

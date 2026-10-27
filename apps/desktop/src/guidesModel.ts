@@ -5,6 +5,7 @@
    docs: jobs/2026-10-26/setup-guides-design/guides-scope.md (§1 to §3). */
 
 import type { LivenessPayload } from "./IntegrationsPanel";
+import type { T3HealthGap } from "./railHealth";
 
 export type GuideId =
   | "claude_code"
@@ -282,7 +283,7 @@ export type RowTone = "ok" | "warn" | "err" | "neutral";
 export type GuideState = { tone: RowTone; label: string };
 
 export function guideStates(
-  s: StartSignals & { grok: GrokBotProgress; problems: number },
+  s: StartSignals & { grok: GrokBotProgress; problems: number | null; t3?: T3HealthGap },
 ): Record<GuideId, GuideState> {
   const rec = (id: string): GuideState => {
     const lv = s.liveness?.harnesses?.[id];
@@ -299,11 +300,15 @@ export function guideStates(
     cursor: rec("cursor"),
     aegis: rec("aegis"),
     grok_bot: s.grok.finished
-      ? { tone: "ok", label: "Connected" }
+      ? { tone: "warn", label: "Ready to test" }
       : s.grok.started
         ? { tone: "warn", label: `${s.grok.passed} of 5 steps` }
         : { tone: "neutral", label: "Not set up" },
-    t3: { tone: "ok", label: "Covered" },
+    t3: s.t3?.lookupFailed
+      ? { tone: "err", label: "Lookup failing" }
+      : s.t3?.warning
+        ? { tone: "warn", label: "Needs a look" }
+        : { tone: "ok", label: "Covered" },
     other_cloud: guide,
     grok_build: { tone: "neutral", label: "Not supported yet" },
     add_account: s.accountsRead > 0
@@ -317,16 +322,18 @@ export function guideStates(
     backups: guide,
     another_mac: guide,
     gateway: guide,
-    red: s.problems > 0
-      ? { tone: "err", label: s.problems === 1 ? "1 problem" : `${s.problems} problems` }
-      : { tone: "ok", label: "No problems" },
+    red: s.problems == null
+      ? { tone: "neutral", label: "Checking" }
+      : s.problems > 0
+        ? { tone: "err", label: s.problems === 1 ? "1 problem" : `${s.problems} problems` }
+        : { tone: "ok", label: "No problems" },
   };
 }
 
 /** The rail badge: setups started and not finished, plus health problems.
  *  Never a count of guides merely unread. */
-export function railBadge(grok: GrokBotProgress, problems: number): number {
-  return (grok.started && !grok.finished ? 1 : 0) + Math.max(0, problems);
+export function railBadge(grok: GrokBotProgress, problems: number | null): number {
+  return (grok.started && !grok.finished ? 1 : 0) + Math.max(0, problems ?? 0);
 }
 
 /** What Home's hint says: the next unfinished item, "You're set up" once, or
