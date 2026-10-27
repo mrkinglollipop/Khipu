@@ -16,7 +16,8 @@ export function HowThisWorks({
   title: string;
   items: Array<{ term: string; text: ReactNode }>;
   openLabel?: string;
-  onOpenGuide: () => void;
+  /** Omitted for a harness with no guide page yet: the popover then has Close only. */
+  onOpenGuide?: () => void;
   className?: string;
   linkLabel?: string;
 }) {
@@ -77,16 +78,18 @@ export function HowThisWorks({
             ))}
           </dl>
           <div className="gd-pop-acts">
-            <button
-              type="button"
-              className="primary sm"
-              onClick={() => {
-                setOpen(false);
-                onOpenGuide();
-              }}
-            >
-              {openLabel}
-            </button>
+            {onOpenGuide ? (
+              <button
+                type="button"
+                className="primary sm"
+                onClick={() => {
+                  setOpen(false);
+                  onOpenGuide();
+                }}
+              >
+                {openLabel}
+              </button>
+            ) : null}
             <button type="button" className="sm" onClick={close}>
               Close
             </button>

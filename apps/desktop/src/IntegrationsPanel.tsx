@@ -1,6 +1,8 @@
 import { t3WarningReason } from "./railHealth";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react";
+import { Loader2, RefreshCw, TriangleAlert } from "lucide-react";
+import { CheckMark, FunctionChecks, MARK_WORD } from "./HarnessRows";
+import type { Mark } from "./HarnessRows";
 import { WorkingBanner } from "./WorkingBanner";
 import { Callout, Dialog, Tag } from "./ui";
 import { GatewayTokenCard } from "./SettingsControls";
@@ -8,6 +10,11 @@ import { HowThisWorks } from "./HowThisWorks";
 import type { GuideId } from "./guidesModel";
 import { captureIsIdle, fmtAgo } from "./time";
 import type { Tone } from "./ui";
+import { AG_HOW, AntigravityCard, antigravityStatus } from "./AntigravityCard";
+import { antigravityMacRows, antigravityT3Rows, cursorFunctionRows, hasFunctions, parseProof, plainNote, providerSummary } from "./harnessFunctions";
+import type { AntigravityProject, FunctionRow, ProviderLike } from "./harnessFunctions";
+import { callCli } from "./settingsCli";
+import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 
 /**
  * Harnesses — one card per harness on this Mac (desktop overhaul phase 5,
@@ -30,8 +37,8 @@ import type { Tone } from "./ui";
  * and is deliberately not a button on this pane yet.
  */
 
-type HarnessId = "claude_code" | "cursor" | "aegis" | "codex" | "grok_bot";
-const ALL_HARNESSES: HarnessId[] = ["claude_code", "cursor", "aegis", "codex", "grok_bot"];
+type HarnessId = "claude_code" | "cursor" | "aegis" | "codex" | "grok_bot" | "antigravity";
+const ALL_HARNESSES: HarnessId[] = ["claude_code", "cursor", "aegis", "codex", "grok_bot", "antigravity"];
 
 /** One Claude home in `khipu integrations status claude_code` → `homes[]`
  *  (packages/cli/khipu/integrations.py `_claude_home_status`). Hooks live in
@@ -110,11 +117,13 @@ export function parseStatusRows(raw: string): StatusRow[] | null {
       && typeof row.detected === "boolean"
       && typeof row.mcp === "boolean"
       && typeof row.hook_stop === "boolean"
-      && typeof row.hook_precompact === "boolean"
+      && (typeof row.hook_precompact === "boolean" || row.harness === "antigravity")
       && typeof row.recall_rule === "string"
       && (row.homes === undefined || (Array.isArray(row.homes) && row.homes.every(isClaudeHomeRow)));
   });
-  return valid ? (rows as StatusRow[]) : null;
+  if (!valid) return null;
+  // Antigravity has no PreCompact event; the rest of the page reads the flag.
+  return (rows as StatusRow[]).map((r) => (typeof r.hook_precompact === "boolean" ? r : { ...r, hook_precompact: false }));
 }
 
 export type StatusRow = {
@@ -138,6 +147,15 @@ export type StatusRow = {
   /** Claude Code only: one row per Claude home found. The pack-level fields
    *  above are the AND over the homes that exist. */
   homes?: ClaudeHomeRow[];
+  /** Cursor and Antigravity: one flag per function Khipu adds, and the
+   *  per-function proof table (`CURSOR_PROOF`: "real-run <date>", "not-seen
+   *  <date>", "hermetic", "unproven"). Absent from an older CLI. */
+  installed?: boolean;
+  hook_sessionstart?: boolean;
+  hook_prompt_recall?: boolean;
+  prompt_recall?: string;
+  delegation_push?: string;
+  proof?: Record<string, string>;
 };
 
 type Probe = {
@@ -210,7 +228,12 @@ export type T3Health = {
   last_thread_linked_capture_harness?: string | null;
   thread_linked_captures_today?: number;
   warnings?: string[];
-  providers?: Array<{ id?: string; driver?: string; name?: string; hooks?: string }>;
+  /** `hooks` is installed, partial or missing; `functions`, `projects` and
+   *  `runtime` come from the Cursor and Antigravity drivers. */
+  providers?: ProviderLike[];
+  /** Facts about a harness the owner cannot change (Antigravity in T3 ignores
+   *  injected context). Plain sentences, shown as notes, never as warnings. */
+  notes?: string[];
 };
 
 /** `doctor.recall_probe` — `khipu.probe.status()`: the LAST RECORDED probe,
@@ -252,19 +275,17 @@ export const LABEL: Record<HarnessId, string> = {
   aegis: "Aegis",
   codex: "Codex",
   grok_bot: "Grok Bot · cloud",
+  antigravity: "Antigravity",
 };
 
 const WHERE: Record<HarnessId, string> = {
   claude_code: "~/.claude.json · ~/.claude/settings.json",
-  cursor: "~/.cursor/mcp.json · ~/.cursor/hooks.json",
+  cursor: "~/.cursor/hooks.json · ~/.cursor/mcp.json",
   aegis: "~/.grok/config.toml",
   codex: "~/.codex/config.toml · ~/.codex/hooks.json",
   grok_bot: "per repo: .cursor/mcp.json → your Khipu gateway",
+  antigravity: "~/.gemini/config/hooks.json · ~/.gemini/config/mcp_config.json",
 };
-
-/** Check-line marks. `ok`/`err`/`warn` are verdicts; `off` is "nothing to do
- *  here, by design" and must never read as either. */
-type Mark = "ok" | "warn" | "err" | "off";
 
 /** The short explanation behind each card's "How this works" link. */
 const HOW: Record<HarnessId, { title: string; items: Array<{ term: string; text: string }> }> = {
@@ -285,7 +306,7 @@ const HOW: Record<HarnessId, { title: string; items: Array<{ term: string; text:
   cursor: {
     title: "How Cursor connects",
     items: [
-      { term: "Install covers the global hooks", text: "Each project also needs a memory rule so Cursor recalls at the start." },
+      { term: "Install covers the global hooks", text: "Each project also needs a memory rule so Cursor recalls at the start. Quit and reopen Cursor after installing." },
       { term: "What the checks mean", text: "The card turns green by itself once a session has run the hook." },
     ],
   },
@@ -296,6 +317,7 @@ const HOW: Record<HarnessId, { title: string; items: Array<{ term: string; text:
       { term: "The gateway key", text: "Aegis reaches your gateway with the key saved on this page." },
     ],
   },
+  antigravity: AG_HOW,
   grok_bot: {
     title: "How Grok Bot connects",
     items: [
@@ -306,18 +328,11 @@ const HOW: Record<HarnessId, { title: string; items: Array<{ term: string; text:
   },
 };
 
-function CheckMark({ mark }: { mark: Mark }) {
-  const cls = `ck ${mark}`;
-  if (mark === "ok") return <Check size={14} className={cls} aria-hidden />;
-  if (mark === "err") return <X size={14} className={cls} aria-hidden />;
-  if (mark === "warn") return <TriangleAlert size={14} className={cls} aria-hidden />;
-  return <Minus size={14} className={cls} aria-hidden />;
-}
-
 export function t3CardStatus(t3: T3Health): CardStatus {
   if (t3.lookup?.ok === false) return { tone: "warn", label: "Not linking threads" };
   const reason = t3WarningReason(t3);
   if (reason === "hooks") return { tone: "warn", label: "Providers without hooks" };
+  if (reason === "partial") return { tone: "warn", label: "Providers partly set up" };
   if (reason === "other") return { tone: "warn", label: "Needs a look" };
   if (reason != null) return { tone: "warn", label: "Needs a linked capture" };
   return { tone: "ok", label: "Linking threads" };
@@ -336,6 +351,38 @@ function firstReason(lv: HarnessLiveness | undefined): string {
 
 type CardStatus = { tone: Tone; label: string };
 
+function projectName(path: string): string {
+  return path.split("/").filter(Boolean).pop() ?? path;
+}
+
+/** The capture line of a card: the heartbeat, not the config file. */
+export function captureHookLine(
+  harness: HarnessId,
+  installed: boolean,
+  lv: HarnessLiveness | undefined,
+): { mark: Mark; text: string } {
+  return harness === "grok_bot"
+    ? { mark: "off", text: "Capture hook · cloud writes through the memory tool" }
+    : !installed
+      ? { mark: "err", text: "Capture hook · not installed" }
+      : lv?.ok === false
+        ? { mark: "err", text: `Capture hook · ${firstReason(lv) || "stopped recording"}` }
+        : lv?.seen && (lv.captures ?? 0) > 0
+          ? {
+              mark: captureIsIdle(lv.last_captured_age_s) ? "off" : "ok",
+              text: captureIsIdle(lv.last_captured_age_s)
+                ? `Capture hook · idle, last capture ${fmtAgo(lv.last_captured_age_s)}`
+                : `Capture hook · last capture ${fmtAgo(lv.last_captured_age_s)}`,
+            }
+          : lv?.seen
+            ? { mark: "warn", text: "Capture hook · ran, nothing captured yet" }
+            : lv
+              ? { mark: "off", text: "Capture hook · no session has run it yet" }
+              : { mark: "off", text: "Capture hook · recording not checked yet" };
+}
+
+
+
 function unreadableLabel(n: number): string {
   return n === 1 ? "1 home can't be read" : `${n} homes can't be read`;
 }
@@ -350,8 +397,10 @@ export function foundHomes(row: Pick<StatusRow, "homes">): ClaudeHomeRow[] {
  *  pack-level fields are the AND, so one missing home would read as nothing
  *  installed); every other harness asks its own config. */
 export function installedAnywhere(
-  row: Pick<StatusRow, "mcp" | "hook_stop" | "hook_precompact" | "homes">,
+  row: Pick<StatusRow, "mcp" | "hook_stop" | "hook_precompact" | "homes"> & { harness?: HarnessId; installed?: boolean },
 ): boolean {
+  // Antigravity's CLI row says it outright (its pack has no PreCompact hook).
+  if (row.harness === "antigravity") return row.installed === true;
   const homes = foundHomes(row);
   if (homes.length > 0) return homes.some((h) => h.installed);
   return row.mcp && row.hook_stop && row.hook_precompact;
@@ -418,14 +467,6 @@ export function homeSourceLine(h: ClaudeHomeRow, homeDir?: string): string {
   }
   return h.source;
 }
-
-/** What a check mark says, for the reader who cannot see it. */
-const MARK_WORD: Record<Mark, string> = {
-  ok: "installed",
-  warn: "partly installed",
-  err: "not installed",
-  off: "not checked",
-};
 
 /** A home's two checks. Hooks is `warn` when the capture hooks are in but the
  *  rest of the six are not (Reinstall fills them in). */
@@ -719,6 +760,47 @@ export async function runInstall(
   }
 }
 
+/** The owner actions the Antigravity card runs besides install, verify and
+ *  remove. Each is one fixed-argv command in the Tauri layer (`khipu t3
+ *  antigravity add|remove|list`, `khipu owner-direction set`), so the page never
+ *  names a flag. Injectable so a test can stand in for the app. */
+export type AntigravityApi = {
+  list: () => Promise<{ ok: true; projects: AntigravityProject[] } | { ok: false; error: string }>;
+  run: (action: "add" | "remove", project: string) => Promise<{ ok: true; notes: string[] } | { ok: false; error: string }>;
+  pickFolder: () => Promise<string | null>;
+  readTrust: () => Promise<boolean | null>;
+  setTrust: (on: boolean) => Promise<{ ok: true } | { ok: false; error: string }>;
+};
+
+/** `harness:entrypoint` of a session T3 Code runs, as `owner_turns` keys it. */
+export const ANTIGRAVITY_T3_FRONT_END = "antigravity:t3";
+
+export const defaultAntigravityApi: AntigravityApi = {
+  async list() {
+    const res = await callCli<{ projects?: AntigravityProject[] }>("khipu_t3_antigravity", { action: "list" });
+    return res.ok ? { ok: true, projects: res.data.projects ?? [] } : { ok: false, error: res.error };
+  },
+  async run(action, project) {
+    const res = await callCli<{ notes?: string[] }>("khipu_t3_antigravity", { action, project });
+    return res.ok ? { ok: true, notes: res.data.notes ?? [] } : { ok: false, error: res.error };
+  },
+  async pickFolder() {
+    const picked = await openFolderDialog({ directory: true, multiple: false });
+    return typeof picked === "string" ? picked : null;
+  },
+  async readTrust() {
+    const res = await callCli<{ settings?: { trusted?: string[] } }>("khipu_owner_direction_show");
+    return res.ok ? (res.data.settings?.trusted ?? []).includes(ANTIGRAVITY_T3_FRONT_END) : null;
+  },
+  async setTrust(on) {
+    const res = await callCli("khipu_owner_direction_set", {
+      key: on ? "trust" : "untrust",
+      value: ANTIGRAVITY_T3_FRONT_END,
+    });
+    return res.ok ? { ok: true } : { ok: false, error: res.error };
+  },
+};
+
 export function IntegrationsPanel({
   runKhipu,
   onToast,
@@ -730,6 +812,7 @@ export function IntegrationsPanel({
   onSearchT3Captures = () => {},
   onOpenGuide = () => {},
   onAnotherMac,
+  antigravityApi = defaultAntigravityApi,
 }: {
   runKhipu: (args: string[]) => Promise<string>;
   onToast: (msg: string) => void;
@@ -749,6 +832,7 @@ export function IntegrationsPanel({
   /** Opens a setup guide in Guides (Grok Bot opens at its first open step). */
   onOpenGuide?: (id: GuideId) => void;
   onAnotherMac: () => void;
+  antigravityApi?: AntigravityApi;
 }) {
   const [rows, setRows] = useState<StatusRow[] | null>(null);
   const [verify, setVerify] = useState<Record<string, VerifyRow>>({});
@@ -766,6 +850,20 @@ export function IntegrationsPanel({
   const [focusHome, setFocusHome] = useState<{ path: string; cmd: "install" | "uninstall" } | null>(null);
   const homeButtons = useRef<Record<string, HTMLButtonElement | null>>({});
   const harnessCards = useRef<Record<string, HTMLDivElement | null>>({});
+  // Antigravity inside T3: the projects Khipu was added to, and whether typing
+  // there counts as the owner (owner direction's trusted front ends).
+  const [agProjects, setAgProjects] = useState<AntigravityProject[]>([]);
+  const [agTrusted, setAgTrusted] = useState<boolean | null>(null);
+  const [agTrustError, setAgTrustError] = useState<string | null>(null);
+  const agWanted = useRef(false);
+  agWanted.current = Boolean(t3?.detected) || (rows ?? []).some((r) => r.harness === "antigravity" && r.detected);
+
+  const loadAntigravity = useCallback(async () => {
+    if (!agWanted.current) return;
+    const [list, trusted] = await Promise.all([antigravityApi.list(), antigravityApi.readTrust()]);
+    if (list.ok) setAgProjects(list.projects);
+    setAgTrusted(trusted);
+  }, [antigravityApi]);
 
   const focusHarnessCard = (harness: HarnessId) => {
     const card = harnessCards.current[harness];
@@ -784,6 +882,8 @@ export function IntegrationsPanel({
       const nextRows = parseStatusRows(raw);
       if (nextRows == null) throw new Error("Khipu returned an unreadable harness status.");
       setRows(nextRows);
+      agWanted.current = Boolean(t3?.detected) || nextRows.some((r) => r.harness === "antigravity" && r.detected);
+      void loadAntigravity();
     } catch (e) {
       // A failed status read is NOT "nothing installed" — keep the last rows
       // and surface the failure as its own state.
@@ -791,7 +891,7 @@ export function IntegrationsPanel({
     } finally {
       if (latestLoad.current === request) setBusy((prev) => (prev === "load" ? null : prev));
     }
-  }, [runKhipu]);
+  }, [runKhipu, loadAntigravity, t3?.detected]);
 
   // Panels are CSS-hidden on tab switch, not unmounted, so a mount-only
   // effect never re-fetches — the pane goes stale as soon as something
@@ -987,6 +1087,90 @@ export function IntegrationsPanel({
     [runKhipu, load, onToast, refreshHealth, rows],
   );
 
+  /** What every Antigravity project action does once it has run: re-read what
+   *  is on disk and in the health report, then say what happened. */
+  const finishAntigravity = useCallback(
+    async (message: string) => {
+      await load();
+      const healthError = await refreshHealth();
+      onToast(
+        typeof healthError === "string" && healthError
+          ? `${message} The health check then failed: ${healthError.slice(0, 160)}`
+          : message,
+      );
+      setBusy(null);
+    },
+    [load, refreshHealth, onToast],
+  );
+
+  const addAntigravityProject = useCallback(async () => {
+    let picked: string | null = null;
+    try {
+      picked = await antigravityApi.pickFolder();
+    } catch (e) {
+      onToast(`Couldn't open the folder picker: ${String(e).slice(0, 160)}`);
+      return;
+    }
+    if (!picked) return;
+    setBusy("add:antigravity");
+    const res = await antigravityApi.run("add", picked);
+    const name = picked.split("/").filter(Boolean).pop() ?? picked;
+    await finishAntigravity(
+      res.ok
+        ? `Added Khipu to ${name}. ${res.notes.join(" ")}`.trim()
+        : `Couldn't add Khipu to ${name}: ${res.error.slice(0, 160)}`,
+    );
+  }, [antigravityApi, finishAntigravity, onToast]);
+
+  const removeAntigravityProject = useCallback(
+    async (project: string) => {
+      setBusy(`remove:${project}`);
+      const res = await antigravityApi.run("remove", project);
+      const name = project.split("/").filter(Boolean).pop() ?? project;
+      await finishAntigravity(
+        res.ok
+          ? `Removed Khipu from ${name}. Anything else in its .agents folder was left alone.`
+          : `Couldn't remove Khipu from ${name}: ${res.error.slice(0, 160)}`,
+      );
+    },
+    [antigravityApi, finishAntigravity],
+  );
+
+  /** Verify on the Antigravity card: the timed round trip for this Mac's
+   *  install when there is one, and for a T3-only Mac a read of every added
+   *  project's files (nothing in T3 can be run from here). */
+  const verifyAntigravity = useCallback(async () => {
+    const mac = rows?.find((r) => r.harness === "antigravity");
+    if (mac?.detected && mac.installed) {
+      await act("antigravity", "verify");
+      return;
+    }
+    setBusy("verify:antigravity");
+    const list = await antigravityApi.list();
+    let message: string;
+    if (!list.ok) message = `Couldn't read the projects: ${list.error.slice(0, 160)}`;
+    else if (list.projects.length === 0) message = "No project has Khipu yet. Add to a project first.";
+    else {
+      const bad = list.projects.filter((p) => !p.installed || p.exists === false);
+      message = bad.length === 0
+        ? `Khipu's three files are in ${list.projects.length === 1 ? "the project" : `all ${list.projects.length} projects`}. Antigravity inside T3 has not run them in a test yet.`
+        : `${bad.length} of ${list.projects.length} projects are missing some of Khipu's files: ${bad.map((p) => projectName(p.project)).join(", ")}. Add to a project again repairs them.`;
+    }
+    await finishAntigravity(message);
+  }, [rows, act, antigravityApi, finishAntigravity]);
+
+  const toggleAntigravityTrust = useCallback(
+    async (on: boolean) => {
+      setBusy("trust:antigravity");
+      setAgTrustError(null);
+      const res = await antigravityApi.setTrust(on);
+      if (!res.ok) setAgTrustError(res.error.slice(0, 200));
+      setAgTrusted(await antigravityApi.readTrust());
+      setBusy(null);
+    },
+    [antigravityApi],
+  );
+
   // Put keyboard focus back on a home row's action once the rows have reloaded.
   useEffect(() => {
     if (!focusHome || busy != null) return;
@@ -999,6 +1183,56 @@ export function IntegrationsPanel({
   const detected = (rows ?? []).filter((r) => r.detected);
   const unreadableStatus =
     loadError?.includes("Khipu returned an unreadable harness status.") ?? false;
+
+  const agProvider = (t3?.providers ?? []).find((p) => p.driver === "antigravity");
+  const agT3Visible = Boolean(t3?.detected) || agProjects.length > 0;
+  const renderAntigravity = (r: StatusRow) => {
+    const lv = liveness?.harnesses?.[r.harness];
+    const macInstalled = r.detected && r.installed === true;
+    const capture: FunctionRow = { key: "capture", ...captureHookLine("antigravity", macInstalled, lv) };
+    const base = antigravityMacRows(r, capture);
+    const macRows: FunctionRow[] = macInstalled
+      ? [...base, { key: "verified", ...verifiedLine("antigravity", verify[r.harness]?.components?.recall_probe, recallProbe, lv) }]
+      : base;
+    const recording = Boolean(lv?.seen && (lv.captures ?? 0) > 0 && !captureIsIdle(lv.last_captured_age_s));
+    return (
+      <AntigravityCard
+        key="antigravity"
+        status={antigravityStatus({
+          detected: r.detected,
+          macInstalled,
+          projectsInstalled: agProjects.filter((p) => p.installed).length,
+          t3Present: agT3Visible,
+          lvOk: lv?.ok,
+          recording,
+        })}
+        detected={r.detected}
+        macInstalled={macInstalled}
+        macRows={macRows}
+        t3Visible={agT3Visible}
+        t3Rows={antigravityT3Rows(agProvider?.functions, agProjects)}
+        projects={agProjects}
+        trust={{ on: agTrusted, proven: parseProof(r.proof?.workspace_files).kind === "proven" }}
+        busy={busy}
+        onInstallMac={() => void act("antigravity", "install")}
+        onRemoveMac={() => setRemoveConfirm({ harness: "antigravity", label: "Antigravity" })}
+        onAddProject={() => void addAntigravityProject()}
+        onRemoveProject={(project) => void removeAntigravityProject(project)}
+        onVerify={() => void verifyAntigravity()}
+        onToggleTrust={(on) => void toggleAntigravityTrust(on)}
+        trustError={agTrustError}
+      />
+    );
+  };
+  // Antigravity sits beside Cursor, as the two cards a Cursor user compares.
+  const shown = (() => {
+    const all = rows ?? [];
+    const ag = all.find((r) => r.harness === "antigravity");
+    if (!ag) return all;
+    const rest = all.filter((r) => r !== ag);
+    const at = rest.findIndex((r) => r.harness === "cursor");
+    return [...rest.slice(0, at + 1), ag, ...rest.slice(at + 1)];
+  })();
 
   return (
     <div className="panel-body wide">
@@ -1077,6 +1311,7 @@ export function IntegrationsPanel({
             .filter((p) => p.hooks === "missing")
             .map((p) => p.name || p.driver || "a provider");
           const linkedToday = t3.thread_linked_captures_today ?? 0;
+          const providerRows = (t3.providers ?? []).filter(hasFunctions).map((p) => ({ id: p.id, ...providerSummary(p) }));
           const claude = rows?.find((r) => r.harness === "claude_code");
           const codex = rows?.find((r) => r.harness === "codex");
           const installedClaudeNames = claude
@@ -1148,6 +1383,25 @@ export function IntegrationsPanel({
                   </div>
                 ))}
               </div>
+              {providerRows.length > 0 ? (
+                <div className="t3-providers">
+                  <div className="ag-head">T3 providers</div>
+                  <div role="list" aria-label="T3 providers, feature by feature">
+                    {providerRows.map((p) => (
+                      <div className="t3-prov" role="listitem" key={p.id ?? p.name}>
+                        <span className="prov-line">{p.line}</span>
+                        <Tag tone={p.tag.tone} dot>{p.tag.label}</Tag>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="t3-prov-notes">
+                    {(t3.notes ?? []).map((n) => (
+                      <div className="note wrap flat" key={n}>{plainNote(n)}</div>
+                    ))}
+                    <div className="note wrap flat">Partial is amber, never red: it means a harness limit or a feature you haven't added, not a fault.</div>
+                  </div>
+                </div>
+              ) : null}
               <div className="note wrap">{lookup
                 ? "When you switch account or provider inside a thread, Khipu recalls that thread’s decisions and open commitments first."
                 : "Nothing is lost: captures still land and search still finds them. Until a Khipu update reads T3's new layout, search can't filter by thread and recall after a switch falls back to the usual top 3."}</div>
@@ -1163,7 +1417,8 @@ export function IntegrationsPanel({
             </div>
           );
         })() : null}
-        {(rows ?? []).map((r) => {
+        {shown.map((r) => {
+          if (r.harness === "antigravity") return renderAntigravity(r);
           const v = verify[r.harness];
           const lv = liveness?.harnesses?.[r.harness];
           const justAutoVerified = autoVerified[r.harness] === true;
@@ -1185,28 +1440,7 @@ export function IntegrationsPanel({
           const awaitingAutoVerify = installedAt[r.harness] != null && !justAutoVerified;
 
           // 1. Capture hook — the heartbeat, not the config file.
-          const hook: { mark: Mark; text: string } =
-            r.harness === "grok_bot"
-              ? { mark: "off", text: "Capture hook · cloud writes through the memory tool" }
-              : !installed
-                ? { mark: "err", text: "Capture hook · not installed" }
-                : lv?.ok === false
-                  ? {
-                      mark: "err",
-                      text: `Capture hook · ${firstReason(lv) || "stopped recording"}`,
-                    }
-                  : lv?.seen && (lv.captures ?? 0) > 0
-                    ? {
-                        mark: captureIsIdle(lv.last_captured_age_s) ? "off" : "ok",
-                        text: captureIsIdle(lv.last_captured_age_s)
-                          ? `Capture hook · idle, last capture ${fmtAgo(lv.last_captured_age_s)}`
-                          : `Capture hook · last capture ${fmtAgo(lv.last_captured_age_s)}`,
-                      }
-                    : lv?.seen
-                      ? { mark: "warn", text: "Capture hook · ran, nothing captured yet" }
-                      : lv
-                        ? { mark: "off", text: "Capture hook · no session has run it yet" }
-                        : { mark: "off", text: "Capture hook · recording not checked yet" };
+          const hook = captureHookLine(r.harness, installed, lv);
 
           // 2. Recall at session start.
           const ruleStale = v?.rule_stale;
@@ -1252,7 +1486,16 @@ export function IntegrationsPanel({
 
           // With homes, memory tools are installed per home and shown there;
           // the shared line appears only once Verify has probed the handshake.
-          const checks = homes.length > 0 && !mcpProbe ? [hook, recall, verified] : [hook, recall, mcp, verified];
+          // Cursor reads one row per function once the CLI reports its proof
+          // table; an older CLI keeps the single recall line.
+          const fnRows = r.harness === "cursor" && installed ? cursorFunctionRows(r, installed) : null;
+          const recallLines: FunctionRow[] = fnRows ?? [{ key: "recall", ...recall }];
+          const checkRows: FunctionRow[] = [
+            { key: "hook", ...hook },
+            ...recallLines,
+            ...(homes.length > 0 && !mcpProbe ? [] : [{ key: "mcp", ...mcp }]),
+            { key: "verified", ...verified },
+          ];
           const notRecording = status.label === "Not recording";
           const found = foundHomes(r);
           const homeDir = userHomeDir(r.homes);
@@ -1265,12 +1508,7 @@ export function IntegrationsPanel({
                 </Tag>
               </div>
               <div className="checks">
-                {checks.map((c, i) => (
-                  <div key={i}>
-                    <CheckMark mark={c.mark} />
-                    <span>{c.text}</span>
-                  </div>
-                ))}
+                <FunctionChecks rows={checkRows} />
               </div>
               {homes.length > 0 ? (
                 <div className="homes">
@@ -1448,7 +1686,7 @@ export function IntegrationsPanel({
                 <HowThisWorks
                   title={HOW[r.harness].title}
                   items={HOW[r.harness].items}
-                  onOpenGuide={() => onOpenGuide(r.harness)}
+                  onOpenGuide={() => onOpenGuide(r.harness as GuideId)}
                 />
               </div>
             </div>

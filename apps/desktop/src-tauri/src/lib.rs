@@ -653,6 +653,38 @@ async fn khipu_jobs_refresh() -> Result<String, String> {
     run_khipu_cli_async(JOBS_REFRESH_ARGV.iter().map(|s| s.to_string()).collect()).await
 }
 
+/// Harnesses -> Antigravity card: `khipu t3 antigravity add|remove|list`, the
+/// per-project files for Antigravity inside T3 Code. `t3` stays out of
+/// `ALLOWED_SUBCOMMANDS`; the webview names one of three verbs and a project
+/// folder the native folder picker gave it. The folder travels after `--project`
+/// as its own argv entry (never a flag), and must be an absolute path, so
+/// nothing the page sends becomes an option. The CLI still refuses a harness
+/// home, T3's private state or a file Khipu did not write.
+fn t3_antigravity_argv(action: &str, project: Option<&str>) -> Result<Vec<String>, String> {
+    match action {
+        "list" => Ok(fixed_argv(&["t3", "antigravity", "list"])),
+        "add" | "remove" | "status" => {
+            let project = project.map(str::trim).unwrap_or("");
+            if project.is_empty() || !project.starts_with('/') || project.contains('\0') {
+                return Err("choose a project folder".to_string());
+            }
+            Ok(vec![
+                "t3".to_string(),
+                "antigravity".to_string(),
+                action.to_string(),
+                "--project".to_string(),
+                project.to_string(),
+            ])
+        }
+        _ => Err(format!("not an Antigravity project action: {action:?}")),
+    }
+}
+
+#[tauri::command]
+async fn khipu_t3_antigravity(action: String, project: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(t3_antigravity_argv(&action, project.as_deref())?).await
+}
+
 /// D3: Home's "Right now" card — pending turns per live harness, queue
 /// depth, captured-today — without waiting on the slower full `doctor` pass
 /// (DB round trips, backup checks, etc.) that also carries this same data
@@ -5424,6 +5456,7 @@ pub fn run() {
             khipu_migrate,
             khipu_embed_backfill,
             khipu_jobs_refresh,
+            khipu_t3_antigravity,
             khipu_features_show,
             khipu_feature_set,
             khipu_config_show,
@@ -5985,6 +6018,21 @@ mod run_khipu_guard_tests {
         // Grown by hand, so pin the size: adding an entry without a call site is
         // how the five above got in.
         assert_eq!(ALLOWED_SUBCOMMANDS.len(), 15);
+    }
+
+    #[test]
+    fn antigravity_project_actions_are_three_verbs_and_an_absolute_folder() {
+        use super::t3_antigravity_argv;
+        assert_eq!(
+            t3_antigravity_argv("add", Some("/Users/me/code/app")).unwrap(),
+            vec!["t3", "antigravity", "add", "--project", "/Users/me/code/app"]
+        );
+        assert_eq!(t3_antigravity_argv("list", None).unwrap(), vec!["t3", "antigravity", "list"]);
+        for bad in [None, Some(""), Some("  "), Some("relative/dir"), Some("--dry-run")] {
+            assert!(t3_antigravity_argv("remove", bad).is_err(), "{bad:?}");
+        }
+        assert!(t3_antigravity_argv("uninstall", Some("/x")).is_err());
+        assert!(!ALLOWED_SUBCOMMANDS.contains(&"t3"));
     }
 
     #[test]

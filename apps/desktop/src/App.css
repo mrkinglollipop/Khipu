@@ -2448,6 +2448,166 @@ button.t3-detail {
   text-align: left;
 }
 
+/* Per-function marks and tags (Cursor and Antigravity cards, slice G).
+   `wait` is installed and not yet seen working, `na` is a limit of the harness:
+   amber and grey, never red. */
+.ck.wait {
+  color: var(--warn);
+}
+
+.ck.na {
+  color: var(--muted);
+}
+
+.ftag {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  margin-left: var(--s2);
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  font-size: var(--t-xs);
+  font-weight: 500;
+  line-height: 1;
+  color: var(--text-2);
+  white-space: nowrap;
+  vertical-align: 1px;
+}
+
+.ftag.warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+/* The Antigravity card: two places Khipu can be wired in, one section each. */
+.hcard.ag-card .name .ftag.new {
+  font-weight: 500;
+}
+
+.ag-sec {
+  padding: var(--s3) 0 0;
+  border-top: 1px solid var(--border);
+}
+
+.ag-sec.first {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.ag-head {
+  padding: 0 var(--s4) var(--s2);
+  font-size: var(--t-sm);
+  font-weight: 650;
+  color: var(--text);
+}
+
+.hcard .checks.flush {
+  padding-top: 0;
+}
+
+.ag-acts {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 var(--s4) var(--s3);
+}
+
+.ag-projects {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 var(--s4);
+}
+
+.ag-project {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+  padding: 2px var(--s3);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-size: var(--t-sm);
+}
+
+.ag-pname {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ag-pnote {
+  flex: none;
+  color: var(--muted);
+}
+
+.ag-pnote.warn {
+  color: var(--warn);
+}
+
+.ag-note {
+  margin: 0;
+  padding: var(--s2) var(--s4) var(--s3);
+  font-size: var(--t-xs);
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.ag-note.flat {
+  padding: 0;
+}
+
+.ag-trust {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s3);
+  padding: var(--s3) var(--s4);
+}
+
+.ag-trust .opt-name {
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ag-card .hacts {
+  border-top: 1px solid var(--border);
+}
+
+/* T3 card: Cursor and Antigravity feature by feature. */
+.t3-providers {
+  margin: 0 0 var(--s2);
+  padding-top: var(--s1);
+}
+
+.t3-prov {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  padding: var(--s1) var(--s4);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.t3-prov .prov-line {
+  min-width: 0;
+}
+
+.t3-prov-notes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  padding-top: var(--s2);
+}
+
+.hcard .note.flat {
+  padding: 0 var(--s4);
+}
+
 .homes {
   display: flex;
   flex-direction: column;
