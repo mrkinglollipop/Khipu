@@ -128,9 +128,9 @@ def test_rule13_budget_and_concurrency_remain_outside_provider_schema(replay):
 
 
 @pytest.mark.parametrize('surface', ['mcp', 'cli'])
-def test_owner_definition_writer_creates_matching_real_lane_shapes(world, surface):
-    world.say('Track GLM and DeepSeek and their model restrictions.', session='owner')
-    world.server('owner')
+def test_owner_definition_writer_creates_matching_real_lane_shapes(mcp_world, surface):
+    mcp_world.say('Track GLM and DeepSeek and their model restrictions.', session='owner')
+    mcp_world.server('owner')
     for ident, fact in catalog().items():
         for name, value in [('provider', fact), ('account', {
             'id': ident + ':main', 'label': ident.title(), 'provider': ident})]:
@@ -144,15 +144,15 @@ def test_owner_definition_writer_creates_matching_real_lane_shapes(world, surfac
     for ident, spec in [('glm', {'kind': 'deepseek', 'model': 'glm-5.3'}),
                         ('deepseek', {'kind': 'deepseek', 'model': 'deepseek-flash'})]:
         assert routing.resolve_lane('r', ident, {}, routing.accounts(), spec, catalog())['key'] == ident + ':main'
-    world.server(None)
+    mcp_world.server(None)
     assert _act('route.definition.set', {'definition': 'provider', 'value': catalog()['glm']})[0]
 
 
 @pytest.mark.parametrize("definition", ["provider", "account", "lane_map"])
-def test_definition_owner_undo_restores_prior_fact_and_removes_new_fact(world, definition):
+def test_definition_owner_undo_restores_prior_fact_and_removes_new_fact(mcp_world, definition):
     from khipu import owner_direction
-    world.say('Track GLM.', session='owner')
-    world.server('owner')
+    mcp_world.say('Track GLM.', session='owner')
+    mcp_world.server('owner')
     fact = {'provider': catalog()['glm'],
             'account': {'id': 'glm:main', 'label': 'GLM', 'provider': 'glm'},
             'lane_map': {'runner': 'r', 'lane': 'tier', 'account': 'codex:main'}}[definition]
@@ -196,7 +196,7 @@ def test_real_church_lane_shapes_and_owner_secondary_override(mac):
         'main-haiku': 'Claude', 'secondary-haiku': 'Claude second'}
 
 
-def test_app_definition_argv_reaches_the_same_owner_writer(world, khipu_app):
+def test_app_definition_argv_reaches_the_same_owner_writer(mcp_world, khipu_app):
     args = ['route', 'definition', 'set', 'provider', '--value=' + json.dumps(catalog()['glm']), '--from-app']
     ns = cli.build_parser().parse_args(args)
     assert ns.func(ns) == 2

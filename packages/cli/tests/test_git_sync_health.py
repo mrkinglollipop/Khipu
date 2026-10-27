@@ -134,6 +134,16 @@ class GitSyncHealthTest(unittest.TestCase):
         self.assertFalse(s["ok"])
         self.assertTrue(any("did not record a result" in r for r in s["reasons"]), s["reasons"])
 
+    def test_later_nightly_steps_after_the_sync_do_not_look_like_a_missed_sync(self):
+        """The sync ends with consolidate; embed, ledger and the rest log later."""
+        self._write_hb(ts="2026-08-13T02:10:00Z")
+        self._nightly_ran_at("2026-08-13T03:30:00Z")
+        last = {"steps": [{"name": "consolidate_nightly", "ok": True, "ts": "2026-08-13T02:11:00+00:00"},
+                          {"name": "snapshot_refresh", "ok": True, "ts": "2026-08-13T03:30:00+00:00"}]}
+        with mock.patch.object(jobs, "nightly_last", return_value=last):
+            s = gh.status(now=calendar.timegm(time.strptime("2026-08-13 12:00", "%Y-%m-%d %H:%M")))
+        self.assertTrue(s["ok"], s["reasons"])
+
     def test_old_heartbeat_with_equally_old_nightly_is_green(self):
         """Machine asleep or off for days: heartbeat is stale, nothing is broken.
         The old wall-clock rule cried wolf here (audit 2026-08-17)."""

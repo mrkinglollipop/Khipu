@@ -246,6 +246,19 @@ def refresh(now: datetime | None = None) -> dict[str, Any]:
     end = time.monotonic() + REFRESH_BUDGET_SECONDS
     status, discovered = bounded(_discovery_result,
         min(DISCOVERY_DEADLINE_SECONDS, max(0, end - time.monotonic())))
+    if status != "ok":
+        # Discovery itself stalled: nothing was re-read, so the last good
+        # snapshot keeps its hits and its own scan time, and the stall is
+        # recorded as a skip so the report reads incomplete.
+        previous = _read_raw()
+        if previous is not None:
+            kept = dict(previous)
+            kept["skipped"] = [item for item in previous.get("skipped", [])
+                               if isinstance(item, dict)
+                               and item.get("file") != "candidate discovery"]
+            kept["skipped"].append({"file": "candidate discovery", "reason": status})
+            _write_report(kept)
+            return _public(kept, now)
     skipped = [] if status != "ok" else discovered["skipped"]
     entries = [] if status != "ok" else discovered["entries"]
     if status != "ok":

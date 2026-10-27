@@ -251,7 +251,9 @@ def test_r2_forget_runs_the_backfill_first_for_a_project_not_yet_covered(env):
     assert out["provenance_backfill"]["claims"] >= 1 and out["commitments_closed"] == 0
     assert [r[1:] for r in _visible_commitments(env)] == [(ALT, None)]
     assert _rows(env, "SELECT opened_episode FROM commitments") == [(b,)]
-    assert _rows(env, "SELECT project FROM provenance_projects WHERE backfilled_at IS NOT NULL") == [(PROJECT,)]
+    # Forget backfills only the facts it re-projects; the project's whole
+    # pass stays the nightly's (test_provenance_forget_deadline.py).
+    assert _rows(env, "SELECT project FROM provenance_projects WHERE backfilled_at IS NOT NULL") == []
 
 
 def test_r3_a_negative_readiness_answer_is_not_kept(env):

@@ -398,7 +398,7 @@ def test_a_timed_out_probe_keeps_its_last_good_figures_marked_stale(home):
     assert fact["used_pct"] == 25 and fact["left_pct"] == 75
     assert fact["resets_at"] == routing._iso(T0 + timedelta(days=2))
     assert fact["figures_at"] == kept_at
-    assert fact["words"] == "figures from 12:00Z; the last read timed out"
+    assert fact["words"] == "figures from 12:00Z (2 h ago), last read failed (timeout)"
     assert fact["pace_pct_per_hour"] is None and fact["hurry"] is False
     # No kept figures: still unreadable.
     failed = routing.plan_fact(_row("Grok", "grok", None, ok=False, error=usage.E_TIMEOUT), T0)
@@ -709,7 +709,14 @@ def test_the_real_process_lookup_reads_this_process():
 LONG = "use it hard " * 170  # about 2,000 characters
 
 
-def test_a_conversations_long_priority_fits_the_summary_budget_as_a_pointer(home):
+def _before_the_role_budget(monkeypatch):
+    # A role this long can no longer be written (ROLE_BUDGET); one stored
+    # before the budget still reads, which is what these tests render.
+    monkeypatch.setattr(routing, "ROLE_BUDGET", 10 ** 6)
+
+
+def test_a_conversations_long_priority_fits_the_summary_budget_as_a_pointer(home, monkeypatch):
+    _before_the_role_budget(monkeypatch)
     _set(home, routing_summary_chars=1500)
     routing.set_note("Owner's note.", via="app")
     shown = routing.conversation_view()
@@ -725,7 +732,8 @@ def test_a_conversations_long_priority_fits_the_summary_budget_as_a_pointer(home
     assert LONG.strip() in _summary(home)
 
 
-def test_a_conversations_long_priority_fits_the_push_budget_as_a_pointer(home):
+def test_a_conversations_long_priority_fits_the_push_budget_as_a_pointer(home, monkeypatch):
+    _before_the_role_budget(monkeypatch)
     _set(home, routing_prompt_chars=400)
     start = routing.read_view()
     shown = routing.conversation_view()
@@ -851,7 +859,8 @@ def test_a_request_that_does_not_fit_always_leaves_a_pointer(sizes):
 
 
 @pytest.mark.parametrize("seed", range(40))
-def test_no_combination_of_push_parts_exceeds_the_budget(home, seed):
+def test_no_combination_of_push_parts_exceeds_the_budget(home, seed, monkeypatch):
+    _before_the_role_budget(monkeypatch)
     # Property-style: the owner's priority or a conversation's, short or long
     # roles, entries that end, pending rule requests, changed accounts, the
     # not-refreshed line and the overflow pointer, against budgets from tiny

@@ -112,11 +112,10 @@ def test_real_write_pg_raw_defaults_round_trip_through_legacy_projection(world, 
 
 
 @pytest.mark.parametrize("stored, supplied", [
-    ({"tags": ["real-tag"]}, {}), ({"scope": "real-scope"}, {}),
-    ({"tags": []}, {"tags": ["changed-tag"]}), ({"scope": None}, {"scope": ""}),
-    ({"tags": []}, {"tags": None}), ({"scope": "real-scope"}, {"scope": None}),
+    ({"tags": []}, {"tags": ["changed-tag"]}), ({"tags": ["real-tag"]}, {"tags": ["other-tag"]}),
+    ({"scope": "real-scope"}, {"scope": "other-scope"}),
 ])
-def test_nonempty_or_changed_writer_defaults_remain_conflicts(world, stored, supplied):
+def test_changed_writer_defaults_remain_conflicts(world, stored, supplied):
     cur, _ = world
     cur.episodes[1]["raw"].update(stored)
     path = queue({**projection(), **supplied})
@@ -150,20 +149,38 @@ def test_projection_requires_explicit_unknown_owner_file_recovery(world, reason,
     assert path.exists()
 
 
-def test_missing_non_identity_field_is_not_proven_dropped(world):
+@pytest.mark.parametrize("stored, supplied", [
+    ({"tags": ["real-tag"]}, {}), ({"scope": "real-scope"}, {}), ({"scope": None}, {"scope": ""}),
+    ({"tags": []}, {"tags": None}), ({"scope": "real-scope"}, {"scope": None}),
+])
+def test_line_without_a_value_the_hub_holds_is_landed(world, stored, supplied):
+    cur, _ = world
+    cur.episodes[1]["raw"].update(stored)
+    before = deepcopy(cur.episodes)
+    path = queue({**projection(), **supplied})
+    assert outbox.drain().get("resolved") == 1
+    assert not path.exists()
+    [record] = (outbox.outbox_dir() / "resolved").glob("*.json")
+    assert json.loads(record.read_text())["resolution"]["kind"] == "legacy_landed_line"
+    assert cur.episodes == before
+
+
+def test_line_missing_a_field_the_hub_holds_is_landed(world):
     queued = projection()
     queued.pop("preferences")
     path = queue(queued)
-    assert outbox.drain()["failed"] == 1
-    assert path.exists()
+    assert outbox.drain().get("resolved") == 1
+    assert not path.exists()
 
 
-def test_original_only_unknown_evidence_is_not_proven_dropped(world):
+def test_hub_only_fields_do_not_hold_a_landed_line(world):
     cur, _ = world
     cur.episodes[1]["raw"]["future_evidence"] = ["preserve this"]
+    before = deepcopy(cur.episodes)
     path = queue()
-    assert outbox.drain()["failed"] == 1
-    assert path.exists()
+    assert outbox.drain().get("resolved") == 1
+    assert not path.exists()
+    assert cur.episodes == before
 
 
 def test_python_equal_but_json_distinct_values_are_not_projection_proof(world):
@@ -368,3 +385,42 @@ def test_transition_reuses_only_equal_complete_envelope(world):
     with pytest.raises(FileExistsError):
         outbox._transition_destination(preferred, changed)
     assert preferred.read_bytes() == original_bytes
+
+
+SECRET = "sk-ant-" + "a1B2c3D4e5" * 3
+
+
+def _redacted_hub_projection(world, middle):
+    cur, _ = world
+    stored = deepcopy(ORIGINAL)
+    stored["decisions"] = ["Use alpha, [REDACTED], gamma"]
+    cur.episodes[1].update(stored, raw=deepcopy(stored))
+    queued = deepcopy(stored)
+    for key in ("harness", "transcript_range", "window_id", "part"):
+        queued.pop(key, None)
+    queued["decisions"] = ["Use alpha", middle, "gamma"]
+    path = queue(queued)
+    return path, outbox.drain()
+
+
+def test_a_literal_redacted_marker_projection_resolves(world):
+    _, report = _redacted_hub_projection(world, "[REDACTED]")
+    assert report.get("resolved") == 1, report
+
+
+def test_a_projection_holding_a_secret_the_hub_stored_redacted_resolves(world):
+    path, report = _redacted_hub_projection(world, SECRET)
+    assert report.get("resolved") == 1, report
+    assert not path.exists()
+    [record] = (outbox.outbox_dir() / "resolved").glob("*.json")
+    outbox._validate_resolution(json.loads(record.read_text()))
+
+
+def test_a_buried_evidence_conflict_names_retry_dead(world):
+    path = queue(deepcopy(ORIGINAL))
+    job = json.loads(path.read_text())
+    job.update(evidence_conflict=True, attempts=outbox.MAX_ATTEMPTS)
+    outbox._bury(path, job)
+    st = outbox.status()
+    assert st["pending"] == 0 and st["dead"] == 1 and st["evidence_conflicts"] >= 1, st
+    assert "khipu outbox retry-dead" in st["fix"], st["fix"]

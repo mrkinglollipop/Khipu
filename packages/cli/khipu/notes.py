@@ -39,6 +39,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -676,14 +677,39 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     # The scan report refreshes before the hub write, not after it, so a
     # reconcile with no hub reachable still refreshes it.
     _refresh_scan_report()
+    from khipu import offline
     from khipu.db import connect
     from khipu.mirror import _upsert_topic
 
+    # Bound waits on a held topics row: a stuck lock must not stall the night.
+    # hub_statement_timeout 0 means "unlimited" for interactive reads; reconcile
+    # still needs a finite bound (same default as the setting when unset).
+    timeout_s = float(offline.setting("hub_statement_timeout") or 0)
+    if timeout_s <= 0:
+        timeout_s = 30.0
     new_files_state = dict(files_state)
     written_plan: list[dict[str, Any]] = []
-    with connect() as conn:
+    # Cap the whole write loop so N stuck locks cannot each burn timeout_s; the
+    # cap is larger than one statement's bound so a slow backfill can finish.
+    deadline = time.monotonic() + max(timeout_s, 300.0)
+    with connect(statement_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
-            for item in plan:
+            cur.execute(
+                "SELECT set_config('lock_timeout', %s, false)",
+                (f"{int(timeout_s * 1000)}ms",),
+            )
+            # Session-level lock_timeout survives; commit so the connection is
+            # idle again — otherwise every conn.transaction() below is only a
+            # savepoint and nothing lands until the final commit.
+            conn.commit()
+            for i, item in enumerate(plan):
+                if time.monotonic() >= deadline:
+                    for left in plan[i:]:
+                        out["errors"].append({
+                            "path": left["path"],
+                            "error": "DeadlineExceeded: reconcile overall budget exhausted",
+                        })
+                    break
                 try:
                     with getattr(conn, "transaction", nullcontext)():
                         _upsert_topic(
@@ -705,6 +731,17 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
             # a stale bookmark or a stale search hit still resolves).
             failed_slugs = {item["parsed"]["slug"] for item in plan if item not in written_plan}
             for redirect in collision_report["redirects"]:
+                if time.monotonic() >= deadline:
+                    # Forget the notes behind this redirect so changed_only
+                    # re-plans them (and the redirect) on the next run.
+                    for item in inventory:
+                        if item["parsed"]["slug"] in redirect["new_slugs"]:
+                            new_files_state.pop(item["path"], None)
+                    out["errors"].append({
+                        "path": redirect["old_slug"],
+                        "error": "DeadlineExceeded: reconcile overall budget exhausted",
+                    })
+                    continue
                 if failed_slugs.intersection(redirect["new_slugs"]):
                     continue
                 try:

@@ -809,9 +809,13 @@ export function Welcome({
   }, [step, graphOk, graphInstalling, installGraphify]);
 
   const [harnesses, setHarnesses] = useState<HarnessRow[] | null>(null);
+  const [harnessesError, setHarnessesError] = useState<string | null>(null);
+  const [harnessesKey, setHarnessesKey] = useState(0);
   useEffect(() => {
     if (step !== "agents") return;
     void (async () => {
+      setHarnessesError(null);
+      setHarnesses(null);
       try {
         const v = JSON.parse(await runKhipu(["integrations", "status"])) as unknown;
         const rows: HarnessRow[] = Array.isArray(v)
@@ -820,11 +824,12 @@ export function Welcome({
             ? (v as { harnesses: HarnessRow[] }).harnesses
             : Object.entries(v as Record<string, HarnessRow>).map(([harness, r]) => ({ ...r, harness }));
         setHarnesses(rows.filter((r) => r.harness !== "grok_bot"));
-      } catch {
+      } catch (e) {
+        setHarnessesError(e instanceof Error ? e.message : String(e));
         setHarnesses([]);
       }
     })();
-  }, [step, runKhipu]);
+  }, [step, runKhipu, harnessesKey]);
 
   const [doctor, setDoctor] = useState<DoctorPayload | null>(null);
   const [doctorErr, setDoctorErr] = useState<string | null>(null);
@@ -1635,6 +1640,13 @@ export function Welcome({
           </p>
           {harnesses == null ? (
             <p className="muted">Looking for harnesses…</p>
+          ) : harnessesError ? (
+            <div role="alert">
+              <p className="muted">Couldn&apos;t look for harnesses{harnessesError ? `: ${harnessesError}` : "."}</p>
+              <button type="button" className="sm" onClick={() => setHarnessesKey((k) => k + 1)}>
+                Try again
+              </button>
+            </div>
           ) : harnesses.length === 0 ? (
             <p className="muted">No supported harness was found on this Mac yet.</p>
           ) : (

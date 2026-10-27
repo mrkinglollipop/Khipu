@@ -1445,6 +1445,7 @@ _GENERATION_FILE = "fact-endpoint-generation"
 # What a reader compares when no endpoint fingerprint is recorded; no stamp
 # names it, so no fact row shows.
 _UNRESOLVED = "unresolved"
+_DEFAULT_DSN_FILE = Path.home() / ".config" / "khipu" / "dsn"  # khipu.db.DEFAULT_DSN_FILE
 _LEGACY_DSN_FILE = Path.home() / ".config" / "alzy" / "dsn"  # khipu.db.LEGACY_DSN_FILE
 
 
@@ -1611,9 +1612,15 @@ def _saved_dsn(*, ask_keychain: bool) -> str | None:
 
 def _file_dsn() -> str | None:
     """The DSN files' answer as ``db.resolve_dsn`` reads them: the DSN file
-    (``KHIPU_DSN_FILE`` or the configured one), then the legacy file."""
+    (``KHIPU_DSN_FILE`` or the configured one), then the config and legacy
+    files unless the environment names where the DSN lives."""
+    from khipu.paths import explicit_dsn_location as _explicit_dsn_location
+
     env = (os.environ.get("KHIPU_DSN_FILE") or "").strip() or (os.environ.get("ALZY_DSN_FILE") or "").strip()
-    for path in (Path(env) if env else _configured_dsn_file(), _LEGACY_DSN_FILE):
+    candidates = [Path(env) if env else _configured_dsn_file()]
+    if not _explicit_dsn_location():
+        candidates += [_DEFAULT_DSN_FILE, _LEGACY_DSN_FILE]
+    for path in candidates:
         try:
             return path.read_text(encoding="utf-8").strip()
         except OSError:
@@ -6906,7 +6913,10 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
     """A forgotten (soft-deleted) episode is not found here (B3 in
     docs/research/hindsight-plan-review-2026-09-28.md), same as the hub path
     (``activity.episode_detail``) — the replica's ``episodes`` schema always
-    carries ``deleted_at`` (``_create_schema``), so no gating is needed here."""
+    carries ``deleted_at`` (``_create_schema``), so no gating is needed here.
+    When the replica carries a ``decisions`` table, also attach
+    ``decision_states`` / ``validity`` so hub-down ``khipu_get`` matches the
+    live path."""
     con = open_snapshot()
     row = con.execute(
         """
@@ -6919,7 +6929,7 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
     if not row:
         return None
     topics = json.loads(row[6] or "[]")
-    return {
+    out = {
         "id": row[0],
         "ts": row[1],
         "ingested_at": row[2],
@@ -6932,6 +6942,56 @@ def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
         "preferences": json.loads(row[9] or "[]"),
         "edges": json.loads(row[10] or "[]"),
     }
+    out.update(_decision_states_for_episode_snapshot(con, episode_id))
+    return out
+
+
+def _decision_states_for_episode_snapshot(
+    con: sqlite3.Connection, episode_id: int
+) -> dict[str, Any]:
+    """Replica twin of ``decisions.decision_states_for_episode`` for rows
+    owned by this episode id only. Unlike the hub path
+    (``briefs._decision_rows`` / ``decision_states_for_episode``), this does
+    not attach decisions by normalized text within the project and dedupe
+    window — a restatement whose row lives on an earlier episode therefore
+    still has empty ``decision_states`` when the hub is down. Empty/zeroed
+    when the table is absent."""
+    empty = {
+        "decision_states": [],
+        "validity": {"current": 0, "superseded": 0, "retracted": 0},
+    }
+    cols = _snapshot_table_columns(con, "decisions")
+    if not cols or "episode_id" not in cols:
+        return empty
+    select = ["id", "text", "superseded_by"]
+    has_retract = "retracted_at" in cols
+    if has_retract:
+        select.append("retracted_at")
+    fence = forget_fence_sql(con, "decisions", "episode_id")
+    try:
+        rows = con.execute(
+            f"SELECT {', '.join(select)} FROM decisions WHERE episode_id = ?{fence} ORDER BY id",
+            (episode_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return empty
+    from khipu.decisions import state_of
+
+    states = []
+    counts = {"current": 0, "superseded": 0, "retracted": 0}
+    for row in rows:
+        payload = {"id": row[0], "text": row[1], "superseded_by": row[2]}
+        if has_retract:
+            payload["retracted_at"] = row[3]
+        state = state_of(payload)
+        counts[state] += 1
+        states.append({
+            "id": payload["id"],
+            "text": payload["text"],
+            "state": state,
+            "superseded_by": payload.get("superseded_by"),
+        })
+    return {"decision_states": states, "validity": counts}
 
 
 def topic_detail_snapshot(slug: str, *, offset: int = 0,

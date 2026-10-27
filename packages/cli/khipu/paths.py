@@ -156,6 +156,16 @@ def _env_override() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+def explicit_dsn_location() -> bool:
+    """Whether KHIPU_DATA_DIR or KHIPU_DSN_FILE names where the DSN lives: then
+    a missing file there means no DSN, never the config or ~/.config/alzy one.
+    Here, not in khipu.db, so the replica readers can ask without loading the
+    database driver."""
+    if any((os.environ.get(n) or "").strip() for n in ("KHIPU_DSN_FILE", "ALZY_DSN_FILE")):
+        return True
+    return _env_override() is not None
+
+
 def default_data_dir() -> Path:
     return DEFAULT_DIR
 
@@ -207,8 +217,10 @@ def set_data_dir(path: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
-    # Seed essentials from previous locations when empty.
-    for name in ("dsn", "root.crt"):
+    # Seed the hub certificate from previous locations when empty. Never the
+    # DSN: the app can name any folder here, and the hub credentials would
+    # land wherever it pointed.
+    for name in ("root.crt",):
         dst = target / name
         if dst.is_file():
             continue
@@ -216,8 +228,6 @@ def set_data_dir(path: Path) -> Path:
             src = src_root / name
             if src.is_file() and src.resolve() != dst:
                 shutil.copy2(src, dst)
-                if name == "dsn":
-                    dst.chmod(0o600)
                 break
     return target
 
@@ -325,6 +335,10 @@ def backup_local(*, dest: Path) -> dict:
                     if not p.is_file():
                         continue
                     if p.name == POINTER_NAME and src == DEFAULT_DIR:
+                        continue
+                    # The archive goes wherever the caller names; the hub DSN
+                    # and gateway token never leave this Mac in it.
+                    if p.name in SENSITIVE_FILENAMES:
                         continue
                     if staged is not None and p == staged:
                         continue
@@ -846,7 +860,13 @@ def _import_local(*, source: Path, merge: bool) -> dict:
             if registry is not None:
                 tombstones.merge_registry_bytes(registry.read_bytes())
             with tombstones.write_gate() as gate:
-                for scrub, staged, _dest, rel in candidates:
+                for scrub, staged, dest, rel in candidates:
+                    if rel in SENSITIVE_FILENAMES and dest.exists():
+                        # A backup may bring credentials to a Mac that has
+                        # none, never swap this Mac's hub or gateway for its own.
+                        not_restored.append({"path": rel, "why": (
+                            "this Mac already has its own; a restore never replaces credentials")})
+                        continue
                     if scrub == "job":
                         refusal = _job_refusal(staged.read_bytes(), gate)
                         if refusal == "forgotten":

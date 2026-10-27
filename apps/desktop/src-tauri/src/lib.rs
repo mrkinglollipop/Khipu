@@ -1500,7 +1500,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
             }
             Ok(set(OWED_GITHUB_KEY, v.to_string()))
         }
-        k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
+        k if PATH_KEYS.contains(&k) => Ok(set(k, checked_path(key, value)?)),
         k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         k if REPLICA_DURATION_KEYS.contains(&k) => Ok(set(k, replica_setting_value(k, value)?)),
@@ -2554,11 +2554,15 @@ const OWNER_DIRECTION_ACKNOWLEDGE_ARGV: &[&str] = &["owner-direction", "acknowle
 /// The keys `khipu owner-direction set` takes.
 const OWNER_DIRECTION_KEYS: &[&str] = &["latest_window_h", "session_binding", "trust", "untrust"];
 
-/// An owner-actions log line's id: 8 lowercase hex characters.
-fn owner_direction_undo_argv(id: &str) -> Result<Vec<String>, String> {
+/// An owner-actions log line's id: 8 lowercase hex characters. `over_newer`
+/// is the owner's second confirm: undo even over a newer change to the same target.
+fn owner_direction_undo_argv(id: &str, over_newer: bool) -> Result<Vec<String>, String> {
     let ok = id.len() == 8 && id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
     if !ok {
         return Err("that is not an owner action Khipu knows".to_string());
+    }
+    if over_newer {
+        return Ok(fixed_argv(&["owner-direction", "undo", "--from-app", "--over-newer", "--", id]));
     }
     Ok(fixed_argv(&["owner-direction", "undo", "--from-app", "--", id]))
 }
@@ -2616,8 +2620,8 @@ async fn khipu_owner_direction_acknowledge() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_owner_direction_undo(id: String) -> Result<String, String> {
-    run_khipu_cli_async(owner_direction_undo_argv(&id)?).await
+async fn khipu_owner_direction_undo(id: String, over_newer: Option<bool>) -> Result<String, String> {
+    run_khipu_cli_async(owner_direction_undo_argv(&id, over_newer.unwrap_or(false))?).await
 }
 
 #[tauri::command]
@@ -3793,9 +3797,67 @@ fn checked_space(space: &str) -> Result<String, String> {
     }
 }
 
-/// A folder or file path: non-empty, no control characters, never a flag.
+/// Folders under HOME that hold sign-in material; no Khipu setting points there.
+const CREDENTIAL_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", "Library/Keychains"];
+
+/// A folder or file path: non-empty, no control characters, never a flag,
+/// no `..` step, and never inside a credential folder (checked on the
+/// resolved path too, so a link into one is refused). The text passed on is
+/// the owner's own, unchanged.
 fn checked_path(key: &str, raw: &str) -> Result<String, String> {
-    checked_operand(key, raw, false)
+    let v = checked_operand(key, raw, false)?;
+    let path = PathBuf::from(&v);
+    if path.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!("{key} must not contain '..'"));
+    }
+    let Ok(home) = std::env::var("HOME") else { return Ok(v) };
+    let target = expand_home_path(&v).unwrap_or(path);
+    if in_credential_folder(&target, Path::new(&home)) {
+        return Err(format!("{key} must not point into a credential folder"));
+    }
+    Ok(v)
+}
+
+/// The path is resolved through its deepest existing ancestor (the setting
+/// may name a file or folder Khipu will create later, under a link) and
+/// compared in lowercase, because the Mac disk ignores case. A dangling link
+/// is followed to where it points, since opening it creates that target.
+fn in_credential_folder(target: &Path, home: &Path) -> bool {
+    /// None when dangling links chain past `hops`; the caller refuses then.
+    fn resolved(p: &Path, hops: u32) -> Option<PathBuf> {
+        let mut rest = Vec::new();
+        let mut cur = p;
+        loop {
+            let probe = if cur.as_os_str().is_empty() { Path::new(".") } else { cur };
+            if let Ok(real) = std::fs::canonicalize(probe) {
+                return Some(rest.iter().rev().fold(real, |acc, part| acc.join(part)));
+            }
+            if let Ok(link) = std::fs::read_link(probe) {
+                let next = hops.checked_sub(1)?;
+                let to = probe.parent().unwrap_or(Path::new("")).join(link);
+                let real = resolved(&to, next)?;
+                return Some(rest.iter().rev().fold(real, |acc, part| acc.join(part)));
+            }
+            match (cur.parent(), cur.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    cur = parent;
+                }
+                _ => return Some(p.to_path_buf()),
+            }
+        }
+    }
+    let (Some(real_target), Some(real_home)) = (resolved(target, 40), resolved(home, 40)) else {
+        return true;
+    };
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    let targets = [lower(target), lower(&real_target)];
+    let homes = [lower(home), lower(&real_home)];
+    targets.iter().any(|t| {
+        homes
+            .iter()
+            .any(|h| CREDENTIAL_DIRS.iter().any(|d| t.starts_with(h.join(d.to_lowercase()))))
+    })
 }
 
 fn embed_estimate_argv(profile: &str, space: &str, stale: bool) -> Result<Vec<String>, String> {
@@ -4507,23 +4569,44 @@ fn set_khipu_secret_sync(account: String, value: String) -> Result<String, Strin
 /// empty passphrase unless `allow_unencrypted` (the owner's explicit opt-out).
 #[tauri::command]
 async fn join_export(
+    app: AppHandle,
     passphrase: String,
     out_path: String,
     allow_unencrypted: Option<bool>,
 ) -> Result<String, String> {
     spawn_blocking_cli(move || {
-        join_export_sync(passphrase, out_path, allow_unencrypted.unwrap_or(false))
+        join_export_sync(&app, passphrase, out_path, allow_unencrypted.unwrap_or(false))
     })
     .await
 }
 
 fn join_export_sync(
+    app: &AppHandle,
     passphrase: String,
     out_path: String,
     allow_unencrypted: bool,
 ) -> Result<String, String> {
     if out_path.trim().is_empty() {
         return Err("out_path is empty".to_string());
+    }
+    // An unencrypted kit holds the hub credentials in plain text, so the
+    // owner confirms it in a native dialog: a flag from the page alone could
+    // be sent by any script running in the webview.
+    if allow_unencrypted {
+        use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
+        let confirmed = app
+            .dialog()
+            .message(format!(
+                "This join kit is not encrypted. Anyone who gets the file can read your Khipu database password.\n\nSave it to {}?",
+                out_path.trim()
+            ))
+            .title("Save an unencrypted join kit?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom("Save unencrypted".to_string(), "Cancel".to_string()))
+            .blocking_show();
+        if !confirmed {
+            return Err("Unencrypted export cancelled.".to_string());
+        }
     }
     let root = khipu_root()?;
     let py = khipu_python()?;
@@ -4624,7 +4707,8 @@ fn join_advertise_sync(
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
     let (bc_key, bc_val) = khipu_bytecode_env();
-    let tout = timeout.max(60);
+    // The page picks the window; Rust bounds it to the CLI's 10-minute default.
+    let tout = timeout.clamp(60, 600);
     let mut cmd = Command::new(&py);
     cmd.arg("-m")
         .arg("khipu")
@@ -4973,13 +5057,24 @@ fn data_dir_from_pointer_json(raw: &str) -> Option<PathBuf> {
     expand_home_path(path)
 }
 
+/// `~` expanded. A path with a `..` step that exists comes back
+/// canonicalized, so the step is resolved before anything reads it; one that
+/// does not exist yet is kept as written (the CLI resolves it the same way
+/// when it creates it). Other paths keep their spelling (`/var` is not
+/// rewritten to `/private/var`).
 fn expand_home_path(raw: &str) -> Option<PathBuf> {
     let path = raw.trim();
-    if path == "~" { return std::env::var("HOME").ok().map(PathBuf::from); }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(rest));
+    let expanded = if path == "~" {
+        std::env::var("HOME").ok().map(PathBuf::from)
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(rest))
+    } else {
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }?;
+    if !expanded.components().any(|c| c == std::path::Component::ParentDir) {
+        return Some(expanded);
     }
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    Some(std::fs::canonicalize(&expanded).unwrap_or(expanded))
 }
 
 fn data_dir_from_pointer() -> Option<PathBuf> {
@@ -5979,8 +6074,12 @@ mod settings_command_tests {
             v(&["owner-direction", "acknowledge", "--from-app"])
         );
         assert_eq!(
-            owner_direction_undo_argv("a1b2c3d4").unwrap(),
+            owner_direction_undo_argv("a1b2c3d4", false).unwrap(),
             v(&["owner-direction", "undo", "--from-app", "--", "a1b2c3d4"])
+        );
+        assert_eq!(
+            owner_direction_undo_argv("a1b2c3d4", true).unwrap(),
+            v(&["owner-direction", "undo", "--from-app", "--over-newer", "--", "a1b2c3d4"])
         );
         assert_eq!(owner_direction_switch_argv(true), v(&["owner-direction", "on", "--from-app"]));
         assert_eq!(owner_direction_switch_argv(false), v(&["owner-direction", "off", "--from-app"]));
@@ -6012,7 +6111,8 @@ mod settings_command_tests {
             assert!(owner_direction_set_argv(key, value).is_err(), "{key}={value}");
         }
         for id in ["", "-a1b2c3d", "a1b2c3d4e5", "a1b2 c3d", "A1B2C3D4"] {
-            assert!(owner_direction_undo_argv(id).is_err(), "{id:?}");
+            assert!(owner_direction_undo_argv(id, false).is_err(), "{id:?}");
+            assert!(owner_direction_undo_argv(id, true).is_err(), "{id:?}");
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"owner-direction"));
     }
@@ -6650,6 +6750,86 @@ mod settings_command_tests {
             config_set_argv("memory_root", "~/Memory notes").unwrap(),
             v(&["config", "--set", "memory_root", "~/Memory notes"])
         );
+    }
+
+    #[test]
+    fn path_operands_refuse_parent_steps_and_credential_folders() {
+        let home = std::env::var("HOME").unwrap();
+        for bad in [
+            "~/.ssh",
+            "~/.ssh/id_ed25519",
+            "~/.gnupg/x",
+            "~/.aws/credentials",
+            "~/Library/Keychains/login.keychain-db",
+            &format!("{home}/.ssh/config"),
+            "/Volumes/X/../../etc",
+            "~/Memory/../.ssh",
+            "..",
+        ] {
+            assert!(checked_path("folder", bad).is_err(), "folder accepted {bad:?}");
+            assert!(config_set_argv("memory_root", bad).is_err(), "memory_root accepted {bad:?}");
+            assert!(library_add_argv("books", bad, "voyage-3@1024").is_err(), "library add accepted {bad:?}");
+        }
+        for ok in ["~/Memory notes", "/Volumes/X/mem", "~/.config/khipu/mem", "~/sshkeys", "a..b/c"] {
+            assert_eq!(checked_path("folder", ok).unwrap(), ok);
+        }
+    }
+
+    #[test]
+    fn a_symlink_into_a_credential_folder_is_refused() {
+        let dir = std::env::temp_dir().join(format!("khipu-path-gate-{}", std::process::id()));
+        let home = dir.join("home");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let link = dir.join("innocent");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&ssh, &link).unwrap();
+        let dangling = dir.join("dangling");
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(ssh.join("authorized_keys2"), &dangling).unwrap();
+        let relative = dir.join("relative");
+        let _ = std::fs::remove_file(&relative);
+        std::os::unix::fs::symlink("home/.ssh/missing/key", &relative).unwrap();
+        let loop_a = dir.join("loop_a");
+        let _ = std::fs::remove_file(&loop_a);
+        std::os::unix::fs::symlink("loop_b", &loop_a).unwrap();
+        let loop_b = dir.join("loop_b");
+        let _ = std::fs::remove_file(&loop_b);
+        std::os::unix::fs::symlink("loop_a", &loop_b).unwrap();
+        let benign = dir.join("benign");
+        let _ = std::fs::remove_file(&benign);
+        std::os::unix::fs::symlink(dir.join("elsewhere/missing"), &benign).unwrap();
+        let cases = [
+            (link.clone(), true),
+            (dangling.clone(), true),
+            (relative.clone(), true),
+            (loop_a.clone(), true),
+            (benign.clone(), false),
+            (link.join("newfile"), true),
+            (link.join("new/deeper/file"), true),
+            (home.join(".SSH/new_key"), true),
+            (home.join(".AWS/credentials"), true),
+            (home.join("library/keychains/x"), true),
+            (home.join("Memory/new"), false),
+            (dir.join("elsewhere/new"), false),
+        ];
+        let got: Vec<_> = cases.iter().map(|(p, _)| in_credential_folder(p, &home)).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        for ((p, want), got) in cases.iter().zip(got) {
+            assert_eq!(got, *want, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn expand_home_path_resolves_parent_steps_that_exist() {
+        let dir = std::env::temp_dir().join(format!("khipu-expand-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        let raw = format!("{}/a/..", dir.display());
+        let got = expand_home_path(&raw).unwrap();
+        let want = std::fs::canonicalize(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, want);
+        assert_eq!(expand_home_path("/no/such/khipu/place").unwrap(), PathBuf::from("/no/such/khipu/place"));
     }
 
     #[test]

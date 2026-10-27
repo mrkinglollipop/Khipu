@@ -2454,12 +2454,18 @@ def _episode_schema_flags(cur) -> dict[str, bool]:
     from khipu import db
 
     cols = db.table_columns(cur, "episodes")
-    return {
+    flags = {
         "project": "project" in cols,
         "deleted_at": "deleted_at" in cols,
         "harness": "harness" in cols,
         "parent_session_id": "parent_session_id" in cols,
     }
+    # Same rule as has_columns: only a complete yes is cached. A process that
+    # probed before 0008/0010 must see those columns after migrate, not after
+    # a restart.
+    if not all(flags.values()):
+        db._TABLE_COLUMNS_CACHE.pop("episodes", None)
+    return flags
 
 
 def _aware(ts):
@@ -2550,8 +2556,16 @@ class _SearchFilters:
 
         out: dict[str, Any] = {}
         if self.project:
-            patterns = [f"%{_escape_like(p)}%" for p in self.projects]
-            out["kf_project"] = patterns[0] if len(patterns) == 1 else patterns
+            # Typed name keeps substring ILIKE; alias-group members match
+            # exactly so an old name like ``notes`` does not pull
+            # ``release-notes`` when filtering ``notes-v2`` (Q3 projects).
+            out["kf_project"] = f"%{_escape_like(self.project)}%"
+            aliases = [p for p in self.projects if p != self.project]
+            if aliases:
+                # Lowercased to match lower(proj) in episode_sql (and the
+                # Python post-filter); stored names are usually exact but
+                # case must not diverge from the fallback path.
+                out["kf_project_aliases"] = [p.lower() for p in aliases]
         if self.session_id:
             out["kf_session"] = f"{_escape_like(self.session_id)}%"
         if self.harness:
@@ -2572,11 +2586,12 @@ class _SearchFilters:
         parts: list[str] = []
         if self.project:
             proj = f"COALESCE({a}project, {a}scope)" if flags["project"] else f"{a}scope"
-            if len(self.projects) == 1:
-                parts.append(proj + " ILIKE %(kf_project)s ESCAPE '" + chr(92) + "'")
+            typed = proj + " ILIKE %(kf_project)s ESCAPE '" + chr(92) + "'"
+            aliases = [p for p in self.projects if p != self.project]
+            if aliases:
+                parts.append(f"({typed} OR lower({proj}) = ANY(%(kf_project_aliases)s))")
             else:
-                # ESCAPE cannot follow ANY(...); backslash is the default escape.
-                parts.append(proj + " ILIKE ANY(%(kf_project)s)")
+                parts.append(typed)
         if self.session_id:
             parts.append(f"{a}session_id LIKE %(kf_session)s ESCAPE '" + chr(92) + "'")
         if self.harness:
@@ -2733,7 +2748,15 @@ def _apply_search_filters(
                 continue
             if project:
                 row_project = (m.get("project") or "").lower()
-                if not any(p.strip().lower() in row_project for p in (projects or [project])):
+                typed = project.strip().lower()
+                # Typed name: substring (existing filter semantics). Alias
+                # members: exact equality only (Q3 projects).
+                alias_exact = {
+                    p.strip().lower()
+                    for p in (projects or [project])
+                    if p and p.strip().lower() != typed
+                }
+                if typed not in row_project and row_project not in alias_exact:
                     continue
             if session_id and not (m.get("session_id") or "").startswith(session_id):
                 continue
@@ -3204,6 +3227,11 @@ def hybrid_search(
                 session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
                 projects=filters.projects,
             )
+            # A forget this Mac holds that the hub lacks leaves the hub row
+            # live: drop it here, before the reranker or any caller sees it.
+            from khipu.tombstones import without_hidden_episodes
+
+            fused = without_hidden_episodes(fused)
 
             # Absolute relevance gate: the list unchanged when any row is
             # evidence, empty when none is. Once, after fusion, graph expansion
@@ -3676,10 +3704,23 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     todo.append(("episode", str(eid), i, chunk, _md5(chunk)))
                 if out["embedded"] >= limit:
                     break
+            # Refs with a chunk in a rejected batch keep their old rows;
+            # an episode that now has no chunks is still pruned.
+            episode_failed_refs: set[str] = set()
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
                 api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
-                vecs = embed_batch(api, profile=profile)
+                try:
+                    vecs = embed_batch(api, profile=profile)
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "budget exhausted" in msg or "network error after" in msg:
+                        raise
+                    # One batch the provider rejects must not abort commitments
+                    # or topics; those refs stay missing for the next run.
+                    _log(f"episode embed catch-up: {type(exc).__name__}: {exc}")
+                    episode_failed_refs.update(r for _, r, *_ in batch)
+                    continue
                 live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
                 writable = [(row, vec) for row, vec in zip(batch, vecs) if row[:2] in live_refs]
                 built = _upsert_chunks(cur, profile,
@@ -3691,12 +3732,16 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                      "chunk_text": t, "content_hash": h, "embedding": v, "built_at": b}
                     for ((k, r, i, t, h), v), b in zip(writable, _stamps(built, len(writable)))
                 )
-            for ref, indices in episode_replacements.items():
+            embedded_replacements = {
+                ref: indices for ref, indices in episode_replacements.items()
+                if ref not in episode_failed_refs
+            }
+            for ref, indices in embedded_replacements.items():
                 cur.execute(
                     "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'episode' "
                     "AND ref = %s AND NOT (chunk_idx = ANY(%s))", (profile, ref, indices),
                 )
-            if episode_replacements:
+            if embedded_replacements:
                 from khipu.hub_snapshot import read_anchor_identities, upsert_embeddings
 
                 # Each episode's source identities, for the replica's source
@@ -3707,7 +3752,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 cur.execute("SAVEPOINT embed_anchor_read")
                 try:
                     anchors = read_anchor_identities(
-                        cur, [int(r) for r in episode_replacements if str(r).isdigit()])
+                        cur, [int(r) for r in embedded_replacements if str(r).isdigit()])
                 except Exception as exc:  # noqa: BLE001
                     cur.execute("ROLLBACK TO SAVEPOINT embed_anchor_read")
                     _log(f"episode snapshot anchors unread: {type(exc).__name__}: {exc}")
@@ -3717,9 +3762,9 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     if anchors is None:
                         raise RuntimeError("no anchor identities")
                     upsert_embeddings(episode_snapshot_rows, replace_refs=[
-                        (profile, "episode", ref) for ref in episode_replacements],
+                        (profile, "episode", ref) for ref in embedded_replacements],
                         anchors={int(r): anchors.get(int(r), frozenset())
-                                 for r in episode_replacements if str(r).isdigit()})
+                                 for r in embedded_replacements if str(r).isdigit()})
                 except Exception as exc:  # noqa: BLE001 — replica cannot roll back the hub commit
                     _log(f"episode snapshot upsert failed: {type(exc).__name__}: {exc}")
 
@@ -3751,7 +3796,14 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     continue
                 chunks = chunk_text(text)
                 api = _api_texts(profile, [("", c) for c in chunks])
-                vecs = embed_batch(api, profile=profile)
+                try:
+                    vecs = embed_batch(api, profile=profile)
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "budget exhausted" in msg or "network error after" in msg:
+                        raise
+                    _log(f"commitment embed catch-up: {cid}: {type(exc).__name__}: {exc}")
+                    continue
                 # Bound to the wording embedded: a forget that changed it
                 # while the provider ran leaves these vectors unwritten, and
                 # the next catch-up embeds the new wording. The projector

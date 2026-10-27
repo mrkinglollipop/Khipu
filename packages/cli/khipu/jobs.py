@@ -462,7 +462,8 @@ def _run_nightly_locked() -> int:
     _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
-    _record_nightly_step(steps, "commitments_close_rules", **_step_result(_commitment_close_rules()))
+    completion_result = _step_result(_commitment_close_rules())
+    _record_nightly_step(steps, "commitments_close_rules", **completion_result)
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
@@ -473,7 +474,7 @@ def _run_nightly_locked() -> int:
     if briefs_result is not None:
         _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
     briefs_ok = briefs_result is None or _step_result(briefs_result)["ok"]
-    final_rc = rc or (0 if drain_result["ok"] and briefs_ok else 1)
+    final_rc = rc or (0 if drain_result["ok"] and briefs_ok and completion_result["ok"] else 1)
     _write_job_state("nightly", final_rc)
     return final_rc
 
@@ -694,7 +695,16 @@ def _library_backfill() -> dict[str, Any] | None:
             and (
                 not bool(row.get("ok", True))
                 or int(row.get("failed") or row.get("failed_chunks") or 0) > 0
-                or int(row.get("remaining") or 0) > 0
+                # Cap-hit partial with nothing failed is healthy (matches
+                # library.nightly's own bf_ok); remaining after a hard failure
+                # still counts.
+                or (
+                    int(row.get("remaining") or 0) > 0
+                    and not (
+                        str(row.get("status") or "") == "partial"
+                        and int(row.get("failed") or row.get("failed_chunks") or 0) == 0
+                    )
+                )
                 or bool(row.get("time_budget_exhausted") or row.get("budget_exhausted"))
                 or bool(row.get("error"))
                 or "budget" in str(row.get("skipped") or "").lower()
@@ -763,11 +773,42 @@ def _mark_stale_commitments() -> dict[str, Any]:
     return out
 
 
+def _transient_provenance_error(exc: BaseException) -> bool:
+    """Retryable DB outages/contention, never a provenance or schema refusal."""
+    from khipu.provenance import retryable_db_error
+
+    return retryable_db_error(exc)
+
+
+def _provenance_failures(out: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep helper-returned failures, including older replay receipts with
+    ``ok=True, failed>0``. A missing transient classification is fatal."""
+    failures = []
+    if out.get("ok") is False or out.get("failed", 0):
+        failures.append(out)
+    for key in ("gaps", "index", "changes", "exception"):
+        child = out.get(key)
+        if isinstance(child, dict):
+            failures.extend(_provenance_failures(child))
+    return failures
+
+
+def _provenance_outcome(out: dict[str, Any]) -> dict[str, Any]:
+    failures = _provenance_failures(out)
+    if failures:
+        fatal = [failure for failure in failures if not failure.get("transient", False)]
+        failure = (fatal or failures)[0]
+        reason = failure.get("reason") or failure.get("error") or "provenance cleanup failed"
+        out.update(ok=False, transient=not fatal, reason=reason)
+    return out
+
+
 def _provenance_backfill(conn) -> dict[str, Any]:
     """``khipu provenance backfill`` inside the nightly's close-rules step,
     until every project is covered, then the 30-day prune of the replica
-    change stream (``fact_changes``). Fail-open: an error is reported and the
-    rules still run."""
+    change stream (``fact_changes``). Errors remain visible and the rules
+    still run; only transient database errors are nonfatal to the nightly."""
+    out: dict[str, Any] = {}
     try:
         from khipu import provenance
 
@@ -775,44 +816,83 @@ def _provenance_backfill(conn) -> dict[str, Any]:
         # Fact steps a capture kept as gaps are re-run (invariant I4), after
         # the backfill and before tonight's rules read the facts.
         out["gaps"] = provenance.replay_gaps(conn)
+        if out["gaps"].get("connection_unusable", False):
+            out["connection_unusable"] = True
+            return _provenance_outcome(out)
         # The hub refusals' identity index and duplicate sweep, until every
         # episode from before 0047 is indexed (section 6.1).
         out["index"] = provenance.index_identities(conn)
+        if out["index"].get("connection_unusable", False):
+            out["connection_unusable"] = True
+            return _provenance_outcome(out)
         # The replica stream's 30-day retention (section 6 of the design).
         out["changes"] = provenance.prune_changes(conn)
-        return out
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+    except Exception as exc:  # noqa: BLE001 — the rules still run after a backfill failure
+        rollback_failed = False
         try:
             conn.rollback()
         except Exception:  # noqa: BLE001
-            pass
-        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+            rollback_failed = True
+        # Retain any real failure an earlier helper returned; a later
+        # transient exception must not replace it with a nonfatal receipt.
+        out["exception"] = {"ok": False, "transient": _transient_provenance_error(exc),
+                            "reason": f"{type(exc).__name__}: {exc}"[:300]}
+        if rollback_failed or getattr(conn, "closed", False):
+            out["connection_unusable"] = True
+    return _provenance_outcome(out)
 
 
 def _commitment_close_rules() -> dict[str, Any]:
     """Owed slice 2: the fact-provenance witness backfill while projects
     are pending, fill ``prs`` on rows from before migration 0034, then
     run the PR and decision close rules over every open item
-    (``close_rules.run``). Before mark_stale, so an item whose PR merged
-    closes as done rather than aging out. Fail-open like its neighbours."""
+    (``close_rules.run_nightly``). Before mark_stale, so an item whose PR merged
+    closes as done rather than aging out. Failure is recorded without blocking
+    the remaining steps, and makes a successful driver's nightly nonzero."""
+    witness: dict[str, Any] | None = None
+    preparation: dict[str, Any] | None = None
     try:
         from khipu import close_rules
         from khipu.db import connect
 
-        with connect() as conn:
-            # Fact provenance's witness backfill first (section 4 of the
-            # 2026-10-23 design): a legacy restater proven tonight counts
-            # for tonight's rules (its PR refs clear needs_owner).
-            witness = _provenance_backfill(conn)
-            with conn.cursor() as cur:
-                filled = close_rules.backfill_prs(cur)
-            conn.commit()
-            with conn.cursor() as cur:
-                report = close_rules.run(cur)
-            conn.commit()
+        filled = 0
+        try:
+            with connect() as conn:
+                # Fact provenance's witness backfill first (section 4 of the
+                # 2026-10-23 design): a legacy restater proven tonight counts
+                # for tonight's rules (its PR refs clear needs_owner).
+                witness = _provenance_outcome(_provenance_backfill(conn))
+                reconnect = witness.get("connection_unusable", False)
+                if reconnect:
+                    # A dropped connection cannot run preparation or commit on
+                    # context exit. Retire it; the next phase gets one fresh try.
+                    conn.close()
+                else:
+                    with conn.cursor() as cur:
+                        filled = close_rules.backfill_prs(cur)
+                    conn.commit()
+            if reconnect:
+                with connect() as conn:
+                    with conn.cursor() as cur:
+                        filled = close_rules.backfill_prs(cur)
+                    conn.commit()
+        except Exception as exc:  # noqa: BLE001 — rolled-back preparation may wait until next night
+            if not _transient_provenance_error(exc):
+                raise
+            filled = 0
+            preparation = {"ok": False, "transient": True, "reason": f"{type(exc).__name__}: {exc}"}
+        report = close_rules.run_nightly()
         out = {**report, "backfilled": int(filled), "provenance": witness}
+        if preparation is not None:
+            out["preparation"] = preparation
+            out["deferred_transient"] = out.get("deferred_transient", 0) + 1
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if witness is not None:
+            out["provenance"] = witness
+    if witness is not None and not witness.get("ok", True) and not witness.get("transient", False):
+        out["ok"] = False
+        out.setdefault("reason", witness.get("reason") or witness.get("error") or "provenance backfill failed")
     _nightly_log(f"commitments-close-rules: {json.dumps(out, default=str)[:300]}")
     return out
 
@@ -884,6 +964,36 @@ def nightly_last() -> dict[str, Any] | None:
         return None
 
 
+def nightly_consolidate_ts(log_mtime: float | None, *, slack_s: float) -> float | None:
+    """When the latest nightly's consolidate driver finished, for checks that
+    judge work the driver does (index rebuild, memory git sync).
+
+    Later nightly steps also log to the nightly log, so its mtime can sit an
+    hour or more past consolidate. The ``consolidate_nightly`` receipt is used
+    only when that receipt file's last step is within ``slack_s`` of the log
+    mtime (the same run); otherwise the log is newer than any receipt and its
+    mtime decides, as before."""
+    if log_mtime is None:
+        return None
+    data = nightly_last()
+    steps = data.get("steps") if data else None
+    if not isinstance(steps, list):
+        return log_mtime
+    consolidate: float | None = None
+    last: float | None = None
+    for step in steps:
+        try:
+            ts = datetime.fromisoformat(str(step["ts"])).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        last = ts if last is None else max(last, ts)
+        if step.get("name") == "consolidate_nightly":
+            consolidate = ts
+    if consolidate is None or last is None or log_mtime - last > slack_s:
+        return log_mtime
+    return min(consolidate, log_mtime)
+
+
 # D1: doctor `*_ok` key -> (nightly-last.json step name, fix hint). Every
 # step here is written by `run_nightly` above, fail-open, so a step that
 # never runs (missing key, provider outage, etc.) is otherwise invisible —
@@ -903,6 +1013,14 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
         "check the embedding provider key/credentials, then run `khipu jobs install nightly`"
         " or wait for the next nightly",
     ),
+    "query_cache_prune_ok": (
+        "query_cache_prune",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "commitments_close_rules_ok": (
+        "commitments_close_rules",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
     "commitments_hygiene_ok": (
         "commitments_hygiene",
         "run `khipu hygiene commitments` and check the error",
@@ -910,6 +1028,10 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     "mark_stale_ok": (
         "commitments_mark_stale",
         "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "ledger_ok": (
+        "ledger",
+        "run `khipu ledger drain` and check the error",
     ),
 }
 
@@ -1197,11 +1319,16 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
 
 def skipped_step_names(health: dict[str, dict[str, Any]]) -> list[str]:
     """The base name (``key`` minus its ``_ok`` suffix) of every
-    `nightly_step_health()` entry marked `skipped` — doctor folds these into
-    its `not_configured` list so healthRows.tsx renders them with the same
-    grey "not set up" row `memory_root`/`graph_sqlite` already use, instead
-    of a false red for a step that simply hasn't run yet."""
-    return [key[: -len("_ok")] for key, v in health.items() if v.get("skipped")]
+    `nightly_step_health()` entry marked `skipped` or `applicable: false` —
+    doctor folds these into its `not_configured` list so healthRows.tsx
+    renders them with the same grey "not set up" row `memory_root`/
+    `graph_sqlite` already use, instead of a false green for a step that
+    never runs on this Mac or has not run yet."""
+    names: list[str] = []
+    for key, v in health.items():
+        if v.get("skipped") or v.get("applicable") is False:
+            names.append(key[: -len("_ok")])
+    return names
 
 
 def run_monthly(*, dry_run: bool = False) -> int:
@@ -1485,9 +1612,10 @@ def index_freshness(*, memory_root: Path | None = None) -> dict[str, Any]:
     out["nightly_log"] = str(nightly_log)
     out["nightly_log_mtime"] = nightly_mtime
     out["index_files"] = [str(p.relative_to(mem)) for p in index_files[:20]]
+    consolidated = nightly_consolidate_ts(nightly_mtime, slack_s=INDEX_SLACK_S)
 
-    if nightly_mtime and nightly_mtime - index_mtime > INDEX_SLACK_S:
-        lag_min = int((nightly_mtime - index_mtime) // 60)
+    if consolidated and consolidated - index_mtime > INDEX_SLACK_S:
+        lag_min = int((consolidated - index_mtime) // 60)
         out["ok"] = False
         out["reasons"].append(
             f"index is {lag_min} min older than the last nightly log — rebuild may have been skipped"

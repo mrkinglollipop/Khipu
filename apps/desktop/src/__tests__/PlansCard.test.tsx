@@ -342,7 +342,7 @@ describe("PlansCard on Home", () => {
       windows: [{ name: "five_hour", used_pct: 12, resets_at: "2026-10-14T15:00:00Z", window_mins: 300 }] };
     status = r;
     render(<Home />);
-    await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("60% left")).toBeTruthy());
     const codex = within(rowFor("Codex"));
     expect(codex.getByText("Can't read it now; figures from 2 days ago")).toBeTruthy();
     expect(codex.getByRole("meter").classList.contains("dim")).toBe(true);
@@ -1069,7 +1069,7 @@ describe("a Codex whose live read failed (fix round 3)", () => {
   it("says not signed in beside its last-turn figures on Home and in Settings", async () => {
     status = signedOutCodex();
     const { unmount } = render(<Home />);
-    await waitFor(() => expect(screen.getByText("40%")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("60% left")).toBeTruthy());
     const codex = within(rowFor("Codex"));
     expect(codex.getByText("Not signed in")).toBeTruthy();
     expect(rowFor("Codex").querySelectorAll(".plan-say")).toHaveLength(1);

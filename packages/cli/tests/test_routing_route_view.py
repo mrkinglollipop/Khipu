@@ -119,7 +119,7 @@ def test_summary_of_a_large_record_stays_under_16kb():
     assert set(compact) == {"accounts", "priority", "rules", "holds", "omitted"}
     assert "providers" in compact["omitted"] and "note" in compact["omitted"]
     first = compact["accounts"][0]
-    assert set(first) == {"label", "state", "until", "pace"}
+    assert set(first) == {"label", "state", "until", "pace", "advice"}
     assert first["pace"][0] == {"window": "five_hour", "used_pct": 80.0,
                                 "cycle_resets_at": "2026-10-14T20:00:00Z",
                                 "plan": {"verdict": "on_pace"}}

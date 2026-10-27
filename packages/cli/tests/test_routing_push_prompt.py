@@ -872,6 +872,10 @@ def test_paged_delivery_continues_on_the_daemon_path(home, monkeypatch, daemon):
     _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, {})
     _push_on(monkeypatch)
     def pull():
+        # This daemon has no routing helper, whose one-second tick keeps the
+        # table inside its two-second freshness window; a stale table makes
+        # the prompt skip routing (InventoryUnavailable) and no page advances.
+        agent_view.prepare_routing_table(refresh=True)
         expected = len(_log_lines()) + 1
         code, output = _client(home)
         assert code == 0
@@ -1984,24 +1988,44 @@ def _answered_while_the_search_ran(home, monkeypatch) -> recall_prompt._RoutingA
     return at
 
 
-@pytest.mark.parametrize("change", ["none", "report", "refold"])
+@pytest.mark.parametrize("change", ["none", "report", "refold", "telemetry", "source", "epoch", "damaged", "pace_verdict"])
 def test_a_buffered_answer_from_an_older_record_generation_is_dropped(home, monkeypatch, change):
     """Codex review of the cold-start fix: an answer buffered while the
     search ran was taken after the record changed under it, so the prompt
     said "Claude: open" at version 2 while the record said limited at 3. An
-    answer is taken only while the record it was read from is still the
-    current one: a conversation's report, or a fold another process saved
-    (a source change reaches prompts that way), drops it at once."""
+    answer is taken only while its routing is current. A source change or
+    a new count drops it; saving the same routing with newer telemetry does
+    not withdraw an already buffered answer."""
     at = _answered_while_the_search_ran(home, monkeypatch)
     before = _marker()
     if change == "report":
         routing.report(account="Claude", state="limited", until="2h", author=ME)
     elif change == "refold":
         routing._save_view(routing._load_view())
+    elif change in {"telemetry", "source", "epoch", "pace_verdict"}:
+        view = routing._load_view()
+        if change == "telemetry":
+            view.update(folded_at=routing._iso(T0 + timedelta(seconds=6)),
+                        checked_at=routing._iso(T0 + timedelta(seconds=6)),
+                        valid_until=routing._iso(T0 + timedelta(seconds=7)))
+            view["accounts"][0]["pace"] = [{"window": "weekly", "rate_pct_per_h": 1.25}]
+        elif change == "source":
+            # A folded external change is rejected even without a new log
+            # stat or version, as with an unsaved source-backed fold.
+            view["effective"]["runner:synthetic"] = {"silent": True, "unreadable": False}
+        elif change == "epoch":
+            view["epoch"] = "replacement-count"
+        else:
+            view["accounts"][0]["pace"] = [{"window": "weekly", "plan": {"verdict": "outpacing"}}]
+        routing._save_view(view)
+    elif change == "damaged":
+        view = routing._load_view()
+        view["effective"] = {}
+        routing.view_file().write_text(json.dumps(view))  # the digest no longer matches
     began = time.monotonic()
     out = at.collect()
     assert time.monotonic() - began < 0.05  # stats, never a wait
-    if change == "none":
+    if change in {"none", "refold", "telemetry"}:
         assert out is not None and out["kind"] == "full"
         return
     assert out is None and at.status == "skipped:stale"

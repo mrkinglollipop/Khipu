@@ -590,6 +590,83 @@ class _CatchupConn:
         return False
 
 
+class EmbedRecentMissingBatchIsolationTest(unittest.TestCase):
+    """One failing episode batch must not abort the rest of the Stop catch-up."""
+
+    def test_stop_hook_catchup_isolates_one_failing_episode_batch(self):
+        import contextlib
+        from unittest import mock
+
+        from khipu import db
+
+        class Cur:
+            n = 0
+            rows = []
+
+            def execute(self, sql, params=None):
+                Cur.n += 1
+                self.rows = (
+                    [(7, "summary text long enough to chunk", [], [], [], [])]
+                    if Cur.n == 1 else []
+                )
+
+            def fetchall(self):
+                return list(self.rows)
+
+            def fetchone(self):
+                return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class Conn(Cur):
+            def cursor(self):
+                return Cur()
+
+            def commit(self):
+                pass
+
+        @contextlib.contextmanager
+        def fake_connect(*a, **k):
+            yield Conn()
+
+        with mock.patch.object(db, "connect", fake_connect), \
+                mock.patch.object(db, "has_columns", lambda *a, **k: False), \
+                mock.patch.object(em, "_active_profile", lambda cur: "m@4"), \
+                mock.patch.object(em, "_existing_hashes_for_refs", lambda *a, **k: {}), \
+                mock.patch.object(em, "_api_texts", lambda profile, pairs: [t for _a, t in pairs]), \
+                mock.patch.object(
+                    em, "embed_batch",
+                    side_effect=RuntimeError("embed HTTP 400")):
+            out = em.embed_recent_missing(limit=5)
+        self.assertIsInstance(out, dict)
+
+    def test_stop_hook_catchup_stops_on_network_error_after_retries(self):
+        """An outage after retries must end the pass — not burn daily budget
+        across every remaining commitment (5× retries × N refs)."""
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def _embed(api, profile=None, **kw):
+            calls["n"] += 1
+            raise RuntimeError("embed network error after 4 retries: URLError: timed out")
+
+        cur = _CatchupCursor([(1, "one"), (2, "two"), (3, "three")])
+        conn = _CatchupConn(cur)
+        with mock.patch("khipu.db.connect", return_value=conn), \
+                mock.patch.object(em, "_active_profile", return_value="prof-1"), \
+                mock.patch.object(em, "embed_batch", side_effect=_embed):
+            with self.assertRaises(RuntimeError) as ctx:
+                em.embed_recent_missing(limit=10)
+        self.assertIn("network error after", str(ctx.exception))
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(cur.inserts, [])
+
+
 class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
     """fix 5c: the hook's bounded embed catch-up (embed_recent_missing) also
     embeds open commitments with no vector yet — not inline on the capture

@@ -147,6 +147,38 @@ def is_old_writer_refusal(exc: BaseException) -> bool:
         or getattr(exc, "sqlstate", None) == OLD_WRITER_SQLSTATE
 
 
+def retryable_db_error(exc: BaseException) -> bool:
+    """Explicit DB outages/contention; schema and provenance refusals are fatal."""
+    import psycopg
+
+    from khipu import hub_errors
+
+    if is_old_writer_refusal(exc):
+        return False
+    state = getattr(getattr(exc, "diag", None), "sqlstate", None) or getattr(exc, "sqlstate", None)
+    if state is not None:
+        return state in {"08000", "08001", "08003", "08006", "08007",
+                         "40001", "40P01", "55P03", "57014", "57P01", "57P02", "57P03"}
+    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError)) \
+        and hub_errors.unreachable_error(exc)
+
+
+def _rollback_cleanup(conn, out: dict[str, Any]) -> bool:
+    """Retire a failed connection without replacing the recorded failure."""
+    try:
+        conn.rollback()
+        if not getattr(conn, "closed", False):
+            return True
+    except Exception:  # noqa: BLE001 — the original failure owns classification
+        pass
+    out["connection_unusable"] = True
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001 — retain the receipt even if close fails
+        pass
+    return False
+
+
 # ---- Legacy witness backfill (section 4) ----------------------------------------
 #
 # Migration 0047 attributes only what the writer inventory proves. A legacy
@@ -266,9 +298,14 @@ def _prove_prs(cur, fact_id: int, episode_id: int, words: str, project: str | No
     return added
 
 
-def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]], counts: dict) -> set[int]:
+def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]], counts: dict,
+                         only: list[int] | None = None) -> set[int]:
     """Claims for open-loop values that exactly equal a text or restatement
-    value on a commitment in the project (retired facts excluded)."""
+    value on a commitment in the project (retired facts excluded).
+
+    ``only`` limits the facts that receive claims, never the rows read: the
+    own-fact rule below must see every fact so a targeted pass decides
+    exactly as the whole pass would."""
     if not items:
         return set()
     values = sorted({v for _e, v in items})
@@ -276,9 +313,11 @@ def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]],
         "SELECT fc.fact_id, fc.value, fc.field, fc.episode_id FROM commitments c "
         "JOIN fact_claims fc ON fc.kind = 'commitment' AND fc.fact_id = c.id "
         "WHERE c.project IS NOT DISTINCT FROM %s AND fc.field IN ('text', 'restatement') "
-        "AND fc.value = ANY(%s) AND NOT (c.status = 'closed' AND c.close_reason IS NOT DISTINCT FROM 'forgotten')",
+        "AND fc.value = ANY(%s) "
+        "AND NOT (c.status = 'closed' AND c.close_reason IS NOT DISTINCT FROM 'forgotten')",
         (project, values),
     )
+    covered = None if only is None else set(only)
     by_value: dict[str, list[tuple[int, str, int | None]]] = {}
     for fid, value, field, by in cur.fetchall():
         by_value.setdefault(value, []).append((int(fid), field, by))
@@ -292,6 +331,8 @@ def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]],
         # after 0047 claimed it): it supports that one only.
         own = sorted({fid for fid, _field, by in rows if by == eid})
         for fid in own or sorted({fid for fid, _f, _b in rows}):
+            if covered is not None and fid not in covered:
+                continue
             added = 0
             if not own:
                 added += record_claim(cur, "commitment", fid, "restatement", value, episode_id=eid)
@@ -302,10 +343,12 @@ def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]],
     return touched
 
 
-def _witness_decisions(cur, project: str | None, items: list[tuple[int, str]], counts: dict) -> set[int]:
+def _witness_decisions(cur, project: str | None, items: list[tuple[int, str]], counts: dict,
+                       only: list[int] | None = None) -> set[int]:
     if not items:
         return set()
     values = sorted({v for _e, v in items})
+    # As for commitments: read every fact, restrict only the claims written.
     cur.execute(
         "SELECT fc.fact_id, fc.value, fc.episode_id FROM decisions d "
         "JOIN fact_claims fc ON fc.kind = 'decision' AND fc.fact_id = d.id AND fc.field = 'text' "
@@ -313,6 +356,7 @@ def _witness_decisions(cur, project: str | None, items: list[tuple[int, str]], c
         "AND d.retract_reason IS DISTINCT FROM 'forgotten'",
         (project, values),
     )
+    covered = None if only is None else set(only)
     by_value: dict[str, list[tuple[int, int | None]]] = {}
     for fid, value, by in cur.fetchall():
         by_value.setdefault(value, []).append((int(fid), by))
@@ -322,13 +366,18 @@ def _witness_decisions(cur, project: str | None, items: list[tuple[int, str]], c
         if any(by == eid for _fid, by in rows):
             continue
         for fid in sorted({fid for fid, _b in rows}):
+            if covered is not None and fid not in covered:
+                continue
             if record_claim(cur, "decision", fid, "text", value, episode_id=eid):
                 counts["claims"] += 1
                 touched.add(fid)
     return touched
 
 
-def _witness_deliverables(cur, project: str | None, items: list[tuple[int, tuple]], counts: dict) -> set[int]:
+def _witness_deliverables(cur, project: str | None, items: list[tuple[int, tuple]], counts: dict,
+                          only: list[int] | None = None) -> set[int]:
+    if only is not None:
+        return _witness_deliverables_in(cur, project, items, counts, only)
     touched: set[int] = set()
     for eid, (kind, path, url, title) in items:
         title_clause = "AND title IS NOT DISTINCT FROM %s " if not path and not url else ""
@@ -350,16 +399,54 @@ def _witness_deliverables(cur, project: str | None, items: list[tuple[int, tuple
     return touched
 
 
+def _witness_deliverables_in(cur, project: str | None, items: list[tuple[int, tuple]], counts: dict,
+                             only: list[int]) -> set[int]:
+    """:func:`_witness_deliverables` for a targeted backfill: the covered
+    deliverables are read once and matched here with the same rule (kind,
+    path and url equal, NULL equal to NULL; title too when there is neither
+    path nor url), instead of one query per item in the project."""
+    touched: set[int] = set()
+    if not items or not only:
+        return touched
+    cur.execute("SELECT id, kind, path, url, title FROM deliverables "
+                "WHERE project IS NOT DISTINCT FROM %s AND id = ANY(%s) ORDER BY id", (project, only))
+    facts = [(int(fid), (k, p, u, t)) for fid, k, p, u, t in cur.fetchall()]
+    for eid, (kind, path, url, title) in items:
+        for fid, (k, p, u, t) in facts:
+            if (k, p, u) != (kind, path, url) or (not path and not url and t != title):
+                continue
+            if title:
+                added = record_claim(cur, "deliverable", fid, "title", title, episode_id=eid)
+            else:
+                added = record_claim(cur, "deliverable", fid, "support", "", episode_id=eid)
+            if added:
+                counts["claims"] += 1
+                touched.add(fid)
+    return touched
+
+
 def backfill_project(cur, project: str | None, *, batch: int = BACKFILL_BATCH,
-                     between_batches=None) -> dict[str, Any]:
+                     between_batches=None, only: dict[str, Any] | None = None) -> dict[str, Any]:
     """Witness backfill of one project (section 4). Streams the project's
     live episodes ``batch`` at a time, selecting only their open loops,
     decisions and deliverables (their own and their merged captures'), so
     memory is bounded by the batch, not the project. Each re-projected fact
     is recorded. Marks the project backfilled. ``between_batches`` (the
     nightly passes its connection's commit) runs after each batch; forget
-    passes none and keeps everything in its own transaction."""
+    passes none and keeps everything in its own transaction.
+
+    ``only`` (``{kind: fact ids}``) makes it a targeted backfill: witnesses
+    are claimed on those facts only, and the project is NOT marked
+    backfilled (the nightly still owes it the whole pass). Forget uses it:
+    deleting one episode's claims re-projects only the facts it claims, so
+    those are the only facts whose other witnesses must be on file first,
+    and the whole project's inserts never run inside forget's deadline."""
     counts = {"project": project, "episodes": 0, "claims": 0, "projected": 0}
+    scope = None if only is None else {k: sorted(int(i) for i in (only.get(k) or ())) for k in KINDS}
+    if scope is not None:
+        counts["targeted"] = sum(len(v) for v in scope.values())
+        if not counts["targeted"]:
+            return counts
     last = 0
     while True:
         cur.execute(
@@ -384,25 +471,35 @@ def backfill_project(cur, project: str | None, *, batch: int = BACKFILL_BATCH,
         delivered: list[tuple[int, tuple]] = []
         for eid, lo, de, dv in rows:
             eid = int(eid)
-            for item in _json_list(lo):
-                loops += [(eid, v) for v in _loop_values(item)]
-            for item in _json_list(de):
-                value = _decision_value(item)
-                if value is not None:
-                    decided.append((eid, value))
-            for item in _json_list(dv):
-                key = _deliverable_key(item)
-                if key is not None:
-                    delivered.append((eid, key))
+            # A targeted pass skips the value functions for kinds it does not cover.
+            if scope is None or scope["commitment"]:
+                for item in _json_list(lo):
+                    loops += [(eid, v) for v in _loop_values(item)]
+            if scope is None or scope["decision"]:
+                for item in _json_list(de):
+                    value = _decision_value(item)
+                    if value is not None:
+                        decided.append((eid, value))
+            if scope is None or scope["deliverable"]:
+                for item in _json_list(dv):
+                    key = _deliverable_key(item)
+                    if key is not None:
+                        delivered.append((eid, key))
         rows = None
-        touched = [("commitment", f) for f in sorted(_witness_commitments(cur, project, loops, counts))]
-        touched += [("decision", f) for f in sorted(_witness_decisions(cur, project, decided, counts))]
-        touched += [("deliverable", f) for f in sorted(_witness_deliverables(cur, project, delivered, counts))]
+        sc = scope or {}
+        touched = [("commitment", f) for f in sorted(
+            _witness_commitments(cur, project, loops, counts, sc.get("commitment")))]
+        touched += [("decision", f) for f in sorted(
+            _witness_decisions(cur, project, decided, counts, sc.get("decision")))]
+        touched += [("deliverable", f) for f in sorted(
+            _witness_deliverables(cur, project, delivered, counts, sc.get("deliverable")))]
         for kind, fid in touched:
             if _reproject(cur, kind, fid) in ("projected", "retired", "deleted"):
                 counts["projected"] += 1
         if between_batches is not None:
             between_batches()
+    if scope is not None:
+        return counts
     cur.execute(
         "INSERT INTO provenance_projects (project, backfilled_at) VALUES (%s, now()) "
         "ON CONFLICT (project) DO UPDATE SET backfilled_at = EXCLUDED.backfilled_at",
@@ -411,14 +508,16 @@ def backfill_project(cur, project: str | None, *, batch: int = BACKFILL_BATCH,
     return counts
 
 
-def ensure_backfilled(cur, project: str | None) -> dict[str, Any] | None:
+def ensure_backfilled(cur, project: str | None, facts: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Forget's step before it deletes an episode's claims (section 4): the
     project's witness backfill, in the caller's transaction, when the
     project has not been covered yet. Returns its counts, or None when it
-    already was."""
+    already was. With ``facts`` (``{kind: ids}``, the facts the forget will
+    re-project) it is the targeted backfill of those facts only, which
+    leaves the project pending for the nightly (see :func:`backfill_project`)."""
     if backfilled(cur, project):
         return None
-    return backfill_project(cur, project)
+    return backfill_project(cur, project, only=facts)
 
 
 def backfill(conn, *, batch: int = BACKFILL_BATCH) -> dict[str, Any]:
@@ -469,7 +568,9 @@ def _gap_step(cur, step: str, payload: dict[str, Any], episode_id: int) -> None:
     elif name == "close rules":
         from khipu import close_rules
 
-        close_rules.run(cur, payload=payload, episode_id=episode_id)
+        # Replay owns episode/gap locks. Missing GitHub evidence is gathered
+        # by the subsequent connection-owning nightly pass, outside SQL.
+        close_rules.run(cur, payload=payload, episode_id=episode_id, github_enabled=False)
     elif name == "deliverables":
         from khipu import deliverables
 
@@ -588,16 +689,27 @@ def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
                         ("unreplayable: the merged capture is not in the episode's raw", ids))
             conn.commit()
         except Exception as exc:  # noqa: BLE001 — the gap stays open for the next night
-            conn.rollback()
             out["failed"] += 1
+            transient = retryable_db_error(exc)
+            if "reason" not in out or (out.get("transient", False) and not transient):
+                out["reason"] = f"{type(exc).__name__}: {exc}"[:300]
+            out["transient"] = out.get("transient", True) and transient
+            out["ok"] = False
+            if not _rollback_cleanup(conn, out):
+                return out
             try:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE fact_gaps SET resolution = %s, attempts = attempts + 1 WHERE id = ANY(%s)",
                         (f"replay failed: {type(exc).__name__}: {exc}"[:500], ids))
                 conn.commit()
-            except Exception:  # noqa: BLE001 — counted above; nothing else to keep
-                conn.rollback()
+            except Exception as receipt_exc:  # noqa: BLE001 — classify before rollback can fail
+                receipt_transient = retryable_db_error(receipt_exc)
+                if out["transient"] and not receipt_transient:
+                    out["reason"] = f"{type(receipt_exc).__name__}: {receipt_exc}"[:300]
+                out["transient"] = out["transient"] and receipt_transient
+                if not _rollback_cleanup(conn, out):
+                    return out
     return out
 
 
@@ -1013,8 +1125,10 @@ def index_identities(conn, *, batch: int = INDEX_BATCH, dry_run: bool = False) -
                 done = _index_batch(cur, through, target, batch)
             conn.commit()
         except Exception as exc:  # noqa: BLE001 - the batch rolled back; the next run redoes it
-            conn.rollback()
-            return {**out, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+            out.update(ok=False, transient=retryable_db_error(exc),
+                       error=f"{type(exc).__name__}: {exc}"[:300])
+            _rollback_cleanup(conn, out)
+            return out
         out["batches"] += 1
         out["indexed"] += done["indexed"]
         out["refused"] += done["refused"]

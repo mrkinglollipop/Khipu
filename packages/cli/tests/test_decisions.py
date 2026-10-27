@@ -106,6 +106,14 @@ class _Cursor:
             self._result = [(hit,)] if hit is not None else []
             return
 
+        if s.startswith("SELECT id, project, superseded_by, retracted_at FROM decisions WHERE id"):
+            (did,) = params
+            r = self.rows.get(did)
+            self._result = (
+                [(r["id"], r["project"], r["superseded_by"], r["retracted_at"])] if r else []
+            )
+            return
+
         if s.startswith("SELECT id, project, superseded_by FROM decisions WHERE id"):
             (did,) = params
             r = self.rows.get(did)
@@ -541,6 +549,15 @@ class SupersedeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             de.supersede(cur, b, a)  # would close the loop b -> a -> b
 
+    def test_superseding_onto_a_retracted_row_is_refused(self):
+        cur = _Cursor(evidence=True)
+        old = cur.seed(project="acme/widget", text="old")
+        new = cur.seed(project="acme/widget", text="new",
+                       retracted_at="2026-09-03T00:00:00+00:00")
+        with self.assertRaises(ValueError):
+            de.supersede(cur, old, new)
+        self.assertIsNone(cur.rows[old]["superseded_by"])
+
     def test_records_applied_link_when_table_exists(self):
         cur = _Cursor(evidence=True, links=True)
         old = cur.seed(project="acme/widget", text="old")
@@ -679,6 +696,15 @@ class ListDecisionsStatusTest(unittest.TestCase):
         rows = de.list_decisions(cur, project="acme/widget", status="superseded")
         self.assertEqual({r["id"] for r in rows}, {old})
 
+    def test_status_superseded_lists_only_superseded_rows(self):
+        """A row that was superseded and then retracted is not listed under
+        status=superseded (state_of reports retracted; that filter owns it)."""
+        cur, current, old, new, retracted = self._cursor()
+        cur.rows[old]["retracted_at"] = "2026-09-04T00:00:00+00:00"
+        rows = de.list_decisions(cur, project="acme/widget", status="superseded")
+        self.assertEqual([r["state"] for r in rows], [])
+        self.assertEqual({r["id"] for r in rows}, set())
+
     def test_retracted_status(self):
         cur, current, old, new, retracted = self._cursor()
         rows = de.list_decisions(cur, project="acme/widget", status="retracted")
@@ -766,31 +792,25 @@ class EnrichSearchResultsTest(unittest.TestCase):
 
 class DecisionStatesForEpisodeTest(unittest.TestCase):
     def test_returns_states_and_counts(self):
-        cur = _Cursor(evidence=True)
-        cur.seed(project="acme/widget", text="current", episode_id=7)
-        old = cur.seed(project="acme/widget", text="old", episode_id=7)
-        new = cur.seed(project="acme/widget", text="new", episode_id=7)
-        cur.rows[old]["superseded_by"] = new
-        cur.seed(project="acme/widget", text="bad", episode_id=7, retracted_at="t")
-        from unittest import mock
-
-        fake_conn = mock.MagicMock()
-        fake_conn.__enter__.return_value = fake_conn
-        fake_conn.cursor.return_value.__enter__.return_value = cur
-        with mock.patch("khipu.db.connect", return_value=fake_conn):
+        rows = [
+            {"id": 1, "text": "current", "state": "current", "superseded_by": None},
+            {"id": 2, "text": "old", "state": "superseded", "superseded_by": 3},
+            {"id": 3, "text": "new", "state": "current", "superseded_by": None},
+            {"id": 4, "text": "bad", "state": "retracted", "superseded_by": None},
+        ]
+        with mock.patch("khipu.briefs._decision_rows", return_value={7: rows}), \
+                mock.patch.object(de, "_decisions_ready", return_value=True), \
+                mock.patch("khipu.db.connect") as connect:
+            fake_conn = connect.return_value.__enter__.return_value
+            fake_conn.cursor.return_value.__enter__.return_value = mock.Mock()
             out = de.decision_states_for_episode(7)
         self.assertEqual(out["validity"], {"current": 2, "superseded": 1, "retracted": 1})
         self.assertEqual(len(out["decision_states"]), 4)
 
     def test_pre_migration_hub_is_empty_not_an_error(self):
-        cur = _Cursor(evidence=False)
-        cur.next_id = 1  # decisions table itself not "ready" (no base probe seeded)
-
-        from unittest import mock
-
         fake_conn = mock.MagicMock()
         fake_conn.__enter__.return_value = fake_conn
-        fake_conn.cursor.return_value.__enter__.return_value = cur
+        fake_conn.cursor.return_value.__enter__.return_value = _Cursor(evidence=False)
         with mock.patch("khipu.db.connect", return_value=fake_conn), \
                 mock.patch.object(de, "_decisions_ready", return_value=False):
             out = de.decision_states_for_episode(7)
