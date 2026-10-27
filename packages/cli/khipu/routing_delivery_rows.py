@@ -6,7 +6,8 @@ built solely for the owner's ``khipu route --json`` view: friendly
 conversation names, Mac labels, last-prompt times and per-change
 recipients must never ride a push, a child page, the MCP conversation
 view, a replication record, doctor output, a log or the gateway
-projection. Every read failure reads as empty, never as an error.
+projection. A damaged whole-source read returns ``rows: null`` so the
+owner view can tell that apart from "nobody live".
 """
 from __future__ import annotations
 
@@ -273,8 +274,8 @@ def delivery_data(view, now, cfg):
     with no session id, Mac id or path in any field."""
     try:
         return _delivery_data(view, now, cfg)
-    except Exception:  # noqa: BLE001 - a damaged source reads as empty
-        return {"rows": [], "macs": [], "recipients": {}}
+    except Exception:  # noqa: BLE001 - damaged ≠ empty; null rows, not []
+        return {"rows": None, "macs": [], "recipients": {}}
 
 
 def _delivery_data(view, now, cfg):

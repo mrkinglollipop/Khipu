@@ -386,15 +386,38 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 
+def owner_turn() -> bool:
+    """Whether this call comes from a conversation the owner typed in, the
+    only place a forgotten episode's summary may be shown (choosing
+    forget.here or forget.not_same). Any doubt answers no."""
+    from khipu import owner_direction
+
+    try:
+        owner_direction.check("forget.here")
+    except Exception:  # noqa: BLE001 - any doubt keeps the text back
+        return False
+    return True
+
+
+def without_summaries(out: dict) -> dict:
+    """``unsent_forgets`` output with each listed id kept and every other
+    item field (the summary) dropped; an item that is not an id entry is
+    dropped whole."""
+    return dict(out, ids=[{"id": item.get("id")} for item in out.get("ids") or [] if isinstance(item, dict)])
+
+
 def _forget_list() -> dict:
     from khipu import forget
 
-    return forget.unsent_forgets()
+    out = forget.unsent_forgets()
+    return out if owner_turn() else without_summaries(out)
 
 
-# Actions that only read, answered without the owner-direction check: the
-# forgets this Mac holds that the hub lacks (design 6.2), each bare id with
-# its hub summary, so the owner can choose forget.here or forget.not_same.
+# Actions that only read, answered without refusing: the forgets this Mac
+# holds that the hub lacks (design 6.2), each bare id, with its hub summary
+# only when the owner-direction check passes, so the owner can choose
+# forget.here or forget.not_same. The app reads its list through
+# ``khipu episode forget-pending`` instead.
 _READS = {"forget.list": _forget_list}
 
 

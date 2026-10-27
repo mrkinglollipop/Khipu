@@ -435,6 +435,33 @@ def read_gate() -> Gate:
     return Gate(_read_unlocked())
 
 
+def episode_hidden(episode_id: Any) -> bool:
+    """Whether a reader must treat hub episode ``episode_id`` as not found:
+    a forget this Mac holds that the hub lacks leaves the hub row live, and
+    its text reaches a caller only through the owner's forget.list. True for
+    any id when the registry can't be read."""
+    try:
+        return int(episode_id) in read_gate().episode_ids
+    except Exception:  # noqa: BLE001 - an unreadable registry shows no episode
+        return True
+
+
+def without_hidden_episodes(results: list[Any]) -> list[Any]:
+    """``results`` minus every hub episode hit ``episode_hidden`` names."""
+    try:
+        hidden = read_gate().episode_ids
+    except Exception:  # noqa: BLE001 - an unreadable registry shows no hub episode
+        hidden = None
+    kept = []
+    for hit in results:
+        ident = str(hit.get("id", "")) if isinstance(hit, dict) else ""
+        if (isinstance(hit, dict) and hit.get("kind") == "episode" and ident.isdigit()
+                and (hidden is None or int(ident) in hidden)):
+            continue
+        kept.append(hit)
+    return kept
+
+
 def is_forgotten(payload: dict[str, Any]) -> bool:
     """Whether this Mac's registry names ``payload``. A read: never waits
     on a writer's lock (a capture's hub write must not block on a replica
