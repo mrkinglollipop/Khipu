@@ -156,14 +156,23 @@ class _CommitmentsCursor:
                 if r["status"] == "open" and r["project"] == project
             ]
             return
-        if s.startswith("SELECT c.id, c.text, c.kind, c.owner FROM commitments c JOIN episodes"):
+        if s.startswith("SELECT c.id, c.text, c.kind, c.owner") and "FROM commitments c JOIN episodes" in s:
             (session_id,) = params
-            self._result = [
-                (r["id"], r["text"], r["kind"], r["owner"])
-                for r in self.rows.values()
-                if r["status"] == "open"
-                and self.episode_sessions.get(r["opened_episode"]) == session_id
-            ]
+            want_seen = "c.last_seen_at" in s
+            want_latest = "c.latest_text" in s
+            out = []
+            for r in self.rows.values():
+                if r["status"] != "open":
+                    continue
+                if self.episode_sessions.get(r["opened_episode"]) != session_id:
+                    continue
+                row = [r["id"], r["text"], r["kind"], r["owner"]]
+                if want_latest:
+                    row.append(r.get("latest_text"))
+                if want_seen:
+                    row.extend([r.get("last_seen_at"), r.get("seen_count") or 1])
+                out.append(tuple(row))
+            self._result = out
             return
         if s.startswith("UPDATE commitments SET last_seen_at = now(), seen_count"):
             (cid,) = params
@@ -871,6 +880,16 @@ class SessionPlanClosureTest(unittest.TestCase):
             "Send Matt the restore numbers next session",
             "Run oracle.sh when Matt says the lane is re-authed",
         })
+
+    def test_a_restated_row_survives_the_opening_sessions_sessionend(self):
+        cur = _CommitmentsCursor(migrated=True)
+        cid = cur._seed("Rebuild the index and paste the timings", episode=7,
+                        session_id="claude:s1")
+        cur.rows[cid]["seen_count"] = 2
+        cur.rows[cid]["last_seen_at"] = "now"
+        payload = {"project": "acme/widget", "session_id": "claude:s1", "event": "sessionend"}
+        self.assertEqual(co.close_session_plan(cur, payload, 9), 0)
+        self.assertEqual(cur.rows[cid]["status"], "open")
 
     def test_event_is_read_from_scope_when_the_payload_predates_the_field(self):
         cur = self._cur()
