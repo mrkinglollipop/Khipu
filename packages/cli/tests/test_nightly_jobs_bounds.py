@@ -250,3 +250,54 @@ def test_failed_close_rules_query_cache_and_ledger_steps_turn_a_doctor_row_red(m
     monkeypatch.setattr(_features, "enabled", lambda *_a, **_k: False)
     health = jobs.nightly_step_health()
     assert any(not v.get("ok") for v in health.values()), {k: v.get("ok") for k, v in health.items()}
+
+
+def test_reconcile_overall_budget_exceeds_per_statement_timeout(monkeypatch):
+    """A slow-but-not-stuck backfill past timeout_s still writes its notes."""
+    from khipu import db, notes
+
+    ticks = {"n": 0}
+
+    def fake_mono():
+        # Past the 30s statement timeout but inside the overall budget.
+        ticks["n"] += 1
+        return 0.0 if ticks["n"] == 1 else 100.0
+
+    class _Conn:
+        def cursor(self):
+            return self
+
+        def execute(self, *a, **k):
+            return None
+
+        def commit(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    upserts = {"n": 0}
+
+    with tempfile.TemporaryDirectory() as td:
+        claude, codex = _note_tree(td)
+        monkeypatch.setattr(notes, "claude_projects_root", lambda: claude)
+        monkeypatch.setattr(notes, "codex_memories_root", lambda: codex)
+        monkeypatch.setattr(notes, "_project_for_slug", lambda *a, **k: "acme/repo-a")
+        monkeypatch.setattr(notes, "_refresh_scan_report", lambda *a, **k: None)
+        monkeypatch.setattr(notes, "_tombstone_missing_notes", lambda *a, **k: {"tombstoned": 0})
+        monkeypatch.setattr(notes.time, "monotonic", fake_mono)
+        monkeypatch.setattr(db, "connect", lambda **k: _Conn())
+        monkeypatch.setattr(
+            "khipu.mirror._upsert_topic",
+            lambda *a, **k: upserts.__setitem__("n", upserts["n"] + 1),
+        )
+        monkeypatch.setattr(
+            "khipu.organise.after_reconcile",
+            lambda **k: {"ok": True, "mocked": True},
+        )
+        notes.reconcile(dry_run=False)
+
+    assert upserts["n"] >= 1, upserts

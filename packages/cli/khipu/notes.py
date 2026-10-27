@@ -689,8 +689,9 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
         timeout_s = 30.0
     new_files_state = dict(files_state)
     written_plan: list[dict[str, Any]] = []
-    # Cap the whole write loop so N stuck locks cannot each burn timeout_s.
-    deadline = time.monotonic() + timeout_s
+    # Cap the whole write loop so N stuck locks cannot each burn timeout_s; the
+    # cap is larger than one statement's bound so a slow backfill can finish.
+    deadline = time.monotonic() + max(timeout_s, 300.0)
     with connect(statement_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
             cur.execute(
