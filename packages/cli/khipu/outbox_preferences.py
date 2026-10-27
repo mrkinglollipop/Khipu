@@ -392,15 +392,19 @@ def _undo_fenced(cur, eid: int, entry: dict[str, Any]) -> bool:
 
 
 def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None = None,
-         committed: set[int] | frozenset[int] = frozenset()) -> dict[str, Any]:
+         committed: set[int] | frozenset[int] = frozenset(), include_unproven: bool = False) -> dict[str, Any]:
     """Put every job the merge resolved back where it was held, and the exact
     prior preferences of every episode it changed, when the row still holds
     exactly what the merge left. A row changed since (or forgotten) is left
     alone and named: undo never removes text something else wrote. Only an
-    entry whose episode id is in ``committed`` is reverted; one whose batch
-    never proved its commit counts as already restored, since identical text
-    on its row may be a later writer's. A resolved record undo can't move
-    back (forgotten, or a job already in its place) stays and is named."""
+    entry whose episode id is in ``committed`` is reverted. One whose batch
+    never proved its commit and whose row still holds exactly prior + added
+    is ``unproven`` (identical text may be a later writer's): left alone and
+    named, never counted as restored, until the owner asks again with
+    ``include_unproven``. An unproven entry whose row holds anything else
+    never landed, or has changed since, and counts as already restored. A
+    resolved record undo can't move back (forgotten, or a job already in its
+    place) stays and is named."""
     from khipu import memory_lock, outbox
     from khipu.db import connect
 
@@ -413,7 +417,7 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
         elif status in ("forgotten", "present"):
             still_resolved.append({"record": str(r["record"]), "job": str(r["job"]), "why": status})
     latest = {int(e["episode_id"]): e for e in entries}  # one entry per episode per merge
-    restored, already, left_alone = 0, 0, []
+    restored, already, left_alone, unproven, reverted = 0, 0, [], [], []
     ids = sorted(latest)
     with connect() as conn, conn.cursor() as cur:
         for start in range(0, len(ids), BATCH):
@@ -424,12 +428,13 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
                     rows = {int(r[0]): r for r in cur.fetchall()}
                     for eid in part:
                         e, row = latest[eid], rows.get(eid)
-                        if eid not in committed:
-                            already += 1
-                            continue
+                        proven = eid in committed
                         if (row is None or row[1] is not None or not isinstance(row[2], dict)
                                 or _undo_fenced(cur, eid, e)):
-                            left_alone.append(eid)
+                            if proven:
+                                left_alone.append(eid)
+                            else:
+                                already += 1
                             continue
                         raw_now, col_now = row[2].get("preferences"), row[3]
                         prior_raw = _str_list(e["prior_raw"]) or []
@@ -439,8 +444,16 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
                             continue
                         if (_str_list(raw_now) != prior_raw + list(e["added"])
                                 or (_str_list(col_now) or []) != prior_col + list(e["column_added"])):
-                            left_alone.append(eid)
+                            if proven:
+                                left_alone.append(eid)
+                            else:
+                                already += 1
                             continue
+                        if not proven:
+                            if not include_unproven:
+                                unproven.append(eid)
+                                continue
+                            reverted.append(eid)
                         if e.get("prior_raw_set"):
                             raw_sql = ("raw = jsonb_set(coalesce(raw, '{}'::jsonb), '{preferences}', "
                                        "%s::jsonb, true)")
@@ -456,5 +469,13 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
                 except BaseException:
                     conn.rollback()
                     raise
-    return {"ok": True, "restored": restored, "already_restored": already, "left_alone": left_alone,
-            "lines_unresolved": unresolved, "lines_left_resolved": still_resolved}
+    out = {"ok": True, "restored": restored, "already_restored": already, "left_alone": left_alone,
+           "lines_unresolved": unresolved, "lines_left_resolved": still_resolved, "unproven": unproven}
+    if reverted:
+        out["unproven_reverted"] = reverted
+    if unproven:
+        out["next"] = (f"Episodes {unproven} still hold the merged text: Khipu has no proof their batch committed, "
+                       "so it can't tell the text from a later writer's identical text. This action is not fully "
+                       "undone. To revert them, run the undo again with --include-unproven (owner direction "
+                       "required, logged).")
+    return out

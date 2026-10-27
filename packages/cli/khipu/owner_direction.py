@@ -660,7 +660,8 @@ def _merged(rows: list[dict]) -> dict[str, dict]:
                 or row["id"] == inflight):
             continue
         undo_state, line = lines[row["id"]]["state"], lines[row["undoes"]]
-        if line["state"] in ("cancelled", "done", "failed") or undo_state == "failed":
+        # "partial": the undo left something it could not prove was its to revert.
+        if line["state"] in ("cancelled", "done", "failed") or undo_state in ("failed", "partial"):
             continue
         line["state"] = "unconfirmed" if undo_state == "unconfirmed" else "undone"
     return lines
@@ -1687,6 +1688,9 @@ def _undo_owed_tidy(line, via):
     return {"ok": True, **counted, "left_alone": out.get("left_alone") or []}
 
 
+_INCLUDE_UNPROVEN: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_include_unproven", default=False)
+
+
 def _undo_outbox_preferences(line, via):
     from khipu import outbox_preferences
 
@@ -1702,7 +1706,7 @@ def _undo_outbox_preferences(line, via):
     # (written only after every batch committed).
     committed = {int(c["episode_id"]) for c in preference_merges(line["id"], "preference_commits")}
     committed |= {int(i) for i in (line.get("result") or {}).get("episode_ids") or []}
-    return outbox_preferences.undo(entries, resolved, committed)
+    return outbox_preferences.undo(entries, resolved, committed, include_unproven=_INCLUDE_UNPROVEN.get())
 
 
 def _ledger_undo(verb: str):
@@ -1959,10 +1963,19 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
     return None
 
 
-def undo(line_id: str, via: str, *, holds: dict | None = None) -> dict:
+def undo(line_id: str, via: str, *, holds: dict | None = None, include_unproven: bool = False) -> dict:
     """Apply the inverse of a logged action. Its ``undo`` line is written
     ahead by the owner gate (``gate``/``noted``) and completed by
-    ``finish``."""
+    ``finish``. ``include_unproven`` (a preference merge only) also reverts
+    episodes whose commit was never proven."""
+    token = _INCLUDE_UNPROVEN.set(include_unproven)
+    try:
+        return _undo(line_id, via, holds)
+    finally:
+        _INCLUDE_UNPROVEN.reset(token)
+
+
+def _undo(line_id: str, via: str, holds: dict | None) -> dict:
     line = _find(line_id)
     why = _undo_refusal(line, line_id)
     if why:

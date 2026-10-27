@@ -4361,6 +4361,14 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
     if args.apply and args.undo:
         print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
         return 2
+    if getattr(args, "include_unproven", False) and not args.undo:
+        print(json.dumps({"ok": False, "error": "--include-unproven goes with --undo"}))
+        return 2
+    if getattr(args, "include_unproven", False) and not getattr(args, "by_direction", False):
+        print(json.dumps({"ok": False, "code": "owner_only",
+                          "error": "--include-unproven needs --owner-direction (a conversation the owner typed "
+                                   "in); it is logged. Nothing was changed."}))
+        return 2
     if not (args.apply or args.undo):
         print(json.dumps(outbox_preferences.dry_run(), indent=2))
         return 0
@@ -4374,7 +4382,9 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
         if why:
             print(json.dumps({"ok": False, "code": "refused", "error": why + "; nothing was changed"}))
             return 2
-        want = owner_direction.intent("direction.undo", args.undo)
+        unproven = bool(getattr(args, "include_unproven", False))
+        want = owner_direction.intent("direction.undo", args.undo,
+                                      facts={"include_unproven": True} if unproven else None)
     else:
         want = owner_direction.intent(outbox_preferences.ACTION, "outbox")
     refused = {"ok": False, "code": "owner_only",
@@ -4403,7 +4413,7 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
         return 2
     try:
         if args.undo:
-            res = owner_direction.undo(args.undo, via)
+            res = owner_direction.undo(args.undo, via, include_unproven=unproven)
         else:
             res = outbox_preferences.apply(record=owner_direction.record_preference_merges,
                                            record_resolutions=owner_direction.record_preference_resolutions,
@@ -4411,7 +4421,7 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
     except BaseException:
         owner_direction._abandon()
         raise
-    res = owner_direction.finish(res) or res
+    res = owner_direction.finish(res, **({"state": "partial"} if res.get("unproven") else {})) or res
     print(json.dumps(res, indent=2, default=str))
     return 0 if res.get("ok") else 1
 
@@ -6805,6 +6815,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "or --owner-direction)")
     obm.add_argument("--undo", metavar="OWNER_ACTION", default=None,
                      help="Put back the exact prior preferences of one merge (the owner's, as --apply)")
+    obm.add_argument("--include-unproven", action="store_true",
+                     help="With --undo: also revert episodes whose commit Khipu could not prove (owner direction, "
+                          "logged)")
     obm.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     from khipu.owner_direction import add_owner_flags as _merge_owner_flags
 

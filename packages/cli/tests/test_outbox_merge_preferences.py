@@ -597,5 +597,57 @@ def test_undo_of_a_batch_that_never_committed_keeps_a_later_writers_identical_te
     cur.episodes[1]["raw"]["preferences"] = [*HUB["preferences"], *NEW]
     cur.episodes[1]["preferences"] = [*HUB["preferences"], *NEW]
     rc, undone = _run("--undo", line["id"], "--owner-direction")
-    assert rc == 0 and undone["restored"] == 0 and undone["already_restored"] == 1, undone
+    assert rc == 0 and undone["restored"] == 0 and undone["already_restored"] == 0, undone
+    assert undone["unproven"] == [1] and "--include-unproven" in undone["next"], undone
     assert _prefs(cur, 1) == ([*HUB["preferences"], *NEW], [*HUB["preferences"], *NEW])
+
+
+class _Killed(BaseException):
+    pass
+
+
+def _crash_at_second_marker(monkeypatch):
+    real = owner_direction.record_preference_commits
+    calls = {"n": 0}
+
+    def marker(ids):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise _Killed()
+        return real(ids)
+
+    monkeypatch.setattr(owner_direction, "record_preference_commits", marker)
+
+
+def test_undo_names_a_batch_that_committed_before_its_marker_and_stays_open(backlog, tmp_path, monkeypatch):
+    cur, _paths = backlog
+    monkeypatch.setattr(outbox_preferences, "BATCH", 1)
+    _crash_at_second_marker(monkeypatch)
+    _direction(tmp_path, monkeypatch)
+    with pytest.raises(_Killed):
+        cli.main(["outbox", "merge-line-preferences", "--apply", "--owner-direction"])
+    line = next(x for x in owner_direction.actions() if x["action"] == "outbox.merge_preferences")
+    merged = _prefs(cur, 2)
+    rc, undone = _run("--undo", line["id"], "--owner-direction")
+    assert rc == 0 and undone["restored"] == 1 and undone["already_restored"] == 0, undone
+    assert undone["unproven"] == [2] and "--include-unproven" in undone["next"], undone
+    assert _prefs(cur, 2) == merged
+    assert owner_direction.line_state(line["id"]) != "undone"
+    rc, refused = _run("--undo", line["id"], "--include-unproven")
+    assert rc == 2 and refused["code"] == "owner_only", refused
+    rc, second = _run("--undo", line["id"], "--include-unproven", "--owner-direction")
+    assert rc == 0 and second["unproven"] == [] and second["unproven_reverted"] == [2], second
+    assert second["restored"] == 1, second
+    assert _prefs(cur, 2) != merged
+    assert owner_direction.line_state(line["id"]) == "undone"
+    logged = [x for x in owner_direction.read_log() if x.get("kind") == "undo"]
+    assert any((x.get("facts") or {}).get("include_unproven") for x in logged)
+
+
+def test_a_normal_undo_has_nothing_unproven(backlog, tmp_path, monkeypatch):
+    _cur, _paths = backlog
+    _direction(tmp_path, monkeypatch)
+    rc, out = _run("--apply", "--owner-direction")
+    rc, undone = _run("--undo", out["owner_action"], "--owner-direction")
+    assert rc == 0 and undone["unproven"] == [] and "next" not in undone, undone
+    assert owner_direction.line_state(out["owner_action"]) == "undone"
