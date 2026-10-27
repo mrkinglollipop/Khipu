@@ -490,7 +490,7 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
             # the known project names first; this one is already exact.
             if "FROM commitments WHERE project IS NOT NULL" in self.sql:
                 return [("acme/widget",)]
-            if self.sql.startswith("SELECT alias FROM project_aliases"):
+            if self.sql.startswith("SELECT alias, project FROM project_aliases"):
                 return []
             assert self.sql.startswith("WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases")
             project, fallback = self.params

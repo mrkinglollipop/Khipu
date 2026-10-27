@@ -4204,21 +4204,34 @@ def snapshot_resolve_project(con: sqlite3.Connection, project: str | None) -> st
     differently-cased name read as the stored project it means; an ambiguous
     one raises ``identity.AmbiguousProject``. Unchanged when the replica
     cannot say."""
+    return snapshot_resolve_project_known(con, project)[0]
+
+
+def snapshot_resolve_project_known(con: sqlite3.Connection, project: str | None, *,
+                                   fence: str | None = None,
+                                   also_visible: Iterable[str] = ()) -> tuple[str | None, bool]:
+    """``snapshot_resolve_project`` and whether the answer is a visible
+    project (``identity.resolve_project``'s contract). ``fence`` is a forget
+    fence the caller already took, so its row read applies the same one."""
     if not project:
-        return project
+        return project, True
     from khipu import identity
 
-    known: set[str] = set()
-    # Names of commitments opened by a forgotten episode never resolve a name:
-    # the replica's forget fence, like every other replica read of them.
-    for sql in ("SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL"
-                + forget_fence_sql(con, "commitments", "opened_episode"),
-                "SELECT alias FROM project_aliases UNION SELECT project FROM project_aliases"):
+    found: list[list[tuple]] = []
+    # Names of commitments opened by a forgotten episode, or one whose erasure
+    # is queued, never resolve a name: the replica's forget fence, like every
+    # other replica read of them. An alias counts only for a group one of the
+    # fenced names belongs to.
+    if fence is None:
+        fence = forget_fence_sql(con, "commitments", "opened_episode")
+    for sql in ("SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL" + fence,
+                "SELECT alias, project FROM project_aliases"):
         try:
-            known.update(str(r[0]) for r in con.execute(sql).fetchall() if r[0])
+            found.append(list(con.execute(sql).fetchall()))
         except sqlite3.Error:
-            continue
-    return identity.pick_project(project, known, lambda n: snapshot_project_group(con, n)[0] or n)
+            found.append([])
+    known = identity.visible_project_names([*(r[0] for r in found[0]), *also_visible], found[1])
+    return identity.pick_project_known(project, known, lambda n: snapshot_project_group(con, n)[0] or n)
 
 
 def _hub_commitments(cur) -> tuple[list[str], list[Any]] | None:
