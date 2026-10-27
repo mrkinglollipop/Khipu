@@ -131,7 +131,7 @@ def _validate_resolution(record: Any) -> None:
     hub_view = _redact_capture_values(hub_view)
     if (not isinstance(resolution, dict)
             or resolution.get("kind") not in ("legacy_comma_projection", "legacy_landed_line",
-                                              "preferences_contained")
+                                              "preferences_contained", "preferences_contained_normalized")
             or type(resolution.get("episode_id")) is not int or resolution["episode_id"] <= 0
             or not isinstance(resolution.get("resolved_at"), str) or not resolution["resolved_at"]
             or resolution.get("original_payload_sha256") != payload_sha256(record["payload"])
@@ -150,6 +150,15 @@ def _validate_resolution(record: Any) -> None:
     if resolution["kind"] == "preferences_contained":
         proved = (_legacy_projection_kind(record["payload"], hub_view) is None
                   and _legacy_preferences_contained(record["payload"], hub_view))
+    elif resolution["kind"] == "preferences_contained_normalized":
+        from khipu.outbox_preferences import normalized_missing
+
+        # The projection matched at archive time, when stored, so today's
+        # noise list or scope limit never decides an old record.
+        proved = (_legacy_projection_kind(record["payload"], hub_view) is None
+                  and not _legacy_preferences_contained(record["payload"], hub_view)
+                  and normalized_missing(record["payload"], hub_view,
+                                         resolution.get("normalized_projection")) == [])
     else:
         proved = _legacy_projection_kind(record["payload"], hub_view) == resolution["kind"]
     if not proved:
