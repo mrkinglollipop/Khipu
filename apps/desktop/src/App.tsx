@@ -3667,9 +3667,30 @@ export default function App() {
   };
   const guideStartItems = buildStartItems(guideStartSignals);
   const guideProblems = liveness ? (liveness.red ?? []).length : null;
-  const guideRowStates = guideStates({ ...guideStartSignals, grok: guideSignals.grok, problems: guideProblems, t3: t3Gap });
+  // "When something turns red" follows doctor itself, not only capture
+  // liveness: it must not say "No problems" while doctor is red.
+  const doctorProblems =
+    doctorOk == null ? null : attention.length > 0 ? attention.length : doctorOk ? 0 : 1;
+  const guideRowStates = guideStates({
+    ...guideStartSignals,
+    grok: guideSignals.grok,
+    problems: guideProblems,
+    doctorProblems,
+    t3: t3Gap,
+  });
   const guidesBadge = railBadge(guideSignals.grok, guideProblems);
-  const homeHint = hintState(guideStartItems, guideSignals.prefs);
+  // Every setup item reads live state that arrives after first paint. Until
+  // each source has answered (or failed, or the database is unreachable) the
+  // hint says it is checking, instead of "2 of 4 done" from empty defaults.
+  const setupSignalsKnown =
+    guideSignals.logSettled &&
+    (liveness != null || doctorReadError != null || dbReachable === false) &&
+    (counts != null || error != null || dbReachable === false) &&
+    (plans.data != null || plans.error != null || dbReachable === false);
+  const homeHint = hintState(guideStartItems, guideSignals.prefs, {
+    prefs: guideSignals.prefsLoaded,
+    signals: setupSignalsKnown,
+  });
 
   const coverage = (() => {
     if (!embedCoverage) return null;
@@ -5971,6 +5992,7 @@ export default function App() {
               runKhipu={runKhipu}
               signals={guideSignals}
               startItems={guideStartItems}
+              setupKnown={{ prefs: guideSignals.prefsLoaded, signals: setupSignalsKnown }}
               states={guideRowStates}
               open={guideOpen}
               onOpen={(id) => openGuide(id)}

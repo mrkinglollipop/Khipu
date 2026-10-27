@@ -1,6 +1,8 @@
 // The Guides page, the Grok Bot guide, the "How this works" popover and Home's
 // hint. Tauri is stubbed: `invoke` answers each fixed command the guide uses.
 // Every key and address below is made up.
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -9,7 +11,7 @@ import { GuidesPage } from "../GuidesPage";
 import { HowThisWorks } from "../HowThisWorks";
 import { SetupHint } from "../SetupHint";
 import { useGuideSignals, gatewayCheckWords, runGatewayCheck } from "../guideSignals";
-import { guideStates, hintState, startItems, DEFAULT_PREFS } from "../guidesModel";
+import { grokBotProgress, guideStates, hintState, startItems, DEFAULT_PREFS } from "../guidesModel";
 import type { GuideId } from "../guidesModel";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -116,6 +118,33 @@ describe("Guides page", () => {
     expect(screen.queryByText("Codex")).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Search guides"), { target: { value: "zzzz" } });
     expect(screen.getByText(/No guide matches/)).toBeInTheDocument();
+  });
+
+  it("shows a checking card instead of a setup count while the evidence is still loading", () => {
+    const signals = { prefs: DEFAULT_PREFS, updatePrefs: async () => {} } as unknown as Parameters<typeof GuidesPage>[0]["signals"];
+    const states = guideStates({ liveness: null, gatewayCheckOk: false, episodes: null, accountsRead: 0, agentAsked: false, grok: grokBotProgress({ gatewayUrl: "", keySaved: false, check: null, ack: 0 }), problems: null });
+    render(
+      <GuidesPage
+        runKhipu={makeRunKhipu()}
+        signals={signals}
+        startItems={startItems({ liveness: null, gatewayCheckOk: false, episodes: null, accountsRead: 0, agentAsked: false })}
+        setupKnown={{ prefs: true, signals: false }}
+        states={states}
+        open={null}
+        onOpen={() => {}}
+        onBack={() => {}}
+        onTarget={() => {}}
+      />,
+    );
+    expect(screen.getByText("Checking your setup")).toBeInTheDocument();
+    expect(screen.queryByText(/of 4 done/)).not.toBeInTheDocument();
+  });
+
+  it("guide cards grow with their blurb: the stylesheet overrides the global 30px button height", () => {
+    const css: string = readFileSync(`${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/guides.css`, "utf8");
+    const rule = css.match(/\.gd-item\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(rule).toMatch(/height:\s*auto/);
+    expect(css).toMatch(/\.gd-list\s*\{[^}]*minmax\(0,\s*1fr\)/);
   });
 
   it("hides Start here, remembers it, and brings it back", async () => {
@@ -287,6 +316,20 @@ describe("Home hint", () => {
     expect(onSeeAll).toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Hide this hint" }));
     expect(onHide).toHaveBeenCalled();
+  });
+
+  it("shows a checking state, not a '2 of 4' count, until the setup evidence is read", () => {
+    render(<SetupHint state={hintState(items, DEFAULT_PREFS, { prefs: true, signals: false })} onAct={() => {}} onSeeAll={() => {}} onHide={() => {}} onDismissAllSet={() => {}} />);
+    expect(screen.getByRole("status")).toHaveTextContent("Checking your setup");
+    expect(screen.queryByText(/setup steps done/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Connect an agent" })).not.toBeInTheDocument();
+  });
+
+  it("renders nothing before the saved choices are read", () => {
+    const { container } = render(
+      <SetupHint state={hintState(items, DEFAULT_PREFS, { prefs: false, signals: false })} onAct={() => {}} onSeeAll={() => {}} onHide={() => {}} onDismissAllSet={() => {}} />,
+    );
+    expect(container).toBeEmptyDOMElement();
   });
 
   it("renders nothing once hidden", () => {

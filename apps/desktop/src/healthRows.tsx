@@ -616,7 +616,7 @@ export function HealthReportRows({
                 className="muted"
               />
               <span className="row-main">{row.label}</span>
-              <span className="row-meta">{row.key === "routing_delivery_ok" ? `can't be checked${row.detail ? `: ${row.detail}` : ""}` : "not set up"}</span>
+              <span className="row-meta wrap">{row.key === "routing_delivery_ok" ? `can't be checked${row.detail ? `: ${row.detail}` : ""}` : "not set up"}</span>
             </div>
           );
         }
@@ -646,7 +646,7 @@ export function HealthReportRows({
               className="err"
             />
             <span className="row-main">{row.label}</span>
-            <span className={row.key === "routing" ? "row-meta wrap" : "row-meta"}>{text}</span>
+            <span className="row-meta wrap">{text}</span>
             {single?.fix ? (
               <button
                 type="button"

@@ -19,6 +19,18 @@ export function SetupHint({
 }) {
   if (state.kind === "hidden") return null;
 
+  if (state.kind === "loading") {
+    return (
+      <div className="gd-hint" role="status" aria-label="Setup hint" aria-busy="true">
+        <Sparkles size={16} className="gd-hint-lead" aria-hidden />
+        <div>
+          <b>Checking your setup</b>
+          <p>Looking at which agents and accounts are connected.</p>
+        </div>
+      </div>
+    );
+  }
+
   if (state.kind === "all-set") {
     return (
       <div className="gd-hint" role="region" aria-label="Setup hint">
