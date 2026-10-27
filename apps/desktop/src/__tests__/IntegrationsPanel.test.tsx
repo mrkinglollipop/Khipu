@@ -101,6 +101,12 @@ describe("cardStatus — Claude homes", () => {
     expect(cardStatus(row, RECORDING, undefined)).toEqual({ tone: "ok", label: "Recording" });
   });
 
+  it("reads Idle, not green Recording, when the last capture is over a week old", () => {
+    const row = claudeRow([home(), t3Home()]);
+    const old: HarnessLiveness = { ok: true, seen: true, captures: 4, last_captured_age_s: 7 * 86400 + 3600 };
+    expect(cardStatus(row, old, undefined)).toEqual({ tone: "neutral", label: "Idle" });
+  });
+
   it("reads '1 home not installed', warn, when one of two is missing", () => {
     const row = claudeRow([home(), t3Home(T3_NOT_INSTALLED)]);
     expect(cardStatus(row, RECORDING, undefined)).toEqual({ tone: "warn", label: "1 home not installed" });

@@ -84,6 +84,7 @@ export function GuidesPage({
   runKhipu,
   signals,
   startItems,
+  setupKnown = { prefs: true, signals: true },
   states,
   open,
   onOpen,
@@ -93,6 +94,9 @@ export function GuidesPage({
   runKhipu: (args: string[]) => Promise<string>;
   signals: Signals;
   startItems: StartItem[];
+  /** What has been read yet; the setup card waits for it instead of showing
+   *  a count made of empty defaults. */
+  setupKnown?: { prefs: boolean; signals: boolean };
   states: Record<GuideId, GuideState>;
   /** The guide on screen, with the step to open it at (Grok Bot). */
   open: { id: GuideId; step?: number } | null;
@@ -155,12 +159,17 @@ export function GuidesPage({
   const shown = filterGuides(query);
   return (
     <div className="gd-page">
-      {prefs.startHidden ? (
+      {!setupKnown.prefs ? null : prefs.startHidden ? (
         <div className="gd-row gd-showagain">
           <button type="button" className="link" onClick={() => updatePrefs({ startHidden: false, hintHidden: false })}>
             Show setup steps again
           </button>
         </div>
+      ) : !setupKnown.signals ? (
+        <section className="gd-card gd-start" role="status" aria-busy="true" aria-label="Setup progress">
+          <h4>Checking your setup</h4>
+          <div className="gd-count">Looking at which agents and accounts are connected.</div>
+        </section>
       ) : (
         <StartHere
           items={startItems}

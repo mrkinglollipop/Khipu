@@ -6,6 +6,7 @@
 
 import type { LivenessPayload } from "./IntegrationsPanel";
 import type { T3HealthGap } from "./railHealth";
+import { captureIsIdle } from "./time";
 
 export type GuideId =
   | "claude_code"
@@ -283,12 +284,22 @@ export type RowTone = "ok" | "warn" | "err" | "neutral";
 export type GuideState = { tone: RowTone; label: string };
 
 export function guideStates(
-  s: StartSignals & { grok: GrokBotProgress; problems: number | null; t3?: T3HealthGap },
+  s: StartSignals & {
+    grok: GrokBotProgress;
+    problems: number | null;
+    /** What doctor reports red, for the "When something turns red" row; null
+     *  while doctor has not answered. Falls back to `problems` when omitted. */
+    doctorProblems?: number | null;
+    t3?: T3HealthGap;
+  },
 ): Record<GuideId, GuideState> {
+  const redCount = s.doctorProblems === undefined ? s.problems : s.doctorProblems;
   const rec = (id: string): GuideState => {
     const lv = s.liveness?.harnesses?.[id];
     if (lv?.ok === false) return { tone: "err", label: "Stopped recording" };
-    if (lv?.seen && (lv.captures ?? 0) > 0) return { tone: "ok", label: "Recording" };
+    if (lv?.seen && (lv.captures ?? 0) > 0) {
+      return captureIsIdle(lv.last_captured_age_s) ? { tone: "neutral", label: "Idle" } : { tone: "ok", label: "Recording" };
+    }
     if (lv?.seen) return { tone: "warn", label: "Nothing saved yet" };
     return { tone: "neutral", label: "Not set up" };
   };
@@ -322,10 +333,10 @@ export function guideStates(
     backups: guide,
     another_mac: guide,
     gateway: guide,
-    red: s.problems == null
+    red: redCount == null
       ? { tone: "neutral", label: "Checking" }
-      : s.problems > 0
-        ? { tone: "err", label: s.problems === 1 ? "1 problem" : `${s.problems} problems` }
+      : redCount > 0
+        ? { tone: "err", label: redCount === 1 ? "1 problem" : `${redCount} problems` }
         : { tone: "ok", label: "No problems" },
   };
 }
@@ -340,11 +351,23 @@ export function railBadge(grok: GrokBotProgress, problems: number | null): numbe
  *  nothing at all. */
 export type HintState =
   | { kind: "hidden" }
+  /** The saved choices are read but the live evidence is not: say so rather
+   *  than show a setup state that is only the empty default. */
+  | { kind: "loading" }
   | { kind: "next"; item: StartItem; done: number; total: number }
   | { kind: "all-set" };
 
-export function hintState(items: StartItem[], prefs: Pick<GuidesPrefs, "hintHidden" | "startHidden" | "setUpSeen">): HintState {
+export function hintState(
+  items: StartItem[],
+  prefs: Pick<GuidesPrefs, "hintHidden" | "startHidden" | "setUpSeen">,
+  /** What has been read yet. `prefs`: the saved hide/seen choices; `signals`:
+   *  the evidence behind the four items. Omitted means both are known. */
+  known: { prefs: boolean; signals: boolean } = { prefs: true, signals: true },
+): HintState {
+  // Nothing is shown until the saved choices are read, so a hidden hint never flashes.
+  if (!known.prefs) return { kind: "hidden" };
   if (prefs.hintHidden || prefs.startHidden) return { kind: "hidden" };
+  if (!known.signals) return { kind: "loading" };
   const { done, total, next } = startProgress(items);
   if (next) return { kind: "next", item: next, done, total };
   return prefs.setUpSeen ? { kind: "hidden" } : { kind: "all-set" };
