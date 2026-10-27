@@ -199,24 +199,38 @@ def pick_project(name: str, known: Iterable[str], canonical_of: Callable[[str], 
     return canon[0]
 
 
+def visible_project_names(visible: Iterable[str], alias_rows: Iterable[tuple[Any, Any]]) -> set[str]:
+    """The names a typed project may resolve to: every project a visible
+    commitment is filed under, plus the aliases and canonical of each alias
+    group one of those names belongs to. An alias group backed only by
+    commitments of forgotten (or pending-erasure) episodes adds no name, so
+    it never resolves a short name nor appears in an ambiguity error."""
+    known = {str(v) for v in visible if v}
+    rows = [(str(a), str(p)) for a, p in alias_rows if a and p]
+    live_groups = {p for a, p in rows if a in known or p in known}
+    known.update(n for a, p in rows if p in live_groups for n in (a, p))
+    return known
+
+
 def resolve_project_name(cur, project: str | None) -> str | None:
-    """``pick_project`` over the hub: every project a commitment is filed
-    under, plus every alias and canonical in ``project_aliases``."""
+    """``pick_project`` over the hub: every project a visible commitment is
+    filed under, plus the aliases of the groups those projects belong to."""
     if not project:
         return project
     from khipu import commitments
 
     # Names come only from commitments whose opening episode is not forgotten,
     # the same filter the owed listing applies (computed outside the savepoint:
-    # it may introspect the schema).
+    # it may introspect the schema). An alias counts only for a group one of
+    # those names belongs to.
     live = commitments._not_forgotten_clause(cur)
-    known: set[str] = set()
+    found: list[list[tuple]] = []
     for table_sql in (f"SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL AND {live}",
-                      "SELECT alias FROM project_aliases UNION SELECT project FROM project_aliases"):
+                      "SELECT alias, project FROM project_aliases"):
         cur.execute("SAVEPOINT project_name_known", ())
         try:
             cur.execute(table_sql, ())
-            known.update(str(r[0]) for r in cur.fetchall() if r[0])
+            found.append(list(cur.fetchall()))
             cur.execute("RELEASE SAVEPOINT project_name_known", ())
         except Exception as exc:  # compatibility only for an older schema
             cur.execute("ROLLBACK TO SAVEPOINT project_name_known", ())
@@ -225,6 +239,8 @@ def resolve_project_name(cur, project: str | None) -> str | None:
 
             if not isinstance(exc, (UndefinedTable, UndefinedColumn)):
                 raise
+            found.append([])
+    known = visible_project_names((r[0] for r in found[0]), found[1])
     return pick_project(project, known, lambda n: project_canonical_group(cur, n)[0] or n)
 
 
