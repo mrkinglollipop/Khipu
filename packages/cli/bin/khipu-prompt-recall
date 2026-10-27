@@ -43,6 +43,23 @@ for a in "$@"; do
 done
 # stdin can be read once, and every path below needs the payload.
 PAYLOAD=$(cat)
+# Antigravity's PreInvocation fires before every model call and carries no
+# prompt: the owner-turn script reads the newest USER_INPUT from the
+# transcript and lets only the first call of each user turn through (it prints
+# nothing for any other payload, "{}" for a turn already handled, and the
+# payload with its prompt filled in for a new one).
+case "$PAYLOAD" in
+  *'"conversationId"'*)
+    if [ -f "$SELF_DIR/khipu-owner-turn.py" ]; then
+      TURN=$(printf '%s' "$PAYLOAD" | "$PY" -S -E -B "$SELF_DIR/khipu-owner-turn.py" --antigravity-turn 2>/dev/null)
+      case "$TURN" in
+        "") ;;
+        "{}") echo '{}'; exit 0 ;;
+        *) PAYLOAD="$TURN" ;;
+      esac
+    fi
+    ;;
+esac
 # Owner direction: record that the owner typed, first, on every path
 # (khipu.owner_turns). The recorder is stdlib-only, prints nothing and never
 # fails.
