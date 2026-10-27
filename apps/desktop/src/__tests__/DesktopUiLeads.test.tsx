@@ -198,7 +198,11 @@ describe("Re-read banners after a failed refresh with last-good data", () => {
     render(<UsageAccountsField active />);
     await screen.findByText("Your list");
     fireEvent.click(screen.getByRole("button", { name: "Remove Claude" }));
-    await waitFor(() => expect(screen.getByRole("alert").textContent).toMatch(/Couldn't refresh; showing the last value/));
+    await waitFor(() => {
+      const texts = screen.getAllByRole("alert").map((n) => n.textContent ?? "");
+      expect(texts.some((t) => /Couldn't refresh; showing the last value/.test(t))).toBe(true);
+      expect(texts.some((t) => /Could not re-read the account list/.test(t))).toBe(true);
+    });
     expect(screen.queryByText(/Saved, but/)).toBeNull();
   });
 });
