@@ -1038,8 +1038,8 @@ TOOLS: list[dict] = [
             "setting, a ledger row, several of the owner's Owed items at once "
             "(owed.change: \"close those\"), apply or undo an Owed clean-up "
             "(owed.tidy, after showing the owner the plan's summary), resolve the forgets this "
-            "Mac holds that the hub lacks (forget.list reads them, each listed episode id with its "
-            "hub summary, and changes nothing; forget.send; forget.here or forget.not_same with "
+            "Mac holds that the hub lacks (forget.list reads them, each listed episode id, with its "
+            "hub summary only in a conversation the owner typed in, and changes nothing; forget.send; forget.here or forget.not_same with "
             "{\"id\": N} for a listed episode id), or confirm a request that is "
             "waiting for the owner. Submit the exact action and its arguments; it applies "
             "at once. Khipu accepts it only from a conversation the owner has "
@@ -1268,6 +1268,9 @@ def _tool_search(args: dict) -> dict:
             since=since, until=until, project=project, session_id=session_id,
             harness=harness, t3_thread=t3_thread, via=via, tz=tz,
         )
+    from khipu.tombstones import without_hidden_episodes
+
+    payload["results"] = without_hidden_episodes(payload.get("results") or [])
     query_log.log_query(
         query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
@@ -1316,6 +1319,11 @@ def _tool_get(args: dict) -> dict:
     inferred = kind
     if inferred is None:
         inferred = "episode" if ident.isdigit() else "topic"
+    if inferred == "episode" and ident.isdigit():
+        from khipu.tombstones import episode_hidden
+
+        if episode_hidden(ident):
+            raise ValueError(f"episode not found: {ident}")
 
     hub_failed = False
     try:

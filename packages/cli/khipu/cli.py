@@ -2841,7 +2841,14 @@ def _cmd_episode_forget_pending(args: argparse.Namespace) -> int:
     elif args.not_same is not None:
         action, target = "forget.not_same", str(args.not_same)
     else:
-        print(json.dumps(forget.unsent_forgets(), default=str))
+        from khipu import owner_act, routing
+
+        out = forget.unsent_forgets()
+        # Summaries are forgotten episodes' text: only the app itself or a
+        # conversation the owner typed in sees them.
+        if not ((args.from_app and routing._caller()["app"]) or owner_act.owner_turn()):
+            out = owner_act.without_summaries(out)
+        print(json.dumps(out, default=str))
         return 0
     from khipu import owner_direction
 
@@ -3293,7 +3300,9 @@ def cmd_activity(args: argparse.Namespace) -> int:
     from khipu.activity import activity_payload, episode_detail
 
     if args.show is not None:
-        row = episode_detail(args.show)
+        from khipu.tombstones import episode_hidden
+
+        row = None if episode_hidden(args.show) else episode_detail(args.show)
         if row is None:
             print(f"error: episode {args.show} not found", file=sys.stderr)
             return 1
@@ -3407,7 +3416,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         if not ident.isdigit():
             print(json.dumps({"ok": False, "error": "episode id must be digits"}))
             return 2
-        row = episode_detail(int(ident))
+        from khipu.tombstones import episode_hidden
+
+        row = None if episode_hidden(ident) else episode_detail(int(ident))
     else:
         from khipu.text_pages import page_args
 
