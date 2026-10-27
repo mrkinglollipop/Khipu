@@ -53,7 +53,7 @@ ALT = "Review the deployment checklist before the release goes out"
 @pytest.fixture
 def env(hub, monkeypatch, tmp_path):  # noqa: F811
     """A hub at main's schema (0044) with capture's side effects stubbed.
-    ``env.migrate()`` applies 0047."""
+    ``env.migrate()`` applies 0047 and any later pending migrations (0050)."""
     from khipu import db, embed, topic_graph
 
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "state"))
@@ -71,7 +71,7 @@ def env(hub, monkeypatch, tmp_path):  # noqa: F811
     def migrate():
         db._TABLE_COLUMNS_CACHE.clear()
         result = hub.migrate()
-        assert result["ran"] == ["0047_fact_provenance", "0049_commitment_origin_requests"], result
+        assert result["ran"] == ["0047_fact_provenance", "0049_commitment_origin_requests", "0050_pr_list_hashes"], result
         db._TABLE_COLUMNS_CACHE.clear()
 
     hub.to_0047 = migrate

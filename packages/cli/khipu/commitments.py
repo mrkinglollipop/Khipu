@@ -1077,7 +1077,10 @@ def _near_duplicate_open(cur, scope: str | None, text: str, *,
         return None
     best_id, best_score = None, 0.0
     for row in rows:
-        score = _match_score(text, row["text"])
+        # Score the original wording and any restatement: a later capture that
+        # adds another repo's PR must match the current words, not only the
+        # first open (asymmetric containment no longer equates base ⊂ URL).
+        score = _row_near_dup_score(text, row)
         if score >= NEAR_DUP_MIN_SCORE and score > best_score:
             best_id, best_score = row["id"], score
     if best_id is not None:
@@ -1311,7 +1314,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                     _keep_pr_refs(cur, existing, labels)
             continue
         linked = [r["id"] for r in others
-                  if r["id"] == exact or _match_score(norm["text"], r["text"]) >= NEAR_DUP_MIN_SCORE]
+                  if r["id"] == exact or _row_near_dup_score(norm["text"], r) >= NEAR_DUP_MIN_SCORE]
         closed_relays: list[int] = []
         for rid in relay_ids:
             # Closed before the insert: an identical text shares the open
@@ -1431,6 +1434,32 @@ def _keep_pr_refs(cur, commitment_id: int, labels: list[str]) -> None:
                     (json.dumps({**check, "refs": refs + new}), commitment_id))
 
 
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _url_as_token(text: str) -> str:
+    """``text`` with each URL reduced to one token. A pull URL is six or so
+    tokens (``https github com owner repo pull N``) of boilerplate; left
+    whole, two different items that cite the same link (or two links into
+    one repository) clear the near-dup bar on the link alone."""
+    return _URL_RE.sub(lambda m: " url" + re.sub(r"[^a-z0-9]", "", m.group().lower().rstrip(".,;:)]}'\"")) + " ",
+                       text)
+
+
+def _row_near_dup_score(text: str, row: dict[str, Any]) -> float:
+    """Near-dup score against a row's opening text and, when present, its
+    latest restatement — so a third wording that drifts from the original
+    but tracks the current phrasing still folds into the same item. Links
+    count as one token each (:func:`_url_as_token`), so the words, not a
+    shared URL, carry the match."""
+    probe = _url_as_token(text)
+    score = _match_score(probe, _url_as_token(row["text"]))
+    latest = row.get("latest_text")
+    if latest and latest != row["text"]:
+        score = max(score, _match_score(probe, _url_as_token(latest)))
+    return score
+
+
 def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
                    job_rows: list[dict[str, Any]]) -> list[int]:
     """Open job items this conversation item restates: the exact text, or
@@ -1439,7 +1468,7 @@ def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
     :func:`_near_duplicate_open` uses)."""
     if exact is not None and any(r["id"] == exact for r in job_rows):
         return [exact]
-    hits = [r["id"] for r in job_rows if _match_score(text, r["text"]) >= NEAR_DUP_MIN_SCORE]
+    hits = [r["id"] for r in job_rows if _row_near_dup_score(text, r) >= NEAR_DUP_MIN_SCORE]
     if hits:
         return hits
     best = _near_duplicate_open(cur, scope, text, rows=job_rows)
@@ -1454,6 +1483,9 @@ def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None 
     (its resolved ``owner`` and ``owner_label`` replace the stored ones)."""
     lineage, params = _lineage_clause(cur, payload or {"project": scope}, episode_id)
     cols = ["id", "text"] + (["origin"] if with_origin else [])
+    # Near-dup / relay need latest_text even when owner columns are unused.
+    if _lineage_columns_ready(cur):
+        cols.append("latest_text")
     if with_owner:
         cols += ["owner", "kind"]
         if _owner_columns_ready(cur):
@@ -1462,8 +1494,6 @@ def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None 
             cols.append("owner_reassigned_at")
         if _close_columns_ready(cur):
             cols += ["prs", "pr_check"]
-        if _lineage_columns_ready(cur):
-            cols.append("latest_text")
     cur.execute(
         f"SELECT {', '.join(cols)} FROM commitments WHERE status = 'open' AND project IS NOT DISTINCT FROM %s "
         f"AND {lineage} AND {_not_forgotten_clause(cur)}",
@@ -1511,10 +1541,23 @@ def _match_score(a: str, b: str) -> float:
     """Best of Jaccard and substring/containment (fix 4) — used for the
     explicit ``done: <text>`` close, which has no similarity config of its
     own but must still match the CLOSED text against candidate commitment
-    text rather than closing an arbitrary open row."""
+    text rather than closing an arbitrary open row.
+
+    Near-dup and relay treat containment as identity only when the longer
+    side adds no tokens (token cover) or the strings are nearly the same
+    length; a shorter phrase inside a longer distinct one is not a match.
+    Explicit ``done:`` still allows asymmetric containment in
+    :func:`completion_match`."""
     al, bl = a.strip().lower(), b.strip().lower()
     if al and bl and (al in bl or bl in al):
-        return 1.0
+        shorter, longer = (al, bl) if len(al) <= len(bl) else (bl, al)
+        short_toks = set(re.findall(r"[a-z0-9]+", shorter))
+        long_toks = set(re.findall(r"[a-z0-9]+", longer))
+        # Token cover or near-equal length → identity. Otherwise Jaccard still
+        # scores paraphrases ("…seal fix" / "…seal fix or waits"); do not
+        # zero out and skip the fallback.
+        if long_toks <= short_toks or len(shorter) / max(len(longer), 1) >= 0.9:
+            return 1.0
     return _jaccard(a, b)
 
 
@@ -1586,8 +1629,16 @@ def completion_match(text: str, row_text: str, *, kind: str, threshold: float,
     if not exact and len(tokens) < 3:
         return 0.0, "", False
     # Ordinary completion must preserve the full lexical evidence;
-    # substring containment is reserved for an explicit done statement.
-    text_score = _match_score(text, row_text) if kind == "done" else _jaccard(completion, target)
+    # substring containment is reserved for an explicit done statement
+    # (including asymmetric containment the near-dup bar rejects).
+    if kind == "done":
+        al, bl = text.strip().lower(), row_text.strip().lower()
+        if al and bl and (al in bl or bl in al):
+            text_score = 1.0
+        else:
+            text_score = _match_score(text, row_text)
+    else:
+        text_score = _jaccard(completion, target)
     covers = set(re.findall(r"[\w./-]+", target)) <= tokens
     score = 0.0
     via = ""
