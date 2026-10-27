@@ -462,7 +462,8 @@ def _run_nightly_locked() -> int:
     _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
-    _record_nightly_step(steps, "commitments_close_rules", **_step_result(_commitment_close_rules()))
+    completion_result = _step_result(_commitment_close_rules())
+    _record_nightly_step(steps, "commitments_close_rules", **completion_result)
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
@@ -473,7 +474,7 @@ def _run_nightly_locked() -> int:
     if briefs_result is not None:
         _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
     briefs_ok = briefs_result is None or _step_result(briefs_result)["ok"]
-    final_rc = rc or (0 if drain_result["ok"] and briefs_ok else 1)
+    final_rc = rc or (0 if drain_result["ok"] and briefs_ok and completion_result["ok"] else 1)
     _write_job_state("nightly", final_rc)
     return final_rc
 
@@ -772,11 +773,42 @@ def _mark_stale_commitments() -> dict[str, Any]:
     return out
 
 
+def _transient_provenance_error(exc: BaseException) -> bool:
+    """Retryable DB outages/contention, never a provenance or schema refusal."""
+    from khipu.provenance import retryable_db_error
+
+    return retryable_db_error(exc)
+
+
+def _provenance_failures(out: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep helper-returned failures, including older replay receipts with
+    ``ok=True, failed>0``. A missing transient classification is fatal."""
+    failures = []
+    if out.get("ok") is False or out.get("failed", 0):
+        failures.append(out)
+    for key in ("gaps", "index", "changes", "exception"):
+        child = out.get(key)
+        if isinstance(child, dict):
+            failures.extend(_provenance_failures(child))
+    return failures
+
+
+def _provenance_outcome(out: dict[str, Any]) -> dict[str, Any]:
+    failures = _provenance_failures(out)
+    if failures:
+        fatal = [failure for failure in failures if not failure.get("transient", False)]
+        failure = (fatal or failures)[0]
+        reason = failure.get("reason") or failure.get("error") or "provenance cleanup failed"
+        out.update(ok=False, transient=not fatal, reason=reason)
+    return out
+
+
 def _provenance_backfill(conn) -> dict[str, Any]:
     """``khipu provenance backfill`` inside the nightly's close-rules step,
     until every project is covered, then the 30-day prune of the replica
-    change stream (``fact_changes``). Fail-open: an error is reported and the
-    rules still run."""
+    change stream (``fact_changes``). Errors remain visible and the rules
+    still run; only transient database errors are nonfatal to the nightly."""
+    out: dict[str, Any] = {}
     try:
         from khipu import provenance
 
@@ -784,44 +816,83 @@ def _provenance_backfill(conn) -> dict[str, Any]:
         # Fact steps a capture kept as gaps are re-run (invariant I4), after
         # the backfill and before tonight's rules read the facts.
         out["gaps"] = provenance.replay_gaps(conn)
+        if out["gaps"].get("connection_unusable", False):
+            out["connection_unusable"] = True
+            return _provenance_outcome(out)
         # The hub refusals' identity index and duplicate sweep, until every
         # episode from before 0047 is indexed (section 6.1).
         out["index"] = provenance.index_identities(conn)
+        if out["index"].get("connection_unusable", False):
+            out["connection_unusable"] = True
+            return _provenance_outcome(out)
         # The replica stream's 30-day retention (section 6 of the design).
         out["changes"] = provenance.prune_changes(conn)
-        return out
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
+    except Exception as exc:  # noqa: BLE001 — the rules still run after a backfill failure
+        rollback_failed = False
         try:
             conn.rollback()
         except Exception:  # noqa: BLE001
-            pass
-        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+            rollback_failed = True
+        # Retain any real failure an earlier helper returned; a later
+        # transient exception must not replace it with a nonfatal receipt.
+        out["exception"] = {"ok": False, "transient": _transient_provenance_error(exc),
+                            "reason": f"{type(exc).__name__}: {exc}"[:300]}
+        if rollback_failed or getattr(conn, "closed", False):
+            out["connection_unusable"] = True
+    return _provenance_outcome(out)
 
 
 def _commitment_close_rules() -> dict[str, Any]:
     """Owed slice 2: the fact-provenance witness backfill while projects
     are pending, fill ``prs`` on rows from before migration 0034, then
     run the PR and decision close rules over every open item
-    (``close_rules.run``). Before mark_stale, so an item whose PR merged
-    closes as done rather than aging out. Fail-open like its neighbours."""
+    (``close_rules.run_nightly``). Before mark_stale, so an item whose PR merged
+    closes as done rather than aging out. Failure is recorded without blocking
+    the remaining steps, and makes a successful driver's nightly nonzero."""
+    witness: dict[str, Any] | None = None
+    preparation: dict[str, Any] | None = None
     try:
         from khipu import close_rules
         from khipu.db import connect
 
-        with connect() as conn:
-            # Fact provenance's witness backfill first (section 4 of the
-            # 2026-10-23 design): a legacy restater proven tonight counts
-            # for tonight's rules (its PR refs clear needs_owner).
-            witness = _provenance_backfill(conn)
-            with conn.cursor() as cur:
-                filled = close_rules.backfill_prs(cur)
-            conn.commit()
-            with conn.cursor() as cur:
-                report = close_rules.run(cur)
-            conn.commit()
+        filled = 0
+        try:
+            with connect() as conn:
+                # Fact provenance's witness backfill first (section 4 of the
+                # 2026-10-23 design): a legacy restater proven tonight counts
+                # for tonight's rules (its PR refs clear needs_owner).
+                witness = _provenance_outcome(_provenance_backfill(conn))
+                reconnect = witness.get("connection_unusable", False)
+                if reconnect:
+                    # A dropped connection cannot run preparation or commit on
+                    # context exit. Retire it; the next phase gets one fresh try.
+                    conn.close()
+                else:
+                    with conn.cursor() as cur:
+                        filled = close_rules.backfill_prs(cur)
+                    conn.commit()
+            if reconnect:
+                with connect() as conn:
+                    with conn.cursor() as cur:
+                        filled = close_rules.backfill_prs(cur)
+                    conn.commit()
+        except Exception as exc:  # noqa: BLE001 — rolled-back preparation may wait until next night
+            if not _transient_provenance_error(exc):
+                raise
+            filled = 0
+            preparation = {"ok": False, "transient": True, "reason": f"{type(exc).__name__}: {exc}"}
+        report = close_rules.run_nightly()
         out = {**report, "backfilled": int(filled), "provenance": witness}
+        if preparation is not None:
+            out["preparation"] = preparation
+            out["deferred_transient"] = out.get("deferred_transient", 0) + 1
     except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
         out = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if witness is not None:
+            out["provenance"] = witness
+    if witness is not None and not witness.get("ok", True) and not witness.get("transient", False):
+        out["ok"] = False
+        out.setdefault("reason", witness.get("reason") or witness.get("error") or "provenance backfill failed")
     _nightly_log(f"commitments-close-rules: {json.dumps(out, default=str)[:300]}")
     return out
 
