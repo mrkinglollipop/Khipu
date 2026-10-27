@@ -403,16 +403,20 @@ def _step_result(result: Any) -> dict[str, Any]:
     bare ``Mock``/``MagicMock`` instead, which is treated as an
     unremarkable success — its shape is unknown, not its outcome."""
     if isinstance(result, dict):
-        return {
+        out = {
             "ok": bool(result.get("ok", True)),
             "counts": result,
             "error": result.get("error") or result.get("reason"),
         }
+        if result.get("deferred") and isinstance(result["deferred"], str):
+            out["deferred"] = result["deferred"]
+        return out
     return {"ok": True, "counts": None, "error": None}
 
 
 def _record_nightly_step(
-    steps: list[dict[str, Any]], name: str, *, ok: bool, counts: Any = None, error: str | None = None
+    steps: list[dict[str, Any]], name: str, *, ok: bool, counts: Any = None, error: str | None = None,
+    deferred: str | None = None,
 ) -> None:
     """F3/D1: persist this nightly's step-by-step outcome to
     ``nightly-last.json`` (one entry per step: name/ok/counts/error/ts) —
@@ -422,10 +426,15 @@ def _record_nightly_step(
     reads this file; written here so it exists starting now. Written after
     EVERY step (not once at the end) so a step that hangs or crashes the
     process still leaves every step before it on record."""
-    steps.append({
+    entry = {
         "name": name, "ok": bool(ok), "counts": counts, "error": error,
         "ts": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if deferred:
+        # Part of the step was put off on purpose (a lock another run held);
+        # it is not a failure, and readers show the reason instead of "ok".
+        entry["deferred"] = deferred
+    steps.append(entry)
     try:
         _nightly_last_path().write_text(
             json.dumps({"steps": steps}, default=str, indent=2), encoding="utf-8"
@@ -519,7 +528,20 @@ def _refresh_snapshot() -> dict[str, Any]:
         from khipu.hub_snapshot import refresh
 
         out = refresh()
-        return {"ok": bool(out.get("ok")), **{k: v for k, v in out.items() if k != "path"}}
+        res = {"ok": bool(out.get("ok")), **{k: v for k, v in out.items() if k != "path"}}
+        # The dump is only half of this step: the fact copy that follows it
+        # must not fail unseen behind an ok dump. A copy that gave up because
+        # another copy held the lock is a deferral (the next copy reconciles),
+        # recorded with its reason; any other miss fails the step.
+        facts = out.get("facts")
+        if res["ok"] and isinstance(facts, dict) and not facts.get("ok", True):
+            reason = facts.get("error") or "unknown"
+            if facts.get("deferred"):
+                res["deferred"] = f"facts copy deferred: {reason}"
+            else:
+                res["ok"] = False
+                res["error"] = f"facts copy failed: {reason}"
+        return res
     except Exception as exc:  # noqa: BLE001 — a replica miss cannot fail the night
         from khipu.storage import describe_os_error
 
@@ -1033,6 +1055,10 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
         "ledger",
         "run `khipu ledger drain` and check the error",
     ),
+    "snapshot_refresh_ok": (
+        "snapshot_refresh",
+        "run `khipu snapshot refresh` and check the error",
+    ),
 }
 
 _EMBED_HTTP_STATUS_RE = re.compile(r"\b(401|403|429)\b")
@@ -1305,7 +1331,9 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
             }
             continue
         ok = bool(entry.get("ok"))
+        deferred = entry.get("deferred") if ok and isinstance(entry.get("deferred"), str) else None
         out[doctor_key] = {
+            **({"deferred": deferred} if deferred else {}),
             "ok": ok, "applicable": True,
             "error": None if ok else entry.get("error"),
             "fix": None if ok else (

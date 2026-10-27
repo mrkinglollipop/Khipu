@@ -486,6 +486,12 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
             self.sql, self.params = sql, params
 
         def fetchall(self):
+            # Resolving the typed name (a bare repo name -> its project) reads
+            # the known project names first; this one is already exact.
+            if "FROM commitments WHERE project IS NOT NULL" in self.sql:
+                return [("acme/widget",)]
+            if self.sql.startswith("SELECT alias FROM project_aliases"):
+                return []
             assert self.sql.startswith("WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases")
             project, fallback = self.params
             assert project == fallback
@@ -506,6 +512,7 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
 
     monkeypatch.setattr(db, "connect", lambda **kwargs: Connection())
     monkeypatch.setattr(co, "fetch_owed_rows", lambda *args, **kwargs: rows)
+    monkeypatch.setattr(co, "_not_forgotten_clause", lambda cur: "1=1")
     monkeypatch.setattr(config, "count_setting", lambda key: 200)
     args = cli.build_parser().parse_args(["owed", "--project", "acme/widget", "--limit", "500"])
     assert args.func(args) == 0
