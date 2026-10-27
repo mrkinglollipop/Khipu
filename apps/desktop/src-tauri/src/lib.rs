@@ -1500,7 +1500,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
             }
             Ok(set(OWED_GITHUB_KEY, v.to_string()))
         }
-        k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
+        k if PATH_KEYS.contains(&k) => Ok(set(k, checked_path(key, value)?)),
         k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         k if REPLICA_DURATION_KEYS.contains(&k) => Ok(set(k, replica_setting_value(k, value)?)),
@@ -3793,9 +3793,34 @@ fn checked_space(space: &str) -> Result<String, String> {
     }
 }
 
-/// A folder or file path: non-empty, no control characters, never a flag.
+/// Folders under HOME that hold sign-in material; no Khipu setting points there.
+const CREDENTIAL_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", "Library/Keychains"];
+
+/// A folder or file path: non-empty, no control characters, never a flag,
+/// no `..` step, and never inside a credential folder (checked on the
+/// resolved path too, so a link into one is refused). The text passed on is
+/// the owner's own, unchanged.
 fn checked_path(key: &str, raw: &str) -> Result<String, String> {
-    checked_operand(key, raw, false)
+    let v = checked_operand(key, raw, false)?;
+    let path = PathBuf::from(&v);
+    if path.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!("{key} must not contain '..'"));
+    }
+    let Ok(home) = std::env::var("HOME") else { return Ok(v) };
+    let home = PathBuf::from(home);
+    let mut candidates = vec![expand_home_path(&v).unwrap_or(path)];
+    if let Ok(real) = std::fs::canonicalize(&candidates[0]) {
+        candidates.push(real);
+    }
+    let homes = [home.clone(), std::fs::canonicalize(&home).unwrap_or(home)];
+    for c in &candidates {
+        for h in &homes {
+            if CREDENTIAL_DIRS.iter().any(|d| c.starts_with(h.join(d))) {
+                return Err(format!("{key} must not point into a credential folder"));
+            }
+        }
+    }
+    Ok(v)
 }
 
 fn embed_estimate_argv(profile: &str, space: &str, stale: bool) -> Result<Vec<String>, String> {
@@ -4973,13 +4998,24 @@ fn data_dir_from_pointer_json(raw: &str) -> Option<PathBuf> {
     expand_home_path(path)
 }
 
+/// `~` expanded. A path with a `..` step that exists comes back
+/// canonicalized, so the step is resolved before anything reads it; one that
+/// does not exist yet is kept as written (the CLI resolves it the same way
+/// when it creates it). Other paths keep their spelling (`/var` is not
+/// rewritten to `/private/var`).
 fn expand_home_path(raw: &str) -> Option<PathBuf> {
     let path = raw.trim();
-    if path == "~" { return std::env::var("HOME").ok().map(PathBuf::from); }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(rest));
+    let expanded = if path == "~" {
+        std::env::var("HOME").ok().map(PathBuf::from)
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(rest))
+    } else {
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }?;
+    if !expanded.components().any(|c| c == std::path::Component::ParentDir) {
+        return Some(expanded);
     }
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    Some(std::fs::canonicalize(&expanded).unwrap_or(expanded))
 }
 
 fn data_dir_from_pointer() -> Option<PathBuf> {
@@ -6650,6 +6686,58 @@ mod settings_command_tests {
             config_set_argv("memory_root", "~/Memory notes").unwrap(),
             v(&["config", "--set", "memory_root", "~/Memory notes"])
         );
+    }
+
+    #[test]
+    fn path_operands_refuse_parent_steps_and_credential_folders() {
+        let home = std::env::var("HOME").unwrap();
+        for bad in [
+            "~/.ssh",
+            "~/.ssh/id_ed25519",
+            "~/.gnupg/x",
+            "~/.aws/credentials",
+            "~/Library/Keychains/login.keychain-db",
+            &format!("{home}/.ssh/config"),
+            "/Volumes/X/../../etc",
+            "~/Memory/../.ssh",
+            "..",
+        ] {
+            assert!(checked_path("folder", bad).is_err(), "folder accepted {bad:?}");
+            assert!(config_set_argv("memory_root", bad).is_err(), "memory_root accepted {bad:?}");
+            assert!(library_add_argv("books", bad, "voyage-3@1024").is_err(), "library add accepted {bad:?}");
+        }
+        for ok in ["~/Memory notes", "/Volumes/X/mem", "~/.config/khipu/mem", "~/sshkeys", "a..b/c"] {
+            assert_eq!(checked_path("folder", ok).unwrap(), ok);
+        }
+    }
+
+    #[test]
+    fn a_symlink_into_a_credential_folder_is_refused() {
+        let home = std::env::var("HOME").unwrap();
+        let ssh = PathBuf::from(&home).join(".ssh");
+        if !ssh.is_dir() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("khipu-path-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("innocent");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&ssh, &link).unwrap();
+        let refused = checked_path("folder", link.to_str().unwrap()).is_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(refused, "a link to ~/.ssh was accepted");
+    }
+
+    #[test]
+    fn expand_home_path_resolves_parent_steps_that_exist() {
+        let dir = std::env::temp_dir().join(format!("khipu-expand-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        let raw = format!("{}/a/..", dir.display());
+        let got = expand_home_path(&raw).unwrap();
+        let want = std::fs::canonicalize(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, want);
+        assert_eq!(expand_home_path("/no/such/khipu/place").unwrap(), PathBuf::from("/no/such/khipu/place"));
     }
 
     #[test]
