@@ -34,7 +34,7 @@ class ResumeAfterEditTest(_Base):
         p = Path(self.tmp.name) / name
         p.write_text("\n".join(json.dumps({
             "node_id": "a", "chunk_idx": i, "source_file": "corpus/book.txt",
-            "chunk_text": f"chunk {i}", "embedding": [1.0, 0.0, 0.0, 0.0], "model": "voyage-t", "dims": 4,
+            "chunk_text": f"chunk {i}", "embedding": [1.0, 0.0, 0.0, 0.0], "model": "voyage-3.5", "dims": 4,
         }) for i in idxs) + "\n")
         return p
 
@@ -58,7 +58,7 @@ class GrewPastCapDuringResumeTest(_Base):
         def row(f, i):
             return json.dumps({"node_id": "a", "chunk_idx": i, "source_file": f"corpus/{f}",
                                "chunk_text": "small" if f == "book.txt" else "other",
-                               "embedding": [1.0, 0.0, 0.0, 0.0], "model": "voyage-t", "dims": 4})
+                               "embedding": [1.0, 0.0, 0.0, 0.0], "model": "voyage-3.5", "dims": 4})
         p.write_text(row("book.txt", 0) + "\n")
         library.import_index(self.hub, "lib1", str(p), strip_prefix="corpus/")
         p.write_text(row("book.txt", 0) + "\n" + row("other.txt", 0) + "\n")
