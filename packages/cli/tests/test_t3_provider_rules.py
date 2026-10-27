@@ -349,6 +349,15 @@ def test_cli_add_status_list_remove_round_trip(home, capsys):
     assert json.loads(capsys.readouterr().out)["status"]["installed"] is False
 
 
+def test_list_carries_when_each_project_was_added(home):
+    project = home / "proj"
+    project.mkdir()
+    ag.install_project(str(project), home=home)
+    row = ag.projects_report(home)["projects"][0]
+    assert row["project"] == str(project.resolve())
+    assert row["added_at"].startswith("20") and row["installed"] is True
+
+
 def test_install_never_writes_under_t3_or_gemini(home):
     _settings(home, AG_INSTANCE)
     project = home / "proj"

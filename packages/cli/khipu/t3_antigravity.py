@@ -278,6 +278,22 @@ def uninstall_project(project: str, *, dry_run: bool = False, home: Path | None 
     return out
 
 
+def _added_at(home: Path | None) -> dict[str, str]:
+    projects = _read(registry_path(home)).get("projects")
+    if not isinstance(projects, dict):
+        return {}
+    return {str(k): v["added_at"] for k, v in projects.items()
+            if isinstance(v, dict) and isinstance(v.get("added_at"), str)}
+
+
 def projects_report(home: Path | None = None) -> dict:
-    return {"runtime_version": runtime_version(home),
-            "projects": [project_status(p) for p in registered_projects(home)]}
+    """Every project the owner added, with its file state and when it was added
+    (``added_at``, ISO 8601; absent for an entry that never recorded one)."""
+    added = _added_at(home)
+    rows = []
+    for project in registered_projects(home):
+        row = project_status(project)
+        if project in added:
+            row["added_at"] = added[project]
+        rows.append(row)
+    return {"runtime_version": runtime_version(home), "projects": rows}

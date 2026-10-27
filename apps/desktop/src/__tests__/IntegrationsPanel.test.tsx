@@ -280,6 +280,7 @@ function renderPanel(
     t3?: import("../IntegrationsPanel").T3Health | null;
     onSearchT3Captures?: () => void;
     onOpenGuide?: (id: string) => void;
+    antigravityApi?: import("../IntegrationsPanel").AntigravityApi;
   } = {},
 ) {
   const runKhipu = vi.fn(async (args: string[]) => {
@@ -288,7 +289,7 @@ function renderPanel(
       onInstall();
       return opts.actResult ?? JSON.stringify(
         args[2] === "all"
-          ? ["claude_code", "cursor", "aegis", "codex", "grok_bot"].map((harness) => ({
+          ? ["claude_code", "cursor", "aegis", "codex", "grok_bot", "antigravity"].map((harness) => ({
               harness,
               detected: rowsFor().some((row) => row.harness === harness && row.detected),
               changes: [],
@@ -300,7 +301,7 @@ function renderPanel(
       if (opts.verifyThrows) throw new Error(opts.verifyThrows);
       return opts.verifyResult ?? JSON.stringify(
         args[2] === "all"
-          ? ["claude_code", "cursor", "aegis", "codex", "grok_bot"].map((harness) => ({
+          ? ["claude_code", "cursor", "aegis", "codex", "grok_bot", "antigravity"].map((harness) => ({
               harness,
               detected: rowsFor().some((row) => row.harness === harness && row.detected),
               ok: true,
@@ -326,6 +327,7 @@ function renderPanel(
       onSearchT3Captures={opts.onSearchT3Captures}
       onOpenGuide={opts.onOpenGuide}
       onAnotherMac={() => {}}
+      antigravityApi={opts.antigravityApi}
     />,
   );
   return runKhipu;
@@ -843,7 +845,7 @@ const ENTRY_POINTS: EntryPoint[] = [
 
 function verifyFixture(ep: EntryPoint, ok: boolean): { raw: string; failedHarness: string } {
   const requested = ep.harness === "all"
-    ? ["claude_code", "cursor", "aegis", "codex", "grok_bot"]
+    ? ["claude_code", "cursor", "aegis", "codex", "grok_bot", "antigravity"]
     : [ep.harness];
   const visible = ep.rows();
   const detected = (harness: string) => visible.some((row) => row.harness === harness && row.detected);
@@ -879,7 +881,7 @@ describe.each(ENTRY_POINTS)("IntegrationsPanel — $name", (ep) => {
     await waitFor(() => expect(toasts).toHaveLength(1));
 
     expect(toasts[0]).toBe(ep.harness === "all"
-      ? `${INSTALL_OK_COPY} Skipped: Aegis, Codex, Grok Bot · cloud.`
+      ? `${INSTALL_OK_COPY} Skipped: Aegis, Codex, Grok Bot · cloud, Antigravity.`
       : INSTALL_OK_COPY);
     const argv = calls(runKhipu).filter((a) => a[1] === "install" || a[1] === "verify");
     expect(argv).toEqual([

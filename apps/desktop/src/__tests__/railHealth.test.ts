@@ -171,3 +171,25 @@ describe("T3 health", () => {
     expect(t3WarningReason({ ...t3, warnings: [] })).toBeNull();
   });
 });
+
+describe("partial T3 providers are amber, never missing or red", () => {
+  const partial = { detected: true, lookup: { ok: true }, providers: [{ driver: "antigravity", hooks: "partial" }] };
+
+  it("raises nothing on its own: Antigravity in T3 is partial for good", () => {
+    expect(t3WarningReason({ ...partial, warnings: [] })).toBeNull();
+    expect(t3HealthGap({ ...partial, warnings: [] })).toEqual({ warning: false, lookupFailed: false });
+  });
+
+  it("names a partial provider's own warning as partial, not as hooks missing", () => {
+    const t3 = { ...partial, warnings: ["T3 provider Cursor is missing Khipu routing after a delegation"] };
+    expect(t3WarningReason(t3)).toBe("partial");
+    const gap = t3HealthGap(t3);
+    expect(railHealthLine(true, OK, NONE, gap)).toEqual({ tone: "warn", text: "T3 providers partly set up" });
+    expect(harnessesBadge(OK, NONE, gap)).toEqual({ n: 1, quiet: false });
+  });
+
+  it("still calls a provider with no hooks at all 'missing'", () => {
+    const t3 = { detected: true, warnings: ["x"], providers: [{ hooks: "partial" }, { hooks: "missing" }] };
+    expect(t3WarningReason(t3)).toBe("hooks");
+  });
+});
