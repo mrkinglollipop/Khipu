@@ -383,12 +383,19 @@ class PathsPrivacyTest(unittest.TestCase):
                 finally:
                     os.umask(old)
             self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+            with zipfile.ZipFile(archive) as zf:
+                self.assertNotIn("dsn", zf.namelist())
+            # Backups no longer carry the DSN; an older one that does still
+            # restores it private.
+            older = root / "older.zip"
+            with zipfile.ZipFile(older, "w") as zf:
+                zf.write(source / "dsn", "dsn")
             restored = root / "restored"
             restored.mkdir()
             with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(restored)}):
                 old = os.umask(0o022)
                 try:
-                    paths.import_local(source=archive)
+                    paths.import_local(source=older)
                 finally:
                     os.umask(old)
             self.assertEqual(stat.S_IMODE((restored / "dsn").stat().st_mode), 0o600)

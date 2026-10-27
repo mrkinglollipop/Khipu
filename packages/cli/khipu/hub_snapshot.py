@@ -1445,6 +1445,7 @@ _GENERATION_FILE = "fact-endpoint-generation"
 # What a reader compares when no endpoint fingerprint is recorded; no stamp
 # names it, so no fact row shows.
 _UNRESOLVED = "unresolved"
+_DEFAULT_DSN_FILE = Path.home() / ".config" / "khipu" / "dsn"  # khipu.db.DEFAULT_DSN_FILE
 _LEGACY_DSN_FILE = Path.home() / ".config" / "alzy" / "dsn"  # khipu.db.LEGACY_DSN_FILE
 
 
@@ -1611,9 +1612,15 @@ def _saved_dsn(*, ask_keychain: bool) -> str | None:
 
 def _file_dsn() -> str | None:
     """The DSN files' answer as ``db.resolve_dsn`` reads them: the DSN file
-    (``KHIPU_DSN_FILE`` or the configured one), then the legacy file."""
+    (``KHIPU_DSN_FILE`` or the configured one), then the config and legacy
+    files unless the environment names where the DSN lives."""
+    from khipu.paths import explicit_dsn_location as _explicit_dsn_location
+
     env = (os.environ.get("KHIPU_DSN_FILE") or "").strip() or (os.environ.get("ALZY_DSN_FILE") or "").strip()
-    for path in (Path(env) if env else _configured_dsn_file(), _LEGACY_DSN_FILE):
+    candidates = [Path(env) if env else _configured_dsn_file()]
+    if not _explicit_dsn_location():
+        candidates += [_DEFAULT_DSN_FILE, _LEGACY_DSN_FILE]
+    for path in candidates:
         try:
             return path.read_text(encoding="utf-8").strip()
         except OSError:
