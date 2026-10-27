@@ -13,7 +13,22 @@ describe("doctor attention wording", () => {
     const item = items.find((i) => i.key === "outbox");
     expect(item, "outbox attention item").toBeDefined();
     expect(item!.cause).not.toMatch(/outbox drain/);
-    expect(item!.cause).toMatch(/retry-dead|retry/i);
+    expect(item!.cause).toMatch(/held on this Mac/);
+    expect(item!.cause).not.toMatch(/`khipu|retry-dead/);
+  });
+
+  it("no outbox or capture wording hands the owner a terminal command", () => {
+    const { items } = buildAttention({
+      outbox_ok: false,
+      outbox: { pending: 3, dead: 0 },
+      capture_liveness: {
+        ok: false,
+        red: ["claude_code"],
+        harnesses: { claude_code: { reasons: ["last capture attempt failed: database unreachable"] } },
+      },
+    });
+    expect(items.length).toBeGreaterThan(1);
+    for (const i of items) expect(i.cause, i.key).not.toMatch(/`khipu|run `|retry-dead/);
   });
 
   it("a drain failure or stale queue is not fixed with Reinstall hook", () => {

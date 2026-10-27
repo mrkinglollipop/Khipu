@@ -112,7 +112,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
         title: `${harnessLabel(h)} has stopped recording sessions`,
         cause: why
           ? drainish
-            ? `${captureCauseWords(why)}. After the database answers, run \`khipu sessions drain\` (or wait for the queue drain); reinstalling the hook will not clear this.`
+            ? `${captureCauseWords(why)}. Once the database answers, the queued sessions go out by themselves; reinstalling the hook will not clear this.`
             : hookish
               ? `${captureCauseWords(why)}. Reinstalling the hook puts it back without losing the session.`
               : `${captureCauseWords(why)}.`
@@ -171,8 +171,8 @@ export function buildAttention(parsed: Record<string, unknown>): {
       tone: "warn",
       title: "Some captures are still waiting to reach the database",
       cause: deadOnly
-        ? "Buried jobs sit outside the normal queue. After the cause is fixed, run `khipu outbox retry-dead` to put them back; a plain drain cannot move them."
-        : "They were recorded while the database was unreachable and are queued on this Mac. After reconnecting, run `khipu outbox drain` to deliver them; nothing is lost meanwhile.",
+        ? "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to put them back."
+        : "They were recorded while the database was unreachable and are queued on this Mac. They are delivered automatically once the database answers; nothing is lost meanwhile.",
     });
   }
 

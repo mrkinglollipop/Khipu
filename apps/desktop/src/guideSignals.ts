@@ -98,16 +98,21 @@ export function useGuideSignals(refreshKey: unknown) {
   const token = useCliState<TokenStatus>("khipu_gateway_token_status", false);
   const [log, setLog] = useState<LogEntry[] | null>(null);
   const [prefs, setPrefsState] = useState<GuidesPrefs>(DEFAULT_PREFS);
+  // Until these are read, `prefs` and `agentAsked` are only the empty defaults.
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const [logSettled, setLogSettled] = useState(false);
 
   const reloadCfg = cfg.reload;
   const reloadToken = token.reload;
   const reloadLog = useCallback(async () => {
     const res = await callCli<LogEntry[]>("khipu_recall_log");
     if (res.ok && Array.isArray(res.data)) setLog(res.data);
+    setLogSettled(true);
   }, []);
 
   const reloadPrefs = useCallback(async () => {
     setPrefsState(await loadPrefsFromApp());
+    setPrefsLoaded(true);
   }, []);
 
   // Re-read whenever the user comes back to a screen that shows these.
@@ -153,6 +158,10 @@ export function useGuideSignals(refreshKey: unknown) {
 
   return {
     prefs,
+    /** The saved hide/seen choices have been read. */
+    prefsLoaded,
+    /** The search log has answered (or failed), so `agentAsked` is real. */
+    logSettled,
     updatePrefs,
     gatewayUrl,
     keySaved,

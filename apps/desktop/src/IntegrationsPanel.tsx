@@ -6,7 +6,7 @@ import { Callout, Dialog, Tag } from "./ui";
 import { GatewayTokenCard } from "./SettingsControls";
 import { HowThisWorks } from "./HowThisWorks";
 import type { GuideId } from "./guidesModel";
-import { fmtAgo } from "./time";
+import { captureIsIdle, fmtAgo } from "./time";
 import type { Tone } from "./ui";
 
 /**
@@ -490,7 +490,12 @@ export function cardStatus(
     ].filter(Boolean);
     return { tone: "warn", label: parts.join(", ") };
   }
-  if (lv?.seen && (lv.captures ?? 0) > 0) return { tone: "ok", label: "Recording" };
+  if (lv?.seen && (lv.captures ?? 0) > 0) {
+    // Green means a capture landed lately. A week of silence is idle: not red
+    // (an unused harness is fine), but not "Recording" either.
+    if (captureIsIdle(lv.last_captured_age_s)) return { tone: "neutral", label: "Idle" };
+    return { tone: "ok", label: "Recording" };
+  }
   return { tone: "neutral", label: "No sessions yet" };
 }
 
@@ -1192,8 +1197,10 @@ export function IntegrationsPanel({
                     }
                   : lv?.seen && (lv.captures ?? 0) > 0
                     ? {
-                        mark: "ok",
-                        text: `Capture hook · last capture ${fmtAgo(lv.last_captured_age_s)}`,
+                        mark: captureIsIdle(lv.last_captured_age_s) ? "off" : "ok",
+                        text: captureIsIdle(lv.last_captured_age_s)
+                          ? `Capture hook · idle, last capture ${fmtAgo(lv.last_captured_age_s)}`
+                          : `Capture hook · last capture ${fmtAgo(lv.last_captured_age_s)}`,
                       }
                     : lv?.seen
                       ? { mark: "warn", text: "Capture hook · ran, nothing captured yet" }
