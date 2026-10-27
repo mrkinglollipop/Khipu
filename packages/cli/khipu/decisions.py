@@ -207,6 +207,18 @@ def _record_applied_link(cur, old_id: int, new_id: int, *, source: str, reason: 
         _log(f"recording applied link {old_id}->{new_id} failed ({type(exc).__name__}: {exc})")
 
 
+def _project_match(cur, project: str | None) -> tuple[str, Any]:
+    """SQL fragment and bind for ``project`` including its alias group (Q3)."""
+    if project is None:
+        return "project IS NOT DISTINCT FROM %s", None
+    from khipu.identity import project_group
+
+    group = project_group(cur, project)
+    if len(group) == 1:
+        return "project IS NOT DISTINCT FROM %s", group[0]
+    return "project = ANY(%s)", group
+
+
 def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at: Any) -> int | None:
     """id of an existing decision in ``project`` with the same normalised text,
     decided within ``DEDUP_WINDOW_DAYS`` before (or at) ``decided_at`` — or
@@ -220,10 +232,11 @@ def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at:
     forgotten = _not_forgotten_clause(cur, "decisions")
     if forgotten:
         clauses.append(forgotten)
+    project_sql, project_param = _project_match(cur, project)
     cur.execute(
         f"""
         SELECT id FROM decisions
-        WHERE project IS NOT DISTINCT FROM %s
+        WHERE {project_sql}
           AND lower(regexp_replace(text, '\\s+', ' ', 'g')) = %s
           AND decided_at >= COALESCE(%s::timestamptz, now()) - interval '{DEDUP_WINDOW_DAYS} days'
           AND decided_at <= COALESCE(%s::timestamptz, now())
@@ -231,7 +244,7 @@ def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at:
         ORDER BY decided_at DESC, id DESC
         LIMIT 1
         """,
-        (project, norm_text, decided_at, decided_at),
+        (project_param, norm_text, decided_at, decided_at),
     )
     row = cur.fetchone()
     return int(row[0]) if row else None
@@ -400,20 +413,21 @@ def _trgm_available(cur) -> bool:
         return False
 
 
-def _standing_before_clause(cur, evidence_ready: bool) -> str:
+def _standing_before_clause(cur, evidence_ready: bool, project: str | None) -> tuple[str, Any]:
     """Shared WHERE fragment for both reversal-match finders below: standing
     (not superseded, not retracted once evidence is ready), not forgotten,
-    same project, decided strictly before the new decision, excluding the
-    new decision itself. Every caller binds its params in this exact order:
-    (project, exclude_id, before)."""
-    clauses = ["project IS NOT DISTINCT FROM %s", "id != %s", "decided_at < %s",
-               "superseded_by IS NULL"]
+    same project (alias group), decided strictly before the new decision,
+    excluding the new decision itself. Returns ``(sql, project_param)``;
+    callers bind ``(project_param, exclude_id, before)`` after any leading
+    SELECT params."""
+    project_sql, project_param = _project_match(cur, project)
+    clauses = [project_sql, "id != %s", "decided_at < %s", "superseded_by IS NULL"]
     if evidence_ready:
         clauses.append("retracted_at IS NULL")
     forgotten = _not_forgotten_clause(cur, "decisions")
     if forgotten:
         clauses.append(forgotten)
-    return " AND ".join(clauses)
+    return " AND ".join(clauses), project_param
 
 
 def _best_reversal_match_sql(cur, *, project, exclude_id, before, reverses_text,
@@ -422,11 +436,11 @@ def _best_reversal_match_sql(cur, *, project, exclude_id, before, reverses_text,
     in the project against ``reverses_text`` and return the single best
     match. No 200-row cap here — that bound is the Python fallback's own,
     named in ``BUILD`` item 3."""
-    where = _standing_before_clause(cur, evidence_ready)
+    where, project_param = _standing_before_clause(cur, evidence_ready, project)
     cur.execute(
         f"SELECT id, similarity(text, %s) AS score FROM decisions "
         f"WHERE {where} ORDER BY score DESC LIMIT 1",
-        (reverses_text, project, exclude_id, before),
+        (reverses_text, project_param, exclude_id, before),
     )
     row = cur.fetchone()
     if row is None or row[1] is None:
@@ -442,11 +456,11 @@ def _best_reversal_match_python(cur, *, project, exclude_id, before, reverses_te
     not copied, so the two never drift apart)."""
     from khipu.capture import _jaccard
 
-    where = _standing_before_clause(cur, evidence_ready)
+    where, project_param = _standing_before_clause(cur, evidence_ready, project)
     cur.execute(
         f"SELECT id, text FROM decisions WHERE {where} "
         f"ORDER BY decided_at DESC LIMIT {REVERSAL_CANDIDATE_POOL}",
-        (project, exclude_id, before),
+        (project_param, exclude_id, before),
     )
     best: tuple[int, float] | None = None
     for did, text in cur.fetchall():

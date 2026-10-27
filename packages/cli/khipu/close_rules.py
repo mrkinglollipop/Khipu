@@ -578,8 +578,16 @@ def _open_items(cur, project: str | None) -> list[dict[str, Any]]:
     where = "status = 'open' AND project IS NOT NULL"
     params: tuple = ()
     if project is not None:
-        where += " AND project = %s"
-        params = (project,)
+        # Alias-group members share one project for close rules (Q3 projects).
+        from khipu.identity import project_group
+
+        group = project_group(cur, project)
+        if len(group) == 1:
+            where += " AND project = %s"
+            params = (group[0],)
+        else:
+            where += " AND project = ANY(%s)"
+            params = (group,)
     # The owner columns (migration 0033) come before the close columns (0034).
     extra = ["owner", "origin", "owner_label"]
     if _future_trigger_ready(cur):
