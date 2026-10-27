@@ -67,9 +67,9 @@ def test_doctor_uses_owner_lane_map(mac, monkeypatch, mapping):
 @pytest.mark.parametrize('label', ['GLM https://example.invalid/?token=synthetic',
                                    'sk-live-0123456789abcdef0123456789abcdef',
                                    'GLM abcdefgh1234567890', 'GLM xai-abcdefghijklmnop'])
-def test_owner_provider_label_refuses_url_or_token(world, label):
-    world.say('Track GLM', session='owner')
-    world.server('owner')
+def test_owner_provider_label_refuses_url_or_token(mcp_world, label):
+    mcp_world.say('Track GLM', session='owner')
+    mcp_world.server('owner')
     before = routing.events_file().read_bytes() if routing.events_file().exists() else b''
     error, result = _act('route.definition.set', {'definition': 'provider', 'value': {
         'id': 'glm', 'label': label, 'family': 'Zhipu'}})

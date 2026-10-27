@@ -560,11 +560,17 @@ def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]
     the refusal table names: a tombstoned episode at its key (a collateral
     carrier) neither holds its facts nor forgets it, and before history is
     indexed it makes the line wait in the outbox (design 6.1). Without the
-    index, a tombstone at the key is the forget."""
+    index, a tombstone at the key is the forget.
+
+    A line is not listed either when a live episode at its key already
+    holds it (``capture._legacy_landed_line``: the row carries every field
+    the line does, decisions compared after the legacy comma join). The
+    file line is a lossy projection of that row, so its items differ from
+    the row's only in representation."""
     want = [(obj, key) for obj, key in lines if _carries_fact_items(obj)]
     if not want:
         return []
-    from khipu.capture import _refusals_settled
+    from khipu.capture import _legacy_landed_line, _refusals_settled
     from khipu.capture_identity import sources_ready
     from khipu.tombstones import hub_source_forgotten
 
@@ -572,8 +578,9 @@ def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]
     waiting: set[tuple[str, str]] = set()
 
     held: dict[tuple[str, str], set[str]] = {}
+    raws: dict[tuple[str, str], list[Any]] = {}
     forgotten: set[tuple[str, str]] = set()
-    cols = "e.deleted_at, " + ", ".join(
+    cols = "e.deleted_at, e.raw, " + ", ".join(
         [f"e.raw->'{k}'" for k in _FACT_KEYS]
         + [f"jsonb_path_query_array(e.raw, '$.merged_from[*].payload.{k}[*]')" for k in _FACT_KEYS])
     by_source = sources_ready(cur)
@@ -598,12 +605,19 @@ def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]
                 elif not settled:
                     waiting.add(key)
                 continue
+            raws.setdefault(key, []).append(row[3])
             items = held.setdefault(key, set())
-            for at, name in enumerate((*_FACT_KEYS, *_FACT_KEYS), start=3):
+            for at, name in enumerate((*_FACT_KEYS, *_FACT_KEYS), start=4):
                 items |= _fact_items({name: row[at]})
+
+    def landed(obj: dict[str, Any], key: tuple[str, str]) -> bool:
+        stored = _stored_form(obj)
+        return (_fact_items(stored) <= held.get(key, set())
+                or any(_legacy_landed_line(raw, stored) for raw in raws.get(key, ())))
+
     return [obj for obj, key in want
             if key not in forgotten
-            and (key in waiting or not _fact_items(_stored_form(obj)) <= held.get(key, set()))
+            and (key in waiting or not landed(obj, key))
             and (settled is None or not hub_source_forgotten(cur, obj))]
 
 
@@ -638,7 +652,7 @@ def _tombstone_only_line(cur, obj: dict[str, Any], settled: bool) -> bool:
     from khipu.outbox import enqueue
 
     enqueue(obj, reason="recovery: matches a tombstoned episode before history is indexed",
-            origin=None)
+            origin=None, recovery=True)
     _log("recovered line kept in the outbox: it matches a tombstone before history is indexed")
     return False
 
@@ -647,11 +661,12 @@ def _queue_conflict(obj: dict[str, Any]) -> None:
     """Keep a recovered line whose legacy key holds different facts as
     durable work: queued in the outbox with its owner unknown. Its drain
     lands it through ``capture.write_pg``, whose legacy-key collision keeps
-    it queued as an ``evidence_conflict`` (never buried; ``khipu outbox
-    status`` and doctor count it) unless capture's dedup lands its facts."""
+    it queued as an ``evidence_conflict`` then held after bounded retries
+    (``khipu outbox status`` and doctor count both), unless strict legacy
+    projection proof resolves it with a durable evidence record."""
     from khipu.outbox import enqueue
 
-    enqueue(obj, reason="recovery: the legacy key holds different facts", origin=None)
+    enqueue(obj, reason="recovery: the legacy key holds different facts", origin=None, recovery=True)
     _log("recovered line kept in the outbox: its legacy key holds different facts")
 
 
@@ -684,7 +699,7 @@ def _line_deferred(cur, obj: dict[str, Any], exc: BaseException) -> bool:
     # A synced file can hold another machine's captures: the queued line
     # keeps the unknown owner a direct recovery leaves (origin NULL), never
     # the recovering caller's (third Astra review #3).
-    enqueue(obj, reason=f"recovery fact step deferred: {exc}"[:200], origin=None)
+    enqueue(obj, reason=f"recovery fact step deferred: {exc}"[:200], origin=None, recovery=True)
     _log(f"recovered line deferred to the outbox ({exc})")
     return True
 

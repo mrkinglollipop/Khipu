@@ -4,7 +4,8 @@
 
    This Mac shows no owed items, decisions or deliverables while one is
    listed: a forget learned from a backup, or one whose hub step failed.
-   `khipu episode forget-pending` lists them, as the last fact copy found
+   `khipu episode forget-pending --from-app` lists them (summaries only for
+   the app itself or the owner's conversation), as the last fact copy found
    them. The owner's actions (each `--from-app`, owner actions
    `forget.send`, `forget.here` and `forget.not_same`): "Send to the hub"
    for the listed forgets, and for a forgotten episode number whose hub
@@ -52,7 +53,7 @@ export function PendingForgets({
 
   const load = useCallback(async () => {
     try {
-      setListed(parse<Listed>(await run(["episode", "forget-pending"])) ?? {});
+      setListed(parse<Listed>(await run(["episode", "forget-pending", "--from-app"])) ?? {});
     } catch {
       setListed({});
     }

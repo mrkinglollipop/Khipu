@@ -374,7 +374,8 @@ button.rail-feedback {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   padding: 8px 24px;
   background: var(--accent-soft);
   border-bottom: 1px solid var(--border);
@@ -383,8 +384,10 @@ button.rail-feedback {
   font-weight: 600;
 }
 
+/* The clock and hint follow the label rather than the far edge, so nothing
+   the owner needs sits where a floating window or a narrow width cuts it. */
 .working-banner-label {
-  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .working-banner-elapsed {
@@ -3081,7 +3084,7 @@ input.switch:disabled {
 .plan-meter i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; background: var(--accent); }
 .plan-meter.warn i { background: var(--warn); }
 .plan-meter.err i { background: var(--err); }
-.plan-pct { font-variant-numeric: tabular-nums; text-align: right; font-size: var(--t-sm); color: var(--text); }
+.plan-pct { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; font-size: var(--t-sm); color: var(--text); }
 .plan-pct.warn { color: var(--warn); font-weight: 600; }
 .plan-pct.err { color: var(--err); font-weight: 600; }
 /* Settings clarity phase 2: a Home row ends in exactly one status phrase
@@ -3089,7 +3092,7 @@ input.switch:disabled {
    .plan-block with every line about it inside. */
 .card .row.plan-row {
   display: grid;
-  grid-template-columns: minmax(9rem, 13rem) minmax(4rem, 1fr) 3.5rem minmax(0, 17rem) minmax(0, auto);
+  grid-template-columns: minmax(9rem, 13rem) minmax(4rem, 1fr) 4.5rem minmax(0, 17rem) minmax(0, auto);
   column-gap: var(--s3);
   align-items: center;
 }
@@ -3127,13 +3130,13 @@ input.switch:disabled {
 .plan-details dd { margin: 0; }
 .plan-details code { font-family: var(--mono); font-size: var(--t-xs); }
 @media (max-width: 1100px) {
-  .card .row.plan-row { grid-template-columns: minmax(9rem, 12rem) minmax(3rem, 1fr) 3.5rem minmax(0, 12rem); row-gap: var(--s1); }
+  .card .row.plan-row { grid-template-columns: minmax(9rem, 12rem) minmax(3rem, 1fr) 4.5rem minmax(0, 12rem); row-gap: var(--s1); }
   .plan-row .plan-say-col { grid-column: 2 / -1; justify-self: start; text-align: left; justify-content: flex-start; }
   .plan-win { grid-template-columns: 6.5rem minmax(4rem, 1fr) 3.5rem; }
   .plan-win .plan-reset { grid-column: 2 / -1; }
 }
 @media (max-width: 760px) {
-  .card .row.plan-row { grid-template-columns: minmax(6rem, 1fr) minmax(4rem, 2fr) 3.5rem; }
+  .card .row.plan-row { grid-template-columns: minmax(6rem, 1fr) minmax(4rem, 2fr) 4.5rem; }
   .plan-row .plan-when { grid-column: 1 / -1; }
 }
 
@@ -3536,3 +3539,14 @@ dialog.sheet-dialog { position: fixed; inset: 0 0 0 auto; z-index: 50; margin: 0
 .sheet-hist li:last-child { border-bottom: 0; }
 .sheet-hist .t { color: var(--muted); }
 .sheet-gap { font-size: var(--t-sm); color: var(--muted); }
+/* Controls inside the detail sheets: they sit under the fact they change. */
+.ctl { margin-top: var(--s2); }
+.ctl .toolbar { margin-top: var(--s2); }
+.ctl .route-pause, .ctl .route-confirm, .ctl .route-disagree { margin-top: var(--s2); }
+.ctl input.num { width: 5.5em; }
+.ctl .route-field.wide { display: flex; flex-direction: column; align-items: stretch; width: 100%; }
+.ctl .check-line { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--t-sm); }
+.ctl .spacer, .route-pause .spacer { flex: 1; }
+.undo { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3); margin-top: var(--s2); border-radius: var(--r-sm); background: var(--surface-2); border: 1px solid var(--border-strong); font-size: var(--t-sm); }
+.undo span { flex: 1; min-width: 0; }
+.undo.err { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 35%, var(--border)); }

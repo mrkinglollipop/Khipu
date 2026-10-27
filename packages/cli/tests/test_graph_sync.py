@@ -321,7 +321,7 @@ class SyncDriftExcuseTest(unittest.TestCase):
                     out = gs.sync_from_sqlite(p)
                 except Exception as exc:  # noqa: BLE001 — the stub PG may trip the sync body
                     self.fail(f"sync body not reachable with stubs: {exc!r}")
-        check.assert_called_once_with(p, excuse_pending=False)
+        check.assert_called_once_with(p, excuse_pending=False, mirror_connections=True)
         self.assertEqual(out["drift"], drift)
 
     def test_cli_exits_two_when_drift_is_left_after_sync(self):

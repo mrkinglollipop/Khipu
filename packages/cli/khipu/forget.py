@@ -55,7 +55,7 @@ from typing import Any
 
 from khipu.lines import split_lines
 
-LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis")
+LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build")
 
 # What a forget keeps, said plainly in every result. Nothing deletes a
 # forgotten episode's row: there is no purge command and no restore command.
@@ -132,8 +132,11 @@ _FACT_TABLES = (("commitment", "commitments"), ("decision", "decisions"), ("deli
 def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
     """Section 3.4's forget: the episode row is already locked FOR UPDATE.
     Lock every fact the episode claims or anchors in ``(kind, id)`` order,
-    run the project's witness backfill when it has not run yet (section 4:
-    a legacy restater gets its claim before the forget decides anything),
+    run the witness backfill of those facts when the project's has not run
+    yet (section 4: a legacy restater gets its claim before the forget
+    decides anything; only these facts are re-projected, so a targeted pass
+    protects exactly what the whole-project pass would, without its inserts
+    inside forget's deadline),
     then delete the episode's claims and project each fact. The tombstone is
     already set in this transaction, so the backfill never credits the
     forgotten episode itself. Counts are what the
@@ -163,7 +166,7 @@ def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
             before[(kind, int(fact_id))] = bool(live)
     cur.execute("SELECT project FROM episodes WHERE id = %s", (episode_id,))
     row = cur.fetchone()
-    backfill = provenance.ensure_backfilled(cur, row[0] if row else None)
+    backfill = provenance.ensure_backfilled(cur, row[0] if row else None, facts)
     cur.execute("DELETE FROM fact_claims WHERE episode_id = %s", (episode_id,))
     out = {"commitments_closed": 0, "commitment_vectors_removed": 0, "deliverables_removed": 0,
            "decisions_retracted": 0, "facts_reprojected": 0, "backfill": backfill,
@@ -205,6 +208,57 @@ def _briefs_ready(cur) -> bool:
         return False
 
 
+def _clear_cited_suggestions(cur, episode_id: int) -> int:
+    """Clear every commitment's "Looks done" / "Looks settled" suggestion
+    (``settle_suggestion``) that cites the episode as its evidence, or a
+    decision the episode wrote or claimed: the suggestion quotes that
+    evidence's words, and it sits on a commitment another episode opened, so
+    no other step of the cascade reaches it. Only the suggestion goes; the
+    close rules suggest again from live evidence. 0 on a hub before 0034."""
+    try:
+        from khipu.db import has_columns, has_table
+
+        if not has_columns(cur, "commitments", "settle_suggestion"):
+            return 0
+        claimed = ("UNION SELECT fact_id FROM fact_claims WHERE kind = 'decision' AND episode_id = %(e)s "
+                   if has_table(cur, "fact_claims") else "")
+        decisions = (f"SELECT id FROM decisions WHERE episode_id = %(e)s {claimed}"
+                     if has_columns(cur, "decisions", "episode_id") else None)
+    except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
+        return 0
+    cited = "settle_suggestion->>'episode' = %(t)s"
+    if decisions:
+        cited += (f" OR settle_suggestion->>'decision_id' IN (SELECT id::text FROM ({decisions}) d)"
+                  f" OR settle_suggestion->'evidence'->>'decision_id' IN (SELECT id::text FROM ({decisions}) d)")
+    cur.execute(f"UPDATE commitments SET settle_suggestion = NULL WHERE settle_suggestion IS NOT NULL "
+                f"AND ({cited})", {"e": episode_id, "t": str(episode_id)})
+    return cur.rowcount
+
+
+def _clear_cited_closes(cur, episode_id: int) -> int:
+    """Replace ``close_reason`` with 'forgotten' and drop ``close_evidence``
+    on every commitment the episode closed, or closed citing a decision the
+    episode wrote or claimed: a rule close quotes that evidence's words. The
+    commitment stays closed."""
+    try:
+        from khipu.db import has_columns, has_table
+
+        evidence = has_columns(cur, "commitments", "close_evidence")
+        claimed = ("UNION SELECT fact_id FROM fact_claims WHERE kind = 'decision' AND episode_id = %(e)s "
+                   if has_table(cur, "fact_claims") else "")
+        decisions = (f"SELECT id FROM decisions WHERE episode_id = %(e)s {claimed}"
+                     if has_columns(cur, "decisions", "episode_id") else None)
+    except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
+        evidence, decisions = False, None
+    cited = "closed_episode = %(e)s"
+    if evidence and decisions:
+        cited += f" OR close_evidence->>'decision_id' IN (SELECT id::text FROM ({decisions}) d)"
+    cur.execute(f"UPDATE commitments SET close_reason = 'forgotten'"
+                f"{', close_evidence = NULL' if evidence else ''} WHERE ({cited}) "
+                "AND close_reason IS DISTINCT FROM 'forgotten'", {"e": episode_id})
+    return cur.rowcount
+
+
 def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
     """Tombstone one episode (its row already locked) and cascade: its
     vectors, its fact claims (each fact re-projected, or retired as the
@@ -224,6 +278,10 @@ def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
         (str(episode_id),),
     )
     embeddings_removed = cur.rowcount
+    # Before the claims go: a decision the episode claimed may keep another
+    # claimant's wording, but a suggestion quoting it may quote this one's.
+    suggestions_cleared = _clear_cited_suggestions(cur, episode_id)
+    closes_cleared = _clear_cited_closes(cur, episode_id)
     provenance_out = None
     if _provenance_ready(cur):
         # Fact provenance (0047): the episode's claims go and each fact it
@@ -279,6 +337,8 @@ def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
         "deliverables_removed": deliverables_removed,
         "decisions_retracted": decisions_retracted,
         "briefs_staled": briefs_staled,
+        "suggestions_cleared": suggestions_cleared,
+        "closes_cleared": closes_cleared,
         "facts_reprojected": (provenance_out or {}).get("facts_reprojected", 0),
         # (kind, id) of every fact the forget re-projected: forget_everywhere
         # writes their new rows into this Mac's replica at once (section 6).
@@ -313,6 +373,40 @@ def _forget_read(cur, episode_id: int, *, lock: bool, refusals: bool) -> dict[st
     return read
 
 
+def owner_refusal(cur, episode_id: int, owner: str | None) -> dict[str, Any] | None:
+    """None when ``owner`` may forget the episode, else the refusal result.
+    ``owner`` None is this machine's owner, who owns everything. A gateway
+    caller (``gateway:<label>``) owns only rows the server stamped with that
+    origin (docs/plans/2026-10-11-gateway-provenance.md, decision 2): NULL
+    and every other origin refuse, the message naming the class, never the
+    value. A hub without the origin column keeps the harness-prefix fallback."""
+    if owner is None:
+        return None
+    from khipu.db import has_columns
+
+    if has_columns(cur, "episodes", "origin"):
+        cur.execute("SELECT origin FROM episodes WHERE id = %s", (episode_id,))
+        row = cur.fetchone()
+        if row is None:
+            return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+        origin = row[0]
+        if origin == owner:
+            return None
+        why = ("its owner is unknown" if origin is None
+               else "it was captured on a Mac" if str(origin).startswith("local:")
+               else "another gateway token captured it")
+    else:
+        cur.execute("SELECT session_id FROM episodes WHERE id = %s", (episode_id,))
+        row = cur.fetchone()
+        if row is None:
+            return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+        if str(row[0] or "").split(":", 1)[0] not in LOCAL_HARNESSES:
+            return None
+        why = "it was captured on a Mac"
+    return {"ok": False, "id": episode_id, "refused": True,
+            "error": f"episode {episode_id} is not this token's to forget: {why}"}
+
+
 def publish_local(read: dict[str, Any], episode_id: int, hub: set[str]) -> None:
     """Publish one forget's refusals in this Mac's registry, in one atomic
     write: every source the read names, the hub identities ``hub`` the hub
@@ -327,7 +421,8 @@ def publish_local(read: dict[str, Any], episode_id: int, hub: set[str]) -> None:
 
 def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
                    known: set[str] | None = None,
-                   published: dict[str, Any] | None = None) -> dict[str, Any]:
+                   published: dict[str, Any] | None = None,
+                   owner: str | None = None) -> dict[str, Any]:
     """The hub half. Caller commits. Returns the counts and the (ts, summary
     md5) identity the legacy file uses, or ``{"ok": False}`` when unknown.
     With ``memory_root`` the legacy lines themselves are hashed too, so a line
@@ -345,10 +440,15 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
     On a hub without the index, ``published`` is the read the caller already
     published (``_forget_on_hub``): this publishes nothing itself, and a read
     under the row lock that names more returns ``{"grown": []}`` the same
-    way."""
+    way.
+
+    ``owner`` (``gateway:<label>``) is checked against the row's stored
+    origin before anything is published and again under the row lock."""
     from khipu.tombstones import RegistryError
 
     registry_error: str | None = None
+    if (refused := owner_refusal(cur, episode_id, owner)) is not None:
+        return refused
     refusals = _refusals_ready(cur)
     if refusals:
         if known is None:
@@ -364,6 +464,9 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
         read = _forget_read(cur, episode_id, lock=True, refusals=True)
         if read is None:
             return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+        # Under the row lock: an origin stamped since the first check is final.
+        if (refused := owner_refusal(cur, episode_id, owner)) is not None:
+            return refused
         if not read["hub"] <= known:
             return {"ok": False, "id": episode_id, "grown": sorted(known | read["hub"]),
                     "read": read, "registry_error": registry_error}
@@ -371,6 +474,8 @@ def forget_episode(cur, episode_id: int, *, memory_root: Path | None = None,
         read = _forget_read(cur, episode_id, lock=True, refusals=False)
         if read is None:
             return {"ok": False, "id": episode_id, "error": f"no such episode: {episode_id}"}
+        if (refused := owner_refusal(cur, episode_id, owner)) is not None:
+            return refused
         if published is not None:
             if _read_identities(read) - _read_identities(published):
                 return {"ok": False, "id": episode_id, "grown": [], "read": read,
@@ -1203,7 +1308,7 @@ def _outbox_entries() -> list[dict[str, Any]]:
     beside them, with its bytes and payload or the error reading it. The
     caller holds the outbox lock: every writer writes its temp under it, so a
     temp seen here was left by a crash."""
-    from khipu.capture_stores import outbox_folders
+    from khipu.capture_stores import outbox_folders, outbox_payloads
 
     entries: list[dict[str, Any]] = []
     for directory in outbox_folders():
@@ -1223,13 +1328,11 @@ def _outbox_entries() -> list[dict[str, Any]]:
             try:
                 entry["data"] = path.read_bytes()
                 envelope = json.loads(entry["data"])
-                payload = envelope.get("payload") if isinstance(envelope, dict) else None
-                if not isinstance(payload, dict):
-                    raise ValueError("job payload is not an object")
-                entry["payload"] = payload
+                entry["payloads"] = outbox_payloads(envelope)
+                entry["payload"] = envelope["payload"]
             except FileNotFoundError:
                 continue  # drained or renamed since the listing
-            except (OSError, ValueError, TypeError) as exc:
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
                 entry["error"] = type(exc).__name__
             entries.append(entry)
     return entries
@@ -1258,11 +1361,13 @@ def _classify_entries(entries: list[dict[str, Any]],
         if "payload" not in entry:
             continue
         try:
-            match = _source_match(entry["payload"], source_rows)
-            exact = match == "exact"
-            entry["match"] = match
-            entry["hashes"] = _job_hashes(entry["payload"]) if exact else set()
-            entry["ident"] = _job_identity(entry["payload"]) if exact else None
+            matches = [(payload, _source_match(payload, source_rows))
+                       for payload in entry["payloads"]]
+            exact = [payload for payload, match in matches if match == "exact"]
+            entry["match"] = ("exact" if exact else "identity"
+                              if any(match == "identity" for _, match in matches) else None)
+            entry["hashes"] = set().union(*(_job_hashes(payload) for payload in exact))
+            entry["idents"] = [ident for payload in exact if (ident := _job_identity(payload))]
         except (UnicodeError, ValueError, TypeError) as exc:
             entry.pop("payload")
             entry["error"] = type(exc).__name__
@@ -1323,7 +1428,8 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                     continue
                 # Without a session id there is no way to tell this job from
                 # the forgotten episode's capture, so any retained job counts.
-                if not session_id or entry["payload"].get("session_id") == session_id:
+                if not session_id or any(payload.get("session_id") == session_id
+                                         for payload in entry["payloads"]):
                     # A job keeps the bare reason callers already match on; a
                     # temp is named, since nothing else lists it.
                     remaining.append(reason if place == "outbox job" else f"{reason}; {path}")
@@ -1340,10 +1446,11 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
         # First pass: which jobs are exact copies, and so whose ownership to ask.
         with _locked_outbox():
             first = _outbox_entries()
+        first_data = {entry["path"]: entry.get("data") for entry in first}
         _classify_entries(first, source_rows)
         exact = [e for e in first if e.get("match") == "exact"]
         asked: set[str] = set().union(*(e["hashes"] for e in exact))
-        asked_idents = [e["ident"] for e in exact if e["ident"]]
+        asked_idents = [ident for entry in exact for ident in entry["idents"]]
         owners: tuple[set[str], set[tuple[str, Any]]] | None = None
         owner_error = ""
         if episode_id is None:
@@ -1371,8 +1478,9 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                     why = (f"queued capture job {path} could not be read ({entry['error']}), "
                            "so it was kept")
                 else:
-                    match, hashes, ident = entry["match"], entry["hashes"], entry["ident"]
-                    key = (ident["summary_md5"], _instant(ident["ts"])) if ident else None
+                    match, hashes = entry["match"], entry["hashes"]
+                    keys = {(ident["summary_md5"], _instant(ident["ts"]))
+                            for ident in entry["idents"]}
                     if match == "identity":
                         state = "copy remains"
                         why = (f"queued capture job {path} matches this episode only by time "
@@ -1382,16 +1490,24 @@ def _outbox_remainder(session_id: str | None, *, has_merged_sources: bool = Fals
                         why = (f"queued capture job {path} could not be checked against other "
                                f"episodes ({owner_error}), so it was kept")
                     elif match == "exact" and (not hashes <= asked
-                                               or (key is not None and key not in asked_keys)):
+                                               or not keys <= asked_keys
+                                               or entry["data"] != first_data.get(path)):
                         state = "copy remains"
                         why = (f"queued capture job {path} changed while the forget ran, "
                                "so it was kept")
-                    elif match == "exact" and (hashes & owners[0] or key in owners[1]):
+                    elif match == "exact" and (hashes & owners[0] or keys & owners[1]):
                         state = "copy remains"
                         why = (f"queued capture job {path} is also held by another live "
                                "episode, so it was kept")
                     elif match == "exact":
                         try:
+                            from khipu import tombstones
+
+                            # Fence every nested identity before the file goes:
+                            # a resolution archive's queued_evidence may be a
+                            # lossy projection that is not itself an exact
+                            # source-row match.
+                            tombstones.publish_payloads(entry["payloads"])
                             path.unlink()
                         except FileNotFoundError:
                             continue
@@ -2016,10 +2132,14 @@ def _native_job_remainder(session_id: str | None,
 
 
 def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
-                      gateway: bool | None = None) -> dict[str, Any]:
+                      gateway: bool | None = None, owner: str | None = None) -> dict[str, Any]:
     """Hub + legacy file. Opens its own connection and commits. ``gateway``
     defaults to the marker the HTTPS gateway sets at startup: a gateway with
     no memory root keeps no legacy logs, so they are not applicable there.
+    ``owner`` is a gateway caller's ``gateway:<label>``: the hub transaction
+    refuses an episode whose stored origin is not that (``owner_refusal``).
+    It is passed, not read from the request context, because the hub work
+    runs on a worker thread that does not inherit the context.
 
     Holds this Mac's memory lock exclusive for the whole run, from the
     registry publish to the completion check: two forgets serialize, and no
@@ -2031,7 +2151,7 @@ def forget_everywhere(episode_id: int, *, memory_root: Path | None = None,
     try:
         with memory_lock.exclusive(wait=FORGET_RETRY_BUDGET_S):
             out = _forget_everywhere(episode_id, memory_root=memory_root, gateway=gateway,
-                                     deadline=deadline)
+                                     deadline=deadline, owner=owner)
     except memory_lock.MemoryLockError as exc:
         return {"ok": False, "id": episode_id, "complete": False,
                 "error": f"forget not started: {exc}"}
@@ -2068,7 +2188,7 @@ def _retryable(exc: BaseException) -> bool:
 
 
 def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None,
-                   deadline: float | None = None) -> dict[str, Any]:
+                   deadline: float | None = None, owner: str | None = None) -> dict[str, Any]:
     """The hub forget under one deadline, ``FORGET_RETRY_BUDGET_S`` from its
     start (section 6.4), on a worker (``provenance.hub_call``) abandoned at
     the deadline. On one connection: read the episode's identity set, roll
@@ -2116,6 +2236,11 @@ def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None,
                 raise provenance.NotDone("the deadline passed")
             try:
                 if known is None:
+                    # Before any read is handed over: nothing of an episode
+                    # the caller may not forget reaches this Mac's registry.
+                    if (refused := owner_refusal(tx.cur, episode_id, owner)) is not None:
+                        tx.rollback()
+                        return refused
                     # Either schema: the worker never publishes locally; the
                     # read is handed to the caller between transactions.
                     refusals = _refusals_ready(tx.cur)
@@ -2127,7 +2252,7 @@ def _forget_on_hub(connect, episode_id: int, *, memory_root: Path | None,
                     error = tx.handoff((read, known, refusals))
                     published = None if refusals else {**read, "registry_error": error}
                 out = forget_episode(tx.cur, episode_id, memory_root=memory_root, known=known,
-                                     published=published)
+                                     published=published, owner=owner)
                 if out.get("grown") is not None:
                     tx.rollback()
                     known = set(out["grown"])
@@ -2245,7 +2370,8 @@ def not_same_episode(episode_id: int, *, connect: Any = None) -> dict[str, Any]:
 
 
 def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
-                       gateway: bool | None, deadline: float | None = None) -> dict[str, Any]:
+                       gateway: bool | None, deadline: float | None = None,
+                       owner: str | None = None) -> dict[str, Any]:
     from khipu import writer_groups
     from khipu.db import connect
 
@@ -2268,7 +2394,8 @@ def _forget_everywhere(episode_id: int, *, memory_root: Path | None,
         except Exception:  # noqa: BLE001
             memory_root = None
             root_resolved = False
-    out = _forget_on_hub(connect, episode_id, memory_root=memory_root, deadline=deadline)
+    out = _forget_on_hub(connect, episode_id, memory_root=memory_root, deadline=deadline,
+                         owner=owner)
     if not out.get("ok"):
         return out
     if out.get("registry_error"):

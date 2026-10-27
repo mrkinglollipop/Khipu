@@ -239,7 +239,12 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
     outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
-    if not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
+    # Dead letters sit outside drain(); only retry-dead moves them back. Held
+    # file lines with preferences the hub lacks would only fail again there,
+    # so status's fix (naming the merge first) stands for them.
+    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0 and not outbox.get("line_conflicts"):
+        outbox["fix"] = "run `khipu outbox retry-dead`"
+    elif not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
         outbox["fix"] = "run `khipu sessions drain`"
     # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
     # of a failure (hook error, drain failure, stale queue, cadence never
@@ -272,6 +277,8 @@ def _doctor_local_checks(mem: Path | None) -> dict:
             "error": f"{type(e).__name__}: {e}",
             "reasons": ["check failed"],
         }
+    if git_sync.get("applicable") is False:
+        not_configured.append("git_sync")
     try:
         secrets = secrets_status()
     except Exception as e:  # noqa: BLE001 — malformed local diagnostics must not crash doctor
@@ -899,6 +906,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     schema = workers["schema"].result()
     if not hub_ok and schema.get("error"):
         schema = {**schema, "ok": True, "skipped": "the database did not answer"}
+    if schema.get("skipped"):
+        not_configured.append("schema_migrations")
     schema_ok = bool(schema.get("ok"))
     # Fact provenance (docs/plans/2026-10-23-fact-provenance.md, phase 5): 0047
     # on the hub or not, open fact_gaps, section 4's limit count. Visibility
@@ -1947,7 +1956,11 @@ def cmd_library(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
     print(json.dumps(out, indent=2, default=str))
-    return _backfill_exit_code(out) if cmd == "backfill" else 0
+    if cmd == "backfill":
+        return _backfill_exit_code(out)
+    if cmd == "import" and out.get("ok") is False:
+        return 1
+    return 0
 
 
 def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
@@ -2109,7 +2122,13 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
               JOIN edges e ON e.src = w.node_id OR e.dst = w.node_id
               WHERE w.hops < %(max_hops)s
             )
-            SELECT node_id, via, type, hops FROM walk
+            SELECT node_id, via, type, hops FROM (
+              SELECT DISTINCT ON (node_id)
+                node_id, via, type, hops
+              FROM walk
+              WHERE NOT (node_id = ANY(%(ids)s))
+              ORDER BY node_id, hops ASC
+            ) d
             ORDER BY hops ASC, node_id ASC
             LIMIT %(lim)s
             """,
@@ -2838,7 +2857,14 @@ def _cmd_episode_forget_pending(args: argparse.Namespace) -> int:
     elif args.not_same is not None:
         action, target = "forget.not_same", str(args.not_same)
     else:
-        print(json.dumps(forget.unsent_forgets(), default=str))
+        from khipu import owner_act, routing
+
+        out = forget.unsent_forgets()
+        # Summaries are forgotten episodes' text: only the app itself or a
+        # conversation the owner typed in sees them.
+        if not ((args.from_app and routing._caller()["app"]) or owner_act.owner_turn()):
+            out = owner_act.without_summaries(out)
+        print(json.dumps(out, default=str))
         return 0
     from khipu import owner_direction
 
@@ -3290,7 +3316,9 @@ def cmd_activity(args: argparse.Namespace) -> int:
     from khipu.activity import activity_payload, episode_detail
 
     if args.show is not None:
-        row = episode_detail(args.show)
+        from khipu.tombstones import episode_hidden
+
+        row = None if episode_hidden(args.show) else episode_detail(args.show)
         if row is None:
             print(f"error: episode {args.show} not found", file=sys.stderr)
             return 1
@@ -3404,7 +3432,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         if not ident.isdigit():
             print(json.dumps({"ok": False, "error": "episode id must be digits"}))
             return 2
-        row = episode_detail(int(ident))
+        from khipu.tombstones import episode_hidden
+
+        row = None if episode_hidden(ident) else episode_detail(int(ident))
     else:
         from khipu.text_pages import page_args
 
@@ -3414,9 +3444,10 @@ def cmd_get(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
+        wiki = bool(getattr(args, "wiki", False))
         if getattr(args, "all", False):
-            return _get_topic_all(ident, offset, max_bytes)
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+            return _get_topic_all(ident, offset, max_bytes, wiki=wiki)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
@@ -3430,7 +3461,8 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
-def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
+def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
+                   wiki: bool = False) -> int:
     """`khipu get <topic> --all`: follow body_next_offset and write the body
     from ``offset`` to the end on stdout, raw, one page at a time. Stops with
     an error if the topic changes between pages (content_hash or updated_at),
@@ -3439,7 +3471,7 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
 
     first = None
     while True:
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
         if row is None:
             print(json.dumps({"ok": False, "error": f"topic not found: {ident}"}),
                   file=sys.stderr)
@@ -4059,7 +4091,7 @@ def cmd_db(args: argparse.Namespace) -> int:
     """khipu db preflight|connect|move|status — the setup pipeline's CLI face
     (see docs/plans/2026-09-05-setup-that-cannot-strand-you.md). Every
     subcommand prints JSON and never the password."""
-    from khipu.setup import connect_database, host_kind, mask_dsn
+    from khipu.setup import connect_database, host_kind, mask_dsn, redact_dsn_text
 
     def _missing_dsn(flag: str, env_name: str) -> int:
         print(
@@ -4148,7 +4180,7 @@ def cmd_db(args: argparse.Namespace) -> int:
                     out["topics"] = cur.fetchone()[0]
         except Exception as exc:  # noqa: BLE001
             out["ok"] = False
-            out["error"] = f"{type(exc).__name__}: {exc}"
+            out["error"] = f"{type(exc).__name__}: {redact_dsn_text(str(exc), dsn)}"
         print(json.dumps(out, indent=2))
         return 0 if out.get("ok") else 1
 
@@ -4260,8 +4292,9 @@ def cmd_join(args: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001 — its text can quote the DSN
                 migrate_out = {"ok": False, "error": public_error(exc, "Applying migrations")}
         hub_ok = bool(counts.get("ok"))
+        migrate_ok = migrate_out is None or migrate_out.get("ok") is not False
         result = {
-            "ok": True,
+            "ok": migrate_ok,
             "kit_imported": True,
             "hub_ok": hub_ok,
             "action": "import",
@@ -4275,7 +4308,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         if migrate_out is not None:
             result["migrate"] = migrate_out
         print(json.dumps(result, indent=2))
-        return 0
+        return 0 if migrate_ok else 1
 
     if args.join_cmd == "advertise":
         try:
@@ -4323,10 +4356,88 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     if args.outbox_cmd == "retry-dead":
         print(json.dumps(outbox.retry_dead(), indent=2))
         return 0
+    if args.outbox_cmd == "merge-line-preferences":
+        return _outbox_merge_preferences(args)
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
     return 0 if not out.get("failed") else 1
+
+
+def _outbox_merge_preferences(args: argparse.Namespace) -> int:
+    """``khipu outbox merge-line-preferences``: a dry run by default (counts
+    and redacted samples). ``--apply`` and ``--undo ID`` change the hub, so
+    each is the owner's: the app (``--from-app``), a yes typed on a terminal,
+    or ``--owner-direction``, as ``routing._owner_via`` checks them; logged
+    with its Undo either way."""
+    from khipu import outbox_preferences, owner_direction, routing
+
+    if args.apply and args.undo:
+        print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
+        return 2
+    if getattr(args, "include_unproven", False) and not args.undo:
+        print(json.dumps({"ok": False, "error": "--include-unproven goes with --undo"}))
+        return 2
+    if getattr(args, "include_unproven", False) and not getattr(args, "by_direction", False):
+        print(json.dumps({"ok": False, "code": "owner_only",
+                          "error": "--include-unproven needs --owner-direction (a conversation the owner typed "
+                                   "in); it is logged. Nothing was changed."}))
+        return 2
+    if not (args.apply or args.undo):
+        print(json.dumps(outbox_preferences.dry_run(), indent=2))
+        return 0
+    if args.undo:
+        line = owner_direction._find(args.undo)
+        if line is not None and line.get("action") != outbox_preferences.ACTION:
+            print(json.dumps({"ok": False, "code": "refused",
+                              "error": f"owner action {args.undo} is not a preference merge; nothing was changed"}))
+            return 2
+        why = owner_direction._undo_refusal(line, args.undo)
+        if why:
+            print(json.dumps({"ok": False, "code": "refused", "error": why + "; nothing was changed"}))
+            return 2
+        unproven = bool(getattr(args, "include_unproven", False))
+        want = owner_direction.intent("direction.undo", args.undo,
+                                      facts={"include_unproven": True} if unproven else None)
+    else:
+        want = owner_direction.intent(outbox_preferences.ACTION, "outbox")
+    refused = {"ok": False, "code": "owner_only",
+               "error": "Merging into the hub (or undoing a merge) is the owner's change: make it in the Khipu "
+                        "app, type yes on a terminal, or pass --owner-direction from a conversation the owner "
+                        "typed in. Nothing was changed."}
+    via = None
+    if getattr(args, "from_app", False):
+        caller = routing._caller()
+        if caller["app"]:
+            owner_direction.noted(want, {"auth": "app",
+                                         "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
+            via = "app"
+    elif getattr(args, "by_direction", False):
+        try:
+            owner_direction.gate(want)
+        except owner_direction.DirectionRefused as err:
+            print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
+            return 2
+        via = "direction"
+    elif routing.typed_yes("This changes preferences on hub episodes (Undo puts them back). Type yes to confirm: "):
+        owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
+        via = "cli"
+    if via is None:
+        print(json.dumps(refused))
+        return 2
+    try:
+        if args.undo:
+            res = owner_direction.undo(args.undo, via, include_unproven=unproven)
+        else:
+            res = outbox_preferences.apply(record=owner_direction.record_preference_merges,
+                                           record_resolutions=owner_direction.record_preference_resolutions,
+                                           record_committed=owner_direction.record_preference_commits)
+    except BaseException:
+        owner_direction._abandon()
+        raise
+    res = owner_direction.finish(res, **({"state": "partial"} if res.get("unproven") else {})) or res
+    print(json.dumps(res, indent=2, default=str))
+    return 0 if res.get("ok") else 1
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
@@ -4684,6 +4795,12 @@ def cmd_integrations(args: argparse.Namespace) -> int:
     # `integrations status` lists (its `homes[].path`); without it every home
     # Khipu found is acted on.
     home = getattr(args, "home", None)
+    skipped: list[dict] = []
+    # grok_build needs --project; an `all` run without it must not fail the pack.
+    if (args.harness == "all" and not project and "grok_build" in targets
+            and args.integ_cmd in ("install", "verify")):
+        targets = [h for h in targets if h != "grok_build"]
+        skipped.append({"harness": "grok_build", "skipped": "needs --project", "ok": True})
     if home is not None:
         try:
             if args.harness != "claude_code":
@@ -4708,23 +4825,25 @@ def cmd_integrations(args: argparse.Namespace) -> int:
         print(json.dumps([_status(h) for h in targets], indent=2))
         return 0
     if args.integ_cmd == "verify":
-        results = [_verify(h) for h in targets]
+        results = [_verify(h) for h in targets] + skipped
         synth_check = integ.verify_synth_provider()
         if synth_check is not None:
             for result in results:
+                if result.get("skipped"):
+                    continue
                 result.setdefault("components", {})["synth_provider"] = synth_check
                 result["ok"] = result.get("ok", not result["detected"]) and synth_check["ok"]
         print(json.dumps(results, indent=2))
-        return 0 if all(r.get("ok", not r["detected"]) for r in results) else 2
+        return 0 if all(r.get("ok", not r.get("detected", False)) for r in results) else 2
     fn = integ.install if args.integ_cmd == "install" else integ.uninstall
-    results = [fn(h, dry_run=args.dry_run, project=project, home=home) for h in targets]
+    results = [fn(h, dry_run=args.dry_run, project=project, home=home) for h in targets] + skipped
     print(json.dumps(results, indent=2))
     if not all(r.get("ok", True) and not r.get("aborted", False) for r in results):
         return 1
     if args.integ_cmd == "install" and not args.dry_run and not args.no_verify:
-        verified = [_verify(h) for h in targets]
+        verified = [_verify(h) for h in targets] + skipped
         print(json.dumps({"verify": verified}, indent=2))
-        return 0 if all(v.get("ok", not v["detected"]) for v in verified) else 2
+        return 0 if all(v.get("ok", not v.get("detected", False)) for v in verified) else 2
     return 0
 
 
@@ -4741,6 +4860,12 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     if args.gateway_token_cmd == "status":
         print(json.dumps(integ.gateway_token_file_status(), indent=2))
         return 0
+    if args.gateway_token_cmd == "copy":
+        # The key goes Keychain/file -> clipboard inside this process; the
+        # answer is only whether it worked, never the key.
+        result = integ.copy_gateway_token()
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 2
     if args.gateway_token_cmd == "set":
         if args.from_env is not None:
             token = os.environ.get(args.from_env, "")
@@ -5510,7 +5635,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--limit", type=int, default=50)
     g.set_defaults(func=cmd_graph)
 
-    r = sub.add_parser("regen-memory", help="Write MEMORY.md from PG topics")
+    r = sub.add_parser(
+        "regen-memory",
+        help="Write MEMORY.from-khipu.md from PG topics (or live MEMORY.md with --index)",
+    )
     r.add_argument(
         "--out",
         default=None,  # resolved against memory_root at run time
@@ -5834,6 +5962,12 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--summary", action="store_true", help="The summary a conversation gets at its start")
     rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
     rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")
+    rt.add_argument(
+        "--view", default=None, metavar="NAME",
+        choices=("summary", "accounts", "priority", "rules", "holds", "note", "proposals"),
+        help="JSON only: summary (compact) or one section name for that section in full; "
+             "omit for the full record; not with --summary, --brief, or --since",
+    )
     rt.set_defaults(func=cmd_route, route_cmd=None)
     # Writes always print JSON; --json is accepted after any of them too, so a
     # script that adds it to every khipu call doesn't lose its write. SUPPRESS
@@ -5912,9 +6046,19 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Give up after S seconds (or 30m, 2h; 0 checks once); default: no end")
     rprio = rt_sub.add_parser(
         "priority", parents=[rt_json],
-        help="The owner's priority: show it; set, confirm, undo or clear it (asks for a typed confirmation)")
-    rprio.add_argument("action", nargs="?", default="show", choices=("show", "set", "confirm", "undo", "clear"))
-    rprio.add_argument("accounts", nargs="*", help="set: the accounts in your order (or --entries)")
+        help="The owner's priority: show it; set, amend one account's entry, confirm, undo or clear it "
+             "(asks for a typed confirmation)")
+    rprio.add_argument("action", nargs="?", default="show",
+                       choices=("show", "set", "amend", "confirm", "undo", "clear"))
+    rprio.add_argument("accounts", nargs="*",
+                       help="set: the accounts in your order (or --entries); amend: the one account")
+    rprio.add_argument("--append", default=None, metavar="TEXT", help="amend: words added to the account's role")
+    rprio.add_argument("--role", default=None, metavar="TEXT", help="amend: the account's new role, in place of its old one")
+    rprio.add_argument("--exception", default=None, metavar="TEXT",
+                       help="amend: a direction with an end, in your words; --until is its end (default: the account's "
+                            "next weekly reset, else 7 days). It lapses on its own")
+    rprio.add_argument("--end-exception", default=None, metavar="ID", dest="end_exception",
+                       help="amend: end one exception early (its id is in the amend result and `route priority --json`)")
     rprio.add_argument("--entries", default=None, metavar="JSON",
                        help='set: [{"account": "...", "role": "your words", "until": "T"}, ...] in your order')
     rprio.add_argument("--until", default=None, metavar="T", help="set: when the whole priority ends")
@@ -5973,6 +6117,8 @@ def build_parser() -> argparse.ArgumentParser:
     rcap.add_argument("--tier", default=None, choices=("opus", "sonnet", "haiku"), help="Check allowance: this tier only")
     rcap.add_argument("--sensitive-only", action=argparse.BooleanOptionalAction, default=None,
                       help="Check allowance: only caller-declared sensitive code")
+    rcap.add_argument("--until", default=None, metavar="T",
+                      help="set: when the cap stops applying (a time, or 2d, 30h); the cap it replaced applies again")
     rcap.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rcap)
     radv = rt_sub.add_parser("advise", parents=[rt_json],
@@ -6303,6 +6449,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true",
         help="Topics: write the whole body (from --offset) to stdout, page by page",
     )
+    gt.add_argument(
+        "--wiki", action="store_true",
+        help="Topics: return the raw wiki page even when a current brief exists",
+    )
     gt.set_defaults(func=cmd_get)
 
     mg = sub.add_parser(
@@ -6595,7 +6745,7 @@ def build_parser() -> argparse.ArgumentParser:
             "harness",
             nargs="?",
             default="all",
-            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_bot"),
+            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot"),
         )
         if name in ("install", "uninstall"):
             sp.add_argument("--dry-run", action="store_true")
@@ -6608,7 +6758,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("install", "uninstall", "status", "verify"):
             sp.add_argument(
                 "--project",
-                help="Cursor / Grok Bot: repo dir for .cursor/rules/khipu.mdc and .cursor/mcp.json",
+                help="Cursor / Grok Build / Grok Bot: repo dir for that pack's recall and MCP files",
             )
         if name == "install":
             sp.add_argument("--no-verify", action="store_true")
@@ -6686,6 +6836,23 @@ def build_parser() -> argparse.ArgumentParser:
         "retry-dead",
         help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue",
     )
+    obm = ob_sub.add_parser(
+        "merge-line-preferences",
+        help="Held memory-file lines that differ from the hub only by preferences it lacks: "
+             "count them (default), merge them (--apply) or undo a merge (--undo ID)",
+    )
+    obm.add_argument("--apply", action="store_true",
+                     help="Append the missing preferences to their hub episodes (the owner's: the app, a typed yes "
+                          "or --owner-direction)")
+    obm.add_argument("--undo", metavar="OWNER_ACTION", default=None,
+                     help="Put back the exact prior preferences of one merge (the owner's, as --apply)")
+    obm.add_argument("--include-unproven", action="store_true",
+                     help="With --undo: also revert episodes whose commit Khipu could not prove (owner direction, "
+                          "logged)")
+    obm.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    from khipu.owner_direction import add_owner_flags as _merge_owner_flags
+
+    _merge_owner_flags(obm)
     ob.set_defaults(func=cmd_outbox)
 
     jb = sub.add_parser(
@@ -6861,6 +7028,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gwt_sub.add_parser(
         "status", help="exists / mode / bytes only — never the token"
+    )
+    gwt_sub.add_parser(
+        "copy",
+        help="Copy the saved key to the clipboard and clear it after 60 s (never prints it)",
     )
     gw.set_defaults(func=cmd_gateway)
 

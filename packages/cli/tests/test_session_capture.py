@@ -239,6 +239,86 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         self.now += sc.CAPTURE_HELD_COOLDOWN_S
         self.assertEqual(sc.drain()["captured"], 1)
 
+    def test_racing_drains_do_not_bypass_held_cooldown(self):
+        first, _ = self.enqueue("1/1", disposition="held", attempts=sc.CAPTURE_MAX_ATTEMPTS,
+                                last_attempt_at=sc._iso_not_after(
+                                    self.now - sc.CAPTURE_HELD_COOLDOWN_S - 1))
+        thaw = sc._thaw_held
+        interleaved = False
+
+        def race(path, *, auto):
+            nonlocal interleaved
+            if not interleaved:
+                interleaved = True
+                sc.drain()  # B renews the hold after A's age check, before A claims.
+            return thaw(path, auto=auto)
+
+        with mock.patch.object(sc, "_thaw_held", side_effect=race):
+            sc.drain()
+        self.assertEqual(self.extract.call_count, 1,
+                         {"paid_extractions": self.extract.call_count, "state": sc._retry_state(first)})
+
+    def test_auto_retry_releases_a_newly_held_claim_without_mutating_it(self):
+        first, _ = self.enqueue("1/1", disposition="held", attempts=sc.CAPTURE_MAX_ATTEMPTS,
+                                last_attempt_at=sc._iso_not_after(self.now), last_error="extract: RuntimeError")
+        retry_path = sc._retry_state_path(first)
+        job_before, retry_before = first.read_bytes(), retry_path.read_bytes()
+        claim = sc._claim
+        claims = []
+
+        def track_claim(*args, **kwargs):
+            claimed = claim(*args, **kwargs)
+            claims.append(claimed)
+            return claimed
+
+        with mock.patch.object(sc, "_claim", side_effect=track_claim):
+            self.assertFalse(sc._thaw_held(first, auto=True))
+        self.assertEqual(len(claims), 1)
+        self.assertIsNotNone(claims[0])
+        self.assertEqual(first.read_bytes(), job_before)
+        self.assertEqual(retry_path.read_bytes(), retry_before)
+        self.assertEqual(sc._retry_state(first)["attempts"], sc.CAPTURE_MAX_ATTEMPTS)
+        self.assertEqual(list(sc.queue_dir().glob("*.claimed.*")), [])
+        self.assertFalse(sc._claim_owner_path(claims[0]).exists())
+        self.extract.assert_not_called()
+        self.capture.assert_not_called()
+
+    def test_manual_retry_bypasses_fresh_held_cooldown_and_resets_attempts(self):
+        first, _ = self.enqueue("1/1", disposition="held", attempts=sc.CAPTURE_MAX_ATTEMPTS,
+                                last_attempt_at=sc._iso_not_after(self.now))
+        before = first.read_bytes()
+        self.assertEqual(sc.retry_held(), 1)
+        self.assertEqual(first.read_bytes(), before)
+        state = sc._retry_state(first)
+        self.assertEqual(state["attempts"], 0)
+        self.assertNotIn("disposition", state)
+        self.assertNotIn("next_attempt_at", state)
+        self.assertEqual(list(sc.queue_dir().glob("*.claimed.*")), [])
+        self.extract.assert_not_called()
+
+    def test_retry_checkpoint_survives_crash_before_release(self):
+        first, job = self.enqueue("1/1")
+        claim = sc._claim(first)
+        with mock.patch.object(sc, "_release", side_effect=SystemExit("crash")):
+            with self.assertRaises(SystemExit):
+                sc._capture_failure(claim, job, "extract: RuntimeError", {})
+        with mock.patch.object(sc, "_claimant_gone", return_value=True):
+            sc.drain()
+        self.assertEqual(sc._retry_state(first)["attempts"], 1)
+        self.extract.assert_not_called()
+
+    def test_empty_checkpoint_survives_crash_before_archive(self):
+        first, job = self.enqueue("1/1", capture_note="", checkout=None)
+        claim = sc._claim(first)
+        with mock.patch.object(sc, "_archive_claimed", side_effect=SystemExit("crash")):
+            with self.assertRaises(SystemExit):
+                sc._archive_empty(claim, job)
+        with mock.patch.object(sc, "_claimant_gone", return_value=True):
+            result = sc.drain()
+        self.assertEqual(result["empty"], 1)
+        self.extract.assert_not_called()
+        self.assertFalse(first.exists())
+
     def test_extract_checkpoint_failure_releases_the_claim(self):
         first, _ = self.enqueue("1/1")
         self.extract.side_effect = lambda *a, **kw: {"summary": "s", "topics": []}
@@ -521,7 +601,27 @@ class HarnessInferenceTest(unittest.TestCase):
         self.assertEqual(sc.infer_harness({"transcript_path": "/u/.codex/sessions/r.jsonl"}, {}), "codex")
         self.assertEqual(sc.infer_harness({}, {"GROK_HOOK_EVENT": "stop"}), "aegis")
         self.assertEqual(sc.infer_harness({}, {"KHIPU_HARNESS": "aegis", "CLAUDE_PROJECT_DIR": "/x"}), "aegis")
+        self.assertEqual(sc.infer_harness({}, {"KHIPU_HARNESS": "grok_build", "GROK_HOOK_EVENT": "stop"}), "grok_build")
         self.assertEqual(sc.infer_harness({}, {}), "unknown")
+
+    def test_grok_build_finds_the_grok_updates_transcript_without_a_payload_pointer(self):
+        with tempfile.TemporaryDirectory() as td:
+            cwd, sid = "/made-up/project", "grok-session"
+            path = Path(td) / ".grok" / "sessions" / sc.urllib.parse.quote(cwd, safe="") / sid / "updates.jsonl"
+            _write(path, [])
+            with mock.patch.object(Path, "home", return_value=Path(td)), \
+                    mock.patch.dict(os.environ, {"GROK_HOME": str(Path(td) / ".grok")}):
+                self.assertEqual(sc.transcript_path({"cwd": cwd, "session_id": sid}, "grok_build"), path)
+
+    def test_grok_build_uses_custom_grok_home_for_transcript_and_project_match(self):
+        with tempfile.TemporaryDirectory() as td:
+            cwd, sid = "/made-up/project", "grok-session"
+            custom_home = Path(td) / "custom-grok"
+            path = custom_home / "sessions" / sc.urllib.parse.quote(cwd, safe="") / sid / "updates.jsonl"
+            _write(path, [])
+            with mock.patch.dict(os.environ, {"GROK_HOME": str(custom_home)}):
+                self.assertEqual(sc.transcript_path({"cwd": cwd, "session_id": sid}, "grok_build"), path)
+            self.assertTrue(sc._transcript_project_matches("grok_build", path, cwd))
 
     def test_cursor_and_claude_payload_shapes_drive_the_hook(self):
         with tempfile.TemporaryDirectory() as td, _home(td):

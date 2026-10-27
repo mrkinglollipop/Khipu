@@ -1545,22 +1545,36 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
 
 def _routing_generation_current(files) -> bool:
     """Whether every file a routing answer was read from
-    (``routing._generation``: ``[[path, stat], ...]``) still has the stat it
-    had then. An answer can sit in the pipe while the search runs, and the
-    record can change meanwhile; one read from an older generation is never
-    delivered. A stat each, never a wait."""
+    (``routing._generation``) still has its stat or, for a rewritten view,
+    the same semantic routing revision. Changed heartbeats require an
+    equivalent view folded from their current stats. An answer can sit in
+    the pipe while search runs; telemetry-only saves must not suppress it."""
     if not isinstance(files, list):
         return False
+    changed = {}
+    views = []
     for item in files:
-        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+        if not (isinstance(item, list) and len(item) in (2, 3) and isinstance(item[0], str)):
+            return False
+        if len(item) == 3 and not isinstance(item[2], str):
             return False
         try:
             st = os.stat(item[0])
             now = [st.st_mtime_ns, st.st_size, st.st_ino]
         except OSError:
             now = None
-        if now != item[1]:
-            return False
+        if len(item) == 3:
+            views.append((item, now != item[1]))
+        elif now != item[1]:
+            changed[item[0]] = now
+    if changed and not views:
+        return False
+    for item, rewritten in views:
+        if rewritten or changed:
+            from khipu.routing_generation import matches
+
+            if not matches(item[0], item[2], heartbeats=changed):
+                return False
     return True
 
 
@@ -2803,8 +2817,9 @@ def _hub_hits_budgeted(
 
     from khipu.search_text import fuse_ranked_lists
     from khipu.recency import apply_project_and_status
+    from khipu.tombstones import without_hidden_episodes
 
-    fused = fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)
+    fused = without_hidden_episodes(fuse_ranked_lists(lists, limit=_SEARCH_LIMIT))
     fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
     fused = _attach_hub_routing_state(fused, deadline=deadline)

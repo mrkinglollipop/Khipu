@@ -37,7 +37,7 @@ def pg(hub, monkeypatch):  # noqa: F811
     # is reached through the class constructor the fixture itself uses.
     monkeypatch.setattr(
         hs, "try_hub_connect",
-        lambda *, connect_timeout=5: psycopg.Connection.connect(hub.dsn, connect_timeout=connect_timeout))
+        lambda *, connect_timeout=5, **_kw: psycopg.Connection.connect(hub.dsn, connect_timeout=connect_timeout))
     conn = hub.connect()
     hub.migrate(conn=conn)
     cur = conn.cursor()

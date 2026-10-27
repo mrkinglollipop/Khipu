@@ -86,7 +86,11 @@ def test_migration_timestamp_does_not_prove_writer_metadata(hub, monkeypatch, tm
         eid = cur.fetchone()[0]
         cur.execute("INSERT INTO commitments(project,text,owner,kind,opened_episode,opened_at,content_hash) VALUES('example/widget','Should the synthetic fixture use a queue?','assistant','question',%s,clock_timestamp(),'cached-writer') RETURNING id",(eid,))
         cid = cur.fetchone()[0]
-        assert commitments.reassign(cur,cid,'user',by='app',reason='I own this')
+        # Main's has_columns now refreshes a cached miss on the next write, so a
+        # writer that predates 0035 is pinned explicitly instead of through the cache.
+        with monkeypatch.context() as stale:
+            stale.setattr(commitments, '_reassigned_column_ready', lambda cur: False)
+            assert commitments.reassign(cur,cid,'user',by='app',reason='I own this')
         cur.execute('SELECT owner_reassigned_at FROM commitments WHERE id=%s',(cid,))
         assert cur.fetchone()[0] is None
     hub.migrate(conn=conn)

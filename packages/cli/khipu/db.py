@@ -74,13 +74,23 @@ def resolve_dsn(*, migrate_legacy: bool = True) -> str:
     path = Path(_env("KHIPU_DSN_FILE", "ALZY_DSN_FILE") or str(configured))
     if path.is_file():
         return path.read_text(encoding="utf-8").strip()
-    if LEGACY_DSN_FILE.is_file():
-        return LEGACY_DSN_FILE.read_text(encoding="utf-8").strip()
+    if not _explicit_dsn_location():
+        # A moved data folder holds no DSN (set_data_dir never copies it);
+        # the config one comes first, the order the desktop reads them.
+        for fallback in (DEFAULT_DSN_FILE, LEGACY_DSN_FILE):
+            if fallback.is_file():
+                return fallback.read_text(encoding="utf-8").strip()
     raise RuntimeError(
         "No Khipu DSN. Set KHIPU_DATABASE_URL, store in Keychain "
         "(pipe it to `khipu secrets --set database_url`), or create "
         f"{path} (chmod 600). See packages/cli/README.md"
     )
+
+
+def _explicit_dsn_location() -> bool:
+    from khipu.paths import explicit_dsn_location
+
+    return explicit_dsn_location()
 
 
 def conninfo_with_local_root_cert(dsn: str, *, create_data_dir: bool = True) -> str:
@@ -226,8 +236,15 @@ def prime_table_columns(conn, *tables: str) -> None:
 
 
 def has_columns(cur, table: str, *names: str) -> bool:
+    """Whether ``table`` has every named column. Only a yes is cached: a
+    long-lived process (MCP server, gateway) that started before a migration
+    must see the new columns on its next write, not after a restart — same
+    rule ``has_table`` uses for a missing table."""
     cols = table_columns(cur, table)
-    return all(name in cols for name in names)
+    if all(name in cols for name in names):
+        return True
+    _TABLE_COLUMNS_CACHE.pop(table, None)
+    return False
 
 
 def has_table(cur, table: str) -> bool:

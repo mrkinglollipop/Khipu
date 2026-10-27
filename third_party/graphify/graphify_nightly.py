@@ -125,7 +125,7 @@ def _export_sources(env: dict[str, str]) -> Path | None:
                 [sys.executable, "-c",
                  "from khipu.sources import sources_file; "
                  "raise SystemExit(0 if sources_file().exists() else 3)"],
-                env=env, capture_output=True, text=True, timeout=120,
+                env=env, capture_output=True, text=True, timeout=60,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             log(f"  source registry check failed (non-fatal): {exc}")
@@ -142,9 +142,9 @@ def _export_sources(env: dict[str, str]) -> Path | None:
             env=env,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=60,
         )
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         log(f"  sources export skipped (non-fatal): {exc}")
         return None
     if proc.returncode != 0:
@@ -246,7 +246,9 @@ def main() -> int:
     rc = run_step(
         "semantic extract",
         "code_semantic_extractor.py",
-        timeout=1800,
+        # Cap so export (probe + export) + semantic + build + embed + mirror
+        # ≤ DRIVER_TIMEOUT_SECONDS (3600).
+        timeout=1000,
         env=khipu_env,
     )
     if rc != 0:
@@ -299,6 +301,11 @@ def main() -> int:
                 text=True,
                 timeout=600,
             )
+            # Retry diagnostics are safe to retain even when the mirror recovers;
+            # other stderr can contain connection details.
+            for line in (proc.stderr or "").splitlines():
+                if line.startswith("graph mirror connect:"):
+                    log(f"  {line}")
             if proc.returncode == 0:
                 skipped = _mirror_skip_reason(proc)
                 log(f"  khipu graph mirror skipped: {skipped}" if skipped

@@ -211,10 +211,14 @@ def _under(path_real: str, root_real: str) -> bool:
     return path_real == root_real or path_real.startswith(root_real.rstrip(os.sep) + os.sep)
 
 
-def _iter_files(root: Path, skipped: dict[str, int]) -> Iterator[tuple[str, Path, os.stat_result]]:
+def _iter_files(
+    root: Path, skipped: dict[str, int], *, keep: set[str] | None = None,
+) -> Iterator[tuple[str, Path, os.stat_result]]:
     """(rel_posix, path, stat) for every eligible file under ``root``: .txt and
     .md, no dotfiles or hidden directories, no symlink that leaves the root,
-    nothing over MAX_FILE_BYTES (counted in ``skipped``, not yielded)."""
+    nothing over MAX_FILE_BYTES (counted in ``skipped``, not yielded).
+    Oversized paths are added to ``keep`` so a scan still treats them as
+    present without blocking deletion of other vanished files."""
     root_real = os.path.realpath(root)
 
     def skip(why: str) -> None:
@@ -242,6 +246,8 @@ def _iter_files(root: Path, skipped: dict[str, int]) -> Iterator[tuple[str, Path
                 continue
             if st.st_size > MAX_FILE_BYTES:
                 skip("too_large")
+                if keep is not None:
+                    keep.add(p.relative_to(root).as_posix())
                 continue
             yield p.relative_to(root).as_posix(), p, st
 
@@ -534,7 +540,7 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
         plan: list[tuple[str, str]] = []
         added = updated = unchanged = imported_kept = pending = 0
         rebuild_embedded = 0
-        for rel, path, _st in _iter_files(root, skipped):
+        for rel, path, _st in _iter_files(root, skipped, keep=seen):
             seen.add(rel)
             try:
                 data = path.read_bytes()
@@ -568,22 +574,33 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
             if prior and prior[0] in embedded_ids:
                 rebuild_embedded += 1
         embedded_docs = len(embedded_ids)
-        if (not allow_rebuild and rebuild_embedded > max(
+        # too_large paths are in ``seen`` (via _iter_files keep=); only
+        # traversal_error / unreadable freeze deletions for the whole walk.
+        walk_incomplete = bool(
+            skipped.get("traversal_error") or skipped.get("unreadable")
+        )
+        gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
+        # A new oversize, empty or undecodable file is never indexed, so it must
+        # not count as the folder still holding documents (that would let it
+        # wipe the rest); only files planned for indexing do.
+        survivors = {rel for rel, _ in plan} | (seen & existing.keys())
+        if gone and not survivors:
+            conn.rollback()
+            raise LibraryError(
+                f"{src.root!r} has no indexable .txt or .md files but {len(gone)} documents are "
+                "indexed; refusing to delete them all (use `khipu library remove` if the "
+                "folder was emptied on purpose)"
+            )
+        gone_embedded = sum(1 for doc_id in gone if doc_id in embedded_ids)
+        vector_loss = rebuild_embedded + gone_embedded
+        if (not allow_rebuild and vector_loss > max(
                 MASS_REBUILD_MIN_DOCS, MASS_REBUILD_MAX_FRACTION * embedded_docs)):
             conn.rollback()
             raise LibraryError(
-                f"{rebuild_embedded} embedded documents would be rebuilt out of {embedded_docs}; "
+                f"{vector_loss} embedded documents would be rebuilt or removed "
+                f"out of {embedded_docs}; "
                 "their vectors would be deleted; nothing was changed. "
                 f"Run `khipu library scan {name} --allow-rebuild` to proceed"
-            )
-        walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
-        gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
-        if gone and not seen:
-            conn.rollback()
-            raise LibraryError(
-                f"{src.root!r} has no .txt or .md files but {len(gone)} documents are "
-                "indexed; refusing to delete them all (use `khipu library remove` if the "
-                "folder was emptied on purpose)"
             )
         for rel, decision in plan:
             if decision.startswith("keep"):
@@ -616,7 +633,9 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
             if pending >= SCAN_COMMIT_EVERY:
                 conn.commit()
                 pending = 0
-        walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
+        walk_incomplete = bool(
+            skipped.get("traversal_error") or skipped.get("unreadable")
+        )
         if walk_incomplete:
             gone = []
         if gone:
@@ -927,7 +946,9 @@ def _decode_vector(raw: Any) -> list[float] | None:
             return None
     else:
         return None
-    return vec if math.isfinite(sum(vec)) else None
+    if not math.isfinite(sum(vec)) or not any(v != 0.0 for v in vec):
+        return None
+    return vec
 
 
 def _infer_provider(model: str) -> str:
@@ -961,9 +982,9 @@ def _resolve_import_profile(cur, model: Any, dims: Any) -> profiles.ProfileSpec:
                 "and pass --profile"
             )
         spec = profiles.validate_spec(pid, provider=provider, model=str(model), dim=int(dims))
+        profiles.add_profile(cur, spec, note="created by khipu library import")
     except ValueError as exc:
         raise LibraryError(str(exc)) from exc
-    profiles.add_profile(cur, spec, note="created by khipu library import")
     return spec
 
 
@@ -973,6 +994,9 @@ def _map_path(source_file: str, prefix: str, roots: tuple[str, ...]) -> str | No
     sf = source_file.replace("\\", "/")
     if prefix and sf.startswith(prefix):
         sf = sf[len(prefix):]
+        # "corpus" (no trailing slash) must not leave "/Author/..." looking absolute.
+        if not prefix.endswith("/") and sf.startswith("/"):
+            sf = sf[1:]
     if sf.startswith("/"):
         for base in roots:
             b = base.rstrip("/") + "/"
@@ -1030,6 +1054,8 @@ def import_index(
         )
         existing = {r[1]: (int(r[0]), r[2]) for r in cur.fetchall()}
         doc_ids: dict[str, int] = {}
+        changed: set[str] = set()
+        unmapped_imported = 0
         prior_chunks: dict[int, dict[int, str]] = {}
         touched: dict[int, set[int]] = {}
         chunk_rows: list[tuple] = []
@@ -1047,8 +1073,20 @@ def import_index(
         def document_for(rel: str, p: Path) -> int | None:
             if rel in doc_ids:
                 return doc_ids[rel]
+            if rel in changed:
+                return None
             if rel in existing:
-                doc_id = existing[rel][0]
+                doc_id, prior_hash = existing[rel]
+                if str(prior_hash or "").startswith(IMPORTED_HASH_PREFIX):
+                    # Resuming an import: the vectors were made from the bytes
+                    # hashed then, so an edited file must not take more of them.
+                    try:
+                        digest = hashlib.sha256(p.read_bytes()).hexdigest()
+                    except OSError:
+                        return None
+                    if IMPORTED_HASH_PREFIX + digest != prior_hash:
+                        changed.add(rel)
+                        return None
                 cur.execute(
                     "SELECT chunk_idx, chunk_text FROM library_chunks WHERE document = %s", (doc_id,)
                 )
@@ -1085,6 +1123,8 @@ def import_index(
                     eligible[rel] = eligible_file(root, root_real, rel)
                 if eligible[rel] is None:
                     stats["unmapped"] += 1
+                    if str(existing.get(rel, (None, ""))[1] or "").startswith(IMPORTED_HASH_PREFIX):
+                        unmapped_imported += 1
                     continue
                 text = row.get("chunk_text")
                 if not isinstance(text, str) or is_corrupt_chunk_text(text):
@@ -1118,19 +1158,32 @@ def import_index(
                     continue
                 doc_id = document_for(rel, eligible[rel])
                 if doc_id is None:
-                    stats["unmapped"] += 1
+                    stats["skipped_conflict" if rel in changed else "unmapped"] += 1
                     continue
                 clean = _clean(text)
-                if (doc_id in prior_chunks and prior_chunks[doc_id].get(idx) != clean):
-                    stats["skipped_conflict"] += 1
-                    continue
+                priors = prior_chunks.get(doc_id)
+                if priors is not None:
+                    if idx in priors:
+                        if priors[idx] != clean:
+                            stats["skipped_conflict"] += 1
+                            continue
+                    else:
+                        # Missing index: allow only when the doc was itself imported
+                        # (resume a partial import); conflict for scan-owned docs.
+                        prior_hash = existing.get(rel, (None, ""))[1] or ""
+                        if not str(prior_hash).startswith(IMPORTED_HASH_PREFIX):
+                            stats["skipped_conflict"] += 1
+                            continue
                 if spec.id not in used:
                     bulk.defer(spec.id, None)  # rows unknown up front
                 used[spec.id] = spec
                 digest = _md5(clean)
                 touched.setdefault(doc_id, set()).add(idx)
-                if doc_id not in prior_chunks:
+                if priors is None:
                     chunk_rows.append((doc_id, idx, clean, digest))
+                elif idx not in priors:
+                    chunk_rows.append((doc_id, idx, clean, digest))
+                    priors[idx] = clean
                 emb_rows.append((spec.id, doc_id, idx, embed._vec_literal(vec), digest))
                 stats["imported"] += 1
                 if len(emb_rows) >= batch:
@@ -1143,8 +1196,11 @@ def import_index(
                 )
             conn.commit()
     ids = sorted(used)
+    # Unmapped rows of an already-imported document leave it partly imported.
+    ok = (not stats["skipped_conflict"] and not unmapped_imported
+          and not (stats["read"] > 0 and stats["imported"] == 0))
     out: dict[str, Any] = {
-        "ok": not stats["skipped_conflict"], "source": name, **stats, "documents": len(touched),
+        "ok": ok, "source": name, **stats, "documents": len(touched),
         "profile": ids[0] if ids else (profile or None), "profiles": ids,
         "source_profile": src.profile,
         "imported_documents": sum(1 for rel in doc_ids if rel not in existing),
@@ -1153,6 +1209,8 @@ def import_index(
             and (rel not in existing or not existing[rel][1])
         ),
     }
+    if unmapped_imported:
+        out["unmapped_imported"] = unmapped_imported
     if ids and src.profile not in ids:
         out["note"] = (
             f"vectors went under {ids}; library {name!r} searches with {src.profile!r}, "

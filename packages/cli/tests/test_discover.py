@@ -1445,6 +1445,28 @@ def test_a_claude_home_pointing_at_zai_is_offered_as_glm_and_the_token_never_sho
     assert all(TOKEN_SENTINEL not in channel for channel in channels)
 
 
+@pytest.mark.parametrize("folder_name", [".claude-glm", ".claude-glm-orbit"])
+def test_a_name_only_glm_home_without_link_targets_keeps_its_token_login(mac, capsys, folder_name):
+    mac.install("claude")
+    _accounts()
+    folder = mac.folder(folder_name)
+    _settings(folder, {"env": {"ANTHROPIC_AUTH_TOKEN": TOKEN_SENTINEL}})
+    assert not any(t["provider"] == "glm" for t in discover._link_targets())
+
+    out = discover.discover(at=NOW)
+    glm = [c for c in out["candidates"] if c["cli"] == "glm"]
+    assert len(glm) == 1
+    assert glm[0]["state"] == "signed_in"
+    assert glm[0]["default"] is True and glm[0]["offer_on_home"] is True
+    assert glm[0]["path"] is None
+    assert glm[0]["login_evidence"] == ["settings_token"]
+    assert not [call for call in mac.calls("claude") if call[0] == str(folder)]
+    captured = capsys.readouterr()
+    channels = [json.dumps(out), discover.store_file().read_text(), captured.out, captured.err,
+                json.dumps(mac.calls("claude"))]
+    assert all(TOKEN_SENTINEL not in channel for channel in channels)
+
+
 def test_a_folder_holding_only_worktrees_is_not_offered(mac):
     box = mac.folder(".claude-box")
     (box / "worktrees").mkdir()
@@ -1647,3 +1669,162 @@ def test_bounded_settings_does_not_follow_a_symlinked_settings_file(mac):
     got = discover.bounded_settings(folder)
     assert got == {"host": None, "provider": None, "has_token": False, "unreadable": True}
     assert TOKEN_SENTINEL not in json.dumps(got)
+
+
+@pytest.mark.parametrize('cli,provider,folder,evidence', [
+    ('claude', 'atlas', '.claude-atlas-orbit', 'folder_provider_name'),
+    ('grok', 'grok', '.grok-orbit', 'same_cli_folder'),
+    ('claude', 'glm', '.claude-glm-orbit', 'folder_provider_name'),
+])
+def test_folder_link_guess_is_public_and_requires_owner_confirmation(mac, monkeypatch, cli, provider, folder, evidence):
+    from khipu import routing
+
+    path = mac.folder(folder)
+    _accounts()
+    known = [{'key': provider + ':fictional', 'harness': provider, 'label': 'Orbit plan',
+              'home': None, 'definition_id': provider + ':fictional'}]
+    monkeypatch.setattr(routing, 'accounts', lambda: known)
+    monkeypatch.setattr(routing, '_identity_snapshot', lambda accounts: ((
+        {a['key']: a['definition_id'] for a in accounts}, {}, {}), {}, {}))
+    before = config.config_file().read_bytes()
+    found, _, _ = discover._gather(NOW)
+    view = discover._view({'candidates': found})
+    row = _by_path(view)['~/' + folder]
+    assert row['cli'] == cli
+    assert row['suggested_link'] == {
+        'account_id': provider + ':fictional', 'label': 'Orbit plan', 'provider': provider,
+        'evidence': [evidence], 'requires_owner_confirmation': True,
+    }
+    assert row['state'] == discover.NOT_CHECKED
+    assert row['needs_owner_check'] is True
+    assert config.config_file().read_bytes() == before
+    assert not routing.events_file().exists()
+    assert path.is_dir()
+
+
+def test_folder_link_guess_refuses_ambiguous_accounts_and_conflicting_settings(mac, monkeypatch):
+    from khipu import routing
+
+    folder = mac.folder('.claude-atlas-orbit')
+    _accounts()
+    known = [{'key': 'atlas:' + suffix, 'harness': 'atlas', 'label': 'Orbit ' + suffix,
+              'home': None, 'definition_id': 'atlas:' + suffix} for suffix in ('one', 'two')]
+    monkeypatch.setattr(routing, 'accounts', lambda: known)
+    monkeypatch.setattr(routing, '_identity_snapshot', lambda accounts: ((
+        {a['key']: a['definition_id'] for a in accounts}, {}, {}), {}, {}))
+    assert _by_path(discover._view({'candidates': discover._gather(NOW)[0]}))[
+        '~/.claude-atlas-orbit']['suggested_link'] is None
+    known.pop()
+    _settings(folder, {'env': {'ANTHROPIC_BASE_URL': 'https://api.anthropic.com'}})
+    assert _by_path(discover._view({'candidates': discover._gather(NOW)[0]}))[
+        '~/.claude-atlas-orbit']['suggested_link'] is None
+
+
+def test_folder_link_guess_refresh_drops_removed_target(mac, monkeypatch):
+    from khipu import routing
+
+    mac.folder('.grok-orbit')
+    _accounts()
+    known = [{'key': 'grok:fictional', 'harness': 'grok', 'label': 'Orbit plan',
+              'home': None, 'definition_id': 'grok:fictional'}]
+    monkeypatch.setattr(routing, 'accounts', lambda: known)
+    monkeypatch.setattr(routing, '_identity_snapshot', lambda accounts: ((
+        {a['key']: a['definition_id'] for a in accounts}, {}, {}), {}, {}))
+    assert _by_path(discover.discover(at=NOW))['~/.grok-orbit']['suggested_link']
+    known.clear()
+    assert _by_path(discover.discover(at=NOW + 10))['~/.grok-orbit']['suggested_link'] is None
+
+
+
+def test_folder_link_guess_uses_existing_routing_identity_without_writes(mac):
+    from khipu import routing
+
+    mac.folder('.grok-orbit')
+    _accounts({'label': 'Orbit plan', 'harness': 'grok', 'home': None})
+    before = config.config_file().read_bytes()
+    row = _by_path(discover.discover(at=NOW))['~/.grok-orbit']
+    assert row['suggested_link']['account_id'] == 'grok:orbit-plan'
+    assert config.config_file().read_bytes() == before
+    assert not routing.events_file().exists()
+
+
+def test_folder_link_guess_preserves_ambiguous_glm_folder_and_refuses_near_names(mac, monkeypatch):
+    from khipu import routing
+
+    folder = mac.folder('.claude-glm-orbit')
+    mac.folder('.claude-glimmer-orbit')
+    _settings(folder, {'env': {'ANTHROPIC_BASE_URL': 'https://api.z.ai/api/anthropic'}})
+    _accounts({'label': 'Orbit plan', 'harness': 'glm', 'home': None})
+    known = [{'key': 'glm:' + suffix, 'harness': 'glm', 'label': 'Orbit ' + suffix,
+              'home': None, 'definition_id': 'glm:' + suffix} for suffix in ('one', 'two')]
+    monkeypatch.setattr(routing, 'accounts', lambda: known)
+    monkeypatch.setattr(routing, '_identity_snapshot', lambda accounts: ((
+        {a['key']: a['definition_id'] for a in accounts}, {}, {}), {}, {}))
+    rows = _by_path(discover._view({'candidates': discover._gather(NOW)[0]}))
+    assert rows['~/.claude-glm-orbit']['cli'] == 'claude'
+    assert rows['~/.claude-glm-orbit']['suggested_link'] is None
+    assert rows['~/.claude-glimmer-orbit']['suggested_link'] is None
+
+
+# ---- z.ai folders never reach the claude CLI ----------------------------------------------
+
+
+def _glm_probe_stub(monkeypatch) -> list:
+    asked = []
+    monkeypatch.setattr(usage, "probe_glm", lambda **kw: asked.append(kw) or {"ok": True, "plan": "Coding Plan"})
+    return asked
+
+
+def test_automatic_discover_never_asks_claude_about_a_tracked_name_only_glm_folder(mac, monkeypatch):
+    mac.install("claude")
+    _accounts({"label": "Z plan", "harness": "glm", "home": None})
+    folder = mac.folder(".claude-glm")
+    mac.session("claude_code", "z", login_home=str(folder))
+    assert any(t["provider"] == "glm" for t in discover._link_targets())
+    asked = _glm_probe_stub(monkeypatch)
+
+    out = discover.discover(at=NOW)
+    row = _by_path(out)["~/.claude-glm"]
+    assert row["cli"] == "claude" and row["state"] == discover.SIGNED_IN
+    assert asked
+    assert not [c for c in mac.calls("claude") if c[0] == str(folder)]
+
+
+def test_owner_check_never_asks_claude_about_a_tracked_zai_folder(mac, monkeypatch):
+    mac.install("claude")
+    _accounts({"label": "Z plan", "harness": "glm", "home": None})
+    folder = mac.folder(".claude-glm")
+    asked = _glm_probe_stub(monkeypatch)
+
+    out = discover.discover(check="~/.claude-glm", at=NOW)
+    assert out["check"]["ok"] is True
+    assert asked
+    assert not [c for c in mac.calls("claude") if c[0] == str(folder)]
+
+
+def test_owner_check_routes_a_settings_pointed_zai_folder_to_the_glm_probe(mac, monkeypatch):
+    mac.install("claude")
+    _accounts({"label": "Z plan", "harness": "glm", "home": None})
+    folder = mac.folder(".claude-custom")
+    _settings(folder, {"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}})
+    asked = _glm_probe_stub(monkeypatch)
+
+    discover.discover(check="~/.claude-custom", at=NOW)
+    assert asked
+    assert not [c for c in mac.calls("claude") if c[0] == str(folder)]
+
+
+def test_a_row_collapsed_to_glm_drops_another_providers_suggested_link(mac, monkeypatch):
+    from khipu import routing
+
+    mac.folder(".claude-glm-orbit")
+    _settings(mac.home / ".claude-glm-orbit", {"env": {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"}})
+    _accounts()
+    known = [{"key": "deepseek:fictional", "harness": "deepseek", "label": "Orbit plan",
+              "home": None, "definition_id": "deepseek:fictional"}]
+    monkeypatch.setattr(routing, "accounts", lambda: known)
+    monkeypatch.setattr(routing, "_identity_snapshot", lambda accounts: ((
+        {a["key"]: a["definition_id"] for a in accounts}, {}, {}), {}, {}))
+    found, _, _ = discover._gather(NOW)
+    glm = [c for c in found.values() if c["cli"] == "glm"]
+    assert len(glm) == 1 and glm[0]["suggested_link"] is None

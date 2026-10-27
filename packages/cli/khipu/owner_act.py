@@ -35,9 +35,12 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.dismiss": (("rule",), ()),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
-    "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only")),
+    "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only", "until")),
     "route.cap.remove": (("account", "kind"), ("window", "purpose")),
     "route.priority.set": (("entries",), ("until", "expect", "holds")),
+    # One account's entry only: ``append`` words to its role or ``role`` in its place (one of the two).
+    # ``exception`` (with ``until`` as its end) adds a direction that lapses on its own; ``end_exception`` ends one.
+    "route.priority.amend": (("account", "expect"), ("append", "role", "until", "exception", "end_exception", "holds")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
@@ -86,15 +89,17 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "direction.on": ((), ()),
     "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
-    "direction.undo": (("id",), ("holds",)),
+    "direction.undo": (("id",), ("holds", "over_newer", "owner_words")),
     "forget.send": ((), ()),
     "forget.here": (("id",), ()),
     "forget.not_same": (("id",), ()),
+    # Undone through direction.undo with the id this returns.
+    "outbox.merge_preferences": ((), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only"}
+_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -297,7 +302,13 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "hold"], ["end", v["hold"]]
     if action.startswith("route.cap."):
         return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "slack", "usd", "days", "n",
-                                             "revision", "purpose", "tier", "sensitive_only")], [v["account"]]
+                                             "revision", "purpose", "tier", "sensitive_only", "until")], [v["account"]]
+    if action == "route.priority.amend":
+        if sum(k in v for k in ("append", "role", "exception", "end_exception")) != 1:
+            raise _bad("route.priority.amend takes append (words added to the role), role (its new words), "
+                       "exception (a direction with an end, with until) or end_exception (an exception's id), one of the four")
+        return ["route", "priority", "amend",
+                *_opts(v, "append", "role", "until", "exception", "end_exception", "holds", "expect")], [v["account"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":
@@ -385,25 +396,50 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad(f"key must be one of: {', '.join(_DIRECTION_KEYS)}")
         return ["owner-direction", "set"], [v["key"], v["value"]]
     if action == "direction.undo":
-        return ["owner-direction", "undo", *_opts(v, "holds")], [v["id"]]
+        return ["owner-direction", "undo", *_opts(v, "holds", "over_newer", "owner_words")], [v["id"]]
     if action == "forget.send":
         return ["episode", "forget-pending", "--send"], []
     if action == "forget.here":
         return ["episode", "forget-pending", f"--forget-here={v['id']}"], []
     if action == "forget.not_same":
         return ["episode", "forget-pending", f"--not-same={v['id']}"], []
+    if action == "outbox.merge_preferences":
+        return ["outbox", "merge-line-preferences", "--apply"], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
+
+
+def owner_turn() -> bool:
+    """Whether this call comes from a conversation the owner typed in, the
+    only place a forgotten episode's summary may be shown (choosing
+    forget.here or forget.not_same). Any doubt answers no."""
+    from khipu import owner_direction
+
+    try:
+        owner_direction.check("forget.here")
+    except Exception:  # noqa: BLE001 - any doubt keeps the text back
+        return False
+    return True
+
+
+def without_summaries(out: dict) -> dict:
+    """``unsent_forgets`` output with each listed id kept and every other
+    item field (the summary) dropped; an item that is not an id entry is
+    dropped whole."""
+    return dict(out, ids=[{"id": item.get("id")} for item in out.get("ids") or [] if isinstance(item, dict)])
 
 
 def _forget_list() -> dict:
     from khipu import forget
 
-    return forget.unsent_forgets()
+    out = forget.unsent_forgets()
+    return out if owner_turn() else without_summaries(out)
 
 
-# Actions that only read, answered without the owner-direction check: the
-# forgets this Mac holds that the hub lacks (design 6.2), each bare id with
-# its hub summary, so the owner can choose forget.here or forget.not_same.
+# Actions that only read, answered without refusing: the forgets this Mac
+# holds that the hub lacks (design 6.2), each bare id, with its hub summary
+# only when the owner-direction check passes, so the owner can choose
+# forget.here or forget.not_same. The app reads its list through
+# ``khipu episode forget-pending`` instead.
 _READS = {"forget.list": _forget_list}
 
 

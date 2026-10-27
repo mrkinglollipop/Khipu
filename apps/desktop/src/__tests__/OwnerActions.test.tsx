@@ -11,7 +11,14 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
 }));
 
-type Backend = { settings: OwnerDirectionSettings; actions: OwnerAction[]; refuse?: string; chain?: ChainState };
+type Backend = {
+  settings: OwnerDirectionSettings;
+  actions: OwnerAction[];
+  refuse?: string;
+  /** A newer change touched the same target: refused unless asked over it. */
+  newer?: string;
+  chain?: ChainState;
+};
 let backend: Backend;
 const calls: Array<[string, Record<string, unknown> | undefined]> = [];
 
@@ -65,6 +72,9 @@ beforeEach(() => {
         });
       case "khipu_owner_direction_undo": {
         if (backend.refuse) return JSON.stringify({ ok: false, error: backend.refuse });
+        if (backend.newer && !args?.overNewer) {
+          return JSON.stringify({ ok: false, code: "newer_change", error: backend.newer, newer: { id: "n1" } });
+        }
         const row = backend.actions.find((a) => a.id === args?.id)!;
         row.state = row.state === "scheduled" ? "cancelled" : "undone";
         return JSON.stringify({ ok: true, undid: row.id });
@@ -121,6 +131,36 @@ describe("Owner actions", () => {
     await waitFor(() => expect(within(items[2]).getByText("Undone")).toBeTruthy());
     expect(calls).toContainEqual(["khipu_owner_direction_undo", { id: "a1" }]);
     expect(within(items[2]).queryByRole("button")).toBeNull();
+  });
+
+  it("an Undo refused over a newer change says so and offers a labelled second confirm", async () => {
+    backend.newer =
+      "Not undone: your later change (a pause, owner action n1) changed the same pause after this change, at " +
+      "2026-10-16T15:00:00Z. Undoing now would put back what was there before and lose that newer change, so " +
+      "nothing was changed.";
+    render(<OwnerActions active />);
+    const items = within(await list()).getAllByRole("listitem");
+    fireEvent.click(within(items[2]).getByRole("button", { name: "Undo: Paused Codex" }));
+    const alert = await within(items[2]).findByRole("alert");
+    expect(alert.textContent).toContain("your later change (a pause, owner action n1)");
+    expect(alert.textContent).toContain("2026-10-16T15:00:00Z");
+    expect(alert.textContent).toContain("nothing was changed");
+    expect(calls).toContainEqual(["khipu_owner_direction_undo", { id: "a1" }]);
+    expect(items[2].textContent).not.toContain("Undone");
+    const anyway = within(items[2]).getByRole("button", { name: "Undo anyway and lose the newer change: Paused Codex" });
+    fireEvent.click(anyway);
+    await waitFor(() => expect(within(items[2]).getByText("Undone")).toBeTruthy());
+    expect(calls).toContainEqual(["khipu_owner_direction_undo", { id: "a1", overNewer: true }]);
+    expect(within(items[2]).queryByRole("button", { name: /Undo anyway/ })).toBeNull();
+  });
+
+  it("offers no undo-anyway for any other refusal", async () => {
+    backend.refuse = "Khipu can't tell which hold this was, so it can't undo it";
+    render(<OwnerActions active />);
+    const items = within(await list()).getAllByRole("listitem");
+    fireEvent.click(within(items[2]).getByRole("button", { name: "Undo: Paused Codex" }));
+    await within(items[2]).findByRole("alert");
+    expect(within(items[2]).queryByRole("button", { name: /Undo anyway/ })).toBeNull();
   });
 
   it("shows the app's and a terminal's changes with how they were made, each with Undo", async () => {

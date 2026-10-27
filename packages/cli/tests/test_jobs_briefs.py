@@ -118,6 +118,7 @@ class RunNightlyBriefsStepTest(unittest.TestCase):
                 mock.patch.object(jobs, "_reconcile_notes_if_due", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_commitment_close_rules", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_nightly_log"), \
