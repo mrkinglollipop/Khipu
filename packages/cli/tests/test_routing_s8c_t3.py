@@ -130,7 +130,7 @@ def test_doctor_names_t3_providers_without_hooks(tmp_path, monkeypatch):
     assert by_id["cursor_1"]["hooks"] == "missing"
     assert "off_1" not in by_id
     warnings = "\n".join(out["warnings"])
-    assert "Codex bare" in warnings and "hooks" in warnings and "missing" in warnings
+    assert "Codex bare (codex) has no Khipu hooks" in warnings
     assert "Cursor" in warnings
     assert "Codex hooked" not in warnings and "Codex disabled" not in warnings
     assert secret not in json.dumps(out)
