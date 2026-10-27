@@ -331,6 +331,13 @@ export function useRoutingDetail({ state, plans, onOpenSettings }: {
   const host = useDetailHost<{ key: string; words: boolean }>();
   const view = state.data;
   const account = host.target && view ? (view.accounts ?? []).find((a) => a.key === host.target?.key) : undefined;
+  // Same as PlansCard: drop a target whose account left, so it does not reopen
+  // if that account returns later.
+  const closeDetail = host.close;
+  const hasTarget = host.target != null;
+  useEffect(() => {
+    if (hasTarget && !account) closeDetail();
+  }, [hasTarget, account, closeDetail]);
   const node =
     host.target && view && account ? (
       <RoutingDetailSheet

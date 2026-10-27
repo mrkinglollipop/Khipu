@@ -281,7 +281,7 @@ class OutboxAgeTest(unittest.TestCase):
             old_ts = time.strftime(
                 "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() - 7200)
             )
-            job.write_text(json.dumps({"queued_at": old_ts, "attempts": 1}), encoding="utf-8")
+            job.write_text(json.dumps({"queued_at": old_ts, "attempts": 1, "payload": {}}), encoding="utf-8")
             with mock.patch.object(outbox, "outbox_dir", return_value=d), \
                     mock.patch.object(outbox, "dead_dir", return_value=d / "dead"):
                 st = outbox.status()

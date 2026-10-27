@@ -1425,6 +1425,7 @@ def main() -> int:
         print(f"  skill→task_type edges: {len(task_type_edges)}")
         all_nodes += task_type_nodes
     else:
+        model_call_rows = []
         task_type_edges = []
 
     # custom AST code layer (replaces the retired graphify bridge)
