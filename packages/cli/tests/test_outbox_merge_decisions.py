@@ -517,3 +517,95 @@ def test_one_bad_line_never_stops_later_batches(tricky, tmp_path, monkeypatch):
     assert [f["episode_id"] for f in out["lines_failed"]] == [4], out
     assert out["lines_resolved"] == 1 and paths["four"].exists() and not paths["five"].exists()
     assert cur.episodes[5]["raw"]["preferences"][-1] == "Another new preference"
+
+
+# --- a scope K6 drops that the row stores verbatim, and comma-joined people ---------------------
+
+
+PATH_SCOPE = "/Users/someone/Code/Khipu/.claude/worktrees/outbox-scope-people"
+
+
+@pytest.fixture
+def scoped(hub, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(db, "_TABLE_COLUMNS_CACHE", {})
+    monkeypatch.setattr(provenance, "_READY", False)
+    monkeypatch.setattr("khipu.identity.project_group", lambda _cur, p: [p])
+    monkeypatch.setattr(hygiene, "classify_topics", _classify)
+    _handles_decisions_sql(hub)
+    hub.episodes[1]["summary"] = hub.episodes[1]["raw"]["summary"] = "Synthetic episode 1"
+    _episode(hub, 2, scope=PATH_SCOPE, tags=["tmp"])          # stored verbatim, written before K6
+    _episode(hub, 3, scope=PATH_SCOPE + "-other")             # a different scope than the line's
+    _episode(hub, 4, people=["Ann, Bo", "Cy"])                # two names, three pieces
+    _episode(hub, 5, people=["Ann", "Bo"])
+    for e in hub.episodes.values():
+        e["project"] = "khipu"
+    hub._existing_keys = {(e["ts"], _md5(e["summary"])) for e in hub.episodes.values()}
+    hub.next_id = 100
+    paths = {
+        "equal": _queue(_line(2, scope=PATH_SCOPE + " ", topics=["outbox", "tmp"],
+                              preferences=[*HUB["preferences"], "A new preference"],
+                              decisions=["A new decision", *LINE_DECISIONS])),
+        "differs": _queue(_line(3, scope=PATH_SCOPE, preferences=[*HUB["preferences"], "A new preference"])),
+        "people": _queue(_line(4, people=["Ann", "Bo", "Cy"], preferences=[*HUB["preferences"], "A new preference"])),
+        "new_person": _queue(_line(5, people=["Ann", "Bo", "Cy"], preferences=[*HUB["preferences"], "A new preference"])),
+    }
+    return hub, paths
+
+
+@pytest.mark.parametrize("raw_scope, line_scope, expected", [
+    (PATH_SCOPE, PATH_SCOPE, []),
+    (PATH_SCOPE, f"  {PATH_SCOPE} ", []),
+    (PATH_SCOPE + "-other", PATH_SCOPE, None),
+    (None, PATH_SCOPE, []),
+])
+def test_a_dropped_scope_the_row_stores_verbatim_is_held(raw_scope, line_scope, expected):
+    raw = {**deepcopy(HUB), "scope": raw_scope}
+    view = outbox_preferences._hub_view(_line(1, summary=HUB["summary"], scope=line_scope))
+    assert outbox_preferences.normalized_missing(raw, view) == expected
+    projection = outbox_preferences.projection_of(outbox_preferences._writer_projection(raw, view) or {})
+    if expected is not None:
+        assert outbox_preferences.normalized_missing(raw, view, projection) == expected
+    assert outbox_preferences.normalized_missing(raw, view, {"scope": "other"}) is None
+
+
+@pytest.mark.parametrize("raw_people, line_people, held", [
+    (["Ann, Bo", "Cy"], ["Ann", "Bo", "Cy"], True),
+    (["Ann", "Bo", "Cy"], ["Ann, Bo", "Cy"], True),
+    (["Ann", "Bo"], ["Ann", "Bo", "Cy"], False),
+    (["Ann, Bo"], ["Bo, Ann"], False),
+    (None, ["Ann"], False),
+    (["Ann"], [], True),
+])
+def test_people_compare_after_the_legacy_comma_join(raw_people, line_people, held):
+    raw = {**deepcopy(HUB), **({} if raw_people is None else {"people": raw_people})}
+    view = outbox_preferences._hub_view(_line(1, summary=HUB["summary"], people=line_people))
+    assert (outbox_preferences.normalized_missing(raw, view) == []) is held
+
+
+def test_scope_and_people_lines_merge_and_a_real_difference_stays_held(scoped, tmp_path, monkeypatch):
+    cur, paths = scoped
+    before = deepcopy(cur.episodes)
+    jobs_before = {k: json.loads(p.read_text()) for k, p in paths.items()}
+    rc, dry = _run("--include-decisions")
+    assert rc == 0 and dry["needs_review_episode_ids"] == [5], dry
+    _direction(tmp_path, monkeypatch)
+    rc, out = _run("--include-decisions", "--apply", "--owner-direction")
+    assert rc == 0 and out["episode_ids"] == [2, 3, 4], out
+    # Preferences and decisions land; the noise topic is already a tag; the hub scope is unchanged.
+    assert cur.episodes[2]["raw"]["preferences"] == [*HUB["preferences"], "A new preference"]
+    assert cur.episodes[2]["raw"]["decisions"] == [*HUB["decisions"], "A new decision"]
+    assert cur.episodes[2]["raw"]["tags"] == ["tmp"] and cur.episodes[2]["raw"]["scope"] == PATH_SCOPE
+    assert cur.episodes[4]["raw"]["preferences"] == [*HUB["preferences"], "A new preference"]
+    assert cur.episodes[4]["raw"]["people"] == ["Ann, Bo", "Cy"]
+    # A genuinely different scope is not the verbatim case: it archives as the existing
+    # scope_differs_kept, and the hub scope stays; a name the row lacks stays held.
+    assert cur.episodes[3]["raw"]["scope"] == PATH_SCOPE + "-other"
+    assert cur.episodes[5] == before[5] and json.loads(paths["new_person"].read_text()) == jobs_before["new_person"]
+    records = _records()
+    assert sorted(records) == [2, 3, 4]
+    for record in records.values():
+        outbox._validate_resolution(record)
+    assert records[3]["resolution"]["kind"] == outbox_preferences.DECISIONS_KIND or \
+        records[3]["resolution"]["kind"] == outbox_preferences.SCOPE_KIND
+    assert records[2]["resolution"]["kind"] != outbox_preferences.SCOPE_KIND
+    assert records[2]["queued_evidence"]["payload"]["scope"] == PATH_SCOPE + " "
