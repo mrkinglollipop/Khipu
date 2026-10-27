@@ -3704,7 +3704,9 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     todo.append(("episode", str(eid), i, chunk, _md5(chunk)))
                 if out["embedded"] >= limit:
                     break
-            episode_embedded_refs: set[str] = set()
+            # Refs with a chunk in a rejected batch keep their old rows;
+            # an episode that now has no chunks is still pruned.
+            episode_failed_refs: set[str] = set()
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
                 api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
@@ -3717,6 +3719,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     # One batch the provider rejects must not abort commitments
                     # or topics; those refs stay missing for the next run.
                     _log(f"episode embed catch-up: {type(exc).__name__}: {exc}")
+                    episode_failed_refs.update(r for _, r, *_ in batch)
                     continue
                 live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
                 writable = [(row, vec) for row, vec in zip(batch, vecs) if row[:2] in live_refs]
@@ -3724,21 +3727,21 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                                        [(k, r, i, t, h, v) for (k, r, i, t, h), v in writable])
                 conn.commit()
                 out["chunks"] += len(writable)
-                for row, _vec in writable:
-                    episode_embedded_refs.add(row[1])
                 episode_snapshot_rows.extend(
                     {"profile": profile, "kind": k, "ref": r, "chunk_idx": i,
                      "chunk_text": t, "content_hash": h, "embedding": v, "built_at": b}
                     for ((k, r, i, t, h), v), b in zip(writable, _stamps(built, len(writable)))
                 )
-            for ref, indices in episode_replacements.items():
-                if ref not in episode_embedded_refs:
-                    continue
+            embedded_replacements = {
+                ref: indices for ref, indices in episode_replacements.items()
+                if ref not in episode_failed_refs
+            }
+            for ref, indices in embedded_replacements.items():
                 cur.execute(
                     "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'episode' "
                     "AND ref = %s AND NOT (chunk_idx = ANY(%s))", (profile, ref, indices),
                 )
-            if episode_embedded_refs:
+            if embedded_replacements:
                 from khipu.hub_snapshot import read_anchor_identities, upsert_embeddings
 
                 # Each episode's source identities, for the replica's source
@@ -3746,10 +3749,6 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 # savepoint before the commit; without them nothing is
                 # written to the replica here, and the next pull brings it.
                 anchors = None
-                embedded_replacements = {
-                    ref: indices for ref, indices in episode_replacements.items()
-                    if ref in episode_embedded_refs
-                }
                 cur.execute("SAVEPOINT embed_anchor_read")
                 try:
                     anchors = read_anchor_identities(
