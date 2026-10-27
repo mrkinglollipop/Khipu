@@ -78,12 +78,11 @@ WRITE_LOCK_NAME = "usage.write.lock"
 ATTEMPTS_NAME = "usage-attempts.jsonl"
 ATTEMPTS_MAX_BYTES = 512 * 1024
 ATTEMPTS_ROTATED_SUFFIX = ".1"
-# Grok near a weekly reset, or after a failed attempt: retry sooner than the
-# five-minute periodic age (60–120 s band).
+# Grok within 15 minutes of a weekly reset, or after a transient failed
+# attempt: retry sooner than the five-minute periodic age. Sign-in and
+# install failures never recover by themselves, so they keep the normal age.
 NEAR_RESET_MAX_AGE_S = 90
-NEAR_RESET_WITHIN_S = 3600
-# Keep the last pre-reset figure on the row for a few hours after the roll.
-PREV_FIGURE_KEEP_S = 3 * 3600
+NEAR_RESET_WITHIN_S = 900
 # probe_all's overall deadline is the per-probe timeout plus this grace.
 OVERALL_GRACE_S = 2.0
 ROLLOUT_FILES = 5
@@ -132,6 +131,7 @@ E_NO_LIMITS = "no_plan_limits"
 # passing gap, not a sign-in problem, so the last figures stay shown.
 E_NO_FIGURES = "no_plan_figures"
 E_CLI = "cli_error"
+TRANSIENT_RETRY_ERRORS = frozenset({E_TIMEOUT, E_CLI, E_NO_ANSWER, E_BAD, E_START})
 E_INVALID = "invalid_account"
 E_INTERNAL = "internal_error"
 E_PENDING = "pending"
@@ -3188,8 +3188,7 @@ def _age_limit_for(account: dict, cached: dict, now: datetime, max_age: float) -
     if account.get("harness") == "deepseek":
         return min(max_age, DEEPSEEK_POLL_S)
     if account.get("harness") == "grok":
-        failed = bool(cached.get("last_error")) or (
-            cached.get("ok") is False and bool(cached.get("last_attempt_at")))
+        failed = (cached.get("last_error") or cached.get("error")) in TRANSIENT_RETRY_ERRORS
         if failed or _weekly_reset_within(cached, now, NEAR_RESET_WITHIN_S):
             return min(max_age, NEAR_RESET_MAX_AGE_S)
     return max_age
