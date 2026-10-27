@@ -42,7 +42,7 @@ class PartialImportTest(_Base):
         p = Path(self.tmp.name) / name
         p.write_text("\n".join(json.dumps({
             "node_id": "a", "chunk_idx": i, "source_file": "corpus/book.txt",
-            "chunk_text": f"chunk {i}", "embedding": [1.0, 0.0, 0.0, 0.0], "model": "voyage-t", "dims": 4,
+            "chunk_text": f"chunk {i}", "embedding": [1.0, 0.0, 0.0, 0.0], "model": TINY.model, "dims": TINY.dim,
         }) for i in idxs) + "\n")
         return p
 
@@ -62,7 +62,7 @@ class StripPrefixTest(_Base):
         p = Path(self.tmp.name) / "i.jsonl"
         p.write_text(json.dumps({
             "node_id": "a", "chunk_idx": 0, "source_file": "corpus/Author/Book.txt",
-            "chunk_text": "hello world", "embedding": [1.0, 0.0, 0.0, 0.0], "model": "voyage-t", "dims": 4,
+            "chunk_text": "hello world", "embedding": [1.0, 0.0, 0.0, 0.0], "model": TINY.model, "dims": TINY.dim,
         }) + "\n")
         out = library.import_index(self.hub, "lib1", str(p), strip_prefix="corpus")
         self.assertTrue(out["imported"] > 0 or out["ok"] is False,

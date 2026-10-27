@@ -24,7 +24,7 @@ from unittest import mock
 from khipu import cli, db, embed, jobs, library, profiles
 from khipu.profiles import ProfileSpec
 
-TINY = ProfileSpec("voyage-t@4", "voyage", "voyage-t", 4)
+TINY = ProfileSpec("voyage-3.5@4", "voyage", "voyage-3.5", 4)
 
 
 class ConnectionTimeout(Exception):
@@ -46,7 +46,7 @@ class FakeHub:
 
     def __init__(self, *, profile_rows=None):
         self.profile_rows = dict(profile_rows or {
-            TINY.id: ("voyage", "voyage-t", 4, "l2", None),
+            TINY.id: ("voyage", "voyage-3.5", 4, "l2", None),
         })
         self.sources: dict[str, dict] = {}
         self.docs: dict[int, dict] = {}
@@ -483,7 +483,7 @@ class ScanTest(_Base):
             with self.assertRaises(library.LibraryError) as ctx:
                 library.scan(self.hub, "lib1")
         rollback.assert_called_once()
-        self.assertIn("30 embedded documents would be rebuilt out of 30", str(ctx.exception))
+        self.assertIn("30 embedded documents would be rebuilt or removed out of 30", str(ctx.exception))
         self.assertIn("vectors would be deleted", str(ctx.exception))
         self.assertIn("nothing was changed", str(ctx.exception))
         self.assertIn("khipu library scan lib1 --allow-rebuild", str(ctx.exception))
@@ -519,6 +519,31 @@ class ScanTest(_Base):
             self.hub.chunks[key] = ("broken", "bad")
         with self.assertRaisesRegex(library.LibraryError, "31 embedded documents.*300"):
             library.scan(self.hub, "lib1")
+
+    def test_gone_plus_rebuild_share_one_mass_vector_loss_limit(self):
+        """99 renamed + 99 content-changed must not slip past two separate 10% gates."""
+        n = 1000
+        for i in range(n):
+            self.write(f"keep/doc{i:04}.txt", f"text {i}")
+        library.scan(self.hub, "lib1")
+        for (doc, idx), (_, digest) in self.hub.chunks.items():
+            self.hub.embs[(TINY.id, doc, idx)] = ("[1,0,0,0]", digest)
+        for i in range(99):
+            old = self.root / f"keep/doc{i:04}.txt"
+            new = self.root / f"moved/doc{i:04}.txt"
+            new.parent.mkdir(exist_ok=True)
+            old.rename(new)
+        for i in range(99, 198):
+            self.write(f"keep/doc{i:04}.txt", f"changed {i}")
+        before = copy.deepcopy((self.hub.docs, self.hub.chunks, self.hub.embs))
+        with mock.patch.object(self.hub, "rollback") as rollback:
+            with self.assertRaises(library.LibraryError) as ctx:
+                library.scan(self.hub, "lib1")
+        rollback.assert_called_once()
+        msg = str(ctx.exception)
+        self.assertIn("198 embedded documents", msg)
+        self.assertIn("--allow-rebuild", msg)
+        self.assertEqual((self.hub.docs, self.hub.chunks, self.hub.embs), before)
 
     def test_file_unreadable_between_scan_phases_is_skipped_without_deletion(self):
         path = self.write("existing.txt", "old text")
@@ -902,12 +927,12 @@ class ImportTest(_Base):
         self.write("Lewis/Mere.md", "gamma delta")
         self.idx = Path(self.tmp.name) / "graph.sqlite"
         self.rows = [
-            ("author:Heiser", 0, "corpus/Heiser/Unseen.txt", "first chunk", _blob(1, 0, 0, 0), "voyage-t", 4),
-            ("author:Heiser", 1, "corpus/Heiser/Unseen.txt", "second chunk", _blob(0, 1, 0, 0), "voyage-t", 4),
-            ("author:Lewis", 0, "corpus/Lewis/Mere.md", "lewis chunk", _blob(0, 0, 1, 0), "voyage-t", 4),
-            ("author:Lewis", 1, "corpus/Lewis/Mere.md", "\x01\x02\x03\x04garbage", _blob(0, 0, 0, 1), "voyage-t", 4),
-            ("author:X", 0, "corpus/Ghost/Gone.txt", "no such file", _blob(1, 1, 0, 0), "voyage-t", 4),
-            ("author:Lewis", 2, "corpus/Lewis/Mere.md", "short vector", _blob(1, 2, 3), "voyage-t", 4),
+            ("author:Heiser", 0, "corpus/Heiser/Unseen.txt", "first chunk", _blob(1, 0, 0, 0), "voyage-3.5", 4),
+            ("author:Heiser", 1, "corpus/Heiser/Unseen.txt", "second chunk", _blob(0, 1, 0, 0), "voyage-3.5", 4),
+            ("author:Lewis", 0, "corpus/Lewis/Mere.md", "lewis chunk", _blob(0, 0, 1, 0), "voyage-3.5", 4),
+            ("author:Lewis", 1, "corpus/Lewis/Mere.md", "\x01\x02\x03\x04garbage", _blob(0, 0, 0, 1), "voyage-3.5", 4),
+            ("author:X", 0, "corpus/Ghost/Gone.txt", "no such file", _blob(1, 1, 0, 0), "voyage-3.5", 4),
+            ("author:Lewis", 2, "corpus/Lewis/Mere.md", "short vector", _blob(1, 2, 3), "voyage-3.5", 4),
         ]
         _make_index(self.idx, self.rows)
 
@@ -1010,7 +1035,7 @@ class ImportTest(_Base):
         self.hub.profile_rows.clear()
         profiles.clear_learned()  # add() had cached the profile in this process
         self.run_import()
-        self.assertEqual(self.hub.profile_rows[TINY.id][:3], ("voyage", "voyage-t", 4))
+        self.assertEqual(self.hub.profile_rows[TINY.id][:3], ("voyage", "voyage-3.5", 4))
         # a gemini-named model infers gemini
         self.assertEqual(library._infer_provider("gemini-embedding-001"), "gemini")
         self.assertEqual(library._infer_provider("Voyage-3"), "voyage")
@@ -1024,21 +1049,30 @@ class ImportTest(_Base):
         self.assertIn("--endpoint", str(ctx.exception))
         self.assertNotIn("nomic-embed-text@4", self.hub.profile_rows)
 
+    def test_a_new_profile_at_the_wrong_native_width_is_a_library_error(self):
+        # voyage-3 only emits 1024 wide; add_profile refuses it, and import must
+        # report that as LibraryError so the CLI prints {"ok": false}, not a traceback.
+        idx = Path(self.tmp.name) / "mislabelled.sqlite"
+        _make_index(idx, [("n", 0, "Heiser/Unseen.txt", "t", _blob(1, 0, 0, 0), "voyage-3", 4)])
+        with self.assertRaises(library.LibraryError):
+            library.import_index(self.hub, "lib1", str(idx))
+        self.assertNotIn("voyage-3@4", self.hub.profile_rows)
+
     def test_explicit_profile_wins_and_must_exist(self):
         self.hub.profile_rows["other@4"] = ("voyage", "other", 4, "l2", None)
         library.scan(self.hub, "lib1")
         idx = Path(self.tmp.name) / "matching.sqlite"
-        _make_index(idx, [("n", 0, "Heiser/Unseen.txt", "alpha beta", _blob(1, 0, 0, 0), "voyage-t", 4)])
+        _make_index(idx, [("n", 0, "Heiser/Unseen.txt", "alpha beta", _blob(1, 0, 0, 0), "voyage-3.5", 4)])
         out = library.import_index(self.hub, "lib1", str(idx), profile="other@4")
         self.assertEqual(out["profile"], "other@4")
-        self.assertIn("note", out)  # library searches with voyage-t@4, not other@4
+        self.assertIn("note", out)  # library searches with voyage-3.5@4, not other@4
         self.assertEqual({k[0] for k in self.hub.embs}, {"other@4"})
         with self.assertRaises(library.LibraryError):
             self.run_import(profile="ghost@4")
 
     def test_dims_that_disagree_with_the_blob_are_counted_bad(self):
         idx = Path(self.tmp.name) / "d.sqlite"
-        _make_index(idx, [("n", 0, "Heiser/Unseen.txt", "t", _blob(1, 0, 0, 0), "voyage-t", 8)])
+        _make_index(idx, [("n", 0, "Heiser/Unseen.txt", "t", _blob(1, 0, 0, 0), "voyage-3.5", 8)])
         out = library.import_index(self.hub, "lib1", str(idx), profile=TINY.id)
         self.assertEqual((out["imported"], out["skipped_bad_vector"]), (0, 1))
         self.assertEqual(self.hub.embs, {})
@@ -1047,9 +1081,9 @@ class ImportTest(_Base):
         j = Path(self.tmp.name) / "idx.jsonl"
         lines = [
             {"node_id": "a", "chunk_idx": 0, "source_file": "corpus/Heiser/Unseen.txt",
-             "chunk_text": "from jsonl", "embedding": [0.5, 0.5, 0.5, 0.5], "model": "voyage-t", "dims": 4},
+             "chunk_text": "from jsonl", "embedding": [0.5, 0.5, 0.5, 0.5], "model": "voyage-3.5", "dims": 4},
             {"node_id": "a", "chunk_idx": 1, "source_file": "corpus/Heiser/Unseen.txt",
-             "chunk_text": "bad vec", "embedding": [0.5, "x"], "model": "voyage-t", "dims": 4},
+             "chunk_text": "bad vec", "embedding": [0.5, "x"], "model": "voyage-3.5", "dims": 4},
         ]
         j.write_text("\n".join(json.dumps(x) for x in lines) + "\nnot json\n[1,2]\n")
         out = library.import_index(self.hub, "lib1", str(j), strip_prefix="corpus/")
@@ -1116,11 +1150,11 @@ class ImportTest(_Base):
         outside.write_text("x")
         idx = Path(self.tmp.name) / "p.sqlite"
         _make_index(idx, [
-            ("n", 0, "Lewis/data.csv", "t", _blob(1, 0, 0, 0), "voyage-t", 4),
-            ("n", 0, "../outside.txt", "t", _blob(1, 0, 0, 0), "voyage-t", 4),
-            ("n", 0, str(outside), "t", _blob(1, 0, 0, 0), "voyage-t", 4),
-            ("n", 0, "", "t", _blob(1, 0, 0, 0), "voyage-t", 4),
-            ("n", 0, f"{self.root}/Lewis/Mere.md", "abs path under root", _blob(1, 0, 0, 0), "voyage-t", 4),
+            ("n", 0, "Lewis/data.csv", "t", _blob(1, 0, 0, 0), "voyage-3.5", 4),
+            ("n", 0, "../outside.txt", "t", _blob(1, 0, 0, 0), "voyage-3.5", 4),
+            ("n", 0, str(outside), "t", _blob(1, 0, 0, 0), "voyage-3.5", 4),
+            ("n", 0, "", "t", _blob(1, 0, 0, 0), "voyage-3.5", 4),
+            ("n", 0, f"{self.root}/Lewis/Mere.md", "abs path under root", _blob(1, 0, 0, 0), "voyage-3.5", 4),
         ])
         out = library.import_index(self.hub, "lib1", str(idx))
         self.assertEqual((out["unmapped"], out["imported"]), (4, 1))
@@ -1140,7 +1174,7 @@ class ImportTest(_Base):
             library.import_index(self.hub, "lib1", str(junk))
 
     def test_streaming_commits_in_batches(self):
-        many = [("n", i, "corpus/Heiser/Unseen.txt", f"chunk {i}", _blob(1, 0, 0, 0), "voyage-t", 4)
+        many = [("n", i, "corpus/Heiser/Unseen.txt", f"chunk {i}", _blob(1, 0, 0, 0), "voyage-3.5", 4)
                 for i in range(25)]
         idx = Path(self.tmp.name) / "many.sqlite"
         _make_index(idx, many)
@@ -1172,7 +1206,7 @@ class AuditImportTest(_Base):
         path = Path(self.tmp.name) / "audit.jsonl"
         path.write_text("\n".join(json.dumps({
             "source_file": "book.txt", "chunk_idx": idx, "chunk_text": text,
-            "embedding": [1, 0, 0, 0], "model": "voyage-t", "dims": 4,
+            "embedding": [1, 0, 0, 0], "model": "voyage-3.5", "dims": 4,
         }) for idx, text in rows))
         return str(path)
 
@@ -1312,13 +1346,13 @@ class CliTest(_Base):
             {"embedded": 1, "failed": 0, "remaining": 0, "profile": TINY.id})
         idx = Path(self.tmp.name) / "i.sqlite"
         # Matching scan text so the import is ok (conflict used to exit 0 anyway).
-        _make_index(idx, [("n", 0, "A/x.txt", "some text", _blob(1, 0, 0, 0), "voyage-t", 4)])
+        _make_index(idx, [("n", 0, "A/x.txt", "some text", _blob(1, 0, 0, 0), "voyage-3.5", 4)])
         rc, out = self.run_cli(library_cmd="import", name="lib1", path=str(idx), strip_prefix="", profile=None)
         self.assertEqual(rc, 0)
         self.assertTrue({"read", "imported", "skipped_corrupt", "unmapped", "documents",
                          "profile"} <= set(out))
         bad = Path(self.tmp.name) / "bad.sqlite"
-        _make_index(bad, [("n", 0, "Ghost/Gone.txt", "nope", _blob(1, 0, 0, 0), "voyage-t", 4)])
+        _make_index(bad, [("n", 0, "Ghost/Gone.txt", "nope", _blob(1, 0, 0, 0), "voyage-3.5", 4)])
         rc, out = self.run_cli(library_cmd="import", name="lib1", path=str(bad), strip_prefix="", profile=None)
         self.assertEqual(rc, 1)
         self.assertFalse(out["ok"])
@@ -1668,6 +1702,92 @@ class NightlyAndDoctorTest(_Base):
         self.assertEqual(library._pct(4335, 4336), 99.9)
         self.assertEqual(library._pct(4336, 4336), 100.0)
         self.assertEqual(library._pct(0, 0), 0.0)
+
+
+class DecodeVectorTest(unittest.TestCase):
+    def test_all_zero_list_is_rejected(self):
+        self.assertIsNone(library._decode_vector([0.0, 0.0, 0.0, 0.0]))
+
+    def test_live_generator_rejects_all_zero_control(self):
+        with self.assertRaises(RuntimeError):
+            embed._validated_vector([0.0, 0.0, 0.0, 0.0], 4)
+
+
+class _RenameCur:
+    def __init__(self, conn):
+        self.conn, self._rows = conn, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.conn.log.append((sql, params))
+        s = " ".join(sql.split())
+        if "FROM library_sources WHERE name" in s:
+            self._rows = [("heiser", self.conn.root, "p", True)]
+        elif s.startswith("SELECT id, rel_path, content_hash"):
+            self._rows = self.conn.existing
+        elif "DISTINCT e.document" in s:
+            self._rows = [(r[0],) for r in self.conn.existing]
+        elif "INSERT INTO library_documents" in s:
+            self.conn.next_id += 1
+            self._rows = [(self.conn.next_id,)]
+        else:
+            self._rows = []
+
+    def executemany(self, sql, rows):
+        self.conn.log.append((sql, list(rows)))
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _RenameConn:
+    def __init__(self, root, existing):
+        self.root, self.existing, self.log, self.next_id = root, existing, [], 1000
+
+    def cursor(self):
+        return _RenameCur(self)
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+
+class FolderRenameScanTest(unittest.TestCase):
+    def test_renaming_the_top_level_folder_does_not_silently_delete_imported_documents(self):
+        """Mass-delete of embedded imports after a folder rename must hit the
+        same allow-rebuild gate as in-place rebuilds (money: vectors re-bought)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = [(i, f"Heiser/doc{i}.txt", None) for i in range(1, 26)]
+            new_dir = root / "Authors"
+            new_dir.mkdir()
+            existing = []
+            for i, rel, _ in old:
+                body = f"imported text number {i}\n".encode()
+                (new_dir / f"doc{i}.txt").write_bytes(body)
+                existing.append(
+                    (i, rel, library.IMPORTED_HASH_PREFIX + hashlib.sha256(body).hexdigest())
+                )
+            conn = _RenameConn(str(root), existing)
+            try:
+                library.scan(conn, "heiser")
+            except library.LibraryError:
+                return
+            deleted = [p for sql, p in conn.log if "DELETE FROM library_documents" in sql]
+            self.assertFalse(
+                deleted,
+                f"{len(deleted[0][0])} imported documents deleted without --allow-rebuild",
+            )
 
 
 if __name__ == "__main__":

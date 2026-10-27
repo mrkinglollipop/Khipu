@@ -36,6 +36,24 @@ _LOOPBACK = ("localhost", "127.0.0.1", "::1")
 # pgvector's HNSW index on vector(n) tops out at 2000 dimensions.
 MAX_INDEXED_DIM = 2000
 
+# Voyage fixed-width native sizes (docs.voyageai.com). Flex models accept
+# output_dimension; everything else must match its native width on add so a
+# paid call is never discarded. validate_spec does not enforce this — an
+# already-active profile must still load (hub_snapshot).
+VOYAGE_DEFAULT_DIM = 1024
+_VOYAGE_FLEX_PREFIXES = ("voyage-3-large", "voyage-3.5", "voyage-4", "voyage-code-3")
+_VOYAGE_NATIVE_DIM: dict[str, int] = {
+    "voyage-3-lite": 512,
+    "voyage-3": 1024,
+    "voyage-2": 1024,
+    "voyage-finance-2": 1024,
+    "voyage-law-2": 1024,
+    "voyage-multilingual-2": 1024,
+    "voyage-large-2-instruct": 1024,
+    "voyage-code-2": 1536,
+    "voyage-large-2": 1536,
+}
+
 
 @dataclass(frozen=True)
 class ProfileSpec:
@@ -196,11 +214,25 @@ def validate_spec(
     return ProfileSpec(profile_id, provider, model, int(dim), normalize, endpoint or None)
 
 
+def _refuse_voyage_width_mismatch(spec: ProfileSpec) -> None:
+    """On profile add only: fixed Voyage models must use their native width."""
+    if spec.provider != "voyage" or spec.model.startswith(_VOYAGE_FLEX_PREFIXES):
+        return
+    native = _VOYAGE_NATIVE_DIM.get(spec.model, VOYAGE_DEFAULT_DIM)
+    if int(spec.dim) == native:
+        return
+    raise ValueError(
+        f"voyage model {spec.model!r} returns {native} dimensions; "
+        f"use {native} or a flexible model ({', '.join(_VOYAGE_FLEX_PREFIXES)})"
+    )
+
+
 # ---- the hub ------------------------------------------------------------------
 
 def add_profile(cur, spec: ProfileSpec, *, note: str | None = None) -> dict[str, Any]:
     """Insert ``spec`` inactive. Profiles are never overwritten: an existing id
     with the same record is a no-op, with a different record it is refused."""
+    _refuse_voyage_width_mismatch(spec)
     existing = load_spec(cur, spec.id)
     if existing is not None:
         if existing == spec:
