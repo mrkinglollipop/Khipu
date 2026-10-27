@@ -1423,14 +1423,29 @@ def _keep_pr_refs(cur, commitment_id: int, labels: list[str]) -> None:
                     (json.dumps({**check, "refs": refs + new}), commitment_id))
 
 
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _url_as_token(text: str) -> str:
+    """``text`` with each URL reduced to one token. A pull URL is six or so
+    tokens (``https github com owner repo pull N``) of boilerplate; left
+    whole, two different items that cite the same link (or two links into
+    one repository) clear the near-dup bar on the link alone."""
+    return _URL_RE.sub(lambda m: " url" + re.sub(r"[^a-z0-9]", "", m.group().lower().rstrip(".,;:)]}'\"")) + " ",
+                       text)
+
+
 def _row_near_dup_score(text: str, row: dict[str, Any]) -> float:
     """Near-dup score against a row's opening text and, when present, its
     latest restatement — so a third wording that drifts from the original
-    but tracks the current phrasing still folds into the same item."""
-    score = _match_score(text, row["text"])
+    but tracks the current phrasing still folds into the same item. Links
+    count as one token each (:func:`_url_as_token`), so the words, not a
+    shared URL, carry the match."""
+    probe = _url_as_token(text)
+    score = _match_score(probe, _url_as_token(row["text"]))
     latest = row.get("latest_text")
     if latest and latest != row["text"]:
-        score = max(score, _match_score(text, latest))
+        score = max(score, _match_score(probe, _url_as_token(latest)))
     return score
 
 

@@ -55,3 +55,38 @@ def test_a_decision_mentioning_item_12_does_not_strictly_settle_commitment_12():
     decisions = [(5, "Ship item 12 of the release train", 2, datetime(2026, 10, 1, tzinfo=timezone.utc))]
     out = cr._settles(item, decisions, 0.8)
     assert not (out and out[0] == "strict"), out
+
+
+class _NoDb:
+    """Cursor stand-in: any query fails, so the cosine fallback reads as
+    "no embeddings" and only the token scores decide."""
+
+    def execute(self, *a, **k):
+        raise RuntimeError("no database in this test")
+
+    def fetchone(self):
+        return None
+
+
+def _fold(new: str, text: str, latest: str | None) -> int | None:
+    return co._near_duplicate_open(_NoDb(), "p", new, rows=[{"id": 7, "text": text, "latest_text": latest}])
+
+
+def test_a_shared_pull_link_in_latest_text_does_not_fold_a_different_item():
+    """Review of 1790d06b: scoring against latest_text let a pull URL's six
+    boilerplate tokens carry a different item over the near-dup bar."""
+    url12 = "https://github.com/acme/widget/pull/12"
+    assert _fold(f"Deploy the gateway after {url12} merges",
+                 "Review the parser fix", f"Review the parser fix {url12}") is None
+    assert _fold("Land the docs https://github.com/acme/widget/pull/13",
+                 "Land the fix", f"Land the fix {url12}") is None
+    # The restatement that adds another repository's PR still folds.
+    assert _fold(f"Merge the release fix {url12} and https://github.com/other/repo/pull/7",
+                 "Merge the release fix", f"Merge the release fix {url12}") == 7
+
+
+def test_rows_without_latest_text_score_as_before():
+    for new, text in (("Review the parser fix now", "Review the parser fix"),
+                      ("I will fix the parser tests", "I will fix the parser")):
+        assert co._row_near_dup_score(new, {"text": text}) == co._match_score(new, text)
+        assert co._row_near_dup_score(new, {"text": text, "latest_text": None}) == co._match_score(new, text)
