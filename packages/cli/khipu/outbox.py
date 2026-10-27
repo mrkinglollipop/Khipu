@@ -117,17 +117,24 @@ def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str
 def _validate_resolution(record: Any) -> None:
     """Validate archived content itself, never trust its saved hash claims."""
     from khipu.capture_identity import payload_sha256
-    from khipu.capture import _legacy_comma_projection
+    from khipu.capture import _legacy_comma_projection, _redact_capture_values
 
     outbox_payloads(record)
     resolution = record.get("resolution")
     queued = record.get("queued_evidence")
-    if (not isinstance(resolution, dict) or not isinstance(queued, dict)
+    if not isinstance(queued, dict) or not isinstance(queued.get("payload"), dict):
+        raise ValueError("resolution queued envelope is invalid")
+    # The hub proved the projection on the copy write_pg stores: origin
+    # dropped and secrets redacted. The archive keeps the file's own bytes.
+    hub_view = json.loads(json.dumps(queued["payload"]))
+    hub_view.pop("origin", None)
+    hub_view = _redact_capture_values(hub_view)
+    if (not isinstance(resolution, dict)
             or resolution.get("kind") != "legacy_comma_projection"
             or type(resolution.get("episode_id")) is not int or resolution["episode_id"] <= 0
             or not isinstance(resolution.get("resolved_at"), str) or not resolution["resolved_at"]
             or resolution.get("original_payload_sha256") != payload_sha256(record["payload"])
-            or resolution.get("queued_payload_sha256") != payload_sha256(queued["payload"])):
+            or resolution.get("queued_payload_sha256") != payload_sha256(hub_view)):
         raise ValueError("resolution record conflicts with archived evidence")
     from khipu.request_context import valid_origin
 
@@ -136,7 +143,7 @@ def _validate_resolution(record: Any) -> None:
             or ("origin" in queued and not valid_origin(queued["origin"]))
             or queued.get("reason") != "recovery: the legacy key holds different facts"
             or "origin" not in queued or queued["origin"] is not None
-            or not _legacy_comma_projection(record["payload"], queued["payload"])):
+            or not _legacy_comma_projection(record["payload"], hub_view)):
         raise ValueError("resolution queued envelope is invalid")
     _canonical(record)
 
@@ -522,6 +529,9 @@ def status() -> dict[str, Any]:
     if evidence_conflicts:
         result["fix"] = ("Inspect the conflicting evidence in the local outbox and hub; "
                          "owner reconciliation is required before these jobs can replay.")
+        if held_conflicts:
+            # A buried job never re-enters the queue on its own.
+            result["fix"] += " Then run `khipu outbox retry-dead` to replay the buried ones."
     return result
 
 
@@ -716,7 +726,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                         _validate_resolution(record)
                         if (not isinstance(record_id, str) or not re.fullmatch(r"[0-9a-f]{64}", record_id)
                                 or _canonical(record["payload"]) != _canonical(original)
-                                or not _same_evidence(record["queued_evidence"], payload,
+                                or not _same_evidence(record["queued_evidence"], job["payload"],
                                                       {k: job[k] for k in ("origin",) if k in job})
                                 or any(_canonical(record["resolution"].get(k)) != _canonical(v)
                                        for k, v in resolution.items())):

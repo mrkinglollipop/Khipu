@@ -132,8 +132,11 @@ _FACT_TABLES = (("commitment", "commitments"), ("decision", "decisions"), ("deli
 def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
     """Section 3.4's forget: the episode row is already locked FOR UPDATE.
     Lock every fact the episode claims or anchors in ``(kind, id)`` order,
-    run the project's witness backfill when it has not run yet (section 4:
-    a legacy restater gets its claim before the forget decides anything),
+    run the witness backfill of those facts when the project's has not run
+    yet (section 4: a legacy restater gets its claim before the forget
+    decides anything; only these facts are re-projected, so a targeted pass
+    protects exactly what the whole-project pass would, without its inserts
+    inside forget's deadline),
     then delete the episode's claims and project each fact. The tombstone is
     already set in this transaction, so the backfill never credits the
     forgotten episode itself. Counts are what the
@@ -163,7 +166,7 @@ def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
             before[(kind, int(fact_id))] = bool(live)
     cur.execute("SELECT project FROM episodes WHERE id = %s", (episode_id,))
     row = cur.fetchone()
-    backfill = provenance.ensure_backfilled(cur, row[0] if row else None)
+    backfill = provenance.ensure_backfilled(cur, row[0] if row else None, facts)
     cur.execute("DELETE FROM fact_claims WHERE episode_id = %s", (episode_id,))
     out = {"commitments_closed": 0, "commitment_vectors_removed": 0, "deliverables_removed": 0,
            "decisions_retracted": 0, "facts_reprojected": 0, "backfill": backfill,
