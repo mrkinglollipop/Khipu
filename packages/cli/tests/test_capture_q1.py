@@ -90,15 +90,15 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tp = Path(td) / "t.jsonl"
             _write(tp, [_user(long_u), tool] + tail)
-            _, offset, _ = sc.read_window(tp, 0)
-            # True copies: long + every short line from the earlier window.
-            seen = [sc.text_fingerprint("user", long_u)]
-            for i in range(5):
-                seen.append(sc.text_fingerprint("user", f"short copy {i} xxxxxxxxxxxxx"))
-                seen.append(sc.text_fingerprint("assistant", f"short reply {i} yyyyyyyyyy"))
-            _write(tp, [_user(long_u), tool] + tail + [_user(long_u), tool] + tail)
-            _, _, turns = sc.read_window(tp, offset, seen=seen, stats={})
-            self.assertEqual(turns, 0, f"the re-emitted copy counted {turns} new user turns")
+            first: dict = {}
+            sc.read_window(tp, 0, stats=first)
+            # The file is re-emitted from the top; the ordered digest proves the copy.
+            _write(tp, [_user(long_u), tool] + tail + [_user("a brand new short turn")])
+            msgs, _, turns = sc.read_window(
+                tp, 0, seen=[sc.text_fingerprint("user", long_u)], stats={},
+                replay_prefix=first["prefix"])
+            self.assertEqual(turns, 1, f"the re-emitted copy counted extra user turns: {msgs}")
+            self.assertEqual([t for _, t in msgs], ["a brand new short turn"])
 
     def test_genuine_short_turns_after_seen_long_are_kept(self):
         """A seen long head must not eat new short turns and tool markers."""
@@ -122,10 +122,10 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
             self.assertEqual(stats.get("deduped_msgs"), 1, stats)
 
 
-    def test_repeated_short_turn_beyond_captured_count_is_kept(self):
-        """A short line seen once proves one copy, not every later repeat."""
+    def test_short_turn_captured_earlier_is_kept_without_an_ordered_replay(self):
+        """A text match alone never proves a short line is a copy."""
         long_u = "A long already captured user question that is clearly over forty characters"
-        rows = [_user(long_u), _user("yes"), _assistant("done"), _user("yes")]
+        rows = [_user(long_u), _user("yes"), _assistant("done")]
         seen = [sc.text_fingerprint("user", long_u), sc.text_fingerprint("user", "yes"),
                 sc.text_fingerprint("assistant", "done")]
         with tempfile.TemporaryDirectory() as td:
@@ -133,7 +133,7 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
             _write(tp, rows)
             msgs, _, turns = sc.read_window(tp, 0, seen=seen, stats={})
             self.assertEqual(turns, 1, f"msgs={msgs}")
-            self.assertEqual([t for _, t in msgs], ["yes"])
+            self.assertEqual([t for _, t in msgs], ["yes", "done"])
 
     def test_skip_to_stops_before_a_kept_tool_marker(self):
         long_u = "A long already captured user question that is clearly over forty characters"
@@ -147,7 +147,7 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
             msgs, _, _ = sc.read_window(
                 tp, 0, seen=[sc.text_fingerprint("user", long_u), sc.text_fingerprint("user", "ok")],
                 stats=stats)
-            self.assertEqual([r for r, _ in msgs], ["tool"])
+            self.assertEqual([r for r, _ in msgs], ["tool", "user"])
             self.assertEqual(stats["skip_to"], head, stats)
 
 

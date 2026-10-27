@@ -822,9 +822,6 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     msgs: list[tuple[str, str]] = []
     users = 0
     known = set(seen) if seen is not None else None
-    # Short lines recur legitimately, so a seen short fingerprint proves a copy
-    # only as many times as it was captured (``seen`` keeps one entry per capture).
-    short_budget = collections.Counter(seen) if seen is not None else None
     fresh: list[str] = []
     dropped = dropped_chars = 0
     if stats is not None:
@@ -902,10 +899,8 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     checkpoints = checkpoints[replay_end:]
     last_user_counted = False   # the open user block already holds a real turn
     head_open = True            # every message so far was an already-seen copy
-    # After a leading already-seen long turn, short lines whose exact text was
-    # already captured are copies (compaction re-emits them). Tool markers and
-    # short lines that were never seen stay: position alone is not proof.
-    skipping_copies = False
+    # Short lines recur legitimately, so only the ordered ``replay_prefix`` digest
+    # (above) may drop them; a text match never does.
     skip_frozen = False         # a kept tool marker pins skip_to before it
     for (d, role, text, line_end), checkpoint in zip(items, checkpoints):
         real = False
@@ -918,12 +913,10 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             if stand_in is not None:
                 text = stand_in
         if role == "tool":
-            # Tools are never fingerprinted; keep them. A copy-run stays open
-            # so a following short line can still match an earlier fingerprint.
+            # Tools are never fingerprinted; keep them.
             msgs.append(("tool", text))
             skip_frozen = True
-            if not skipping_copies:
-                head_open = False
+            head_open = False
             continue
         streamed = isinstance(d.get("params"), dict)
         if known is not None and not streamed and len(text) >= FINGERPRINT_MIN_CHARS:
@@ -934,27 +927,16 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                 dropped += 1
                 dropped_chars += len(text)
                 if head_open:
-                    skipping_copies = True
                     if stats is not None and not skip_frozen:
                         stats["skip_to"] = line_end
                         stats["skip_prefix"] = checkpoint
                 continue
             known.add(fp)
             fresh.append(fp)
-            skipping_copies = False
         elif known is not None and not streamed and len(text) < FINGERPRINT_MIN_CHARS:
             fp = text_fingerprint(role, text)
-            if head_open and skipping_copies and short_budget[fp] > 0:
-                short_budget[fp] -= 1
-                dropped += 1
-                dropped_chars += len(text)
-                if stats is not None and not skip_frozen:
-                    stats["skip_to"] = line_end
-                    stats["skip_prefix"] = checkpoint
-                continue
             known.add(fp)
             fresh.append(fp)
-            skipping_copies = False
         if head_open and d.get("isCompactSummary") and stats is not None:
             # Claude Code's own summary sits ahead of the copies it re-emits;
             # it leaves the head open and rides along (``carry``) when the
