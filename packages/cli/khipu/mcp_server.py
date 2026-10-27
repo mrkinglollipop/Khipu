@@ -2267,9 +2267,9 @@ class _ToolFailure(ValueError):
 
 
 def _tool_forget(args: dict) -> dict:
-    """Complete forget of one episode (khipu.forget). From the gateway only a
-    cloud harness's own captures may be forgotten: a local episode belongs to
-    the Mac that captured it and is forgotten there."""
+    """Complete forget of one episode (khipu.forget). From the gateway a token
+    may forget only rows stamped with its own origin (forget.owner_refusal): a
+    Mac's or an unowned episode is forgotten on the Mac."""
     args = _validate_tool_args("khipu_forget", args)
     if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
         _ensure_path()

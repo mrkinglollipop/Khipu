@@ -24,8 +24,8 @@ def test_a_confirmed_looks_done_close_does_not_keep_quoting_a_forgotten_decision
     with pg.connect() as conn, conn.cursor() as cur:
         assert co.suggest_looks_done(cur, cid, rule="decision", reason=quote, key=f"decision:{did}",
                                      evidence={"text": PRIVATE, "decision_id": did}, episode=later)
-        # what the app's "Looks done" button sends: the suggestion's own reason
-        assert co.set_status(cur, cid, "closed", reason=quote, by=co.BY_APP)
+        # what the app's "Looks done" button sends (App.tsx): the suggestion's reason, prefixed
+        assert co.set_status(cur, cid, "closed", reason=f"Looked done: {quote}", by=co.BY_APP)
         conn.commit()
     forget.forget_everywhere(later, memory_root=pg.memory, gateway=False)
     with pg.connect() as conn, conn.cursor() as cur:
