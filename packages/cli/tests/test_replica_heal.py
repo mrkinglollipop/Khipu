@@ -385,12 +385,13 @@ def test_a_fresh_ledger_copy_is_ok_and_says_its_age(hub):
     assert 590 <= out["age_seconds"] <= 610 and out["ledger_caught_up_at"]
 
 
-def test_a_ledger_copy_older_than_two_hours_is_red_only_while_the_hub_answers(hub):
+def test_a_ledger_copy_older_than_two_hours_is_red_whether_or_not_the_hub_answers(hub):
     now = datetime.now(timezone.utc)
     _ledger_image(now - timedelta(hours=3))
     out = replica_heal.ledger_copy_status(hub_ok=True, now=now)
     assert not out["ok"] and out["state"] == "old"
-    assert replica_heal.ledger_copy_status(hub_ok=False, now=now)["ok"]
+    offline = replica_heal.ledger_copy_status(hub_ok=False, now=now)
+    assert not offline["ok"] and offline["state"] == "old"
 
 
 def test_a_ledger_failure_turns_red_after_two_retry_intervals(hub, monkeypatch):
