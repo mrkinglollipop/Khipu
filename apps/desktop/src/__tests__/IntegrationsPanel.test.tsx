@@ -273,6 +273,7 @@ function renderPanel(
     refreshHealth?: () => Promise<void> | void;
     t3?: import("../IntegrationsPanel").T3Health | null;
     onSearchT3Captures?: () => void;
+    onOpenGuide?: (id: string) => void;
   } = {},
 ) {
   const runKhipu = vi.fn(async (args: string[]) => {
@@ -317,6 +318,7 @@ function renderPanel(
       t3={opts.t3}
       refreshHealth={opts.refreshHealth ?? (() => {})}
       onSearchT3Captures={opts.onSearchT3Captures}
+      onOpenGuide={opts.onOpenGuide}
       onAnotherMac={() => {}}
     />,
   );
@@ -980,5 +982,30 @@ describe("IntegrationsPanel — after an action", () => {
 
     release();
     await waitFor(() => expect(within(card).getByRole("button", { name: "Verify" })).not.toBeDisabled());
+  });
+});
+
+
+describe("Grok Bot card and the guides", () => {
+  const grokRow: StatusRow = { harness: "grok_bot", detected: true, mcp: false, hook_stop: false, hook_precompact: false, recall_rule: "n/a" };
+
+  it("replaces the disabled Install with Set up…, which opens the Grok Bot guide", async () => {
+    const onOpenGuide = vi.fn();
+    renderPanel(() => [grokRow], undefined, { onOpenGuide });
+    const card = (await screen.findByText("Grok Bot · cloud")).closest(".hcard") as HTMLElement;
+    expect(within(card).queryByRole("button", { name: "Install" })).not.toBeInTheDocument();
+    fireEvent.click(within(card).getByRole("button", { name: "Set up…" }));
+    expect(onOpenGuide).toHaveBeenCalledWith("grok_bot");
+    expect(within(card).getByRole("button", { name: "Check the gateway" })).toBeInTheDocument();
+  });
+
+  it("puts a How this works link on the card and opens the guide from it", async () => {
+    const onOpenGuide = vi.fn();
+    renderPanel(() => [grokRow], undefined, { onOpenGuide });
+    const card = (await screen.findByText("Grok Bot · cloud")).closest(".hcard") as HTMLElement;
+    fireEvent.click(within(card).getByRole("button", { name: /How this works/ }));
+    expect(screen.getByRole("dialog", { name: "How Grok Bot connects" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open the setup guide" }));
+    expect(onOpenGuide).toHaveBeenCalledWith("grok_bot");
   });
 });

@@ -1197,11 +1197,16 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
 
 def skipped_step_names(health: dict[str, dict[str, Any]]) -> list[str]:
     """The base name (``key`` minus its ``_ok`` suffix) of every
-    `nightly_step_health()` entry marked `skipped` — doctor folds these into
-    its `not_configured` list so healthRows.tsx renders them with the same
-    grey "not set up" row `memory_root`/`graph_sqlite` already use, instead
-    of a false red for a step that simply hasn't run yet."""
-    return [key[: -len("_ok")] for key, v in health.items() if v.get("skipped")]
+    `nightly_step_health()` entry marked `skipped` or `applicable: false` —
+    doctor folds these into its `not_configured` list so healthRows.tsx
+    renders them with the same grey "not set up" row `memory_root`/
+    `graph_sqlite` already use, instead of a false green for a step that
+    never runs on this Mac or has not run yet."""
+    names: list[str] = []
+    for key, v in health.items():
+        if v.get("skipped") or v.get("applicable") is False:
+            names.append(key[: -len("_ok")])
+    return names
 
 
 def run_monthly(*, dry_run: bool = False) -> int:
@@ -1255,11 +1260,18 @@ def _offsite_if_due() -> None:
     from khipu import graph_backup
 
     try:
-        last_ok = graph_backup._last_ok_time("graph_snapshot_offsite")
+        last_ok = graph_backup._last_ok_time(
+            "graph_snapshot_offsite",
+            statement_timeout_s=graph_backup.OFFSITE_RECEIPT_STATEMENT_TIMEOUT_SECONDS,
+            connect_timeout=graph_backup.OFFSITE_RECEIPT_CONNECT_TIMEOUT_SECONDS,
+            raise_on_error=True,
+        )
         now = datetime.now(timezone.utc)
         if not graph_backup.offsite_due(last_ok=last_ok, now=now):
             return
         out = graph_backup.run_offsite()
+    except graph_backup.OffsiteReceiptReadError as exc:
+        out = {"ok": False, "reason": str(exc)}
     except Exception as exc:  # noqa: BLE001
         out = {"ok": False, "reason": str(exc)}
     try:

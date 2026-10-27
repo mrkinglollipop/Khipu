@@ -3807,6 +3807,10 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             # by a date window: a note edited in place keeps its frontmatter
             # updated_at. Each embedded topic drops out of the next run's
             # list, so a bulk edit drains a few per Stop and none is stranded.
+            # When the topic sources were read, before the read: the replica
+            # keeps a copy read later (an edit landing while the provider
+            # embeds this one) instead of this older body.
+            topics_read_at = time.time()
             try:
                 changed = _changed_topic_refs(cur, profile)
                 cur.execute(
@@ -3880,7 +3884,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     from khipu.hub_snapshot import upsert_embeddings
 
                     snap = upsert_embeddings(topic_snapshot_rows, topic_rows=topic_sources,
-                                             replace_refs=topic_replacements)
+                                             replace_refs=topic_replacements, read_at=topics_read_at)
                     if not snap.get("ok"):
                         _log(f"topic snapshot upsert skipped: {snap.get('error')}")
                 except Exception as exc:  # noqa: BLE001

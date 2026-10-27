@@ -312,10 +312,18 @@ describe("the priority and the pace in Settings -> Routing", () => {
     await page(view(null));
     expect(screen.getByText("No priority set. Conversations hear the accounts in their usual order.")).toBeTruthy();
     const accounts = screen.getByRole("list", { name: "Accounts" });
-    const second = within(accounts).getAllByRole("listitem").find((li) => li.textContent?.startsWith("Claude second"))!;
+    // An account's line opens its Routing detail, which says the pace.
+    const detailOf = (start: string) => {
+      const li = within(accounts).getAllByRole("listitem").find((x) => x.textContent?.startsWith(start))!;
+      fireEvent.click(within(li).getByRole("button"));
+      return screen.getByRole("dialog");
+    };
+    const second = detailOf("Claude second");
     expect(second).toHaveTextContent("88% of its week left, resets Sat 2:00 PM: using it all would take about 1.7% an hour");
-    const grok = within(accounts).getAllByRole("listitem").find((li) => li.textContent?.startsWith("Grok"))!;
+    fireEvent.click(within(second).getByRole("button", { name: "Close details" }));
+    const grok = detailOf("Grok");
     expect(grok).toHaveTextContent("Plan figures can't be read: sign in again");
+    fireEvent.click(within(grok).getByRole("button", { name: "Close details" }));
     const sw = screen.getByRole("switch", { name: "With no priority set, list accounts by how soon their allowance runs out unused" });
     expect(sw).toBeChecked();
     fireEvent.click(sw);

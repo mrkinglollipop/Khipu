@@ -238,7 +238,10 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
     outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
-    if not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
+    # Dead letters sit outside drain(); only retry-dead moves them back.
+    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0:
+        outbox["fix"] = "run `khipu outbox retry-dead`"
+    elif not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
         outbox["fix"] = "run `khipu sessions drain`"
     # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
     # of a failure (hook error, drain failure, stale queue, cadence never
@@ -271,6 +274,8 @@ def _doctor_local_checks(mem: Path | None) -> dict:
             "error": f"{type(e).__name__}: {e}",
             "reasons": ["check failed"],
         }
+    if git_sync.get("applicable") is False:
+        not_configured.append("git_sync")
     try:
         secrets = secrets_status()
     except Exception as e:  # noqa: BLE001 — malformed local diagnostics must not crash doctor
@@ -898,6 +903,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     schema = workers["schema"].result()
     if not hub_ok and schema.get("error"):
         schema = {**schema, "ok": True, "skipped": "the database did not answer"}
+    if schema.get("skipped"):
+        not_configured.append("schema_migrations")
     schema_ok = bool(schema.get("ok"))
     # Fact provenance (docs/plans/2026-10-23-fact-provenance.md, phase 5): 0047
     # on the hub or not, open fact_gaps, section 4's limit count. Visibility
@@ -1946,7 +1953,11 @@ def cmd_library(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
     print(json.dumps(out, indent=2, default=str))
-    return _backfill_exit_code(out) if cmd == "backfill" else 0
+    if cmd == "backfill":
+        return _backfill_exit_code(out)
+    if cmd == "import" and out.get("ok") is False:
+        return 1
+    return 0
 
 
 def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
@@ -2108,7 +2119,13 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
               JOIN edges e ON e.src = w.node_id OR e.dst = w.node_id
               WHERE w.hops < %(max_hops)s
             )
-            SELECT node_id, via, type, hops FROM walk
+            SELECT node_id, via, type, hops FROM (
+              SELECT DISTINCT ON (node_id)
+                node_id, via, type, hops
+              FROM walk
+              WHERE NOT (node_id = ANY(%(ids)s))
+              ORDER BY node_id, hops ASC
+            ) d
             ORDER BY hops ASC, node_id ASC
             LIMIT %(lim)s
             """,
@@ -4681,6 +4698,12 @@ def cmd_integrations(args: argparse.Namespace) -> int:
     # `integrations status` lists (its `homes[].path`); without it every home
     # Khipu found is acted on.
     home = getattr(args, "home", None)
+    skipped: list[dict] = []
+    # grok_build needs --project; an `all` run without it must not fail the pack.
+    if (args.harness == "all" and not project and "grok_build" in targets
+            and args.integ_cmd in ("install", "verify")):
+        targets = [h for h in targets if h != "grok_build"]
+        skipped.append({"harness": "grok_build", "skipped": "needs --project", "ok": True})
     if home is not None:
         try:
             if args.harness != "claude_code":
@@ -4705,23 +4728,25 @@ def cmd_integrations(args: argparse.Namespace) -> int:
         print(json.dumps([_status(h) for h in targets], indent=2))
         return 0
     if args.integ_cmd == "verify":
-        results = [_verify(h) for h in targets]
+        results = [_verify(h) for h in targets] + skipped
         synth_check = integ.verify_synth_provider()
         if synth_check is not None:
             for result in results:
+                if result.get("skipped"):
+                    continue
                 result.setdefault("components", {})["synth_provider"] = synth_check
                 result["ok"] = result.get("ok", not result["detected"]) and synth_check["ok"]
         print(json.dumps(results, indent=2))
-        return 0 if all(r.get("ok", not r["detected"]) for r in results) else 2
+        return 0 if all(r.get("ok", not r.get("detected", False)) for r in results) else 2
     fn = integ.install if args.integ_cmd == "install" else integ.uninstall
-    results = [fn(h, dry_run=args.dry_run, project=project, home=home) for h in targets]
+    results = [fn(h, dry_run=args.dry_run, project=project, home=home) for h in targets] + skipped
     print(json.dumps(results, indent=2))
     if not all(r.get("ok", True) and not r.get("aborted", False) for r in results):
         return 1
     if args.integ_cmd == "install" and not args.dry_run and not args.no_verify:
-        verified = [_verify(h) for h in targets]
+        verified = [_verify(h) for h in targets] + skipped
         print(json.dumps({"verify": verified}, indent=2))
-        return 0 if all(v.get("ok", not v["detected"]) for v in verified) else 2
+        return 0 if all(v.get("ok", not v.get("detected", False)) for v in verified) else 2
     return 0
 
 
@@ -4738,6 +4763,12 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     if args.gateway_token_cmd == "status":
         print(json.dumps(integ.gateway_token_file_status(), indent=2))
         return 0
+    if args.gateway_token_cmd == "copy":
+        # The key goes Keychain/file -> clipboard inside this process; the
+        # answer is only whether it worked, never the key.
+        result = integ.copy_gateway_token()
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 2
     if args.gateway_token_cmd == "set":
         if args.from_env is not None:
             token = os.environ.get(args.from_env, "")
@@ -5507,7 +5538,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--limit", type=int, default=50)
     g.set_defaults(func=cmd_graph)
 
-    r = sub.add_parser("regen-memory", help="Write MEMORY.md from PG topics")
+    r = sub.add_parser(
+        "regen-memory",
+        help="Write MEMORY.from-khipu.md from PG topics (or live MEMORY.md with --index)",
+    )
     r.add_argument(
         "--out",
         default=None,  # resolved against memory_root at run time
@@ -5826,6 +5860,12 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--summary", action="store_true", help="The summary a conversation gets at its start")
     rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
     rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")
+    rt.add_argument(
+        "--view", default=None, metavar="NAME",
+        choices=("summary", "accounts", "priority", "rules", "holds", "note", "proposals"),
+        help="JSON only: summary (compact) or one section name for that section in full; "
+             "omit for the full record; not with --summary, --brief, or --since",
+    )
     rt.set_defaults(func=cmd_route, route_cmd=None)
     # Writes always print JSON; --json is accepted after any of them too, so a
     # script that adds it to every khipu call doesn't lose its write. SUPPRESS
@@ -6587,7 +6627,7 @@ def build_parser() -> argparse.ArgumentParser:
             "harness",
             nargs="?",
             default="all",
-            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_bot"),
+            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot"),
         )
         if name in ("install", "uninstall"):
             sp.add_argument("--dry-run", action="store_true")
@@ -6600,7 +6640,7 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("install", "uninstall", "status", "verify"):
             sp.add_argument(
                 "--project",
-                help="Cursor / Grok Bot: repo dir for .cursor/rules/khipu.mdc and .cursor/mcp.json",
+                help="Cursor / Grok Build / Grok Bot: repo dir for that pack's recall and MCP files",
             )
         if name == "install":
             sp.add_argument("--no-verify", action="store_true")
@@ -6853,6 +6893,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gwt_sub.add_parser(
         "status", help="exists / mode / bytes only — never the token"
+    )
+    gwt_sub.add_parser(
+        "copy",
+        help="Copy the saved key to the clipboard and clear it after 60 s (never prints it)",
     )
     gw.set_defaults(func=cmd_gateway)
 

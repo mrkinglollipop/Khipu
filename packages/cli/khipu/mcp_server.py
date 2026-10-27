@@ -18,8 +18,9 @@ Tools:
   - ``khipu_usage``   — plan headroom per subscription CLI (local only; the
     gateway answers ``available: false``)
   - ``khipu_route``: the routing record: which accounts are open, by whom
-    and since when (local only until the cloud copy; the gateway answers
-    ``available: false``). Khipu reports; it never picks or ranks.
+    and since when (local full record; on the HTTPS gateway, the closed
+    published cloud copy when enabled — ``since`` is local-only). Khipu
+    reports; it never picks or ranks.
   - ``khipu_route_report``: a conversation's report or hold; the author is
     set by Khipu, and the owner's changes are refused.
   - ``khipu_route_rule``: a conversation may record the owner's requested
@@ -801,7 +802,7 @@ TOOLS: list[dict] = [
         "name": "khipu_route",
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
         "description": (
-            "The routing record on this Mac: which accounts are open, limited "
+            "The routing record: which accounts are open, limited "
             "(until when, and whether that time is the CLI's own or a guess), "
             "paused by the owner, down or unknown, who said so and how long "
             "ago; the owner's standing rules and note, word for word; holds, "
@@ -809,9 +810,18 @@ TOOLS: list[dict] = [
             "`khipu_route_report action=end_hold hold_id=...`; an owner hold "
             "is ended only by the owner); provider facts (models_allowed, models_never and use); "
             "and job runner lanes not matched to an account, with candidates. "
-            "Read it before you hand work to another account or model. "
+            "Locally this is the full record; through the HTTPS gateway it is "
+            "the closed published cloud copy when enabled (otherwise "
+            "`{available: false}`). Read it before you hand work to another "
+            "account or model. "
+            "`view` (optional): `summary` for a compact read (per-account state "
+            "and pace, priority, clipped rules and holds, plus omitted section "
+            "names), or one section name (`accounts`, `priority`, `rules`, "
+            "`holds`, `note`, `proposals`) for that section in full; omit "
+            "`view` for the full record. Do not combine `view` with `since`. "
             "`since` (a version, or epoch:version, as an earlier answer gave "
-            "it) answers only what changed after it; `account` narrows to one "
+            "it) answers only what changed after it and is local-only — the "
+            "gateway refuses `since`; `account` narrows to one "
             "account. The answer carries `routing_changes` (a batch issued to "
             "this conversation's `mcp` component) and `delivery`; pass `ack` "
             "with that batch once you have read it, and only with your own "
@@ -832,6 +842,9 @@ TOOLS: list[dict] = [
                 "since": {"type": ["string", "integer"],
                           "description": "Only what changed after this version (integer V, string V or epoch:V)"},
                 "account": {"type": "string", "description": "One account: its label or its id, as khipu_route lists them"},
+                "view": {"type": "string",
+                         "enum": ["summary", "accounts", "priority", "rules", "holds", "note", "proposals"],
+                         "description": "summary: compact record; or one section name for that section in full; omit for the full record"},
                 "session_id": {"type": "string",
                                "description": "This conversation's own session id when its environment names none; "
                                               "a descendant uses the canonical root as its prefix (claude:<id>/child, codex:<id>/child)"},
@@ -1459,7 +1472,8 @@ def _tool_status_light(args: dict) -> dict:
 
 
 ROUTING_GATEWAY_REASON = (
-    "the routing record lives on the Mac that runs the accounts; the HTTPS gateway has no copy yet. "
+    "routing writes, advice and live plan usage stay on the Mac that runs the accounts; "
+    "this tool is not available through the HTTPS gateway. "
     "Use the local khipu MCP server or `khipu route`."
 )
 
@@ -2236,7 +2250,17 @@ def _tool_forget(args: dict) -> dict:
     from khipu.forget import KEPT, LOCAL_HARNESSES, forget_everywhere, plain_summary
     from khipu.db import connect
 
+    owner = None
     if _via_https_gateway():
+        from khipu.request_context import gateway_label
+
+        label = gateway_label()
+        if not label:
+            raise ValueError("a gateway forget needs the calling token's label")
+        # The authorization itself is forget_everywhere's, against the row's
+        # server-stamped origin inside the hub transaction; this read only
+        # turns a local capture away with directions before any work starts.
+        owner = f"gateway:{label}"
         with connect() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT session_id FROM episodes WHERE id = %s", (eid,))
@@ -2252,7 +2276,7 @@ def _tool_forget(args: dict) -> dict:
     from khipu.hub_snapshot import hub_connection_failed
 
     try:
-        out = forget_everywhere(eid)
+        out = forget_everywhere(eid) if owner is None else forget_everywhere(eid, owner=owner)
     except Exception as exc:  # noqa: BLE001
         if not hub_connection_failed(exc):
             raise
@@ -2656,6 +2680,12 @@ def _tool_route_projected(args: dict) -> dict:
     since = args.get("since")
     if since is not None and (isinstance(since, bool) or not isinstance(since, (str, int))):
         raise ValueError("since must be a version number, or epoch:version")
+    mode = args.get("view")
+    if mode is not None and not isinstance(mode, str):
+        raise ValueError("view must be text")
+    if since is not None and mode is not None and str(mode).strip():
+        raise ValueError("view cannot be combined with since; omit view for a since answer, "
+                         "or omit since for a view projection")
     for key in ("session_id", "ack"):
         if args.get(key) is not None and not isinstance(args[key], str):
             raise ValueError(f"{key} must be text")
@@ -2681,6 +2711,8 @@ def _tool_route_projected(args: dict) -> dict:
                                          "the batch stays where it was."})
     try:
         out = routing.conversation_view(since_version=since, account=account or None, now=now, view=view)
+        if mode:
+            out = routing.project_route_view(out, mode)
     except ValueError as exc:
         # A refusal still carries this caller's routing changes, scrubbed
         # with the error at the dispatch boundary like any other addition.

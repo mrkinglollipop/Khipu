@@ -5,8 +5,9 @@
    (docs/plans/2026-10-14-routing-truth.md, phase 4,
    second half; mock docs/mockups/2026-10-14-routing/settings-routing.html).
    Every option phases 1a to 3c built, each usable here and each limit
-   raisable or removable on the spot: the accounts (Mark paused until, Lift,
-   Clear, Dismiss one report), the owner's note, the standing rules, holds,
+   raisable or removable on the spot: the accounts (each line opens its
+   Routing detail, AccountControls.tsx, where Pause, Lift, Clear, Dismiss one
+   report, holds, caps and the words live), the owner's note, the standing rules, holds,
    telling conversations, the providers and lanes group with the job runner
    folders folded under it (routing slice 15c), the routing table file and
    recent changes.
@@ -25,15 +26,18 @@ import { ChevronRight, Loader2 } from "lucide-react";
 import { EmptyState, Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
 import type { FeaturesShape } from "./settingsCli";
-import { PlanBlock, RefreshButton, UsageAccountsField, planPauses, planStatus } from "./PlansCard";
+import { PlanBlock, RefreshButton, UsageAccountsField, planPauses } from "./PlansCard";
 import type { PlanUsageState, UsageAccount, UsageReport } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
-import { RoutingDetailSheet, useDetailHost } from "./AccountDetail";
+import { PlanDetailSheet, RoutingDetailSheet, useDetailHost } from "./AccountDetail";
+import { AccountsRequestBand } from "./AccountControls";
+import { priorityItems } from "./accountControlsModel";
+import type { PriorityItem } from "./accountControlsModel";
 import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import { paceModel } from "./routingPace";
 import type { PaceTrend, PaceWindow } from "./routingPace";
-import { checksModel } from "./routingChecks";
+import { checksModel, fileCopySkipWords } from "./routingChecks";
 import { endedWords, holdChoiceIds, holdChoiceTargets, proposalsModel } from "./routingProposals";
 import type { ProposalRow } from "./routingProposals";
 import {
@@ -51,7 +55,7 @@ import {
 } from "./routingLists";
 import type { AccountFilter, AccountSort, ChangeAboutFilter, ChangeByFilter, ListControls, RuleFilter } from "./routingLists";
 import "./routingOverview.css";
-import { AccountExtras, FinderBottom, FinderTop, foundCount, useAccountsFinder } from "./FoundAccounts";
+import { FinderBottom, FinderTop, foundCount, useAccountsFinder } from "./FoundAccounts";
 import type { AccountsFinder, FinderConfig } from "./FoundAccounts";
 import {
   accountSource,
@@ -63,7 +67,6 @@ import {
   deliveryReason,
   holdWords,
   modelDisagreementWords,
-  paceWords,
   pastWords,
   ROUTE_READ_FAILED,
   priorityPendingWords,
@@ -73,7 +76,6 @@ import {
   whenLocal,
 } from "./routing";
 import type {
-  PlanFact,
   RouteAccount,
   RouteDeliveryFreshness,
   RouteDeliveryHealth,
@@ -82,7 +84,6 @@ import type {
   RouteHold,
   RouteModel,
   RoutePriority,
-  RoutePriorityEntry,
   RouteReport,
   RouteRule,
   RouteRunner,
@@ -119,7 +120,7 @@ type RouteSetting = {
 type RouteConfig = { routing?: Record<string, RouteSetting> };
 
 /** Where focus goes when the control that made a change is gone. */
-type Back = () => HTMLElement | null | undefined;
+export type Back = () => HTMLElement | null | undefined;
 
 /** The most words the app hands the CLI in one change, in KB of text: the
  *  size of one argument, not a limit the owner chose (src-tauri lib.rs,
@@ -128,9 +129,9 @@ const WORDS_MOST_KB = 128;
 
 /** A write's arguments, or a function that builds them from state read just
  *  before the write runs (a string is a refusal in words: nothing is sent). */
-type WriteArgs = Record<string, unknown> | undefined | (() => Promise<Record<string, unknown> | string>);
+export type WriteArgs = Record<string, unknown> | undefined | (() => Promise<Record<string, unknown> | string>);
 
-type Writer = {
+export type Writer = {
   /** Whether a write under `id` is running or waiting its turn. */
   isBusy: (id: string) => boolean;
   /** Whether any write is running or waiting. */
@@ -156,9 +157,12 @@ type Writer = {
   /** The error under `id` as it stands now, readable in the same tick a
    *  write's promise settles (the state above lands a render later). */
   errorOf: (id: string) => string | undefined;
+  /** The CLI's answer to the last write under `id` that went through, read in
+   *  the same tick its promise settles; undefined after a refusal. */
+  dataOf: (id: string) => unknown;
 };
 
-function useWriter(reread: () => Promise<unknown>): Writer {
+export function useWriter(reread: () => Promise<unknown>): Writer {
   // The writes running or waiting, oldest first.
   const [pending, setPending] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -181,6 +185,7 @@ function useWriter(reread: () => Promise<unknown>): Writer {
     if (usable(to) && to !== at) to.focus();
   });
   const errorsNow = useRef<Record<string, string>>({});
+  const dataNow = useRef<Record<string, unknown>>({});
   const fail = (id: string, message: string | null) => {
     if (message) errorsNow.current[id] = message;
     else delete errorsNow.current[id];
@@ -207,6 +212,9 @@ function useWriter(reread: () => Promise<unknown>): Writer {
         } else {
           const res = await callCli(command, command.startsWith("khipu_route_") && command !== "khipu_route_check"
             ? { ...built, op } : built);
+          // Kept before the re-read, which can take a while, and cleared on a refusal.
+          if (res.ok) dataNow.current[id] = res.data;
+          else delete dataNow.current[id];
           await (after ?? reread)();
           fail(
             id,
@@ -239,7 +247,7 @@ function useWriter(reread: () => Promise<unknown>): Writer {
     queue.current = job.catch(() => undefined);
     return job;
   };
-  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, results, run, fail, errorOf: (id: string) => errorsNow.current[id] };
+  return { isBusy: (id) => pending.includes(id), anyBusy: pending.length > 0, errors, results, run, fail, errorOf: (id: string) => errorsNow.current[id], dataOf: (id: string) => dataNow.current[id] };
 }
 
 /** One routing setting's value as `khipu config` reports it now, read just
@@ -252,7 +260,7 @@ async function currentSetting(key: string): Promise<{ value: unknown } | string>
 
 /** `say` puts a refusal in the control's own words, as a setting's name
  *  for its internal key. */
-function WriteError({ w, id, say }: { w: Writer; id: string; say?: (msg: string) => string }) {
+export function WriteError({ w, id, say }: { w: Writer; id: string; say?: (msg: string) => string }) {
   const msg = w.errors[id];
   if (!msg) return null;
   return (
@@ -265,16 +273,16 @@ function WriteError({ w, id, say }: { w: Writer; id: string; say?: (msg: string)
 
 /** Gives focus to `el()` once the click that removed the focused button has
  *  rendered, so keyboard focus never drops to the page. */
-function focusAfter(el: () => HTMLElement | null | undefined): void {
+export function focusAfter(el: () => HTMLElement | null | undefined): void {
   requestAnimationFrame(() => el()?.focus());
 }
 
-function Busy({ on }: { on: boolean }) {
+export function Busy({ on }: { on: boolean }) {
   return on ? <Loader2 size={14} className="spin" aria-hidden /> : null;
 }
 
 /** Escape cancels an inline form and gives focus back to its button. */
-function escapeCloses(close: () => void) {
+export function escapeCloses(close: () => void) {
   return (e: KeyboardEvent) => {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -289,7 +297,7 @@ function escapeCloses(close: () => void) {
  * cancelled or Escape) and focus would be lost with it, focus goes to
  * `back()`, the button that opened it or what took its place (fix round 1, F5).
  */
-function ConfirmGroup({
+export function ConfirmGroup({
   label,
   onClose,
   back,
@@ -344,7 +352,7 @@ type HoldAsk = {
 /** `attempt` runs a write; on the end-or-keep refusal it keeps the retry
  *  (with the choices merged into the same write's arguments) for the panel
  *  below. Returns the write's own result. */
-function useEndOrKeep(w: Writer) {
+export function useEndOrKeep(w: Writer) {
   const [ask, setAsk] = useState<HoldAsk | null>(null);
   const attempt = async (
     id: string,
@@ -377,7 +385,7 @@ function useEndOrKeep(w: Writer) {
   return { ask, setAsk, attempt };
 }
 
-function EndOrKeepChoices({
+export function EndOrKeepChoices({
   view,
   ask,
   now,
@@ -434,7 +442,7 @@ function EndOrKeepChoices({
 // When something ends: the pause form and the hold form share these choices.
 // ---------------------------------------------------------------------------
 
-function EndFields({
+export function EndFields({
   idBase,
   label,
   firstHours,
@@ -485,69 +493,6 @@ function EndFields({
 // Accounts
 // ---------------------------------------------------------------------------
 
-function PauseForm({
-  a,
-  formId,
-  w,
-  onClose,
-}: {
-  a: RouteAccount;
-  formId: string;
-  w: Writer;
-  onClose: () => void;
-}) {
-  const [choice, setChoice] = useState("tomorrow");
-  const [custom, setCustom] = useState("");
-  const selectRef = useFocusFirst<HTMLSelectElement>();
-  const id = `pause:${a.key}`;
-  async function submit(e: FormEvent) {
-    e.preventDefault();
-    const now = new Date();
-    const end = chosenEnd(choice, custom, endChoices(now, 1), now);
-    if ("error" in end) {
-      w.fail(id, end.error);
-      return;
-    }
-    const ok = await w.run(id, "khipu_route_pause", { account: a.key, until: end.iso });
-    if (ok) onClose();
-  }
-  return (
-    <form className="route-pause" id={formId} aria-label={`Mark ${a.label} paused`} onSubmit={submit} onKeyDown={escapeCloses(onClose)}>
-      <div className="toolbar">
-        <EndFields
-          idBase={formId}
-          label={`Mark ${a.label} paused until`}
-          firstHours={1}
-          choice={choice}
-          setChoice={setChoice}
-          custom={custom}
-          setCustom={setCustom}
-          selectRef={selectRef}
-        />
-      </div>
-      <p className="set-help">
-        This doesn't stop anything that is running; it tells conversations you want {a.label} left alone. They hear
-        it on their next prompt, or when they ask.
-      </p>
-      <WriteError w={w} id={id} />
-      <div className="toolbar">
-        <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
-          <Busy on={w.isBusy(id)} />
-          Mark {a.label} paused
-        </button>
-        <button type="button" className="sm link" onClick={onClose}>
-          Cancel
-        </button>
-      </div>
-    </form>
-  );
-}
-
-function clearable(a: RouteAccount, now: Date): boolean {
-  if (a.state === "limited" || a.state === "down") return true;
-  return (a.models ?? []).some((m) => m.until && new Date(m.until).getTime() > now.getTime());
-}
-
 /** One side of a disagreement as the panel lists it. */
 function sideWords(state: string | undefined, by: string, at: string | null | undefined, now: Date): ReactNode {
   return (
@@ -566,7 +511,7 @@ const DISMISS_WHO: Record<string, string> = {
   check: "reset check's",
 };
 
-function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: Date; back: Back }) {
+export function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: Date; back: Back }) {
   const sides: { d: RouteReport; model?: RouteModel; sentence: string }[] = [];
   const own = disagreementWords(a, now);
   if (a.disagreement && own) sides.push({ d: a.disagreement, sentence: own });
@@ -652,106 +597,6 @@ function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer; now: D
   );
 }
 
-/** What an account line shows when it opens: who said so, the next check,
- *  the pace sentence, its buttons, its forms and its disagreement panel,
- *  then (`children`) its Plans block. Its name and state are on the line. */
-function AccountRow({
-  a,
-  w,
-  now,
-  reportDefault,
-  fact,
-  suppressResetReadFailure,
-  children,
-}: {
-  a: RouteAccount;
-  w: Writer;
-  now: Date;
-  reportDefault?: number;
-  fact?: PlanFact;
-  /** PlanBlock owns a failed read's explanation and its checked time. */
-  suppressResetReadFailure?: boolean;
-  children?: ReactNode;
-}) {
-  const [pausing, setPausing] = useState(false);
-  const pauseBtn = useRef<HTMLButtonElement>(null);
-  const formId = `pause-${useId().replace(/:/g, "")}`;
-  const src = accountSource(a, now, null, reportDefault, !(suppressResetReadFailure && a.reset_check?.status === "error"));
-  const close = () => {
-    setPausing(false);
-    requestAnimationFrame(() => pauseBtn.current?.focus());
-  };
-  const paused = a.state === "paused";
-  const liftId = `lift:${a.key}`;
-  const clearId = `clear:${a.key}`;
-  return (
-    <div className="acct-body">
-      <span className="route-what">
-        {src ? <span className="route-src">{src}</span> : null}
-        {a.next_check ? <span className="route-src">Khipu checks again at {whenLocal(a.next_check, now)}.</span> : null}
-        {fact && a.configured !== false && (!suppressResetReadFailure || fact.readable) ? <span className="route-src">{paceWords(fact, now)}</span> : null}
-      </span>
-      <span className="route-acts toolbar">
-        {a.checkable !== false && a.configured !== false && ["limited", "probably_open", "unknown"].includes(a.state) ? (
-          <>
-            <button type="button" className="sm" disabled={w.anyBusy}
-              onClick={() => void w.run(`check:${a.key}`, "khipu_route_check", { account: a.key })}>
-              <Busy on={w.isBusy(`check:${a.key}`)} />
-              Check now
-            </button>
-            {w.results[`check:${a.key}`] ? <span className="route-src" role="status">{w.results[`check:${a.key}`]}</span> : null}
-          </>
-        ) : null}
-        <button
-          ref={pauseBtn}
-          type="button"
-          className="sm"
-          aria-expanded={pausing}
-          aria-controls={pausing ? formId : undefined}
-          aria-label={paused ? `Change the pause for ${a.label}` : `Mark ${a.label} paused until…`}
-          onClick={() => setPausing((v) => !v)}
-        >
-          {paused ? "Change…" : "Mark paused until…"}
-        </button>
-        {paused ? (
-          <button
-            type="button"
-            className="sm"
-            aria-label={`Lift the pause for ${a.label}`}
-            disabled={w.isBusy(liftId)}
-            onClick={() => void w.run(liftId, "khipu_route_lift", { account: a.key }, null, () => pauseBtn.current)}
-          >
-            <Busy on={w.isBusy(liftId)} />
-            Lift the pause
-          </button>
-        ) : null}
-        {!paused && clearable(a, now) ? (
-          <button
-            type="button"
-            className="sm"
-            aria-label={`Clear ${a.state === "down" ? "the down report" : "the limit"} for ${a.label}`}
-            disabled={w.isBusy(clearId)}
-            onClick={() => void w.run(clearId, "khipu_route_clear", { account: a.key }, null, () => pauseBtn.current)}
-          >
-            <Busy on={w.isBusy(clearId)} />
-            Clear
-          </button>
-        ) : null}
-      </span>
-      {pausing ? <PauseForm a={a} formId={formId} w={w} onClose={close} /> : null}
-      <DisagreePanel a={a} w={w} now={now} back={() => pauseBtn.current} />
-      {w.errors[`check:${a.key}`] || w.errors[liftId] || w.errors[clearId] ? (
-        <div className="route-pause" role="group" aria-label={`${a.label}: the change failed`}>
-          <WriteError w={w} id={`check:${a.key}`} />
-          <WriteError w={w} id={liftId} />
-          <WriteError w={w} id={clearId} />
-        </div>
-      ) : null}
-      {children}
-    </div>
-  );
-}
-
 /** Each routing setting a conversation changed at your request: what it
  *  said you asked, and Confirm or Undo (the value it replaced comes back). */
 function SettingRequests({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
@@ -818,12 +663,6 @@ function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteVie
 // order shown; Khipu keeps it as sent and never reorders it.
 // ---------------------------------------------------------------------------
 
-type PriorityItem = { account: string; role: string | null; until: string | null };
-
-/** The list as the CLI takes it back: account key, role and end only. */
-function priorityItems(entries: RoutePriorityEntry[]): PriorityItem[] {
-  return entries.map((e) => ({ account: e.account, role: e.role ?? null, until: e.until ?? null }));
-}
 
 /** "until Sat 3:00 PM", or "no end". */
 function endText(until: string | null | undefined, now: Date): string {
@@ -1160,50 +999,45 @@ function PrioritySection({
 /** Which groups, account lines and inner folds are open, by key. */
 type Folds = { isOpen: (key: string) => boolean; toggle: (key: string) => void; openKeys: (keys: string[]) => void };
 
-/** One account as a line that folds: name, state in words with its dot, the
- *  week and pace, and its problem tags; open, what today's row showed and its
- *  Plans block. */
+/** One account as a line: name, state in words with its dot, the week and
+ *  pace, and its problem tags. It opens the Routing detail, where every
+ *  control for the account lives (one place, not a second copy here); Rename
+ *  and Stop tracking open from its More menu. */
 function AccountLine({
   a,
   data,
   plan,
-  suppressResetReadFailure,
-  pause,
-  onSignedIn,
   tags,
-  folds,
   staleAfterS,
-  w,
   now,
   reread,
   finder,
+  onPlansChanged,
 }: {
   a: RouteAccount;
   data: RouteView;
   plan?: UsageAccount;
-  suppressResetReadFailure?: boolean;
-  pause?: string;
-  onSignedIn?: () => Promise<unknown> | void;
   tags: GroupTag[];
-  folds: Folds;
   staleAfterS: number;
-  w: Writer;
   now: Date;
   reread: () => Promise<unknown>;
   finder?: AccountsFinder | null;
+  onPlansChanged?: () => Promise<unknown> | void;
 }) {
   const key = `account:${a.key}`;
-  const open = folds.isOpen(key);
-  const bodyId = `route-acct-${useId().replace(/:/g, "")}`;
   const st = accountState(a, now);
   const fact = data.plan_facts?.[a.key];
   const { week, pace } = a.configured !== false ? accountWeek(fact, now, plan, staleAfterS) : { week: null, pace: null };
   const detail = useDetailHost<true>();
+  const planSheet = useDetailHost<true>();
+  const managed = { key: a.key, label: a.label, harness: a.harness, home: homeOfKey(a.key) };
+  // Rename and Stop tracking wait, as they did in the fold, for the account list to be read.
+  const manageable = !!finder && finder.support.state === "here" && a.configured !== false;
   return (
     <div role="listitem">
-      <div className="fold route-aline" data-open={open}>
-        <button type="button" className="fold-btn" aria-expanded={open} aria-controls={bodyId} data-route-item={key}
-          onClick={() => folds.toggle(key)}>
+      <div className="fold route-aline" data-open={false}>
+        <button type="button" className="fold-btn" aria-haspopup="dialog" data-route-item={key}
+          onClick={() => detail.open(true)}>
           <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
           <span className="an">{a.label}</span>
           <span className="as">
@@ -1222,27 +1056,16 @@ function AccountLine({
             ))}
           </span>
         </button>
-        <div className="fold-body" id={bodyId} role="region" aria-label={a.label} hidden={!open}>
-          {finder && a.configured !== false ? (
-            <AccountExtras label={a.label} harness={a.harness} home={homeOfKey(a.key)} row={plan} support={finder.support} now={now}
-              onRename={() => finder.openRename({ key: a.key, label: a.label, harness: a.harness, home: homeOfKey(a.key) })}
-              onStop={() => finder.openStop({ key: a.key, label: a.label, harness: a.harness, home: homeOfKey(a.key) })}
-              onChooseFolder={(opener) =>
-                void finder.chooseFolderFor({ key: a.key, label: a.label, harness: a.harness, home: homeOfKey(a.key) }, opener)
-              } />
-          ) : null}
-          <AccountRow a={a} w={w} now={now} reportDefault={data.report_default_limit} fact={fact}
-            suppressResetReadFailure={suppressResetReadFailure}>
-            {plan ? <PlanBlock row={plan} now={now} pause={pause} onSignedIn={onSignedIn} /> : null}
-          </AccountRow>
-          <button type="button" className="sm" aria-haspopup="dialog" aria-label={`See routing details for ${a.label}`}
-            onClick={() => detail.open(true)}>
-            See routing details
-          </button>
-          {detail.target ? (
-            <RoutingDetailSheet account={a} view={data} plans={plan} now={now} onClose={detail.close} onChanged={reread} />
-          ) : null}
-        </div>
+        {detail.target ? (
+          <RoutingDetailSheet account={a} view={data} plans={plan} now={now} onClose={detail.close} onChanged={reread}
+            onRename={manageable ? () => finder.openRename(managed) : undefined}
+            onStop={manageable ? () => finder.openStop(managed) : undefined}
+            onChooseFolder={manageable && plan?.ok === false && plan.error === "login_folder_missing" ? () => void finder.chooseFolderFor(managed, null) : undefined}
+            onSeePlan={plan ? () => { detail.close(); planSheet.open(true); } : undefined} />
+        ) : null}
+        {planSheet.target && plan ? (
+          <PlanDetailSheet row={plan} view={data} now={now} onClose={planSheet.close} onChanged={reread} onRefresh={onPlansChanged ? () => void onPlansChanged() : undefined} />
+        ) : null}
       </div>
     </div>
   );
@@ -1334,7 +1157,6 @@ function AccountsSection({
   data,
   plansState,
   problems,
-  folds,
   lists,
   active,
   staleAfterS,
@@ -1346,7 +1168,6 @@ function AccountsSection({
   data: RouteView;
   plansState?: PlanUsageState | null;
   problems: Problem[];
-  folds: Folds;
   lists: ListControls;
   staleAfterS: number;
   active: boolean;
@@ -1369,10 +1190,6 @@ function AccountsSection({
   const filterLabel = useId();
   const rows = plans?.accounts ?? [];
   const pauses = planPauses(data, now);
-  const planReadFailure = (row: UsageAccount | undefined) => {
-    const code = row ? planStatus(row, now).code : null;
-    return code != null && !["pending", "not_signed_in", "no_plan_limits"].includes(code);
-  };
   const routed = (row: UsageAccount) => row.key != null && accounts.some((a) => a.key === row.key);
   const loose = rows.filter((row) => !routed(row));
   const [changing, setChanging] = useState(false);
@@ -1386,6 +1203,7 @@ function AccountsSection({
   const names = (plans ? rows.map((r) => r.account || r.harness || "an account") : accounts.map((a) => a.label)).join(", ");
   return (
     <div className="section-body">
+      {finder ? <AccountsRequestBand support={finder.support} reload={finder.reload} onChanged={() => void reread()} /> : null}
       {finder ? <FinderTop finder={finder} rows={rows} /> : null}
       <AddProviderAccount data={data} w={w} />
       {accounts.length ? (
@@ -1425,9 +1243,8 @@ function AccountsSection({
             <div className="route-alist" role="list" aria-label="Accounts">
               {shownAccounts.map((a) => (
                 <AccountLine key={a.key} a={a} data={data} plan={rows.find((r) => r.key != null && r.key === a.key)}
-                  suppressResetReadFailure={planReadFailure(rows.find((r) => r.key != null && r.key === a.key))}
-                  pause={pauses.get(a.key)} onSignedIn={plansState?.reread} tags={accountTags(problems, a.key)}
-                  folds={folds} staleAfterS={staleAfterS} w={w} now={now} reread={reread} finder={finder} />
+                  tags={accountTags(problems, a.key)} staleAfterS={staleAfterS} now={now} reread={reread} finder={finder}
+                  onPlansChanged={plansState?.reread} />
               ))}
             </div>
           ) : (
@@ -2472,7 +2289,7 @@ function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: D
 // Holds
 // ---------------------------------------------------------------------------
 
-const HOLD_REASON_ARGS: { value: string; label: string }[] = [
+export const HOLD_REASON_ARGS: { value: string; label: string }[] = [
   { value: "machine-busy", label: "Machine busy" },
   { value: "disk-low", label: "Disk low" },
   { value: "keep", label: "Keep for one purpose" },
@@ -3731,34 +3548,50 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
       ) : null}
       {model.fileCopies ? (
         <div className="section-body">
-          <h2 className="sub-title">Routing written in files{model.fileCopies.status === "checked" ? <span className="meta">{model.fileCopies.hits_total} found</span> : null}</h2>
-          {model.fileCopies.status !== "checked" ? (
+          <h2 className="sub-title">Routing written in files{model.fileCopies.status !== "not_checked" ? <span className="meta">{model.fileCopies.hits_total} found</span> : null}</h2>
+          {model.fileCopies.status === "not_checked" ? (
             <div className="empty">
               <b>Khipu hasn't looked at your files yet</b>
               <span>Nothing is known about copies until the first look. It reads only, and never edits a file.</span>
             </div>
-          ) : model.fileCopies.hits.length ? (
+          ) : (
             <>
-              <p className="set-help">Conversations are told Khipu's record wins over these.</p>
-              <div className="mrows" role="list" aria-label="Copies of routing found in files">
-                {model.fileCopies.hits.map((h) => row({
-                  key: `copy:${h.file}:${h.line}`,
-                  title: `${h.file} line ${h.line}`,
-                  sub: `“${h.quote}”`,
-                }))}
-              </div>
-              {model.fileCopies.more_not_shown ? (
-                <p className="set-help">{model.fileCopies.more_not_shown} more not shown.</p>
+              <p className="set-help">
+                Files last looked at{model.fileCopies.scanned_at && whenLocal(model.fileCopies.scanned_at, now)
+                  ? ` ${whenLocal(model.fileCopies.scanned_at, now)}` : " at an unknown time"}: {model.fileCopies.files_checked} files, {model.fileCopies.hits_total} {model.fileCopies.hits_total === 1 ? "copy" : "copies"}.
+              </p>
+              {model.fileCopies.status === "stale" ? (
+                <p className="set-help">Scan is out of date. These are retained results from the last look.</p>
+              ) : null}
+              {model.fileCopies.status === "incomplete" || model.fileCopies.skipped.length || model.fileCopies.too_large.length ? (
+                <p className="set-help">Scan incomplete. Some files were not read.</p>
+              ) : null}
+              {model.fileCopies.hits.length ? (
+                <>
+                  <p className="set-help">Conversations are told Khipu's record wins over these.</p>
+                  <div className="mrows" role="list" aria-label="Copies of routing found in files">
+                    {model.fileCopies.hits.map((h) => row({
+                      key: `copy:${h.file}:${h.line}`,
+                      title: `${h.file} line ${h.line}`,
+                      sub: `“${h.quote}”`,
+                    }))}
+                  </div>
+                  {model.fileCopies.more_not_shown ? (
+                    <p className="set-help">{model.fileCopies.more_not_shown} more not shown.</p>
+                  ) : null}
+                </>
               ) : null}
               {model.fileCopies.too_large.length ? (
                 <p className="set-help">Too large to read: {model.fileCopies.too_large.join(", ")}.</p>
               ) : null}
+              {model.fileCopies.skipped.length ? (
+                <ul className="set-help" aria-label="Files not checked">
+                  {model.fileCopies.skipped.map((skip, index) => (
+                    <li key={`${skip.file}:${skip.reason}:${index}`}>{skip.file}: {fileCopySkipWords(skip)}</li>
+                  ))}
+                </ul>
+              ) : null}
             </>
-          ) : (
-            <p className="set-help">
-              Files last looked at{model.fileCopies.scanned_at ? ` ${whenLocal(model.fileCopies.scanned_at, now)}` : ""}: {model.fileCopies.files_checked} files, 0 copies.
-              {model.fileCopies.too_large.length ? ` Too large to read: ${model.fileCopies.too_large.join(", ")}.` : ""}
-            </p>
           )}
         </div>
       ) : null}
@@ -5055,7 +4888,7 @@ export function RoutingSettings({
 
   const body: Record<GroupKey, ReactNode> = {
     accounts: data ? (
-      <AccountsSection data={data} plansState={plansState} problems={overview.problems} folds={folds} lists={lists} active={active}
+      <AccountsSection data={data} plansState={plansState} problems={overview.problems} lists={lists} active={active}
         staleAfterS={staleAfterSeconds(settings)} w={w} now={now} reread={rereadRoute}
         finder={finder} />
     ) : (

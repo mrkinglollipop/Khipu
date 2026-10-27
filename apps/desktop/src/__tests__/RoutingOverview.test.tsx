@@ -343,13 +343,14 @@ describe("Accounts and routing: every problem shows, once", () => {
       within(screen.getByRole("list", { name: "Accounts" })).getAllByRole("listitem").find((li) => li.textContent?.startsWith(label))!;
     expect(line("Claude second").querySelector(".at")).toHaveTextContent("Sources disagree");
     expect(line("Grok Build").querySelector(".at")?.textContent).toBe("");
+    // The line opens the Routing detail; its Plan detail says the read failed, once.
     fireEvent.click(within(line("Grok Build")).getByRole("button", { name: /^Grok Build/ }));
-    const grokDetails = within(screen.getByRole("region", { name: "Grok Build" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "See the plan" }));
+    const grokDetails = within(screen.getByRole("dialog"));
     expect(grokDetails.queryByText("Plan figures can't be read just now")).toBeNull();
     expect(grokDetails.queryByText("Khipu could not read this account's usage")).toBeNull();
-    const grokFailures = grokDetails.getAllByText(/Can't read its plan: Grok Build didn't answer/);
-    expect(grokFailures).toHaveLength(1);
-    expect(grokFailures[0]).toHaveTextContent("Last checked 2 min ago.");
+    expect(grokDetails.getAllByText(/Not read: .*didn't answer/)).toHaveLength(1);
+    fireEvent.click(grokDetails.getByRole("button", { name: "Close details" }));
     expect(line("Codex").querySelector(".at")).toHaveTextContent("Not signed in");
     expect(line("Claude main").querySelector(".at")?.textContent).toBe("");
   });
@@ -461,8 +462,11 @@ describe("Accounts and routing: links open their group", () => {
     const line = document.querySelector<HTMLButtonElement>('[data-route-item="account:claude|/logins/claude-second"]')!;
     await waitFor(() => expect(document.activeElement).toBe(line));
     expect(groupButton("Accounts")).toHaveAttribute("aria-expanded", "true");
-    expect(line).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("group", { name: "Claude second: two reports disagree" })).toBeVisible();
+    // The line opens the Routing detail (no fold of its own); the disagreement is there.
+    expect(line).toHaveAttribute("aria-haspopup", "dialog");
+    fireEvent.click(line);
+    expect(within(screen.getByRole("dialog")).getByRole("group", { name: "Claude second: two reports disagree" })).toBeVisible();
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close details" }));
 
     fireEvent.click(within(needs).getByRole("button", { name: "Show lane opus-batch" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="lane:Project B/opus-batch"]')));
@@ -559,10 +563,7 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
 // Every control on the page before phase 3, by its accessible name, captured
 // from RoutingSettings.test.tsx's fixture ("Save" twice).
 const BEFORE = ["Add to the end", "Add", "With no priority set, list accounts by how soon their allowance runs out unused",
-  "Change: Warn when a priority a conversation set is still unconfirmed after", "Check now", "Mark Claude main paused until…",
-  "Clear the limit for Claude main", "Mark Claude second paused until…", "Clear the limit for Claude second",
-  "Dismiss the runner's report", "Dismiss the conversation's report", "Mark Codex paused until…", "Change the pause for Grok Build",
-  "Lift the pause for Grok Build", "Edit note", "End this note", "All, 2 rules", "To confirm, 1 rule", "Checked by Khipu, 1 rule",
+  "Change: Warn when a priority a conversation set is still unconfirmed after", "Edit note", "End this note", "All, 2 rules", "To confirm, 1 rule", "Checked by Khipu, 1 rule",
   "May be broken, 0 rules", "Confirm rule 3", "Edit rule 3", "Remove rule 3", "Edit rule 7", "Remove rule 7", "New rule", "Add rule…",
   "End the hold on this Mac", "Words", "About", "Kind", "Ends", "Add hold", "Change: How long a conversation's hold lasts",
   "Change: Longest words in a hold", "Change: Remind me about my own holds after", "Check an account at its reset time",
@@ -600,6 +601,32 @@ describe("Accounts and routing: nothing that was on the page is missing", () => 
     const missing = [...want].filter(([name, n]) => named(name).length < n).map(([name]) => name);
     expect(missing).toEqual([]);
   });
+
+  it("keeps the account controls the old fold had, now in each account's Routing detail", async () => {
+    const keys = view().accounts!.map((a) => `account:${a.key}`);
+    store.set(OPEN_KEY, JSON.stringify([...GROUPS.map((g) => g.key), ...keys]));
+    render(<RoutingSettings active plansState={plansOf([planRow({ key: "claude|" })])} />);
+    await settled();
+    const detail = (label: string) => {
+      const list = screen.getByRole("list", { name: "Accounts" });
+      const li = within(list).getAllByRole("listitem").find((x) => x.textContent?.startsWith(label))!;
+      fireEvent.click(within(li).getByRole("button", { name: new RegExp(`^${label}`) }));
+      return within(screen.getByRole("dialog"));
+    };
+    const closeIt = (d: ReturnType<typeof detail>) => fireEvent.click(d.getByRole("button", { name: "Close details" }));
+    const main = detail("Claude main");
+    for (const name of ["Check now", "Pause Claude main until…", "It isn't limited: clear this report"]) {
+      expect(main.getByRole("button", { name })).toBeInTheDocument();
+    }
+    closeIt(main);
+    const second = detail("Claude second");
+    expect(second.getAllByRole("button", { name: /^Dismiss the / })).toHaveLength(2);
+    closeIt(second);
+    const grok = detail("Grok Build");
+    for (const name of ["Change the pause…", "Lift the pause"]) expect(grok.getByRole("button", { name })).toBeInTheDocument();
+    closeIt(grok);
+    expect(detail("Codex").getByRole("button", { name: "Pause Codex until…" })).toBeInTheDocument();
+  });
 });
 
 describe("Accounts and routing: folds and words", () => {
@@ -607,8 +634,9 @@ describe("Accounts and routing: folds and words", () => {
     answers.khipu_route_view = troubled();
     render(<RoutingSettings active plansState={TROUBLED_PLANS()} />);
     await settled();
-    const folds = [...document.querySelectorAll<HTMLButtonElement>("button.fold-btn")];
-    expect(folds.length).toBeGreaterThanOrEqual(GROUPS.length + 5 + 2);
+    // An account's line opens its Routing detail instead of folding.
+    const folds = [...document.querySelectorAll<HTMLButtonElement>("button.fold-btn:not([aria-haspopup])")];
+    expect(folds.length).toBeGreaterThanOrEqual(GROUPS.length + 2);
     for (const b of folds) {
       expect(b.getAttribute("aria-expanded")).toMatch(/^(true|false)$/);
       const body = document.getElementById(b.getAttribute("aria-controls") ?? "");
