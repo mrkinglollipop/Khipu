@@ -813,6 +813,17 @@ def record_preference_resolutions(jobs: list[dict]) -> None:
              "state": "pending", "preference_resolutions": jobs})
 
 
+def record_preference_commits(episode_ids: list[int]) -> None:
+    """Mark one transaction's recorded additions committed, after its commit
+    returns: Undo reverts only entries proven committed."""
+    pend = _PENDING.get()
+    line = (pend or {}).get("line")
+    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
+        raise OSError("the owner action must be recorded before a merge commit can be marked")
+    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+             "state": "pending", "preference_commits": [{"episode_id": int(i)} for i in episode_ids]})
+
+
 def preference_merges(line_id: str, key: str = "preference_merges") -> list[dict]:
     """Every addition a merge recorded (or, with ``preference_resolutions``,
     every job it resolved), in log order. Read from the raw log: the merged
@@ -1687,7 +1698,11 @@ def _undo_outbox_preferences(line, via):
                 and line["state"] == "applied"):
             return {"ok": True, "restored": 0, "left_alone": []}
         raise ValueError("Khipu has no record of which preferences this merge added, so it can't undo it")
-    return outbox_preferences.undo(entries, resolved)
+    # Committed: a batch's own marker, or the finished result's episode list
+    # (written only after every batch committed).
+    committed = {int(c["episode_id"]) for c in preference_merges(line["id"], "preference_commits")}
+    committed |= {int(i) for i in (line.get("result") or {}).get("episode_ids") or []}
+    return outbox_preferences.undo(entries, resolved, committed)
 
 
 def _ledger_undo(verb: str):

@@ -537,3 +537,65 @@ def test_apply_from_the_app_and_a_forged_from_app_is_refused(backlog, tmp_path, 
     assert rc == 0 and out["episode_ids"] == [1, 2, 6, 7], out
     line = next(x for x in owner_direction.actions() if x["action"] == "outbox.merge_preferences")
     assert line["auth"] == "app" and line["state"] == "applied", line
+
+
+def test_undo_leaves_the_resolved_job_of_an_episode_forgotten_by_id(backlog, tmp_path, monkeypatch):
+    cur, paths = backlog
+    _direction(tmp_path, monkeypatch)
+    rc, out = _run("--apply", "--owner-direction")
+    assert rc == 0 and not paths["order"].exists()
+    [record] = list(outbox.resolved_dir().glob("*.json"))
+    after6 = deepcopy(cur.episodes[6])
+    tombstones.publish_episode_ids({6})
+    rc, undone = _run("--undo", out["owner_action"], "--owner-direction")
+    assert rc == 0, undone
+    assert cur.episodes[6] == after6
+    assert not paths["order"].exists() and record.exists()
+    assert undone["lines_left_resolved"] == [{"record": record.stem, "job": paths["order"].name,
+                                              "why": "forgotten"}]
+
+
+def test_a_job_is_not_archived_when_its_episode_is_forgotten_by_id_before_the_move(backlog, tmp_path,
+                                                                                   monkeypatch):
+    _cur, paths = backlog
+    real_archive = outbox.archive_resolved
+
+    def forget_first(jp, snapshot, record):
+        tombstones.publish_episode_ids({6})
+        return real_archive(jp, snapshot, record)
+
+    monkeypatch.setattr(outbox, "archive_resolved", forget_first)
+    _direction(tmp_path, monkeypatch)
+    rc, out = _run("--apply", "--owner-direction")
+    assert rc == 0 and out["lines_resolved"] == 0, out
+    assert paths["order"].exists()
+    assert not list(outbox.resolved_dir().glob("*.json"))
+
+
+def _fail_first_update(cur, monkeypatch):
+    real = cur.execute
+    state = {"done": False}
+
+    def execute(sql, params=None):
+        if " ".join(sql.split()).startswith("UPDATE episodes") and not state["done"]:
+            state["done"] = True
+            raise RuntimeError("hub dropped at the first UPDATE, after its entries were recorded")
+        return real(sql, params)
+
+    monkeypatch.setattr(cur, "execute", execute)
+
+
+def test_undo_of_a_batch_that_never_committed_keeps_a_later_writers_identical_text(backlog, tmp_path,
+                                                                                   monkeypatch):
+    cur, _paths = backlog
+    monkeypatch.setattr(outbox_preferences, "BATCH", 1)
+    _fail_first_update(cur, monkeypatch)
+    _direction(tmp_path, monkeypatch)
+    assert cli.main(["outbox", "merge-line-preferences", "--apply", "--owner-direction"]) != 0
+    line = next(x for x in owner_direction.actions() if x["action"] == "outbox.merge_preferences")
+    assert line["state"] == "unconfirmed" and owner_direction.preference_merges(line["id"])
+    cur.episodes[1]["raw"]["preferences"] = [*HUB["preferences"], *NEW]
+    cur.episodes[1]["preferences"] = [*HUB["preferences"], *NEW]
+    rc, undone = _run("--undo", line["id"], "--owner-direction")
+    assert rc == 0 and undone["restored"] == 0 and undone["already_restored"] == 1, undone
+    assert _prefs(cur, 1) == ([*HUB["preferences"], *NEW], [*HUB["preferences"], *NEW])

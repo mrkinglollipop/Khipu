@@ -185,10 +185,10 @@ def archive_resolved(jp: Path, snapshot: bytes, record: dict[str, Any]) -> str:
     landed line: the record (both payloads and the whole job) is validated and
     written before the job file goes, under the same source fence and outbox
     lock. ``resolved``; ``changed`` when the file moved or changed since
-    ``snapshot`` was read; ``forgotten`` when a source is forgotten (the job
-    is left for forget's sweep). Raises on an invalid record or a different
+    ``snapshot`` was read; ``forgotten`` when a source, or the episode the
+    record names, is forgotten (the job is left for forget's sweep). Raises on an invalid record or a different
     record already archived under the job's id."""
-    from khipu.tombstones import write_guard
+    from khipu.tombstones import episode_hidden, write_guard
 
     _validate_resolution(record)
     record_id = hashlib.sha256(snapshot).hexdigest()
@@ -199,7 +199,9 @@ def archive_resolved(jp: Path, snapshot: bytes, record: dict[str, Any]) -> str:
                     return "changed"
             except FileNotFoundError:
                 return "changed"
-            if not allowed:
+            # An id forgotten after the merge's batch committed (that check
+            # ran before this lock) still holds the job back.
+            if not allowed or episode_hidden(record["resolution"]["episode_id"]):
                 return "forgotten"
             resolved_dir().mkdir(parents=True, exist_ok=True)
             record_path = resolved_dir() / (record_id + ".json")
@@ -221,8 +223,9 @@ def unresolve(record_id: str, destination: Path, kind: str) -> str:
     then remove its record: the Undo of ``archive_resolved``. Only a record of
     ``kind`` moves. ``restored``; ``absent`` (no such record); ``present``
     (a job is already at ``destination``: never overwritten, the record
-    stays); ``forgotten`` (left for forget's sweep)."""
-    from khipu.tombstones import write_guard
+    stays); ``forgotten`` (a source, or the record's episode by id, is
+    forgotten: the record stays for forget's sweep)."""
+    from khipu.tombstones import episode_hidden, write_guard
 
     record_path = resolved_dir() / (record_id + ".json")
     try:
@@ -240,7 +243,7 @@ def unresolve(record_id: str, destination: Path, kind: str) -> str:
                     return "absent"
             except FileNotFoundError:
                 return "absent"
-            if not allowed:
+            if not allowed or episode_hidden(record["resolution"]["episode_id"]):
                 return "forgotten"
             if destination.exists():
                 return "present"

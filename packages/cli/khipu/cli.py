@@ -4406,7 +4406,8 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
             res = owner_direction.undo(args.undo, via)
         else:
             res = outbox_preferences.apply(record=owner_direction.record_preference_merges,
-                                           record_resolutions=owner_direction.record_preference_resolutions)
+                                           record_resolutions=owner_direction.record_preference_resolutions,
+                                           record_committed=owner_direction.record_preference_commits)
     except BaseException:
         owner_direction._abandon()
         raise

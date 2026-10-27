@@ -304,11 +304,13 @@ def _resolve(resolve: list, record_resolutions) -> int:
                for line, record, _record_id in built)
 
 
-def apply(*, record, record_resolutions) -> dict[str, Any]:
+def apply(*, record, record_resolutions, record_committed=None) -> dict[str, Any]:
     """Merge every qualifying line, BATCH episodes per transaction, each row
     locked in id order and re-proved under its lock. ``record(entries)``
     writes a transaction's entries to the owner-actions log before it
-    commits; when it raises, that transaction is rolled back. Then each line
+    commits; when it raises, that transaction is rolled back.
+    ``record_committed(episode_ids)`` marks them committed once the commit
+    returns: Undo reverts only an entry proven committed. Then each line
     the merged row now contains is archived as resolved
     (``record_resolutions`` logs them first)."""
     from khipu import memory_lock
@@ -348,6 +350,13 @@ def apply(*, record, record_resolutions) -> dict[str, Any]:
                     except BaseException:
                         conn.rollback()
                         raise
+                if entries and record_committed is not None:
+                    try:
+                        record_committed([e["episode_id"] for e in entries])
+                    except OSError:
+                        # Unproven, so Undo leaves this batch's text alone
+                        # unless the finished result names its episodes.
+                        pass
                 merged += entries
                 resolved += _resolve(to_resolve, record_resolutions)
     return {"ok": True, "applied": True, **counts, "episodes_merged": len(merged),
@@ -382,19 +391,27 @@ def _undo_fenced(cur, eid: int, entry: dict[str, Any]) -> bool:
     return cur.fetchone() is not None
 
 
-def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None = None,
+         committed: set[int] | frozenset[int] = frozenset()) -> dict[str, Any]:
     """Put every job the merge resolved back where it was held, and the exact
     prior preferences of every episode it changed, when the row still holds
     exactly what the merge left. A row changed since (or forgotten) is left
-    alone and named: undo never removes text something else wrote."""
+    alone and named: undo never removes text something else wrote. Only an
+    entry whose episode id is in ``committed`` is reverted; one whose batch
+    never proved its commit counts as already restored, since identical text
+    on its row may be a later writer's. A resolved record undo can't move
+    back (forgotten, or a job already in its place) stays and is named."""
     from khipu import memory_lock, outbox
     from khipu.db import connect
 
-    unresolved = 0
+    unresolved, still_resolved = 0, []
     for r in resolutions or []:
         folder = outbox.outbox_dir() if r.get("where") == "outbox" else outbox.dead_dir()
-        unresolved += outbox.unresolve(str(r["record"]), folder / str(r["job"]),
-                                       "preferences_contained") == "restored"
+        status = outbox.unresolve(str(r["record"]), folder / str(r["job"]), "preferences_contained")
+        if status == "restored":
+            unresolved += 1
+        elif status in ("forgotten", "present"):
+            still_resolved.append({"record": str(r["record"]), "job": str(r["job"]), "why": status})
     latest = {int(e["episode_id"]): e for e in entries}  # one entry per episode per merge
     restored, already, left_alone = 0, 0, []
     ids = sorted(latest)
@@ -407,6 +424,9 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
                     rows = {int(r[0]): r for r in cur.fetchall()}
                     for eid in part:
                         e, row = latest[eid], rows.get(eid)
+                        if eid not in committed:
+                            already += 1
+                            continue
                         if (row is None or row[1] is not None or not isinstance(row[2], dict)
                                 or _undo_fenced(cur, eid, e)):
                             left_alone.append(eid)
@@ -437,4 +457,4 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
                     conn.rollback()
                     raise
     return {"ok": True, "restored": restored, "already_restored": already, "left_alone": left_alone,
-            "lines_unresolved": unresolved}
+            "lines_unresolved": unresolved, "lines_left_resolved": still_resolved}
