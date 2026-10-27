@@ -225,11 +225,14 @@ def resolve_project_name(cur, project: str | None) -> str | None:
     return resolve_project(cur, project)[0]
 
 
-def resolve_project(cur, project: str | None) -> tuple[str | None, bool]:
+def resolve_project(cur, project: str | None, *,
+                    also_visible: Iterable[str] = ()) -> tuple[str | None, bool]:
     """``resolve_project_name`` and whether the answer is a visible project.
     ``False`` means an unknown name -- including an exact alias of a project
     that exists only through forgotten episodes -- which a caller must not
-    widen through ``project_aliases`` (that would name the hidden project)."""
+    widen through ``project_aliases`` (that would name the hidden project).
+    ``also_visible`` names projects of other owed items the caller lists
+    (open routing directions), which count as visible too."""
     if not project:
         return project, True
     from khipu import commitments
@@ -255,7 +258,7 @@ def resolve_project(cur, project: str | None) -> tuple[str | None, bool]:
             if not isinstance(exc, (UndefinedTable, UndefinedColumn)):
                 raise
             found.append([])
-    known = visible_project_names((r[0] for r in found[0]), found[1])
+    known = visible_project_names([*(r[0] for r in found[0]), *also_visible], found[1])
     return pick_project_known(project, known, lambda n: project_canonical_group(cur, n)[0] or n)
 
 

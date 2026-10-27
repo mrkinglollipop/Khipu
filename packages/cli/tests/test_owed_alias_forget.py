@@ -355,8 +355,8 @@ def test_hub_forget_between_resolution_and_rows_never_names_the_project(hub, hub
     hub_conn.commit()
     real = identity.resolve_project
 
-    def resolve_then_forget(cur, project):
-        answer = real(cur, project)
+    def resolve_then_forget(cur, project, **kw):
+        answer = real(cur, project, **kw)
         other = hub.connect()
         with other.cursor() as oc:
             oc.execute("DELETE FROM fact_claims WHERE kind = 'commitment' AND fact_id = %s", (cid,))
@@ -422,3 +422,23 @@ def test_replica_fence_between_resolution_and_rows_never_names_the_project(repli
          mock.patch.object(srv, "_routing_direction_rows", return_value=[]):
         after = srv.owed_listing({"project": asked})
     assert after["project"] == asked and after["results"] == []
+
+
+def test_replica_directions_only_project_still_canonicalizes(replica_dir, monkeypatch):
+    # An open routing direction is an owed item: its project counts as visible,
+    # so its alias group canonicalizes with no commitment behind it. A hidden
+    # (forgotten-only) group stays hidden.
+    con = _replica()
+    con.execute("INSERT INTO project_aliases(alias, project) VALUES ('fixture/old', 'fixture/alpha')")
+    _alias_rows(con)
+    con.close()
+    item = {"id": "rd-0123456789abcdef", "kind": "routing_direction", "text": "Routing said here",
+            "project": "fixture/old", "opened_at": "2090-01-01T00:00:00+00:00"}
+    monkeypatch.setattr("khipu.routing_directions.owed_items", lambda: [dict(item)])
+    with mock.patch.object(db, "connect", side_effect=psycopg.OperationalError("connection is closed")):
+        out = srv.owed_listing({"project": "fixture/old"})
+        hidden = srv.owed_listing({"project": "old-secret"})
+    assert out["project"] == "fixture/alpha"
+    assert [(r["id"], r["project"]) for r in out["results"]] == [("rd-0123456789abcdef", "fixture/alpha")]
+    assert hidden["project"] == "old-secret" and hidden["results"] == []
+    assert "secret/leaf" not in json.dumps(hidden, default=str)

@@ -112,14 +112,16 @@ def _cited_forgotten(con, rows: list[dict[str, Any]]) -> set[Any]:
     return out
 
 
-def owed_read(project: str | None, status: str) -> dict[str, Any] | None:
+def owed_read(project: str | None, status: str, *,
+              also_visible: tuple[str, ...] = ()) -> dict[str, Any] | None:
     """The owed listing's whole replica read in ONE read transaction: the
     typed ``project`` resolved (``snapshot_resolve_project_known``), its alias
     group, and the rows, all from the same replica state and one forget fence
     (deleted episodes and queued erasures, taken once). A canonical is
     expanded only when the name is visible in that same read; otherwise the
     name stays as typed with no alias widening. ``None`` with nothing to read.
-    Raises ``identity.AmbiguousProject``."""
+    ``also_visible``: projects of the other owed items the listing shows
+    (open routing directions). Raises ``identity.AmbiguousProject``."""
     con = _open()
     if con is None:
         return None
@@ -130,7 +132,8 @@ def owed_read(project: str | None, status: str) -> dict[str, Any] | None:
         if not hub_snapshot._snapshot_table_columns(con, "commitments"):
             return None
         fence = hub_snapshot.forget_fence_sql(con, "commitments", "opened_episode")
-        resolved, visible = hub_snapshot.snapshot_resolve_project_known(con, project, fence=fence)
+        resolved, visible = hub_snapshot.snapshot_resolve_project_known(con, project, fence=fence,
+                                                                       also_visible=also_visible)
         canonical, group = resolved, ([resolved] if resolved else None)
         if resolved and visible:
             canonical, group = hub_snapshot.snapshot_project_group(con, resolved)
@@ -145,7 +148,8 @@ def owed_read(project: str | None, status: str) -> dict[str, Any] | None:
             # this read can't see), so still visible now means the rows read
             # saw it too. Otherwise the name reads as typed, with no rows.
             try:
-                again, visible = hub_snapshot.snapshot_resolve_project_known(con, project, fence=fence)
+                again, visible = hub_snapshot.snapshot_resolve_project_known(con, project, fence=fence,
+                                                                       also_visible=also_visible)
             except identity.AmbiguousProject:
                 again, visible = None, False
             if not visible or again != resolved:

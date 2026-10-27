@@ -4208,7 +4208,8 @@ def snapshot_resolve_project(con: sqlite3.Connection, project: str | None) -> st
 
 
 def snapshot_resolve_project_known(con: sqlite3.Connection, project: str | None, *,
-                                   fence: str | None = None) -> tuple[str | None, bool]:
+                                   fence: str | None = None,
+                                   also_visible: Iterable[str] = ()) -> tuple[str | None, bool]:
     """``snapshot_resolve_project`` and whether the answer is a visible
     project (``identity.resolve_project``'s contract). ``fence`` is a forget
     fence the caller already took, so its row read applies the same one."""
@@ -4229,7 +4230,7 @@ def snapshot_resolve_project_known(con: sqlite3.Connection, project: str | None,
             found.append(list(con.execute(sql).fetchall()))
         except sqlite3.Error:
             found.append([])
-    known = identity.visible_project_names((r[0] for r in found[0]), found[1])
+    known = identity.visible_project_names([*(r[0] for r in found[0]), *also_visible], found[1])
     return identity.pick_project_known(project, known, lambda n: snapshot_project_group(con, n)[0] or n)
 
 

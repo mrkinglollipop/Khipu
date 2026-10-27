@@ -1899,6 +1899,11 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     canonical = project
     project_names = [project] if project else None
     hub_now = None
+    # Open routing directions are owed items too: read once, their projects
+    # count as visible names, and the same read fills the listing.
+    direction_filters = {"origin": filters.get("origin")}
+    direction_items = _routing_direction_items(status, direction_filters)
+    direction_projects = tuple(sorted({str(i["project"]) for i in direction_items if i.get("project")}))
     try:
         with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
             from psycopg import IsolationLevel
@@ -1917,7 +1922,7 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
                     # only through forgotten episodes included -- is never
                     # widened through its alias group: that names the hidden
                     # project. Its rows are fenced, so the read is empty.
-                    project, visible = identity.resolve_project(cur, project)
+                    project, visible = identity.resolve_project(cur, project, also_visible=direction_projects)
                     if visible:
                         canonical, project_names = identity.project_canonical_group(cur, project)
                         canonical = canonical or project
@@ -1936,14 +1941,14 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
         # expansion of it, and resolve it, group it and read its rows in one
         # replica read (``offline_reads.owed_read``): the canonical is echoed
         # only when that same read can see the project.
-        read = offline_reads.owed_read(asked_name, status)
+        read = offline_reads.owed_read(asked_name, status, also_visible=direction_projects)
         if read is None:
             raise
         project, rows = read["project"], read["rows"]
         canonical, project_names = read["canonical"], read["group"]
         stale = stale_fields()
-    directions = _routing_direction_rows(status, {"origin": filters.get("origin")},
-                                         projects=project_names, canonical=canonical)
+    directions = _routing_direction_rows(status, direction_filters, projects=project_names,
+                                         canonical=canonical, items=direction_items)
     page = commitments.page_owed(rows + directions, **filters, limit=limit)
     if hub_ages:
         from datetime import datetime, timezone
@@ -1956,14 +1961,11 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     return out
 
 
-def _routing_direction_rows(status: str, filters: dict, *, projects: list[str] | None = None,
-                            canonical: str | None = None) -> list[dict]:
-    """Open routing directions (slice 19a) in the owed list the owner
-    reads. They live in the local routing-directions store, not the
-    commitments table; the words in ``text`` come from that store and
-    are shown only through this owner-facing list. Fail-open: a broken
-    store never breaks the owed list. Dismiss one with
-    ``khipu owed --close <id>`` (the app's owed close control)."""
+def _routing_direction_items(status: str, filters: dict) -> list[dict]:
+    """The open routing directions ``filters`` admits, any project: the
+    store's items (``routing_directions.owed_items``, open only, so a
+    dismissed one never counts) before the project scope. Fail-open: a
+    broken store reads as none."""
     if status != "open" or filters.get("pr") is not None or filters.get("origin") \
             or filters.get("looks_done"):
         return []
@@ -1979,11 +1981,24 @@ def _routing_direction_rows(status: str, filters: dict, *, projects: list[str] |
     except Exception:  # noqa: BLE001 - the owed list must not fail on the directions store
         return []
     words = [w for w in (filters.get("query") or "").lower().split() if w]
+    return [item for item in items
+            if not words or all(w in (item.get("text") or "").lower() for w in words)]
+
+
+def _routing_direction_rows(status: str, filters: dict, *, projects: list[str] | None = None,
+                            canonical: str | None = None, items: list[dict] | None = None) -> list[dict]:
+    """Open routing directions (slice 19a) in the owed list the owner
+    reads. They live in the local routing-directions store, not the
+    commitments table; the words in ``text`` come from that store and
+    are shown only through this owner-facing list. Fail-open: a broken
+    store never breaks the owed list. Dismiss one with
+    ``khipu owed --close <id>`` (the app's owed close control). ``items``
+    is the caller's own read of them (``_routing_direction_items``)."""
+    if items is None:
+        items = _routing_direction_items(status, filters)
     out = []
     for item in items:
         if projects is not None and item.get("project") not in projects:
-            continue
-        if words and not all(w in (item.get("text") or "").lower() for w in words):
             continue
         out.append({"id": item["id"], "kind": "routing_direction", "text": item["text"],
                     "owner": "user", "project": canonical or item.get("project"),
