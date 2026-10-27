@@ -122,6 +122,35 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
             self.assertEqual(stats.get("deduped_msgs"), 1, stats)
 
 
+    def test_repeated_short_turn_beyond_captured_count_is_kept(self):
+        """A short line seen once proves one copy, not every later repeat."""
+        long_u = "A long already captured user question that is clearly over forty characters"
+        rows = [_user(long_u), _user("yes"), _assistant("done"), _user("yes")]
+        seen = [sc.text_fingerprint("user", long_u), sc.text_fingerprint("user", "yes"),
+                sc.text_fingerprint("assistant", "done")]
+        with tempfile.TemporaryDirectory() as td:
+            tp = Path(td) / "t.jsonl"
+            _write(tp, rows)
+            msgs, _, turns = sc.read_window(tp, 0, seen=seen, stats={})
+            self.assertEqual(turns, 1, f"msgs={msgs}")
+            self.assertEqual([t for _, t in msgs], ["yes"])
+
+    def test_skip_to_stops_before_a_kept_tool_marker(self):
+        long_u = "A long already captured user question that is clearly over forty characters"
+        tool = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/x"}}]}}
+        with tempfile.TemporaryDirectory() as td:
+            tp = Path(td) / "t.jsonl"
+            _write(tp, [_user(long_u), tool, _user("ok")])
+            head = len((json.dumps(_user(long_u)) + "\n").encode())
+            stats: dict = {}
+            msgs, _, _ = sc.read_window(
+                tp, 0, seen=[sc.text_fingerprint("user", long_u), sc.text_fingerprint("user", "ok")],
+                stats=stats)
+            self.assertEqual([r for r, _ in msgs], ["tool"])
+            self.assertEqual(stats["skip_to"], head, stats)
+
+
 class SubagentLineageTest(unittest.TestCase):
     """parent_session_id may be bare; the parent episode is harness:id."""
 
