@@ -816,6 +816,8 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
         if cli == "claude" and (bool(settings and settings["provider"] == GLM) or zai_home(path)) \
                 and not any(t["provider"] == GLM for t in link_targets):
             cli, path = GLM, None  # one GLM login, whatever folder ran it
+            if suggestion and suggestion.get("provider") != GLM:
+                suggestion = None  # a GLM row never suggests another provider's account
         ident = identity(path) if path is not None else MUSE_IDENTITY
         is_default = path is None or defaults.get(cli) == ident
         if (cli, ident) in tracked or (cli, ident) in declined:
@@ -1019,7 +1021,10 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
         # that token's presence alone; the token itself is never read out.
         # Any other home is asked through its CLI instead.
         return settle(SIGNED_IN, None)
-    if cli == GLM:
+    if cli == GLM or (cli == "claude" and (zai_home(rec.get("abs"))
+                                         or PROVIDER_HOSTS.get(rec.get("provider_host")) == GLM)):
+        # A z.ai folder is the GLM Coding Plan, never an Anthropic login: the
+        # claude CLI is not asked about it, by name or by where its settings point.
         return settle(*_from_probe(usage.probe_glm(timeout=left())))
     binary = usage._command(cli)
     if not binary:

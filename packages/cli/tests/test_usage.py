@@ -1775,3 +1775,19 @@ def test_foreground_report_never_probes_without_the_shared_refresh_lock(fake, mo
     out = usage.report(fresh=True, accounts=[account])
     assert out["refreshing"] is True
     assert out["accounts"][0]["error"] == usage.E_PENDING
+
+
+def test_accounts_status_reads_the_config_once(monkeypatch):
+    from khipu import config as khipu_config
+
+    reads = []
+    stored = [{"usage_accounts": [{"label": "Work", "harness": "codex"}]}, {}]
+
+    def load():
+        reads.append(1)
+        return stored[min(len(reads) - 1, 1)]
+
+    monkeypatch.setattr(khipu_config, "load_config", load)
+    status = usage.accounts_status()
+    assert [a["label"] for a in status["accounts"]] == ["Work"]
+    assert len(reads) == 1
