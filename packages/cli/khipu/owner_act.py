@@ -92,12 +92,12 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "forget.here": (("id",), ()),
     "forget.not_same": (("id",), ()),
     # Undone through direction.undo with the id this returns.
-    "outbox.merge_preferences": ((), ()),
+    "outbox.merge_preferences": ((), ("include_content", "include_decisions")),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer"}
+_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -395,7 +395,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "forget.not_same":
         return ["episode", "forget-pending", f"--not-same={v['id']}"], []
     if action == "outbox.merge_preferences":
-        return ["outbox", "merge-line-preferences", "--apply"], []
+        return ["outbox", "merge-line-preferences", "--apply", *_opts(v, "include_content", "include_decisions")], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 

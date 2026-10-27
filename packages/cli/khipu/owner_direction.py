@@ -1818,7 +1818,9 @@ def _undo_outbox_preferences(line, via):
     # (written only after every batch committed).
     committed = {int(c["episode_id"]) for c in preference_merges(line["id"], "preference_commits")}
     committed |= {int(i) for i in (line.get("result") or {}).get("episode_ids") or []}
-    return outbox_preferences.undo(entries, resolved, committed, include_unproven=_INCLUDE_UNPROVEN.get())
+    return outbox_preferences.undo(entries, resolved, committed, include_unproven=_INCLUDE_UNPROVEN.get(),
+                                   retract_reason=f"undo of owner action {line['id']} "
+                                                  "(outbox merge-line-preferences --include-decisions)")
 
 
 def _ledger_undo(verb: str):

@@ -4369,8 +4369,15 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
                           "error": "--include-unproven needs --owner-direction (a conversation the owner typed "
                                    "in); it is logged. Nothing was changed."}))
         return 2
+    with_decisions = bool(getattr(args, "include_decisions", False))
+    content = bool(getattr(args, "include_content", False)) or with_decisions
+    if content and args.undo:
+        print(json.dumps({"ok": False, "error": "--include-content and --include-decisions go with a dry run or "
+                                                "--apply; --undo reads what the merge recorded"}))
+        return 2
     if not (args.apply or args.undo):
-        print(json.dumps(outbox_preferences.dry_run(), indent=2))
+        print(json.dumps(outbox_preferences.dry_run(include_content=content, include_decisions=with_decisions),
+                         indent=2))
         return 0
     if args.undo:
         line = owner_direction._find(args.undo)
@@ -4386,7 +4393,10 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
         want = owner_direction.intent("direction.undo", args.undo,
                                       facts={"include_unproven": True} if unproven else None)
     else:
-        want = owner_direction.intent(outbox_preferences.ACTION, "outbox")
+        facts = {"include_content": True} if content else {}
+        if with_decisions:
+            facts["include_decisions"] = True
+        want = owner_direction.intent(outbox_preferences.ACTION, "outbox", facts=facts or None)
     refused = {"ok": False, "code": "owner_only",
                "error": "Merging into the hub (or undoing a merge) is the owner's change: make it in the Khipu "
                         "app, type yes on a terminal, or pass --owner-direction from a conversation the owner "
@@ -4405,7 +4415,9 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
             print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
             return 2
         via = "direction"
-    elif routing.typed_yes("This changes preferences on hub episodes (Undo puts them back). Type yes to confirm: "):
+    elif routing.typed_yes(f"This changes preferences{' and topics' if content else ''}"
+                           f"{' and adds decision rows' if with_decisions else ''} on hub episodes "
+                           "(Undo puts them back). Type yes to confirm: "):
         owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
         via = "cli"
     if via is None:
@@ -4417,7 +4429,8 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
         else:
             res = outbox_preferences.apply(record=owner_direction.record_preference_merges,
                                            record_resolutions=owner_direction.record_preference_resolutions,
-                                           record_committed=owner_direction.record_preference_commits)
+                                           record_committed=owner_direction.record_preference_commits,
+                                           include_content=content, include_decisions=with_decisions)
     except BaseException:
         owner_direction._abandon()
         raise
@@ -6827,6 +6840,15 @@ def build_parser() -> argparse.ArgumentParser:
                           "or --owner-direction)")
     obm.add_argument("--undo", metavar="OWNER_ACTION", default=None,
                      help="Put back the exact prior preferences of one merge (the owner's, as --apply)")
+    obm.add_argument("--include-content", action="store_true",
+                     help="Also append the topic items a held line carries that its hub episode lacks (where the "
+                          "hub's writer would put them), and archive lines that differ only by a kept hub scope; "
+                          "decisions are appended only with --include-decisions")
+    obm.add_argument("--include-decisions", action="store_true",
+                     help="Also store the decisions a held line carries that its hub episode lacks, through the "
+                          "capture's decision writer (own rows, dedup, reversal detection, fact claims), and "
+                          "append them to the episode (implies --include-content; Undo retracts the rows it "
+                          "created)")
     obm.add_argument("--include-unproven", action="store_true",
                      help="With --undo: also revert episodes whose commit Khipu could not prove (owner direction, "
                           "logged)")
