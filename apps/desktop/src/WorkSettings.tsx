@@ -111,11 +111,49 @@ export function ledgerProjectName(
 ): string {
   if (p.name !== p.project) return p.name;
   const main = canonical.get(p.project);
-  if (!main) return p.name;
+  // A project keyed by its current name reads as the Work tab names it too.
+  if (!main) return view?.projects.find((b) => b.project === p.project)?.name ?? p.name;
   return view?.projects.find((b) => b.project === main)?.name ?? shortProject(main);
 }
 
-function ProjectRow({ p, shown, w }: { p: LedgerProject; shown: string; w: Writes }) {
+/** A ledger project with the older keys that read as the same project folded
+ *  in: `project` is the key writes go to first, `members` every key. */
+export type MergedLedgerProject = LedgerProject & { members: string[] };
+
+/** One row per project as Khipu names it. A ledger can hold rows under an
+ *  older name of a renamed project (church-harness, now olivewood) and under
+ *  the new one; they are one project, so their counts add and a rename or hide
+ *  reaches every key. */
+export function mergeLedgerProjects(projects: LedgerProject[], canonical: Map<string, string>): MergedLedgerProject[] {
+  const groups = new Map<string, LedgerProject[]>();
+  for (const p of projects) {
+    const key = canonical.get(p.project) ?? p.project;
+    groups.set(key, [...(groups.get(key) ?? []), p]);
+  }
+  return [...groups.entries()].map(([key, list]) => {
+    const primary = list.find((p) => p.project === key) ?? [...list].sort((a, b) => b.rows - a.rows)[0];
+    const dates = list.map((p) => p.created_at).filter((d): d is string => Boolean(d)).sort();
+    return {
+      ...primary,
+      rows: list.reduce((n, p) => n + p.rows, 0),
+      open: list.reduce((n, p) => n + p.open, 0),
+      needs_owner: list.reduce((n, p) => n + p.needs_owner, 0),
+      hidden: list.every((p) => p.hidden),
+      created_at: dates[0] ?? primary.created_at,
+      members: [primary.project, ...list.filter((p) => p !== primary).map((p) => p.project)],
+    };
+  });
+}
+
+/** A rename or hide on a merged project reaches every key it folds in: the
+ *  others are written here, and the first key's arguments go back for the
+ *  caller's own write. */
+async function setEach(members: string[], change: { name: string | null; hidden: boolean | null }): Promise<Record<string, unknown>> {
+  for (const project of members.slice(1)) await callCli("khipu_ledger_project_set", { project, ...change });
+  return { project: members[0], ...change };
+}
+
+function ProjectRow({ p, shown, w, waiting = 0 }: { p: MergedLedgerProject; shown: string; w: Writes; waiting?: number }) {
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(shown);
   const btn = useRef<HTMLButtonElement>(null);
@@ -127,7 +165,8 @@ function ProjectRow({ p, shown, w }: { p: LedgerProject; shown: string; w: Write
   };
   async function save(e: FormEvent) {
     e.preventDefault();
-    if (await w.run(id, "khipu_ledger_project_set", { project: p.project, name: name.trim() === p.project || (shown !== p.name && name.trim() === shown) ? "" : name, hidden: null })) close();
+    const next = name.trim() === p.project || (shown !== p.name && name.trim() === shown) ? "" : name;
+    if (await w.run(id, "khipu_ledger_project_set", () => setEach(p.members, { name: next, hidden: null }))) close();
   }
   const started = dayWords(p.created_at);
   return (
@@ -142,6 +181,7 @@ function ProjectRow({ p, shown, w }: { p: LedgerProject; shown: string; w: Write
           {p.hidden ? <span className="tag">Hidden from the Work tab</span> : null}
           {p.hidden && started ? " " : null}
           {started ? `Started in Khipu on ${started}.` : null}
+          {waiting ? `${started || p.hidden ? " " : ""}${waiting.toLocaleString()} waiting on you on the Work tab.` : null}
         </span>
       </span>
       <span className="wk-proj-acts">
@@ -164,7 +204,7 @@ function ProjectRow({ p, shown, w }: { p: LedgerProject; shown: string; w: Write
           className="sm"
           aria-label={`${p.hidden ? "Show" : "Hide"} ${shown}`}
           disabled={w.busy !== null}
-          onClick={() => void w.run(id, "khipu_ledger_project_set", { project: p.project, name: null, hidden: !p.hidden })}
+          onClick={() => void w.run(id, "khipu_ledger_project_set", () => setEach(p.members, { name: null, hidden: !p.hidden }))}
         >
           {p.hidden ? "Show" : "Hide"}
         </button>
@@ -207,11 +247,17 @@ export type WorkOnlyProject = { project: string; name: string; waiting: number }
 /** The Work tab's projects that the ledger doesn't list, named as the Work
  *  tab names them, and how many waiting items have no project or a withheld
  *  one (the tab's "No project" and "Name withheld" chips). */
-export function workOnlyProjects(view: WorkView | null | undefined, ledger: LedgerProject[]): {
+export function workOnlyProjects(view: WorkView | null | undefined, ledger: LedgerProject[], canonical: Map<string, string> = new Map()): {
   projects: WorkOnlyProject[];
   unnamed: { withheld: number; none: number };
+  /** Waiting items by project as Khipu names it, for the projects the ledger does list. */
+  inLedger: Map<string, number>;
 } {
-  const known = new Set(ledger.map((p) => p.project));
+  // A board keyed by a project's current name and a ledger keyed by its older
+  // one are the same project: compare by the name Khipu shows.
+  const key = (project: string) => canonical.get(project) ?? project;
+  const known = new Set(ledger.map((p) => key(p.project)));
+  const inLedger = new Map<string, number>();
   const found = new Map<string, WorkOnlyProject>();
   const unnamed = { withheld: 0, none: 0 };
   const nameOf = (project: string) => {
@@ -219,7 +265,7 @@ export function workOnlyProjects(view: WorkView | null | undefined, ledger: Ledg
     return board?.name ?? shortProject(project);
   };
   for (const b of view?.projects ?? []) {
-    if (b.project && !known.has(b.project) && !found.has(b.project)) found.set(b.project, { project: b.project, name: nameOf(b.project), waiting: 0 });
+    if (b.project && !known.has(key(b.project)) && !found.has(key(b.project))) found.set(key(b.project), { project: key(b.project), name: nameOf(key(b.project)), waiting: 0 });
   }
   for (const item of view?.waiting ?? []) {
     if (!item.project) {
@@ -227,17 +273,22 @@ export function workOnlyProjects(view: WorkView | null | undefined, ledger: Ledg
       else if (item.source !== "routing") unnamed.none += 1;
       continue;
     }
-    if (known.has(item.project)) continue;
-    const got = found.get(item.project) ?? { project: item.project, name: nameOf(item.project), waiting: 0 };
+    const k = key(item.project);
+    if (known.has(k)) {
+      inLedger.set(k, (inLedger.get(k) ?? 0) + 1);
+      continue;
+    }
+    const got = found.get(k) ?? { project: k, name: nameOf(k), waiting: 0 };
     got.waiting += 1;
-    found.set(item.project, got);
+    found.set(k, got);
   }
   const projects = [...found.values()].sort((a, b) => b.waiting - a.waiting || a.name.localeCompare(b.name));
-  return { projects, unnamed };
+  return { projects, unnamed, inLedger };
 }
 
 function ProjectsSection({ projects, error, view, canonical, w }: { projects: LedgerProject[] | null; error: string | null; view: WorkView | null; canonical: Map<string, string>; w: Writes }) {
-  const others = workOnlyProjects(view, projects ?? []);
+  const others = workOnlyProjects(view, projects ?? [], canonical);
+  const merged = mergeLedgerProjects(projects ?? [], canonical);
   const unnamedWords = [
     others.unnamed.withheld ? `${others.unnamed.withheld.toLocaleString()} under ${WITHHELD.name}` : "",
     others.unnamed.none ? `${others.unnamed.none.toLocaleString()} under ${NO_PROJECT}` : "",
@@ -256,10 +307,10 @@ function ProjectsSection({ projects, error, view, canonical, w }: { projects: Le
         ) : empty ? (
           <p className="set-help">No projects yet.</p>
         ) : null}
-        {projects?.length ? (
+        {merged.length ? (
           <div className="rows" role="list" aria-label="Ledger projects">
-            {projects.map((p) => (
-              <ProjectRow key={p.project} p={p} shown={ledgerProjectName(p, canonical, view)} w={w} />
+            {merged.map((p) => (
+              <ProjectRow key={p.project} p={p} shown={ledgerProjectName(p, canonical, view)} w={w} waiting={others.inLedger.get(canonical.get(p.project) ?? p.project) ?? 0} />
             ))}
           </div>
         ) : null}

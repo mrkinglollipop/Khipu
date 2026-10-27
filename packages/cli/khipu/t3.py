@@ -443,8 +443,14 @@ def _age_seconds(value: str | None) -> float | None:
         return None
 
 
+_DRIVER_DISPLAY = {"cursor": "Cursor", "antigravity": "Antigravity"}
+
+
 def _provider_label(inst: dict[str, Any]) -> str:
     name, driver = str(inst["name"]), str(inst["driver"])
+    if name.strip().lower() == driver.strip().lower() and driver.strip().lower() in _DRIVER_DISPLAY:
+        # T3 names the instance in lowercase; the owner reads the harness's own name.
+        return _DRIVER_DISPLAY[driver.strip().lower()]
     return name if not driver or name.strip().lower() == driver.strip().lower() else f"{name} ({driver})"
 
 
@@ -459,8 +465,11 @@ def _provider_messages(inst: dict[str, Any], status: dict[str, Any]) -> tuple[st
                      "routing reaches it through `khipu_route` and the brief")
         runtime = status.get("runtime") or {}
         if runtime.get("recheck"):
-            notes.append(f"T3's {label} runtime ({runtime.get('version') or 'unknown version'}) is not one "
-                         "Khipu has checked; verify it from the Antigravity card")
+            version = str(runtime.get("version") or "")
+            # A 64-character build hash is not something to read: say "a build".
+            shown = f" ({version})" if version and len(version) <= 24 else ""
+            notes.append(f"T3's {label} runtime{shown} is a build Khipu has not checked; "
+                         "verify it from the Antigravity card")
     if status["hooks"] == MISSING:
         if inst["driver"] == ANTIGRAVITY_DRIVER:
             return (f"T3 provider {label} has no Khipu hooks, so its sessions are not captured and it has no "

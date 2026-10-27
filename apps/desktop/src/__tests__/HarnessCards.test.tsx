@@ -10,18 +10,21 @@ import {
   cursorFunctionRows,
   parseProof,
   projectLine,
+  plainNote,
   providerSummary,
   shortDate,
 } from "../harnessFunctions";
 import { antigravityStatus } from "../AntigravityCard";
 import {
   AG_ABSENT,
+  AG_BARE,
   AG_ON_MAC,
   CURSOR_LIVENESS,
   CURSOR_PROBE,
   CURSOR_ROW,
   KHIPU_PROJECT,
   T3_PROVIDERS,
+  T3_REAL,
 } from "./harnessCardsFixtures";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => "{}") }));
@@ -68,11 +71,28 @@ describe("T3 provider rows", () => {
     expect(antigravity.tag).toEqual({ tone: "warn", label: "Partial" });
   });
 
-  it("says Complete only when every feature is in, and Not added when none is", () => {
+  it("says All 5 features (green) when every feature is in, and Not added to any project (neutral) when none is", () => {
     const all = { driver: "cursor", name: "Cursor", hooks: "installed", functions: { capture: "installed", start_block: "installed", prompt_recall: "installed", delegation: "installed", mcp: "installed" } };
-    expect(providerSummary(all).tag).toEqual({ tone: "ok", label: "Complete" });
+    expect(providerSummary(all).tag).toEqual({ tone: "ok", label: "All 5 features" });
     const none = { driver: "antigravity", name: "Antigravity", hooks: "missing", functions: { capture: "missing", mcp: "missing", start_block: "unsupported", prompt_recall: "unsupported", delegation: "unsupported" } };
-    expect(providerSummary(none).tag).toEqual({ tone: "warn", label: "Not added" });
+    expect(providerSummary(none).tag).toEqual({ tone: "neutral", label: "Not added to any project" });
+  });
+
+  it("uses the display name, not T3's lowercase instance name, and never red", () => {
+    const [cursor, antigravity] = T3_REAL.providers!.map(providerSummary);
+    expect(cursor.name).toBe("Cursor");
+    expect(cursor.line).toBe("Cursor");
+    expect(cursor.tag).toEqual({ tone: "ok", label: "All 5 features" });
+    expect(antigravity.name).toBe("Antigravity");
+    expect(antigravity.line).toBe("Antigravity · add a project to start");
+    expect(antigravity.tag.tone).toBe("neutral");
+  });
+
+  it("drops the 64-character runtime hash and capitalises provider names in notes", () => {
+    const text = T3_REAL.notes!.map(plainNote).join(" ");
+    expect(text).not.toMatch(/[0-9a-f]{16,}/);
+    expect(text).toContain("T3 runs Antigravity without");
+    expect(text).toContain("T3's Antigravity runtime");
   });
 
   it("reads recall as a harness limit, not a gap", () => {
@@ -91,8 +111,10 @@ describe("Antigravity's verdict", () => {
   const base = { detected: false, macInstalled: false, projectsInstalled: 0, t3Present: true, lvOk: undefined, recording: false };
   it("reads In T3 only for project files with no Mac install, amber not red", () => {
     expect(antigravityStatus({ ...base, projectsInstalled: 1 })).toEqual({ tone: "warn", label: "In T3 only" });
-    expect(antigravityStatus(base)).toEqual({ tone: "neutral", label: "Not added yet" });
+    expect(antigravityStatus(base)).toEqual({ tone: "neutral", label: "Not set up" });
     expect(antigravityStatus({ ...base, t3Present: false })).toEqual({ tone: "neutral", label: "Not on this Mac" });
+    // The ~/.gemini folder is there but Khipu is not: grey, never red.
+    expect(antigravityStatus({ ...base, detected: true })).toEqual({ tone: "neutral", label: "Not set up" });
     expect(antigravityStatus({ ...base, macInstalled: true, detected: true, recording: true })).toEqual({ tone: "ok", label: "Recording" });
   });
 });
@@ -174,6 +196,26 @@ describe("the Antigravity card", () => {
     expect(within(list).getByText(/added Oct 27/)).toBeInTheDocument();
     expect(within(card).getByText(/writes three files in its \.agents folder/)).toBeInTheDocument();
     expect(card.textContent).not.toMatch(/terminal|command line|khipu t3/i);
+  });
+
+  it("with the Antigravity folder but nothing of Khipu in it: one grey line, a grey badge, no red", async () => {
+    renderCards({ rows: [CURSOR_ROW, AG_BARE], t3: T3_REAL, api: { list: vi.fn(async () => ({ ok: true as const, projects: [] })) } });
+    const card = await agCard();
+    expect(within(card).getByText(/Khipu isn't installed in Antigravity on this Mac/)).toBeInTheDocument();
+    expect(within(card).getByText("Not set up")).toBeInTheDocument();
+    expect(card.querySelector(".ck.err")).toBeNull();
+    expect(within(card).queryByText(/Install adds it/)).toBeNull();
+    expect(within(card).getByRole("button", { name: "Install on this Mac" })).toBeEnabled();
+  });
+
+  it("the T3 card shows provider names and tags as words, with no hash", async () => {
+    renderCards({ rows: [CURSOR_ROW, AG_BARE], t3: T3_REAL });
+    const providers = await screen.findByRole("list", { name: "T3 providers, feature by feature" });
+    expect(providers.textContent).toContain("Cursor");
+    expect(providers.textContent).toContain("All 5 features");
+    expect(providers.textContent).toContain("Not added to any project");
+    expect(providers.textContent).not.toMatch(/cursor ·|antigravity ·/);
+    expect(document.body.textContent).not.toMatch(/[0-9a-f]{40,}/);
   });
 
   it("offers a one-click install when the app is on this Mac", async () => {

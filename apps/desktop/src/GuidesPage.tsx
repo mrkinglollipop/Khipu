@@ -74,7 +74,7 @@ function GuideRow({ id, state, featured, onOpen }: { id: GuideId; state: GuideSt
     <button type="button" className={featured ? "gd-item featured" : "gd-item"} onClick={onOpen}>
       <b>{g.title}</b>
       <Tag tone={state.tone} dot>{state.label}</Tag>
-      <span className="d">{g.blurb}</span>
+      <span className="d">{state.blurb ?? g.blurb}</span>
       <ChevronRight size={16} className="chev" aria-hidden />
     </button>
   );

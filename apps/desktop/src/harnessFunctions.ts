@@ -52,13 +52,13 @@ export function functionRow(
   label: string,
   installed: boolean,
   proofRaw: string | undefined | null,
-  opts: { who: string; detail?: string; missing: string; packInstalled: boolean },
+  opts: { who: string; detail?: string; missing: string; packInstalled: boolean; neverRed?: boolean },
 ): FunctionRow {
   if (!installed) {
     return {
       key,
       // Red only when the whole pack is absent, as the capture line already reads.
-      mark: opts.packInstalled ? "warn" : "err",
+      mark: opts.packInstalled || opts.neverRed ? "warn" : "err",
       text: `${label} · ${opts.missing}`,
     };
   }
@@ -125,7 +125,9 @@ export type AntigravityStatusFields = {
   proof?: Record<string, string>;
 };
 
-/** "On this Mac": the global ~/.gemini files, only when Antigravity is there. */
+/** "On this Mac": the global ~/.gemini files, only when Antigravity is there.
+ *  Nothing installed yet is one neutral line, never a column of red crosses: an
+ *  app that is not set up is a choice, not a fault. */
 export function antigravityMacRows(
   row: AntigravityStatusFields,
   captureRow: FunctionRow,
@@ -138,8 +140,16 @@ export function antigravityMacRows(
     }];
   }
   const packInstalled = row.installed === true;
+  const anyPart = packInstalled || row.mcp || row.hook_sessionstart === true || row.hook_prompt_recall === true;
+  if (!anyPart) {
+    return [{
+      key: "app",
+      mark: "off",
+      text: "Khipu isn't installed in Antigravity on this Mac. Install adds capture, recall and memory tools with one click.",
+    }];
+  }
   const proof = row.proof ?? {};
-  const common = { who: "Antigravity", packInstalled, missing: "Install adds it" };
+  const common = { who: "Antigravity", packInstalled, missing: "Install adds it", neverRed: true };
   return [
     captureRow,
     functionRow("start_block", "Recall at session start", row.hook_sessionstart === true, proof.start_block, common),
@@ -232,8 +242,20 @@ export function hasFunctions(p: ProviderLike): boolean {
   return Boolean(p.functions) && (p.driver === "cursor" || p.driver === "antigravity");
 }
 
-/** One row of "T3 providers": the name, "N of M features", what the limit is,
- *  and a tag that is amber for anything short of complete, never red. */
+const PROVIDER_NAMES: Record<string, string> = { cursor: "Cursor", antigravity: "Antigravity" };
+
+/** T3 names an instance in lowercase ("cursor"); the page uses the harness's
+ *  own display name. */
+export function providerDisplayName(p: ProviderLike): string {
+  const driver = (p.driver ?? "").toLowerCase();
+  if (PROVIDER_NAMES[driver]) return PROVIDER_NAMES[driver];
+  const raw = (p.name || p.driver || "").trim();
+  return raw ? raw.charAt(0).toUpperCase() + raw.slice(1) : "a provider";
+}
+
+/** One row of "T3 providers": the name, what it has, and a tag. All five is
+ *  green, none added is neutral, anything between is amber "Partial". Never
+ *  red: a limit of the harness or a feature not added is not a fault. */
 export function providerSummary(p: ProviderLike): {
   name: string;
   line: string;
@@ -242,27 +264,32 @@ export function providerSummary(p: ProviderLike): {
   const f = p.functions ?? {};
   const have = FEATURES.filter((k) => state(f[k]) === "installed").length;
   const limited = FEATURES.some((k) => state(f[k]) === "unsupported");
-  const name = p.name || (p.driver === "antigravity" ? "Antigravity" : "Cursor");
+  const name = providerDisplayName(p);
+  const antigravity = p.driver === "antigravity";
+  if (have === 0 && (antigravity || p.hooks !== "missing")) {
+    return { name, line: antigravity ? `${name} · add a project to start` : name, tag: { tone: "neutral", label: "Not added to any project" } };
+  }
+  if (have === 0) return { name, line: name, tag: { tone: "warn", label: "No hooks" } };
+  if (p.hooks !== "partial" && !limited && have === FEATURES.length) {
+    return { name, line: name, tag: { tone: "ok", label: `All ${FEATURES.length} features` } };
+  }
   let line = `${name} · ${have} of ${FEATURES.length} features`;
-  if (p.driver === "antigravity") {
+  if (antigravity) {
     const n = p.projects?.installed ?? 0;
     const where = n === 1 ? "1 project" : `${n} projects`;
     const has = state(f.capture) === "installed" || state(f.mcp) === "installed";
-    line += has ? `, capture and tools in ${where}; recall not possible in T3` : "; add a project to start";
-  } else {
-    const missing = FEATURES.filter((k) => state(f[k]) === "missing").length;
-    if (missing > 0 && have > 0) line += ", Reinstall adds the rest";
+    if (has) line += `, capture and tools in ${where}; recall not possible in T3`;
+  } else if (FEATURES.some((k) => state(f[k]) === "missing")) {
+    line += ", Reinstall adds the rest";
   }
-  if (p.hooks === "missing" || have === 0) {
-    return { name, line, tag: { tone: "warn", label: p.driver === "antigravity" ? "Not added" : "No hooks" } };
-  }
-  if (p.hooks === "partial" || limited || have < FEATURES.length) {
-    return { name, line, tag: { tone: "warn", label: "Partial" } };
-  }
-  return { name, line, tag: { tone: "ok", label: "Complete" } };
+  return { name, line, tag: { tone: "warn", label: "Partial" } };
 }
 
 /** A back-end note without the code quoting, for plain reading. */
 export function plainNote(note: string): string {
-  return note.replace(/`/g, "");
+  return note
+    .replace(/`/g, "")
+    // A runtime build id is a 64-character hash: say "a build" instead.
+    .replace(/\s*\(\s*[0-9a-f]{16,}\s*\)/gi, "")
+    .replace(/\b(T3 runs |T3's )(cursor|antigravity)\b/g, (_m, a: string, b: string) => `${a}${PROVIDER_NAMES[b] ?? b}`);
 }

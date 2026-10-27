@@ -168,6 +168,41 @@ describe("Settings, Work", () => {
     expect(within(list).getByText("Atlas")).toBeInTheDocument();
   });
 
+  it("lists a renamed project once: the ledger's older key and the Work tab's current key are one row", async () => {
+    // The live shape 2026-10-27: the ledger still keys 1,102 rows under church-harness,
+    // Work keys the waiting items under olivewood, and GitHub says one is now the other.
+    projects = [
+      { project: "mrkinglollipop/church-harness", name: "mrkinglollipop/church-harness", hidden: false, created_at: "2026-10-17T15:00:48Z", rows: 1102, open: 261, needs_owner: 52 },
+      { project: "mrkinglollipop/olivewood", name: "mrkinglollipop/olivewood", hidden: false, created_at: "2026-10-20T10:00:00Z", rows: 3, open: 1, needs_owner: 0 },
+    ];
+    const state = work();
+    const data = state.data as unknown as { projects: Array<Record<string, unknown>>; waiting: unknown[] };
+    data.projects = [{ ...data.projects[0], project: "mrkinglollipop/olivewood", name: "olivewood" }];
+    data.waiting = Array.from({ length: 2 }, (_, i) => ({
+      source: "commitment", key: `c${i}`, project: "mrkinglollipop/olivewood", id: String(i), title: "t", kind: "followup", since: ago(60), blocking: false, actions: [], masked: false,
+    }));
+    render(
+      <WorkSettings
+        active
+        work={state}
+        projectNames={{
+          groups: [{ canonical: "mrkinglollipop/olivewood", names: [{ name: "mrkinglollipop/olivewood", role: "canonical" }, { name: "mrkinglollipop/church-harness", role: "alias" }] }],
+          pairs: [],
+        } as never}
+      />,
+    );
+    const list = await screen.findByRole("list", { name: "Ledger projects" });
+    expect(within(list).getAllByText("olivewood")).toHaveLength(1);
+    expect(within(list).getByText("1,105 rows · 262 open · 52 need you")).toBeInTheDocument();
+    expect(within(list).getByText(/2 waiting on you on the Work tab/)).toBeInTheDocument();
+    const other = screen.queryByRole("list", { name: "Projects on the Work tab with no ledger rows" });
+    expect(other?.textContent ?? "").not.toContain("olivewood");
+    // Hide reaches both keys.
+    fireEvent.click(await enabled("Hide olivewood"));
+    await waitFor(() => expect(setCalls("khipu_ledger_project_set")).toHaveLength(2));
+    expect(setCalls("khipu_ledger_project_set").map((a) => a?.project).sort()).toEqual(["mrkinglollipop/church-harness", "mrkinglollipop/olivewood"]);
+  });
+
   it("lists the Work tab's projects even when the ledger has none (the installed app said No projects yet)", async () => {
     projects = [];
     const state = work();

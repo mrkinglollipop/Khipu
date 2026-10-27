@@ -47,6 +47,28 @@ function fixture(overrides: Record<string, unknown> = {}): Record<string, unknow
   return { ...base, ...overrides };
 }
 
+describe("the offline-copy row's icon matches its sentence", () => {
+  // The doctor's own shape: `ok` is always true, `fresh` is the real signal.
+  const stale = fixture({ prompt_recall_snapshot_ok: true, prompt_recall_snapshot: { ok: true, fresh: false, exists: true, age_seconds: 840 } });
+  const fresh = fixture({ prompt_recall_snapshot_ok: true, prompt_recall_snapshot: { ok: true, fresh: true } });
+
+  it("is amber with the 'not trusted yet' sentence while the copy is not trusted", () => {
+    const row = healthRows(stale).find((r) => r.key === "prompt_recall_snapshot_ok")!;
+    expect(row.status).toBe("warn");
+    expect(row.detail).toContain("not trusted yet");
+    render(<HealthReportRows parsed={stale} attention={[]} />);
+    const el = document.querySelector('[data-health-key="prompt_recall_snapshot_ok"]')!;
+    expect(el.querySelector("svg.warn")).not.toBeNull();
+    expect(el.querySelector("svg.ok")).toBeNull();
+  });
+
+  it("is green only when the copy is fresh", () => {
+    const row = healthRows(fresh).find((r) => r.key === "prompt_recall_snapshot_ok")!;
+    expect(row.status).toBe("ok");
+    expect(row.detail).toBeUndefined();
+  });
+});
+
 describe("healthRows (pure)", () => {
   it("returns one row per _ok key, all green, when everything passes", () => {
     const rows = healthRows(fixture());

@@ -13,6 +13,12 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
 }));
 
+// Shaped like the live record: the entity is the long id the log targets.
+const RULES = [
+  { n: 15, entity: "rule-01a17d50-aaaa-7bbb-8ccc-111111111111", text: "Olivewood review routing (Matt 2026-10-27 ~12:25Z, approved in the Olivewood thread), refining rule 1." },
+  { n: 16, entity: "rule-01a17eee-e9df-78d3-88c8-969c4f71a4c4", text: "Codex model choice (benchmark 2026-10-27, blind, 5 reviews + 2 fixes with known findings): gpt-6.1-terra may take mechanical fix rounds only." },
+];
+
 type Backend = {
   settings: OwnerDirectionSettings;
   actions: OwnerAction[];
@@ -96,6 +102,8 @@ beforeEach(() => {
         else if (key === "untrust") s.trusted = s.trusted.filter((t) => t !== value);
         return JSON.stringify({ ok: true, settings: s });
       }
+      case "khipu_route_view":
+        return JSON.stringify({ rules: RULES });
       default:
         throw new Error(`unexpected command ${cmd}`);
     }
@@ -321,6 +329,30 @@ describe("Owner actions", () => {
 
 
 describe("actionWords", () => {
+  const RULE_ID = "rule-01a17eee-e9df-78d3-88c8-969c4f71a4c4";
+  const confirm = { id: "1", at: "2026-10-27T00:00:00Z", action: "route.rule.confirm", target: RULE_ID };
+
+  it("names a rule by its number and a short title from the routing record", () => {
+    const text = actionWords(confirm, RULES);
+    expect(text).toBe("Confirmed standing rule 16 (Codex model choice)");
+    expect(text).not.toContain("rule-01a1");
+  });
+
+  it("falls back to 'a routing rule' when the record has no such rule, never the raw id", () => {
+    expect(actionWords(confirm, [])).toBe("Confirmed a routing rule");
+    expect(actionWords(confirm)).toBe("Confirmed a routing rule");
+    expect(actionWords({ ...confirm, action: "route.rule.retire" }, null)).not.toContain(RULE_ID);
+    expect(actionWords({ ...confirm, target: "2" })).toBe("Confirmed standing rule 2");
+  });
+
+  it("the Owner actions list shows the rule by number and title", async () => {
+    backend.actions = [{ ...confirm, auth: "direction", state: "applied" }];
+    render(<OwnerActions active />);
+    const items = within(await list()).getAllByRole("listitem");
+    await waitFor(() => expect(items[0].textContent).toContain("Confirmed standing rule 16 (Codex model choice)"));
+    expect(items[0].textContent).not.toContain("rule-01a17eee");
+  });
+
   it("never shows an internal id for the outbox merge", () => {
     const text = actionWords({ id: "1", at: "2026-10-27T00:00:00Z", action: "outbox.merge_preferences", target: "held lines" });
     expect(text).not.toContain("outbox.");

@@ -129,7 +129,8 @@ button.wk-job-title {
 .hdot.run { background: var(--accent); }
 .hdot.idle { background: var(--muted); }
 .wk-foot { margin-top: var(--s2); font-size: var(--t-sm); color: var(--muted); }
-.wk-owed { margin-top: var(--s5); }
+/* scroll-margin: the Owed section scrolled to from elsewhere clears the sticky page header. */
+.wk-owed { margin-top: var(--s5); scroll-margin-top: 88px; }
 .wk-owed-head { display: flex; align-items: center; gap: var(--s3); margin: 0 0 var(--s3); }
 .wk-owed-head h2 { margin: 0; font-size: var(--t-lg); font-weight: 650; color: var(--text); }
 .wk-owed-head .spacer { flex: 1; }

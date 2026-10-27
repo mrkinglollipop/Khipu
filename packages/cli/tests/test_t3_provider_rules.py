@@ -232,6 +232,20 @@ def test_runtime_version_is_recorded_and_a_new_one_asks_for_a_recheck(home):
     assert runtime["checked_version"] == "1.10.0" and runtime["recheck"] is False
 
 
+def test_lowercase_instance_reads_by_display_name_and_a_hash_build_is_not_printed(home):
+    """The live shape: T3 names the instances "antigravity"/"cursor" and the
+    runtime folder is a 64-character hash. The owner reads neither."""
+    build = "fdfa915652cdb7ba8085cc8fffed072cbe009251aa2c951aabdda07a8c28a189"
+    _settings(home, {"antigravity": {"driver": "antigravity", "displayName": "antigravity"}})
+    (home / ".t3" / "tools" / "antigravity-acp" / "darwin-arm64" / "versions" / build).mkdir(parents=True)
+    out = _health(home)
+    text = " ".join(out["notes"] + out["warnings"])
+    assert build not in text
+    assert "T3 runs Antigravity without" in text
+    assert "T3 provider Antigravity has no Khipu hooks" in text
+    assert any("is a build Khipu has not checked" in n for n in out["notes"])
+
+
 # ---- Antigravity: per-project files ------------------------------------------
 
 
