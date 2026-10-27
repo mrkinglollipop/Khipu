@@ -73,6 +73,7 @@ class DirectionRefused(Exception):
 # its log line is ``_UNDO``.
 
 ACTIONS: frozenset[str] = frozenset({
+    "owed.correct_job_origin", "owed.correct_job_origin.confirm",
     "route.definition.set", "route.pause", "route.lift", "route.clear", "route.note.set", "route.note.end", "route.rule.add",
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
     "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
@@ -778,16 +779,38 @@ def pending_direction() -> dict | None:
 def record_owed_batch(batch: str) -> None:
     """Persist a batch's identity before its transaction can change items."""
     pend = _PENDING.get()
-    if not pend or pend["intent"]["action"] not in ("owed.change", "owed.tidy"):
+    if not pend or pend["intent"]["action"] not in ("owed.change", "owed.tidy", "owed.correct_job_origin.confirm"):
         return
     line = pend.get("line")
     if line is None:
         raise OSError("the owner action must be recorded before its batch can be written")
     before = dict(pend["before"]) if isinstance(pend.get("before"), dict) else {}
-    if pend["intent"]["action"] == "owed.change":
+    if pend["intent"]["action"] in ("owed.change", "owed.correct_job_origin.confirm"):
         before["batches"] = [*(before.get("batches") or []), batch]
     else:
         before["batch"] = batch
+    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+             "state": "pending", "before": before})
+    pend["before"] = before
+
+
+def record_owed_undo_scope(batch: str, ids: list[int]) -> None:
+    """Write the exact successful inverse scope before the hub can commit.
+
+    The writer starts with an empty scope and replaces it after successful
+    restores. Requested selectors remain in the action's facts, never its
+    inverse. A logging failure must propagate and roll back the hub write.
+    """
+    pend = _PENDING.get()
+    if not pend or pend["intent"]["action"] != "owed.tidy":
+        return
+    facts = pend["intent"].get("facts") or {}
+    if facts.get("change") != "undo" or facts.get("batch") != batch:
+        return
+    line = pend.get("line")
+    if line is None:
+        raise OSError("the owner action must be recorded before its undo can be written")
+    before = dict(pend.get("before") or {}, ids=list(ids))
     _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
              "state": "pending", "before": before})
     pend["before"] = before
@@ -986,12 +1009,48 @@ def _inverse_state(writes: list[dict]) -> str:
     return "applied" if all(state == "applied" for state in states) else "failed"
 
 
+def _origin_request_outcome(request_id: str) -> tuple[str, dict | None]:
+    """Resolve a correction by its durable request, never by a COMMIT reply.
+
+    A completed SELECT is authoritative even if closing its read transaction
+    loses another acknowledgement. No SELECT reply means the outcome is still
+    unknown, and Undo must wait rather than disable or replay it.
+    """
+    from khipu.db import connect
+
+    found, read = None, False
+    try:
+        with connect(record_reachability=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT state, result FROM commitment_origin_requests WHERE id = %s", (request_id,))
+                found, read = cur.fetchone(), True
+    except Exception:  # noqa: BLE001 - unavailable durable outcome remains uncertain
+        if not read:
+            return "pending", None
+    if found and found[0] == "applied" and isinstance(found[1], dict):
+        return "applied", found[1]
+    if found and found[0] == "applied":
+        return "pending", None
+    return "failed", None
+
+
+def _origin_outcome_fields(state: str, result: dict | None) -> dict:
+    fields = {"state": state}
+    if result is not None:
+        fields.update(result=result, before={"batches": result.get("batches", [])})
+    return fields
+
+
 def _abandon() -> None:
     """A lost hub reply is uncertain until its durable outcome can be read."""
     pend = _PENDING.get()
     _PENDING.set(None)
     if pend and pend.get("line"):
         state = "failed"
+        outcome = {}
+        if pend["intent"]["action"] == "owed.correct_job_origin.confirm":
+            state, result = _origin_request_outcome(pend["intent"]["target"])
+            outcome = _origin_outcome_fields(state, result)
         write = pend.get("owner_write")
         if write:
             state = _hub_write_state(write)
@@ -1003,7 +1062,7 @@ def _abandon() -> None:
             state = "pending"
         try:
             _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": pend["line"]["id"],
-                     "state": state})
+                     "state": state, **outcome})
         except OSError:
             pass
 
@@ -1088,6 +1147,8 @@ _PUSH_WORDS = {
     "accounts.decline": "Stopped offering an account", "accounts.offer_again": "Offered an account again",
     "accounts.auto_track": "Changed whether new accounts are tracked",
     "owed.tidy": "Applied or undid an Owed list clean-up",
+    "owed.correct_job_origin": "Requested historical job-origin corrections",
+    "owed.correct_job_origin.confirm": "Confirmed historical job-origin corrections",
     "forget.send": "Sent this Mac's forgets the hub lacked to the hub",
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
@@ -1330,9 +1391,12 @@ def _before(want: dict):
         except Exception:  # noqa: BLE001 - what Khipu can't read now can't be put back
             return _UNREADABLE
         return _UNREADABLE if mine is None else {"owners_items": mine}
+    if action == "owed.correct_job_origin.confirm":
+        return {"batches": []}
     if action == "owed.tidy":
         facts = want.get("facts") or {}
-        return {"project": target, "change": facts.get("change"), "batch": facts.get("batch")}
+        return {"project": target, "change": facts.get("change"), "batch": facts.get("batch"),
+                **({"ids": []} if facts.get("change") == "undo" else {})}
     if action == "outbox.merge_preferences":
         # Each transaction's additions are written ahead as their own state
         # line (``record_preference_merges``) before it commits.
@@ -1788,8 +1852,10 @@ def _undo_owed_tidy(line, via):
     if not batch:
         raise ValueError("Khipu has no record of which batch this clean-up wrote, so it can't undo it")
     if _b(line).get("change") == "undo":
+        if _b(line).get("ids") == []:
+            return {"ok": True, "reapplied": 0, "left_alone": []}
         out = owed_tidy.redo(batch, project=line["target"], owner_gate=_by(via),
-                             write_id=_inverse_write_id(line, batch))
+                             ids=_b(line).get("ids"), write_id=_inverse_write_id(line, batch))
         counted = {"reapplied": int(out.get("reapplied") or 0)}
     else:
         out = owed_tidy.undo(batch, project=line["target"], owner_gate=_by(via),
@@ -1912,6 +1978,7 @@ _UNDO = {
     "project.separate": _undo_project_group,
     "owed.change": _undo_owed_change,
     "owed.tidy": _undo_owed_tidy,
+    "owed.correct_job_origin.confirm": _undo_owed_change,
     "outbox.merge_preferences": _undo_outbox_preferences,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
@@ -2003,7 +2070,7 @@ def _inverse_write_id(line: dict, batch: str) -> str:
 
 def _hub_inverse_writes(line: dict) -> list[dict]:
     before, result = line.get("before") or {}, line.get("result") or {}
-    if line.get("action") == "owed.change":
+    if line.get("action") in ("owed.change", "owed.correct_job_origin.confirm"):
         batches = before.get("batches") or result.get("batches") or []
     elif line.get("action") == "owed.tidy":
         batch = before.get("batch") or result.get("batch")
@@ -2041,6 +2108,18 @@ def _undo_refusal(line: dict | None, line_id: str) -> str | None:
             continue
         line.update(_find(line_id) or {})
     state = line["state"]
+    if line["action"] == "owed.correct_job_origin.confirm" and state in ("failed", "unconfirmed"):
+        settled, result = _origin_request_outcome(line["target"])
+        if settled == "pending":
+            return "Khipu cannot confirm this correction's hub outcome yet; retry Undo when the hub is available"
+        fields = _origin_outcome_fields(settled, result)
+        try:
+            _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()),
+                     "target": line_id, **fields})
+        except OSError:
+            return "Khipu cannot record this correction's confirmed outcome; retry Undo when the log is writable"
+        line.update(fields)
+        state = settled
     if state in ("undone", "cancelled"):
         return f"owner action {line_id} was already undone"
     if state == "failed":
@@ -2495,6 +2574,8 @@ def _undo(line_id: str, via: str, holds: dict | None, over_newer: bool = False) 
     why = _undo_refusal(line, line_id)
     if why:
         raise ValueError(why)
+    if line["action"] in ("direction.set", "direction.on", "direction.off") and via not in ("app", "direction"):
+        raise ValueError("Authorization settings require verified app or prompt-bound owner direction")
     if line["action"] == "ledger.purge":
         _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line_id, "state": "cancelled"})
         return {"ok": True, "undid": line_id, "state": "cancelled"}
@@ -2541,6 +2622,14 @@ def _run_inverse(line, inverse, via, holds, line_id):
 
 
 # ---- the CLI: khipu owner-direction --------------------------------------------------------
+
+
+def _settings_owner_via(args, want):
+    from khipu import routing
+
+    if not getattr(args, "from_app", False) and not getattr(args, "by_direction", False):
+        return None
+    return routing._owner_via(args, want)
 
 
 def _print(data: dict) -> None:
@@ -2620,7 +2709,8 @@ def run_cli(args) -> int:
             want = intent("direction.undo", args.id, facts=facts or None)
             if over and getattr(args, "by_direction", False):
                 want.update(over_newer=True, owner_words=getattr(args, "owner_words", None))
-            via = routing._owner_via(args, want)
+            via = (_settings_owner_via(args, want) if line["action"] in
+                   ("direction.set", "direction.on", "direction.off") else routing._owner_via(args, want))
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
                 return 2
@@ -2630,7 +2720,7 @@ def run_cli(args) -> int:
         if cmd == "on":
             # Turning it on is an owner action like any other: logged, with an Undo.
             want = intent("direction.on", "direction")
-            via = routing._owner_via(args, want)
+            via = _settings_owner_via(args, want)
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
                 return 2
@@ -2654,7 +2744,7 @@ def run_cli(args) -> int:
             return 0
         if cmd == "off":
             want = intent("direction.off", "direction")
-            via = routing._owner_via(args, want)
+            via = _settings_owner_via(args, want)
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
                 return 2
@@ -2669,7 +2759,7 @@ def run_cli(args) -> int:
                 return 2
             target = args.key if args.key not in ("trust", "untrust") else f"{args.key} {args.value}"
             want = intent("direction.set", target)
-            via = routing._owner_via(args, want)
+            via = _settings_owner_via(args, want)
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
                 return 2

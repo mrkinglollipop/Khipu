@@ -1515,7 +1515,7 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime,
     Blocking first, then oldest first. The next time an item's words change
     (a hold's age in days) is added to ``times``."""
     from khipu import ledger
-    from khipu.commitments import content_hash
+    from khipu.commitments import content_hash, _as_utc
 
     links, hidden = read_links(), read_hidden()
     same = {(p, r): c for p, r, c in links["same"]}
@@ -1549,6 +1549,13 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime,
         cid, project, text = str(c.get("id")), c.get("project") or None, c.get("text") or ""
         if hidden.get(cid) == _hide_mark(c):
             continue
+        seen = _as_utc(c.get("last_seen_at")) or _as_utc(c.get("opened_at"))
+        due = _as_utc(c.get("due_after"))
+        quiet_at = max(seen, due) + timedelta(days=14) if seen and due else (
+            seen + timedelta(days=14) if seen else None)
+        quiet = bool(quiet_at and now >= quiet_at)
+        if times is not None and quiet_at and quiet_at > now:
+            times.append(quiet_at)
         rows_here = by_project.get(project) or []
         # An explicit link (the row's reference or a remembered "Same") wins;
         # equal words link only a row with no explicit link, never a pair
@@ -1574,6 +1581,7 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime,
         items.append({"source": "commitment", "key": f"commitment:{cid}", "project": project, "id": cid,
                       "title": clean_text(text, TITLE_CHARS), "kind": c.get("kind"), "since": _z(opened),
                       "blocking": c.get("kind") == "blocker", "looks_like": looks_like,
+                      "quiet": quiet,
                       "actions": ["done", "snooze", "open_owed", "hide"] + (["same", "not_same"] if looks_like else [])})
     rules = routing_info.get("rules") or []
     for r in rules:
@@ -1598,7 +1606,7 @@ def _waiting(ledger_data: dict, owed: dict, routing_info: dict, now: datetime,
                           "title": f"Your hold on {clean_text(h.get('scope_label'), 60) or 'an account'} "
                                    f"has been on for {days} days",
                           "kind": "hold", "since": h.get("at"), "blocking": False, "actions": ["open_routing"]})
-    items.sort(key=lambda i: (not i["blocking"], i.get("since") or "9999"))
+    items.sort(key=lambda i: (bool(i.get("quiet")), not i["blocking"], i.get("since") or "9999"))
     return items
 
 
@@ -1753,7 +1761,9 @@ def build_view(now: datetime | None = None, *, cfg: dict | None = None, ledger_d
         "format": VIEW_FORMAT, "version": VIEW_VERSION, "generated_at": _z(now),
         "valid_until": _z_up(min(future)) if future else None,
         "projects": projects, "live": live, "waiting": waiting, "accounts": routing_info.get("accounts") or [],
-        "counts": {"waiting": len(waiting), "blocking": sum(1 for w in waiting if w["blocking"]),
+        "counts": {"waiting": sum(1 for w in waiting if not w.get("quiet")),
+                   "quiet": sum(1 for w in waiting if w.get("quiet")),
+                   "blocking": sum(1 for w in waiting if w["blocking"] and not w.get("quiet")),
                    "running": sum(1 for j in live if j["state"] == "running"),
                    "flagged": sum(p["flagged"] for p in projects),
                    "stale_sources": sum(1 for p in projects if p["source"]["state"] not in ("ok", "none", "off")),
@@ -1911,9 +1921,9 @@ WITHHELD_WORDS = "(left out: it held a path or a secret)"
 
 def render_text(view: dict) -> str:
     c = view["counts"]
-    lines = [f"Waiting on you: {c['waiting']} ({c['blocking']} blocking)"]
+    lines = [f"Waiting on you: {c['waiting']} ({c['blocking']} blocking), {c.get('quiet', 0)} quiet"]
     for w in view["waiting"][:8]:
-        lines.append(f"  - {'[blocking] ' if w['blocking'] else ''}{w['title'] or WITHHELD_WORDS}"
+        lines.append(f"  - {'[quiet] ' if w.get('quiet') else '[blocking] ' if w['blocking'] else ''}{w['title'] or WITHHELD_WORDS}"
                      + (f" ({w['project']})" if w.get("project") else ""))
     lines.append(f"Running now: {c['running']}")
     for j in view["live"]:

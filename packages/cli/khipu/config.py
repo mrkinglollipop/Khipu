@@ -17,6 +17,8 @@ Modes:
 from __future__ import annotations
 
 import contextlib
+import contextvars
+import copy
 import hashlib
 import json
 import os
@@ -48,6 +50,7 @@ def config_file() -> Path:
 # (``accounts.recover``), so no reader sees a list the record and the usage
 # cache do not yet agree with.
 ACCOUNT_CHANGE_OPEN = "account_change_open"
+_READ_ONLY_CONFIG: contextvars.ContextVar[dict | None] = contextvars.ContextVar("read_only_config", default=None)
 
 
 def _read_config() -> dict:
@@ -84,6 +87,9 @@ def _settle_account_change(data: dict) -> bool:
 
 @secret_result("config")
 def load_config() -> dict:
+    snapshot = _READ_ONLY_CONFIG.get()
+    if snapshot is not None:
+        return copy.deepcopy(snapshot)
     data = _read_config()
     if _settle_account_change(data):
         data = _read_config()
@@ -95,6 +101,21 @@ def read_config_unsettled() -> dict:
     reader that holds a lock an account change takes after the routing lock
     (the usage cache's), which must not wait on that lock here."""
     return _read_config()
+
+
+@contextlib.contextmanager
+def read_only_config():
+    """Read config through a scoped snapshot without read-triggered recovery.
+
+    Nested readers retain the same document; unrelated execution contexts and
+    intentional mutation helpers keep their normal behavior.
+    """
+    snapshot = _READ_ONLY_CONFIG.get()
+    token = _READ_ONLY_CONFIG.set(read_config_unsettled() if snapshot is None else snapshot)
+    try:
+        yield
+    finally:
+        _READ_ONLY_CONFIG.reset(token)
 
 
 @secret_result("config")

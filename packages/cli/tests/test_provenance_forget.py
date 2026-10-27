@@ -71,7 +71,7 @@ def env(hub, monkeypatch, tmp_path):  # noqa: F811
     def migrate():
         db._TABLE_COLUMNS_CACHE.clear()
         result = hub.migrate()
-        assert result["ran"] == ["0047_fact_provenance"], result
+        assert result["ran"] == ["0047_fact_provenance", "0049_commitment_origin_requests"], result
         db._TABLE_COLUMNS_CACHE.clear()
 
     hub.to_0047 = migrate

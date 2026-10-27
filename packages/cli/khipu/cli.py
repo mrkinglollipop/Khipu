@@ -38,10 +38,11 @@ def _memory_root_default() -> str | None:
     so a fresh install (no legacy file wiki) gets None rather than a path that
     exists only on the machine this was first written on.
     """
-    from khipu.config import path_setting
+    from khipu.config import path_setting, read_only_config
 
-    v = path_setting("memory_root")
-    return str(v) if v else None
+    with read_only_config():
+        v = path_setting("memory_root")
+        return str(v) if v else None
 
 
 def _require_memory_root(args: argparse.Namespace) -> Path | None:
@@ -2455,6 +2456,15 @@ def cmd_owed_tidy(args: argparse.Namespace) -> int:
     if args.apply and args.undo:
         print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
         return 2
+    if getattr(args, "ids", None) is not None:
+        try:
+            if not args.undo:
+                raise ValueError
+            args.undo_ids = _owed_ids_arg(args.ids)
+        except (TypeError, ValueError):
+            print(json.dumps({"ok": False, "error": "--ids requires --undo and positive commitment IDs; "
+                                                    "nothing was changed"}))
+            return 2
     if getattr(args, "by_direction", False):
         if not (args.apply or args.undo):
             print(json.dumps({"ok": False, "error": "--owner-direction applies or undoes a clean-up; "
@@ -2488,7 +2498,8 @@ def cmd_owed_tidy(args: argparse.Namespace) -> int:
                    else f"batch {args.undo!r} is for project {owner_project!r}, not {project!r}")
             print(json.dumps({"ok": False, "error": why + "; nothing was changed"}))
             return 2
-        res = owed_tidy.undo(args.undo, project=project)
+        res = owed_tidy.undo(args.undo, project=project, **(
+            {"ids": args.undo_ids} if getattr(args, "ids", None) is not None else {}))
         print(json.dumps(res, indent=2, default=str))
         return 0 if res.get("ok") else 1
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
@@ -2512,6 +2523,8 @@ def _owed_tidy_by_direction(args: argparse.Namespace, project: str) -> int:
 
     change = "apply" if args.apply else "undo"
     facts = {"change": change, **({"plan": args.apply} if args.apply else {"batch": args.undo})}
+    if getattr(args, "ids", None) is not None:
+        facts["ids"] = args.undo_ids
     want = owner_direction.intent("owed.tidy", project, facts=facts)
     try:
         owner_direction.gate(want)
@@ -2530,7 +2543,8 @@ def _owed_tidy_by_direction(args: argparse.Namespace, project: str) -> int:
                        if isinstance(doc, dict) and doc.get("project") != project
                        else owed_tidy.apply(doc, owner_gate="direction"))
         else:
-            res = owed_tidy.undo(args.undo, project=project, owner_gate="direction")
+            res = owed_tidy.undo(args.undo, project=project, owner_gate="direction", **(
+                {"ids": args.undo_ids} if getattr(args, "ids", None) is not None else {}))
     except BaseException:
         owner_direction._abandon()
         raise
@@ -5878,6 +5892,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Always include stale, snapshot_refreshed_at and waiting_to_sync with the page",
     )
     owed_sub = owed.add_subparsers(dest="owed_cmd")
+    from khipu import owed_origin
+
+    owed_origin.add_parser(owed_sub)
     tidy = owed_sub.add_parser(
         "tidy", help="Plan the one-time clean-up of a project's Owed list; apply or undo a plan")
     tidy.add_argument("--project", required=True)
@@ -5885,6 +5902,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Write the plan to FILE and print only its totals")
     tidy.add_argument("--apply", metavar="PLAN", default=None, help="Apply the plan in the file PLAN")
     tidy.add_argument("--undo", metavar="BATCH", default=None, help="Undo the applied batch BATCH")
+    tidy.add_argument("--ids", metavar="ID,ID", default=None,
+                      help="With --undo, restore only these commitment IDs from the batch")
     tidy.add_argument("--no-model", action="store_true",
                       help="Rules only: no model pass for the items the rules cannot sort")
     _owed_owner_flags(tidy)

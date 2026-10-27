@@ -4060,6 +4060,7 @@ export default function App() {
             {navItems.map(([id, label, hint]) => {
               const waitingN = work.data?.counts.waiting ?? 0;
               const blockingN = work.data?.counts.blocking ?? 0;
+              const quietN = work.data?.counts.quiet ?? 0;
               const badge =
                 id === "harnesses"
                     ? harnessesBadge(liveness, claudeHomes, t3Gap)
@@ -4075,10 +4076,11 @@ export default function App() {
                 >
                   {NAV_ICONS[id]}
                   <span className="nav-label">{label}</span>
-                  {id === "work" && waitingN > 0 ? (
-                    <span className="nav-badge" aria-label={badgeLabel(waitingN, blockingN)}>
+                  {id === "work" && waitingN + quietN > 0 ? (
+                    <span className={waitingN ? "nav-badge" : "nav-badge quiet"}
+                      aria-label={badgeLabel(waitingN, blockingN, quietN)} title={badgeLabel(waitingN, blockingN, quietN)}>
                       {blockingN > 0 ? <span className="bdot" aria-hidden /> : null}
-                      {waitingN.toLocaleString()}
+                      {(waitingN + quietN).toLocaleString()}
                     </span>
                   ) : null}
                   {badge ? (
