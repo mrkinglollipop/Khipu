@@ -12,6 +12,7 @@ collapse under rate limiting.
 """
 
 import argparse
+import ast
 import concurrent.futures
 import datetime
 import hashlib
@@ -228,12 +229,31 @@ def collect_code_semantic(roots: list[Path], now_iso: str) -> tuple[list, list]:
             'payload': json.dumps({}), 'built_at': now_iso,
         })
 
+    def _top_level_kinds(path: Path) -> dict[str, str]:
+        """Map top-level def/class names to 'function' or 'class'."""
+        try:
+            tree = ast.parse(path.read_text(encoding='utf-8', errors='ignore'))
+        except (OSError, SyntaxError, ValueError):
+            return {}
+        kinds: dict[str, str] = {}
+        for stmt in tree.body:
+            if isinstance(stmt, ast.ClassDef):
+                kinds[stmt.name] = 'class'
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                kinds.setdefault(stmt.name, 'function')
+        return kinds
+
     for f in layer.get('files', []):
         relpath = f.get('relpath', '')
         if not relpath or not _relpath_in_roots(relpath):
             continue
         mslug = slug(relpath)
         module_id = f'module:{mslug}'
+        file_path = next(
+            (root / relpath for root in roots if (root / relpath).is_file()),
+            None,
+        )
+        kinds = _top_level_kinds(file_path) if file_path is not None else {}
         summary = (f.get('summary') or '').strip()
         if summary:
             sid = f'concept:smry__{mslug}'
@@ -253,7 +273,8 @@ def collect_code_semantic(roots: list[Path], now_iso: str) -> tuple[list, list]:
                 continue
             pid = f'concept:fnp__{mslug}__{slug(fname)}'
             _node(pid, f'{fname}: {purpose}'[:200])
-            _edge(pid, f'function:{mslug}::{fname}', 'rationale_for')
+            kind = kinds.get(fname, 'function')
+            _edge(pid, f'{kind}:{mslug}::{fname}', 'rationale_for')
     print(f'code_semantic: {len(nodes)} nodes, {len(edges)} edges '
           f'from semantic_layer.json')
     return list(nodes.values()), edges

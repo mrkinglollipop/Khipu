@@ -23,7 +23,9 @@ BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
 
 PYCACHE_WRAPPERS = ("khipu-stop-hook", "khipu-mcp", "khipu-recall-hook", "khipu-prompt-recall",
                     "khipu-delegation-hook")
-DONTWRITE_WRAPPERS = ("khipu-aegis-capture",)
+# khipu-grok-build-capture runs where Aegis does (Grok Build shares ~/.grok
+# with it), so it takes the same no-bytecode mechanism.
+DONTWRITE_WRAPPERS = ("khipu-aegis-capture", "khipu-grok-build-capture")
 # Plain Python scripts run as __main__ with no khipu import (the launcher starts
 # them under `python3 -S -E -B`): nothing of theirs is ever compiled to a .pyc,
 # so there is no bytecode cache to redirect.

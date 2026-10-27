@@ -50,7 +50,10 @@ WITHHELD = "[redacted]"
 # A private-looking path Khipu doesn't know: a "~/" path, or one under a
 # folder that holds people's or temp files. It ends at the first space.
 _PATHLIKE = re.compile(r"~/[^\s\"'`,;)\]}]*"
-                       r"|(?<![\w.])/(?i:Users|home|private|tmp|var|Volumes|root)(?:/[^\s\"'`,;)\]}]*)?")
+                       r"|(?<![\w.])/(?i:Users|home|private|tmp|var|Volumes|root)(?:/[^\s\"'`,;)\]}]*)?"
+                       # Windows: a drive path (C:\Users\...) or a UNC share (\\host\share).
+                       r"|(?<![\w.])[A-Za-z]:[\\/][^\s\"'`,;)\]}]*"
+                       r"|\\\\[^\s\"'`,;)\]}\\]+\\[^\s\"'`,;)\]}]*")
 _SEG = r"[^\s\"'`,;)\]}/]+"
 # After a known root, the path that follows it: inner segments may hold
 # spaces (a "/" follows them); the last ends at one.
@@ -749,7 +752,7 @@ def _lookup(mapping: dict, found: str, fallback: str) -> str:
 def _scrub_text(text: str, table: _Table, keep: list[str]) -> str:
     if table.previous is not None:
         text = _scrub_text(text, table.previous, keep)
-    pathy = "/" in text or "~" in text
+    pathy = "/" in text or "~" in text or "\\" in text
     held = [w for w in keep if w and w in text]
     for i, word in enumerate(held):
         text = text.replace(word, f"\x00{i}\x00")

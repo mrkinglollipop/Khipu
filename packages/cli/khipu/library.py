@@ -211,10 +211,14 @@ def _under(path_real: str, root_real: str) -> bool:
     return path_real == root_real or path_real.startswith(root_real.rstrip(os.sep) + os.sep)
 
 
-def _iter_files(root: Path, skipped: dict[str, int]) -> Iterator[tuple[str, Path, os.stat_result]]:
+def _iter_files(
+    root: Path, skipped: dict[str, int], *, keep: set[str] | None = None,
+) -> Iterator[tuple[str, Path, os.stat_result]]:
     """(rel_posix, path, stat) for every eligible file under ``root``: .txt and
     .md, no dotfiles or hidden directories, no symlink that leaves the root,
-    nothing over MAX_FILE_BYTES (counted in ``skipped``, not yielded)."""
+    nothing over MAX_FILE_BYTES (counted in ``skipped``, not yielded).
+    Oversized paths are added to ``keep`` so a scan still treats them as
+    present without blocking deletion of other vanished files."""
     root_real = os.path.realpath(root)
 
     def skip(why: str) -> None:
@@ -242,6 +246,8 @@ def _iter_files(root: Path, skipped: dict[str, int]) -> Iterator[tuple[str, Path
                 continue
             if st.st_size > MAX_FILE_BYTES:
                 skip("too_large")
+                if keep is not None:
+                    keep.add(p.relative_to(root).as_posix())
                 continue
             yield p.relative_to(root).as_posix(), p, st
 
@@ -534,7 +540,7 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
         plan: list[tuple[str, str]] = []
         added = updated = unchanged = imported_kept = pending = 0
         rebuild_embedded = 0
-        for rel, path, _st in _iter_files(root, skipped):
+        for rel, path, _st in _iter_files(root, skipped, keep=seen):
             seen.add(rel)
             try:
                 data = path.read_bytes()
@@ -568,7 +574,11 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
             if prior and prior[0] in embedded_ids:
                 rebuild_embedded += 1
         embedded_docs = len(embedded_ids)
-        walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
+        # too_large paths are in ``seen`` (via _iter_files keep=); only
+        # traversal_error / unreadable freeze deletions for the whole walk.
+        walk_incomplete = bool(
+            skipped.get("traversal_error") or skipped.get("unreadable")
+        )
         gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
         if gone and not seen:
             conn.rollback()
@@ -619,7 +629,9 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
             if pending >= SCAN_COMMIT_EVERY:
                 conn.commit()
                 pending = 0
-        walk_incomplete = bool(skipped.get("traversal_error") or skipped.get("unreadable"))
+        walk_incomplete = bool(
+            skipped.get("traversal_error") or skipped.get("unreadable")
+        )
         if walk_incomplete:
             gone = []
         if gone:
@@ -978,6 +990,9 @@ def _map_path(source_file: str, prefix: str, roots: tuple[str, ...]) -> str | No
     sf = source_file.replace("\\", "/")
     if prefix and sf.startswith(prefix):
         sf = sf[len(prefix):]
+        # "corpus" (no trailing slash) must not leave "/Author/..." looking absolute.
+        if not prefix.endswith("/") and sf.startswith("/"):
+            sf = sf[1:]
     if sf.startswith("/"):
         for base in roots:
             b = base.rstrip("/") + "/"
@@ -1126,16 +1141,29 @@ def import_index(
                     stats["unmapped"] += 1
                     continue
                 clean = _clean(text)
-                if (doc_id in prior_chunks and prior_chunks[doc_id].get(idx) != clean):
-                    stats["skipped_conflict"] += 1
-                    continue
+                priors = prior_chunks.get(doc_id)
+                if priors is not None:
+                    if idx in priors:
+                        if priors[idx] != clean:
+                            stats["skipped_conflict"] += 1
+                            continue
+                    else:
+                        # Missing index: allow only when the doc was itself imported
+                        # (resume a partial import); conflict for scan-owned docs.
+                        prior_hash = existing.get(rel, (None, ""))[1] or ""
+                        if not str(prior_hash).startswith(IMPORTED_HASH_PREFIX):
+                            stats["skipped_conflict"] += 1
+                            continue
                 if spec.id not in used:
                     bulk.defer(spec.id, None)  # rows unknown up front
                 used[spec.id] = spec
                 digest = _md5(clean)
                 touched.setdefault(doc_id, set()).add(idx)
-                if doc_id not in prior_chunks:
+                if priors is None:
                     chunk_rows.append((doc_id, idx, clean, digest))
+                elif idx not in priors:
+                    chunk_rows.append((doc_id, idx, clean, digest))
+                    priors[idx] = clean
                 emb_rows.append((spec.id, doc_id, idx, embed._vec_literal(vec), digest))
                 stats["imported"] += 1
                 if len(emb_rows) >= batch:
@@ -1148,8 +1176,9 @@ def import_index(
                 )
             conn.commit()
     ids = sorted(used)
+    ok = not stats["skipped_conflict"] and not (stats["read"] > 0 and stats["imported"] == 0)
     out: dict[str, Any] = {
-        "ok": not stats["skipped_conflict"], "source": name, **stats, "documents": len(touched),
+        "ok": ok, "source": name, **stats, "documents": len(touched),
         "profile": ids[0] if ids else (profile or None), "profiles": ids,
         "source_profile": src.profile,
         "imported_documents": sum(1 for rel in doc_ids if rel not in existing),

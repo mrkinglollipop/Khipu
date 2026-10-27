@@ -2550,8 +2550,16 @@ class _SearchFilters:
 
         out: dict[str, Any] = {}
         if self.project:
-            patterns = [f"%{_escape_like(p)}%" for p in self.projects]
-            out["kf_project"] = patterns[0] if len(patterns) == 1 else patterns
+            # Typed name keeps substring ILIKE; alias-group members match
+            # exactly so an old name like ``notes`` does not pull
+            # ``release-notes`` when filtering ``notes-v2`` (Q3 projects).
+            out["kf_project"] = f"%{_escape_like(self.project)}%"
+            aliases = [p for p in self.projects if p != self.project]
+            if aliases:
+                # Lowercased to match lower(proj) in episode_sql (and the
+                # Python post-filter); stored names are usually exact but
+                # case must not diverge from the fallback path.
+                out["kf_project_aliases"] = [p.lower() for p in aliases]
         if self.session_id:
             out["kf_session"] = f"{_escape_like(self.session_id)}%"
         if self.harness:
@@ -2572,11 +2580,12 @@ class _SearchFilters:
         parts: list[str] = []
         if self.project:
             proj = f"COALESCE({a}project, {a}scope)" if flags["project"] else f"{a}scope"
-            if len(self.projects) == 1:
-                parts.append(proj + " ILIKE %(kf_project)s ESCAPE '" + chr(92) + "'")
+            typed = proj + " ILIKE %(kf_project)s ESCAPE '" + chr(92) + "'"
+            aliases = [p for p in self.projects if p != self.project]
+            if aliases:
+                parts.append(f"({typed} OR lower({proj}) = ANY(%(kf_project_aliases)s))")
             else:
-                # ESCAPE cannot follow ANY(...); backslash is the default escape.
-                parts.append(proj + " ILIKE ANY(%(kf_project)s)")
+                parts.append(typed)
         if self.session_id:
             parts.append(f"{a}session_id LIKE %(kf_session)s ESCAPE '" + chr(92) + "'")
         if self.harness:
@@ -2733,7 +2742,15 @@ def _apply_search_filters(
                 continue
             if project:
                 row_project = (m.get("project") or "").lower()
-                if not any(p.strip().lower() in row_project for p in (projects or [project])):
+                typed = project.strip().lower()
+                # Typed name: substring (existing filter semantics). Alias
+                # members: exact equality only (Q3 projects).
+                alias_exact = {
+                    p.strip().lower()
+                    for p in (projects or [project])
+                    if p and p.strip().lower() != typed
+                }
+                if typed not in row_project and row_project not in alias_exact:
                     continue
             if session_id and not (m.get("session_id") or "").startswith(session_id):
                 continue
@@ -3827,6 +3844,10 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             # by a date window: a note edited in place keeps its frontmatter
             # updated_at. Each embedded topic drops out of the next run's
             # list, so a bulk edit drains a few per Stop and none is stranded.
+            # When the topic sources were read, before the read: the replica
+            # keeps a copy read later (an edit landing while the provider
+            # embeds this one) instead of this older body.
+            topics_read_at = time.time()
             try:
                 changed = _changed_topic_refs(cur, profile)
                 cur.execute(
@@ -3900,7 +3921,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     from khipu.hub_snapshot import upsert_embeddings
 
                     snap = upsert_embeddings(topic_snapshot_rows, topic_rows=topic_sources,
-                                             replace_refs=topic_replacements)
+                                             replace_refs=topic_replacements, read_at=topics_read_at)
                     if not snap.get("ok"):
                         _log(f"topic snapshot upsert skipped: {snap.get('error')}")
                 except Exception as exc:  # noqa: BLE001
