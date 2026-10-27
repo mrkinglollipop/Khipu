@@ -2544,7 +2544,8 @@ def _copy_once(path: Path, deadline: float, connect: Any, *, may_restart: bool) 
                 (path.parent / _ENDPOINT_CHANGES_DIR / name).unlink(missing_ok=True)
         return out
     except _NotAdmitted as exc:
-        return _not_refreshed(exc)
+        # A lock wait that ran out, not a fault: the next copy reconciles.
+        return _not_refreshed(exc, deferred=True)
     except Exception as exc:  # noqa: BLE001 - rolled back: the previous copy and stamp stay
         _record_write_error(_FACT_TABLES, f"fact copy: {type(exc).__name__}: {exc}")
         return _not_refreshed(f"{type(exc).__name__}: {exc}")
@@ -2590,7 +2591,9 @@ def copy_facts(*, connect: Any = None, deadline: float | None = None, session: A
         with _fact_copy_lock(path, deadline):
             out = _copy_once(path, deadline, connect, may_restart=True)
     except _CopyBusy as exc:
-        out = _not_refreshed(exc)
+        # Another copy is running and holds the lock: this one defers to it
+        # (a later copy reconciles), which callers must not read as a fault.
+        out = _not_refreshed(exc, deferred=True)
     out["seconds"] = round(time.monotonic() - started, 3)
     return out
 
@@ -4194,6 +4197,28 @@ def snapshot_project_group(con: sqlite3.Connection, project: str | None) -> tupl
         return canonical, [canonical] + [a for a in rest if a != canonical]
     except Exception:  # noqa: BLE001 — grouping is best-effort, like the hub's
         return project, [project]
+
+
+def snapshot_resolve_project(con: sqlite3.Connection, project: str | None) -> str | None:
+    """The replica's ``identity.resolve_project_name``: a short or
+    differently-cased name read as the stored project it means; an ambiguous
+    one raises ``identity.AmbiguousProject``. Unchanged when the replica
+    cannot say."""
+    if not project:
+        return project
+    from khipu import identity
+
+    known: set[str] = set()
+    # Names of commitments opened by a forgotten episode never resolve a name:
+    # the replica's forget fence, like every other replica read of them.
+    for sql in ("SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL"
+                + forget_fence_sql(con, "commitments", "opened_episode"),
+                "SELECT alias FROM project_aliases UNION SELECT project FROM project_aliases"):
+        try:
+            known.update(str(r[0]) for r in con.execute(sql).fetchall() if r[0])
+        except sqlite3.Error:
+            continue
+    return identity.pick_project(project, known, lambda n: snapshot_project_group(con, n)[0] or n)
 
 
 def _hub_commitments(cur) -> tuple[list[str], list[Any]] | None:

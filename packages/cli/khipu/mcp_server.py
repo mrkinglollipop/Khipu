@@ -868,6 +868,9 @@ TOOLS: list[dict] = [
                 "view": {"type": "string",
                          "enum": ["summary", "accounts", "priority", "rules", "holds", "note", "proposals"],
                          "description": "summary: compact record; or one section name for that section in full; omit for the full record"},
+                "summary": {"type": "boolean",
+                            "description": "true: the same compact read as view=summary (bounded; its `omitted` "
+                                           "list names the sections to page in with view=<section>)"},
                 "session_id": {"type": "string",
                                "description": "This conversation's own session id when its environment names none; "
                                               "a descendant uses the canonical root as its prefix (claude:<id>/child, codex:<id>/child)"},
@@ -1889,6 +1892,7 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     filters = owed_filters(args)
     limit, note = owed_page_limit(args.get("limit"))
     project = args.get("project") or None
+    asked_name = project
     # The alias the caller named reads as -- and is reported as -- its
     # canonical project, the same labels the rows carry; `asked` keeps the
     # name they typed (``project_group.show``'s asked/canonical pair).
@@ -1901,6 +1905,10 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
                 if project:
                     from khipu import identity
 
+                    # A bare repo name ("Khipu") reads as the one stored project
+                    # it is the last segment of; several candidates are an error
+                    # naming them, never an empty list.
+                    project = identity.resolve_project_name(cur, project)
                     canonical, project_names = identity.project_canonical_group(cur, project)
                     canonical = canonical or project
                 rows = commitments.fetch_owed_rows(cur, project=project, status=status)
@@ -1912,6 +1920,7 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     except Exception as exc:  # noqa: BLE001
         if not hub_connection_failed(exc):
             raise
+        project = offline_reads.owed_resolve_project(project)
         rows = offline_reads.owed_rows(project, status)
         if rows is None:
             raise
@@ -1936,7 +1945,7 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
 
         commitments.add_hub_ages(page["results"], hub_now or datetime.now(timezone.utc))
     out = {"status": status, "project": canonical, **page, "limit": limit,
-           **({"asked": project} if project and canonical != project else {}),
+           **({"asked": asked_name} if asked_name and canonical != asked_name else {}),
            **({"limit_note": note} if note else {}), **stale}
     out.update(owner_writes.annotate(out["results"], "owed_update"))
     return out
@@ -2745,6 +2754,22 @@ def _tool_route_projected(args: dict) -> dict:
     mode = args.get("view")
     if mode is not None and not isinstance(mode, str):
         raise ValueError("view must be text")
+    # `summary: true` is the compact read, the same as `view: "summary"` (and
+    # `khipu route --summary`). It used to be ignored, which answered the full
+    # record, tens of thousands of characters, to a caller who asked for less.
+    want_summary = args.get("summary")
+    if want_summary is not None:
+        if isinstance(want_summary, str) and want_summary.strip().lower() in ("true", "false", "1", "0"):
+            want_summary = want_summary.strip().lower() in ("true", "1")
+        elif type(want_summary) is int and want_summary in (0, 1):
+            want_summary = bool(want_summary)
+        if not isinstance(want_summary, bool):
+            raise ValueError("summary must be true or false")
+        if want_summary:
+            if mode is not None and mode.strip() and mode.strip().lower() != "summary":
+                raise ValueError("summary cannot be combined with another view; "
+                                 "use view alone for one section in full")
+            mode = "summary"
     if since is not None and mode is not None and str(mode).strip():
         raise ValueError("view cannot be combined with since; omit view for a since answer, "
                          "or omit since for a view projection")

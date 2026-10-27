@@ -54,6 +54,20 @@ def owed_canonical(project: str | None) -> str | None:
         con.close()
 
 
+def owed_resolve_project(project: str | None) -> str | None:
+    """``project`` as the replica's commitments name it (a short name resolved);
+    unchanged with no replica. Raises ``identity.AmbiguousProject``."""
+    if not project:
+        return project
+    con = _open()
+    if con is None:
+        return project
+    try:
+        return hub_snapshot.snapshot_resolve_project(con, project)
+    finally:
+        con.close()
+
+
 def _cited_forgotten(con, rows: list[dict[str, Any]]) -> set[Any]:
     """Ids of ``rows`` whose ``settle_suggestion`` cites, as its evidence, an
     episode the replica holds forgotten or queued for erasure, or a decision

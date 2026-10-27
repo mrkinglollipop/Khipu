@@ -314,3 +314,36 @@ def test_cli_view_refused_with_summary_or_brief(home, capsys):
     assert cli.main(["route", "--brief", "--view", "summary"]) == 2
     refused = json.loads(capsys.readouterr().out)
     assert refused.get("ok") is False and "view" in refused.get("error", "").lower()
+
+
+def test_summary_true_is_the_compact_read_not_the_full_record(home, monkeypatch):
+    """`summary: true` used to be ignored, answering the whole record."""
+    monkeypatch.setenv("CODEX_THREAD_ID", "summary-flag")
+    routing.add_rule("Never a -fast tier. " + ("rule-body-" * 60), via="app")
+    routing.set_note("Owner note " + ("n" * 3000), via="app")
+    full = _route()
+    flagged = _route(summary=True)
+    viewed = _route(view="summary")
+    assert "omitted" in flagged and "note" in flagged["omitted"]
+    assert "note" not in flagged and "providers" not in flagged
+    assert all(len(r["text"]) <= 120 for r in flagged["rules"])
+    body = lambda out: {k: v for k, v in out.items() if k not in ("routing_changes", "delivery")}  # noqa: E731
+    assert body(flagged) == body(viewed)
+    assert len(json.dumps(body(flagged))) < len(json.dumps(body(full)))
+    # Paging: the omitted section is one call away, in full.
+    assert _route(view="note")["note"] == full["note"]
+    assert body(_route(summary=False)) == body(full)
+
+
+def test_summary_flag_conflicts_are_refused(home):
+    error, body = _call("khipu_route", {"summary": True, "view": "rules"})
+    assert error and "summary" in (body.get("error") or "").lower()
+    error, body = _call("khipu_route", {"summary": True, "since": "0"})
+    assert error and "since" in (body.get("error") or "").lower()
+    error, body = _call("khipu_route", {"summary": "maybe"})
+    assert error
+
+
+def test_summary_flag_is_in_the_tool_schema():
+    tool = next(item for item in ms.TOOLS if item["name"] == "khipu_route")
+    assert tool["inputSchema"]["properties"]["summary"]["type"] == "boolean"
