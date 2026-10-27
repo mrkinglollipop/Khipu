@@ -1009,3 +1009,27 @@ describe("Grok Bot card and the guides", () => {
     expect(onOpenGuide).toHaveBeenCalledWith("grok_bot");
   });
 });
+
+describe("IntegrationsPanel — unknown harness rows", () => {
+  it("still renders its cards when the CLI status lists grok_build", async () => {
+    const rows = [
+      { harness: "claude_code", detected: true, mcp: true, hook_stop: true, hook_precompact: true, recall_rule: "installed", homes: [] },
+      { harness: "grok_build", detected: false, mcp: false, hook_stop: false, hook_precompact: false, recall_rule: "project_required" },
+    ];
+    const runKhipu = vi.fn(async (args: string[]) => (args[1] === "status" ? JSON.stringify(rows) : "{}"));
+    render(
+      <IntegrationsPanel
+        runKhipu={runKhipu}
+        onToast={() => {}}
+        active={true}
+        liveness={{ ok: true, harnesses: {} }}
+        recallProbe={null}
+        refreshHealth={() => {}}
+        onAnotherMac={() => {}}
+      />,
+    );
+    await waitFor(() => expect(runKhipu).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByText("Claude Code")).toBeInTheDocument());
+    expect(screen.queryAllByText(/Couldn't read the harness configs/)).toHaveLength(0);
+  });
+});
