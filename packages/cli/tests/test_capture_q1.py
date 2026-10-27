@@ -23,6 +23,10 @@ def _user(text, **extra):
     return {"type": "user", "message": {"role": "user", "content": text}, **extra}
 
 
+STAND = ("[notification: task-notification] A long already captured notification that is clearly "
+         "over forty characters")
+
+
 def _assistant(text):
     return {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
 
@@ -102,7 +106,8 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
 
     def test_genuine_short_turns_after_seen_long_are_kept(self):
         """A seen long head must not eat new short turns and tool markers."""
-        long_u = "A long already captured user question that is clearly over forty characters"
+        long_u = ("<task-notification><summary>A long already captured notification that is clearly over "
+                  "forty characters</summary></task-notification>")
         tool = {"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/x"}}]}}
         rows = [_user(long_u), tool, _user("yes, go ahead"), _assistant("done"),
@@ -112,7 +117,7 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
             _write(tp, rows)
             stats: dict = {}
             msgs, _, turns = sc.read_window(
-                tp, 0, seen=[sc.text_fingerprint("user", long_u)], stats=stats)
+                tp, 0, seen=[sc.text_fingerprint("user", STAND)], stats=stats)
             self.assertEqual(turns, 2, f"genuine short turns were lost; turns={turns} msgs={msgs}")
             texts = [t for _, t in msgs]
             self.assertIn("yes, go ahead", texts)
@@ -124,9 +129,10 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
 
     def test_short_turn_captured_earlier_is_kept_without_an_ordered_replay(self):
         """A text match alone never proves a short line is a copy."""
-        long_u = "A long already captured user question that is clearly over forty characters"
+        long_u = ("<task-notification><summary>A long already captured notification that is clearly over "
+                  "forty characters</summary></task-notification>")
         rows = [_user(long_u), _user("yes"), _assistant("done")]
-        seen = [sc.text_fingerprint("user", long_u), sc.text_fingerprint("user", "yes"),
+        seen = [sc.text_fingerprint("user", STAND), sc.text_fingerprint("user", "yes"),
                 sc.text_fingerprint("assistant", "done")]
         with tempfile.TemporaryDirectory() as td:
             tp = Path(td) / "t.jsonl"
@@ -136,7 +142,8 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
             self.assertEqual([t for _, t in msgs], ["yes", "done"])
 
     def test_skip_to_stops_before_a_kept_tool_marker(self):
-        long_u = "A long already captured user question that is clearly over forty characters"
+        long_u = ("<task-notification><summary>A long already captured notification that is clearly over "
+                  "forty characters</summary></task-notification>")
         tool = {"type": "assistant", "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/x"}}]}}
         with tempfile.TemporaryDirectory() as td:
@@ -145,7 +152,7 @@ class ShortCopiesAfterToolLineTest(unittest.TestCase):
             head = len((json.dumps(_user(long_u)) + "\n").encode())
             stats: dict = {}
             msgs, _, _ = sc.read_window(
-                tp, 0, seen=[sc.text_fingerprint("user", long_u), sc.text_fingerprint("user", "ok")],
+                tp, 0, seen=[sc.text_fingerprint("user", STAND), sc.text_fingerprint("user", "ok")],
                 stats=stats)
             self.assertEqual([r for r, _ in msgs], ["tool", "user"])
             self.assertEqual(stats["skip_to"], head, stats)

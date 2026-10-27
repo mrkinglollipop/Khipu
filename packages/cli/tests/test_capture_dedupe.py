@@ -69,7 +69,7 @@ class ReadWindowDedupeTest(unittest.TestCase):
             self.assertEqual(users, 3)
             self.assertEqual(len(msgs), 6)
             self.assertEqual(stats["deduped_msgs"], 0)
-            self.assertEqual(len(stats["fresh"]), 6)
+            self.assertEqual(len(stats["fresh"]), 9)  # six text fingerprints and the three replies' message identities
             st: dict = {}
             sc.remember_seen(st, stats["fresh"])
 
@@ -93,7 +93,7 @@ class ReadWindowDedupeTest(unittest.TestCase):
             msgs, _, users, stats = _window(tp, 0, ())
             self.assertEqual((len(msgs), users), (6, 3))
             self.assertEqual(stats["deduped_msgs"], 6)
-            self.assertEqual(len(stats["fresh"]), 6)
+            self.assertEqual(len(stats["fresh"]), 9)  # six text fingerprints and the three replies' message identities
 
     def test_without_seen_nothing_is_deduplicated(self):
         with tempfile.TemporaryDirectory() as td:
@@ -186,7 +186,7 @@ class HookDedupeTest(unittest.TestCase):
             beat = sc._read_beat("claude_code")
             self.assertNotIn("deduped_msgs", beat)
             self.assertNotIn("deduped=", sc.log_path().read_text(encoding="utf-8"))
-            self.assertEqual(len(sc.load_state("claude_code", "s1")["seen_text"]), 6)
+            self.assertEqual(len(sc.load_state("claude_code", "s1")["seen_text"]), 9)  # six text fingerprints and the three replies' message identities
 
             _append(tp, [COMPACT] + _reemitted() + [_user(NEW_TURN)])
             with mock.patch.object(sc, "save_state", wraps=sc.save_state) as save:
@@ -243,7 +243,7 @@ class HookDedupeTest(unittest.TestCase):
             st = sc.load_state("claude_code", "s1")
             self.assertGreater(st["offset"], captured_end)
             self.assertLessEqual(st["offset"], copies_end)
-            self.assertEqual(len(st["seen_text"]), 6)  # nothing new remembered
+            self.assertEqual(len(st["seen_text"]), 9)  # nothing new remembered
             env["hook_event_name"] = "SessionEnd"
             out = sc.hook_main(json.dumps(env))
             self.assertTrue(out["due"], out)

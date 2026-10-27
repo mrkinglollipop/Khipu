@@ -238,7 +238,10 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
     outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
-    if not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
+    # Dead letters sit outside drain(); only retry-dead moves them back.
+    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0:
+        outbox["fix"] = "run `khipu outbox retry-dead`"
+    elif not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
         outbox["fix"] = "run `khipu sessions drain`"
     # Capture liveness: is each harness ACTUALLY being recorded? Red on evidence
     # of a failure (hook error, drain failure, stale queue, cadence never
@@ -271,6 +274,8 @@ def _doctor_local_checks(mem: Path | None) -> dict:
             "error": f"{type(e).__name__}: {e}",
             "reasons": ["check failed"],
         }
+    if git_sync.get("applicable") is False:
+        not_configured.append("git_sync")
     try:
         secrets = secrets_status()
     except Exception as e:  # noqa: BLE001 — malformed local diagnostics must not crash doctor
@@ -898,6 +903,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     schema = workers["schema"].result()
     if not hub_ok and schema.get("error"):
         schema = {**schema, "ok": True, "skipped": "the database did not answer"}
+    if schema.get("skipped"):
+        not_configured.append("schema_migrations")
     schema_ok = bool(schema.get("ok"))
     # Fact provenance (docs/plans/2026-10-23-fact-provenance.md, phase 5): 0047
     # on the hub or not, open fact_gaps, section 4's limit count. Visibility
@@ -1946,7 +1953,11 @@ def cmd_library(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 2
     print(json.dumps(out, indent=2, default=str))
-    return _backfill_exit_code(out) if cmd == "backfill" else 0
+    if cmd == "backfill":
+        return _backfill_exit_code(out)
+    if cmd == "import" and out.get("ok") is False:
+        return 1
+    return 0
 
 
 def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
@@ -2108,7 +2119,13 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
               JOIN edges e ON e.src = w.node_id OR e.dst = w.node_id
               WHERE w.hops < %(max_hops)s
             )
-            SELECT node_id, via, type, hops FROM walk
+            SELECT node_id, via, type, hops FROM (
+              SELECT DISTINCT ON (node_id)
+                node_id, via, type, hops
+              FROM walk
+              WHERE NOT (node_id = ANY(%(ids)s))
+              ORDER BY node_id, hops ASC
+            ) d
             ORDER BY hops ASC, node_id ASC
             LIMIT %(lim)s
             """,
@@ -2824,7 +2841,14 @@ def _cmd_episode_forget_pending(args: argparse.Namespace) -> int:
     elif args.not_same is not None:
         action, target = "forget.not_same", str(args.not_same)
     else:
-        print(json.dumps(forget.unsent_forgets(), default=str))
+        from khipu import owner_act, routing
+
+        out = forget.unsent_forgets()
+        # Summaries are forgotten episodes' text: only the app itself or a
+        # conversation the owner typed in sees them.
+        if not ((args.from_app and routing._caller()["app"]) or owner_act.owner_turn()):
+            out = owner_act.without_summaries(out)
+        print(json.dumps(out, default=str))
         return 0
     from khipu import owner_direction
 
@@ -3276,7 +3300,9 @@ def cmd_activity(args: argparse.Namespace) -> int:
     from khipu.activity import activity_payload, episode_detail
 
     if args.show is not None:
-        row = episode_detail(args.show)
+        from khipu.tombstones import episode_hidden
+
+        row = None if episode_hidden(args.show) else episode_detail(args.show)
         if row is None:
             print(f"error: episode {args.show} not found", file=sys.stderr)
             return 1
@@ -3390,7 +3416,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         if not ident.isdigit():
             print(json.dumps({"ok": False, "error": "episode id must be digits"}))
             return 2
-        row = episode_detail(int(ident))
+        from khipu.tombstones import episode_hidden
+
+        row = None if episode_hidden(ident) else episode_detail(int(ident))
     else:
         from khipu.text_pages import page_args
 
@@ -3400,9 +3428,10 @@ def cmd_get(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
+        wiki = bool(getattr(args, "wiki", False))
         if getattr(args, "all", False):
-            return _get_topic_all(ident, offset, max_bytes)
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+            return _get_topic_all(ident, offset, max_bytes, wiki=wiki)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
@@ -3416,7 +3445,8 @@ def cmd_get(args: argparse.Namespace) -> int:
     return 0
 
 
-def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
+def _get_topic_all(ident: str, offset: int, max_bytes: int, *,
+                   wiki: bool = False) -> int:
     """`khipu get <topic> --all`: follow body_next_offset and write the body
     from ``offset`` to the end on stdout, raw, one page at a time. Stops with
     an error if the topic changes between pages (content_hash or updated_at),
@@ -3425,7 +3455,7 @@ def _get_topic_all(ident: str, offset: int, max_bytes: int) -> int:
 
     first = None
     while True:
-        row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+        row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
         if row is None:
             print(json.dumps({"ok": False, "error": f"topic not found: {ident}"}),
                   file=sys.stderr)
@@ -4246,8 +4276,9 @@ def cmd_join(args: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001 — its text can quote the DSN
                 migrate_out = {"ok": False, "error": public_error(exc, "Applying migrations")}
         hub_ok = bool(counts.get("ok"))
+        migrate_ok = migrate_out is None or migrate_out.get("ok") is not False
         result = {
-            "ok": True,
+            "ok": migrate_ok,
             "kit_imported": True,
             "hub_ok": hub_ok,
             "action": "import",
@@ -4261,7 +4292,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         if migrate_out is not None:
             result["migrate"] = migrate_out
         print(json.dumps(result, indent=2))
-        return 0
+        return 0 if migrate_ok else 1
 
     if args.join_cmd == "advertise":
         try:
@@ -4735,6 +4766,12 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     if args.gateway_token_cmd == "status":
         print(json.dumps(integ.gateway_token_file_status(), indent=2))
         return 0
+    if args.gateway_token_cmd == "copy":
+        # The key goes Keychain/file -> clipboard inside this process; the
+        # answer is only whether it worked, never the key.
+        result = integ.copy_gateway_token()
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("ok") else 2
     if args.gateway_token_cmd == "set":
         if args.from_env is not None:
             token = os.environ.get(args.from_env, "")
@@ -5826,6 +5863,12 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--summary", action="store_true", help="The summary a conversation gets at its start")
     rt.add_argument("--brief", action="store_true", help="The text a job runner puts into a brief")
     rt.add_argument("--account", dest="view_account", default=None, metavar="A", help="One account only")
+    rt.add_argument(
+        "--view", default=None, metavar="NAME",
+        choices=("summary", "accounts", "priority", "rules", "holds", "note", "proposals"),
+        help="JSON only: summary (compact) or one section name for that section in full; "
+             "omit for the full record; not with --summary, --brief, or --since",
+    )
     rt.set_defaults(func=cmd_route, route_cmd=None)
     # Writes always print JSON; --json is accepted after any of them too, so a
     # script that adds it to every khipu call doesn't lose its write. SUPPRESS
@@ -6294,6 +6337,10 @@ def build_parser() -> argparse.ArgumentParser:
     gt.add_argument(
         "--all", action="store_true",
         help="Topics: write the whole body (from --offset) to stdout, page by page",
+    )
+    gt.add_argument(
+        "--wiki", action="store_true",
+        help="Topics: return the raw wiki page even when a current brief exists",
     )
     gt.set_defaults(func=cmd_get)
 
@@ -6853,6 +6900,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gwt_sub.add_parser(
         "status", help="exists / mode / bytes only — never the token"
+    )
+    gwt_sub.add_parser(
+        "copy",
+        help="Copy the saved key to the clipboard and clear it after 60 s (never prints it)",
     )
     gw.set_defaults(func=cmd_gateway)
 

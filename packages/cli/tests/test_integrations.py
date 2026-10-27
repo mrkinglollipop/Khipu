@@ -886,13 +886,13 @@ class RecallRuleTest(_TempHomeCase):
         self.assertEqual(integ.install("cursor", project=str(proj))["changes"], [])  # idempotent
         integ.uninstall("cursor", project=str(proj))
         self.assertFalse(mdc.exists())
+        # --project uninstall removes only the repo rule; global MCP/hooks stay.
         h2 = json.loads((self.home / ".cursor" / "hooks.json").read_text())
-        self.assertEqual(
-            [e["command"] for e in h2["hooks"]["sessionStart"]],
-            ["\"/harness/session_start.sh\""],
-        )
+        self.assertEqual(h2["hooks"]["sessionStart"][0]["command"], "\"/harness/session_start.sh\"")
+        self.assertTrue(any("khipu-recall-hook" in e["command"] for e in h2["hooks"]["sessionStart"]))
+        self.assertIn("khipu", json.loads((self.home / ".cursor" / "mcp.json").read_text()).get("mcpServers", {}))
         self.assertEqual(integ.status("cursor")["recall_rule"], "project_scoped")
-        self.assertFalse(integ.status("cursor")["hook_sessionstart"])
+        self.assertTrue(integ.status("cursor")["hook_sessionstart"])
 
     def test_recall_probe_real_hook(self):
         # _shim() is read-only outside install() now (B1): a real link must
