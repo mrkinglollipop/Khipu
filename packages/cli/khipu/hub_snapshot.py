@@ -60,6 +60,13 @@ SNAPSHOT_NAME = "hub_snapshot.sqlite"
 META_NAME = "hub_snapshot.sqlite.meta.json"
 HUB_CONNECT_TIMEOUT_S = 5
 REFRESH_CONNECT_TIMEOUT_S = 30
+# Every replica session's statements end on the server by this; a full dump's
+# whole-table reads get the dump's own deadline instead.
+HUB_STATEMENT_TIMEOUT_S = float(os.environ.get("KHIPU_HUB_STATEMENT_TIMEOUT_S", "120"))
+# A full dump's hub reads, whole: past it the session is abandoned (cancel
+# sent, socket shut down), the temp removed and the refresh lock released
+# (_dump_deadline).
+REFRESH_DEADLINE_S = float(os.environ.get("KHIPU_REFRESH_DEADLINE_S", "900"))
 # Status used to call maybe_refresh on every tab click, which dumped every
 # episode + embedding over the wire and froze the desktop. Doctor may refresh,
 # but not more often than this unless the operator runs `khipu snapshot refresh`.
@@ -396,18 +403,25 @@ def hub_connection_failed(exc: BaseException) -> bool:
 
 
 def try_hub_connect(
-    *, connect_timeout: int = HUB_CONNECT_TIMEOUT_S
+    *, connect_timeout: int = HUB_CONNECT_TIMEOUT_S,
+    statement_timeout_s: float = HUB_STATEMENT_TIMEOUT_S,
 ) -> psycopg.Connection:
+    """A replica session whose every statement ends by ``statement_timeout_s``
+    on the server and whose socket is given up when the network goes silent
+    (keepalives), so a stalled hub cannot hold a replica writer for good."""
     import psycopg
 
+    from khipu import db
     from khipu.db import conninfo_with_local_root_cert, resolve_dsn
 
     from khipu import hub_reach
 
     try:
         conn = psycopg.connect(
-            conninfo_with_local_root_cert(resolve_dsn()),
+            db._with_statement_timeout(conninfo_with_local_root_cert(resolve_dsn()),
+                                       statement_timeout_s),
             connect_timeout=connect_timeout,
+            **db._keepalive_kwargs(),
         )
     except Exception as exc:
         if hub_connection_failed(exc):
@@ -4191,7 +4205,11 @@ def _hub_commitments(cur) -> tuple[list[str], list[Any]] | None:
     if not {"id", "text", "status"} <= hub_cols:
         return None
     cols = [c for c in _COMMITMENT_COLS if c in hub_cols]
-    sel = ", ".join(cols)
+    from khipu.commitments import close_reason_sql, settle_suggestion_sql
+
+    # A suggestion or close reason quoting a forgotten episode's evidence never reaches the replica.
+    sel = ", ".join(settle_suggestion_sql(cur) if c == "settle_suggestion"
+                    else close_reason_sql(cur) if c == "close_reason" else c for c in cols)
     where = ""
     if "opened_episode" in cols and "deleted_at" in _pg_columns(cur, "episodes"):
         where = (
@@ -4263,6 +4281,41 @@ def _write_commitment_rows(con: sqlite3.Connection, cols: Sequence[str], rows: S
     return written
 
 
+class DumpDeadline(TimeoutError):
+    """A full dump's hub reads did not finish by their deadline."""
+
+
+@contextmanager
+def _dump_deadline(pg: Any, seconds: float):
+    """Bound a full dump's hub reads as a whole: at ``seconds`` a timer
+    abandons the session (``provenance._abandon``: the cancel sent without
+    waiting, the socket shut down), so a read the hub stopped answering
+    fails at once and the dump unwinds, releasing the refresh lock. The
+    dump's error then reads as :class:`DumpDeadline`."""
+    from khipu.provenance import _abandon
+
+    expired = threading.Event()
+
+    def fire() -> None:
+        expired.set()
+        _abandon(pg)
+
+    timer = threading.Timer(seconds, fire)
+    timer.daemon = True
+    timer.start()
+    message = f"the hub dump did not finish within {seconds:.0f} s; its session was abandoned"
+    try:
+        yield
+    except Exception as exc:
+        if expired.is_set():
+            raise DumpDeadline(message) from exc
+        raise
+    finally:
+        timer.cancel()
+    if expired.is_set():
+        raise DumpDeadline(message)
+
+
 def refresh() -> dict[str, Any]:
     """Dump hub tables into a fresh sqlite file and atomically replace the snapshot.
 
@@ -4270,9 +4323,12 @@ def refresh() -> dict[str, Any]:
     and ``khipu snapshot refresh`` serialize. If another dump is live, returns
     ``{"ok": False, "error": ...}`` instead of dumping anyway.
 
-    The shared memory lock is held from the first hub read to publication, so
-    a forget (which holds it exclusive) never completes while a dump that read
-    the forgotten rows is still being written.
+    No memory lock is held over the hub reads (``_dump_hub``, bounded as a
+    whole by ``REFRESH_DEADLINE_S``), so a stalled hub never holds up a
+    forget. The publication takes it: the source fence's ``write_gate`` holds
+    the memory lock from the queued erasures and the registry scrub through
+    the replace, so anything forgotten while the dump read is dropped from the
+    new file before it becomes the replica.
 
     The dump carries no fact row: after it is published, and outside every
     lock, one fact copy (``copy_facts``) fills them (``facts``).
@@ -4280,8 +4336,7 @@ def refresh() -> dict[str, Any]:
     from khipu import memory_lock
 
     try:
-        with memory_lock.shared():
-            out = _refresh_locked()
+        out = _refresh_locked()
     except memory_lock.MemoryLockError as exc:
         return {"ok": False, "error": str(exc)}
     if out.get("ok"):
@@ -4315,7 +4370,11 @@ def _refresh_locked() -> dict[str, Any]:
         try:
             con = sqlite3.connect(str(tmp_path))
             _create_schema(con)
-            with try_hub_connect(connect_timeout=REFRESH_CONNECT_TIMEOUT_S) as pg:
+            # Every statement ends on the server within the dump's deadline,
+            # and the deadline itself ends the whole read (_dump_deadline).
+            with try_hub_connect(connect_timeout=REFRESH_CONNECT_TIMEOUT_S,
+                                 statement_timeout_s=REFRESH_DEADLINE_S) as pg, \
+                    _dump_deadline(pg, REFRESH_DEADLINE_S):
                 from psycopg import IsolationLevel
 
                 pg.isolation_level = IsolationLevel.REPEATABLE_READ
@@ -4985,12 +5044,24 @@ def upsert_embeddings(
             # A catch-up that read a topic before it was purged must not put
             # it back: its hub write may have committed before the purge.
             purged = _purged_topic_slugs(path)
+            topic_version = time.time() if read_at is None else float(read_at)
+            stale_topics: set[str] = set()
             for row in topic_rows:
                 if row["slug"] in purged:
                     continue
                 row = _topic_routing_metadata(row)
-                old = con.execute("SELECT deleted_at FROM topics WHERE slug = ?", (row["slug"],)).fetchone()
+                old = con.execute("SELECT deleted_at, updated_at FROM topics WHERE slug = ?",
+                                  (row["slug"],)).fetchone()
                 if old and old[0] is not None:
+                    continue
+                # The freshness rule, as for a pull: a topic read before the
+                # copy the replica holds (an embed that read its source, then
+                # waited on the provider) never replaces it.
+                held, incoming = (_utc(old[1]) if old else None), _utc(row.get("updated_at"))
+                if (_held_read_at(con, "topics", row["slug"]) > topic_version
+                        or (held and incoming and held > incoming)):
+                    # Its vectors were built from that older body too.
+                    stale_topics.add(str(row["slug"]))
                     continue
                 cols = [c for c in _TOPIC_COLS if c in topic_cols and c in row]
                 vals = [_json_text(row[c]) if c in ("links", "frontmatter") else
@@ -5000,15 +5071,18 @@ def upsert_embeddings(
                     "ON CONFLICT(slug) DO UPDATE SET " + ", ".join(f"{c}=excluded.{c}" for c in cols if c != "slug"),
                     vals,
                 )
-                _record_read_at(con, "topics", row["slug"],
-                                time.time() if read_at is None else float(read_at))
+                _record_read_at(con, "topics", row["slug"], topic_version)
             version = time.time() if read_at is None else float(read_at)
             refs = {(str(p), str(k), str(r)) for p, k, r in replace_refs}
             refs |= {(str(e.get("profile")), str(e.get("kind")), str(e.get("ref"))) for e in embedding_rows}
-            # An episode's vectors are also as new as the episode row written with them.
+            # An episode's or topic's vectors are also as new as the source row
+            # held beside them: vectors read before that row was are built from
+            # an older body, with or without ``topic_rows`` in this call.
             newer = {(p, k, r) for p, k, r in refs
                      if max(_held_read_at(con, "vectors", _vector_key(p, k, r)),
-                            _held_read_at(con, "episodes", r) if k == "episode" else 0.0) > version}
+                            _held_read_at(con, "episodes", r) if k == "episode" else
+                            _held_read_at(con, "topics", r) if k == "topic" else 0.0) > version
+                     or (k == "topic" and r in stale_topics)}
             for profile, kind, ref in replace_refs:
                 if (str(profile), str(kind), str(ref)) in newer or kind in _FACT_VECTOR_KINDS:
                     continue

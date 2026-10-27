@@ -243,7 +243,13 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
     mark_ready(pg)
     proxy = DelayProxy(pg_cluster.port)
     remote = pg.dsn.replace(f":{pg_cluster.port}/", f":{proxy.port}/")
-    monkeypatch.setattr(hs, "try_hub_connect", lambda **kw: psycopg.Connection.connect(remote, **kw))
+    def _connect_remote(*, statement_timeout_s=None, **kw):
+        # Same translation db.connect does: psycopg has no such conninfo key.
+        if statement_timeout_s:
+            kw["options"] = f"-c statement_timeout={int(statement_timeout_s * 1000)}"
+        return psycopg.Connection.connect(remote, **kw)
+
+    monkeypatch.setattr(hs, "try_hub_connect", _connect_remote)
     monkeypatch.setattr(db, "resolve_dsn", lambda: remote)
     # The seed wrote 5,000 episodes a moment before the dump; without this
     # the pull's overlap window would read them all again.

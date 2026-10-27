@@ -76,6 +76,9 @@ NOT_CAPTURE = {
     "t3._recent_conversation_use": "opens T3's thread database read-only to inspect its newest message time; writes nothing",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
+                     # Grok's config.toml, a repo's AGENTS.md recall block, the Aegis [memory] marker.
+                     "integrations._aegis_install", "integrations._grok_build_install",
+                     "integrations._grok_build_uninstall",
                      "integrations._write_toml", "integrations.set_gateway_token",
                      "join._import_kit", "join._restore_file", "join._write_dsn_file",
                      "join.write_kit_file", "join.write_private_file",

@@ -222,8 +222,15 @@ def prime_table_columns(conn, *tables: str) -> None:
 
 
 def has_columns(cur, table: str, *names: str) -> bool:
+    """Whether ``table`` has every named column. Only a yes is cached: a
+    long-lived process (MCP server, gateway) that started before a migration
+    must see the new columns on its next write, not after a restart — same
+    rule ``has_table`` uses for a missing table."""
     cols = table_columns(cur, table)
-    return all(name in cols for name in names)
+    if all(name in cols for name in names):
+        return True
+    _TABLE_COLUMNS_CACHE.pop(table, None)
+    return False
 
 
 def has_table(cur, table: str) -> bool:

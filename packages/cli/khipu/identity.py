@@ -218,11 +218,32 @@ def add_project_alias(cur, alias: str, canonical: str) -> dict[str, Any]:
 
 
 def remove_project_alias(cur, alias: str) -> dict[str, Any]:
+    """Drop ``alias``. Episodes captured while it pointed at a canonical keep
+    ``raw.typed_project`` from capture; restore those rows to the typed name
+    so undo does not leave them stranded under the former target."""
     alias = (alias or "").strip()
-    cur.execute("DELETE FROM project_aliases WHERE alias = %s", (alias,))
-    if not cur.rowcount:
+    cur.execute("SELECT project FROM project_aliases WHERE alias = %s", (alias,))
+    row = cur.fetchone()
+    if not row:
         return {"ok": False, "error": f"{alias!r} is not an alias"}
-    return {"ok": True, "alias": alias, "changed": True}
+    canonical = str(row[0])
+    # Match every name in the group: after a second rename the row may still
+    # sit under an older member, not the newest canonical.
+    group = project_group(cur, canonical)
+    cur.execute(
+        "UPDATE episodes SET project = %s "
+        "WHERE project = ANY(%s) AND raw->>'typed_project' = %s",
+        (alias, group, alias),
+    )
+    restored = int(cur.rowcount or 0)
+    cur.execute("DELETE FROM project_aliases WHERE alias = %s", (alias,))
+    return {
+        "ok": True,
+        "alias": alias,
+        "changed": True,
+        "episodes_restored": restored,
+        "note": "Only episodes with raw.typed_project are restored; older rows without it stay under their current project.",
+    }
 
 
 # Advisory lock classes (the first key of the two-key form), so a project
