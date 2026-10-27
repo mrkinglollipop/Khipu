@@ -203,13 +203,14 @@ class CursorHooksStatusTest(_Home):
         proof = integ.status("cursor")["proof"]
         self.assertEqual(set(proof), {"mcp", "capture", "session_recall", "prompt_recall", "delegation_push"})
         self.assertTrue(set(proof.values()) <= {"hermetic", "unproven"}
-                        | {v for v in proof.values() if v.startswith("real-run ")})
+                        | {v for v in proof.values() if v.startswith(("real-run ", "not-seen "))})
         # Context at a prompt or a tool call is the unproven part (the docs
-        # disagree with the shipped binary); nothing claims it works.
-        self.assertEqual(proof["prompt_recall"], "unproven")
+        # disagree with the shipped binary); nothing claims it works. Slice C's
+        # real runs never saw beforeSubmitPrompt fire (CLI, T3 logs).
+        self.assertEqual(proof["prompt_recall"], "not-seen 2026-10-27")
         self.assertEqual(proof["delegation_push"], "unproven")
         proof["prompt_recall"] = "real-run 2099-01-01"  # a copy: the module's table is untouched
-        self.assertEqual(integ.status("cursor")["proof"]["prompt_recall"], "unproven")
+        self.assertEqual(integ.status("cursor")["proof"]["prompt_recall"], "not-seen 2026-10-27")
 
     def test_a_removed_entry_reads_missing_not_installed(self):
         integ.install("cursor")
