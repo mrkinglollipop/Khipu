@@ -10,14 +10,31 @@ export type ClaudeHomesReport = {
 
 export type ClaudeHomesGap = { missing: number; unreadable: number; checkFailed?: boolean };
 
-export type T3HealthGap = { warning: boolean; lookupFailed: boolean };
+/** `reason` says what the warning is about, so the rail and the card never call
+ *  a provider-hooks warning "needs a linked capture". */
+export type T3WarningReason = "lookup" | "unlinked" | "hooks" | "other";
+export type T3HealthGap = { warning: boolean; lookupFailed: boolean; reason?: T3WarningReason };
+
+/** Which kind of T3 warning is showing. The CLI sends plain sentences, so the
+ *  "used without a thread-linked capture" one is matched by its wording; a
+ *  provider with `hooks: "missing"` is the other known kind. A lookup failure
+ *  outranks both, an unlinked run outranks missing hooks. */
+export function t3WarningReason(t3: T3Health | null | undefined): T3WarningReason | null {
+  if (!t3?.detected) return null;
+  if (t3.lookup?.ok === false) return "lookup";
+  const warnings = t3.warnings ?? [];
+  if (warnings.length === 0) return null;
+  if (warnings.some((w) => /thread-linked capture/i.test(w))) return "unlinked";
+  if ((t3.providers ?? []).some((p) => p.hooks === "missing")) return "hooks";
+  return "other";
+}
 
 /** T3 is optional, but once its settings file exists a failed thread lookup
  * or a recent unlinked run is actionable and must not sit behind a green rail. */
 export function t3HealthGap(t3: T3Health | null | undefined): T3HealthGap {
-  if (!t3?.detected) return { warning: false, lookupFailed: false };
-  const lookupFailed = t3.lookup?.ok === false;
-  return { warning: lookupFailed || (t3.warnings?.length ?? 0) > 0, lookupFailed };
+  const reason = t3WarningReason(t3);
+  if (reason == null) return { warning: false, lookupFailed: false };
+  return { warning: true, lookupFailed: reason === "lookup", reason };
 }
 
 /** Found Claude homes with no Khipu in them, and found homes whose config
@@ -56,7 +73,14 @@ export function railHealthLine(
   if (gap.missing > 0) return { tone: "warn", text: `${homesWord(gap.missing)} not installed` };
   if (gap.unreadable > 0) return { tone: "warn", text: `${homesWord(gap.unreadable)} can't be read` };
   if (t3.lookupFailed) return { tone: "warn", text: "T3 threads not linking" };
-  if (t3.warning) return { tone: "warn", text: "T3 needs a linked capture" };
+  if (t3.warning) {
+    return {
+      tone: "warn",
+      text: t3.reason === "hooks" ? "T3 providers without hooks"
+        : t3.reason === "other" ? "T3 needs a look"
+        : "T3 needs a linked capture",
+    };
+  }
   const harnesses = Object.values(liveness.harnesses ?? {});
   if (harnesses.length === 0 || harnesses.some((h) => h.seen !== true || h.ok !== true)) {
     return { tone: "warn", text: "Recording not checked" };

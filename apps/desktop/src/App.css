@@ -782,6 +782,16 @@ button.id-chip:hover {
   text-align: right;
 }
 
+/* Full health report: a long sentence wraps beside its label; the label keeps
+   room to show (it was squeezed to nothing and the sentence clipped). */
+.row-item[data-health-key] .row-main {
+  flex: 1 0 11rem;
+  white-space: normal;
+}
+.row-item[data-health-key] .row-meta.wrap {
+  overflow-wrap: anywhere;
+}
+
 .edge-arrow {
   flex: none;
   font-family: var(--mono);

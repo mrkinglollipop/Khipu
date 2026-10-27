@@ -57,6 +57,21 @@ function result(id: number, label = `Episode ${id}`) {
 }
 
 describe("App — Recall audit", () => {
+  it("the search box does not capitalise or correct what is typed", async () => {
+    bootstrap((args) => {
+      if (args[0] === "doctor") return doctor();
+      if (args[0] === "status") return status();
+      if (args[0] === "activity") return JSON.stringify({ episode_count: 0, recent: [] });
+      return "{}";
+    });
+    render(<App />);
+    const box = await openRecall();
+    expect(box).toHaveAttribute("autocapitalize", "off");
+    expect(box).toHaveAttribute("autocorrect", "off");
+    expect(box).toHaveAttribute("spellcheck", "false");
+  });
+
+
   it("UI-5 treats failed, malformed, and schema-less search replies as failures", async () => {
     let reply = JSON.stringify({ ok: false, error: "hub refused search" });
     bootstrap((args) => {

@@ -475,9 +475,9 @@ def health(home: Path | None = None) -> dict[str, Any] | None:
         hooks = provider_hooks(inst, home if home is not None else Path.home())
         providers.append({"id": inst["id"], "driver": inst["driver"], "name": inst["name"], "hooks": hooks})
         if hooks == "missing":
-            warnings.append(f"T3 provider {inst['name']} ({inst['driver']}) is missing Khipu hooks; "
-                            "sessions on it get no Khipu routing start block, so a brief for its "
-                            "children must carry `khipu route --brief`.")
+            name, driver = str(inst["name"]), str(inst["driver"])
+            label = name if not driver or name.strip().lower() == driver.strip().lower() else f"{name} ({driver})"
+            warnings.append(f"T3 provider {label} has no Khipu hooks, so sessions on it get no Khipu routing start block")
     return {
         "detected": True,
         "providers": providers,

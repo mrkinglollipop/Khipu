@@ -741,6 +741,18 @@ describe("verifiedLine — live beat vs. no probe", () => {
     expect(result.text).toContain("Verify to time a round trip");
   });
 
+  it("an old timed probe stays green while the hook ran recently, and warns when it did not", () => {
+    const stored = { ok: false, age_seconds: 12 * 86400, harnesses: { codex: { ok: true, stale: true, ts: "2026-10-15T00:00:00Z", age_seconds: 12 * 86400, seconds: 3.1 } } };
+    const live = verifiedLine("codex", undefined, stored, { ok: true, seen: true, captures: 4, last_captured_age_s: 3600 });
+    expect(live.mark).toBe("ok");
+    expect(live.text).toContain("Last timed round trip");
+    expect(live.text).toContain("hook ran");
+    expect(live.text).not.toContain("run Verify");
+    const quiet = verifiedLine("codex", undefined, stored, { ok: true, seen: true, captures: 4, last_captured_age_s: 9 * 86400 });
+    expect(quiet.mark).toBe("warn");
+    expect(quiet.text).toContain("older than a week, run Verify");
+  });
+
   it("keeps 'Not verified on this pack yet' when there is no probe and no beat", () => {
     const result = verifiedLine("claude_code", undefined, null, {
       ok: false,

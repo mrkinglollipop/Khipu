@@ -179,6 +179,72 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
     ],
   },
   {
+    version: "0.4.9",
+    items: [
+      {
+        title: "Faster Embeddings screen and library search",
+        text: "Settings › Embeddings opens in about two seconds instead of twelve with a large library, and adding a library no longer slows everyday search.",
+        short: "Embeddings opens fast; a new library no longer slows search.",
+        target: { kind: "settings", section: "index" },
+      },
+    ],
+  },
+  {
+    version: "0.4.10",
+    items: [
+      {
+        title: "Khipu works across T3 Code",
+        text: "Every Claude account T3 uses is found and set up, captures link to their T3 thread, and a T3 Code card shows whether thread linking works.",
+        short: "T3 accounts found, captures linked to their thread, a T3 Code card.",
+        target: { kind: "harnesses" },
+      },
+    ],
+  },
+  {
+    version: "0.4.11",
+    items: [
+      {
+        title: "Reliability and polish",
+        text: "A failed load now says so, with Retry; Owed shows each commitment in full; every screen holds at the 960 by 600 minimum size; new capture summaries lead with what happened.",
+        short: "Failed loads say so with Retry; Owed shows commitments in full.",
+        target: { kind: "home" },
+      },
+    ],
+  },
+  {
+    version: "0.4.12",
+    items: [
+      {
+        title: "Pick the summariser provider",
+        text: "Settings lets you pick gemini, anthropic, openai, openrouter, claude-cli, codex-cli or local for summaries, with a daily ceiling you can lift for today.",
+        short: "Pick the summariser provider and set its daily ceiling.",
+        target: { kind: "settings", section: "capture" },
+      },
+    ],
+  },
+  {
+    version: "0.4.14",
+    items: [
+      {
+        title: "Plans on Home",
+        text: "Home has one row per account showing its tightest usage window, with a Refresh button; Settings lists every window.",
+        short: "One row per account on Home, with Refresh.",
+        target: { kind: "home" },
+      },
+    ],
+  },
+  {
+    version: "0.4.15",
+    items: [
+      {
+        title: "Routing card on Home",
+        text: "Home shows one row per account with who said so and when, any holds, your note word for word, and the standing rules.",
+        short: "Per-account routing, holds, your note and the rules on Home.",
+        target: { kind: "home" },
+      },
+    ],
+  },
+  {
     // The first version after 0.4.15, so these show whatever the release is
     // numbered.
     version: "0.4.16",

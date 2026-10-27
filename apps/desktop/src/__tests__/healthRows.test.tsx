@@ -5,6 +5,8 @@
 // render (icon per status, the shared attention sentence/action on red, and
 // that it never renders the raw JSON itself — that lives behind App.tsx's
 // nested "Raw report" disclosure, outside this component).
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { healthRows, HealthReportRows } from "../healthRows";
@@ -401,5 +403,35 @@ describe("ledger copy row", () => {
       .find((r) => r.key === "ledger_copy_ok")!;
     expect(row.status).toBe("ok");
     expect(row.detail).toBe("no ledger in the offline copy yet");
+  });
+});
+
+describe("HealthReportRows layout", () => {
+  it("every row's long sentence wraps beside its title, so the title is never squeezed away", () => {
+    const parsed = fixture({
+      outbox_ok: false,
+      outbox: { pending: 0, dead: 59 },
+      embed_coverage_ok: false,
+      embed_coverage: { missing: 58, stale: 11818, pct: 63.1 },
+      routing_delivery_ok: false,
+      routing_delivery: { status: "red", reasons: ["budget-stall"] },
+    });
+    const { items } = buildAttention(parsed);
+    const { container } = render(<HealthReportRows parsed={parsed} attention={items} />);
+    for (const key of ["outbox_ok", "embed_coverage_ok", "routing_delivery_ok"]) {
+      const row = container.querySelector(`[data-health-key="${key}"]`)!;
+      expect(row.querySelector(".row-main")?.textContent, key).toBeTruthy();
+      expect(row.querySelector(".row-meta")?.classList.contains("wrap"), key).toBe(true);
+    }
+    const titles = Array.from(container.querySelectorAll(".row-main")).map((n) => n.textContent);
+    expect(titles).toContain("Queued captures delivered");
+    expect(titles).toContain("Search index complete");
+    expect(titles).toContain("Routing delivery");
+  });
+
+  it("the stylesheet gives a health row's title room and lets its sentence wrap", () => {
+    const css: string = readFileSync(`${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/src/App.css`, "utf8");
+    expect(css).toMatch(/\.row-item\[data-health-key\] \.row-main\s*\{[^}]*flex:\s*1 0 11rem/);
+    expect(css).toMatch(/\.row-meta\.wrap\s*\{[^}]*white-space:\s*normal/);
   });
 });
