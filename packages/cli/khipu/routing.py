@@ -1558,19 +1558,29 @@ class LockBusy(OSError):
     """The routing lock stayed held past this thread's lock budget."""
 
 
+_SAME = object()
+
+
 @contextlib.contextmanager
-def lock_budget(seconds: float | None):
+def lock_budget(seconds: float | None, *, fold=_SAME):
     """Bound how long this thread waits for the routing lock (None: no
     bound). A read that runs out answers from an unsaved fold (``saved:
     false``); a write that runs out is refused as a RouteError, and nothing
     is written. Every caller that must answer in time (MCP tools, ``khipu
-    route wait --timeout``) reads inside one."""
-    before = getattr(_held, "deadline", None)
-    _held.deadline = None if seconds is None else time.monotonic() + max(0.0, seconds)
+    route wait --timeout``) reads inside one. ``fold`` bounds the wait for
+    ``prompt-fold.lock`` apart (``_take_fold_lock``; by default the same
+    bound): the per-prompt child waits for another fold up to its hook's own
+    deadline, since that fold saves the view it then answers from, while
+    its wait for the routing lock stays short."""
+    before = getattr(_held, "deadline", None), getattr(_held, "fold_deadline", None)
+    start = time.monotonic()
+    _held.deadline = None if seconds is None else start + max(0.0, seconds)
+    fold = seconds if fold is _SAME else fold
+    _held.fold_deadline = None if fold is None else start + max(0.0, fold)
     try:
         yield
     finally:
-        _held.deadline = before
+        _held.deadline, _held.fold_deadline = before
 
 
 def _acquire(fd: int) -> None:
@@ -4573,11 +4583,20 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     # The next change the clock alone will cause.
     times: list[datetime] = []
     if pace_samples:
-        # Pace allowances and rolling forecasts change continuously, not only
-        # at reset/freshness deadlines. Views have second-resolution clocks;
-        # keep a pace snapshot for at most that second rather than scheduling
-        # only some of its verdict transitions and hiding the others.
-        times.append(now.replace(microsecond=0) + timedelta(seconds=1))
+        # A cached pace snapshot never outlives a reading going stale or a
+        # reset passing (the October 23 audit: it did, for hours). Those step
+        # changes are scheduled at their own second; the continuous drift of
+        # allowances and rolling forecasts between them is refolded every
+        # ``REFOLD_S``, never every second: a once-a-second refold (170-330 ms
+        # each) held prompt-fold.lock a fifth of the time and made prompts
+        # skip their routing lines (2026-10-27).
+        times.append(now.replace(microsecond=0) + timedelta(seconds=_pace.REFOLD_S))
+        per_day = {(a, w) for (a, w, k, _purpose) in pace_caps if k == "per_day"}
+        for (account, window), group in pace_samples.items():
+            step = _pace.next_change(group, now, window, day=(account, window) in per_day)
+            if step is not None:
+                # Views keep whole seconds: the first whole second past the step.
+                times.append(step.replace(microsecond=0) + timedelta(seconds=1))
     for key in live_proposals.values():
         written = _parse(proposals[key].get("at"))
         if written is not None:
@@ -8242,7 +8261,8 @@ def pace_line_for(entry: dict, now: datetime) -> str | None:
     from khipu import routing_pace
 
     pace = headline_pace(entry)
-    return routing_pace.pace_line(entry["label"], pace, now) if pace else None
+    # The figures the clock moves are worded as of the prompt, not the fold.
+    return routing_pace.pace_line(entry["label"], routing_pace.at(pace, now), now) if pace else None
 
 
 def _pace_of(fact: dict | None) -> float:
@@ -10399,8 +10419,9 @@ def _take_fold_lock(fd: int) -> None:
     recall daemon's poll, a session start's or a reader's) no longer than
     this thread's ``lock_budget`` (with none, until it ends): a fold that
     ends in that time has saved the view, which the waiter then answers as
-    it is. Raises ``FoldBusy`` when it does not end in time."""
-    deadline = getattr(_held, "deadline", None)
+    it is. Raises ``FoldBusy`` when it does not end in time. The bound is
+    the budget's ``fold`` part (``lock_budget``)."""
+    deadline = getattr(_held, "fold_deadline", None)
     if deadline is None:
         fcntl.flock(fd, fcntl.LOCK_EX)
         return
@@ -10757,7 +10778,7 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
 
 
 def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-                on_fold=None, session_id: str | None = None) -> dict:
+                on_fold=None, session_id: str | None = None, fold_wait: float | None = None) -> dict:
     """What the per-prompt hook adds for a conversation whose last-seen
     marker is ``marker`` (``recall_prompt.routing_marker``):
     ``{"kind": "none" | "changes" | "full", "text", "version", "epoch",
@@ -10768,8 +10789,14 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
     read (the caller sends nothing), and raises ``PushUnsaved`` when the
     view changed but could not be saved and the session would get changes:
     its version is still the saved one's, so the version check would say
-    nothing changed (fix round 5)."""
-    with lock_budget(budget / 2):
+    nothing changed (fix round 5). ``fold_wait`` (seconds) is how long it
+    may wait for another fold's ``prompt-fold.lock`` (at least half of
+    ``budget``): that fold saves the view this prompt then answers from, so
+    the per-prompt child waits for it up to its hook's own deadline rather
+    than skip (2026-10-27: a 25 ms wait beside 170-330 ms folds skipped
+    about a fifth of prompts as fold-busy). An answer finished after the
+    hook stopped taking it is still the hook's ``skipped:budget``."""
+    with lock_budget(budget / 2, fold=budget / 2 if fold_wait is None else max(budget / 2, fold_wait)):
         now = now or _now()
         _view_seen.stat = None
         view = _prompt_view(now, on_fold=on_fold)
@@ -10785,7 +10812,7 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
                 out = _pace_push_adjust(out, view, now, session, marker.component)
                 out = _advice_push_adjust(out, view, now, session, marker.component)
                 out = routing_delivery.offer(routing_delivery.plan(out, view, now, cfg, session=session),
-                                             session=session, component=marker.component)
+                                             session=session, component=marker.component, deferred=True)
             return dict(out, _delivery_view=view, _reserved=True)
     return _prompt_text(marker, view, now, cfg, session_id=session_id)
 
@@ -10917,15 +10944,17 @@ def _prompt_text(marker, view, now, cfg, *, session_id=None):
 
 
 def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-                on_fold=None, session_id: str | None = None) -> dict:
-    """Offer a leased batch when the marker carries a hook delivery identity."""
+                on_fold=None, session_id: str | None = None, fold_wait: float | None = None) -> dict:
+    """Offer a leased batch when the marker carries a hook delivery identity.
+    ``fold_wait``: as for ``_prompt_push``."""
     if session_id is not None:
         from khipu.routing_delivery import Marker
 
         marker = Marker(marker or {}, session=session_id, component=getattr(marker, "component", "main"))
     else:
         session_id = getattr(marker, "session", None)
-    out = _prompt_push(marker, budget=budget, now=now, on_fold=on_fold, session_id=session_id)
+    out = _prompt_push(marker, budget=budget, now=now, on_fold=on_fold, session_id=session_id,
+                       fold_wait=fold_wait)
     view = out.pop("_delivery_view")
     session = getattr(marker, "session", None)
     if not session:
@@ -10936,7 +10965,8 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
 
     now = now or _now()
     out = routing_delivery.plan(out, view, now, settings(), session=session)
-    return _replication_push_age(routing_delivery.offer(out, session=session, component=marker.component), now)
+    return _replication_push_age(routing_delivery.offer(out, session=session, component=marker.component,
+                                                        deferred=True), now)
 
 
 def _replication_push_age(out: dict, now=None) -> dict:

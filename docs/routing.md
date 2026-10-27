@@ -699,14 +699,20 @@ clients. Agent components count separately. Child receipts never clear parent
 debt. Each revision records its first owed delivery point and the ceiling of
 characters ahead plus its own characters divided by the available payload
 budget (page framing and the owed tail consume part of the configured cap). Still owed
-at that bound plus `routing_delivery_slack` (2) further delivery points is red. The
+at that bound plus `routing_delivery_slack` (2) further delivery points is red. For a
+hooked conversation a delivery point is an answer the per-prompt hook took (sent, or
+taken and then not sent); an answer it discarded as late, stale or busy is not one, so
+a conversation that sends no prompts never ages its debt. The
 bound belongs to that revision: a replacement revision starts a new age and budget.
 An entity replaced on every delivery point continually restarts this bound;
 health does not accumulate stall age across its successive revisions.
 Two expired leases for the same revision are also red. An acknowledgement past
 its shown receipt is red; old ledgers without receipt proof are unknown.
 
-Other red reasons are more than 1% of today's recorded prompts skipping routing,
+Other red reasons are more than `routing_slow_read_pct` (1%) of today's recorded
+prompts skipping routing for lack of time (`skipped:budget`, `skipped:fold-busy`,
+`skipped:busy`, `skipped:starting`; other skips arrive with a later prompt), one
+conversation skipping routing on 3 or more prompts in a row (`prompt-delay`),
 a cross-Mac caught-up cursor more than 10 minutes behind, a gateway delivered
 projection still behind after `routing_cloud_copy_stale_after` seconds since the
 current local revision's `folded_at`, and a limited lane still
