@@ -97,21 +97,11 @@ class ToolOwedUpdateTest(unittest.TestCase):
 
 
 class ToolForgetTest(unittest.TestCase):
-    def test_gateway_refuses_a_local_capture_and_allows_a_cloud_one(self):
-        cur = _FakeCur(one=("claude_code:f916790e",))
+    def test_gateway_forget_is_authorized_by_the_token(self):
+        # Every gateway forget goes on to forget_everywhere, which authorizes
+        # it against the row's stored origin for this token
+        # (forget.owner_refusal); a Mac's row is refused there.
         with request_context.gateway_request("default"), \
-                mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
-                mock.patch("khipu.forget.forget_everywhere") as m_forget:
-            with self.assertRaises(ValueError) as ctx:
-                srv._tool_forget({"id": 11617})
-        self.assertIn("claude_code", str(ctx.exception))
-        m_forget.assert_not_called()
-
-        # A cloud capture goes on to the forget, which authorizes it against
-        # the row's stored origin for this token (forget.owner_refusal).
-        cur2 = _FakeCur(one=("grokbot:x-intern:pack",))
-        with request_context.gateway_request("default"), \
-                mock.patch("khipu.db.connect", return_value=_FakeConn(cur2)), \
                 mock.patch("khipu.forget.forget_everywhere",
                            return_value={"ok": True, "id": 5, "identity": {"ts": "t"}}) as m_forget:
             out = srv._tool_forget({"id": 5})

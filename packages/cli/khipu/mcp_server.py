@@ -656,9 +656,10 @@ TOOLS: list[dict] = [
             "another live episode also holds is kept. The result says plainly "
             "(message, locations) whether the forget is complete, what was removed, "
             "and what was kept or could not be checked and why. Use it for a capture that was wrong, a test, or something "
-            "that should not have been remembered. Through the HTTPS gateway only "
-            "episodes captured by a cloud harness can be forgotten; local captures "
-            "are forgotten from the Mac that owns them. "
+            "that should not have been remembered. Through the HTTPS gateway a token "
+            "can forget only episodes it captured itself; episodes with no known "
+            "owner, captured on a Mac, or captured by another token are refused "
+            "(forget those from the Mac that owns them). "
             "A ledger id (ledger:<project>#<row id>) removes that ledger row, the "
             "same as `khipu ledger remove`: it leaves every list at once and the "
             "owner can restore it in the app for 30 days."
@@ -801,8 +802,8 @@ TOOLS: list[dict] = [
             "How much of each subscription plan is left, per configured "
             "account (Claude, Codex, Grok, Muse, GLM): plan, windows (name, "
             "used_pct, resets_at), credits, probed_at, ok/error, stale. Read "
-            "from each CLI with the login it already holds; no model call, no "
-            "tokens spent. Answers at once from the cache and refreshes in "
+            "from each CLI with the login it already holds; a refresh may spend "
+            "one tiny model turn per login per 30 minutes. Answers at once from the cache and refreshes in "
             "the background (refreshing: true) when a row is older than "
             "max_age seconds (default 120) or fresh: true; ask again a few "
             "seconds later for the new figures. An account never probed reads "
@@ -949,8 +950,9 @@ TOOLS: list[dict] = [
         "description": (
             "Record the owner's request to add a standing rule, or to change "
             "one when `rule` names its number. The wording is live for every "
-            "conversation immediately, marked with this conversation as the "
-            "requester, and remains pending until the owner confirms it in "
+            "conversation immediately (unless `base` is stale: then it is "
+            "recorded as crossed and never applied), marked with this "
+            "conversation as the requester, and remains pending until the owner confirms it in "
             "Settings -> Routing or with a terminal confirmation. This tool "
             "cannot confirm, retire, dismiss or undo a rule."
         ),
@@ -981,7 +983,8 @@ TOOLS: list[dict] = [
             "Record the owner's priority at his request: the full ordered list "
             "of accounts he wants used first (each by its label or its id, as "
             "khipu_route lists them), with his words for each one's role and an "
-            "optional end. It is live for every conversation at once, marked "
+            "optional end. It is live for every conversation at once (unless `base` is stale: "
+            "then it is recorded as crossed and never applied), marked "
             "with this conversation and unconfirmed, with the priority it "
             "replaced shown beside it, until the owner confirms or undoes it "
             "in Settings -> Routing. Khipu keeps his order as given and never "
@@ -2267,9 +2270,9 @@ class _ToolFailure(ValueError):
 
 
 def _tool_forget(args: dict) -> dict:
-    """Complete forget of one episode (khipu.forget). From the gateway only a
-    cloud harness's own captures may be forgotten: a local episode belongs to
-    the Mac that captured it and is forgotten there."""
+    """Complete forget of one episode (khipu.forget). From the gateway a token
+    may forget only rows stamped with its own origin (forget.owner_refusal): a
+    Mac's or an unowned episode is forgotten on the Mac."""
     args = _validate_tool_args("khipu_forget", args)
     if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
         _ensure_path()
@@ -2284,8 +2287,7 @@ def _tool_forget(args: dict) -> dict:
             raise _ToolFailure(agent_view.project({"ok": False, "error": str(exc), "reason": exc.reason})) from None
     eid = _positive_id(args.get("id"), "id")
     _ensure_path()
-    from khipu.forget import KEPT, LOCAL_HARNESSES, forget_everywhere, plain_summary
-    from khipu.db import connect
+    from khipu.forget import KEPT, forget_everywhere, plain_summary
 
     owner = None
     if _via_https_gateway():
@@ -2294,22 +2296,11 @@ def _tool_forget(args: dict) -> dict:
         label = gateway_label()
         if not label:
             raise ValueError("a gateway forget needs the calling token's label")
-        # The authorization itself is forget_everywhere's, against the row's
-        # server-stamped origin inside the hub transaction; this read only
-        # turns a local capture away with directions before any work starts.
+        # The authorization is forget_everywhere's alone, against the row's
+        # server-stamped origin inside the hub transaction: a session prefix
+        # names a harness, not who wrote the row (a token may capture under
+        # a local harness's prefix).
         owner = f"gateway:{label}"
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT session_id FROM episodes WHERE id = %s", (eid,))
-                row = cur.fetchone()
-        if row is None:
-            raise ValueError(f"no such episode: {eid}")
-        harness = str(row[0] or "").split(":", 1)[0]
-        if harness in LOCAL_HARNESSES:
-            raise ValueError(
-                f"episode {eid} was captured by {harness} on a Mac; forget it there "
-                "(khipu episode forget) — the gateway forgets only cloud captures"
-            )
     from khipu.hub_snapshot import hub_connection_failed
 
     try:

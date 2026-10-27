@@ -277,31 +277,14 @@ class MutationTest(unittest.TestCase):
                 # this token (forget.owner_refusal), so the owner is passed on.
                 forget.assert_called_once_with(7, owner="gateway:cloud")
 
-    def test_forget_rejects_local_gateway_provenance(self):
-        from khipu.forget import LOCAL_HARNESSES
-
-        for sid in (h + ":local" for h in LOCAL_HARNESSES):
-            # Under a token label, so the refusal is the local-harness one,
-            # not the missing-label one.
-            with self.subTest(sid=sid), \
-                    request_context.gateway_request("cloud"), \
-                    mock.patch.object(srv, "_via_https_gateway", return_value=True), \
-                    mock.patch("khipu.db.connect", return_value=_Connection((sid,))), \
-                    mock.patch("khipu.forget.forget_everywhere") as forget:
-                with self.assertRaises(ValueError) as raised:
-                    srv._tool_forget({"id": 7})
-                self.assertIn("on a Mac", str(raised.exception))
-                forget.assert_not_called()
-
-    def test_forget_rejects_grok_build_episode_on_the_gateway(self):
+    def test_gateway_forget_leaves_a_local_harness_prefix_to_the_origin_check(self):
+        # The row's stored origin decides (forget.owner_refusal), not its
+        # session prefix: a token may capture under a local harness's prefix.
         with request_context.gateway_request("cloud"), \
                 mock.patch.object(srv, "_via_https_gateway", return_value=True), \
-                mock.patch("khipu.db.connect", return_value=_Connection(("grok_build:session-1",))), \
-                mock.patch("khipu.forget.forget_everywhere") as forget:
-            with self.assertRaises(ValueError) as raised:
-                srv._tool_forget({"id": 7})
-            self.assertIn("grok_build", str(raised.exception))
-            forget.assert_not_called()
+                mock.patch("khipu.forget.forget_everywhere", return_value={"ok": True, "id": 7}) as forget:
+            srv._tool_forget({"id": 7})
+        forget.assert_called_once_with(7, owner="gateway:cloud")
 
     def test_partial_forget_exposes_diagnostics_as_tool_error(self):
         failed = {"ok": False, "id": 7, "complete": False, "partial": ["outbox"],

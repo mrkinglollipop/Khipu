@@ -4565,23 +4565,44 @@ fn set_khipu_secret_sync(account: String, value: String) -> Result<String, Strin
 /// empty passphrase unless `allow_unencrypted` (the owner's explicit opt-out).
 #[tauri::command]
 async fn join_export(
+    app: AppHandle,
     passphrase: String,
     out_path: String,
     allow_unencrypted: Option<bool>,
 ) -> Result<String, String> {
     spawn_blocking_cli(move || {
-        join_export_sync(passphrase, out_path, allow_unencrypted.unwrap_or(false))
+        join_export_sync(&app, passphrase, out_path, allow_unencrypted.unwrap_or(false))
     })
     .await
 }
 
 fn join_export_sync(
+    app: &AppHandle,
     passphrase: String,
     out_path: String,
     allow_unencrypted: bool,
 ) -> Result<String, String> {
     if out_path.trim().is_empty() {
         return Err("out_path is empty".to_string());
+    }
+    // An unencrypted kit holds the hub credentials in plain text, so the
+    // owner confirms it in a native dialog: a flag from the page alone could
+    // be sent by any script running in the webview.
+    if allow_unencrypted {
+        use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
+        let confirmed = app
+            .dialog()
+            .message(format!(
+                "This join kit is not encrypted. Anyone who gets the file can read your Khipu database password.\n\nSave it to {}?",
+                out_path.trim()
+            ))
+            .title("Save an unencrypted join kit?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom("Save unencrypted".to_string(), "Cancel".to_string()))
+            .blocking_show();
+        if !confirmed {
+            return Err("Unencrypted export cancelled.".to_string());
+        }
     }
     let root = khipu_root()?;
     let py = khipu_python()?;
@@ -4682,7 +4703,8 @@ fn join_advertise_sync(
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
     let (bc_key, bc_val) = khipu_bytecode_env();
-    let tout = timeout.max(60);
+    // The page picks the window; Rust bounds it to the CLI's 10-minute default.
+    let tout = timeout.clamp(60, 600);
     let mut cmd = Command::new(&py);
     cmd.arg("-m")
         .arg("khipu")

@@ -295,7 +295,9 @@ class NotesCursor:
         if c.aborted:
             raise RuntimeError("transaction is aborted")
         sql = " ".join(sql.split())
-        if sql.startswith("SELECT content_hash"):
+        if sql.startswith("SELECT set_config('lock_timeout'"):
+            self.result = []
+        elif sql.startswith("SELECT content_hash"):
             row = c.topics.get(params[0])
             self.result = [(row["content_hash"],)] if row else []
         elif sql.startswith("INSERT INTO topics"):
