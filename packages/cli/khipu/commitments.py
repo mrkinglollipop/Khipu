@@ -921,11 +921,22 @@ def _open_id_for_hash(cur, scope: str | None, content_h: str) -> int | None:
     than a bool so the caller can record the restatement (``last_seen_at`` /
     ``seen_count``) instead of silently dropping it.
     """
+    # Alias-group members share one open-hash scope (Q3 projects).
+    if scope is None:
+        project_sql, project_param = "project IS NOT DISTINCT FROM %s", None
+    else:
+        from khipu.identity import project_group
+
+        group = project_group(cur, scope)
+        if len(group) == 1:
+            project_sql, project_param = "project IS NOT DISTINCT FROM %s", group[0]
+        else:
+            project_sql, project_param = "project = ANY(%s)", group
     cur.execute(
         "SELECT id FROM commitments WHERE status = 'open' AND content_hash = %s "
-        "AND project IS NOT DISTINCT FROM %s "
+        f"AND {project_sql} "
         f"AND {_not_forgotten_clause(cur)} LIMIT 1",
-        (content_h, scope),
+        (content_h, project_param),
     )
     row = cur.fetchone()
     return int(row[0]) if row else None
