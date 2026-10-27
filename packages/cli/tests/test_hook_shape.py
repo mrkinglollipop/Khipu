@@ -153,11 +153,14 @@ def test_a_claude_session_started_inside_codex_stays_claude_by_its_transcript(ho
     assert session_capture.infer_harness(CLAUDE_PAYLOAD, inherited) == "claude_code"
 
 
-def test_a_cursor_launched_job_is_cursor_before_any_claude_test(home):
-    # Cursor exports CURSOR_VERSION and also CLAUDE_PROJECT_DIR; no payload fields.
+def test_cursors_env_alone_never_makes_a_cursor_answer(home):
+    # Cursor exports CURSOR_VERSION and also CLAUDE_PROJECT_DIR to every hook,
+    # the Claude ones it imports included; a real Cursor hook names itself in
+    # its payload. Env alone keeps Claude's envelope (review lead 2).
     env = {"CURSOR_VERSION": "3.26.13", "CLAUDE_PROJECT_DIR": "/work/a"}
-    assert hook_shape.detect({}, env) == ("cursor", "cursor")
-    assert owner_turns.harness_of(env, {}) == "cursor"
+    assert hook_shape.detect({}, env) == ("claude_code", "claude")
+    assert hook_shape.detect({}, {"CURSOR_VERSION": "3.26.13"}) == ("cursor", "claude")
+    assert hook_shape.detect(CURSOR_PAYLOADS["stop"], env) == ("cursor", "cursor")
     # A Codex job started from Cursor's shell is Codex.
     assert hook_shape.detect({}, dict(env, CODEX_THREAD_ID="cx-1")) == ("codex", "claude")
 

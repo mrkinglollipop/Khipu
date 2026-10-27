@@ -17,11 +17,17 @@ Order, strongest first:
    ``workspacePaths`` or ``artifactDirectoryPath``.
 3. The transcript path (``/.cursor/``, a Claude home, ``/.codex/``,
    an Antigravity app data dir).
-4. Environment markers, the harness-specific ones first: Codex
-   (``CODEX_THREAD_ID``, ``CODEX_HOME``, ``CODEX_SANDBOX``), then Cursor
-   (``CURSOR_VERSION``, and Cursor also sets ``CLAUDE_PROJECT_DIR``), and
-   Claude's last, because a Codex, Cursor or Grok job started from inside a
-   Claude session inherits ``CLAUDECODE`` and the rest.
+4. A running session's own environment: Codex's ``CODEX_THREAD_ID`` (a Codex
+   job started from a Claude session inherits ``CLAUDECODE`` but has its own
+   thread), then Claude Code's ``CLAUDECODE`` / ``CLAUDE_CODE_ENTRYPOINT`` /
+   ``CLAUDE_CODE_SESSION_ID``.
+5. Configuration that is merely inherited or set globally, weakest last:
+   ``CODEX_HOME`` / ``CODEX_SANDBOX``, then ``CLAUDE_PROJECT_DIR``, then
+   ``CURSOR_VERSION``. Many shells export ``CODEX_HOME`` for good, and Cursor
+   exports ``CURSOR_VERSION`` to every hook, the Claude ones it imports
+   included: neither may turn a running Claude Code turn into another
+   harness, or a Claude answer into Cursor's flat shape (Claude Code drops
+   ``additional_context``). A real Cursor hook names itself in its payload.
 """
 from __future__ import annotations
 
@@ -44,8 +50,13 @@ SHAPES = (CLAUDE, CURSOR, ANTIGRAVITY)
 _CONTEXT_MOST = 10_000
 BUDGETS = {CLAUDE: _CONTEXT_MOST - 200, CURSOR: _CONTEXT_MOST - 200, ANTIGRAVITY: _CONTEXT_MOST - 200}
 
-_CODEX_ENV = ("CODEX_THREAD_ID", "CODEX_HOME", "CODEX_SANDBOX")
-_CLAUDE_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PROJECT_DIR")
+_CODEX_CONFIG_ENV = ("CODEX_HOME", "CODEX_SANDBOX")
+_CLAUDE_RUNNING_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID")
+# The environment detect() reads, which the recall client forwards with each
+# request so the recall service judges the hook's identity, not its own.
+IDENTITY_ENV = ("KHIPU_HARNESS", "GROK_HOOK_NAME", "GROK_HOOK_EVENT", "CODEX_THREAD_ID", *_CLAUDE_RUNNING_ENV,
+                *_CODEX_CONFIG_ENV, "CLAUDE_PROJECT_DIR", "CURSOR_VERSION",
+                "CURSOR_PROJECT_DIR")
 
 
 def budget(shape: str) -> int:
@@ -151,12 +162,18 @@ def detect(payload: dict, env: Any = None) -> tuple[str, str]:
         return "codex", CLAUDE
     if _in_claude_home(tp, env):
         return "claude_code", CLAUDE
-    if any(env.get(k) for k in _CODEX_ENV):
+    if env.get("CODEX_THREAD_ID"):
         return "codex", CLAUDE
-    if env.get("CURSOR_VERSION"):
-        return CURSOR, CURSOR
-    if any(env.get(k) for k in _CLAUDE_ENV):
+    if any(env.get(k) for k in _CLAUDE_RUNNING_ENV):
         return "claude_code", CLAUDE
+    if any(env.get(k) for k in _CODEX_CONFIG_ENV):
+        return "codex", CLAUDE
+    if env.get("CLAUDE_PROJECT_DIR"):
+        return "claude_code", CLAUDE
+    if env.get("CURSOR_VERSION"):
+        # Cursor's env with no Cursor payload key: a hook Cursor runs from the
+        # Claude settings it imports, which answers in Claude's shape.
+        return CURSOR, CLAUDE
     return "unknown", CLAUDE
 
 
@@ -235,6 +252,33 @@ def reshape(out: dict, shape: str) -> dict:
 # ---- single flight -----------------------------------------------------------
 
 SINGLE_FLIGHT_S = 60.0
+# Cursor starts its own entry and the Claude entry it imports together (all
+# matching hooks run at once), so the pair window is short: two real sessions
+# opening in one folder seconds apart are both served.
+CURSOR_PAIR_S = 15.0
+
+
+def single_flight(payload: dict, env: Any, event: str, discriminator: str = "") -> bool:
+    """Whether this run should answer, or is the second of a duplicate pair.
+
+    Inside a Cursor hook (``CURSOR_VERSION`` set by Cursor's executor, and no
+    running Claude Code session, which sets ``CLAUDECODE``), Cursor's own entry
+    and the Claude entry it imports carry different payloads and session ids
+    (Cursor's conversation id, Claude's uuid), so the pair is keyed on what
+    both share: Cursor's project folder, the event and ``discriminator`` (a
+    prompt's hash). Elsewhere a Cursor- or Antigravity-shaped call is keyed on
+    its own session; Claude and Codex are never held. Fail-open."""
+    env = os.environ if env is None else env
+    payload = payload if isinstance(payload, dict) else {}
+    if env.get("CURSOR_VERSION") and not any(env.get(k) for k in _CLAUDE_RUNNING_ENV):
+        folder = str(env.get("CURSOR_PROJECT_DIR") or workspace(payload) or "")
+        if folder:
+            return claim("cursor-pair", folder, event, discriminator, ttl=CURSOR_PAIR_S)
+    harness, shape = detect(payload, env)
+    session = session_id(payload)
+    if shape == CLAUDE or not session:
+        return True
+    return claim(harness, session, event, discriminator)
 
 
 def claim(harness: str, session: str, event: str, discriminator: str = "", *,

@@ -46,8 +46,10 @@ PAYLOAD=$(cat)
 # Antigravity's PreInvocation fires before every model call and carries no
 # prompt: the owner-turn script reads the newest USER_INPUT from the
 # transcript and lets only the first call of each user turn through (it prints
-# nothing for any other payload, "{}" for a turn already handled, and the
-# payload with its prompt filled in for a new one).
+# nothing for any other payload, a turn not yet flushed to the transcript
+# included, so that call goes on and a later one can still record the turn;
+# "{}" only for a turn already handled; the payload with its prompt filled in
+# for a new one).
 case "$PAYLOAD" in
   *'"conversationId"'*)
     if [ -f "$SELF_DIR/khipu-owner-turn.py" ]; then

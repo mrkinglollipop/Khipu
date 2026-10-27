@@ -902,6 +902,10 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
 _AG_TAIL = 4 << 20
 _AG_WRAP = re.compile(r"^\s*<USER_REQUEST>(.*)</USER_REQUEST>\s*$", re.S)
 _AG_MARKER_KEEP_S = 3 * 24 * 3600
+# PreInvocation can fire before the USER_INPUT step reaches the transcript;
+# the gate re-reads briefly (well inside the hook's 3 s timeout).
+_AG_FLUSH_WAIT_S = 0.4
+_AG_FLUSH_POLL_S = 0.05
 
 
 def _ag_text(content) -> str:
@@ -953,15 +957,26 @@ def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     return None
 
 
-def antigravity_turn(payload: dict, now: float | None = None) -> dict | None:
+def _ag_flush_wait() -> float:
+    try:
+        return max(0.0, min(2.0, float(os.environ.get("KHIPU_AG_FLUSH_WAIT_S", _AG_FLUSH_WAIT_S))))
+    except ValueError:
+        return _AG_FLUSH_WAIT_S
+
+
+def antigravity_turn(payload: dict, now: float | None = None, wait: float | None = None) -> dict | None:
     """What the prompt hook does with one Antigravity PreInvocation payload.
 
     None: not for this function (another harness, or it already names a
-    prompt), so the payload goes on unchanged. ``{}``: this user turn was
-    already handled (or there is no turn), so the hook prints ``{}`` and
-    records nothing. Otherwise the payload with ``prompt`` (and ``cwd``)
-    filled in from the transcript, for the first model call of a new turn.
-    Never raises."""
+    prompt), or no user turn could be read yet, so the payload goes on
+    unchanged and no marker is written: a PreInvocation that fires before
+    Antigravity flushes the USER_INPUT step never ends the hook, and a later
+    call of the same turn can still record it. ``{}``: this user turn was
+    already handled (its once-per-turn marker exists), so the hook prints
+    ``{}``. Otherwise the payload with ``prompt`` (and ``cwd``) filled in
+    from the transcript, for the first model call of a new turn. Before
+    giving up on an unflushed transcript it re-reads for up to ``wait``
+    seconds (``KHIPU_AG_FLUSH_WAIT_S``, default 0.4). Never raises."""
     try:
         if not isinstance(payload, dict) or hook_shape.detect(payload, os.environ)[0] != "antigravity":
             return None
@@ -972,14 +987,19 @@ def antigravity_turn(payload: dict, now: float | None = None) -> dict | None:
             return None
         found = None
         tp = hook_shape.transcript_path(payload)
+        last = payload.get("lastUserInput") or payload.get("last_user_input")
+        has_last = isinstance(last, str) and bool(last.strip())
         if tp:
             found = _ag_last_user_input(tp)
+            if found is None and not has_last:
+                give_up = time.monotonic() + (_ag_flush_wait() if wait is None else max(0.0, wait))
+                while found is None and time.monotonic() < give_up:
+                    time.sleep(_AG_FLUSH_POLL_S)
+                    found = _ag_last_user_input(tp)
+        if found is None and has_last:
+            found = ("h-" + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], last.strip())
         if found is None:
-            last = payload.get("lastUserInput") or payload.get("last_user_input")
-            if isinstance(last, str) and last.strip():
-                found = ("h-" + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], last.strip())
-        if found is None:
-            return {}
+            return None
         key, text = found
         directory = folder() / "antigravity"
         directory.mkdir(parents=True, exist_ok=True)
@@ -1012,8 +1032,9 @@ def main(argv: list[str]) -> int:
     Always exits 0.
 
     ``--antigravity-turn`` is the gate in front of it (see ``antigravity_turn``):
-    it prints nothing for a payload to pass on as it is, ``{}`` for a turn
-    already handled, and the payload with its prompt filled in for a new one."""
+    it prints nothing for a payload to pass on as it is (no turn readable yet
+    included), ``{}`` only for a turn already handled, and the payload with
+    its prompt filled in for a new one."""
     import sys
 
     try:

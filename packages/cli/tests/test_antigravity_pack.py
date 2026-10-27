@@ -335,9 +335,9 @@ def test_gate_leaves_other_harnesses_and_prompted_payloads_alone(home, tmp_path)
 
 def test_gate_with_no_user_turn_yet_says_nothing_and_marks_nothing(home, tmp_path):
     tp = _transcript(tmp_path)
-    assert owner_turns.antigravity_turn(_pre(tp)) == {}                                # no transcript file at all
+    assert owner_turns.antigravity_turn(_pre(tp), wait=0) is None                      # no transcript file at all
     _step(tp, "PLANNER_RESPONSE", 1, "hello")
-    assert owner_turns.antigravity_turn(_pre(tp)) == {}
+    assert owner_turns.antigravity_turn(_pre(tp), wait=0) is None
     _step(tp, "USER_INPUT", 2, "late arrival")                                         # appears on a later invocation
     assert owner_turns.antigravity_turn(_pre(tp))["prompt"] == "late arrival"
 

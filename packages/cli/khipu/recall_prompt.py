@@ -476,7 +476,11 @@ def caller_environ(sent) -> Any:
     import collections
 
     ours = {k: v for k, v in sent.items() if k in ROUTING_SWITCHES and isinstance(v, str)}
-    return collections.ChainMap(ours, os.environ)
+    # Who is calling (hook_shape.detect, single_flight) is the hook's, never
+    # this service's: its identity variables come from the request or not at all.
+    env = {k: v for k, v in os.environ.items() if k not in hook_shape.IDENTITY_ENV}
+    env.update((k, v) for k, v in sent.items() if k in hook_shape.IDENTITY_ENV and isinstance(v, str))
+    return collections.ChainMap(ours, env)
 
 
 def _inherited_fds() -> list[int]:
@@ -3573,9 +3577,8 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
     session_id = hook_shape.session_id(payload) or None
     if is_helper_session(cwd):
         return {}  # T3's thread-title helper: no recall, and no log line either
-    if shape != "claude" and session_id and isinstance(prompt, str) and not hook_shape.claim(
-            hook_shape.detect(payload, environ)[0], session_id, "UserPromptSubmit",
-            hashlib.sha256(prompt.encode("utf-8", "replace")).hexdigest()[:16]):
+    if isinstance(prompt, str) and prompt and not hook_shape.single_flight(
+            payload, environ, "UserPromptSubmit", hashlib.sha256(prompt.encode("utf-8", "replace")).hexdigest()[:16]):
         return {}
 
     # Routing (phase 3b) reads in its own process, overlapping the search.

@@ -39,6 +39,11 @@ MAX_ANSWER_BYTES = 8 * 1024 * 1024
 # The hook's routing switches (khipu.recall_prompt.ROUTING_SWITCHES): the
 # service reads them as this hook's, not as its own environment's.
 ROUTING_SWITCHES = ("ROUTING_NOW_OFF", "KHIPU_FEATURE_ROUTING_PUSH")
+# Who is calling (khipu.hook_shape.IDENTITY_ENV): sent too, so the service
+# tells Cursor's duplicate pair apart by the hook's environment, not its own.
+HOOK_IDENTITY = ("KHIPU_HARNESS", "GROK_HOOK_NAME", "GROK_HOOK_EVENT", "CODEX_THREAD_ID", "CLAUDECODE",
+                 "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CODEX_HOME", "CODEX_SANDBOX",
+                 "CLAUDE_PROJECT_DIR", "CURSOR_VERSION", "CURSOR_PROJECT_DIR")
 
 
 def load_wire():
@@ -180,7 +185,7 @@ def main(argv):
         return NO_CONNECTION
     line = None
     try:
-        env = {k: os.environ[k] for k in ROUTING_SWITCHES if k in os.environ}
+        env = {k: os.environ[k] for k in ROUTING_SWITCHES + HOOK_IDENTITY if k in os.environ}
         request = json.dumps({"op": "recall", "raw": raw, "shape": shape,
                               "protocol": 1, "deadline": deadline, "env": env}) + "\n"
         sock.settimeout(max(0.001, deadline - time.monotonic()))

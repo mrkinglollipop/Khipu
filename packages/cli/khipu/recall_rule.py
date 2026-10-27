@@ -883,8 +883,12 @@ def session_start_main(*, shape: str | None = None) -> None:
             print("{}")  # T3's thread-title helper: no recall
             return
         sid = hook_shape.session_id(payload)
-        if detected and want != "claude" and sid and not hook_shape.claim(
-                hook_shape.detect(payload, os.environ)[0], sid, "SessionStart", str(payload.get("source") or "")):
+        # Cursor runs its own entry and the Claude one it imports: the second
+        # of the pair prints {} (the pair shares no session id; see
+        # hook_shape.single_flight). A start source (a resume) is its own call,
+        # except inside that pair, whose two payloads need not agree on it.
+        source = "" if os.environ.get("CURSOR_VERSION") else str(payload.get("source") or "")
+        if detected and not hook_shape.single_flight(payload, os.environ, "SessionStart", source):
             reason = "single_flight"
             print("{}")
             return
