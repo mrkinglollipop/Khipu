@@ -37,7 +37,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-from khipu import t3
+from khipu import hook_shape, t3
 from khipu.turn_text import clean_user_text, is_machine, owner_text
 
 RETENTION_S = 24 * 3600
@@ -152,21 +152,11 @@ def session_file(session: str) -> Path:
 
 
 def harness_of(env: dict, payload: dict) -> str:
-    """The harness running this hook, from its environment (the same signals
-    ``routing.conversation_author`` reads) and the payload's transcript."""
-    named = (env.get("KHIPU_HARNESS") or "").strip().lower()
-    if named:
-        return named
-    if env.get("GROK_HOOK_NAME") or env.get("GROK_HOOK_EVENT"):
-        return "aegis"
-    if env.get("CLAUDECODE") or env.get("CLAUDE_CODE_ENTRYPOINT") or env.get("CLAUDE_CODE_SESSION_ID"):
-        return "claude_code"
-    transcript = str(payload.get("transcript_path") or "")
-    if env.get("CODEX_THREAD_ID") or env.get("CODEX_HOME") or "/.codex/" in transcript:
-        return "codex"
-    if "/.claude" in transcript:
-        return "claude_code"
-    return "unknown"
+    """The harness running this hook (``khipu.hook_shape.detect``): the
+    harness's own signals first (the payload, its transcript path, its own
+    environment markers), an environment it merely inherited last, so a Codex
+    job started from inside a Claude Code session is Codex, not claude_code."""
+    return hook_shape.detect(payload, env)[0]
 
 
 def _codex_originator(transcript: str) -> str | None:
@@ -205,6 +195,11 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         if origin != "codex_exec" and t3.thread_for_session(session):
             return "t3"
         return origin or "unknown"
+    if harness == "cursor":
+        return "t3" if t3.thread_for_session(session) else hook_shape.cursor_entrypoint(payload)
+    if harness == "antigravity":
+        surface = hook_shape.antigravity_entrypoint(payload)
+        return "t3" if surface == "unknown" and t3.thread_for_session(session) else surface
     return "unknown"
 
 
@@ -549,7 +544,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     if not isinstance(payload, dict):
         return None
     conf = settings()
-    session = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
+    session = hook_shape.session_id(payload).strip()
     prompt = payload.get("prompt")
     if not session or not isinstance(prompt, str):
         return None
@@ -841,7 +836,8 @@ def counts(now: float | None = None) -> dict:
     return out
 
 
-_HARNESS_WORDS = {"claude_code": "Claude Code", "codex": "Codex", "aegis": "Aegis"}
+_HARNESS_WORDS = {"claude_code": "Claude Code", "codex": "Codex", "aegis": "Aegis", "cursor": "Cursor",
+                  "antigravity": "Antigravity"}
 
 
 def _prompt_hook_installed() -> list[str]:

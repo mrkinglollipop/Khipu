@@ -46,7 +46,7 @@ import shlex
 import time
 from typing import Any
 
-from khipu import wire
+from khipu import hook_shape, wire
 
 # Claude Code's subagent tool (``Task`` in older versions) and Codex's native
 # one (``spawn_agent``).
@@ -808,7 +808,7 @@ def _agent_tool_use(payload: dict, environ, agent_id: str) -> tuple[dict, dict |
         # per-agent ledger. Its deferred routing comes only through
         # pull delivery on its own Khipu tool calls (slice 7).
         return {}, None, None
-    session_id = payload.get("session_id") or payload.get("sessionId")
+    session_id = hook_shape.session_id(payload) or None
     if not isinstance(session_id, str) or not session_id:
         return {}, None, None
     from khipu import routing
@@ -842,7 +842,7 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
         return {}, None, None
     from khipu import recall_prompt
 
-    session_id = payload.get("session_id") or payload.get("sessionId")
+    session_id = hook_shape.session_id(payload) or None
     routing = recall_prompt._RoutingAtPrompt().begin(session_id, environ, moment="delegation")
     try:
         ctx, info = routing.add_to("", routing.collect())
@@ -895,7 +895,7 @@ def _subagent_start(payload: dict, environ=None) -> tuple[dict, dict | None, str
     identity (slice 7 pull delivery)."""
     from khipu import recall_rule
 
-    session_id = payload.get("session_id") or payload.get("sessionId") or ""
+    session_id = hook_shape.session_id(payload)
     agent_id = payload.get("agent_id") or payload.get("agentId") or ""
     if _is_codex_child(environ, payload):
         # Snapshot only: no per-agent ledger under the parent. The
@@ -1059,7 +1059,7 @@ def note_brief(payload: dict, env) -> None:
             return
         from khipu import owner_turns
 
-        parent = str(payload.get("session_id") or payload.get("sessionId") or "")
+        parent = str(hook_shape.session_id(payload))
         harness = owner_turns.harness_of(env, payload)
         for brief in briefs_of(payload):
             owner_turns.note_brief(brief, parent=parent, harness=harness)
@@ -1077,6 +1077,8 @@ def main() -> None:
     info, kind, out = None, None, {}
     try:
         out, info, kind = hook_main(raw)
+        # The answer is built Claude-shaped; Cursor and Antigravity read their own.
+        out = hook_shape.reshape(out, hook_shape.detect(_payload(raw), os.environ)[1])
     except Exception:  # noqa: BLE001 - the one thing this must never do is fail the call
         out = {}
     delivered = True
@@ -1090,7 +1092,7 @@ def main() -> None:
         from khipu import recall_prompt
 
         routed = recall_prompt._routing_delivered(info, delivered)
-        session = _payload(raw).get("session_id") or "?"
+        session = hook_shape.session_id(_payload(raw)) or "?"
         # Not the per-prompt summary line's shape, so the lane's outcome rate never counts it.
         recall_prompt._log(f"delegation session={session} call={kind.replace(' ', '_')}{routed}")
     except Exception:  # noqa: BLE001

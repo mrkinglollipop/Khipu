@@ -34,9 +34,12 @@ if [ -x "$ROOT/python/bin/python3.11" ]; then
   PY="${KHIPU_PYTHON:-$ROOT/python/bin/python3.11}"
 fi
 [ -x "$PY" ] || PY="python3"
+# The payload names the harness (khipu/hook_shape.py). An older install's --cursor
+# is only a hint, used when the payload names no Cursor or Antigravity.
 SHAPE=claude
+HINT=""
 for a in "$@"; do
-  case "$a" in --cursor) SHAPE=cursor ;; esac
+  case "$a" in --cursor) SHAPE=cursor; HINT="--cursor" ;; esac
 done
 # stdin can be read once, and every path below needs the payload.
 PAYLOAD=$(cat)
@@ -77,5 +80,5 @@ export PYTHONPATH
 PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
 mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null
 export PYTHONPYCACHEPREFIX
-printf '%s' "$PAYLOAD" | "$PY" -c "from khipu.recall_prompt import prompt_recall_main; prompt_recall_main(shape='$SHAPE')" 2>/dev/null || echo '{}'
+printf '%s' "$PAYLOAD" | "$PY" -c "from khipu.recall_prompt import prompt_recall_main; prompt_recall_main(shape=None)" $HINT 2>/dev/null || echo '{}'
 exit 0

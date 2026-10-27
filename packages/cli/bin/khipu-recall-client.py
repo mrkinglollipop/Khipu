@@ -8,7 +8,10 @@ the service is that a prompt no longer pays for a fresh interpreter importing
 the package. The one exception is ``khipu/wire.py``, loaded by file path
 (stdlib only, no package ``__init__``), so what it prints is strict JSON.
 
-Reads the hook payload on stdin. Argument: ``claude`` (default) or ``cursor``.
+Reads the hook payload on stdin. The payload decides the output shape
+(``claude``, ``cursor`` or ``antigravity``, by ``khipu/hook_shape.py`` loaded
+by file path); an argument of ``cursor`` or ``--cursor`` (an older install)
+only counts when the payload names no Cursor or Antigravity.
 
   answer arrives         prints it, exit 0
   immediate failure      exits 3 while a cold attempt still fits the budget
@@ -50,6 +53,33 @@ def load_wire():
             spec.loader.exec_module(module)
             return module
     return None
+
+
+def load_hook_shape():
+    """khipu/hook_shape.py beside this script, as ``load_wire`` finds wire.py;
+    None if missing."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    for rel in (("..", "khipu"), ("..", "packages", "cli", "khipu")):
+        path = os.path.join(here, *rel, "hook_shape.py")
+        if os.path.isfile(path):
+            spec = importlib.util.spec_from_file_location("khipu_hook_shape", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    return None
+
+
+def output_shape(raw, argv):
+    """claude, cursor or antigravity: the payload's, else the argument's."""
+    hinted = "cursor" if any(a in ("cursor", "--cursor") for a in argv[1:]) else "claude"
+    try:
+        payload = json.loads(raw)
+        module = load_hook_shape()
+        if module is not None and isinstance(payload, dict):
+            return module.resolve_shape(payload, os.environ, argv[1:] + (["--cursor"] if hinted == "cursor" else []))
+    except Exception:  # noqa: BLE001 - the argument still decides
+        pass
+    return hinted
 
 
 def hook_stdout(out):
@@ -114,7 +144,7 @@ def as_hook_output(line):
     if isinstance(out, dict) and out.get("ok") is True and isinstance(out.get("output"), dict):
         return out["output"]
     # A populated answer from an older service proves it retrieved context.
-    if isinstance(out, dict) and ("hookSpecificOutput" in out or "additional_context" in out):
+    if isinstance(out, dict) and ("hookSpecificOutput" in out or "additional_context" in out or "injectSteps" in out):
         return out
     return None
 
@@ -137,8 +167,8 @@ def log_failure(raw, reason, started):
 
 
 def main(argv):
-    shape = "cursor" if any(a in ("cursor", "--cursor") for a in argv[1:]) else "claude"
     raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+    shape = output_shape(raw, argv)
     started = time.monotonic()
     deadline = started + ANSWER_TIMEOUT_S
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

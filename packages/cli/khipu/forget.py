@@ -55,7 +55,7 @@ from typing import Any
 
 from khipu.lines import split_lines
 
-LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build")
+LOCAL_HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build", "antigravity")
 
 # What a forget keeps, said plainly in every result. Nothing deletes a
 # forgotten episode's row: there is no purge command and no restore command.

@@ -20,8 +20,12 @@ Shape, same posture as ``recall_rule``'s SessionStart push:
                          discards stdout (recall_rule.py's SessionStart
                          finding applies here too; unverified for this event
                          specifically, but the mechanism is identical).
-  Cursor                no per-prompt hook event exists; Cursor keeps the
-                         pull rule (``.cursor/rules/khipu.mdc``) instead.
+  Cursor                ``beforeSubmitPrompt`` exists and is sent flat
+                         ``additional_context``; whether Cursor passes that
+                         to the model is unproven (slice C), so the pull rule
+                         (``.cursor/rules/khipu.mdc``) stays as the fallback.
+  Antigravity           ``PreInvocation`` ``injectSteps`` (provisional form,
+                         slice H confirms it).
 
 Every step here is fail-open: a bad payload, a slow search, a DB outage, or
 an unexpected exception all print nothing rather than block or corrupt the
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 try:
     import fcntl
 except ImportError:
@@ -48,6 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from khipu import hook_shape
 from khipu import t3 as _t3
 from khipu import wire
 if not hasattr(_t3, 'handoff_thread'):
@@ -3487,7 +3493,7 @@ def _hub_unreachable_error(exc: BaseException) -> bool:
 
 def log_terminal_outcome(raw: str, reason: str, *, ms: float = 0.0) -> None:
     payload = _stdin_payload(raw)
-    session = payload.get("session_id") or payload.get("sessionId") or "?"
+    session = hook_shape.session_id(payload) or "?"
     _log(f"session={session} reason={reason} ms={ms:.1f} hits=[] legs=[] degraded=None")
 
 
@@ -3502,7 +3508,7 @@ def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | 
         if reason:
             result = {**result, "reason": reason, "hits": []}
         payload = _stdin_payload(delivery.get("raw", ""))
-        session = payload.get("session_id") or payload.get("sessionId") or "?"
+        session = hook_shape.session_id(payload) or "?"
         hit_ids = [f"{h.get('kind')}:{h.get('id')}" for h in result["hits"]]
         stage = f" stage={result['stage']}" if result.get("stage") else ""
         stage += " offline=1" if result.get("offline") else ""
@@ -3519,9 +3525,11 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
     """Build the harness-native envelope for one UserPromptSubmit call.
 
     ``shape='claude'`` (default, also used for Codex — same JSON shape):
-    ``hookSpecificOutput.additionalContext``. ``shape='cursor'`` is accepted
-    for symmetry with recall_rule but is never installed for Cursor (no
-    per-prompt event exists there); it emits ``additional_context``.
+    ``hookSpecificOutput.additionalContext``. ``shape='cursor'`` emits flat
+    ``additional_context``; ``shape='antigravity'`` emits ``injectSteps``
+    (``khipu.hook_shape.render``). On those two a second call for the same
+    session and prompt within a minute answers ``{}`` (Cursor runs the Claude
+    entry it imports beside its own).
     ``environ`` is the hook's own environment for routing's switches when it
     is not this process's (the recall daemon: ``caller_environ``), and
     ``routing_forkserver`` the daemon's helper that starts the routing child
@@ -3530,10 +3538,14 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
     payload = _stdin_payload(raw)
     started = time.monotonic()
     prompt = payload.get("prompt") or payload.get("message") or ""
-    cwd = payload.get("cwd") or payload.get("cwd_path")
-    session_id = payload.get("session_id") or payload.get("sessionId")
+    cwd = payload.get("cwd") or payload.get("cwd_path") or hook_shape.workspace(payload) or None
+    session_id = hook_shape.session_id(payload) or None
     if is_helper_session(cwd):
         return {}  # T3's thread-title helper: no recall, and no log line either
+    if shape != "claude" and session_id and isinstance(prompt, str) and not hook_shape.claim(
+            hook_shape.detect(payload, environ)[0], session_id, "UserPromptSubmit",
+            hashlib.sha256(prompt.encode("utf-8", "replace")).hexdigest()[:16]):
+        return {}
 
     # Routing (phase 3b) reads in its own process, overlapping the search.
     routing = _RoutingAtPrompt().begin(session_id, environ, routing_forkserver)
@@ -3564,16 +3576,7 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
             f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
             f"{routed_log}"
         )
-    if shape == "cursor":
-        return {"additional_context": ctx} if ctx else {}
-    if not ctx:
-        return {}
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": ctx,
-        }
-    }
+    return hook_shape.render(shape, "UserPromptSubmit", ctx) if ctx else {}
 
 
 def prompt_recall_main(*, shape: str | None = None) -> None:
@@ -3583,7 +3586,14 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
         raw = wire.read_stdin()
     except Exception:  # noqa: BLE001
         raw = ""
-    want = (shape or ("cursor" if "--cursor" in sys.argv[1:] else "claude")).strip().lower()
+    if shape:
+        want = shape.strip().lower()
+    else:
+        try:
+            payload = json.loads(raw or "{}")
+        except ValueError:
+            payload = {}
+        want = hook_shape.resolve_shape(payload, os.environ, sys.argv[1:])
     delivery: dict[str, Any] = {}
     try:
         deadline = None

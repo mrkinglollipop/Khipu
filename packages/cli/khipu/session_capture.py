@@ -75,6 +75,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from khipu import hook_shape
 from khipu import t3 as _t3
 from khipu import wire
 if not hasattr(_t3, 'cache_thread'):
@@ -86,7 +87,7 @@ from khipu.lines import split_lines
 from khipu.t3 import cache_thread, is_helper_session
 from khipu.turn_text import INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine  # noqa: F401
 
-HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build")
+HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build", "antigravity")
 
 
 def _env_int(new: str, old: str, default: str) -> str:
@@ -204,15 +205,13 @@ def norm_event(name: Any) -> str:
 
 
 def session_id(env: dict) -> str:
-    return str(_get(env, "sessionId", "session_id", "conversation_id", default="") or "")
+    return hook_shape.session_id(env)
 
 
 def session_cwd(env: dict) -> str:
     cwd = _get(env, "cwd", default="")
     if not cwd:
-        roots = _get(env, "workspace_roots", default=None)
-        if isinstance(roots, list) and roots:
-            cwd = roots[0]
+        cwd = hook_shape.workspace(env)
     return str(cwd or "")
 
 
@@ -282,39 +281,11 @@ def capture_origin(env: dict, osenv: dict | None = None, *, harness: str = "", s
 def infer_harness(env: dict, osenv: dict | None = None) -> str:
     """Which harness invoked us. The hook command is identical in every harness
     (the packs re-point drifted entries to one canonical shim path), so the
-    identity has to come from what the harness hands us. Explicit KHIPU_HARNESS
+    identity has to come from what the harness hands us: the payload, then its
+    transcript path, then environment markers, the harness's own before any it
+    could have inherited (``khipu.hook_shape.detect``). Explicit KHIPU_HARNESS
     always wins (the Aegis pack sets it)."""
-    osenv = os.environ if osenv is None else osenv
-    explicit = osenv.get("KHIPU_HARNESS")
-    if explicit:
-        return explicit
-    if osenv.get("GROK_HOOK_NAME") or osenv.get("GROK_HOOK_EVENT"):
-        return "aegis"
-    tp = str(_get(env, "transcriptPath", "transcript_path", default="") or "")
-    if "conversation_id" in env or "workspace_roots" in env or "/.cursor/" in tp:
-        return "cursor"
-    # Path evidence before env-only Codex markers: a Claude session started
-    # inside Codex inherits CODEX_HOME but still writes under a Claude home.
-    if "/.claude/" in tp or _in_claude_home(tp, osenv):
-        return "claude_code"
-    if "/.codex/" in tp or osenv.get("CODEX_HOME") or osenv.get("CODEX_SANDBOX"):
-        return "codex"
-    if osenv.get("CLAUDE_PROJECT_DIR"):
-        return "claude_code"
-    return "unknown"
-
-
-def _in_claude_home(tp: str, osenv: dict) -> bool:
-    """A transcript under ``<home>/projects/`` of any Claude home Khipu finds
-    (CLAUDE_CONFIG_DIR, T3's accounts): ``/.claude/`` only names the default."""
-    if not tp:
-        return False
-    try:
-        from khipu import claude_homes
-
-        return claude_homes.transcript_home(tp, claude_homes.discover(environ=osenv)) is not None
-    except Exception:  # noqa: BLE001 — inference is best-effort, never fatal
-        return False
+    return hook_shape.detect(env, os.environ if osenv is None else osenv)[0]
 
 
 def _current_claude_home() -> Path:
