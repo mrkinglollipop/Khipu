@@ -7464,6 +7464,8 @@ _WINDOW_MINUTES = {"five_hour": 300, "daily": 1440, "weekly": 10080}
 # keep a working Mac's figures well inside it.
 FIGURES_STALE_S = 15 * 60
 RESET_PASSED_WHY = "its reset time passed; figures out of date"
+# How long after a window roll the pre-reset figure stays in the routing block.
+PREV_FIGURE_SHOW_S = 3 * 3600
 
 
 def _window_minutes(window: dict) -> int | None:
@@ -7500,6 +7502,21 @@ def _longest_window(row: dict, now: datetime | None) -> dict | None:
     return best
 
 
+def _prev_figure_fields(row: dict, now: datetime) -> dict:
+    """Pre-reset figure still shown for a few hours after the window rolled."""
+    from khipu import usage
+
+    end = _parse(row.get("prev_window_end"))
+    used = row.get("prev_used_pct")
+    if end is None or isinstance(used, bool) or not isinstance(used, (int, float)):
+        return {}
+    age = (now - end).total_seconds()
+    if not 0 <= age < PREV_FIGURE_SHOW_S:
+        return {}
+    shown = math.floor(min(100.0, max(0.0, float(used))) * 10 + 0.5) / 10
+    return {"prev_used_pct": shown, "prev_window_end": usage._iso(end.timestamp())}
+
+
 def plan_fact(row: dict | None, now: datetime) -> dict:
     """One account's plan figures as facts: ``readable`` with its longest
     window, how much of it is used and left, when it resets and the pace
@@ -7530,7 +7547,16 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
         # The longest window's reset has passed since it was read: it has
         # started again, so its figures are known to be wrong (an account
         # can also reset early; only a new read says where it stands).
-        return {"readable": False, "why": RESET_PASSED_WHY, "reset_passed": True}
+        out = {"readable": False, "why": RESET_PASSED_WHY, "reset_passed": True}
+        # After a post-reset read, ``_merge`` stashes the pre-reset figure;
+        # show it here for a few hours when the new window is not yet in force
+        # (or when a later fold still carries the pair).
+        prev = _prev_figure_fields(row, now)
+        if prev:
+            out.update(prev)
+            out["why"] = (f"{RESET_PASSED_WHY} (was {prev['prev_used_pct']:g}% at "
+                          f"{_clock(_parse(prev['prev_window_end']), now)})")
+        return out
     if window is None:
         return {"readable": False, "why": "its plan reports no window with a reset time ahead"}
     used = min(100.0, max(0.0, float(window["used_pct"])))
@@ -7547,19 +7573,29 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
     fact = {"readable": True, "window": usage._window_words(window), "used_pct": used, "left_pct": left,
             "resets_at": _iso(resets), "seconds": int(seconds), "pace_pct_per_hour": round(pace, 3),
             "hurry": left > 0 and pace >= even * PACE_HURRY, "words": words}
+    fact.update(_prev_figure_fields(row, now))
     figures_at = usage._figures_time(row, window)
     if kept_failure:
         # A provider can return figures older than the probe that fetched them: their own time wins.
         figures_at = _parse(row.get("observed_at")) or _parse(row.get("last_good_at")) or figures_at
-        last_read = "the last read timed out" if error == usage.E_TIMEOUT else "the last read failed"
+        if error == usage.E_TIMEOUT:
+            last_read = "last read failed (timeout)"
+        elif error:
+            last_read = f"last read failed ({error})"
+        else:
+            last_read = "last read failed"
         if figures_at is not None:
-            last_read = f"figures from {_clock(figures_at, now)}; {last_read}"
+            last_read = f"figures from {_clock(figures_at, now)} ({_ago(figures_at, now)}), {last_read}"
         fact.update(stale=True, figures_at=_iso(figures_at) if figures_at else None, pace_pct_per_hour=None,
                     hurry=False, words=last_read)
     elif figures_at is None or (now - figures_at).total_seconds() > FIGURES_STALE_S:
         # Shown as what was read, with its age; never a pace or a verdict.
+        if figures_at is not None:
+            age_words = f"figures from {_clock(figures_at, now)} ({_ago(figures_at, now)}); may be out of date"
+        else:
+            age_words = "figures may be out of date"
         fact.update(stale=True, figures_at=_iso(figures_at) if figures_at else None, pace_pct_per_hour=None,
-                    hurry=False, words="figures may be out of date")
+                    hurry=False, words=age_words)
     return fact
 
 
@@ -7625,31 +7661,49 @@ def _read_when(fact: dict, now: datetime) -> str:
     return f"when read {_ago(at, now)}" if at else "when last read"
 
 
+def _prev_words(fact: dict, now: datetime) -> str:
+    end = _parse(fact.get("prev_window_end"))
+    used = fact.get("prev_used_pct")
+    if end is None or not isinstance(used, (int, float)) or isinstance(used, bool):
+        return ""
+    return f"; was {used:g}% before reset at {_clock(end, now)}"
+
+
 def pace_words(fact: dict, now: datetime) -> str:
     """'88% of its week left, resets Sat 15:00Z (2 d 4 h): about 1.7% an hour
     to use it all; a lot left, little time', or why there is no pace."""
     if not fact.get("readable"):
         return fact.get("why") or "plan figures can't be read"
     resets = _parse(fact["resets_at"])
+    prev = _prev_words(fact, now)
     if fact.get("stale"):
+        detail = fact.get("words") or ""
+        if "last read" in detail:
+            return (f"{fact['left_pct']:g}% of its {fact['window']} left {_read_when(fact, now)}, resets "
+                    f"{_clock(resets, now)} ({_span(fact['seconds'])}); {detail}, so no pace is given{prev}")
         return (f"{fact['left_pct']:g}% of its {fact['window']} left {_read_when(fact, now)}, resets "
                 f"{_clock(resets, now)} ({_span(fact['seconds'])}); these figures may be out of date, so no "
-                "pace is given")
+                f"pace is given{prev}")
     text = (f"{fact['left_pct']:g}% of its {fact['window']} left, resets {_clock(resets, now)} "
             f"({_span(fact['seconds'])})")
     if fact["left_pct"] <= 0:
-        return text + ": nothing left to use until then"
-    return text + f": about {_rate_words(fact['pace_pct_per_hour'])}% an hour to use it all; {fact['words']}"
+        return text + f": nothing left to use until then{prev}"
+    return text + f": about {_rate_words(fact['pace_pct_per_hour'])}% an hour to use it all; {fact['words']}{prev}"
 
 
 def used_words(fact: dict, now: datetime) -> str:
     """'12% of its week used, resets in 2 d 4 h', or why there are no figures."""
     if not fact.get("readable"):
         return fact.get("why") or "plan figures can't be read"
+    prev = _prev_words(fact, now)
     if fact.get("stale"):
+        detail = fact.get("words") or ""
+        if "last read" in detail:
+            return (f"{fact['used_pct']:g}% of its {fact['window']} used {_read_when(fact, now)}; "
+                    f"{detail}; resets in {_span(fact['seconds'])}{prev}")
         return (f"{fact['used_pct']:g}% of its {fact['window']} used {_read_when(fact, now)}, may be out of "
-                f"date; resets in {_span(fact['seconds'])}")
-    return f"{fact['used_pct']:g}% of its {fact['window']} used, resets in {_span(fact['seconds'])}"
+                f"date; resets in {_span(fact['seconds'])}{prev}")
+    return f"{fact['used_pct']:g}% of its {fact['window']} used, resets in {_span(fact['seconds'])}{prev}"
 
 
 def _state_fact(entry: dict, now: datetime, relative: bool) -> str:

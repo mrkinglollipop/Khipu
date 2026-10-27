@@ -246,7 +246,8 @@ def test_an_unchanged_pull_at_50ms_is_under_half_a_second(pg, replica, pg_cluste
     assert hs.refresh()["facts"].get("copied")
     proxy = DelayProxy(pg_cluster.port)
     remote = pg.dsn.replace(f":{pg_cluster.port}/", f":{proxy.port}/")
-    monkeypatch.setattr(hs, "try_hub_connect", lambda **kw: psycopg.Connection.connect(remote, **kw))
+    monkeypatch.setattr(hs, "try_hub_connect", lambda statement_timeout_s=None, **kw: psycopg.Connection.connect(
+        db._with_statement_timeout(remote, statement_timeout_s) if statement_timeout_s else remote, **kw))
     monkeypatch.setattr(hs, "FRESHNESS_OVERLAP_S", 0)
     loads: list = []
     real = hs._held_commitment_vectors
