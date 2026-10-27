@@ -574,14 +574,6 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
             if prior and prior[0] in embedded_ids:
                 rebuild_embedded += 1
         embedded_docs = len(embedded_ids)
-        if (not allow_rebuild and rebuild_embedded > max(
-                MASS_REBUILD_MIN_DOCS, MASS_REBUILD_MAX_FRACTION * embedded_docs)):
-            conn.rollback()
-            raise LibraryError(
-                f"{rebuild_embedded} embedded documents would be rebuilt out of {embedded_docs}; "
-                "their vectors would be deleted; nothing was changed. "
-                f"Run `khipu library scan {name} --allow-rebuild` to proceed"
-            )
         # too_large paths are in ``seen`` (via _iter_files keep=); only
         # traversal_error / unreadable freeze deletions for the whole walk.
         walk_incomplete = bool(
@@ -594,6 +586,17 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
                 f"{src.root!r} has no .txt or .md files but {len(gone)} documents are "
                 "indexed; refusing to delete them all (use `khipu library remove` if the "
                 "folder was emptied on purpose)"
+            )
+        gone_embedded = sum(1 for doc_id in gone if doc_id in embedded_ids)
+        vector_loss = rebuild_embedded + gone_embedded
+        if (not allow_rebuild and vector_loss > max(
+                MASS_REBUILD_MIN_DOCS, MASS_REBUILD_MAX_FRACTION * embedded_docs)):
+            conn.rollback()
+            raise LibraryError(
+                f"{vector_loss} embedded documents would be rebuilt or removed "
+                f"out of {embedded_docs}; "
+                "their vectors would be deleted; nothing was changed. "
+                f"Run `khipu library scan {name} --allow-rebuild` to proceed"
             )
         for rel, decision in plan:
             if decision.startswith("keep"):
@@ -939,7 +942,9 @@ def _decode_vector(raw: Any) -> list[float] | None:
             return None
     else:
         return None
-    return vec if math.isfinite(sum(vec)) else None
+    if not math.isfinite(sum(vec)) or not any(v != 0.0 for v in vec):
+        return None
+    return vec
 
 
 def _infer_provider(model: str) -> str:
@@ -973,9 +978,9 @@ def _resolve_import_profile(cur, model: Any, dims: Any) -> profiles.ProfileSpec:
                 "and pass --profile"
             )
         spec = profiles.validate_spec(pid, provider=provider, model=str(model), dim=int(dims))
+        profiles.add_profile(cur, spec, note="created by khipu library import")
     except ValueError as exc:
         raise LibraryError(str(exc)) from exc
-    profiles.add_profile(cur, spec, note="created by khipu library import")
     return spec
 
 
