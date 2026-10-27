@@ -87,6 +87,13 @@ describe("Telling conversations", () => {
     expect(screen.getByText("No live conversations")).toBeInTheDocument();
   });
 
+  it("says Can't be checked, not 'No live conversations', when a non-empty delivery_rows list is malformed", () => {
+    const view = { ...DELIVERY_VIEW, delivery_rows: [{ harness: "claude_code" }] } as unknown as typeof DELIVERY_VIEW;
+    render(<DeliverySection data={view} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    expect(screen.queryByText("No live conversations")).toBeNull();
+    expect(screen.getByText("Khipu could not read live delivery rows.")).toBeInTheDocument();
+  });
+
   it("does not paint a green owed-0 row as 'No changes owed' while the doctor read failed", () => {
     const view = {
       ...DELIVERY_VIEW,

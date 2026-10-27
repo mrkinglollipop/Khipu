@@ -2704,27 +2704,27 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
 
       <div className="section-body">
         <h2 className="sub-title">Live conversations <span className="meta">{liveLabel}</span></h2>
-        {data?.delivery_rows === null ? (
+        {data?.delivery_rows === null || (Array.isArray(data?.delivery_rows) && data.delivery_rows.length > 0 && !ownerRows) ? (
           <div className="empty">
             <b>Can&apos;t be checked</b>
             <span>Khipu could not read live delivery rows.</span>
           </div>
         ) : ownerRows && ownerRows.length ? (
-            <div className="mrows" role="list" aria-label="Live conversations">
-              {ownerRows.map((row, index) => {
-                const state = healthError
-                  ? { text: "Can't be checked", detail: undefined as string | undefined, tone: undefined as "ok" | "warn" | "err" | undefined }
-                  : identityWords({ identity: "", component: "", status: row.status ?? "unknown", owed: row.owed ?? undefined, reasons: row.reasons, missing: row.missing }, tellingOff);
-                return (
-                  <div key={`owner-delivery-${index}`} className="mrow delivery" role="listitem">
-                    <span><span className="name">{row.label}</span><br /><span className="src">{[deliveryHarnessName(row.harness), deliveryComponentWord(row.component)].filter(Boolean).join(" · ")}</span></span>
-                    <span className="mac-col">{row.mac ?? "This Mac"}</span>
-                    <span className="num">{row.last_prompt_at ? agoSpan(row.last_prompt_at, now) : "Can't be checked"}</span>
-                    <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
-                  </div>
-                );
-              })}
-            </div>
+          <div className="mrows" role="list" aria-label="Live conversations">
+            {ownerRows.map((row, index) => {
+              const state = healthError
+                ? { text: "Can't be checked", detail: undefined as string | undefined, tone: undefined as "ok" | "warn" | "err" | undefined }
+                : identityWords({ identity: "", component: "", status: row.status ?? "unknown", owed: row.owed ?? undefined, reasons: row.reasons, missing: row.missing }, tellingOff);
+              return (
+                <div key={`owner-delivery-${index}`} className="mrow delivery" role="listitem">
+                  <span><span className="name">{row.label}</span><br /><span className="src">{[deliveryHarnessName(row.harness), deliveryComponentWord(row.component)].filter(Boolean).join(" · ")}</span></span>
+                  <span className="mac-col">{row.mac ?? "This Mac"}</span>
+                  <span className="num">{row.last_prompt_at ? agoSpan(row.last_prompt_at, now) : "Can't be checked"}</span>
+                  <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
+                </div>
+              );
+            })}
+          </div>
         ) : Array.isArray(data?.delivery_rows) ? (
           <div className="empty">
             <b>No live conversations</b>
