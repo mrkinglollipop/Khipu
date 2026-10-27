@@ -77,11 +77,18 @@ NOT_CAPTURE = {
     "storage.trim_synth_usage": "the summariser's token counts, rewritten without old lines",
     "hub_reach.note_unreachable": "the hub-unreachable memo: two times and a short error word, no capture text",
     "t3._recent_conversation_use": "opens T3's thread database read-only to inspect its newest message time; writes nothing",
+    # Cursor/Antigravity hooks (docs/plans/2026-10-27-cursor-antigravity-hooks.md).
+    "hook_shape.claim": "an empty single-flight marker named by a hash of harness, session and event; "
+                        "no capture text",
+    "owner_turns.antigravity_turn": "an empty once-per-turn gate marker named by a hash of the session and "
+                                    "the transcript step; no capture text",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
                      # Grok's config.toml, a repo's AGENTS.md recall block, the Aegis [memory] marker.
                      "integrations._aegis_install", "integrations._grok_build_install",
                      "integrations._grok_build_uninstall",
+                     # Antigravity's hooks.json "khipu" key, mcp_config.json entry and rule file.
+                     "integrations._ag_install_base",
                      "integrations._write_toml", "integrations.set_gateway_token",
                      "join._import_kit", "join._restore_file", "join._write_dsn_file",
                      "join.write_kit_file", "join.write_private_file",
@@ -135,7 +142,9 @@ NOT_CAPTURE = {
                      "components_graphify.upgrade_graphify", "graph_backup.scratch_drill",
                      "promote.gate_capture", "integrations._probe_aegis_isolation",
                      "integrations._probe_aegis_refusal", "integrations._probe_extract",
-                     "integrations._probe_hook", "integrations._probe_native_extract"), _TOOLS),
+                     "integrations._probe_hook", "integrations._probe_native_extract",
+                     # A synthetic Antigravity transcript in a throwaway folder (its nested ``turn``).
+                     "integrations._probe_antigravity_prompt", "integrations.turn"), _TOOLS),
     **dict.fromkeys(("hub_snapshot._mark_purged_topic", "hub_snapshot._queue_erasure",
                      "hub_snapshot._write_last_known", "hub_snapshot._write_meta",
                      "hub_snapshot._queue_missed_patch", "hub_snapshot._clear_missed_patches"),

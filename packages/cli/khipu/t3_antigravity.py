@@ -11,11 +11,17 @@ adds three files there, only for a project the owner picks in the app:
   <project>/.agents/mcp_config.json   ``mcpServers.khipu``
   <project>/.agents/rules/khipu.md    the always-on rule, in a file of its own
 
-Hooks written: SessionStart (standalone Antigravity only; T3's runtime has no
-SessionStart), PreInvocation, PostInvocation and Stop. Never PreToolUse or
-PostToolUse: registering PreToolUse makes ``agy`` skip its permission prompt.
-T3's runtime also ignores injected context, so recall and the routing start
-block reach a T3 session through the MCP tools and the rule, not through hooks.
+The files are written by the Antigravity pack in ``khipu.integrations``, the
+installer of record (``integrations install antigravity --project X`` writes
+the same bytes): PreInvocation → ``khipu-prompt-recall``, PostInvocation and
+Stop → ``khipu-stop-hook --event <event>`` (Antigravity's payloads name no
+event). No SessionStart in a workspace file: T3's runtime has none, and a
+standalone Antigravity already gets it from the global file. Never PreToolUse
+or PostToolUse: registering PreToolUse makes ``agy`` skip its permission
+prompt. T3's runtime also ignores injected context, so recall and the routing
+start block reach a T3 session through the MCP tools and the rule, not hooks.
+This module adds the registry, the runtime-version record and T3's
+per-function states on top of that installer.
 
 The folders the owner has added are listed in Khipu's own
 ``~/.config/khipu/t3-antigravity-projects.json``, so doctor can say how many
@@ -33,7 +39,6 @@ from typing import Any
 
 HOOK_NAME = "khipu"
 AGENTS_DIR = ".agents"
-RULE_MARK = "<!-- khipu: managed rule, rewritten by Khipu; remove it from the Khipu app -->"
 REGISTRY_NAME = "t3-antigravity-projects.json"
 
 # The one fact about T3's managed runtime that Khipu's states rest on (read from
@@ -46,17 +51,6 @@ KNOWN_NO_INJECTION_RUNTIMES = frozenset({"1.3.0"})
 RESTART_NOTE = "If Antigravity asks whether to trust this workspace's hooks, choose Trust."
 LOCAL_FILES_NOTE = ("These files point at this Mac's Khipu install: keep them out of version control "
                     "and out of anything you share.")
-
-_ROUTING_RULE = """
-## Routing in this harness
-
-Khipu cannot push its routing start block into this session. Before you start
-or delegate work, call the `khipu_route` tool once and follow its account and
-lane guidance; it is guidance, not a gate. At the start of a session, call
-`khipu_status` with the user's first prompt as `prompt` to get the prior work
-Khipu would otherwise have pushed.
-"""
-
 
 def _home(home: Path | None) -> Path:
     return home if home is not None else Path.home()
@@ -156,23 +150,24 @@ def folder_functions(config_dir: Path) -> dict[str, bool]:
 
 
 def project_status(project: str | Path) -> dict:
+    """Which of Khipu's files a project has, read with the installer's own
+    reader (``integrations.antigravity_project_state``), so status can never
+    disagree with what ``add`` wrote. Never raises: an unreadable file reads
+    as absent."""
+    from khipu import integrations as integ
+
     root = Path(project).expanduser()
-    agents = root / AGENTS_DIR
-    funcs = folder_functions(agents)
-    rule = agents / "rules" / "khipu.md"
-    try:
-        rule_ok = rule.is_file() and RULE_MARK in rule.read_text(encoding="utf-8")
-    except OSError:
-        rule_ok = False
-    events = hook_events(agents / "hooks.json")
+    state = integ.antigravity_project_state(str(root))
+    events = set(state["events"])
+    capture = {"PostInvocation", "Stop"} <= events
     return {
         "project": str(root),
         "exists": root.is_dir(),
-        "capture": funcs["capture"],
-        "mcp": funcs["mcp"],
-        "rule": rule_ok,
-        "prompt_hook": "khipu-prompt-recall" in events.get("PreInvocation", []),
-        "installed": funcs["capture"] and funcs["mcp"] and rule_ok,
+        "capture": capture,
+        "mcp": state["mcp"],
+        "rule": state["rule"],
+        "prompt_hook": "PreInvocation" in events,
+        "installed": capture and state["mcp"] and state["rule"] and "PreInvocation" in events,
     }
 
 
@@ -224,35 +219,6 @@ def _stamp_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _refuse_private(root: Path, home: Path) -> str | None:
-    """Khipu never writes T3's private state or another harness's home."""
-    resolved = root.resolve()
-    for private in (home / ".t3", home / ".gemini", home / ".cursor", home / ".claude", home / ".codex"):
-        base = private.resolve()
-        if resolved == base or base in resolved.parents:
-            return f"{root} is inside {private}, which is not a project; pick a project folder"
-    return None
-
-
-def _rule_text() -> str:
-    from khipu.recall_rule import RULE_MD
-
-    return f"---\ntrigger: always_on\n---\n\n{RULE_MARK}\n\n{RULE_MD.strip()}\n{_ROUTING_RULE}"
-
-
-def _hook_set(integ) -> dict:
-    def handler(command: str, timeout: int) -> dict:
-        return {"type": "command", "command": command, "timeout": timeout}
-
-    return {
-        "enabled": True,
-        "SessionStart": [handler(integ.recall_hook(), integ.CURSOR_RECALL_TIMEOUT)],
-        "PreInvocation": [handler(integ.prompt_recall_hook(), integ.PROMPT_RECALL_TIMEOUT)],
-        "PostInvocation": [handler(integ.queue_only_stop_hook(), 20)],
-        "Stop": [handler(integ.stop_hook(), 20)],
-    }
-
-
 def _record(home: Path | None, project: Path, version: str | None, *, remove: bool = False) -> None:
     from khipu import integrations as integ
 
@@ -270,118 +236,46 @@ def _record(home: Path | None, project: Path, version: str | None, *, remove: bo
     integ._write_json(path, data)
 
 
+def _result(out: dict, root: Path) -> dict:
+    out = dict(out, harness="antigravity-t3", project=str(root))
+    out.setdefault("ok", True)
+    out.pop("detected", None)
+    out.pop("project_only", None)
+    return out
+
+
 def install_project(project: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
-    """Add Khipu to one project's ``.agents`` folder. Re-running is a no-op."""
+    """Add Khipu to one project's ``.agents`` folder through the Antigravity
+    pack (its refusals: not a folder, a harness home or T3's private state, a
+    foreign ``"khipu"`` hook set, MCP entry or rule file), then record the
+    project and the runtime version. Re-running is a no-op."""
     from khipu import integrations as integ
 
     home = _home(home)
     root = Path(project).expanduser()
-    out: dict[str, Any] = {"harness": "antigravity-t3", "project": str(root), "changes": [], "ok": True}
-    if not root.is_dir():
-        return dict(out, ok=False, error=f"{root} is not a folder")
-    refused = _refuse_private(root, home)
-    if refused:
-        return dict(out, ok=False, error=refused)
-    agents = root / AGENTS_DIR
-    with integ._installing(dry=dry_run):
-        want_hooks = _hook_set(integ)
-        want_mcp = {"command": integ.mcp_launcher()}
-    want_rule = _rule_text()
-
-    hooks_file, mcp_file, rule_file = agents / "hooks.json", agents / "mcp_config.json", agents / "rules" / "khipu.md"
-    hooks = integ._load_json(hooks_file)
-    if hooks.get(HOOK_NAME) != want_hooks:
-        out["changes"].append(f"{hooks_file}: set the {HOOK_NAME!r} hook set")
-        if not dry_run:
-            _keep_backup(out, integ, hooks_file)
-            hooks[HOOK_NAME] = want_hooks
-            integ._write_json(hooks_file, hooks)
-    mcp = integ._load_json(mcp_file)
-    if (mcp.get("mcpServers") or {}).get("khipu") != want_mcp:
-        out["changes"].append(f"{mcp_file}: mcpServers.khipu -> {want_mcp['command']}")
-        if not dry_run:
-            _keep_backup(out, integ, mcp_file)
-            mcp.setdefault("mcpServers", {})["khipu"] = want_mcp
-            integ._write_json(mcp_file, mcp)
-    current = rule_file.read_text(encoding="utf-8") if rule_file.is_file() else None
-    if current != want_rule:
-        out["changes"].append(f"{rule_file}: write the always-on rule")
-        if not dry_run:
-            if current is not None:
-                _keep_backup(out, integ, rule_file)
-            rule_file.parent.mkdir(parents=True, exist_ok=True)
-            rule_file.write_text(want_rule, encoding="utf-8")
-    if not dry_run:
+    out = _result(integ.antigravity_project_install(str(root), dry_run=dry_run, home=home), root)
+    if out["ok"] and not dry_run:
         _record(home, root, runtime_version(home))
         out["status"] = project_status(root)
-    out["notes"] = [RESTART_NOTE, LOCAL_FILES_NOTE]
+    if out["ok"]:
+        out["notes"] = [RESTART_NOTE, LOCAL_FILES_NOTE]
     return out
 
 
 def uninstall_project(project: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
     """Take Khipu out of one project. Other hook sets, other MCP servers and a
-    rule file Khipu did not write are left exactly as they are."""
+    rule file Khipu did not write are left exactly as they are; a file or
+    folder left holding nothing is removed."""
     from khipu import integrations as integ
 
     home = _home(home)
     root = Path(project).expanduser()
-    out: dict[str, Any] = {"harness": "antigravity-t3", "project": str(root), "changes": [], "ok": True}
-    agents = root / AGENTS_DIR
-    hooks_file, mcp_file, rule_file = agents / "hooks.json", agents / "mcp_config.json", agents / "rules" / "khipu.md"
-
-    hooks = integ._load_json(hooks_file)
-    if HOOK_NAME in hooks:
-        out["changes"].append(f"{hooks_file}: remove the {HOOK_NAME!r} hook set")
-        if not dry_run:
-            _keep_backup(out, integ, hooks_file)
-            hooks.pop(HOOK_NAME)
-            _write_or_drop(integ, hooks_file, hooks)
-    mcp = integ._load_json(mcp_file)
-    if "khipu" in (mcp.get("mcpServers") or {}):
-        out["changes"].append(f"{mcp_file}: remove mcpServers.khipu")
-        if not dry_run:
-            _keep_backup(out, integ, mcp_file)
-            mcp["mcpServers"].pop("khipu")
-            if not mcp["mcpServers"]:
-                mcp.pop("mcpServers")
-            _write_or_drop(integ, mcp_file, mcp)
-    try:
-        ours = rule_file.is_file() and RULE_MARK in rule_file.read_text(encoding="utf-8")
-    except OSError:
-        ours = False
-    if ours:
-        out["changes"].append(f"{rule_file}: remove the always-on rule")
-        if not dry_run:
-            _keep_backup(out, integ, rule_file)
-            rule_file.unlink()
-            for folder in (rule_file.parent, agents):
-                try:
-                    folder.rmdir()
-                except OSError:
-                    break
-    if not dry_run:
+    out = _result(integ.antigravity_project_uninstall(str(root), dry_run=dry_run, home=home), root)
+    out.pop("note", None)
+    if out["ok"] and not dry_run:
         _record(home, root, None, remove=True)
         out["status"] = project_status(root)
     return out
-
-
-def _keep_backup(out: dict, integ, path: Path) -> None:
-    backup = integ._backup(path)
-    if backup:
-        out.setdefault("backups", []).append(backup)
-
-
-def _write_or_drop(integ, path: Path, data: dict) -> None:
-    """An emptied file Khipu created goes (its backup keeps the old bytes); a
-    file with anything else in it is rewritten without Khipu's part."""
-    if data:
-        integ._write_json(path, data)
-    else:
-        path.unlink(missing_ok=True)
-        try:
-            path.parent.rmdir()
-        except OSError:
-            pass
 
 
 def projects_report(home: Path | None = None) -> dict:

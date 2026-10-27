@@ -244,15 +244,18 @@ def test_install_writes_the_three_files_and_never_pre_or_post_tool_use(home):
     hooks = json.loads((project / ".agents" / "hooks.json").read_text())
     assert set(hooks) == {"khipu"} and hooks["khipu"]["enabled"] is True
     events = {k for k in hooks["khipu"] if k != "enabled"}
-    assert events == {"SessionStart", "PreInvocation", "PostInvocation", "Stop"}
+    # The workspace set: no SessionStart (T3's runtime has none; standalone
+    # Antigravity gets it from the global file), never a tool event.
+    assert events == {"PreInvocation", "PostInvocation", "Stop"}
     assert "PreToolUse" not in hooks["khipu"] and "PostToolUse" not in hooks["khipu"]
     for event in events:
         for handler in hooks["khipu"][event]:
             assert handler["type"] == "command" and t3._khipu_hook_name(handler["command"])
-    assert "env KHIPU_CAPTURE_QUEUE_ONLY=1" in hooks["khipu"]["PostInvocation"][0]["command"]
+    for event in ("PostInvocation", "Stop"):
+        assert hooks["khipu"][event][0]["command"].endswith(f"khipu-stop-hook --event {event}")
     assert json.loads((project / ".agents" / "mcp_config.json").read_text())["mcpServers"]["khipu"]["command"]
     rule = (project / ".agents" / "rules" / "khipu.md").read_text()
-    assert rule.startswith("---\ntrigger: always_on\n---") and "khipu_route" in rule
+    assert rule.startswith("---\n") and "trigger: always_on\n---" in rule and "khipu_route" in rule
     assert len(rule.encode()) < 24_000  # Antigravity truncates larger rule files
     registry = json.loads(ag.registry_path(home).read_text())
     assert list(registry["projects"]) == [str(project.resolve())]
@@ -292,13 +295,12 @@ def test_install_and_uninstall_leave_foreign_content_byte_identical(home):
     assert ag.registered_projects(home) == []
 
 
-def test_uninstall_removes_files_khipu_created_and_keeps_only_backups(home):
+def test_uninstall_removes_files_khipu_created_and_leaves_no_backups_in_the_repo(home):
     project = home / "proj"
     project.mkdir()
     ag.install_project(str(project), home=home)
     ag.uninstall_project(str(project), home=home)
-    left = sorted(p.name for p in (project / ".agents").rglob("*") if p.is_file())
-    assert left and all(".bak-khipu-" in name for name in left)
+    assert not (project / ".agents").exists()
 
 
 def test_uninstall_leaves_a_rule_file_khipu_did_not_write(home):
@@ -318,6 +320,7 @@ def test_install_refuses_t3s_private_state_and_other_harness_homes(home):
         before = _tree(home)
         out = ag.install_project(str(private), home=home)
         assert out["ok"] is False and "not a project" in out["error"]
+        assert integ.install("antigravity", project=str(private))["ok"] is False
         assert _tree(home) == before
     assert ag.install_project(str(home / "nope"), home=home)["ok"] is False
 
@@ -402,3 +405,29 @@ def test_claude_codex_and_unknown_drivers_keep_their_single_word(home):
     assert providers["grok"]["hooks"] == "missing" and "functions" not in providers["grok"]
     assert _warnings(out) == ["T3 provider Grok Build (grokBuild) has no Khipu hooks, "
                                "so sessions on it get no Khipu routing start block"]
+
+
+# ---- one writer: the Antigravity pack and `khipu t3 antigravity` agree ----------
+
+
+def test_t3_add_and_pack_project_install_write_the_same_bytes(home):
+    via_t3, via_pack = home / "a", home / "b"
+    via_t3.mkdir()
+    via_pack.mkdir()
+    assert ag.install_project(str(via_t3), home=home)["ok"]
+    # No ~/.gemini here, so the pack writes the project files only, as t3 does.
+    assert integ.install("antigravity", project=str(via_pack)).get("ok", True)
+    assert _tree(via_t3) == _tree(via_pack)
+    assert integ.status("antigravity", project=str(via_t3))["project"]["installed"] is True
+    assert ag.project_status(via_pack)["installed"] is True
+
+
+def test_t3_add_refuses_a_foreign_khipu_hook_set(home):
+    project = home / "proj"
+    (project / ".agents").mkdir(parents=True)
+    foreign = {"khipu": {"enabled": True, "Stop": [{"type": "command", "command": "someone-elses-hook"}]}}
+    (project / ".agents" / "hooks.json").write_text(json.dumps(foreign), encoding="utf-8")
+    out = ag.install_project(str(project), home=home)
+    assert out["ok"] is False and "does not own" in out["error"]
+    assert json.loads((project / ".agents" / "hooks.json").read_text()) == foreign
+    assert ag.registered_projects(home) == []

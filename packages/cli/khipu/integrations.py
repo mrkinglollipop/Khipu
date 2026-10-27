@@ -1292,6 +1292,28 @@ def _ag_project_base(project: str | None) -> Path | None:
     return Path(project).expanduser() / ".agents" if project else None
 
 
+# A "project" inside one of these is a harness home or T3's private state, never
+# a workspace: writing .agents/ there would edit state Khipu must not touch
+# (T3's Antigravity profile above all, decision 6.1).
+_AG_PRIVATE_HOMES = (".t3", ".gemini", ".cursor", ".claude", ".codex")
+
+
+def _ag_refuse_project(project: str, home: Path | None = None) -> str | None:
+    """Why ``project`` may not take Khipu's ``.agents`` files, or None. The one
+    check every writer of those files runs (``integrations install antigravity
+    --project`` and ``khipu t3 antigravity add`` alike)."""
+    root = Path(project).expanduser()
+    if not root.is_dir():
+        return f"{root} is not a folder; antigravity --project must point to an existing folder"
+    base_home = home if home is not None else HOME
+    resolved = root.resolve()
+    for name in _AG_PRIVATE_HOMES:
+        private = (base_home / name).resolve()
+        if resolved == private or private in resolved.parents:
+            return f"{root} is inside {base_home / name}, which is not a project; pick a project folder"
+    return None
+
+
 def _ag_handler(event: str) -> dict:
     if event == "SessionStart":
         return {"type": "command", "command": recall_hook(), "timeout": ANTIGRAVITY_RECALL_TIMEOUT}
@@ -1419,32 +1441,50 @@ def _ag_install_base(base: Path, events: tuple[str, ...], dry: bool, out: dict) 
     if hooks.get(ANTIGRAVITY_HOOK_KEY) != want_entry:
         out["changes"].append(f"{paths['hooks']}: {ANTIGRAVITY_HOOK_KEY} -> {', '.join(events)}")
         if not dry:
-            out.setdefault("backups", []).append(_backup(paths["hooks"]))
+            _ag_keep_backup(out, paths["hooks"])
             hooks[ANTIGRAVITY_HOOK_KEY] = want_entry
             _write_json(paths["hooks"], hooks)
     want_mcp = {"command": mcp_launcher()}
     if current != want_mcp:
         out["changes"].append(f"{paths['mcp']}: mcpServers.khipu -> {want_mcp['command']}")
         if not dry:
-            out.setdefault("backups", []).append(_backup(paths["mcp"]))
+            _ag_keep_backup(out, paths["mcp"])
             mcp.setdefault("mcpServers", {})["khipu"] = want_mcp
             _write_json(paths["mcp"], mcp)
     want_rule = antigravity_rule()
     if not paths["rule"].is_file() or paths["rule"].read_text(encoding="utf-8") != want_rule:
         out["changes"].append(f"{paths['rule']}: write always-on rule")
         if not dry:
-            if paths["rule"].is_file():
-                out.setdefault("backups", []).append(_backup(paths["rule"]))
+            _ag_keep_backup(out, paths["rule"])
             paths["rule"].parent.mkdir(parents=True, exist_ok=True)
             paths["rule"].write_text(want_rule, encoding="utf-8")
     return True
 
 
-def _antigravity_install(dry: bool, project: str | None = None) -> dict:
+def _ag_keep_backup(out: dict, path: Path) -> None:
+    backup = _backup(path)
+    if backup:
+        out.setdefault("backups", []).append(backup)
+
+
+def _antigravity_install(dry: bool, project: str | None = None, project_only: bool = False,
+                         home: Path | None = None) -> dict:
+    """The installer of record for every Antigravity file Khipu writes: the
+    global ``~/.gemini/config`` set and a project's ``.agents`` set.
+    ``project_only`` (``khipu t3 antigravity add``) writes the project files
+    and nothing global, the same bytes either way."""
     out: dict[str, Any] = {"harness": "antigravity", "detected": _antigravity_detected(), "changes": []}
     pbase = _ag_project_base(project)
-    if pbase is not None and not pbase.parent.is_dir():
-        out.update(ok=False, error="antigravity --project must point to an existing folder")
+    if pbase is not None:
+        refused = _ag_refuse_project(project, home)
+        if refused:
+            out.update(ok=False, error=refused)
+            return out
+    if project_only:
+        if pbase is None:
+            out.update(ok=False, error="project_only needs a project")
+            return out
+        _ag_install_base(pbase, _AG_PROJECT_EVENTS, dry, out)
         return out
     if not out["detected"] and pbase is None:
         return out
@@ -1508,11 +1548,16 @@ def _ag_uninstall_base(base: Path, dry: bool, out: dict, *, tidy: bool) -> None:
                 pass
 
 
-def _antigravity_uninstall(dry: bool, project: str | None = None) -> dict:
+def _antigravity_uninstall(dry: bool, project: str | None = None, home: Path | None = None) -> dict:
     """Without ``--project``: the global files. With it: only that project's
     ``.agents`` files, as the Cursor pack does with its project rule."""
     out: dict[str, Any] = {"harness": "antigravity", "changes": []}
     pbase = _ag_project_base(project)
+    if pbase is not None and Path(project).expanduser().is_dir():
+        refused = _ag_refuse_project(project, home)
+        if refused:
+            out.update(ok=False, error=refused)
+            return out
     if pbase is None:
         _ag_uninstall_base(_ag_config_dir(), dry, out, tidy=False)
         out["note"] = "project .agents files left in place; pass --project to remove them"
@@ -1535,6 +1580,8 @@ def _ag_state(base: Path | None, events: tuple[str, ...]) -> dict:
         servers = _load_json(paths["mcp"]).get("mcpServers")
     except ConfigUnreadable:
         entry, servers = None, None
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        entry = None  # switched off: Antigravity runs none of it
     for event in events:
         for h in _ag_handlers(entry.get(event) if isinstance(entry, dict) else None):
             if _ag_is_ours(event, h.get("command")):
@@ -1550,6 +1597,23 @@ def _ag_state(base: Path | None, events: tuple[str, ...]) -> dict:
     except OSError:
         state["rule"] = False
     return state
+
+
+def antigravity_project_install(project: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
+    """A project's ``.agents`` files only, through the same installer, guard
+    and launcher frame as ``install("antigravity", project=...)``."""
+    with _installing(dry=dry_run):
+        return _guarded("antigravity", _antigravity_install, dry_run, project, True, home)
+
+
+def antigravity_project_uninstall(project: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
+    return _guarded("antigravity", _antigravity_uninstall, dry_run, project, home)
+
+
+def antigravity_project_state(project: str) -> dict:
+    """What a project's ``.agents`` folder holds, read the way the installer
+    writes it (exact commands, ``--event`` included, and the exact rule)."""
+    return _ag_state(_ag_project_base(project), _AG_PROJECT_EVENTS)
 
 
 def _antigravity_status(project: str | None = None) -> dict:
