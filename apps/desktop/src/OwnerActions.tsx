@@ -15,6 +15,7 @@ import { Loader2 } from "lucide-react";
 import { Tag } from "./ui";
 import { callCli, useCliState } from "./settingsCli";
 import { SettingField } from "./SettingsControls";
+import type { RouteRule } from "./routing";
 
 export type OwnerDirectionSettings = {
   enabled: boolean;
@@ -172,10 +173,33 @@ function unknownActionWords(id: string): string {
   return words ? `Owner change: ${words}` : "An owner change";
 }
 
-/** What was done, in words. */
-export function actionWords(a: OwnerAction): string {
+/** A rule's short title: its first clause, cut at a bracket or colon and kept
+ *  to a few words. */
+export function ruleTitle(text: string): string {
+  const clause = text.split(/[(:.;]/)[0].trim();
+  const words = clause.split(/\s+/).filter(Boolean);
+  if (!words.length) return "";
+  const short = words.slice(0, 7).join(" ").replace(/[,\s]+$/, "");
+  return words.length > 7 ? `${short}…` : short;
+}
+
+/** A standing rule named by its number and a short title from the routing
+ *  record, never its raw id. A rule the record no longer holds is "a routing
+ *  rule". */
+export function ruleWords(target: string, rules: RouteRule[] | null | undefined, after?: OwnerAction["after"]): string {
+  const found = rules?.find((r) => r.entity === target);
+  const bare = /^\d+$/.test(target) ? target : null;
+  const n = found?.n ?? (bare ? Number(bare) : after && typeof after.n === "number" ? after.n : null);
+  const title = found ? ruleTitle(found.text) : "";
+  if (n != null) return title ? `standing rule ${n} (${title})` : `standing rule ${n}`;
+  return "a routing rule";
+}
+
+/** What was done, in words. `rules` is the routing record's rule list, when the
+ *  app has read it, so a rule reads by number and title and never by its id. */
+export function actionWords(a: OwnerAction, rules?: RouteRule[] | null): string {
   const t = a.target;
-  const n = a.after && typeof a.after.n === "number" ? String(a.after.n) : t;
+  const rw = ruleWords(t, rules, a.after);
   const row = t.includes("#") ? t.split("#")[1] : t;
   switch (a.action) {
     case "route.pause":
@@ -191,19 +215,19 @@ export function actionWords(a: OwnerAction): string {
     case "route.note.end":
       return "Ended the note";
     case "route.rule.add":
-      return `Added standing rule ${n}`;
+      return a.after && typeof a.after.n === "number" ? `Added standing rule ${a.after.n}` : `Added ${rw}`;
     case "route.rule.edit":
-      return `Changed standing rule ${t}`;
+      return `Changed ${rw}`;
     case "route.rule.retire":
-      return `Retired standing rule ${t}`;
+      return `Retired ${rw}`;
     case "route.rule.restore":
-      return `Restored standing rule ${t}`;
+      return `Restored ${rw}`;
     case "route.rule.confirm":
-      return `Confirmed standing rule ${t}`;
+      return `Confirmed ${rw}`;
     case "route.rule.undo":
-      return `Undid the change to standing rule ${t}`;
+      return `Undid the change to ${rw}`;
     case "route.rule.dismiss":
-      return `Dismissed standing rule ${t}`;
+      return `Dismissed ${rw}`;
     case "route.hold.add":
       return "Added a hold";
     case "route.hold.end":
@@ -391,6 +415,9 @@ export function chainWords(chain: ChainState | undefined): string | null {
 export function OwnerActions({ active }: { active: boolean }) {
   const show = useCliState<OwnerDirectionShow>("khipu_owner_direction_show", active);
   const log = useCliState<ActionsShape>("khipu_owner_direction_actions", active);
+  // Rules are named by number and title from the routing record; a failed read
+  // only means they read as "a routing rule".
+  const route = useCliState<{ rules?: RouteRule[] }>("khipu_route_view", active);
   const [busy, setBusy] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // Undos refused because a newer change touched the same target: they offer
@@ -508,7 +535,7 @@ export function OwnerActions({ active }: { active: boolean }) {
             <div className="rows" role="list" aria-label="Every owner action, newest first">
               {rows.map((a) => {
                 const id = `undo:${a.id}`;
-                const what = actionWords(a);
+                const what = actionWords(a, route.data?.rules);
                 return (
                   <div key={a.id} className="row-item route-acct owner-act" role="listitem">
                     <span className="route-name">{when(a.at)}</span>

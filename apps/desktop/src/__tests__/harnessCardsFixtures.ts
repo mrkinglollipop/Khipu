@@ -101,3 +101,45 @@ export const T3_PROVIDERS: T3Health = {
     "T3 runs Antigravity without Khipu's start block (its runtime ignores injected context); routing reaches it through `khipu_route` and the brief",
   ],
 };
+
+// The live shapes from 2026-10-27 (khipu integrations status / doctor.t3): the
+// ~/.gemini folder is there, Khipu is in none of it, T3 names its instances in
+// lowercase, and the runtime is a 64-character build hash.
+export const AG_BARE: StatusRow = { ...AG_ABSENT, detected: true, hook_sessionstart: false, hook_prompt_recall: false };
+
+export const T3_REAL: T3Health = {
+  detected: true,
+  lookup: { ok: true },
+  last_thread_linked_capture_age_s: 650,
+  last_thread_linked_capture_harness: "claude_code",
+  thread_linked_captures_today: 92,
+  warnings: [
+    "T3 provider Antigravity has no Khipu hooks, so its sessions are not captured and it has no Khipu memory tools; add Khipu to a project from the Antigravity card",
+  ],
+  providers: [
+    {
+      id: "cursor",
+      driver: "cursor",
+      name: "cursor",
+      hooks: "installed",
+      functions: { capture: "installed", start_block: "installed", prompt_recall: "installed", delegation: "installed", mcp: "installed" },
+    },
+    {
+      id: "antigravity",
+      driver: "antigravity",
+      name: "antigravity",
+      hooks: "missing",
+      functions: { capture: "missing", start_block: "unsupported", prompt_recall: "unsupported", delegation: "unsupported", mcp: "missing" },
+      projects: { registered: 0, installed: 0 },
+      runtime: {
+        version: "fdfa915652cdb7ba8085cc8fffed072cbe009251aa2c951aabdda07a8c28a189",
+        checked_version: null,
+        recheck: true,
+      },
+    },
+  ],
+  notes: [
+    "T3 runs antigravity without Khipu's start block (its runtime ignores injected context); routing reaches it through `khipu_route` and the brief",
+    "T3's antigravity runtime (fdfa915652cdb7ba8085cc8fffed072cbe009251aa2c951aabdda07a8c28a189) is not one Khipu has checked; verify it from the Antigravity card",
+  ],
+};

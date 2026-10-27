@@ -281,7 +281,22 @@ export function startProgress(items: StartItem[]): { done: number; total: number
 // ---------------------------------------------------------------------------
 
 export type RowTone = "ok" | "warn" | "err" | "neutral";
-export type GuideState = { tone: RowTone; label: string };
+/** `blurb` replaces the guide's fixed one-line description when the live state
+ *  would contradict it (T3 "Covered" beside "Needs a look"). */
+export type GuideState = { tone: RowTone; label: string; blurb?: string };
+
+/** The T3 row: the label and its one-line description always say the same thing.
+ *  Claude Code's install covers T3's Claude; what is left is a T3 provider with
+ *  no Khipu hooks, a thread that was never linked, or T3's lookup failing. */
+function t3State(gap: T3HealthGap | undefined): GuideState {
+  const covered = "Claude Code's install covers T3's Claude.";
+  if (gap?.lookupFailed) return { tone: "err", label: "Lookup failing", blurb: "Khipu can't read T3's thread records. The T3 Code card in Harnesses says why." };
+  if (!gap?.warning) return { tone: "ok", label: "Covered" };
+  if (gap.reason === "hooks") return { tone: "warn", label: "A provider has no hooks", blurb: `${covered} A provider T3 runs has no Khipu hooks yet: add it from Harnesses.` };
+  if (gap.reason === "unlinked") return { tone: "warn", label: "No linked capture", blurb: `${covered} T3 was used recently without a capture linked to a thread: see Harnesses.` };
+  if (gap.reason === "partial") return { tone: "warn", label: "Partly set up", blurb: `${covered} A T3 provider has only some of Khipu's features: see Harnesses.` };
+  return { tone: "warn", label: "Needs a look", blurb: `${covered} T3 reports something to check: see the T3 Code card in Harnesses.` };
+}
 
 export function guideStates(
   s: StartSignals & {
@@ -315,11 +330,7 @@ export function guideStates(
       : s.grok.started
         ? { tone: "warn", label: `${s.grok.passed} of 5 steps` }
         : { tone: "neutral", label: "Not set up" },
-    t3: s.t3?.lookupFailed
-      ? { tone: "err", label: "Lookup failing" }
-      : s.t3?.warning
-        ? { tone: "warn", label: "Needs a look" }
-        : { tone: "ok", label: "Covered" },
+    t3: t3State(s.t3),
     other_cloud: guide,
     grok_build: { tone: "neutral", label: "Not supported yet" },
     add_account: s.accountsRead > 0

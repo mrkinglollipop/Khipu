@@ -41,8 +41,7 @@ export function antigravityStatus(args: {
   if (any && args.recording) return { tone: "ok", label: args.macInstalled ? "Recording" : "Recording in T3" };
   if (args.macInstalled) return { tone: "neutral", label: "No sessions yet" };
   if (args.projectsInstalled > 0) return { tone: "warn", label: "In T3 only" };
-  if (args.detected) return { tone: "neutral", label: "Not installed" };
-  if (args.t3Present) return { tone: "neutral", label: "Not added yet" };
+  if (args.detected || args.t3Present) return { tone: "neutral", label: "Not set up" };
   return { tone: "neutral", label: "Not on this Mac" };
 }
 

@@ -44,7 +44,7 @@ import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { buildAttention, harnessLabel, promotionAttention, routingAttention, type Attention } from "./doctorAttention";
-import { HealthReportRows, TILE_HEALTH_KEYS, healthKeysForAttention, markHealthRows } from "./healthRows";
+import { HealthReportRows, TILE_HEALTH_KEYS, healthKeysForAttention, markHealthRows, snapshotNotTrusted } from "./healthRows";
 import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
 import { KeysCard } from "./KeysCard";
 import { PlansCard, liveWords, usePlanAttention, usePlanUsage } from "./PlansCard";
@@ -1411,6 +1411,8 @@ export default function App() {
   const [snapshotHealth, setSnapshotHealth] = useState<{
     ok?: boolean;
     age_seconds?: number;
+    /** This Mac's offline copy is behind or just replaced (the doctor's `prompt_recall_snapshot.fresh`). */
+    notTrusted?: boolean;
   } | null>(null);
   const [probeBusy, setProbeBusy] = useState(false);
   const [doctorJobs, setDoctorJobs] = useState<DoctorJobs | null>(null);
@@ -1788,9 +1790,10 @@ export default function App() {
       setBackupHealth(
         (parsed as { backup?: { ok?: boolean; freshest_backup_age_seconds?: number } }).backup ?? null,
       );
-      setSnapshotHealth(
-        (parsed as { hub_snapshot?: { ok?: boolean; age_seconds?: number } }).hub_snapshot ?? null,
-      );
+      {
+        const hub = (parsed as { hub_snapshot?: { ok?: boolean; age_seconds?: number } }).hub_snapshot;
+        setSnapshotHealth(hub ? { ...hub, notTrusted: snapshotNotTrusted(parsed) } : null);
+      }
       setDoctorJobs((parsed as { jobs?: DoctorJobs }).jobs ?? null);
       const notConfiguredRaw = (parsed as { not_configured?: unknown })
         .not_configured;
@@ -4397,10 +4400,10 @@ export default function App() {
                 }
                 sub={
                   snapshotHealth?.age_seconds != null
-                    ? `Offline copy ${fmtAgo(snapshotHealth.age_seconds)}`
+                    ? `Offline copy ${fmtAgo(snapshotHealth.age_seconds)}${snapshotHealth.notTrusted ? " · not trusted yet" : ""}`
                     : undefined
                 }
-                tone={dbReachable === false ? "err" : "neutral"}
+                tone={dbReachable === false ? "err" : snapshotHealth?.notTrusted ? "warn" : "neutral"}
                 onOpen={() => openHealth(TILE_HEALTH_KEYS.database)}
                 openLabel="Database: show its health checks"
               />

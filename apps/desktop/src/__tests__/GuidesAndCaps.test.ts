@@ -25,6 +25,22 @@ describe("Guides row states", () => {
     expect(failed.tone).toBe("err");
   });
 
+  it("the T3 label and its description agree: never Needs a look beside Nothing extra to do", () => {
+    const calm = guideStates({ ...base, grok, problems: 0 }).t3;
+    expect(calm.blurb).toBeUndefined();
+    // The live case 2026-10-27: antigravity in T3 has no Khipu hooks.
+    const hooks = guideStates({ ...base, grok, problems: 0, t3: { warning: true, lookupFailed: false, reason: "hooks" } }).t3;
+    expect(hooks.tone).toBe("warn");
+    expect(hooks.label).toBe("A provider has no hooks");
+    expect(hooks.blurb).toContain("no Khipu hooks");
+    expect(hooks.blurb).not.toMatch(/Nothing extra to do/);
+    for (const reason of ["unlinked", "partial", "other"] as const) {
+      const row = guideStates({ ...base, grok, problems: 0, t3: { warning: true, lookupFailed: false, reason } }).t3;
+      expect(row.blurb, reason).toBeTruthy();
+      expect(row.blurb).not.toMatch(/Nothing extra to do/);
+    }
+  });
+
   it("Grok Bot is not Connected on two clicks and a gateway ping", () => {
     const p = grokBotProgress({
       gatewayUrl: "https://gw.example.test", keySaved: true, ack: 4,

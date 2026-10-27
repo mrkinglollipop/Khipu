@@ -33,7 +33,9 @@ import type { RouteView } from "./routing";
 import { fmtAge, fmtAgo, fmtAgoSince, fmtClock } from "./time";
 import { plural, shortProject, timeOnly } from "./work";
 
-export type HealthRowStatus = "ok" | "err" | "skipped";
+/** `warn` is a green flag with an amber fact beside it: a check that is not
+ *  failing but whose own detail says it is not yet trustworthy. */
+export type HealthRowStatus = "ok" | "warn" | "err" | "skipped";
 
 export type HealthRow = {
   /** The `*_ok` field name this row renders, e.g. "hub_ok". */
@@ -275,6 +277,13 @@ export function ledgerCopyDetail(block: LedgerCopyBlock | undefined): string | u
   return parts.join(" · ");
 }
 
+/** This Mac's offline copy is behind the database or just replaced: not trusted
+ *  yet (the same `fresh: false` the "not trusted yet" sentence is written for). */
+export function snapshotNotTrusted(parsed: Record<string, unknown>): boolean {
+  const prs = parsed.prompt_recall_snapshot as ReplicaTrust | undefined;
+  return prs?.fresh === false;
+}
+
 function detailFor(key: string, parsed: Record<string, unknown>): string | undefined {
   if (key === "routing_delivery_ok") {
     const delivery = parsed.routing_delivery as { status?: unknown; reasons?: unknown; missing?: unknown } | undefined;
@@ -481,6 +490,12 @@ export function healthRows(
     ) {
       return { key, status: "skipped", label, ...extra };
     }
+    // The offline copy is "ok" by the doctor's own rule ("never red on its
+    // own"); its `fresh` flag is the real signal, so the icon follows that and
+    // matches the sentence beside it.
+    if (key === "prompt_recall_snapshot_ok" && parsed[key] && snapshotNotTrusted(parsed)) {
+      return { key, status: "warn", label, ...extra };
+    }
     return { key, status: parsed[key] ? "ok" : "err", label, ...extra };
   });
   const plansRow = plansHealthRow(plans);
@@ -492,8 +507,9 @@ export function healthRows(
 
   const statusRank: Record<HealthRowStatus, number> = {
     err: 0,
-    skipped: 1,
-    ok: 2,
+    warn: 1,
+    skipped: 2,
+    ok: 3,
   };
   const orderIndex = (key: string) => {
     const i = ORDER.indexOf(key);
@@ -606,6 +622,15 @@ export function HealthReportRows({
                 size={16} strokeWidth={1.75} aria-hidden className="ok" />
               <span className="row-main">{row.label}</span>
               {text ? <span className="row-meta wrap">{text}</span> : null}
+            </div>
+          );
+        }
+        if (row.status === "warn") {
+          return (
+            <div key={row.key} className="row-item" data-health-key={row.key}>
+              <TriangleAlert size={16} strokeWidth={1.75} aria-hidden className="warn" />
+              <span className="row-main">{row.label}</span>
+              {row.detail ? <span className="row-meta wrap">{row.detail}</span> : null}
             </div>
           );
         }

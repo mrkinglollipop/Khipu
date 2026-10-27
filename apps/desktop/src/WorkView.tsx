@@ -129,6 +129,8 @@ function DragHeader({ title, lede, children }: { title: string; lede: string; ch
   );
 }
 
+const OWED_LEDE = "What you still owe on each project, kept from your own sessions.";
+
 const PROBLEM_WORDS: Record<string, string> = {
   ledger: "The ledger couldn't be read just now; what shows from it may be out of date.",
   owed: "Owed couldn't be read just now; commitments may be missing from Waiting on you.",
@@ -154,6 +156,25 @@ export function WorkView(props: WorkViewProps) {
       if (el && typeof el.scrollIntoView === "function") el.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   }, [owedFocusKey]);
+
+  // The sticky header names the part of the page the owner is reading: once the
+  // Owed section has scrolled up under it, the page says Owed (Work stays the
+  // sidebar's name for the whole destination).
+  const [inOwed, setInOwed] = useState(false);
+  useEffect(() => {
+    const owedEl = document.getElementById("work-owed");
+    let scroller: HTMLElement | null = owedEl?.parentElement ?? null;
+    while (scroller && !/(auto|scroll)/.test(getComputedStyle(scroller).overflowY)) scroller = scroller.parentElement;
+    if (!owedEl || !scroller) return;
+    const check = () => {
+      if (!scroller || scroller.scrollTop <= 0) return setInOwed(false);
+      const headBottom = document.querySelector(".panel-head")?.getBoundingClientRect().bottom ?? 0;
+      setInOwed(owedEl.getBoundingClientRect().top <= headBottom + 24);
+    };
+    check();
+    scroller.addEventListener("scroll", check, { passive: true });
+    return () => scroller?.removeEventListener("scroll", check);
+  });
 
   const view = work.data;
   const reload = () => work.load(true);
@@ -184,7 +205,7 @@ export function WorkView(props: WorkViewProps) {
   };
 
   const header = (
-    <DragHeader title="Work" lede={WORK_LEDE}>
+    <DragHeader title={inOwed ? "Owed" : "Work"} lede={inOwed ? OWED_LEDE : WORK_LEDE}>
       {view?.generated_at ? <span className="meta">Updated {updatedWords(view.generated_at, now)}</span> : null}
     </DragHeader>
   );

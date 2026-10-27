@@ -11,7 +11,7 @@ import type { GuideId } from "./guidesModel";
 import { captureIsIdle, fmtAgo } from "./time";
 import type { Tone } from "./ui";
 import { AG_HOW, AntigravityCard, antigravityStatus } from "./AntigravityCard";
-import { antigravityMacRows, antigravityT3Rows, cursorFunctionRows, hasFunctions, parseProof, plainNote, providerSummary } from "./harnessFunctions";
+import { antigravityMacRows, antigravityT3Rows, cursorFunctionRows, hasFunctions, parseProof, plainNote, providerDisplayName, providerSummary } from "./harnessFunctions";
 import type { AntigravityProject, FunctionRow, ProviderLike } from "./harnessFunctions";
 import { callCli } from "./settingsCli";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
@@ -1309,7 +1309,7 @@ export function IntegrationsPanel({
           const latest = t3.last_thread_linked_capture_age_s;
           const hooklessNames = (t3.providers ?? [])
             .filter((p) => p.hooks === "missing")
-            .map((p) => p.name || p.driver || "a provider");
+            .map((p) => providerDisplayName(p));
           const linkedToday = t3.thread_linked_captures_today ?? 0;
           const providerRows = (t3.providers ?? []).filter(hasFunctions).map((p) => ({ id: p.id, ...providerSummary(p) }));
           const claude = rows?.find((r) => r.harness === "claude_code");
