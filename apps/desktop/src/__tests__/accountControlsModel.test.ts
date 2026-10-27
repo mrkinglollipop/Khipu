@@ -173,8 +173,8 @@ describe("changing a cap never relaxes what it did not change", () => {
     expect(draftFromCap({ kind: "pace_target", window: "weekly", slack: 2 }).target).toBe("100");
   });
 
-  it("keeps a per-day cap on its own window", () => {
+  it("forces a per-day cap onto the weekly window", () => {
     const draft = draftFromCap({ kind: "per_day", window: "five_hour", pct: 30 });
-    expect(capSetArgs(draft)).toEqual({ cap: { kind: "per_day", window: "five_hour", pct: 30 } });
+    expect(capSetArgs(draft)).toEqual({ cap: { kind: "per_day", window: "weekly", pct: 30 } });
   });
 });
