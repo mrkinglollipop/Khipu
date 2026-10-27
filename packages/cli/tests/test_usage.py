@@ -1248,7 +1248,7 @@ def test_mcp_tool_answers_from_the_cache_while_a_refresh_hangs(fake, monkeypatch
 
     monkeypatch.setattr(usage, "probe_all", slow)
     monkeypatch.setattr(usage, "configured_accounts",
-                        lambda: [{"label": "Claude", "harness": "claude", "home": None}])
+                        lambda config=None: [{"label": "Claude", "harness": "claude", "home": None}])
     started = time.monotonic()
     out = mcp_server.TOOL_FUNCS["khipu_usage"]({})
     assert time.monotonic() - started < 0.5
@@ -1791,3 +1791,22 @@ def test_accounts_status_reads_the_config_once(monkeypatch):
     status = usage.accounts_status()
     assert [a["label"] for a in status["accounts"]] == ["Work"]
     assert len(reads) == 1
+
+
+def test_routing_accounts_hands_its_one_config_read_to_usage(monkeypatch):
+    from khipu import config as khipu_config, routing
+
+    stored = {"usage_accounts": [{"label": "Work", "harness": "codex"}]}
+    seen = []
+    monkeypatch.setattr(khipu_config, "load_config", lambda: stored)
+    monkeypatch.setattr(routing, "_entry_definitions", lambda: ({"accounts": {}}, {}))
+    monkeypatch.setattr(routing, "_definition_accounts", lambda out, **kw: out)
+
+    def configured(config=None):
+        seen.append(config)
+        return [{"label": "Work", "harness": "codex"}]
+
+    monkeypatch.setattr(usage, "configured_accounts", configured)
+    monkeypatch.setattr(usage, "_key", lambda a: f"{a['harness']}|")
+    assert [a["label"] for a in routing.accounts()] == ["Work"]
+    assert seen == [stored]

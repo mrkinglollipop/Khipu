@@ -998,7 +998,7 @@ def accounts() -> list[dict]:
     defined_providers = {a["provider"] for a in definitions["accounts"].values()}
     explicit = isinstance(config.get("usage_accounts"), list)
     out = []
-    for account in usage.configured_accounts():
+    for account in usage.configured_accounts(config=config):
         if account.get("invalid"):
             continue
         # _inputs() starts with the explicit account list, never PATH/key
