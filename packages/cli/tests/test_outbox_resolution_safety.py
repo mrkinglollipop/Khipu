@@ -84,7 +84,8 @@ def _recovery(world, monkeypatch, tmp_path, payload):
     def sql(statement, params=()):
         if statement.startswith('SELECT v.ts, v.md,'):
             cur._result = [(original['ts'], hashlib.md5(original['summary'].encode()).hexdigest(),
-                            None, *[original.get(k) for k in mirror._FACT_KEYS], *([[]] * 5))]
+                            None, cur.episodes[1]['raw'],
+                            *[original.get(k) for k in mirror._FACT_KEYS], *([[]] * 5))]
             return
         return execute(statement, params)
     monkeypatch.setattr(cur, 'execute', sql)
@@ -103,13 +104,10 @@ def test_full_recovery_requeues_held_conflict(world, monkeypatch, tmp_path):
     assert not outbox.jobs(), 'Full sync_recent_episodes recreated held job'
 
 
-def test_full_recovery_requeues_resolved(world, monkeypatch, tmp_path):
+def test_full_recovery_does_not_queue_a_landed_line(world, monkeypatch, tmp_path):
     recover = _recovery(world, monkeypatch, tmp_path, projection())
-    assert recover()['conflicts'] == 1
-    assert outbox.drain().get('resolved') == 1
-    recover()
-    outbox.drain()
-    assert len(list(outbox.resolved_dir().glob('*.json'))) == 1, 'Full recovery produced duplicate resolution records'
+    assert recover().get('conflicts', 0) == 0
+    assert not outbox.jobs() and not list(outbox.resolved_dir().glob('*.json'))
 
 
 def test_full_import_restores_forgotten_nested_payload(world, tmp_path):

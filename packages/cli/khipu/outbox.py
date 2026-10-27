@@ -117,7 +117,7 @@ def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str
 def _validate_resolution(record: Any) -> None:
     """Validate archived content itself, never trust its saved hash claims."""
     from khipu.capture_identity import payload_sha256
-    from khipu.capture import _legacy_comma_projection, _redact_capture_values
+    from khipu.capture import _legacy_projection_kind, _redact_capture_values
 
     outbox_payloads(record)
     resolution = record.get("resolution")
@@ -130,7 +130,7 @@ def _validate_resolution(record: Any) -> None:
     hub_view.pop("origin", None)
     hub_view = _redact_capture_values(hub_view)
     if (not isinstance(resolution, dict)
-            or resolution.get("kind") != "legacy_comma_projection"
+            or resolution.get("kind") not in ("legacy_comma_projection", "legacy_landed_line")
             or type(resolution.get("episode_id")) is not int or resolution["episode_id"] <= 0
             or not isinstance(resolution.get("resolved_at"), str) or not resolution["resolved_at"]
             or resolution.get("original_payload_sha256") != payload_sha256(record["payload"])
@@ -143,7 +143,7 @@ def _validate_resolution(record: Any) -> None:
             or ("origin" in queued and not valid_origin(queued["origin"]))
             or queued.get("reason") != "recovery: the legacy key holds different facts"
             or "origin" not in queued or queued["origin"] is not None
-            or not _legacy_comma_projection(record["payload"], hub_view)):
+            or _legacy_projection_kind(record["payload"], hub_view) != resolution["kind"]):
         raise ValueError("resolution queued envelope is invalid")
     _canonical(record)
 
@@ -535,16 +535,26 @@ def status() -> dict[str, Any]:
     return result
 
 
-def _retry_order(jp: Path) -> tuple[bool, str, str]:
-    """Jobs never tried run first, in queue order; then failed jobs, oldest
-    attempt first; deferred origin claims last, also oldest attempt first. A
-    bounded drain therefore rotates through every retry instead of spending
-    its budget on the same failures in filename order."""
+def _is_recovery_job(job: Any) -> bool:
+    """A memory-file line a recovery writer queued with its owner unknown.
+    Recovery reasons are "recovery: …" and "recovery fact step deferred: …"."""
+    return (isinstance(job, dict) and "origin" in job and job["origin"] is None
+            and str(job.get("reason") or "").startswith("recovery"))
+
+
+def _retry_order(jp: Path) -> tuple[bool, bool, str, str]:
+    """Real captures before file-recovery lines, so a failed capture never
+    waits behind a reconcile's backlog. Within each, jobs never tried run
+    first, in queue order; then failed jobs, oldest attempt first; deferred
+    origin claims last, also oldest attempt first. A bounded drain therefore
+    rotates through every retry instead of spending its budget on the same
+    failures in filename order."""
     try:
         job = json.loads(jp.read_text())
-        return (bool(job.get("claim_deferred")), str(job.get("last_attempt_at") or ""), jp.name)
+        return (_is_recovery_job(job), bool(job.get("claim_deferred")),
+                str(job.get("last_attempt_at") or ""), jp.name)
     except (OSError, ValueError, AttributeError):
-        return (False, "", jp.name)
+        return (False, False, "", jp.name)
 
 
 def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> dict[str, Any]:
@@ -709,7 +719,7 @@ def drain(*, limit: int | None = None, time_budget_s: float | None = None) -> di
                 if proof:
                     original = proof["payload"]
                     resolution = {
-                        "kind": "legacy_comma_projection",
+                        "kind": proof.get("kind", "legacy_comma_projection"),
                         "episode_id": proof["episode_id"],
                         "original_payload_sha256": proof["original_payload_sha256"],
                         "queued_payload_sha256": proof["queued_payload_sha256"],
