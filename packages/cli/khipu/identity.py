@@ -204,8 +204,14 @@ def resolve_project_name(cur, project: str | None) -> str | None:
     under, plus every alias and canonical in ``project_aliases``."""
     if not project:
         return project
+    from khipu import commitments
+
+    # Names come only from commitments whose opening episode is not forgotten,
+    # the same filter the owed listing applies (computed outside the savepoint:
+    # it may introspect the schema).
+    live = commitments._not_forgotten_clause(cur)
     known: set[str] = set()
-    for table_sql in ("SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL",
+    for table_sql in (f"SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL AND {live}",
                       "SELECT alias FROM project_aliases UNION SELECT project FROM project_aliases"):
         cur.execute("SAVEPOINT project_name_known", ())
         try:

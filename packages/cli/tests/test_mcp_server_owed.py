@@ -188,20 +188,46 @@ def test_owed_cli_ambiguous_short_name_is_an_error_not_an_empty_list(aliased_hub
     assert printed["ok"] is False and CANON in printed["error"]
 
 
-def test_owed_short_name_resolves_on_the_offline_replica_too(tmp_path):
+def test_owed_short_name_ignores_projects_of_forgotten_episodes(aliased_hub):
+    with aliased_hub.cursor() as cur:
+        fact_seed.announce(cur)
+        cur.execute("INSERT INTO episodes (ts, session_id, summary, project) "
+                    "VALUES (now(), 'owed-forgotten', 'gone', %s) RETURNING id", ("someone/olivewood",))
+        ep = cur.fetchone()[0]
+        cur.execute("INSERT INTO commitments (text, project, owner, content_hash, opened_episode) "
+                    "VALUES ('x', %s, 'user', 'h-forgot', %s) RETURNING id", ("someone/olivewood", ep))
+        cid = cur.fetchone()[0]
+        fact_seed.adopt(cur, "commitment", cid)
+        # Forgetting retires the fact's claims that name the episode first.
+        cur.execute("DELETE FROM fact_claims WHERE kind = 'commitment' AND fact_id = %s", (cid,))
+        cur.execute("UPDATE episodes SET deleted_at = now() WHERE id = %s", (ep,))
+    aliased_hub.commit()
+    assert srv._tool_owed({"project": "olivewood"})["project"] == CANON
+
+
+def test_owed_short_name_resolves_on_the_offline_replica_too(monkeypatch):
     import sqlite3
 
     from khipu import hub_snapshot, identity
 
+    # A bare sqlite file has no fact stamp, which would hide every row; the
+    # forget fence (deleted episodes) is what this test is about.
+    monkeypatch.setattr(hub_snapshot, "_fact_epoch_sql", lambda con: "")
+    monkeypatch.setattr(hub_snapshot, "_pending_erasure_ids", lambda path=None: set())
     con = sqlite3.connect(":memory:")
-    con.execute("CREATE TABLE commitments (id INTEGER, project TEXT)")
+    con.execute("CREATE TABLE commitments (id INTEGER, project TEXT, opened_episode INTEGER)")
+    con.execute("CREATE TABLE episodes (id INTEGER, deleted_at TEXT)")
     con.execute("CREATE TABLE project_aliases (alias TEXT, project TEXT)")
-    con.execute("INSERT INTO commitments VALUES (1, 'owner/olivewood')")
+    con.execute("INSERT INTO commitments VALUES (1, 'owner/olivewood', NULL)")
     con.execute("INSERT INTO project_aliases VALUES ('owner/church-harness', 'owner/olivewood')")
     assert hub_snapshot.snapshot_resolve_project(con, "olivewood") == "owner/olivewood"
     assert hub_snapshot.snapshot_resolve_project(con, "church-harness") == "owner/olivewood"
     assert hub_snapshot.snapshot_resolve_project(con, "nothing-like-it") == "nothing-like-it"
-    con.execute("INSERT INTO commitments VALUES (2, 'someone/olivewood')")
+    # A commitment opened by a forgotten episode does not make the name ambiguous.
+    con.execute("INSERT INTO episodes VALUES (9, '2026-10-27')")
+    con.execute("INSERT INTO commitments VALUES (2, 'someone/olivewood', 9)")
+    assert hub_snapshot.snapshot_resolve_project(con, "olivewood") == "owner/olivewood"
+    con.execute("INSERT INTO commitments VALUES (3, 'someone/olivewood', NULL)")
     with pytest.raises(identity.AmbiguousProject):
         hub_snapshot.snapshot_resolve_project(con, "olivewood")
 

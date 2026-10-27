@@ -4209,7 +4209,10 @@ def snapshot_resolve_project(con: sqlite3.Connection, project: str | None) -> st
     from khipu import identity
 
     known: set[str] = set()
-    for sql in ("SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL",
+    # Names of commitments opened by a forgotten episode never resolve a name:
+    # the replica's forget fence, like every other replica read of them.
+    for sql in ("SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL"
+                + forget_fence_sql(con, "commitments", "opened_episode"),
                 "SELECT alias FROM project_aliases UNION SELECT project FROM project_aliases"):
         try:
             known.update(str(r[0]) for r in con.execute(sql).fetchall() if r[0])
