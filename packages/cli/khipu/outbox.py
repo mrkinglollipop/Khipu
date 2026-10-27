@@ -132,7 +132,8 @@ def _validate_resolution(record: Any) -> None:
     if (not isinstance(resolution, dict)
             or resolution.get("kind") not in ("legacy_comma_projection", "legacy_landed_line",
                                               "preferences_contained", "preferences_contained_normalized",
-                                              "content_contained_normalized", "scope_differs_kept")
+                                              "content_contained_normalized", "scope_differs_kept",
+                                              "decisions_contained_normalized")
             or type(resolution.get("episode_id")) is not int or resolution["episode_id"] <= 0
             or not isinstance(resolution.get("resolved_at"), str) or not resolution["resolved_at"]
             or resolution.get("original_payload_sha256") != payload_sha256(record["payload"])
@@ -160,7 +161,8 @@ def _validate_resolution(record: Any) -> None:
                   and not _legacy_preferences_contained(record["payload"], hub_view)
                   and normalized_missing(record["payload"], hub_view,
                                          resolution.get("normalized_projection")) == [])
-    elif resolution["kind"] in ("content_contained_normalized", "scope_differs_kept"):
+    elif resolution["kind"] in ("content_contained_normalized", "scope_differs_kept",
+                                "decisions_contained_normalized"):
         from khipu.outbox_preferences import content_proved
 
         # Topic folds and the scope projection were stored at archive time,

@@ -36,10 +36,24 @@ held. A line whose every field the row then holds is archived as
 ``content_contained_normalized``; one that differs only by a non-null scope
 other than the row's is archived as ``scope_differs_kept`` (the hub scope is
 never changed; the whole job, scope text included, is kept in resolved/).
-Decisions are never appended: the hub keeps each decision as its own row
-(the ``decisions`` registry, its supersede/retract lifecycle and the 0047
-fact claims) beside the episode's list, so a line whose decisions differ
-stays ``needs_review``.
+Decisions are not appended by ``--include-content``: the hub keeps each
+decision as its own row (the ``decisions`` registry, its supersede/retract
+lifecycle and the 0047 fact claims) beside the episode's list, so a line
+whose decisions differ stays ``needs_review`` there.
+
+``--include-decisions`` (Matt 2026-10-27; implies ``--include-content``)
+stores each decision a held line carries that its episode lacks through the
+capture's own decision steps (``decisions.insert_decisions_from_episode``
+then ``detect_reversals_from_episode``, as ``capture._merge_into_episode``
+runs them for an existing episode), attached to that episode, and appends
+it to the episode's decision list in column and raw. The log holds the
+texts and the created row ids before the commit; a decision the writer
+dedups onto a row already on file is never counted as created. Undo
+retracts exactly the created rows (``decisions.retract``, reason naming the
+owner action) and restores the prior list, refusing an episode whose rows
+changed since. A line the row then holds, decisions read by the legacy
+comma join as contiguous runs, is archived as
+``decisions_contained_normalized``.
 """
 from __future__ import annotations
 
@@ -49,8 +63,10 @@ from typing import Any
 ACTION = "outbox.merge_preferences"
 CONTENT_KIND = "content_contained_normalized"
 SCOPE_KIND = "scope_differs_kept"
+DECISIONS_KIND = "decisions_contained_normalized"
 _CONTENT_FIELDS = ("topics", "tags")
-_COLUMN_AT = {"preferences": 3, "topics": 4, "tags": 5}
+_LIST_FIELDS = ("topics", "tags", "decisions")
+_COLUMN_AT = {"preferences": 3, "topics": 4, "tags": 5, "decisions": 6}
 LEGACY_REASON = "recovery: the legacy key holds different facts"
 BATCH = 50
 SAMPLES = 5
@@ -68,6 +84,11 @@ _UPDATE_SQL = ("UPDATE episodes SET preferences = %s::jsonb, "
                "WHERE id = %s AND deleted_at IS NULL")
 _CONTENT_LOCK_SQL = ("SELECT id, deleted_at, raw, preferences, topics, tags FROM episodes "
                      "WHERE id = ANY(%s) ORDER BY id FOR UPDATE")
+_DECISIONS_LOCK_SQL = ("SELECT id, deleted_at, raw, preferences, topics, tags, decisions, project, session_id, ts "
+                       "FROM episodes WHERE id = ANY(%s) ORDER BY id FOR UPDATE")
+_DECISION_IDS_SQL = "SELECT id, text FROM decisions WHERE episode_id = %s ORDER BY id"
+_DECISION_ROWS_SQL = ("SELECT id, text, episode_id, superseded_by, retracted_at FROM decisions "
+                      "WHERE id = ANY(%s) ORDER BY id FOR UPDATE")
 
 
 def _field_update_sql(field: str) -> str:
@@ -287,7 +308,7 @@ def _content_items(view: dict[str, Any]) -> tuple[list[str], list[str]] | None:
             list(dict.fromkeys(t for t in tags if t)))
 
 
-def _placer(cur):
+def _placer(cur, decisions: bool = False):
     """Where the hub's writer would put one topic slug now:
     ``("tags", slug)`` for a noise slug, ``("topics", canonical)`` for any
     other (folded onto an existing page or alias), None when the check
@@ -313,19 +334,52 @@ def _placer(cur):
                 cache[slug] = (("tags", tags[0]) if tags else ("topics", resolved[0]) if resolved else None)
         return cache[slug]
 
+    place.decisions = decisions  # --include-decisions: decisions are content too
     return place
 
 
-def content_missing(raw: Any, view: dict[str, Any], place, projection: Any = None) -> dict[str, list[str]] | None:
+def decisions_missing(raw: Any, view: dict[str, Any]) -> list[str] | None:
+    """The line's decision strings the row lacks, each held only when its
+    comma pieces are a contiguous, in-order run of the row's comma-joined
+    decisions (the drain's legacy join, as ``normalized_missing`` reads
+    preferences); None for a shape that is not a list of strings."""
+    from khipu.capture import _legacy_comma_join
+
+    if not isinstance(raw, dict):
+        return None
+    line = view.get("decisions")
+    line = [] if line in (None, "", []) else line
+    hub = _str_list(raw.get("decisions"))
+    if hub is None or not isinstance(line, list) or not all(isinstance(d, str) for d in line):
+        return None
+    pieces = _legacy_comma_join(hub)
+    return list(dict.fromkeys(d.strip() for d in line
+                              if _legacy_comma_join([d]) and not _contiguous(_legacy_comma_join([d]), pieces)))
+
+
+def content_missing(raw: Any, view: dict[str, Any], place, projection: Any = None,
+                    decisions: bool | None = None) -> dict[str, list[str]] | None:
     """What the row lacks of a line once topics and tags are read as held
     content: ``{"preferences", "topics", "tags"}`` to append (preferences
     as ``normalized_missing`` finds them, on the line without its topics and
     tags), or None when anything else still differs (decisions, people,
     scope, unknown fields) or a topic's place is unknown. A line topic (or
     tag) already in the row's topics or tags is held; a missing one goes
-    where ``place`` says, unless that slug is already held."""
+    where ``place`` says, unless that slug is already held. With
+    ``decisions`` (default: the placer's own ``decisions`` flag, set by
+    ``--include-decisions``) the line's decisions are content too: the ones
+    ``decisions_missing`` finds are returned under ``"decisions"``."""
     if not isinstance(raw, dict):
         return None
+    if decisions is None:
+        decisions = bool(getattr(place, "decisions", False))
+    missing_decisions: list[str] = []
+    if decisions:
+        found = decisions_missing(raw, view)
+        if found is None:
+            return None
+        missing_decisions = found
+        view = {k: v for k, v in view.items() if k != "decisions"}
     items = _content_items(view)
     hub_topics, hub_tags = _str_list(raw.get("topics")), _str_list(raw.get("tags"))
     if items is None or hub_topics is None or hub_tags is None:
@@ -343,36 +397,68 @@ def content_missing(raw: Any, view: dict[str, Any], place, projection: Any = Non
         if where is None or where[0] not in add or not isinstance(where[1], str) or not where[1]:
             return None
         field, slug = where
+        if field == "topics" and slug in hub_tags and slug not in hub_topics:
+            # The writer would have put the folded topic in topics; the row
+            # has it only as a tag, which no record proves (content_proved
+            # accepts a fold only into topics), so the line stays held.
+            return None
         if slug not in held and slug not in add[field]:
             add[field].append(slug)
     for t in line_tags:
         if t not in held and t not in add["tags"]:
             add["tags"].append(t)
-    return {"preferences": prefs, **add}
+    out = {"preferences": prefs, **add}
+    if decisions:
+        out["decisions"] = missing_decisions
+    return out
 
 
 def _all_held(missing: dict[str, list[str]] | None) -> bool:
     return missing is not None and not any(missing.values())
 
 
+def _scope_differs_kept(raw: dict[str, Any], view: dict[str, Any]) -> bool:
+    """The one test for ``scope_differs_kept``, used to plan it and to prove
+    its record: the line names a scope, the row keeps a non-empty one, and
+    they differ."""
+    scope, hub = view.get("scope"), raw.get("scope")
+    return (isinstance(scope, str) and bool(scope.strip()) and isinstance(hub, str) and bool(hub)
+            and scope.strip() != hub)
+
+
 def _scope_dropped(raw: dict[str, Any], view: dict[str, Any]) -> dict[str, Any] | None:
-    """The line without its scope, when it names one and the row keeps a
-    non-null scope (the hub's is never changed); None otherwise."""
-    scope = view.get("scope")
-    if isinstance(scope, str) and scope.strip() and raw.get("scope") is not None:
+    """The line without its scope, when ``_scope_differs_kept`` holds (the
+    hub's scope is never changed); None otherwise."""
+    if _scope_differs_kept(raw, view):
         return {k: v for k, v in view.items() if k != "scope"}
     return None
 
 
-def _content_or_scope(raw: dict[str, Any], view: dict[str, Any], place) -> tuple[str, dict[str, Any]] | None:
+def _content_or_scope(raw: dict[str, Any], view: dict[str, Any], place,
+                      decisions: bool | None = None) -> tuple[str, dict[str, Any]] | None:
     """``("content", view)`` when the row, with ``content_missing`` appended,
     holds the line; else ``("scope_kept", view without scope)`` when it
     holds the line but for a scope other than the row's; else None."""
-    if content_missing(raw, view, place) is not None:
+    if content_missing(raw, view, place, decisions=decisions) is not None:
         return "content", view
     dropped = _scope_dropped(raw, view)
-    if dropped is not None and content_missing(raw, dropped, place) is not None:
+    if dropped is not None and content_missing(raw, dropped, place, decisions=decisions) is not None:
         return "scope_kept", dropped
+    return None
+
+
+def _held_kind(raw: dict[str, Any], view: dict[str, Any], place) -> tuple[str, dict[str, Any]] | None:
+    """How the row holds a line once read as content: ``content`` /
+    ``scope_kept`` without reading decisions as content, else (only with
+    ``--include-decisions``) ``decisions`` / ``decisions_scope_kept``, with
+    the line as proved (scope dropped for a kept one); None when it does not."""
+    found = _content_or_scope(raw, view, place, decisions=False)
+    if found is not None and _all_held(content_missing(raw, found[1], place, decisions=False)):
+        return found
+    if getattr(place, "decisions", False):
+        found = _content_or_scope(raw, view, place, decisions=True)
+        if found is not None and _all_held(content_missing(raw, found[1], place, decisions=True)):
+            return ("decisions" if found[0] == "content" else "decisions_scope_kept"), found[1]
     return None
 
 
@@ -406,10 +492,16 @@ def content_proved(payload: Any, view: dict[str, Any], resolution: dict[str, Any
     if not (isinstance(folds, dict) and all(isinstance(k, str) and isinstance(v, str) and v
                                             for k, v in folds.items())):
         return False
-    if resolution["kind"] == SCOPE_KIND:
-        scope, hub = view.get("scope"), payload.get("scope")
-        if not (isinstance(scope, str) and scope.strip() and isinstance(hub, str) and hub
-                and scope.strip() != hub):
+    decisions = resolution["kind"] == DECISIONS_KIND
+    scope_kept = resolution.get("scope_kept", False)
+    if type(scope_kept) is not bool or (scope_kept and not decisions):
+        return False
+    if decisions and _decisions_held(payload, view):
+        # Decisions the row holds exactly need no decision proof: such a
+        # line is a content or scope kind, never this one.
+        return False
+    if resolution["kind"] == SCOPE_KIND or scope_kept:
+        if not _scope_differs_kept(payload, view):
             return False
         view = {k: v for k, v in view.items() if k != "scope"}
     hub_topics = _str_list(payload.get("topics")) or []
@@ -417,7 +509,8 @@ def content_proved(payload: Any, view: dict[str, Any], resolution: dict[str, Any
     def place(slug: str) -> tuple[str, str] | None:
         return ("topics", folds[slug]) if slug in folds and folds[slug] in hub_topics else None
 
-    return _all_held(content_missing(payload, view, place, resolution.get("normalized_projection")))
+    return _all_held(content_missing(payload, view, place, resolution.get("normalized_projection"),
+                                     decisions=decisions))
 
 
 def _forgotten(cur, eid: int, view: dict[str, Any]) -> bool:
@@ -441,10 +534,13 @@ def _episode_plan(row: tuple, lines: list[dict[str, Any]], place=None
     ``preferences_contained_normalized``. With ``place`` (``--include-content``)
     a line still ``other`` is tried through ``content_missing``: its topic
     and tag items are appended too (third value, by field), and it is
-    ``content`` or ``scope_kept`` when the merged row then holds it. None when
+    ``content`` or ``scope_kept`` when the merged row then holds it. With a
+    placer whose ``decisions`` flag is set (``--include-decisions``) its
+    missing decisions are content too, and a line held only that way is
+    ``decisions`` or ``decisions_scope_kept``. None when
     apply would skip the row for its shape (a raw that is not an object, or a
-    preference, topic or tag list in either place that is not a list of
-    strings)."""
+    preference, topic, tag or (with decisions) decision list in either place
+    that is not a list of strings)."""
     from khipu.capture import _legacy_preferences_contained, _legacy_projection_kind
 
     _eid, _deleted_at, raw, column = row[:4]
@@ -455,7 +551,7 @@ def _episode_plan(row: tuple, lines: list[dict[str, Any]], place=None
         return None
     hub_content: dict[str, list[str]] = {}
     if place is not None:
-        for f in _CONTENT_FIELDS:
+        for f in (_LIST_FIELDS if getattr(place, "decisions", False) else _CONTENT_FIELDS):
             hub_content[f] = _str_list(raw.get(f))
             if hub_content[f] is None or (len(row) > _COLUMN_AT[f] and _str_list(row[_COLUMN_AT[f]]) is None):
                 return None
@@ -499,22 +595,24 @@ def _episode_plan(row: tuple, lines: list[dict[str, Any]], place=None
             kinds.append("contained")
         elif normalized_missing(final, line["view"]) == []:
             kinds.append("normalized")
-        elif place is not None and (found := _content_or_scope(final, line["view"], place)) is not None \
-                and _all_held(content_missing(final, found[1], place)):
+        elif place is not None and (found := _held_kind(final, line["view"], place)) is not None:
             kinds.append(found[0])
         else:
             kinds.append("other")
     return kinds, added, content_added
 
 
-def _lookup(cur, lines: list[dict[str, Any]], content: bool = False) -> dict[int, tuple]:
+def _lookup(cur, lines: list[dict[str, Any]], content: bool = False, decisions: bool = False) -> dict[int, tuple]:
     """Each line's hub row by index: the row the drain's legacy check reads
     (live first, newest id), as (id, deleted_at, raw, preferences), plus the
     topics and tags columns with ``content``."""
     from khipu.capture import _md5_hex
 
-    sql = _LOOKUP_SQL.replace("e.raw, e.preferences ", "e.raw, e.preferences, e.topics, e.tags ") if content \
-        else _LOOKUP_SQL
+    sql = _LOOKUP_SQL
+    if decisions:
+        sql = sql.replace("e.raw, e.preferences ", "e.raw, e.preferences, e.topics, e.tags, e.decisions ")
+    elif content:
+        sql = sql.replace("e.raw, e.preferences ", "e.raw, e.preferences, e.topics, e.tags ")
     rows: dict[int, tuple] = {}
     for start in range(0, len(lines), _LOOKUP_CHUNK):
         part = lines[start:start + _LOOKUP_CHUNK]
@@ -529,8 +627,9 @@ _COUNTS = ("mergeable", "landed", "preferences_contained", NORMALIZED_KIND, "nee
            "no_hub_row", "column_shape")
 _CONTENT_COUNTS = (CONTENT_KIND, SCOPE_KIND)
 _COUNT_OF = {"contained": "preferences_contained", "normalized": NORMALIZED_KIND, "other": "needs_review",
-             "content": CONTENT_KIND, "scope_kept": SCOPE_KIND}
-_RESOLVED_KINDS = ("contained", "normalized", "content", "scope_kept")
+             "content": CONTENT_KIND, "scope_kept": SCOPE_KIND, "decisions": DECISIONS_KIND,
+             "decisions_scope_kept": DECISIONS_KIND}
+_RESOLVED_KINDS = ("contained", "normalized", "content", "scope_kept", "decisions", "decisions_scope_kept")
 
 
 def _plan(cur, place=None) -> tuple[dict[str, Any], dict[int, list[dict[str, Any]]], dict[int, list[str]],
@@ -542,14 +641,17 @@ def _plan(cur, place=None) -> tuple[dict[str, Any], dict[int, list[dict[str, Any
     tag additions."""
     lines = held_lines()
     counts: dict[str, Any] = {"held_lines": len(lines), **{k: 0 for k in _COUNTS}}
+    decisions = bool(getattr(place, "decisions", False))
     if place is not None:
         counts.update({k: 0 for k in _CONTENT_COUNTS})
+    if decisions:
+        counts[DECISIONS_KIND] = 0
     review: set[int] = set()
     review_decisions: set[int] = set()
     scope_kept: set[int] = set()
     grouped: dict[int, list[dict[str, Any]]] = {}
     rows: dict[int, tuple] = {}
-    for i, row in _lookup(cur, lines, content=place is not None).items():
+    for i, row in _lookup(cur, lines, content=place is not None, decisions=decisions).items():
         lines[i]["row"] = row
     for line in lines:
         row = line.get("row")
@@ -573,7 +675,7 @@ def _plan(cur, place=None) -> tuple[dict[str, Any], dict[int, list[dict[str, Any
         kinds, added, content_added = planned
         for kind, line in zip(kinds, group):
             counts[_COUNT_OF.get(kind, kind)] += 1
-            if kind == "scope_kept":
+            if kind in ("scope_kept", "decisions_scope_kept"):
                 scope_kept.add(eid)
             if kind == "other" and place is not None and not _decisions_held(rows[eid][2], line["view"]):
                 review_decisions.add(eid)
@@ -605,7 +707,8 @@ def _sample(by_episode: dict[int, list[dict[str, Any]]], additions: dict[int, li
         item = {"episode_id": eid, "job": line["job"], "where": line["where"],
                 "lines": len(by_episode[eid]), "preferences_to_add": len(additions[eid])}
         if content_additions is not None:
-            item.update({f"{f}_to_add": len(content_additions[eid].get(f) or []) for f in _CONTENT_FIELDS})
+            item.update({f"{f}_to_add": len(content_additions[eid].get(f) or []) for f in _LIST_FIELDS
+                         if f in content_additions[eid] or f in _CONTENT_FIELDS})
         out.append(item)
     return out
 
@@ -616,18 +719,37 @@ def _content_ready(cur) -> bool:
     return has_columns(cur, "episodes", "topics", "tags")
 
 
+def _decisions_ready(cur) -> bool:
+    """The decisions registry with its lifecycle (0019 + 0024: Undo retracts)
+    and the episode columns the writer reads."""
+    from khipu import decisions
+    from khipu.db import has_columns
+
+    return (decisions._decisions_ready(cur) and decisions._evidence_ready(cur)
+            and has_columns(cur, "episodes", "decisions", "project", "session_id"))
+
+
+_NO_DECISIONS = {"ok": False, "code": "schema",
+                 "error": "--include-decisions needs the hub's decisions registry with its retract columns "
+                          "(migrations 0019 and 0024); nothing was changed."}
+
+
 _NO_TAGS = {"ok": False, "code": "schema",
             "error": "--include-content needs the hub's episodes.tags column (migration 0010); nothing was changed."}
 
 
-def dry_run(include_content: bool = False) -> dict[str, Any]:
+def dry_run(include_content: bool = False, include_decisions: bool = False) -> dict[str, Any]:
     from khipu.db import connect
 
+    include_content = include_content or include_decisions
     with connect() as conn, conn.cursor() as cur:
         if include_content and not _content_ready(cur):
             conn.rollback()
             return dict(_NO_TAGS)
-        place = _placer(cur) if include_content else None
+        if include_decisions and not _decisions_ready(cur):
+            conn.rollback()
+            return dict(_NO_DECISIONS)
+        place = _placer(cur, include_decisions) if include_content else None
         counts, by_episode, additions, content_additions = _plan(cur, place)
         conn.rollback()
     out = {"ok": True, "dry_run": True, **counts,
@@ -644,6 +766,14 @@ def dry_run(include_content: bool = False) -> dict[str, Any]:
                        "--owner-direction`; decisions are never appended, so lines whose decisions differ stay "
                        "held (needs_review_decisions_episode_ids)." if by_episode else
                        "No held line differs from its hub episode only by preferences or topics the hub lacks.")
+    if include_decisions:
+        out["decisions_to_add"] = sum(len(c.get("decisions") or []) for c in content_additions.values())
+        out["decisions_episode_ids"] = sorted(eid for eid, c in content_additions.items() if c.get("decisions"))
+        out["next"] = ("Import them with `khipu outbox merge-line-preferences --include-decisions --apply "
+                       "--owner-direction`: each missing decision goes through the capture's decision writer "
+                       "(its own row, dedup, reversal detection, fact claims); lines still differing stay held "
+                       "(needs_review_episode_ids)." if by_episode else
+                       "No held line differs from its hub episode only by items the hub lacks.")
     return out
 
 
@@ -713,10 +843,12 @@ def _resolution(line: dict[str, Any], final_raw: dict[str, Any], place=None) -> 
     elif normalized_missing(final_raw, view) == []:
         kind = NORMALIZED_KIND
         extra["normalized_projection"] = projection_of(_writer_projection(final_raw, view))
-    elif (place is not None and (found := _content_or_scope(final_raw, view, place)) is not None
-          and _all_held(content_missing(final_raw, found[1], place))):
-        kind = CONTENT_KIND if found[0] == "content" else SCOPE_KIND
-        rest = {k: v for k, v in found[1].items() if k not in _CONTENT_FIELDS}
+    elif place is not None and (found := _held_kind(final_raw, view, place)) is not None:
+        kind = {"content": CONTENT_KIND, "scope_kept": SCOPE_KIND}.get(found[0], DECISIONS_KIND)
+        if found[0] == "decisions_scope_kept":
+            extra["scope_kept"] = True
+        rest = {k: v for k, v in found[1].items()
+                if k not in _CONTENT_FIELDS and not (kind == DECISIONS_KIND and k == "decisions")}
         extra["normalized_projection"] = projection_of(_writer_projection(final_raw, rest))
         extra["topic_folds"] = _alias_folds(final_raw, found[1], place)
     else:
@@ -729,17 +861,35 @@ def _resolution(line: dict[str, Any], final_raw: dict[str, Any], place=None) -> 
     return record, hashlib.sha256(line["snapshot"]).hexdigest()
 
 
-def _resolve(resolve: list, record_resolutions) -> int:
+def _resolve(resolve: list, record_resolutions, failed: list | None = None) -> int:
     """Archive each contained line (logged first), after its row's merge
     committed. A line whose file changed, or whose source is forgotten, is
-    left where it is."""
+    left where it is. A line whose record fails its own proof (validated
+    before it is logged, and again by the archive) stays held and is added
+    to ``failed`` by job name and episode id: one bad line never stops the
+    rest."""
     from khipu import outbox
 
     done = 0
     pending = list(resolve)
+    failed = [] if failed is None else failed
+
+    def fail(line: dict[str, Any], exc: Exception) -> None:
+        failed.append({"job": line["job"], "where": line["where"], "episode_id": int(line["row"][0]),
+                       "error": f"{type(exc).__name__}: {exc}"})
+
     for _round in range(_RESOLVE_ROUNDS):
-        built = [(line, final, place, *made) for line, final, place in pending
-                 if (made := _resolution(line, final, place))]
+        built = []
+        for line, final, place in pending:
+            made = _resolution(line, final, place)
+            if not made:
+                continue
+            try:
+                outbox._validate_resolution(made[0])
+            except (ValueError, TypeError, KeyError) as exc:
+                fail(line, exc)
+                continue
+            built.append((line, final, place, *made))
         if not built:
             break
         record_resolutions([{"episode_id": int(line["row"][0]), "record": record_id, "job": line["job"],
@@ -747,7 +897,11 @@ def _resolve(resolve: list, record_resolutions) -> int:
                             for line, _final, _place, record, record_id in built])
         pending = []
         for line, final, place, record, _record_id in built:
-            status = outbox.archive_resolved(line["path"], line["snapshot"], record)
+            try:
+                status = outbox.archive_resolved(line["path"], line["snapshot"], record)
+            except ValueError as exc:
+                fail(line, exc)
+                continue
             if status == "resolved":
                 done += 1
             elif status == "changed":
@@ -788,7 +942,75 @@ def _reread(line: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def apply(*, record, record_resolutions, record_committed=None, include_content: bool = False) -> dict[str, Any]:
+def _decision_payload(row: tuple, texts: list[str], lines: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the capture's decision steps read, for the hub episode itself:
+    its own project, session and ts (the writer dedups in the 30 days before
+    the episode's ts, never now), the decisions to add, and any
+    ``decision_details`` the lines carry for exactly those texts."""
+    eid, _deleted_at, raw, *_rest = row
+    project, session_id, ts = row[7], row[8], row[9]
+    ts = ts.isoformat() if hasattr(ts, "isoformat") else (ts or raw.get("ts"))
+    wanted = set(texts)
+    details = []
+    for line in lines:
+        for item in line["view"].get("decision_details") or []:
+            if (isinstance(item, dict) and str(item.get("text") or "").strip() in wanted
+                    and item not in details):
+                details.append(item)
+    payload = {"decisions": list(texts), "project": project if project is not None else raw.get("project"),
+               "session_id": session_id if session_id is not None else raw.get("session_id"), "ts": ts}
+    if details:
+        payload["decision_details"] = details
+    return payload
+
+
+def _write_decisions(cur, row: tuple, spec: dict[str, Any], lines: list[dict[str, Any]]) -> bool:
+    """Store one episode's missing decisions through the capture's own
+    decision steps (``decisions.insert_decisions_from_episode``: a row each,
+    the 30-day dedup, 0047 fact claims; then
+    ``decisions.detect_reversals_from_episode``), attached to the hub
+    episode, in savepoints as ``capture._merge_into_episode`` runs them for
+    an existing episode. Records in ``spec`` the rows it created (id and
+    text: Undo retracts exactly these) and the texts it deduped onto a row
+    already on file (never created, never retracted). False when the insert
+    step failed: nothing of it stays, and the episode is skipped."""
+    from khipu import decisions
+    from khipu.decisions import normalize_text
+
+    eid = int(row[0])
+    payload = _decision_payload(row, spec["added"], lines)
+    cur.execute(_DECISION_IDS_SQL, (eid,))
+    before = {int(r[0]) for r in cur.fetchall()}
+    cur.execute("SAVEPOINT outbox_decisions")
+    try:
+        decisions.insert_decisions_from_episode(cur, payload, eid)
+    except Exception as exc:  # noqa: BLE001 - the episode is skipped, its lines stay held
+        cur.execute("ROLLBACK TO SAVEPOINT outbox_decisions")
+        decisions._log(f"outbox decisions import skipped episode {eid} ({type(exc).__name__})")
+        return False
+    cur.execute("RELEASE SAVEPOINT outbox_decisions")
+    cur.execute(_DECISION_IDS_SQL, (eid,))
+    asked = {normalize_text(decisions._redacted_value(t)) for t in spec["added"]}
+    created = [{"id": int(i), "text": t} for i, t in cur.fetchall()
+               if int(i) not in before and normalize_text(t or "") in asked]
+    made = {normalize_text(c["text"]) for c in created}
+    spec["created"] = created
+    spec["deduped"] = [t for t in spec["added"] if normalize_text(decisions._redacted_value(t)) not in made]
+    # Reversal detection reads the rows just written; as in the capture, a
+    # failure here never takes those rows down with it.
+    cur.execute("SAVEPOINT outbox_decision_detection")
+    try:
+        decisions.detect_reversals_from_episode(cur, payload, eid)
+    except Exception as exc:  # noqa: BLE001 - fail-open, as the capture's step
+        cur.execute("ROLLBACK TO SAVEPOINT outbox_decision_detection")
+        decisions._log(f"outbox decision detection failed for episode {eid} ({type(exc).__name__})")
+    else:
+        cur.execute("RELEASE SAVEPOINT outbox_decision_detection")
+    return True
+
+
+def apply(*, record, record_resolutions, record_committed=None, include_content: bool = False,
+          include_decisions: bool = False) -> dict[str, Any]:
     """Merge every qualifying line, BATCH episodes per transaction, each row
     locked in id order and re-proved under its lock. ``record(entries)``
     writes a transaction's entries to the owner-actions log before it
@@ -798,22 +1020,33 @@ def apply(*, record, record_resolutions, record_committed=None, include_content:
     the merged row now contains is archived as resolved
     (``record_resolutions`` logs them first). ``include_content`` also
     appends topic and tag items (``content_missing``), written the same way
-    and recorded under ``content`` in each entry."""
+    and recorded under ``content`` in each entry. ``include_decisions``
+    (implies ``include_content``) also stores each missing decision through
+    ``_write_decisions`` before the transaction's entries are logged, so the
+    log holds the texts and the created row ids before it commits."""
     from khipu import memory_lock
     from khipu.db import connect
 
+    include_content = include_content or include_decisions
     merged: list[dict[str, Any]] = []
     resolved = 0
+    failed_lines: list[dict[str, Any]] = []
+    decisions_failed: list[int] = []
     with connect() as conn:
         with conn.cursor() as cur:
             if include_content and not _content_ready(cur):
                 conn.rollback()
                 return dict(_NO_TAGS)
-            planned = _plan(cur, _placer(cur)) if include_content else _plan(cur)
+            if include_decisions and not _decisions_ready(cur):
+                conn.rollback()
+                return dict(_NO_DECISIONS)
+            planned = _plan(cur, _placer(cur, include_decisions)) if include_content else _plan(cur)
             counts, by_episode = planned[0], planned[1]
             conn.rollback()
-            place = _placer(cur) if include_content else None
-            width = 6 if include_content else 4
+            place = _placer(cur, include_decisions) if include_content else None
+            width = 10 if include_decisions else 6 if include_content else 4
+            lock_sql = _DECISIONS_LOCK_SQL if include_decisions else _CONTENT_LOCK_SQL if include_content \
+                else _LOCK_SQL
             ids = sorted(by_episode)
             for start in range(0, len(ids), BATCH):
                 part = ids[start:start + BATCH]
@@ -821,11 +1054,18 @@ def apply(*, record, record_resolutions, record_committed=None, include_content:
                 to_resolve: list = []
                 with memory_lock.shared():
                     try:
-                        cur.execute(_CONTENT_LOCK_SQL if include_content else _LOCK_SQL, (part,))
+                        cur.execute(lock_sql, (part,))
                         for r in cur.fetchall():
-                            for line in by_episode[int(r[0])]:
+                            lines = by_episode[int(r[0])]
+                            for line in lines:
                                 line["row"] = tuple(r[:4])
-                            entry, resolve = _merge_episode(cur, tuple(r[:width]), by_episode[int(r[0])], place)
+                            entry, resolve = _merge_episode(cur, tuple(r[:width]), lines, place)
+                            spec = ((entry or {}).get("content") or {}).get("decisions")
+                            if spec and not _write_decisions(cur, tuple(r[:width]), spec, lines):
+                                # Nothing of this episode is written or
+                                # resolved: its lines stay held.
+                                decisions_failed.append(int(r[0]))
+                                continue
                             entries += [entry] if entry else []
                             to_resolve += resolve
                         if entries:
@@ -857,7 +1097,7 @@ def apply(*, record, record_resolutions, record_committed=None, include_content:
                         # unless the finished result names its episodes.
                         pass
                 merged += entries
-                resolved += _resolve(to_resolve, record_resolutions)
+                resolved += _resolve(to_resolve, record_resolutions, failed_lines)
     out = {"ok": True, "applied": True, **counts, "episodes_merged": len(merged),
            "preferences_added": sum(len(e["added"]) for e in merged),
            "episode_ids": [e["episode_id"] for e in merged], "lines_resolved": resolved,
@@ -868,6 +1108,19 @@ def apply(*, record, record_resolutions, record_committed=None, include_content:
     if include_content:
         for f in _CONTENT_FIELDS:
             out[f"{f}_added"] = sum(len(((e.get("content") or {}).get(f) or {}).get("added") or []) for e in merged)
+    if include_decisions:
+        specs = [(e["episode_id"], (e.get("content") or {}).get("decisions")) for e in merged]
+        specs = [(eid, d) for eid, d in specs if d]
+        out["decisions_added"] = sum(len(d["added"]) for _eid, d in specs)
+        out["decision_ids_created"] = sorted(c["id"] for _eid, d in specs for c in d.get("created") or [])
+        out["decisions_deduped"] = sum(len(d.get("deduped") or []) for _eid, d in specs)
+        out["decisions_failed_episode_ids"] = decisions_failed
+    if failed_lines:
+        # One line whose record fails its own proof stays held; the rest
+        # were still merged and archived.
+        out["lines_failed"] = failed_lines
+        out["next"] += (f" {len(failed_lines)} line(s) could not be archived (lines_failed) and stay held; "
+                        "every other line was handled.")
     return out
 
 
@@ -897,11 +1150,11 @@ def _undo_fenced(cur, eid: int, entry: dict[str, Any]) -> bool:
 def _undo_specs(entry: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Each field one merge entry changed, with its prior lists and
     additions: preferences (every entry from before ``--include-content``
-    has them), then topics and tags under ``content``."""
+    has them), then topics, tags and decisions under ``content``."""
     specs = []
     if entry.get("added") or not entry.get("content"):
         specs.append(("preferences", entry))
-    for f in _CONTENT_FIELDS:
+    for f in _LIST_FIELDS:
         spec = (entry.get("content") or {}).get(f)
         if isinstance(spec, dict) and spec.get("added"):
             specs.append((f, spec))
@@ -921,8 +1174,37 @@ def _field_state(row: tuple, field: str, spec: dict[str, Any]) -> str:
     return "changed"
 
 
+def _changed_decisions(cur, eid: int, created: list[dict[str, Any]]) -> list[int]:
+    """The created decision rows (locked, after their episode) that changed
+    since the import: gone, reworded, moved to another episode, superseded,
+    retracted, in a link someone resolved (confirmed, rejected, restored), or
+    claimed by another episode or the owner. Undo retracts none of a row's
+    episode's rows when any of them changed."""
+    from khipu import decisions
+
+    ids = sorted(int(c["id"]) for c in created)
+    cur.execute(_DECISION_ROWS_SQL, (ids,))
+    rows = {int(r[0]): r for r in cur.fetchall()}
+    changed = set()
+    for c in created:
+        r = rows.get(int(c["id"]))
+        if (r is None or r[1] != c["text"] or r[2] is None or int(r[2]) != eid
+                or r[3] is not None or r[4] is not None):
+            changed.add(int(c["id"]))
+    if decisions._links_ready(cur):
+        cur.execute("SELECT old_id, new_id FROM decision_links WHERE (old_id = ANY(%s) OR new_id = ANY(%s)) "
+                    "AND state <> 'candidate'", (ids, ids))
+        changed |= {int(i) for pair in cur.fetchall() for i in pair if int(i) in ids}
+    if decisions._provenance_ready(cur):
+        cur.execute("SELECT DISTINCT fact_id FROM fact_claims WHERE kind = 'decision' AND fact_id = ANY(%s) "
+                    "AND (claimant <> 'episode' OR episode_id IS DISTINCT FROM %s)", (ids, eid))
+        changed |= {int(r[0]) for r in cur.fetchall()}
+    return sorted(changed)
+
+
 def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None = None,
-         committed: set[int] | frozenset[int] = frozenset(), include_unproven: bool = False) -> dict[str, Any]:
+         committed: set[int] | frozenset[int] = frozenset(), include_unproven: bool = False,
+         retract_reason: str | None = None) -> dict[str, Any]:
     """Put every job the merge resolved back where it was held, and the exact
     prior preferences of every episode it changed, when the row still holds
     exactly what the merge left. A row changed since (or forgotten) is left
@@ -934,14 +1216,18 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
     ``include_unproven``. An unproven entry whose row holds anything else
     never landed, or has changed since, and counts as already restored. A
     resolved record undo can't move back (forgotten, or a job already in its
-    place) stays and is named."""
-    from khipu import memory_lock, outbox
+    place) stays and is named. An entry that imported decisions also
+    retracts exactly the rows it created (``decisions.retract``, the normal
+    path, with ``retract_reason`` naming the owner action), never one it
+    deduped onto; when any created row changed since (``_changed_decisions``)
+    nothing of that episode is undone and the rows are named."""
+    from khipu import decisions, memory_lock, outbox
     from khipu.db import connect
 
     unresolved, still_resolved = 0, []
     for r in resolutions or []:
         folder = outbox.outbox_dir() if r.get("where") == "outbox" else outbox.dead_dir()
-        kind = (r.get("kind") if r.get("kind") in (NORMALIZED_KIND, CONTENT_KIND, SCOPE_KIND)
+        kind = (r.get("kind") if r.get("kind") in (NORMALIZED_KIND, CONTENT_KIND, SCOPE_KIND, DECISIONS_KIND)
                 else "preferences_contained")
         status = outbox.unresolve(str(r["record"]), folder / str(r["job"]), kind)
         if status == "restored":
@@ -950,14 +1236,18 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
             still_resolved.append({"record": str(r["record"]), "job": str(r["job"]), "why": status})
     latest = {int(e["episode_id"]): e for e in entries}  # one entry per episode per merge
     restored, already, left_alone, unproven, reverted = 0, 0, [], [], []
+    retracted: list[int] = []
+    decisions_changed: list[dict[str, Any]] = []
     ids = sorted(latest)
     content = any(e.get("content") for e in latest.values())
+    with_decisions = any((e.get("content") or {}).get("decisions") for e in latest.values())
+    lock_sql = _DECISIONS_LOCK_SQL if with_decisions else _CONTENT_LOCK_SQL if content else _LOCK_SQL
     with connect() as conn, conn.cursor() as cur:
         for start in range(0, len(ids), BATCH):
             part = ids[start:start + BATCH]
             with memory_lock.shared():
                 try:
-                    cur.execute(_CONTENT_LOCK_SQL if content else _LOCK_SQL, (part,))
+                    cur.execute(lock_sql, (part,))
                     rows = {int(r[0]): r for r in cur.fetchall()}
                     for eid in part:
                         e, row = latest[eid], rows.get(eid)
@@ -984,7 +1274,18 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
                             if not include_unproven:
                                 unproven.append(eid)
                                 continue
+                        created = ((e.get("content") or {}).get("decisions") or {}).get("created") or []
+                        if created:
+                            changed = _changed_decisions(cur, eid, created)
+                            if changed:
+                                left_alone.append(eid)
+                                decisions_changed.append({"episode_id": eid, "decision_ids": changed})
+                                continue
+                        if not proven:
                             reverted.append(eid)
+                        for c in created:
+                            if decisions.retract(cur, int(c["id"]), retract_reason):
+                                retracted.append(int(c["id"]))
                         for f, spec in specs:
                             if spec.get("prior_raw_set"):
                                 raw_sql = (f"raw = jsonb_set(coalesce(raw, '{{}}'::jsonb), '{{{f}}}', "
@@ -1003,6 +1304,9 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
                     raise
     out = {"ok": True, "restored": restored, "already_restored": already, "left_alone": left_alone,
            "lines_unresolved": unresolved, "lines_left_resolved": still_resolved, "unproven": unproven}
+    if with_decisions:
+        out["decisions_retracted"] = sorted(retracted)
+        out["decisions_changed"] = decisions_changed
     if reverted:
         out["unproven_reverted"] = reverted
     if unproven:
