@@ -530,9 +530,10 @@ CHILD_NO_ROUTING_ADVISORY = "This child got no routing: add `khipu route --brief
 
 
 def _t3_child_advisory(payload: dict) -> str | None:
-    """The advisory line for a T3 ``delegate_task`` child whose provider has
-    no Khipu hooks: it will get no start block, so a brief without routing
-    leaves it with nothing. Nothing is added to the brief itself."""
+    """The advisory line for a T3 ``delegate_task`` child whose provider gives
+    it no Khipu start block (no hooks, or a harness like T3's Antigravity
+    runtime that ignores injected context): a brief without routing leaves it
+    with nothing. Nothing is added to the brief itself."""
     name = _tool_name(payload)
     if name is None or not (name == "delegate_task" or name.endswith("__delegate_task")):
         return None
@@ -551,7 +552,7 @@ def _t3_child_advisory(payload: dict) -> str | None:
 
     instance = next((inst for inst in t3.all_provider_instances(t3.settings_path())
                      if inst["id"] == instance_id and inst["enabled"]), None)
-    if instance is None or t3.provider_hooks(instance) != "missing":
+    if instance is None or t3.child_gets_start_block(instance):
         return None
     return CHILD_NO_ROUTING_ADVISORY
 
