@@ -976,6 +976,13 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         running = set(known)
         replay = False
         span: set[str] = set()
+        # A re-emission copies the old history in its original order, so a
+        # seen line that sits earlier in that history than a copy already
+        # proven is a repeat typed afterwards, not part of the replay.
+        order: dict[str, int] = {}
+        for n, item in enumerate(seen or ()):
+            order.setdefault(item, n)
+        replay_pos = -1
         for i, entry in enumerate(entries):
             d, role, fp = entry[0], entry[1], entry[7]
             if d.get("isCompactSummary"):
@@ -986,6 +993,10 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                 continue
             seen = fp in running
             seen_flags[i] = seen
+            pos = order.get(fp, -1)
+            out_of_order = replay and seen and 0 <= pos < replay_pos
+            if out_of_order:
+                breaks.add(i)
             if replay and fp in span:
                 after = next((e for e in entries[i + 1:] if e[7] is not None and e[1] == "assistant"), None)
                 after_ident = after and _message_identity(after[0], after[1], after[7])
@@ -994,9 +1005,11 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
                     breaks.add(i)
             span.add(fp)
             ident = _message_identity(d, role, fp)
-            if seen and (replay or not entry[5] and role != "assistant"
+            if seen and ((replay and not out_of_order) or not entry[5] and role != "assistant"
                          or (ident is not None and ident in running)):
                 proven.add(i)
+                if replay and pos > replay_pos:
+                    replay_pos = pos
             elif not seen:
                 replay = False
             running.add(fp)
@@ -3232,7 +3245,8 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                 offset = int(st.get("offset", 0))
                 replaced = st.get("transcript_identity") not in (
                     None, [info.st_dev, info.st_ino])
-                if offset == info.st_size and not replaced:
+                if offset == info.st_size and not replaced \
+                        and not _prefix_rewritten(st, path, offset):
                     skip("nothing_unread")
                     continue
                 cwd = str(st.get("cwd") or "")
