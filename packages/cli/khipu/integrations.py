@@ -27,12 +27,21 @@ Packs:
                  Code's SessionEnd; subagentStop confirmed in Cursor's own docs, K4,
                  same shape as its stop entry)
                ~/.cursor/hooks.json hooks.sessionStart += khipu-recall-hook
-                 (--cursor → additional_context; timeout 30s for PG;
-                 does not replace existing harness sessionStart entries)
-               optional --project → .cursor/rules/khipu.mdc (pull; the ONLY
-                 per-prompt mechanism Cursor gets — it has no UserPromptSubmit
-                 hook event to push through, so the rule text itself carries
-                 the "search before answering" instruction)
+                 (timeout 30s for PG; does not replace existing harness
+                 sessionStart entries)
+               ~/.cursor/hooks.json hooks.beforeSubmitPrompt += khipu-prompt-recall
+                 (always records the owner's turn; its additional_context may be
+                 dropped by Cursor, proof is "unproven" until a real run)
+               ~/.cursor/hooks.json hooks.postToolUse (matcher Task|Shell) +=
+                 khipu-delegation-hook (routing at delegation; never a permission
+                 field, never a preToolUse entry)
+               Every command is the SAME string the claude_code pack writes, no
+               flags: Cursor also loads ~/.claude/settings.json and drops a Claude
+               hook whose command equals its own for the same event, so each Khipu
+               hook then runs once. The harness and output shape come from the
+               payload (khipu.hook_shape), not argv.
+               optional --project → .cursor/rules/khipu.mdc (pull fallback: the
+                 rule text carries the "search before answering" instruction)
   aegis        ~/.grok/config.toml [mcp_servers.khipu]
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] → khipu-stop-hook
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] / [[hooks.SessionEnd]]
@@ -259,7 +268,8 @@ def launcher_states() -> list[dict]:
 _PACK_LAUNCHERS: dict[str, tuple[str, ...]] = {
     "claude_code": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
                     "khipu-delegation-hook"),
-    "cursor": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook"),
+    "cursor": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+               "khipu-delegation-hook"),
     "aegis": ("khipu-mcp", "khipu-aegis-capture"),
     "codex": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
               "khipu-delegation-hook"),
@@ -394,11 +404,6 @@ def _install_delegation_hooks(hooks: dict, path: Path, changes: list[str]) -> bo
 
 # Cursor sessionStart must outlive a hub PG slice; harness session_start.sh stays at 5s.
 CURSOR_RECALL_TIMEOUT = 30
-
-
-def recall_hook_cursor() -> str:
-    """Cursor sessionStart command: same binary, Cursor inject field via --cursor."""
-    return f"{recall_hook()} --cursor"
 
 
 def aegis_capture_hook() -> str:
@@ -1013,6 +1018,56 @@ def _cursor_rule_path(project: str | None) -> Path | None:
     return Path(project).expanduser() / ".cursor" / "rules" / CURSOR_RULE_NAME if project else None
 
 
+# Cursor runs a hook by its tool name, not Claude's: Task is the subagent tool,
+# Shell the shell. postToolUse is the only delegation event Khipu installs
+# (docs: additional_context is accepted there). A preToolUse entry is added only
+# if a real run proves its context reaches the model (slice C), and then never
+# with a permission field: the hook answers context and nothing else.
+CURSOR_DELEGATION_MATCHER = "Task|Shell"
+
+# What a real run has shown, per function, for `status()["proof"]`: "hermetic"
+# (the round trip in tests only), "real-run <date>" (seen working in the
+# harness), "unproven". Slice C sets these from its evidence files.
+CURSOR_PROOF = {
+    "mcp": "hermetic",
+    "capture": "real-run 2026-10-27",
+    "session_recall": "real-run 2026-10-27",
+    "prompt_recall": "unproven",
+    "delegation_push": "unproven",
+}
+
+# Claude Code event -> the Cursor event its settings import maps it to
+# (https://cursor.com/docs/reference/third-party-hooks).
+_CURSOR_IMPORT_EVENTS = {
+    "Stop": "stop", "PreCompact": "preCompact", "SessionEnd": "sessionEnd",
+    "SubagentStop": "subagentStop", "SessionStart": "sessionStart",
+    "UserPromptSubmit": "beforeSubmitPrompt", "PreToolUse": "preToolUse",
+    "SubagentStart": "subagentStart",
+}
+
+
+def _cursor_specs() -> list[dict]:
+    """The hooks.json entries Khipu owns: event, ownership test, command,
+    timeout, matcher, and whether a drifted timeout is put back."""
+    stop = {"is_ours": _is_ours, "command": stop_hook(), "timeout": 20, "matcher": None,
+            "enforce": False, "label": "khipu-stop-hook"}
+    specs = [dict(stop, event=e) for e in ("stop", "preCompact", "sessionEnd", "subagentStop")]
+    specs.append({"event": "sessionStart", "is_ours": _is_our_recall, "command": recall_hook(),
+                  "timeout": CURSOR_RECALL_TIMEOUT, "matcher": None, "enforce": True,
+                  "label": "khipu-recall-hook"})
+    specs.append({"event": "beforeSubmitPrompt", "is_ours": _is_our_prompt_recall,
+                  "command": prompt_recall_hook(), "timeout": PROMPT_RECALL_TIMEOUT, "matcher": None,
+                  "enforce": True, "label": "khipu-prompt-recall"})
+    specs.append({"event": "postToolUse", "is_ours": _is_our_delegation, "command": delegation_hook(),
+                  "timeout": DELEGATION_TIMEOUT, "matcher": CURSOR_DELEGATION_MATCHER, "enforce": True,
+                  "label": "khipu-delegation-hook"})
+    return specs
+
+
+def _cursor_is_khipu(cmd: Any) -> bool:
+    return any(t(cmd) for t in (_is_ours, _is_our_recall, _is_our_prompt_recall, _is_our_delegation))
+
+
 def _cursor_install(dry: bool, project: str | None = None) -> dict:
     out: dict[str, Any] = {"harness": "cursor", "detected": _cursor_detected(), "changes": []}
     if not out["detected"]:
@@ -1042,42 +1097,34 @@ def _cursor_install(dry: bool, project: str | None = None) -> dict:
     h = _load_json(CURSOR_HOOKS)
     hooks = h.setdefault("hooks", {})
     changed = False
-    # subagentStop (K4): Cursor exposes this event (alongside subagentStart);
-    # same shape as its existing stop entry.
-    for event in ("stop", "preCompact", "sessionEnd", "subagentStop"):
+    # Cursor runs every matching hook, so each Khipu entry is appended beside
+    # whatever the harness already has (session_start.sh, before_submit_prompt_chain.sh).
+    # An older install's `khipu-recall-hook --cursor` is repointed in place.
+    for spec in _cursor_specs():
+        event, want_cmd, timeout, matcher = spec["event"], spec["command"], spec["timeout"], spec["matcher"]
         entries = hooks.setdefault(event, [])
-        if not any(_is_ours(e.get("command")) for e in entries):
-            entries.append({"command": stop_hook(), "timeout": 20})
-            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} += khipu-stop-hook")
+        ours = [e for e in entries if spec["is_ours"](e.get("command"))]
+        if not ours:
+            entry: dict[str, Any] = {"command": want_cmd, "timeout": timeout}
+            if matcher:
+                entry["matcher"] = matcher
+            entries.append(entry)
+            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} += {spec['label']}")
             changed = True
-        elif _repoint(entries, _is_ours, stop_hook()):
-            out["changes"].append(
-                f"{CURSOR_HOOKS}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
-            changed = True
-    # Push recall: append a second sessionStart entry. Do not replace harness
-    # session_start.sh (Cursor runs all matching hooks; inject field is
-    # additional_context — verified vs Claude additionalContext).
-    ss = hooks.setdefault("sessionStart", [])
-    want_recall = recall_hook_cursor()
-    if not any(_is_our_recall(e.get("command")) for e in ss):
-        ss.append({"command": want_recall, "timeout": CURSOR_RECALL_TIMEOUT})
-        out["changes"].append(
-            f"{CURSOR_HOOKS}: hooks.sessionStart += khipu-recall-hook "
-            f"(additional_context, timeout={CURSOR_RECALL_TIMEOUT})"
-        )
-        changed = True
-    else:
-        for e in ss:
-            if not _is_our_recall(e.get("command")):
+            continue
+        for e in ours:
+            drift = e.get("command") != want_cmd
+            if spec["enforce"]:
+                drift = drift or e.get("timeout") != timeout or (matcher and e.get("matcher") != matcher)
+            if not drift:
                 continue
-            if e.get("command") != want_recall or e.get("timeout") != CURSOR_RECALL_TIMEOUT:
-                e["command"] = want_recall
-                e["timeout"] = CURSOR_RECALL_TIMEOUT
-                out["changes"].append(
-                    f"{CURSOR_HOOKS}: hooks.sessionStart khipu-recall-hook -> "
-                    f"cursor shape timeout={CURSOR_RECALL_TIMEOUT}"
-                )
-                changed = True
+            e["command"] = want_cmd
+            if spec["enforce"]:
+                e["timeout"] = timeout
+                if matcher:
+                    e["matcher"] = matcher
+            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} {spec['label']} -> {want_cmd}")
+            changed = True
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CURSOR_HOOKS))
         h.setdefault("version", 1)
@@ -1106,17 +1153,15 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
             _write_json(CURSOR_MCP, d)
     h = _load_json(CURSOR_HOOKS)
     changed = False
-    for event in ("stop", "preCompact", "sessionEnd", "subagentStop", "sessionStart"):
+    # Every event Khipu writes to, plus preToolUse/subagentStart in case a later
+    # slice or an owner added Khipu there. Only Khipu launcher commands go.
+    events = [s["event"] for s in _cursor_specs()] + ["preToolUse", "subagentStart"]
+    for event in events:
         entries = h.get("hooks", {}).get(event, [])
-        if event == "sessionStart":
-            kept = [e for e in entries if not _is_our_recall(e.get("command"))]
-            label = "khipu-recall-hook"
-        else:
-            kept = [e for e in entries if not _is_ours(e.get("command"))]
-            label = "khipu-stop-hook"
+        kept = [e for e in entries if not _cursor_is_khipu(e.get("command"))]
         if len(kept) != len(entries):
             changed = True
-            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} -= {label}")
+            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} -= khipu hooks")
             h["hooks"][event] = kept
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CURSOR_HOOKS))
@@ -1124,13 +1169,32 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
     return out
 
 
+def _cursor_third_party_import(h: dict) -> dict:
+    """What Cursor's Claude-settings import does with Khipu's Claude hooks.
+    Cursor loads ``~/.claude/settings.json`` too and drops an imported hook
+    only when its command string equals a Cursor hook's for the same event.
+    ``double_firing`` lists events where both run Khipu (different strings), so
+    a recall or capture would run twice; ``events`` lists every event the
+    import carries a Khipu hook for."""
+    claude = _load_json(CLAUDE_SETTINGS).get("hooks", {})
+    events, double = [], []
+    for claude_event, event in _CURSOR_IMPORT_EVENTS.items():
+        imported = [x.get("command") for e in claude.get(claude_event, []) if isinstance(e, dict)
+                    for x in e.get("hooks", []) if isinstance(x, dict) and _cursor_is_khipu(x.get("command"))]
+        if not imported:
+            continue
+        events.append(event)
+        own = [e.get("command") for e in h.get("hooks", {}).get(event, []) if _cursor_is_khipu(e.get("command"))]
+        if own and any(c not in own for c in imported):
+            double.append(event)
+    return {"claude_settings": bool(events), "events": events, "double_firing": double}
+
+
 def _cursor_status() -> dict:
     d = _load_json(CURSOR_MCP)
     h = _load_json(CURSOR_HOOKS)
-    def has(ev: str) -> bool:
-        return any(_is_ours(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
-    def has_recall(ev: str) -> bool:
-        return any(_is_our_recall(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
+    def has(ev: str, pred=_is_ours) -> bool:
+        return any(pred(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
     def _cmd(ev: str, pred) -> str | None:
         for e in h.get("hooks", {}).get(ev, []):
             if pred(e.get("command")):
@@ -1142,13 +1206,19 @@ def _cursor_status() -> dict:
             "hook_stop": has("stop"), "hook_precompact": has("preCompact"),
             "hook_sessionend": has("sessionEnd"),
             "hook_subagentstop": has("subagentStop"),
-            "hook_sessionstart": has_recall("sessionStart"),
+            "hook_sessionstart": has("sessionStart", _is_our_recall),
             "recall_rule": "project_scoped",
-            "extract": "installed" if has("stop") and has("preCompact") else "missing"}
+            "prompt_recall": "installed" if has("beforeSubmitPrompt", _is_our_prompt_recall) else "missing",
+            "delegation_push": "installed" if has("postToolUse", _is_our_delegation) else "missing",
+            "extract": "installed" if has("stop") and has("preCompact") else "missing",
+            "proof": dict(CURSOR_PROOF),
+            "third_party_import": _cursor_third_party_import(h)}
     out.update(_pack_launchers("cursor", {
         "khipu-mcp": mcp_cmd,
         "khipu-stop-hook": _cmd("stop", _is_ours),
         "khipu-recall-hook": _cmd("sessionStart", _is_our_recall),
+        "khipu-prompt-recall": _cmd("beforeSubmitPrompt", _is_our_prompt_recall),
+        "khipu-delegation-hook": _cmd("postToolUse", _is_our_delegation),
     }))
     return out
 
@@ -2712,12 +2782,19 @@ def _probe_hook(command: str) -> dict:
     return out
 
 
-def _probe_recall(command: str) -> dict:
+# What Cursor's SDK sends a sessionStart hook (docs and SDK 1.0.35): the payload,
+# not an argv flag, tells khipu.hook_shape to answer in Cursor's flat form.
+_CURSOR_PROBE_PAYLOAD = json.dumps({
+    "hook_event_name": "sessionStart", "conversation_id": "khipu-verify", "session_id": "khipu-verify",
+    "cursor_version": "3.26.13", "workspace_roots": ["/tmp/khipu-verify"], "source": "startup"})
+
+
+def _probe_recall(command: str, payload: str = "{}") -> dict:
     """SessionStart hook must print Claude or Cursor inject context with khipu_search.
     Shell-run for the same reason as _probe_hook."""
     t0 = time.time()
     try:
-        p = subprocess.run(command, shell=True, input="{}", capture_output=True, encoding="utf-8", timeout=30)
+        p = subprocess.run(command, shell=True, input=payload, capture_output=True, encoding="utf-8", timeout=30)
         d = json.loads(p.stdout.strip() or "{}")
         ctx = (
             d.get("hookSpecificOutput", {}).get("additionalContext")
@@ -2750,7 +2827,7 @@ def _recall_part(ctx: str) -> str:
     return ctx if _RECALL_HEADING in ctx[cut:] else ctx[:cut]
 
 
-def _probe_prompt_recall(command: str) -> dict:
+def _probe_prompt_recall(command: str, cursor: bool = False) -> dict:
     """UserPromptSubmit hook: a trivial prompt must carry no recall output
     (R11's gate) and a topical one must run cleanly and return valid JSON,
     shell-run for the same reason as _probe_hook. Since routing truth phase
@@ -2788,13 +2865,18 @@ def _probe_prompt_recall(command: str) -> dict:
     # red on a Mac whose `khipu-verify` dedup file already held today's batches).
     trivial_session_id = f"khipu-verify-trivial-{uuid.uuid4().hex[:8]}"
     topical_session_id = f"khipu-verify-topical-{uuid.uuid4().hex[:8]}"
+    def _payload(prompt: str, session: str) -> str:
+        data: dict[str, Any] = {"prompt": prompt, "session_id": session}
+        if cursor:  # Cursor's beforeSubmitPrompt envelope: the answer comes back flat
+            data.update(hook_event_name="beforeSubmitPrompt", conversation_id=session,
+                        cursor_version="3.26.13", workspace_roots=["/tmp/khipu-verify"])
+        return json.dumps(data)
+
     try:
-        trivial = subprocess.run(command, shell=True,
-                                  input=json.dumps({"prompt": "ok", "session_id": trivial_session_id}),
+        trivial = subprocess.run(command, shell=True, input=_payload("ok", trivial_session_id),
                                   capture_output=True, encoding="utf-8", timeout=10)
         topical = subprocess.run(
-            command, shell=True,
-            input=json.dumps({"prompt": "khipu prompt recall verify probe", "session_id": topical_session_id}),
+            command, shell=True, input=_payload("khipu prompt recall verify probe", topical_session_id),
             capture_output=True, encoding="utf-8", timeout=10,
         )
     except Exception as e:  # noqa: BLE001
@@ -3272,16 +3354,19 @@ def verify(harness: str, *, project: str | None = None, home: str | None = None)
                               ok=recall["ok"] and ref["ok"])
             out["components"]["recall"] = recall
         elif harness == "cursor" and st.get("hook_sessionstart"):
-            recall = _probe_recall(recall_hook_cursor())
+            recall = _probe_recall(recall_hook(), _CURSOR_PROBE_PAYLOAD)
             if recall.get("ok"):
-                ref = _probe_aegis_refusal(recall_hook_cursor())
+                ref = _probe_aegis_refusal(recall_hook())
                 recall.update({k: v for k, v in ref.items() if k != "ms"},
                               ok=recall["ok"] and ref["ok"])
             out["components"]["recall"] = recall
-        # Per-prompt recall (R1): Claude Code / Codex only — Cursor has no
-        # UserPromptSubmit event to hook (it keeps the pull rule instead).
+        # Per-prompt recall (R1): Claude Code / Codex, and Cursor's
+        # beforeSubmitPrompt (a Cursor-shaped payload; whether Cursor passes the
+        # answer to the model is the real-run proof, not this probe's).
         if harness in ("claude_code", "codex") and st.get("prompt_recall") == "installed":
             out["components"]["prompt_recall"] = _probe_prompt_recall(prompt_recall_hook())
+        elif harness == "cursor" and st.get("prompt_recall") == "installed":
+            out["components"]["prompt_recall"] = _probe_prompt_recall(prompt_recall_hook(), cursor=True)
         if harness == "cursor":
             # The recall rule is written per-project (Cursor's User Rules live
             # in app state, not a writable file) — `khipu integrations install

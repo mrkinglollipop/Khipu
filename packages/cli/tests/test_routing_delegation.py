@@ -530,5 +530,57 @@ def test_a_dry_run_reports_both_hooks_and_writes_nothing(fake_home):
 
 
 def test_no_grok_build_or_aegis_pack_gets_the_hook(fake_home):
+    # Cursor has it since slice B (postToolUse, never preToolUse); Aegis and Grok Build never do.
     assert "khipu-delegation-hook" not in integ._PACK_LAUNCHERS["aegis"]
-    assert "khipu-delegation-hook" not in integ._PACK_LAUNCHERS["cursor"]
+    assert "khipu-delegation-hook" not in integ._PACK_LAUNCHERS["grok_build"]
+    assert "khipu-delegation-hook" in integ._PACK_LAUNCHERS["cursor"]
+
+
+# ---- Cursor: postToolUse is its delegation event (slice B) ----------------------------------
+
+def _cursor_call(tool: str = "Task", tool_input: dict | None = None, event: str = "postToolUse", **extra) -> dict:
+    """What Cursor's SDK 1.0.35 sends a tool hook: its own tool names and event
+    casing, cursor_version, workspace_roots, and session_id beside conversation_id."""
+    out = {"hook_event_name": event, "conversation_id": SESSION, "session_id": SESSION,
+           "cursor_version": "3.26.13", "workspace_roots": ["/work/project-a"], "cwd": "/work/project-a",
+           "tool_name": tool, "tool_input": tool_input if tool_input is not None else {"prompt": "build it"},
+           "tool_output": "{}"}
+    out.update(extra)
+    return out
+
+
+@pytest.mark.parametrize("tool, tool_input, kind", [
+    ("Task", {"prompt": "build it"}, "agent"),
+    ("Shell", {"command": "codex exec -m m 'fix it'"}, "codex exec"),
+    ("Shell", {"command": "ls -la"}, None),
+    ("Read", {"path": "/x"}, None),
+])
+def test_cursor_tool_names_are_delegations(tool, tool_input, kind):
+    assert routing_delegation.delegation_kind(_cursor_call(tool, tool_input)) == kind
+
+
+def test_cursor_post_tool_use_delivers_routing_in_cursors_flat_shape(home, monkeypatch):
+    out = _run(_cursor_call("Task"), monkeypatch)
+    assert set(out) == {"additional_context"}, out  # context alone: no permission, no decision
+    assert out["additional_context"].startswith(FULL)
+    # The same conversation heard it: a second delegation adds nothing new.
+    assert _run(_cursor_call("Task"), monkeypatch) == {}
+
+
+def test_cursor_post_tool_use_ignores_a_call_that_is_not_a_delegation(home, monkeypatch):
+    assert _run(_cursor_call("Shell", {"command": "ls -la"}), monkeypatch) == {}
+    assert _run(_cursor_call("Read", {"path": "/x"}), monkeypatch) == {}
+
+
+def test_a_claude_shaped_post_tool_use_still_does_nothing(home, monkeypatch):
+    """Only Cursor's own postToolUse carries a delegation; a payload without
+    Cursor's markers keeps the old rule (PreToolUse and SubagentStart only)."""
+    claude = _call("Task", hook_event_name="postToolUse")
+    assert _run(claude, monkeypatch) == {}
+
+
+def test_cursor_pre_tool_use_is_still_not_acted_on(home, monkeypatch):
+    """No preToolUse entry is installed, and an imported Claude one arrives as
+    Cursor's camelCase event, which the hook leaves alone until a real run
+    proves it (slice C)."""
+    assert _run(_cursor_call("Task", event="preToolUse"), monkeypatch) == {}

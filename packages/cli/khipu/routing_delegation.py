@@ -51,11 +51,11 @@ from khipu import hook_shape, wire
 # Claude Code's subagent tool (``Task`` in older versions) and Codex's native
 # one (``spawn_agent``).
 AGENT_TOOLS = frozenset({"Agent", "Task", "spawn_agent"})
-# Each shell tool and the field its command arrives in: Claude Code's Bash and
+# Each shell tool and the field its command arrives in: Cursor's Shell and Claude Code's Bash and
 # Codex's shell_command take a string in ``command``, Codex's shell and
 # local_shell an argv list in ``command``, Codex's exec_command a string in ``cmd``.
 SHELL_TOOLS = {"Bash": "command", "shell": "command", "shell_command": "command", "local_shell": "command",
-               "exec_command": "cmd"}
+               "exec_command": "cmd", "Shell": "command"}
 _BUILT_IN = ("claude", "codex", "grok", "muse")
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 # A wrapper's options that take an operand, short (attached or the next word)
@@ -939,7 +939,11 @@ def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
     event = _event(payload)
     if event == "SubagentStart":
         return ({}, None, None) if _helper(payload) else _subagent_start(payload, env)
-    if event and event != "PreToolUse":
+    # Cursor's postToolUse is the one non-Claude event that carries a delegation
+    # (its docs accept additional_context there). Only a Cursor-shaped payload
+    # qualifies, and the answer is context alone: Cursor reads no permission here.
+    cursor_post = event == "postToolUse" and hook_shape.detect(payload, env)[1] == hook_shape.CURSOR
+    if event and event != "PreToolUse" and not cursor_post:
         return {}, None, None
     out = pre_tool_use(payload, environ)
     # After the push, so noting the brief never spends the push's time budget.
