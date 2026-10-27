@@ -4,16 +4,23 @@ in memory-file lines, merged into the hub episode at the line's key.
 The 2026-10-27 backlog (jobs/2026-10-26/diag-outbox-backlog) is recovery
 lines held as ``evidence_conflict`` because the hub row lacks preferences the
 line carries; the owner chose to merge that text into the hub rather than
-lose it. A line qualifies only when appending its missing preferences to the
-row makes it count as landed by ``capture._legacy_landed_line`` (the check
-the drain's ``write_pg(legacy_projection=True)`` makes), so its next drain
-archives it as resolved. Every other difference is counted and left alone.
+lose it. A line qualifies only when every field but its preferences already
+matches the row (``capture._legacy_landed_line``). Its missing preferences
+are appended, one running list per episode, so several lines for one episode
+all count. Afterwards a line that matches the row exactly lands on its next
+drain (the drain's exact check is unchanged); one whose every preference is
+now on the row but in another order, or beside preferences it lacks, is
+archived to resolved/ here as ``preferences_contained``
+(``outbox.archive_resolved``: the record keeps the whole job, and forget's
+sweep reads that folder). Every other difference is counted and left alone.
 
 Append only: an existing hub preference is never removed, reordered or
-rewritten, and a forgotten episode is never touched. Each transaction's
-additions (episode ids, exact strings, prior lists) are written to the
-owner-actions log before it commits, so ``--undo`` restores the exact prior
-preferences. Job files and memory files are never moved or deleted here.
+rewritten, and a forgotten episode (deleted, forgotten by id on this Mac, or
+by source) is never touched. Each transaction's additions (episode ids,
+exact strings, prior lists) and each job to resolve are written to the
+owner-actions log before they happen, so ``--undo`` restores the exact prior
+preferences and puts resolved jobs back. A job file is only ever moved into
+resolved/, never deleted; memory files are never touched.
 """
 from __future__ import annotations
 
@@ -58,20 +65,23 @@ def _hub_view(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def held_lines() -> list[dict[str, Any]]:
-    """Every recovery line held for a legacy-key conflict, queued or buried.
-    Unreadable files are counted by ``outbox status``; they are skipped here."""
+    """Every recovery line held for a legacy-key conflict, queued or buried,
+    with the bytes it was read from. Unreadable files are counted by
+    ``outbox status``; they are skipped here."""
     from khipu import outbox
 
     out: list[dict[str, Any]] = []
     for where, paths in (("outbox", outbox.jobs()), ("dead", outbox.dead_jobs())):
         for path in paths:
             try:
+                snapshot = path.read_bytes()
                 job = outbox._read_job(path)
             except (OSError, ValueError, TypeError, RecursionError):
                 continue
             if job.get("reason") != LEGACY_REASON or "origin" not in job or job["origin"] is not None:
                 continue
-            out.append({"job": path.name, "where": where, "payload": job["payload"]})
+            out.append({"job": path.name, "where": where, "path": path, "snapshot": snapshot,
+                        "payload": job["payload"]})
     return out
 
 
@@ -79,8 +89,9 @@ def classify(raw: Any, view: dict[str, Any]) -> tuple[str, list[str]]:
     """What separates a held line from its hub row's raw, and the preferences
     to append: ``landed`` (nothing), ``mergeable`` (only preferences the row
     lacks, and appending them lands the line), ``preference_order`` (only
-    preferences differ, but no append-only change can land it: the row holds
-    preferences the line lacks, or in another order), or ``other`` (decisions,
+    preferences differ, and no append lands it exactly: the row holds
+    preferences the line lacks, or in another order; appending the missing
+    ones leaves every line preference on the row), or ``other`` (decisions,
     facts or unknown fields differ; never merged)."""
     from khipu.capture import _legacy_landed_line, _legacy_projection_kind
 
@@ -98,7 +109,51 @@ def classify(raw: Any, view: dict[str, Any]) -> tuple[str, list[str]]:
     missing = list(dict.fromkeys(p for p in line_prefs if p not in hub_prefs))
     if missing and _legacy_landed_line(dict(raw, preferences=hub_prefs + missing), view):
         return "mergeable", missing
-    return "preference_order", []
+    return "preference_order", missing
+
+
+def _forgotten(cur, eid: int, view: dict[str, Any]) -> bool:
+    """The fences every reader and writer uses: forgotten on this Mac by id
+    (``episode_hidden``: a backup's older raw no source identity matches) or
+    by source, here or in the hub (``hub_source_forgotten``)."""
+    from khipu.tombstones import episode_hidden, hub_source_forgotten
+
+    return episode_hidden(eid) or hub_source_forgotten(cur, view)
+
+
+def _episode_plan(row: tuple, lines: list[dict[str, Any]]) -> tuple[list[str], list[str]] | None:
+    """One hub row's held lines against the row as the merge leaves it: each
+    line's outcome (``landed`` as it stands, ``mergeable`` it lands once the
+    additions are made, ``contained`` resolved here as
+    ``preferences_contained``, ``other``) and the preferences to append, in
+    one running list. None when apply would skip the row for its shape (a
+    raw that is not an object, or a preference list in either place that is
+    not a list of strings)."""
+    from khipu.capture import _legacy_preferences_contained, _legacy_projection_kind
+
+    _eid, _deleted_at, raw, column = row
+    if not isinstance(raw, dict):
+        return None
+    hub_prefs, col_prefs = _str_list(raw.get("preferences")), _str_list(column)
+    if hub_prefs is None or col_prefs is None:
+        return None
+    added: list[str] = []
+    before: list[str] = []
+    for line in lines:
+        kind, missing = classify(dict(raw, preferences=hub_prefs + added), line["view"])
+        before.append(classify(raw, line["view"])[0])
+        if kind in ("mergeable", "preference_order"):
+            added += [p for p in missing if p not in added]
+    final = dict(raw, preferences=hub_prefs + added) if added else raw
+    kinds = []
+    for line, was in zip(lines, before):
+        if _legacy_projection_kind(final, line["view"]):
+            kinds.append("landed" if was == "landed" else "mergeable")
+        elif _legacy_preferences_contained(final, line["view"]):
+            kinds.append("contained")
+        else:
+            kinds.append("other")
+    return kinds, added
 
 
 def _lookup(cur, lines: list[dict[str, Any]]) -> dict[int, tuple]:
@@ -116,14 +171,16 @@ def _lookup(cur, lines: list[dict[str, Any]]) -> dict[int, tuple]:
     return rows
 
 
-def _plan(cur) -> tuple[dict[str, int], dict[int, list[dict[str, Any]]]]:
-    """Counts by outcome, and the mergeable lines grouped by episode id."""
-    from khipu.tombstones import hub_source_forgotten
+_COUNTS = ("mergeable", "landed", "preferences_contained", "other", "forgotten", "no_hub_row", "column_shape")
 
+
+def _plan(cur) -> tuple[dict[str, int], dict[int, list[dict[str, Any]]], dict[int, list[str]]]:
+    """Counts by outcome, the held lines grouped by the episode they belong
+    to (only episodes with something to do), and each one's additions."""
     lines = held_lines()
-    counts = {"held_lines": len(lines), "mergeable": 0, "landed": 0, "preference_order": 0,
-              "other": 0, "forgotten": 0, "no_hub_row": 0}
-    by_episode: dict[int, list[dict[str, Any]]] = {}
+    counts = {"held_lines": len(lines), **{k: 0 for k in _COUNTS}}
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    rows: dict[int, tuple] = {}
     for i, row in _lookup(cur, lines).items():
         lines[i]["row"] = row
     for line in lines:
@@ -131,25 +188,34 @@ def _plan(cur) -> tuple[dict[str, int], dict[int, list[dict[str, Any]]]]:
         if row is None:
             counts["no_hub_row"] += 1
             continue
-        eid, deleted_at, raw, _prefs = row
         view = _hub_view(line["payload"])
-        if deleted_at is not None or hub_source_forgotten(cur, view):
+        if row[1] is not None or _forgotten(cur, row[0], view):
             counts["forgotten"] += 1
             continue
-        kind, missing = classify(raw, view)
-        counts[kind] += 1
-        if kind == "mergeable":
-            by_episode.setdefault(eid, []).append(dict(line, view=view, missing=missing))
-    return counts, by_episode
+        rows[row[0]] = row
+        grouped.setdefault(row[0], []).append(dict(line, view=view))
+    by_episode: dict[int, list[dict[str, Any]]] = {}
+    additions: dict[int, list[str]] = {}
+    for eid, group in grouped.items():
+        planned = _episode_plan(rows[eid], group)
+        if planned is None:
+            counts["column_shape"] += len(group)
+            continue
+        kinds, added = planned
+        for kind in kinds:
+            counts["preferences_contained" if kind == "contained" else kind] += 1
+        if added or "contained" in kinds:
+            by_episode[eid], additions[eid] = group, added
+    return counts, by_episode, additions
 
 
-def _sample(by_episode: dict[int, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+def _sample(by_episode: dict[int, list[dict[str, Any]]], additions: dict[int, list[str]]) -> list[dict[str, Any]]:
     """Ids and counts only: preference text never reaches the summary."""
     out = []
     for eid in sorted(by_episode)[:SAMPLES]:
         line = by_episode[eid][0]
         out.append({"episode_id": eid, "job": line["job"], "where": line["where"],
-                    "preferences_to_add": len(line["missing"])})
+                    "lines": len(by_episode[eid]), "preferences_to_add": len(additions[eid])})
     return out
 
 
@@ -157,94 +223,178 @@ def dry_run() -> dict[str, Any]:
     from khipu.db import connect
 
     with connect() as conn, conn.cursor() as cur:
-        counts, by_episode = _plan(cur)
+        counts, by_episode, additions = _plan(cur)
         conn.rollback()
-    return {"ok": True, "dry_run": True, **counts, "episodes": len(by_episode),
-            "preferences_to_add": sum(len(x["missing"]) for lines in by_episode.values() for x in lines),
-            "samples": _sample(by_episode),
+    return {"ok": True, "dry_run": True, **counts,
+            "episodes": sum(1 for eid in by_episode if additions[eid]),
+            "preferences_to_add": sum(len(a) for a in additions.values()),
+            "samples": _sample(by_episode, additions),
             "next": ("Merge them with `khipu outbox merge-line-preferences --apply --owner-direction`; "
                      "lines that differ in anything else stay held." if by_episode else
                      "No held line differs from its hub episode only by preferences the hub lacks.")}
 
 
-def _merge_episode(cur, row: tuple, lines: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _merge_episode(cur, row: tuple, lines: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list]:
     """The append-only change for one locked row, re-proved against it now:
-    what to record and write, or None when nothing qualifies any more."""
-    from khipu.tombstones import hub_source_forgotten
-
+    what to record and write (None when nothing is to be added any more), and
+    the lines to resolve as ``preferences_contained`` once it commits, each
+    with the row's raw as the merge leaves it."""
     eid, deleted_at, raw, column = row
-    raw = raw if isinstance(raw, dict) else None
-    hub_prefs = _str_list((raw or {}).get("preferences"))
-    col_prefs = _str_list(column)
-    if deleted_at is not None or raw is None or hub_prefs is None or col_prefs is None:
-        return None
-    added: list[str] = []
-    for line in lines:
-        if hub_source_forgotten(cur, line["view"]):
-            continue
-        kind, missing = classify(dict(raw, preferences=hub_prefs + added), line["view"])
-        if kind == "mergeable":
-            added += [p for p in missing if p not in added]
+    if deleted_at is not None:
+        return None, []
+    live = [line for line in lines if not _forgotten(cur, eid, line["view"])]
+    planned = _episode_plan(row, live) if live else None
+    if planned is None:
+        return None, []
+    kinds, added = planned
+    hub_prefs, col_prefs = _str_list(raw.get("preferences")), _str_list(column)
+    final = dict(raw, preferences=hub_prefs + added) if added else raw
+    resolve = [(line, final) for line, kind in zip(live, kinds) if kind == "contained"]
     if not added:
+        return None, resolve
+    identities = sorted({tag for line in live for tag in _identity_tags(line["view"])})
+    return ({"episode_id": eid, "added": added,
+             "prior_raw": raw.get("preferences"), "prior_raw_set": "preferences" in raw,
+             "prior_column": column,
+             "column_added": [p for p in added if p not in col_prefs],
+             "identities": identities}, resolve)
+
+
+def _identity_tags(view: dict[str, Any]) -> set[str]:
+    """The registry identities a merged line is known by (hashes, never
+    text), kept so Undo re-checks the same source fence apply did."""
+    from khipu.tombstones import identity_strings
+
+    return identity_strings(view)
+
+
+def _resolution(line: dict[str, Any], final_raw: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
+    """The resolved/ record for one held line, built from the bytes it was
+    read from, and its record id; None when those bytes no longer prove it."""
+    import hashlib
+    from datetime import datetime, timezone
+
+    from khipu.capture import _legacy_preferences_contained
+    from khipu.capture_identity import payload_sha256
+
+    queued = json.loads(line["snapshot"])
+    view = _hub_view(queued["payload"])
+    if not _legacy_preferences_contained(final_raw, view):
         return None
-    return {"episode_id": eid, "added": added,
-            "prior_raw": (raw or {}).get("preferences"), "prior_raw_set": "preferences" in raw,
-            "prior_column": column,
-            "column_added": [p for p in added if p not in col_prefs]}
+    record = {"payload": final_raw, "queued_evidence": queued,
+              "resolution": {"kind": "preferences_contained", "episode_id": int(line["row"][0]),
+                             "original_payload_sha256": payload_sha256(final_raw),
+                             "queued_payload_sha256": payload_sha256(view),
+                             "resolved_at": datetime.now(timezone.utc).isoformat()}}
+    return record, hashlib.sha256(line["snapshot"]).hexdigest()
 
 
-def apply(*, record) -> dict[str, Any]:
+def _resolve(resolve: list, record_resolutions) -> int:
+    """Archive each contained line (logged first), after its row's merge
+    committed. A line whose file changed, or whose source is forgotten, is
+    left where it is."""
+    from khipu import outbox
+
+    built = [(line, *made) for line, final in resolve if (made := _resolution(line, final))]
+    if not built:
+        return 0
+    record_resolutions([{"episode_id": int(line["row"][0]), "record": record_id, "job": line["job"],
+                         "where": line["where"]} for line, _record, record_id in built])
+    return sum(outbox.archive_resolved(line["path"], line["snapshot"], record) == "resolved"
+               for line, record, _record_id in built)
+
+
+def apply(*, record, record_resolutions) -> dict[str, Any]:
     """Merge every qualifying line, BATCH episodes per transaction, each row
     locked in id order and re-proved under its lock. ``record(entries)``
     writes a transaction's entries to the owner-actions log before it
-    commits; when it raises, that transaction is rolled back."""
+    commits; when it raises, that transaction is rolled back. Then each line
+    the merged row now contains is archived as resolved
+    (``record_resolutions`` logs them first)."""
     from khipu import memory_lock
     from khipu.db import connect
 
     merged: list[dict[str, Any]] = []
+    resolved = 0
     with connect() as conn:
         with conn.cursor() as cur:
-            counts, by_episode = _plan(cur)
+            counts, by_episode, _additions = _plan(cur)
             conn.rollback()
             ids = sorted(by_episode)
             for start in range(0, len(ids), BATCH):
                 part = ids[start:start + BATCH]
+                entries: list[dict[str, Any]] = []
+                to_resolve: list = []
                 with memory_lock.shared():
                     try:
                         cur.execute(_LOCK_SQL, (part,))
-                        entries = [e for e in (_merge_episode(cur, tuple(r[:4]), by_episode[int(r[0])])
-                                               for r in cur.fetchall()) if e]
-                        if not entries:
+                        for r in cur.fetchall():
+                            for line in by_episode[int(r[0])]:
+                                line["row"] = tuple(r[:4])
+                            entry, resolve = _merge_episode(cur, tuple(r[:4]), by_episode[int(r[0])])
+                            entries += [entry] if entry else []
+                            to_resolve += resolve
+                        if entries:
+                            record(entries)
+                            for e in entries:
+                                hub = _str_list(e["prior_raw"]) or []
+                                col = _str_list(e["prior_column"]) or []
+                                cur.execute(_UPDATE_SQL, (json.dumps(col + e["column_added"], ensure_ascii=False),
+                                                          json.dumps(hub + e["added"], ensure_ascii=False),
+                                                          e["episode_id"]))
+                            conn.commit()
+                        else:
                             conn.rollback()
-                            continue
-                        record(entries)
-                        for e in entries:
-                            hub = _str_list(e["prior_raw"]) or []
-                            col = _str_list(e["prior_column"]) or []
-                            cur.execute(_UPDATE_SQL, (json.dumps(col + e["column_added"], ensure_ascii=False),
-                                                      json.dumps(hub + e["added"], ensure_ascii=False),
-                                                      e["episode_id"]))
-                        conn.commit()
                     except BaseException:
                         conn.rollback()
                         raise
                 merged += entries
+                resolved += _resolve(to_resolve, record_resolutions)
     return {"ok": True, "applied": True, **counts, "episodes_merged": len(merged),
             "preferences_added": sum(len(e["added"]) for e in merged),
-            "episode_ids": [e["episode_id"] for e in merged],
+            "episode_ids": [e["episode_id"] for e in merged], "lines_resolved": resolved,
             "next": ("Each merged line now counts as landed: a queued one resolves on its next drain; "
-                     "a held one in dead/ resolves after `khipu outbox retry-dead`." if merged else
-                     "Nothing qualified; the hub is unchanged.")}
+                     "a held one in dead/ resolves after `khipu outbox retry-dead`. Lines the hub now "
+                     "holds every preference of, in another order, were archived as resolved."
+                     if merged or resolved else "Nothing qualified; the hub is unchanged.")}
 
 
-def undo(entries: list[dict[str, Any]]) -> dict[str, Any]:
-    """Put back the exact prior preferences of every episode a merge changed,
-    when the row still holds exactly what the merge left. A row changed
-    since (or forgotten) is left alone and named: undo never removes text
-    something else wrote."""
-    from khipu import memory_lock
+def _undo_fenced(cur, eid: int, entry: dict[str, Any]) -> bool:
+    """Apply's fences, re-checked for Undo: forgotten by id on this Mac, or
+    by any source identity the merged lines carried, here or in the hub."""
+    from khipu.db import has_table
+    from khipu.tombstones import episode_hidden, hub_form, read_gate
+
+    if episode_hidden(eid):
+        return True
+    tags = set(entry.get("identities") or [])
+    if not tags:
+        return False
+    try:
+        if tags & read_gate().refusals:
+            return True
+    except Exception:  # noqa: BLE001 - an unreadable registry shows no episode
+        return True
+    if not has_table(cur, "forgotten_sources"):
+        return False
+    cur.execute("SELECT 1 FROM forgotten_sources WHERE identity = ANY(%s) LIMIT 1",
+                (sorted(f for t in tags if (f := hub_form(t))),))
+    return cur.fetchone() is not None
+
+
+def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Put every job the merge resolved back where it was held, and the exact
+    prior preferences of every episode it changed, when the row still holds
+    exactly what the merge left. A row changed since (or forgotten) is left
+    alone and named: undo never removes text something else wrote."""
+    from khipu import memory_lock, outbox
     from khipu.db import connect
 
+    unresolved = 0
+    for r in resolutions or []:
+        folder = outbox.outbox_dir() if r.get("where") == "outbox" else outbox.dead_dir()
+        unresolved += outbox.unresolve(str(r["record"]), folder / str(r["job"]),
+                                       "preferences_contained") == "restored"
     latest = {int(e["episode_id"]): e for e in entries}  # one entry per episode per merge
     restored, already, left_alone = 0, 0, []
     ids = sorted(latest)
@@ -257,7 +407,8 @@ def undo(entries: list[dict[str, Any]]) -> dict[str, Any]:
                     rows = {int(r[0]): r for r in cur.fetchall()}
                     for eid in part:
                         e, row = latest[eid], rows.get(eid)
-                        if row is None or row[1] is not None or not isinstance(row[2], dict):
+                        if (row is None or row[1] is not None or not isinstance(row[2], dict)
+                                or _undo_fenced(cur, eid, e)):
                             left_alone.append(eid)
                             continue
                         raw_now, col_now = row[2].get("preferences"), row[3]
@@ -285,4 +436,5 @@ def undo(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 except BaseException:
                     conn.rollback()
                     raise
-    return {"ok": True, "restored": restored, "already_restored": already, "left_alone": left_alone}
+    return {"ok": True, "restored": restored, "already_restored": already, "left_alone": left_alone,
+            "lines_unresolved": unresolved}

@@ -1249,6 +1249,22 @@ def _legacy_landed_line(original: Any, incoming: Any) -> bool:
     return True
 
 
+def _legacy_preferences_contained(original: Any, incoming: Any) -> bool:
+    """A memory-file line whose every preference is on the hub row (which may
+    hold more, in another order) and whose other fields pass
+    ``_legacy_landed_line``. Never a drain proof: only the owner's
+    ``khipu outbox merge-line-preferences`` resolves such a line, as
+    ``preferences_contained``."""
+    if not isinstance(original, dict) or not isinstance(incoming, dict):
+        return False
+    line, stored = incoming.get("preferences"), original.get("preferences")
+    if not (isinstance(line, list) and line and all(isinstance(p, str) for p in line)
+            and isinstance(stored, list) and all(isinstance(p, str) for p in stored)):
+        return False
+    rest = {k: v for k, v in incoming.items() if k != "preferences"}
+    return set(line) <= set(stored) and _legacy_landed_line(original, rest)
+
+
 def _legacy_projection_kind(original: Any, incoming: dict[str, Any]) -> str | None:
     """The resolution kind a queued file line proves against the hub row, if any."""
     if _legacy_comma_projection(original, incoming):

@@ -4353,8 +4353,10 @@ def cmd_outbox(args: argparse.Namespace) -> int:
 def _outbox_merge_preferences(args: argparse.Namespace) -> int:
     """``khipu outbox merge-line-preferences``: a dry run by default (counts
     and redacted samples). ``--apply`` and ``--undo ID`` change the hub, so
-    each needs ``--owner-direction``: the owner gate, logged with its Undo."""
-    from khipu import outbox_preferences, owner_direction
+    each is the owner's: the app (``--from-app``), a yes typed on a terminal,
+    or ``--owner-direction``, as ``routing._owner_via`` checks them; logged
+    with its Undo either way."""
+    from khipu import outbox_preferences, owner_direction, routing
 
     if args.apply and args.undo:
         print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
@@ -4362,12 +4364,6 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
     if not (args.apply or args.undo):
         print(json.dumps(outbox_preferences.dry_run(), indent=2))
         return 0
-    if not getattr(args, "by_direction", False):
-        print(json.dumps({"ok": False, "code": "owner_only",
-                          "error": "Merging into the hub (or undoing a merge) needs the owner's direction: "
-                                   "pass --owner-direction from a conversation the owner typed in. "
-                                   "Nothing was changed."}))
-        return 2
     if args.undo:
         line = owner_direction._find(args.undo)
         if line is not None and line.get("action") != outbox_preferences.ACTION:
@@ -4381,16 +4377,36 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
         want = owner_direction.intent("direction.undo", args.undo)
     else:
         want = owner_direction.intent(outbox_preferences.ACTION, "outbox")
-    try:
-        owner_direction.gate(want)
-    except owner_direction.DirectionRefused as err:
-        print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
+    refused = {"ok": False, "code": "owner_only",
+               "error": "Merging into the hub (or undoing a merge) is the owner's change: make it in the Khipu "
+                        "app, type yes on a terminal, or pass --owner-direction from a conversation the owner "
+                        "typed in. Nothing was changed."}
+    via = None
+    if getattr(args, "from_app", False):
+        caller = routing._caller()
+        if caller["app"]:
+            owner_direction.noted(want, {"auth": "app",
+                                         "auth_chain": " < ".join(caller["chain"] + [caller["where"]])})
+            via = "app"
+    elif getattr(args, "by_direction", False):
+        try:
+            owner_direction.gate(want)
+        except owner_direction.DirectionRefused as err:
+            print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
+            return 2
+        via = "direction"
+    elif routing.typed_yes("This changes preferences on hub episodes (Undo puts them back). Type yes to confirm: "):
+        owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
+        via = "cli"
+    if via is None:
+        print(json.dumps(refused))
         return 2
     try:
         if args.undo:
-            res = owner_direction.undo(args.undo, "direction")
+            res = owner_direction.undo(args.undo, via)
         else:
-            res = outbox_preferences.apply(record=owner_direction.record_preference_merges)
+            res = outbox_preferences.apply(record=owner_direction.record_preference_merges,
+                                           record_resolutions=owner_direction.record_preference_resolutions)
     except BaseException:
         owner_direction._abandon()
         raise
@@ -6784,9 +6800,11 @@ def build_parser() -> argparse.ArgumentParser:
              "count them (default), merge them (--apply) or undo a merge (--undo ID)",
     )
     obm.add_argument("--apply", action="store_true",
-                     help="Append the missing preferences to their hub episodes (needs --owner-direction)")
+                     help="Append the missing preferences to their hub episodes (the owner's: the app, a typed yes "
+                          "or --owner-direction)")
     obm.add_argument("--undo", metavar="OWNER_ACTION", default=None,
-                     help="Put back the exact prior preferences of one merge (needs --owner-direction)")
+                     help="Put back the exact prior preferences of one merge (the owner's, as --apply)")
+    obm.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     from khipu.owner_direction import add_owner_flags as _merge_owner_flags
 
     _merge_owner_flags(obm)

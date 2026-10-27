@@ -801,13 +801,26 @@ def record_preference_merges(entries: list[dict]) -> None:
              "state": "pending", "preference_merges": entries})
 
 
-def preference_merges(line_id: str) -> list[dict]:
-    """Every addition a merge recorded, in log order. Read from the raw log:
-    the merged view keeps only the last state line's fields."""
+def record_preference_resolutions(jobs: list[dict]) -> None:
+    """Persist the held jobs a merge is about to archive as resolved (record
+    id, job name, where it was held) before any moves: the Undo puts them
+    back."""
+    pend = _PENDING.get()
+    line = (pend or {}).get("line")
+    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
+        raise OSError("the owner action must be recorded before held lines can be resolved")
+    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+             "state": "pending", "preference_resolutions": jobs})
+
+
+def preference_merges(line_id: str, key: str = "preference_merges") -> list[dict]:
+    """Every addition a merge recorded (or, with ``preference_resolutions``,
+    every job it resolved), in log order. Read from the raw log: the merged
+    view keeps only the last state line's fields."""
     out: list[dict] = []
     for row in read_log():
         if row.get("kind") == "state" and row.get("target") == line_id:
-            out += [e for e in row.get("preference_merges") or [] if isinstance(e, dict)]
+            out += [e for e in row.get(key) or [] if isinstance(e, dict)]
     return out
 
 
@@ -936,11 +949,22 @@ def _abandon() -> None:
             state = _hub_write_state(write)
         elif pend["line"].get("inverse_writes"):
             state = _inverse_state(pend["line"]["inverse_writes"])
+        elif pend["intent"]["action"] == "outbox.merge_preferences" and _merge_recorded(pend["line"]["id"]):
+            # Batches before the failure committed and their Undo is logged:
+            # unconfirmed, so Undo still runs.
+            state = "pending"
         try:
             _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": pend["line"]["id"],
                      "state": state})
         except OSError:
             pass
+
+
+def _merge_recorded(line_id: str) -> bool:
+    try:
+        return bool(preference_merges(line_id) or preference_merges(line_id, "preference_resolutions"))
+    except Exception:  # noqa: BLE001 - an unreadable log can't show a merge to undo
+        return False
 
 
 _INCOMPLETE = ("The change was made and its Undo is recorded, but Khipu could not write that it finished, so "
@@ -1656,11 +1680,14 @@ def _undo_outbox_preferences(line, via):
     from khipu import outbox_preferences
 
     entries = preference_merges(line["id"])
-    if not entries:
-        if int((line.get("result") or {}).get("episodes_merged") or 0) == 0 and line["state"] == "applied":
+    resolved = preference_merges(line["id"], "preference_resolutions")
+    if not (entries or resolved):
+        result = line.get("result") or {}
+        if (int(result.get("episodes_merged") or 0) == 0 and int(result.get("lines_resolved") or 0) == 0
+                and line["state"] == "applied"):
             return {"ok": True, "restored": 0, "left_alone": []}
         raise ValueError("Khipu has no record of which preferences this merge added, so it can't undo it")
-    return outbox_preferences.undo(entries)
+    return outbox_preferences.undo(entries, resolved)
 
 
 def _ledger_undo(verb: str):
