@@ -387,3 +387,39 @@ def test_the_gateway_keeps_the_priority_when_valid_until_is_a_second_after_publi
     body = gc.answer(identity=None, now=now + timedelta(seconds=5), hub=hub)
     assert {e["label"] for e in body["priority"]["entries"]} == {"Codex", "Grok"}
     assert WORDS in str(body) and not body["stale"]
+
+
+def test_line_stripper_cuts_only_the_forms_the_line_is_built_with():
+    from khipu.routing_gateway_copy import _without_line_exceptions as cut
+    line = ("Your priority (x): 1. Codex: reviews (exceptional cases only) (exception until 18:52Z: go wide); "
+            "2. Grok (exception: a (b) c).")
+    assert cut(line) == "Your priority (x): 1. Codex: reviews (exceptional cases only); 2. Grok."
+
+
+def test_line_stripper_survives_brackets_in_the_words_and_unmatched_ones():
+    from khipu.routing_gateway_copy import _without_line_exceptions as cut
+    line = "P: 1. A (exception: go wide :) LEAKED TAIL); 2. B: keep (exception until 18:52Z: x)."
+    assert cut(line) == "P: 1. A; 2. B: keep."
+    open_ = "P: 1. A (exception: never closed; 2. B: later entry."
+    assert cut(open_) == open_
+
+
+def test_gateway_leaves_the_line_alone_when_entries_carry_structured_exceptions(direction_world, monkeypatch):
+    gc, now, projection = _published(direction_world, monkeypatch)
+    projection["valid_until"] = routing._iso(now + timedelta(seconds=1))
+    projection["priority"]["line"] += " Also reviews (exceptional cases only) (exception: kept by design)."
+    hub = _OneRowHub(projection, routing._iso(now))
+    body = gc.answer(identity=None, now=now + timedelta(seconds=5), hub=hub)
+    assert "(exceptional cases only) (exception: kept by design)" in body["priority"]["line"]
+
+
+def test_gateway_cuts_line_exceptions_from_an_older_copy_past_valid_until(direction_world, monkeypatch):
+    gc, now, projection = _published(direction_world, monkeypatch)
+    projection["valid_until"] = routing._iso(now + timedelta(seconds=1))
+    for entry in projection["priority"]["entries"]:
+        entry.pop("exceptions", None)
+    projection["priority"]["line"] = ("P: 1. Codex: reviews (exceptional cases only) "
+                                      "(exception: go wide :) LEAKED TAIL); 2. Grok: build.")
+    hub = _OneRowHub(projection, routing._iso(now))
+    body = gc.answer(identity=None, now=now + timedelta(seconds=5), hub=hub)
+    assert body["priority"]["line"] == "P: 1. Codex: reviews (exceptional cases only); 2. Grok: build."
