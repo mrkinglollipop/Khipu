@@ -7,7 +7,7 @@ from datetime import timedelta
 
 import pytest
 
-from khipu import routing, routing_gateway_copy as gc
+from khipu import owner_act, routing, routing_gateway_copy as gc
 
 pytest_plugins = ("tests.test_routing_acceptance", "tests.test_owner_direction")
 
@@ -78,21 +78,25 @@ class _OneRowHub:
         return self.row
 
 
-def test_an_older_copys_baked_in_allowance_is_cut_from_the_line_past_valid_until(direction_world, monkeypatch):
+def test_a_current_copy_has_no_exception_in_the_line_and_keeps_its_priority_past_valid_until(direction_world, monkeypatch):
     real = routing.settings
     monkeypatch.setattr(routing, "settings", lambda *a, **k: {**real(*a, **k), "routing_cloud_copy": True,
                                                               "routing_cloud_copy_rules": True})
     routing.set_priority([{"account": "Codex", "role": "reviews"}], via="app", expect=routing.priority_version())
+    direction_world.say("Codex may run over pace for a bit")
+    ok, out = owner_act.act("route.priority.amend", {"account": "Codex", "exception": "OLD ALLOWANCE", "until": "1h",
+                                                     "expect": routing.priority_version()})
+    assert ok, out
     now = routing._now()
     projection = routing.gateway_projection(now=now)
-    # As code before round 6 published it: the exception only in the line.
-    projection["priority"]["line"] += " (exception until 10:01Z: OLD ALLOWANCE)"
+    assert "OLD ALLOWANCE" not in projection["priority"]["line"]
     projection["valid_until"] = routing._iso(now + timedelta(hours=1))
     gc.validate(projection)
     hub = _OneRowHub(projection, routing._iso(now))
     assert "OLD ALLOWANCE" in str(gc.answer(identity=None, now=now + timedelta(minutes=30), hub=hub))
     after = gc.answer(identity=None, now=now + timedelta(hours=2), hub=hub)
     assert "OLD ALLOWANCE" not in str(after) and after["priority"]["entries"]
+    assert not any("exceptions" in e for e in after["priority"]["entries"])
 
 
 # ---- (2) a cap layer's natural expiry never blocks a first retry ----------------------------------

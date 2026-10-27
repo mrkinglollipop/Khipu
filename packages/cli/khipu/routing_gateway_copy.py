@@ -646,29 +646,6 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
         return _failed(state, now, cleanup)
 
 
-# How priority_line writes an exception, and what can follow its closing ")":
-# the next exception, a level or hold note, the next entry, or the line's end.
-_LINE_EXCEPTION_OPEN = re.compile(r"\(exception(?: until [^()]{1,40}?)?: ")
-_LINE_EXCEPTION_CLOSE = re.compile(r"\)(?= \((?:exception|level:|contradicts)|; \d+\. |\.|$)")
-
-
-def _without_line_exceptions(line):
-    """Cut the "(exception until T: words)" and "(exception: words)" forms the
-    priority line is built with. The words may hold brackets, so an exception
-    ends at the first ")" that a line part can follow; one with no such end is
-    left alone rather than cutting what comes after it."""
-    out, i = [], 0
-    while i < len(line):
-        start = _LINE_EXCEPTION_OPEN.search(line, i)
-        end = _LINE_EXCEPTION_CLOSE.search(line, start.end()) if start else None
-        if end is None:
-            out.append(line[i:])
-            break
-        out.append(line[i:start.start()].rstrip())
-        i = end.end()
-    return "".join(out)
-
-
 def answer(*, identity, account=None, ack="", now=None, hub=None):
     now = now or routing._now()
     hub = hub or PostgresHub()
@@ -687,7 +664,6 @@ def answer(*, identity, account=None, ack="", now=None, hub=None):
     # A priority exception is served only before its end, whenever the copy
     # was published: one that ended since is dropped at read time.
     entries = (body.get("priority") or {}).get("entries") or []
-    structured = any("exceptions" in entry for entry in entries)
     for entry in entries:
         live = [x for x in entry.get("exceptions") or []
                 if (routing._parse(x.get("until")) or now) > now]
@@ -697,14 +673,6 @@ def answer(*, identity, account=None, ack="", now=None, hub=None):
             entry.pop("exceptions", None)
     as_of = routing._parse(row["published_at"])
     stale = bool(row["stale_after"] and (now - as_of).total_seconds() > row["stale_after"])
-    # An older copy carried an exception only inside the priority line. Past
-    # the copy's own valid_until that text may have ended, so it is cut from
-    # the line; the priority itself is always kept.
-    valid_until = routing._parse(body.get("valid_until"))
-    priority = body.get("priority")
-    if valid_until is not None and now >= valid_until and isinstance(priority, dict) and priority.get("line") \
-            and not structured:
-        priority["line"] = _without_line_exceptions(priority["line"])
     body.update(as_of=row["published_at"], stale=stale)
     if stale:
         body["stale_message"] = "this Mac has not reported since " + as_of.strftime("%H:%MZ")
