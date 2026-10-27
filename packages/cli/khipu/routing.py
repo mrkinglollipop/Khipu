@@ -10468,7 +10468,7 @@ def _fold_turn():
         os.close(fd)
 
 
-def _prompt_view(now: datetime, on_fold=None) -> dict:
+def _prompt_view(now: datetime, on_fold=None, clock: dict | None = None) -> dict:
     """The view for a prompt. A fresh view.json is answered as it is. When
     an input changed or ``valid_until`` has passed (the clock caused a
     change and nothing refolded yet), the record is refolded inline, as the
@@ -10480,7 +10480,9 @@ def _prompt_view(now: datetime, on_fold=None) -> dict:
     called once the lock is held: the per-prompt child then lets this fold
     run on until it has saved the view, so a fold slower than a prompt's
     wait still ends with a saved view instead of starting again on every
-    prompt."""
+    prompt. ``clock`` (``{"now": ...}``): the clock is read again once the
+    fold lock is ours, and the time used is left there, so a wait for
+    another fold never answers a view that fell due meanwhile."""
     try:
         os.stat(events_file())
     except FileNotFoundError:
@@ -10495,6 +10497,8 @@ def _prompt_view(now: datetime, on_fold=None) -> dict:
             and not routing_sources.any_configured(cfg["_raw_sources"], cfg):
         return read_view(now)  # no record: nothing to fold, and nothing written
     with _fold_turn():
+        if clock is not None:
+            now = clock["now"] = _now()  # the clock once the lock is ours, not before waiting for it
         if on_fold is not None:
             on_fold()
         return _start_view(now)
@@ -10797,9 +10801,11 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
     about a fifth of prompts as fold-busy). An answer finished after the
     hook stopped taking it is still the hook's ``skipped:budget``."""
     with lock_budget(budget / 2, fold=budget / 2 if fold_wait is None else max(budget / 2, fold_wait)):
+        clock = None if now is not None else {}
         now = now or _now()
         _view_seen.stat = None
-        view = _prompt_view(now, on_fold=on_fold)
+        view = _prompt_view(now, on_fold=on_fold, clock=clock)
+        now = (clock or {}).get("now", now)
     cfg = settings()
     session = getattr(marker, "session", None)
     if session:

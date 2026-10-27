@@ -28,30 +28,36 @@ T0 = audit.T0
 
 
 def test_a_fold_that_holds_the_lock_briefly_is_waited_for_and_delivered(home, monkeypatch):
+    """The recall daemon's helper path (its children count against the cap;
+    a one-shot hook's child keeps the half-budget wait)."""
     push._record()
-    routing.view_file().unlink()  # a refold is due
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
     push._set(home, routing_prompt_budget_ms=50)  # the shipped budget: half of it was the old wait
     home["search"]["delay"] = 0.6  # the hook takes an answer finished while it searched
-    held, done = threading.Event(), threading.Event()
-
-    def other_fold():
-        with routing._fold_turn():  # another prompt's (or the poll's) fold
-            held.set()
-            time.sleep(0.15)
-            routing.read_view()  # it saves the view, then lets go
-        done.set()
-
-    thread = threading.Thread(target=other_fold)
-    thread.start()
-    assert held.wait(5)
     push._push_on(monkeypatch)
+    svc, thread = push._fresh_daemon(home, "wait")
     try:
-        out = push._cold(monkeypatch)
+        assert svc.routing_forkserver.wait_ready(10)
+        routing.view_file().unlink()  # a refold is due
+        held, done = threading.Event(), threading.Event()
+
+        def other_fold():
+            with routing._fold_turn():  # another prompt's (or the poll's) fold
+                held.set()
+                time.sleep(0.15)
+                routing.read_view()  # it saves the view, then lets go
+            done.set()
+
+        holder = threading.Thread(target=other_fold)
+        holder.start()
+        assert held.wait(5)
+        first = len(push._log_lines()) + 1
+        push._timed(svc)
+        holder.join(10)
+        assert done.is_set()
+        assert push._statuses(first, 1) == ["full"], push._log_lines()[-1:]
     finally:
-        thread.join(10)
-    assert done.is_set()
-    assert push._routing_part(out).startswith(push.FULL), push._log_lines()[-1:]
-    assert push._last_log().endswith(" routing=full")
+        push._end(svc, thread)
 
 
 def test_the_routing_lock_keeps_its_short_wait(monkeypatch):
@@ -59,7 +65,7 @@ def test_the_routing_lock_keeps_its_short_wait(monkeypatch):
     keeps the budget's half."""
     seen = {}
 
-    def fake_view(now, on_fold=None):
+    def fake_view(now, on_fold=None, clock=None):
         seen["deadline"] = routing._held.deadline - time.monotonic()
         seen["fold"] = routing._held.fold_deadline - time.monotonic()
         raise routing.FoldBusy("stop here")
@@ -248,3 +254,110 @@ def test_three_skips_in_a_row_in_one_conversation_is_a_delay(replay):
     _log(rows + [("one", "skipped:unsaved")])
     result = health.prompt_health(acceptance.T0, 5.0)
     assert result["reasons"] == ["prompt-delay"] and result["longest_skip_run"] == 3
+
+
+# ---- review round 1 (Grok leads, 2026-10-27) -------------------------------------------------
+
+
+def _wait_behind(world, holder_work):
+    """A prompt whose view is due waits for another fold's lock; ``holder_work``
+    runs while it waits. Returns the (view, now) the prompt built its lines from."""
+    import os
+
+    seen = {}
+
+    def text(marker, view, now, cfg, *, session_id=None):
+        seen.update(view=view, now=now)
+        return {"kind": "none", "_delivery_view": view}
+
+    held, waiting = threading.Event(), threading.Event()
+
+    def other():
+        with routing._fold_turn():
+            held.set()
+            waiting.wait(5)
+            time.sleep(0.05)  # the prompt is now inside its fold-lock wait
+            holder_work()
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    assert held.wait(5)
+    real_take = routing._take_fold_lock
+
+    def take(fd):
+        waiting.set()
+        return real_take(fd)
+
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(routing, "_prompt_text", text)
+        m.setattr(routing, "_take_fold_lock", take)
+        routing._prompt_push(None, budget=0.05, fold_wait=2.0)
+    thread.join(10)
+    assert os.path.exists(routing.view_file())
+    return seen["view"], seen["now"]
+
+
+def test_a_view_that_falls_due_during_the_fold_wait_is_not_served(world):
+    _pace_world(T0 - timedelta(minutes=19, seconds=50))
+    routing.read_view()  # valid until T0 + 11 s
+    world[0] = T0 + timedelta(seconds=12)  # due: the prompt waits for the other fold
+
+    def holder():
+        routing._start_fold(world[0], save=True)  # saves a view valid until T0 + 42 s
+        world[0] = T0 + timedelta(seconds=50)  # and the clock moves on past it while the prompt waits
+
+    view, now = _wait_behind(world, holder)
+    assert now == T0 + timedelta(seconds=50)
+    assert routing._parse(view["valid_until"]) > now, (view["valid_until"], now)
+
+
+def test_a_waiter_past_its_routing_lock_deadline_still_folds_and_saves(world):
+    _pace_world(T0)
+    routing.read_view()
+    world[0] = T0 + timedelta(seconds=31)  # due
+    view, now = _wait_behind(world, lambda: time.sleep(0.1))  # the other fold saves nothing
+    assert view.get("saved") is not False
+    assert routing._load_view()["folded_at"] == routing._iso(now)
+
+
+def test_one_shot_children_do_not_pile_up_behind_a_held_fold_lock(home, monkeypatch):
+    import os
+
+    push._record()
+    push._set(home, routing_prompt_budget_ms=50)
+    routing.view_file().unlink()
+    push._push_on(monkeypatch)
+    lock = open(routing.routing_dir() / routing.PROMPT_FOLD_LOCK, "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        most = 0
+        for i in range(recall_prompt._FORKSERVER_CHILDREN_MOST + 6):
+            push._cold(monkeypatch)
+            most = max(most, len(push._live_children(os.getpid())))
+        assert most <= recall_prompt._FORKSERVER_CHILDREN_MOST, most
+    finally:
+        lock.close()
+
+
+def test_the_helpers_poll_counts_against_the_child_cap(home, monkeypatch):
+    push._record()
+    home["clock"].now = datetime.now(timezone.utc).replace(microsecond=0)
+    push._set(home, routing_prompt_budget_ms=50, routing_poll_interval=1)
+    routing.view_file().unlink()
+    push._push_on(monkeypatch)
+    svc, thread = push._fresh_daemon(home, "pollcap")
+    lock = open(routing.routing_dir() / routing.PROMPT_FOLD_LOCK, "a")
+    try:
+        assert svc.routing_forkserver.wait_ready(10)
+        helper = svc.routing_forkserver._proc
+        fcntl.flock(lock, fcntl.LOCK_EX)  # every child and every poll waits
+        most, end = 0, time.monotonic() + 4.0
+        while time.monotonic() < end:
+            push._timed(svc)
+            most = max(most, len(push._live_children(helper.pid)))
+        assert most <= recall_prompt._FORKSERVER_CHILDREN_MOST, most
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        push._wait_children_ended(helper, 30)
+    finally:
+        lock.close()
+        push._end(svc, thread)

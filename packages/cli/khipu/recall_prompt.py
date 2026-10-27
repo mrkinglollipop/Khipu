@@ -487,7 +487,7 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, decided: bool = False,
-                          moment: str = "prompt") -> None:
+                          moment: str = "prompt", wait_fold: bool = False) -> None:
     """The forked child: decide whether routing is on for this prompt (the
     switches, read from ``environ``, and the settings; ``moment`` names
     the push: "prompt", or "delegation" for the delegation hook) unless the
@@ -555,7 +555,11 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                 # then answers from: wait for it up to the hook's own
                 # deadline, not half the budget; a late answer is still the
                 # hook's skipped:budget.
-                fold_wait = max(0.0, deadline - time.monotonic() - _ROUTING_FOLD_WAIT_SLACK)
+                # Only the helper's children wait: it counts them against
+                # ``_FORKSERVER_CHILDREN_MOST``; a one-shot hook's child is
+                # counted by nobody and keeps the half-budget wait.
+                fold_wait = (max(0.0, deadline - time.monotonic() - _ROUTING_FOLD_WAIT_SLACK)
+                             if wait_fold else None)
                 out = routing.prompt_push(marker, budget=budget, on_fold=fold_started, session_id=session_id,
                                           fold_wait=fold_wait)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
@@ -1476,13 +1480,19 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
     try:
         while True:
             reap()
+            held_back = False
             if poll_fd is None and (time.monotonic() >= next_look or schedule.due()):
                 # The switches as they are now: never a poll with the push off.
                 _look_at_settings(schedule, routing)
                 next_look = time.monotonic() + _SETTINGS_LOOK_S
                 if schedule.due():
-                    poll_fd, poll_buf = start_poll(), b""
-            wait = _HELPER_TICK_S if poll_fd is not None else schedule.sleep_for(_HELPER_TICK_S)
+                    reap()
+                    # The poll is a live child too: never past the one cap.
+                    if len(children) + len(pollers) < _FORKSERVER_CHILDREN_MOST:
+                        poll_fd, poll_buf = start_poll(), b""
+                    else:
+                        held_back = True  # looked at again next tick
+            wait = _HELPER_TICK_S if poll_fd is not None or held_back else schedule.sleep_for(_HELPER_TICK_S)
             watched = [sock, 0] if poll_fd is None else [sock, 0, poll_fd]
             ready, _, _ = select.select(watched, [], [], wait)
             if 0 in ready and not os.read(0, 4096):
@@ -1535,7 +1545,7 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
                 continue
             if pid == 0:
                 # The daemon decided the switches already.
-                _prompt_routing_child(write_fd, session_id, None, cap, decided=True)
+                _prompt_routing_child(write_fd, session_id, None, cap, decided=True, wait_fold=True)
             children.add(pid)
             os.close(write_fd)
             agent_view.prepare_routing_table(refresh=True)
