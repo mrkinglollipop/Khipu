@@ -9039,10 +9039,15 @@ def project_route_view(answer: dict, view: str) -> dict:
                           "used_pct": pace.get("used_pct"),
                           "cycle_resets_at": _route_view_clip(pace.get("cycle_resets_at")),
                           "plan": {"verdict": _route_view_clip(plan.get("verdict"))}})
-        accounts.append({"label": _route_view_clip(row.get("label")),
-                         "state": _route_view_clip(row.get("state")),
-                         "until": _route_view_clip(row.get("until")),
-                         "pace": _route_view_cap(paces, _ROUTE_VIEW_PACE_CAP)})
+        advice = row.get("advice") if isinstance(row.get("advice"), dict) else {}
+        summary_row = {"label": _route_view_clip(row.get("label")),
+                       "state": _route_view_clip(row.get("state")),
+                       "until": _route_view_clip(row.get("until")),
+                       "pace": _route_view_cap(paces, _ROUTE_VIEW_PACE_CAP)}
+        if advice.get("verdict") is not None:
+            summary_row["advice"] = {"verdict": _route_view_clip(advice.get("verdict")),
+                                     "reason": _route_view_clip(advice.get("reason"))}
+        accounts.append(summary_row)
 
     priority = answer.get("priority")
     priority_out = None
