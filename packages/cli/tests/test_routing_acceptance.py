@@ -1370,8 +1370,11 @@ def test_15_health_red_and_recovery(replay, condition, gateway_hub):
     outcomes()
     if condition == "budget-stall":
         # Repeated delivery points inside one lease isolate the budget bound.
+        # A point is an answer the hook took (here taken, then not sent);
+        # an offer it discarded is none (2026-10-27).
         for _ in range(5):
-            replay.offer()
+            _, _, taken = replay.offer()
+            replay.ack(taken, delivered=False)
     elif condition == "lease-expired-twice":
         for _ in range(2):
             replay.advance(61)
