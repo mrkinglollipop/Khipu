@@ -732,6 +732,11 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
             failed_slugs = {item["parsed"]["slug"] for item in plan if item not in written_plan}
             for redirect in collision_report["redirects"]:
                 if time.monotonic() >= deadline:
+                    # Forget the notes behind this redirect so changed_only
+                    # re-plans them (and the redirect) on the next run.
+                    for item in inventory:
+                        if item["parsed"]["slug"] in redirect["new_slugs"]:
+                            new_files_state.pop(item["path"], None)
                     out["errors"].append({
                         "path": redirect["old_slug"],
                         "error": "DeadlineExceeded: reconcile overall budget exhausted",

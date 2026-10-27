@@ -221,6 +221,63 @@ def test_reconcile_stops_when_overall_budget_is_exhausted(monkeypatch):
     assert any("DeadlineExceeded" in e["error"] for e in out["errors"]), out["errors"]
 
 
+def test_redirect_skipped_by_deadline_is_replanned_next_run(monkeypatch):
+    """A redirect dropped at the deadline must not leave its notes in files_state,
+    or changed_only filters them out and the redirect is never written."""
+    from khipu import db, notes
+
+    upserts = {"n": 0}
+    saved: dict = {}
+
+    def fake_mono():
+        # Past the deadline only once both note writes have landed.
+        return 1_000.0 if upserts["n"] >= 2 else 0.0
+
+    class _Conn:
+        def cursor(self):
+            return self
+
+        def execute(self, *a, **k):
+            return None
+
+        def commit(self):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with tempfile.TemporaryDirectory() as td:
+        claude, codex = _note_tree(td)
+        other = claude / "-repo-b" / "memory" / "note-one.md"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text(
+            "---\nname: khipu-state-of-play\ndescription: y\n---\ndifferent body\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(notes, "claude_projects_root", lambda: claude)
+        monkeypatch.setattr(notes, "codex_memories_root", lambda: codex)
+        monkeypatch.setattr(notes, "_project_for_slug", lambda *a, **k: "acme/repo-a")
+        monkeypatch.setattr(notes, "_refresh_scan_report", lambda *a, **k: None)
+        monkeypatch.setattr(notes, "_tombstone_missing_notes", lambda *a, **k: {"tombstoned": 0})
+        monkeypatch.setattr(notes, "_write_state", lambda s: saved.update(s))
+        monkeypatch.setattr(notes.time, "monotonic", fake_mono)
+        monkeypatch.setattr(db, "connect", lambda **k: _Conn())
+        monkeypatch.setattr(
+            "khipu.mirror._upsert_topic",
+            lambda *a, **k: upserts.__setitem__("n", upserts["n"] + 1),
+        )
+        monkeypatch.setattr("khipu.organise.after_reconcile", lambda **k: {"ok": True})
+        out = notes.reconcile(dry_run=False)
+
+    assert out["written"] == 2, out
+    assert any("DeadlineExceeded" in e["error"] for e in out["errors"]), out["errors"]
+    mine = [path for path in saved["files"] if path.startswith(td)]
+    assert mine == [], mine
+
+
 def test_a_library_over_the_nightly_cap_is_not_a_failed_embed_step(monkeypatch):
     from khipu import library
     import khipu.db as db
