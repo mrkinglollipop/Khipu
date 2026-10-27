@@ -473,19 +473,26 @@ def _inherit_project(cur, payload: dict[str, Any]) -> None:
     parent = payload.get("parent_session_id")
     if not parent:
         return
+    # SubagentStop stores a bare parent id; parent episodes are harness:id.
+    harness = str(payload.get("harness") or "").strip()
+    if not harness:
+        sid = str(payload.get("session_id") or "")
+        if ":" in sid:
+            harness = sid.split(":", 1)[0]
+    prefixed = f"{harness}:{parent}" if harness and ":" not in str(parent) else parent
     try:
         cur.execute(
             """
             SELECT project, repo_root
             FROM episodes
-            WHERE (parent_session_id = %s OR session_id = %s)
+            WHERE (parent_session_id = %s OR session_id IN (%s, %s))
               AND deleted_at IS NULL
               AND project IS NOT NULL
               AND ts >= now() - interval '24 hours'
             ORDER BY ts DESC
             LIMIT 1
             """,
-            (parent, parent),
+            (parent, parent, prefixed),
         )
         row = cur.fetchone()
     except Exception:  # noqa: BLE001 — inheritance is best-effort, never blocks a write
@@ -1299,19 +1306,26 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                 if payload.get("project"):
                     from khipu.identity import _resolve_project_alias
 
+                    # Clients must not supply typed_project; only this path sets it.
+                    payload.pop("typed_project", None)
                     # Alias enrichment is optional. Keep its failure inside a
                     # caller-owned savepoint so even a lookup that raises before
                     # recovering its own savepoint cannot abort the capture.
                     cur.execute("SAVEPOINT capture_project_alias")
                     try:
-                        canonical = _resolve_project_alias(cur, payload["project"])
+                        typed = payload["project"]
+                        canonical = _resolve_project_alias(cur, typed)
                     except Exception as exc:  # noqa: BLE001 — optional enrichment, never abort the caller
                         cur.execute("ROLLBACK TO SAVEPOINT capture_project_alias")
                         cur.execute("RELEASE SAVEPOINT capture_project_alias")
                         _log(f"project alias lookup failed ({type(exc).__name__}); keeping original project")
                     else:
                         cur.execute("RELEASE SAVEPOINT capture_project_alias")
-                        payload["project"] = canonical or payload["project"]
+                        # Keep the typed name in raw so alias remove can restore
+                        # episodes that landed under the canonical (Q3 projects).
+                        if canonical and canonical != typed:
+                            payload["typed_project"] = typed
+                            payload["project"] = canonical
                 _note_project_root(cur, payload)
                 dedup = dedup_before_insert(cur, payload, source=source)
                 if dedup["action"] in ("skip", "merge"):

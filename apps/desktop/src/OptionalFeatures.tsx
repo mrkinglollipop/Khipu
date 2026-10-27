@@ -274,6 +274,11 @@ export function OptionalFeatures({ active }: { active: boolean }) {
           Could not read the switches: {features.error}
         </p>
       ) : null}
+      {features.error && features.data ? (
+        <p className="set-error" role="alert">
+          Couldn&apos;t refresh; showing the last value: {features.error}
+        </p>
+      ) : null}
 
       <div className="section-card">
         <div className="section-head">Search and memory</div>

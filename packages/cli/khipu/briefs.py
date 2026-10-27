@@ -179,9 +179,15 @@ def _decision_rows(cur, episode_ids: list[int], *, with_text: bool = False) -> d
         row["state"] = decisions.state_of(row)
         out.setdefault(int(episode_id), []).append(row)
     # Backfill deduplicates repeated strings into an earlier episode's row.
+    # Retracted rows stay visible even when their source episode was forgotten:
+    # forgetting the original must not resurrect a retracted restatement as
+    # "(validity unknown)" for a later episode that still carries the text.
     body = "d.text" if with_text else "length(d.text)"
-    retracted = "d.retracted_at" if decisions._evidence_ready(cur) else "NULL"
+    evidence = decisions._evidence_ready(cur)
+    retracted = "d.retracted_at" if evidence else "NULL"
     live = decisions._not_forgotten_clause(cur, "d")
+    if live and evidence:
+        live = f"({live} OR d.retracted_at IS NOT NULL)"
     cur.execute(
         f"SELECT e.id, d.id, {body}, d.superseded_by, {retracted} "
         "FROM episodes e CROSS JOIN LATERAL jsonb_array_elements_text(e.decisions) legacy(text) "

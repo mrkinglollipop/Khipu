@@ -62,6 +62,8 @@ ALLOWED = {
     ("hub_snapshot", "forget_episode_in_snapshot"): "erase",
     ("hygiene", "apply_backfill_identity"): "metadata",
     ("hygiene", "apply_backfill_project"): "metadata",
+    # Alias undo moves only the project column, never a forgotten row.
+    ("identity", "remove_project_alias"): "metadata",
     ("mirror", "_upsert_episode"): "gate",
     ("mirror", "mirror_episode"): "calls:mirror._upsert_episode",
     ("mirror", "reconcile_memory_root"): "calls:mirror._upsert_episode",
