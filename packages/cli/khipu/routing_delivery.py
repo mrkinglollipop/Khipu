@@ -592,11 +592,23 @@ def _merge(state, out):
         state.pop("flight", None)
     return entries
 
-def _delivery_point(state, out, now):
-    """Budget debt when its revision first becomes owed; progress never resets its age."""
+_POINT_PLAN_KEYS = ("harness", "slack", "page_limit", "limit")
+
+
+def _delivery_point(state, out, now, *, count=True):
+    """Budget debt when its revision first becomes owed; progress never resets its age.
+
+    ``count``: this is a delivery point (the agent got the answer). Not
+    ``count``: an offer the per-prompt hook may still discard; newly owed
+    debt is dated to the next point, which only a take counts
+    (``take_point``), so answers the hook never took are not points."""
     import math
 
-    point = state["delivery_points"] = state.get("delivery_points", 0) + 1
+    if count:
+        point = state["delivery_points"] = state.get("delivery_points", 0) + 1
+    else:
+        point = state.setdefault("delivery_points", 0) + 1
+    # When this conversation last asked (its liveness), taken or not.
     state["last_delivery_point"] = _iso(now)
     plan = out["delivery_plan"]
     state["harness"] = health_harness(plan.get("harness"))
@@ -632,12 +644,23 @@ def _expire(state, flight):
             entry["expired"] = entry.get("expired", 0) + 1
 
 
-def _render(state, out, now, component, *, delivery_point=True):
+def _render(state, out, now, component, *, delivery_point=True, deferred=False):
     entries = _merge(state, out)
     if entries is None:
         return {"kind": "none", "text": None, "version": state.get("source_version"),
                 "epoch": state.get("epoch")}
-    if delivery_point:
+    if delivery_point and deferred:
+        if state.get("point_basis") != "take":
+            # Debt dated by the old count (every offer, taken or not) starts
+            # again from the next take, once: those counts were not stalls.
+            for entry in state.get("entries", {}).values():
+                if not entry.get("acked"):
+                    for key in ("owed_point", "owed_chars", "budget", "bound"):
+                        entry.pop(key, None)
+            state["point_basis"] = "take"
+        _delivery_point(state, out, now, count=False)
+        state["point_plan"] = {key: out["delivery_plan"].get(key) for key in _POINT_PLAN_KEYS}
+    elif delivery_point:
         _delivery_point(state, out, now)
     flight = state.get("flight")
     if flight and _parse(flight["until"]) > now:
@@ -973,8 +996,41 @@ def _attachment(data, session, component, now, harness, *, gateway=False):
     return attachment
 
 
-def offer(out, *, session=None, component="main"):
-    """Reserve one component's batch under its independent delivery lock."""
+def take_point(session, component="main", *, now=None):
+    """The per-prompt hook took this component's answer (delivered or not):
+    one delivery point. Its offers (``offer(deferred=True)``) count none, so
+    an answer the hook discarded (late, stale, busy) is not a point and a
+    session that sends no prompt does not age its debt."""
+    try:
+        if not _path(session).exists():
+            return True  # nothing owed here: no ledger is made for it
+        with _transaction(session) as data:
+            state = data.get(component)
+            if isinstance(state, dict):
+                _take_point(state, now or _clock())
+        return True
+    except Exception:  # noqa: BLE001 - a point never fails the hook
+        return False
+
+
+def _take_point(state, now):
+    plan = state.get("point_plan")
+    if state.get("point_basis") != "take" or not isinstance(plan, dict):
+        return  # its offers counted their own points
+    plan = {key: plan.get(key) for key in _POINT_PLAN_KEYS}
+    for key in ("page_limit", "limit"):
+        if type(plan[key]) is not int or plan[key] < 0:
+            plan[key] = None
+    if type(plan["slack"]) is not int or plan["slack"] < 0:
+        plan["slack"] = 2
+    _delivery_point(state, {"delivery_plan": plan}, now)
+
+
+def offer(out, *, session=None, component="main", deferred=False):
+    """Reserve one component's batch under its independent delivery lock.
+    ``deferred``: the per-prompt hook's offer, which it may discard; its
+    delivery point is counted when the hook takes it (``take_point``, or
+    ``acknowledge(take=True)``)."""
     now = _parse(out["delivery_plan"]["at"])
     if not session:
         state = {}
@@ -988,7 +1044,7 @@ def offer(out, *, session=None, component="main"):
         if component == "main":
             _attachment(data, session, "main", now, out["delivery_plan"].get("harness"))
         state = data.setdefault(component, {})
-        answer = _render(state, out, now, component)
+        answer = _render(state, out, now, component, deferred=deferred)
         _prune_agent_components(data, now, keep=component)
         return answer
 
@@ -1800,14 +1856,16 @@ def pull_acknowledge(session, batch, *, component="mcp", now=None):
     return "foreign" if _batch_owned_elsewhere(session, batch) else "unknown"
 
 
-def acknowledge(session, changes, *, reservation=None, now=None):
-    """Only an issued batch can ack; failed persistence leaves it retryable."""
+def acknowledge(session, changes, *, reservation=None, now=None, take=False):
+    """Only an issued batch can ack; failed persistence leaves it retryable.
+    ``take``: the per-prompt hook took this answer, which is also its
+    delivery point (``take_point``), acknowledged or not."""
     try:
-        return _acknowledge(session, changes, reservation=reservation, now=now)
+        return _acknowledge(session, changes, reservation=reservation, now=now, take=take)
     except Exception:
         return False
 
-def _acknowledge(session, changes, *, reservation=None, now=None):
+def _acknowledge(session, changes, *, reservation=None, now=None, take=False):
     """Ack only a batch actually issued to this session and component."""
     now = now or _clock()
     component, batch = changes["component"], changes["batch"]
@@ -1819,6 +1877,8 @@ def _acknowledge(session, changes, *, reservation=None, now=None):
                 _attachment(data, session, "main", now, state.get("harness"))
         if batch in state.get("batches", {}):
             return True
+        if take:
+            _take_point(state, now)
         flight = state.get("flight")
         if not flight or flight["out"]["routing_changes"] != changes:
             return False

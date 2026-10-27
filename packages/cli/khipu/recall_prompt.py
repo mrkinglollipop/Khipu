@@ -434,6 +434,10 @@ _ROUTING_CHILD_MOST = 2.0
 # the fold has saved the view, at most this long: a fold killed before it
 # saves would only start again at the next prompt, and the one after.
 _ROUTING_FOLD_MOST = 900.0
+# A child waits for another fold's ``prompt-fold.lock`` until this long
+# before its hook's latest wait (``deadline``), so an answer that it waited
+# too long ("fold-busy") still reaches a hook that waits that long.
+_ROUTING_FOLD_WAIT_SLACK = 0.05
 # Once a prompt's wait for routing is over, it reads what the child already
 # wrote for at most this long, and never more than this many bytes in all: a
 # pipe that never stops being readable never holds the prompt (fix round 5).
@@ -483,7 +487,7 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, decided: bool = False,
-                          moment: str = "prompt") -> None:
+                          moment: str = "prompt", wait_fold: bool = False) -> None:
     """The forked child: decide whether routing is on for this prompt (the
     switches, read from ``environ``, and the settings; ``moment`` names
     the push: "prompt", or "delegation" for the delegation hook) unless the
@@ -547,7 +551,17 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
 
             try:
                 marker = routing_marker(session_id, canonical=True)
-                out = routing.prompt_push(marker, budget=budget, on_fold=fold_started, session_id=session_id)
+                # Another fold holding the lock saves the view this prompt
+                # then answers from: wait for it up to the hook's own
+                # deadline, not half the budget; a late answer is still the
+                # hook's skipped:budget.
+                # Only the helper's children wait: it counts them against
+                # ``_FORKSERVER_CHILDREN_MOST``; a one-shot hook's child is
+                # counted by nobody and keeps the half-budget wait.
+                fold_wait = (max(0.0, deadline - time.monotonic() - _ROUTING_FOLD_WAIT_SLACK)
+                             if wait_fold else None)
+                out = routing.prompt_push(marker, budget=budget, on_fold=fold_started, session_id=session_id,
+                                          fold_wait=fold_wait)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
                                                    "owed_entities", "shown_entities", "generation", "notices", "routing_changes")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
@@ -1466,13 +1480,19 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
     try:
         while True:
             reap()
+            held_back = False
             if poll_fd is None and (time.monotonic() >= next_look or schedule.due()):
                 # The switches as they are now: never a poll with the push off.
                 _look_at_settings(schedule, routing)
                 next_look = time.monotonic() + _SETTINGS_LOOK_S
                 if schedule.due():
-                    poll_fd, poll_buf = start_poll(), b""
-            wait = _HELPER_TICK_S if poll_fd is not None else schedule.sleep_for(_HELPER_TICK_S)
+                    reap()
+                    # The poll is a live child too: never past the one cap.
+                    if len(children) + len(pollers) < _FORKSERVER_CHILDREN_MOST:
+                        poll_fd, poll_buf = start_poll(), b""
+                    else:
+                        held_back = True  # looked at again next tick
+            wait = _HELPER_TICK_S if poll_fd is not None or held_back else schedule.sleep_for(_HELPER_TICK_S)
             watched = [sock, 0] if poll_fd is None else [sock, 0, poll_fd]
             ready, _, _ = select.select(watched, [], [], wait)
             if 0 in ready and not os.read(0, 4096):
@@ -1525,7 +1545,7 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
                 continue
             if pid == 0:
                 # The daemon decided the switches already.
-                _prompt_routing_child(write_fd, session_id, None, cap, decided=True)
+                _prompt_routing_child(write_fd, session_id, None, cap, decided=True, wait_fold=True)
             children.add(pid)
             os.close(write_fd)
             agent_view.prepare_routing_table(refresh=True)
@@ -1812,7 +1832,7 @@ class _RoutingAtPrompt:
             return ctx, {"status": f"pointer-said:{label}"}
         combined = f"{ctx}\n\n{ROUTING_TOO_LONG}" if ctx else ROUTING_TOO_LONG
         pending = {"session": self.session, "version": out["version"], "epoch": out.get("epoch"),
-                   "pointer": True}
+                   "pointer": True, "component": (out.get("routing_changes") or {}).get("component", "main")}
         return combined, {"status": f"pointer:{label}", "pending": pending}
 
 
@@ -1823,20 +1843,31 @@ def _routing_delivered(info: dict | None, delivered: bool) -> str:
         return ""
     status, pending = info.get("status"), info.get("pending")
     if pending:
+        # The hook took this answer: that is its delivery point, whether or
+        # not it went out whole (an answer the hook discarded never is).
+        changes = pending.get("routing_changes")
+        component = (changes or {}).get("component") or pending.get("component") or "main"
+        if not delivered or pending.get("pointer"):
+            from khipu.routing_delivery import take_point
+
+            take_point(pending["session"], component)
         if not delivered:
             status = f"unsent:{status}"
         elif pending.get("pointer"):
             if not mark_routing_pointer(pending["session"], version=pending["version"], epoch=pending["epoch"]):
                 status = f"{status}:unmarked"
         else:
-            changes = pending.get("routing_changes")
             if pending.get("notices") and not changes:
                 return f" routing={status}:unmarked"
             if changes:
                 from khipu.routing_delivery import acknowledge
 
-                if not acknowledge(pending["session"], changes):
+                if not acknowledge(pending["session"], changes, take=True):
                     return f" routing={status}:unmarked"
+            else:
+                from khipu.routing_delivery import take_point
+
+                take_point(pending["session"], component)
             # The child's clock when it read (this process never imports routing).
             full_at = pending.get("at") if pending["full"] else None
             if not mark_routing_seen(pending["session"], version=pending["version"], epoch=pending["epoch"],

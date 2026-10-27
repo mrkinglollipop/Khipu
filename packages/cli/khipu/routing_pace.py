@@ -205,6 +205,87 @@ def _cycles(samples, window):
             s["_cycle_key"] = target or ("reset", i, iso(comp[0]["reset"]))
 
 
+# A view holding pace figures is folded again at least this often. Its
+# allowances, needed rates and trailing averages drift with the clock between
+# readings; the step changes (a reading going stale, a reset passing, a
+# reading leaving the trailing window) are scheduled at their own second
+# (``next_change``). The prompt words the clock-relative parts at prompt time.
+REFOLD_S = 30
+
+
+def next_change(samples, now, window, *, day=False):
+    """The earliest moment after ``now`` at which the clock alone changes
+    what ``compute_pace`` reads from ``samples`` by a step: the newest
+    reading turning stale, a reset passing, a reading leaving the trailing
+    window (or the rolling day, ``day``), or a reading witnessed ahead of the
+    clock coming due. None when there is none. Continuous drift (allowances,
+    needed rates) is bounded by ``REFOLD_S`` instead."""
+    params = WINDOWS.get(window)
+    if params is None:
+        return None
+    best = newest = None
+    trailing = timedelta(seconds=params["trailing_s"])
+    for s in samples:
+        t, reset = s.get("t"), s.get("reset")
+        if not isinstance(t, datetime):
+            continue
+        newest = t if newest is None or t > newest else newest
+        for moment in (reset, t, t + trailing, t + timedelta(days=1) if day else None):
+            if isinstance(moment, datetime) and moment > now and (best is None or moment < best):
+                best = moment
+    if newest is not None:
+        stale = min(newest, now) + timedelta(seconds=2 * params["sample_s"])
+        if stale > now and (best is None or stale < best):
+            best = stale
+    return best
+
+
+def at(pace, now):
+    """``pace`` (folded at some earlier moment of the same readings) with its
+    clock-driven figures as of ``now``: each pace target's allowance and
+    verdict, and the needed rate and unused-at-reset share of the plan and
+    the share cap. Everything else is as folded; a step change (a reading
+    going stale, a reset passing) refolds the view itself (``next_change``),
+    and the trailing average's drift is bounded by ``REFOLD_S``. A prompt's
+    pace words are built from this, so a cached view says what a fold at
+    the prompt would."""
+    params = WINDOWS.get(pace.get("window"))
+    reset = parse(pace.get("cycle_resets_at"))
+    used = _num(pace.get("used_pct"))
+    if params is None or reset is None or used is None:
+        return pace
+    secs = (reset - now).total_seconds()
+    if secs <= 0:
+        return pace
+    out = dict(pace)
+    rate = pace.get("rate_pct_per_h")
+    for field, ceiling in (("plan", 100.0), ("share_cap", None)):
+        obj = pace.get(field)
+        if not isinstance(obj, dict) or _num(obj.get("needed_pct_per_h")) is None:
+            continue
+        top = ceiling if ceiling is not None else _num(obj.get("pct"))
+        if top is None:
+            continue
+        headroom = top - used
+        obj = dict(obj, needed_pct_per_h=headroom / (secs / 3600))
+        if obj.get("verdict") == "underpacing" and obj.get("unused_at_reset_pct") is not None:
+            obj["unused_at_reset_pct"] = headroom if not rate or rate < 0.01 else headroom - rate * secs / 3600
+        out[field] = obj
+    for field in ("pace_target", "check_pace_target"):
+        target = pace.get(field)
+        if not isinstance(target, dict) or _num(target.get("allowance_pct")) is None \
+                or target.get("verdict") not in ("ahead", "within", "recovering"):
+            continue
+        elapsed = min(max(params["window_s"] - secs, 0.0), float(params["window_s"]))
+        allowance = target["pct"] * elapsed / params["window_s"] + target["slack"]
+        # The allowance only grows within a cycle: ahead can become
+        # recovering (it was ahead) or within; within stays within.
+        verdict = ("ahead" if used > allowance else
+                   "within" if used <= allowance - 1 or target["verdict"] == "within" else "recovering")
+        out[field] = dict(target, allowance_pct=allowance, verdict=verdict)
+    return out
+
+
 def compute_pace(samples, caps, now, window):
     """One window's pace object from sanitized sample dicts.
 

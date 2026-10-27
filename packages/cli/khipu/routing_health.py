@@ -5,6 +5,7 @@ This module only reads evidence. It never probes, acknowledges, or feeds a gate.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 
 
@@ -93,25 +94,53 @@ def _component_health(state, now, *, slack):
                                              if isinstance(e, dict)))
 
 
-def prompt_health(now):
+# A conversation whose routing lines were skipped on this many prompts in a
+# row has waited too long for them (``prompt-delay``), whatever the share.
+PROMPT_DELAY_RUN = 3
+# Skips that are not a delay: there was nowhere to deliver to.
+_NOT_A_DELAY = ("skipped:no-session", "skipped:no-fork")
+_SESSION_RE = re.compile(r"\] session=(?P<session>\S+) ")
+
+
+def prompt_health(now, warn_pct=1.0):
+    """Today's per-prompt routing outcomes. ``prompt-skips``: more than
+    ``warn_pct`` percent of them ran out of time (``ROUTING_OUT_OF_TIME``,
+    the doctor's ``routing_slow_read_pct``; 0 never warns); a skip for any
+    other reason (a record changed under the read, an unsaved fold) is
+    sent with a later prompt and is not counted. ``prompt-delay``: one
+    conversation skipped ``PROMPT_DELAY_RUN`` or more prompts in a row,
+    whatever the reason."""
     from khipu import recall_prompt
 
     try:
         raw = recall_prompt._tail_text(recall_prompt._log_path(), max_bytes=recall_prompt._OUTCOMES_TAIL_BYTES)
     except OSError:
         return _result([], ["today's hook outcomes"])
-    statuses = []
+    statuses, runs, longest = [], {}, 0
     for line in raw.splitlines():
         match = recall_prompt._LOG_LINE_RE.match(line)
         stamp = _time(match.group("stamp")) if match else None
         status = recall_prompt.routing_status_of(line)
         if stamp and stamp.date() == now.astimezone(timezone.utc).date() and stamp <= now and status:
             statuses.append(status)
+            found = _SESSION_RE.search(line)
+            session = found.group("session") if found else "?"
+            if session != "?":
+                delayed = status.startswith("skipped:") and status not in _NOT_A_DELAY
+                runs[session] = runs.get(session, 0) + 1 if delayed else 0
+                longest = max(longest, runs[session])
     if not statuses:
         return _result([], ["today's hook outcomes"])
     skipped = sum(s.startswith("skipped:") for s in statuses)
-    rate = 100 * skipped / len(statuses)
-    return _result(["prompt-skips"] if rate > 1 else [], [], count=len(statuses), skipped=skipped, rate_pct=rate)
+    late = sum(s in recall_prompt.ROUTING_OUT_OF_TIME for s in statuses)
+    rate = 100 * late / len(statuses)
+    reasons = []
+    if warn_pct and rate > warn_pct:
+        reasons.append("prompt-skips")
+    if longest >= PROMPT_DELAY_RUN:
+        reasons.append("prompt-delay")
+    return _result(reasons, [], count=len(statuses), skipped=skipped, out_of_time=late, rate_pct=rate,
+                   warn_pct=warn_pct, longest_skip_run=longest)
 
 
 def doctor_block(view, now, cfg):
@@ -171,7 +200,11 @@ def doctor_block(view, now, cfg):
                              last_delivery_point=state["last_delivery_point"], **health))
             reasons += health["reasons"]
             missing += health["missing"]
-    prompts = prompt_health(now)
+    try:
+        warn_pct = float(cfg.get("routing_slow_read_pct", 1.0))
+    except (TypeError, ValueError):
+        warn_pct = 1.0
+    prompts = prompt_health(now, warn_pct)
     reasons += prompts["reasons"]
     missing += prompts["missing"]
     replication = {"status": "not_applicable"}
