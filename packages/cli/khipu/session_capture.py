@@ -994,7 +994,7 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
             seen = fp in running
             seen_flags[i] = seen
             pos = order.get(fp, -1)
-            out_of_order = replay and seen and 0 <= pos < replay_pos
+            out_of_order = replay and seen and fp not in span and 0 <= pos < replay_pos
             if out_of_order:
                 breaks.add(i)
             if replay and fp in span:
