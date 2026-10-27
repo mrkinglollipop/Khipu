@@ -1274,6 +1274,51 @@ def _legacy_projection_kind(original: Any, incoming: dict[str, Any]) -> str | No
     return None
 
 
+def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
+    """The summary a multi-part capture lands under when a sibling part holds
+    its legacy key, else None.
+
+    Parts of one window share ``ts``, and parts the model left without a
+    summary share the fallback summary, so they collided on the legacy
+    ``(ts, md5(summary))`` key and were held as evidence conflicts (2026-10-27,
+    parts 4/7 and 5/7 against part 2/7). A live row at the key whose capture is
+    the same window (harness, session, transcript range, window id) with a
+    different ``part`` is a sibling, never this capture: the summary gains the
+    part so it lands as its own row. Called only after the insert met the key.
+    The source key was snapshotted before and does not change; nothing else in
+    the payload does either. Anything else at the key stays a conflict."""
+    from khipu.capture_identity import has_natural_key
+
+    part = str(payload.get("part") or "")
+    summary = payload.get("summary")
+    if not part or not isinstance(summary, str) or not has_natural_key(payload):
+        return None
+    cur.execute("SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s "
+                "ORDER BY deleted_at IS NOT NULL, id DESC LIMIT 1",
+                (payload["ts"], _md5_hex(summary)))
+    found = cur.fetchone()
+    if not found:
+        return None
+    cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (int(found[0]),))
+    row = cur.fetchone()
+    target = row[0] if row else None
+    if not isinstance(target, dict) or target.get("deleted_at"):
+        return None
+    raw = target.get("raw") if isinstance(target.get("raw"), dict) else {}
+
+    def held(key: str) -> str:
+        value = raw.get(key, target.get(key))
+        return "" if value is None else str(value)
+
+    held_part = held("part")
+    if not held_part or held_part == part:
+        return None
+    if any(held(k) != ("" if payload.get(k) is None else str(payload.get(k)))
+           for k in ("harness", "session_id", "transcript_range", "window_id")):
+        return None
+    return f"{summary} (part {part})"
+
+
 def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
@@ -1522,6 +1567,14 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                 if upserted.get("forgotten_source"):
                     return _forgotten_result(cur, payload, source, dedup=dedup)
                 episode_id = upserted.get("episode_id")
+                sibling_summary = None if inserted else _sibling_part_summary(cur, payload)
+                if sibling_summary:
+                    payload["summary"] = sibling_summary
+                    upserted = {}
+                    inserted = _upsert_episode(cur, payload, source=source, out=upserted, origin=origin)
+                    if upserted.get("forgotten_source"):
+                        return _forgotten_result(cur, payload, source, dedup=dedup)
+                    episode_id = upserted.get("episode_id")
                 if not inserted:
                     # The insert hit the legacy unique key, so the row holding that
                     # key is where this capture landed (the key stays unique until
