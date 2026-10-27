@@ -189,7 +189,9 @@ def _writer_projection(raw: dict[str, Any], view: dict[str, Any]) -> dict[str, A
         kept = normalize_scope(scope)
         if kept is not None:
             out["scope"] = kept
-        elif scope.strip() and raw.get("scope") is not None:
+        elif scope.strip() and raw.get("scope") is not None and raw["scope"] != scope.strip():
+            # A row holding the scope K6 drops, verbatim (written before K6),
+            # holds the line's scope; any other kept scope is a difference.
             return None
         else:
             out.pop("scope")
@@ -238,7 +240,7 @@ def _stored_projection(raw: dict[str, Any], view: dict[str, Any], stored: Any) -
         if (not (isinstance(stored["scope"], str) and stored["scope"]) if isinstance(scope, str)
                 else stored["scope"] != scope):
             return None
-    elif isinstance(scope, str) and scope.strip() and raw.get("scope") is not None:
+    elif isinstance(scope, str) and scope.strip() and raw.get("scope") not in (None, scope.strip()):
         return None
     topics = view.get("topics")
     if isinstance(topics, list) and topics:
@@ -289,11 +291,30 @@ def normalized_missing(raw: Any, view: dict[str, Any], projection: Any = None) -
     line_prefs, hub_prefs = _str_list(projected.get("preferences")), _str_list(raw.get("preferences"))
     if line_prefs is None or hub_prefs is None:
         return None
-    if not _legacy_landed_line(raw, {k: v for k, v in projected.items() if k != "preferences"}):
+    if not _legacy_landed_line(raw, {k: v for k, v in projected.items() if k not in ("preferences", "people")}):
+        return None
+    if not _people_held(raw, projected):
         return None
     pieces = _legacy_comma_join(hub_prefs)
     return list(dict.fromkeys(p for p in line_prefs
                               if not _contiguous(_legacy_comma_join([p]), pieces)))
+
+
+def _people_held(raw: dict[str, Any], view: dict[str, Any]) -> bool:
+    """The row holds the line's ``people``, compared the way decisions are:
+    each name's comma pieces are a contiguous, in-order run of the row's
+    comma-joined people. An empty line value carries nothing; any other
+    shape falls back to the drain's exact rule."""
+    from khipu.capture import _legacy_comma_join, _legacy_landed_line
+
+    line, hub = view.get("people"), raw.get("people")
+    if line in (None, "", [], {}):
+        return True
+    if not (isinstance(line, list) and isinstance(hub, list)
+            and all(isinstance(n, str) for n in [*line, *hub])):
+        return _legacy_landed_line(raw, {"people": line})
+    pieces = _legacy_comma_join(hub)
+    return all(_contiguous(_legacy_comma_join([n]), pieces) for n in line if _legacy_comma_join([n]))
 
 
 def _content_items(view: dict[str, Any]) -> tuple[list[str], list[str]] | None:
