@@ -37,3 +37,7 @@ BEGIN
     RETURN ARRAY(SELECT DISTINCT n FROM unnest(found) AS n WHERE n > 0 ORDER BY n);
 END
 $fn$;
+
+INSERT INTO schema_migrations (version, note)
+VALUES ('0050_pr_list_hashes', 'khipu_text_prs follows close_rules.parse_prs: PR lists after the word PR, not a later issue number')
+ON CONFLICT (version) DO NOTHING;
