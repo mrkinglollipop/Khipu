@@ -2433,11 +2433,19 @@ def set_status(cur, commitment_id: int, status: str, *, reason: str | None = Non
         extra = ", closed_at = now()" if status == "closed" else ""
         params: list[Any] = [status]
         if status in ("closed", "dropped"):
+            stored = (reason or "").strip()[:300] or f"{status} by hand"
             extra += ", close_reason = %s"
-            params.append((reason or "").strip()[:300] or f"{status} by hand")
+            params.append(stored)
             if close_ready:
-                extra += ", closed_by = %s, close_rule_key = NULL, close_evidence = NULL"
-                params.append(by)
+                # A close that quotes the "Looks done" suggestion keeps its
+                # evidence and episode, so a forget of that episode or its
+                # decision still finds and clears the quote.
+                extra += (", closed_by = %s, close_rule_key = NULL, close_evidence = CASE "
+                          "WHEN btrim(settle_suggestion->>'reason') = %s THEN settle_suggestion->'evidence' END, "
+                          "closed_episode = CASE WHEN btrim(settle_suggestion->>'reason') = %s "
+                          "AND settle_suggestion->>'episode' IS NOT NULL "
+                          "THEN (settle_suggestion->>'episode')::bigint ELSE closed_episode END")
+                params.extend([by, stored, stored])
         cur.execute(
             f"UPDATE commitments SET status = %s{extra} WHERE id = %s "
             f"AND {_not_forgotten_clause(cur)}",
