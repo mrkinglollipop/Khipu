@@ -140,7 +140,8 @@ def test_received_incarnation_survives_transport_loss(pg, replica, pg_cluster, m
 
         threading.Thread(target=accept, daemon=True).start()
         remote = other.dsn.replace(f":{other.cluster.port}/", f":{server.getsockname()[1]}/") + "?sslmode=disable"
-        monkeypatch.setattr(hs, "try_hub_connect", lambda **kw: psycopg.Connection.connect(remote))
+        monkeypatch.setattr(hs, "try_hub_connect", lambda statement_timeout_s=None, **kw: psycopg.Connection.connect(
+            db._with_statement_timeout(remote, statement_timeout_s) if statement_timeout_s else remote, **kw))
         # The configured address stays A while it serves replacement B.
         monkeypatch.setattr(db, "resolve_dsn", lambda: pg.dsn)
         with other.connect() as lock:
