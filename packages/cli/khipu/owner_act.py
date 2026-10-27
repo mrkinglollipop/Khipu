@@ -87,7 +87,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "direction.on": ((), ()),
     "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
-    "direction.undo": (("id",), ("holds",)),
+    "direction.undo": (("id",), ("holds", "over_newer")),
     "forget.send": ((), ()),
     "forget.here": (("id",), ()),
     "forget.not_same": (("id",), ()),
@@ -95,7 +95,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only"}
+_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -385,7 +385,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad(f"key must be one of: {', '.join(_DIRECTION_KEYS)}")
         return ["owner-direction", "set"], [v["key"], v["value"]]
     if action == "direction.undo":
-        return ["owner-direction", "undo", *_opts(v, "holds")], [v["id"]]
+        return ["owner-direction", "undo", *_opts(v, "holds", "over_newer")], [v["id"]]
     if action == "forget.send":
         return ["episode", "forget-pending", "--send"], []
     if action == "forget.here":

@@ -303,6 +303,9 @@ export function OwnerActions({ active }: { active: boolean }) {
   const log = useCliState<ActionsShape>("khipu_owner_direction_actions", active);
   const [busy, setBusy] = useState<string | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // Undos refused because a newer change touched the same target: they offer
+  // a second, explicit confirm to undo over it.
+  const [newer, setNewer] = useState<Record<string, boolean>>({});
 
   async function write(id: string, command: string, args: Record<string, unknown>): Promise<string | null> {
     setBusy(id);
@@ -314,6 +317,7 @@ export function OwnerActions({ active }: { active: boolean }) {
       else out[id] = res.error;
       return out;
     });
+    setNewer((prev) => ({ ...prev, [id]: !res.ok && res.refusal?.code === "newer_change" }));
     setBusy(null);
     return res.ok ? null : res.error;
   }
@@ -446,6 +450,20 @@ export function OwnerActions({ active }: { active: boolean }) {
                         <p className="set-error" role="alert">
                           {errors[id]}
                         </p>
+                        {newer[id] ? (
+                          <div className="toolbar">
+                            <button
+                              type="button"
+                              className="sm danger"
+                              aria-label={`Undo anyway and lose the newer change: ${what}`}
+                              disabled={busy !== null}
+                              onClick={() => void write(id, "khipu_owner_direction_undo", { id: a.id, overNewer: true })}
+                            >
+                              {busy === id ? <Loader2 size={14} className="spin" aria-hidden /> : null}
+                              Undo anyway and lose the newer change
+                            </button>
+                          </div>
+                        ) : null}
                       </div>
                     ) : null}
                   </div>
