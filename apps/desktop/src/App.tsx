@@ -1,4 +1,4 @@
-import { Component, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
@@ -38,7 +38,7 @@ import type { OwedOffline } from "./OfflineBanner";
 import { ComponentsPanel } from "./ComponentsPanel";
 import { IntegrationsPanel, runInstall } from "./IntegrationsPanel";
 import type { LivenessPayload, RecallProbeStatus, T3Health } from "./IntegrationsPanel";
-import { claudeHomesGap, harnessesBadge, railHealthLine, t3HealthGap } from "./railHealth";
+import { claudeHomesGap, harnessesBadge, railHealthLine, t3HealthGap, t3WarningReason } from "./railHealth";
 import type { ClaudeHomesReport } from "./railHealth";
 import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
@@ -1306,6 +1306,12 @@ export default function App() {
   const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
     "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, settings: 0, guides: 0,
   });
+  // Every screen shares one scroll container (`.main-content`), so a screen
+  // would open scrolled to wherever the last one was left. A layout effect runs
+  // before the screens' own scroll-to-section effects, which still win.
+  useLayoutEffect(() => {
+    document.querySelector<HTMLElement>(".main-content")?.scrollTo?.({ top: 0 });
+  }, [tab]);
   // Configuration presence lets setup proceed; it does not prove the database answers.
   const [dsnOk, setDsnOk] = useState<boolean | null>(null);
   const [dbReachable, setDbReachable] = useState<boolean | null>(null);
@@ -1739,11 +1745,21 @@ export default function App() {
       const doctorT3 = (parsed as { t3?: T3Health }).t3 ?? null;
       const t3Warnings = doctorT3?.warnings ?? [];
       if (t3Warnings.length > 0) {
+        const reason = t3WarningReason(doctorT3);
+        const sentences = t3Warnings.map((w) => w.trim().replace(/[.\s]+$/, ""));
         items.push({
           key: "t3",
           tone: "warn",
-          title: doctorT3?.lookup?.ok === false ? "T3 Code is not linking threads" : "Recent T3 work is not linked to a thread",
-          cause: t3Warnings.join(". ") + ". Captures still land and remain searchable; thread filtering is unavailable until this is resolved.",
+          title:
+            reason === "lookup" ? "T3 Code is not linking threads"
+              : reason === "hooks" ? "Some T3 providers have no Khipu hooks"
+              : reason === "unlinked" ? "Recent T3 work is not linked to a thread"
+              : "T3 Code needs a look",
+          cause:
+            sentences.join(". ") +
+            (reason === "hooks"
+              ? ". Captures still land and remain searchable."
+              : ". Captures still land and remain searchable; thread filtering is unavailable until this is resolved."),
           fix: { label: "Open Harnesses", kind: "open-harnesses" },
         });
       }
@@ -4987,6 +5003,9 @@ export default function App() {
                   "ask in your own words"
                 }
                 aria-label="Search"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") void doSearch();
                 }}
@@ -5779,6 +5798,7 @@ export default function App() {
             work={work}
             routing={routing}
             plans={plans.data}
+            projects={projects.data}
             owedFocusKey={owedFocusKey}
             onOwedClose={(id) => owedWrite(id, [`--close=${id}`])}
             onSnooze={(id, title) =>
