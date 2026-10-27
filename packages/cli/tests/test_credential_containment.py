@@ -200,3 +200,17 @@ class MovedDataDirKeepsTheConfigDsnTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
             self._moved(stack, Path(td))
             self.assertIn("config-host", hub_snapshot._file_dsn() or "")
+
+    def test_dsn_source_reports_the_config_dsn_after_a_move(self):
+        from khipu import drift
+
+        with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
+            self._moved(stack, Path(td))
+            self.assertEqual(drift._dsn_source(), "file")
+
+    def test_hub_configured_sees_the_config_dsn_after_a_move(self):
+        from khipu import routing
+
+        with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
+            self._moved(stack, Path(td))
+            self.assertTrue(routing._hub_configured())
