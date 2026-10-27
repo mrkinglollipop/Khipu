@@ -1638,11 +1638,14 @@ def _local_mac() -> str | None:
 
 def _hub_configured() -> bool:
     # Detection only: never connect, migrate credentials or start a probe.
-    from khipu import keychain
+    from khipu import db, keychain
     from khipu.paths import dsn_file
 
+    # A moved data folder holds no DSN; resolve_dsn() falls back to the
+    # config and legacy files unless the environment names the location.
+    fallback = not db._explicit_dsn_location() and (db.DEFAULT_DSN_FILE.is_file() or db.LEGACY_DSN_FILE.is_file())
     return bool(os.environ.get("KHIPU_DATABASE_URL") or os.environ.get("ALZY_DATABASE_URL")
-                or dsn_file().is_file() or keychain.get_password(keychain.DSN_ACCOUNT)
+                or dsn_file().is_file() or fallback or keychain.get_password(keychain.DSN_ACCOUNT)
                 or keychain.get_password(keychain.DSN_ACCOUNT, service=keychain.LEGACY_SERVICE))
 
 
@@ -7464,6 +7467,8 @@ _WINDOW_MINUTES = {"five_hour": 300, "daily": 1440, "weekly": 10080}
 # keep a working Mac's figures well inside it.
 FIGURES_STALE_S = 15 * 60
 RESET_PASSED_WHY = "its reset time passed; figures out of date"
+# How long after a window roll the pre-reset figure stays in the routing block.
+PREV_FIGURE_SHOW_S = 3 * 3600
 
 
 def _window_minutes(window: dict) -> int | None:
@@ -7500,6 +7505,21 @@ def _longest_window(row: dict, now: datetime | None) -> dict | None:
     return best
 
 
+def _prev_figure_fields(row: dict, now: datetime) -> dict:
+    """Pre-reset figure still shown for a few hours after the window rolled."""
+    from khipu import usage
+
+    end = _parse(row.get("prev_window_end"))
+    used = row.get("prev_used_pct")
+    if end is None or isinstance(used, bool) or not isinstance(used, (int, float)):
+        return {}
+    age = (now - end).total_seconds()
+    if not 0 <= age < PREV_FIGURE_SHOW_S:
+        return {}
+    shown = math.floor(min(100.0, max(0.0, float(used))) * 10 + 0.5) / 10
+    return {"prev_used_pct": shown, "prev_window_end": usage._iso(end.timestamp())}
+
+
 def plan_fact(row: dict | None, now: datetime) -> dict:
     """One account's plan figures as facts: ``readable`` with its longest
     window, how much of it is used and left, when it resets and the pace
@@ -7530,7 +7550,16 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
         # The longest window's reset has passed since it was read: it has
         # started again, so its figures are known to be wrong (an account
         # can also reset early; only a new read says where it stands).
-        return {"readable": False, "why": RESET_PASSED_WHY, "reset_passed": True}
+        out = {"readable": False, "why": RESET_PASSED_WHY, "reset_passed": True}
+        # After a post-reset read, ``_merge`` stashes the pre-reset figure;
+        # show it here for a few hours when the new window is not yet in force
+        # (or when a later fold still carries the pair).
+        prev = _prev_figure_fields(row, now)
+        if prev:
+            out.update(prev)
+            out["why"] = (f"{RESET_PASSED_WHY} (was {prev['prev_used_pct']:g}% at "
+                          f"{_clock(_parse(prev['prev_window_end']), now)})")
+        return out
     if window is None:
         return {"readable": False, "why": "its plan reports no window with a reset time ahead"}
     used = min(100.0, max(0.0, float(window["used_pct"])))
@@ -7547,19 +7576,29 @@ def plan_fact(row: dict | None, now: datetime) -> dict:
     fact = {"readable": True, "window": usage._window_words(window), "used_pct": used, "left_pct": left,
             "resets_at": _iso(resets), "seconds": int(seconds), "pace_pct_per_hour": round(pace, 3),
             "hurry": left > 0 and pace >= even * PACE_HURRY, "words": words}
+    fact.update(_prev_figure_fields(row, now))
     figures_at = usage._figures_time(row, window)
     if kept_failure:
         # A provider can return figures older than the probe that fetched them: their own time wins.
         figures_at = _parse(row.get("observed_at")) or _parse(row.get("last_good_at")) or figures_at
-        last_read = "the last read timed out" if error == usage.E_TIMEOUT else "the last read failed"
+        if error == usage.E_TIMEOUT:
+            last_read = "last read failed (timeout)"
+        elif error:
+            last_read = f"last read failed ({error})"
+        else:
+            last_read = "last read failed"
         if figures_at is not None:
-            last_read = f"figures from {_clock(figures_at, now)}; {last_read}"
+            last_read = f"figures from {_clock(figures_at, now)} ({_ago(figures_at, now)}), {last_read}"
         fact.update(stale=True, figures_at=_iso(figures_at) if figures_at else None, pace_pct_per_hour=None,
                     hurry=False, words=last_read)
     elif figures_at is None or (now - figures_at).total_seconds() > FIGURES_STALE_S:
         # Shown as what was read, with its age; never a pace or a verdict.
+        if figures_at is not None:
+            age_words = f"figures from {_clock(figures_at, now)} ({_ago(figures_at, now)}); may be out of date"
+        else:
+            age_words = "figures may be out of date"
         fact.update(stale=True, figures_at=_iso(figures_at) if figures_at else None, pace_pct_per_hour=None,
-                    hurry=False, words="figures may be out of date")
+                    hurry=False, words=age_words)
     return fact
 
 
@@ -7625,31 +7664,49 @@ def _read_when(fact: dict, now: datetime) -> str:
     return f"when read {_ago(at, now)}" if at else "when last read"
 
 
+def _prev_words(fact: dict, now: datetime) -> str:
+    end = _parse(fact.get("prev_window_end"))
+    used = fact.get("prev_used_pct")
+    if end is None or not isinstance(used, (int, float)) or isinstance(used, bool):
+        return ""
+    return f"; was {used:g}% before reset at {_clock(end, now)}"
+
+
 def pace_words(fact: dict, now: datetime) -> str:
     """'88% of its week left, resets Sat 15:00Z (2 d 4 h): about 1.7% an hour
     to use it all; a lot left, little time', or why there is no pace."""
     if not fact.get("readable"):
         return fact.get("why") or "plan figures can't be read"
     resets = _parse(fact["resets_at"])
+    prev = _prev_words(fact, now)
     if fact.get("stale"):
+        detail = fact.get("words") or ""
+        if "last read" in detail:
+            return (f"{fact['left_pct']:g}% of its {fact['window']} left {_read_when(fact, now)}, resets "
+                    f"{_clock(resets, now)} ({_span(fact['seconds'])}); {detail}, so no pace is given{prev}")
         return (f"{fact['left_pct']:g}% of its {fact['window']} left {_read_when(fact, now)}, resets "
                 f"{_clock(resets, now)} ({_span(fact['seconds'])}); these figures may be out of date, so no "
-                "pace is given")
+                f"pace is given{prev}")
     text = (f"{fact['left_pct']:g}% of its {fact['window']} left, resets {_clock(resets, now)} "
             f"({_span(fact['seconds'])})")
     if fact["left_pct"] <= 0:
-        return text + ": nothing left to use until then"
-    return text + f": about {_rate_words(fact['pace_pct_per_hour'])}% an hour to use it all; {fact['words']}"
+        return text + f": nothing left to use until then{prev}"
+    return text + f": about {_rate_words(fact['pace_pct_per_hour'])}% an hour to use it all; {fact['words']}{prev}"
 
 
 def used_words(fact: dict, now: datetime) -> str:
     """'12% of its week used, resets in 2 d 4 h', or why there are no figures."""
     if not fact.get("readable"):
         return fact.get("why") or "plan figures can't be read"
+    prev = _prev_words(fact, now)
     if fact.get("stale"):
+        detail = fact.get("words") or ""
+        if "last read" in detail:
+            return (f"{fact['used_pct']:g}% of its {fact['window']} used {_read_when(fact, now)}; "
+                    f"{detail}; resets in {_span(fact['seconds'])}{prev}")
         return (f"{fact['used_pct']:g}% of its {fact['window']} used {_read_when(fact, now)}, may be out of "
-                f"date; resets in {_span(fact['seconds'])}")
-    return f"{fact['used_pct']:g}% of its {fact['window']} used, resets in {_span(fact['seconds'])}"
+                f"date; resets in {_span(fact['seconds'])}{prev}")
+    return f"{fact['used_pct']:g}% of its {fact['window']} used, resets in {_span(fact['seconds'])}{prev}"
 
 
 def _state_fact(entry: dict, now: datetime, relative: bool) -> str:
@@ -8474,17 +8531,15 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     ]
     # Owner-local only (survey rows 8-11): live delivery rows with friendly
     # names, Mac labels and last-prompt times, other Macs, and who has each
-    # recent change. Built here and nowhere else; a damaged source reads as
-    # empty lists, never as a broken route view.
+    # recent change. Built here and nowhere else. A damaged source yields
+    # ``delivery_rows: null`` (not ``[]``) so the UI does not say "nobody live".
     from khipu import routing_delivery_rows
 
-    try:
-        delivery = routing_delivery_rows.delivery_data(view, now, cfg)
-    except Exception:  # noqa: BLE001 - delivery evidence never breaks the view
-        delivery = {"rows": [], "macs": [], "recipients": {}}
+    # delivery_data never raises: a damaged source becomes rows=None inside it.
+    delivery = routing_delivery_rows.delivery_data(view, now, cfg)
     out["delivery_rows"] = delivery["rows"]
-    out["delivery_macs"] = delivery["macs"]
-    recipients = delivery["recipients"]
+    out["delivery_macs"] = delivery.get("macs") or []
+    recipients = delivery.get("recipients") or {}
     out["changes"] = [dict(change, recipients=recipients.get(change.get("version")))
                        for change in out["changes"]]
     # Owner-local only, like the directions above: today's rule 12 model
@@ -8497,7 +8552,7 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     from khipu import routing_scan_report
 
     try:
-        out["routing_file_copies"] = routing_scan_report.report()
+        out["routing_file_copies"] = routing_scan_report.report(now)
     except Exception:  # noqa: BLE001 - a damaged scan report must not break the route view
         out["routing_file_copies"] = {"status": "not_checked", "scanned_at": None,
                                       "files_checked": 0, "hits": [], "hits_total": 0,
@@ -8932,6 +8987,115 @@ def _for_a_conversation():
         raise RouteError(exc.public if exc.public is not None else str(exc)) from None
     except Exception:  # noqa: BLE001 - its text may name a file
         raise RouteError(_FAILED) from None
+
+
+# Compact / section projections for ``khipu_route`` / ``khipu route --view``.
+# The default (no view) answer is untouched; callers attach delivery after.
+ROUTE_VIEW_CHOICES = ("summary", "accounts", "priority", "rules", "holds", "note", "proposals")
+_ROUTE_SUMMARY_KEYS = ("accounts", "priority", "rules", "holds")
+_ROUTE_VIEW_CLIP = 120
+_ROUTE_VIEW_ACCOUNTS_CAP = 12
+_ROUTE_VIEW_PRIORITY_CAP = 8
+_ROUTE_VIEW_RULES_CAP = 16
+_ROUTE_VIEW_HOLDS_CAP = 10
+_ROUTE_VIEW_PACE_CAP = 4
+
+
+def _route_view_clip(value):
+    """Clip a summary string field (ids, until, text) to ``_ROUTE_VIEW_CLIP``."""
+    if isinstance(value, str) and len(value) > _ROUTE_VIEW_CLIP:
+        return value[:_ROUTE_VIEW_CLIP]
+    return value
+
+
+def _route_view_cap(rows: list, cap: int) -> list:
+    """Keep the first ``cap`` rows; when truncated, append ``{"more": K}``."""
+    if len(rows) <= cap:
+        return rows
+    return rows[:cap] + [{"more": len(rows) - cap}]
+
+
+def project_route_view(answer: dict, view: str) -> dict:
+    """Project a full route JSON answer to ``summary`` or one named section.
+
+    Delivery fields (``routing_changes``, ``delivery``) are not part of this
+    projection — MCP attaches them after, unchanged from the full path.
+    """
+    if not isinstance(view, str):
+        raise ValueError("view must be text")
+    mode = view.strip().lower()
+    if mode not in ROUTE_VIEW_CHOICES:
+        raise ValueError("view must be one of " + ", ".join(ROUTE_VIEW_CHOICES))
+    if mode != "summary":
+        return {mode: answer.get(mode)}
+
+    accounts = []
+    for row in answer.get("accounts") or []:
+        if not isinstance(row, dict):
+            continue
+        paces = []
+        for pace in row.get("pace") or []:
+            if not isinstance(pace, dict):
+                continue
+            plan = pace.get("plan") if isinstance(pace.get("plan"), dict) else {}
+            paces.append({"window": _route_view_clip(pace.get("window")),
+                          "used_pct": pace.get("used_pct"),
+                          "cycle_resets_at": _route_view_clip(pace.get("cycle_resets_at")),
+                          "plan": {"verdict": _route_view_clip(plan.get("verdict"))}})
+        advice = row.get("advice") if isinstance(row.get("advice"), dict) else {}
+        summary_row = {"label": _route_view_clip(row.get("label")),
+                       "state": _route_view_clip(row.get("state")),
+                       "until": _route_view_clip(row.get("until")),
+                       "pace": _route_view_cap(paces, _ROUTE_VIEW_PACE_CAP)}
+        if advice.get("verdict") is not None:
+            summary_row["advice"] = {"verdict": _route_view_clip(advice.get("verdict")),
+                                     "reason": _route_view_clip(advice.get("reason"))}
+        accounts.append(summary_row)
+
+    priority = answer.get("priority")
+    priority_out = None
+    if isinstance(priority, dict):
+        entries = []
+        for entry in priority.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            account = entry.get("account")
+            if account is None:
+                account = entry.get("label") or entry.get("id")
+            entries.append({"account": _route_view_clip(account),
+                            "role": _route_view_clip(entry.get("role")),
+                            "until": _route_view_clip(entry.get("until"))})
+        priority_out = {"entries": _route_view_cap(entries, _ROUTE_VIEW_PRIORITY_CAP),
+                        "version": _route_view_clip(priority.get("version")),
+                        "pending": priority.get("pending"),
+                        "confirmed": priority.get("confirmed")}
+
+    rules = []
+    for rule in answer.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        text = rule.get("text")
+        rule_id = rule.get("entity") if rule.get("entity") is not None else rule.get("n")
+        rules.append({"id": _route_view_clip(rule_id),
+                      "text": text[:_ROUTE_VIEW_CLIP] if isinstance(text, str) else text})
+
+    holds = []
+    for hold in answer.get("holds") or []:
+        if not isinstance(hold, dict):
+            continue
+        scope = hold.get("scope") if isinstance(hold.get("scope"), dict) else {}
+        text = hold.get("text")
+        holds.append({"id": _route_view_clip(hold.get("id")),
+                      "account": _route_view_clip(scope.get("account")),
+                      "until": _route_view_clip(hold.get("until")),
+                      "text": text[:_ROUTE_VIEW_CLIP] if isinstance(text, str) else text})
+
+    body = {"accounts": _route_view_cap(accounts, _ROUTE_VIEW_ACCOUNTS_CAP),
+            "priority": priority_out,
+            "rules": _route_view_cap(rules, _ROUTE_VIEW_RULES_CAP),
+            "holds": _route_view_cap(holds, _ROUTE_VIEW_HOLDS_CAP)}
+    body["omitted"] = sorted(key for key in answer if key not in _ROUTE_SUMMARY_KEYS)
+    return body
 
 
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
@@ -10775,6 +10939,9 @@ def run_cli(args) -> int:
         if cmd is None:
             view = read_view(now)
             account = _resolve_account_key(args.view_account) if getattr(args, "view_account", None) else None
+            mode = getattr(args, "view", None)
+            if mode and (args.since is not None or args.summary or args.brief):
+                raise RouteError("--view cannot be combined with --summary, --brief, or --since")
             if args.since is not None:
                 version, epoch = _parse_since(args.since)
                 out = since(version, view, now=now, epoch=epoch)
@@ -10797,8 +10964,11 @@ def run_cli(args) -> int:
                     from khipu import recall_prompt
                     recall_prompt.mark_routing_notices(session, text["notices"])
                 return 0
-            if args.json:
-                _print_json(public_view(view, now, account))
+            if args.json or mode:
+                out = public_view(view, now, account)
+                if mode:
+                    out = project_route_view(out, mode)
+                _print_json(out)
             else:
                 _print_view(view, now, account)
             _record_read(view, rules=True, priority=True)

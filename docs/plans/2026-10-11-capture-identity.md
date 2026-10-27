@@ -279,6 +279,7 @@ through the gate and added here.
 | `ledger` import | ledger rows | writes no episodes | none |
 | migrations 0027, 0029, 0030 | backfills (source rows, origin, `forgotten_sources`) | 0030 backfills the forgotten identities | none (table locks, see below) |
 | `hygiene.apply_backfill_*`, `capture._claim_unowned_episode`, `cli._cmd_episode_edit` | project/repo_root, origin, summary on existing rows | metadata only; the edit skips forgotten rows | none |
+| `identity.remove_project_alias` | project on existing rows (alias undo restores `raw.typed_project`) | metadata only; skips forgotten rows (`deleted_at IS NULL`) | none |
 | `forget.forget_episode` | hub tombstone, `forgotten_sources` | erase | exclusive (`forget.forget_everywhere`) |
 
 ### The four holes and the test that pins each
@@ -433,7 +434,7 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 |---|---|---|---|
 | native capture job | capture home `queue/`: `*.json`, `*.claimed.<pid>`, `*.tmp`, `.extract-*.tmp` | transcript text, and the extracted episode once checkpointed | scan "native jobs" |
 | native empty archive | capture home `empty/`: `*.json` | transcript text of a window that yielded no episode | scan "native jobs" |
-| outbox job | `outbox/`, `outbox/dead/`, `outbox/quarantine/`: `*.json` and `.*.tmp` | whole capture payloads waiting for the hub | scan "outbox" |
+| outbox job | `outbox/`, `outbox/dead/`, `outbox/quarantine/`, `outbox/resolved/`: `*.json` and `.*.tmp` | whole capture payloads waiting for the hub and resolved legacy evidence | scan "outbox" |
 | legacy log | memory root: `episodes*.jsonl`, their `.bak` copies, `.khipu-forget-backups/`, `.tmp` files beside them | one capture per line, summary text | scan "legacy logs" |
 | replica | data folder `hub_snapshot.sqlite` | episode rows, vectors, decisions and deliverables | scan "replica" |
 | replica temp | data folder `.hub_snapshot.<random>.sqlite` and its journal and WAL | a refresh dump or a staged backup replica | scan "replica temps" |

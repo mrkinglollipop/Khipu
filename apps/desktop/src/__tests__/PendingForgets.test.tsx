@@ -16,7 +16,7 @@ const NONE = { ok: true, strings: [], ids: [], count: 0 };
 
 describe("PendingForgets", () => {
   it("shows nothing when no forget is listed", async () => {
-    const { run, calls } = runner({ "episode forget-pending": [NONE] });
+    const { run, calls } = runner({ "episode forget-pending --from-app": [NONE] });
     const { container } = render(<PendingForgets run={run} />);
     await waitFor(() => expect(calls).toHaveLength(1));
     expect(container).toBeEmptyDOMElement();
@@ -24,7 +24,7 @@ describe("PendingForgets", () => {
 
   it("sends the listed forgets from the app and reads the list again", async () => {
     const { run, calls } = runner({
-      "episode forget-pending": [{ ok: true, strings: ["k:aa", "h:bb"], ids: [], count: 2 }, NONE],
+      "episode forget-pending --from-app": [{ ok: true, strings: ["k:aa", "h:bb"], ids: [], count: 2 }, NONE],
       "episode forget-pending --send --from-app": [{ ok: true, pending: 0 }],
     });
     const { container } = render(<PendingForgets run={run} />);
@@ -37,7 +37,7 @@ describe("PendingForgets", () => {
 
   it("says what is still listed when the hub does not take them all", async () => {
     const { run } = runner({
-      "episode forget-pending": [{ ok: true, strings: ["k:aa"], ids: [], count: 1 }],
+      "episode forget-pending --from-app": [{ ok: true, strings: ["k:aa"], ids: [], count: 1 }],
       "episode forget-pending --send --from-app": [{ ok: false, pending: 1, error: "not sent: the hub refused" }],
     });
     render(<PendingForgets run={run} />);
@@ -49,7 +49,7 @@ describe("PendingForgets", () => {
   it("offers both answers for a forgotten episode number the hub still holds", async () => {
     const listed = { ok: true, strings: [], ids: [{ id: 42, summary: "An unrelated hub episode" }], count: 1 };
     const { run, calls } = runner({
-      "episode forget-pending": [listed, listed, NONE],
+      "episode forget-pending --from-app": [listed, listed, NONE],
       "episode forget-pending --forget-here 42 --from-app": [{ ok: false, error: "forget not done" }],
       "episode forget-pending --not-same 42 --from-app": [{ ok: true }],
     });

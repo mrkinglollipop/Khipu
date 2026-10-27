@@ -433,6 +433,39 @@ def test_failed_mirror_is_reported_as_a_failed_graph_job(tmp_path, monkeypatch):
     assert jobs._read_job_state('graph_build')['exit'] != 0
 
 
+@pytest.mark.parametrize('mirror_rc', [0, 2])
+def test_offsite_starts_after_mirror_finishes_and_preserves_its_exit(
+    tmp_path, monkeypatch, mirror_rc,
+):
+    import subprocess
+    from types import SimpleNamespace
+    from khipu import jobs
+
+    events = []
+    def mirror():
+        events.append('mirror finished')
+        return subprocess.CompletedProcess([], mirror_rc, '{}', '')
+
+    g, _ = _run_nightly_with_mirror(tmp_path, monkeypatch, mirror)
+    monkeypatch.setattr(jobs, 'GRAPHIFY_NIGHTLY', GRAPH / 'graphify_nightly.py')
+    monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path / 'data')
+    monkeypatch.setattr(jobs, '_log_paths', lambda stem: (tmp_path / 'out.log', tmp_path / 'err.log'))
+    def launch(argv, **kw):
+        # Only the nightly driver may be spawned; offsite stays synchronous.
+        assert argv == [sys.executable, str(GRAPH / 'graphify_nightly.py')]
+        def wait(*, timeout):
+            rc = g.main()
+            events.append('nightly finished')
+            return rc
+        return SimpleNamespace(wait=wait)
+    monkeypatch.setattr(jobs.subprocess, 'Popen', launch)
+    monkeypatch.setattr(jobs, '_offsite_if_due', lambda: events.append('offsite started'))
+
+    assert jobs.run_graph_build() == mirror_rc
+    assert events == ['mirror finished', 'nightly finished', 'offsite started']
+    assert jobs._read_job_state('graph_build')['exit'] == mirror_rc
+
+
 def test_non_producer_mirror_skip_is_logged_and_exits_zero(tmp_path, monkeypatch, capsys):
     import subprocess
     skipped = json.dumps({'ok': True, 'skipped': 'not the graph producer; PG is read-only'})
@@ -453,3 +486,22 @@ def test_clean_or_disabled_mirror_keeps_exit_zero(tmp_path, monkeypatch, capsys,
     assert g.main() == 0
     assert len(calls) == (1 if root_set else 0)
     assert 'nightly complete' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('mirror_rc', [0, 2])
+def test_mirror_connection_retry_diagnostics_reach_nightly_log(
+    tmp_path, monkeypatch, capsys, mirror_rc,
+):
+    import subprocess
+    diagnostic = 'graph mirror connect: attempt 1/3 failed (OperationalError); retrying in 2s'
+    g, _ = _run_nightly_with_mirror(
+        tmp_path, monkeypatch,
+        lambda: subprocess.CompletedProcess(
+            [], mirror_rc, json.dumps({'error': 'synthetic connection failure'}),
+            diagnostic + '\nunrelated private diagnostic\n',
+        ),
+    )
+    assert g.main() == mirror_rc
+    output = capsys.readouterr().out
+    assert diagnostic in output
+    assert 'unrelated private diagnostic' not in output

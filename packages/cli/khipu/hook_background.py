@@ -130,8 +130,10 @@ def run(mem_root: str, harness: str, sid: str) -> None:
         from khipu.outbox import drain as outbox_drain
         from khipu.outbox import jobs as outbox_jobs
 
+        # Bounded like the scheduled drain (session_capture.drain): a
+        # reconcile backlog must not hold the drain lock for a whole session.
         if outbox_jobs():
-            _say(sid, harness, f"outbox drain {outbox_drain()}")
+            _say(sid, harness, f"outbox drain {outbox_drain(limit=20, time_budget_s=60)}")
     except Exception as e:  # noqa: BLE001
         _say(sid, harness, f"outbox drain skipped: {type(e).__name__}: {e}")
     try:

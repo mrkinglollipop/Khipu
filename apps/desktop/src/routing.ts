@@ -496,6 +496,8 @@ export type RouteProvider = {
   family: string;
   login?: string;
   probe?: string;
+  /** Where an http-quota provider's usage is read (set from the Plan detail). */
+  host?: string;
   lane_names?: string[];
   models_allowed?: string[];
   models_never?: string[];
@@ -604,7 +606,8 @@ export type RouteView = {
   rule_hygiene?: RouteHygiene[];
   /** Live delivery rows, other Macs and per-change recipients, projected
    *  for this Mac's owner only (survey rows 8-11). */
-  delivery_rows?: RouteDeliveryRow[];
+  /** Null means the CLI could not build rows (damaged read); empty means nobody live. */
+  delivery_rows?: RouteDeliveryRow[] | null;
   delivery_macs?: RouteDeliveryMac[];
   /** Routing copies found in files, for this Mac's owner only (slice 13/15d). */
   routing_file_copies?: {
@@ -615,6 +618,7 @@ export type RouteView = {
     hits_total?: number;
     more_not_shown?: number;
     too_large?: string[];
+    skipped?: { file: string; reason: string; message?: string }[];
   };
   /** Open owed directions, projected for this Mac's owner only (slice 19a). */
   unreached_directions?: {

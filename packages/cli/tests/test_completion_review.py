@@ -80,6 +80,8 @@ def _install_gap(harness, monkeypatch):
         if 'FROM fact_gaps' in sql and 'array_agg' in sql:
             original(cur, 'SAVEPOINT gap_probe')
             cur.rows = [(2, 'close rules', None, [99])]
+        elif 'FROM project_aliases' in sql:
+            cur.rows = []
         elif sql.startswith('SELECT raw, deleted_at FROM episodes'):
             original(cur, 'SAVEPOINT gap_probe')
             harness.events.append('episode_share_lock')

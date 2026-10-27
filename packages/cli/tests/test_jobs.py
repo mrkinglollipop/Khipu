@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -556,6 +557,48 @@ class IndexFreshnessTest(unittest.TestCase):
                 out = jobs.index_freshness(memory_root=mem)
         self.assertFalse(out["ok"])
         self.assertTrue(out["reasons"])
+
+    def _night(self, mem: Path, *, consolidate_ago: float, steps_after: bool):
+        """Index written when consolidate finished; later steps log afterwards."""
+        from datetime import datetime, timezone
+
+        now = time.time()
+        done = now - consolidate_ago
+        index = mem / "MEMORY.md"
+        index.write_text("# Memory\n", encoding="utf-8")
+        os.utime(index, (done, done))
+        log = mem / "nightly.log"
+        log.write_text("consolidate done\n[khipu-embed] backfill ok\n")
+        os.utime(log, (now, now))
+        iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()  # noqa: E731
+        steps = [{"name": "sessions_drain", "ok": True, "ts": iso(done - 600)},
+                 {"name": "consolidate_nightly", "ok": True, "ts": iso(done + 5)}]
+        if steps_after:
+            steps.append({"name": "embed_backfill", "ok": True, "ts": iso(now)})
+        return log, {"steps": steps}
+
+    def test_later_nightly_steps_do_not_make_the_index_look_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td)
+            log, last = self._night(mem, consolidate_ago=4000, steps_after=True)
+            with mock.patch("khipu.git_sync_health.is_sync_host", return_value=True), \
+                 mock.patch.object(jobs, "nightly_log_path", return_value=log), \
+                 mock.patch.object(jobs, "nightly_last", return_value=last):
+                out = jobs.index_freshness(memory_root=mem)
+        self.assertTrue(out["ok"], out["reasons"])
+
+    def test_a_log_newer_than_the_last_receipt_still_judges_by_the_log(self):
+        # The log moved on without a matching receipt (a run that recorded no
+        # steps): the receipt is from an older night, so the log decides.
+        with tempfile.TemporaryDirectory() as td:
+            mem = Path(td)
+            log, last = self._night(mem, consolidate_ago=4000, steps_after=False)
+            with mock.patch("khipu.git_sync_health.is_sync_host", return_value=True), \
+                 mock.patch.object(jobs, "nightly_log_path", return_value=log), \
+                 mock.patch.object(jobs, "nightly_last", return_value=last):
+                out = jobs.index_freshness(memory_root=mem)
+        self.assertFalse(out["ok"])
+        self.assertIn("older than the last nightly", out["reasons"][0])
 
 
 class EmbedProviderFixTextTest(unittest.TestCase):

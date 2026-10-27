@@ -695,7 +695,16 @@ def _library_backfill() -> dict[str, Any] | None:
             and (
                 not bool(row.get("ok", True))
                 or int(row.get("failed") or row.get("failed_chunks") or 0) > 0
-                or int(row.get("remaining") or 0) > 0
+                # Cap-hit partial with nothing failed is healthy (matches
+                # library.nightly's own bf_ok); remaining after a hard failure
+                # still counts.
+                or (
+                    int(row.get("remaining") or 0) > 0
+                    and not (
+                        str(row.get("status") or "") == "partial"
+                        and int(row.get("failed") or row.get("failed_chunks") or 0) == 0
+                    )
+                )
                 or bool(row.get("time_budget_exhausted") or row.get("budget_exhausted"))
                 or bool(row.get("error"))
                 or "budget" in str(row.get("skipped") or "").lower()
@@ -955,6 +964,36 @@ def nightly_last() -> dict[str, Any] | None:
         return None
 
 
+def nightly_consolidate_ts(log_mtime: float | None, *, slack_s: float) -> float | None:
+    """When the latest nightly's consolidate driver finished, for checks that
+    judge work the driver does (index rebuild, memory git sync).
+
+    Later nightly steps also log to the nightly log, so its mtime can sit an
+    hour or more past consolidate. The ``consolidate_nightly`` receipt is used
+    only when that receipt file's last step is within ``slack_s`` of the log
+    mtime (the same run); otherwise the log is newer than any receipt and its
+    mtime decides, as before."""
+    if log_mtime is None:
+        return None
+    data = nightly_last()
+    steps = data.get("steps") if data else None
+    if not isinstance(steps, list):
+        return log_mtime
+    consolidate: float | None = None
+    last: float | None = None
+    for step in steps:
+        try:
+            ts = datetime.fromisoformat(str(step["ts"])).timestamp()
+        except (KeyError, TypeError, ValueError):
+            continue
+        last = ts if last is None else max(last, ts)
+        if step.get("name") == "consolidate_nightly":
+            consolidate = ts
+    if consolidate is None or last is None or log_mtime - last > slack_s:
+        return log_mtime
+    return min(consolidate, log_mtime)
+
+
 # D1: doctor `*_ok` key -> (nightly-last.json step name, fix hint). Every
 # step here is written by `run_nightly` above, fail-open, so a step that
 # never runs (missing key, provider outage, etc.) is otherwise invisible —
@@ -974,6 +1013,14 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
         "check the embedding provider key/credentials, then run `khipu jobs install nightly`"
         " or wait for the next nightly",
     ),
+    "query_cache_prune_ok": (
+        "query_cache_prune",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "commitments_close_rules_ok": (
+        "commitments_close_rules",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
     "commitments_hygiene_ok": (
         "commitments_hygiene",
         "run `khipu hygiene commitments` and check the error",
@@ -981,6 +1028,10 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     "mark_stale_ok": (
         "commitments_mark_stale",
         "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "ledger_ok": (
+        "ledger",
+        "run `khipu ledger drain` and check the error",
     ),
 }
 
@@ -1268,11 +1319,16 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
 
 def skipped_step_names(health: dict[str, dict[str, Any]]) -> list[str]:
     """The base name (``key`` minus its ``_ok`` suffix) of every
-    `nightly_step_health()` entry marked `skipped` — doctor folds these into
-    its `not_configured` list so healthRows.tsx renders them with the same
-    grey "not set up" row `memory_root`/`graph_sqlite` already use, instead
-    of a false red for a step that simply hasn't run yet."""
-    return [key[: -len("_ok")] for key, v in health.items() if v.get("skipped")]
+    `nightly_step_health()` entry marked `skipped` or `applicable: false` —
+    doctor folds these into its `not_configured` list so healthRows.tsx
+    renders them with the same grey "not set up" row `memory_root`/
+    `graph_sqlite` already use, instead of a false green for a step that
+    never runs on this Mac or has not run yet."""
+    names: list[str] = []
+    for key, v in health.items():
+        if v.get("skipped") or v.get("applicable") is False:
+            names.append(key[: -len("_ok")])
+    return names
 
 
 def run_monthly(*, dry_run: bool = False) -> int:
@@ -1326,11 +1382,18 @@ def _offsite_if_due() -> None:
     from khipu import graph_backup
 
     try:
-        last_ok = graph_backup._last_ok_time("graph_snapshot_offsite")
+        last_ok = graph_backup._last_ok_time(
+            "graph_snapshot_offsite",
+            statement_timeout_s=graph_backup.OFFSITE_RECEIPT_STATEMENT_TIMEOUT_SECONDS,
+            connect_timeout=graph_backup.OFFSITE_RECEIPT_CONNECT_TIMEOUT_SECONDS,
+            raise_on_error=True,
+        )
         now = datetime.now(timezone.utc)
         if not graph_backup.offsite_due(last_ok=last_ok, now=now):
             return
         out = graph_backup.run_offsite()
+    except graph_backup.OffsiteReceiptReadError as exc:
+        out = {"ok": False, "reason": str(exc)}
     except Exception as exc:  # noqa: BLE001
         out = {"ok": False, "reason": str(exc)}
     try:
@@ -1549,9 +1612,10 @@ def index_freshness(*, memory_root: Path | None = None) -> dict[str, Any]:
     out["nightly_log"] = str(nightly_log)
     out["nightly_log_mtime"] = nightly_mtime
     out["index_files"] = [str(p.relative_to(mem)) for p in index_files[:20]]
+    consolidated = nightly_consolidate_ts(nightly_mtime, slack_s=INDEX_SLACK_S)
 
-    if nightly_mtime and nightly_mtime - index_mtime > INDEX_SLACK_S:
-        lag_min = int((nightly_mtime - index_mtime) // 60)
+    if consolidated and consolidated - index_mtime > INDEX_SLACK_S:
+        lag_min = int((consolidated - index_mtime) // 60)
         out["ok"] = False
         out["reasons"].append(
             f"index is {lag_min} min older than the last nightly log — rebuild may have been skipped"
