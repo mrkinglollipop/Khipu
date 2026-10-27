@@ -255,3 +255,58 @@ def test_replica_exact_hidden_alias_reads_as_an_unknown_name(replica_dir, alias,
     with mock.patch.object(db, "connect", side_effect=psycopg.OperationalError("connection is closed")):
         rendered = json.dumps(_mcp_owed(alias))
     assert hidden not in rendered
+
+
+# --- a fence landing between hub resolution and the replica fallback --------
+
+@pytest.mark.parametrize("surface", ["listing", "mcp", "cli"])
+@pytest.mark.parametrize("kind", ["forgotten", "pending"])
+def test_fallback_after_hub_resolution_never_names_a_newly_hidden_project(hub_conn, capsys, kind, surface):
+    from khipu import cli, commitments
+
+    hidden = "secret/leaf"
+    with hub_conn.cursor() as cur:
+        fact_seed.announce(cur)
+        cur.execute("INSERT INTO episodes (ts, session_id, summary, project) "
+                    "VALUES (now(), 's-mid', 'live for now', %s) RETURNING id", (hidden,))
+        ep = cur.fetchone()[0]
+        cur.execute("INSERT INTO commitments (text, project, owner, content_hash, opened_episode) "
+                    "VALUES ('soon forgotten', %s, 'user', 'h-mid', %s) RETURNING id", (hidden, ep))
+        fact_seed.adopt(cur, "commitment", cur.fetchone()[0])
+        cur.execute("INSERT INTO project_aliases (alias, project) VALUES ('old-secret', %s)", (hidden,))
+    hub_conn.commit()
+    con = sqlite3.connect(hs.snapshot_path())
+    hs._create_schema(con)
+    con.execute("INSERT INTO episodes(id, summary, deleted_at) VALUES (?, 'live for now', NULL)", (ep,))
+    con.execute("INSERT INTO commitments(id, text, project, opened_episode, status, owner) "
+                "VALUES (1, 'soon forgotten', ?, ?, 'open', 'user')", (hidden, ep))
+    con.execute("INSERT INTO project_aliases(alias, project) VALUES ('old-secret', ?)", (hidden,))
+    certify(con)
+    con.commit()
+    con.close()
+
+    def fence_then_disconnect(*a, **k):
+        # The hub already read OLD-SECRET as secret/leaf; now the forget (or
+        # a queued erasure) lands on the replica and the hub goes away.
+        if kind == "forgotten":
+            with sqlite3.connect(hs.snapshot_path()) as rcon:
+                rcon.execute("UPDATE episodes SET deleted_at = '2026-10-27' WHERE id = ?", (ep,))
+        else:
+            hs._queue_erasure(ep)
+        raise psycopg.OperationalError("connection is closed")
+
+    asked = "OLD-SECRET"
+    with mock.patch.object(commitments, "fetch_owed_rows", side_effect=fence_then_disconnect), \
+         mock.patch.object(srv, "_routing_direction_rows", return_value=[]):
+        if surface == "listing":
+            out = srv.owed_listing({"project": asked})
+            assert out["project"] == asked and "asked" not in out and out["results"] == []
+            rendered = json.dumps(out, default=str)
+        elif surface == "mcp":
+            rendered = json.dumps(_mcp_owed(asked))
+        else:
+            args = cli.build_parser().parse_args(["owed", "--project", asked, "--json"])
+            assert args.func(args) == 0
+            rendered = capsys.readouterr().out
+            assert json.loads(rendered)["project"] == asked
+    assert hidden not in rendered and "soon forgotten" not in rendered

@@ -1927,7 +1927,11 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     except Exception as exc:  # noqa: BLE001
         if not hub_connection_failed(exc):
             raise
-        project, visible = offline_reads.owed_resolve_project_known(project)
+        # Start again from the name the caller typed, never the hub's
+        # expansion of it: a forget (or queued erasure) may have landed since,
+        # and the hub's canonical must not be echoed past the replica's fence.
+        project, visible = offline_reads.owed_resolve_project_known(asked_name)
+        canonical, project_names = project, [project] if project else None
         rows = offline_reads.owed_rows(project, status)
         if rows is None:
             raise
