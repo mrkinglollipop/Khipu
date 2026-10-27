@@ -1901,6 +1901,11 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     hub_now = None
     try:
         with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
+            from psycopg import IsolationLevel
+
+            # One snapshot for the name, its alias group and the rows: a forget
+            # landing mid-read can't leave a canonical echoed over rows it hid.
+            conn.isolation_level = IsolationLevel.REPEATABLE_READ
             with conn.cursor() as cur:
                 if project:
                     from khipu import identity
@@ -1928,27 +1933,14 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
         if not hub_connection_failed(exc):
             raise
         # Start again from the name the caller typed, never the hub's
-        # expansion of it: a forget (or queued erasure) may have landed since,
-        # and the hub's canonical must not be echoed past the replica's fence.
-        project, visible = offline_reads.owed_resolve_project_known(asked_name)
-        canonical, project_names = project, [project] if project else None
-        rows = offline_reads.owed_rows(project, status)
-        if rows is None:
+        # expansion of it, and resolve it, group it and read its rows in one
+        # replica read (``offline_reads.owed_read``): the canonical is echoed
+        # only when that same read can see the project.
+        read = offline_reads.owed_read(asked_name, status)
+        if read is None:
             raise
-        canonical = offline_reads.owed_canonical(project) if project and visible else project
-        if project and not visible:
-            project_names = [project]
-        elif project:
-            from khipu.hub_snapshot import snapshot_project_group
-
-            replica = offline_reads._open()
-            if replica is not None:
-                try:
-                    canonical, project_names = snapshot_project_group(replica, project)
-                finally:
-                    replica.close()
-            else:
-                project_names = list(dict.fromkeys([project, canonical]))
+        project, rows = read["project"], read["rows"]
+        canonical, project_names = read["canonical"], read["group"]
         stale = stale_fields()
     directions = _routing_direction_rows(status, {"origin": filters.get("origin")},
                                          projects=project_names, canonical=canonical)

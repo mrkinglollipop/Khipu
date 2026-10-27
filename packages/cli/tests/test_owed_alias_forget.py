@@ -310,3 +310,115 @@ def test_fallback_after_hub_resolution_never_names_a_newly_hidden_project(hub_co
             rendered = capsys.readouterr().out
             assert json.loads(rendered)["project"] == asked
     assert hidden not in rendered and "soon forgotten" not in rendered
+
+
+# --- a fence landing between name resolution and the row read ---------------
+# Each backend resolves the name and reads the rows in one snapshot, so the
+# response is wholly from before the fence (canonical + its row) or wholly
+# after it (the name as typed, empty) -- never a canonical over hidden rows.
+
+def _surface(surface, asked, capsys):
+    from khipu import cli
+
+    if surface == "listing":
+        out = srv.owed_listing({"project": asked})
+        return out, json.dumps(out, default=str)
+    if surface == "mcp":
+        response = _mcp_owed(asked)
+        return json.loads(response["result"]["content"][0]["text"]), json.dumps(response)
+    args = cli.build_parser().parse_args(["owed", "--project", asked, "--json"])
+    assert args.func(args) == 0
+    text = capsys.readouterr().out
+    return json.loads(text), text
+
+
+def _assert_one_snapshot(out, rendered, hidden, asked, row_text):
+    if hidden in rendered:
+        assert out["project"] == hidden and [r["text"] for r in out["results"]] == [row_text]
+    else:
+        assert out["project"] == asked and out["results"] == []
+
+
+@pytest.mark.parametrize("surface", ["listing", "mcp", "cli"])
+def test_hub_forget_between_resolution_and_rows_never_names_the_project(hub, hub_conn, capsys, surface):  # noqa: F811
+    hidden, asked, text = "secret/leaf", "OLD-SECRET", "visible until now"
+    with hub_conn.cursor() as cur:
+        fact_seed.announce(cur)
+        cur.execute("INSERT INTO episodes (ts, session_id, summary, project) "
+                    "VALUES (now(), 's-rr', 'live', %s) RETURNING id", (hidden,))
+        ep = cur.fetchone()[0]
+        cur.execute("INSERT INTO commitments (text, project, owner, content_hash, opened_episode) "
+                    "VALUES (%s, %s, 'user', 'h-rr', %s) RETURNING id", (text, hidden, ep))
+        cid = cur.fetchone()[0]
+        fact_seed.adopt(cur, "commitment", cid)
+        cur.execute("INSERT INTO project_aliases (alias, project) VALUES ('old-secret', %s)", (hidden,))
+    hub_conn.commit()
+    real = identity.resolve_project
+
+    def resolve_then_forget(cur, project):
+        answer = real(cur, project)
+        other = hub.connect()
+        with other.cursor() as oc:
+            oc.execute("DELETE FROM fact_claims WHERE kind = 'commitment' AND fact_id = %s", (cid,))
+            oc.execute("UPDATE episodes SET deleted_at = now() WHERE id = %s", (ep,))
+        other.commit()
+        other.close()
+        return answer
+
+    with mock.patch.object(identity, "resolve_project", side_effect=resolve_then_forget), \
+         mock.patch.object(srv, "_routing_direction_rows", return_value=[]):
+        out, rendered = _surface(surface, asked, capsys)
+    _assert_one_snapshot(out, rendered, hidden, asked, text)
+    # The forget did land: the next read is wholly after it.
+    with mock.patch.object(srv, "_routing_direction_rows", return_value=[]):
+        after = srv.owed_listing({"project": asked})
+    assert after["project"] == asked and after["results"] == []
+
+
+@pytest.mark.parametrize("surface", ["listing", "mcp", "cli"])
+@pytest.mark.parametrize("kind", ["forgotten", "pending"])
+def test_replica_fence_between_resolution_and_rows_never_names_the_project(replica_dir, capsys, kind, surface):
+    import threading
+
+    hidden, asked, text = "secret/leaf", "OLD-SECRET", "visible until now"
+    con = sqlite3.connect(hs.snapshot_path())
+    hs._create_schema(con)
+    con.execute("INSERT INTO episodes(id, summary, deleted_at) VALUES (7, 'live', NULL)")
+    con.execute("INSERT INTO commitments(id, text, project, opened_episode, status, owner) "
+                "VALUES (1, ?, ?, 7, 'open', 'user')", (text, hidden))
+    con.execute("INSERT INTO project_aliases(alias, project) VALUES ('old-secret', ?)", (hidden,))
+    certify(con)
+    con.commit()
+    con.close()
+    real = hs.snapshot_resolve_project_known
+    late: list[threading.Thread] = []
+
+    def forget(timeout):
+        with sqlite3.connect(hs.snapshot_path(), timeout=timeout) as w:
+            w.execute("UPDATE episodes SET deleted_at = '2026-10-27' WHERE id = 7")
+
+    def resolve_then_fence(con, project, **kw):
+        answer = real(con, project, **kw)
+        if kind == "pending":
+            hs._queue_erasure(7)
+        else:
+            try:
+                forget(0)
+            except sqlite3.OperationalError:
+                # The read holds the replica: the writer waits it out, as a pull would.
+                t = threading.Thread(target=forget, args=(30,))
+                t.start()
+                late.append(t)
+        return answer
+
+    with mock.patch.object(db, "connect", side_effect=psycopg.OperationalError("connection is closed")), \
+         mock.patch.object(hs, "snapshot_resolve_project_known", side_effect=resolve_then_fence), \
+         mock.patch.object(srv, "_routing_direction_rows", return_value=[]):
+        out, rendered = _surface(surface, asked, capsys)
+    for t in late:
+        t.join(30)
+    _assert_one_snapshot(out, rendered, hidden, asked, text)
+    with mock.patch.object(db, "connect", side_effect=psycopg.OperationalError("connection is closed")), \
+         mock.patch.object(srv, "_routing_direction_rows", return_value=[]):
+        after = srv.owed_listing({"project": asked})
+    assert after["project"] == asked and after["results"] == []

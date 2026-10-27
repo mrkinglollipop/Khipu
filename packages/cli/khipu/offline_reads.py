@@ -14,7 +14,7 @@ import json
 import sqlite3
 from typing import Any
 
-from khipu import hub_snapshot
+from khipu import hub_snapshot, identity
 
 
 def _open() -> sqlite3.Connection | None:
@@ -112,24 +112,79 @@ def _cited_forgotten(con, rows: list[dict[str, Any]]) -> set[Any]:
     return out
 
 
-def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
-    """The replica's raw commitment rows of one scope (owners not yet
-    resolved), for ``owed`` and the paged read (``commitments.page_owed``)."""
+def owed_read(project: str | None, status: str) -> dict[str, Any] | None:
+    """The owed listing's whole replica read in ONE read transaction: the
+    typed ``project`` resolved (``snapshot_resolve_project_known``), its alias
+    group, and the rows, all from the same replica state and one forget fence
+    (deleted episodes and queued erasures, taken once). A canonical is
+    expanded only when the name is visible in that same read; otherwise the
+    name stays as typed with no alias widening. ``None`` with nothing to read.
+    Raises ``identity.AmbiguousProject``."""
     con = _open()
     if con is None:
         return None
+    try:
+        # Deferred BEGIN: the first SELECT takes the read lock (or the WAL
+        # snapshot) and holds it to the end, so no forget can land in between.
+        con.execute("BEGIN")
+        if not hub_snapshot._snapshot_table_columns(con, "commitments"):
+            return None
+        fence = hub_snapshot.forget_fence_sql(con, "commitments", "opened_episode")
+        resolved, visible = hub_snapshot.snapshot_resolve_project_known(con, project, fence=fence)
+        canonical, group = resolved, ([resolved] if resolved else None)
+        if resolved and visible:
+            canonical, group = hub_snapshot.snapshot_project_group(con, resolved)
+            canonical = canonical or resolved
+        rows = owed_rows(resolved, status, con=con, fence=fence, group=group, canonical=canonical)
+        if rows is not None and resolved and visible:
+            # The fact epoch (stamp vs the refusal registry and the queued
+            # erasures) is checked as each statement runs, outside SQLite's
+            # snapshot, so a queued erasure can hide the rows after the name
+            # resolved. Ask again AFTER the rows: within this read the epoch
+            # only goes from certified to not (re-certifying is a stamp write
+            # this read can't see), so still visible now means the rows read
+            # saw it too. Otherwise the name reads as typed, with no rows.
+            try:
+                again, visible = hub_snapshot.snapshot_resolve_project_known(con, project, fence=fence)
+            except identity.AmbiguousProject:
+                again, visible = None, False
+            if not visible or again != resolved:
+                resolved, visible, canonical, group, rows = project, False, project, [project], []
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if rows is None:
+        return None
+    return {"project": resolved, "visible": visible, "canonical": canonical, "group": group, "rows": rows}
+
+
+def owed_rows(project: str | None, status: str, *, con: sqlite3.Connection | None = None,
+              fence: str | None = None, group: list[str] | None = None,
+              canonical: str | None = None) -> list[dict[str, Any]] | None:
+    """The replica's raw commitment rows of one scope (owners not yet
+    resolved), for ``owed`` and the paged read (``commitments.page_owed``).
+    ``owed_read`` passes its own connection, fence and alias group so the rows
+    come from the read that resolved the name."""
+    own = con is None
+    if own:
+        con = _open()
+        if con is None:
+            return None
     try:
         if not hub_snapshot._snapshot_table_columns(con, "commitments"):
             return None
         sql = "SELECT * FROM commitments WHERE status = ?"
         params: list[Any] = [status]
-        canonical = None
-        if project:
+        if project and group is None:
             # An aliased key reads as its canonical project, as on the hub.
             canonical, group = hub_snapshot.snapshot_project_group(con, project)
+        if project:
             sql += f" AND project IN ({', '.join('?' * len(group))})"
             params.extend(group)
-        sql += hub_snapshot.forget_fence_sql(con, "commitments", "opened_episode")
+        else:
+            canonical = None
+        sql += fence if fence is not None else hub_snapshot.forget_fence_sql(con, "commitments", "opened_episode")
         rows = [dict(r) for r in con.execute(sql, params).fetchall()]
         gone = _cited_forgotten(con, rows)
         if canonical:
@@ -139,7 +194,8 @@ def owed_rows(project: str | None, status: str) -> list[dict[str, Any]] | None:
     except sqlite3.Error:
         return None
     finally:
-        con.close()
+        if own:
+            con.close()
     for row in rows:
         for col in ("opened_at", "due_after", "closed_at", "last_seen_at"):
             row[col] = hub_snapshot._utc(row.get(col))

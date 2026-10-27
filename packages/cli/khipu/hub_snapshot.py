@@ -4207,9 +4207,11 @@ def snapshot_resolve_project(con: sqlite3.Connection, project: str | None) -> st
     return snapshot_resolve_project_known(con, project)[0]
 
 
-def snapshot_resolve_project_known(con: sqlite3.Connection, project: str | None) -> tuple[str | None, bool]:
+def snapshot_resolve_project_known(con: sqlite3.Connection, project: str | None, *,
+                                   fence: str | None = None) -> tuple[str | None, bool]:
     """``snapshot_resolve_project`` and whether the answer is a visible
-    project (``identity.resolve_project``'s contract)."""
+    project (``identity.resolve_project``'s contract). ``fence`` is a forget
+    fence the caller already took, so its row read applies the same one."""
     if not project:
         return project, True
     from khipu import identity
@@ -4219,8 +4221,9 @@ def snapshot_resolve_project_known(con: sqlite3.Connection, project: str | None)
     # is queued, never resolve a name: the replica's forget fence, like every
     # other replica read of them. An alias counts only for a group one of the
     # fenced names belongs to.
-    for sql in ("SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL"
-                + forget_fence_sql(con, "commitments", "opened_episode"),
+    if fence is None:
+        fence = forget_fence_sql(con, "commitments", "opened_episode")
+    for sql in ("SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL" + fence,
                 "SELECT alias, project FROM project_aliases"):
         try:
             found.append(list(con.execute(sql).fetchall()))
