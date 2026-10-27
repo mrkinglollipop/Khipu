@@ -117,7 +117,7 @@ def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str
 def _validate_resolution(record: Any) -> None:
     """Validate archived content itself, never trust its saved hash claims."""
     from khipu.capture_identity import payload_sha256
-    from khipu.capture import _legacy_projection_kind, _redact_capture_values
+    from khipu.capture import _legacy_preferences_contained, _legacy_projection_kind, _redact_capture_values
 
     outbox_payloads(record)
     resolution = record.get("resolution")
@@ -130,7 +130,8 @@ def _validate_resolution(record: Any) -> None:
     hub_view.pop("origin", None)
     hub_view = _redact_capture_values(hub_view)
     if (not isinstance(resolution, dict)
-            or resolution.get("kind") not in ("legacy_comma_projection", "legacy_landed_line")
+            or resolution.get("kind") not in ("legacy_comma_projection", "legacy_landed_line",
+                                              "preferences_contained")
             or type(resolution.get("episode_id")) is not int or resolution["episode_id"] <= 0
             or not isinstance(resolution.get("resolved_at"), str) or not resolution["resolved_at"]
             or resolution.get("original_payload_sha256") != payload_sha256(record["payload"])
@@ -142,8 +143,16 @@ def _validate_resolution(record: Any) -> None:
     if (type(attempts) is not int or attempts < 0
             or ("origin" in queued and not valid_origin(queued["origin"]))
             or queued.get("reason") != "recovery: the legacy key holds different facts"
-            or "origin" not in queued or queued["origin"] is not None
-            or _legacy_projection_kind(record["payload"], hub_view) != resolution["kind"]):
+            or "origin" not in queued or queued["origin"] is not None):
+        raise ValueError("resolution queued envelope is invalid")
+    # preferences_contained is the owner's merge command's proof
+    # (outbox_preferences), never one the drain makes.
+    if resolution["kind"] == "preferences_contained":
+        proved = (_legacy_projection_kind(record["payload"], hub_view) is None
+                  and _legacy_preferences_contained(record["payload"], hub_view))
+    else:
+        proved = _legacy_projection_kind(record["payload"], hub_view) == resolution["kind"]
+    if not proved:
         raise ValueError("resolution queued envelope is invalid")
     _canonical(record)
 
@@ -169,6 +178,79 @@ def _recovery_terminal(payload: dict[str, Any], stamp: dict[str, Any]) -> Path |
         except (OSError, ValueError, TypeError, KeyError, RecursionError):
             continue
     return None
+
+
+def archive_resolved(jp: Path, snapshot: bytes, record: dict[str, Any]) -> str:
+    """Move one held job to resolved/ with its proof, as the drain does for a
+    landed line: the record (both payloads and the whole job) is validated and
+    written before the job file goes, under the same source fence and outbox
+    lock. ``resolved``; ``changed`` when the file moved or changed since
+    ``snapshot`` was read; ``forgotten`` when a source, or the episode the
+    record names, is forgotten (the job is left for forget's sweep). Raises on an invalid record or a different
+    record already archived under the job's id."""
+    from khipu.tombstones import episode_hidden, write_guard
+
+    _validate_resolution(record)
+    record_id = hashlib.sha256(snapshot).hexdigest()
+    with write_guard(*outbox_payloads(record)) as allowed:
+        with _locked_outbox():
+            try:
+                if jp.read_bytes() != snapshot:
+                    return "changed"
+            except FileNotFoundError:
+                return "changed"
+            # An id forgotten after the merge's batch committed (that check
+            # ran before this lock) still holds the job back.
+            if not allowed or episode_hidden(record["resolution"]["episode_id"]):
+                return "forgotten"
+            resolved_dir().mkdir(parents=True, exist_ok=True)
+            record_path = resolved_dir() / (record_id + ".json")
+            if record_path.exists():
+                saved = json.loads(record_path.read_bytes())
+                _validate_resolution(saved)
+                expected = {**record, "resolution": {**record["resolution"],
+                                                     "resolved_at": saved["resolution"]["resolved_at"]}}
+                if _canonical(saved) != _canonical(expected):
+                    raise ValueError("resolution record conflicts with queued evidence")
+            else:
+                _atomic_write(record_path, record)
+            jp.unlink()
+    return "resolved"
+
+
+def unresolve(record_id: str, destination: Path, kind: str) -> str:
+    """Put a resolved job back where it was held (its ``queued_evidence``),
+    then remove its record: the Undo of ``archive_resolved``. Only a record of
+    ``kind`` moves. ``restored``; ``absent`` (no such record); ``present``
+    (a job is already at ``destination``: never overwritten, the record
+    stays); ``forgotten`` (a source, or the record's episode by id, is
+    forgotten: the record stays for forget's sweep)."""
+    from khipu.tombstones import episode_hidden, write_guard
+
+    record_path = resolved_dir() / (record_id + ".json")
+    try:
+        data = record_path.read_bytes()
+    except FileNotFoundError:
+        return "absent"
+    record = json.loads(data)
+    _validate_resolution(record)
+    if record["resolution"]["kind"] != kind:
+        return "absent"
+    with write_guard(*outbox_payloads(record)) as allowed:
+        with _locked_outbox():
+            try:
+                if record_path.read_bytes() != data:
+                    return "absent"
+            except FileNotFoundError:
+                return "absent"
+            if not allowed or episode_hidden(record["resolution"]["episode_id"]):
+                return "forgotten"
+            if destination.exists():
+                return "present"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(destination, record["queued_evidence"])
+            record_path.unlink()
+    return "restored"
 
 
 _STAMP = object()
@@ -476,6 +558,7 @@ def status() -> dict[str, Any]:
     unreadable = 0
     offline = 0
     evidence_conflicts = 0
+    line_conflicts = 0
     now = datetime.now(timezone.utc)
     for jp in js:
         try:
@@ -493,6 +576,7 @@ def status() -> dict[str, Any]:
         attempts = job.get("attempts", 0)
         if job.get("evidence_conflict"):
             evidence_conflicts += 1
+            line_conflicts += _is_line_conflict(job)
         if (not isinstance(job.get("payload"), dict) or isinstance(attempts, bool)
                 or not isinstance(attempts, int) or attempts < 0):
             unreadable += 1
@@ -504,10 +588,12 @@ def status() -> dict[str, Any]:
     held_conflicts = []
     for jp in dead_jobs():
         try:
-            if _read_job(jp).get("evidence_conflict"):
-                held_conflicts.append(jp.name)
+            held = _read_job(jp)
         except (OSError, ValueError, TypeError, RecursionError):
-            pass  # dead still names unreadable held work
+            continue  # dead still names unreadable held work
+        if held.get("evidence_conflict"):
+            held_conflicts.append(jp.name)
+            line_conflicts += _is_line_conflict(held)
     evidence_conflicts += len(held_conflicts)
     resolved = len(list(resolved_dir().glob("*.json"))) if resolved_dir().is_dir() else 0
     # Existing doctor callers use ``dead`` to detect work that cannot replay.
@@ -525,14 +611,28 @@ def status() -> dict[str, Any]:
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
             "evidence_conflicts": evidence_conflicts,
             "held_conflicts": len(held_conflicts), "held_conflict_jobs": held_conflicts,
-            "resolved": resolved}
-    if evidence_conflicts:
+            "line_conflicts": line_conflicts, "resolved": resolved}
+    if line_conflicts:
+        # Most of these lines differ from the hub only by preference text it
+        # lacks (2026-10-27); retry-dead alone would just fail them again.
+        result["fix"] = ("Run `khipu outbox merge-line-preferences` to count the held memory-file lines that "
+                         "differ from the hub only by preferences it lacks; merge those with `--apply "
+                         "--owner-direction` on the owner's direction. The rest need owner reconciliation.")
+        if held_conflicts:
+            result["fix"] += " Then run `khipu outbox retry-dead` so the merged lines resolve."
+    elif evidence_conflicts:
         result["fix"] = ("Inspect the conflicting evidence in the local outbox and hub; "
                          "owner reconciliation is required before these jobs can replay.")
         if held_conflicts:
             # A buried job never re-enters the queue on its own.
             result["fix"] += " Then run `khipu outbox retry-dead` to replay the buried ones."
     return result
+
+
+def _is_line_conflict(job: Any) -> bool:
+    """A recovered memory-file line whose legacy key holds different facts
+    (``khipu outbox merge-line-preferences`` reads these)."""
+    return (_is_recovery_job(job) and job.get("reason") == "recovery: the legacy key holds different facts")
 
 
 def _is_recovery_job(job: Any) -> bool:
