@@ -31,7 +31,7 @@ Packs:
                  sessionStart entries)
                ~/.cursor/hooks.json hooks.beforeSubmitPrompt += khipu-prompt-recall
                  (always records the owner's turn; its additional_context may be
-                 dropped by Cursor, proof is "unproven" until a real run)
+                 dropped by Cursor; "not-seen" in the CLI and T3 on 2026-10-27, IDE untested)
                ~/.cursor/hooks.json hooks.postToolUse (matcher Task|Shell) +=
                  khipu-delegation-hook (routing at delegation; never a permission
                  field, never a preToolUse entry)
@@ -1038,12 +1038,23 @@ CURSOR_DELEGATION_MATCHER = "Task|Shell"
 
 # What a real run has shown, per function, for `status()["proof"]`: "hermetic"
 # (the round trip in tests only), "real-run <date>" (seen working in the
-# harness), "unproven". Slice C sets these from its evidence files.
+# harness), "not-seen <date>" (installed, and the real runs of that date never
+# saw the event fire), "unproven". Set from slice C's evidence
+# (jobs/2026-10-27/cursor-proof/evidence.md), four cursor-agent CLI runs plus
+# the day's logs, none in the IDE:
+#   capture, session_recall: sessionEnd and sessionStart fire in the CLI; recall
+#     ran once per session (the imported Claude entry is dropped), episodes landed.
+#   prompt_recall: beforeSubmitPrompt never fired in the CLI (an event logger
+#     and a canary hook both stayed silent), and 16 sessions in T3 worktrees left
+#     no prompt-recall line or owner-turn record. The IDE is untested.
+#   delegation_push: postToolUse fires for Shell and its additional_context
+#     reaches the model (canary quoted back), but Khipu's own advisory never did:
+#     its routing read missed the 1.0 s wait on a loaded Mac (skipped:budget).
 CURSOR_PROOF = {
     "mcp": "hermetic",
     "capture": "real-run 2026-10-27",
     "session_recall": "real-run 2026-10-27",
-    "prompt_recall": "unproven",
+    "prompt_recall": "not-seen 2026-10-27",
     "delegation_push": "unproven",
 }
 
