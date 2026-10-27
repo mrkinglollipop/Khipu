@@ -6,12 +6,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Sheet, Tag } from "./ui";
-import { Meter, fmtPct } from "./PlansCard";
+import { Meter, SignInControl, fmtPct } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
+import { paceWords, whenLocal } from "./routing";
 import type { RouteAccount, RoutingState, RouteView } from "./routing";
 import { planDetail, routingDetail } from "./accountDetailModel";
 import { callCli } from "./settingsCli";
 import { plainError } from "./humanWords";
+import { CapControls, HoldControls, ReadingControls, StateControls, WordsControls, useAccountControls } from "./AccountControls";
 
 /** Opening a detail remembers what had focus, and closing puts it back there
  *  (the row, or the priority name), as a modal should. */
@@ -58,7 +60,7 @@ function StateLine({ text, tone, extra }: { text: string; tone: string | null; e
 // ---------------------------------------------------------------------------
 
 export function PlanDetailSheet({
-  row, view, now, onClose, onRefresh, refreshing, onOpenSettings,
+  row, view, now, onClose, onRefresh, refreshing, onOpenSettings, onChanged,
 }: {
   row: UsageAccount;
   view: RouteView | null | undefined;
@@ -67,8 +69,11 @@ export function PlanDetailSheet({
   onRefresh?: () => void;
   refreshing?: boolean;
   onOpenSettings?: () => void;
+  /** Called after a change to how Khipu reads this plan, so the record is read again. */
+  onChanged?: () => Promise<unknown> | void;
 }) {
   const d = planDetail(row, view, now);
+  const routeAccount = (view?.accounts ?? []).find((x) => x.key === row.key) ?? null;
   const titleId = "plan-detail-title";
   return (
     <Sheet
@@ -132,6 +137,10 @@ export function PlanDetailSheet({
               </div>
             ))}
           </dl>
+          <div className="toolbar">
+            <SignInControl row={row} onSignedIn={onRefresh} />
+          </div>
+          <ReadingControls account={routeAccount} row={row} view={view} onChanged={async () => { await onChanged?.(); onRefresh?.(); }} />
         </Section>
       </div>
     </Sheet>
@@ -143,21 +152,32 @@ export function PlanDetailSheet({
 // ---------------------------------------------------------------------------
 
 export function RoutingDetailSheet({
-  account, view, plans, now, onClose, onChanged, onOpenSettings, focusWords,
+  account, view, plans, now, onClose, onChanged, onOpenSettings, focusWords, onRename, onStop, onChooseFolder, onSeePlan,
 }: {
   account: RouteAccount;
   view: RouteView;
   plans?: UsageAccount;
   now: Date;
   onClose: () => void;
-  /** Called after Check now so the record is read again. */
+  /** Called after Check now and after every change here, so the record is read again. */
   onChanged?: () => Promise<unknown> | void;
   onOpenSettings?: () => void;
   /** Scroll to the owner's words when the sheet opens (a priority name). */
   focusWords?: boolean;
+  /** Settings hosts Rename and Stop tracking (their own dialogs) in More. */
+  onRename?: () => void;
+  onStop?: () => void;
+  /** Offered when the login folder is missing: pick the folder it moved to. */
+  onChooseFolder?: () => void;
+  /** Opens this account's Plan detail. */
+  onSeePlan?: () => void;
 }) {
   const d = routingDetail(account, view, plans, now);
   const titleId = "routing-detail-title";
+  const ctl = useAccountControls(async () => { await onChanged?.(); });
+  const [more, setMore] = useState(false);
+  const holds = (view.holds ?? []).filter((h) => h.scope?.account === account.key);
+  const fact = view.plan_facts?.[account.key];
   const words = useRef<HTMLElement | null>(null);
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState<{ text: string; error: boolean } | null>(null);
@@ -189,8 +209,33 @@ export function RoutingDetailSheet({
               {checking ? "Checking…" : "Check now"}
             </button>
           ) : null}
-          {result ? <span className={result.error ? "set-error" : "meta"} role="status">{result.text}</span> : null}
+          {result ? <span className={result.error ? "set-error" : "meta"} role={result.error ? "alert" : "status"}>{result.text}</span> : null}
           <span className="spacer" />
+          {onSeePlan ? (
+            <button type="button" className="link sm" onClick={onSeePlan}>
+              See the plan
+            </button>
+          ) : null}
+          {onRename || onStop || onChooseFolder ? (
+            <button type="button" className="link sm" aria-expanded={more} onClick={() => setMore((v) => !v)}>
+              More
+            </button>
+          ) : null}
+          {more && onChooseFolder ? (
+            <button type="button" className="sm" onClick={() => { onClose(); onChooseFolder(); }}>
+              Use another login folder…
+            </button>
+          ) : null}
+          {more && onRename ? (
+            <button type="button" className="sm" onClick={() => { onClose(); onRename(); }}>
+              Rename…
+            </button>
+          ) : null}
+          {more && onStop ? (
+            <button type="button" className="sm" onClick={() => { onClose(); onStop(); }}>
+              Stop tracking…
+            </button>
+          ) : null}
           {onOpenSettings ? (
             <button type="button" className="link sm" onClick={() => { onClose(); onOpenSettings(); }}>
               Open in Settings
@@ -202,40 +247,27 @@ export function RoutingDetailSheet({
       <div className="routing-detail" data-view="routing">
         <Section title="State and how it was read">
           <p className="sheet-p">{d.source || "Khipu has no report on this account yet."}</p>
+          {account.next_check ? <p className="meta">Khipu checks again at {whenLocal(account.next_check, now)}.</p> : null}
+          {fact && account.configured !== false ? <p className="meta">{paceWords(fact, now)}</p> : null}
+          <StateControls ctl={ctl} a={account} now={now} />
         </Section>
         <Section title="Exceptions in force">
-          {d.exceptions.length || d.holds.length ? (
-            <>
-              {d.exceptions.map((e) => (
-                <div key={e.text} className="sheet-item warn">
-                  <b>{e.text}</b>
-                  <span className="end"><strong>{e.ends}</strong>{e.by ? ` · ${e.by}` : ""}</span>
-                </div>
-              ))}
-              {d.holds.map((h) => (
-                <div key={h} className="sheet-item warn">
-                  <b>Hold: {h}</b>
-                </div>
-              ))}
-            </>
+          {d.exceptions.length || holds.length ? (
+            d.exceptions.map((e) => (
+              <div key={e.text} className="sheet-item warn">
+                <b>{e.text}</b>
+                <span className="end"><strong>{e.ends}</strong>{e.by ? ` · ${e.by}` : ""}</span>
+              </div>
+            ))
           ) : d.exceptionsUnknown ? (
             <p className="meta">Not stored as rows yet. Any exception is inside your words below.</p>
           ) : (
             <p className="meta">None.</p>
           )}
+          <HoldControls ctl={ctl} a={account} view={view} now={now} />
         </Section>
         <Section title="Your caps">
-          {d.caps.length ? (
-            d.caps.map((c) => (
-              <div key={c.title} className="sheet-item">
-                <b>{c.title}</b>
-                {c.now ? <span className="end">{c.now}</span> : null}
-                <span className="end">{c.ends}</span>
-              </div>
-            ))
-          ) : (
-            <p className="meta">No caps set.</p>
-          )}
+          <CapControls ctl={ctl} a={account} rows={d.caps} />
         </Section>
         <Section title="Khipu's advice">
           {d.advice.length ? (
@@ -253,7 +285,8 @@ export function RoutingDetailSheet({
         </Section>
         <section className="sheet-sec" id="routing-words" aria-label="Your words for this account" ref={words}>
           <h3>Your words for this account{d.rank ? ` · ${d.rank}` : ""}</h3>
-          {d.role ? <WordsQuote text={d.role} /> : <p className="meta">Not in your priority.</p>}
+          {d.role ? <WordsQuote text={d.role} /> : <p className="meta">{d.rank ? "No words written." : "Not in your priority."}</p>}
+          <WordsControls ctl={ctl} a={account} view={view} now={now} />
         </section>
         <Section title="Recent changes">
           {d.history.length ? (
@@ -298,6 +331,13 @@ export function useRoutingDetail({ state, plans, onOpenSettings }: {
   const host = useDetailHost<{ key: string; words: boolean }>();
   const view = state.data;
   const account = host.target && view ? (view.accounts ?? []).find((a) => a.key === host.target?.key) : undefined;
+  // Same as PlansCard: drop a target whose account left, so it does not reopen
+  // if that account returns later.
+  const closeDetail = host.close;
+  const hasTarget = host.target != null;
+  useEffect(() => {
+    if (hasTarget && !account) closeDetail();
+  }, [hasTarget, account, closeDetail]);
   const node =
     host.target && view && account ? (
       <RoutingDetailSheet

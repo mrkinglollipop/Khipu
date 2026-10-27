@@ -749,8 +749,8 @@ def _later(item: dict, decision_episode: int | None, decided_at: Any) -> bool:
 
 def _settles(item: dict, decisions: list[tuple], threshold: float):
     """``("strict", did, text, how, score, episode)`` for the best strict
-    match, else ``("loose", did, text, score)`` for the best looser one, else
-    None."""
+    match, else ``("loose", did, text, score, episode)`` for the best looser
+    one, else None."""
     loose = None
     strict = None
     for did, text, dep, decided_at in decisions:
@@ -769,7 +769,7 @@ def _settles(item: dict, decisions: list[tuple], threshold: float):
         near = max(_jaccard(text, item["text"]), _match_score(text, item["text"]) if len(text.split()) >= 3
                    else 0.0)
         if near >= LOOSE_SETTLE_MIN_SCORE and (loose is None or near > loose[3]):
-            loose = ("loose", did, text, near)
+            loose = ("loose", did, text, near, dep)
     return strict or loose
 
 
@@ -819,14 +819,21 @@ def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | No
                                     "score": round(score, 3), "text": text[:2000]}, episode=dep, sink=sink):
                     report["closed_decision"] += 1
                 continue
-            _, did, text, near = hit
+            _, did, text, near, dep = hit
             if sink is not None:
                 continue
             old = item["suggestion"] if isinstance(item["suggestion"], dict) else {}
-            if old.get("looks_done") or old.get("decision_id") == did or float(old.get("score") or 0) > near:
+            # A suggestion without its source episode (older code) is not shown
+            # (commitments.settle_suggestion_sql), so it is rewritten here.
+            sourced = old.get("episode") is not None
+            if old.get("looks_done") or (sourced and old.get("decision_id") == did) or (
+                    sourced and float(old.get("score") or 0) > near):
                 continue
+            # ``episode`` is the source the quoted text came from: a forget of it
+            # hides the suggestion even after the decision moves to another source.
             cur.execute("UPDATE commitments SET settle_suggestion = %s::jsonb WHERE id = %s",
-                        (json.dumps({"decision_id": did, "text": text[:200], "score": round(near, 3)}),
+                        (json.dumps({"decision_id": did, "text": text[:200], "score": round(near, 3),
+                                     "episode": dep}),
                          item["id"]))
             report["suggested"] += 1
 

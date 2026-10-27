@@ -404,7 +404,9 @@ def ledger_copy_status(hub_ok: bool, now: datetime | None = None) -> dict[str, A
             out.update(ok=False, state="failing")
             return out
         out["state"] = "retrying"
-    if hub_ok and (age is None or age > LEDGER_COPY_MAX_AGE_S):
+    # Age is judged whether or not the hub answers: an offline Mac with a
+    # days-old (or never-made) copy must not read "fresh" behind a red hub_ok.
+    if age is None or age > LEDGER_COPY_MAX_AGE_S:
         out.update(ok=False, state="old")
     return out
 

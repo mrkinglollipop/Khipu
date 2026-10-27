@@ -8934,6 +8934,110 @@ def _for_a_conversation():
         raise RouteError(_FAILED) from None
 
 
+# Compact / section projections for ``khipu_route`` / ``khipu route --view``.
+# The default (no view) answer is untouched; callers attach delivery after.
+ROUTE_VIEW_CHOICES = ("summary", "accounts", "priority", "rules", "holds", "note", "proposals")
+_ROUTE_SUMMARY_KEYS = ("accounts", "priority", "rules", "holds")
+_ROUTE_VIEW_CLIP = 120
+_ROUTE_VIEW_ACCOUNTS_CAP = 12
+_ROUTE_VIEW_PRIORITY_CAP = 8
+_ROUTE_VIEW_RULES_CAP = 16
+_ROUTE_VIEW_HOLDS_CAP = 10
+_ROUTE_VIEW_PACE_CAP = 4
+
+
+def _route_view_clip(value):
+    """Clip a summary string field (ids, until, text) to ``_ROUTE_VIEW_CLIP``."""
+    if isinstance(value, str) and len(value) > _ROUTE_VIEW_CLIP:
+        return value[:_ROUTE_VIEW_CLIP]
+    return value
+
+
+def _route_view_cap(rows: list, cap: int) -> list:
+    """Keep the first ``cap`` rows; when truncated, append ``{"more": K}``."""
+    if len(rows) <= cap:
+        return rows
+    return rows[:cap] + [{"more": len(rows) - cap}]
+
+
+def project_route_view(answer: dict, view: str) -> dict:
+    """Project a full route JSON answer to ``summary`` or one named section.
+
+    Delivery fields (``routing_changes``, ``delivery``) are not part of this
+    projection — MCP attaches them after, unchanged from the full path.
+    """
+    if not isinstance(view, str):
+        raise ValueError("view must be text")
+    mode = view.strip().lower()
+    if mode not in ROUTE_VIEW_CHOICES:
+        raise ValueError("view must be one of " + ", ".join(ROUTE_VIEW_CHOICES))
+    if mode != "summary":
+        return {mode: answer.get(mode)}
+
+    accounts = []
+    for row in answer.get("accounts") or []:
+        if not isinstance(row, dict):
+            continue
+        paces = []
+        for pace in row.get("pace") or []:
+            if not isinstance(pace, dict):
+                continue
+            plan = pace.get("plan") if isinstance(pace.get("plan"), dict) else {}
+            paces.append({"window": _route_view_clip(pace.get("window")),
+                          "used_pct": pace.get("used_pct"),
+                          "cycle_resets_at": _route_view_clip(pace.get("cycle_resets_at")),
+                          "plan": {"verdict": _route_view_clip(plan.get("verdict"))}})
+        accounts.append({"label": _route_view_clip(row.get("label")),
+                         "state": _route_view_clip(row.get("state")),
+                         "until": _route_view_clip(row.get("until")),
+                         "pace": _route_view_cap(paces, _ROUTE_VIEW_PACE_CAP)})
+
+    priority = answer.get("priority")
+    priority_out = None
+    if isinstance(priority, dict):
+        entries = []
+        for entry in priority.get("entries") or []:
+            if not isinstance(entry, dict):
+                continue
+            account = entry.get("account")
+            if account is None:
+                account = entry.get("label") or entry.get("id")
+            entries.append({"account": _route_view_clip(account),
+                            "role": _route_view_clip(entry.get("role")),
+                            "until": _route_view_clip(entry.get("until"))})
+        priority_out = {"entries": _route_view_cap(entries, _ROUTE_VIEW_PRIORITY_CAP),
+                        "version": _route_view_clip(priority.get("version")),
+                        "pending": priority.get("pending"),
+                        "confirmed": priority.get("confirmed")}
+
+    rules = []
+    for rule in answer.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        text = rule.get("text")
+        rule_id = rule.get("entity") if rule.get("entity") is not None else rule.get("n")
+        rules.append({"id": _route_view_clip(rule_id),
+                      "text": text[:_ROUTE_VIEW_CLIP] if isinstance(text, str) else text})
+
+    holds = []
+    for hold in answer.get("holds") or []:
+        if not isinstance(hold, dict):
+            continue
+        scope = hold.get("scope") if isinstance(hold.get("scope"), dict) else {}
+        text = hold.get("text")
+        holds.append({"id": _route_view_clip(hold.get("id")),
+                      "account": _route_view_clip(scope.get("account")),
+                      "until": _route_view_clip(hold.get("until")),
+                      "text": text[:_ROUTE_VIEW_CLIP] if isinstance(text, str) else text})
+
+    body = {"accounts": _route_view_cap(accounts, _ROUTE_VIEW_ACCOUNTS_CAP),
+            "priority": priority_out,
+            "rules": _route_view_cap(rules, _ROUTE_VIEW_RULES_CAP),
+            "holds": _route_view_cap(holds, _ROUTE_VIEW_HOLDS_CAP)}
+    body["omitted"] = sorted(key for key in answer if key not in _ROUTE_SUMMARY_KEYS)
+    return body
+
+
 def conversation_view(*, since_version=None, account: str | None = None, now: datetime | None = None,
                       lock_wait: float | None = CONVERSATION_LOCK_BUDGET, view: dict | None = None) -> dict:
     """What MCP ``khipu_route`` answers (``_conversation_view``), read
@@ -10775,6 +10879,9 @@ def run_cli(args) -> int:
         if cmd is None:
             view = read_view(now)
             account = _resolve_account_key(args.view_account) if getattr(args, "view_account", None) else None
+            mode = getattr(args, "view", None)
+            if mode and (args.since is not None or args.summary or args.brief):
+                raise RouteError("--view cannot be combined with --summary, --brief, or --since")
             if args.since is not None:
                 version, epoch = _parse_since(args.since)
                 out = since(version, view, now=now, epoch=epoch)
@@ -10797,8 +10904,11 @@ def run_cli(args) -> int:
                     from khipu import recall_prompt
                     recall_prompt.mark_routing_notices(session, text["notices"])
                 return 0
-            if args.json:
-                _print_json(public_view(view, now, account))
+            if args.json or mode:
+                out = public_view(view, now, account)
+                if mode:
+                    out = project_route_view(out, mode)
+                _print_json(out)
             else:
                 _print_view(view, now, account)
             _record_read(view, rules=True, priority=True)

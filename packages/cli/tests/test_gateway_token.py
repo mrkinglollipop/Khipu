@@ -37,12 +37,12 @@ class _TempHomeAndDataDirCase(unittest.TestCase):
             mock.patch.object(integ, "AEGIS_TOML", self.home / ".grok" / "config.toml"),
             mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(self.data_dir)}),
         ]
+        # addCleanup, not tearDown: an os.environ patch a test starts with
+        # addCleanup must stop before these do, or its stop restores a snapshot
+        # still holding KHIPU_DATA_DIR and leaks it into later tests.
         for p in self._patches:
             p.start()
-
-    def tearDown(self):
-        for p in self._patches:
-            p.stop()
+            self.addCleanup(p.stop)
 
 
 class GatewayTokenFileTest(_TempHomeAndDataDirCase):
@@ -60,9 +60,20 @@ class GatewayTokenFileTest(_TempHomeAndDataDirCase):
         self.assertNotIn(secret, json.dumps(status))
 
     def test_status_reports_absence_without_creating_anything(self):
-        status = integ.gateway_token_file_status()
+        with mock.patch.dict(os.environ, {"KHIPU_GATEWAY_TOKEN": ""}, clear=False), \
+             mock.patch("khipu.keychain.get_password", return_value=""):
+            status = integ.gateway_token_file_status()
         self.assertEqual(status, {"path": str(self.data_dir / "gateway-token"), "exists": False})
         self.assertFalse((self.data_dir / "gateway-token").exists())
+
+    def test_status_sees_a_keychain_only_key_without_echoing_it(self):
+        secret = "keychain-only-gateway-token"
+        with mock.patch.dict(os.environ, {"KHIPU_GATEWAY_TOKEN": ""}, clear=False), \
+             mock.patch("khipu.keychain.get_password", return_value=secret):
+            status = integ.gateway_token_file_status()
+        self.assertTrue(status["exists"])
+        self.assertFalse((self.data_dir / "gateway-token").exists())
+        self.assertNotIn(secret, json.dumps(status))
 
     def test_set_is_umask_safe(self):
         """A permissive umask must not weaken the file below 0600 — the explicit
@@ -210,7 +221,6 @@ class AegisGatewayVerifyTest(_TempHomeAndDataDirCase):
 
     def tearDown(self):
         self._url_patch.stop()
-        super().tearDown()
 
     def test_not_applicable_without_a_configured_gateway_url(self):
         with mock.patch.dict(os.environ, {"KHIPU_GATEWAY_URL": ""}):
@@ -296,3 +306,66 @@ class AegisGatewayVerifyTest(_TempHomeAndDataDirCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GatewayTokenCopyTest(_TempHomeAndDataDirCase):
+    """The app's Copy gateway key: the key reaches the clipboard and never
+    appears in the answer; the probe resolves a key the app saved to the file."""
+
+    def _fake_clipboard(self):
+        """pbcopy/pbpaste stand-ins backed by one file, put first on PATH."""
+        bindir = self.home / "bin"
+        bindir.mkdir()
+        board = self.home / "board.txt"
+        board.write_text("", encoding="utf-8")
+        (bindir / "pbcopy").write_text(f"#!/bin/sh\ncat > '{board}'\n", encoding="utf-8")
+        (bindir / "pbpaste").write_text(f"#!/bin/sh\ncat '{board}'\n", encoding="utf-8")
+        for name in ("pbcopy", "pbpaste"):
+            (bindir / name).chmod(0o755)
+        patch = mock.patch.dict(os.environ, {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        return board
+
+    def test_probe_resolves_the_file_the_app_saves(self):
+        secret = "made-up-file-key-0001"
+        integ.set_gateway_token(secret)
+        with mock.patch.dict(os.environ, {integ.GROK_BOT_TOKEN_ENV: ""}), \
+                mock.patch("khipu.keychain.get_password", return_value=""):
+            self.assertEqual(integ._gateway_token(), secret)
+
+    def test_copy_puts_the_key_on_the_clipboard_and_never_in_the_answer(self):
+        board = self._fake_clipboard()
+        secret = "made-up-copy-key-0002"
+        integ.set_gateway_token(secret)
+        with mock.patch.dict(os.environ, {integ.GROK_BOT_TOKEN_ENV: ""}), \
+                mock.patch("khipu.keychain.get_password", return_value=""):
+            result = integ.copy_gateway_token(clear_after_s=0.3)
+        self.assertEqual(result, {"ok": True, "clear_after_s": 0.3})
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(board.read_text(encoding="utf-8"), secret)
+        import time
+        for _ in range(40):
+            if board.read_text(encoding="utf-8") == "":
+                break
+            time.sleep(0.1)
+        self.assertEqual(board.read_text(encoding="utf-8"), "")
+
+    def test_clear_leaves_a_clipboard_that_holds_something_else(self):
+        board = self._fake_clipboard()
+        integ.set_gateway_token("made-up-copy-key-0003")
+        with mock.patch.dict(os.environ, {integ.GROK_BOT_TOKEN_ENV: ""}), \
+                mock.patch("khipu.keychain.get_password", return_value=""):
+            integ.copy_gateway_token(clear_after_s=0.6)
+        board.write_text("something the user copied next", encoding="utf-8")
+        import time
+        time.sleep(1.5)
+        self.assertEqual(board.read_text(encoding="utf-8"), "something the user copied next")
+
+    def test_copy_with_no_saved_key_says_so_without_touching_the_clipboard(self):
+        board = self._fake_clipboard()
+        with mock.patch.dict(os.environ, {integ.GROK_BOT_TOKEN_ENV: ""}), \
+                mock.patch("khipu.keychain.get_password", return_value=""):
+            result = integ.copy_gateway_token()
+        self.assertFalse(result["ok"])
+        self.assertEqual(board.read_text(encoding="utf-8"), "")

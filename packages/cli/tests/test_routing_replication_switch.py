@@ -59,6 +59,16 @@ def test_replication_live_strict_true_enables(home):
     assert routing._replication_live() is False
 
 
+def test_an_app_write_returns_the_id_of_its_own_owner_action_line(home, capsys):
+    from khipu import owner_direction
+
+    rc, out = _cli(["config", "--from-app", "--set", "routing_replication_live", "on"], capsys)
+    assert rc == 0, out
+    line = owner_direction.actions()[-1]
+    assert line["auth"] == "app"
+    assert json.loads(out)["owner_action"] == line["id"]
+
+
 def test_config_set_replication_live_from_app_records_owner_action(home, capsys):
     from khipu import owner_direction
 
