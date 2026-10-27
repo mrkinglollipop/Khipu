@@ -198,6 +198,8 @@ export function actionWords(a: OwnerAction): string {
       return "Sent this Mac's forgets the hub lacked to the hub";
     case "forget.here":
       return `Forgot hub episode ${t}, already forgotten on this Mac`;
+    case "outbox.merge_preferences":
+      return "Merged saved notes from held captures into the hub";
     case "forget.not_same":
       return `Marked hub episode ${t} as not the one forgotten on this Mac`;
     case "direction.set": {

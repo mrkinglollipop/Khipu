@@ -23,6 +23,7 @@ import {
 } from "../work";
 import type { LedgerGoal, Vocab, WaitItem, WorkBoard, WorkJob, WorkView as WorkViewDoc } from "../work";
 import type { RoutingState } from "../routing";
+import type { ProjectsList } from "../ProjectsSettings";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -147,7 +148,9 @@ function Harness({
   routing = stubRouting(),
   onImportTracker,
   onOpenWorkSettings = () => {},
+  projects = null,
 }: {
+  projects?: ProjectsList | null;
   onOwedClose?: (id: number) => Promise<void>;
   onSnooze?: (id: string, title: string) => void;
   routing?: RoutingState;
@@ -160,6 +163,7 @@ function Harness({
       work={work}
       routing={routing}
       plans={null}
+      projects={projects}
       owedSection={<p>The Owed body</p>}
       owedFocusKey={0}
       onOwedClose={onOwedClose}
@@ -376,6 +380,17 @@ describe("Waiting on you", () => {
   const atlas = board("atlas", "Atlas", { state: "none" }, { ledger: ledgerPart() });
   const harbor = board("harbor", "Harbor", { state: "none" }, { ledger: ledgerPart() });
 
+  it("counts an older name of a project under the project's own name", async () => {
+    const items = [wait("atlas", "a-1"), wait("atlas-old", "a-2"), wait("harbor", "h-1")];
+    serve(view({ projects: [atlas, harbor], waiting: items }));
+    const totals = { open_commitments: 0, standing_decisions: 0, episodes: 0 };
+    const name = (n: string, role: "canonical" | "alias") => ({ name: n, role, ...totals });
+    render(<Harness projects={{ pairs: [], groups: [{ canonical: "atlas", names: [name("atlas", "canonical"), name("atlas-old", "alias")], totals }] }} />);
+    await screen.findByRole("list", { name: "Waiting on you" });
+    expect(screen.getByRole("button", { name: /^Atlas 2$/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /atlas-old/ })).not.toBeInTheDocument();
+  });
+
   it("keeps the order given, shows 8 then Show all, says Blocking in words, and filters by project", async () => {
     const items = [
       wait("atlas", "n-1", { blocking: true, title: "First, blocking" }),
@@ -562,7 +577,7 @@ describe("Running now", () => {
   it("says no jobs are running and how many projects reported", async () => {
     serve(view({ projects: [board("a", "Atlas", { state: "ok", as_of: ago(5 * S) }), board("b", "Bay", { state: "ok", as_of: ago(5 * S) })] }));
     render(<Harness />);
-    expect(await screen.findByText("No jobs are running. 2 projects reported in the last minute.")).toBeInTheDocument();
+    expect(await screen.findByText("No jobs from your job runners are running. 2 projects reported in the last minute.")).toBeInTheDocument();
   });
 });
 

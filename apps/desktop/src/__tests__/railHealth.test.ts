@@ -2,7 +2,7 @@
 // with no Khipu in it is a warning, never "All harnesses recording"; a red
 // heartbeat or a dead database still wins.
 import { describe, expect, it } from "vitest";
-import { claudeHomesGap, harnessesBadge, railHealthLine, t3HealthGap } from "../railHealth";
+import { claudeHomesGap, harnessesBadge, railHealthLine, t3HealthGap, t3WarningReason } from "../railHealth";
 import type { LivenessPayload } from "../IntegrationsPanel";
 
 const OK: LivenessPayload = { ok: true, red: [], harnesses: { claude_code: { ok: true, seen: true } } };
@@ -156,5 +156,18 @@ describe("T3 health", () => {
     });
     expect(railHealthLine(true, OK, NONE, gap)).toEqual({ tone: "warn", text: "T3 threads not linking" });
     expect(harnessesBadge(OK, NONE, gap)).toEqual({ n: 1, quiet: false });
+  });
+
+  it("names a provider-hooks warning as that, not as a missing linked capture", () => {
+    const t3 = {
+      detected: true,
+      lookup: { ok: true },
+      warnings: ["T3 provider cursor has no Khipu hooks, so sessions on it get no Khipu routing start block"],
+      providers: [{ id: "cursor", driver: "cursor", name: "cursor", hooks: "missing" }],
+    };
+    expect(t3WarningReason(t3)).toBe("hooks");
+    expect(railHealthLine(true, OK, NONE, t3HealthGap(t3))).toEqual({ tone: "warn", text: "T3 providers without hooks" });
+    expect(t3WarningReason({ ...t3, warnings: [...t3.warnings, "T3 was used in the last day without a thread-linked capture"] })).toBe("unlinked");
+    expect(t3WarningReason({ ...t3, warnings: [] })).toBeNull();
   });
 });

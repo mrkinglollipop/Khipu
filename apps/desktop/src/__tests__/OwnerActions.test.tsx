@@ -3,7 +3,7 @@
 // the screen shows what the re-read says.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { OwnerActions } from "../OwnerActions";
+import { OwnerActions, actionWords } from "../OwnerActions";
 import type { ChainState, OwnerAction, OwnerDirectionSettings } from "../OwnerActions";
 
 const invokeMock = vi.fn();
@@ -314,5 +314,14 @@ describe("Owner actions", () => {
     fireEvent.click(within(trusted).getByRole("button", { name: "Remove Codex, typed in a terminal" }));
     await waitFor(() => expect(within(trusted).getAllByRole("listitem")).toHaveLength(2));
     expect(calls).toContainEqual(["khipu_owner_direction_set", { key: "untrust", value: "codex:codex_cli_rs" }]);
+  });
+});
+
+
+describe("actionWords", () => {
+  it("never shows an internal id for the outbox merge", () => {
+    const text = actionWords({ id: "1", at: "2026-10-27T00:00:00Z", action: "outbox.merge_preferences", target: "held lines" });
+    expect(text).not.toContain("outbox.");
+    expect(text.length).toBeGreaterThan(10);
   });
 });
