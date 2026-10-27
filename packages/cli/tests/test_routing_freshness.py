@@ -167,7 +167,7 @@ def cache(tmp_path, monkeypatch):
     data = tmp_path / "data"
     (data / "state").mkdir(parents=True)
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
-    monkeypatch.setattr(usage, "configured_accounts", lambda: [dict(a) for a in ACCOUNTS])
+    monkeypatch.setattr(usage, "configured_accounts", lambda config=None: [dict(a) for a in ACCOUNTS])
     # The cache keeps only rows for the accounts the config lists.
     monkeypatch.setattr("khipu.routing_sources.configured_keys", lambda _cfg: {usage._key(a) for a in ACCOUNTS})
     return data

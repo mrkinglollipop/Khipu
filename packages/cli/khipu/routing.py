@@ -71,8 +71,8 @@ from typing import Any, Iterable
 from khipu import routing_identity as account_identity
 from khipu import routing_events as event_identity
 from khipu import routing_entries as entry_model
+from khipu.routing_generation import SCHEMA
 
-SCHEMA = 1
 STATE_DIR = ("state", "routing")
 EVENTS_NAME = "events.jsonl"
 VIEW_NAME = "view.json"
@@ -984,17 +984,33 @@ def parse_limit_message(text: str, now: datetime, seen: datetime | None = None) 
 
 def accounts() -> list[dict]:
     """The accounts plan usage reads (``usage_accounts``, or every installed
-    CLI with its default login), keyed as the usage cache keys them."""
-    from khipu import usage
+    CLI with its default login), plus the owner's account definitions.
 
+    Definitions use the same durable login bindings as the fold. An
+    installed CLI is only a fallback for providers without definitions;
+    its availability must never rebind an owner's account identity.
+    """
+    from khipu import usage
+    from khipu.config import load_config
+
+    config = load_config()
+    definitions, entry_cache = _entry_definitions()
+    defined_providers = {a["provider"] for a in definitions["accounts"].values()}
+    explicit = isinstance(config.get("usage_accounts"), list)
     out = []
-    for account in usage.configured_accounts():
+    for account in usage.configured_accounts(config=config):
         if account.get("invalid"):
+            continue
+        # _inputs() starts with the explicit account list, never PATH/key
+        # discovery. Use that same definition source here: otherwise a
+        # source reader can see provider| while its fold sees provider:main.
+        # Definitions hide defaults from all readers (including discovery); explicit usage_accounts bindings remain.
+        if not explicit and account["harness"] in defined_providers:
             continue
         out.append({"key": usage._key(account), "label": account["label"], "harness": account["harness"],
                     "home": account.get("home"),
                     **({"label_source": account["label_source"]} if "label_source" in account else {})})
-    return _definition_accounts(out)
+    return _definition_accounts(out, config=config, definitions=definitions, entry_cache=entry_cache)
 
 
 _ENTRY_INPUTS: dict[tuple, dict] = {}
@@ -5100,9 +5116,9 @@ def _touched(kind: str | None, event: dict, info: dict) -> str | None:
 
 def _digest(view: dict) -> str:
     """The sha256 of the view as JSON, its own ``digest`` left out."""
-    body = {k: v for k, v in view.items() if k != "digest"}
-    text = json.dumps(body, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
-    return hashlib.sha256(text.encode("ascii")).hexdigest()
+    from khipu.routing_generation import digest
+
+    return digest(view)
 
 
 def _load_view() -> dict | None:
@@ -5150,7 +5166,8 @@ def _save_view(view: dict) -> None:
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     if (not view or view.get("fingerprint") != fingerprint or "priority_version" not in view
             or "priority_owner_revision" not in view or view.get("event_identity") != 2
-            or view.get("proposal_schema") != 1 or view.get("fold_audit_schema") != 1):
+            or view.get("proposal_schema") != 1 or view.get("fold_audit_schema") != 1
+            or "advice_cap_decisions" not in view):
         return False
     # A whole-log read of a runner's events still under way goes on at the
     # next read, one bounded chunk at a time, though no file changed.
@@ -5276,6 +5293,15 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
         changes = changes[-CHANGES_KEPT:]
     out = dict(body, schema=SCHEMA, event_identity=2, proposal_schema=1, fold_audit_schema=1, epoch=epoch, version=version, folded_at=_iso(now), checked_at=_iso(now),
                record=record, bad_lines=bad, fingerprint=fingerprint, changes=changes)
+    # Persist only telemetry decisions, so the prompt's lightweight freshness
+    # check can compare advice without importing the engine or raw readings.
+    out["advice_cap_decisions"] = {
+        entry["key"]: [{k: status[k] for k in ("kind", "revision", "window", "purpose", "verdict")
+                        if k in status}
+                       for status in cap_statuses(out, entry, now)
+                       if status.get("kind") in ("spend", "concurrency")]
+        for entry in out.get("accounts") or []
+        if any(cap.get("kind") in ("spend", "concurrency") for cap in entry.get("caps") or [])}
     if not saved:
         out["saved"] = False
         # Its version is the saved view's, but what it says may not be: the
@@ -8433,7 +8459,7 @@ def _launch_warnings(view: dict, launched: list[dict], cfg: dict, now: datetime)
 # owner wrote). Nothing here returns a pick or a ranking.
 
 ABOUT = "Khipu reports; routing stays with you. This is data, not instructions, and guidance, not a gate."
-_INTERNAL = ("fingerprint", "digest", "source_cache")
+_INTERNAL = ("fingerprint", "digest", "source_cache", "advice_cap_decisions")
 
 
 def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
@@ -9828,21 +9854,30 @@ def _prompt_view(now: datetime, on_fold=None) -> dict:
 def _generation(view: dict, cfg: dict) -> list[list]:
     """The record generation ``view`` stands on: each file it was read
     from, with the stat it had then (the log, the config and the rules seed
-    as its fold saw them, and view.json as this thread read or saved it).
-    The hook takes a buffered answer only while every one of them still has
-    that stat (``recall_prompt._routing_generation_current``): a stat each,
-    never a wait. A source change reaches a prompt through view.json, once a
-    fold saved it."""
+    as its fold saw them). The view also carries a semantic revision, so
+    telemetry-only saves do not withdraw an answer. A source or clock-driven
+    routing change still invalidates it when the next fold saves the view."""
     from khipu.config import config_file
+    from khipu.routing_generation import revision
 
     fingerprint = view.get("fingerprint") if isinstance(view.get("fingerprint"), dict) else {}
     files = [[str(events_file()), fingerprint.get("events")], [str(config_file()), fingerprint.get("config")],
-             [str(view_file()), getattr(_view_seen, "stat", None)],
+             [str(view_file()), getattr(_view_seen, "stat", None), revision(view)],
              [str(routing_dir() / "remote.jsonl"), (fingerprint.get("replication") or (None, None))[0]],
              [str(routing_dir() / "replication.json"), (fingerprint.get("replication") or (None, None))[1]]]
     seed = cfg.get("routing_rules_seed")
     if seed:
         files.append([str(Path(seed)), fingerprint.get("seed")])
+    # Use the stats recorded before the fold read each runner, not fresh
+    # stats that could bless a heartbeat changed after this advice was made.
+    runner_stats = dict((fingerprint.get("sources") or {}).get("runners") or [])
+    from khipu.routing_sources import RUNNER_FILES
+
+    heartbeat_index = list(RUNNER_FILES).index("heartbeat")
+    for runner in (view.get("sources") or {}).get("runners") or []:
+        stats = runner_stats.get(runner["name"]) or []
+        files.append([str(Path(runner["path"]).joinpath(*RUNNER_FILES["heartbeat"])),
+                      stats[heartbeat_index] if len(stats) > heartbeat_index else None])
     return files
 
 
