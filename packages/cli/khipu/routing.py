@@ -8474,17 +8474,15 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     ]
     # Owner-local only (survey rows 8-11): live delivery rows with friendly
     # names, Mac labels and last-prompt times, other Macs, and who has each
-    # recent change. Built here and nowhere else; a damaged source reads as
-    # empty lists, never as a broken route view.
+    # recent change. Built here and nowhere else. A damaged source yields
+    # ``delivery_rows: null`` (not ``[]``) so the UI does not say "nobody live".
     from khipu import routing_delivery_rows
 
-    try:
-        delivery = routing_delivery_rows.delivery_data(view, now, cfg)
-    except Exception:  # noqa: BLE001 - delivery evidence never breaks the view
-        delivery = {"rows": [], "macs": [], "recipients": {}}
+    # delivery_data never raises: a damaged source becomes rows=None inside it.
+    delivery = routing_delivery_rows.delivery_data(view, now, cfg)
     out["delivery_rows"] = delivery["rows"]
-    out["delivery_macs"] = delivery["macs"]
-    recipients = delivery["recipients"]
+    out["delivery_macs"] = delivery.get("macs") or []
+    recipients = delivery.get("recipients") or {}
     out["changes"] = [dict(change, recipients=recipients.get(change.get("version")))
                        for change in out["changes"]]
     # Owner-local only, like the directions above: today's rule 12 model

@@ -337,7 +337,9 @@ TOOLS: list[dict] = [
             "slug, title, updated_at, content_hash, body_total_bytes, "
             "body_offset, body_next_offset and complete; while complete is "
             "false, call again with offset set to body_next_offset to read the "
-            "rest. Media: path/sha256/mime. Library ids "
+            "rest. When briefs are on and a current brief exists, the body is "
+            "that brief (source='brief', content_hash=brief id) unless wiki is "
+            "true. Media: path/sha256/mime. Library ids "
             "(library:<name>:<doc>#<chunk>): the chunk text, its document "
             "(title, author, tags, rel_path, root) and the previous/next chunk "
             "text so you can read around a hit; library:<name>:<doc> returns the "
@@ -378,6 +380,13 @@ TOOLS: list[dict] = [
                         "Topics only: largest page body in UTF-8 bytes "
                         f"(default {PAGE_BYTES_DEFAULT}, at most {PAGE_BYTES_MAX}). "
                         "A page never splits a character."
+                    ),
+                },
+                "wiki": {
+                    "type": "boolean",
+                    "description": (
+                        "Topics only: when true, return the raw wiki page even "
+                        "if a current brief exists (default false)."
                     ),
                 },
             },
@@ -539,6 +548,19 @@ TOOLS: list[dict] = [
                         "slice off of. Omit only when there truly is no repo context."
                     ),
                 },
+                "open_loops": {
+                    "type": "array",
+                    "description": "Follow-ups still open: text, or {text, kind}. Owner is "
+                                   "derived from the text; a declared owner is ignored.",
+                },
+                "closed_loops": {
+                    "type": "array",
+                    "description": "Items finished this session: text, or {text}. Matched by "
+                                   "text; a commitment_id is ignored.",
+                },
+                "deliverables": {"type": "array"},
+                "decision_details": {"type": "array"},
+                "verbatim": {"type": "object"},
             },
             "required": ["summary"],
         },
@@ -1025,8 +1047,8 @@ TOOLS: list[dict] = [
             "setting, a ledger row, several of the owner's Owed items at once "
             "(owed.change: \"close those\"), apply or undo an Owed clean-up "
             "(owed.tidy, after showing the owner the plan's summary), resolve the forgets this "
-            "Mac holds that the hub lacks (forget.list reads them, each listed episode id with its "
-            "hub summary, and changes nothing; forget.send; forget.here or forget.not_same with "
+            "Mac holds that the hub lacks (forget.list reads them, each listed episode id, with its "
+            "hub summary only in a conversation the owner typed in, and changes nothing; forget.send; forget.here or forget.not_same with "
             "{\"id\": N} for a listed episode id), or confirm a request that is "
             "waiting for the owner. Submit the exact action and its arguments; it applies "
             "at once. Khipu accepts it only from a conversation the owner has "
@@ -1255,6 +1277,9 @@ def _tool_search(args: dict) -> dict:
             since=since, until=until, project=project, session_id=session_id,
             harness=harness, t3_thread=t3_thread, via=via, tz=tz,
         )
+    from khipu.tombstones import without_hidden_episodes
+
+    payload["results"] = without_hidden_episodes(payload.get("results") or [])
     query_log.log_query(
         query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
@@ -1277,6 +1302,7 @@ def _tool_get(args: dict) -> dict:
     if kind not in (None, "episode", "topic", "media", "library"):
         raise ValueError("kind must be 'episode', 'topic', 'media', or 'library'")
     offset, max_bytes = page_args(args.get("offset"), args.get("max_bytes"))
+    wiki = bool(args.get("wiki"))
     _ensure_path()
     from khipu import library_search
 
@@ -1303,6 +1329,11 @@ def _tool_get(args: dict) -> dict:
     inferred = kind
     if inferred is None:
         inferred = "episode" if ident.isdigit() else "topic"
+    if inferred == "episode" and ident.isdigit():
+        from khipu.tombstones import episode_hidden
+
+        if episode_hidden(ident):
+            raise ValueError(f"episode not found: {ident}")
 
     hub_failed = False
     try:
@@ -1318,17 +1349,15 @@ def _tool_get(args: dict) -> dict:
                 inferred = "topic"
             else:
                 row = dict(row)
-                # Additive (Phase 2A): decision_states (one entry per decision
-                # this episode produced) + validity (current/superseded/
-                # retracted counts). Hub path only — the sqlite replica has no
-                # decisions table, so the stale-fallback payload below stays
-                # exactly as it was.
+                # Additive (Phase 2A): decision_states + validity. The stale
+                # fallback attaches the same fields from the replica's
+                # decisions table inside episode_detail_snapshot.
                 from khipu.decisions import decision_states_for_episode
 
                 row.update(decision_states_for_episode(int(ident)))
                 return _detail_response("episode", row)
         if inferred == "topic":
-            row = topic_detail(ident, offset=offset, max_bytes=max_bytes)
+            row = topic_detail(ident, offset=offset, max_bytes=max_bytes, wiki=wiki)
             if row is None and kind is None:
                 media = media_detail(ident)
                 if media is not None:
@@ -1744,7 +1773,23 @@ def _tool_capture(args: dict) -> dict:
             "write through MCP."
         )
     from khipu.capture import capture, load_payload
+    from khipu.commitments import _payload_event, SESSION_END_EVENTS
 
+    # Only declared keys pass. A session end is the hook's to declare
+    # (close_session_plan would close the open items of a session_id the
+    # caller names), and lineage, owners, decision authors and commitment ids
+    # are the hook's and the owner's to set, never a tool caller's.
+    schema = next(t["inputSchema"] for t in TOOLS if t["name"] == "khipu_capture")
+    args = {k: v for k, v in args.items() if k in schema["properties"]}
+    scope = str(args.get("scope") or "").lower()
+    if _payload_event(args) in SESSION_END_EVENTS or "sessionend" in scope:
+        args["scope"] = "general"
+    for key, dropped in (("open_loops", {"owner", "owner_label"}),
+                         ("closed_loops", {"commitment_id"}),
+                         ("decision_details", {"by"})):
+        if isinstance(args.get(key), list):
+            args[key] = [{k: v for k, v in item.items() if k not in dropped}
+                         if isinstance(item, dict) else item for item in args[key]]
     # load_payload validates + mints ts; capture() routes by mode (hub → PG only).
     payload = load_payload(json.dumps({k: v for k, v in args.items() if v is not None}))
     # PG-row-only, exactly as khipu.probe does it: the legacy file leg prints

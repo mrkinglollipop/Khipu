@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 import shutil
 import socket
@@ -41,6 +42,7 @@ def _run(
     timeout: float | None = None,
     check: bool = True,
     input_text: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
@@ -49,7 +51,15 @@ def _run(
         timeout=timeout,
         check=check,
         input=input_text,
+        env=env,
     )
+
+
+def _secret_env(**values: str) -> dict[str, str]:
+    """The current environment plus secrets, for a child that reads them by
+    name (``docker -e NAME``, libpq's PGPASSWORD) so they never sit on argv,
+    where any local process can read them."""
+    return {**os.environ, **values}
 
 
 def docker_available() -> dict[str, Any]:
@@ -450,7 +460,7 @@ def install_local_postgres() -> dict[str, Any]:
             "-e",
             "POSTGRES_DB=khipu",
             "-e",
-            f"POSTGRES_PASSWORD={password}",
+            "POSTGRES_PASSWORD",
             "-e",
             "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
             "-p",
@@ -460,6 +470,7 @@ def install_local_postgres() -> dict[str, Any]:
             image,
         ],
         check=False,
+        env=_secret_env(POSTGRES_PASSWORD=password),
     )
     if run_proc.returncode != 0:
         err = (run_proc.stderr or run_proc.stdout or "").strip()
@@ -822,12 +833,13 @@ def _recover_previous_upgrade(
         [
             "run", "-d", "--name", PG_CONTAINER,
             "-e", "POSTGRES_USER=khipu", "-e", "POSTGRES_DB=khipu",
-            "-e", f"POSTGRES_PASSWORD={password}",
+            "-e", "POSTGRES_PASSWORD",
             "-e", "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
             "-p", f"127.0.0.1:{port}:5432",
             "-v", f"{PG_VOLUME}:/var/lib/postgresql", previous_image,
         ],
         check=False,
+        env=_secret_env(POSTGRES_PASSWORD=password),
     )
     if started.returncode != 0:
         return _recovery_failure(
@@ -977,7 +989,7 @@ def upgrade_postgres() -> dict[str, Any]:
             "-e",
             "POSTGRES_DB=khipu",
             "-e",
-            f"POSTGRES_PASSWORD={password}",
+            "POSTGRES_PASSWORD",
             "-e",
             "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
             "-p",
@@ -987,6 +999,7 @@ def upgrade_postgres() -> dict[str, Any]:
             target_image,
         ],
         check=False,
+        env=_secret_env(POSTGRES_PASSWORD=password),
     )
     if run_proc.returncode != 0:
         err = (run_proc.stderr or run_proc.stdout or "").strip()
