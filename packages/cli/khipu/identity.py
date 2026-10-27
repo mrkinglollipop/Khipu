@@ -23,6 +23,7 @@ import re
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -167,6 +168,64 @@ def project_canonical_group(cur, project: str | None) -> tuple[str | None, list[
         if not isinstance(exc, (UndefinedTable, UndefinedColumn)):
             raise
         return project, [project]
+
+
+class AmbiguousProject(ValueError):
+    """A typed project name that fits more than one project."""
+
+
+def pick_project(name: str, known: Iterable[str], canonical_of: Callable[[str], str]) -> str:
+    """The stored project name a typed ``name`` means, among ``known`` names.
+
+    An exact known name (or alias) wins as typed. Otherwise a name differing
+    only by case, or a bare repo name (no ``/``) equal to the last path
+    segment of a known name, resolves to it. Candidates that read as one
+    project (same canonical through ``canonical_of``) count once. No match
+    returns ``name`` unchanged; several different projects raise
+    ``AmbiguousProject`` naming them, never a silent empty answer."""
+    known = {k for k in known if k}
+    if name in known:
+        return name
+    lowered = name.casefold()
+    bare = "/" not in name
+    hits = sorted(k for k in known
+                  if k.casefold() == lowered or (bare and k.rsplit("/", 1)[-1].casefold() == lowered))
+    canon = sorted({canonical_of(k) for k in hits})
+    if not canon:
+        return name
+    if len(canon) > 1:
+        raise AmbiguousProject(f"project {name!r} is ambiguous: could be {', '.join(canon)}; "
+                               "use the full name")
+    return canon[0]
+
+
+def resolve_project_name(cur, project: str | None) -> str | None:
+    """``pick_project`` over the hub: every project a commitment is filed
+    under, plus every alias and canonical in ``project_aliases``."""
+    if not project:
+        return project
+    from khipu import commitments
+
+    # Names come only from commitments whose opening episode is not forgotten,
+    # the same filter the owed listing applies (computed outside the savepoint:
+    # it may introspect the schema).
+    live = commitments._not_forgotten_clause(cur)
+    known: set[str] = set()
+    for table_sql in (f"SELECT DISTINCT project FROM commitments WHERE project IS NOT NULL AND {live}",
+                      "SELECT alias FROM project_aliases UNION SELECT project FROM project_aliases"):
+        cur.execute("SAVEPOINT project_name_known", ())
+        try:
+            cur.execute(table_sql, ())
+            known.update(str(r[0]) for r in cur.fetchall() if r[0])
+            cur.execute("RELEASE SAVEPOINT project_name_known", ())
+        except Exception as exc:  # compatibility only for an older schema
+            cur.execute("ROLLBACK TO SAVEPOINT project_name_known", ())
+            cur.execute("RELEASE SAVEPOINT project_name_known", ())
+            from psycopg.errors import UndefinedColumn, UndefinedTable
+
+            if not isinstance(exc, (UndefinedTable, UndefinedColumn)):
+                raise
+    return pick_project(project, known, lambda n: project_canonical_group(cur, n)[0] or n)
 
 
 def project_group(cur, project: str | None) -> list[str]:
