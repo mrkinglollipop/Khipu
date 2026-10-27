@@ -6960,9 +6960,10 @@ def _decision_states_for_episode_snapshot(
     has_retract = "retracted_at" in cols
     if has_retract:
         select.append("retracted_at")
+    fence = forget_fence_sql(con, "decisions", "episode_id")
     try:
         rows = con.execute(
-            f"SELECT {', '.join(select)} FROM decisions WHERE episode_id = ? ORDER BY id",
+            f"SELECT {', '.join(select)} FROM decisions WHERE episode_id = ?{fence} ORDER BY id",
             (episode_id,),
         ).fetchall()
     except sqlite3.Error:

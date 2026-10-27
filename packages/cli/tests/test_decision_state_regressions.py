@@ -112,6 +112,7 @@ def _episode_at(cur, ts, decisions, topics=("alpha",), project=PROJECT):
 
 def test_hub_down_get_reports_decision_states_from_the_replica():
     from khipu import hub_snapshot
+    from tests.replica_copy import certify
 
     con = sqlite3.connect(":memory:")
     hub_snapshot._create_schema(con)
@@ -124,6 +125,7 @@ def test_hub_down_get_reports_decision_states_from_the_replica():
         "INSERT INTO decisions (id, project, text, episode_id, superseded_by) "
         "VALUES (1, 'p', 'use sqlite', 5, 2)"
     )
+    certify(con)
     with mock.patch.object(hub_snapshot, "open_snapshot", lambda **k: con):
         row = hub_snapshot.episode_detail_snapshot(5)
     assert row is not None
