@@ -1745,18 +1745,31 @@ def settle_suggestion_sql(cur, table: str = "commitments") -> str:
         decisions = has_columns(cur, "decisions", "episode_id")
     except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
         return col
-    cited = f"fe.id::text = {col}->>'episode'"
+    episode = _json_id_sql(col + "->>'episode'")
+    forgotten = f"SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND fe.id = {episode}"
     if decisions:
-        cited += (f" OR fe.id IN (SELECT d.episode_id FROM decisions d WHERE d.id::text IN "
-                  f"({col}->>'decision_id', {col}->'evidence'->>'decision_id'))")
+        for decision in (col + "->>'decision_id'", col + "->'evidence'->>'decision_id'"):
+            forgotten += f" UNION ALL {_forgotten_decision_sql(_json_id_sql(decision))}"
     # A suggestion quoting a decision names the episode its text came from
     # (``episode``); one without it cannot be checked, as the decision may
     # have moved to another source since, so it is not shown.
     unsourced = (f"({col}->>'decision_id' IS NOT NULL OR {col}->'evidence'->>'decision_id' IS NOT NULL) "
                  f"AND {col}->>'episode' IS NULL")
     return (f"CASE WHEN {unsourced} THEN NULL "
-            f"WHEN EXISTS (SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND ({cited})) "
+            f"WHEN EXISTS ({forgotten}) "
             f"THEN NULL ELSE {col} END")
+
+
+def _json_id_sql(text_expr: str) -> str:
+    """A JSON text id as a bigint (NULL when it is not one), so the lookup
+    uses the primary key: ``id::text = ...`` scanned every decision once per
+    commitment, and the open list ran past the hub's statement timeout."""
+    return f"(CASE WHEN {text_expr} ~ '^[0-9]{{1,18}}$' THEN ({text_expr})::bigint END)"
+
+
+def _forgotten_decision_sql(id_expr: str) -> str:
+    return (f"SELECT 1 FROM decisions d JOIN episodes fe ON fe.id = d.episode_id "
+            f"WHERE fe.deleted_at IS NOT NULL AND d.id = {id_expr}")
 
 
 def close_reason_sql(cur, table: str = "commitments") -> str:
@@ -1770,14 +1783,13 @@ def close_reason_sql(cur, table: str = "commitments") -> str:
 
         if not has_columns(cur, "episodes", "deleted_at"):
             return col
-        cited = f"fe.id = {table}.closed_episode"
+        forgotten = f"SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND fe.id = {table}.closed_episode"
         if has_columns(cur, "decisions", "episode_id") and has_columns(cur, "commitments", "close_evidence"):
-            cited += (f" OR fe.id IN (SELECT d.episode_id FROM decisions d "
-                      f"WHERE d.id::text = {table}.close_evidence->>'decision_id')")
+            forgotten += (" UNION ALL "
+                          + _forgotten_decision_sql(_json_id_sql(f"{table}.close_evidence->>'decision_id'")))
     except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
         return col
-    return (f"CASE WHEN EXISTS (SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND ({cited})) "
-            f"THEN 'forgotten' ELSE {col} END")
+    return f"CASE WHEN EXISTS ({forgotten}) THEN 'forgotten' ELSE {col} END"
 
 
 def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: str,
