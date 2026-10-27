@@ -87,7 +87,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "direction.on": ((), ()),
     "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
-    "direction.undo": (("id",), ("holds", "over_newer")),
+    "direction.undo": (("id",), ("holds", "over_newer", "owner_words")),
     "forget.send": ((), ()),
     "forget.here": (("id",), ()),
     "forget.not_same": (("id",), ()),
@@ -385,7 +385,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad(f"key must be one of: {', '.join(_DIRECTION_KEYS)}")
         return ["owner-direction", "set"], [v["key"], v["value"]]
     if action == "direction.undo":
-        return ["owner-direction", "undo", *_opts(v, "holds", "over_newer")], [v["id"]]
+        return ["owner-direction", "undo", *_opts(v, "holds", "over_newer", "owner_words")], [v["id"]]
     if action == "forget.send":
         return ["episode", "forget-pending", "--send"], []
     if action == "forget.here":

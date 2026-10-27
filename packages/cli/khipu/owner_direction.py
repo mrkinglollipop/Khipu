@@ -726,6 +726,8 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
                                "That change can't be made by direction: it needs the Khipu app or a yes typed on a "
                                "terminal.")
     stamp = check(want["action"], env=env, now=now)
+    if want.pop("over_newer", False):
+        _bind_over_newer(want.pop("owner_words", None), stamp)
     before = _before(want)
     if before is _NO_UNDO and want["action"] == "ledger.import":
         raise DirectionRefused("not_by_direction",
@@ -2103,9 +2105,9 @@ def _line_keys(line: dict, forward: dict | None = None) -> set[tuple]:
     if action in ("accounts.track", "accounts.request.confirm", "accounts.request.undo", "config.usage_accounts"):
         return {("accounts",)}
     if action in ("accounts.rename", "accounts.stop"):
-        return {("account", target)}
+        return {("account", acct(target))}
     if action == "accounts.move":
-        keys = {("account", target)}
+        keys = {("account", acct(target))}
         try:
             from khipu import usage
 
@@ -2186,40 +2188,68 @@ def _held(keys: set[tuple], aliases: dict[str, str]) -> set[tuple]:
     return {("hold", aliases.get(k[1], k[1])) if k[0] == "hold" else k for k in keys}
 
 
-def _op_line(op, lines: dict[str, dict]) -> str | None:
-    """The owner-actions line a routing write belongs to: its own op, or an
-    Undo's (``owner-undo:<id>``), or None for a write no owner action made."""
+def _op_owner(op, lines: dict[str, dict]) -> tuple[str, str] | None:
+    """Which owner-actions line a routing write belongs to: ``("action",
+    id)`` for an action's own write, ``("undo", id of the undone action)``
+    for an Undo's (``owner-undo:<id>``, or an older Undo line's own id), or
+    None for a write no owner action made."""
     op = str(op or "")
     parts = op.split(":")
     if op.startswith("owner-undo:") and len(parts) > 1:
-        return parts[1] if parts[1] in lines else None
+        return ("undo", parts[1]) if parts[1] in lines else None
     if parts[0] in lines:
         line = lines[parts[0]]
         # Older Undo lines used their own id as the routing operation.
-        return line.get("undoes") if line.get("kind") == "undo" else parts[0]
+        if line.get("kind") == "undo":
+            return ("undo", line["undoes"]) if line.get("undoes") in lines else None
+        return ("action", parts[0])
     return None
+
+
+def _undo_lines_of(undone_id: str, lines: dict[str, dict]) -> list[str]:
+    return [i for i, x in lines.items() if x.get("kind") == "undo" and x.get("undoes") == undone_id
+            and x["state"] != "failed"]
+
+
+def _forwarding():
+    """The routing record's account forwarding (a moved login's old key to
+    its key now) and its lines in write order, each forwarded as of when it
+    was written."""
+    from khipu import routing
+
+    return routing.forward_events(routing._in_write_order(routing.read_events()[0]),
+                                  {a["key"] for a in routing.accounts()})
 
 
 def newer_change(line: dict) -> dict | None:
     """The newest change, made after ``line``, to a target its Undo would
     restore: ``{"what", "at", "id", "target", "count"}``; None when there is
-    none. Changes that were themselves undone (with their Undo) don't count."""
+    none. Changes that were themselves undone (with their Undo) don't count.
+    Account keys are followed through moves to the key the account has now,
+    and a later owner action counts by every routing line it wrote, not only
+    by its name (``accounts stop`` also changes the priority)."""
     lines = _merged(read_log())
     order = list(lines)
     if line["id"] not in lines:
         return None
     mine_at = order.index(line["id"])
-    aliases = _hold_aliases() if (line.get("action") or "").startswith("route.hold.") else {}
-    keys = _held(_line_keys(line), aliases)
+    if not _line_keys(line):
+        return None
+    forward, ordered = _forwarding()
+    aliases = _hold_aliases(ordered) if (line.get("action") or "").startswith("route.hold.") else {}
+    keys = _held(_line_keys(line, forward), aliases)
     if not keys:
         return None
-    found: list[dict] = []
+    # One finding per change: an owner action (or the Undo of one) is
+    # counted once, whether its name or one of its routing lines matched.
+    found: dict[tuple, dict] = {}
     for later_id in order[mine_at + 1:]:
         later = lines[later_id]
         if later.get("kind") == "action":
             if later["state"] in ("failed", "undone", "cancelled"):
                 continue
-            words, subject = _ACTION_WORDS.get(later.get("action"), f"owner action {later.get('action')}"), later
+            words, subject, source = (_ACTION_WORDS.get(later.get("action"), f"owner action {later.get('action')}"),
+                                      later, ("action", later_id))
         elif later.get("kind") == "undo":
             undone = lines.get(later.get("undoes") or "")
             if (undone is None or later["state"] == "failed" or undone["id"] == line["id"]
@@ -2227,47 +2257,66 @@ def newer_change(line: dict) -> dict | None:
                 # The newer action and its own Undo cancel out.
                 continue
             words = "the undo of " + _ACTION_WORDS.get(undone.get("action"), f"owner action {undone.get('action')}")
-            subject = undone
+            subject, source = undone, ("undo", undone["id"])
         else:
             continue
-        shared = _overlap(keys, _held(_line_keys(subject), aliases))
-        if shared:
-            found.append({"what": f"your later change ({words}, owner action {later_id})", "at": later.get("at"),
-                          "id": later_id, "target": shared[0]})
+        shared = _overlap(keys, _held(_line_keys(subject, forward), aliases))
+        if shared and source not in found:
+            found[source] = {"what": f"your later change ({words}, owner action {later_id})", "at": later.get("at"),
+                             "id": later_id, "target": shared[0]}
     if (line.get("action") or "").startswith("route."):
-        found += _newer_routing_writes(line, lines)
+        _newer_routing_writes(line, lines, mine_at, keys, forward, ordered, found)
     if not found:
         return None
-    newest = max(found, key=lambda f: str(f.get("at") or ""))
+    newest = max(found.values(), key=lambda f: str(f.get("at") or ""))
     return dict(newest, count=len(found))
 
 
-def _newer_routing_writes(line: dict, lines: dict[str, dict]) -> list[dict]:
-    """Routing-record writes after this action's own lines that no owner
-    action made (a conversation's proposal, a conversation ending its hold).
-    An action whose own lines can't be found is checked against the
-    owner-actions log alone."""
-    from khipu import routing
-
-    forward, ordered = routing.forward_events(routing._in_write_order(routing.read_events()[0]),
-                                              {a["key"] for a in routing.accounts()})
-    own = [i for i, e in enumerate(ordered) if _op_line(e.get("op"), lines) == line["id"]
-           and not str(e.get("op") or "").startswith("owner-undo:")]
+def _newer_routing_writes(line: dict, lines: dict[str, dict], mine_at: int, keys: set[tuple], forward: dict,
+                          ordered: list[dict], found: dict[tuple, dict]) -> None:
+    """Add to ``found`` the routing-record writes after this action's own
+    lines that touch its target: a conversation's (a proposal, a hold
+    ended), or one an owner action wrote as part of its batch. An action
+    whose own lines can't be found is checked against the owner-actions log
+    alone."""
+    order = list(lines)
+    own = [i for i, e in enumerate(ordered) if _op_owner(e.get("op"), lines) == ("action", line["id"])]
     if not own:
-        return []
+        return
     holds = _hold_aliases(ordered)
-    keys = _held(_line_keys(line, forward), holds)
-    out = []
     for e in ordered[max(own) + 1:]:
-        if _op_line(e.get("op"), lines) is not None:
-            continue  # an owner action's line: checked against the owner-actions log
+        source = _op_owner(e.get("op"), lines)
+        if source is not None:
+            kind, owner_id = source
+            if owner_id == line["id"] or source in found:
+                continue
+            owner_line = lines[owner_id]
+            if kind == "action" and (order.index(owner_id) <= mine_at
+                                     or owner_line["state"] in ("failed", "undone", "cancelled")):
+                continue
+            if kind == "undo" and (order.index(owner_id) > mine_at or not _undo_lines_of(owner_id, lines)):
+                # A later action's own Undo cancels it out.
+                continue
         shared = _overlap(keys, _event_keys(e, holds, forward))
-        if shared:
+        if not shared:
+            continue
+        if source is None:
             who = "a conversation's" if (e.get("written_by") or {}).get("kind") == "conversation" else "your"
-            out.append({"what": f"{who} later {_EVENT_WORDS.get(e.get('type'), 'routing')} change "
-                                f"(routing line {e.get('id')})", "at": e.get("written_at"), "id": e.get("id"),
-                        "target": shared[0]})
-    return out
+            found[("routing", e.get("id"))] = {
+                "what": f"{who} later {_EVENT_WORDS.get(e.get('type'), 'routing')} change (routing line {e.get('id')})",
+                "at": e.get("written_at"), "id": e.get("id"), "target": shared[0]}
+            continue
+        kind, owner_id = source
+        if kind == "action":
+            words = _ACTION_WORDS.get(lines[owner_id].get("action"), f"owner action {lines[owner_id].get('action')}")
+            at, line_id = lines[owner_id].get("at"), owner_id
+        else:
+            line_id = _undo_lines_of(owner_id, lines)[-1]
+            words = "the undo of " + _ACTION_WORDS.get(lines[owner_id].get("action"),
+                                                        f"owner action {lines[owner_id].get('action')}")
+            at = lines[line_id].get("at")
+        found[source] = {"what": f"your later change ({words}, owner action {line_id}, routing line {e.get('id')})",
+                         "at": at, "id": line_id, "target": shared[0]}
 
 
 def newer_change_words(line: dict, newer: dict) -> str:
@@ -2279,10 +2328,57 @@ def newer_change_words(line: dict, newer: dict) -> str:
             "this one over it on purpose.")
 
 
-def _refuse_over_newer(line: dict) -> None:
+def _refuse_over_newer(line: dict, over_newer: bool) -> None:
+    """Refuse the Undo over a newer change, or (``over_newer``) record that
+    change's id on the Undo's own line, as it stands under the lock."""
     newer = newer_change(line)
-    if newer:
+    if not newer:
+        return
+    if not over_newer:
         raise NewerChange(newer_change_words(line, newer), newer)
+    pend = _PENDING.get()
+    if not pend:
+        return
+    facts = dict(pend["intent"].get("facts") or {})
+    if facts.get("newer") == newer.get("id"):
+        return
+    facts.update(over_newer=True, newer=newer.get("id"))
+    pend["intent"]["facts"] = facts
+    ahead = pend.get("line")
+    if ahead and ahead.get("kind") == "undo" and ahead.get("undoes") == line["id"]:
+        _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": ahead["id"], "state": "pending",
+                 "facts": facts})
+        ahead["facts"] = facts
+
+
+# Through owner direction an Undo over a newer change needs the owner's own
+# latest message (its hash is the recorded turn's) to ask for it: an undo,
+# and that it go ahead anyway or lose the newer change.
+_ASKS_UNDO = re.compile(r"\b(undo|undoing|revert|restore|roll ?back|put (it|that|them|this) back)\b")
+_ASKS_ANYWAY = re.compile(r"\b(anyway|anyways|regardless|even so|even though|overwrite|override|over-newer|"
+                          r"over (the|that|my|its|this) (newer|later)( change| one)?|"
+                          r"los(e|ing) (the|that|my|this) (newer|later))\b")
+_NOT_ASKED = re.compile(r"\b(don'?t|do not|never|not|no)\b\W+(\w+\W+){0,3}?(undo|revert|restore|lose|overwrite|"
+                        r"override)\b")
+
+
+def _bind_over_newer(words, stamp: dict) -> None:
+    from khipu import owner_turns as turns
+
+    if not isinstance(words, str) or not words.strip():
+        raise DirectionRefused("over_newer_not_asked",
+                               "Undoing over a newer change by direction needs the owner's own words asking for it: "
+                               "pass the owner's latest message here, word for word, as owner_words. Nothing was "
+                               "changed.")
+    if not stamp.get("prompt_sha256") or turns.prompt_sha256(words) != stamp["prompt_sha256"]:
+        raise DirectionRefused("over_newer_not_asked",
+                               "Those words are not the owner's latest message in this conversation, so they can't "
+                               "authorise undoing over a newer change. Nothing was changed.")
+    text = turns.canonical_prompt(words).lower().replace("\u2019", "'")
+    if not (_ASKS_UNDO.search(text) and _ASKS_ANYWAY.search(text)) or _NOT_ASKED.search(text):
+        raise DirectionRefused("over_newer_not_asked",
+                               "The owner's message doesn't ask to undo anyway and lose the newer change, so this "
+                               "Undo can't go over it. Nothing was changed; ask the owner whether to undo anyway.")
 
 
 def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False) -> dict:
@@ -2299,7 +2395,10 @@ def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool 
         return {"ok": True, "undid": line_id, "state": "cancelled"}
     from khipu import routing
 
-    with routing._lock() if line["action"].startswith("route.") else contextlib.nullcontext():
+    # The routing lock covers the account list's writers too, so no newer
+    # change can land between the check below and the inverse.
+    locked = line["action"].startswith(("route.", "accounts.", "config.usage_accounts"))
+    with routing._lock() if locked else contextlib.nullcontext():
         inverse_id = "owner-undo:" + line_id
         if line["action"].startswith("route."):
             # Older Undo rows used their own line id as the routing operation.
@@ -2308,10 +2407,7 @@ def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool 
                        if e.get("op") in known_ids and e.get("type") != "owner_change"]
             if matches:
                 return {"ok": True, "undid": line_id, "id": matches[0].get("id"), "already_applied": True}
-        if not over_newer:
-            # Under the routing lock for a routing change, so no write can
-            # land between this check and the inverse.
-            _refuse_over_newer(line)
+        _refuse_over_newer(line, over_newer)
         inverse = _UNDO[line["action"]]
         pending = (_PENDING.get() or {}).get("line")
         if (pending and pending.get("kind") == "undo" and pending.get("undoes") == line_id
@@ -2417,6 +2513,8 @@ def run_cli(args) -> int:
                 # Logged as its own owner action: an Undo made over the newer change on purpose.
                 facts.update(over_newer=True, newer=newer.get("id"))
             want = intent("direction.undo", args.id, facts=facts or None)
+            if over and getattr(args, "by_direction", False):
+                want.update(over_newer=True, owner_words=getattr(args, "owner_words", None))
             via = routing._owner_via(args, want)
             if via is None:
                 _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
@@ -2523,5 +2621,7 @@ def add_parser(sub) -> None:
                     help='Explicit choices for held or paused accounts: {"id": "end" or "keep"}')
     un.add_argument("--over-newer", dest="over_newer", action="store_true",
                     help="Undo even though a newer change touched the same target since; that change is lost")
+    un.add_argument("--owner-words", dest="owner_words", default=None, metavar="TEXT",
+                    help="By direction with --over-newer: the owner's latest message, word for word, asking for it")
     un.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     add_owner_flags(un)

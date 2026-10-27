@@ -245,3 +245,167 @@ def test_owner_act_passes_the_override_to_the_undo():
     assert argv == ["owner-direction", "undo", "--over-newer"] and positional == ["a1b2c3d4"]
     argv, _ = owner_act.argv("direction.undo", {"id": "a1b2c3d4", "over_newer": False})
     assert "--over-newer" not in argv
+
+
+def test_owner_act_passes_the_owners_words_to_the_undo():
+    argv, _ = owner_act.argv("direction.undo", {"id": "a1b2c3d4", "over_newer": True,
+                                                "owner_words": "undo it anyway"})
+    assert argv == ["owner-direction", "undo", "--over-newer", "--owner-words=undo it anyway"]
+
+
+# ---- a moved login: the newer change is on its new key ----------------------------------------
+
+
+SECOND = "claude|/logins/claude-second"
+
+
+def _move(world, khipu_app, key: str) -> dict:
+    from khipu import config
+
+    folder = world.tmp / "moved-login"
+    folder.mkdir()
+    return _app(world, khipu_app, ["accounts", "move", f"--account={key}", f"--folder={folder}",
+                                   "--expect=" + config.accounts_version()])
+
+
+def _caps_of(key: str) -> list[dict]:
+    return next(a for a in routing.read_view()["accounts"] if a["key"] == key).get("caps") or []
+
+
+def test_cap_undo_refuses_over_a_newer_cap_set_on_the_moved_key(world, khipu_app):
+    first = _cap(world, khipu_app, SECOND, "30")
+    moved = _move(world, khipu_app, SECOND)
+    assert moved["key"] != SECOND
+    second = _cap(world, khipu_app, moved["key"], "60")
+    rc, out = _undo(world, first["owner_action"])
+    _refused(rc, out, second["owner_action"])
+    assert "same cap" in out["error"]
+    assert [c.get("pct") for c in _caps_of(moved["key"])] == [60]
+
+
+def test_pause_undo_refuses_over_a_newer_lift_on_the_moved_key(world, khipu_app):
+    first = _app(world, khipu_app, ["route", "pause", SECOND])
+    moved = _move(world, khipu_app, SECOND)
+    second = _app(world, khipu_app, ["route", "lift", moved["key"]])
+    rc, out = _undo(world, first["owner_action"])
+    _refused(rc, out, second["owner_action"])
+    assert "same pause" in out["error"]
+
+
+# ---- a newer change inside another owner action's batch ---------------------------------------
+
+
+def _priority(world, khipu_app, entries: list[dict]) -> dict:
+    return _app(world, khipu_app, ["route", "priority", "set", "--entries=" + json.dumps(entries),
+                                   "--expect=" + routing.priority_version()])
+
+
+def test_priority_undo_refuses_over_the_priority_line_an_account_stop_wrote(world, khipu_app):
+    from khipu import config
+
+    _priority(world, khipu_app, [{"account": "Codex", "role": "a"}, {"account": "Grok", "role": "b"}])
+    later = _priority(world, khipu_app, [{"account": "Codex", "role": "a2"}, {"account": "Grok", "role": "b2"}])
+    stop = _app(world, khipu_app, ["accounts", "stop", "--account", "grok|", "--expect=" + config.accounts_version()])
+    entries = routing.read_view()["priority"]["entries"]
+    rc, out = _undo(world, later["owner_action"])
+    _refused(rc, out, stop["owner_action"])
+    assert "same priority" in out["error"] and "an account no longer tracked" in out["error"]
+    assert routing.read_view()["priority"]["entries"] == entries
+
+
+def test_a_newer_owner_action_matched_by_name_and_by_its_line_counts_once(world, khipu_app):
+    first = _set_priority(world, khipu_app, "first role")
+    second = _set_priority(world, khipu_app, "second role")
+    newer = owner_direction.newer_change(owner_direction._find(first["owner_action"]))
+    assert newer["id"] == second["owner_action"] and newer["count"] == 1
+
+
+# ---- the check is made again under the lock ---------------------------------------------------
+
+
+def _missed_once(monkeypatch):
+    """The CLI's early check misses the newer change (it lands between that
+    check and the Undo); the check under the lock sees it."""
+    real, calls = owner_direction.newer_change, []
+
+    def once(line):
+        calls.append(1)
+        return None if len(calls) == 1 else real(line)
+
+    monkeypatch.setattr(owner_direction, "newer_change", once)
+
+
+def test_a_plain_undo_refuses_a_newer_change_that_landed_after_the_early_check(world, khipu_app, monkeypatch):
+    first = _set_priority(world, khipu_app, "first role")
+    second = _set_priority(world, khipu_app, "second role")
+    _missed_once(monkeypatch)
+    rc, out = _undo(world, first["owner_action"])
+    _refused(rc, out, second["owner_action"])
+    assert _role() == "second role"
+    assert owner_direction._find(first["owner_action"])["state"] == "applied"
+
+
+def test_an_undo_over_newer_records_a_newer_change_that_landed_after_the_early_check(world, khipu_app, monkeypatch):
+    first = _set_priority(world, khipu_app, "first role")
+    second = _set_priority(world, khipu_app, "second role")
+    _missed_once(monkeypatch)
+    rc, out = _undo(world, first["owner_action"], "--over-newer")
+    assert rc == 0, out
+    (ahead,) = _undo_lines()
+    merged = owner_direction._merged(owner_direction.read_log())[ahead["id"]]
+    assert merged["facts"]["over_newer"] is True and merged["facts"]["newer"] == second["owner_action"]
+    assert owner_direction.line_state(ahead["id"]) == "applied"
+
+
+# ---- by direction, the override is the owner's own words --------------------------------------
+
+
+def _direction_undo(world, khipu_app, line_id: str, *extra: str) -> tuple[int, dict]:
+    khipu_app.as_shell("/opt/harness/claude")
+    return world.run(["owner-direction", "undo", line_id, "--over-newer", *extra], True)
+
+
+def _two_priorities(world, khipu_app) -> tuple[dict, dict]:
+    first = _set_priority(world, khipu_app, "first role")
+    return first, _set_priority(world, khipu_app, "second role")
+
+
+def _not_asked(rc: int, out: dict) -> None:
+    assert rc == 2 and out["code"] == "over_newer_not_asked", out
+    assert _role() == "second role" and not _undo_lines()
+
+
+def test_direction_over_newer_without_the_owners_words_is_refused(world, khipu_app):
+    first, _second = _two_priorities(world, khipu_app)
+    world.say("undo that first priority change anyway")
+    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"]))
+
+
+def test_direction_over_newer_with_words_that_are_not_the_latest_message_is_refused(world, khipu_app):
+    first, _second = _two_priorities(world, khipu_app)
+    world.say("undo that first priority change anyway")
+    world.say("thanks")
+    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"],
+                                "--owner-words=undo that first priority change anyway"))
+
+
+def test_direction_over_newer_when_the_owner_only_asked_for_an_undo_is_refused(world, khipu_app):
+    first, _second = _two_priorities(world, khipu_app)
+    world.say("undo the first priority change")
+    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"],
+                                "--owner-words=undo the first priority change"))
+    world.say("don't undo it anyway, keep the newer one")
+    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"],
+                                "--owner-words=don't undo it anyway, keep the newer one"))
+
+
+def test_direction_over_newer_when_the_owner_asked_for_it_restores_and_records_it(world, khipu_app):
+    first, second = _two_priorities(world, khipu_app)
+    words = "Undo that first priority change anyway,  and lose the newer one."
+    world.say(words)
+    rc, out = _direction_undo(world, khipu_app, first["owner_action"], "--owner-words=" + words)
+    assert rc == 0, out
+    assert not routing.read_view().get("priority")
+    (line,) = _undo_lines()
+    assert line["auth"] == "direction" and line["facts"]["newer"] == second["owner_action"]
+    assert "words" not in line
