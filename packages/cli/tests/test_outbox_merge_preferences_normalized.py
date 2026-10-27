@@ -242,3 +242,36 @@ def test_a_stored_projection_validates_whatever_the_noise_list_and_scope_limit_b
         bad["resolution"]["normalized_projection"] = bad_projection
         with pytest.raises(ValueError):
             outbox._validate_resolution(bad)
+
+
+@pytest.mark.parametrize("change", ["drain_rewrite", "buried"])
+def test_a_queued_normalized_line_the_drain_touched_mid_run_is_still_resolved(lines, tmp_path, monkeypatch,
+                                                                              change):
+    """A drain pass rewrites a queued job (attempts, last error) or buries it
+    between planning and archiving; the same --apply re-reads it and
+    resolves it rather than leaving it queued."""
+    _cur, paths = lines
+    _direction(tmp_path, monkeypatch)
+    real = outbox_preferences._resolve
+
+    def touched(resolve, record_resolutions):
+        for key in ("scope", "tags", "comma"):
+            job = json.loads(paths[key].read_text())
+            job["attempts"] = 3
+            job["last_error"] = "drain: held"
+            if change == "buried" and key == "tags":
+                outbox.dead_dir().mkdir(parents=True, exist_ok=True)
+                outbox._atomic_write(outbox.dead_dir() / paths[key].name, job)
+                paths[key].unlink()
+            else:
+                outbox._atomic_write(paths[key], job)
+        return real(resolve, record_resolutions)
+
+    monkeypatch.setattr(outbox_preferences, "_resolve", touched)
+    rc, out = _run("--apply", "--owner-direction")
+    assert rc == 0 and out["lines_resolved"] == 3, out
+    assert sorted(_records()) == [2, 3, 4]
+    assert not list(outbox.dead_dir().glob("*.json")) and not paths["scope"].exists()
+    for record in _records().values():
+        outbox._validate_resolution(record)
+        assert record["queued_evidence"]["attempts"] == 3

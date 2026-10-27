@@ -459,14 +459,56 @@ def _resolve(resolve: list, record_resolutions) -> int:
     left where it is."""
     from khipu import outbox
 
-    built = [(line, *made) for line, final in resolve if (made := _resolution(line, final))]
-    if not built:
-        return 0
-    record_resolutions([{"episode_id": int(line["row"][0]), "record": record_id, "job": line["job"],
-                         "where": line["where"], "kind": record["resolution"]["kind"]}
-                        for line, record, record_id in built])
-    return sum(outbox.archive_resolved(line["path"], line["snapshot"], record) == "resolved"
-               for line, record, _record_id in built)
+    done = 0
+    pending = list(resolve)
+    for _round in range(_RESOLVE_ROUNDS):
+        built = [(line, final, *made) for line, final in pending if (made := _resolution(line, final))]
+        if not built:
+            break
+        record_resolutions([{"episode_id": int(line["row"][0]), "record": record_id, "job": line["job"],
+                             "where": line["where"], "kind": record["resolution"]["kind"]}
+                            for line, _final, record, record_id in built])
+        pending = []
+        for line, final, record, _record_id in built:
+            status = outbox.archive_resolved(line["path"], line["snapshot"], record)
+            if status == "resolved":
+                done += 1
+            elif status == "changed":
+                # A queued line is rewritten by every drain pass (attempts,
+                # last error) and can move to dead/ while the merge runs, so
+                # the bytes read at planning time go stale. Re-read it and
+                # retry when it is still the same held line.
+                fresh = _reread(line)
+                if fresh is not None:
+                    pending.append((fresh, final))
+        if not pending:
+            break
+    return done
+
+
+_RESOLVE_ROUNDS = 3
+
+
+def _reread(line: dict[str, Any]) -> dict[str, Any] | None:
+    """The same held line as it sits now, in outbox/ or dead/, with its
+    current bytes; None when it is gone, unreadable, no longer a held legacy
+    line, or carries a different payload than the one that was proved."""
+    from khipu import outbox
+
+    for where, folder in (("outbox", outbox.outbox_dir()), ("dead", outbox.dead_dir())):
+        path = folder / line["job"]
+        try:
+            snapshot = path.read_bytes()
+            job = outbox._read_job(path)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, TypeError, RecursionError):
+            return None
+        if (job.get("reason") != LEGACY_REASON or "origin" not in job or job["origin"] is not None
+                or job["payload"] != line["payload"]):
+            return None
+        return dict(line, where=where, path=path, snapshot=snapshot)
+    return None
 
 
 def apply(*, record, record_resolutions, record_committed=None) -> dict[str, Any]:
