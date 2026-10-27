@@ -159,3 +159,44 @@ class LegacyMigrationPastExplicitDataDirTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(keychain, "LEGACY_CONFIG_DIR", legacy_cfg))
                 keychain.migrate_legacy_secrets()
             self.assertFalse((cfg / "dsn").exists(), "legacy dsn copied into the config dir")
+
+
+class MovedDataDirKeepsTheConfigDsnTest(unittest.TestCase):
+    """Moving the data folder no longer copies the DSN, so without Keychain
+    both readers fall back to ~/.config/khipu/dsn, as the desktop does."""
+
+    def _moved(self, stack, root):
+        from khipu import db, hub_snapshot, keychain, paths
+
+        default, legacy, moved = root / "khipu", root / "alzy", root / "moved"
+        default.mkdir()
+        (default / "dsn").write_text("postgres://u:pw@config-host/d\n")
+        stack.enter_context(mock.patch.dict(os.environ, {"KHIPU_KEYCHAIN": "0"}))
+        for name in ("KHIPU_DATABASE_URL", "ALZY_DATABASE_URL", "KHIPU_ISOLATED_DIR", "KHIPU_DATA_DIR",
+                     "ALZY_DATA_DIR", "KHIPU_DSN_FILE", "ALZY_DSN_FILE"):
+            os.environ.pop(name, None)
+        stack.enter_context(mock.patch.object(paths, "DEFAULT_DIR", default))
+        stack.enter_context(mock.patch.object(paths, "LEGACY_DIR", legacy))
+        stack.enter_context(mock.patch.object(keychain, "CONFIG_DIR", default))
+        stack.enter_context(mock.patch.object(keychain, "LEGACY_CONFIG_DIR", legacy))
+        stack.enter_context(mock.patch.object(db, "DEFAULT_DSN_FILE", default / "dsn"))
+        stack.enter_context(mock.patch.object(db, "LEGACY_DSN_FILE", legacy / "dsn"))
+        stack.enter_context(mock.patch.object(db, "_MIGRATION_DONE", True))
+        stack.enter_context(mock.patch.object(hub_snapshot, "_DEFAULT_DSN_FILE", default / "dsn"))
+        stack.enter_context(mock.patch.object(hub_snapshot, "_LEGACY_DSN_FILE", legacy / "dsn"))
+        paths.set_data_dir(moved)
+        self.assertFalse((moved / "dsn").exists())
+
+    def test_resolve_dsn_reads_the_config_dsn_after_a_move(self):
+        from khipu import db
+
+        with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
+            self._moved(stack, Path(td))
+            self.assertIn("config-host", db.resolve_dsn())
+
+    def test_file_dsn_reads_the_config_dsn_after_a_move(self):
+        from khipu import hub_snapshot
+
+        with tempfile.TemporaryDirectory() as td, contextlib.ExitStack() as stack:
+            self._moved(stack, Path(td))
+            self.assertIn("config-host", hub_snapshot._file_dsn() or "")
