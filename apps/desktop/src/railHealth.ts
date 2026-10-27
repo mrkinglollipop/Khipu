@@ -12,13 +12,16 @@ export type ClaudeHomesGap = { missing: number; unreadable: number; checkFailed?
 
 /** `reason` says what the warning is about, so the rail and the card never call
  *  a provider-hooks warning "needs a linked capture". */
-export type T3WarningReason = "lookup" | "unlinked" | "hooks" | "other";
+export type T3WarningReason = "lookup" | "unlinked" | "hooks" | "partial" | "other";
 export type T3HealthGap = { warning: boolean; lookupFailed: boolean; reason?: T3WarningReason };
 
 /** Which kind of T3 warning is showing. The CLI sends plain sentences, so the
  *  "used without a thread-linked capture" one is matched by its wording; a
- *  provider with `hooks: "missing"` is the other known kind. A lookup failure
- *  outranks both, an unlinked run outranks missing hooks. */
+ *  provider with `hooks: "missing"` (or `"partial"`, amber) is the other known
+ *  kind. A lookup failure outranks both, an unlinked run outranks missing hooks.
+ *  A provider that is partial on its own raises nothing: Antigravity in T3 is
+ *  partial for good (its runtime cannot take injected context), so only a
+ *  warning the CLI actually sent makes it a reason. */
 export function t3WarningReason(t3: T3Health | null | undefined): T3WarningReason | null {
   if (!t3?.detected) return null;
   if (t3.lookup?.ok === false) return "lookup";
@@ -26,6 +29,9 @@ export function t3WarningReason(t3: T3Health | null | undefined): T3WarningReaso
   if (warnings.length === 0) return null;
   if (warnings.some((w) => /thread-linked capture/i.test(w))) return "unlinked";
   if ((t3.providers ?? []).some((p) => p.hooks === "missing")) return "hooks";
+  // A provider with some features in and some not is amber, never "without hooks":
+  // the CLI only warns for it when a feature the harness can carry is missing.
+  if ((t3.providers ?? []).some((p) => p.hooks === "partial")) return "partial";
   return "other";
 }
 
@@ -77,6 +83,7 @@ export function railHealthLine(
     return {
       tone: "warn",
       text: t3.reason === "hooks" ? "T3 providers without hooks"
+        : t3.reason === "partial" ? "T3 providers partly set up"
         : t3.reason === "other" ? "T3 needs a look"
         : "T3 needs a linked capture",
     };

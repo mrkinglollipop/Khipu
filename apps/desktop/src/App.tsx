@@ -1753,11 +1753,12 @@ export default function App() {
           title:
             reason === "lookup" ? "T3 Code is not linking threads"
               : reason === "hooks" ? "Some T3 providers have no Khipu hooks"
+              : reason === "partial" ? "Some T3 providers are missing a Khipu feature"
               : reason === "unlinked" ? "Recent T3 work is not linked to a thread"
               : "T3 Code needs a look",
           cause:
             sentences.join(". ") +
-            (reason === "hooks"
+            (reason === "hooks" || reason === "partial"
               ? ". Captures still land and remain searchable."
               : ". Captures still land and remain searchable; thread filtering is unavailable until this is resolved."),
           fix: { label: "Open Harnesses", kind: "open-harnesses" },
