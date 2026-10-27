@@ -3807,20 +3807,42 @@ fn checked_path(key: &str, raw: &str) -> Result<String, String> {
         return Err(format!("{key} must not contain '..'"));
     }
     let Ok(home) = std::env::var("HOME") else { return Ok(v) };
-    let home = PathBuf::from(home);
-    let mut candidates = vec![expand_home_path(&v).unwrap_or(path)];
-    if let Ok(real) = std::fs::canonicalize(&candidates[0]) {
-        candidates.push(real);
+    let target = expand_home_path(&v).unwrap_or(path);
+    if in_credential_folder(&target, Path::new(&home)) {
+        return Err(format!("{key} must not point into a credential folder"));
     }
-    let homes = [home.clone(), std::fs::canonicalize(&home).unwrap_or(home)];
-    for c in &candidates {
-        for h in &homes {
-            if CREDENTIAL_DIRS.iter().any(|d| c.starts_with(h.join(d))) {
-                return Err(format!("{key} must not point into a credential folder"));
+    Ok(v)
+}
+
+/// The path is resolved through its deepest existing ancestor (the setting
+/// may name a file or folder Khipu will create later, under a link) and
+/// compared in lowercase, because the Mac disk ignores case.
+fn in_credential_folder(target: &Path, home: &Path) -> bool {
+    fn resolved(p: &Path) -> PathBuf {
+        let mut rest = Vec::new();
+        let mut cur = p;
+        loop {
+            let probe = if cur.as_os_str().is_empty() { Path::new(".") } else { cur };
+            if let Ok(real) = std::fs::canonicalize(probe) {
+                return rest.iter().rev().fold(real, |acc, part| acc.join(part));
+            }
+            match (cur.parent(), cur.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    cur = parent;
+                }
+                _ => return p.to_path_buf(),
             }
         }
     }
-    Ok(v)
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    let targets = [lower(target), lower(&resolved(target))];
+    let homes = [lower(home), lower(&resolved(home))];
+    targets.iter().any(|t| {
+        homes
+            .iter()
+            .any(|h| CREDENTIAL_DIRS.iter().any(|d| t.starts_with(h.join(d.to_lowercase()))))
+    })
 }
 
 fn embed_estimate_argv(profile: &str, space: &str, stale: bool) -> Result<Vec<String>, String> {
@@ -6713,19 +6735,28 @@ mod settings_command_tests {
 
     #[test]
     fn a_symlink_into_a_credential_folder_is_refused() {
-        let home = std::env::var("HOME").unwrap();
-        let ssh = PathBuf::from(&home).join(".ssh");
-        if !ssh.is_dir() {
-            return;
-        }
         let dir = std::env::temp_dir().join(format!("khipu-path-gate-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let home = dir.join("home");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
         let link = dir.join("innocent");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&ssh, &link).unwrap();
-        let refused = checked_path("folder", link.to_str().unwrap()).is_err();
+        let cases = [
+            (link.clone(), true),
+            (link.join("newfile"), true),
+            (link.join("new/deeper/file"), true),
+            (home.join(".SSH/new_key"), true),
+            (home.join(".AWS/credentials"), true),
+            (home.join("library/keychains/x"), true),
+            (home.join("Memory/new"), false),
+            (dir.join("elsewhere/new"), false),
+        ];
+        let got: Vec<_> = cases.iter().map(|(p, _)| in_credential_folder(p, &home)).collect();
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(refused, "a link to ~/.ssh was accepted");
+        for ((p, want), got) in cases.iter().zip(got) {
+            assert_eq!(got, *want, "{p:?}");
+        }
     }
 
     #[test]

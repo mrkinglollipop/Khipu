@@ -20,12 +20,16 @@ describe("webview-facing path and policy gates", () => {
     expect(csp).toMatch(/ipc:/);
   });
 
+  // Presence guard only: the cargo tests next to checked_path test behaviour.
   it("a path operand is refused when it points into a credential folder or climbs with ..", () => {
     const body = fnBody("checked_path");
+    const gate = fnBody("in_credential_folder");
     expect(lib).toMatch(/const CREDENTIAL_DIRS: &\[&str\] = &\[".ssh"/);
-    expect(body).toMatch(/CREDENTIAL_DIRS/);
     expect(body).toMatch(/ParentDir/);
-    expect(body).toMatch(/canonicalize/);
+    expect(body).toMatch(/in_credential_folder\(/);
+    expect(gate).toMatch(/CREDENTIAL_DIRS/);
+    expect(gate).toMatch(/canonicalize/);
+    expect(gate).toMatch(/to_lowercase/);
   });
 
   it("every settable path key goes through checked_path", () => {
