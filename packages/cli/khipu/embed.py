@@ -3704,10 +3704,23 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     todo.append(("episode", str(eid), i, chunk, _md5(chunk)))
                 if out["embedded"] >= limit:
                     break
+            # Refs with a chunk in a rejected batch keep their old rows;
+            # an episode that now has no chunks is still pruned.
+            episode_failed_refs: set[str] = set()
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
                 api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
-                vecs = embed_batch(api, profile=profile)
+                try:
+                    vecs = embed_batch(api, profile=profile)
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "budget exhausted" in msg or "network error after" in msg:
+                        raise
+                    # One batch the provider rejects must not abort commitments
+                    # or topics; those refs stay missing for the next run.
+                    _log(f"episode embed catch-up: {type(exc).__name__}: {exc}")
+                    episode_failed_refs.update(r for _, r, *_ in batch)
+                    continue
                 live_refs = _lock_live_embedding_refs(cur, ((k, r) for k, r, *_ in batch))
                 writable = [(row, vec) for row, vec in zip(batch, vecs) if row[:2] in live_refs]
                 built = _upsert_chunks(cur, profile,
@@ -3719,12 +3732,16 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                      "chunk_text": t, "content_hash": h, "embedding": v, "built_at": b}
                     for ((k, r, i, t, h), v), b in zip(writable, _stamps(built, len(writable)))
                 )
-            for ref, indices in episode_replacements.items():
+            embedded_replacements = {
+                ref: indices for ref, indices in episode_replacements.items()
+                if ref not in episode_failed_refs
+            }
+            for ref, indices in embedded_replacements.items():
                 cur.execute(
                     "DELETE FROM memory_embeddings WHERE profile = %s AND kind = 'episode' "
                     "AND ref = %s AND NOT (chunk_idx = ANY(%s))", (profile, ref, indices),
                 )
-            if episode_replacements:
+            if embedded_replacements:
                 from khipu.hub_snapshot import read_anchor_identities, upsert_embeddings
 
                 # Each episode's source identities, for the replica's source
@@ -3735,7 +3752,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 cur.execute("SAVEPOINT embed_anchor_read")
                 try:
                     anchors = read_anchor_identities(
-                        cur, [int(r) for r in episode_replacements if str(r).isdigit()])
+                        cur, [int(r) for r in embedded_replacements if str(r).isdigit()])
                 except Exception as exc:  # noqa: BLE001
                     cur.execute("ROLLBACK TO SAVEPOINT embed_anchor_read")
                     _log(f"episode snapshot anchors unread: {type(exc).__name__}: {exc}")
@@ -3745,9 +3762,9 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     if anchors is None:
                         raise RuntimeError("no anchor identities")
                     upsert_embeddings(episode_snapshot_rows, replace_refs=[
-                        (profile, "episode", ref) for ref in episode_replacements],
+                        (profile, "episode", ref) for ref in embedded_replacements],
                         anchors={int(r): anchors.get(int(r), frozenset())
-                                 for r in episode_replacements if str(r).isdigit()})
+                                 for r in embedded_replacements if str(r).isdigit()})
                 except Exception as exc:  # noqa: BLE001 — replica cannot roll back the hub commit
                     _log(f"episode snapshot upsert failed: {type(exc).__name__}: {exc}")
 
@@ -3779,7 +3796,14 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     continue
                 chunks = chunk_text(text)
                 api = _api_texts(profile, [("", c) for c in chunks])
-                vecs = embed_batch(api, profile=profile)
+                try:
+                    vecs = embed_batch(api, profile=profile)
+                except RuntimeError as exc:
+                    msg = str(exc)
+                    if "budget exhausted" in msg or "network error after" in msg:
+                        raise
+                    _log(f"commitment embed catch-up: {cid}: {type(exc).__name__}: {exc}")
+                    continue
                 # Bound to the wording embedded: a forget that changed it
                 # while the provider ran leaves these vectors unwritten, and
                 # the next catch-up embeds the new wording. The projector

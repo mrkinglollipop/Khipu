@@ -100,7 +100,10 @@ export function parseStatusRows(raw: string): StatusRow[] | null {
     return null;
   }
   if (!Array.isArray(value)) return null;
-  const valid = value.every((row): row is StatusRow => {
+  // The CLI also reports harnesses this pane has no card for (grok_build); skip those rows.
+  value = value.filter((row) => !(isRecord(row) && typeof row.harness === "string" && !isHarnessId(row.harness)));
+  const rows = value as unknown[];
+  const valid = rows.every((row): row is StatusRow => {
     if (!isRecord(row)) return false;
     return isHarnessId(row.harness)
       && typeof row.detected === "boolean"
@@ -110,7 +113,7 @@ export function parseStatusRows(raw: string): StatusRow[] | null {
       && typeof row.recall_rule === "string"
       && (row.homes === undefined || (Array.isArray(row.homes) && row.homes.every(isClaudeHomeRow)));
   });
-  return valid ? value : null;
+  return valid ? (rows as StatusRow[]) : null;
 }
 
 export type StatusRow = {
