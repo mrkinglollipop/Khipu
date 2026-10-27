@@ -537,13 +537,11 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
         embedded_ids = {int(r[0]) for r in cur.fetchall()}
         skipped: dict[str, int] = {}
         seen: set[str] = set()
-        walked: set[str] = set()
         plan: list[tuple[str, str]] = []
         added = updated = unchanged = imported_kept = pending = 0
         rebuild_embedded = 0
         for rel, path, _st in _iter_files(root, skipped, keep=seen):
             seen.add(rel)
-            walked.add(rel)
             try:
                 data = path.read_bytes()
             except OSError:
@@ -590,9 +588,10 @@ def scan(conn, name: str, *, allow_rebuild: bool = False) -> dict[str, Any]:
             skipped.get("traversal_error") or skipped.get("unreadable")
         )
         gone = [] if walk_incomplete else [existing[rel][0] for rel in existing if rel not in seen]
-        # A new oversize file is never indexed, so it must not count as the
-        # folder still holding documents (that would let it wipe the rest).
-        survivors = walked | (seen & existing.keys())
+        # A new oversize, empty or undecodable file is never indexed, so it must
+        # not count as the folder still holding documents (that would let it
+        # wipe the rest); only files planned for indexing do.
+        survivors = {rel for rel, _ in plan} | (seen & existing.keys())
         if gone and not survivors:
             conn.rollback()
             raise LibraryError(
@@ -1069,6 +1068,8 @@ def import_index(
         def document_for(rel: str, p: Path) -> int | None:
             if rel in doc_ids:
                 return doc_ids[rel]
+            if rel in changed:
+                return None
             if rel in existing:
                 doc_id, prior_hash = existing[rel]
                 if str(prior_hash or "").startswith(IMPORTED_HASH_PREFIX):

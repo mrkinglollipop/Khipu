@@ -66,3 +66,38 @@ class GrewPastCapDuringResumeTest(_Base):
             self.write("book.txt", "small but now over the cap")
             out = library.import_index(self.hub, "lib1", str(p), strip_prefix="corpus/")
         self.assertFalse(out["ok"] and out.get("unmapped"), f"unmapped rows of an imported doc but ok: {out}")
+
+
+class EditedResumeHashesOnceTest(ResumeAfterEditTest):
+    def test_an_edited_document_is_hashed_once_not_once_per_row(self):
+        self.add()
+        self.write("book.txt", "the file bytes stay the same")
+        library.import_index(self.hub, "lib1", str(self._jsonl("one.jsonl", [0])), strip_prefix="corpus/")
+        self.write("book.txt", "the file was edited after the first run")
+        real = Path.read_bytes
+        calls = []
+
+        def counting(p):
+            if p.name == "book.txt":
+                calls.append(p)
+            return real(p)
+        with mock.patch.object(Path, "read_bytes", counting):
+            out = library.import_index(self.hub, "lib1", str(self._jsonl("two.jsonl", range(50))), strip_prefix="corpus/")
+        self.assertEqual(out["skipped_conflict"], 50, out)
+        self.assertLessEqual(len(calls), 1, f"edited file read {len(calls)} times for 50 rows")
+
+
+class UndecodableOnlyWalkTest(_Base):
+    def test_a_non_utf8_file_does_not_let_a_scan_delete_every_document(self):
+        self.add()
+        self.write("a.txt", "alpha text")
+        self.write("b.txt", "beta text")
+        library.scan(self.hub, "lib1")
+        (self.root / "a.txt").unlink()
+        (self.root / "b.txt").unlink()
+        (self.root / "junk.txt").write_bytes(b"\xff\xfe")
+        try:
+            out = library.scan(self.hub, "lib1")
+        except library.LibraryError:
+            return  # refusing is the fix
+        self.assertTrue(self.hub.docs, f"every document deleted by a walk that found only an undecodable file: {out}")
