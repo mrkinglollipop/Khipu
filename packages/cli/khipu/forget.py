@@ -270,6 +270,9 @@ def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
         (episode_id,),
     )
     soft_deleted = cur.rowcount > 0
+    from khipu.owed_origin import scrub_request_previews
+
+    scrub_request_previews(cur)
     cur.execute(
         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
         (str(episode_id),),

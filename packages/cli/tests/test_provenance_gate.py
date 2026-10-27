@@ -54,7 +54,7 @@ def _migrate_0047(hub):  # noqa: F811
 
     db._TABLE_COLUMNS_CACHE.clear()
     result = hub.migrate()
-    assert result["ran"] == ["0047_fact_provenance", "0050_pr_list_hashes"], result
+    assert result["ran"] == ["0047_fact_provenance", "0049_commitment_origin_requests", "0050_pr_list_hashes"], result
     return result
 
 

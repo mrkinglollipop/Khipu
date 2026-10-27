@@ -138,7 +138,7 @@ def _select(cur, project: str, *, ids: list[int] | None = None, lock: bool = Fal
 
     have = table_columns(cur, "commitments")
     wanted = ("id", "project", "opened_episode", "opened_at", "future_trigger", *FINGERPRINT_FIELDS,
-              *LINEAGE_FIELDS)
+              *LINEAGE_FIELDS, "origin_reviewed_at")
     cols = [c for c in wanted if c in have]
     lineage = "NULL"
     if has_columns(cur, "episodes", "parent_session_id"):
@@ -663,7 +663,7 @@ BULK_PRIOR_FIELDS = (*PRIOR_FIELDS, "due_after")
 
 
 def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
-               gate: str | None) -> tuple[dict[int, bool], list[str]]:
+               gate: str | None, origin_correction: bool = False) -> tuple[dict[int, bool], list[str]]:
     """Apply ``change(cid) -> bool`` (a close, reopen, snooze or reassign) to
     ``ids`` as undoable batches, one per project, in the caller's
     transaction. Every bulk action keeps the same record: the batch, and per
@@ -697,11 +697,14 @@ def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
                 continue
             cur.execute("UPDATE commitments SET tidy_batch = %s WHERE id = %s", (batch, cid))
             after = _select(cur, project, ids=[cid])[cid]
+            prior = {f: _plain(row.get(f)) for f in BULK_PRIOR_FIELDS}
+            if origin_correction:
+                prior["origin_correction_stamp"] = _plain(after.get("origin_reviewed_at"))
             cur.execute(
                 "INSERT INTO commitment_tidy_items (batch_id, commitment_id, action, reason, prior, "
                 "after_fingerprint) VALUES (%s, %s, %s, %s, %s::jsonb, %s)",
                 (batch, cid, action, reason[:400],
-                 json.dumps({f: _plain(row.get(f)) for f in BULK_PRIOR_FIELDS}, default=str), fingerprint(after)))
+                 json.dumps(prior, default=str), fingerprint(after)))
             changed[cid] = True
             count += 1
         cur.execute("UPDATE commitment_tidy_batches SET counts = %s::jsonb WHERE id = %s",
@@ -725,15 +728,30 @@ def batch_project(batch: str) -> str | None:
     return None if found is None else str(found[0])
 
 
+def _undo_selection(ids: list[int] | None) -> list[int] | None:
+    if ids is None:
+        return None
+    if not isinstance(ids, list) or not ids or any(type(cid) is not int or cid <= 0 for cid in ids):
+        raise ValueError("ids must be a nonempty list of whole numbers above 0")
+    return sorted(set(ids))
+
+
 def undo(batch: str, *, project: str | None = None, owner_gate: str | None = None,
+         ids: list[int] | None = None,
          write_id: str | None = None) -> dict[str, Any]:
     """Undo one applied batch (see the module docstring). With ``project``,
     a batch of another project is refused before anything changes.
     ``owner_gate`` is how the owner gate already passed for this Undo (the
-    owner-actions log's Undo of a bulk change made by direction)."""
+    owner-actions log's Undo of a bulk change made by direction). ``ids``
+    restricts the inverse to selected, still-applied members of this batch;
+    omitted, it retains the whole-batch behavior."""
     from khipu import commitments as co, offline
     from khipu.db import connect
 
+    try:
+        selected = _undo_selection(ids)
+    except ValueError as exc:
+        return {"ok": False, "restored": 0, "error": str(exc) + "; nothing was changed"}
     batch = str(batch or "").strip()
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
@@ -747,22 +765,42 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 return {"ok": False, "restored": 0, "batch": batch, "project": found[0],
                         "error": f"batch {batch!r} is for project {found[0]!r}, not {project!r}; "
                                  "nothing was changed"}
+            if selected is not None:
+                cur.execute("SELECT commitment_id FROM commitment_tidy_items WHERE batch_id = %s "
+                            "AND undone_at IS NULL AND commitment_id = ANY(%s)", (batch, selected))
+                if {int(r[0]) for r in cur.fetchall()} != set(selected):
+                    return {"ok": False, "restored": 0, "batch": batch,
+                            "error": "ids must name still-applied items in this batch; nothing was changed"}
+            project = found[0] or None
+            cur.execute("SELECT commitment_id, action, prior, after_fingerprint FROM commitment_tidy_items "
+                        "WHERE batch_id = %s AND undone_at IS NULL ORDER BY commitment_id", (batch,))
+            entries = [(int(c), a, p if isinstance(p, dict) else json.loads(p), fp) for c, a, p, fp in cur.fetchall()]
+            if selected is not None:
+                entries = [entry for entry in entries if entry[0] in selected]
+            if any("origin_correction_stamp" in prior for _, _, prior, _ in entries):
+                if owner_gate not in ("app", "direction"):
+                    from khipu import routing
+                    if owner_gate is None and routing._caller()["app"]:
+                        owner_gate = "app"
+                    else:
+                        return {"ok": False, "restored": 0, "batch": batch,
+                                "needs_owner": [cid for cid, _, _, _ in entries],
+                                "code": "owner_confirmation_required",
+                                "error": "Correction Undo requires verified app or prompt-bound owner direction"}
             if write_id:
                 from khipu import owner_writes
 
                 if not owner_writes.record_on_hub(cur, "owner_undo", {"write_id": write_id}):
                     return {"ok": True, "batch": batch, "restored": 0, "already_applied": True}
-            project = found[0] or None
-            cur.execute("SELECT commitment_id, action, prior, after_fingerprint FROM commitment_tidy_items "
-                        "WHERE batch_id = %s AND undone_at IS NULL ORDER BY commitment_id", (batch,))
-            entries = [(int(c), a, p if isinstance(p, dict) else json.loads(p), fp) for c, a, p, fp in cur.fetchall()]
             rows = _select(cur, project, ids=[e[0] for e in entries], lock=True)
             left_alone, todo = [], []
             for cid, action, prior, fp in entries:
                 row = rows.get(cid)
                 if row is None:
                     left_alone.append({"id": cid, "why": "no longer on the hub, or forgotten"})
-                elif fingerprint(row) != fp:
+                elif (fingerprint(row) != fp or
+                      ("origin_correction_stamp" in prior and
+                       _plain(row.get("origin_reviewed_at")) != prior["origin_correction_stamp"])):
                     left_alone.append({"id": cid, "why": "changed after the clean-up"})
                 else:
                     todo.append((cid, action, prior))
@@ -772,7 +810,11 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 conn.rollback()
                 return {"ok": False, "restored": 0, "batch": batch, "needs_owner": mine,
                         "error": co.BULK_OWNER_REFUSAL}
+            from khipu import owner_direction
+
+            owner_direction.record_owed_undo_scope(batch, [])
             restored = 0
+            restored_ids = []
             lineage_ready = co._lineage_columns_ready(cur)
             redo_from = _redo_states(cur, batch)
             for cid, action, prior in todo:
@@ -786,9 +828,13 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                 redo_from[str(cid)] = {"state": undone_from,
                                        "fingerprint": fingerprint(_select(cur, project, ids=[cid])[cid])}
                 restored += 1
+                restored_ids.append(cid)
             report = {"restored": restored, "left_alone": left_alone, "owner_gate": gate}
-            cur.execute("UPDATE commitment_tidy_batches SET undone_at = now(), undo_report = %s::jsonb "
-                        "WHERE id = %s", (json.dumps(dict(report, redo=redo_from), default=str), batch))
+            cur.execute("UPDATE commitment_tidy_batches SET undone_at = CASE WHEN EXISTS "
+                        "(SELECT 1 FROM commitment_tidy_items WHERE batch_id = %s AND undone_at IS NULL) "
+                        "THEN NULL ELSE now() END, undo_report = %s::jsonb "
+                        "WHERE id = %s", (batch, json.dumps(dict(report, redo=redo_from), default=str), batch))
+            owner_direction.record_owed_undo_scope(batch, restored_ids)
     _log(f"{batch}: undo restored {restored}, left alone {len(left_alone)}")
     return {"ok": True, "batch": batch, "project": project or "", **report}
 
@@ -838,6 +884,7 @@ def _redo_states(cur, batch: str) -> dict:
 
 
 def redo(batch: str, *, project: str | None = None, owner_gate: str | None = None,
+         ids: list[int] | None = None,
          write_id: str | None = None) -> dict[str, Any]:
     """Put an undone batch's changes back: each item ``undo`` restored and
     that has not changed since gets the state it had before that undo; an
@@ -846,6 +893,10 @@ def redo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
     from khipu import commitments as co, offline
     from khipu.db import connect
 
+    try:
+        selected = _undo_selection(ids)
+    except ValueError as exc:
+        return {"ok": False, "reapplied": 0, "error": str(exc) + "; nothing was changed"}
     batch = str(batch or "").strip()
     with connect(statement_timeout_s=offline.setting("hub_statement_timeout")) as conn:
         with conn.cursor() as cur:
@@ -866,9 +917,23 @@ def redo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
                     return {"ok": True, "batch": batch, "reapplied": 0, "already_applied": True}
             project = found[0] or None
             redo_from = _redo_states(cur, batch)
+            # A generic Undo-of-Undo must not provide a second application
+            # path around the historical correction's explicit owner gate.
+            cur.execute("SELECT EXISTS (SELECT 1 FROM commitment_tidy_items "
+                        "WHERE batch_id = %s AND prior ? 'origin_correction_stamp')", (batch,))
+            if cur.fetchone()[0]:
+                conn.rollback()
+                return {"ok": False, "reapplied": 0, "code": "owner_confirmation_required",
+                        "error": "Historical job-origin corrections cannot be replayed through a clean-up Undo"}
             cur.execute("SELECT commitment_id FROM commitment_tidy_items WHERE batch_id = %s "
                         "AND undone_at IS NOT NULL ORDER BY commitment_id", (batch,))
             ids = [int(r[0]) for r in cur.fetchall() if str(r[0]) in redo_from]
+            if selected is not None:
+                if not set(selected).issubset(ids):
+                    conn.rollback()
+                    return {"ok": False, "reapplied": 0, "batch": batch,
+                            "error": "ids must name undone items in this batch; nothing was changed"}
+                ids = selected
             rows = _select(cur, project, ids=ids, lock=True)
             left_alone, todo = [], []
             for cid in ids:

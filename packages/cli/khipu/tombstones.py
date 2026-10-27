@@ -706,6 +706,26 @@ def hub_source_forgotten(cur, payload: dict[str, Any],
     return cur.fetchone() is not None
 
 
+def hub_source_forgotten_tags(cur, tags: Any) -> bool:
+    """``hub_source_forgotten`` for a payload no longer at hand, by the
+    registry tags a writer kept for it (``identity_strings``): whether this
+    Mac's registry (read as ``is_forgotten`` reads it) or the hub's
+    ``forgotten_sources`` names any of them. No tags, no refusal.
+    ``RegistryError`` propagates: fail closed."""
+    tags = {str(t) for t in tags or ()}
+    if not tags:
+        return False
+    if Gate(_read_unlocked()).refuses(tags):
+        return True
+    from khipu.db import has_table
+
+    forms = sorted(f for t in tags if (f := hub_form(t)))
+    if not forms or not has_table(cur, "forgotten_sources"):
+        return False
+    cur.execute("SELECT 1 FROM forgotten_sources WHERE identity = ANY(%s) LIMIT 1", (forms,))
+    return cur.fetchone() is not None
+
+
 def publish_hub_forget(cur, episode_id: int,
                        source_rows: list[dict[str, Any]] | None) -> None:
     """Record a forget's source identities in the hub, in the forget's own

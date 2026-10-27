@@ -68,11 +68,24 @@ ALLOWED = {
     ("mirror", "mirror_episode"): "calls:mirror._upsert_episode",
     ("mirror", "reconcile_memory_root"): "calls:mirror._upsert_episode",
     ("mirror", "sync_recent_episodes"): "calls:mirror._upsert_episode",
+    # Resolved-record moves (merge-line-preferences and its Undo): write_guard
+    # plus episode_hidden under the outbox lock, around the job file write.
+    ("outbox", "archive_resolved"): "gate",
+    ("outbox", "unresolve"): "gate",
     ("outbox", "_bury"): "inside:outbox.drain",
     ("outbox", "_quarantine"): "inside:outbox.drain,outbox.retry_dead",
     ("outbox", "drain"): "gate",
     ("outbox", "enqueue"): "gate",
     ("outbox", "retry_dead"): "gate",
+    # "<module>" is the module-level _UPDATE_SQL constant (the preferences
+    # UPDATE), executed only by apply; _field_update_sql builds the same
+    # UPDATE per list field, called only from apply. apply checks
+    # episode_hidden and hub_source_forgotten per episode under the memory
+    # lock and the row lock before any write; undo re-checks episode_hidden
+    # and hub_source_forgotten_tags (the identities apply kept) the same way.
+    ("outbox_preferences", "<module>"): "calls:outbox_preferences.apply",
+    ("outbox_preferences", "_field_update_sql"): "inside:outbox_preferences.apply",
+    ("outbox_preferences", "undo"): "gate",
 }
 
 # Every local writer entry point, by module.function, and what it must name.
@@ -92,9 +105,13 @@ LOCKED = {
     "mirror.mirror_episode": "shared",
     "mirror.reconcile_memory_root": "shared",
     "mirror.sync_recent_episodes": "shared",
+    "outbox.archive_resolved": "shared",
     "outbox.drain": "shared",
     "outbox.enqueue": "shared",
     "outbox.retry_dead": "shared",
+    "outbox.unresolve": "shared",
+    "outbox_preferences.apply": "shared",
+    "outbox_preferences.undo": "shared",
     "paths.import_local": "shared",
     "session_capture._archive_empty": "shared",
     "session_capture._claim": "shared",
@@ -180,6 +197,28 @@ def test_every_episode_write_path_is_in_the_inventory():
     assert not unlisted, f"unlisted episode write path(s) {unlisted}: {HOW_TO_FIX}"
     stale = sorted(set(ALLOWED) - found)
     assert not stale, f"inventory lists {stale}, which no longer write; remove them here and in the doc"
+
+
+def test_module_level_write_sql_is_run_only_by_the_writer_its_entry_names():
+    """A "<module>" entry is an episode-writing SQL constant at module level;
+    its "calls:" target must be the only function anywhere that reads it."""
+    modules = _modules()
+    for (mod, func), how in sorted(ALLOWED.items()):
+        if func != "<module>":
+            continue
+        assert how.startswith("calls:"), f"{mod}.<module> must name the one writer that runs its SQL"
+        target = how.split(":", 1)[1]
+        tree = modules[mod].tree
+        names = {t.id for node in tree.body if isinstance(node, ast.Assign)
+                 for c in ast.walk(node.value)
+                 if isinstance(c, ast.Constant) and isinstance(c.value, str)
+                 and any(p.search(c.value) for p in SQL_WRITES)
+                 for t in node.targets if isinstance(t, ast.Name)}
+        assert names, f"{mod}.<module> is listed but holds no module-level write SQL"
+        users = {f"{m.name}.{m.enclosing(n.lineno)}" for m in modules.values() for n in ast.walk(m.tree)
+                 if (isinstance(n, ast.Name) and n.id in names and isinstance(n.ctx, ast.Load))
+                 or (isinstance(n, ast.Attribute) and n.attr in names)}
+        assert users == {target}, f"{mod} write SQL {sorted(names)} is run from {sorted(users)}, not only {target}"
 
 
 def test_every_inventory_entry_is_gated_the_way_it_says():

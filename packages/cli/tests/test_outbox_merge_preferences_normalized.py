@@ -254,7 +254,7 @@ def test_a_queued_normalized_line_the_drain_touched_mid_run_is_still_resolved(li
     _direction(tmp_path, monkeypatch)
     real = outbox_preferences._resolve
 
-    def touched(resolve, record_resolutions):
+    def touched(resolve, record_resolutions, *rest):
         for key in ("scope", "tags", "comma"):
             job = json.loads(paths[key].read_text())
             job["attempts"] = 3
@@ -265,7 +265,7 @@ def test_a_queued_normalized_line_the_drain_touched_mid_run_is_still_resolved(li
                 paths[key].unlink()
             else:
                 outbox._atomic_write(paths[key], job)
-        return real(resolve, record_resolutions)
+        return real(resolve, record_resolutions, *rest)
 
     monkeypatch.setattr(outbox_preferences, "_resolve", touched)
     rc, out = _run("--apply", "--owner-direction")
