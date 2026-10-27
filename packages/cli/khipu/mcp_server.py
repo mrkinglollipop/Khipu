@@ -2270,9 +2270,9 @@ class _ToolFailure(ValueError):
 
 
 def _tool_forget(args: dict) -> dict:
-    """Complete forget of one episode (khipu.forget). From the gateway only a
-    cloud harness's own captures may be forgotten: a local episode belongs to
-    the Mac that captured it and is forgotten there."""
+    """Complete forget of one episode (khipu.forget). From the gateway a token
+    may forget only rows stamped with its own origin (forget.owner_refusal): a
+    Mac's or an unowned episode is forgotten on the Mac."""
     args = _validate_tool_args("khipu_forget", args)
     if isinstance(args.get("id"), str) and args["id"].startswith("ledger:"):
         _ensure_path()
@@ -2287,8 +2287,7 @@ def _tool_forget(args: dict) -> dict:
             raise _ToolFailure(agent_view.project({"ok": False, "error": str(exc), "reason": exc.reason})) from None
     eid = _positive_id(args.get("id"), "id")
     _ensure_path()
-    from khipu.forget import KEPT, LOCAL_HARNESSES, forget_everywhere, plain_summary
-    from khipu.db import connect
+    from khipu.forget import KEPT, forget_everywhere, plain_summary
 
     owner = None
     if _via_https_gateway():
@@ -2297,22 +2296,11 @@ def _tool_forget(args: dict) -> dict:
         label = gateway_label()
         if not label:
             raise ValueError("a gateway forget needs the calling token's label")
-        # The authorization itself is forget_everywhere's, against the row's
-        # server-stamped origin inside the hub transaction; this read only
-        # turns a local capture away with directions before any work starts.
+        # The authorization is forget_everywhere's alone, against the row's
+        # server-stamped origin inside the hub transaction: a session prefix
+        # names a harness, not who wrote the row (a token may capture under
+        # a local harness's prefix).
         owner = f"gateway:{label}"
-        with connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT session_id FROM episodes WHERE id = %s", (eid,))
-                row = cur.fetchone()
-        if row is None:
-            raise ValueError(f"no such episode: {eid}")
-        harness = str(row[0] or "").split(":", 1)[0]
-        if harness in LOCAL_HARNESSES:
-            raise ValueError(
-                f"episode {eid} was captured by {harness} on a Mac; forget it there "
-                "(khipu episode forget) — the gateway forgets only cloud captures"
-            )
     from khipu.hub_snapshot import hub_connection_failed
 
     try:
