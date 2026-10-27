@@ -2528,14 +2528,16 @@ def _cursor_entry(entry) -> bool:
     return isinstance(entry, dict) and str(entry.get("harness") or "").strip().lower() == "cursor"
 
 
-def configured_accounts() -> list[dict]:
+def configured_accounts(config: dict | None = None) -> list[dict]:
     """Config ``usage_accounts`` (``[{label, harness, home?}]``), or by default
     every installed CLI with its default home, or none after the owner chose
     "Read no accounts". Invalid entries come back with an ``invalid`` reason
-    so the report shows them instead of hiding them."""
-    from khipu.config import load_config
+    so the report shows them instead of hiding them. ``config`` is a copy the
+    caller already read, so one call never sees two versions of the list."""
+    if config is None:
+        from khipu.config import load_config
 
-    config = load_config()
+        config = load_config()
     raw = config.get("usage_accounts")
     if not isinstance(raw, list):
         if reads_none(config):
@@ -2770,7 +2772,7 @@ def accounts_status() -> dict:
     # changed after it was read.
     request = config.get("usage_accounts_request")
     return {"value": stored, "source": "none" if none else "file" if stored is not None else "default",
-            "accounts": configured_accounts(), "user_home": user_home, "version": accounts_version(config),
+            "accounts": configured_accounts(config=config), "user_home": user_home, "version": accounts_version(config),
             "none": none, "request": request if isinstance(request, dict) else None}
 
 

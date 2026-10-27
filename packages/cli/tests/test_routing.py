@@ -1502,7 +1502,7 @@ def test_the_account_set_does_not_depend_on_which_clis_the_caller_finds(home, mo
     (home["data"] / "config.json").write_text(json.dumps({}))  # the public default: no usage_accounts
     found = [True]
     monkeypatch.setattr(usage, "configured_accounts",
-                        lambda: [{"label": "Codex", "harness": "codex", "home": None}] if found[0] else [])
+                        lambda config=None: [{"label": "Codex", "harness": "codex", "home": None}] if found[0] else [])
     first = _report(account="Claude", state="open")["version"]
     for codex_found in (False, True, False):
         found[0] = codex_found

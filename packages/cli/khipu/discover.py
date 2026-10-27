@@ -733,6 +733,61 @@ def _source_t3() -> list[tuple[str, Path, str]]:
     return out
 
 
+def _link_targets() -> list[dict]:
+    """Tracked account ids from read-only routing inputs; never migrate or bind.
+
+    Unpinned generated ids are intentionally omitted: a suggestion must name
+    an identity the owner can later confirm, not mint one during discovery.
+    """
+    from khipu import routing, routing_identity
+
+    known = routing.accounts()
+    (ids, forwards, _aliases), _moves, _sources = routing._identity_snapshot(known)
+    (pinned, _f, _a), _m, _s = routing._identity_snapshot([])
+    targets = []
+    for account in known:
+        ident = ids.get(account["key"])
+        if not ident or not routing_identity.STABLE.fullmatch(ident):
+            continue
+        if re.fullmatch(r"[a-z]+:a-[a-z2-7]{8}", ident) and account["key"] not in pinned:
+            continue
+        targets.append({"account_id": routing_identity.forwarded(ident, forwards),
+                        "label": account["label"], "provider": account["harness"]})
+    return targets
+
+
+def _suggested_link(cli: str, path, settings: dict | None, targets: list[dict]) -> dict | None:
+    """A folder-name/endpoint hint only; never proof of the same subscription.
+
+    Multiple accounts or competing provider hints have no default winner.
+    In particular a name never overrides a readable, different endpoint.
+    """
+    if path is None or (settings and settings.get("unreadable")):
+        return None
+    name = Path(path).name
+    provider = settings.get("provider") if settings else None
+    evidence = "settings_provider_host" if provider else None
+    if cli == "claude":
+        hints = {t["provider"] for t in targets if t["provider"] not in CLIS
+                 and (name == f".claude-{t['provider']}"
+                      or name.startswith(f".claude-{t['provider']}-")
+                      or name.startswith(f".claude-{t['provider']}."))}
+        if len(hints) > 1 or (provider and hints and hints != {provider}):
+            return None
+        if not provider and hints:
+            provider, evidence = next(iter(hints)), "folder_provider_name"
+        if provider in CLIS:
+            return None
+    elif cli == "grok" and name.startswith(".grok-"):
+        provider, evidence = cli, "same_cli_folder"
+    else:
+        return None
+    matches = [t for t in targets if t["provider"] == provider]
+    if len(matches) != 1:
+        return None
+    return dict(matches[0], evidence=[evidence], requires_owner_confirmation=True)
+
+
 def _gather(now_ts: float) -> tuple[dict, set, set]:
     """Every candidate from sources 1 to 4, keyed by id, minus the tracked
     and turned-down ones; returns (candidates, tracked keys, declined keys)."""
@@ -742,6 +797,7 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
     found: dict[str, dict] = {}
 
     settings_cache: dict[str, dict] = {}
+    link_targets = _link_targets()
 
     def settings_for(path) -> dict:
         key = str(path)
@@ -755,9 +811,13 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
                 and _worktree_container(cli, path, settings):
             return  # a folder holding only worktrees is not offered
         evidence_home = path
+        suggestion = _suggested_link(cli, path, settings, link_targets)
         provider_pointed = bool(settings and settings["host"]) or zai_home(path)
-        if cli == "claude" and (zai_home(path) or (settings and settings["provider"] == GLM)):
+        if cli == "claude" and (bool(settings and settings["provider"] == GLM) or zai_home(path)) \
+                and not any(t["provider"] == GLM for t in link_targets):
             cli, path = GLM, None  # one GLM login, whatever folder ran it
+            if suggestion and suggestion.get("provider") != GLM:
+                suggestion = None  # a GLM row never suggests another provider's account
         ident = identity(path) if path is not None else MUSE_IDENTITY
         is_default = path is None or defaults.get(cli) == ident
         if (cli, ident) in tracked or (cli, ident) in declined:
@@ -771,7 +831,7 @@ def _gather(now_ts: float) -> tuple[dict, set, set]:
             rec = {"id": cid, "cli": cli, "identity": ident, "default": is_default,
                    "abs": str(shown) if shown is not None else None,
                    "path": display_path(shown) if shown is not None else None,
-                   "sources": [], "conversations_7d": None}
+                   "sources": [], "conversations_7d": None, "suggested_link": suggestion}
             found[cid] = rec
         if source not in rec["sources"]:
             rec["sources"].append(source)
@@ -961,7 +1021,10 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
         # that token's presence alone; the token itself is never read out.
         # Any other home is asked through its CLI instead.
         return settle(SIGNED_IN, None)
-    if cli == GLM:
+    if cli == GLM or (cli == "claude" and (zai_home(rec.get("abs"))
+                                         or PROVIDER_HOSTS.get(rec.get("provider_host")) == GLM)):
+        # A z.ai folder is the GLM Coding Plan, never an Anthropic login: the
+        # claude CLI is not asked about it, by name or by where its settings point.
         return settle(*_from_probe(usage.probe_glm(timeout=left())))
     binary = usage._command(cli)
     if not binary:
@@ -1198,6 +1261,7 @@ def public(rec: dict) -> dict:
         "plan": rec.get("plan") if state == SIGNED_IN else None,
         "conversations_7d": rec.get("conversations_7d"),
         "needs_owner_check": owner,
+        "suggested_link": rec.get("suggested_link"),
         "provider_host": rec.get("provider_host"),
         "login_evidence": sorted(rec.get("login_evidence") or ()),
         "settings": rec.get("settings") if rec.get("settings") == R_UNREADABLE else None,

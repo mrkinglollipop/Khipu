@@ -277,7 +277,7 @@ def test_backward_clock_is_stale_and_due(monkeypatch):
     out = usage.report(accounts=[ACCOUNT], background=True)["accounts"][0]
     assert out["stale"] is True and out["refreshing"] is True
     assert usage._due([ACCOUNT], cache, now, 600) == [ACCOUNT]
-    monkeypatch.setattr(usage, "configured_accounts", lambda: [ACCOUNT])
+    monkeypatch.setattr(usage, "configured_accounts", lambda config=None: [ACCOUNT])
     monkeypatch.setattr(config, "load_config", lambda: {"usage_accounts": [ACCOUNT]})
     assert usage.doctor_block(now=now)["accounts"][0]["stale"] is True
 
