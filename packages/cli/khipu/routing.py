@@ -1638,11 +1638,14 @@ def _local_mac() -> str | None:
 
 def _hub_configured() -> bool:
     # Detection only: never connect, migrate credentials or start a probe.
-    from khipu import keychain
+    from khipu import db, keychain
     from khipu.paths import dsn_file
 
+    # A moved data folder holds no DSN; resolve_dsn() falls back to the
+    # config and legacy files unless the environment names the location.
+    fallback = not db._explicit_dsn_location() and (db.DEFAULT_DSN_FILE.is_file() or db.LEGACY_DSN_FILE.is_file())
     return bool(os.environ.get("KHIPU_DATABASE_URL") or os.environ.get("ALZY_DATABASE_URL")
-                or dsn_file().is_file() or keychain.get_password(keychain.DSN_ACCOUNT)
+                or dsn_file().is_file() or fallback or keychain.get_password(keychain.DSN_ACCOUNT)
                 or keychain.get_password(keychain.DSN_ACCOUNT, service=keychain.LEGACY_SERVICE))
 
 

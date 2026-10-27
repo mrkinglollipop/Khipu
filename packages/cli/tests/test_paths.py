@@ -191,20 +191,20 @@ class BackupAndStatusTest(unittest.TestCase):
     def test_backup_to_a_directory_names_the_archive(self):
         out = paths.backup_local(dest=self.root / "backups")
         self.assertTrue(out["ok"])
-        self.assertEqual(out["files"], 2)
+        self.assertEqual(out["files"], 1)
         z = Path(out["archive"])
         self.assertTrue(z.is_file())
         self.assertTrue(z.name.startswith("khipu-local-") and z.suffix == ".zip")
         with zipfile.ZipFile(z) as zf:
-            self.assertEqual(sorted(zf.namelist()), ["dsn", "root.crt"])
+            self.assertEqual(sorted(zf.namelist()), ["root.crt"])
 
     def test_backup_roundtrips_into_a_fresh_data_dir(self):
         archive = Path(paths.backup_local(dest=self.root / "b")["archive"])
         fresh = self.root / "fresh"
         fresh.mkdir()
         with mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(fresh)}):
-            self.assertEqual(paths.import_local(source=archive)["imported"], 2)
-            self.assertEqual((fresh / "dsn").read_text(), "postgres://x")
+            self.assertEqual(paths.import_local(source=archive)["imported"], 1)
+            self.assertEqual((fresh / "root.crt").read_text(), "cert")
 
     def test_status_reports_the_resolved_dir_and_files(self):
         st = paths.paths_status()
