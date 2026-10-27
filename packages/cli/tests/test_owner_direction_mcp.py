@@ -175,6 +175,12 @@ def test_a_routing_setting_outside_the_routing_settings_is_refused(mcp_world):
 def test_the_tool_takes_only_an_action_and_its_arguments(mcp_world):
     tool = next(t for t in ms.TOOLS if t["name"] == "khipu_owner_act")
     text = tool["description"].lower()
+    # The one place owner words are asked for: an Undo over a newer change by
+    # direction carries the owner's latest message, checked against its hash.
+    over_newer = ("pass the owner's latest message word for word as owner_words, "
+                  "and it must ask to undo anyway. ")
+    assert over_newer in text
+    text = text.replace(over_newer, "")
     for phrase in ("page", "another conversation", "dispatched"):
         assert phrase in text, phrase
     for gone in ("quote", "paraphrase", "owner turn", "words"):

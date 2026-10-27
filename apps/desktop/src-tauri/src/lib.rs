@@ -2554,11 +2554,15 @@ const OWNER_DIRECTION_ACKNOWLEDGE_ARGV: &[&str] = &["owner-direction", "acknowle
 /// The keys `khipu owner-direction set` takes.
 const OWNER_DIRECTION_KEYS: &[&str] = &["latest_window_h", "session_binding", "trust", "untrust"];
 
-/// An owner-actions log line's id: 8 lowercase hex characters.
-fn owner_direction_undo_argv(id: &str) -> Result<Vec<String>, String> {
+/// An owner-actions log line's id: 8 lowercase hex characters. `over_newer`
+/// is the owner's second confirm: undo even over a newer change to the same target.
+fn owner_direction_undo_argv(id: &str, over_newer: bool) -> Result<Vec<String>, String> {
     let ok = id.len() == 8 && id.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
     if !ok {
         return Err("that is not an owner action Khipu knows".to_string());
+    }
+    if over_newer {
+        return Ok(fixed_argv(&["owner-direction", "undo", "--from-app", "--over-newer", "--", id]));
     }
     Ok(fixed_argv(&["owner-direction", "undo", "--from-app", "--", id]))
 }
@@ -2616,8 +2620,8 @@ async fn khipu_owner_direction_acknowledge() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn khipu_owner_direction_undo(id: String) -> Result<String, String> {
-    run_khipu_cli_async(owner_direction_undo_argv(&id)?).await
+async fn khipu_owner_direction_undo(id: String, over_newer: Option<bool>) -> Result<String, String> {
+    run_khipu_cli_async(owner_direction_undo_argv(&id, over_newer.unwrap_or(false))?).await
 }
 
 #[tauri::command]
@@ -6070,8 +6074,12 @@ mod settings_command_tests {
             v(&["owner-direction", "acknowledge", "--from-app"])
         );
         assert_eq!(
-            owner_direction_undo_argv("a1b2c3d4").unwrap(),
+            owner_direction_undo_argv("a1b2c3d4", false).unwrap(),
             v(&["owner-direction", "undo", "--from-app", "--", "a1b2c3d4"])
+        );
+        assert_eq!(
+            owner_direction_undo_argv("a1b2c3d4", true).unwrap(),
+            v(&["owner-direction", "undo", "--from-app", "--over-newer", "--", "a1b2c3d4"])
         );
         assert_eq!(owner_direction_switch_argv(true), v(&["owner-direction", "on", "--from-app"]));
         assert_eq!(owner_direction_switch_argv(false), v(&["owner-direction", "off", "--from-app"]));
@@ -6103,7 +6111,8 @@ mod settings_command_tests {
             assert!(owner_direction_set_argv(key, value).is_err(), "{key}={value}");
         }
         for id in ["", "-a1b2c3d", "a1b2c3d4e5", "a1b2 c3d", "A1B2C3D4"] {
-            assert!(owner_direction_undo_argv(id).is_err(), "{id:?}");
+            assert!(owner_direction_undo_argv(id, false).is_err(), "{id:?}");
+            assert!(owner_direction_undo_argv(id, true).is_err(), "{id:?}");
         }
         assert!(!ALLOWED_SUBCOMMANDS.contains(&"owner-direction"));
     }

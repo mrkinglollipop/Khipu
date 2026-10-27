@@ -872,6 +872,10 @@ def test_paged_delivery_continues_on_the_daemon_path(home, monkeypatch, daemon):
     _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, {})
     _push_on(monkeypatch)
     def pull():
+        # This daemon has no routing helper, whose one-second tick keeps the
+        # table inside its two-second freshness window; a stale table makes
+        # the prompt skip routing (InventoryUnavailable) and no page advances.
+        agent_view.prepare_routing_table(refresh=True)
         expected = len(_log_lines()) + 1
         code, output = _client(home)
         assert code == 0
