@@ -69,6 +69,7 @@ import calendar
 import contextlib
 import json
 import os
+import sys
 import re
 import shlex
 import shutil
@@ -1092,6 +1093,10 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
         if not dry:
             out.setdefault("backups", []).append(_backup(rp))
             rp.unlink()
+    # --project only drops the repo rule; global MCP/hooks stay for the
+    # account-wide pack (and for `uninstall cursor` with no --project).
+    if project is not None:
+        return out
     d = _load_json(CURSOR_MCP)
     if "khipu" in d.get("mcpServers", {}):
         out["changes"].append(f"{CURSOR_MCP}: remove mcpServers.khipu")
@@ -1357,6 +1362,13 @@ def _aegis_memory_block() -> str:
     return '[memory]\nbackend = "khipu"\nenabled = true\n'
 
 
+def _aegis_memory_owned_marker() -> Path:
+    """Sidecar recording that install added `[memory]` (not a user-authored twin)."""
+    from khipu.paths import data_dir
+
+    return data_dir() / "aegis-memory-owned"
+
+
 def _aegis_memory_khipu_block(token_path: Path) -> str:
     # TOML basic string: backslashes and quotes must be escaped, or a path
     # containing either would corrupt the table (same rationale as the
@@ -1472,6 +1484,10 @@ def _aegis_install(dry: bool) -> dict:
         if mem_match is None:
             new = new.rstrip("\n") + "\n\n" + _aegis_memory_block()
             out["changes"].append(f'{AEGIS_TOML}: add [memory] backend = "khipu", enabled = true')
+            if not dry:
+                marker = _aegis_memory_owned_marker()
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text("1\n", encoding="utf-8")
         else:
             # An existing [memory] table is an existing backend choice — never
             # overridden, only reported, however it is configured.
@@ -1512,6 +1528,27 @@ def _aegis_uninstall(dry: bool) -> dict:
     new2 = _remove_native_aegis_hooks(_AEGIS_HOOK_RE.sub("", new))
     if new2 != new:
         out["changes"].append(f"{AEGIS_TOML}: remove khipu hooks block")
+    # [memory.khipu] is pack-owned. [memory] is Aegis's backend choice — only
+    # strip it when it still equals the block install wrote (leave a user's
+    # own backend / extra keys alone).
+    stripped_khipu = _remove_toml_table(new2, "memory.khipu")
+    if stripped_khipu != new2:
+        out["changes"].append(f"{AEGIS_TOML}: remove [memory.khipu]")
+        new2 = stripped_khipu
+    mem = _AEGIS_MEMORY_RE.search(new2)
+    owned = _aegis_memory_owned_marker()
+    if (
+        mem is not None
+        and mem.group(0).strip() == _aegis_memory_block().strip()
+        and owned.is_file()
+    ):
+        new2 = new2[:mem.start()] + new2[mem.end():]
+        out["changes"].append(f"{AEGIS_TOML}: remove [memory] (install-owned)")
+        if not dry:
+            try:
+                owned.unlink()
+            except OSError:
+                pass
     if new2 != text and not dry:
         new2 = new2.rstrip("\n") + "\n"
         _validate_toml(AEGIS_TOML, new2)
@@ -2413,25 +2450,75 @@ def set_gateway_token(token: str) -> Path:
 
 
 def gateway_token_file_status() -> dict:
-    """Presence-only status — exists / mode / bytes. Never the token itself."""
+    """Presence-only status — exists / mode / bytes. Never the token itself.
+
+    A key that lives only in the Keychain (or env) still counts as saved: Copy
+    can reach it, so the guide must not show "No key saved" for that Mac.
+    """
     path = gateway_token_file()
-    if not path.is_file():
-        return {"path": str(path), "exists": False}
-    st = path.stat()
-    return {"path": str(path), "exists": True,
-            "mode": oct(st.st_mode & 0o777), "bytes": st.st_size}
+    if path.is_file():
+        st = path.stat()
+        return {"path": str(path), "exists": True,
+                "mode": oct(st.st_mode & 0o777), "bytes": st.st_size}
+    if _gateway_token():
+        return {"path": str(path), "exists": True}
+    return {"path": str(path), "exists": False}
 
 
 def _gateway_token() -> str:
+    """The bearer for the gateway: env, then the Keychain, then the on-disk
+    file the app's token card writes. Without the file, a Mac that only ever
+    saved the key in the app could not run Probe or the liveness check."""
     tok = (os.environ.get(GROK_BOT_TOKEN_ENV) or "").strip()
     if tok:
         return tok
     try:
         from khipu.keychain import get_password
 
-        return (get_password("gateway_token") or "").strip()
+        tok = (get_password("gateway_token") or "").strip()
     except Exception:  # noqa: BLE001
-        return ""
+        tok = ""
+    return tok or _read_gateway_token_file()
+
+
+CLIPBOARD_CLEAR_AFTER_S = 60
+
+# Runs detached from `copy_gateway_token`: the token arrives on stdin, so it is
+# never in argv or the environment. It clears the clipboard only if the key is
+# still what is on it, so a later copy of something else is left alone.
+_CLIPBOARD_CLEARER = (
+    "import subprocess, sys, time\n"
+    "tok = sys.stdin.read()\n"
+    "time.sleep(float(sys.argv[1]))\n"
+    "now = subprocess.run(['pbpaste'], capture_output=True, text=True).stdout\n"
+    "if tok and now == tok:\n"
+    "    subprocess.run(['pbcopy'], input='', text=True)\n"
+)
+
+
+def copy_gateway_token(clear_after_s: float = CLIPBOARD_CLEAR_AFTER_S) -> dict:
+    """Put the gateway key on the clipboard without ever returning it, and
+    clear it after `clear_after_s` seconds. The answer carries no key text."""
+    import shutil
+    import subprocess
+
+    token = _gateway_token()
+    if not token:
+        return {"ok": False, "error": "No gateway key is saved on this Mac yet."}
+    if not (shutil.which("pbcopy") and shutil.which("pbpaste")):
+        return {"ok": False, "error": "Copying the key needs macOS."}
+    try:
+        subprocess.run(["pbcopy"], input=token, text=True, check=True, timeout=10)
+        clearer = subprocess.Popen(
+            [sys.executable, "-c", _CLIPBOARD_CLEARER, str(clear_after_s)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, text=True,
+        )
+        clearer.stdin.write(token)
+        clearer.stdin.close()
+    except (OSError, subprocess.SubprocessError):
+        return {"ok": False, "error": "Khipu could not reach the clipboard."}
+    return {"ok": True, "clear_after_s": clear_after_s}
 
 
 def _aegis_gateway_token() -> str:

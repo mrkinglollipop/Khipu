@@ -11,7 +11,7 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from khipu import gateway as gw, mcp_server as srv
+from khipu import gateway as gw, mcp_server as srv, request_context
 import pytest
 
 
@@ -258,6 +258,7 @@ class MutationTest(unittest.TestCase):
             if sid is not None:
                 args["session_id"] = sid
             with self.subTest(sid=sid), \
+                    request_context.gateway_request("cloud"), \
                     mock.patch.object(srv, "_via_https_gateway", return_value=True), \
                     mock.patch.object(srv, "_stdio_hook_owns_capture", return_value=False), \
                     mock.patch.object(srv, "_capture_mode", return_value="hub"), \
@@ -269,22 +270,29 @@ class MutationTest(unittest.TestCase):
                 self.assertEqual(capture.call_args.args[0].get("session_id"), sid)
                 out = srv.handle_message(request("khipu_forget", {"id": captured["episode_id"]}))
                 self.assertFalse(out["result"]["isError"], out)
-                forget.assert_called_once_with(7)
+                # The forget authorizes against the row's stored origin for
+                # this token (forget.owner_refusal), so the owner is passed on.
+                forget.assert_called_once_with(7, owner="gateway:cloud")
 
     def test_forget_rejects_local_gateway_provenance(self):
         from khipu.forget import LOCAL_HARNESSES
 
         for sid in (h + ":local" for h in LOCAL_HARNESSES):
+            # Under a token label, so the refusal is the local-harness one,
+            # not the missing-label one.
             with self.subTest(sid=sid), \
+                    request_context.gateway_request("cloud"), \
                     mock.patch.object(srv, "_via_https_gateway", return_value=True), \
                     mock.patch("khipu.db.connect", return_value=_Connection((sid,))), \
                     mock.patch("khipu.forget.forget_everywhere") as forget:
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ValueError) as raised:
                     srv._tool_forget({"id": 7})
+                self.assertIn("on a Mac", str(raised.exception))
                 forget.assert_not_called()
 
     def test_forget_rejects_grok_build_episode_on_the_gateway(self):
-        with mock.patch.object(srv, "_via_https_gateway", return_value=True), \
+        with request_context.gateway_request("cloud"), \
+                mock.patch.object(srv, "_via_https_gateway", return_value=True), \
                 mock.patch("khipu.db.connect", return_value=_Connection(("grok_build:session-1",))), \
                 mock.patch("khipu.forget.forget_everywhere") as forget:
             with self.assertRaises(ValueError) as raised:
