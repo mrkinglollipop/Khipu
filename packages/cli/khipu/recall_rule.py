@@ -138,6 +138,32 @@ def cursor_mdc() -> str:
     return CURSOR_MDC
 
 
+# Antigravity loads ``~/.gemini/config/rules/*.md`` (global) and a workspace's
+# ``.agents/rules/*.md`` when the file says ``trigger: always_on``; files past
+# 24,000 bytes are cut. T3's Antigravity runtime wires no SessionStart and
+# ignores injected context, so this text is also how that session learns to
+# pull what the other harnesses are pushed: memory (``khipu_status`` with the
+# first message as ``prompt``) and routing (``khipu_route`` before delegating).
+ANTIGRAVITY_RULE_MARK = "<!-- khipu-antigravity-rule -->"
+ANTIGRAVITY_RULE_TAIL = """
+## Antigravity: pull what other harnesses are pushed
+
+- At the start of a session, and before the first answer that could rest on
+  prior work, call `khipu_status` with the user's first message as `prompt`: it
+  returns the same "prior work" a session-start hook would have injected.
+- Before you delegate work to another agent or model (a subagent, a shell
+  command that starts one, a dispatched job), call `khipu_route`: it says which
+  accounts are open or limited and which rules and holds apply. Then call
+  `khipu_route_advise` for the lane you mean to use.
+"""
+
+
+def antigravity_rule() -> str:
+    return ("---\ndescription: Khipu cross-session memory - when and how to use the khipu MCP tools\n"
+            "trigger: always_on\n---\n" + ANTIGRAVITY_RULE_MARK + "\n\n"
+            + RULE_MD.rstrip("\n") + "\n" + ANTIGRAVITY_RULE_TAIL)
+
+
 _CWD_SKIP = frozenset(
     {
         "src",
