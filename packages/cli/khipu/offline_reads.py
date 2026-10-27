@@ -57,13 +57,19 @@ def owed_canonical(project: str | None) -> str | None:
 def owed_resolve_project(project: str | None) -> str | None:
     """``project`` as the replica's commitments name it (a short name resolved);
     unchanged with no replica. Raises ``identity.AmbiguousProject``."""
+    return owed_resolve_project_known(project)[0]
+
+
+def owed_resolve_project_known(project: str | None) -> tuple[str | None, bool]:
+    """``owed_resolve_project`` and whether the answer is a visible project
+    (``True`` with no replica: it cannot say)."""
     if not project:
-        return project
+        return project, True
     con = _open()
     if con is None:
-        return project
+        return project, True
     try:
-        return hub_snapshot.snapshot_resolve_project(con, project)
+        return hub_snapshot.snapshot_resolve_project_known(con, project)
     finally:
         con.close()
 

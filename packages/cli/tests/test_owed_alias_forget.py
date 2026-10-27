@@ -211,3 +211,47 @@ def test_replica_alias_of_a_visible_project_still_resolves(replica_dir):
         assert hs.snapshot_resolve_project(con, "public/leaf") == "public/leaf"
     finally:
         con.close()
+
+
+# --- an exact hidden alias reads as an unknown name -------------------------
+
+def _shape(out):
+    return sorted(k for k in out if k not in ("asked",))
+
+
+def _mcp_owed(project):
+    with mock.patch.object(srv, "_RELOAD_ON_CHANGE", False):
+        return srv.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "khipu_owed", "arguments": {"project": project}}})
+
+
+def test_hub_exact_hidden_alias_reads_as_an_unknown_name(hub_conn):
+    _hub_commitment(hub_conn, "public/leaf", "public task", "h-pub")
+    _hub_commitment(hub_conn, "secret/leaf", "forgotten task", "h-sec", forgotten=True)
+    _hub_alias(hub_conn, "old-secret", "secret/leaf")
+    unknown = srv._tool_owed({"project": "never-heard-of-it"})
+    out = srv._tool_owed({"project": "old-secret"})
+    assert out["project"] == "old-secret" and "asked" not in out
+    assert out["results"] == []
+    assert _shape(out) == _shape(unknown)
+    assert "secret/leaf" not in json.dumps(out, default=str)
+    rendered = json.dumps(_mcp_owed("old-secret"))
+    assert "secret/leaf" not in rendered and "forgotten task" not in rendered
+
+
+@pytest.mark.parametrize("alias, hidden", [("old-secret", "secret/leaf"), ("old-pending", "pending/leaf")])
+def test_replica_exact_hidden_alias_reads_as_an_unknown_name(replica_dir, alias, hidden):
+    con = _replica()
+    _alias_rows(con)
+    con.close()
+    with mock.patch.object(db, "connect", side_effect=psycopg.OperationalError("connection is closed")), \
+         mock.patch.object(srv, "_routing_direction_rows", return_value=[]):
+        unknown = srv.owed_listing({"project": "never-heard-of-it"})
+        out = srv.owed_listing({"project": alias})
+    assert out["project"] == alias and "asked" not in out
+    assert out["results"] == []
+    assert _shape(out) == _shape(unknown)
+    assert hidden not in json.dumps(out, default=str)
+    with mock.patch.object(db, "connect", side_effect=psycopg.OperationalError("connection is closed")):
+        rendered = json.dumps(_mcp_owed(alias))
+    assert hidden not in rendered

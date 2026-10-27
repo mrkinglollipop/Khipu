@@ -1908,9 +1908,16 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
                     # A bare repo name ("Khipu") reads as the one stored project
                     # it is the last segment of; several candidates are an error
                     # naming them, never an empty list.
-                    project = identity.resolve_project_name(cur, project)
-                    canonical, project_names = identity.project_canonical_group(cur, project)
-                    canonical = canonical or project
+                    # An unknown name -- an exact alias of a project known
+                    # only through forgotten episodes included -- is never
+                    # widened through its alias group: that names the hidden
+                    # project. Its rows are fenced, so the read is empty.
+                    project, visible = identity.resolve_project(cur, project)
+                    if visible:
+                        canonical, project_names = identity.project_canonical_group(cur, project)
+                        canonical = canonical or project
+                    else:
+                        canonical, project_names = project, [project]
                 rows = commitments.fetch_owed_rows(cur, project=project, status=status)
                 if hub_ages:
                     # A Mac clock ahead of or behind the hub can't make an age negative.
@@ -1920,12 +1927,14 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
     except Exception as exc:  # noqa: BLE001
         if not hub_connection_failed(exc):
             raise
-        project = offline_reads.owed_resolve_project(project)
+        project, visible = offline_reads.owed_resolve_project_known(project)
         rows = offline_reads.owed_rows(project, status)
         if rows is None:
             raise
-        canonical = offline_reads.owed_canonical(project) if project else project
-        if project:
+        canonical = offline_reads.owed_canonical(project) if project and visible else project
+        if project and not visible:
+            project_names = [project]
+        elif project:
             from khipu.hub_snapshot import snapshot_project_group
 
             replica = offline_reads._open()

@@ -4204,8 +4204,14 @@ def snapshot_resolve_project(con: sqlite3.Connection, project: str | None) -> st
     differently-cased name read as the stored project it means; an ambiguous
     one raises ``identity.AmbiguousProject``. Unchanged when the replica
     cannot say."""
+    return snapshot_resolve_project_known(con, project)[0]
+
+
+def snapshot_resolve_project_known(con: sqlite3.Connection, project: str | None) -> tuple[str | None, bool]:
+    """``snapshot_resolve_project`` and whether the answer is a visible
+    project (``identity.resolve_project``'s contract)."""
     if not project:
-        return project
+        return project, True
     from khipu import identity
 
     found: list[list[tuple]] = []
@@ -4221,7 +4227,7 @@ def snapshot_resolve_project(con: sqlite3.Connection, project: str | None) -> st
         except sqlite3.Error:
             found.append([])
     known = identity.visible_project_names((r[0] for r in found[0]), found[1])
-    return identity.pick_project(project, known, lambda n: snapshot_project_group(con, n)[0] or n)
+    return identity.pick_project_known(project, known, lambda n: snapshot_project_group(con, n)[0] or n)
 
 
 def _hub_commitments(cur) -> tuple[list[str], list[Any]] | None:

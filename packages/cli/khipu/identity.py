@@ -183,20 +183,27 @@ def pick_project(name: str, known: Iterable[str], canonical_of: Callable[[str], 
     project (same canonical through ``canonical_of``) count once. No match
     returns ``name`` unchanged; several different projects raise
     ``AmbiguousProject`` naming them, never a silent empty answer."""
+    return pick_project_known(name, known, canonical_of)[0]
+
+
+def pick_project_known(name: str, known: Iterable[str],
+                       canonical_of: Callable[[str], str]) -> tuple[str, bool]:
+    """``pick_project`` and whether the answer is one of the ``known``
+    projects (``False``: no match, ``name`` came back unchanged)."""
     known = {k for k in known if k}
     if name in known:
-        return name
+        return name, True
     lowered = name.casefold()
     bare = "/" not in name
     hits = sorted(k for k in known
                   if k.casefold() == lowered or (bare and k.rsplit("/", 1)[-1].casefold() == lowered))
     canon = sorted({canonical_of(k) for k in hits})
     if not canon:
-        return name
+        return name, False
     if len(canon) > 1:
         raise AmbiguousProject(f"project {name!r} is ambiguous: could be {', '.join(canon)}; "
                                "use the full name")
-    return canon[0]
+    return canon[0], True
 
 
 def visible_project_names(visible: Iterable[str], alias_rows: Iterable[tuple[Any, Any]]) -> set[str]:
@@ -215,8 +222,16 @@ def visible_project_names(visible: Iterable[str], alias_rows: Iterable[tuple[Any
 def resolve_project_name(cur, project: str | None) -> str | None:
     """``pick_project`` over the hub: every project a visible commitment is
     filed under, plus the aliases of the groups those projects belong to."""
+    return resolve_project(cur, project)[0]
+
+
+def resolve_project(cur, project: str | None) -> tuple[str | None, bool]:
+    """``resolve_project_name`` and whether the answer is a visible project.
+    ``False`` means an unknown name -- including an exact alias of a project
+    that exists only through forgotten episodes -- which a caller must not
+    widen through ``project_aliases`` (that would name the hidden project)."""
     if not project:
-        return project
+        return project, True
     from khipu import commitments
 
     # Names come only from commitments whose opening episode is not forgotten,
@@ -241,7 +256,7 @@ def resolve_project_name(cur, project: str | None) -> str | None:
                 raise
             found.append([])
     known = visible_project_names((r[0] for r in found[0]), found[1])
-    return pick_project(project, known, lambda n: project_canonical_group(cur, n)[0] or n)
+    return pick_project_known(project, known, lambda n: project_canonical_group(cur, n)[0] or n)
 
 
 def project_group(cur, project: str | None) -> list[str]:
