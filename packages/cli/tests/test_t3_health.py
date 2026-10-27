@@ -357,3 +357,16 @@ def test_t3_health_tolerates_an_old_replica_without_raw(tmp_path, monkeypatch):
     _freeze_now(monkeypatch)
 
     assert t3.health(tmp_path)["last_thread_linked_capture_at"] is None
+
+
+def test_t3_hooks_warning_names_a_provider_once_and_shows_no_terminal_command(tmp_path, monkeypatch):
+    _settings(tmp_path, json.dumps({"providerInstances": {
+        "cursor": {"driver": "cursor", "displayName": "cursor", "enabled": True},
+        "grok": {"driver": "grokBuild", "displayName": "Grok Build", "enabled": True},
+    }}))
+    monkeypatch.setenv("KHIPU_T3_DB", str(tmp_path / "missing.sqlite"))
+    out = t3.health(tmp_path)
+    hooks = [w for w in out["warnings"] if "no Khipu hooks" in w]
+    assert hooks, out["warnings"]
+    assert not any("cursor (cursor)" in w for w in hooks)
+    assert all("`" not in w and not w.endswith(".") for w in hooks)

@@ -109,6 +109,10 @@ describe("the notice list", () => {
       expect(i.text.length).toBeGreaterThan(0);
     }
   });
+  it("lists what shipped in every release since 0.4.8 that has release notes", () => {
+    const versions = noticesBetween("0.4.8", "0.4.16").map((n) => n.version);
+    for (const v of ["0.4.9", "0.4.10", "0.4.11", "0.4.12", "0.4.14", "0.4.15"]) expect(versions).toContain(v);
+  });
   it("orders versions numerically, newest first", () => {
     expect(versionGreaterThan("0.4.10", "0.4.9")).toBe(true);
     const v = noticesBetween("", "0.4.16").map((n) => n.version);
@@ -116,7 +120,7 @@ describe("the notice list", () => {
     expect(v[v.length - 1]).toBe("0.3.16");
   });
   it("this release has more items than the dialog and card show", () => {
-    const items = itemsBetween("0.4.8", "0.4.16", ALL_CAPABILITIES);
+    const items = itemsBetween("0.4.15", "0.4.16", ALL_CAPABILITIES);
     expect(items.length).toBe(8);
     expect(DIALOG_MAX_ITEMS).toBe(5);
     expect(CARD_MAX_ITEMS).toBe(3);

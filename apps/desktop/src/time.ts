@@ -18,6 +18,18 @@ export function fmtAgo(s: number | null | undefined): string {
   return `${fmtAge(s)} ago`;
 }
 
+/** A harness whose last capture is older than this is idle, not "Recording".
+ *  The same week the stored recall probe uses (`MAX_PROBE_AGE_DAYS` in
+ *  packages/cli/khipu/probe.py) before it reads as stale. Doctor itself never
+ *  goes red on idleness, so this only changes the word, never the colour red. */
+export const IDLE_CAPTURE_AFTER_S = 7 * 86400;
+
+/** True when a harness's last capture is more than a week old. Unknown age
+ *  is not stale: nothing is claimed either way. */
+export function captureIsIdle(lastCapturedAgeS: number | null | undefined): boolean {
+  return lastCapturedAgeS != null && Number.isFinite(lastCapturedAgeS) && lastCapturedAgeS > IDLE_CAPTURE_AFTER_S;
+}
+
 /** `fmtAgo` for an ISO timestamp aged against this Mac's clock; null when it
  *  will not parse. Use it only for times this Mac wrote, or where no
  *  hub-side age exists. */

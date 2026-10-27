@@ -442,7 +442,10 @@ def _cut_paths(text: str) -> str:
             elif not link and _path_token(piece):
                 core = piece.lstrip(_WRAP_OPEN).rstrip(_WRAP_CLOSE)
                 start = piece.index(core)
-                piece = piece[:start] + PATH_WORDS + piece[start + len(core):]
+                # "(/x/y location)" keeps its own "(": the placeholder drops
+                # its parentheses there, not "((a path) location)".
+                words = PATH_WORDS[1:-1] if piece[:start].endswith("(") else PATH_WORDS
+                piece = piece[:start] + words + piece[start + len(core):]
             parts.append(piece)
         out.append("".join(parts))
     return " ".join(out)

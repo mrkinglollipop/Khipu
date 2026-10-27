@@ -107,6 +107,15 @@ describe("Home hint", () => {
     expect(hintState(items, { ...DEFAULT_PREFS, startHidden: true }).kind).toBe("hidden");
   });
 
+  it("says it is checking until the live evidence has been read, never a count from empty defaults", () => {
+    expect(hintState(items, DEFAULT_PREFS, { prefs: true, signals: false }).kind).toBe("loading");
+    // Nothing at all until the saved hide/seen choices are read, so a hidden hint never flashes.
+    expect(hintState(items, DEFAULT_PREFS, { prefs: false, signals: false }).kind).toBe("hidden");
+    // A hint the owner hid stays hidden even while signals load.
+    expect(hintState(items, { ...DEFAULT_PREFS, hintHidden: true }, { prefs: true, signals: false }).kind).toBe("hidden");
+    expect(hintState(items, DEFAULT_PREFS, { prefs: true, signals: true }).kind).toBe("next");
+  });
+
   it("says 'You're set up' once, then folds away", () => {
     const all = startItems({ liveness: { ok: true, harnesses: { cursor: { ok: true, seen: true, captures: 1 } } }, gatewayCheckOk: false, episodes: 1, accountsRead: 1, agentAsked: true });
     expect(hintState(all, DEFAULT_PREFS).kind).toBe("all-set");
@@ -135,6 +144,25 @@ describe("rail badge and row states", () => {
     expect(st.add_account.label).toBe("5 accounts");
     expect(st.red).toEqual({ tone: "err", label: "1 problem" });
     expect(st.grok_build.label).toBe("Not supported yet");
+  });
+
+  it("'When something turns red' follows doctor, not only capture liveness", () => {
+    const base = { ...none, grok: started, problems: 0 };
+    // Liveness has no red harness, but doctor has three problems: not "No problems".
+    expect(guideStates({ ...base, doctorProblems: 3 }).red).toEqual({ tone: "err", label: "3 problems" });
+    expect(guideStates({ ...base, doctorProblems: 1 }).red).toEqual({ tone: "err", label: "1 problem" });
+    expect(guideStates({ ...base, doctorProblems: 0 }).red).toEqual({ tone: "ok", label: "No problems" });
+    // Doctor not answered yet: no health claim at all.
+    expect(guideStates({ ...base, doctorProblems: null }).red).toEqual({ tone: "neutral", label: "Checking" });
+  });
+
+  it("a harness whose last capture is over a week old reads Idle, never green Recording", () => {
+    const wk = 7 * 86400;
+    const live = (age: number | null) => ({ ok: true, harnesses: { aegis: { ok: true, seen: true, captures: 3, last_captured_age_s: age } } });
+    expect(guideStates({ ...none, grok: started, problems: 0, liveness: live(wk + 60) }).aegis).toEqual({ tone: "neutral", label: "Idle" });
+    expect(guideStates({ ...none, grok: started, problems: 0, liveness: live(wk - 60) }).aegis).toEqual({ tone: "ok", label: "Recording" });
+    // Unknown age claims nothing either way.
+    expect(guideStates({ ...none, grok: started, problems: 0, liveness: live(null) }).aegis).toEqual({ tone: "ok", label: "Recording" });
   });
 });
 

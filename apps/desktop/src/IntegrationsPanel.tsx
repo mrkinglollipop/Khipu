@@ -1,3 +1,4 @@
+import { t3WarningReason } from "./railHealth";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, Loader2, Minus, RefreshCw, TriangleAlert, X } from "lucide-react";
 import { WorkingBanner } from "./WorkingBanner";
@@ -5,7 +6,7 @@ import { Callout, Dialog, Tag } from "./ui";
 import { GatewayTokenCard } from "./SettingsControls";
 import { HowThisWorks } from "./HowThisWorks";
 import type { GuideId } from "./guidesModel";
-import { fmtAgo } from "./time";
+import { captureIsIdle, fmtAgo } from "./time";
 import type { Tone } from "./ui";
 
 /**
@@ -209,6 +210,7 @@ export type T3Health = {
   last_thread_linked_capture_harness?: string | null;
   thread_linked_captures_today?: number;
   warnings?: string[];
+  providers?: Array<{ id?: string; driver?: string; name?: string; hooks?: string }>;
 };
 
 /** `doctor.recall_probe` — `khipu.probe.status()`: the LAST RECORDED probe,
@@ -314,7 +316,10 @@ function CheckMark({ mark }: { mark: Mark }) {
 
 export function t3CardStatus(t3: T3Health): CardStatus {
   if (t3.lookup?.ok === false) return { tone: "warn", label: "Not linking threads" };
-  if ((t3.warnings ?? []).length > 0) return { tone: "warn", label: "Needs a linked capture" };
+  const reason = t3WarningReason(t3);
+  if (reason === "hooks") return { tone: "warn", label: "Providers without hooks" };
+  if (reason === "other") return { tone: "warn", label: "Needs a look" };
+  if (reason != null) return { tone: "warn", label: "Needs a linked capture" };
   return { tone: "ok", label: "Linking threads" };
 }
 
@@ -485,7 +490,12 @@ export function cardStatus(
     ].filter(Boolean);
     return { tone: "warn", label: parts.join(", ") };
   }
-  if (lv?.seen && (lv.captures ?? 0) > 0) return { tone: "ok", label: "Recording" };
+  if (lv?.seen && (lv.captures ?? 0) > 0) {
+    // Green means a capture landed lately. A week of silence is idle: not red
+    // (an unused harness is fine), but not "Recording" either.
+    if (captureIsIdle(lv.last_captured_age_s)) return { tone: "neutral", label: "Idle" };
+    return { tone: "ok", label: "Recording" };
+  }
   return { tone: "neutral", label: "No sessions yet" };
 }
 
@@ -503,6 +513,8 @@ export function verifiedLine(
   // round-trip probe for this pack yet — only the timing is missing, not the
   // "does it work at all" answer (2026-09-05 pixel-pass finding 3).
   const liveBeat = lv?.ok !== false && lv?.seen && (lv.captures ?? 0) > 0;
+  // Fresh enough to stand in for an old timed probe: a capture in the last two days.
+  const recentBeat = liveBeat && (lv?.last_captured_age_s ?? Infinity) < 2 * 86400;
   if (fresh) {
     if (fresh.status === "skipped") {
       return {
@@ -531,12 +543,16 @@ export function verifiedLine(
     }
     const ownAge = own.age_seconds;
     if (own.ok) {
+      // An old timed probe is a chronic warning for a hook that is working
+      // right now: the live beat is the current evidence, so it stays green
+      // and the old probe is only named as the last timed one.
+      const oldButLive = own.stale && recentBeat;
       return {
-        mark: own.stale ? "warn" : "ok",
+        mark: own.stale && !oldButLive ? "warn" : "ok",
         text:
-          `Verified ${ownAge != null ? `${fmtAgo(ownAge)}` : "at an unknown time"}` +
+          `${oldButLive ? "Last timed round trip" : "Verified"} ${ownAge != null ? `${fmtAgo(ownAge)}` : "at an unknown time"}` +
           (own.seconds != null ? ` · ${fmtSeconds(own.seconds)} round trip` : "") +
-          (own.stale ? " — older than a week, run Verify" : ""),
+          (oldButLive ? ` · hook ran ${fmtAgo(lv?.last_captured_age_s)}` : own.stale ? " — older than a week, run Verify" : ""),
       };
     }
     return {
@@ -582,12 +598,13 @@ export function verifiedLine(
   }
   const age = stored?.age_seconds;
   if (last.ok) {
+    const oldButLive = stored?.ok === false && recentBeat;
     return {
-      mark: stored?.ok === false ? "warn" : "ok",
+      mark: stored?.ok === false && !oldButLive ? "warn" : "ok",
       text:
-        `Verified ${age != null ? `${fmtAgo(age)}` : "at an unknown time"}` +
+        `${oldButLive ? "Last timed round trip" : "Verified"} ${age != null ? `${fmtAgo(age)}` : "at an unknown time"}` +
         (last.seconds != null ? ` · ${fmtSeconds(last.seconds)} round trip` : "") +
-        (stored?.ok === false ? " — older than a week, run Verify" : ""),
+        (oldButLive ? ` · hook ran ${fmtAgo(lv?.last_captured_age_s)}` : stored?.ok === false ? " — older than a week, run Verify" : ""),
     };
   }
   return {
@@ -1056,6 +1073,9 @@ export function IntegrationsPanel({
             (t3.last_thread_linked_capture_age_s == null || t3.last_thread_linked_capture_age_s > 86400),
           );
           const latest = t3.last_thread_linked_capture_age_s;
+          const hooklessNames = (t3.providers ?? [])
+            .filter((p) => p.hooks === "missing")
+            .map((p) => p.name || p.driver || "a provider");
           const linkedToday = t3.thread_linked_captures_today ?? 0;
           const claude = rows?.find((r) => r.harness === "claude_code");
           const codex = rows?.find((r) => r.harness === "codex");
@@ -1113,6 +1133,12 @@ export function IntegrationsPanel({
                       : "No T3 captures linked today"
                     : "Search by thread and switch-aware recall paused"}</span>
                 </div>
+                {hooklessNames.length > 0 ? (
+                  <div>
+                    <CheckMark mark="warn" />
+                    <span>{`No Khipu hooks on ${hooklessNames.join(", ")} · sessions there get no routing start block`}</span>
+                  </div>
+                ) : null}
               </div>
               <div className="t3-legs" role="list" aria-label="Providers T3 runs">
                 {legs.map((item) => (
@@ -1171,8 +1197,10 @@ export function IntegrationsPanel({
                     }
                   : lv?.seen && (lv.captures ?? 0) > 0
                     ? {
-                        mark: "ok",
-                        text: `Capture hook · last capture ${fmtAgo(lv.last_captured_age_s)}`,
+                        mark: captureIsIdle(lv.last_captured_age_s) ? "off" : "ok",
+                        text: captureIsIdle(lv.last_captured_age_s)
+                          ? `Capture hook · idle, last capture ${fmtAgo(lv.last_captured_age_s)}`
+                          : `Capture hook · last capture ${fmtAgo(lv.last_captured_age_s)}`,
                       }
                     : lv?.seen
                       ? { mark: "warn", text: "Capture hook · ran, nothing captured yet" }

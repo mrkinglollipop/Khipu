@@ -14,6 +14,7 @@ import type { UsageReport } from "./PlansCard";
 import { accountState } from "./routing";
 import type { RoutingState } from "./routing";
 import { callCli } from "./settingsCli";
+import type { ProjectsList } from "./ProjectsSettings";
 import { LedgerOfflineNotice, LedgerPage, OutboxNotice } from "./LedgerPage";
 import {
   WITHHELD,
@@ -63,6 +64,8 @@ export type WorkViewProps = {
   work: WorkState;
   routing: RoutingState;
   plans?: UsageReport | null;
+  /** Settings -> Projects' answer; its groups say which names are one project. */
+  projects?: ProjectsList | null;
   /** The Owed section's body, rendered by App so its state stays there. */
   owedSection: ReactNode;
   /** Bumped by App to open Work at the Owed section. */
@@ -90,6 +93,16 @@ function projectName(view: WorkViewDoc, project: string): string {
   const board = view.projects.find((p) => p.project === project);
   if (board) return boardName(board);
   return shortProject(project);
+}
+
+/** Every older name of a project, mapped to the name Khipu shows it as, from
+ *  Settings -> Projects' groups. A name Khipu has no group for maps to nothing. */
+export function canonicalNames(projects: ProjectsList | null | undefined): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const g of projects?.groups ?? []) {
+    for (const n of g.names ?? []) if (n.name !== g.canonical) map.set(n.name, g.canonical);
+  }
+  return map;
 }
 
 /** A waiting item's project words, by Owed's rule (`shortProject`). A ledger
@@ -144,6 +157,7 @@ export function WorkView(props: WorkViewProps) {
 
   const view = work.data;
   const reload = () => work.load(true);
+  const canonical = useMemo(() => canonicalNames(props.projects), [props.projects]);
 
   if (ledger) {
     return (
@@ -268,6 +282,7 @@ export function WorkView(props: WorkViewProps) {
               onOwedClose={props.onOwedClose}
               onSnooze={props.onSnooze}
               onOpenRouting={props.onOpenRouting}
+              canonical={canonical}
             />
             <RunningCard view={view} routing={props.routing} now={now} />
             <div className="card routing-card">
@@ -334,8 +349,10 @@ function WaitingCard({
   onOwedClose,
   onSnooze,
   onOpenRouting,
+  canonical,
 }: {
   view: WorkViewDoc;
+  canonical: Map<string, string>;
   now: Date;
   reload: () => Promise<void>;
   onOpenLedger: (project: string, row?: string) => void;
@@ -353,15 +370,19 @@ function WaitingCard({
   const [notice, setNotice] = useState<string | null>(null);
   const [answering, setAnswering] = useState<WaitItem | null>(null);
   const items = view.waiting;
-  const nameOf = (w: WaitItem) => waitProject(view, w);
+  // An older name of a project filters and counts under the project's own name.
+  const nameOf = (w: WaitItem) => {
+    const main = w.project ? canonical.get(w.project) : undefined;
+    return main ? projectName(view, main) : waitProject(view, w);
+  };
   const groups = useMemo(() => {
     const counts = new Map<string, number>();
     for (const w of items) {
-      const n = waitProject(view, w);
+      const n = nameOf(w);
       counts.set(n, (counts.get(n) ?? 0) + 1);
     }
     return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-  }, [items, view]);
+  }, [items, view, canonical]);
   const { waiting, blocking, quiet = 0 } = view.counts;
   const shown = items.filter((w) =>
     filter === "all" ? true : filter === "blocking" ? w.blocking && !w.quiet : nameOf(w) === filter.slice(2),
@@ -720,7 +741,7 @@ function RunningCard({ view, routing, now }: { view: WorkViewDoc; routing: Routi
         <div className="row">
           <span className="hdot idle" aria-hidden />
           <span className="grow t2">
-            No jobs are running.
+            No jobs from your job runners are running.
             {reporting ? ` ${plural(reporting, "project")} reported in the last minute.` : ""}
           </span>
         </div>

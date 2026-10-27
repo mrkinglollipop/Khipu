@@ -10,8 +10,8 @@ const plan = (since: string, version: string) => ({ since, version, items: items
 
 describe("PostUpdateNoticeDialog", () => {
   it("shows at most 5 items and says how many more for 8", () => {
-    render(<PostUpdateNoticeDialog caps={ALL_CAPABILITIES} plan={plan("0.4.8", "0.4.16")} needsRoutingSetup={false} onShow={vi.fn()} onDismiss={vi.fn()} />);
-    expect(screen.getByRole("heading", { name: "What's new since 0.4.8" })).toBeInTheDocument();
+    render(<PostUpdateNoticeDialog caps={ALL_CAPABILITIES} plan={plan("0.4.15", "0.4.16")} needsRoutingSetup={false} onShow={vi.fn()} onDismiss={vi.fn()} />);
+    expect(screen.getByRole("heading", { name: "What's new since 0.4.15" })).toBeInTheDocument();
     expect(screen.getByText(/Khipu is now version 0\.4\.16\. This list also stays on Home/)).toBeInTheDocument();
     expect(within(screen.getByRole("list")).getAllByRole("listitem")).toHaveLength(5);
     expect(screen.getByText("And 3 more in Settings → Updates.")).toBeInTheDocument();
@@ -25,7 +25,7 @@ describe("PostUpdateNoticeDialog", () => {
   it("Got it dismisses without calling onShow", () => {
     const onShow = vi.fn();
     const onDismiss = vi.fn();
-    render(<PostUpdateNoticeDialog caps={ALL_CAPABILITIES} plan={plan("0.4.8", "0.4.16")} needsRoutingSetup={false} onShow={onShow} onDismiss={onDismiss} />);
+    render(<PostUpdateNoticeDialog caps={ALL_CAPABILITIES} plan={plan("0.4.15", "0.4.16")} needsRoutingSetup={false} onShow={onShow} onDismiss={onDismiss} />);
     fireEvent.click(screen.getByRole("button", { name: "Got it" }));
     expect(onDismiss).toHaveBeenCalledTimes(1);
     expect(onShow).not.toHaveBeenCalled();
@@ -34,7 +34,7 @@ describe("PostUpdateNoticeDialog", () => {
   it("routing without setup shows Set up accounts that opens the accounts step", () => {
     const onShow = vi.fn();
     const onDismiss = vi.fn();
-    render(<PostUpdateNoticeDialog caps={ALL_CAPABILITIES} plan={plan("0.4.8", "0.4.16")} needsRoutingSetup onShow={onShow} onDismiss={onDismiss} />);
+    render(<PostUpdateNoticeDialog caps={ALL_CAPABILITIES} plan={plan("0.4.15", "0.4.16")} needsRoutingSetup onShow={onShow} onDismiss={onDismiss} />);
     fireEvent.click(screen.getByRole("button", { name: "Set up accounts: Accounts and routing" }));
     expect(onShow).toHaveBeenCalledWith({ kind: "setup", step: "accounts" });
     expect(onDismiss).toHaveBeenCalled();
@@ -70,13 +70,13 @@ describe("PostUpdateNoticeDialog", () => {
 });
 
 describe("WhatsNewCard", () => {
-  it("shows 3 items and '5 more since 0.4.12'", () => {
+  it("shows 3 items and '5 more since 0.4.15'", () => {
     render(
-      <WhatsNewCard caps={ALL_CAPABILITIES} appVersion="0.4.16" card={{ since: "0.4.12", version: "0.4.16" }} needsRoutingSetup={false} onShow={vi.fn()} onClose={vi.fn()} onSeeAll={vi.fn()} />,
+      <WhatsNewCard caps={ALL_CAPABILITIES} appVersion="0.4.16" card={{ since: "0.4.15", version: "0.4.16" }} needsRoutingSetup={false} onShow={vi.fn()} onClose={vi.fn()} onSeeAll={vi.fn()} />,
     );
     const region = screen.getByRole("region", { name: "New in 0.4.16" });
     expect(within(region).getAllByRole("listitem")).toHaveLength(3);
-    expect(within(region).getByText("5 more since 0.4.12")).toBeInTheDocument();
+    expect(within(region).getByText("5 more since 0.4.15")).toBeInTheDocument();
   });
 
   it("Close and See all call their handlers, Show me calls onShow", () => {
@@ -84,7 +84,7 @@ describe("WhatsNewCard", () => {
     const onSeeAll = vi.fn();
     const onShow = vi.fn();
     render(
-      <WhatsNewCard caps={ALL_CAPABILITIES} appVersion="0.4.16" card={{ since: "0.4.12", version: "0.4.16" }} needsRoutingSetup={false} onShow={onShow} onClose={onClose} onSeeAll={onSeeAll} />,
+      <WhatsNewCard caps={ALL_CAPABILITIES} appVersion="0.4.16" card={{ since: "0.4.15", version: "0.4.16" }} needsRoutingSetup={false} onShow={onShow} onClose={onClose} onSeeAll={onSeeAll} />,
     );
     fireEvent.click(screen.getByRole("button", { name: "Close the What's new card" }));
     fireEvent.click(screen.getByRole("button", { name: "See all in Settings → Updates" }));
@@ -103,7 +103,7 @@ describe("WhatsNewCard", () => {
 
   it("uses the Set up accounts button when routing is not set up", () => {
     render(
-      <WhatsNewCard caps={ALL_CAPABILITIES} appVersion="0.4.16" card={{ since: "0.4.12", version: "0.4.16" }} needsRoutingSetup onShow={vi.fn()} onClose={vi.fn()} onSeeAll={vi.fn()} />,
+      <WhatsNewCard caps={ALL_CAPABILITIES} appVersion="0.4.16" card={{ since: "0.4.15", version: "0.4.16" }} needsRoutingSetup onShow={vi.fn()} onClose={vi.fn()} onSeeAll={vi.fn()} />,
     );
     expect(screen.getByRole("button", { name: "Set up accounts: Accounts and routing" })).toBeInTheDocument();
   });
@@ -116,13 +116,13 @@ describe("WhatsNewHistory", () => {
     const fold = screen.getByRole("button", { name: /Earlier versions/ });
     expect(fold.tagName).toBe("BUTTON");
     expect(fold).toHaveAttribute("aria-expanded", "false");
-    expect(fold).toHaveTextContent("5 more");
+    expect(fold).toHaveTextContent("11 more");
     const body = document.getElementById(fold.getAttribute("aria-controls")!)!;
     expect(body.hidden).toBe(true);
     fireEvent.click(fold);
     expect(fold).toHaveAttribute("aria-expanded", "true");
     expect(body.hidden).toBe(false);
-    expect(within(body).getByText("0.4.5 and older, newest first.")).toBeInTheDocument();
+    expect(within(body).getByText("0.4.12 and older, newest first.")).toBeInTheDocument();
     fireEvent.click(fold);
     expect(fold).toHaveAttribute("aria-expanded", "false");
   });

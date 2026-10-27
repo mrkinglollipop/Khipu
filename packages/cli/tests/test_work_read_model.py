@@ -147,6 +147,12 @@ def test_looks_like_builds_a_full_matcher_only_for_pairs_that_need_one(monkeypat
     assert len(built) < len(owed["items"]) // 4, len(built)
 
 
+def test_a_path_inside_parentheses_does_not_double_them():
+    assert work._cut_paths("keys (/Users/x/keys/n.p8 location)") == "keys (a path location)"
+    assert work._cut_paths("keys (/Users/x/keys/n.p8)") == "keys (a path)"
+    assert work._cut_paths("keys /Users/x/keys/n.p8 here") == "keys (a path) here"
+
+
 def test_text_with_no_path_character_is_never_split():
     calls = []
     real = work._pieces
