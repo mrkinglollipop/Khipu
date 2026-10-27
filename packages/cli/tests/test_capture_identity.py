@@ -260,6 +260,108 @@ class DualWriteTest(_WritePgCase):
 SECRET = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"
 
 
+class _WindowsFakeCursor(_SourcesFakeCursor):
+    """A hub with the K3 window columns, so the exact-window dedup matches a
+    sibling part by its window id and part, as the live hub does."""
+
+    def execute(self, sql, params=None):
+        s = " ".join(sql.split())
+        if s.startswith("SELECT column_name FROM information_schema.columns") and params == ("episodes",):
+            super().execute(sql, params)
+            self._result = [*self._result, ("window_id",), ("truncated_chars",), ("verbatim",)]
+            return
+        if s.startswith("SELECT id FROM episodes WHERE harness") and "window_id = %s" in s:
+            self.calls.append((s, params))
+            harness, sid, tr, wid, part = params
+            self._result = [(eid,) for eid, e in self.episodes.items()
+                            if (e.get("harness"), e.get("session_id"), e.get("transcript_range"),
+                                e["raw"].get("window_id"), e["raw"].get("part")) == (harness, sid, tr, wid, part)][:1]
+            return
+        super().execute(sql, params)
+
+
+class SiblingPartsShareTheLegacyKeyTest(_WritePgCase):
+    """2026-10-27: parts 4/7 and 5/7 of one Cursor window carried the fallback
+    summary part 2/7 already held, so all three shared (ts, md5(summary)) and
+    the later parts were held as evidence conflicts. A sibling part is not a
+    conflict: it lands as its own row, keyed by its own source."""
+
+    FALLBACK = "Session evidence retained without a model summary."
+
+    def _part(self, part, **kw):
+        return self._payload(summary=self.FALLBACK, harness="cursor", session_id="cursor:879382d5",
+                             transcript_range="0:124618", window_id="e9b8", part=part, topics=[],
+                             verbatim={"paths": [f"p{part}"], "quotes": [f"quote of {part}"]}, **kw)
+
+    def test_sibling_parts_with_the_fallback_summary_each_land(self):
+        cur = _WindowsFakeCursor()
+        self.assertTrue(self._write(cur, self._part("2/7"))["episode_inserted"])
+        incoming = {p: self._part(p) for p in ("4/7", "5/7")}
+        keys = {p: ci.source_identity(dict(v)) for p, v in incoming.items()}
+        for part in ("4/7", "5/7"):
+            stats = self._write(cur, incoming[part])
+            self.assertTrue(stats["episode_inserted"], part)
+            self.assertEqual(stats["source_key"], keys[part]["source_key"])
+            row = cur.episodes[stats["episode_id"]]
+            self.assertEqual(row["summary"], f"{self.FALLBACK} (part {part})")
+            self.assertEqual(row["raw"]["verbatim"], incoming[part]["verbatim"])
+            self.assertEqual(cur.sources[keys[part]["source_key"]]["part"], part)
+            self.assertEqual(cur.sources[keys[part]["source_key"]]["payload_sha256"],
+                             keys[part]["payload_sha256"])
+            # The caller's payload (an outbox job's, on a retry) is untouched.
+            self.assertEqual(incoming[part]["summary"], self.FALLBACK)
+        self.assertEqual(len(cur.episodes), 3)
+        first = next(e for e in cur.episodes.values() if e["raw"]["part"] == "2/7")
+        self.assertEqual(first["summary"], self.FALLBACK)
+
+    def test_replayed_sibling_part_is_skipped_not_duplicated(self):
+        cur = _WindowsFakeCursor()
+        self._write(cur, self._part("2/7"))
+        landed = self._write(cur, self._part("4/7"))["episode_id"]
+        replay = self._write(cur, self._part("4/7"))
+        self.assertFalse(replay["episode_inserted"])
+        self.assertEqual(replay["episode_id"], landed)
+        self.assertEqual(len(cur.episodes), 2)
+
+    def test_held_sibling_part_lands_after_retry_dead(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from khipu import outbox
+
+        cur = _WindowsFakeCursor()
+        self._write(cur, self._part("2/7"))
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"KHIPU_OUTBOX": str(Path(td) / "outbox")}), \
+                mock.patch("khipu.db.connect", return_value=_FakeConn(cur)), \
+                mock.patch("khipu.embed.embed_on_capture"), \
+                mock.patch.object(outbox, "_queued_origin", return_value={"origin": "local:test"}):
+            queued = outbox.enqueue(self._part("4/7"), reason="CaptureEvidenceConflict")
+            job = json.loads(queued.read_text())
+            job.update(attempts=25, evidence_conflict=True,
+                       last_error="CaptureEvidenceConflict: legacy episode key conflicts")
+            outbox.dead_dir().mkdir(parents=True, exist_ok=True)
+            (outbox.dead_dir() / queued.name).write_text(json.dumps(job))
+            queued.unlink()
+            self.assertEqual(outbox.retry_dead()["moved"], 1)
+            result = outbox.drain()
+            self.assertEqual(result["replayed"], 1, result)
+            self.assertEqual((outbox.jobs(), outbox.dead_jobs()), ([], []))
+        landed = [e for e in cur.episodes.values() if e["raw"]["part"] == "4/7"]
+        self.assertEqual(len(landed), 1)
+        self.assertEqual(landed[0]["raw"]["verbatim"], self._part("4/7")["verbatim"])
+
+    def test_another_window_on_the_key_is_still_a_conflict(self):
+        cur = _WindowsFakeCursor()
+        self._write(cur, self._part("2/7"))
+        before = json.loads(json.dumps(cur.episodes))
+        for other in ({"window_id": "other"}, {"transcript_range": "0:999"}):
+            with self.subTest(other=other), self.assertRaises(cap.CaptureEvidenceConflict):
+                self._write(cur, {**self._part("4/7"), **other})
+        self.assertEqual(json.loads(json.dumps(cur.episodes)), before)
+
+
 class SourceIdentityIsSanitizedAndStableTest(_WritePgCase):
     """Review fixes: the source row holds only what the episode row holds
     (redacted), and its key depends on the incoming capture alone, never on
