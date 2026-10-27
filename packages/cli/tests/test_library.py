@@ -1352,7 +1352,7 @@ class CliTest(_Base):
         self.assertTrue({"read", "imported", "skipped_corrupt", "unmapped", "documents",
                          "profile"} <= set(out))
         bad = Path(self.tmp.name) / "bad.sqlite"
-        _make_index(bad, [("n", 0, "Ghost/Gone.txt", "nope", _blob(1, 0, 0, 0), "voyage-t", 4)])
+        _make_index(bad, [("n", 0, "Ghost/Gone.txt", "nope", _blob(1, 0, 0, 0), "voyage-3.5", 4)])
         rc, out = self.run_cli(library_cmd="import", name="lib1", path=str(bad), strip_prefix="", profile=None)
         self.assertEqual(rc, 1)
         self.assertFalse(out["ok"])
