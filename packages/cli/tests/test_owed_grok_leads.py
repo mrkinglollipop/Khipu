@@ -90,3 +90,14 @@ def test_rows_without_latest_text_score_as_before():
                       ("I will fix the parser tests", "I will fix the parser")):
         assert co._row_near_dup_score(new, {"text": text}) == co._match_score(new, text)
         assert co._row_near_dup_score(new, {"text": text, "latest_text": None}) == co._match_score(new, text)
+
+
+def test_item_with_a_hash_still_names_the_commitment():
+    """Merge with main: a decision "Resolved item #1" (the hash marks an id)
+    still settles commitment 1; bare "item 12" stays prose."""
+    names = lambda text: [int(m.group(1)) for m in cr._NAMES_ITEM_RE.finditer(text)]
+    assert names("Resolved item #1") == [1]
+    assert names("Answered question #7") == [7]
+    assert names("Closed commitment 4 and owed item #5") == [4, 5]
+    assert names("Ship item 12 of the release train") == []
+    assert names("question 3 of the survey") == []
