@@ -121,3 +121,9 @@ export function toastWords(text: string): string {
   }
   return inner;
 }
+
+/** A stored Owed reason in words: the duplicate rule's `duplicate-of-21201`
+ *  reads "a duplicate of #21201" (the number is the item's id in the table). */
+export function owedReasonWords(reason: string | null | undefined): string {
+  return (reason ?? "").replace(/\bduplicate-of[-:](\d+)\b/g, "a duplicate of #$1");
+}

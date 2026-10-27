@@ -370,15 +370,28 @@ button.rail-feedback {
   overflow-y: auto;
 }
 
+/* A floating status pill, not a row in the column: appearing and vanishing as
+   the page auto-refreshes must not move anything the owner is aiming at.
+   It sits over the bottom edge, ignores the pointer (clicks reach what is
+   under it), and stays a polite live region for assistive tech. */
 .working-banner {
-  flex: none;
+  position: absolute;
+  z-index: 20;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: calc(100% - 48px);
+  pointer-events: none;
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 4px 8px;
-  padding: 8px 24px;
+  padding: 8px 14px;
   background: var(--accent-soft);
-  border-bottom: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18);
   color: var(--accent-text);
   font-size: 12px;
   font-weight: 600;

@@ -417,6 +417,14 @@ describe("estimate, start, progress and cancel", () => {
     expect(jobsReads).toBe(reads);
   });
 
+  it("calls an unused, half-embedded model inactive, not partial", async () => {
+    profiles = [gemini(), nomic({ coverage: { memory: { total: 22271, embedded: 8120, missing: 14151, stale: 0, pct: 36.4 } }, rows: { memory: 8120, library: 0 } })];
+    render(<EmbeddingsPanel active />);
+    const n = await model("nomic-embed-text@768");
+    expect(within(n).getByText("Inactive")).toBeInTheDocument();
+    expect(within(n).queryByText("Partial")).toBeNull();
+  });
+
   it("shows a failed job with its error, partial coverage and Retry", async () => {
     jobs = [job({ state: "failed", error: "the server at localhost:11434 did not answer" })];
     profiles = [gemini(), nomic({ coverage: { memory: { total: 22271, embedded: 8120, missing: 14151, stale: 0, pct: 36.4 } }, rows: { memory: 8120, library: 0 } })];

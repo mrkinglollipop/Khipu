@@ -3,7 +3,9 @@
 // the screen shows what the re-read says.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { OwnerActions, actionWords } from "../OwnerActions";
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
+import { ACTION_LABELS, OwnerActions, actionWords } from "../OwnerActions";
 import type { ChainState, OwnerAction, OwnerDirectionSettings } from "../OwnerActions";
 
 const invokeMock = vi.fn();
@@ -323,5 +325,29 @@ describe("actionWords", () => {
     const text = actionWords({ id: "1", at: "2026-10-27T00:00:00Z", action: "outbox.merge_preferences", target: "held lines" });
     expect(text).not.toContain("outbox.");
     expect(text.length).toBeGreaterThan(10);
+  });
+
+  it("has a plain label for every action id the back end can log", () => {
+    const cwd = (globalThis as unknown as { process: { cwd(): string } }).process.cwd();
+    const src: string = readFileSync(`${cwd}/../../packages/cli/khipu/owner_direction.py`, "utf8");
+    const block = src.match(/ACTIONS: frozenset\[str\] = frozenset\(\{([\s\S]*?)\}\)/)![1];
+    const ids = [...block.matchAll(/"([a-z_.]+)"/g)].map((m) => m[1]);
+    expect(ids.length).toBeGreaterThan(60);
+    for (const id of ids) {
+      expect(ACTION_LABELS[id], id).toBeTruthy();
+      const text = actionWords({ id: "1", at: "2026-10-27T00:00:00Z", action: id, target: "claude|/Users/x/.claude" });
+      expect(text, id).not.toContain(id);
+    }
+  });
+
+  it("reads an unknown id as words, never the dotted id", () => {
+    const text = actionWords({ id: "1", at: "2026-10-27T00:00:00Z", action: "future.new_thing", target: "x" });
+    expect(text).not.toContain(".");
+    expect(text).toContain("future new thing");
+  });
+
+  it("names the account for a priority amendment", () => {
+    const text = actionWords({ id: "1", at: "2026-10-27T00:00:00Z", action: "route.priority.amend", target: "codex|/Users/x/.codex" });
+    expect(text).toBe("Changed the priority entry for Codex (codex)");
   });
 });

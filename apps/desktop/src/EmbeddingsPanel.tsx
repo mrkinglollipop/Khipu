@@ -624,7 +624,12 @@ export function EmbeddingsPanel({ active }: { active: boolean }) {
           ? ({ tone: "warn", text: `${num(toRedo)} to redo` } as const)
           : mem.embedded === 0
             ? ({ tone: "warn", text: "Not started" } as const)
-            : ({ tone: "warn", text: memJob?.state === "running" ? "In progress" : "Partial" } as const);
+            : memJob?.state === "running"
+              ? ({ tone: "warn", text: "In progress" } as const)
+              : !p.is_active && !inUse && memJob == null
+                ? // A model nothing uses is not a fault: say it is inactive, not partial.
+                  ({ tone: "neutral", text: "Inactive" } as const)
+                : ({ tone: "warn", text: "Partial" } as const);
 
     const failedJob = memJob && memJob.state === "failed" ? memJob : null;
     const deleteWhy = anyBusy

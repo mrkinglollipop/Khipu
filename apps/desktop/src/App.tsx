@@ -49,7 +49,7 @@ import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelEr
 import { KeysCard } from "./KeysCard";
 import { PlansCard, liveWords, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
-import { toastWords } from "./humanWords";
+import { owedReasonWords, toastWords } from "./humanWords";
 import { RoutingSettings } from "./RoutingSettings";
 import { WorkSettings } from "./WorkSettings";
 import { useRouting } from "./routing";
@@ -1195,7 +1195,7 @@ const OwedRow = memo(function OwedRow({
           {c.text}
         </span>
         {c.status === "closed" && c.close_reason ? (
-          <span className="meta owed-reason">Closed: {c.close_reason}</span>
+          <span className="meta owed-reason">Closed: {owedReasonWords(c.close_reason)}</span>
         ) : null}
         {c.status !== "closed" && c.looks_settled ? (
           <span className="inline owed-settled">
@@ -1213,7 +1213,7 @@ const OwedRow = memo(function OwedRow({
         {c.status !== "closed" && c.looks_done ? (
           <span className="inline owed-settled">
             <span className="meta">
-              Looks done{c.looks_done.reason ? `: ${c.looks_done.reason}` : ""}
+              Looks done{c.looks_done.reason ? `: ${owedReasonWords(c.looks_done.reason)}` : ""}
             </span>
             <button
               type="button"
@@ -3927,7 +3927,7 @@ export default function App() {
   owedActRef.current = (action, c) => {
     if (action === "select" || action === "unselect") toggleOwed([c.id], action === "select");
     else if (action === "settle") void owedChangeMany("close", [c.id], c.looks_settled ?? "", null, null);
-    else if (action === "closedone") void owedChangeMany("close", [c.id], c.looks_done?.reason ? `Looked done: ${c.looks_done.reason}` : LOOKED_DONE_REASON, null, null);
+    else if (action === "closedone") void owedChangeMany("close", [c.id], c.looks_done?.reason ? `Looked done: ${owedReasonWords(c.looks_done.reason)}` : LOOKED_DONE_REASON, null, null);
     else if (action === "activity") openInActivity(c.opened_episode ?? 0);
     else if (action === "reopen") void owedWrite(c.id, [`--reopen=${c.id}`]);
     else if (action === "done") void owedWrite(c.id, [`--close=${c.id}`]);
@@ -6244,6 +6244,7 @@ export default function App() {
                   <WorkSettings
                     active={tab === "settings" && settingsSection === "work"}
                     work={work}
+                    projectNames={projects.data}
                     importCard={
                       <LedgerImport
                         active={tab === "settings" && settingsSection === "work"}

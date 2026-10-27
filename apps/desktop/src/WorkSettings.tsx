@@ -10,6 +10,8 @@ import { type FormEvent, type ReactNode, useCallback, useEffect, useId, useRef, 
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { type ConfigShape, callCli } from "./settingsCli";
 import { type LimitUnit, limitWords } from "./routingWords";
+import { canonicalNames } from "./WorkView";
+import type { ProjectsList } from "./ProjectsSettings";
 import { type WorkBoard, type WorkState, type WorkView, NO_PROJECT, WITHHELD, plural, shortProject, sourceLine } from "./work";
 import "./Work.css";
 
@@ -99,9 +101,23 @@ function sameProject(fileProject: string | null | undefined, project: string): b
 
 // ---- projects in the ledger ---------------------------------------------------------
 
-function ProjectRow({ p, w }: { p: LedgerProject; w: Writes }) {
+/** A ledger project's name as the Work tab shows it: a name the owner set stays;
+ *  otherwise an older name of a project (Settings -> Projects) reads as the name
+ *  Khipu shows that project under, the same source the Work filter uses. */
+export function ledgerProjectName(
+  p: { project: string; name: string },
+  canonical: Map<string, string>,
+  view: WorkView | null | undefined,
+): string {
+  if (p.name !== p.project) return p.name;
+  const main = canonical.get(p.project);
+  if (!main) return p.name;
+  return view?.projects.find((b) => b.project === main)?.name ?? shortProject(main);
+}
+
+function ProjectRow({ p, shown, w }: { p: LedgerProject; shown: string; w: Writes }) {
   const [renaming, setRenaming] = useState(false);
-  const [name, setName] = useState(p.name);
+  const [name, setName] = useState(shown);
   const btn = useRef<HTMLButtonElement>(null);
   const fieldId = `${useId().replace(/:/g, "")}-name`;
   const id = `project:${p.project}`;
@@ -111,12 +127,12 @@ function ProjectRow({ p, w }: { p: LedgerProject; w: Writes }) {
   };
   async function save(e: FormEvent) {
     e.preventDefault();
-    if (await w.run(id, "khipu_ledger_project_set", { project: p.project, name: name.trim() === p.project ? "" : name, hidden: null })) close();
+    if (await w.run(id, "khipu_ledger_project_set", { project: p.project, name: name.trim() === p.project || (shown !== p.name && name.trim() === shown) ? "" : name, hidden: null })) close();
   }
   const started = dayWords(p.created_at);
   return (
     <div className="row-item wk-proj-row" role="listitem">
-      <span className="wk-proj-name">{p.name}</span>
+      <span className="wk-proj-name">{shown}</span>
       <span className="wk-proj-what">
         <span>
           {plural(p.rows, "row")} · {p.open.toLocaleString()} open · {p.needs_owner.toLocaleString()}{" "}
@@ -133,11 +149,11 @@ function ProjectRow({ p, w }: { p: LedgerProject; w: Writes }) {
           ref={btn}
           type="button"
           className="sm"
-          aria-label={`Rename ${p.name}`}
+          aria-label={`Rename ${shown}`}
           aria-expanded={renaming}
           disabled={w.busy !== null}
           onClick={() => {
-            setName(p.name);
+            setName(shown);
             setRenaming((v) => !v);
           }}
         >
@@ -146,7 +162,7 @@ function ProjectRow({ p, w }: { p: LedgerProject; w: Writes }) {
         <button
           type="button"
           className="sm"
-          aria-label={`${p.hidden ? "Show" : "Hide"} ${p.name}`}
+          aria-label={`${p.hidden ? "Show" : "Hide"} ${shown}`}
           disabled={w.busy !== null}
           onClick={() => void w.run(id, "khipu_ledger_project_set", { project: p.project, name: null, hidden: !p.hidden })}
         >
@@ -156,7 +172,7 @@ function ProjectRow({ p, w }: { p: LedgerProject; w: Writes }) {
       {renaming ? (
         <form
           className="wk-add wk-span"
-          aria-label={`Rename ${p.name}`}
+          aria-label={`Rename ${shown}`}
           onSubmit={save}
           onKeyDown={(e) => {
             if (e.key === "Escape") {
@@ -220,7 +236,7 @@ export function workOnlyProjects(view: WorkView | null | undefined, ledger: Ledg
   return { projects, unnamed };
 }
 
-function ProjectsSection({ projects, error, view, w }: { projects: LedgerProject[] | null; error: string | null; view: WorkView | null; w: Writes }) {
+function ProjectsSection({ projects, error, view, canonical, w }: { projects: LedgerProject[] | null; error: string | null; view: WorkView | null; canonical: Map<string, string>; w: Writes }) {
   const others = workOnlyProjects(view, projects ?? []);
   const unnamedWords = [
     others.unnamed.withheld ? `${others.unnamed.withheld.toLocaleString()} under ${WITHHELD.name}` : "",
@@ -243,7 +259,7 @@ function ProjectsSection({ projects, error, view, w }: { projects: LedgerProject
         {projects?.length ? (
           <div className="rows" role="list" aria-label="Ledger projects">
             {projects.map((p) => (
-              <ProjectRow key={p.project} p={p} w={w} />
+              <ProjectRow key={p.project} p={p} shown={ledgerProjectName(p, canonical, view)} w={w} />
             ))}
           </div>
         ) : null}
@@ -765,7 +781,7 @@ function HiddenSection({ items, error, w }: { items: HiddenItem[] | null; error:
 
 // ---- the page -----------------------------------------------------------------------
 
-export function WorkSettings({ active, work, importCard }: { active: boolean; work: WorkState; importCard?: ReactNode }) {
+export function WorkSettings({ active, work, importCard, projectNames }: { active: boolean; work: WorkState; importCard?: ReactNode; projectNames?: ProjectsList | null }) {
   const [cfg, setCfg] = useState<WorkConfig | null>(null);
   const [cfgError, setCfgError] = useState<string | null>(null);
   const [projects, setProjects] = useState<LedgerProject[] | null>(null);
@@ -823,7 +839,7 @@ export function WorkSettings({ active, work, importCard }: { active: boolean; wo
           Khipu couldn't read its settings: {cfgError}
         </p>
       ) : null}
-      <ProjectsSection projects={projects} error={projectsError} view={work.data ?? null} w={w} />
+      <ProjectsSection projects={projects} error={projectsError} view={work.data ?? null} canonical={canonicalNames(projectNames)} w={w} />
       {/* Import a tracker…, Last import and Old tracker files: the mock's second card. */}
       {importCard}
       <SummarySection entries={entries} suggested={cfg?.work_suggested ?? []} boards={boards} projects={projects ?? []} w={w} write={writeEntries} />

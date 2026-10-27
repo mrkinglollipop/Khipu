@@ -64,6 +64,26 @@ describe("RightNowCard", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows a grey dot and says idle after a week of silence, like the Harnesses card", () => {
+    const week = 8 * 86400;
+    const liveness: LivenessPayload = {
+      ok: true,
+      harnesses: {
+        aegis: { ok: true, seen: true, pending_turns: 0, last_captured_age_s: week },
+        codex: { ok: true, seen: true, pending_turns: 0, last_captured_age_s: 60 },
+      },
+      queue_depth: 0,
+      captured_today: 0,
+    };
+    const { container } = render(
+      <RightNowCard liveness={liveness} busy={false} message={null} onCaptureNow={() => {}} />,
+    );
+    const dots = container.querySelectorAll(".hdot");
+    expect(dots[0].className).not.toMatch(/\b(ok|err|warn)\b/);
+    expect(dots[1].className).toMatch(/\bok\b/);
+    expect(screen.getByText(/idle, last capture 8 days ago/)).toBeInTheDocument();
+  });
+
   it("does not call an uncollected liveness payload an empty session list", () => {
     render(
       <RightNowCard
