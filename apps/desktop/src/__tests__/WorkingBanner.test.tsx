@@ -65,7 +65,10 @@ describe("WorkingBanner", () => {
     expect(scrollerAt).toBeGreaterThan(bannerAt);
     expect(rule(".main")).toContain("overflow: hidden;");
     expect(rule(".main-content")).toContain("overflow-y: auto;");
-    expect(rule(".working-banner")).toContain("flex: none;");
+    // Overlay, not a row: it must not push the page down when it appears.
+    expect(rule(".working-banner")).toContain("position: absolute;");
+    expect(rule(".working-banner")).toContain("pointer-events: none;");
+    expect(rule(".main")).toContain("position: relative;");
     expect(rule(".panel-head")).toContain("top: 0;");
   });
 });

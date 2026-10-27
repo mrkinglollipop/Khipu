@@ -124,6 +124,24 @@ describe("buildAttention: rate checks", () => {
     expect(item?.fix?.kind).toBe("refresh-snapshot");
   });
 
+  it("the health row says the same as Home's notice when the offline copy is not trusted", () => {
+    const parsed = {
+      prompt_recall_snapshot_ok: true,
+      prompt_recall_snapshot: { ok: true, fresh: false, exists: true, age_seconds: 480 },
+    };
+    const item = buildAttention(parsed).items.find((i) => i.key === "prompt_recall_snapshot");
+    const row = healthRows(parsed).find((r) => r.key === "prompt_recall_snapshot_ok");
+    expect(item?.cause).toMatch(/not trusted yet/);
+    expect(item?.cause).toMatch(/by itself/);
+    expect(row?.detail).toBe(item?.cause);
+    const fresh = healthRows({ prompt_recall_snapshot_ok: true, prompt_recall_snapshot: { ok: true, fresh: true } })
+      .find((r) => r.key === "prompt_recall_snapshot_ok");
+    expect(fresh?.detail).toBeUndefined();
+    const old = buildAttention({ prompt_recall_snapshot_ok: true, prompt_recall_snapshot: { ok: true, fresh: false, exists: true, age_seconds: 90000 } })
+      .items.find((i) => i.key === "prompt_recall_snapshot");
+    expect(old?.cause).toMatch(/more than a day old/);
+  });
+
   it("shows an offline copy built for another version as amber, with the row still green", () => {
     const message = "This Mac's offline copy was built for an older version of Khipu (layout 5; this version uses 6).";
     const parsed = {

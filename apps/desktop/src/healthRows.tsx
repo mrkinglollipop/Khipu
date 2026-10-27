@@ -7,7 +7,8 @@
 // via `doctorAttention.ts`), or grey (not configured on this Mac, so never
 // checked at all — distinct from both).
 import { Check, CircleMinus, TriangleAlert } from "lucide-react";
-import type { Attention } from "./doctorAttention";
+import { replicaUntrustedWords } from "./doctorAttention";
+import type { Attention, ReplicaTrust } from "./doctorAttention";
 import {
   canonicalSynthProvider,
   formatUsd,
@@ -294,8 +295,10 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
     return ds?.level === "amber" && ds.message ? ds.message : undefined;
   }
   if (key === "prompt_recall_snapshot_ok") {
-    const prs = parsed.prompt_recall_snapshot as { level?: string; message?: string } | undefined;
-    return prs?.level === "amber" && prs.message ? prs.message : undefined;
+    const prs = parsed.prompt_recall_snapshot as ReplicaTrust | undefined;
+    if (prs?.level === "amber" && prs.message) return prs.message;
+    // `ok` here is always true; Home's notice reads `fresh`. Say the same thing on the row.
+    return prs?.fresh === false ? replicaUntrustedWords(prs) : undefined;
   }
   return undefined;
 }

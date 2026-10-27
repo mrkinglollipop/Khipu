@@ -90,6 +90,88 @@ const SETTING_WORDS: Record<string, string> = {
   session_binding: "session-only binding",
 };
 
+/** One plain label for every owner action id the back end can log
+ *  (`ACTIONS` in packages/cli/khipu/owner_direction.py). `actionWords` adds the
+ *  target where it helps; an id missing here still reads as words, never as the
+ *  raw dotted id. A test keeps this table equal to the back end's list. */
+export const ACTION_LABELS: Record<string, string> = {
+  "owed.correct_job_origin": "Checked which Owed items came from background jobs",
+  "owed.correct_job_origin.confirm": "Moved Owed items that came from background jobs",
+  "owed.change": "Changed Owed items",
+  "owed.tidy": "Tidied the Owed list",
+  "route.definition.set": "Changed an account or provider definition",
+  "route.pause": "Paused an account",
+  "route.lift": "Lifted a pause",
+  "route.clear": "Cleared a report",
+  "route.note.set": "Set the note",
+  "route.note.end": "Ended the note",
+  "route.rule.add": "Added a standing rule",
+  "route.rule.edit": "Changed a standing rule",
+  "route.rule.retire": "Retired a standing rule",
+  "route.rule.restore": "Restored a standing rule",
+  "route.rule.confirm": "Confirmed a standing rule",
+  "route.rule.undo": "Undid a change to a standing rule",
+  "route.rule.dismiss": "Dismissed a standing rule",
+  "route.hold.add": "Added a hold",
+  "route.hold.end": "Ended a hold",
+  "route.cap.set": "Set a usage cap",
+  "route.cap.remove": "Removed a usage cap",
+  "route.priority.set": "Set the priority",
+  "route.priority.amend": "Changed an account's priority entry",
+  "route.priority.confirm": "Confirmed the priority",
+  "route.priority.undo": "Undid the priority change",
+  "route.priority.clear": "Cleared the priority",
+  "route.tier_table.set": "Changed the model tier table",
+  "route.tier_table.confirm": "Confirmed the model tier table",
+  "route.tier_table.clear": "Cleared the model tier table",
+  "accounts.track": "Started tracking an account",
+  "accounts.rename": "Renamed an account",
+  "accounts.stop": "Stopped tracking an account",
+  "accounts.move": "Moved an account to another login folder",
+  "accounts.decline": "Stopped offering an account",
+  "accounts.offer_again": "Offered an account again",
+  "accounts.auto_track": "Changed automatic account tracking",
+  "accounts.request.confirm": "Kept a change a conversation asked for",
+  "accounts.request.undo": "Undid a change a conversation asked for",
+  "config.usage_accounts": "Changed the tracked accounts",
+  "config.routing_setting": "Changed a routing setting",
+  "config.answer_request.confirm": "Kept a change a conversation asked for",
+  "config.answer_request.undo": "Undid a change a conversation asked for",
+  "promote.gate_ignore": "Let the next update skip a check",
+  "promote.gate_ignore.cancel": "Cancelled the update's skipped check",
+  "ledger.import": "Imported rows into the ledger",
+  "ledger.restore": "Restored a row in the ledger",
+  "ledger.purge": "Removed a row from the ledger for good",
+  "ledger.project": "Changed a ledger project",
+  "ledger.add": "Added a row to the ledger",
+  "ledger.set": "Changed a row in the ledger",
+  "ledger.remove": "Removed a row from the ledger",
+  "work.hide": "Hid a commitment",
+  "work.unhide": "Showed a commitment again",
+  "work.same": "Marked two commitments as the same",
+  "work.not_same": "Marked two commitments as different",
+  "direction.off": "Turned owner direction off",
+  "direction.on": "Turned owner direction on",
+  "direction.acknowledge": "Acknowledged the tamper alarm",
+  "direction.set": "Changed an owner direction setting",
+  "direction.undo": "Undid an owner action",
+  "project.alias_add": "Made one project name an alias of another",
+  "project.alias_remove": "Removed a project alias",
+  "project.merge": "Merged two projects",
+  "project.keep_separate": "Kept two projects separate",
+  "project.separate": "Split a project name out again",
+  "forget.send": "Sent this Mac's forgets the hub lacked to the hub",
+  "forget.here": "Forgot a hub episode, already forgotten on this Mac",
+  "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
+  "outbox.merge_preferences": "Merged saved notes from held captures into the hub",
+};
+
+/** An id with no label above, as words: "foo.bar_baz" reads "Owner change: foo bar baz". */
+function unknownActionWords(id: string): string {
+  const words = id.replace(/[._]+/g, " ").trim();
+  return words ? `Owner change: ${words}` : "An owner change";
+}
+
 /** What was done, in words. */
 export function actionWords(a: OwnerAction): string {
   const t = a.target;
@@ -128,6 +210,12 @@ export function actionWords(a: OwnerAction): string {
       return "Ended a hold";
     case "route.priority.set":
       return "Set the priority";
+    case "route.priority.amend":
+      return `Changed the priority entry for ${accountWords(t)}`;
+    case "route.cap.set":
+      return `Set a usage cap on ${accountWords(t)}`;
+    case "route.cap.remove":
+      return `Removed a usage cap on ${accountWords(t)}`;
     case "route.priority.confirm":
       return "Confirmed the priority";
     case "route.priority.undo":
@@ -208,7 +296,7 @@ export function actionWords(a: OwnerAction): string {
       return `Changed ${SETTING_WORDS[t] ?? t}`;
     }
     default:
-      return a.action;
+      return ACTION_LABELS[a.action] ?? unknownActionWords(a.action);
   }
 }
 

@@ -146,6 +146,28 @@ describe("Settings, Work", () => {
     await waitFor(() => expect(setCalls("khipu_ledger_project_set")).toContainEqual({ project: "acme/atlas", name: "Atlas app", hidden: null }));
   });
 
+  it("shows an older name of a project under the name the Work tab uses", async () => {
+    projects = [
+      { project: "mrkinglollipop/church-harness", name: "mrkinglollipop/church-harness", hidden: false, created_at: null, rows: 1102, open: 5, needs_owner: 1 },
+      { project: "acme/atlas", name: "Atlas", hidden: false, created_at: null, rows: 4, open: 1, needs_owner: 0 },
+    ];
+    render(
+      <WorkSettings
+        active
+        work={work()}
+        projectNames={{
+          groups: [{ canonical: "olivewood", names: [{ name: "mrkinglollipop/church-harness", role: "alias" }, { name: "olivewood", role: "canonical" }] }],
+          pairs: [],
+        } as never}
+      />,
+    );
+    const list = await screen.findByRole("list", { name: "Ledger projects" });
+    expect(within(list).getByText("olivewood")).toBeInTheDocument();
+    expect(within(list).queryByText("mrkinglollipop/church-harness")).toBeNull();
+    // A name the owner set stays as set.
+    expect(within(list).getByText("Atlas")).toBeInTheDocument();
+  });
+
   it("lists the Work tab's projects even when the ledger has none (the installed app said No projects yet)", async () => {
     projects = [];
     const state = work();

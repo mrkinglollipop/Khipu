@@ -164,15 +164,13 @@ export function buildAttention(parsed: Record<string, unknown>): {
 
   if ((parsed as { outbox_ok?: boolean }).outbox_ok === false) {
     issues.push("Captures waiting to sync");
-    const box = (parsed as { outbox?: { pending?: number; dead?: number } }).outbox;
-    const deadOnly = (box?.dead ?? 0) > 0 && (box?.pending ?? 0) === 0;
+    const box = (parsed as { outbox?: OutboxFields }).outbox;
+    const notice = outboxNotice(box);
     items.push({
       key: "outbox",
       tone: "warn",
-      title: "Some captures are still waiting to reach the database",
-      cause: deadOnly
-        ? "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to put them back."
-        : "They were recorded while the database was unreachable and are queued on this Mac. They are delivered automatically once the database answers; nothing is lost meanwhile.",
+      title: notice.title,
+      cause: notice.cause,
     });
   }
 
@@ -374,7 +372,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
     }
   }
 
-  const prs = (parsed as { prompt_recall_snapshot?: { fresh?: boolean; level?: string; message?: string } })
+  const prs = (parsed as { prompt_recall_snapshot?: ReplicaTrust })
     .prompt_recall_snapshot;
   // Amber while the offline copy was built for another version: the replica
   // job rebuilds it on its next check, so this clears by itself.
@@ -394,7 +392,7 @@ export function buildAttention(parsed: Record<string, unknown>): {
       key: "prompt_recall_snapshot",
       tone: "warn",
       title: "Recall before each prompt is reading the slower database",
-      cause: "This Mac's offline copy is not trusted right now, so each prompt waits on the database and may time out. Refreshing the offline copy brings recall back to this Mac.",
+      cause: replicaUntrustedWords(prs),
       fix: { label: "Refresh offline copy", kind: "refresh-snapshot" },
     });
   }
@@ -662,4 +660,77 @@ export function promotionAttention(parsed: Record<string, unknown> | null | unde
         "It goes live by itself once the database answers and its checks pass.",
     },
   ];
+}
+
+/** The `outbox status` fields the notice reads (also nested in the doctor report). */
+export type OutboxFields = {
+  pending?: number;
+  dead?: number;
+  offline?: number;
+  offline_only?: boolean;
+  evidence_conflicts?: number;
+  oldest_age_s?: number | null;
+};
+
+/** Which of the real states the queued captures are in, read from the outbox
+ *  status fields: held for a conflict, buried, waiting for the database, or
+ *  just waiting for the next delivery pass. No terminal command in any. */
+export function outboxNotice(box: OutboxFields | undefined): { title: string; cause: string } {
+  const pending = box?.pending ?? 0;
+  const dead = box?.dead ?? 0;
+  const conflicts = box?.evidence_conflicts ?? 0;
+  const offline = box?.offline ?? 0;
+  if (conflicts > 0) {
+    return {
+      title: `${conflicts === 1 ? "A capture is" : `${conflicts} captures are`} held for a conflict`,
+      cause:
+        "What this Mac recorded disagrees with what the database already holds, so these captures are not sent automatically. The database is reachable and nothing is lost. Ask your agent to reconcile them.",
+    };
+  }
+  if (dead > 0 && pending === 0) {
+    return {
+      title: "Some captures are held on this Mac",
+      cause:
+        "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to put them back.",
+    };
+  }
+  // With no state fields at all (an older report), keep the long-standing wording.
+  const known = box?.offline !== undefined || box?.evidence_conflicts !== undefined;
+  if (offline > 0 || box?.offline_only || !known) {
+    return {
+      title: "Some captures are still waiting to reach the database",
+      cause:
+        "They were recorded while the database was unreachable and are queued on this Mac. They are delivered automatically once the database answers; nothing is lost meanwhile.",
+    };
+  }
+  const stuck = (box?.oldest_age_s ?? 0) > 3600;
+  return {
+    title: "Some captures are queued on this Mac",
+    cause: stuck
+      ? "The oldest has been waiting over an hour although the database is not reported down. Nothing is lost; ask your agent to look at why the queue is not draining."
+      : "They are waiting for the next delivery pass and go to the database automatically; nothing is lost meanwhile.",
+  };
+}
+
+/** The doctor's `prompt_recall_snapshot` block (`hub_snapshot.prompt_recall_snapshot_status`).
+ *  Its `ok` is always true ("never red on its own"); `fresh` is the real signal. */
+export type ReplicaTrust = {
+  ok?: boolean;
+  fresh?: boolean;
+  exists?: boolean;
+  age_seconds?: number | null;
+  level?: string;
+  message?: string;
+};
+
+/** Why Home says recall is using the database, from the fields the doctor
+ *  reports. A copy that is young but not trusted is the transient case: a
+ *  check just found it behind, or it was just replaced (a live-slot swap) and
+ *  has not been checked yet, and it comes back by itself. */
+export function replicaUntrustedWords(prs: ReplicaTrust | undefined): string {
+  const tail = "Each prompt waits on the database meanwhile and may time out. Refreshing the offline copy brings recall back to this Mac.";
+  if (prs?.exists === false) return `This Mac has no offline copy yet. ${tail}`;
+  const age = prs?.age_seconds;
+  if (typeof age === "number" && age > 24 * 3600) return `This Mac's offline copy is more than a day old. ${tail}`;
+  return `This Mac's offline copy is newer than a day but not trusted yet: the last check found it behind the database, or it was just replaced and has not been checked. It is trusted again by itself after the next check. ${tail}`;
 }

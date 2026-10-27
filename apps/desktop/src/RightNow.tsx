@@ -7,7 +7,7 @@
 import { EmptyState, ListRow } from "./ui";
 import { LABEL as HARNESS_LABEL } from "./IntegrationsPanel";
 import type { LivenessPayload } from "./IntegrationsPanel";
-import { fmtAgo } from "./time";
+import { captureIsIdle, fmtAgo } from "./time";
 
 export function RightNowCard({
   liveness,
@@ -54,10 +54,12 @@ export function RightNowCard({
         <>
           {harnesses.map(([id, h]) => {
             const pending = h.pending_turns ?? 0;
+            // Same rule as the Harnesses card: a week of silence is Idle (grey), not green.
+            const idle = h.ok !== false && captureIsIdle(h.last_captured_age_s);
             return (
               <ListRow key={id}>
                 <span
-                  className={`hdot ${h.ok === false ? "err" : "ok"}`}
+                  className={`hdot${h.ok === false ? " err" : idle ? "" : " ok"}`}
                   aria-hidden
                 />
                 <span className="grow ellip t2">
@@ -67,7 +69,7 @@ export function RightNowCard({
                   {pending > 0
                     ? `${pending} turn${pending === 1 ? "" : "s"} waiting for capture`
                     : "nothing waiting"}
-                  {" · last capture "}
+                  {idle ? " · idle, last capture " : " · last capture "}
                   {h.last_captured_age_s != null
                     ? `${fmtAgo(h.last_captured_age_s)}`
                     : "never"}
