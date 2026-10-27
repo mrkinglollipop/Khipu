@@ -536,9 +536,10 @@ def status() -> dict[str, Any]:
 
 
 def _is_recovery_job(job: Any) -> bool:
-    """A memory-file line a recovery writer queued with its owner unknown."""
+    """A memory-file line a recovery writer queued with its owner unknown.
+    Recovery reasons are "recovery: …" and "recovery fact step deferred: …"."""
     return (isinstance(job, dict) and "origin" in job and job["origin"] is None
-            and str(job.get("reason") or "").startswith("recovery:"))
+            and str(job.get("reason") or "").startswith("recovery"))
 
 
 def _retry_order(jp: Path) -> tuple[bool, bool, str, str]:

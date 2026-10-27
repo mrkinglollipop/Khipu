@@ -164,13 +164,19 @@ def test_real_captures_retry_before_recovery_jobs(tmp_path, monkeypatch):
         "20261027T100000Z-real-deferred.json": {"origin": "local:aaaaaaaaaaaa", "reason": "",
                                                 "attempts": 1, "claim_deferred": True,
                                                 "last_attempt_at": "2026-10-27T10:00:00Z"},
+        # mirror's fact-step deferral queues a recovery line under its own reason.
+        "20260603T000000Z-recovery-fact-deferred.json": {
+            "origin": None, "reason": "recovery fact step deferred: history not indexed",
+            "attempts": 0},
     }
     for name, job in jobs.items():
         (folder / name).write_text(json.dumps({"payload": {}, **job}))
     order = [p.name for p in sorted(outbox.jobs(), key=outbox._retry_order)]
     assert order == ["20261027T120000Z-real.json", "20261027T110000Z-real-tried.json",
                      "20261027T100000Z-real-deferred.json",
-                     "20260601T000000Z-recovery.json", "20260602T000000Z-recovery-tried.json"]
+                     "20260601T000000Z-recovery.json",
+                     "20260603T000000Z-recovery-fact-deferred.json",
+                     "20260602T000000Z-recovery-tried.json"]
 
 
 def test_bounded_drain_reaches_a_real_capture_behind_a_recovery_backlog(world, monkeypatch):  # noqa: F811
