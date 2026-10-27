@@ -921,11 +921,22 @@ def _open_id_for_hash(cur, scope: str | None, content_h: str) -> int | None:
     than a bool so the caller can record the restatement (``last_seen_at`` /
     ``seen_count``) instead of silently dropping it.
     """
+    # Alias-group members share one open-hash scope (Q3 projects).
+    if scope is None:
+        project_sql, project_param = "project IS NOT DISTINCT FROM %s", None
+    else:
+        from khipu.identity import project_group
+
+        group = project_group(cur, scope)
+        if len(group) == 1:
+            project_sql, project_param = "project IS NOT DISTINCT FROM %s", group[0]
+        else:
+            project_sql, project_param = "project = ANY(%s)", group
     cur.execute(
         "SELECT id FROM commitments WHERE status = 'open' AND content_hash = %s "
-        "AND project IS NOT DISTINCT FROM %s "
+        f"AND {project_sql} "
         f"AND {_not_forgotten_clause(cur)} LIMIT 1",
-        (content_h, scope),
+        (content_h, project_param),
     )
     row = cur.fetchone()
     return int(row[0]) if row else None
@@ -1719,12 +1730,64 @@ def _owner_unchanged(cur, row: dict[str, Any]) -> tuple[str, tuple]:
     return sql, tuple(params)
 
 
+def settle_suggestion_sql(cur, table: str = "commitments") -> str:
+    """``settle_suggestion`` as a hub reader may return it: NULL when the
+    suggestion cites a forgotten episode, or a decision of one, as its
+    evidence (the forget clears those, ``forget._clear_cited_suggestions``;
+    this holds for a row written meanwhile or by older code), or cites a
+    decision without naming its source episode."""
+    col = f"{table}.settle_suggestion"
+    try:
+        from khipu.db import has_columns
+
+        if not has_columns(cur, "episodes", "deleted_at"):
+            return col
+        decisions = has_columns(cur, "decisions", "episode_id")
+    except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
+        return col
+    cited = f"fe.id::text = {col}->>'episode'"
+    if decisions:
+        cited += (f" OR fe.id IN (SELECT d.episode_id FROM decisions d WHERE d.id::text IN "
+                  f"({col}->>'decision_id', {col}->'evidence'->>'decision_id'))")
+    # A suggestion quoting a decision names the episode its text came from
+    # (``episode``); one without it cannot be checked, as the decision may
+    # have moved to another source since, so it is not shown.
+    unsourced = (f"({col}->>'decision_id' IS NOT NULL OR {col}->'evidence'->>'decision_id' IS NOT NULL) "
+                 f"AND {col}->>'episode' IS NULL")
+    return (f"CASE WHEN {unsourced} THEN NULL "
+            f"WHEN EXISTS (SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND ({cited})) "
+            f"THEN NULL ELSE {col} END")
+
+
+def close_reason_sql(cur, table: str = "commitments") -> str:
+    """``close_reason`` as a hub reader may return it: 'forgotten' when the
+    close was made by a forgotten episode or cites a decision of one (the
+    forget rewrites those, ``forget._clear_cited_closes``; this holds for a
+    row written meanwhile or by older code)."""
+    col = f"{table}.close_reason"
+    try:
+        from khipu.db import has_columns
+
+        if not has_columns(cur, "episodes", "deleted_at"):
+            return col
+        cited = f"fe.id = {table}.closed_episode"
+        if has_columns(cur, "decisions", "episode_id") and has_columns(cur, "commitments", "close_evidence"):
+            cited += (f" OR fe.id IN (SELECT d.episode_id FROM decisions d "
+                      f"WHERE d.id::text = {table}.close_evidence->>'decision_id')")
+    except Exception:  # noqa: BLE001 - a failed probe reads as not migrated
+        return col
+    return (f"CASE WHEN EXISTS (SELECT 1 FROM episodes fe WHERE fe.deleted_at IS NOT NULL AND ({cited})) "
+            f"THEN 'forgotten' ELSE {col} END")
+
+
 def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: str,
                        evidence: dict | None = None, episode: int | None = None) -> bool:
     """Keep a refused close on the owner's item as a "Looks done" suggestion
     (``settle_suggestion``) with its rule, reason and evidence, for him to
     close. Evidence he already reopened against (``reopened_rule_keys``) is
-    never suggested again, and the same key is not rewritten."""
+    never suggested again, and the same key is not rewritten unless the old
+    one quotes a decision without its source episode (readers hide that one,
+    :func:`settle_suggestion_sql`). A PR suggestion has no episode to name."""
     if not _close_columns_ready(cur):
         return False
     doc = {"looks_done": True, "rule": rule, "reason": str(reason or "")[:300], "key": key,
@@ -1732,7 +1795,9 @@ def suggest_looks_done(cur, commitment_id: int, *, rule: str, reason: str, key: 
     cur.execute(
         "UPDATE commitments SET settle_suggestion = %s::jsonb WHERE id = %s AND status = 'open' "
         "AND NOT (%s = ANY(reopened_rule_keys)) "
-        "AND (settle_suggestion IS NULL OR settle_suggestion->>'key' IS DISTINCT FROM %s)",
+        "AND (settle_suggestion IS NULL OR settle_suggestion->>'key' IS DISTINCT FROM %s "
+        "OR (settle_suggestion->>'episode' IS NULL AND (settle_suggestion->>'decision_id' IS NOT NULL "
+        "OR settle_suggestion->'evidence'->>'decision_id' IS NOT NULL)))",
         (json.dumps(doc, default=str), commitment_id, key, key),
     )
     return cur.rowcount > 0
@@ -2029,11 +2094,17 @@ def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
     """Open commitments opened by an episode of THIS session.
 
     Joined through ``episodes`` rather than a new column so rows written
-    before this change are covered too.
+    before this change are covered too. ``latest_text`` is included when
+    migration lineage columns exist so a restatement's future-trigger wording
+    is visible to :func:`close_session_plan`. ``last_seen_at`` / ``seen_count``
+    come along when migration 0012 is present so a later session's restatement
+    can block the opening session's session-ended close.
     """
+    latest = ", c.latest_text" if _lineage_columns_ready(cur) else ""
+    seen = ", c.last_seen_at, c.seen_count" if _seen_columns_ready(cur) else ""
     cur.execute(
         f"""
-        SELECT c.id, c.text, c.kind, c.owner
+        SELECT c.id, c.text, c.kind, c.owner{latest}{seen}
         FROM commitments c
         JOIN episodes e ON e.id = c.opened_episode
         WHERE c.status = 'open' AND e.session_id = %s
@@ -2041,10 +2112,18 @@ def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
         """,
         (session_id,),
     )
-    return [
-        {"id": r[0], "text": r[1], "kind": r[2], "owner": r[3]}
-        for r in cur.fetchall()
-    ]
+    rows = []
+    for r in cur.fetchall():
+        item = {"id": r[0], "text": r[1], "kind": r[2], "owner": r[3]}
+        i = 4
+        if latest:
+            item["latest_text"] = r[i]
+            i += 1
+        if seen:
+            item["last_seen_at"] = r[i]
+            item["seen_count"] = r[i + 1]
+        rows.append(item)
+    return rows
 
 
 def _is_user_owed(row: dict[str, Any]) -> bool:
@@ -2090,13 +2169,21 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         return 0
     closed = 0
     for row in rows:
-        trigger = has_future_trigger(row["text"])
+        # Restatements store newer wording in latest_text; a folded
+        # "… next session" must keep the row open through sessionend.
+        trigger = (has_future_trigger(row["text"] or "")
+                   or has_future_trigger(row.get("latest_text") or ""))
         owner, _label = row_owner(row, future_trigger=trigger)
         # Only the assistant's own items die with its session: the user's,
         # and an agent's (a job's item for its orchestrator), outlive it.
         if _is_user_owed(row) or owner != OWNER_ASSISTANT:
             continue
         if is_end and not trigger:
+            # A later capture restating this row bumps seen_count; the opening
+            # session alone must not retire it (same posture as the nightly
+            # recently_restated guard).
+            if int(row.get("seen_count") or 1) > 1:
+                continue
             # The session-ended rule: an assistant promise with no explicit
             # cross-session trigger dies with its session, whatever shape its
             # text has.
@@ -2193,9 +2280,11 @@ def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str |
     if _lineage_columns_ready(cur):
         select_cols += ["owner_reassigned_by", "owner_reassign_reason", "owner_prior", "owner_prior_label",
                         "linked_ids", "latest_text"]
+    exprs = [settle_suggestion_sql(cur) if c == "settle_suggestion"
+             else f"{close_reason_sql(cur)} AS close_reason" if c == "close_reason" else c for c in select_cols]
     cur.execute(
         f"""
-        SELECT {', '.join(select_cols)}
+        SELECT {', '.join(exprs)}
         FROM commitments
         WHERE {' AND '.join(clauses)}
         ORDER BY opened_at DESC, id DESC

@@ -725,7 +725,7 @@ function PlanRow({ row, now, pause, onSignedIn, onOpen }: {
       {w && p != null ? (
         <>
           <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={meterTone(p)} dim={dim} />
-          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{status.figures === "live" ? `${fmtPct(left!)} left` : fmtPct(p)}</span>
+          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{`${fmtPct(left!)} left`}</span>
           <span className="plan-when meta">
             {windowLabel(w)}
             {reset ? ` · ${reset}` : ""}
@@ -1279,7 +1279,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       ? await callCli("khipu_config_unset", { key: "usage_accounts", expect })
       : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list), expect });
     if (res.ok) onSaved?.();
-    await cfg.reload();
+    const fresh = await cfg.reload();
     setSaving(false);
     if (!res.ok) {
       const problem = accountsRefusal(res, (next ?? []).map(shownAs), added);
@@ -1287,6 +1287,15 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       setClash(problem.field);
       if (problem.field) (problem.field === "name" ? nameRef : homeRef).current?.focus();
       return false;
+    }
+    // `fresh.error` is set only on a real read failure; a superseded reload
+    // returns error: null even when data is null (see useCliState.reload).
+    if (fresh.error != null) {
+      setErr("Could not re-read the account list after saving. Close and reopen this section to try again.");
+      setClash(null);
+      // Save already landed; parent still needs to know the list changed.
+      void onChanged?.();
+      return true;
     }
     void onChanged?.();
     return true;
@@ -1341,6 +1350,11 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       {cfg.error && !status ? (
         <p className="set-error" role="alert">
           Could not read the account list. Close and reopen this section to try again.
+        </p>
+      ) : null}
+      {cfg.error && status ? (
+        <p className="set-error" role="alert">
+          Couldn&apos;t refresh; showing the last value: {cfg.error}
         </p>
       ) : null}
       {entries.length ? (

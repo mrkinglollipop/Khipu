@@ -59,14 +59,15 @@ class NightlyStepHealthTest(unittest.TestCase):
             self.assertTrue(out[key]["ok"], key)
             self.assertTrue(out[key]["skipped"], key)
             self.assertEqual(out[key]["reason"], "not checked yet — the nightly runs at 02:05")
-        self.assertEqual(
-            jobs.skipped_step_names(out),
-            [
-                "notes_reconcile", "embed_provider", "query_cache_prune",
-                "commitments_close_rules", "commitments_hygiene", "mark_stale",
-                "ledger",
-            ],
-        )
+        skipped = jobs.skipped_step_names(out)
+        for name in (
+            "notes_reconcile", "embed_provider", "query_cache_prune",
+            "commitments_close_rules", "commitments_hygiene", "mark_stale",
+            "ledger",
+        ):
+            self.assertIn(name, skipped)
+        # briefs disabled → applicable:false, also greyed via the same list
+        self.assertIn("briefs_build", skipped)
 
     def test_a_stale_recording_over_36h_old_is_red_even_if_it_was_ok(self):
         """A nightly that stopped running altogether must not hide behind a
@@ -293,7 +294,7 @@ class OutboxAgeTest(unittest.TestCase):
             old_ts = time.strftime(
                 "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() - 7200)
             )
-            job.write_text(json.dumps({"queued_at": old_ts, "attempts": 1}), encoding="utf-8")
+            job.write_text(json.dumps({"queued_at": old_ts, "attempts": 1, "payload": {}}), encoding="utf-8")
             with mock.patch.object(outbox, "outbox_dir", return_value=d), \
                     mock.patch.object(outbox, "dead_dir", return_value=d / "dead"):
                 st = outbox.status()

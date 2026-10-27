@@ -176,7 +176,7 @@ def test_owed_offline_preserves_close_rule_fields(tmp_path, version):
     # Exactly the current dump/pull selects columns, no fabricated snapshot columns.
     class Cur:
         def execute(self, sql): self.sql = sql
-        def fetchall(self): return [tuple(rows[0].get(c.strip()) for c in self.sql.split('SELECT ', 1)[1].split(' FROM ', 1)[0].split(','))]
+        def fetchall(self): return [tuple(rows[0].get(c.strip().rsplit('.', 1)[-1]) for c in self.sql.split('SELECT ', 1)[1].split(' FROM ', 1)[0].split(','))]
     cur = Cur()
     with patch.object(hs, '_pg_columns', lambda cur, table: set(rows[0]) if table == 'commitments' else set()):
         cols, exported = hs._hub_commitments(cur)
