@@ -367,7 +367,8 @@ class _SessionCursor:
                 out = out[: int(params[-1])]
             self._result = [
                 (r["id"], r["text"], r["project"], r["kind"], r["owner"], r["opened_at"],
-                 r["session_id"], "t9", r["aged"], r["end_event"])
+                 r["session_id"], "t9", r["aged"], r["end_event"],
+                 r.get("recently_restated", False), r.get("latest_text"))
                 for r in out
             ]
             return
