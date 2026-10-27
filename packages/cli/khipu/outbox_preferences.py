@@ -778,7 +778,9 @@ def dry_run(include_content: bool = False, include_decisions: bool = False) -> d
 
 
 def _merge_episode(cur, row: tuple, lines: list[dict[str, Any]], place=None) -> tuple[dict[str, Any] | None, list]:
-    """The append-only change for one locked row, re-proved against it now:
+    """The append-only change for one locked row, re-proved against it now
+    for its ``lines`` that passed the forget fences (``apply`` drops the rest
+    under the memory lock and the row lock, before it calls this):
     what to record and write (None when nothing is to be added any more), and
     the lines to resolve (``preferences_contained``,
     ``preferences_contained_normalized`` or, with ``place``,
@@ -787,7 +789,7 @@ def _merge_episode(cur, row: tuple, lines: list[dict[str, Any]], place=None) -> 
     eid, deleted_at, raw, column = row[:4]
     if deleted_at is not None:
         return None, []
-    live = [line for line in lines if not _forgotten(cur, eid, line["view"])]
+    live = lines  # past the forget fences: ``apply`` checks them under both locks
     planned = _episode_plan(row, live, place) if live else None
     if planned is None:
         return None, []
@@ -1026,6 +1028,7 @@ def apply(*, record, record_resolutions, record_committed=None, include_content:
     log holds the texts and the created row ids before it commits."""
     from khipu import memory_lock
     from khipu.db import connect
+    from khipu.tombstones import episode_hidden, hub_source_forgotten
 
     include_content = include_content or include_decisions
     merged: list[dict[str, Any]] = []
@@ -1056,10 +1059,17 @@ def apply(*, record, record_resolutions, record_committed=None, include_content:
                     try:
                         cur.execute(lock_sql, (part,))
                         for r in cur.fetchall():
-                            lines = by_episode[int(r[0])]
+                            eid = int(r[0])
+                            lines = by_episode[eid]
                             for line in lines:
                                 line["row"] = tuple(r[:4])
-                            entry, resolve = _merge_episode(cur, tuple(r[:width]), lines, place)
+                            # The forget fences, under the memory lock and the
+                            # row lock, before anything of this episode is
+                            # written: forgotten by id on this Mac, or a line's
+                            # source forgotten here or in the hub.
+                            live = [] if episode_hidden(eid) else [
+                                line for line in lines if not hub_source_forgotten(cur, line["view"])]
+                            entry, resolve = _merge_episode(cur, tuple(r[:width]), live, place)
                             spec = ((entry or {}).get("content") or {}).get("decisions")
                             if spec and not _write_decisions(cur, tuple(r[:width]), spec, lines):
                                 # Nothing of this episode is written or
@@ -1122,29 +1132,6 @@ def apply(*, record, record_resolutions, record_committed=None, include_content:
         out["next"] += (f" {len(failed_lines)} line(s) could not be archived (lines_failed) and stay held; "
                         "every other line was handled.")
     return out
-
-
-def _undo_fenced(cur, eid: int, entry: dict[str, Any]) -> bool:
-    """Apply's fences, re-checked for Undo: forgotten by id on this Mac, or
-    by any source identity the merged lines carried, here or in the hub."""
-    from khipu.db import has_table
-    from khipu.tombstones import episode_hidden, hub_form, read_gate
-
-    if episode_hidden(eid):
-        return True
-    tags = set(entry.get("identities") or [])
-    if not tags:
-        return False
-    try:
-        if tags & read_gate().refusals:
-            return True
-    except Exception:  # noqa: BLE001 - an unreadable registry shows no episode
-        return True
-    if not has_table(cur, "forgotten_sources"):
-        return False
-    cur.execute("SELECT 1 FROM forgotten_sources WHERE identity = ANY(%s) LIMIT 1",
-                (sorted(f for t in tags if (f := hub_form(t))),))
-    return cur.fetchone() is not None
 
 
 def _undo_specs(entry: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -1223,6 +1210,16 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
     nothing of that episode is undone and the rows are named."""
     from khipu import decisions, memory_lock, outbox
     from khipu.db import connect
+    from khipu.tombstones import RegistryError, episode_hidden, hub_source_forgotten_tags
+
+    def forgotten_source(entry: dict[str, Any]) -> bool:
+        # Apply's source fence, re-checked by the identities the merged lines
+        # carried (kept in the entry): here or in the hub. An unreadable
+        # registry undoes nothing of the episode.
+        try:
+            return hub_source_forgotten_tags(cur, entry.get("identities"))
+        except RegistryError:
+            return True
 
     unresolved, still_resolved = 0, []
     for r in resolutions or []:
@@ -1253,7 +1250,7 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
                         e, row = latest[eid], rows.get(eid)
                         proven = eid in committed
                         if (row is None or row[1] is not None or not isinstance(row[2], dict)
-                                or _undo_fenced(cur, eid, e)):
+                                or episode_hidden(eid) or forgotten_source(e)):
                             if proven:
                                 left_alone.append(eid)
                             else:
