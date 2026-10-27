@@ -111,7 +111,7 @@ def migrate_legacy_secrets() -> dict:
             if legacy:
                 set_password(account, legacy, service=SERVICE)
                 report[flag] = True
-    from khipu.db import _explicit_dsn_location
+    from khipu.paths import explicit_dsn_location as _explicit_dsn_location
 
     # With KHIPU_DATA_DIR or KHIPU_DSN_FILE set, the legacy files are not this
     # run's DSN, so a read never copies them into the config dir.

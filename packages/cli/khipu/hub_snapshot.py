@@ -1614,7 +1614,7 @@ def _file_dsn() -> str | None:
     """The DSN files' answer as ``db.resolve_dsn`` reads them: the DSN file
     (``KHIPU_DSN_FILE`` or the configured one), then the config and legacy
     files unless the environment names where the DSN lives."""
-    from khipu.db import _explicit_dsn_location
+    from khipu.paths import explicit_dsn_location as _explicit_dsn_location
 
     env = (os.environ.get("KHIPU_DSN_FILE") or "").strip() or (os.environ.get("ALZY_DSN_FILE") or "").strip()
     candidates = [Path(env) if env else _configured_dsn_file()]

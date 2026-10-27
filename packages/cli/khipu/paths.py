@@ -156,6 +156,16 @@ def _env_override() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+def explicit_dsn_location() -> bool:
+    """Whether KHIPU_DATA_DIR or KHIPU_DSN_FILE names where the DSN lives: then
+    a missing file there means no DSN, never the config or ~/.config/alzy one.
+    Here, not in khipu.db, so the replica readers can ask without loading the
+    database driver."""
+    if any((os.environ.get(n) or "").strip() for n in ("KHIPU_DSN_FILE", "ALZY_DSN_FILE")):
+        return True
+    return _env_override() is not None
+
+
 def default_data_dir() -> Path:
     return DEFAULT_DIR
 

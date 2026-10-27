@@ -81,16 +81,9 @@ def resolve_dsn() -> str:
 
 
 def _explicit_dsn_location() -> bool:
-    """Whether KHIPU_DATA_DIR or KHIPU_DSN_FILE names where the DSN lives: then
-    a missing file there means no DSN, never the old ~/.config/alzy one."""
-    if _env("KHIPU_DSN_FILE", "ALZY_DSN_FILE"):
-        return True
-    try:
-        from khipu.paths import _env_override
+    from khipu.paths import explicit_dsn_location
 
-        return _env_override() is not None
-    except Exception:
-        return False
+    return explicit_dsn_location()
 
 
 def conninfo_with_local_root_cert(dsn: str) -> str:
