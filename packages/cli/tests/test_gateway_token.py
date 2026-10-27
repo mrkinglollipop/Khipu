@@ -37,12 +37,12 @@ class _TempHomeAndDataDirCase(unittest.TestCase):
             mock.patch.object(integ, "AEGIS_TOML", self.home / ".grok" / "config.toml"),
             mock.patch.dict(os.environ, {"KHIPU_DATA_DIR": str(self.data_dir)}),
         ]
+        # addCleanup, not tearDown: an os.environ patch a test starts with
+        # addCleanup must stop before these do, or its stop restores a snapshot
+        # still holding KHIPU_DATA_DIR and leaks it into later tests.
         for p in self._patches:
             p.start()
-
-    def tearDown(self):
-        for p in self._patches:
-            p.stop()
+            self.addCleanup(p.stop)
 
 
 class GatewayTokenFileTest(_TempHomeAndDataDirCase):
@@ -221,7 +221,6 @@ class AegisGatewayVerifyTest(_TempHomeAndDataDirCase):
 
     def tearDown(self):
         self._url_patch.stop()
-        super().tearDown()
 
     def test_not_applicable_without_a_configured_gateway_url(self):
         with mock.patch.dict(os.environ, {"KHIPU_GATEWAY_URL": ""}):
