@@ -35,6 +35,7 @@ import threading
 import time
 from pathlib import Path
 
+from khipu import hook_shape
 from khipu.t3 import is_helper_session
 
 RULE_MD = """# Khipu memory (MCP server `khipu`)
@@ -135,6 +136,32 @@ def claude_additional_context() -> str:
 
 def cursor_mdc() -> str:
     return CURSOR_MDC
+
+
+# Antigravity loads ``~/.gemini/config/rules/*.md`` (global) and a workspace's
+# ``.agents/rules/*.md`` when the file says ``trigger: always_on``; files past
+# 24,000 bytes are cut. T3's Antigravity runtime wires no SessionStart and
+# ignores injected context, so this text is also how that session learns to
+# pull what the other harnesses are pushed: memory (``khipu_status`` with the
+# first message as ``prompt``) and routing (``khipu_route`` before delegating).
+ANTIGRAVITY_RULE_MARK = "<!-- khipu-antigravity-rule -->"
+ANTIGRAVITY_RULE_TAIL = """
+## Antigravity: pull what other harnesses are pushed
+
+- At the start of a session, and before the first answer that could rest on
+  prior work, call `khipu_status` with the user's first message as `prompt`: it
+  returns the same "prior work" a session-start hook would have injected.
+- Before you delegate work to another agent or model (a subagent, a shell
+  command that starts one, a dispatched job), call `khipu_route`: it says which
+  accounts are open or limited and which rules and holds apply. Then call
+  `khipu_route_advise` for the lane you mean to use.
+"""
+
+
+def antigravity_rule() -> str:
+    return ("---\ndescription: Khipu cross-session memory - when and how to use the khipu MCP tools\n"
+            "trigger: always_on\n---\n" + ANTIGRAVITY_RULE_MARK + "\n\n"
+            + RULE_MD.rstrip("\n") + "\n" + ANTIGRAVITY_RULE_TAIL)
 
 
 _CWD_SKIP = frozenset(
@@ -541,22 +568,18 @@ def _session_start_payload() -> dict:
 
 
 def _session_start_cwd(payload: dict | None = None) -> str | None:
-    """The session's folder from the payload (read from stdin when not given)."""
+    """The session's folder from the payload (read from stdin when not given):
+    ``cwd``, else Cursor's ``workspace_roots[0]`` or Antigravity's
+    ``workspacePaths[0]`` (neither sends a ``cwd``)."""
     try:
         if payload is None:
             payload = _session_start_payload()
         cwd = payload.get("cwd") or payload.get("cwd_path")
         if isinstance(cwd, str) and cwd.strip():
             return cwd
-        # Cursor sessionStart: common input uses workspace_roots, not cwd.
-        roots = payload.get("workspace_roots")
-        if isinstance(roots, list) and roots:
-            first = roots[0]
-            if isinstance(first, str) and first.strip():
-                return first
+        return hook_shape.workspace(payload) or None
     except Exception:
         return None
-    return None
 
 
 # ---- the hook's size at session start ------------------------------------------
@@ -567,13 +590,14 @@ def _session_start_cwd(payload: dict | None = None) -> str | None:
 # nothing after the first 2,000 characters reaches it: not the memory slice,
 # not the routing summary. With routing in it, the output is kept under
 # ``_HOOK_CONTEXT_BUDGET`` (a margin below the limit).
-_HOOK_CONTEXT_MOST = 10_000
-_HOOK_CONTEXT_BUDGET = _HOOK_CONTEXT_MOST - 200
+_HOOK_CONTEXT_MOST = hook_shape._CONTEXT_MOST
+# Claude's figure; the other harnesses' are ``hook_shape.budget(shape)``.
+_HOOK_CONTEXT_BUDGET = hook_shape.budget("claude")
 _START_SEP = "\n\n"
 
 
 def _utf16_len(text: str) -> int:
-    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+    return hook_shape.utf16_len(text)
 
 
 def fit_start_context(memory: str, routing_text: str | None,
@@ -833,11 +857,16 @@ class _RoutingAtStart:
 def session_start_main(*, shape: str | None = None) -> None:
     """SessionStart entry: print the harness-native inject JSON.
 
-    ``shape`` is ``cursor`` (flat ``additional_context``) or ``claude`` (nested
-    ``hookSpecificOutput``). Default is Claude. Cursor installs pass ``--cursor``
-    on the shim argv; a process-wide env var must not reshape Claude SessionStart.
+    ``shape`` is ``cursor`` (flat ``additional_context``), ``antigravity``
+    (``injectSteps``) or ``claude`` (nested ``hookSpecificOutput``). Left
+    unset, the payload decides (``hook_shape.resolve_shape``; an older Cursor
+    install's ``--cursor`` argument still counts when the payload names
+    nothing); a process-wide env var must not reshape Claude SessionStart.
     With routing's push on, the full routing summary follows the memory part,
     and the whole stays within the harness's limit (``fit_start_context``).
+    On Cursor and Antigravity a second run for the same session and source
+    within a minute prints ``{}`` (Cursor also runs the Claude entry it
+    imports), so the memory is delivered once.
     """
     started = time.monotonic()
     payload = {}
@@ -845,29 +874,34 @@ def session_start_main(*, shape: str | None = None) -> None:
     reason, want = "ok", "claude"
     try:
         payload = _session_start_payload()
+        detected = shape is None
         if shape is None:
-            shape = "cursor" if "--cursor" in sys.argv[1:] else "claude"
+            shape = hook_shape.resolve_shape(payload, os.environ, sys.argv[1:])
         want = shape.strip().lower()
         cwd = _session_start_cwd(payload)
         if is_helper_session(cwd):
             print("{}")  # T3's thread-title helper: no recall
             return
-        routing = _RoutingAtStart(session_id=payload.get("session_id") or payload.get("sessionId") or "").begin()
+        sid = hook_shape.session_id(payload)
+        # Cursor runs its own entry and the Claude one it imports: the second
+        # of the pair prints {} (the pair shares no session id; see
+        # hook_shape.single_flight). A start source (a resume) is its own call,
+        # except inside that pair, whose two payloads need not agree on it.
+        source = "" if os.environ.get("CURSOR_VERSION") else str(payload.get("source") or "")
+        if detected and not hook_shape.single_flight(payload, os.environ, "SessionStart", source):
+            reason = "single_flight"
+            print("{}")
+            return
+        routing = _RoutingAtStart(session_id=sid).begin()
         token = _START_IS_JOB.set(_session_is_job(payload))
         try:
             memory = session_start_context(cwd)
         finally:
             _START_IS_JOB.reset(token)
-        ctx, pushed = fit_start_context(memory, routing.text())
-        if want == "cursor":
-            out = {"additional_context": ctx}
-        else:
-            out = {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": ctx,
-                }
-            }
+        room = hook_shape.budget(want)
+        ctx, pushed = (fit_start_context(memory, routing.text()) if room == _HOOK_CONTEXT_BUDGET
+                       else fit_start_context(memory, routing.text(), room))
+        out = hook_shape.render(want, "SessionStart", ctx)
         from khipu import wire
 
         print(wire.dumps(out, ensure_ascii=True))
@@ -878,7 +912,7 @@ def session_start_main(*, shape: str | None = None) -> None:
             except Exception as exc:
                 reason = f"error: {type(exc).__name__}: {exc}"
                 return
-            routing.delivered(payload.get("session_id") or payload.get("sessionId"))
+            routing.delivered(sid or None)
     except Exception as exc:
         reason = f"error: {type(exc).__name__}: {exc}"
         raise
@@ -887,9 +921,11 @@ def session_start_main(*, shape: str | None = None) -> None:
             from khipu import owner_turns, recall_prompt
 
             harness = "cursor" if want == "cursor" else owner_turns.harness_of(os.environ, payload)
+            if want == "antigravity":
+                harness = "antigravity"
             if harness == "unknown":
                 harness = "claude_code"
-            session = payload.get("session_id") or payload.get("sessionId") or payload.get("conversation_id") or "unknown"
+            session = hook_shape.session_id(payload) or "unknown"
             msg = (f"session={session} harness={harness} source={payload.get('source') or 'startup'} "
                    f"reason={reason} bytes={injected} routing={'yes' if pushed and injected else 'no'} "
                    f"ms={(time.monotonic() - started) * 1000:.1f}")

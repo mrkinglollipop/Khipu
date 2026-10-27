@@ -87,6 +87,15 @@ PY="${KHIPU_PYTHON:-/opt/homebrew/bin/python3.11}"
 [ -x "$PY" ] || PY="python3"
 STDIN_JSON=$(cat 2>/dev/null)
 export KHIPU_HOOK_STDIN="$STDIN_JSON"
+# Antigravity's payloads carry no event name, so its hook command names one:
+# `khipu-stop-hook --event PostInvocation` (queue-only: it fires after every
+# model call) or `--event Stop`. Every other harness names its own event.
+KHIPU_HOOK_EVENT=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in --event) KHIPU_HOOK_EVENT="${2:-}"; [ "$#" -gt 1 ] && shift ;; esac
+  shift
+done
+export KHIPU_HOOK_EVENT
 # Queue-only mode leaves delivery to the next draining Stop or scheduled job.
 "$PY" - "$MEM" "${KHIPU_HARNESS:-}" <<'PY' 2>>"$LOG_DIR/stop-hook.log" || true
 import json
@@ -96,7 +105,11 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-QUEUE_ONLY = os.environ.get("KHIPU_CAPTURE_QUEUE_ONLY") == "1"
+HOOK_EVENT = (os.environ.get("KHIPU_HOOK_EVENT") or "").strip() or None
+# PostInvocation fires after every model call: it only ever queues, and the
+# next Stop (or the scheduled drain) delivers.
+QUEUE_ONLY = os.environ.get("KHIPU_CAPTURE_QUEUE_ONLY") == "1" or \
+    (HOOK_EVENT or "").lower() == "postinvocation"
 _T0 = time.monotonic()
 tag = f" harness={sys.argv[2]}" if len(sys.argv) > 2 and sys.argv[2] else ""
 _default_budget = 3.0 if len(sys.argv) > 2 and sys.argv[2] == "codex" else 20.0
@@ -144,7 +157,7 @@ try:
     signal.setitimer(signal.ITIMER_REAL, _enqueue_budget, 0.01)
     try:
         from khipu.session_capture import hook_main
-        r = hook_main(os.environ.get("KHIPU_HOOK_STDIN", ""), sys.argv[2] or None)
+        r = hook_main(os.environ.get("KHIPU_HOOK_STDIN", ""), sys.argv[2] or None, HOOK_EVENT)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, _previous_alarm)

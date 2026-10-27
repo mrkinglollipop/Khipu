@@ -697,15 +697,15 @@ class AegisIsolationTest(_TempHomeCase):
                 self.assertNotIn("additional_context", out)
 
     def test_recall_hook_cursor_shape_refuses_aegis_mark(self):
-        """Installed Cursor command must refuse on KHIPU_HARNESS=aegis alone."""
+        """The recall command Cursor runs (the same string as Claude's) must refuse on KHIPU_HARNESS=aegis alone."""
         import os
         import subprocess
 
         # _shim() is read-only outside install() now (B1): a real link must
-        # exist before recall_hook_cursor() returns something the shell can run.
+        # exist before recall_hook() returns something the shell can run.
         (self.home / ".claude").mkdir()
         integ.install("claude_code")
-        cmd = integ.recall_hook_cursor()
+        cmd = integ.recall_hook()
         env = {k: v for k, v in os.environ.items() if k not in ("GROK_HOOK_EVENT", "GROK_HOOK_NAME")}
         env["KHIPU_HARNESS"] = "aegis"
         p = subprocess.run(cmd, shell=True, input="{}", capture_output=True, text=True, timeout=60, env=env)
@@ -880,7 +880,7 @@ class RecallRuleTest(_TempHomeCase):
         self.assertEqual(ss[0]["timeout"], 5)
         ours = [e for e in ss if "khipu-recall-hook" in e["command"]]
         self.assertEqual(len(ours), 1)
-        self.assertIn("--cursor", ours[0]["command"])
+        self.assertEqual(ours[0]["command"], integ.recall_hook())  # one string across packs, no flag
         self.assertEqual(ours[0]["timeout"], integ.CURSOR_RECALL_TIMEOUT)
         self.assertTrue(integ.status("cursor")["hook_sessionstart"])
         self.assertEqual(integ.install("cursor", project=str(proj))["changes"], [])  # idempotent
@@ -906,7 +906,7 @@ class RecallRuleTest(_TempHomeCase):
     def test_recall_probe_cursor_shape(self):
         (self.home / ".claude").mkdir()
         integ.install("claude_code")
-        r = integ._probe_recall(integ.recall_hook_cursor())
+        r = integ._probe_recall(integ.recall_hook(), integ._CURSOR_PROBE_PAYLOAD)
         self.assertTrue(r["ok"], r)
         self.assertGreater(r["chars"], 200)
 
@@ -920,6 +920,8 @@ class RecallRuleTest(_TempHomeCase):
         ), mock.patch.object(
             integ, "_probe_native_extract", return_value={"ok": True}
         ), mock.patch.object(
+            integ, "_probe_prompt_recall", return_value={"ok": True}
+        ) as prompt_probe, mock.patch.object(
             integ, "_runtime", return_value={"ok": True}
         ), mock.patch.object(
             integ, "_probe_recall", return_value={"ok": True, "chars": 400}
@@ -934,13 +936,15 @@ class RecallRuleTest(_TempHomeCase):
         self.assertIn("recall_probe", out["components"])
         self.assertTrue(out["components"]["recall_probe"]["ok"])
         probe.assert_called_once()
-        self.assertIn("--cursor", probe.call_args[0][0])
+        self.assertEqual(probe.call_args[0][0], integ.recall_hook())
+        self.assertEqual(probe.call_args[0][1], integ._CURSOR_PROBE_PAYLOAD)
         recall_refuse = [
             c for c in refuse.call_args_list
             if c.args and "khipu-recall-hook" in str(c.args[0])
         ]
         self.assertEqual(len(recall_refuse), 1)
-        self.assertIn("--cursor", recall_refuse[0].args[0])
+        prompt_probe.assert_called_once_with(integ.prompt_recall_hook(), cursor=True)
+        self.assertTrue(out["components"]["prompt_recall"]["ok"])
 
     def test_cursor_verify_fails_when_recall_probe_fails(self):
         """W6.1: a red recall probe must fail verify even when every other
@@ -956,6 +960,8 @@ class RecallRuleTest(_TempHomeCase):
         ), mock.patch.object(
             integ, "_probe_native_extract", return_value={"ok": True}
         ), mock.patch.object(
+            integ, "_probe_prompt_recall", return_value={"ok": True}
+        ) as prompt_probe, mock.patch.object(
             integ, "_runtime", return_value={"ok": True}
         ), mock.patch.object(
             integ, "_probe_recall", return_value={"ok": True, "chars": 400}
@@ -979,6 +985,8 @@ class RecallRuleTest(_TempHomeCase):
         ), mock.patch.object(
             integ, "_probe_native_extract", return_value={"ok": True}
         ), mock.patch.object(
+            integ, "_probe_prompt_recall", return_value={"ok": True}
+        ) as prompt_probe, mock.patch.object(
             integ, "_runtime", return_value={"ok": True}
         ), mock.patch.object(
             integ, "_probe_recall", return_value={"ok": True, "chars": 400}

@@ -34,12 +34,34 @@ if [ -x "$ROOT/python/bin/python3.11" ]; then
   PY="${KHIPU_PYTHON:-$ROOT/python/bin/python3.11}"
 fi
 [ -x "$PY" ] || PY="python3"
+# The payload names the harness (khipu/hook_shape.py). An older install's --cursor
+# is only a hint, used when the payload names no Cursor or Antigravity.
 SHAPE=claude
+HINT=""
 for a in "$@"; do
-  case "$a" in --cursor) SHAPE=cursor ;; esac
+  case "$a" in --cursor) SHAPE=cursor; HINT="--cursor" ;; esac
 done
 # stdin can be read once, and every path below needs the payload.
 PAYLOAD=$(cat)
+# Antigravity's PreInvocation fires before every model call and carries no
+# prompt: the owner-turn script reads the newest USER_INPUT from the
+# transcript and lets only the first call of each user turn through (it prints
+# nothing for any other payload, a turn not yet flushed to the transcript
+# included, so that call goes on and a later one can still record the turn;
+# "{}" only for a turn already handled; the payload with its prompt filled in
+# for a new one).
+case "$PAYLOAD" in
+  *'"conversationId"'*)
+    if [ -f "$SELF_DIR/khipu-owner-turn.py" ]; then
+      TURN=$(printf '%s' "$PAYLOAD" | "$PY" -S -E -B "$SELF_DIR/khipu-owner-turn.py" --antigravity-turn 2>/dev/null)
+      case "$TURN" in
+        "") ;;
+        "{}") echo '{}'; exit 0 ;;
+        *) PAYLOAD="$TURN" ;;
+      esac
+    fi
+    ;;
+esac
 # Owner direction: record that the owner typed, first, on every path
 # (khipu.owner_turns). The recorder is stdlib-only, prints nothing and never
 # fails.
@@ -77,5 +99,5 @@ export PYTHONPATH
 PYTHONPYCACHEPREFIX="${HOME}/Library/Caches/Khipu/pycache"
 mkdir -p "$PYTHONPYCACHEPREFIX" 2>/dev/null
 export PYTHONPYCACHEPREFIX
-printf '%s' "$PAYLOAD" | "$PY" -c "from khipu.recall_prompt import prompt_recall_main; prompt_recall_main(shape='$SHAPE')" 2>/dev/null || echo '{}'
+printf '%s' "$PAYLOAD" | "$PY" -c "from khipu.recall_prompt import prompt_recall_main; prompt_recall_main(shape=None)" $HINT 2>/dev/null || echo '{}'
 exit 0

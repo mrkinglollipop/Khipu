@@ -37,7 +37,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-from khipu import t3
+from khipu import hook_shape, t3
 from khipu.turn_text import clean_user_text, is_machine, owner_text
 
 RETENTION_S = 24 * 3600
@@ -152,21 +152,11 @@ def session_file(session: str) -> Path:
 
 
 def harness_of(env: dict, payload: dict) -> str:
-    """The harness running this hook, from its environment (the same signals
-    ``routing.conversation_author`` reads) and the payload's transcript."""
-    named = (env.get("KHIPU_HARNESS") or "").strip().lower()
-    if named:
-        return named
-    if env.get("GROK_HOOK_NAME") or env.get("GROK_HOOK_EVENT"):
-        return "aegis"
-    if env.get("CLAUDECODE") or env.get("CLAUDE_CODE_ENTRYPOINT") or env.get("CLAUDE_CODE_SESSION_ID"):
-        return "claude_code"
-    transcript = str(payload.get("transcript_path") or "")
-    if env.get("CODEX_THREAD_ID") or env.get("CODEX_HOME") or "/.codex/" in transcript:
-        return "codex"
-    if "/.claude" in transcript:
-        return "claude_code"
-    return "unknown"
+    """The harness running this hook (``khipu.hook_shape.detect``): the
+    harness's own signals first (the payload, its transcript path, its own
+    environment markers), an environment it merely inherited last, so a Codex
+    job started from inside a Claude Code session is Codex, not claude_code."""
+    return hook_shape.detect(payload, env)[0]
 
 
 def _codex_originator(transcript: str) -> str | None:
@@ -205,6 +195,11 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         if origin != "codex_exec" and t3.thread_for_session(session):
             return "t3"
         return origin or "unknown"
+    if harness == "cursor":
+        return "t3" if t3.thread_for_session(session) else hook_shape.cursor_entrypoint(payload)
+    if harness == "antigravity":
+        surface = hook_shape.antigravity_entrypoint(payload)
+        return "t3" if surface == "unknown" and t3.thread_for_session(session) else surface
     return "unknown"
 
 
@@ -549,7 +544,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
     if not isinstance(payload, dict):
         return None
     conf = settings()
-    session = str(payload.get("session_id") or payload.get("sessionId") or "").strip()
+    session = hook_shape.session_id(payload).strip()
     prompt = payload.get("prompt")
     if not session or not isinstance(prompt, str):
         return None
@@ -841,7 +836,8 @@ def counts(now: float | None = None) -> dict:
     return out
 
 
-_HARNESS_WORDS = {"claude_code": "Claude Code", "codex": "Codex", "aegis": "Aegis"}
+_HARNESS_WORDS = {"claude_code": "Claude Code", "codex": "Codex", "aegis": "Aegis", "cursor": "Cursor",
+                  "antigravity": "Antigravity"}
 
 
 def _prompt_hook_installed() -> list[str]:
@@ -892,14 +888,163 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
             "summary": "Turns recorded in the last day: " + (", ".join(parts) if parts else "none") + "."}
 
 
+# ---- Antigravity: the prompt comes from the transcript ------------------------
+#
+# Antigravity's PreInvocation payload carries no prompt text (scope doc section
+# 3.2), and it fires before EVERY model call, not once per user turn. The turn
+# is the newest USER_INPUT step in the conversation's transcript, and a turn is
+# handled once: a marker per (conversation, step) is created exclusively, so the
+# first model call after a new USER_INPUT wins and every later call, or a second
+# copy of the hook (the global file and a workspace file both loaded), is told
+# to do nothing. It never depends on ``invocationNum``, which the docs count per
+# turn and the ACP runtime counts per session.
+
+_AG_TAIL = 4 << 20
+_AG_WRAP = re.compile(r"^\s*<USER_REQUEST>(.*)</USER_REQUEST>\s*$", re.S)
+_AG_MARKER_KEEP_S = 3 * 24 * 3600
+# PreInvocation can fire before the USER_INPUT step reaches the transcript;
+# the gate re-reads briefly (well inside the hook's 3 s timeout).
+_AG_FLUSH_WAIT_S = 0.4
+_AG_FLUSH_POLL_S = 0.05
+
+
+def _ag_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        for key in ("text", "content", "message"):
+            if isinstance(content.get(key), str):
+                return content[key]
+        return ""
+    if isinstance(content, list):
+        return "\n".join(t for t in (_ag_text(c) for c in content) if t)
+    return ""
+
+
+def _ag_last_user_input(path: str) -> tuple[str, str] | None:
+    """(step key, text) of the newest USER_INPUT step in a transcript, reading
+    only its tail. None when there is none or the file cannot be read."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - _AG_TAIL)
+            fh.seek(start)
+            data = fh.read()
+    except OSError:
+        return None
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]  # the first line of a mid-file read is a fragment
+    for number in range(len(lines) - 1, -1, -1):
+        try:
+            step = json.loads(lines[number])
+        except ValueError:
+            continue
+        if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
+            continue
+        text = _ag_text(step.get("content"))
+        wrapped = _AG_WRAP.match(text)
+        text = (wrapped.group(1) if wrapped else text).strip()
+        if not text:
+            continue
+        index = step.get("step_index")
+        if isinstance(index, int) and not isinstance(index, bool):
+            return f"step-{index}", text
+        # No step index: the text and the step's time tell two identical prompts apart.
+        stamp = f"{text}\0{step.get('created_at')}"
+        return "h-" + hashlib.sha256(stamp.encode("utf-8", "replace")).hexdigest()[:16], text
+    return None
+
+
+def _ag_flush_wait() -> float:
+    try:
+        return max(0.0, min(2.0, float(os.environ.get("KHIPU_AG_FLUSH_WAIT_S", _AG_FLUSH_WAIT_S))))
+    except ValueError:
+        return _AG_FLUSH_WAIT_S
+
+
+def antigravity_turn(payload: dict, now: float | None = None, wait: float | None = None) -> dict | None:
+    """What the prompt hook does with one Antigravity PreInvocation payload.
+
+    None: not for this function (another harness, or it already names a
+    prompt), or no user turn could be read yet, so the payload goes on
+    unchanged and no marker is written: a PreInvocation that fires before
+    Antigravity flushes the USER_INPUT step never ends the hook, and a later
+    call of the same turn can still record it. ``{}``: this user turn was
+    already handled (its once-per-turn marker exists), so the hook prints
+    ``{}``. Otherwise the payload with ``prompt`` (and ``cwd``) filled in
+    from the transcript, for the first model call of a new turn. Before
+    giving up on an unflushed transcript it re-reads for up to ``wait``
+    seconds (``KHIPU_AG_FLUSH_WAIT_S``, default 0.4). Never raises."""
+    try:
+        if not isinstance(payload, dict) or hook_shape.detect(payload, os.environ)[0] != "antigravity":
+            return None
+        if isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
+            return None
+        session = hook_shape.session_id(payload).strip()
+        if not session:
+            return None
+        found = None
+        tp = hook_shape.transcript_path(payload)
+        last = payload.get("lastUserInput") or payload.get("last_user_input")
+        has_last = isinstance(last, str) and bool(last.strip())
+        if tp:
+            found = _ag_last_user_input(tp)
+            if found is None and not has_last:
+                give_up = time.monotonic() + (_ag_flush_wait() if wait is None else max(0.0, wait))
+                while found is None and time.monotonic() < give_up:
+                    time.sleep(_AG_FLUSH_POLL_S)
+                    found = _ag_last_user_input(tp)
+        if found is None and has_last:
+            found = ("h-" + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], last.strip())
+        if found is None:
+            return None
+        key, text = found
+        directory = folder() / "antigravity"
+        directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(directory, 0o700)
+        marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
+        try:
+            os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        except FileExistsError:
+            return {}
+        stamp = time.time() if now is None else now
+        for old in directory.iterdir():
+            try:
+                if stamp - old.stat().st_mtime > _AG_MARKER_KEEP_S:
+                    old.unlink()
+            except OSError:
+                continue
+        out = dict(payload)
+        out["prompt"] = text
+        if not isinstance(out.get("cwd"), str) or not out["cwd"]:
+            workspace = hook_shape.workspace(payload)
+            if workspace:
+                out["cwd"] = workspace
+        return out
+    except Exception:  # noqa: BLE001 - the gate must never fail a prompt
+        return None
+
+
 def main(argv: list[str]) -> int:
     """The prompt hook's recorder: the payload on stdin, prints nothing.
-    Always exits 0."""
+    Always exits 0.
+
+    ``--antigravity-turn`` is the gate in front of it (see ``antigravity_turn``):
+    it prints nothing for a payload to pass on as it is (no turn readable yet
+    included), ``{}`` only for a turn already handled, and the payload with
+    its prompt filled in for a new one."""
     import sys
 
     try:
         payload = json.loads(sys.stdin.buffer.read().decode("utf-8", errors="replace"))
     except ValueError:
+        return 0
+    if "--antigravity-turn" in argv:
+        turn = antigravity_turn(payload)
+        if turn is not None:
+            sys.stdout.write(json.dumps(turn, ensure_ascii=True))
         return 0
     record(payload)
     return 0

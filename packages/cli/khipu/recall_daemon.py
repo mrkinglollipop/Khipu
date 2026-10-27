@@ -12,7 +12,7 @@ first and runs the one-shot path when it is not there.
 
 Protocol: one JSON object per line each way, on ``<khipu_home>/recall.sock``.
 
-  {"op": "recall", "raw": "<the hook's stdin payload>", "shape": "claude"|"cursor"}
+  {"op": "recall", "raw": "<the hook's stdin payload>", "shape": "claude"|"cursor"|"antigravity"}
       with protocol=1, answers {"ok": true, "output": <hook output>} or
       {"ok": false, "error": ...}; a successful client sends {"op": "ack"}
   {"op": "ping"}
@@ -76,7 +76,7 @@ _ROUTING_LOOK_S = 2.0
 _ROUTING_IDLE_STOP_S = 60.0
 # sockaddr_un.sun_path is 104 bytes on macOS, 108 on Linux; stay under both.
 _SUN_PATH_MAX = 100
-_SHAPES = ("claude", "cursor")
+_SHAPES = ("claude", "cursor", "antigravity")
 
 
 def _log(msg: str) -> None:

@@ -75,6 +75,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from khipu import hook_shape
 from khipu import t3 as _t3
 from khipu import wire
 if not hasattr(_t3, 'cache_thread'):
@@ -86,7 +87,7 @@ from khipu.lines import split_lines
 from khipu.t3 import cache_thread, is_helper_session
 from khipu.turn_text import INJECTED_CONTEXT_TAGS, MACHINE_USER_TAGS, clean_user_text, is_machine  # noqa: F401
 
-HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build")
+HARNESSES = ("claude_code", "cursor", "codex", "aegis", "grok_build", "antigravity")
 
 
 def _env_int(new: str, old: str, default: str) -> str:
@@ -204,15 +205,13 @@ def norm_event(name: Any) -> str:
 
 
 def session_id(env: dict) -> str:
-    return str(_get(env, "sessionId", "session_id", "conversation_id", default="") or "")
+    return hook_shape.session_id(env)
 
 
 def session_cwd(env: dict) -> str:
     cwd = _get(env, "cwd", default="")
     if not cwd:
-        roots = _get(env, "workspace_roots", default=None)
-        if isinstance(roots, list) and roots:
-            cwd = roots[0]
+        cwd = hook_shape.workspace(env)
     return str(cwd or "")
 
 
@@ -282,39 +281,11 @@ def capture_origin(env: dict, osenv: dict | None = None, *, harness: str = "", s
 def infer_harness(env: dict, osenv: dict | None = None) -> str:
     """Which harness invoked us. The hook command is identical in every harness
     (the packs re-point drifted entries to one canonical shim path), so the
-    identity has to come from what the harness hands us. Explicit KHIPU_HARNESS
+    identity has to come from what the harness hands us: the payload, then its
+    transcript path, then environment markers, the harness's own before any it
+    could have inherited (``khipu.hook_shape.detect``). Explicit KHIPU_HARNESS
     always wins (the Aegis pack sets it)."""
-    osenv = os.environ if osenv is None else osenv
-    explicit = osenv.get("KHIPU_HARNESS")
-    if explicit:
-        return explicit
-    if osenv.get("GROK_HOOK_NAME") or osenv.get("GROK_HOOK_EVENT"):
-        return "aegis"
-    tp = str(_get(env, "transcriptPath", "transcript_path", default="") or "")
-    if "conversation_id" in env or "workspace_roots" in env or "/.cursor/" in tp:
-        return "cursor"
-    # Path evidence before env-only Codex markers: a Claude session started
-    # inside Codex inherits CODEX_HOME but still writes under a Claude home.
-    if "/.claude/" in tp or _in_claude_home(tp, osenv):
-        return "claude_code"
-    if "/.codex/" in tp or osenv.get("CODEX_HOME") or osenv.get("CODEX_SANDBOX"):
-        return "codex"
-    if osenv.get("CLAUDE_PROJECT_DIR"):
-        return "claude_code"
-    return "unknown"
-
-
-def _in_claude_home(tp: str, osenv: dict) -> bool:
-    """A transcript under ``<home>/projects/`` of any Claude home Khipu finds
-    (CLAUDE_CONFIG_DIR, T3's accounts): ``/.claude/`` only names the default."""
-    if not tp:
-        return False
-    try:
-        from khipu import claude_homes
-
-        return claude_homes.transcript_home(tp, claude_homes.discover(environ=osenv)) is not None
-    except Exception:  # noqa: BLE001 — inference is best-effort, never fatal
-        return False
+    return hook_shape.detect(env, os.environ if osenv is None else osenv)[0]
 
 
 def _current_claude_home() -> Path:
@@ -382,6 +353,13 @@ def transcript_path(env: dict, harness: str = "", *, synth_sessions: set[str] | 
     # Cursor keeps one JSONL per conversation under its per-project tree.
     if sid and harness in ("cursor", ""):
         hits = glob.glob(str(Path.home() / ".cursor" / "projects" / "*" / "agent-transcripts" / sid / f"{sid}.jsonl"))
+        if hits:
+            return Path(hits[0])
+    # Antigravity's payload names the transcript; if one ever does not, the brain
+    # folder is keyed by the conversation id under each surface's app data dir.
+    if sid and harness in ("antigravity", ""):
+        hits = sorted(glob.glob(str(Path.home() / ".gemini" / "antigravity*" / "brain" / sid
+                                    / ".system_generated" / "logs" / "transcript.jsonl")))
         if hits:
             return Path(hits[0])
     return None
@@ -461,6 +439,53 @@ def _blocks_text(content: Any) -> tuple[str, list[str], bool]:
     return "\n".join(parts), tools, (saw_result and not parts)
 
 
+# Antigravity ``transcript.jsonl``: one JSON step per line, ``type`` an upper
+# case step kind (USER_INPUT, PLANNER_RESPONSE, AGENCY_TOOL_CALL, ...), with
+# ``content``, ``step_index``, ``created_at`` and ``source``. Format from the
+# scope doc (docs/plans/2026-10-27-cursor-antigravity-hooks.md section 3.2);
+# the shape of ``content`` is not documented, so it is read tolerantly (a
+# string, ``{"text": ...}`` or a list of either) and anything else is dropped.
+_AG_USER_WRAP = re.compile(r"^\s*<USER_REQUEST>(.*)</USER_REQUEST>\s*$", re.S)
+
+
+def _antigravity_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        for key in ("text", "content", "message", "response"):
+            if isinstance(content.get(key), str):
+                return content[key]
+        return ""
+    if isinstance(content, list):
+        return "\n".join(t for t in (_antigravity_text(c) for c in content) if t)
+    return ""
+
+
+def _antigravity_tool(content: Any) -> str:
+    if isinstance(content, dict):
+        call = content.get("toolCall") if isinstance(content.get("toolCall"), dict) else content
+        for key in ("name", "tool_name", "toolName"):
+            if isinstance(call.get(key), str) and call[key].strip():
+                return call[key].strip()[:160]
+    text = _antigravity_text(content).strip()
+    return text.splitlines()[0][:160] if text else "tool"
+
+
+def _parse_antigravity(d: dict) -> list[tuple[str, str]] | None:
+    """The turns in one Antigravity step, or None when ``d`` is not one."""
+    kind = d.get("type")
+    if kind not in ("USER_INPUT", "PLANNER_RESPONSE", "AGENCY_TOOL_CALL"):
+        return None
+    content = d.get("content")
+    if kind == "AGENCY_TOOL_CALL":
+        return [("tool", _antigravity_tool(content))]
+    text = _antigravity_text(content)
+    if kind == "USER_INPUT":
+        wrapped = _AG_USER_WRAP.match(text)
+        text = wrapped.group(1).strip() if wrapped else text
+    return [("user" if kind == "USER_INPUT" else "assistant", text)] if text.strip() else []
+
+
 def _parse_line(d: dict) -> list[tuple[str, str]]:
     """One transcript line → zero or more (role, text) items, for any of the
     shapes Khipu reads (sniffed per line, so a mixed file still works):
@@ -470,7 +495,12 @@ def _parse_line(d: dict) -> list[tuple[str, str]]:
       Cursor      {"role": ..., "message": {"content": [...]}}
       Codex       {"type": "event_msg", "payload": {"type": "user_message"|
                    "agent_message", "message": ...}}  (+ function_call items)
+      Antigravity {"type": "USER_INPUT"|"PLANNER_RESPONSE"|"AGENCY_TOOL_CALL",
+                   "content": ..., "step_index": n}
     """
+    antigravity = _parse_antigravity(d)
+    if antigravity is not None:
+        return antigravity
     u = (d.get("params") or {}).get("update") if isinstance(d.get("params"), dict) else None
     if isinstance(u, dict):
         kind = u.get("sessionUpdate")
@@ -2154,7 +2184,7 @@ def decide(event: str, *, user_turns: int, chars: int, elapsed_s: float, stop_ho
         return False, f"nothing new (turns={user_turns}, chars={chars})"
     if event in ("precompact", "sessionend", "subagentstop"):
         return True, event
-    if event == "stop":
+    if event in ("stop", "postinvocation"):
         if user_turns >= MIN_TURNS:
             return True, f"turns>={MIN_TURNS}"
         if elapsed_s >= MIN_MINUTES * 60:
@@ -2988,7 +3018,25 @@ def _log_subagentstop_shape_once(env: dict) -> None:
     _log(f"subagentstop: first sighting, payload keys = {sorted(env.keys())}")
 
 
-def hook_main(raw: str, harness: str | None = None) -> dict:
+def hook_event(env: dict, harness: str, event: str | None = None) -> str:
+    """The normalised hook event. Antigravity payloads carry no event name, so
+    its hook command names one (``khipu-stop-hook --event PostInvocation``);
+    without that, a Stop is told from a PostInvocation by its own fields
+    (``terminationReason`` / ``executionNum`` / ``fullyIdle`` only a Stop has).
+    A Stop that says the session ended (T3's runtime fires one, once, with
+    ``terminationReason: "session_end"``) is a SessionEnd: always due."""
+    name = norm_event(event or _get(env, "hookEventName", "hook_event_name"))
+    if harness != "antigravity":
+        return name
+    if not name:
+        stop_like = any(k in env for k in ("terminationReason", "executionNum", "fullyIdle"))
+        name = "stop" if stop_like else ("postinvocation" if "invocationNum" in env else "")
+    if name == "stop" and norm_event(env.get("terminationReason")) == "sessionend":
+        return "sessionend"
+    return name
+
+
+def hook_main(raw: str, harness: str | None = None, event: str | None = None) -> dict:
     try:
         env = json.loads(raw or "{}")
     except ValueError:
@@ -3007,7 +3055,7 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
         return {"skipped": "t3 helper session", "due": False}
     harness = harness or infer_harness(env)
     sid = session_id(env)
-    event = norm_event(_get(env, "hookEventName", "hook_event_name"))
+    event = hook_event(env, harness, event)
     # K4: a SubagentStop's own `session_id` names the PARENT session, not the
     # subagent — reusing it as-is for state/offset tracking would collide with
     # the parent's own Stop-hook cadence (two different transcript files, one
@@ -3052,7 +3100,8 @@ def hook_main(raw: str, harness: str | None = None) -> dict:
             # or subagent may never have persisted a transcript at all.
             if is_subagent_stop:
                 out["reason"] = f"subagent transcript not written: {path}"
-            elif event in ("stop", "sessionend") and track_sid and _state_file(harness, track_sid).exists():
+            elif event in ("stop", "sessionend", "postinvocation") and track_sid \
+                    and _state_file(harness, track_sid).exists():
                 out["reason"] = f"transcript missing after earlier turns: {path}"
                 out["transcript_missing"] = True
             else:
@@ -4005,7 +4054,8 @@ def main(argv: list[str] | None = None) -> int:
         print(wire.dumps(liveness_all(), indent=2, ensure_ascii=True))
         return 0
     harness = argv[1] if len(argv) >= 2 and argv[0] == "--harness" else None
-    out = hook_main(wire.read_stdin(), harness)
+    event = argv[argv.index("--event") + 1] if "--event" in argv[:-1] else None
+    out = hook_main(wire.read_stdin(), harness, event)
     if os.environ.get("KHIPU_CAPTURE_PROBE") == "1" or os.environ.get("KHIPU_AEGIS_PROBE") == "1":
         print(wire.dumps(out, ensure_ascii=True))
     return 0

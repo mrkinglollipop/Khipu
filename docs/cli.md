@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 63 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 64 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -245,8 +245,9 @@ Zero is setting-specific: `replica_refresh_after=0` refreshes at every check; `h
 | `aegis` | Older name for `sessions`. Same queue, same drain. Its `status` defaults to `--harness aegis`, where `sessions status` defaults to `all`. |
 | `gateway` | `gateway token set` and `gateway token status` for the gateway bearer token. |
 | `grok-bot-config` | Prints the account-level cloud-agent config and the secret name to add. |
+| `t3` | Khipu for providers inside T3 Code. `t3 antigravity add\|remove --project DIR [--dry-run]` writes or removes Khipu's `.agents/` files in one project (the same files `integrations install antigravity --project` writes), `status --project DIR` reports them, and `list` shows every project added and the runtime version. |
 
-- Harness choices for `integrations`: `all`, `claude_code`, `cursor`, `aegis`, `codex`, `grok_bot`. Flags: `--dry-run`, `--home`, `--project`, `--no-verify`. There is no top-level `install` command.
+- Harness choices for `integrations`: `all`, `claude_code`, `cursor`, `aegis`, `codex`, `grok_build`, `grok_bot`, `antigravity`. Flags: `--dry-run`, `--home`, `--project`, `--no-verify`. There is no top-level `install` command.
 - `sessions status` takes `--harness all|claude_code|cursor|codex|aegis`. `sessions liveness` exits 2 if any harness's capture is failing (its last hook run errored, its last capture failed with nothing landed since, a job has waited too long, or turns keep arriving without a capture). A harness that has never run the hook counts as healthy. `drain` and `sweep` take `--limit` and `--dry-run`.
 - `gateway token set` reads the token from stdin, or from an environment variable with `--from-env [VAR]` (default `KHIPU_GATEWAY_TOKEN`). It never prints the token.
 

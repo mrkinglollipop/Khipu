@@ -1829,7 +1829,7 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
 
         sid = str(payload.get("session_id") or "")
         prefix, separator, native = sid.partition(":")
-        if separator and prefix in {"claude_code", "codex", "cursor", "aegis"}:
+        if separator and prefix in {"claude_code", "codex", "cursor", "aegis", "antigravity"}:
             sid = native
         thread = thread_for_session(sid)
         if thread:

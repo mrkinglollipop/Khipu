@@ -4860,6 +4860,30 @@ def cmd_integrations(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_t3_antigravity(args: argparse.Namespace) -> int:
+    """`khipu t3 antigravity add|remove|status|list`: Khipu's per-project files
+    for Antigravity inside T3 Code (``.agents/``). Khipu never writes T3's
+    private profile, settings or database; these folders are the only place."""
+    from khipu import integrations as integ
+    from khipu import t3_antigravity as ag
+
+    cmd = args.t3_ag_cmd
+    if cmd == "list":
+        print(json.dumps(ag.projects_report(), indent=2))
+        return 0
+    try:
+        if cmd == "status":
+            out = ag.project_status(args.project)
+        elif cmd == "add":
+            out = ag.install_project(args.project, dry_run=args.dry_run)
+        else:
+            out = ag.uninstall_project(args.project, dry_run=args.dry_run)
+    except integ.ConfigUnreadable as e:
+        out = {"harness": "antigravity-t3", "project": args.project, "ok": False, "aborted": True, "error": str(e)}
+    print(json.dumps(out, indent=2))
+    return 0 if out.get("ok", True) else 1
+
+
 def cmd_gateway(args: argparse.Namespace) -> int:
     """`khipu gateway token set` / `status` — the on-disk bearer convention
     Aegis's own config points at (`[memory.khipu] token_file`), and the fix
@@ -6758,7 +6782,7 @@ def build_parser() -> argparse.ArgumentParser:
             "harness",
             nargs="?",
             default="all",
-            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot"),
+            choices=("all", "claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot", "antigravity"),
         )
         if name in ("install", "uninstall"):
             sp.add_argument("--dry-run", action="store_true")
@@ -6771,11 +6795,29 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("install", "uninstall", "status", "verify"):
             sp.add_argument(
                 "--project",
-                help="Cursor / Grok Build / Grok Bot: repo dir for that pack's recall and MCP files",
+                help="Cursor / Grok Build / Grok Bot / Antigravity: repo dir for that pack's recall and MCP files",
             )
         if name == "install":
             sp.add_argument("--no-verify", action="store_true")
     ig.set_defaults(func=cmd_integrations)
+
+    t3p = sub.add_parser("t3", help="Khipu for providers inside T3 Code")
+    t3_sub = t3p.add_subparsers(dest="t3_cmd", required=True)
+    t3ag = t3_sub.add_parser(
+        "antigravity",
+        help="Add or remove Khipu's .agents/ files in a project, for Antigravity inside T3 Code",
+    )
+    t3ag_sub = t3ag.add_subparsers(dest="t3_ag_cmd", required=True)
+    for name, help_ in (("add", "Write .agents/hooks.json, mcp_config.json and rules/khipu.md"),
+                        ("remove", "Remove Khipu's parts only"),
+                        ("status", "Which of Khipu's files a project has"),
+                        ("list", "Every project added so far")):
+        sp = t3ag_sub.add_parser(name, help=help_)
+        if name != "list":
+            sp.add_argument("--project", required=True, help="the project folder")
+        if name in ("add", "remove"):
+            sp.add_argument("--dry-run", action="store_true")
+    t3ag.set_defaults(func=cmd_t3_antigravity)
 
     for name, help_ in (
         (

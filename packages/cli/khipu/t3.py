@@ -443,6 +443,35 @@ def _age_seconds(value: str | None) -> float | None:
         return None
 
 
+def _provider_label(inst: dict[str, Any]) -> str:
+    name, driver = str(inst["name"]), str(inst["driver"])
+    return name if not driver or name.strip().lower() == driver.strip().lower() else f"{name} ({driver})"
+
+
+def _provider_messages(inst: dict[str, Any], status: dict[str, Any]) -> tuple[str | None, list[str]]:
+    """The doctor warning (a gap the owner can fix) and the notes (facts about
+    the harness the owner cannot change) for one provider instance."""
+    label = _provider_label(inst)
+    functions = status.get("functions") or {}
+    notes: list[str] = []
+    if inst["driver"] == ANTIGRAVITY_DRIVER:
+        notes.append(f"T3 runs {label} without Khipu's start block (its runtime ignores injected context); "
+                     "routing reaches it through `khipu_route` and the brief")
+        runtime = status.get("runtime") or {}
+        if runtime.get("recheck"):
+            notes.append(f"T3's {label} runtime ({runtime.get('version') or 'unknown version'}) is not one "
+                         "Khipu has checked; verify it from the Antigravity card")
+    if status["hooks"] == MISSING:
+        if inst["driver"] == ANTIGRAVITY_DRIVER:
+            return (f"T3 provider {label} has no Khipu hooks, so its sessions are not captured and it has no "
+                    "Khipu memory tools; add Khipu to a project from the Antigravity card", notes)
+        return (f"T3 provider {label} has no Khipu hooks, so sessions on it get no Khipu routing start block", notes)
+    gaps = [FUNCTION_LABELS[f] for f in _CORE_FUNCTIONS if functions.get(f) == MISSING]
+    if gaps:
+        return f"T3 provider {label} is missing Khipu {' and '.join(gaps)}", notes
+    return None, notes
+
+
 def health(home: Path | None = None) -> dict[str, Any] | None:
     """Read-only T3 health for ``khipu doctor`` and the desktop card.
 
@@ -468,16 +497,19 @@ def health(home: Path | None = None) -> dict[str, Any] | None:
         warnings.append(lookup_error or "T3's thread lookup is unavailable")
     if recent_without_capture:
         warnings.append("T3 was used in the last day without a thread-linked capture")
+    notes: list[str] = []
     providers: list[dict[str, Any]] = []
     for inst in all_provider_instances(settings_path(home)):
         if not inst["enabled"]:
             continue
-        hooks = provider_hooks(inst, home if home is not None else Path.home())
-        providers.append({"id": inst["id"], "driver": inst["driver"], "name": inst["name"], "hooks": hooks})
-        if hooks == "missing":
-            name, driver = str(inst["name"]), str(inst["driver"])
-            label = name if not driver or name.strip().lower() == driver.strip().lower() else f"{name} ({driver})"
-            warnings.append(f"T3 provider {label} has no Khipu hooks, so sessions on it get no Khipu routing start block")
+        status = provider_status(inst, home if home is not None else Path.home())
+        entry = {"id": inst["id"], "driver": inst["driver"], "name": inst["name"], "hooks": status["hooks"]}
+        entry.update({key: status[key] for key in ("functions", "projects", "runtime") if key in status})
+        providers.append(entry)
+        warning, note = _provider_messages(inst, status)
+        if warning:
+            warnings.append(warning)
+        notes += note
     return {
         "detected": True,
         "providers": providers,
@@ -489,6 +521,7 @@ def health(home: Path | None = None) -> dict[str, Any] | None:
         "last_thread_linked_capture_harness": last_capture_harness,
         "thread_linked_captures_today": captures_today,
         "warnings": warnings,
+        "notes": notes,
     }
 
 
@@ -634,39 +667,137 @@ def _provider_folder(instance: dict[str, Any], home: Path, default_name: str) ->
     return path if path.is_absolute() else home / path
 
 
-def provider_hooks(instance: dict[str, Any], home: Path | None = None) -> str:
-    """``installed`` when the provider's own config home carries a Khipu
-    hook, else ``missing``. Providers whose driver has no Khipu hook pack
-    (anything but Claude Code and Codex) are always ``missing``: a T3 child
-    on them gets no routing start block. Only hook command names are read;
-    nothing else in those files leaves this function."""
+CURSOR_DRIVER = "cursor"
+ANTIGRAVITY_DRIVER = "antigravity"
+
+# What Khipu can give a provider's sessions, in the order the app lists them.
+FUNCTIONS = ("capture", "start_block", "prompt_recall", "delegation", "mcp")
+FUNCTION_LABELS = {
+    "capture": "capture",
+    "start_block": "routing start block",
+    "prompt_recall": "memory on each prompt",
+    "delegation": "routing at delegation",
+    "mcp": "memory tools",
+}
+# A provider with per-function states is flagged in doctor only for these:
+# the other two have no installer in every Khipu build, so a gap there is
+# shown in the app's rows, not raised as a warning.
+_CORE_FUNCTIONS = ("capture", "start_block", "mcp")
+INSTALLED, MISSING, UNSUPPORTED = "installed", "missing", "unsupported"
+
+
+def _read_json_object(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _hook_commands(value: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(value, dict):
+        command = value.get("command")
+        if isinstance(command, str):
+            out.append(command)
+        for inner in value.values():
+            out += _hook_commands(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            out += _hook_commands(inner)
+    return out
+
+
+def _cursor_functions(folder: Path) -> dict[str, str]:
+    """T3 runs Cursor in process with every settings layer the Cursor CLI
+    loads, so the user's ``~/.cursor`` hooks and MCP file apply. Read: only
+    which Khipu launchers each hook event runs."""
+    hooks = _read_json_object(folder / "hooks.json").get("hooks")
+    events: dict[str, set[str]] = {}
+    if isinstance(hooks, dict):
+        for event, handlers in hooks.items():
+            for command in _hook_commands(handlers):
+                name = _khipu_hook_name(command)
+                if name:
+                    events.setdefault(str(event), set()).add(name)
+
+    def runs(name: str, *names: str) -> str:
+        return INSTALLED if any(name in events.get(event, ()) for event in names) else MISSING
+
+    server = (_read_json_object(folder / "mcp.json").get("mcpServers") or {}).get("khipu")
+    command = server.get("command") if isinstance(server, dict) else None
+    try:
+        mcp = isinstance(command, str) and Path(shlex.split(command)[0]).name == "khipu-mcp"
+    except (ValueError, IndexError):
+        mcp = False
+    return {
+        "capture": runs("khipu-stop-hook", "stop"),
+        "start_block": runs("khipu-recall-hook", "sessionStart"),
+        "prompt_recall": runs("khipu-prompt-recall", "beforeSubmitPrompt"),
+        "delegation": runs("khipu-delegation-hook", "postToolUse", "preToolUse"),
+        "mcp": INSTALLED if mcp else MISSING,
+    }
+
+
+def _rollup(functions: dict[str, str]) -> str:
+    """``installed`` when every function the harness can carry is installed,
+    ``missing`` when none is, else ``partial``. ``unsupported`` is the
+    harness's limit, never a gap."""
+    wanted = [state for state in functions.values() if state != UNSUPPORTED]
+    if wanted and all(state == INSTALLED for state in wanted):
+        return INSTALLED
+    return "partial" if any(state == INSTALLED for state in wanted) else MISSING
+
+
+def provider_status(instance: dict[str, Any], home: Path | None = None) -> dict[str, Any]:
+    """What Khipu gives one T3 provider instance: ``{"hooks": rollup}`` for
+    every driver, plus ``functions`` (``installed`` / ``missing`` /
+    ``unsupported`` per function, see ``FUNCTIONS``) for the Cursor and
+    Antigravity drivers, where the answer differs by function. Claude Code
+    and Codex stay a single rollup: either Khipu's hooks are in their config
+    home or they are not. Only provider ids, drivers and ``homePath`` come
+    from T3's settings; the files read are the provider's own hook and MCP
+    files (command names only)."""
     home = home if home is not None else Path.home()
     driver = instance.get("driver")
+    if driver == CURSOR_DRIVER:
+        functions = _cursor_functions(_provider_folder(instance, home, ".cursor"))
+        return {"hooks": _rollup(functions), "functions": functions}
+    if driver == ANTIGRAVITY_DRIVER:
+        from khipu import t3_antigravity
+
+        found = t3_antigravity.functions_for(str(instance.get("id") or ""), home)
+        return {"hooks": _rollup(found["functions"]), **found}
     if driver == CLAUDE_DRIVER:
         target = _provider_folder(instance, home, ".claude") / "settings.json"
     elif driver == CODEX_DRIVER:
         target = _provider_folder(instance, home, ".codex") / "hooks.json"
     else:
-        return "missing"
-    try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return "missing"
-    commands: list[str] = []
+        return {"hooks": MISSING}
+    data = _read_json_object(target)
+    commands = _hook_commands(data.get("hooks"))
+    return {"hooks": INSTALLED if any(_is_khipu_hook_command(command) for command in commands) else MISSING}
 
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            command = value.get("command")
-            if isinstance(command, str):
-                commands.append(command)
-            for inner in value.values():
-                walk(inner)
-        elif isinstance(value, list):
-            for inner in value:
-                walk(inner)
 
-    walk(data.get("hooks") if isinstance(data, dict) else None)
-    return "installed" if any(_is_khipu_hook_command(command) for command in commands) else "missing"
+def provider_hooks(instance: dict[str, Any], home: Path | None = None) -> str:
+    """The single word for a provider: ``installed`` when its own config home
+    carries Khipu, ``partial`` when only some of the functions its harness can
+    carry are in place, else ``missing``. Drivers with no Khipu pack (anything
+    but Claude Code, Codex, Cursor and Antigravity) are always ``missing``: a
+    T3 child on them gets no routing start block."""
+    return provider_status(instance, home)["hooks"]
+
+
+def child_gets_start_block(instance: dict[str, Any], home: Path | None = None) -> bool:
+    """Whether a T3 child on this provider gets Khipu's routing start block.
+    Per-function drivers answer from their ``start_block`` state (always no on
+    Antigravity: T3's runtime ignores injected context); the others from the
+    single rollup."""
+    status = provider_status(instance, home)
+    functions = status.get("functions")
+    if functions:
+        return functions.get("start_block") == INSTALLED
+    return status["hooks"] == INSTALLED
 
 
 # The actual Khipu hook launchers (integrations.LAUNCHER_NAMES minus the
@@ -680,11 +811,13 @@ _KHIPU_HOOK_NAMES = frozenset({
 _INTERPRETERS = frozenset({"sh", "bash", "zsh", "dash", "python3", "python"})
 
 
-def _is_khipu_hook_command(command: str) -> bool:
+def _khipu_hook_name(command: str) -> str | None:
+    """The Khipu hook launcher a command runs (``khipu-stop-hook`` ...), or
+    None when the command is not a direct exec of one."""
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return False
+        return None
     index = 0
     # Skip an `env` prefix and variable assignments (`env K=V <hook>`,
     # `K=V <hook>`) so the executable itself is what gets matched.
@@ -697,16 +830,23 @@ def _is_khipu_hook_command(command: str) -> bool:
         while index < len(tokens) and tokens[index].startswith("-") and tokens[index] != "-c":
             index += 1
         if index < len(tokens) and tokens[index] == "-c":
-            return False  # a shell string, not a direct hook exec
+            return None  # a shell string, not a direct hook exec
     if index < len(tokens) and Path(tokens[index]).name in _KHIPU_HOOK_NAMES:
-        return True
+        return Path(tokens[index]).name
     # A quoted or unquoted absolute path with spaces, standing alone as the
     # whole command, tokenizes into pieces above; accept it when the path
     # itself ends in a Khipu hook name. A mention inside a larger command
-    # (`echo /opt/.../khipu-stop-hook`) is not a hook exec and stays False.
+    # (`echo /opt/.../khipu-stop-hook`) is not a hook exec and stays None.
     trimmed = command.strip().strip("\"'").strip()
-    return any(trimmed == name or trimmed.endswith("/" + name)
-               for name in _KHIPU_HOOK_NAMES) and trimmed.startswith("/")
+    if trimmed.startswith("/"):
+        for name in _KHIPU_HOOK_NAMES:
+            if trimmed == name or trimmed.endswith("/" + name):
+                return name
+    return None
+
+
+def _is_khipu_hook_command(command: str) -> bool:
+    return _khipu_hook_name(command) is not None
 
 
 def claude_instances(settings_file: Path) -> list[dict[str, Any]]:

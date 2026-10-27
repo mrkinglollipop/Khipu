@@ -46,16 +46,16 @@ import shlex
 import time
 from typing import Any
 
-from khipu import wire
+from khipu import hook_shape, wire
 
 # Claude Code's subagent tool (``Task`` in older versions) and Codex's native
 # one (``spawn_agent``).
 AGENT_TOOLS = frozenset({"Agent", "Task", "spawn_agent"})
-# Each shell tool and the field its command arrives in: Claude Code's Bash and
+# Each shell tool and the field its command arrives in: Cursor's Shell and Claude Code's Bash and
 # Codex's shell_command take a string in ``command``, Codex's shell and
 # local_shell an argv list in ``command``, Codex's exec_command a string in ``cmd``.
 SHELL_TOOLS = {"Bash": "command", "shell": "command", "shell_command": "command", "local_shell": "command",
-               "exec_command": "cmd"}
+               "exec_command": "cmd", "Shell": "command"}
 _BUILT_IN = ("claude", "codex", "grok", "muse")
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 # A wrapper's options that take an operand, short (attached or the next word)
@@ -530,9 +530,10 @@ CHILD_NO_ROUTING_ADVISORY = "This child got no routing: add `khipu route --brief
 
 
 def _t3_child_advisory(payload: dict) -> str | None:
-    """The advisory line for a T3 ``delegate_task`` child whose provider has
-    no Khipu hooks: it will get no start block, so a brief without routing
-    leaves it with nothing. Nothing is added to the brief itself."""
+    """The advisory line for a T3 ``delegate_task`` child whose provider gives
+    it no Khipu start block (no hooks, or a harness like T3's Antigravity
+    runtime that ignores injected context): a brief without routing leaves it
+    with nothing. Nothing is added to the brief itself."""
     name = _tool_name(payload)
     if name is None or not (name == "delegate_task" or name.endswith("__delegate_task")):
         return None
@@ -551,7 +552,7 @@ def _t3_child_advisory(payload: dict) -> str | None:
 
     instance = next((inst for inst in t3.all_provider_instances(t3.settings_path())
                      if inst["id"] == instance_id and inst["enabled"]), None)
-    if instance is None or t3.provider_hooks(instance) != "missing":
+    if instance is None or t3.child_gets_start_block(instance):
         return None
     return CHILD_NO_ROUTING_ADVISORY
 
@@ -808,7 +809,7 @@ def _agent_tool_use(payload: dict, environ, agent_id: str) -> tuple[dict, dict |
         # per-agent ledger. Its deferred routing comes only through
         # pull delivery on its own Khipu tool calls (slice 7).
         return {}, None, None
-    session_id = payload.get("session_id") or payload.get("sessionId")
+    session_id = hook_shape.session_id(payload) or None
     if not isinstance(session_id, str) or not session_id:
         return {}, None, None
     from khipu import routing
@@ -842,7 +843,7 @@ def pre_tool_use(payload: dict, environ=None) -> tuple[dict, dict | None, str | 
         return {}, None, None
     from khipu import recall_prompt
 
-    session_id = payload.get("session_id") or payload.get("sessionId")
+    session_id = hook_shape.session_id(payload) or None
     routing = recall_prompt._RoutingAtPrompt().begin(session_id, environ, moment="delegation")
     try:
         ctx, info = routing.add_to("", routing.collect())
@@ -895,7 +896,7 @@ def _subagent_start(payload: dict, environ=None) -> tuple[dict, dict | None, str
     identity (slice 7 pull delivery)."""
     from khipu import recall_rule
 
-    session_id = payload.get("session_id") or payload.get("sessionId") or ""
+    session_id = hook_shape.session_id(payload)
     agent_id = payload.get("agent_id") or payload.get("agentId") or ""
     if _is_codex_child(environ, payload):
         # Snapshot only: no per-agent ledger under the parent. The
@@ -939,7 +940,11 @@ def hook_main(raw: str, environ=None) -> tuple[dict, dict | None, str | None]:
     event = _event(payload)
     if event == "SubagentStart":
         return ({}, None, None) if _helper(payload) else _subagent_start(payload, env)
-    if event and event != "PreToolUse":
+    # Cursor's postToolUse is the one non-Claude event that carries a delegation
+    # (its docs accept additional_context there). Only a Cursor-shaped payload
+    # qualifies, and the answer is context alone: Cursor reads no permission here.
+    cursor_post = event == "postToolUse" and hook_shape.detect(payload, env)[1] == hook_shape.CURSOR
+    if event and event != "PreToolUse" and not cursor_post:
         return {}, None, None
     out = pre_tool_use(payload, environ)
     # After the push, so noting the brief never spends the push's time budget.
@@ -1059,7 +1064,7 @@ def note_brief(payload: dict, env) -> None:
             return
         from khipu import owner_turns
 
-        parent = str(payload.get("session_id") or payload.get("sessionId") or "")
+        parent = str(hook_shape.session_id(payload))
         harness = owner_turns.harness_of(env, payload)
         for brief in briefs_of(payload):
             owner_turns.note_brief(brief, parent=parent, harness=harness)
@@ -1077,6 +1082,8 @@ def main() -> None:
     info, kind, out = None, None, {}
     try:
         out, info, kind = hook_main(raw)
+        # The answer is built Claude-shaped; Cursor and Antigravity read their own.
+        out = hook_shape.reshape(out, hook_shape.detect(_payload(raw), os.environ)[1])
     except Exception:  # noqa: BLE001 - the one thing this must never do is fail the call
         out = {}
     delivered = True
@@ -1090,7 +1097,7 @@ def main() -> None:
         from khipu import recall_prompt
 
         routed = recall_prompt._routing_delivered(info, delivered)
-        session = _payload(raw).get("session_id") or "?"
+        session = hook_shape.session_id(_payload(raw)) or "?"
         # Not the per-prompt summary line's shape, so the lane's outcome rate never counts it.
         recall_prompt._log(f"delegation session={session} call={kind.replace(' ', '_')}{routed}")
     except Exception:  # noqa: BLE001

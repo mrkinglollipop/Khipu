@@ -27,12 +27,21 @@ Packs:
                  Code's SessionEnd; subagentStop confirmed in Cursor's own docs, K4,
                  same shape as its stop entry)
                ~/.cursor/hooks.json hooks.sessionStart += khipu-recall-hook
-                 (--cursor → additional_context; timeout 30s for PG;
-                 does not replace existing harness sessionStart entries)
-               optional --project → .cursor/rules/khipu.mdc (pull; the ONLY
-                 per-prompt mechanism Cursor gets — it has no UserPromptSubmit
-                 hook event to push through, so the rule text itself carries
-                 the "search before answering" instruction)
+                 (timeout 30s for PG; does not replace existing harness
+                 sessionStart entries)
+               ~/.cursor/hooks.json hooks.beforeSubmitPrompt += khipu-prompt-recall
+                 (always records the owner's turn; its additional_context may be
+                 dropped by Cursor, proof is "unproven" until a real run)
+               ~/.cursor/hooks.json hooks.postToolUse (matcher Task|Shell) +=
+                 khipu-delegation-hook (routing at delegation; never a permission
+                 field, never a preToolUse entry)
+               Every command is the SAME string the claude_code pack writes, no
+               flags: Cursor also loads ~/.claude/settings.json and drops a Claude
+               hook whose command equals its own for the same event, so each Khipu
+               hook then runs once. The harness and output shape come from the
+               payload (khipu.hook_shape), not argv.
+               optional --project → .cursor/rules/khipu.mdc (pull fallback: the
+                 rule text carries the "search before answering" instruction)
   aegis        ~/.grok/config.toml [mcp_servers.khipu]
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] → khipu-stop-hook
                ~/.grok/config.toml [[hooks.Stop]] / [[hooks.PreCompact]] / [[hooks.SessionEnd]]
@@ -47,6 +56,16 @@ Packs:
                (Claude-shaped JSON — verified 2026-08-17: same event names +
                {type,command,timeout} entries; UserPromptSubmit exposed the same way;
                SubagentStop, K4, carries agent_transcript_path for the child transcript)
+
+  antigravity  ~/.gemini/config/hooks.json "khipu" key: SessionStart → khipu-recall-hook,
+                 PreInvocation → khipu-prompt-recall, PostInvocation / Stop →
+                 khipu-stop-hook --event <name> (PostInvocation queue-only); never a
+                 PreToolUse (its answer is a permission decision)
+               ~/.gemini/config/mcp_config.json mcpServers.khipu, and
+                 ~/.gemini/config/rules/khipu.md (its own always-on rule file)
+               optional --project → the same under <project>/.agents/ without
+                 SessionStart: the only route to T3's Antigravity runtime, which
+                 keeps its hooks and MCP in a profile Khipu never writes
 
   Every claude_code/codex pack above also gets hooks.PreToolUse (matched to
   delegation tools) and hooks.SubagentStart += khipu-delegation-hook: the
@@ -86,7 +105,7 @@ from typing import Any
 from khipu import claude_homes as _homes
 from khipu import wire
 
-HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot")
+HARNESSES = ("claude_code", "cursor", "aegis", "codex", "grok_build", "grok_bot", "antigravity")
 HOME = Path.home()
 
 
@@ -259,11 +278,13 @@ def launcher_states() -> list[dict]:
 _PACK_LAUNCHERS: dict[str, tuple[str, ...]] = {
     "claude_code": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
                     "khipu-delegation-hook"),
-    "cursor": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook"),
+    "cursor": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
+               "khipu-delegation-hook"),
     "aegis": ("khipu-mcp", "khipu-aegis-capture"),
     "codex": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall",
               "khipu-delegation-hook"),
     "grok_build": ("khipu-mcp", "khipu-grok-build-capture"),
+    "antigravity": ("khipu-mcp", "khipu-stop-hook", "khipu-recall-hook", "khipu-prompt-recall"),
 }
 
 
@@ -394,11 +415,6 @@ def _install_delegation_hooks(hooks: dict, path: Path, changes: list[str]) -> bo
 
 # Cursor sessionStart must outlive a hub PG slice; harness session_start.sh stays at 5s.
 CURSOR_RECALL_TIMEOUT = 30
-
-
-def recall_hook_cursor() -> str:
-    """Cursor sessionStart command: same binary, Cursor inject field via --cursor."""
-    return f"{recall_hook()} --cursor"
 
 
 def aegis_capture_hook() -> str:
@@ -1013,6 +1029,56 @@ def _cursor_rule_path(project: str | None) -> Path | None:
     return Path(project).expanduser() / ".cursor" / "rules" / CURSOR_RULE_NAME if project else None
 
 
+# Cursor runs a hook by its tool name, not Claude's: Task is the subagent tool,
+# Shell the shell. postToolUse is the only delegation event Khipu installs
+# (docs: additional_context is accepted there). A preToolUse entry is added only
+# if a real run proves its context reaches the model (slice C), and then never
+# with a permission field: the hook answers context and nothing else.
+CURSOR_DELEGATION_MATCHER = "Task|Shell"
+
+# What a real run has shown, per function, for `status()["proof"]`: "hermetic"
+# (the round trip in tests only), "real-run <date>" (seen working in the
+# harness), "unproven". Slice C sets these from its evidence files.
+CURSOR_PROOF = {
+    "mcp": "hermetic",
+    "capture": "real-run 2026-10-27",
+    "session_recall": "real-run 2026-10-27",
+    "prompt_recall": "unproven",
+    "delegation_push": "unproven",
+}
+
+# Claude Code event -> the Cursor event its settings import maps it to
+# (https://cursor.com/docs/reference/third-party-hooks).
+_CURSOR_IMPORT_EVENTS = {
+    "Stop": "stop", "PreCompact": "preCompact", "SessionEnd": "sessionEnd",
+    "SubagentStop": "subagentStop", "SessionStart": "sessionStart",
+    "UserPromptSubmit": "beforeSubmitPrompt", "PreToolUse": "preToolUse",
+    "SubagentStart": "subagentStart",
+}
+
+
+def _cursor_specs() -> list[dict]:
+    """The hooks.json entries Khipu owns: event, ownership test, command,
+    timeout, matcher, and whether a drifted timeout is put back."""
+    stop = {"is_ours": _is_ours, "command": stop_hook(), "timeout": 20, "matcher": None,
+            "enforce": False, "label": "khipu-stop-hook"}
+    specs = [dict(stop, event=e) for e in ("stop", "preCompact", "sessionEnd", "subagentStop")]
+    specs.append({"event": "sessionStart", "is_ours": _is_our_recall, "command": recall_hook(),
+                  "timeout": CURSOR_RECALL_TIMEOUT, "matcher": None, "enforce": True,
+                  "label": "khipu-recall-hook"})
+    specs.append({"event": "beforeSubmitPrompt", "is_ours": _is_our_prompt_recall,
+                  "command": prompt_recall_hook(), "timeout": PROMPT_RECALL_TIMEOUT, "matcher": None,
+                  "enforce": True, "label": "khipu-prompt-recall"})
+    specs.append({"event": "postToolUse", "is_ours": _is_our_delegation, "command": delegation_hook(),
+                  "timeout": DELEGATION_TIMEOUT, "matcher": CURSOR_DELEGATION_MATCHER, "enforce": True,
+                  "label": "khipu-delegation-hook"})
+    return specs
+
+
+def _cursor_is_khipu(cmd: Any) -> bool:
+    return any(t(cmd) for t in (_is_ours, _is_our_recall, _is_our_prompt_recall, _is_our_delegation))
+
+
 def _cursor_install(dry: bool, project: str | None = None) -> dict:
     out: dict[str, Any] = {"harness": "cursor", "detected": _cursor_detected(), "changes": []}
     if not out["detected"]:
@@ -1042,42 +1108,34 @@ def _cursor_install(dry: bool, project: str | None = None) -> dict:
     h = _load_json(CURSOR_HOOKS)
     hooks = h.setdefault("hooks", {})
     changed = False
-    # subagentStop (K4): Cursor exposes this event (alongside subagentStart);
-    # same shape as its existing stop entry.
-    for event in ("stop", "preCompact", "sessionEnd", "subagentStop"):
+    # Cursor runs every matching hook, so each Khipu entry is appended beside
+    # whatever the harness already has (session_start.sh, before_submit_prompt_chain.sh).
+    # An older install's `khipu-recall-hook --cursor` is repointed in place.
+    for spec in _cursor_specs():
+        event, want_cmd, timeout, matcher = spec["event"], spec["command"], spec["timeout"], spec["matcher"]
         entries = hooks.setdefault(event, [])
-        if not any(_is_ours(e.get("command")) for e in entries):
-            entries.append({"command": stop_hook(), "timeout": 20})
-            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} += khipu-stop-hook")
+        ours = [e for e in entries if spec["is_ours"](e.get("command"))]
+        if not ours:
+            entry: dict[str, Any] = {"command": want_cmd, "timeout": timeout}
+            if matcher:
+                entry["matcher"] = matcher
+            entries.append(entry)
+            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} += {spec['label']}")
             changed = True
-        elif _repoint(entries, _is_ours, stop_hook()):
-            out["changes"].append(
-                f"{CURSOR_HOOKS}: hooks.{event} khipu-stop-hook -> {stop_hook()}")
-            changed = True
-    # Push recall: append a second sessionStart entry. Do not replace harness
-    # session_start.sh (Cursor runs all matching hooks; inject field is
-    # additional_context — verified vs Claude additionalContext).
-    ss = hooks.setdefault("sessionStart", [])
-    want_recall = recall_hook_cursor()
-    if not any(_is_our_recall(e.get("command")) for e in ss):
-        ss.append({"command": want_recall, "timeout": CURSOR_RECALL_TIMEOUT})
-        out["changes"].append(
-            f"{CURSOR_HOOKS}: hooks.sessionStart += khipu-recall-hook "
-            f"(additional_context, timeout={CURSOR_RECALL_TIMEOUT})"
-        )
-        changed = True
-    else:
-        for e in ss:
-            if not _is_our_recall(e.get("command")):
+            continue
+        for e in ours:
+            drift = e.get("command") != want_cmd
+            if spec["enforce"]:
+                drift = drift or e.get("timeout") != timeout or (matcher and e.get("matcher") != matcher)
+            if not drift:
                 continue
-            if e.get("command") != want_recall or e.get("timeout") != CURSOR_RECALL_TIMEOUT:
-                e["command"] = want_recall
-                e["timeout"] = CURSOR_RECALL_TIMEOUT
-                out["changes"].append(
-                    f"{CURSOR_HOOKS}: hooks.sessionStart khipu-recall-hook -> "
-                    f"cursor shape timeout={CURSOR_RECALL_TIMEOUT}"
-                )
-                changed = True
+            e["command"] = want_cmd
+            if spec["enforce"]:
+                e["timeout"] = timeout
+                if matcher:
+                    e["matcher"] = matcher
+            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} {spec['label']} -> {want_cmd}")
+            changed = True
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CURSOR_HOOKS))
         h.setdefault("version", 1)
@@ -1106,17 +1164,15 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
             _write_json(CURSOR_MCP, d)
     h = _load_json(CURSOR_HOOKS)
     changed = False
-    for event in ("stop", "preCompact", "sessionEnd", "subagentStop", "sessionStart"):
+    # Every event Khipu writes to, plus preToolUse/subagentStart in case a later
+    # slice or an owner added Khipu there. Only Khipu launcher commands go.
+    events = [s["event"] for s in _cursor_specs()] + ["preToolUse", "subagentStart"]
+    for event in events:
         entries = h.get("hooks", {}).get(event, [])
-        if event == "sessionStart":
-            kept = [e for e in entries if not _is_our_recall(e.get("command"))]
-            label = "khipu-recall-hook"
-        else:
-            kept = [e for e in entries if not _is_ours(e.get("command"))]
-            label = "khipu-stop-hook"
+        kept = [e for e in entries if not _cursor_is_khipu(e.get("command"))]
         if len(kept) != len(entries):
             changed = True
-            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} -= {label}")
+            out["changes"].append(f"{CURSOR_HOOKS}: hooks.{event} -= khipu hooks")
             h["hooks"][event] = kept
     if changed and not dry:
         out.setdefault("backups", []).append(_backup(CURSOR_HOOKS))
@@ -1124,13 +1180,32 @@ def _cursor_uninstall(dry: bool, project: str | None = None) -> dict:
     return out
 
 
+def _cursor_third_party_import(h: dict) -> dict:
+    """What Cursor's Claude-settings import does with Khipu's Claude hooks.
+    Cursor loads ``~/.claude/settings.json`` too and drops an imported hook
+    only when its command string equals a Cursor hook's for the same event.
+    ``double_firing`` lists events where both run Khipu (different strings), so
+    a recall or capture would run twice; ``events`` lists every event the
+    import carries a Khipu hook for."""
+    claude = _load_json(CLAUDE_SETTINGS).get("hooks", {})
+    events, double = [], []
+    for claude_event, event in _CURSOR_IMPORT_EVENTS.items():
+        imported = [x.get("command") for e in claude.get(claude_event, []) if isinstance(e, dict)
+                    for x in e.get("hooks", []) if isinstance(x, dict) and _cursor_is_khipu(x.get("command"))]
+        if not imported:
+            continue
+        events.append(event)
+        own = [e.get("command") for e in h.get("hooks", {}).get(event, []) if _cursor_is_khipu(e.get("command"))]
+        if own and any(c not in own for c in imported):
+            double.append(event)
+    return {"claude_settings": bool(events), "events": events, "double_firing": double}
+
+
 def _cursor_status() -> dict:
     d = _load_json(CURSOR_MCP)
     h = _load_json(CURSOR_HOOKS)
-    def has(ev: str) -> bool:
-        return any(_is_ours(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
-    def has_recall(ev: str) -> bool:
-        return any(_is_our_recall(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
+    def has(ev: str, pred=_is_ours) -> bool:
+        return any(pred(e.get("command")) for e in h.get("hooks", {}).get(ev, []))
     def _cmd(ev: str, pred) -> str | None:
         for e in h.get("hooks", {}).get(ev, []):
             if pred(e.get("command")):
@@ -1142,14 +1217,437 @@ def _cursor_status() -> dict:
             "hook_stop": has("stop"), "hook_precompact": has("preCompact"),
             "hook_sessionend": has("sessionEnd"),
             "hook_subagentstop": has("subagentStop"),
-            "hook_sessionstart": has_recall("sessionStart"),
+            "hook_sessionstart": has("sessionStart", _is_our_recall),
             "recall_rule": "project_scoped",
-            "extract": "installed" if has("stop") and has("preCompact") else "missing"}
+            "prompt_recall": "installed" if has("beforeSubmitPrompt", _is_our_prompt_recall) else "missing",
+            "delegation_push": "installed" if has("postToolUse", _is_our_delegation) else "missing",
+            "extract": "installed" if has("stop") and has("preCompact") else "missing",
+            "proof": dict(CURSOR_PROOF),
+            "third_party_import": _cursor_third_party_import(h)}
     out.update(_pack_launchers("cursor", {
         "khipu-mcp": mcp_cmd,
         "khipu-stop-hook": _cmd("stop", _is_ours),
         "khipu-recall-hook": _cmd("sessionStart", _is_our_recall),
+        "khipu-prompt-recall": _cmd("beforeSubmitPrompt", _is_our_prompt_recall),
+        "khipu-delegation-hook": _cmd("postToolUse", _is_our_delegation),
     }))
+    return out
+
+
+# ---- Antigravity ---------------------------------------------------------------
+#
+# Google Antigravity (App, CLI ``agy`` and IDE share one global config folder,
+# ``~/.gemini/config``; a workspace may add ``<project>/.agents``). Scope doc:
+# docs/plans/2026-10-27-cursor-antigravity-hooks.md sections 3.2, 3.3, 5.3, 6.
+#
+#   ~/.gemini/config/hooks.json    one "khipu" key: SessionStart → khipu-recall-hook,
+#                                  PreInvocation → khipu-prompt-recall,
+#                                  PostInvocation → khipu-stop-hook --event PostInvocation
+#                                  (queue-only), Stop → khipu-stop-hook --event Stop
+#   ~/.gemini/config/mcp_config.json  mcpServers.khipu → khipu-mcp
+#   ~/.gemini/config/rules/khipu.md   always-on rule (its own file, never an edit
+#                                  to the user's GEMINI.md)
+#   --project X: the same under X/.agents/ (hooks without SessionStart, which
+#                                  T3's Antigravity runtime does not wire). This is
+#                                  the only way Khipu reaches T3's Antigravity
+#                                  (decision 6.1): T3 keeps its hooks and MCP in a
+#                                  private profile Khipu never writes.
+#
+# NEVER a PreToolUse or PostToolUse hook: registering PreToolUse made agy skip
+# its own permission prompt (claude-mem, agy 1.2.1), and its answer is a
+# required decision, so a Khipu entry there could approve or block tools.
+# Nothing here has been run by Antigravity itself yet (slice H): status says so.
+
+ANTIGRAVITY_HOOK_KEY = "khipu"
+ANTIGRAVITY_RECALL_TIMEOUT = 30
+ANTIGRAVITY_CAPTURE_TIMEOUT = 20
+# Events the global file carries, and the subset a workspace file carries
+# (T3's runtime wires PreInvocation, PostInvocation and Stop, not SessionStart).
+_AG_GLOBAL_EVENTS = ("SessionStart", "PreInvocation", "PostInvocation", "Stop")
+_AG_PROJECT_EVENTS = ("PreInvocation", "PostInvocation", "Stop")
+_AG_OUR_LAUNCHERS = ("khipu-recall-hook", "khipu-prompt-recall", "khipu-stop-hook",
+                     "khipu-delegation-hook", "khipu-mcp")
+
+
+def _ag_config_dir() -> Path:
+    return HOME / ".gemini" / "config"
+
+
+def _antigravity_detected() -> bool:
+    gemini = HOME / ".gemini"
+    if (gemini / "config").is_dir():
+        return True
+    try:
+        return any(p.is_dir() and p.name.startswith("antigravity") for p in gemini.iterdir())
+    except OSError:
+        return False
+
+
+def _ag_paths(base: Path) -> dict[str, Path]:
+    return {"hooks": base / "hooks.json", "mcp": base / "mcp_config.json",
+            "rule": base / "rules" / "khipu.md"}
+
+
+def _ag_project_base(project: str | None) -> Path | None:
+    return Path(project).expanduser() / ".agents" if project else None
+
+
+# A "project" inside one of these is a harness home or T3's private state, never
+# a workspace: writing .agents/ there would edit state Khipu must not touch
+# (T3's Antigravity profile above all, decision 6.1).
+_AG_PRIVATE_HOMES = (".t3", ".gemini", ".cursor", ".claude", ".codex")
+
+
+def _ag_refuse_project(project: str, home: Path | None = None) -> str | None:
+    """Why ``project`` may not take Khipu's ``.agents`` files, or None. The one
+    check every writer of those files runs (``integrations install antigravity
+    --project`` and ``khipu t3 antigravity add`` alike)."""
+    root = Path(project).expanduser()
+    if not root.is_dir():
+        return f"{root} is not a folder; antigravity --project must point to an existing folder"
+    base_home = home if home is not None else HOME
+    resolved = root.resolve()
+    for name in _AG_PRIVATE_HOMES:
+        private = (base_home / name).resolve()
+        if resolved == private or private in resolved.parents:
+            return f"{root} is inside {base_home / name}, which is not a project; pick a project folder"
+    return None
+
+
+def _ag_handler(event: str) -> dict:
+    if event == "SessionStart":
+        return {"type": "command", "command": recall_hook(), "timeout": ANTIGRAVITY_RECALL_TIMEOUT}
+    if event == "PreInvocation":
+        return {"type": "command", "command": prompt_recall_hook(), "timeout": PROMPT_RECALL_TIMEOUT}
+    return {"type": "command", "command": f"{shlex.quote(stop_hook())} --event {event}",
+            "timeout": ANTIGRAVITY_CAPTURE_TIMEOUT}
+
+
+def _ag_is_ours(event: str, cmd: Any) -> bool:
+    """Whether ``cmd`` is the exact Khipu command for ``event`` (a launcher and
+    its argument, so a command with arguments still matches)."""
+    if event == "SessionStart":
+        return _is_launcher_command(cmd, "khipu-recall-hook")
+    if event == "PreInvocation":
+        return _is_launcher_command(cmd, "khipu-prompt-recall")
+    if event in ("PostInvocation", "Stop"):
+        return _is_launcher_command(cmd, "khipu-stop-hook", "--event", event)
+    return False
+
+
+def _ag_any_khipu(cmd: Any) -> bool:
+    """A command that runs any Khipu launcher, in any event or form, so a stray
+    Khipu entry (a PreToolUse one above all) is found and dropped."""
+    if not isinstance(cmd, str):
+        return False
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return False
+    i = 1 if argv and argv[0] == "env" else 0
+    while i < len(argv) and "=" in argv[i] and not argv[i].startswith("/"):
+        i += 1
+    return i < len(argv) and any(_launcher_path_is_legacy(argv[i], n) for n in _AG_OUR_LAUNCHERS)
+
+
+def _ag_handlers(entries: Any) -> list[dict]:
+    """The handler dicts in one event's list: a bare handler, or one wrapped as
+    ``{matcher, hooks: [handler]}`` (the tool events' form)."""
+    out: list[dict] = []
+    for item in entries if isinstance(entries, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+            out.extend(h for h in item["hooks"] if isinstance(h, dict))
+        elif isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def _ag_without_khipu(entries: Any) -> list:
+    """An event's entries without Khipu handlers. A wrapper left with no
+    handler is dropped; foreign entries come back untouched."""
+    out: list = []
+    for item in entries if isinstance(entries, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+            inner = [h for h in item["hooks"] if not (isinstance(h, dict) and _ag_any_khipu(h.get("command")))]
+            if len(inner) == len(item["hooks"]):
+                out.append(item)
+            elif inner:
+                out.append({**item, "hooks": inner})
+        elif not (isinstance(item, dict) and _ag_any_khipu(item.get("command"))):
+            out.append(item)
+    return out
+
+
+def _ag_desired_entry(existing: Any, events: tuple[str, ...]) -> dict:
+    """The "khipu" hooks entry: ours on exactly ``events``, any Khipu handler on
+    another event dropped, anything foreign kept."""
+    entry = dict(existing) if isinstance(existing, dict) else {}
+    for event in list(entry):
+        if event != "enabled" and event not in events:
+            kept = _ag_without_khipu(entry[event])
+            if kept:
+                entry[event] = kept
+            else:
+                del entry[event]
+    for event in events:
+        entry[event] = [_ag_handler(event)] + _ag_without_khipu(entry.get(event))
+    entry["enabled"] = True
+    return entry
+
+
+def _ag_hooks_owned(existing: Any) -> bool:
+    """Whether the existing "khipu" key is Khipu's: absent, empty, or holding
+    a Khipu handler. A key some other tool wrote under that name (handlers
+    that are not ours) is never taken over."""
+    if existing is None:
+        return True
+    if not isinstance(existing, dict):
+        return False
+    handlers = [h for ev, v in existing.items() if ev != "enabled" for h in _ag_handlers(v)]
+    return not handlers or any(_ag_any_khipu(h.get("command")) for h in handlers)
+
+
+def _ag_rule_is_ours(path: Path) -> bool:
+    from khipu.recall_rule import ANTIGRAVITY_RULE_MARK
+
+    try:
+        return ANTIGRAVITY_RULE_MARK in path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def _ag_install_base(base: Path, events: tuple[str, ...], dry: bool, out: dict) -> bool:
+    """Write hooks, MCP and rule under ``base`` (``~/.gemini/config`` or a
+    project's ``.agents``). False when something not Khipu's is in the way."""
+    from khipu.recall_rule import antigravity_rule
+
+    paths = _ag_paths(base)
+    hooks = _load_json(paths["hooks"])
+    if not _ag_hooks_owned(hooks.get(ANTIGRAVITY_HOOK_KEY)):
+        out.update(ok=False, error=f'{paths["hooks"]} already has a "{ANTIGRAVITY_HOOK_KEY}" entry that '
+                                   "Khipu does not own; refusing to overwrite it")
+        return False
+    mcp = _load_json(paths["mcp"])
+    servers = mcp.get("mcpServers") if isinstance(mcp.get("mcpServers"), dict) else {}
+    current = servers.get("khipu")
+    if isinstance(current, dict) and current.get("command") \
+            and not _is_launcher_command(current.get("command"), "khipu-mcp"):
+        out.update(ok=False, error=f'{paths["mcp"]} mcpServers.khipu is not Khipu-owned; refusing to overwrite it')
+        return False
+    if paths["rule"].is_file() and not _ag_rule_is_ours(paths["rule"]):
+        out.update(ok=False, error=f'{paths["rule"]} exists and is not Khipu-owned; refusing to overwrite it')
+        return False
+    want_entry = _ag_desired_entry(hooks.get(ANTIGRAVITY_HOOK_KEY), events)
+    if hooks.get(ANTIGRAVITY_HOOK_KEY) != want_entry:
+        out["changes"].append(f"{paths['hooks']}: {ANTIGRAVITY_HOOK_KEY} -> {', '.join(events)}")
+        if not dry:
+            _ag_keep_backup(out, paths["hooks"])
+            hooks[ANTIGRAVITY_HOOK_KEY] = want_entry
+            _write_json(paths["hooks"], hooks)
+    want_mcp = {"command": mcp_launcher()}
+    if current != want_mcp:
+        out["changes"].append(f"{paths['mcp']}: mcpServers.khipu -> {want_mcp['command']}")
+        if not dry:
+            _ag_keep_backup(out, paths["mcp"])
+            mcp.setdefault("mcpServers", {})["khipu"] = want_mcp
+            _write_json(paths["mcp"], mcp)
+    want_rule = antigravity_rule()
+    if not paths["rule"].is_file() or paths["rule"].read_text(encoding="utf-8") != want_rule:
+        out["changes"].append(f"{paths['rule']}: write always-on rule")
+        if not dry:
+            _ag_keep_backup(out, paths["rule"])
+            paths["rule"].parent.mkdir(parents=True, exist_ok=True)
+            paths["rule"].write_text(want_rule, encoding="utf-8")
+    return True
+
+
+def _ag_keep_backup(out: dict, path: Path) -> None:
+    backup = _backup(path)
+    if backup:
+        out.setdefault("backups", []).append(backup)
+
+
+def _antigravity_install(dry: bool, project: str | None = None, project_only: bool = False,
+                         home: Path | None = None) -> dict:
+    """The installer of record for every Antigravity file Khipu writes: the
+    global ``~/.gemini/config`` set and a project's ``.agents`` set.
+    ``project_only`` (``khipu t3 antigravity add``) writes the project files
+    and nothing global, the same bytes either way."""
+    out: dict[str, Any] = {"harness": "antigravity", "detected": _antigravity_detected(), "changes": []}
+    pbase = _ag_project_base(project)
+    if pbase is not None:
+        refused = _ag_refuse_project(project, home)
+        if refused:
+            out.update(ok=False, error=refused)
+            return out
+    if project_only:
+        if pbase is None:
+            out.update(ok=False, error="project_only needs a project")
+            return out
+        _ag_install_base(pbase, _AG_PROJECT_EVENTS, dry, out)
+        return out
+    if not out["detected"] and pbase is None:
+        return out
+    # Never create ~/.gemini on a Mac without Antigravity: a project-only
+    # install (a T3 user) writes the workspace files and nothing global.
+    if out["detected"] and not _ag_install_base(_ag_config_dir(), _AG_GLOBAL_EVENTS, dry, out):
+        return out
+    if pbase is not None:
+        if not out["detected"]:
+            out["project_only"] = True
+        _ag_install_base(pbase, _AG_PROJECT_EVENTS, dry, out)
+    return out
+
+
+def _ag_uninstall_base(base: Path, dry: bool, out: dict, *, tidy: bool) -> None:
+    """Remove Khipu's parts under ``base``. ``tidy`` also removes a file left
+    empty and the folders (a project's ``.agents``, never the global ones)."""
+    paths = _ag_paths(base)
+    hooks = _load_json(paths["hooks"])
+    entry = hooks.get(ANTIGRAVITY_HOOK_KEY)
+    if isinstance(entry, dict) and _ag_hooks_owned(entry):
+        rest = {ev: kept for ev, v in entry.items() if ev != "enabled"
+                for kept in (_ag_without_khipu(v),) if kept}
+        out["changes"].append(f"{paths['hooks']}: remove Khipu hooks")
+        if not dry:
+            if rest:
+                hooks[ANTIGRAVITY_HOOK_KEY] = {"enabled": entry.get("enabled", True), **rest}
+            else:
+                hooks.pop(ANTIGRAVITY_HOOK_KEY)
+            # A file that held nothing but Khipu's is deleted outright (tidy), with no
+            # backup left in the owner's repo; anything else is backed up and rewritten.
+            if hooks or not tidy:
+                out.setdefault("backups", []).append(_backup(paths["hooks"]))
+                _write_json(paths["hooks"], hooks)
+            else:
+                paths["hooks"].unlink()
+    mcp = _load_json(paths["mcp"])
+    servers = mcp.get("mcpServers") if isinstance(mcp.get("mcpServers"), dict) else {}
+    if isinstance(servers.get("khipu"), dict) and _is_launcher_command(servers["khipu"].get("command"), "khipu-mcp"):
+        out["changes"].append(f"{paths['mcp']}: remove mcpServers.khipu")
+        if not dry:
+            servers.pop("khipu")
+            if not servers:
+                mcp.pop("mcpServers", None)
+            if mcp or not tidy:
+                out.setdefault("backups", []).append(_backup(paths["mcp"]))
+                _write_json(paths["mcp"], mcp)
+            else:
+                paths["mcp"].unlink()
+    if paths["rule"].is_file() and _ag_rule_is_ours(paths["rule"]):
+        out["changes"].append(f"{paths['rule']}: remove always-on rule")
+        if not dry:
+            if not tidy:
+                out.setdefault("backups", []).append(_backup(paths["rule"]))
+            paths["rule"].unlink()
+    if tidy and not dry:
+        for folder in (base / "rules", base):
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+
+
+def _antigravity_uninstall(dry: bool, project: str | None = None, home: Path | None = None) -> dict:
+    """Without ``--project``: the global files. With it: only that project's
+    ``.agents`` files, as the Cursor pack does with its project rule."""
+    out: dict[str, Any] = {"harness": "antigravity", "changes": []}
+    pbase = _ag_project_base(project)
+    if pbase is not None and Path(project).expanduser().is_dir():
+        refused = _ag_refuse_project(project, home)
+        if refused:
+            out.update(ok=False, error=refused)
+            return out
+    if pbase is None:
+        _ag_uninstall_base(_ag_config_dir(), dry, out, tidy=False)
+        out["note"] = "project .agents files left in place; pass --project to remove them"
+    else:
+        _ag_uninstall_base(pbase, dry, out, tidy=True)
+    return out
+
+
+def _ag_state(base: Path | None, events: tuple[str, ...]) -> dict:
+    """What one folder holds: each event Khipu has its handler on (and the
+    command), the MCP entry and the rule. An unreadable file reads as absent."""
+    state: dict[str, Any] = {"events": [], "commands": {}, "mcp": False, "mcp_command": None, "rule": False}
+    if base is None:
+        return state
+    from khipu.recall_rule import antigravity_rule
+
+    paths = _ag_paths(base)
+    try:
+        entry = _load_json(paths["hooks"]).get(ANTIGRAVITY_HOOK_KEY)
+        servers = _load_json(paths["mcp"]).get("mcpServers")
+    except ConfigUnreadable:
+        entry, servers = None, None
+    if isinstance(entry, dict) and entry.get("enabled") is False:
+        entry = None  # switched off: Antigravity runs none of it
+    for event in events:
+        for h in _ag_handlers(entry.get(event) if isinstance(entry, dict) else None):
+            if _ag_is_ours(event, h.get("command")):
+                state["events"].append(event)
+                state["commands"][event] = h.get("command")
+                break
+    ours = servers.get("khipu") if isinstance(servers, dict) else None
+    cmd = ours.get("command") if isinstance(ours, dict) else None
+    state["mcp_command"] = cmd
+    state["mcp"] = cmd == mcp_launcher()
+    try:
+        state["rule"] = paths["rule"].read_text(encoding="utf-8") == antigravity_rule()
+    except OSError:
+        state["rule"] = False
+    return state
+
+
+def antigravity_project_install(project: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
+    """A project's ``.agents`` files only, through the same installer, guard
+    and launcher frame as ``install("antigravity", project=...)``."""
+    with _installing(dry=dry_run):
+        return _guarded("antigravity", _antigravity_install, dry_run, project, True, home)
+
+
+def antigravity_project_uninstall(project: str, *, dry_run: bool = False, home: Path | None = None) -> dict:
+    return _guarded("antigravity", _antigravity_uninstall, dry_run, project, home)
+
+
+def antigravity_project_state(project: str) -> dict:
+    """What a project's ``.agents`` folder holds, read the way the installer
+    writes it (exact commands, ``--event`` included, and the exact rule)."""
+    return _ag_state(_ag_project_base(project), _AG_PROJECT_EVENTS)
+
+
+def _antigravity_status(project: str | None = None) -> dict:
+    g = _ag_state(_ag_config_dir(), _AG_GLOBAL_EVENTS)
+    ev = set(g["events"])
+    out: dict[str, Any] = {
+        "harness": "antigravity", "detected": _antigravity_detected(),
+        "mcp": g["mcp"], "hook_sessionstart": "SessionStart" in ev,
+        "hook_prompt_recall": "PreInvocation" in ev, "hook_postinvocation": "PostInvocation" in ev,
+        "hook_stop": "Stop" in ev,
+        "recall_rule": "installed" if g["rule"] else "missing",
+        "extract": "installed" if {"PostInvocation", "Stop"} <= ev else "missing",
+        # Khipu never writes either (a PreToolUse answer is a permission decision).
+        "hook_pretooluse": False, "config": str(_ag_config_dir()),
+        # "hermetic" = Khipu's side is tested with fixtures; the harness running
+        # it has not been seen yet (slice H's real run settles each "unproven").
+        "proof": {"capture": "hermetic", "start_block": "unproven", "prompt_recall": "unproven",
+                  "mcp": "hermetic", "workspace_files": "unproven"},
+    }
+    if project:
+        p = _ag_state(_ag_project_base(project), _AG_PROJECT_EVENTS)
+        out["project"] = {"path": project, "mcp": p["mcp"], "rule": p["rule"],
+                          "hook_prompt_recall": "PreInvocation" in p["events"],
+                          "hook_postinvocation": "PostInvocation" in p["events"],
+                          "hook_stop": "Stop" in p["events"],
+                          "installed": p["mcp"] and p["rule"] and len(p["events"]) == len(_AG_PROJECT_EVENTS)}
+    out.update(_pack_launchers("antigravity", {
+        "khipu-mcp": g["mcp_command"],
+        "khipu-stop-hook": g["commands"].get("Stop"),
+        "khipu-recall-hook": g["commands"].get("SessionStart"),
+        "khipu-prompt-recall": g["commands"].get("PreInvocation"),
+    }))
+    out["installed"] = bool(out["mcp"] and out["hook_sessionstart"] and out["hook_prompt_recall"]
+                            and out["extract"] == "installed" and out["recall_rule"] == "installed")
     return out
 
 
@@ -2712,18 +3210,36 @@ def _probe_hook(command: str) -> dict:
     return out
 
 
-def _probe_recall(command: str) -> dict:
-    """SessionStart hook must print Claude or Cursor inject context with khipu_search.
-    Shell-run for the same reason as _probe_hook."""
+# What Cursor's SDK sends a sessionStart hook (docs and SDK 1.0.35): the payload,
+# not an argv flag, tells khipu.hook_shape to answer in Cursor's flat form.
+_CURSOR_PROBE_PAYLOAD = json.dumps({
+    "hook_event_name": "sessionStart", "conversation_id": "khipu-verify", "session_id": "khipu-verify",
+    "cursor_version": "3.26.13", "workspace_roots": ["/tmp/khipu-verify"], "source": "startup"})
+
+
+def _injected_context(d: dict) -> str:
+    """The context a hook's answer injects, in any harness's shape: Claude's
+    ``hookSpecificOutput``, Cursor's flat ``additional_context``, Antigravity's
+    ``injectSteps`` (the text of its system, user or ephemeral message)."""
+    ctx = (d.get("hookSpecificOutput", {}).get("additionalContext") or d.get("additional_context") or "")
+    if ctx or not isinstance(d.get("injectSteps"), list):
+        return ctx
+    for step in d["injectSteps"]:
+        if isinstance(step, dict):
+            for key in ("systemMessage", "userMessage", "ephemeralMessage"):
+                if isinstance(step.get(key), str) and step[key]:
+                    return step[key]
+    return ""
+
+
+def _probe_recall(command: str, payload: str = "{}") -> dict:
+    """SessionStart hook must print Claude, Cursor or Antigravity inject context
+    with khipu_search. Shell-run for the same reason as _probe_hook."""
     t0 = time.time()
     try:
-        p = subprocess.run(command, shell=True, input="{}", capture_output=True, encoding="utf-8", timeout=30)
+        p = subprocess.run(command, shell=True, input=payload, capture_output=True, encoding="utf-8", timeout=30)
         d = json.loads(p.stdout.strip() or "{}")
-        ctx = (
-            d.get("hookSpecificOutput", {}).get("additionalContext")
-            or d.get("additional_context")
-            or ""
-        )
+        ctx = _injected_context(d)
         return {"ok": p.returncode == 0 and "khipu_search" in ctx, "chars": len(ctx),
                 "ms": int((time.time() - t0) * 1000)}
     except Exception as e:  # noqa: BLE001
@@ -2750,7 +3266,7 @@ def _recall_part(ctx: str) -> str:
     return ctx if _RECALL_HEADING in ctx[cut:] else ctx[:cut]
 
 
-def _probe_prompt_recall(command: str) -> dict:
+def _probe_prompt_recall(command: str, cursor: bool = False) -> dict:
     """UserPromptSubmit hook: a trivial prompt must carry no recall output
     (R11's gate) and a topical one must run cleanly and return valid JSON,
     shell-run for the same reason as _probe_hook. Since routing truth phase
@@ -2788,13 +3304,18 @@ def _probe_prompt_recall(command: str) -> dict:
     # red on a Mac whose `khipu-verify` dedup file already held today's batches).
     trivial_session_id = f"khipu-verify-trivial-{uuid.uuid4().hex[:8]}"
     topical_session_id = f"khipu-verify-topical-{uuid.uuid4().hex[:8]}"
+    def _payload(prompt: str, session: str) -> str:
+        data: dict[str, Any] = {"prompt": prompt, "session_id": session}
+        if cursor:  # Cursor's beforeSubmitPrompt envelope: the answer comes back flat
+            data.update(hook_event_name="beforeSubmitPrompt", conversation_id=session,
+                        cursor_version="3.26.13", workspace_roots=["/tmp/khipu-verify"])
+        return json.dumps(data)
+
     try:
-        trivial = subprocess.run(command, shell=True,
-                                  input=json.dumps({"prompt": "ok", "session_id": trivial_session_id}),
+        trivial = subprocess.run(command, shell=True, input=_payload("ok", trivial_session_id),
                                   capture_output=True, encoding="utf-8", timeout=10)
         topical = subprocess.run(
-            command, shell=True,
-            input=json.dumps({"prompt": "khipu prompt recall verify probe", "session_id": topical_session_id}),
+            command, shell=True, input=_payload("khipu prompt recall verify probe", topical_session_id),
             capture_output=True, encoding="utf-8", timeout=10,
         )
     except Exception as e:  # noqa: BLE001
@@ -2828,6 +3349,53 @@ def _probe_prompt_recall(command: str) -> dict:
             reason = trivial.stderr or topical.stderr or "probe failed"
         out["error"] = reason[:300]
     return out
+
+
+def _probe_antigravity_prompt(command: str) -> dict:
+    """Antigravity's PreInvocation has no prompt and fires before every model
+    call: the hook must read the newest USER_INPUT from the transcript, answer
+    valid JSON, and say nothing on a later call of the same turn. A new
+    USER_INPUT is a new turn. Shell-run, under a throwaway capture home."""
+    import tempfile
+    t0 = time.time()
+    try:
+        with tempfile.TemporaryDirectory(prefix="khipu-ag-prompt-probe-") as td:
+            conv = f"khipu-verify-{uuid.uuid4().hex[:8]}"
+            tp = Path(td) / ".gemini" / "antigravity" / "brain" / conv / ".system_generated" / "logs" / "transcript.jsonl"
+            tp.parent.mkdir(parents=True)
+            payload = json.dumps({"conversationId": conv, "workspacePaths": [td], "transcriptPath": str(tp),
+                                  "artifactDirectoryPath": str(tp.parents[2]), "modelName": "probe",
+                                  "invocationNum": 1, "initialNumSteps": 0})
+            env = dict(os.environ, KHIPU_CAPTURE_HOME=str(Path(td) / "kh"))
+
+            def turn(text: str, index: int) -> None:
+                with tp.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps({"type": "USER_INPUT", "step_index": index, "content": text}) + "\n")
+
+            def call() -> tuple[int, dict]:
+                p = subprocess.run(command, shell=True, input=payload, capture_output=True, encoding="utf-8",
+                                   timeout=10, env=env)
+                return p.returncode, json.loads(p.stdout.strip() or "{}")
+
+            turn("khipu prompt recall verify probe", 1)
+            rc1, first = call()
+            rc2, second = call()          # the next model call of the same turn
+            turn("ok", 3)
+            rc3, _third = call()          # a new user turn passes the gate again
+            gate = list((Path(td) / "kh" / "owner-turns" / "antigravity").glob("*"))
+        steps = first.get("injectSteps")
+        shaped = steps is None or (isinstance(steps, list) and all(
+            isinstance(x, dict) and len(x) == 1 and next(iter(x)) in
+            ("systemMessage", "userMessage", "ephemeralMessage", "toolCall") for x in steps))
+        ok = (rc1 == rc2 == rc3 == 0 and second == {} and shaped and len(gate) == 2)
+        out = {"ok": ok, "injected": bool(steps), "once_per_turn": second == {}, "turns_gated": len(gate),
+               "ms": int((time.time() - t0) * 1000)}
+        if not ok:
+            out["error"] = (f"exit={rc1}/{rc2}/{rc3} second={json.dumps(second)[:80]} shaped={shaped} "
+                            f"gate_markers={len(gate)}")
+        return out
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
 def _probe_extract(command: str) -> dict:
@@ -2894,6 +3462,15 @@ def _probe_native_extract(command: str, harness: str) -> dict:
                         {"type": "event_msg", "payload": {"type": "agent_message", "message": "ack " * 40}}]
                 envl = {"hook_event_name": "PreCompact", "session_id": "khipu-verify", "cwd": td,
                         "transcript_path": str(tp)}
+            elif harness == "antigravity":
+                tp = (Path(td) / ".gemini" / "antigravity" / "brain" / "khipu-verify" / ".system_generated"
+                      / "logs" / "transcript.jsonl")
+                rows = [{"type": "USER_INPUT", "step_index": 1, "content": "probe: " + "x" * 300},
+                        {"type": "PLANNER_RESPONSE", "step_index": 2, "content": "ack " * 40}]
+                # A Stop that says the session ended is always due (session_capture.hook_event).
+                envl = {"conversationId": "khipu-verify", "workspacePaths": [td], "transcriptPath": str(tp),
+                        "artifactDirectoryPath": str(tp.parents[2]), "modelName": "probe",
+                        "executionNum": 1, "terminationReason": "session_end", "fullyIdle": True}
             elif harness == "grok_build":
                 tp = (Path(td) / ".grok" / "sessions" / urllib.parse.quote(td, safe="")
                       / "khipu-verify" / "updates.jsonl")
@@ -3163,12 +3740,63 @@ def verify_synth_provider() -> dict | None:
     return out
 
 
+def _antigravity_verify(st: dict, project: str | None, out: dict) -> dict:
+    """The Antigravity components. Every probe runs the command Khipu wrote
+    into hooks.json, shell-run as the harness runs it. None of this shows that
+    Antigravity itself loads the file (``proof`` in status says so)."""
+    comp = out["components"]
+    comp["mcp"] = _probe_mcp(mcp_launcher()) if st["mcp"] else {"ok": False, "error": "not installed"}
+    g = _ag_state(_ag_config_dir(), _AG_GLOBAL_EVENTS)
+    stop_cmd, post_cmd = g["commands"].get("Stop"), g["commands"].get("PostInvocation")
+    if stop_cmd and post_cmd:
+        hook = _probe_hook(stop_cmd)
+        if hook.get("ok"):
+            ref = _probe_aegis_refusal(stop_cmd)
+            hook.update({k: v for k, v in ref.items() if k != "ms"}, ok=hook["ok"] and ref["ok"])
+        if hook.get("ok"):
+            queue_only = _probe_hook(post_cmd)
+            hook["post_invocation_ok"] = queue_only.get("ok")
+            hook["ok"] = bool(queue_only.get("ok"))
+        comp["hook"] = hook
+        comp["extract"] = _probe_native_extract(stop_cmd, "antigravity")
+    else:
+        comp["hook"] = comp["extract"] = {"ok": False, "error": "not installed"}
+    if st["hook_sessionstart"]:
+        start = {"conversationId": f"khipu-verify-{uuid.uuid4().hex[:8]}", "workspacePaths": [tempfile.gettempdir()],
+                 "artifactDirectoryPath": "/tmp/khipu-verify-brain"}
+        recall = _probe_recall(g["commands"]["SessionStart"], json.dumps(start))
+        if recall.get("ok"):
+            ref = _probe_aegis_refusal(g["commands"]["SessionStart"])
+            recall.update({k: v for k, v in ref.items() if k != "ms"}, ok=recall["ok"] and ref["ok"])
+        comp["recall"] = recall
+    else:
+        comp["recall"] = {"ok": False, "error": "not installed"}
+    comp["prompt_recall"] = (_probe_antigravity_prompt(g["commands"]["PreInvocation"])
+                             if st["hook_prompt_recall"] else {"ok": False, "error": "not installed"})
+    comp["recall_instruction"] = {"ok": st["recall_rule"] == "installed", "configured": st["recall_rule"],
+                                  "note": "rule loading is offline-inspected; the model's compliance is not asserted"}
+    if project:
+        proj = st.get("project") or {}
+        comp["project_files"] = {"ok": bool(proj.get("installed")), "configured": proj,
+                                 "note": "workspace hooks need the owner's trust in Antigravity; not checked here"}
+    out["runtime"] = _runtime("antigravity")
+    try:
+        from khipu import probe
+
+        comp["recall_probe"] = probe.run_probe("antigravity")
+    except Exception as e:  # noqa: BLE001
+        comp["recall_probe"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    out["ok"] = all(c.get("ok") for c in comp.values()) and out["runtime"].get("ok", True)
+    return out
+
+
 def verify(harness: str, *, project: str | None = None, home: str | None = None) -> dict:
     """``home`` (claude_code only): verify that one Claude home. Without it the
     pack is verified in every home that has Khipu; homes without it are listed
     under ``not_installed_homes``."""
     _claude_only_home(harness, home)
-    st = status(harness, project=project) if harness in ("grok_bot", "grok_build") else status(harness)
+    st = (status(harness, project=project) if harness in ("grok_bot", "grok_build", "antigravity")
+          else status(harness))
     left_out: list[str] | None = None
     if harness == "claude_code":
         st, left_out = _claude_verify_scope(st, home)
@@ -3215,6 +3843,8 @@ def verify(harness: str, *, project: str | None = None, home: str | None = None)
         out["runtime"] = _runtime("grok_build")
         out["ok"] = all(c.get("ok") for c in out["components"].values()) and out["runtime"].get("ok", True)
         return out
+    if harness == "antigravity":
+        return _antigravity_verify(st, project, out)
     if st["mcp"]:
         out["components"]["mcp"] = _probe_mcp(mcp_launcher())
     else:
@@ -3272,16 +3902,19 @@ def verify(harness: str, *, project: str | None = None, home: str | None = None)
                               ok=recall["ok"] and ref["ok"])
             out["components"]["recall"] = recall
         elif harness == "cursor" and st.get("hook_sessionstart"):
-            recall = _probe_recall(recall_hook_cursor())
+            recall = _probe_recall(recall_hook(), _CURSOR_PROBE_PAYLOAD)
             if recall.get("ok"):
-                ref = _probe_aegis_refusal(recall_hook_cursor())
+                ref = _probe_aegis_refusal(recall_hook())
                 recall.update({k: v for k, v in ref.items() if k != "ms"},
                               ok=recall["ok"] and ref["ok"])
             out["components"]["recall"] = recall
-        # Per-prompt recall (R1): Claude Code / Codex only — Cursor has no
-        # UserPromptSubmit event to hook (it keeps the pull rule instead).
+        # Per-prompt recall (R1): Claude Code / Codex, and Cursor's
+        # beforeSubmitPrompt (a Cursor-shaped payload; whether Cursor passes the
+        # answer to the model is the real-run proof, not this probe's).
         if harness in ("claude_code", "codex") and st.get("prompt_recall") == "installed":
             out["components"]["prompt_recall"] = _probe_prompt_recall(prompt_recall_hook())
+        elif harness == "cursor" and st.get("prompt_recall") == "installed":
+            out["components"]["prompt_recall"] = _probe_prompt_recall(prompt_recall_hook(), cursor=True)
         if harness == "cursor":
             # The recall rule is written per-project (Cursor's User Rules live
             # in app state, not a writable file) — `khipu integrations install
@@ -3326,11 +3959,14 @@ def verify(harness: str, *, project: str | None = None, home: str | None = None)
 # ---- dispatch -----------------------------------------------------------------
 
 _INSTALL = {"claude_code": _claude_install, "cursor": _cursor_install, "aegis": _aegis_install,
-            "codex": _codex_install, "grok_build": _grok_build_install}
+            "codex": _codex_install, "grok_build": _grok_build_install,
+            "antigravity": _antigravity_install}
 _UNINSTALL = {"claude_code": _claude_uninstall, "cursor": _cursor_uninstall, "aegis": _aegis_uninstall,
-              "codex": _codex_uninstall, "grok_build": _grok_build_uninstall}
+              "codex": _codex_uninstall, "grok_build": _grok_build_uninstall,
+              "antigravity": _antigravity_uninstall}
 _STATUS = {"claude_code": _claude_status, "cursor": _cursor_status, "aegis": _aegis_status,
-           "codex": _codex_status, "grok_build": _grok_build_status}
+           "codex": _codex_status, "grok_build": _grok_build_status,
+           "antigravity": _antigravity_status}
 
 
 def _guarded(harness: str, fn, *args):
@@ -3367,6 +4003,8 @@ def install(harness: str, *, dry_run: bool = False, project: str | None = None,
             return _guarded(harness, _claude_install, dry_run, home)
         if harness == "grok_build":
             return _guarded(harness, _grok_build_install, dry_run, project)
+        if harness == "antigravity":
+            return _guarded(harness, _antigravity_install, dry_run, project)
         return _guarded(harness, _INSTALL[harness], dry_run)
 
 
@@ -3382,6 +4020,8 @@ def uninstall(harness: str, *, dry_run: bool = False, project: str | None = None
         return _guarded(harness, _grok_bot_uninstall, dry_run, project)
     if harness == "grok_build":
         return _guarded(harness, _grok_build_uninstall, dry_run, project)
+    if harness == "antigravity":
+        return _guarded(harness, _antigravity_uninstall, dry_run, project)
     return _guarded(harness, _UNINSTALL[harness], dry_run)
 
 
@@ -3411,6 +4051,8 @@ def status(harness: str, *, project: str | None = None) -> dict:
         out = _guarded(harness, _grok_bot_status, project)
     elif harness == "grok_build":
         out = _guarded(harness, _grok_build_status, project)
+    elif harness == "antigravity":
+        out = _guarded(harness, _antigravity_status, project)
     else:
         out = _guarded(harness, _STATUS[harness])
     if isinstance(out, dict) and "last_beat_at" not in out:
@@ -3444,7 +4086,7 @@ def _launcher_health_body() -> dict:
     }
     consistent = len(roots) <= 1
     ok = all(status(h).get("launcher_ok", True)
-             for h in ("claude_code", "cursor", "aegis", "codex", "grok_build"))
+             for h in ("claude_code", "cursor", "aegis", "codex", "grok_build", "antigravity"))
     out = {"states": states, "consistent": consistent, "ok": ok}
     if not consistent:
         out["warning"] = (
