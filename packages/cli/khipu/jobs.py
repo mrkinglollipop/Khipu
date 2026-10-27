@@ -694,7 +694,16 @@ def _library_backfill() -> dict[str, Any] | None:
             and (
                 not bool(row.get("ok", True))
                 or int(row.get("failed") or row.get("failed_chunks") or 0) > 0
-                or int(row.get("remaining") or 0) > 0
+                # Cap-hit partial with nothing failed is healthy (matches
+                # library.nightly's own bf_ok); remaining after a hard failure
+                # still counts.
+                or (
+                    int(row.get("remaining") or 0) > 0
+                    and not (
+                        str(row.get("status") or "") == "partial"
+                        and int(row.get("failed") or row.get("failed_chunks") or 0) == 0
+                    )
+                )
                 or bool(row.get("time_budget_exhausted") or row.get("budget_exhausted"))
                 or bool(row.get("error"))
                 or "budget" in str(row.get("skipped") or "").lower()
@@ -933,6 +942,14 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
         "check the embedding provider key/credentials, then run `khipu jobs install nightly`"
         " or wait for the next nightly",
     ),
+    "query_cache_prune_ok": (
+        "query_cache_prune",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "commitments_close_rules_ok": (
+        "commitments_close_rules",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
     "commitments_hygiene_ok": (
         "commitments_hygiene",
         "run `khipu hygiene commitments` and check the error",
@@ -940,6 +957,10 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     "mark_stale_ok": (
         "commitments_mark_stale",
         "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "ledger_ok": (
+        "ledger",
+        "run `khipu ledger drain` and check the error",
     ),
 }
 
