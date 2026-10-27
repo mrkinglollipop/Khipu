@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from khipu import owner_act, owner_direction, routing
 from tests import test_owner_direction as base
 
@@ -377,16 +379,16 @@ def _not_asked(rc: int, out: dict) -> None:
 
 def test_direction_over_newer_without_the_owners_words_is_refused(world, khipu_app):
     first, _second = _two_priorities(world, khipu_app)
-    world.say("undo that first priority change anyway")
+    world.say("undo that first priority change anyway and lose the newer change")
     _not_asked(*_direction_undo(world, khipu_app, first["owner_action"]))
 
 
 def test_direction_over_newer_with_words_that_are_not_the_latest_message_is_refused(world, khipu_app):
     first, _second = _two_priorities(world, khipu_app)
-    world.say("undo that first priority change anyway")
+    world.say("undo that first priority change anyway and lose the newer change")
     world.say("thanks")
     _not_asked(*_direction_undo(world, khipu_app, first["owner_action"],
-                                "--owner-words=undo that first priority change anyway"))
+                                "--owner-words=undo that first priority change anyway and lose the newer change"))
 
 
 def test_direction_over_newer_when_the_owner_only_asked_for_an_undo_is_refused(world, khipu_app):
@@ -399,9 +401,37 @@ def test_direction_over_newer_when_the_owner_only_asked_for_an_undo_is_refused(w
                                 "--owner-words=don't undo it anyway, keep the newer one"))
 
 
+@pytest.mark.parametrize("words", [
+    "what happens if we undo anyway?",
+    "should I undo it anyway?",
+    "Undo it anyway, keep the newer change though",
+    "Revert the cap. Override nothing else.",
+])
+def test_direction_over_newer_loose_wording_is_refused(world, khipu_app, words):
+    first, _second = _two_priorities(world, khipu_app)
+    world.say(words)
+    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"], "--owner-words=" + words))
+
+
+def test_direction_over_newer_refusal_names_the_phrase_to_type(world, khipu_app):
+    first, _second = _two_priorities(world, khipu_app)
+    world.say("undo it anyway")
+    rc, out = _direction_undo(world, khipu_app, first["owner_action"], "--owner-words=undo it anyway")
+    assert rc == 2 and "Undo anyway and lose the newer change" in json.dumps(out)
+
+
+def test_direction_over_newer_imperative_with_lose_the_newer_change_restores(world, khipu_app):
+    first, _second = _two_priorities(world, khipu_app)
+    words = "Fine. Revert the first priority change, lose the newer change."
+    world.say(words)
+    rc, out = _direction_undo(world, khipu_app, first["owner_action"], "--owner-words=" + words)
+    assert rc == 0, out
+    assert not routing.read_view().get("priority")
+
+
 def test_direction_over_newer_when_the_owner_asked_for_it_restores_and_records_it(world, khipu_app):
     first, second = _two_priorities(world, khipu_app)
-    words = "Undo that first priority change anyway,  and lose the newer one."
+    words = "Undo anyway   and LOSE the newer change."
     world.say(words)
     rc, out = _direction_undo(world, khipu_app, first["owner_action"], "--owner-words=" + words)
     assert rc == 0, out

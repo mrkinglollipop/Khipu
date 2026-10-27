@@ -2352,14 +2352,24 @@ def _refuse_over_newer(line: dict, over_newer: bool) -> None:
 
 
 # Through owner direction an Undo over a newer change needs the owner's own
-# latest message (its hash is the recorded turn's) to ask for it: an undo,
-# and that it go ahead anyway or lose the newer change.
-_ASKS_UNDO = re.compile(r"\b(undo|undoing|revert|restore|roll ?back|put (it|that|them|this) back)\b")
-_ASKS_ANYWAY = re.compile(r"\b(anyway|anyways|regardless|even so|even though|overwrite|override|over-newer|"
-                          r"over (the|that|my|its|this) (newer|later)( change| one)?|"
-                          r"los(e|ing) (the|that|my|this) (newer|later))\b")
-_NOT_ASKED = re.compile(r"\b(don'?t|do not|never|not|no)\b\W+(\w+\W+){0,3}?(undo|revert|restore|lose|overwrite|"
-                        r"override)\b")
+# latest message (its hash is the recorded turn's) to say what the app's
+# button says. Strict on purpose: the phrase, or "lose the newer change" with
+# an imperative undo/revert opening a sentence; never a question, never
+# "keep the newer", never a negated loss.
+OVER_NEWER_PHRASE = "undo anyway and lose the newer change"
+_LOSE_NEWER = "lose the newer change"
+_IMPERATIVE_UNDO = re.compile(r"(?:^|[.!;\n])\s*(?:please\s+)?(?:undo|revert|roll ?back)\b")
+_KEEP_NEWER = re.compile(r"\bkeep(?:ing)?\s+the\s+newer\b")
+_NEGATED_LOSS = re.compile(r"\b(?:don'?t|do not|never|not|no|without)\b\W+(?:\w+\W+){0,4}?(?:lose|losing|undo|revert)\b")
+
+
+def _bind_over_newer_asked(text: str) -> bool:
+    text = " ".join(text.lower().replace("\u2019", "'").split())
+    if "?" in text or _KEEP_NEWER.search(text) or _NEGATED_LOSS.search(text):
+        return False
+    if OVER_NEWER_PHRASE in text:
+        return True
+    return _LOSE_NEWER in text and bool(_IMPERATIVE_UNDO.search(text))
 
 
 def _bind_over_newer(words, stamp: dict) -> None:
@@ -2374,11 +2384,10 @@ def _bind_over_newer(words, stamp: dict) -> None:
         raise DirectionRefused("over_newer_not_asked",
                                "Those words are not the owner's latest message in this conversation, so they can't "
                                "authorise undoing over a newer change. Nothing was changed.")
-    text = turns.canonical_prompt(words).lower().replace("\u2019", "'")
-    if not (_ASKS_UNDO.search(text) and _ASKS_ANYWAY.search(text)) or _NOT_ASKED.search(text):
+    if not _bind_over_newer_asked(turns.canonical_prompt(words)):
         raise DirectionRefused("over_newer_not_asked",
-                               "The owner's message doesn't ask to undo anyway and lose the newer change, so this "
-                               "Undo can't go over it. Nothing was changed; ask the owner whether to undo anyway.")
+                               "The owner's message doesn't ask to lose the newer change, so this Undo can't go over "
+                               f"it. Nothing was changed. The owner must say: \"{OVER_NEWER_PHRASE.capitalize()}\".")
 
 
 def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False) -> dict:
