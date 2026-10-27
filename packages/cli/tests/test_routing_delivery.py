@@ -6,6 +6,7 @@ import re
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -304,6 +305,9 @@ def test_f_conversation_route_lists_the_actual_end_hold_action(home):
 
 @pytest.mark.parametrize("path", ["start", "full_prompt", "changes"])
 def test_review_omitted_pending_changes_are_counted_and_delivered_later(home, monkeypatch, path):
+    # UUID7 event ids otherwise read the real wall clock even though report
+    # timestamps and delivery leases use the fixture's clock.
+    monkeypatch.setattr(routing.event_identity, "time", SimpleNamespace(time=lambda: home["clock"].now.timestamp()))
     monkeypatch.setenv("KHIPU_SESSION_ID", "s-one")
     monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "1")
     before = routing.read_view()
