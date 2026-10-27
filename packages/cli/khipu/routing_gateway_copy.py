@@ -646,6 +646,25 @@ def publish(*, force=False, now=None, hub=None, cleanup_only=False):
         return _failed(state, now, cleanup)
 
 
+def _without_line_exceptions(line):
+    """Cut every "(exception ...)" parenthetical, matching nested parentheses."""
+    out, i = [], 0
+    while i < len(line):
+        j = line.find("(exception", i)
+        if j < 0:
+            out.append(line[i:])
+            break
+        out.append(line[i:j].rstrip())
+        depth, k = 0, j
+        while k < len(line):
+            depth += (line[k] == "(") - (line[k] == ")")
+            k += 1
+            if depth == 0:
+                break
+        i = k
+    return "".join(out)
+
+
 def answer(*, identity, account=None, ack="", now=None, hub=None):
     now = now or routing._now()
     hub = hub or PostgresHub()
@@ -672,14 +691,13 @@ def answer(*, identity, account=None, ack="", now=None, hub=None):
             entry.pop("exceptions", None)
     as_of = routing._parse(row["published_at"])
     stale = bool(row["stale_after"] and (now - as_of).total_seconds() > row["stale_after"])
-    # Past the copy's own valid_until something in it has ended (an
-    # exception baked into an older priority line, among others): the copy
-    # is stale whatever its age, and its priority is withheld until the Mac
-    # publishes again.
+    # An older copy carried an exception only inside the priority line. Past
+    # the copy's own valid_until that text may have ended, so it is cut from
+    # the line; the priority itself is always kept.
     valid_until = routing._parse(body.get("valid_until"))
-    if valid_until is not None and now >= valid_until:
-        stale = True
-        body.pop("priority", None)
+    priority = body.get("priority")
+    if valid_until is not None and now >= valid_until and isinstance(priority, dict) and priority.get("line"):
+        priority["line"] = _without_line_exceptions(priority["line"])
     body.update(as_of=row["published_at"], stale=stale)
     if stale:
         body["stale_message"] = "this Mac has not reported since " + as_of.strftime("%H:%MZ")

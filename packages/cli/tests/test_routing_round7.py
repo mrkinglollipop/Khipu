@@ -78,7 +78,7 @@ class _OneRowHub:
         return self.row
 
 
-def test_an_older_copys_baked_in_allowance_is_withheld_past_valid_until(direction_world, monkeypatch):
+def test_an_older_copys_baked_in_allowance_is_cut_from_the_line_past_valid_until(direction_world, monkeypatch):
     real = routing.settings
     monkeypatch.setattr(routing, "settings", lambda *a, **k: {**real(*a, **k), "routing_cloud_copy": True,
                                                               "routing_cloud_copy_rules": True})
@@ -92,7 +92,7 @@ def test_an_older_copys_baked_in_allowance_is_withheld_past_valid_until(directio
     hub = _OneRowHub(projection, routing._iso(now))
     assert "OLD ALLOWANCE" in str(gc.answer(identity=None, now=now + timedelta(minutes=30), hub=hub))
     after = gc.answer(identity=None, now=now + timedelta(hours=2), hub=hub)
-    assert "OLD ALLOWANCE" not in str(after) and after["stale"] is True
+    assert "OLD ALLOWANCE" not in str(after) and after["priority"]["entries"]
 
 
 # ---- (2) a cap layer's natural expiry never blocks a first retry ----------------------------------

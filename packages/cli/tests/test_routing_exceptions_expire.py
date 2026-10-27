@@ -344,3 +344,46 @@ def test_the_cli_request_path_takes_an_exception(direction_world, capsys):
     capsys.readouterr()
     assert routing.read_view()["priority"]["pending"] is True
     assert _live() == ["asked for"]
+
+
+# ---- the gateway copy never loses the priority to an ended exception or a near valid_until ----
+
+
+class _OneRowHub:
+    def __init__(self, projection, published_at):
+        self.row = {"projection": projection, "published_at": published_at, "stale_after": 0}
+
+    def newest(self):
+        return self.row
+
+
+def _published(direction_world, monkeypatch):
+    from khipu import routing_gateway_copy as gc
+    real = routing.settings
+    monkeypatch.setattr(routing, "settings", lambda *a, **k: {**real(*a, **k), "routing_cloud_copy": True,
+                                                              "routing_cloud_copy_rules": True})
+    _start()
+    _add(direction_world)
+    now = routing._now()
+    projection = routing.gateway_projection(now=now)
+    gc.validate(projection)
+    return gc, now, projection
+
+
+def test_the_gateway_keeps_the_priority_after_an_exception_ends(direction_world, monkeypatch):
+    gc, now, projection = _published(direction_world, monkeypatch)
+    hub = _OneRowHub(projection, routing._iso(now))
+    assert WORDS in str(gc.answer(identity=None, now=now + timedelta(hours=1), hub=hub))
+    later = now + timedelta(hours=2, minutes=1)
+    body = gc.answer(identity=None, now=later, hub=hub)
+    assert WORDS not in str(body)
+    assert [e["label"] for e in body["priority"]["entries"]] == [e["label"] for e in routing.read_view(later)["priority"]["entries"]]
+
+
+def test_the_gateway_keeps_the_priority_when_valid_until_is_a_second_after_publish(direction_world, monkeypatch):
+    gc, now, projection = _published(direction_world, monkeypatch)
+    projection["valid_until"] = routing._iso(now + timedelta(seconds=1))
+    hub = _OneRowHub(projection, routing._iso(now))
+    body = gc.answer(identity=None, now=now + timedelta(seconds=5), hub=hub)
+    assert {e["label"] for e in body["priority"]["entries"]} == {"Codex", "Grok"}
+    assert WORDS in str(body) and not body["stale"]
