@@ -105,8 +105,8 @@ export function capSetArgs(d: CapDraft): { cap: CapArgs } | { error: string } {
     case "per_day": {
       const pct = number(d.pct);
       if (pct == null || pct <= 0 || pct > 100) return { error: "A percent from 1 to 100." };
-      // The window stays the cap's own (a new per-day cap starts on the week).
-      return { cap: { kind: d.sentence, window: d.window, pct } };
+      // A per-day cap only reads on the week; a window picked before switching kind must not stick.
+      return { cap: { kind: d.sentence, window: d.sentence === "per_day" ? "weekly" : d.window, pct } };
     }
     case "pace_target": {
       const slack = number(d.slack);
