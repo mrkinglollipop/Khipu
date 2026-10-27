@@ -1049,6 +1049,15 @@ class ImportTest(_Base):
         self.assertIn("--endpoint", str(ctx.exception))
         self.assertNotIn("nomic-embed-text@4", self.hub.profile_rows)
 
+    def test_a_new_profile_at_the_wrong_native_width_is_a_library_error(self):
+        # voyage-3 only emits 1024 wide; add_profile refuses it, and import must
+        # report that as LibraryError so the CLI prints {"ok": false}, not a traceback.
+        idx = Path(self.tmp.name) / "mislabelled.sqlite"
+        _make_index(idx, [("n", 0, "Heiser/Unseen.txt", "t", _blob(1, 0, 0, 0), "voyage-3", 4)])
+        with self.assertRaises(library.LibraryError):
+            library.import_index(self.hub, "lib1", str(idx))
+        self.assertNotIn("voyage-3@4", self.hub.profile_rows)
+
     def test_explicit_profile_wins_and_must_exist(self):
         self.hub.profile_rows["other@4"] = ("voyage", "other", 4, "l2", None)
         library.scan(self.hub, "lib1")

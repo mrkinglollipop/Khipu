@@ -966,9 +966,9 @@ def _resolve_import_profile(cur, model: Any, dims: Any) -> profiles.ProfileSpec:
                 "and pass --profile"
             )
         spec = profiles.validate_spec(pid, provider=provider, model=str(model), dim=int(dims))
+        profiles.add_profile(cur, spec, note="created by khipu library import")
     except ValueError as exc:
         raise LibraryError(str(exc)) from exc
-    profiles.add_profile(cur, spec, note="created by khipu library import")
     return spec
 
 
