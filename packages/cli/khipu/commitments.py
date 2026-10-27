@@ -921,11 +921,22 @@ def _open_id_for_hash(cur, scope: str | None, content_h: str) -> int | None:
     than a bool so the caller can record the restatement (``last_seen_at`` /
     ``seen_count``) instead of silently dropping it.
     """
+    # Alias-group members share one open-hash scope (Q3 projects).
+    if scope is None:
+        project_sql, project_param = "project IS NOT DISTINCT FROM %s", None
+    else:
+        from khipu.identity import project_group
+
+        group = project_group(cur, scope)
+        if len(group) == 1:
+            project_sql, project_param = "project IS NOT DISTINCT FROM %s", group[0]
+        else:
+            project_sql, project_param = "project = ANY(%s)", group
     cur.execute(
         "SELECT id FROM commitments WHERE status = 'open' AND content_hash = %s "
-        "AND project IS NOT DISTINCT FROM %s "
+        f"AND {project_sql} "
         f"AND {_not_forgotten_clause(cur)} LIMIT 1",
-        (content_h, scope),
+        (content_h, project_param),
     )
     row = cur.fetchone()
     return int(row[0]) if row else None
@@ -2083,11 +2094,17 @@ def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
     """Open commitments opened by an episode of THIS session.
 
     Joined through ``episodes`` rather than a new column so rows written
-    before this change are covered too.
+    before this change are covered too. ``latest_text`` is included when
+    migration lineage columns exist so a restatement's future-trigger wording
+    is visible to :func:`close_session_plan`. ``last_seen_at`` / ``seen_count``
+    come along when migration 0012 is present so a later session's restatement
+    can block the opening session's session-ended close.
     """
+    latest = ", c.latest_text" if _lineage_columns_ready(cur) else ""
+    seen = ", c.last_seen_at, c.seen_count" if _seen_columns_ready(cur) else ""
     cur.execute(
         f"""
-        SELECT c.id, c.text, c.kind, c.owner
+        SELECT c.id, c.text, c.kind, c.owner{latest}{seen}
         FROM commitments c
         JOIN episodes e ON e.id = c.opened_episode
         WHERE c.status = 'open' AND e.session_id = %s
@@ -2095,10 +2112,18 @@ def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
         """,
         (session_id,),
     )
-    return [
-        {"id": r[0], "text": r[1], "kind": r[2], "owner": r[3]}
-        for r in cur.fetchall()
-    ]
+    rows = []
+    for r in cur.fetchall():
+        item = {"id": r[0], "text": r[1], "kind": r[2], "owner": r[3]}
+        i = 4
+        if latest:
+            item["latest_text"] = r[i]
+            i += 1
+        if seen:
+            item["last_seen_at"] = r[i]
+            item["seen_count"] = r[i + 1]
+        rows.append(item)
+    return rows
 
 
 def _is_user_owed(row: dict[str, Any]) -> bool:
@@ -2144,13 +2169,21 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         return 0
     closed = 0
     for row in rows:
-        trigger = has_future_trigger(row["text"])
+        # Restatements store newer wording in latest_text; a folded
+        # "… next session" must keep the row open through sessionend.
+        trigger = (has_future_trigger(row["text"] or "")
+                   or has_future_trigger(row.get("latest_text") or ""))
         owner, _label = row_owner(row, future_trigger=trigger)
         # Only the assistant's own items die with its session: the user's,
         # and an agent's (a job's item for its orchestrator), outlive it.
         if _is_user_owed(row) or owner != OWNER_ASSISTANT:
             continue
         if is_end and not trigger:
+            # A later capture restating this row bumps seen_count; the opening
+            # session alone must not retire it (same posture as the nightly
+            # recently_restated guard).
+            if int(row.get("seen_count") or 1) > 1:
+                continue
             # The session-ended rule: an assistant promise with no explicit
             # cross-session trigger dies with its session, whatever shape its
             # text has.
