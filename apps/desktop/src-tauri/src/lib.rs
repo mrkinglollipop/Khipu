@@ -3816,28 +3816,39 @@ fn checked_path(key: &str, raw: &str) -> Result<String, String> {
 
 /// The path is resolved through its deepest existing ancestor (the setting
 /// may name a file or folder Khipu will create later, under a link) and
-/// compared in lowercase, because the Mac disk ignores case.
+/// compared in lowercase, because the Mac disk ignores case. A dangling link
+/// is followed to where it points, since opening it creates that target.
 fn in_credential_folder(target: &Path, home: &Path) -> bool {
-    fn resolved(p: &Path) -> PathBuf {
+    /// None when dangling links chain past `hops`; the caller refuses then.
+    fn resolved(p: &Path, hops: u32) -> Option<PathBuf> {
         let mut rest = Vec::new();
         let mut cur = p;
         loop {
             let probe = if cur.as_os_str().is_empty() { Path::new(".") } else { cur };
             if let Ok(real) = std::fs::canonicalize(probe) {
-                return rest.iter().rev().fold(real, |acc, part| acc.join(part));
+                return Some(rest.iter().rev().fold(real, |acc, part| acc.join(part)));
+            }
+            if let Ok(link) = std::fs::read_link(probe) {
+                let next = hops.checked_sub(1)?;
+                let to = probe.parent().unwrap_or(Path::new("")).join(link);
+                let real = resolved(&to, next)?;
+                return Some(rest.iter().rev().fold(real, |acc, part| acc.join(part)));
             }
             match (cur.parent(), cur.file_name()) {
                 (Some(parent), Some(name)) => {
                     rest.push(name.to_owned());
                     cur = parent;
                 }
-                _ => return p.to_path_buf(),
+                _ => return Some(p.to_path_buf()),
             }
         }
     }
+    let (Some(real_target), Some(real_home)) = (resolved(target, 40), resolved(home, 40)) else {
+        return true;
+    };
     let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
-    let targets = [lower(target), lower(&resolved(target))];
-    let homes = [lower(home), lower(&resolved(home))];
+    let targets = [lower(target), lower(&real_target)];
+    let homes = [lower(home), lower(&real_home)];
     targets.iter().any(|t| {
         homes
             .iter()
@@ -6742,8 +6753,27 @@ mod settings_command_tests {
         let link = dir.join("innocent");
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&ssh, &link).unwrap();
+        let dangling = dir.join("dangling");
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(ssh.join("authorized_keys2"), &dangling).unwrap();
+        let relative = dir.join("relative");
+        let _ = std::fs::remove_file(&relative);
+        std::os::unix::fs::symlink("home/.ssh/missing/key", &relative).unwrap();
+        let loop_a = dir.join("loop_a");
+        let _ = std::fs::remove_file(&loop_a);
+        std::os::unix::fs::symlink("loop_b", &loop_a).unwrap();
+        let loop_b = dir.join("loop_b");
+        let _ = std::fs::remove_file(&loop_b);
+        std::os::unix::fs::symlink("loop_a", &loop_b).unwrap();
+        let benign = dir.join("benign");
+        let _ = std::fs::remove_file(&benign);
+        std::os::unix::fs::symlink(dir.join("elsewhere/missing"), &benign).unwrap();
         let cases = [
             (link.clone(), true),
+            (dangling.clone(), true),
+            (relative.clone(), true),
+            (loop_a.clone(), true),
+            (benign.clone(), false),
             (link.join("newfile"), true),
             (link.join("new/deeper/file"), true),
             (home.join(".SSH/new_key"), true),
