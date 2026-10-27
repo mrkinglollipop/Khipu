@@ -476,6 +476,7 @@ def status() -> dict[str, Any]:
     unreadable = 0
     offline = 0
     evidence_conflicts = 0
+    line_conflicts = 0
     now = datetime.now(timezone.utc)
     for jp in js:
         try:
@@ -493,6 +494,7 @@ def status() -> dict[str, Any]:
         attempts = job.get("attempts", 0)
         if job.get("evidence_conflict"):
             evidence_conflicts += 1
+            line_conflicts += _is_line_conflict(job)
         if (not isinstance(job.get("payload"), dict) or isinstance(attempts, bool)
                 or not isinstance(attempts, int) or attempts < 0):
             unreadable += 1
@@ -504,10 +506,12 @@ def status() -> dict[str, Any]:
     held_conflicts = []
     for jp in dead_jobs():
         try:
-            if _read_job(jp).get("evidence_conflict"):
-                held_conflicts.append(jp.name)
+            held = _read_job(jp)
         except (OSError, ValueError, TypeError, RecursionError):
-            pass  # dead still names unreadable held work
+            continue  # dead still names unreadable held work
+        if held.get("evidence_conflict"):
+            held_conflicts.append(jp.name)
+            line_conflicts += _is_line_conflict(held)
     evidence_conflicts += len(held_conflicts)
     resolved = len(list(resolved_dir().glob("*.json"))) if resolved_dir().is_dir() else 0
     # Existing doctor callers use ``dead`` to detect work that cannot replay.
@@ -525,14 +529,28 @@ def status() -> dict[str, Any]:
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
             "evidence_conflicts": evidence_conflicts,
             "held_conflicts": len(held_conflicts), "held_conflict_jobs": held_conflicts,
-            "resolved": resolved}
-    if evidence_conflicts:
+            "line_conflicts": line_conflicts, "resolved": resolved}
+    if line_conflicts:
+        # Most of these lines differ from the hub only by preference text it
+        # lacks (2026-10-27); retry-dead alone would just fail them again.
+        result["fix"] = ("Run `khipu outbox merge-line-preferences` to count the held memory-file lines that "
+                         "differ from the hub only by preferences it lacks; merge those with `--apply "
+                         "--owner-direction` on the owner's direction. The rest need owner reconciliation.")
+        if held_conflicts:
+            result["fix"] += " Then run `khipu outbox retry-dead` so the merged lines resolve."
+    elif evidence_conflicts:
         result["fix"] = ("Inspect the conflicting evidence in the local outbox and hub; "
                          "owner reconciliation is required before these jobs can replay.")
         if held_conflicts:
             # A buried job never re-enters the queue on its own.
             result["fix"] += " Then run `khipu outbox retry-dead` to replay the buried ones."
     return result
+
+
+def _is_line_conflict(job: Any) -> bool:
+    """A recovered memory-file line whose legacy key holds different facts
+    (``khipu outbox merge-line-preferences`` reads these)."""
+    return (_is_recovery_job(job) and job.get("reason") == "recovery: the legacy key holds different facts")
 
 
 def _is_recovery_job(job: Any) -> bool:

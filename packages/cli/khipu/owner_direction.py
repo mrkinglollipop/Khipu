@@ -85,7 +85,7 @@ ACTIONS: frozenset[str] = frozenset({
     "ledger.restore", "ledger.purge", "ledger.project", "ledger.add", "ledger.set", "ledger.remove", "work.hide", "work.unhide",
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
-    "project.separate", "forget.send", "forget.here", "forget.not_same",
+    "project.separate", "forget.send", "forget.here", "forget.not_same", "outbox.merge_preferences",
 })
 
 
@@ -790,6 +790,27 @@ def record_owed_batch(batch: str) -> None:
     pend["before"] = before
 
 
+def record_preference_merges(entries: list[dict]) -> None:
+    """Persist one transaction's preference additions (episode ids, exact
+    strings, prior lists) before it commits: the Undo of the merge."""
+    pend = _PENDING.get()
+    line = (pend or {}).get("line")
+    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
+        raise OSError("the owner action must be recorded before preferences can be merged")
+    _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
+             "state": "pending", "preference_merges": entries})
+
+
+def preference_merges(line_id: str) -> list[dict]:
+    """Every addition a merge recorded, in log order. Read from the raw log:
+    the merged view keeps only the last state line's fields."""
+    out: list[dict] = []
+    for row in read_log():
+        if row.get("kind") == "state" and row.get("target") == line_id:
+            out += [e for e in row.get("preference_merges") or [] if isinstance(e, dict)]
+    return out
+
+
 def record_setting_before(key: str, data: dict) -> None:
     """Record the exact replaced state while the setter holds both locks."""
     from khipu import routing
@@ -998,6 +1019,7 @@ _PUSH_WORDS = {
     "forget.send": "Sent this Mac's forgets the hub lacked to the hub",
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
+    "outbox.merge_preferences": "Merged preferences held only in memory-file lines into the hub",
 }
 
 
@@ -1218,6 +1240,10 @@ def _before(want: dict):
     if action == "owed.tidy":
         facts = want.get("facts") or {}
         return {"project": target, "change": facts.get("change"), "batch": facts.get("batch")}
+    if action == "outbox.merge_preferences":
+        # Each transaction's additions are written ahead as their own state
+        # line (``record_preference_merges``) before it commits.
+        return {"change": "apply"}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
     if action == "direction.acknowledge":
@@ -1626,6 +1652,17 @@ def _undo_owed_tidy(line, via):
     return {"ok": True, **counted, "left_alone": out.get("left_alone") or []}
 
 
+def _undo_outbox_preferences(line, via):
+    from khipu import outbox_preferences
+
+    entries = preference_merges(line["id"])
+    if not entries:
+        if int((line.get("result") or {}).get("episodes_merged") or 0) == 0 and line["state"] == "applied":
+            return {"ok": True, "restored": 0, "left_alone": []}
+        raise ValueError("Khipu has no record of which preferences this merge added, so it can't undo it")
+    return outbox_preferences.undo(entries)
+
+
 def _ledger_undo(verb: str):
     def run(line, via):
         return _ledger_write(verb, line["target"])
@@ -1715,6 +1752,7 @@ _UNDO = {
     "project.separate": _undo_project_group,
     "owed.change": _undo_owed_change,
     "owed.tidy": _undo_owed_tidy,
+    "outbox.merge_preferences": _undo_outbox_preferences,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,

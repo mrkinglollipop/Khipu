@@ -238,8 +238,10 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
     outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
-    # Dead letters sit outside drain(); only retry-dead moves them back.
-    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0:
+    # Dead letters sit outside drain(); only retry-dead moves them back. Held
+    # file lines with preferences the hub lacks would only fail again there,
+    # so status's fix (naming the merge first) stands for them.
+    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0 and not outbox.get("line_conflicts"):
         outbox["fix"] = "run `khipu outbox retry-dead`"
     elif not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
         outbox["fix"] = "run `khipu sessions drain`"
@@ -4340,10 +4342,61 @@ def cmd_outbox(args: argparse.Namespace) -> int:
     if args.outbox_cmd == "retry-dead":
         print(json.dumps(outbox.retry_dead(), indent=2))
         return 0
+    if args.outbox_cmd == "merge-line-preferences":
+        return _outbox_merge_preferences(args)
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
     return 0 if not out.get("failed") else 1
+
+
+def _outbox_merge_preferences(args: argparse.Namespace) -> int:
+    """``khipu outbox merge-line-preferences``: a dry run by default (counts
+    and redacted samples). ``--apply`` and ``--undo ID`` change the hub, so
+    each needs ``--owner-direction``: the owner gate, logged with its Undo."""
+    from khipu import outbox_preferences, owner_direction
+
+    if args.apply and args.undo:
+        print(json.dumps({"ok": False, "error": "give --apply or --undo, not both"}))
+        return 2
+    if not (args.apply or args.undo):
+        print(json.dumps(outbox_preferences.dry_run(), indent=2))
+        return 0
+    if not getattr(args, "by_direction", False):
+        print(json.dumps({"ok": False, "code": "owner_only",
+                          "error": "Merging into the hub (or undoing a merge) needs the owner's direction: "
+                                   "pass --owner-direction from a conversation the owner typed in. "
+                                   "Nothing was changed."}))
+        return 2
+    if args.undo:
+        line = owner_direction._find(args.undo)
+        if line is not None and line.get("action") != outbox_preferences.ACTION:
+            print(json.dumps({"ok": False, "code": "refused",
+                              "error": f"owner action {args.undo} is not a preference merge; nothing was changed"}))
+            return 2
+        why = owner_direction._undo_refusal(line, args.undo)
+        if why:
+            print(json.dumps({"ok": False, "code": "refused", "error": why + "; nothing was changed"}))
+            return 2
+        want = owner_direction.intent("direction.undo", args.undo)
+    else:
+        want = owner_direction.intent(outbox_preferences.ACTION, "outbox")
+    try:
+        owner_direction.gate(want)
+    except owner_direction.DirectionRefused as err:
+        print(json.dumps({**err.refusal(), "error": err.message + " Nothing was changed."}))
+        return 2
+    try:
+        if args.undo:
+            res = owner_direction.undo(args.undo, "direction")
+        else:
+            res = outbox_preferences.apply(record=owner_direction.record_preference_merges)
+    except BaseException:
+        owner_direction._abandon()
+        raise
+    res = owner_direction.finish(res) or res
+    print(json.dumps(res, indent=2, default=str))
+    return 0 if res.get("ok") else 1
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
@@ -6725,6 +6778,18 @@ def build_parser() -> argparse.ArgumentParser:
         "retry-dead",
         help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue",
     )
+    obm = ob_sub.add_parser(
+        "merge-line-preferences",
+        help="Held memory-file lines that differ from the hub only by preferences it lacks: "
+             "count them (default), merge them (--apply) or undo a merge (--undo ID)",
+    )
+    obm.add_argument("--apply", action="store_true",
+                     help="Append the missing preferences to their hub episodes (needs --owner-direction)")
+    obm.add_argument("--undo", metavar="OWNER_ACTION", default=None,
+                     help="Put back the exact prior preferences of one merge (needs --owner-direction)")
+    from khipu.owner_direction import add_owner_flags as _merge_owner_flags
+
+    _merge_owner_flags(obm)
     ob.set_defaults(func=cmd_outbox)
 
     jb = sub.add_parser(
