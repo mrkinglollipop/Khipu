@@ -90,7 +90,7 @@ STORES: tuple[Store, ...] = (
     Store("outbox job", "outbox/, outbox/dead/, outbox/quarantine/, outbox/resolved/: *.json and .*.tmp",
           "whole capture payloads waiting for the hub and resolved legacy evidence", "outbox",
           _w("outbox._atomic_write", "outbox._bury", "outbox._quarantine", "outbox.drain",
-             "outbox.enqueue", "outbox.retry_dead"),
+             "outbox.enqueue", "outbox.retry_dead", "outbox.archive_resolved", "outbox.unresolve"),
           Restore(("outbox/*.json", "outbox/dead/*.json", "outbox/quarantine/*.json", "outbox/resolved/*.json"),
                   "queued job")),
     Store("legacy log", "memory root: episodes*.jsonl, their .bak copies, .khipu-forget-backups/, "
