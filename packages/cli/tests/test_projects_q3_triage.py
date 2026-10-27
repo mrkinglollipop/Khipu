@@ -70,6 +70,22 @@ def test_undo_after_a_second_rename_restores_the_typed_capture(cur):
     assert cur.fetchall() == [(a, a)]
 
 
+def test_undo_leaves_a_forgotten_capture_where_forget_left_it(cur):
+    from khipu import capture
+
+    _alias(cur)
+    capture.write_pg({"ts": "2026-10-19T12:03:00Z", "summary": "unique zebrafish note three",
+                      "project": ALPHA, "harness": "claude_code", "session_id": "claude_code:s3",
+                      "transcript_range": "0:1"})
+    cur.execute("UPDATE episodes SET project = %s, deleted_at = now()", (BETA,))
+    cur.connection.commit()
+    out = identity.remove_project_alias(cur, ALPHA)
+    cur.connection.commit()
+    assert out.get("ok") and out.get("episodes_restored") == 0, out
+    cur.execute("SELECT project, summary FROM episodes")
+    assert cur.fetchall() == [(BETA, "unique zebrafish note three")]
+
+
 def test_close_rules_see_open_items_stored_under_an_alias_of_the_captured_project(cur):
     from khipu import close_rules
 

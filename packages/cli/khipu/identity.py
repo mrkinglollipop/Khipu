@@ -230,9 +230,11 @@ def remove_project_alias(cur, alias: str) -> dict[str, Any]:
     # Match every name in the group: after a second rename the row may still
     # sit under an older member, not the newest canonical.
     group = project_group(cur, canonical)
+    # Only the project column moves, and a forgotten row (deleted_at set)
+    # stays exactly where forget left it.
     cur.execute(
         "UPDATE episodes SET project = %s "
-        "WHERE project = ANY(%s) AND raw->>'typed_project' = %s",
+        "WHERE project = ANY(%s) AND raw->>'typed_project' = %s AND deleted_at IS NULL",
         (alias, group, alias),
     )
     restored = int(cur.rowcount or 0)
