@@ -73,6 +73,17 @@ CACHE_NAME = "usage.json"
 CACHE_VERSION = 2
 REFRESH_LOCK_NAME = "usage.refresh.lock"
 WRITE_LOCK_NAME = "usage.write.lock"
+# Append-only probe attempts (diagnosis 2026-10-26): evidence for a failed or
+# slow Grok read that usage.json alone drops. Bounded; rotated, never secrets.
+ATTEMPTS_NAME = "usage-attempts.jsonl"
+ATTEMPTS_MAX_BYTES = 512 * 1024
+ATTEMPTS_ROTATED_SUFFIX = ".1"
+# Grok near a weekly reset, or after a failed attempt: retry sooner than the
+# five-minute periodic age (60–120 s band).
+NEAR_RESET_MAX_AGE_S = 90
+NEAR_RESET_WITHIN_S = 3600
+# Keep the last pre-reset figure on the row for a few hours after the roll.
+PREV_FIGURE_KEEP_S = 3 * 3600
 # probe_all's overall deadline is the per-probe timeout plus this grace.
 OVERALL_GRACE_S = 2.0
 ROLLOUT_FILES = 5
@@ -2957,6 +2968,57 @@ def _release(fd: int | None) -> None:
         os.close(fd)
 
 
+def _longest_tracked_window(row: dict) -> dict | None:
+    """The row's longest window that has a used figure and a reset time."""
+    best, best_mins = None, -1
+    for window in row.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        used = window.get("used_pct")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
+            continue
+        if _parse_time(window.get("resets_at")) is None:
+            continue
+        mins = window.get("window_mins")
+        if not isinstance(mins, int) or isinstance(mins, bool) or mins <= 0:
+            name = str(window.get("name") or "")
+            mins = {"five_hour": 300, "daily": 1440, "weekly": 10080}.get(name)
+            if mins is None and name.startswith("weekly_"):
+                mins = 10080
+        if mins is None:
+            continue
+        if mins > best_mins or (mins == best_mins and not window.get("model")
+                                and (best is None or best.get("model"))):
+            best, best_mins = window, mins
+    return best
+
+
+def _prev_after_roll(previous: dict | None, row: dict) -> dict:
+    """``prev_used_pct`` / ``prev_window_end`` when a window rolls, else the
+    previous row's still-held pair (shown for a few hours after the reset)."""
+    carried = {}
+    if previous:
+        for field in ("prev_used_pct", "prev_window_end"):
+            if field in previous:
+                carried[field] = previous[field]
+    old = _longest_tracked_window(previous) if previous else None
+    new = _longest_tracked_window(row)
+    if old is None:
+        return carried
+    old_end = _parse_time(old.get("resets_at"))
+    used = old.get("used_pct")
+    if old_end is None or isinstance(used, bool) or not isinstance(used, (int, float)):
+        return carried
+    new_end = _parse_time((new or {}).get("resets_at")) if new else None
+    probe = _parse_time(row.get("probed_at"))
+    rolled = ((new_end is not None and new_end > old_end)
+              or (probe is not None and probe >= old_end
+                  and (new_end is None or new_end != old_end)))
+    if not rolled:
+        return carried
+    return {"prev_used_pct": float(used), "prev_window_end": _iso(old_end.timestamp())}
+
+
 def _merge(previous: dict | None, row: dict) -> dict:
     """A good probe replaces figures only when they are at least as recent.
     A failed live read keeps newer good figures even if a fallback succeeds.
@@ -2965,7 +3027,8 @@ def _merge(previous: dict | None, row: dict) -> dict:
     ``last_attempt_at`` / ``last_error``, however many failures in a row.
     The note is the failure's own (the ``/login`` hint, say): a note that
     came with the kept figures (the Codex fallback's) held only while that
-    read was good."""
+    read was good. When a window rolls on a good read, the last pre-reset
+    figure is kept as ``prev_used_pct`` / ``prev_window_end``."""
     attempt = row.get("probed_at")
     if row.get("ok"):
         old_time = (_oldest_figures_time(previous)
@@ -2978,13 +3041,47 @@ def _merge(previous: dict | None, row: dict) -> dict:
             if failure:
                 kept.update(ok=False, error=failure, live_error=failure, note=row.get("note"))
             return kept
-        return dict(row, last_attempt_at=attempt, last_error=row.get("live_error"), last_good_at=attempt)
+        out = dict(row, last_attempt_at=attempt, last_error=row.get("live_error"), last_good_at=attempt)
+        out.update(_prev_after_roll(previous, row))
+        return out
     if previous and previous.get("last_good_at"):
         kept = {k: v for k, v in previous.items() if k != "live_error"}
         kept.update(ok=False, error=row.get("error"), last_attempt_at=attempt, last_error=row.get("error"),
                     ms=row.get("ms"), account=row.get("account"), home=row.get("home"), note=row.get("note"))
         return kept
     return dict(row, last_attempt_at=attempt, last_error=row.get("error"), last_good_at=None)
+
+
+def _rotate_attempts(path: Path) -> None:
+    try:
+        if path.is_file() and path.stat().st_size >= ATTEMPTS_MAX_BYTES:
+            path.replace(path.with_name(path.name + ATTEMPTS_ROTATED_SUFFIX))
+    except OSError:
+        pass
+
+
+def _log_attempt(key: str, row: dict) -> None:
+    """Append one probe attempt (time, key, ok, error, ms). Never raises.
+    Never logs secrets, tokens, notes, paths beyond the cache key, or CLI text."""
+    try:
+        path = cache_file().with_name(ATTEMPTS_NAME)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_attempts(path)
+        error = row.get("error") if not row.get("ok") else row.get("live_error")
+        if error is not None and not _is_code(error):
+            error = E_INTERNAL
+        ms = row.get("ms")
+        entry = {
+            "time": row.get("probed_at") or _iso(_now().timestamp()),
+            "key": key if isinstance(key, str) else "?",
+            "ok": bool(row.get("ok")),
+            "error": error,
+            "ms": ms if isinstance(ms, int) and not isinstance(ms, bool) else None,
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception:  # noqa: BLE001 — attempt logging never breaks a store
+        pass
 
 
 def _store(accounts: list[dict], rows: list[dict]) -> list[dict]:
@@ -3009,6 +3106,7 @@ def _store(accounts: list[dict], rows: list[dict]) -> list[dict]:
         for account, row in zip(accounts, rows):
             key = _key(account)
             out = _merge(cache.get(key), row)
+            _log_attempt(key, row)
             if not account.get("invalid") and key in current:
                 cache[key] = {k: v for k, v in out.items() if k not in ("cached", "stale", "refreshing")}
             merged.append(out)
@@ -3064,6 +3162,39 @@ KICK_EVERY_S = 60
 KICK_STAMP_NAME = "usage.kick"
 
 
+def _weekly_reset_within(cached: dict, now: datetime, within_s: float) -> bool:
+    """True when a weekly window on the row resets within ``within_s`` (still ahead)."""
+    for window in cached.get("windows") or []:
+        if not isinstance(window, dict):
+            continue
+        name = str(window.get("name") or "")
+        mins = window.get("window_mins")
+        weekly = ((isinstance(mins, int) and not isinstance(mins, bool) and mins == 10080)
+                  or name == "weekly" or name.startswith("weekly_"))
+        if not weekly:
+            continue
+        reset = _parse_time(window.get("resets_at"))
+        if reset is None:
+            continue
+        until = (reset - now).total_seconds()
+        if 0 < until <= within_s:
+            return True
+    return False
+
+
+def _age_limit_for(account: dict, cached: dict, now: datetime, max_age: float) -> float:
+    """Per-account attempt age before a refresh is due. DeepSeek stays on its
+    poll; Grok near a weekly reset or after a failed attempt retries sooner."""
+    if account.get("harness") == "deepseek":
+        return min(max_age, DEEPSEEK_POLL_S)
+    if account.get("harness") == "grok":
+        failed = bool(cached.get("last_error")) or (
+            cached.get("ok") is False and bool(cached.get("last_attempt_at")))
+        if failed or _weekly_reset_within(cached, now, NEAR_RESET_WITHIN_S):
+            return min(max_age, NEAR_RESET_MAX_AGE_S)
+    return max_age
+
+
 def _due(accounts: list[dict], cache: dict[str, dict], now: datetime, max_age: float) -> list[dict]:
     """The valid accounts whose last attempt is older than ``max_age`` (or
     that were never read)."""
@@ -3073,7 +3204,7 @@ def _due(accounts: list[dict], cache: dict[str, dict], now: datetime, max_age: f
             continue
         cached = cache.get(_key(account)) or {}
         attempted = _parse_time(cached.get("last_attempt_at") or cached.get("probed_at"))
-        age_limit = min(max_age, DEEPSEEK_POLL_S) if account.get("harness") == "deepseek" else max_age
+        age_limit = _age_limit_for(account, cached, now, max_age)
         if attempted is None or _future_times(cached, now) or _reset_due(cached, now) or ((now - attempted).total_seconds() >= age_limit
                                  if account.get("harness") == "deepseek"
                                  else (now - attempted).total_seconds() > age_limit):
