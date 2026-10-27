@@ -1212,6 +1212,52 @@ def _legacy_comma_projection(original: Any, incoming: dict[str, Any]) -> bool:
     return payload_sha256(projected) == payload_sha256(incoming)
 
 
+def _legacy_comma_join(decisions: list[str]) -> list[str]:
+    return [s.strip() for s in ", ".join(decisions).split(",") if s.strip()]
+
+
+def _legacy_landed_line(original: Any, incoming: Any) -> bool:
+    """Prove a memory-file line is a lossy projection of the hub row at its key.
+
+    The file line drops fields the hub row keeps (edges, topic pages, loops,
+    source identity), so the row may hold more. Every field the line carries
+    with a value must be on the row with the same canonical JSON value;
+    decisions compare after the legacy comma join on both sides. An empty line
+    value (null, "", [], {}) carries nothing. A line value the row lacks or
+    holds differently (a preference the row does not carry) is not landed:
+    that line stays held for the owner and nothing is merged into the row.
+    """
+    if not isinstance(original, dict) or not isinstance(incoming, dict):
+        return False
+
+    def canonical(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    for key, value in incoming.items():
+        if value is None or (isinstance(value, (str, list, dict)) and not value):
+            continue
+        if key not in original:
+            return False
+        stored = original[key]
+        if key == "decisions":
+            if not (isinstance(value, list) and all(isinstance(d, str) for d in value)
+                    and isinstance(stored, list) and all(isinstance(d, str) for d in stored)):
+                return False
+            value, stored = _legacy_comma_join(value), _legacy_comma_join(stored)
+        if canonical(value) != canonical(stored):
+            return False
+    return True
+
+
+def _legacy_projection_kind(original: Any, incoming: dict[str, Any]) -> str | None:
+    """The resolution kind a queued file line proves against the hub row, if any."""
+    if _legacy_comma_projection(original, incoming):
+        return "legacy_comma_projection"
+    if _legacy_landed_line(original, incoming):
+        return "legacy_landed_line"
+    return None
+
+
 def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
@@ -1286,13 +1332,14 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                         target = row[0] if row else {}
                         original = target.get("raw") if target else None
                         if target and not target.get("deleted_at"):
-                            if _legacy_comma_projection(original, payload):
+                            kind = _legacy_projection_kind(original, payload)
+                            if kind:
                                 return {
                                     "episode_inserted": False, "topics_written": 0,
                                     "episode_id": existing_id, "source_key": source["source_key"],
-                                    "dedup": {"action": "skip", "matched_via": "legacy_comma_projection"},
+                                    "dedup": {"action": "skip", "matched_via": kind},
                                     "legacy_projection_duplicate": {
-                                        "payload": original, "episode_id": existing_id,
+                                        "kind": kind, "payload": original, "episode_id": existing_id,
                                         "original_payload_sha256": payload_sha256(original),
                                         "queued_payload_sha256": source["payload_sha256"],
                                     },

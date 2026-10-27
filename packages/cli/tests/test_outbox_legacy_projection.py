@@ -112,11 +112,10 @@ def test_real_write_pg_raw_defaults_round_trip_through_legacy_projection(world, 
 
 
 @pytest.mark.parametrize("stored, supplied", [
-    ({"tags": ["real-tag"]}, {}), ({"scope": "real-scope"}, {}),
-    ({"tags": []}, {"tags": ["changed-tag"]}), ({"scope": None}, {"scope": ""}),
-    ({"tags": []}, {"tags": None}), ({"scope": "real-scope"}, {"scope": None}),
+    ({"tags": []}, {"tags": ["changed-tag"]}), ({"tags": ["real-tag"]}, {"tags": ["other-tag"]}),
+    ({"scope": "real-scope"}, {"scope": "other-scope"}),
 ])
-def test_nonempty_or_changed_writer_defaults_remain_conflicts(world, stored, supplied):
+def test_changed_writer_defaults_remain_conflicts(world, stored, supplied):
     cur, _ = world
     cur.episodes[1]["raw"].update(stored)
     path = queue({**projection(), **supplied})
@@ -150,20 +149,38 @@ def test_projection_requires_explicit_unknown_owner_file_recovery(world, reason,
     assert path.exists()
 
 
-def test_missing_non_identity_field_is_not_proven_dropped(world):
+@pytest.mark.parametrize("stored, supplied", [
+    ({"tags": ["real-tag"]}, {}), ({"scope": "real-scope"}, {}), ({"scope": None}, {"scope": ""}),
+    ({"tags": []}, {"tags": None}), ({"scope": "real-scope"}, {"scope": None}),
+])
+def test_line_without_a_value_the_hub_holds_is_landed(world, stored, supplied):
+    cur, _ = world
+    cur.episodes[1]["raw"].update(stored)
+    before = deepcopy(cur.episodes)
+    path = queue({**projection(), **supplied})
+    assert outbox.drain().get("resolved") == 1
+    assert not path.exists()
+    [record] = (outbox.outbox_dir() / "resolved").glob("*.json")
+    assert json.loads(record.read_text())["resolution"]["kind"] == "legacy_landed_line"
+    assert cur.episodes == before
+
+
+def test_line_missing_a_field_the_hub_holds_is_landed(world):
     queued = projection()
     queued.pop("preferences")
     path = queue(queued)
-    assert outbox.drain()["failed"] == 1
-    assert path.exists()
+    assert outbox.drain().get("resolved") == 1
+    assert not path.exists()
 
 
-def test_original_only_unknown_evidence_is_not_proven_dropped(world):
+def test_hub_only_fields_do_not_hold_a_landed_line(world):
     cur, _ = world
     cur.episodes[1]["raw"]["future_evidence"] = ["preserve this"]
+    before = deepcopy(cur.episodes)
     path = queue()
-    assert outbox.drain()["failed"] == 1
-    assert path.exists()
+    assert outbox.drain().get("resolved") == 1
+    assert not path.exists()
+    assert cur.episodes == before
 
 
 def test_python_equal_but_json_distinct_values_are_not_projection_proof(world):
