@@ -55,7 +55,6 @@ from __future__ import annotations
 
 import glob
 import base64
-import collections
 import contextlib
 import fcntl
 import hashlib
