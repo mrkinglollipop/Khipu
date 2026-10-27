@@ -15,7 +15,7 @@
 import { useEffect, useId, useState } from "react";
 import { Loader2, MessageSquare, HelpCircle } from "lucide-react";
 import { Tag } from "./ui";
-import { callCli } from "./settingsCli";
+import { callCli, type ReloadResult } from "./settingsCli";
 import type { OwnerAction } from "./OwnerActions";
 import "./Projects.css";
 
@@ -54,7 +54,7 @@ export type ProjectsState = {
   data: ProjectsList | null;
   error: string | null;
   loading: boolean;
-  reload: () => Promise<ProjectsList | null>;
+  reload: () => Promise<ReloadResult<ProjectsList>>;
 };
 
 /** Pairs waiting on the owner: the count beside Projects in the section list. */

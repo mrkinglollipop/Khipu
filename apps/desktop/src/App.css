@@ -3536,3 +3536,14 @@ dialog.sheet-dialog { position: fixed; inset: 0 0 0 auto; z-index: 50; margin: 0
 .sheet-hist li:last-child { border-bottom: 0; }
 .sheet-hist .t { color: var(--muted); }
 .sheet-gap { font-size: var(--t-sm); color: var(--muted); }
+/* Controls inside the detail sheets: they sit under the fact they change. */
+.ctl { margin-top: var(--s2); }
+.ctl .toolbar { margin-top: var(--s2); }
+.ctl .route-pause, .ctl .route-confirm, .ctl .route-disagree { margin-top: var(--s2); }
+.ctl input.num { width: 5.5em; }
+.ctl .route-field.wide { display: flex; flex-direction: column; align-items: stretch; width: 100%; }
+.ctl .check-line { display: inline-flex; align-items: center; gap: var(--s2); font-size: var(--t-sm); }
+.ctl .spacer, .route-pause .spacer { flex: 1; }
+.undo { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3); margin-top: var(--s2); border-radius: var(--r-sm); background: var(--surface-2); border: 1px solid var(--border-strong); font-size: var(--t-sm); }
+.undo span { flex: 1; min-width: 0; }
+.undo.err { background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 35%, var(--border)); }

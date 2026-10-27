@@ -454,6 +454,20 @@ export function healthRows(
     if (isNotConfigured(key, notConfigured)) {
       return { key, status: "skipped", label, ...extra };
     }
+    // A check that did not run (skipped / not applicable on this Mac) stays
+    // grey even when its boolean is still true — otherwise "ok" reads as done.
+    const blockName = key.replace(/_ok$/, "");
+    const block = parsed[blockName];
+    if (
+      block &&
+      typeof block === "object" &&
+      (("skipped" in block &&
+        (block as { skipped?: unknown }).skipped != null &&
+        (block as { skipped?: unknown }).skipped !== false) ||
+        (block as { applicable?: unknown }).applicable === false)
+    ) {
+      return { key, status: "skipped", label, ...extra };
+    }
     // Delivery's top-level boolean is false for both a confirmed delivery
     // problem and an unreadable report. Keep the latter grey so Home never
     // claims a failure without the doctor's evidence.
