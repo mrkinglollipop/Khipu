@@ -110,6 +110,7 @@ class ResolveGeminiKeyTest(unittest.TestCase):
     def test_file_is_last(self):
         f = self.root / "key.txt"
         f.write_text("from-file\n")
+        f.chmod(0o600)
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": ""}), \
              mock.patch.object(kc, "get_gemini_key", return_value=None):
             self.assertEqual(kc.resolve_gemini_key(key_file=f), "from-file")
@@ -321,6 +322,7 @@ class VoyageKeyTest(unittest.TestCase):
     def test_keychain_then_file(self):
         f = self.root / "voyage.txt"
         f.write_text("from-file\n")
+        f.chmod(0o600)
         with mock.patch.dict(os.environ, {"VOYAGE_API_KEY": ""}):
             with mock.patch.object(kc, "get_voyage_key", return_value="from-kc"):
                 self.assertEqual(kc.resolve_voyage_key(key_file=f), "from-kc")
@@ -330,6 +332,7 @@ class VoyageKeyTest(unittest.TestCase):
     def test_the_file_path_comes_from_the_environment(self):
         f = self.root / "voyage.txt"
         f.write_text("env-file-key")
+        f.chmod(0o600)
         with mock.patch.dict(os.environ, {"VOYAGE_API_KEY": "", "KHIPU_VOYAGE_KEY_FILE": str(f)}), \
              mock.patch.object(kc, "get_voyage_key", return_value=None):
             self.assertEqual(kc.resolve_voyage_key(), "env-file-key")

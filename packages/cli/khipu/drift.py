@@ -776,4 +776,9 @@ def _dsn_source() -> str:
             path = Path.home() / ".config/khipu/dsn"
     if path.is_file():
         return "file"
+    from khipu import db
+
+    # A moved data folder holds no DSN; resolve_dsn() falls back to these.
+    if not db._explicit_dsn_location() and (db.DEFAULT_DSN_FILE.is_file() or db.LEGACY_DSN_FILE.is_file()):
+        return "file"
     return "none"

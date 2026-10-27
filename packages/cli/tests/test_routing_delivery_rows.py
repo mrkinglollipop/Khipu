@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -363,3 +363,14 @@ def test_owner_local_delivery_names_never_reach_other_surfaces(planted, monkeypa
                  MAC_NAME, OTHER_MAC_NAME, OTHER_MAC, SESSION, PRIVATE_PATH)
     for leaf in strings(output):
         assert not any(secret in leaf for secret in forbidden), (surface, leaf)
+
+def test_delivery_rows_distinguishes_a_damaged_read_from_no_live_conversations(monkeypatch):
+    from khipu import routing_delivery_rows as rdr
+
+    def boom(*a, **k):
+        raise RuntimeError("damaged source")
+
+    monkeypatch.setattr(rdr, "_delivery_data", boom)
+    damaged = rdr.delivery_data(None, datetime.now(timezone.utc), {})
+    assert damaged["rows"] is None, damaged
+    assert "error" not in damaged, damaged

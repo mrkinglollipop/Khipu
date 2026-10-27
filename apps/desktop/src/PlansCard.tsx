@@ -725,7 +725,7 @@ function PlanRow({ row, now, pause, onSignedIn, onOpen }: {
       {w && p != null ? (
         <>
           <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={meterTone(p)} dim={dim} />
-          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{fmtPct(p)}</span>
+          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{`${fmtPct(left!)} left`}</span>
           <span className="plan-when meta">
             {windowLabel(w)}
             {reset ? ` · ${reset}` : ""}
@@ -742,9 +742,11 @@ function PlanRow({ row, now, pause, onSignedIn, onOpen }: {
 
 /** Home → Plans: one row per account, the tightest window of each. `routing`
  *  is the routing record when it was read, for the pauses. */
-export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false, onAddAccount }: {
+export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false, onAddAccount, onRoutingChanged }: {
   state: PlanUsageState;
   routing?: RouteView | null;
+  /** Reads the routing record again after a change in the Plan detail. */
+  onRoutingChanged?: () => Promise<unknown> | void;
   onOpenAccounts?: () => void;
   /** The owner stopped tracking every account ("Read no accounts", phase 9). */
   noneTracked?: boolean;
@@ -824,6 +826,7 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
           onRefresh={() => void refresh()}
           refreshing={refreshing || loading}
           onOpenSettings={onOpenAccounts}
+          onChanged={onRoutingChanged}
         />
       ) : null}
     </div>
@@ -1276,7 +1279,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       ? await callCli("khipu_config_unset", { key: "usage_accounts", expect })
       : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list), expect });
     if (res.ok) onSaved?.();
-    await cfg.reload();
+    const fresh = await cfg.reload();
     setSaving(false);
     if (!res.ok) {
       const problem = accountsRefusal(res, (next ?? []).map(shownAs), added);
@@ -1284,6 +1287,15 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       setClash(problem.field);
       if (problem.field) (problem.field === "name" ? nameRef : homeRef).current?.focus();
       return false;
+    }
+    // `fresh.error` is set only on a real read failure; a superseded reload
+    // returns error: null even when data is null (see useCliState.reload).
+    if (fresh.error != null) {
+      setErr("Could not re-read the account list after saving. Close and reopen this section to try again.");
+      setClash(null);
+      // Save already landed; parent still needs to know the list changed.
+      void onChanged?.();
+      return true;
     }
     void onChanged?.();
     return true;
@@ -1338,6 +1350,11 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       {cfg.error && !status ? (
         <p className="set-error" role="alert">
           Could not read the account list. Close and reopen this section to try again.
+        </p>
+      ) : null}
+      {cfg.error && status ? (
+        <p className="set-error" role="alert">
+          Couldn&apos;t refresh; showing the last value: {cfg.error}
         </p>
       ) : null}
       {entries.length ? (

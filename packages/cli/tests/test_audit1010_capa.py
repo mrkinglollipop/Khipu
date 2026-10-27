@@ -111,7 +111,8 @@ class CaptureCapaTest(unittest.TestCase):
                                             "agent_id": "normal", "cwd": td,
                                             "agent_transcript_path": str(child)}), "claude_code")
             self.assertTrue(out["due"], out)
-            self.assertEqual(json.loads(sc.queued_jobs()[0].read_text())["parent_session_id"], "parent")
+            self.assertEqual(json.loads(sc.queued_jobs()[0].read_text())["parent_session_id"],
+                             "claude_code:parent")
 
     def test_short_explicit_request_precedes_minimum_character_gate(self):
         text = "USER: save this"
@@ -141,7 +142,7 @@ class CaptureCapaTest(unittest.TestCase):
             self.assertTrue(out["due"], out)
             job = json.loads(sc.queued_jobs()[0].read_text())
             self.assertEqual(job["session_id"], "parent:agent:child")
-            self.assertEqual(job["parent_session_id"], "parent")
+            self.assertEqual(job["parent_session_id"], "claude_code:parent")
             self.assertTrue(sc._state_file("claude_code", "parent:agent:child").exists())
             self.assertFalse(sc._state_file("claude_code", "parent").exists())
 
