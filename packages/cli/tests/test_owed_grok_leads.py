@@ -100,4 +100,5 @@ def test_item_with_a_hash_still_names_the_commitment():
     assert names("Answered question #7") == [7]
     assert names("Closed commitment 4 and owed item #5") == [4, 5]
     assert names("Ship item 12 of the release train") == []
+    assert names("See https://example.test/board/item#5 for context") == []
     assert names("question 3 of the survey") == []

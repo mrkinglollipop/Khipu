@@ -105,7 +105,7 @@ _DECIDE_RE = re.compile(r"\bdecid(?:e|es|ing|ed)\b|\bdecision\b", re.I)
 # train"); "commitment N" / "owed item N" name one, and so does "item #N" /
 # "question #N", where the hash marks the number as an id.
 _NAMES_ITEM_RE = re.compile(
-    r"\b(?:(?:commitment|owed\s+item)\s*#?|(?:item|question)\s*#)\s*(\d{1,12})\b", re.I)
+    r"(?<![/\w])\b(?:(?:commitment|owed\s+item)\s*#?|(?:item|question)\s*#)\s*(\d{1,12})\b", re.I)
 
 
 def _log(msg: str) -> None:
