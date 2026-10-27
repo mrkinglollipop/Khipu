@@ -4263,8 +4263,9 @@ def cmd_join(args: argparse.Namespace) -> int:
             except Exception as exc:  # noqa: BLE001 — its text can quote the DSN
                 migrate_out = {"ok": False, "error": public_error(exc, "Applying migrations")}
         hub_ok = bool(counts.get("ok"))
+        migrate_ok = migrate_out is None or migrate_out.get("ok") is not False
         result = {
-            "ok": True,
+            "ok": migrate_ok,
             "kit_imported": True,
             "hub_ok": hub_ok,
             "action": "import",
@@ -4278,7 +4279,7 @@ def cmd_join(args: argparse.Namespace) -> int:
         if migrate_out is not None:
             result["migrate"] = migrate_out
         print(json.dumps(result, indent=2))
-        return 0
+        return 0 if migrate_ok else 1
 
     if args.join_cmd == "advertise":
         try:
