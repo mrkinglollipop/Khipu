@@ -12,7 +12,12 @@ drain (the drain's exact check is unchanged); one whose every preference is
 now on the row but in another order, or beside preferences it lacks, is
 archived to resolved/ here as ``preferences_contained``
 (``outbox.archive_resolved``: the record keeps the whole job, and forget's
-sweep reads that folder). Every other difference is counted and left alone.
+sweep reads that folder). A line that differs only because the hub's writer
+reshaped it (K6 scope cleanup, W5.1 topics moved to tags, preferences split
+at other commas) is compared as the writer would have stored it, line side
+only, and archived as ``preferences_contained_normalized`` once the row
+holds it. Every other difference is counted as ``needs_review``, its
+episode ids listed, and left alone.
 
 Append only: an existing hub preference is never removed, reordered or
 rewritten, and a forgotten episode (deleted, forgotten by id on this Mac, or
@@ -112,6 +117,75 @@ def classify(raw: Any, view: dict[str, Any]) -> tuple[str, list[str]]:
     return "preference_order", missing
 
 
+NORMALIZED_KIND = "preferences_contained_normalized"
+
+
+def _writer_projection(raw: dict[str, Any], view: dict[str, Any]) -> dict[str, Any] | None:
+    """The line as ``write_pg`` would have stored it, line side only: scope
+    through ``identity.normalize_scope`` (K6) and topics through the W5.1
+    noise split (``hygiene.is_noise_slug``, which needs no database), noise
+    topics removed from the line once every one of them is in the row's
+    tags. None when the row can't hold what the writer would have written: a
+    line scope K6 drops while the row keeps a non-null scope, or a noise
+    topic (or line tag) the row's tags lack. Topic-alias folding needs the
+    database, so a topic it renamed is not reproduced and stays a difference."""
+    from khipu.hygiene import is_noise_slug
+    from khipu.identity import normalize_scope
+
+    out = dict(view)
+    scope = view.get("scope")
+    if isinstance(scope, str):
+        kept = normalize_scope(scope)
+        if kept is not None:
+            out["scope"] = kept
+        elif scope.strip() and raw.get("scope") is not None:
+            return None
+        else:
+            out.pop("scope")
+    topics = view.get("topics")
+    if isinstance(topics, list) and topics:
+        if not all(isinstance(t, str) for t in topics):
+            return None
+        split: dict[bool, list[str]] = {True: [], False: []}
+        for t in topics:
+            s = t.strip().lower()
+            if s and s not in split[is_noise_slug(s)]:
+                split[is_noise_slug(s)].append(s)
+        out["topics"] = split[False]
+        if split[True]:
+            line_tags = view.get("tags") or []
+            hub_tags = raw.get("tags")
+            if not (isinstance(line_tags, list) and isinstance(hub_tags, list)
+                    and all(isinstance(t, str) for t in [*line_tags, *hub_tags])
+                    and set(line_tags) | set(split[True]) <= set(hub_tags)):
+                return None
+            out.pop("tags", None)
+    return out
+
+
+def normalized_missing(raw: Any, view: dict[str, Any]) -> list[str] | None:
+    """The line's preferences the row lacks once the line is projected the
+    way the hub's writer reshapes it (``_writer_projection``), with
+    preferences compared after the comma join decisions already use; None
+    when anything but preferences still differs. ``[]``: the row holds the
+    whole line, which this command archives as ``preferences_contained_normalized``
+    (the drain's exact check is unchanged and never lands such a line)."""
+    from khipu.capture import _legacy_comma_join, _legacy_landed_line
+
+    if not isinstance(raw, dict):
+        return None
+    projected = _writer_projection(raw, view)
+    if projected is None:
+        return None
+    line_prefs, hub_prefs = _str_list(projected.get("preferences")), _str_list(raw.get("preferences"))
+    if line_prefs is None or hub_prefs is None:
+        return None
+    if not _legacy_landed_line(raw, {k: v for k, v in projected.items() if k != "preferences"}):
+        return None
+    pieces = set(_legacy_comma_join(hub_prefs))
+    return list(dict.fromkeys(p for p in line_prefs if not set(_legacy_comma_join([p])) <= pieces))
+
+
 def _forgotten(cur, eid: int, view: dict[str, Any]) -> bool:
     """The fences every reader and writer uses: forgotten on this Mac by id
     (``episode_hidden``: a backup's older raw no source identity matches) or
@@ -126,9 +200,12 @@ def _episode_plan(row: tuple, lines: list[dict[str, Any]]) -> tuple[list[str], l
     line's outcome (``landed`` as it stands, ``mergeable`` it lands once the
     additions are made, ``contained`` resolved here as
     ``preferences_contained``, ``other``) and the preferences to append, in
-    one running list. None when apply would skip the row for its shape (a
-    raw that is not an object, or a preference list in either place that is
-    not a list of strings)."""
+    one running list. A line no exact rule matches is tried once more
+    through ``normalized_missing``: ``normalized`` when the merged row holds
+    it after the writer's projection, resolved here as
+    ``preferences_contained_normalized``. None when apply would skip the row
+    for its shape (a raw that is not an object, or a preference list in
+    either place that is not a list of strings)."""
     from khipu.capture import _legacy_preferences_contained, _legacy_projection_kind
 
     _eid, _deleted_at, raw, column = row
@@ -140,10 +217,19 @@ def _episode_plan(row: tuple, lines: list[dict[str, Any]]) -> tuple[list[str], l
     added: list[str] = []
     before: list[str] = []
     for line in lines:
-        kind, missing = classify(dict(raw, preferences=hub_prefs + added), line["view"])
+        now = dict(raw, preferences=hub_prefs + added)
+        kind, missing = classify(now, line["view"])
         before.append(classify(raw, line["view"])[0])
-        if kind in ("mergeable", "preference_order"):
-            added += [p for p in missing if p not in added]
+        if kind in ("preference_order", "other"):
+            # No append lands this line exactly, so add only what the
+            # comma-joined comparison finds missing: a preference split at
+            # other commas is already on the row and is never appended again.
+            normalized = normalized_missing(now, line["view"])
+            if normalized is not None:
+                missing = normalized
+            elif kind == "other":
+                missing = []
+        added += [p for p in missing if p not in added]
     final = dict(raw, preferences=hub_prefs + added) if added else raw
     kinds = []
     for line, was in zip(lines, before):
@@ -151,6 +237,8 @@ def _episode_plan(row: tuple, lines: list[dict[str, Any]]) -> tuple[list[str], l
             kinds.append("landed" if was == "landed" else "mergeable")
         elif _legacy_preferences_contained(final, line["view"]):
             kinds.append("contained")
+        elif normalized_missing(final, line["view"]) == []:
+            kinds.append("normalized")
         else:
             kinds.append("other")
     return kinds, added
@@ -171,14 +259,19 @@ def _lookup(cur, lines: list[dict[str, Any]]) -> dict[int, tuple]:
     return rows
 
 
-_COUNTS = ("mergeable", "landed", "preferences_contained", "other", "forgotten", "no_hub_row", "column_shape")
+_COUNTS = ("mergeable", "landed", "preferences_contained", NORMALIZED_KIND, "needs_review", "forgotten",
+           "no_hub_row", "column_shape")
+_COUNT_OF = {"contained": "preferences_contained", "normalized": NORMALIZED_KIND, "other": "needs_review"}
 
 
-def _plan(cur) -> tuple[dict[str, int], dict[int, list[dict[str, Any]]], dict[int, list[str]]]:
-    """Counts by outcome, the held lines grouped by the episode they belong
-    to (only episodes with something to do), and each one's additions."""
+def _plan(cur) -> tuple[dict[str, Any], dict[int, list[dict[str, Any]]], dict[int, list[str]]]:
+    """Counts by outcome (with the episode ids of lines left for the owner's
+    review: a real difference no projection explains), the held lines
+    grouped by the episode they belong to (only episodes with something to
+    do), and each one's additions."""
     lines = held_lines()
-    counts = {"held_lines": len(lines), **{k: 0 for k in _COUNTS}}
+    counts: dict[str, Any] = {"held_lines": len(lines), **{k: 0 for k in _COUNTS}}
+    review: set[int] = set()
     grouped: dict[int, list[dict[str, Any]]] = {}
     rows: dict[int, tuple] = {}
     for i, row in _lookup(cur, lines).items():
@@ -203,9 +296,12 @@ def _plan(cur) -> tuple[dict[str, int], dict[int, list[dict[str, Any]]], dict[in
             continue
         kinds, added = planned
         for kind in kinds:
-            counts["preferences_contained" if kind == "contained" else kind] += 1
-        if added or "contained" in kinds:
+            counts[_COUNT_OF.get(kind, kind)] += 1
+        if "other" in kinds:
+            review.add(eid)
+        if added or "contained" in kinds or "normalized" in kinds:
             by_episode[eid], additions[eid] = group, added
+    counts["needs_review_episode_ids"] = sorted(review)
     return counts, by_episode, additions
 
 
@@ -230,15 +326,16 @@ def dry_run() -> dict[str, Any]:
             "preferences_to_add": sum(len(a) for a in additions.values()),
             "samples": _sample(by_episode, additions),
             "next": ("Merge them with `khipu outbox merge-line-preferences --apply --owner-direction`; "
-                     "lines that differ in anything else stay held." if by_episode else
+                     "lines that differ in anything else stay held (needs_review_episode_ids)." if by_episode else
                      "No held line differs from its hub episode only by preferences the hub lacks.")}
 
 
 def _merge_episode(cur, row: tuple, lines: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list]:
     """The append-only change for one locked row, re-proved against it now:
     what to record and write (None when nothing is to be added any more), and
-    the lines to resolve as ``preferences_contained`` once it commits, each
-    with the row's raw as the merge leaves it."""
+    the lines to resolve (``preferences_contained`` or
+    ``preferences_contained_normalized``) once it commits, each with the
+    row's raw as the merge leaves it."""
     eid, deleted_at, raw, column = row
     if deleted_at is not None:
         return None, []
@@ -249,7 +346,7 @@ def _merge_episode(cur, row: tuple, lines: list[dict[str, Any]]) -> tuple[dict[s
     kinds, added = planned
     hub_prefs, col_prefs = _str_list(raw.get("preferences")), _str_list(column)
     final = dict(raw, preferences=hub_prefs + added) if added else raw
-    resolve = [(line, final) for line, kind in zip(live, kinds) if kind == "contained"]
+    resolve = [(line, final) for line, kind in zip(live, kinds) if kind in ("contained", "normalized")]
     if not added:
         return None, resolve
     identities = sorted({tag for line in live for tag in _identity_tags(line["view"])})
@@ -270,7 +367,9 @@ def _identity_tags(view: dict[str, Any]) -> set[str]:
 
 def _resolution(line: dict[str, Any], final_raw: dict[str, Any]) -> tuple[dict[str, Any], str] | None:
     """The resolved/ record for one held line, built from the bytes it was
-    read from, and its record id; None when those bytes no longer prove it."""
+    read from (the whole queued job, so a scope or topic the writer reshaped
+    is kept verbatim), and its record id; None when those bytes no longer
+    prove it."""
     import hashlib
     from datetime import datetime, timezone
 
@@ -279,10 +378,14 @@ def _resolution(line: dict[str, Any], final_raw: dict[str, Any]) -> tuple[dict[s
 
     queued = json.loads(line["snapshot"])
     view = _hub_view(queued["payload"])
-    if not _legacy_preferences_contained(final_raw, view):
+    if _legacy_preferences_contained(final_raw, view):
+        kind = "preferences_contained"
+    elif normalized_missing(final_raw, view) == []:
+        kind = NORMALIZED_KIND
+    else:
         return None
     record = {"payload": final_raw, "queued_evidence": queued,
-              "resolution": {"kind": "preferences_contained", "episode_id": int(line["row"][0]),
+              "resolution": {"kind": kind, "episode_id": int(line["row"][0]),
                              "original_payload_sha256": payload_sha256(final_raw),
                              "queued_payload_sha256": payload_sha256(view),
                              "resolved_at": datetime.now(timezone.utc).isoformat()}}
@@ -299,7 +402,8 @@ def _resolve(resolve: list, record_resolutions) -> int:
     if not built:
         return 0
     record_resolutions([{"episode_id": int(line["row"][0]), "record": record_id, "job": line["job"],
-                         "where": line["where"]} for line, _record, record_id in built])
+                         "where": line["where"], "kind": record["resolution"]["kind"]}
+                        for line, record, record_id in built])
     return sum(outbox.archive_resolved(line["path"], line["snapshot"], record) == "resolved"
                for line, record, _record_id in built)
 
@@ -411,7 +515,8 @@ def undo(entries: list[dict[str, Any]], resolutions: list[dict[str, Any]] | None
     unresolved, still_resolved = 0, []
     for r in resolutions or []:
         folder = outbox.outbox_dir() if r.get("where") == "outbox" else outbox.dead_dir()
-        status = outbox.unresolve(str(r["record"]), folder / str(r["job"]), "preferences_contained")
+        kind = r.get("kind") if r.get("kind") == NORMALIZED_KIND else "preferences_contained"
+        status = outbox.unresolve(str(r["record"]), folder / str(r["job"]), kind)
         if status == "restored":
             unresolved += 1
         elif status in ("forgotten", "present"):

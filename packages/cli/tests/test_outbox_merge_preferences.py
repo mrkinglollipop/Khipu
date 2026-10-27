@@ -144,10 +144,11 @@ def test_dry_run_counts_each_kind_and_prints_no_preference_text(backlog):
     rc, out = _run()
     assert rc == 0 and out["dry_run"] is True, out
     assert out["held_lines"] == 8
-    assert (out["mergeable"], out["landed"], out["other"], out["forgotten"],
+    assert (out["mergeable"], out["landed"], out["needs_review"], out["forgotten"],
             out["preferences_contained"], out["no_hub_row"], out["column_shape"]) == (3, 1, 1, 1, 1, 1, 0), out
     # The reordered line's one missing preference is appended too, then it is contained.
     assert out["episodes"] == 4 and out["preferences_to_add"] == 2 + 1 + 1 + 1
+    assert out["needs_review_episode_ids"] == [4] and out["preferences_contained_normalized"] == 0
     assert {s["episode_id"]: s["preferences_to_add"] for s in out["samples"]} == {1: 2, 2: 1, 6: 1, 7: 1}
     assert {s["where"] for s in out["samples"]} == {"outbox", "dead"}
     text = json.dumps(out)
