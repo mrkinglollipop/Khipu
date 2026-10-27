@@ -197,3 +197,88 @@ def test_khipu_search_drops_hub_episode_hits_when_the_registry_is_unreadable(mon
 
     monkeypatch.setattr("khipu.tombstones.read_gate", broken)
     assert [r["id"] for r in _search()["results"]] == ["khipu"]
+
+
+# ---- hybrid_search and the budgeted hub lane: every other search route --------------
+# `khipu search`, khipu_reflect and the per-prompt recall push all read
+# hybrid_search; khipu_status's prior work reads _hub_hits_budgeted.
+
+
+def _hub_rows() -> list[dict]:
+    return [{"kind": "episode", "id": "7", "label": "e7", "snippet": "SECRET FORGOTTEN SUMMARY",
+             "score": 0.95, "rank_text": "widget batching endpoint SECRET", "project": "p"},
+            {"kind": "episode", "id": "8", "label": "e8", "snippet": "kept episode",
+             "score": 0.9, "rank_text": "widget batching endpoint kept", "project": "p"},
+            {"kind": "topic", "id": "khipu", "label": "t", "snippet": "kept topic",
+             "score": 0.85, "rank_text": "widget batching endpoint topic"}]
+
+
+class _Conn:
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _fake_hub():
+    from contextlib import ExitStack
+
+    from khipu import embed
+
+    stack = ExitStack()
+    for target, kw in (
+            ("khipu.embed._cosine_candidates", {"side_effect": lambda *a, **k: [dict(r) for r in _hub_rows()]}),
+            ("khipu.cli._literal_candidates", {"side_effect": lambda *a, **k: [dict(r) for r in _hub_rows()]}),
+            ("khipu.hub_snapshot.try_hub_connect", {"return_value": _Conn()}),
+            ("khipu.db.connect", {"return_value": _Conn()}),
+            ("khipu.topic_graph.enrich_search_results", {"side_effect": lambda cur, r: list(r)}),
+            ("khipu.decisions.enrich_search_results", {"side_effect": lambda cur, r: list(r)}),
+            ("khipu.library_search.enabled_libraries", {"return_value": []}),
+            ("khipu.query_log.log_query", {})):
+        stack.enter_context(mock.patch(target, **kw))
+    stack.enter_context(mock.patch.object(embed, "_apply_search_filters", side_effect=lambda cur, r, **k: r))
+    return stack
+
+
+def _routes(capsys) -> dict[str, str]:
+    from khipu import cli, embed, recall_prompt, reflect
+
+    out = {}
+    with _fake_hub():
+        for mode in ("hybrid", "semantic", "literal"):
+            out[f"hybrid_search:{mode}"] = json.dumps(
+                embed.hybrid_search("widget batching endpoint", limit=8, mode=mode))
+        args = cli.build_parser().parse_args(["search", "widget batching endpoint"])
+        args.func(args)
+        out["khipu search"] = capsys.readouterr().out
+        out["khipu_reflect"] = json.dumps(reflect._search("widget batching endpoint", None, 8))
+        out["prior work"] = json.dumps(recall_prompt._hub_hits_budgeted(
+            "widget batching endpoint", ["widget", "batching", "endpoint"], project=None,
+            budget_ms=2000, limit=8))
+    return out
+
+
+def test_every_search_route_drops_a_forgotten_episode(monkeypatch, capsys):
+    monkeypatch.setattr("khipu.tombstones.read_gate", lambda: _gate([7]))
+    routes = _routes(capsys)
+    assert [r for r, text in routes.items() if "SECRET" in text] == []
+    assert [r for r, text in routes.items() if "kept episode" not in text] == []
+
+
+def test_every_search_route_drops_hub_episodes_when_the_registry_is_unreadable(monkeypatch, capsys):
+    from khipu import tombstones
+
+    def broken():
+        raise tombstones.RegistryError("unreadable")
+
+    monkeypatch.setattr("khipu.tombstones.read_gate", broken)
+    assert [r for r, text in _routes(capsys).items() if "SECRET" in text or "kept episode" in text] == []
+
+
+def test_every_search_route_still_returns_an_episode_nobody_forgot(monkeypatch, capsys):
+    monkeypatch.setattr("khipu.tombstones.read_gate", lambda: _gate([9]))
+    assert [r for r, text in _routes(capsys).items() if "SECRET FORGOTTEN SUMMARY" not in text] == []

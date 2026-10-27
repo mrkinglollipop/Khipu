@@ -3204,6 +3204,11 @@ def hybrid_search(
                 session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
                 projects=filters.projects,
             )
+            # A forget this Mac holds that the hub lacks leaves the hub row
+            # live: drop it here, before the reranker or any caller sees it.
+            from khipu.tombstones import without_hidden_episodes
+
+            fused = without_hidden_episodes(fused)
 
             # Absolute relevance gate: the list unchanged when any row is
             # evidence, empty when none is. Once, after fusion, graph expansion
