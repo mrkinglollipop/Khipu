@@ -22,6 +22,7 @@ import type { ReactNode } from "react";
 import { ChevronRight, Loader2 } from "lucide-react";
 import { Tag } from "./ui";
 import { callCli } from "./settingsCli";
+import { plainError } from "./humanWords";
 import {
   COMING,
   LIST_MOVED,
@@ -290,12 +291,12 @@ export function FoundRows({
           const owner = c.state === "not_checked";
           return (
             <div key={c.id} className="aa-found" role="listitem">
-              <Tag>Found, not checked</Tag>
+              <Tag tone="accent">New folder</Tag>
               <span className="aa-ft">
                 <b>{loginTitle(c)}</b>
                 <span className="t2">
                   {owner
-                    ? `Its folder name looks like a ${cliName(c.cli)} login; no conversation has used it, so Khipu has not asked ${cliName(c.cli)} about it yet.`
+                    ? `Looks like a ${cliName(c.cli)} login. Khipu found it by its folder name only.`
                     : "Khipu checks it on its next look."}
                 </span>
                 {owner ? (
@@ -1368,7 +1369,16 @@ export function useAccountsFinder(
       const res = await saveCliSetting(key, v);
       if (!res.ok) {
         console.error(`khipu config ${key} refused:`, res.error);
-        setMessage(key === "node_folder" ? "That folder has no node program Khipu can run." : "That file isn't a program Khipu can run.");
+        const err = String(res.error ?? "");
+        const pathProblem =
+          /must be an executable file|must be a folder holding an executable node/i.test(err);
+        setMessage(
+          pathProblem
+            ? key === "node_folder"
+              ? "That folder has no node program Khipu can run."
+              : "That file isn't a program Khipu can run."
+            : plainError(err),
+        );
         return;
       }
       setMessage(v ? "Saved. Khipu uses it from the next check." : "Cleared. Khipu looks for it by itself again.");

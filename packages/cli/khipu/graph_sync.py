@@ -11,7 +11,8 @@ Model — the same one episodes use: **the producer keeps producing where it doe
 Khipu mirrors at the source, and drift is measured, not assumed.**
 
   * graphify writes graph.sqlite (unchanged). At the end of its nightly it calls
-    :func:`sync_from_sqlite` fail-open, exactly like capture_v2 mirrors episodes.
+    :func:`sync_from_sqlite`; a real mirror or post-sync drift failure fails
+    the nightly. Non-producers skip the mirror without touching PG.
   * The sync is a full, idempotent mirror of graphify's rows: COPY into temp
     tables, upsert nodes then edges, then delete graphify-owned rows that
     graphify no longer has. One transaction; ~20k nodes / 35k edges in seconds.
@@ -33,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -148,14 +150,40 @@ def _read_sqlite(path: Path) -> tuple[list[tuple], list[tuple]]:
     return nodes, edges
 
 
+def _connect_graph_mirror():
+    """Retry connection establishment only, within the nightly's outer deadline.
+
+    Returning the established connection keeps context entry, SQL, and commit
+    outside the retry loop: an ambiguous transaction failure must never replay.
+    Diagnostics deliberately omit exception text, which can contain the DSN.
+    """
+    from psycopg import OperationalError
+    from khipu.db import connect
+
+    for attempt in range(1, 4):
+        try:
+            return connect(connect_timeout=30)
+        except OperationalError:
+            diagnostic = f"graph mirror connect: attempt {attempt}/3 failed (OperationalError)"
+            if attempt == 3:
+                print(f"{diagnostic}; giving up", file=sys.stderr, flush=True)
+                raise
+            delay = 2 ** attempt
+            print(f"{diagnostic}; retrying in {delay}s", file=sys.stderr, flush=True)
+            time.sleep(delay)
+
+
 def sync_from_sqlite(
     sqlite_path: Path | None = None, *, dry_run: bool = False
 ) -> dict[str, Any]:
     """Mirror graphify's graph.sqlite into PG. Idempotent; one transaction.
 
     Returns counts plus the post-sync drift so a caller can assert zero."""
-    from khipu.db import connect
-
+    if not is_graph_producer():
+        # PG is read-only for the graph on this machine: nothing to mirror, and
+        # an unreachable database must not fail a job that never needed it.
+        reason = "not the graph producer; PG is read-only for the graph here"
+        return {"ok": True, "skipped": reason, "drift": {"ok": True, "skipped": reason}}
     path = Path(sqlite_path) if sqlite_path else _default_sqlite()
     if not path.is_file():
         raise FileNotFoundError(f"graph.sqlite not found: {path}")
@@ -181,7 +209,7 @@ def sync_from_sqlite(
         "sqlite_edges": len(edges),
         "dry_run": dry_run,
     }
-    with connect() as conn:
+    with _connect_graph_mirror() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "CREATE TEMP TABLE _sync_nodes (id TEXT PRIMARY KEY, type TEXT, bucket TEXT, name TEXT,"
@@ -359,7 +387,7 @@ def sync_from_sqlite(
                 conn.commit()
     stats["seconds"] = round(time.time() - t0, 1)
     if not dry_run:
-        stats["drift"] = graph_drift(path)
+        stats["drift"] = graph_drift(path, excuse_pending=False, mirror_connections=True)
     return stats
 
 
@@ -399,8 +427,18 @@ def is_graph_producer() -> bool:
     return False
 
 
-def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str, Any]:
-    """Compare graphify rows with PG by identity and normalized content."""
+def graph_drift(
+    sqlite_path: Path | None = None, *, sample: int = 5, excuse_pending: bool = True,
+    mirror_connections: bool = False,
+) -> dict[str, Any]:
+    """Compare graphify rows with PG by identity and normalized content.
+
+    ``excuse_pending`` lets a difference that appeared after the last good
+    nightly mirror read as ok (doctor's view). The sync itself turns it off:
+    drift left right after a mirror ran is that mirror's failure.
+    ``mirror_connections`` opts both PG legs into the nightly's slower-link
+    connection budget; standalone doctor checks retain their fast defaults.
+    """
     from khipu.db import connect
     from khipu import sources as sources_mod
 
@@ -435,8 +473,10 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
             out["error"] = f"source registry unreadable or malformed: {exc}"
             return out
 
+    establish = _connect_graph_mirror if mirror_connections else connect
+
     def _pg_nodes() -> tuple[list[dict[str, Any]], int]:
-        with connect() as conn:
+        with establish() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT n.id, n.type, n.bucket, n.name, n.payload, n.source_path, "
@@ -461,7 +501,7 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
                 return rows, cur.fetchone()[0]
 
     def _pg_edges() -> dict[tuple, tuple]:
-        with connect() as conn:
+        with establish() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"""
@@ -592,7 +632,7 @@ def graph_drift(sqlite_path: Path | None = None, *, sample: int = 5) -> dict[str
         missing_nodes or extra_nodes or missing_edges or extra_edges
         or node_content_drift or edge_content_drift
     )
-    if not out["ok"] and _changed_since_last_mirror(path):
+    if not out["ok"] and excuse_pending and _changed_since_last_mirror(path):
         out["ok"] = True
         out["pending"] = (
             "graph.sqlite changed after the last nightly mirror, which succeeded; "

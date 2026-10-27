@@ -216,6 +216,19 @@ function row(listName: string, start: string): HTMLElement {
   return found;
 }
 
+/** Settings opens the Routing detail from an account's line (one place for
+ *  every control of the account, not a second copy in a fold). */
+function openAccount(label: string): HTMLElement {
+  fireEvent.click(within(row("Accounts", label)).getByRole("button"));
+  return screen.getByRole("dialog");
+}
+
+/** A sheet puts focus on its Close button a frame after it opens; a test that
+ *  moves focus itself waits for that first. */
+async function settled(dialog: HTMLElement) {
+  await waitFor(() => expect(within(dialog).getByRole("button", { name: "Close details" })).toHaveFocus());
+}
+
 describe("Settings -> Routing: the words and choices", () => {
   it("words times, lengths and a rule's origin in local time", () => {
     expect(isoLocal(new Date("2026-10-16T13:00:00Z"))).toBe("2026-10-16T09:00:00-04:00");
@@ -311,47 +324,57 @@ describe("Settings -> Routing: accounts", () => {
   it("shows each account with its state and who said so, and Check now when probeable", async () => {
     await page();
     expect(row("Accounts", "Claude main")).toHaveTextContent("Limit reached, back at 1:52 PM");
-    expect(row("Accounts", "Claude main")).toHaveTextContent("Read from Claude 4 min ago");
     expect(row("Accounts", "Grok Build")).toHaveTextContent("Paused by you until Fri 9:00 AM");
-    expect(within(row("Accounts", "Claude main")).getByRole("button", { name: "Check now" })).toBeInTheDocument();
+    // The line is a button that opens the Routing detail; no controls hide in a fold.
+    expect(within(row("Accounts", "Claude main")).queryByRole("button", { name: "Check now" })).toBeNull();
+    const main = openAccount("Claude main");
+    expect(main).toHaveTextContent("Read from Claude 4 min ago");
+    expect(within(main).getByRole("button", { name: "Check now" })).toBeInTheDocument();
+    fireEvent.click(within(main).getByRole("button", { name: "Close details" }));
     // Open accounts have nothing to clear.
-    expect(within(row("Accounts", "Codex")).queryByRole("button", { name: /Clear/ })).toBeNull();
+    expect(within(openAccount("Codex")).queryByRole("button", { name: /clear this report/ })).toBeNull();
   });
 
-  it("marks an account paused until a chosen time, focusing the form and closing on Escape", async () => {
+  it("pauses an account until a chosen time, focusing the form and closing on Escape", async () => {
     await page();
-    const btn = screen.getByRole("button", { name: "Mark Codex paused until…" });
+    const dialog = openAccount("Codex");
+    const btn = within(dialog).getByRole("button", { name: "Pause Codex until…" });
     fireEvent.click(btn);
     expect(btn).toHaveAttribute("aria-expanded", "true");
-    const select = screen.getByLabelText("Mark Codex paused until");
+    const select = within(dialog).getByLabelText("Pause Codex until");
     expect(select).toHaveFocus();
-    expect(screen.getByText(/This doesn't stop anything that is running/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/This doesn't stop anything that is running/)).toBeInTheDocument();
     fireEvent.keyDown(select, { key: "Escape" });
-    expect(screen.queryByLabelText("Mark Codex paused until")).toBeNull();
+    expect(within(dialog).queryByLabelText("Pause Codex until")).toBeNull();
 
     fireEvent.click(btn);
-    fireEvent.change(screen.getByLabelText("Mark Codex paused until"), { target: { value: "never" } });
-    fireEvent.click(screen.getByRole("button", { name: "Mark Codex paused" }));
+    fireEvent.change(within(dialog).getByLabelText("Pause Codex until"), { target: { value: "never" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Pause Codex" }));
     await waitFor(() => expect(calls("khipu_route_pause")).toEqual([{ account: "codex|", until: null }]));
+    // A change that can be taken back says so in its own section, right away.
+    expect(await within(dialog).findByRole("status")).toHaveTextContent("Codex is paused until you lift it.");
   });
 
   it("refuses a typed time that has passed without calling the CLI", async () => {
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Mark Codex paused until…" }));
-    fireEvent.change(screen.getByLabelText("Mark Codex paused until"), { target: { value: "custom" } });
-    fireEvent.change(screen.getByLabelText("Date and time it ends"), { target: { value: "2026-10-01T09:00" } });
-    fireEvent.click(screen.getByRole("button", { name: "Mark Codex paused" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Choose a time that hasn't passed yet.");
+    const dialog = openAccount("Codex");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Pause Codex until…" }));
+    fireEvent.change(within(dialog).getByLabelText("Pause Codex until"), { target: { value: "custom" } });
+    fireEvent.change(within(dialog).getByLabelText("Date and time it ends"), { target: { value: "2026-10-01T09:00" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Pause Codex" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Choose a time that hasn't passed yet.");
     expect(calls("khipu_route_pause")).toEqual([]);
   });
 
   it("lifts a pause and clears a limit, showing the CLI's refusal in its words", async () => {
     answers.khipu_route_lift = { ok: false, error: "that account isn't paused" };
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Lift the pause for Grok Build" }));
+    const grok = openAccount("Grok Build");
+    fireEvent.click(within(grok).getByRole("button", { name: "Lift the pause" }));
     await waitFor(() => expect(calls("khipu_route_lift")).toEqual([{ account: "grok|" }]));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Khipu didn't make that change: that account isn't paused");
-    fireEvent.click(screen.getByRole("button", { name: "Clear the limit for Claude main" }));
+    expect(await within(grok).findByRole("alert")).toHaveTextContent("Khipu didn't make that change: that account isn't paused");
+    fireEvent.click(within(grok).getByRole("button", { name: "Close details" }));
+    fireEvent.click(within(openAccount("Claude main")).getByRole("button", { name: "It isn't limited: clear this report" }));
     await waitFor(() => expect(calls("khipu_route_clear")).toEqual([{ account: "claude|" }]));
     // Each write re-reads the record.
     expect(calls("khipu_route_view").length).toBeGreaterThanOrEqual(3);
@@ -359,7 +382,8 @@ describe("Settings -> Routing: accounts", () => {
 
   it("dismisses either side of a disagreement, named by whose report it is (F6)", async () => {
     await page();
-    const panel = screen.getByRole("group", { name: "Claude second: two reports disagree" });
+    const dialog = openAccount("Claude second");
+    const panel = within(dialog).getByRole("group", { name: "Claude second: two reports disagree" });
     expect(panel).toHaveTextContent("Two reports disagree.");
     expect(panel).toHaveTextContent("Open: reported by a Claude Code conversation in project-b 9 min ago.");
     const buttons = within(panel).getAllByRole("button");
@@ -368,7 +392,7 @@ describe("Settings -> Routing: accounts", () => {
     await waitFor(() =>
       expect(calls("khipu_route_clear")).toEqual([{ account: "claude|/logins/claude-second", report: "e-open" }]),
     );
-    fireEvent.click(within(screen.getByRole("group", { name: "Claude second: two reports disagree" })).getByRole("button", { name: "Dismiss the runner's report" }));
+    fireEvent.click(within(within(dialog).getByRole("group", { name: "Claude second: two reports disagree" })).getByRole("button", { name: "Dismiss the runner's report" }));
     await waitFor(() =>
       expect(calls("khipu_route_clear")[1]).toEqual({ account: "claude|/logins/claude-second", report: "r-runner" }),
     );
@@ -1201,11 +1225,35 @@ describe("Settings -> Routing: checking for resets", () => {
     await page();
     expect(await screen.findByLabelText("First retry in seconds")).toHaveValue("900");
     expect(screen.getByText(/Claude main:.*this account can't be checked without using a turn/)).toBeInTheDocument();
-    expect(row("Accounts", "Claude main")).toHaveTextContent("Khipu checks again at 2:02 PM.");
-    fireEvent.click(within(row("Accounts", "Claude main")).getByRole("button", { name: "Check now" }));
+    const dialog = openAccount("Claude main");
+    expect(dialog).toHaveTextContent("Khipu checks again at 2:02 PM.");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Check now" }));
     await waitFor(() => expect(calls("khipu_route_check")).toEqual([{ account: "claude|" }]));
-    // The page has its own status line ("Reading what needs you…" without a plan read): look in the row.
-    expect(await within(row("Accounts", "Claude main")).findByRole("status")).toHaveTextContent("not checked: the Mac was busy");
+    expect(await within(dialog).findByRole("status")).toHaveTextContent("not checked: the Mac was busy");
+  });
+
+  it("re-reads the record after Check now in the routing detail, so the state line is not left old", async () => {
+    const v = view();
+    v.accounts![0]!.reset_check = { status: "cannot_check", reason: "this account can't be checked without using a turn" };
+    answers.khipu_route_view = v;
+    answers.khipu_route_check = { ok: true, reason: "not checked: the Mac was busy" };
+    await page();
+    await screen.findByLabelText("First retry in seconds");
+    const dialog = openAccount("Claude main");
+    const stateLine = () => dialog.querySelector(".sheet-state")!;
+    expect(stateLine()).toHaveTextContent(/Limit reached/);
+    // The check finds the account open: the next read of the record says so.
+    const after = view();
+    after.accounts![0]!.state = "open";
+    after.accounts![0]!.until = null;
+    answers.khipu_route_view = after;
+    const before = calls("khipu_route_view").length;
+    fireEvent.click(within(dialog).getByRole("button", { name: "Check now" }));
+    await waitFor(() => expect(calls("khipu_route_check")).toEqual([{ account: "claude|" }]));
+    await waitFor(() => expect(calls("khipu_route_view").length).toBeGreaterThan(before));
+    // What the sheet displays changes, not just what was fetched.
+    await waitFor(() => expect(stateLine()).toHaveTextContent("Open"));
+    expect(stateLine()).not.toHaveTextContent(/Limit reached/);
   });
 
   it("words the busy-Mac row and offers no wait, no attempts and no retries (fix round 1, F7)", async () => {
@@ -1236,14 +1284,15 @@ describe("Settings -> Routing: checking for resets", () => {
     v.accounts![0]!.configured = false;
     answers.khipu_route_view = v;
     await page();
-    expect(within(row("Accounts", "Claude main")).queryByRole("button", { name: "Check now" })).toBeNull();
+    expect(within(openAccount("Claude main")).queryByRole("button", { name: "Check now" })).toBeNull();
   });
 
   it("shows a Check now refusal beside its account", async () => {
     answers.khipu_route_check = { ok: false, error: "another usage check is running" };
     await page();
-    fireEvent.click(within(row("Accounts", "Claude main")).getByRole("button", { name: "Check now" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("another usage check is running");
+    const dialog = openAccount("Claude main");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Check now" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("another usage check is running");
   });
 });
 
@@ -1548,6 +1597,43 @@ describe("Settings -> Routing: checks and copies", () => {
     expect(within(group).queryByRole("button", { name: /look now/i })).toBeNull();
   });
 
+  it.each(["checked", "incomplete", "stale"])("shows scan evidence and time for %s reports with hits", async (status) => {
+    Object.assign(answers.khipu_route_view = view(), { routing_file_copies: {
+      status, scanned_at: "2026-10-14T15:30:00Z", files_checked: 1,
+      hits: [{ file: "Repo/AGENTS.md", line: 1, quote: "Prefer Codex first", superseded: true }],
+      skipped: [{ file: "~/Documents/notes", reason: "protected_path" },
+        { file: "Repo/slow.md", reason: "timeout", message: "Couldn't read in time." }],
+      too_large: ["Repo/big.md"],
+    } });
+    await page();
+    const group = screen.getByRole("region", { name: "Checks and copies" });
+    expect(within(group).getByRole("list", { name: "Copies of routing found in files" })).toHaveTextContent("Prefer Codex first");
+    expect(group).toHaveTextContent(/Files last looked at.*11:30 AM/);
+    expect(group).toHaveTextContent("~/Documents/notes");
+    expect(group).toHaveTextContent(/protected/i);
+    expect(group).toHaveTextContent("Couldn't read in time.");
+    expect(group).toHaveTextContent("Too large to read: Repo/big.md.");
+    expect(group).not.toHaveTextContent("Khipu hasn't looked at your files yet");
+    if (status === "stale") expect(group).toHaveTextContent(/out of date/i);
+    if (status === "incomplete") expect(group).toHaveTextContent(/incomplete/i);
+  });
+
+  it.each(["incomplete", "stale"])("explains %s scans with no hits", async (status) => {
+    Object.assign(answers.khipu_route_view = view(), { routing_file_copies: {
+      status, scanned_at: "2026-10-14T15:30:00Z", files_checked: 0, hits: [],
+      skipped: [{ file: "candidate discovery", reason: "candidate_limit" }],
+    } });
+    await page();
+    const group = screen.getByRole("region", { name: "Checks and copies" });
+    expect(group).toHaveTextContent(/Files last looked at.*11:30 AM/);
+    expect(group).toHaveTextContent(/candidate limit/i);
+    expect(group).not.toHaveTextContent("Khipu hasn't looked at your files yet");
+    expect(group).not.toHaveTextContent("Nothing to fix");
+    const summary = document.querySelector('[data-settings-group="checks"]');
+    expect(summary).toHaveTextContent(status === "stale" ? /out of date/i : /incomplete/i);
+    expect(summary).not.toHaveTextContent("Files not looked at yet");
+  });
+
   const TIERS = {
     scope: "opus", mock: "opus", ruling: "opus", "hard-security": "opus", "failed-fix": "opus",
     build: "sonnet", "fix-round": "sonnet", tests: "sonnet", docs: "sonnet", synthesis: "sonnet",
@@ -1760,50 +1846,56 @@ describe("Settings -> Routing: focus after a button removes itself (R2-2)", () =
     answers.khipu_route_view = () => (calls(cmd).length ? change(view()) : view());
   }
 
-  it("Clear gives focus to the account's Mark paused until…", async () => {
+  it("Clear gives focus to the account's Pause until…", async () => {
     afterWrite("khipu_route_clear", (v) => ({
       ...v,
       accounts: v.accounts!.map((a) => (a.label === "Claude main" ? { ...a, state: "open", until: null } : a)),
     }));
     await page();
-    const clear = screen.getByRole("button", { name: "Clear the limit for Claude main" });
+    const dialog = openAccount("Claude main");
+    await settled(dialog);
+    const clear = within(dialog).getByRole("button", { name: "It isn't limited: clear this report" });
     clear.focus();
     fireEvent.click(clear);
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Clear the limit for Claude main" })).toBeNull());
+    await waitFor(() => expect(within(dialog).queryByRole("button", { name: "It isn't limited: clear this report" })).toBeNull());
     await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Mark Claude main paused until…" })),
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Pause Claude main until…" })),
     );
   });
 
-  it("Lift gives focus to the account's Mark paused until…", async () => {
+  it("Lift gives focus to the account's Pause until…", async () => {
     afterWrite("khipu_route_lift", (v) => ({
       ...v,
       accounts: v.accounts!.map((a) => (a.label === "Grok Build" ? { ...a, state: "open", until: null } : a)),
     }));
     await page();
-    const lift = screen.getByRole("button", { name: "Lift the pause for Grok Build" });
+    const dialog = openAccount("Grok Build");
+    await settled(dialog);
+    const lift = within(dialog).getByRole("button", { name: "Lift the pause" });
     lift.focus();
     fireEvent.click(lift);
     await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Mark Grok Build paused until…" })),
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Pause Grok Build until…" })),
     );
   });
 
-  it("Dismiss gives focus to the account's Mark paused until…", async () => {
+  it("Dismiss gives focus to the account's Pause until…", async () => {
     afterWrite("khipu_route_clear", (v) => ({
       ...v,
       accounts: v.accounts!.map((a) => (a.label === "Claude second" ? { ...a, disagreement: null } : a)),
     }));
     await page();
-    const dismiss = within(screen.getByRole("group", { name: "Claude second: two reports disagree" })).getByRole(
+    const dialog = openAccount("Claude second");
+    await settled(dialog);
+    const dismiss = within(within(dialog).getByRole("group", { name: "Claude second: two reports disagree" })).getByRole(
       "button",
       { name: "Dismiss the runner's report" },
     );
     dismiss.focus();
     fireEvent.click(dismiss);
-    await waitFor(() => expect(screen.queryByRole("group", { name: "Claude second: two reports disagree" })).toBeNull());
+    await waitFor(() => expect(within(dialog).queryByRole("group", { name: "Claude second: two reports disagree" })).toBeNull());
     await waitFor(() =>
-      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Mark Claude second paused until…" })),
+      expect(document.activeElement).toBe(within(dialog).getByRole("button", { name: "Pause Claude second until…" })),
     );
   });
 
@@ -1845,10 +1937,12 @@ describe("Settings -> Routing: focus after a button removes itself (R2-2)", () =
   it("leaves focus on a button the write keeps", async () => {
     answers.khipu_route_lift = { ok: false, error: "that account isn't paused" };
     await page();
-    const lift = screen.getByRole("button", { name: "Lift the pause for Grok Build" });
+    const dialog = openAccount("Grok Build");
+    await settled(dialog);
+    const lift = within(dialog).getByRole("button", { name: "Lift the pause" });
     lift.focus();
     fireEvent.click(lift);
-    expect(await screen.findByRole("alert")).toHaveTextContent("that account isn't paused");
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("that account isn't paused");
     expect(document.activeElement).toBe(lift);
   });
 });
@@ -2084,7 +2178,7 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
       return v;
     };
     await page();
-    const panel = screen.getByRole("group", { name: "Claude main (Opus): two reports disagree" });
+    const panel = within(openAccount("Claude main")).getByRole("group", { name: "Claude main (Opus): two reports disagree" });
     expect(panel).toHaveTextContent("Limit reached: the Opus limit, reported by a Codex conversation in project-b 20 min ago.");
     expect(panel).toHaveTextContent("Open: reported by a Claude Code conversation in project-a 10 min ago.");
     const buttons = within(panel).getAllByRole("button");
@@ -2337,4 +2431,37 @@ it("retains a failed account form and existing provider facts", async () => {
     id: "deepseek:main", label: "DeepSeek", provider: "deepseek",
   } }]);
   expect(form).toBeInTheDocument();
+});
+
+describe("Settings -> Routing: an account's line opens its Routing detail (C5)", () => {
+  const status = (extra: Record<string, unknown> = {}) => ({
+    ok: true, version: "v1", none: false, auto_track: true, value: null, accounts: [], user_home: null, declined: [], request: null, ...extra,
+  });
+
+  it("offers Rename and Stop tracking in More once the account list is read, and Stop opens the existing dialog", async () => {
+    answers.khipu_accounts_status = status();
+    await page();
+    const dialog = openAccount("Claude main");
+    fireEvent.click(within(dialog).getByRole("button", { name: "More" }));
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Stop tracking…" })).toBeInTheDocument());
+    expect(within(dialog).getByRole("button", { name: "Rename…" })).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Stop tracking…" }));
+    // The fixture's account list is empty, so the existing dialog asks about "your last account".
+    expect(await screen.findByRole("heading", { name: /Stop tracking your last account\?/ })).toBeInTheDocument();
+  });
+
+  it("offers neither before the account list is read", async () => {
+    answers.khipu_accounts_status = { ok: false, error: "not yet" };
+    await page();
+    const dialog = openAccount("Claude main");
+    expect(within(dialog).queryByRole("button", { name: "More" })).toBeNull();
+  });
+
+  it("shows Keep and Undo for a conversation's change to the accounts, above the list", async () => {
+    answers.khipu_accounts_status = status({ request: { request: "track my Kimi account", by: { label: "a Codex conversation" } } });
+    await page();
+    const band = await screen.findByRole("group", { name: "A conversation changed your accounts" });
+    expect(within(band).getByRole("button", { name: "Keep" })).toBeInTheDocument();
+    expect(within(band).getByRole("button", { name: "Undo" })).toBeInTheDocument();
+  });
 });

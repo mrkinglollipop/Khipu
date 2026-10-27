@@ -10,6 +10,8 @@ import pytest
 
 from khipu import close_rules as cr, commitments as co, db, hub_snapshot as hs
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.fact_seed import announce
+from tests.replica_copy import certify
 
 
 def test_close_restatement_preserves_each_repository_pr(hub):
@@ -21,6 +23,7 @@ def test_close_restatement_preserves_each_repository_pr(hub):
              base + ' once https://github.com/other/repo/pull/41 merges']
     with conn.cursor() as cur:
         for idx, text in enumerate(words):
+            announce(cur)
             cur.execute("INSERT INTO episodes (ts, summary, raw, project, session_id) "
                         "VALUES (now(), %s, '{}'::jsonb, 'acme/widget', 'owed-fake') RETURNING id", (f'fake {idx}',))
             eid = cur.fetchone()[0]
@@ -95,6 +98,7 @@ def test_recall_graph_expansion_obeys_requested_filters(monkeypatch, semantic, f
 
     con = sqlite3.connect(':memory:')
     hs._create_schema(con)
+    certify(con)
     con.execute("INSERT INTO episodes (id,ts,session_id,summary,topics,project,raw) VALUES (1,'2026-10-20T00:00:00+00:00','codex:fake','zebrafish shipment','[\"Shared guide\"]','fake/alpha','{}')")
     con.execute("INSERT INTO topics (slug,title,body,status,created_at,updated_at) VALUES ('shared-guide','Shared guide','unrelated reference','active','2020-01-01','2020-01-01')")
     con.commit()
@@ -139,7 +143,7 @@ def test_decision_alias_supersession_through_mcp():
         def __exit__(self,*_): pass
         def cursor(self): return Cursor()
 
-    with patch.object(db,'connect',return_value=Conn()), patch.object(decisions,'_evidence_ready',return_value=False), patch.object(decisions,'_links_ready',return_value=False), patch.object(decisions,'_mirror_to_snapshot'), patch.object(decisions,'_stale_briefs'), patch.object(decisions,'_not_forgotten_clause',return_value=None), patch.object(owner_writes,'annotate',return_value={}), patch.object(owner_writes,'run',side_effect=lambda _tool,args,**_:srv._decisions_update_on_hub(args)), patch.object(owner_writes,'apply_on_hub',side_effect=lambda conn,cur,tool,args,write,echo:write()):
+    with patch.object(db,'connect',return_value=Conn()), patch.object(decisions,'_evidence_ready',return_value=False), patch.object(decisions,'_links_ready',return_value=False), patch.object(decisions,'_stale_briefs'), patch.object(decisions,'_not_forgotten_clause',return_value=None), patch.object(owner_writes,'annotate',return_value={}), patch.object(owner_writes,'run',side_effect=lambda _tool,args,**_:srv._decisions_update_on_hub(args)), patch.object(owner_writes,'apply_on_hub',side_effect=lambda conn,cur,tool,args,write,echo:write()):
         # Adapt PostgreSQL ANY without replacing the real alias resolver.
         original_execute=Cursor.execute
         def execute(self, sql, params=()):
@@ -172,12 +176,13 @@ def test_owed_offline_preserves_close_rule_fields(tmp_path, version):
     # Exactly the current dump/pull selects columns, no fabricated snapshot columns.
     class Cur:
         def execute(self, sql): self.sql = sql
-        def fetchall(self): return [tuple(rows[0].get(c.strip()) for c in self.sql.split('SELECT ', 1)[1].split(' FROM ', 1)[0].split(','))]
+        def fetchall(self): return [tuple(rows[0].get(c.strip().rsplit('.', 1)[-1]) for c in self.sql.split('SELECT ', 1)[1].split(' FROM ', 1)[0].split(','))]
     cur = Cur()
     with patch.object(hs, '_pg_columns', lambda cur, table: set(rows[0]) if table == 'commitments' else set()):
         cols, exported = hs._hub_commitments(cur)
     con = sqlite3.connect(path)
     hs._create_schema(con, version=version)
+    certify(con)
     hs._write_commitment_rows(con, cols, exported)
     con.commit()
     con.close()
@@ -223,6 +228,7 @@ def test_recall_graph_neighbors_recheck_each_metadata_filter(monkeypatch, semant
 
     con = sqlite3.connect(':memory:')
     hs._create_schema(con)
+    certify(con)
     fields = ('id', 'ts', 'session_id', 'harness', 'project', 'summary', 'raw')
     seed = dict(zip(fields, (1, '2026-10-20T00:00:00Z', 'codex:fake:123', 'codex',
                             'fake/alpha', 'zebrafish shipment', '{"t3_thread_id":"thread-1","via":"t3"}')))
@@ -251,6 +257,7 @@ def test_close_foreign_only_requirement_does_not_invent_own_repository_pr(hub):
     base = 'Prepare the deployment release checklist for the next version'
     with conn.cursor() as cur:
         for idx, text in enumerate((base, base + ' once https://github.com/other/repo/pull/41 merges', base)):
+            announce(cur)
             cur.execute("INSERT INTO episodes (ts, summary, raw, project, session_id) "
                         "VALUES (now(), %s, '{}'::jsonb, 'acme/widget', 'owed-fake') RETURNING id", (str(idx),))
             eid = cur.fetchone()[0]

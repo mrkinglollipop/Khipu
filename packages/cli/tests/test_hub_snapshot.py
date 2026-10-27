@@ -1006,6 +1006,11 @@ def _make_decisions_snapshot(data: Path) -> Path:
         "INSERT INTO decisions (id, project, text, decided_at, episode_id) "
         "VALUES (2, 'acme/widget', 'new decision', '2026-08-15T00:00:00Z', 1)"
     )
+    # Certified as a copy would leave it: readers show no fact row without
+    # a complete stamp (design 6.2).
+    hs._meta_put(con, hs._FACT_DIGEST_KEY, hs._current_refusal_digest(snap))
+    hs._meta_put(con, hs._FACT_STAMP_KEY, json.dumps(
+        {"incarnation": "test", "destination": hs._hub_destination(), "snapshot": "1:1:"}))
     con.commit()
     con.close()
     return snap
@@ -1055,90 +1060,7 @@ class TopicValidityMetaSnapshotTest(unittest.TestCase):
         self.assertEqual(hs.topic_validity_meta_snapshot(con, []), {})
 
 
-class ApplyDecisionChangesTest(unittest.TestCase):
-    def test_inserts_a_new_row(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            snap = _make_decisions_snapshot(data)
-            meta_file = data / "meta.json"
-            meta_file.write_text("{}", encoding="utf-8")
-            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                    mock.patch.object(hs, "meta_path", return_value=meta_file):
-                out = hs.apply_decision_changes([
-                    {"id": 3, "project": "acme/widget", "text": "third decision",
-                     "decided_at": "2026-09-02T00:00:00Z", "episode_id": 1},
-                ])
-            self.assertTrue(out["ok"])
-            con = sqlite3.connect(str(snap))
-            row = con.execute("SELECT text FROM decisions WHERE id = 3").fetchone()
-            self.assertEqual(row[0], "third decision")
-
-    def test_replaces_an_existing_row_not_duplicates_it(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            snap = _make_decisions_snapshot(data)
-            meta_file = data / "meta.json"
-            meta_file.write_text("{}", encoding="utf-8")
-            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                    mock.patch.object(hs, "meta_path", return_value=meta_file):
-                hs.apply_decision_changes([
-                    {"id": 2, "project": "acme/widget", "text": "new decision",
-                     "decided_at": "2026-08-15T00:00:00Z", "episode_id": 1,
-                     "superseded_by": None, "retracted_at": "2026-09-03T00:00:00Z"},
-                ])
-            con = sqlite3.connect(str(snap))
-            rows = con.execute("SELECT id FROM decisions WHERE id = 2").fetchall()
-            self.assertEqual(len(rows), 1)
-            counts = hs.decision_counts_snapshot(con, ["1"])
-        # decision 1 is still superseded (untouched); decision 2 is now
-        # retracted (its row was replaced, not duplicated) — neither is
-        # current, so the episode's counts become (0, 1, 1).
-        self.assertEqual(counts["1"], (0, 1, 1))
-
-    def test_missing_snapshot_is_a_clean_no_op(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            with mock.patch.object(hs, "snapshot_path", return_value=data / "missing.sqlite"):
-                out = hs.apply_decision_changes([{"id": 1}])
-        self.assertFalse(out["ok"])
-
-    def test_empty_rows_is_a_clean_ok_no_op(self) -> None:
-        out = hs.apply_decision_changes([])
-        self.assertEqual(out, {"ok": True, "decisions": 0})
-
-    def test_version_1_replica_reports_not_ok(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            snap = data / "hub_snapshot.sqlite"
-            con = sqlite3.connect(str(snap))
-            hs._create_schema(con, version=1)
-            con.commit()
-            con.close()
-            with mock.patch.object(hs, "snapshot_path", return_value=snap):
-                out = hs.apply_decision_changes([{"id": 1, "project": "p", "text": "x"}])
-        self.assertFalse(out["ok"])
-
-
-class UpsertEpisodeWithDecisionsTest(unittest.TestCase):
-    def test_optional_decision_rows_are_written_under_the_same_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            snap = _make_decisions_snapshot(data)
-            meta_file = data / "meta.json"
-            meta_file.write_text("{}", encoding="utf-8")
-            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                    mock.patch.object(hs, "meta_path", return_value=meta_file):
-                out = hs.upsert_episode(
-                    {"id": 50, "ts": "2026-09-05T00:00:00Z", "summary": "fresh capture"},
-                    [],
-                    [{"id": 10, "project": "acme/widget", "text": "captured decision",
-                      "decided_at": "2026-09-05T00:00:00Z", "episode_id": 50}],
-                )
-            self.assertTrue(out["ok"])
-            con = sqlite3.connect(str(snap))
-            row = con.execute("SELECT text FROM decisions WHERE id = 10").fetchone()
-            self.assertEqual(row[0], "captured decision")
-
+class UpsertEpisodeNoFactsTest(unittest.TestCase):
     def test_no_decision_rows_is_unchanged_from_before(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
@@ -1152,29 +1074,6 @@ class UpsertEpisodeWithDecisionsTest(unittest.TestCase):
                 )
             self.assertTrue(out["ok"])
 
-    def test_a_version_1_replica_ignores_decision_rows_without_failing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            snap = data / "hub_snapshot.sqlite"
-            con = sqlite3.connect(str(snap))
-            hs._create_schema(con, version=1)
-            con.commit()
-            con.close()
-            meta_file = data / "meta.json"
-            meta_file.write_text("{}", encoding="utf-8")
-            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                    mock.patch.object(hs, "meta_path", return_value=meta_file):
-                out = hs.upsert_episode(
-                    {"id": 52, "ts": "2026-09-05T00:00:00Z", "summary": "v1 capture"}, [],
-                    [{"id": 11, "project": "p", "text": "orphaned decision", "episode_id": 52}],
-                )
-            self.assertTrue(out["ok"])
-            con2 = sqlite3.connect(str(snap))
-            row = con2.execute(
-                "SELECT summary FROM episodes WHERE id = 52"
-            ).fetchone()
-        self.assertEqual(row[0], "v1 capture")
-
 
 class SyncDecisionChangesTest(unittest.TestCase):
     def test_missing_snapshot_is_a_clean_no_op(self) -> None:
@@ -1182,7 +1081,7 @@ class SyncDecisionChangesTest(unittest.TestCase):
             data = Path(tmp)
             with mock.patch.object(hs, "snapshot_path", return_value=data / "missing.sqlite"):
                 out = hs.sync_decision_changes()
-        self.assertFalse(out["ok"])
+        self.assertTrue(out["ok"] and out.get("skipped"))
 
     def test_version_1_replica_reports_not_ok_without_touching_the_hub(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

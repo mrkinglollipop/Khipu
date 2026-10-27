@@ -119,7 +119,10 @@ class ReadSqliteTest(unittest.TestCase):
             d = gs.graph_drift(Path("/nonexistent/graph.sqlite"))
             self.assertTrue(d["ok"])
             self.assertIn("skipped", d)
-        with self.assertRaises(FileNotFoundError):
+        with (
+            mock.patch.object(gs, "is_graph_producer", return_value=True),
+            self.assertRaises(FileNotFoundError),
+        ):
             gs.sync_from_sqlite(Path("/nonexistent/graph.sqlite"), dry_run=True)
 
     def test_non_producer_skips_even_when_sqlite_exists(self):
@@ -284,6 +287,52 @@ class LiveGraphMirrorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyncDriftExcuseTest(unittest.TestCase):
+    def test_non_producer_sync_skips_before_touching_the_database(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "graph.sqlite"
+            p.write_bytes(b"")
+            with (
+                mock.patch.object(gs, "is_graph_producer", return_value=False),
+                mock.patch("khipu.db.connect", side_effect=RuntimeError("database unavailable")) as conn,
+                mock.patch.object(gs, "_read_sqlite", side_effect=AssertionError("read")),
+            ):
+                for dry_run in (False, True):
+                    out = gs.sync_from_sqlite(p, dry_run=dry_run)
+                    self.assertTrue(out["drift"]["ok"])
+                    self.assertIn("not the graph producer", out["skipped"])
+        conn.assert_not_called()
+
+    def test_sync_checks_drift_without_the_pending_excuse(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "graph.sqlite"
+            p.write_bytes(b"")
+            drift = {"ok": False, "nodes_content_drift": 3}
+            with (
+                mock.patch.object(gs, "is_graph_producer", return_value=True),
+                mock.patch.object(gs, "_read_sqlite", return_value=([], [])),
+                mock.patch.object(gs, "load_sources", return_value={"sources": []}),
+                mock.patch("khipu.db.connect", return_value=mock.MagicMock()),
+                mock.patch.object(gs, "graph_drift", return_value=drift) as check,
+            ):
+                try:
+                    out = gs.sync_from_sqlite(p)
+                except Exception as exc:  # noqa: BLE001 — the stub PG may trip the sync body
+                    self.fail(f"sync body not reachable with stubs: {exc!r}")
+        check.assert_called_once_with(p, excuse_pending=False, mirror_connections=True)
+        self.assertEqual(out["drift"], drift)
+
+    def test_cli_exits_two_when_drift_is_left_after_sync(self):
+        import argparse
+        from khipu import cli
+
+        args = argparse.Namespace(sqlite=None, check=False, dry_run=False)
+        with mock.patch.object(
+            gs, "sync_from_sqlite", return_value={"drift": {"ok": False, "nodes_content_drift": 1}}
+        ):
+            self.assertEqual(cli.cmd_graph_sync(args), 2)
 
 
 class ChangedSinceLastMirrorTest(unittest.TestCase):

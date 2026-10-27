@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { callCli } from "./settingsCli";
 import { fmtAgoSince } from "./time";
+import { almostPrefix } from "./humanWords";
 
 export type RouteAuthor = { kind?: string; harness?: string; project?: string; session?: string; name?: string };
 
@@ -256,6 +257,18 @@ export type RuleResult = {
   why?: string | null;
 };
 
+/** One exception in force on a priority entry: what it allows, why, and when
+ *  it ends (null while it lasts until something happens). */
+export type RouteException = {
+  text: string;
+  until?: string | null;
+  purpose?: string | null;
+  lanes?: string[];
+  /** How it ends when it has no time ("when that branch is merged"). */
+  ends_when?: string | null;
+  at?: string | null;
+};
+
 /** One account in the owner's priority, in his order (phase 4b). */
 export type RoutePriorityEntry = {
   /** The account's key, as Settings -> Routing sends it back. */
@@ -270,6 +283,9 @@ export type RoutePriorityEntry = {
    *  keeps `level` beside the entry; the CLI marks stale words in its own
    *  lines). */
   level?: { claim: string; as_of?: string | null; until?: string | null } | null;
+  /** Time-limited exceptions to this role, as rows (routing CLI gap G2).
+   *  Absent today: the detail view then shows none rather than parsing prose. */
+  exceptions?: RouteException[];
 };
 
 /** The owner's priority: his order of accounts, never Khipu's. A pending one
@@ -402,6 +418,8 @@ export type CapStatus = {
     gaps_more?: number;
   } | null;
   cap_n?: number | null;
+  /** When the cap ends, once the routing CLI stores one (gap G1). */
+  until?: string | null;
   jobs?: number | null;
   verdict?: string;
   why?: string | null;
@@ -478,6 +496,8 @@ export type RouteProvider = {
   family: string;
   login?: string;
   probe?: string;
+  /** Where an http-quota provider's usage is read (set from the Plan detail). */
+  host?: string;
   lane_names?: string[];
   models_allowed?: string[];
   models_never?: string[];
@@ -586,7 +606,8 @@ export type RouteView = {
   rule_hygiene?: RouteHygiene[];
   /** Live delivery rows, other Macs and per-change recipients, projected
    *  for this Mac's owner only (survey rows 8-11). */
-  delivery_rows?: RouteDeliveryRow[];
+  /** Null means the CLI could not build rows (damaged read); empty means nobody live. */
+  delivery_rows?: RouteDeliveryRow[] | null;
   delivery_macs?: RouteDeliveryMac[];
   /** Routing copies found in files, for this Mac's owner only (slice 13/15d). */
   routing_file_copies?: {
@@ -597,6 +618,7 @@ export type RouteView = {
     hits_total?: number;
     more_not_shown?: number;
     too_large?: string[];
+    skipped?: { file: string; reason: string; message?: string }[];
   };
   /** Open owed directions, projected for this Mac's owner only (slice 19a). */
   unreached_directions?: {
@@ -866,7 +888,7 @@ export function accountSource(
   }
   else if (classification === "limited" && a.checkable === false) parts.push("can't be checked without using a turn");
   if (classification === "open" && a.witness?.source === "probe" && plan) {
-    parts.push(`${Math.round(plan.pct)}% of its ${plan.window} used`);
+    parts.push(`${Math.max(0, 100 - Math.round(plan.pct))}% of its ${plan.window} left`);
   }
   return parts.join(" · ");
 }
@@ -1337,9 +1359,11 @@ export function paceWords(fact: PlanFact | null | undefined, now: Date): string 
     return `${fact.left_pct}% of its ${fact.window} left ${readWhen(fact, now)}, resets ${whenLocal(fact.resets_at, now)}: ` +
       "these figures may be out of date, so no pace is given";
   }
-  const head = `${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
+  const head = `${almostPrefix(fact.left_pct)}${fact.left_pct}% of its ${fact.window} left, resets ${whenLocal(fact.resets_at, now)}`;
   if (!fact.left_pct || fact.left_pct <= 0) return `${head}: nothing left to use until then`;
-  return `${head}: about ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour to use it all (${fact.words})`;
+  // `fact.words` ("a lot left, little time") describes the pace needed, not
+  // how much is left, so it contradicted the figure; the figure speaks alone.
+  return `${head}: using it all would take about ${rateWords(fact.pace_pct_per_hour ?? 0)}% an hour`;
 }
 
 export function deliveryReason(reason: string): string {

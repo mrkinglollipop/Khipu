@@ -30,6 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
+from typing import Any
 
 # The scans forget runs, by the name a store gives.
 FORGET_SCANS = ("native jobs", "outbox", "legacy logs", "replica", "replica temps",
@@ -86,11 +87,11 @@ STORES: tuple[Store, ...] = (
     Store("native empty archive", "capture home empty/: *.json, *.error",
           "transcript text of empty windows or quarantined malformed jobs, with parse reasons", "native jobs",
           _w("session_capture._archive_claimed", "session_capture._quarantine_claim")),
-    Store("outbox job", "outbox/, outbox/dead/, outbox/quarantine/: *.json and .*.tmp",
-          "whole capture payloads waiting for the hub", "outbox",
+    Store("outbox job", "outbox/, outbox/dead/, outbox/quarantine/, outbox/resolved/: *.json and .*.tmp",
+          "whole capture payloads waiting for the hub and resolved legacy evidence", "outbox",
           _w("outbox._atomic_write", "outbox._bury", "outbox._quarantine", "outbox.drain",
              "outbox.enqueue", "outbox.retry_dead"),
-          Restore(("outbox/*.json", "outbox/dead/*.json", "outbox/quarantine/*.json"),
+          Restore(("outbox/*.json", "outbox/dead/*.json", "outbox/quarantine/*.json", "outbox/resolved/*.json"),
                   "queued job")),
     Store("legacy log", "memory root: episodes*.jsonl, their .bak copies, .khipu-forget-backups/, "
           "and .tmp files beside them",
@@ -98,17 +99,16 @@ STORES: tuple[Store, ...] = (
           _w("forget._rewrite_log", "forget._scrub_copy")),
     Store("replica", "data folder hub_snapshot.sqlite",
           "episode rows, vectors, decisions, deliverables, topics and commitments", "replica",
-          _w("hub_snapshot._refresh_locked", "hub_snapshot._upsert_episode_unfenced",
-             "hub_snapshot.upsert_embeddings", "hub_snapshot.apply_decision_changes",
-             "hub_snapshot.sync_decision_changes", "hub_snapshot.ledger_write_snapshot",
-             "hub_snapshot.forget_episode_in_snapshot", "hub_snapshot.scrub_forgotten_snapshot",
+          _w("hub_snapshot._refresh_locked", "hub_snapshot._replica_write_gate",
+             "hub_snapshot._admitted", "hub_snapshot.ledger_write_snapshot",
+             "hub_snapshot.forget_episode_in_snapshot",
              "hub_snapshot.publish_imported_snapshot", "hub_snapshot.purge_topic_in_snapshot",
              "hub_snapshot.ensure_edge_indexes", "hub_snapshot._write_pulled_tables",
              "hub_snapshot.refresh_ledger"),
           Restore(("hub_snapshot.sqlite",), "replica staging")),
     Store("replica temp", "data folder .hub_snapshot.<random>.sqlite and its journal and WAL",
           "a refresh dump or a staged backup replica", "replica temps",
-          _w("hub_snapshot.staging_path")),
+          _w("hub_snapshot.staging_path", "hub_snapshot.export_replica_copy")),
     Store("legacy writer", "data folder .legacy_writers/<pgid>.json",
           "the process group of a legacy writer that may still append", "legacy writers",
           _w("writer_groups.record")),
@@ -276,6 +276,40 @@ def native_job_folders() -> list[tuple[str, Path]]:
 
 def outbox_folders() -> list[Path]:
     """The folders forget's outbox scan reads."""
-    from khipu.outbox import dead_dir, outbox_dir, quarantine_dir
+    from khipu.outbox import dead_dir, outbox_dir, quarantine_dir, resolved_dir
 
-    return [outbox_dir(), dead_dir(), quarantine_dir()]
+    return [outbox_dir(), dead_dir(), quarantine_dir(), resolved_dir()]
+
+
+def outbox_payloads(envelope: Any, *, strict: bool = True) -> list[dict[str, Any]]:
+    """All identities carried by a job or resolution archive.
+
+    A resolution contains the original source and the lossy queued source;
+    failed publication retains that same record under ``resolution_evidence``.
+    Malformed nested records are never admitted by restore/replay. The lenient
+    form is only for fencing known identities before quarantining bad bytes.
+    """
+    payloads = []
+    pending = [envelope]
+    seen = set()
+    while pending:
+        value = pending.pop()
+        if not isinstance(value, dict):
+            if strict:
+                raise ValueError("outbox evidence payload is not an object")
+            continue
+        if id(value) in seen:
+            raise ValueError("outbox evidence contains a cycle")
+        seen.add(id(value))
+        if isinstance(value.get("payload"), dict):
+            payloads.append(value["payload"])
+        elif strict:
+            raise ValueError("outbox evidence payload is not an object")
+        if "resolution" in value and (not isinstance(value["resolution"], dict)
+                                      or "queued_evidence" not in value):
+            if strict:
+                raise ValueError("outbox resolution lacks queued evidence")
+        for key in ("queued_evidence", "resolution_evidence"):
+            if key in value:
+                pending.append(value[key])
+    return payloads

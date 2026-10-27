@@ -136,12 +136,12 @@ def test_due_offsite_preflight_failure_replaces_older_success(tmp_path, monkeypa
     now = datetime.now(timezone.utc)
     old = now - timedelta(days=7, hours=1)
     latest = {'status': 'ok', 'created_at': old, 'age_seconds': (now-old).total_seconds()}
-    monkeypatch.setattr(graph_backup, '_latest_ops_event', lambda kind: latest)
+    monkeypatch.setattr(graph_backup, '_latest_ops_event', lambda kind, **kwargs: latest)
     monkeypatch.setattr(graph_backup, 'resolve_dest_remote', lambda: 'r2:synthetic')
     monkeypatch.setattr(graph_backup, 'resolve_rclone', lambda name: '/fake/rclone')
     monkeypatch.setattr(graph_backup, 'has_r2_remote', lambda **kwargs: True)
     monkeypatch.setattr(graph_backup, 'latest_snapshot', lambda: None)
-    def record(kind, status, detail):
+    def record(kind, status, detail, **kwargs):
         assert kind == 'graph_snapshot_offsite'
         latest.update(status=status, detail=detail, created_at=now, age_seconds=0)
         return {'id': 1}

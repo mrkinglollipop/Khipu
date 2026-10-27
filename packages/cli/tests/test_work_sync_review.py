@@ -151,7 +151,7 @@ def test_a_full_dump_is_as_fresh_as_its_start_not_its_end(hub, tmp_path, monkeyp
     initial = clock["now"]
     monkeypatch.setattr(hs, "_utcnow_iso", lambda: clock["now"].isoformat())
     for name in ("_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges", "_insert_profiles",
-                 "_insert_memory_embeddings", "_insert_decisions", "_insert_deliverables", "_insert_commitments"):
+                 "_insert_memory_embeddings"):
         monkeypatch.setattr(hs, name, lambda *a: 0)
 
     def after_snapshot(cur, con):

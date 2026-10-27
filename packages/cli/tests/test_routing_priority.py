@@ -398,7 +398,7 @@ def test_a_timed_out_probe_keeps_its_last_good_figures_marked_stale(home):
     assert fact["used_pct"] == 25 and fact["left_pct"] == 75
     assert fact["resets_at"] == routing._iso(T0 + timedelta(days=2))
     assert fact["figures_at"] == kept_at
-    assert fact["words"] == "figures from 12:00Z; the last read timed out"
+    assert fact["words"] == "figures from 12:00Z (2 h ago), last read failed (timeout)"
     assert fact["pace_pct_per_hour"] is None and fact["hurry"] is False
     # No kept figures: still unreadable.
     failed = routing.plan_fact(_row("Grok", "grok", None, ok=False, error=usage.E_TIMEOUT), T0)

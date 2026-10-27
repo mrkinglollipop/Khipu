@@ -202,6 +202,7 @@ def test_key_resolution_and_secret_set(provider, tmp_path, monkeypatch):
         resolve()
     path = tmp_path / 'fake-key'
     path.write_text('file-fixture\n')
+    path.chmod(0o600)
     config.set_path_setting(provider + '_key_file', str(path))
     assert 'file-fixture' not in config.config_file().read_text()
     assert resolve() == 'file-fixture'

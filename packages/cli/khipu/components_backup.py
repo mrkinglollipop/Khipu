@@ -16,6 +16,7 @@ from khipu.components_postgres import (
     _generate_password,
     _local_dsn,
     _run,
+    _secret_env,
     docker_available,
     ensure_postgres_image,
 )
@@ -53,6 +54,16 @@ def _password_from_dsn(dsn: str) -> str:
     if ":" not in userinfo:
         return ""
     return unquote(userinfo.split(":", 1)[1])
+
+
+def _split_dsn_password(dsn: str) -> tuple[str, str]:
+    """The DSN without its password, and the password, so a host pg_dump or
+    pg_restore gets the password through PGPASSWORD instead of argv."""
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    params = conninfo_to_dict(dsn)
+    password = str(params.pop("password", "") or "")
+    return make_conninfo("", **params), password
 
 
 def _active_local_docker_backup(dsn: str) -> bool:
@@ -105,11 +116,13 @@ def _docker_exec_pg(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     cmd = ["exec"]
+    env = None
     if password:
-        cmd.extend(["-e", f"PGPASSWORD={password}"])
+        cmd.extend(["-e", "PGPASSWORD"])
+        env = _secret_env(PGPASSWORD=password)
     cmd.append(container)
     cmd.extend(args)
-    return _docker(cmd, timeout=timeout, check=False)
+    return _docker(cmd, timeout=timeout, check=False, env=env)
 
 
 def _proc_error(proc: subprocess.CompletedProcess[str], fallback: str) -> str:
@@ -166,7 +179,7 @@ def _dump_live_db(dest: Path) -> dict:
     dest_file = dest / f"khipu-local-{stamp}.dump"
     host_dump = _pg_dump_path()
     if host_dump:
-        dsn = conninfo_with_local_root_cert(resolve_dsn())
+        dsn, password = _split_dsn_password(conninfo_with_local_root_cert(resolve_dsn()))
         proc = _run(
             [
                 host_dump,
@@ -178,6 +191,7 @@ def _dump_live_db(dest: Path) -> dict:
             ],
             timeout=RESTORE_TIMEOUT_S,
             check=False,
+            env=_secret_env(PGPASSWORD=password) if password else None,
         )
         if proc.returncode != 0:
             return {"ok": False, "error": _proc_error(proc, "pg_dump failed")}
@@ -243,6 +257,8 @@ def _restore_dump_file(
 ) -> dict:
     host_restore = _pg_restore_path()
     if host_restore:
+        dsn, dsn_password = _split_dsn_password(dsn)
+        dsn_password = dsn_password or password
         proc = _run(
             [
                 host_restore,
@@ -253,6 +269,7 @@ def _restore_dump_file(
             ],
             timeout=RESTORE_TIMEOUT_S,
             check=False,
+            env=_secret_env(PGPASSWORD=dsn_password) if dsn_password else None,
         )
         return _pg_restore_result(proc)
 
@@ -313,7 +330,7 @@ def _start_drill_cluster(image: str, port: int, password: str) -> dict:
             "-e",
             "POSTGRES_DB=khipu",
             "-e",
-            f"POSTGRES_PASSWORD={password}",
+            "POSTGRES_PASSWORD",
             "-e",
             "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
             "-p",
@@ -323,6 +340,7 @@ def _start_drill_cluster(image: str, port: int, password: str) -> dict:
             image,
         ],
         check=False,
+        env=_secret_env(POSTGRES_PASSWORD=password),
     )
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()

@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 62 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 63 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -57,7 +57,7 @@ Default mode is hybrid: vector similarity, token overlap and literal match, fuse
 
 - `--mode hybrid` (default), `--mode literal` (exact words, ids, errors), `--mode semantic` (meaning).
 - `--semantic` is a deprecated alias for `--mode semantic`.
-- Filters: `--kind {episode,topic,node,media,library}`, `--source NAME` (a library, implies `--kind library`), `--project`, `--since`, `--until` (ISO date or relative, like `7d`), `--session-id`, `--harness`, `--via`, `--limit`.
+- Filters: `--kind` depends on mode — semantic: `episode`, `topic`, `media`; literal and hybrid: `episode`, `topic`, `node`; plus `library` with `--source NAME` (implies `--kind library`). Also `--project`, `--since`, `--until` (ISO date or relative, like `7d`), `--session-id`, `--harness`, `--via`, `--limit`.
 
 ### get
 
@@ -109,7 +109,8 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `topic` | `topic purge SLUG --yes` hard-deletes an already tombstoned topic from the hub database (with its revisions and vectors). It immediately purges this Mac's replica too; a replica failure is reported as partial, and that copy then needs a successful full refresh. |
 | `notes` | Index per-project harness notes as topics: `reconcile` (`--dry-run`, `--changed-only`), `index` (`--project`, `--cap`, `--dry-run`, `--force`), `split PATH`, `stale` (`--project`), `supersede OLD NEW`. |
 | `reconcile` | Full sync of memory files into Postgres. |
-| `regen-memory` | Write the `MEMORY.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
+| `regen-memory` | Write the `MEMORY.from-khipu.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
+| `provenance` | Fact provenance maintenance: `backfill` proves legacy restaters' claims; `index` indexes episode source identities and sweeps refused carriers. |
 | `topic-graph` | `topic-graph backfill` updates topic links and graph edges from topic files. |
 | `outbox` | The offline queue for captures whose database write failed: `drain`, `status`, `retry-dead`. |
 

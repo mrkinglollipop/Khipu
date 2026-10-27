@@ -746,6 +746,8 @@ class SourceRegistryBoundaryRegressionTest(unittest.TestCase):
             registry.write_text("{broken")
             with (
                 mock.patch.object(sources, "sources_file", return_value=registry),
+                # Only the producer mirrors; a non-producer skips before reading the registry.
+                mock.patch.object(graph_sync, "is_graph_producer", return_value=True),
                 mock.patch("khipu.db.connect") as connect,
             ):
                 with self.assertRaises(sources.InvalidSourcesDocument):

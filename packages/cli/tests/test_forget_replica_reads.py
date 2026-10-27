@@ -116,7 +116,8 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
             def execute(self, sql, params=None):
                 if sql == "SELECT now()":
                     self._result = [(datetime(2026, 10, 3, tzinfo=timezone.utc),)]
-                elif "FROM information_schema.columns" in sql and params in (("ledger_rows",), ("commitments",), ("project_aliases",)):
+                elif "FROM information_schema.columns" in sql and params in (("ledger_rows",), ("commitments",), ("project_aliases",),
+                                                                         ("fact_changes",), ("episode_sources",)):
                     # This fixture has no optional ledger or commitments schema.
                     self._result = []
                 else:
@@ -135,8 +136,7 @@ class ForgottenEpisodeStaysForgottenInTheReplicaTest(unittest.TestCase):
 
         zero = {name: mock.Mock(return_value=0) for name in (
             "_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges",
-            "_insert_profiles", "_insert_memory_embeddings", "_insert_decisions",
-            "_insert_deliverables")}
+            "_insert_profiles", "_insert_memory_embeddings")}
         time.sleep(0.01)  # a new mtime, as any real dump has
         with mock.patch.object(hs, "try_hub_connect", return_value=Pg()), \
                 mock.patch.object(hs, "_insert_episodes", side_effect=episodes), \

@@ -54,7 +54,7 @@ ALLOWED = {
         "inside:mirror._upsert_episode,capture._merge_into_episode",
     ("cli", "_cmd_episode_edit"): "metadata",
     ("embed", "embed_on_capture"): "calls:hub_snapshot.upsert_episode",
-    ("forget", "forget_episode"): "erase",
+    ("forget", "tombstone_on_hub"): "erase",
     ("hub_snapshot", "_apply_pending_erasures"): "erase",
     ("hub_snapshot", "_insert_episodes"): "inside:hub_snapshot._refresh_locked",
     ("hub_snapshot", "_pull_apply"): "calls:hub_snapshot.upsert_episode",
@@ -62,6 +62,8 @@ ALLOWED = {
     ("hub_snapshot", "forget_episode_in_snapshot"): "erase",
     ("hygiene", "apply_backfill_identity"): "metadata",
     ("hygiene", "apply_backfill_project"): "metadata",
+    # Alias undo moves only the project column, never a forgotten row.
+    ("identity", "remove_project_alias"): "metadata",
     ("mirror", "_upsert_episode"): "gate",
     ("mirror", "mirror_episode"): "calls:mirror._upsert_episode",
     ("mirror", "reconcile_memory_root"): "calls:mirror._upsert_episode",

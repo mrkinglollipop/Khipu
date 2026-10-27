@@ -25,6 +25,7 @@ import pytest
 from khipu import commitments as co
 from tests.hermetic_pg import hub, migration_sql, pg_cluster  # noqa: F401
 from tests.test_commitments import _CommitmentsCursor, _alias_env_patch, _no_cosine
+from tests.fact_seed import announce
 
 
 def setUpModule():
@@ -441,6 +442,7 @@ class JobDetectionTest(unittest.TestCase):
 # ---- a real hub without migration 0033 -------------------------------------
 
 def _episode(cur) -> int:
+    announce(cur)
     cur.execute("INSERT INTO episodes (ts, summary, raw) VALUES (now(), 's', %s::jsonb) RETURNING id",
                 (json.dumps({}),))
     return int(cur.fetchone()[0])
@@ -714,7 +716,7 @@ class _RelayCursor(_OwnerCursor):
                            close_rule_key=key)
             return
         if s.startswith("UPDATE commitments SET status = %s"):
-            status, reason, by, cid = params
+            status, reason, by, *_suggestion_reason, cid = params
             self.rows[cid].update(status=status, close_reason=reason, closed_by=by, close_rule_key=None)
             self.rowcount = 1
             return
@@ -764,6 +766,7 @@ def test_a_renewed_owner_question_after_a_reopened_relay_is_visible_on_the_hub(h
     text = "Matt to decide whether the export includes archived rows"
 
     def _ep(cur, n):
+        announce(cur)
         cur.execute("INSERT INTO episodes (ts, summary, raw) VALUES (now(), %s, '{}'::jsonb) RETURNING id",
                     (f"episode {n}",))
         return int(cur.fetchone()[0])

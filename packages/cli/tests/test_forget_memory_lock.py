@@ -429,7 +429,12 @@ def test_interrupted_atomic_publication_retains_prior_fence(monkeypatch, stage):
                 raise OSError("simulated interruption after rename")
             return real_fsync(fd)
         monkeypatch.setattr(tombstones.os, "fsync", fail_directory_fsync)
-    with pytest.raises(tombstones.RegistryError):
+    if stage == "before_replace":
+        with pytest.raises(tombstones.RegistryError):
+            tombstones.publish_payloads([b])
+    else:
+        # The replace is the publication (7A review finding 8); only its
+        # durability across a power loss is uncertain.
         tombstones.publish_payloads([b])
     assert tombstones.is_forgotten(a)
     assert tombstones.is_forgotten(b) == (stage == "after_replace")

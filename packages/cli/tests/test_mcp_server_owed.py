@@ -12,6 +12,7 @@ import pytest
 
 from khipu import mcp_server as srv
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests import fact_seed
 
 
 class _FakeCur:
@@ -115,7 +116,8 @@ def aliased_hub(hub, tmp_path, monkeypatch):  # noqa: F811
     with conn.cursor() as cur:
         cur.execute("INSERT INTO project_aliases (alias, project) VALUES (%s, %s)", (ALIAS, CANON))
         cur.execute("INSERT INTO commitments (text, project, owner, content_hash) "
-                    "VALUES (%s, %s, 'user', %s)", (f"ship it for {ALIAS}", ALIAS, "h-alias"))
+                    "VALUES (%s, %s, 'user', %s) RETURNING id", (f"ship it for {ALIAS}", ALIAS, "h-alias"))
+        fact_seed.adopt(cur, "commitment", cur.fetchone()[0])
     conn.commit()
     db._TABLE_COLUMNS_CACHE.clear()
     monkeypatch.setattr(db, "connect", lambda *a, **k: hub.connect())

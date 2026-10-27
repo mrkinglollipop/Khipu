@@ -10,6 +10,7 @@ import pytest
 from khipu import cli, config, owner_act, owner_direction as od, owner_turns as ot, routing
 from khipu import db, owner_writes as ow, mcp_server as srv, commitments as co
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests import fact_seed
 from tests.test_owner_direction import world  # noqa: F401
 
 
@@ -169,6 +170,8 @@ def test_lost_directed_commit_reply_keeps_batch_undo(pg_world, world, monkeypatc
     db._TABLE_COLUMNS_CACHE.clear()
     with pg_world.connect() as conn:
         ids = [conn.execute("INSERT INTO commitments (text,project,content_hash,owner,status) VALUES (%s,'synthetic/project',%s,'user','open') RETURNING id", (f'owner item {i}', f'audit-owner-{i}')).fetchone()[0] for i in range(2)]
+        with conn.cursor() as cur:
+            fact_seed.adopt(cur, 'commitment', ids)
     world.say('close the two synthetic items')
     real_apply = ow._apply
     replies = []

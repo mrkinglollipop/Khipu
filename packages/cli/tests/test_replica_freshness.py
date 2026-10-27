@@ -533,10 +533,10 @@ class VectorManifestTest(VectorCase):
 class CursorAndErrorEvidenceTest(ReplicaCase):
     def test_a_write_skipped_by_a_running_dump_is_noted_against_its_tables(self) -> None:
         with mock.patch.object(hs, "_acquire_refresh_lock", return_value=None):
-            res = hs.upsert_episode({"id": 2, "summary": "two"}, [], decision_rows=[{"id": 11}])
+            res = hs.upsert_episode({"id": 2, "summary": "two"}, [])
         self.assertFalse(res["ok"])
         out = hs.snapshot_freshness(None, self.health())
-        for name in ("episodes", "vectors", "decisions"):
+        for name in ("episodes", "vectors"):
             self.assertEqual(out["tables"][name]["last_error"]["error"], "hub snapshot refresh in progress")
         self.assertNotIn("last_error", out["tables"]["topics"])
 
@@ -557,7 +557,7 @@ class CursorAndErrorEvidenceTest(ReplicaCase):
         conn = mock.MagicMock()
         conn.__enter__.return_value = conn
         names = ("_insert_episodes", "_insert_topics", "_insert_topic_revisions", "_insert_nodes",
-                 "_insert_edges", "_insert_profiles", "_insert_decisions", "_insert_deliverables")
+                 "_insert_edges", "_insert_profiles")
         with mock.patch.object(hs, "_utcnow_iso", side_effect=tick):
             hs._record_write_error(("episodes",), "database is locked")
             with mock.patch.object(hs, "try_hub_connect", return_value=conn), \
@@ -565,7 +565,9 @@ class CursorAndErrorEvidenceTest(ReplicaCase):
                     mock.patch.multiple(hs, **{n: mock.Mock(return_value=0) for n in names}):
                 self.assertTrue(hs.refresh()["ok"])
         side = json.loads((self.dir / "meta.json").read_text())
-        self.assertEqual(set(side["write_errors"]), {"vectors"})
+        # The mocked hub fails the fact copy that follows the dump (design
+        # 6.2); that is noted against the fact tables, after the dump.
+        self.assertEqual(set(side["write_errors"]) - set(hs._FACT_TABLES), {"vectors"})
         self.assertEqual(side["last_decision_sync_id"], 77, "a dump must carry the decision cursor")
         self.assertNotIn("refresh_error", side)
         con = sqlite3.connect(self.snap)
@@ -959,7 +961,7 @@ class ClockSkewTest(VectorCase):
         conn.__enter__.return_value = conn
         conn.cursor.return_value = Cur()
         names = ("_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges",
-                 "_insert_profiles", "_insert_memory_embeddings", "_insert_decisions", "_insert_deliverables")
+                 "_insert_profiles", "_insert_memory_embeddings")
 
         def episodes(_cur, _con):
             order.append("episodes")

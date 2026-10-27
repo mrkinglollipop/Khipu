@@ -29,6 +29,9 @@ DEDUP_WINDOW_DAYS = 30
 VALID_LINK_KINDS = ("supersedes", "conflicts")
 VALID_LINK_STATES = ("candidate", "applied", "rejected", "restored")
 VALID_SUPERSEDE_SOURCES = ("manual", "agent", "auto")
+# The sources that carry the owner's endorsement of the replacement (the
+# same two migration 0047 classifies as owner links).
+OWNER_SUPERSEDE_SOURCES = ("manual", "agent")
 
 # Reversal-detection thresholds (Phase 2, session C) — provisional until
 # measured against the private golden set; nothing has scored them yet.
@@ -135,37 +138,6 @@ def state_of(row: dict[str, Any]) -> str:
     return "current"
 
 
-def _mirror_to_snapshot(cur, decision_id: int) -> None:
-    """Best-effort local-replica mirror for a decision write made on THIS
-    machine — "the decisions API calls it after a successful local write so
-    a correction made on this machine reaches the local lane at once"
-    (docs/plans/2026-09-27-memory-reasoning-scope.md, Phase 2 session B). A
-    correction made on a DIFFERENT machine reaches this replica instead via
-    ``hub_snapshot.sync_decision_changes``, called from the capture drain.
-    Never raises: the PG write this backs is already durable (or still
-    inside the caller's own open transaction, same-session-visible either
-    way) by the time this runs, so a mirror failure must never surface as
-    if the decision write itself failed."""
-    try:
-        cols = ["id", "project", "text", "decided_at", "episode_id", "superseded_by"]
-        if _evidence_ready(cur):
-            cols += [
-                "source_kind", "evidence", "superseded_at", "supersede_source",
-                "supersede_reason", "retracted_at", "retract_reason",
-            ]
-        cols.append("created_at")
-        cur.execute(f"SELECT {', '.join(cols)} FROM decisions WHERE id = %s", (decision_id,))
-        row = cur.fetchone()
-        if row is None:
-            return
-        payload = dict(zip(cols, row))
-        from khipu import hub_snapshot
-
-        hub_snapshot.apply_decision_changes([payload])
-    except Exception as exc:  # noqa: BLE001 — the PG write already succeeded; mirror is best-effort
-        _log(f"snapshot mirror for decision {decision_id} failed ({type(exc).__name__}: {exc})")
-
-
 def _stale_briefs(cur, decision_id: int) -> None:
     """A brief's claims were built under the decision states of the moment;
     any state change makes the briefs citing this decision's episode stale
@@ -182,14 +154,17 @@ def _lock_decision_row(cur, decision_id: int) -> None:
 
 
 def _fetch_decision_row(cur, decision_id: int) -> dict[str, Any] | None:
+    cols = ["id", "project", "superseded_by"]
+    if _evidence_ready(cur):
+        cols.append("retracted_at")
     cur.execute(
-        "SELECT id, project, superseded_by FROM decisions WHERE id = %s",
+        f"SELECT {', '.join(cols)} FROM decisions WHERE id = %s",
         (decision_id,),
     )
     row = cur.fetchone()
     if row is None:
         return None
-    return {"id": row[0], "project": row[1], "superseded_by": row[2]}
+    return dict(zip(cols, row))
 
 
 def _chain_leads_to(cur, start_id: int, target_id: int, *, max_depth: int = 100) -> bool:
@@ -232,6 +207,18 @@ def _record_applied_link(cur, old_id: int, new_id: int, *, source: str, reason: 
         _log(f"recording applied link {old_id}->{new_id} failed ({type(exc).__name__}: {exc})")
 
 
+def _project_match(cur, project: str | None) -> tuple[str, Any]:
+    """SQL fragment and bind for ``project`` including its alias group (Q3)."""
+    if project is None:
+        return "project IS NOT DISTINCT FROM %s", None
+    from khipu.identity import project_group
+
+    group = project_group(cur, project)
+    if len(group) == 1:
+        return "project IS NOT DISTINCT FROM %s", group[0]
+    return "project = ANY(%s)", group
+
+
 def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at: Any) -> int | None:
     """id of an existing decision in ``project`` with the same normalised text,
     decided within ``DEDUP_WINDOW_DAYS`` before (or at) ``decided_at`` — or
@@ -245,10 +232,11 @@ def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at:
     forgotten = _not_forgotten_clause(cur, "decisions")
     if forgotten:
         clauses.append(forgotten)
+    project_sql, project_param = _project_match(cur, project)
     cur.execute(
         f"""
         SELECT id FROM decisions
-        WHERE project IS NOT DISTINCT FROM %s
+        WHERE {project_sql}
           AND lower(regexp_replace(text, '\\s+', ' ', 'g')) = %s
           AND decided_at >= COALESCE(%s::timestamptz, now()) - interval '{DEDUP_WINDOW_DAYS} days'
           AND decided_at <= COALESCE(%s::timestamptz, now())
@@ -256,7 +244,7 @@ def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at:
         ORDER BY decided_at DESC, id DESC
         LIMIT 1
         """,
-        (project, norm_text, decided_at, decided_at),
+        (project_param, norm_text, decided_at, decided_at),
     )
     row = cur.fetchone()
     return int(row[0]) if row else None
@@ -279,6 +267,45 @@ def _decision_details_by_text(payload: dict[str, Any]) -> dict[str, dict[str, An
         if text:
             out[text] = item
     return out
+
+
+def _provenance_ready(cur) -> bool:
+    """Whether the hub records fact claims (migration 0047); positive-only,
+    and a failed probe reads as not ready (the hub's commit gate then
+    refuses the unprojected write, so it is retried)."""
+    try:
+        from khipu import provenance
+
+        return provenance.ready(cur)
+    except Exception:  # noqa: BLE001 — introspection is best-effort
+        return False
+
+
+def _locked_duplicate(cur, project: str | None, norm_text: str, decided_at: Any) -> int | None:
+    """:func:`_find_recent_duplicate`, with the row locked and the match
+    re-checked under the lock (section 3.4 of the fact-provenance scope): a
+    duplicate retracted or superseded meanwhile is not one."""
+    for _ in range(3):
+        dup = _find_recent_duplicate(cur, project, norm_text, decided_at)
+        if dup is None:
+            return None
+        _lock_decision_row(cur, dup)
+        if _find_recent_duplicate(cur, project, norm_text, decided_at) == dup:
+            return dup
+    return None
+
+
+def _claim_details(cur, decision_id: int, text: str, *, episode_id: int | None,
+                   rationale: Any = None, evidence: Any = None) -> None:
+    from khipu import provenance
+
+    provenance.record_claim(cur, "decision", decision_id, "text", text, episode_id=episode_id)
+    if rationale:
+        provenance.record_claim(cur, "decision", decision_id, "rationale", rationale, episode_id=episode_id)
+    if evidence is not None:
+        provenance.record_claim(cur, "decision", decision_id, "evidence", json.dumps(evidence),
+                                episode_id=episode_id)
+    provenance.project(cur, "decision", decision_id)
 
 
 def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
@@ -310,6 +337,11 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
     decided_at = payload.get("ts")
     evidence_ready = _evidence_ready(cur)
     details = _decision_details_by_text(payload) if evidence_ready else {}
+    prov = _provenance_ready(cur)
+    if prov:
+        from khipu import provenance
+
+        provenance.declare_writer(cur)  # 0047's writer gate (scope 3.1)
     inserted = 0
     for raw in items:
         text = _redacted_value(str(raw or "").strip())
@@ -318,37 +350,51 @@ def insert_decisions_from_episode(cur, payload: dict[str, Any], episode_id: int)
         norm = normalize_text(text)
         if not norm:
             continue
-        if _find_recent_duplicate(cur, project, norm, decided_at) is not None:
-            continue
         detail = details.get(text)
-        if detail is None:
-            cur.execute(
-                """
-                INSERT INTO decisions (project, text, episode_id, session_id, decided_at)
-                VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()))
-                """,
-                (project, text, episode_id, session_id, decided_at),
-            )
-        else:
-            source_kind = detail.get("by") or None
+        rationale = evidence = None
+        if detail is not None:
             rationale = detail.get("rationale") or None
             evidence = {
                 "derivation": "extract-details-v1",
                 "episode_id": episode_id,
                 "reverses": detail.get("reverses") or None,
             }
+        if prov:
+            # Fact provenance (0047): a repeat is this episode's claim on the
+            # decision already on file (its own words, rationale and
+            # evidence, shown once the earlier claimants are forgotten).
+            dup = _locked_duplicate(cur, project, norm, decided_at)
+            if dup is not None:
+                _claim_details(cur, dup, text, episode_id=episode_id, rationale=rationale, evidence=evidence)
+                continue
+        elif _find_recent_duplicate(cur, project, norm, decided_at) is not None:
+            continue
+        returning = " RETURNING id" if prov else ""
+        if detail is None:
+            cur.execute(
+                """
+                INSERT INTO decisions (project, text, episode_id, session_id, decided_at)
+                VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()))
+                """ + returning,
+                (project, text, episode_id, session_id, decided_at),
+            )
+        else:
+            source_kind = detail.get("by") or None
             cur.execute(
                 """
                 INSERT INTO decisions
                     (project, text, episode_id, session_id, decided_at,
                      source_kind, rationale, evidence)
                 VALUES (%s, %s, %s, %s, COALESCE(%s::timestamptz, now()), %s, %s, %s::jsonb)
-                """,
+                """ + returning,
                 (project, text, episode_id, session_id, decided_at,
                  source_kind, rationale, json.dumps(evidence)),
             )
         if cur.rowcount > 0:
             inserted += 1
+            if prov:
+                _claim_details(cur, int(cur.fetchone()[0]), text, episode_id=episode_id,
+                               rationale=rationale, evidence=evidence)
     if inserted:
         _log(f"recorded {inserted} decision(s) for episode {episode_id} (project={project!r})")
     return inserted
@@ -367,20 +413,21 @@ def _trgm_available(cur) -> bool:
         return False
 
 
-def _standing_before_clause(cur, evidence_ready: bool) -> str:
+def _standing_before_clause(cur, evidence_ready: bool, project: str | None) -> tuple[str, Any]:
     """Shared WHERE fragment for both reversal-match finders below: standing
     (not superseded, not retracted once evidence is ready), not forgotten,
-    same project, decided strictly before the new decision, excluding the
-    new decision itself. Every caller binds its params in this exact order:
-    (project, exclude_id, before)."""
-    clauses = ["project IS NOT DISTINCT FROM %s", "id != %s", "decided_at < %s",
-               "superseded_by IS NULL"]
+    same project (alias group), decided strictly before the new decision,
+    excluding the new decision itself. Returns ``(sql, project_param)``;
+    callers bind ``(project_param, exclude_id, before)`` after any leading
+    SELECT params."""
+    project_sql, project_param = _project_match(cur, project)
+    clauses = [project_sql, "id != %s", "decided_at < %s", "superseded_by IS NULL"]
     if evidence_ready:
         clauses.append("retracted_at IS NULL")
     forgotten = _not_forgotten_clause(cur, "decisions")
     if forgotten:
         clauses.append(forgotten)
-    return " AND ".join(clauses)
+    return " AND ".join(clauses), project_param
 
 
 def _best_reversal_match_sql(cur, *, project, exclude_id, before, reverses_text,
@@ -389,11 +436,11 @@ def _best_reversal_match_sql(cur, *, project, exclude_id, before, reverses_text,
     in the project against ``reverses_text`` and return the single best
     match. No 200-row cap here — that bound is the Python fallback's own,
     named in ``BUILD`` item 3."""
-    where = _standing_before_clause(cur, evidence_ready)
+    where, project_param = _standing_before_clause(cur, evidence_ready, project)
     cur.execute(
         f"SELECT id, similarity(text, %s) AS score FROM decisions "
         f"WHERE {where} ORDER BY score DESC LIMIT 1",
-        (reverses_text, project, exclude_id, before),
+        (reverses_text, project_param, exclude_id, before),
     )
     row = cur.fetchone()
     if row is None or row[1] is None:
@@ -409,11 +456,11 @@ def _best_reversal_match_python(cur, *, project, exclude_id, before, reverses_te
     not copied, so the two never drift apart)."""
     from khipu.capture import _jaccard
 
-    where = _standing_before_clause(cur, evidence_ready)
+    where, project_param = _standing_before_clause(cur, evidence_ready, project)
     cur.execute(
         f"SELECT id, text FROM decisions WHERE {where} "
         f"ORDER BY decided_at DESC LIMIT {REVERSAL_CANDIDATE_POOL}",
-        (project, exclude_id, before),
+        (project_param, exclude_id, before),
     )
     best: tuple[int, float] | None = None
     for did, text in cur.fetchall():
@@ -523,6 +570,9 @@ def list_decisions(cur, *, project: str | None = None, since: Any = None,
             clauses.append("retracted_at IS NULL")
     elif status == "superseded":
         clauses.append("superseded_by IS NOT NULL")
+        # Retracted wins in state_of; status=superseded must not list those rows.
+        if evidence_ready:
+            clauses.append("retracted_at IS NULL")
     elif status == "retracted":
         clauses.append("retracted_at IS NOT NULL" if evidence_ready else "FALSE")
     elif status is None and not include_superseded:
@@ -563,11 +613,11 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
     forever (O2's root complaint).
 
     Refuses: self-reference, an unknown id, a cycle (``new_id`` already
-    transitively superseded by ``old_id``), and — unless ``force=True`` —
-    two decisions in different projects, all raising ``ValueError``. An
-    old row that is ALREADY superseded is the one refusal that returns
-    ``False`` instead of raising (today's contract: a caller checking
-    "did this already happen" gets an answer, not an exception).
+    transitively superseded by ``old_id``), a retracted ``new_id``, and —
+    unless ``force=True`` — two decisions in different projects, all raising
+    ``ValueError``. An old row that is ALREADY superseded is the one refusal
+    that returns ``False`` instead of raising (today's contract: a caller
+    checking "did this already happen" gets an answer, not an exception).
     ``source``/``reason`` are recorded when migration 0024's columns exist;
     pre-migration this still supersedes via the original ``superseded_by``
     pointer alone. Records an ``applied`` link in ``decision_links`` when
@@ -576,13 +626,19 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
         raise ValueError(f"source must be one of {VALID_SUPERSEDE_SOURCES}")
     if old_id == new_id:
         raise ValueError("a decision cannot supersede itself")
-    _lock_decision_row(cur, old_id)
+    owner_claim = source in OWNER_SUPERSEDE_SOURCES and _provenance_ready(cur)
+    # Both rows are written when the owner's claim is recorded below: lock
+    # them in id order, the fact lock order (scope 3.4).
+    for decision_id in (sorted((old_id, new_id)) if owner_claim else (old_id,)):
+        _lock_decision_row(cur, decision_id)
     old = _fetch_decision_row(cur, old_id)
     if old is None:
         raise ValueError(f"no such decision: {old_id}")
     new = _fetch_decision_row(cur, new_id)
     if new is None:
         raise ValueError(f"no such decision: {new_id}")
+    if new.get("retracted_at") is not None:
+        raise ValueError(f"decision {new_id} is retracted; cannot supersede onto it")
     if old.get("superseded_by") is not None:
         # Not a raise (unlike the other refusals below): calling supersede
         # again on an already-superseded row is the ordinary "did this
@@ -614,10 +670,24 @@ def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
             (new_id, old_id),
         )
     ok = cur.rowcount > 0
+    if ok and owner_claim:
+        # The owner (or an agent acting for them) chose the replacement: an
+        # owner claim on its words, as migration 0047 records for an owner
+        # link made before it. Selecting an existing decision by id never
+        # passes through create_decision, so the claim is made here, the one
+        # path every manual or agent supersession takes (Astra review
+        # 2026-10-23 #4). Forgetting the replacement's capture then leaves
+        # it standing on the owner's endorsement.
+        from khipu import provenance
+
+        cur.execute("SELECT text FROM decisions WHERE id = %s", (new_id,))
+        row = cur.fetchone()
+        if row and row[0]:
+            provenance.record_claim(cur, "decision", new_id, "text", row[0], claimant="owner")
+            provenance.project(cur, "decision", new_id)
     if ok and _links_ready(cur):
         _record_applied_link(cur, old_id, new_id, source=source, reason=reason)
     if ok:
-        _mirror_to_snapshot(cur, old_id)
         _stale_briefs(cur, old_id)
     return ok
 
@@ -652,7 +722,6 @@ def restore(cur, decision_id: int) -> bool:
             (decision_id, new_id),
         )
     if ok:
-        _mirror_to_snapshot(cur, decision_id)
         _stale_briefs(cur, decision_id)
     return ok
 
@@ -672,7 +741,6 @@ def retract(cur, decision_id: int, reason: str | None = None) -> bool:
     )
     ok = cur.rowcount > 0
     if ok:
-        _mirror_to_snapshot(cur, decision_id)
         _stale_briefs(cur, decision_id)
     return ok
 
@@ -687,7 +755,6 @@ def unretract(cur, decision_id: int) -> bool:
     )
     ok = cur.rowcount > 0
     if ok:
-        _mirror_to_snapshot(cur, decision_id)
         _stale_briefs(cur, decision_id)
     return ok
 
@@ -704,16 +771,26 @@ def create_decision(cur, *, project: str | None, text: str, session_id: str | No
     if not text:
         raise ValueError("text is required")
     norm = normalize_text(text)
-    dup = _find_recent_duplicate(cur, project, norm, decided_at) if norm else None
-    if dup is not None:
-        return dup
+    prov = _provenance_ready(cur)
+    owner_evidence = _redacted_value(evidence) if evidence is not None else None
+    if prov:
+        # The owner's words are an owner claim, on the duplicate already on
+        # file too (shown when no live episode claims it).
+        dup = _locked_duplicate(cur, project, norm, decided_at) if norm else None
+        if dup is not None:
+            _claim_details(cur, dup, text, episode_id=None, evidence=owner_evidence)
+            return dup
+    else:
+        dup = _find_recent_duplicate(cur, project, norm, decided_at) if norm else None
+        if dup is not None:
+            return dup
     if _evidence_ready(cur):
         cur.execute(
             "INSERT INTO decisions (project, text, session_id, decided_at, source_kind, evidence) "
             "VALUES (%s, %s, %s, COALESCE(%s::timestamptz, now()), %s, %s::jsonb) "
             "RETURNING id",
             (project, text, session_id, decided_at, source_kind,
-             json.dumps(_redacted_value(evidence)) if evidence is not None else None),
+             json.dumps(owner_evidence) if evidence is not None else None),
         )
     else:
         cur.execute(
@@ -721,7 +798,11 @@ def create_decision(cur, *, project: str | None, text: str, session_id: str | No
             "VALUES (%s, %s, %s, COALESCE(%s::timestamptz, now())) RETURNING id",
             (project, text, session_id, decided_at),
         )
-    return int(cur.fetchone()[0])
+    new_id = int(cur.fetchone()[0])
+    if prov:
+        _claim_details(cur, new_id, text, episode_id=None,
+                       evidence=owner_evidence if _evidence_ready(cur) else None)
+    return new_id
 
 
 def add_link(cur, old_id: int, new_id: int, *, kind: str = "supersedes",
@@ -884,31 +965,29 @@ def decision_states_for_episode(episode_id: int) -> dict[str, Any]:
     ``{"decision_states": [{"id", "text", "state", "superseded_by"}, ...],
     "validity": {"current": n, "superseded": n, "retracted": n}}``. Opens its
     own connection (same posture as ``khipu.activity.episode_detail``).
+    Includes decisions capture deduplicated onto this episode (same attach
+    path as ``briefs._decision_rows``), so a restatement still shows state.
     Never raises; a pre-migration hub or an episode with no decisions gets
     empty/zeroed results."""
     empty = {"decision_states": [], "validity": {"current": 0, "superseded": 0, "retracted": 0}}
     from khipu.db import connect
 
     try:
+        from khipu import briefs
+
         with connect() as conn:
             with conn.cursor() as cur:
                 if not _decisions_ready(cur):
                     return empty
-                cols = ["id", "text", "superseded_by"]
-                if _evidence_ready(cur):
-                    cols.append("retracted_at")
-                cur.execute(
-                    f"SELECT {', '.join(cols)} FROM decisions WHERE episode_id = %s ORDER BY id",
-                    (episode_id,),
-                )
-                rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+                by_ep = briefs._decision_rows(cur, [int(episode_id)], with_text=True)
     except Exception as exc:  # noqa: BLE001 — additive enrichment, never blocks khipu_get
         _log(f"decision_states_for_episode failed ({type(exc).__name__}: {exc})")
         return empty
+    rows = by_ep.get(int(episode_id), [])
     states = []
     counts = {"current": 0, "superseded": 0, "retracted": 0}
     for row in rows:
-        state = state_of(row)
+        state = row["state"]
         counts[state] += 1
         states.append({"id": row["id"], "text": row["text"], "state": state,
                         "superseded_by": row.get("superseded_by")})

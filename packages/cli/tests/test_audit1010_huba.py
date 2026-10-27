@@ -1,6 +1,7 @@
 """Regression coverage for the authoritative HUBA snapshot audit."""
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 import tempfile
@@ -80,7 +81,10 @@ class HubAuditRegressionTest(unittest.TestCase):
             con.close()
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "meta_path", return_value=Path(tmp) / "meta.json"):
-                hs.upsert_episode({"id": 1, "summary": "alpha"}, [], deliverable_rows=[{"id": 1, "episode_id": 1, "project": "p", "title": "secret", "kind": "file", "created_at": "2026-10-10"}])
+                # Since phase 7B an episode patch carries no fact row at all
+                # (design 6.2): deliverables come only with the fact copy.
+                self.assertNotIn("deliverable_rows", inspect.signature(hs.upsert_episode).parameters)
+                hs.upsert_episode({"id": 1, "summary": "alpha"}, [])
             con = sqlite3.connect(snap)
             rows = con.execute("SELECT * FROM deliverables").fetchall()
             con.close()
@@ -557,53 +561,6 @@ class HubAuditRegressionTest(unittest.TestCase):
         self.assertEqual([row["id"] for row in cosine], ["1"])
         self.assertNotIn("private text", json.dumps([semantic, cosine]))
 
-    def test_decision_sync_pages_through_equal_timestamps_with_tuple_cursor(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data = Path(tmp)
-            snap = self._snapshot(data)
-            sidecar = data / "meta.json"
-            columns = list(hs._DECISION_COLS)
-            stamp = "2026-10-10T12:00:00+00:00"
-            executed: list[tuple[str, tuple]] = []
-
-            class Cursor:
-                def __enter__(self): return self
-                def __exit__(self, *args): return False
-                def execute(self, sql, params): executed.append((sql, tuple(params)))
-                def fetchall(self):
-                    since = executed[-1][1]
-                    ids = (1, 2) if len(since) == 1 else (3,)
-                    rows = []
-                    for rid in ids:
-                        record = {c: None for c in columns}
-                        record.update({"id": rid, "text": f"d{rid}", "created_at": stamp})
-                        rows.append(tuple(record[c] for c in columns) + (stamp,))
-                    return rows
-
-            class Pg:
-                def __enter__(self): return self
-                def __exit__(self, *args): return False
-                def cursor(self): return Cursor()
-
-            with mock.patch.object(hs, "snapshot_path", return_value=snap), \
-                 mock.patch.object(hs, "meta_path", return_value=sidecar), \
-                 mock.patch.object(hs, "try_hub_connect", return_value=Pg()), \
-                 mock.patch.object(hs, "_pg_columns", return_value=set(columns)):
-                first = hs.sync_decision_changes(limit=2)
-                second = hs.sync_decision_changes(limit=2)
-                meta_data = json.loads(sidecar.read_text(encoding="utf-8"))
-                meta_data["last_decision_sync_id"] = "malformed"
-                sidecar.write_text(json.dumps(meta_data), encoding="utf-8")
-                replay = hs.sync_decision_changes(limit=2)
-            con = sqlite3.connect(snap)
-            ids = [r[0] for r in con.execute("SELECT id FROM decisions ORDER BY id")]
-            con.close()
-        self.assertEqual((first["decisions"], second["decisions"]), (2, 1))
-        self.assertTrue(replay["ok"])
-        self.assertEqual(ids, [1, 2, 3])
-        self.assertIn(", id) > (%s, %s)", executed[1][0])
-        self.assertEqual(executed[1][1][:2], (stamp, 2))
-
     def test_incremental_write_cannot_create_refresh_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)
@@ -677,7 +634,7 @@ class HubAuditRegressionTest(unittest.TestCase):
                 mock.patch.object(hs, "_insert_episodes", side_effect=episodes),
                 mock.patch.object(hs, "_insert_memory_embeddings", side_effect=vectors),
             ]
-            zeroes = ["_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges", "_insert_profiles", "_insert_decisions", "_insert_deliverables"]
+            zeroes = ["_insert_topics", "_insert_topic_revisions", "_insert_nodes", "_insert_edges", "_insert_profiles"]
             with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], \
                  mock.patch.multiple(hs, **{name: mock.Mock(return_value=0) for name in zeroes}):
                 self.assertTrue(hs.refresh()["ok"])
@@ -714,10 +671,11 @@ class HubAuditRegressionTest(unittest.TestCase):
                 def cursor(self): return self
                 def execute(self, *args, **kwargs): pass
                 def fetchone(self): return None
+                def fetchall(self): return []
 
             inserts = ["_insert_episodes", "_insert_topics", "_insert_topic_revisions", "_insert_nodes",
                        "_insert_edges", "_insert_profiles", "_insert_memory_embeddings",
-                       "_insert_decisions", "_insert_deliverables", "_insert_commitments", "_insert_ledger",
+                       "_insert_ledger",
                        "_insert_project_aliases"]
             with mock.patch.object(hs, "snapshot_path", return_value=snap), \
                  mock.patch.object(hs, "meta_path", return_value=sidecar), \

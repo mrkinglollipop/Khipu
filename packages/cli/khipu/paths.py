@@ -156,6 +156,16 @@ def _env_override() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+def explicit_dsn_location() -> bool:
+    """Whether KHIPU_DATA_DIR or KHIPU_DSN_FILE names where the DSN lives: then
+    a missing file there means no DSN, never the config or ~/.config/alzy one.
+    Here, not in khipu.db, so the replica readers can ask without loading the
+    database driver."""
+    if any((os.environ.get(n) or "").strip() for n in ("KHIPU_DSN_FILE", "ALZY_DSN_FILE")):
+        return True
+    return _env_override() is not None
+
+
 def default_data_dir() -> Path:
     return DEFAULT_DIR
 
@@ -207,8 +217,10 @@ def set_data_dir(path: Path) -> Path:
         + "\n",
         encoding="utf-8",
     )
-    # Seed essentials from previous locations when empty.
-    for name in ("dsn", "root.crt"):
+    # Seed the hub certificate from previous locations when empty. Never the
+    # DSN: the app can name any folder here, and the hub credentials would
+    # land wherever it pointed.
+    for name in ("root.crt",):
         dst = target / name
         if dst.is_file():
             continue
@@ -216,8 +228,6 @@ def set_data_dir(path: Path) -> Path:
             src = src_root / name
             if src.is_file() and src.resolve() != dst:
                 shutil.copy2(src, dst)
-                if name == "dsn":
-                    dst.chmod(0o600)
                 break
     return target
 
@@ -304,13 +314,40 @@ def backup_local(*, dest: Path) -> dict:
         dest = dest / f"khipu-local-{stamp}.zip"
     dest.parent.mkdir(parents=True, exist_ok=True)
     count = 0
+    replica = src / _SNAPSHOT_NAME
+    staged: Path | None = None
+    _remove_crashed_export_scratch(src)
     try:
         with sensitive_writer(dest) as archive_file:
             with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                if replica.is_file():
+                    # The replica goes in as a checked copy, never its live
+                    # file or journal: a copy whose fact rows belong to a
+                    # refused generation carries none (hub_snapshot.
+                    # export_replica_copy).
+                    from khipu import hub_snapshot
+
+                    staged = hub_snapshot.staging_path()
+                    hub_snapshot.export_replica_copy(replica, staged)
+                    zf.write(staged, arcname=_SNAPSHOT_NAME)
+                    count += 1
                 for p in src.rglob("*"):
                     if not p.is_file():
                         continue
                     if p.name == POINTER_NAME and src == DEFAULT_DIR:
+                        continue
+                    # The archive goes wherever the caller names; the hub DSN
+                    # and gateway token never leave this Mac in it.
+                    if p.name in SENSITIVE_FILENAMES:
+                        continue
+                    if staged is not None and p == staged:
+                        continue
+                    if p.parent == src and (p.name == _SNAPSHOT_NAME
+                                            or p.name.startswith(_SNAPSHOT_NAME + "-")):
+                        continue
+                    # Another refresh's or export's temporary replica, or a
+                    # sidecar of one, never went through the export.
+                    if p.parent == src and (_replica_temp((p.name,)) or _EXPORT_SCRATCH.match(p.name)):
                         continue
                     zf.write(p, arcname=str(p.relative_to(src)))
                     count += 1
@@ -323,6 +360,9 @@ def backup_local(*, dest: Path) -> dict:
         dest.unlink(missing_ok=True)
         return {"ok": False, "error": f"the backup could not be written: {describe_os_error(exc)}",
                 "archive": str(dest), "source": str(src)}
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
     return {"ok": True, "archive": str(dest), "files": count, "source": str(src)}
 
 
@@ -339,12 +379,12 @@ def _job_refusal(data: bytes, gate) -> str | None:
     treated as allowed, since it can still hold a forgotten source's text."""
     try:
         value = json.loads(data.decode("utf-8"))
-    except (UnicodeError, ValueError):
-        return "unreadable"
-    if not isinstance(value, dict) or not isinstance(value.get("payload"), dict):
+    except (UnicodeError, ValueError, RecursionError):
         return "unreadable"
     try:
-        allowed = gate.allows(value["payload"])
+        from khipu.capture_stores import outbox_payloads
+
+        allowed = all(gate.allows(payload) for payload in outbox_payloads(value))
     except Exception:  # noqa: BLE001 (a job the gate cannot judge is not restored)
         return "unreadable"
     return None if allowed else "forgotten"
@@ -369,7 +409,14 @@ def import_local(*, source: Path, merge: bool = True) -> dict:
     from khipu import memory_lock
 
     with memory_lock.shared():
-        return _import_local(source=source, merge=merge)
+        out = _import_local(source=source, merge=merge)
+    if (out.get("snapshot_scrub") or {}).get("imported"):
+        # A restored replica shows no fact row until a copy (design 6.2),
+        # taken after the memory lock: the copy lock is outermost.
+        from khipu import hub_snapshot
+
+        out["snapshot_scrub"]["facts"] = hub_snapshot.copy_facts()
+    return out
 
 
 def _skipped_name(parts: tuple[str, ...]) -> bool:
@@ -380,6 +427,27 @@ def _skipped_name(parts: tuple[str, ...]) -> bool:
 
 
 _REPLICA_TEMP = re.compile(r"^\.hub_snapshot\..+\.sqlite(-.+)?$")
+# The scratch copy (fact rows included) an earlier export made beside its
+# staged replica, ``.<staged name>.facts-<pid>`` where the staged name is
+# ``staging_path``'s ``.hub_snapshot.<8 mkstemp characters>.sqlite``, with
+# its sidecars. Exactly that name: any other file is the owner's.
+_EXPORT_SCRATCH = re.compile(r"^\.\.hub_snapshot\.[a-z0-9_]{8}\.sqlite\.facts-(\d+)(-journal|-wal|-shm)?$")
+
+
+def _remove_crashed_export_scratch(src: Path) -> None:
+    """Delete the scratch copies crashed earlier exports left in the data
+    folder, those whose process is gone."""
+    for p in src.glob("..hub_snapshot.*.sqlite.facts-*"):
+        found = _EXPORT_SCRATCH.match(p.name)
+        if not found or not p.is_file():
+            continue
+        try:
+            os.kill(int(found.group(1)), 0)
+            continue
+        except ProcessLookupError:
+            p.unlink(missing_ok=True)
+        except (PermissionError, OSError):
+            continue
 _WRITER_RECORDS = ".legacy_writers"  # khipu.writer_groups.DIR_NAME
 
 
@@ -792,7 +860,13 @@ def _import_local(*, source: Path, merge: bool) -> dict:
             if registry is not None:
                 tombstones.merge_registry_bytes(registry.read_bytes())
             with tombstones.write_gate() as gate:
-                for scrub, staged, _dest, rel in candidates:
+                for scrub, staged, dest, rel in candidates:
+                    if rel in SENSITIVE_FILENAMES and dest.exists():
+                        # A backup may bring credentials to a Mac that has
+                        # none, never swap this Mac's hub or gateway for its own.
+                        not_restored.append({"path": rel, "why": (
+                            "this Mac already has its own; a restore never replaces credentials")})
+                        continue
                     if scrub == "job":
                         refusal = _job_refusal(staged.read_bytes(), gate)
                         if refusal == "forgotten":

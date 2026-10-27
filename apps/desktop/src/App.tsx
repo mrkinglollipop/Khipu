@@ -44,11 +44,12 @@ import { RightNowCard } from "./RightNow";
 import { SUPPORT_EMAIL, Welcome, welcomeCompleted } from "./Welcome";
 import { SetupStages, type SetupPhase, type SetupPipelineResult } from "./SetupStages";
 import { buildAttention, harnessLabel, promotionAttention, routingAttention, type Attention } from "./doctorAttention";
-import { HealthReportRows } from "./healthRows";
+import { HealthReportRows, TILE_HEALTH_KEYS, healthKeysForAttention, markHealthRows } from "./healthRows";
 import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
 import { KeysCard } from "./KeysCard";
-import { PlansCard, usePlanAttention, usePlanUsage } from "./PlansCard";
+import { PlansCard, liveWords, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
+import { toastWords } from "./humanWords";
 import { RoutingSettings } from "./RoutingSettings";
 import { WorkSettings } from "./WorkSettings";
 import { useRouting } from "./routing";
@@ -66,6 +67,7 @@ import { OwedChangeDialog, OwedSelectionBar, OwedTidyDialog, owedChange } from "
 import type { OwedOwner } from "./OwedBulk";
 import { OptionalFeatures } from "./OptionalFeatures";
 import { OwnerActions } from "./OwnerActions";
+import { PendingForgets } from "./PendingForgets";
 import { ProjectsSettings, askedCount } from "./ProjectsSettings";
 import { requireCliSuccess, requireMigrationSuccess, useCliState } from "./settingsCli";
 import type { ProjectsList } from "./ProjectsSettings";
@@ -91,7 +93,14 @@ import {
 } from "./postUpdateNotices";
 import { WhatsNewCard, WhatsNewHistory, revealSettingsGroup } from "./WhatsNew";
 import { HomeAccountCards } from "./FoundAccounts";
+import { GuidesPage } from "./GuidesPage";
+import { SetupHint } from "./SetupHint";
+import { useGuideSignals } from "./guideSignals";
+import { guideStates, hintState, railBadge, startItems as buildStartItems } from "./guidesModel";
+import type { GuideId } from "./guidesModel";
+import type { GuideTarget } from "./guideOutlines";
 import "./App.css";
+import "./guides.css";
 
 /** Six destinations, one per user job, plus the first-run flow and Revisions —
  *  which is a drill-in from Home's "Conflicting edits" item, not a peer
@@ -105,6 +114,7 @@ type Tab =
   | "activity"
   | "harnesses"
   | "settings"
+  | "guides"
   | "revisions";
 
 type PaneBoundaryProps = {
@@ -137,7 +147,7 @@ class PaneBoundary extends Component<PaneBoundaryProps, { failed: boolean }> {
 
 const PANE_TITLES: Record<Tab, string> = {
   "first-run": "Setup", home: "Home", activity: "Activity", recall: "Recall",
-  revisions: "Revisions", work: "Work", harnesses: "Harnesses", settings: "Settings",
+  revisions: "Revisions", work: "Work", harnesses: "Harnesses", settings: "Settings", guides: "Guides",
 };
 
 type CacheTab = "status" | "activity" | "revisions" | "doctor" | "rightNow";
@@ -291,7 +301,7 @@ const SEARCH_MODES: {
   {
     mode: "semantic",
     label: "By meaning",
-    hint: "Vector similarity only. The words need not appear in the text.",
+    hint: "Vector similarity and word overlap. The words need not appear in the text.",
     placeholder: "describe what you are looking for",
   },
   {
@@ -427,6 +437,16 @@ const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions">, ReactNode> = {
           <path d="M3 5h10M3 11h10" />
           <circle cx="6" cy="5" r="1.5" />
           <circle cx="10" cy="11" r="1.5" />
+        </>
+      }
+    />
+  ),
+  guides: (
+    <RailIcon
+      d={
+        <>
+          <path d="M2 3.5h4a2 2 0 0 1 2 2V13a1.5 1.5 0 0 0-1.5-1.5H2z" />
+          <path d="M14 3.5h-4a2 2 0 0 0-2 2V13a1.5 1.5 0 0 1 1.5-1.5H14z" />
         </>
       }
     />
@@ -1029,9 +1049,7 @@ function ReadFailed({ what, onRetry }: { what: string; onRetry: () => void }) {
 /** A Python traceback in a toast is its last non-empty line (the exception);
  *  the full text stays in the toast's title. */
 function toastLine(text: string): string {
-  if (!text.includes("Traceback (most recent call last)")) return text;
-  const lines = text.split("\n").filter((l) => l.trim() !== "");
-  return (lines[lines.length - 1] ?? text).trim();
+  return toastWords(text);
 }
 
 type Tone = "ok" | "warn" | "err" | "neutral";
@@ -1286,7 +1304,7 @@ const OwedRow = memo(function OwedRow({
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
   const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
-    "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, settings: 0,
+    "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, settings: 0, guides: 0,
   });
   // Configuration presence lets setup proceed; it does not prove the database answers.
   const [dsnOk, setDsnOk] = useState<boolean | null>(null);
@@ -1538,6 +1556,29 @@ export default function App() {
   // Bumped by an attention item with no fix action, and by "Details": opens
   // Home's one disclosure instead of dead-ending.
   const [homeAdvancedKey, setHomeAdvancedKey] = useState(0);
+  // The health rows a tile or callout was opened for: opens the disclosure,
+  // scrolls to the first row it names and marks them for a few seconds.
+  const [healthFocus, setHealthFocus] = useState<{ keys: readonly string[]; n: number } | null>(null);
+  const openHealth = useCallback((keys: readonly string[]) => {
+    setHomeAdvancedKey((k) => k + 1);
+    setHealthFocus((f) => ({ keys, n: (f?.n ?? 0) + 1 }));
+  }, []);
+  useEffect(() => {
+    if (!healthFocus) return;
+    let marked: Element[] = [];
+    const frame = requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        marked = markHealthRows(document, healthFocus.keys);
+        marked[0]?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+      }),
+    );
+    const done = window.setTimeout(() => marked.forEach((el) => el.classList.remove("health-hl")), 4000);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.clearTimeout(done);
+      marked.forEach((el) => el.classList.remove("health-hl"));
+    };
+  }, [healthFocus]);
   const [owedFetchedAt, setOwedFetchedAt] = useState<Partial<Record<OwedStatus, number>>>({});
   const [nodeId, setNodeId] = useState("");
   const [hops, setHops] = useState(1);
@@ -2758,11 +2799,30 @@ export default function App() {
       ? "home"
       : tab === "work"
         ? "work"
-        : tab === "settings" && settingsSection === "routing"
+        : tab === "guides"
+          ? "guides"
+          : tab === "settings" && settingsSection === "routing"
           ? "settings"
           : null,
   );
   const planItems = usePlanAttention(plans.data);
+  // Guides: the guide on screen (Grok Bot also takes the step to open at), and
+  // the live evidence the page, the rail badge and Home's hint all read. It
+  // re-reads when the user comes to one of the screens that shows it.
+  const [guideOpen, setGuideOpen] = useState<{ id: GuideId; step?: number } | null>(null);
+  const guideSignals = useGuideSignals(tab === "home" || tab === "guides" || tab === "harnesses" ? tab : "other");
+  const openGuide = (id: GuideId, step?: number) => {
+    setGuideOpen({ id, step });
+    setTab("guides");
+  };
+  const openGuideTarget = (t: GuideTarget) => {
+    if (t.kind === "guide") openGuide(t.id);
+    else if (t.kind === "harnesses") setTab("harnesses");
+    else {
+      setSettingsSection(t.section as SettingsSection);
+      setTab("settings");
+    }
+  };
   // Routing truth phase 4: the routing record (`khipu route --json`), read on
   // Home and every minute while Home stays open. Its attention items warn and
   // block nothing (the record is guidance, not a gate).
@@ -3551,6 +3611,7 @@ export default function App() {
       case "harnesses": await loadDoctor(true); break;
       case "settings": await Promise.all([refreshDsn(true), loadPaths(), loadGraphSources(), loadModels(), loadSecretsPresence()]); break;
       case "first-run": await refreshDsn(true); break;
+      case "guides": await guideSignals.reload(); break;
       case "recall": break;
     }
     setPaneRetryKeys((keys) => ({ ...keys, [activeTab]: keys[activeTab] + 1 }));
@@ -3593,6 +3654,22 @@ export default function App() {
   );
   const t3Gap = t3HealthGap(t3Health);
   const railHealth = railHealthLine(dbReachable, liveness, claudeHomes, t3Gap);
+
+  // Guides: four "Start here" items ticked from live state, each guide row's
+  // state, and the rail badge (setups started and not finished, plus problems).
+  const accountsRead = (plans.data?.accounts ?? []).filter((a) => liveWords(a).live).length;
+  const guideStartSignals = {
+    liveness,
+    gatewayCheckOk: guideSignals.prefs.grokCheck?.ok === true,
+    episodes: counts?.episodes ?? null,
+    accountsRead,
+    agentAsked: guideSignals.agentAsked,
+  };
+  const guideStartItems = buildStartItems(guideStartSignals);
+  const guideProblems = liveness ? (liveness.red ?? []).length : null;
+  const guideRowStates = guideStates({ ...guideStartSignals, grok: guideSignals.grok, problems: guideProblems, t3: t3Gap });
+  const guidesBadge = railBadge(guideSignals.grok, guideProblems);
+  const homeHint = hintState(guideStartItems, guideSignals.prefs);
 
   const coverage = (() => {
     if (!embedCoverage) return null;
@@ -4018,6 +4095,27 @@ export default function App() {
               );
             })}
           </div>
+          <div className="nav-group" data-tauri-drag-region>
+            <div className="nav-divider" role="separator" />
+            <button
+              type="button"
+              className={tab === "guides" ? "nav active" : "nav"}
+              title="Step-by-step help for setting up Khipu and each tool it works with"
+              aria-current={tab === "guides" ? "page" : undefined}
+              onClick={() => setTab("guides")}
+            >
+              {NAV_ICONS.guides}
+              <span className="nav-label">Guides</span>
+              {guidesBadge > 0 ? (
+                <span
+                  className="nav-count"
+                  aria-label={guidesBadge === 1 ? "1 setup left" : `${guidesBadge} setups left`}
+                >
+                  {guidesBadge}
+                </span>
+              ) : null}
+            </button>
+          </div>
         </div>
         <div className="rail-foot" data-tauri-drag-region>
           <div className="rail-health">
@@ -4086,6 +4184,20 @@ export default function App() {
             </button>
           </PanelHeader>
           <div className="panel-body wide">
+            <SetupHint
+              state={homeHint}
+              onAct={(id) => {
+                if (id === "connect") openGuide("grok_bot", guideSignals.grok.current);
+                else if (id === "accounts") setAddAccountSignal((n) => n + 1);
+                else openGuide("saving");
+              }}
+              onSeeAll={() => {
+                setGuideOpen(null);
+                setTab("guides");
+              }}
+              onHide={() => guideSignals.updatePrefs({ hintHidden: true })}
+              onDismissAllSet={() => guideSignals.updatePrefs({ setUpSeen: true })}
+            />
             {noticeCard ? (
               <WhatsNewCard
                 card={noticeCard}
@@ -4158,7 +4270,7 @@ export default function App() {
                       <button
                         type="button"
                         className="sm"
-                        onClick={() => setHomeAdvancedKey((k) => k + 1)}
+                        onClick={() => openHealth(healthKeysForAttention(a.key))}
                       >
                         Details
                       </button>
@@ -4213,6 +4325,7 @@ export default function App() {
             <PlansCard
               state={plans}
               routing={routingForPlans}
+              onRoutingChanged={() => routing.load(true)}
               noneTracked={noneTracked}
               onAddAccount={() => setAddAccountSignal((n) => n + 1)}
               onOpenAccounts={() => {
@@ -4222,7 +4335,15 @@ export default function App() {
               }}
             />
 
-            <RoutingCard state={routing} plans={plans.data} />
+            <RoutingCard
+              state={routing}
+              plans={plans.data}
+              onOpenAccounts={() => {
+                setSettingsSection("routing");
+                setTab("settings");
+                revealSettingsGroup("accounts");
+              }}
+            />
 
             <div className="tiles">
               <Tile
@@ -4240,12 +4361,16 @@ export default function App() {
                     : undefined
                 }
                 tone={dbReachable === false ? "err" : "neutral"}
+                onOpen={() => openHealth(TILE_HEALTH_KEYS.database)}
+                openLabel="Database: show its health checks"
               />
               <Tile
                 label="Recording"
                 value={recordingValue}
                 sub={recordingSub}
                 tone={harnessRed.length > 0 ? "err" : "neutral"}
+                onOpen={() => openHealth(TILE_HEALTH_KEYS.recording)}
+                openLabel="Recording: show its health checks"
               />
               <Tile
                 label="Search index"
@@ -4264,6 +4389,8 @@ export default function App() {
                     : undefined
                 }
                 tone={coverage && (coverage.missing > 0 || coverage.stale > 0) ? "warn" : "neutral"}
+                onOpen={() => openHealth(TILE_HEALTH_KEYS.search)}
+                openLabel="Search index: show its health checks"
               />
               <Tile
                 label="Backups"
@@ -4276,6 +4403,8 @@ export default function App() {
                 }
                 sub={backupSub || undefined}
                 tone={backupHealth?.ok === false ? "err" : "neutral"}
+                onOpen={() => openHealth(TILE_HEALTH_KEYS.backups)}
+                openLabel="Backups: show its health checks"
               />
             </div>
 
@@ -4365,9 +4494,6 @@ export default function App() {
                         </ListRow>
                       );
                     })}
-                    <ListRow>
-                      <span className="meta">Ages are counted from when this Mac read the list.</span>
-                    </ListRow>
                   </>
                 )}
               </div>
@@ -4512,6 +4638,7 @@ export default function App() {
             </button>
           </PanelHeader>
           <div className="panel-body wide">
+            {tab === "activity" ? <PendingForgets run={runKhipu} refreshKey={activityRawKey} /> : null}
             <div className="inline">
               <input
                 className="activity-filter"
@@ -5831,6 +5958,27 @@ export default function App() {
           </PaneBoundary>
         </section>
 
+        <section className={panelClass("guides")}>
+          <PaneBoundary key={paneRetryKeys["guides"]} title={PANE_TITLES["guides"]} onRetry={retryActivePane}>
+          <PanelHeader
+            title="Guides"
+            lede="Step-by-step help for setting up Khipu and each tool it works with."
+          />
+          <div className="panel-body wide">
+            <GuidesPage
+              runKhipu={runKhipu}
+              signals={guideSignals}
+              startItems={guideStartItems}
+              states={guideRowStates}
+              open={guideOpen}
+              onOpen={(id) => openGuide(id)}
+              onBack={() => setGuideOpen(null)}
+              onTarget={openGuideTarget}
+            />
+          </div>
+          </PaneBoundary>
+        </section>
+
         <section className={panelClass("harnesses")}>
           <PaneBoundary key={paneRetryKeys["harnesses"]} title={PANE_TITLES["harnesses"]} onRetry={retryActivePane}>
           <PanelHeader
@@ -5846,6 +5994,7 @@ export default function App() {
             t3={t3Health}
             refreshHealth={() => loadDoctor(true)}
             onSearchT3Captures={openT3Captures}
+            onOpenGuide={(id) => openGuide(id, id === "grok_bot" ? guideSignals.grok.current : undefined)}
             onAnotherMac={() => {
               setSettingsSection("another-mac");
               setTab("settings");

@@ -73,7 +73,48 @@ def host_kind(dsn: str) -> str:
     return "remote"
 
 
-def explain_connection_error(exc: BaseException) -> tuple[str, str, str]:
+def _dsn_passwords(dsn: str) -> set[str]:
+    """The password as written in ``dsn`` (URI userinfo or a ``password=``
+    keyword) and percent-decoded, read without psycopg: the DSNs that need
+    this are the ones libpq could not parse."""
+    import re
+    from urllib.parse import unquote, urlsplit
+
+    found: set[str] = set()
+    try:
+        raw = urlsplit(dsn).password
+    except ValueError:
+        raw = None
+    if raw:
+        # urlsplit splits userinfo at the last "@", libpq at the first, so a
+        # raw "@" in the password leaves its tail in libpq's host name.
+        found.add(raw)
+        found.update(raw.split("@"))
+    try:
+        from psycopg.conninfo import conninfo_to_dict
+
+        found.add(str(conninfo_to_dict(dsn).get("password") or ""))
+    except Exception:
+        pass
+    for m in re.finditer(r"(?i)\bpassword\s*=\s*('(?:[^'\\]|\\.)*'?|[^\s&]+)", dsn or ""):
+        found.add(m.group(1).strip("'"))
+    found |= {unquote(p) for p in found}
+    return {p for p in found if p}
+
+
+def redact_dsn_text(text: str, dsn: str | None = None) -> str:
+    """``text`` (an error message) with URL userinfo, password parameters and
+    every form of ``dsn``'s password removed. libpq parse errors quote the
+    faulty token, which is often the password."""
+    from khipu.join_errors import redact_connection_text
+
+    out = text or ""
+    for secret in sorted(_dsn_passwords(dsn or ""), key=len, reverse=True):
+        out = out.replace(secret, "[REDACTED]")
+    return redact_connection_text(out)
+
+
+def explain_connection_error(exc: BaseException, dsn: str | None = None) -> tuple[str, str, str]:
     """(title, detail, fix) in plain words for any exception raised while
     reaching, authenticating against, or querying a Postgres server.
 
@@ -82,7 +123,7 @@ def explain_connection_error(exc: BaseException) -> tuple[str, str, str]:
     almost always ``psycopg.OperationalError`` regardless of which of these
     it actually is.
     """
-    text = str(exc)
+    text = redact_dsn_text(str(exc), dsn)
     low = text.lower()
 
     def result(title: str, fix: str) -> tuple[str, str, str]:
@@ -536,7 +577,7 @@ def connect_database(
             time.monotonic() - t0,
         )
     except Exception as exc:  # noqa: BLE001
-        title, detail, fix = explain_connection_error(exc)
+        title, detail, fix = explain_connection_error(exc, dsn)
         ok = record({"id": "reach", "ok": False, "title": title, "detail": detail, "fix": fix}, time.monotonic() - t0)
     if not ok:
         return fail(STAGE_ORDER[1:])
@@ -546,7 +587,7 @@ def connect_database(
     try:
         entry = _stage_version(conn)
     except Exception as exc:  # noqa: BLE001
-        title, detail, fix = explain_connection_error(exc)
+        title, detail, fix = explain_connection_error(exc, dsn)
         entry = {"id": "version", "ok": False, "title": title, "detail": detail, "fix": fix}
     if not record(entry, time.monotonic() - t0):
         return fail(STAGE_ORDER[2:])
@@ -556,7 +597,7 @@ def connect_database(
     try:
         entry = _stage_privileges(conn, read_only=preflight)
     except Exception as exc:  # noqa: BLE001
-        title, detail, fix = explain_connection_error(exc)
+        title, detail, fix = explain_connection_error(exc, dsn)
         entry = {"id": "privileges", "ok": False, "title": title, "detail": detail, "fix": fix}
     if not record(entry, time.monotonic() - t0):
         return fail(STAGE_ORDER[3:])
@@ -566,7 +607,7 @@ def connect_database(
     try:
         entry = _stage_schema(conn, read_only=preflight)
     except Exception as exc:  # noqa: BLE001
-        title, detail, fix = explain_connection_error(exc)
+        title, detail, fix = explain_connection_error(exc, dsn)
         entry = {"id": "schema", "ok": False, "title": title, "detail": detail, "fix": fix}
     if not record(entry, time.monotonic() - t0):
         return fail(STAGE_ORDER[4:])
@@ -576,7 +617,7 @@ def connect_database(
     try:
         entry = _stage_graph(conn)
     except Exception as exc:  # noqa: BLE001
-        title, detail, fix = explain_connection_error(exc)
+        title, detail, fix = explain_connection_error(exc, dsn)
         entry = {"id": "graph", "ok": False, "title": title, "detail": detail, "fix": fix}
     if not record(entry, time.monotonic() - t0):
         return fail(STAGE_ORDER[5:])

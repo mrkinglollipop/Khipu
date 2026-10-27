@@ -402,6 +402,9 @@ def build_corpus(
 
     con = sqlite3.connect(str(snap))
     hs._create_schema(con, version=schema_version)
+    from tests.replica_copy import certify
+
+    certify(con)
 
     for ep in episodes:
         con.execute(

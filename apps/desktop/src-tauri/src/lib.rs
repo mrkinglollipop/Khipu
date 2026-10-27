@@ -737,6 +737,14 @@ const JOBS_STATUS_ARGV: &[&str] = &["jobs", "status"];
 const RECALL_STATUS_ARGV: &[&str] = &["recall", "status"];
 const GATEWAY_TOKEN_STATUS_ARGV: &[&str] = &["gateway", "token", "status"];
 const GATEWAY_TOKEN_SET_ARGV: &[&str] = &["gateway", "token", "set"];
+/// Guides -> Grok Bot -> "Copy gateway key". The CLI copies the key to the
+/// clipboard itself and prints only whether it worked, so no key text ever
+/// passes through this process or the webview. App-only: never an owner
+/// action, never an MCP tool.
+const GATEWAY_TOKEN_COPY_ARGV: &[&str] = &["gateway", "token", "copy"];
+/// Guides -> "Start here": the recent search log, read only to see whether an
+/// agent has asked Khipu anything yet.
+const RECALL_LOG_ARGV: &[&str] = &["recall", "log", "--tail", "200"];
 /// Settings -> Capture -> summariser ceiling: read every scope's calls and cap,
 /// and give back the full synth ceiling for the rest of today. Fixed argv, so
 /// the webview cannot reach `--cap`, `--unlimited` or another scope here (the
@@ -1492,7 +1500,7 @@ fn config_set_argv_kept(key: &str, value: &str, expect: Option<&str>, stored: &[
             }
             Ok(set(OWED_GITHUB_KEY, v.to_string()))
         }
-        k if PATH_KEYS.contains(&k) => Ok(set(k, checked_operand(key, value, false)?)),
+        k if PATH_KEYS.contains(&k) => Ok(set(k, checked_path(key, value)?)),
         k if cli_setting_key(k) => Ok(set(k, checked_cli_setting_path(k, value)?)),
         k if routing_key(k) => Ok(set(k, routing_setting_value(k, value)?)),
         k if REPLICA_DURATION_KEYS.contains(&k) => Ok(set(k, replica_setting_value(k, value)?)),
@@ -2002,6 +2010,74 @@ fn route_hold_end_argv(id: &str) -> Result<Vec<String>, String> {
     Ok(argv)
 }
 
+/// What `route cap set|remove` takes, as the webview sends it. Every field is
+/// checked in `route_cap_argv`; the CLI checks them again against the kind.
+#[derive(serde::Deserialize, Debug, Default)]
+struct RouteCapArgs {
+    kind: String,
+    window: Option<String>,
+    pct: Option<f64>,
+    slack: Option<f64>,
+    usd: Option<f64>,
+    days: Option<f64>,
+    n: Option<u32>,
+    purpose: Option<String>,
+    tier: Option<String>,
+    sensitive_only: Option<bool>,
+}
+
+/// `route cap --from-app [--kind=K ...] -- set|remove ACCOUNT`. Numbers are
+/// formatted here, never passed through as the webview's text, so no value can
+/// become a flag; a field the kind does not use is the CLI's to refuse.
+fn route_cap_argv(action: &str, account: &str, cap: &RouteCapArgs) -> Result<Vec<String>, String> {
+    if !matches!(action, "set" | "remove") {
+        return Err(format!("not a change to a cap: {action:?}"));
+    }
+    if !matches!(cap.kind.as_str(), "share" | "per_day" | "pace_target" | "spend" | "concurrency") {
+        return Err(format!("not a kind of cap: {:?}", cap.kind));
+    }
+    let mut argv = route_base("cap");
+    argv.push(format!("--kind={}", cap.kind));
+    if let Some(w) = cap.window.as_deref() {
+        if !matches!(w, "weekly" | "five_hour") {
+            return Err(format!("a cap's window is the week or the five hours, not {w:?}"));
+        }
+        argv.push(format!("--window={w}"));
+    }
+    if let Some(p) = cap.purpose.as_deref() {
+        if !matches!(p, "job" | "check") {
+            return Err(format!("a cap is for jobs or checks, not {p:?}"));
+        }
+        argv.push(format!("--purpose={p}"));
+    }
+    if action == "set" {
+        for (flag, value) in [("pct", cap.pct), ("slack", cap.slack), ("usd", cap.usd), ("days", cap.days)] {
+            if let Some(v) = value {
+                if !v.is_finite() || !(0.0..=1e9).contains(&v) {
+                    return Err(format!("{flag} is out of range for a cap"));
+                }
+                argv.push(format!("--{flag}={v}"));
+            }
+        }
+        if let Some(n) = cap.n {
+            argv.push(format!("--n={n}"));
+        }
+        if let Some(t) = cap.tier.as_deref() {
+            if !matches!(t, "opus" | "sonnet" | "haiku") {
+                return Err(format!("a cap's tier is opus, sonnet or haiku, not {t:?}"));
+            }
+            argv.push(format!("--tier={t}"));
+        }
+        match cap.sensitive_only {
+            Some(true) => argv.push("--sensitive-only".to_string()),
+            Some(false) => argv.push("--no-sensitive-only".to_string()),
+            None => {}
+        }
+    }
+    argv.extend(["--".to_string(), action.to_string(), checked_route_account(account)?]);
+    Ok(argv)
+}
+
 fn route_definition_argv(definition: &str, value: &Value) -> Result<Vec<String>, String> {
     if !matches!(definition, "provider" | "account" | "lane_map") || !value.is_object() {
         return Err("choose a provider, account or lane definition".to_string());
@@ -2027,6 +2103,18 @@ struct PriorityEntry {
     account: String,
     role: Option<String>,
     until: Option<String>,
+    /// The level the owner worded into the role, kept as read (claim and its
+    /// two times) so a whole-list write by the app never drops another
+    /// account's level.
+    #[serde(default)]
+    level: Option<PriorityLevel>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+struct PriorityLevel {
+    claim: String,
+    as_of: String,
+    until: String,
 }
 
 /// `route priority --from-app [--entries=JSON] [--until=T] -- ACTION`. The
@@ -2077,6 +2165,13 @@ fn route_priority_argv_expect(
             }
             if let Some(t) = e.until.as_deref().filter(|t| !t.trim().is_empty()) {
                 item.insert("until".to_string(), Value::String(checked_route_until(t)?));
+            }
+            if let Some(level) = &e.level {
+                let mut l = serde_json::Map::new();
+                l.insert("claim".to_string(), Value::String(checked_route_words(&level.claim, false)?));
+                l.insert("as_of".to_string(), Value::String(checked_route_until(&level.as_of)?));
+                l.insert("until".to_string(), Value::String(checked_route_until(&level.until)?));
+                item.insert("level".to_string(), Value::Object(l));
             }
             clean.push(Value::Object(item));
         }
@@ -2651,6 +2746,11 @@ async fn khipu_route_hold_add(
     op: Option<String>,
 ) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_hold_add_argv(&text, &reason, &scope, account.as_deref(), until.as_deref())?, op.as_deref())?).await
+}
+
+#[tauri::command]
+async fn khipu_route_cap(action: String, account: String, cap: RouteCapArgs, op: Option<String>) -> Result<String, String> {
+    run_khipu_cli_async(route_operation_argv(route_cap_argv(&action, &account, &cap)?, op.as_deref())?).await
 }
 
 #[tauri::command]
@@ -3525,6 +3625,75 @@ async fn khipu_gateway_token_set(value: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn khipu_gateway_token_copy() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(GATEWAY_TOKEN_COPY_ARGV)).await
+}
+
+/// Guides prefs (hint hide, Start-here hide, Grok ack/check) live next to
+/// config.json so they survive a webview reset — an app setting, not
+/// localStorage (guides-scope §3).
+const GUIDES_PREFS_FILE: &str = "guides-prefs.json";
+
+fn guides_prefs_path() -> Result<PathBuf, String> {
+    Ok(khipu_data_dir()?.join(GUIDES_PREFS_FILE))
+}
+
+#[tauri::command]
+fn khipu_guides_prefs_get() -> Result<String, String> {
+    let path = guides_prefs_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Ok(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("{}".to_string()),
+        Err(e) => Err(format!("could not read guides prefs: {e}")),
+    }
+}
+
+#[tauri::command]
+fn khipu_guides_prefs_set(json: String) -> Result<String, String> {
+    let parsed: Value = serde_json::from_str(&json)
+        .map_err(|_| "guides prefs must be a JSON object".to_string())?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "guides prefs must be a JSON object".to_string())?;
+    // Allowlist: never accept a secret-shaped field from the webview.
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "hintHidden" | "startHidden" | "setUpSeen" | "grokAck" | "grokCheck"
+        ) {
+            return Err(format!("unknown guides prefs key: {key}"));
+        }
+    }
+    if let Some(chk) = obj.get("grokCheck") {
+        if !chk.is_null() {
+            let c = chk
+                .as_object()
+                .ok_or_else(|| "grokCheck must be an object or null".to_string())?;
+            for key in c.keys() {
+                if !matches!(key.as_str(), "ok" | "at" | "error" | "status" | "address") {
+                    return Err(format!("unknown grokCheck field: {key}"));
+                }
+            }
+            if c.contains_key("token") || c.contains_key("key") || c.contains_key("secret") {
+                return Err("guides prefs must not carry a key".to_string());
+            }
+        }
+    }
+    let path = guides_prefs_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("could not make the data folder: {e}"))?;
+    }
+    let body = serde_json::to_string(&parsed).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &body).map_err(|e| format!("could not save guides prefs: {e}"))?;
+    Ok(body)
+}
+
+#[tauri::command]
+async fn khipu_recall_log() -> Result<String, String> {
+    run_khipu_cli_async(fixed_argv(RECALL_LOG_ARGV)).await
+}
+
+#[tauri::command]
 async fn khipu_embed_status(profile: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(embed_status_argv(profile.as_deref())?).await
 }
@@ -3624,9 +3793,67 @@ fn checked_space(space: &str) -> Result<String, String> {
     }
 }
 
-/// A folder or file path: non-empty, no control characters, never a flag.
+/// Folders under HOME that hold sign-in material; no Khipu setting points there.
+const CREDENTIAL_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", "Library/Keychains"];
+
+/// A folder or file path: non-empty, no control characters, never a flag,
+/// no `..` step, and never inside a credential folder (checked on the
+/// resolved path too, so a link into one is refused). The text passed on is
+/// the owner's own, unchanged.
 fn checked_path(key: &str, raw: &str) -> Result<String, String> {
-    checked_operand(key, raw, false)
+    let v = checked_operand(key, raw, false)?;
+    let path = PathBuf::from(&v);
+    if path.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!("{key} must not contain '..'"));
+    }
+    let Ok(home) = std::env::var("HOME") else { return Ok(v) };
+    let target = expand_home_path(&v).unwrap_or(path);
+    if in_credential_folder(&target, Path::new(&home)) {
+        return Err(format!("{key} must not point into a credential folder"));
+    }
+    Ok(v)
+}
+
+/// The path is resolved through its deepest existing ancestor (the setting
+/// may name a file or folder Khipu will create later, under a link) and
+/// compared in lowercase, because the Mac disk ignores case. A dangling link
+/// is followed to where it points, since opening it creates that target.
+fn in_credential_folder(target: &Path, home: &Path) -> bool {
+    /// None when dangling links chain past `hops`; the caller refuses then.
+    fn resolved(p: &Path, hops: u32) -> Option<PathBuf> {
+        let mut rest = Vec::new();
+        let mut cur = p;
+        loop {
+            let probe = if cur.as_os_str().is_empty() { Path::new(".") } else { cur };
+            if let Ok(real) = std::fs::canonicalize(probe) {
+                return Some(rest.iter().rev().fold(real, |acc, part| acc.join(part)));
+            }
+            if let Ok(link) = std::fs::read_link(probe) {
+                let next = hops.checked_sub(1)?;
+                let to = probe.parent().unwrap_or(Path::new("")).join(link);
+                let real = resolved(&to, next)?;
+                return Some(rest.iter().rev().fold(real, |acc, part| acc.join(part)));
+            }
+            match (cur.parent(), cur.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    cur = parent;
+                }
+                _ => return Some(p.to_path_buf()),
+            }
+        }
+    }
+    let (Some(real_target), Some(real_home)) = (resolved(target, 40), resolved(home, 40)) else {
+        return true;
+    };
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    let targets = [lower(target), lower(&real_target)];
+    let homes = [lower(home), lower(&real_home)];
+    targets.iter().any(|t| {
+        homes
+            .iter()
+            .any(|h| CREDENTIAL_DIRS.iter().any(|d| t.starts_with(h.join(d.to_lowercase()))))
+    })
 }
 
 fn embed_estimate_argv(profile: &str, space: &str, stale: bool) -> Result<Vec<String>, String> {
@@ -4338,23 +4565,44 @@ fn set_khipu_secret_sync(account: String, value: String) -> Result<String, Strin
 /// empty passphrase unless `allow_unencrypted` (the owner's explicit opt-out).
 #[tauri::command]
 async fn join_export(
+    app: AppHandle,
     passphrase: String,
     out_path: String,
     allow_unencrypted: Option<bool>,
 ) -> Result<String, String> {
     spawn_blocking_cli(move || {
-        join_export_sync(passphrase, out_path, allow_unencrypted.unwrap_or(false))
+        join_export_sync(&app, passphrase, out_path, allow_unencrypted.unwrap_or(false))
     })
     .await
 }
 
 fn join_export_sync(
+    app: &AppHandle,
     passphrase: String,
     out_path: String,
     allow_unencrypted: bool,
 ) -> Result<String, String> {
     if out_path.trim().is_empty() {
         return Err("out_path is empty".to_string());
+    }
+    // An unencrypted kit holds the hub credentials in plain text, so the
+    // owner confirms it in a native dialog: a flag from the page alone could
+    // be sent by any script running in the webview.
+    if allow_unencrypted {
+        use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
+        let confirmed = app
+            .dialog()
+            .message(format!(
+                "This join kit is not encrypted. Anyone who gets the file can read your Khipu database password.\n\nSave it to {}?",
+                out_path.trim()
+            ))
+            .title("Save an unencrypted join kit?")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom("Save unencrypted".to_string(), "Cancel".to_string()))
+            .blocking_show();
+        if !confirmed {
+            return Err("Unencrypted export cancelled.".to_string());
+        }
     }
     let root = khipu_root()?;
     let py = khipu_python()?;
@@ -4455,7 +4703,8 @@ fn join_advertise_sync(
     let py = khipu_python()?;
     let pythonpath = khipu_pythonpath(&root);
     let (bc_key, bc_val) = khipu_bytecode_env();
-    let tout = timeout.max(60);
+    // The page picks the window; Rust bounds it to the CLI's 10-minute default.
+    let tout = timeout.clamp(60, 600);
     let mut cmd = Command::new(&py);
     cmd.arg("-m")
         .arg("khipu")
@@ -4592,6 +4841,16 @@ const ALLOWED_SUBCOMMANDS: &[&str] = &[
 /// return immediately; the UI must not block on `.output()`.
 const SPAWN_ALLOWED_SUBCOMMANDS: &[&str] = &["nightly", "graph-build", "monthly"];
 
+/// Env the desktop runner adds for selected CLI verbs. Search from Recall must
+/// not look like an agent in the query log (guides "Ask your agent" tick).
+fn desktop_cli_env(args: &[String]) -> Vec<(String, String)> {
+    if args.first().map(String::as_str) == Some("search") {
+        vec![("KHIPU_HARNESS".to_string(), "desktop".to_string())]
+    } else {
+        vec![]
+    }
+}
+
 #[tauri::command]
 async fn run_khipu(args: Vec<String>) -> Result<String, String> {
     let sub = args.first().cloned().unwrap_or_default();
@@ -4599,7 +4858,12 @@ async fn run_khipu(args: Vec<String>) -> Result<String, String> {
         eprintln!("[khipu] refused CLI subcommand from the UI: {sub:?}");
         return Err(format!("subcommand not permitted from the app: {sub:?}"));
     }
-    run_khipu_cli_async(args).await
+    let extra = desktop_cli_env(&args);
+    if extra.is_empty() {
+        run_khipu_cli_async(args).await
+    } else {
+        run_khipu_cli_with_env_async(args, extra).await
+    }
 }
 
 #[tauri::command]
@@ -4789,13 +5053,24 @@ fn data_dir_from_pointer_json(raw: &str) -> Option<PathBuf> {
     expand_home_path(path)
 }
 
+/// `~` expanded. A path with a `..` step that exists comes back
+/// canonicalized, so the step is resolved before anything reads it; one that
+/// does not exist yet is kept as written (the CLI resolves it the same way
+/// when it creates it). Other paths keep their spelling (`/var` is not
+/// rewritten to `/private/var`).
 fn expand_home_path(raw: &str) -> Option<PathBuf> {
     let path = raw.trim();
-    if path == "~" { return std::env::var("HOME").ok().map(PathBuf::from); }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(rest));
+    let expanded = if path == "~" {
+        std::env::var("HOME").ok().map(PathBuf::from)
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(rest))
+    } else {
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }?;
+    if !expanded.components().any(|c| c == std::path::Component::ParentDir) {
+        return Some(expanded);
     }
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    Some(std::fs::canonicalize(&expanded).unwrap_or(expanded))
 }
 
 fn data_dir_from_pointer() -> Option<PathBuf> {
@@ -5163,6 +5438,7 @@ pub fn run() {
             khipu_route_rule,
             khipu_route_hold_add,
             khipu_route_hold_end,
+            khipu_route_cap,
             khipu_route_priority,
             khipu_route_definition,
             khipu_work_view,
@@ -5205,6 +5481,10 @@ pub fn run() {
             khipu_recall_status,
             khipu_gateway_token_status,
             khipu_gateway_token_set,
+            khipu_gateway_token_copy,
+            khipu_guides_prefs_get,
+            khipu_guides_prefs_set,
+            khipu_recall_log,
             khipu_embed_status,
             khipu_embed_activate,
             khipu_embed_profiles_list,
@@ -5635,7 +5915,15 @@ mod db_command_tests {
 
 #[cfg(test)]
 mod run_khipu_guard_tests {
-    use super::ALLOWED_SUBCOMMANDS;
+    use super::{desktop_cli_env, ALLOWED_SUBCOMMANDS};
+
+    #[test]
+    fn search_from_the_app_is_labelled_desktop_not_mcp() {
+        let search = desktop_cli_env(&["search".into(), "--".into(), "q".into()]);
+        assert_eq!(search, vec![("KHIPU_HARNESS".into(), "desktop".into())]);
+        assert!(desktop_cli_env(&["doctor".into()]).is_empty());
+        assert!(desktop_cli_env(&["integrations".into(), "verify".into(), "grok_bot".into()]).is_empty());
+    }
 
     #[test]
     fn every_subcommand_the_ui_calls_is_allowed() {
@@ -5723,6 +6011,8 @@ mod settings_command_tests {
         assert_eq!(fixed_argv(RECALL_STATUS_ARGV), v(&["recall", "status"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_STATUS_ARGV), v(&["gateway", "token", "status"]));
         assert_eq!(fixed_argv(GATEWAY_TOKEN_SET_ARGV), v(&["gateway", "token", "set"]));
+        assert_eq!(fixed_argv(GATEWAY_TOKEN_COPY_ARGV), v(&["gateway", "token", "copy"]));
+        assert_eq!(fixed_argv(RECALL_LOG_ARGV), v(&["recall", "log", "--tail", "200"]));
         assert_eq!(fixed_argv(BUDGET_STATUS_ARGV), v(&["budget", "status"]));
         assert_eq!(fixed_argv(BUDGET_LIFT_SYNTH_TODAY_ARGV), v(&["budget", "lift", "synth", "--today"]));
     }
@@ -5897,6 +6187,44 @@ mod settings_command_tests {
             route_hold_end_argv("h1a2b3c4").unwrap(),
             v(&["route", "hold", "--from-app", "--", "end", "h1a2b3c4"])
         );
+    }
+
+    #[test]
+    fn a_cap_write_is_a_fixed_argv_with_checked_numbers() {
+        let pace = RouteCapArgs {
+            kind: "pace_target".into(),
+            window: Some("weekly".into()),
+            pct: Some(100.0),
+            slack: Some(5.0),
+            purpose: Some("check".into()),
+            tier: Some("sonnet".into()),
+            sensitive_only: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            route_cap_argv("set", "codex|", &pace).unwrap(),
+            v(&["route", "cap", "--from-app", "--kind=pace_target", "--window=weekly", "--purpose=check",
+                "--pct=100", "--slack=5", "--tier=sonnet", "--sensitive-only", "--", "set", "codex|"])
+        );
+        let gone = RouteCapArgs { kind: "share".into(), window: Some("five_hour".into()), ..Default::default() };
+        assert_eq!(
+            route_cap_argv("remove", "codex|", &gone).unwrap(),
+            v(&["route", "cap", "--from-app", "--kind=share", "--window=five_hour", "--", "remove", "codex|"])
+        );
+        let at_most = RouteCapArgs { kind: "concurrency".into(), n: Some(2), ..Default::default() };
+        assert!(route_cap_argv("set", "codex|", &at_most).unwrap().contains(&"--n=2".to_string()));
+        for bad in [
+            RouteCapArgs { kind: "--all".into(), ..Default::default() },
+            RouteCapArgs { kind: "share".into(), window: Some("daily".into()), ..Default::default() },
+            RouteCapArgs { kind: "share".into(), pct: Some(f64::NAN), ..Default::default() },
+            RouteCapArgs { kind: "share".into(), pct: Some(-1.0), ..Default::default() },
+            RouteCapArgs { kind: "pace_target".into(), tier: Some("--x".into()), ..Default::default() },
+            RouteCapArgs { kind: "pace_target".into(), purpose: Some("x".into()), ..Default::default() },
+        ] {
+            assert!(route_cap_argv("set", "codex|", &bad).is_err(), "{bad:?}");
+        }
+        assert!(route_cap_argv("drop", "codex|", &at_most).is_err());
+        assert!(route_cap_argv("set", "-x", &at_most).is_err());
     }
 
     #[test]
@@ -6413,6 +6741,86 @@ mod settings_command_tests {
             config_set_argv("memory_root", "~/Memory notes").unwrap(),
             v(&["config", "--set", "memory_root", "~/Memory notes"])
         );
+    }
+
+    #[test]
+    fn path_operands_refuse_parent_steps_and_credential_folders() {
+        let home = std::env::var("HOME").unwrap();
+        for bad in [
+            "~/.ssh",
+            "~/.ssh/id_ed25519",
+            "~/.gnupg/x",
+            "~/.aws/credentials",
+            "~/Library/Keychains/login.keychain-db",
+            &format!("{home}/.ssh/config"),
+            "/Volumes/X/../../etc",
+            "~/Memory/../.ssh",
+            "..",
+        ] {
+            assert!(checked_path("folder", bad).is_err(), "folder accepted {bad:?}");
+            assert!(config_set_argv("memory_root", bad).is_err(), "memory_root accepted {bad:?}");
+            assert!(library_add_argv("books", bad, "voyage-3@1024").is_err(), "library add accepted {bad:?}");
+        }
+        for ok in ["~/Memory notes", "/Volumes/X/mem", "~/.config/khipu/mem", "~/sshkeys", "a..b/c"] {
+            assert_eq!(checked_path("folder", ok).unwrap(), ok);
+        }
+    }
+
+    #[test]
+    fn a_symlink_into_a_credential_folder_is_refused() {
+        let dir = std::env::temp_dir().join(format!("khipu-path-gate-{}", std::process::id()));
+        let home = dir.join("home");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let link = dir.join("innocent");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&ssh, &link).unwrap();
+        let dangling = dir.join("dangling");
+        let _ = std::fs::remove_file(&dangling);
+        std::os::unix::fs::symlink(ssh.join("authorized_keys2"), &dangling).unwrap();
+        let relative = dir.join("relative");
+        let _ = std::fs::remove_file(&relative);
+        std::os::unix::fs::symlink("home/.ssh/missing/key", &relative).unwrap();
+        let loop_a = dir.join("loop_a");
+        let _ = std::fs::remove_file(&loop_a);
+        std::os::unix::fs::symlink("loop_b", &loop_a).unwrap();
+        let loop_b = dir.join("loop_b");
+        let _ = std::fs::remove_file(&loop_b);
+        std::os::unix::fs::symlink("loop_a", &loop_b).unwrap();
+        let benign = dir.join("benign");
+        let _ = std::fs::remove_file(&benign);
+        std::os::unix::fs::symlink(dir.join("elsewhere/missing"), &benign).unwrap();
+        let cases = [
+            (link.clone(), true),
+            (dangling.clone(), true),
+            (relative.clone(), true),
+            (loop_a.clone(), true),
+            (benign.clone(), false),
+            (link.join("newfile"), true),
+            (link.join("new/deeper/file"), true),
+            (home.join(".SSH/new_key"), true),
+            (home.join(".AWS/credentials"), true),
+            (home.join("library/keychains/x"), true),
+            (home.join("Memory/new"), false),
+            (dir.join("elsewhere/new"), false),
+        ];
+        let got: Vec<_> = cases.iter().map(|(p, _)| in_credential_folder(p, &home)).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        for ((p, want), got) in cases.iter().zip(got) {
+            assert_eq!(got, *want, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn expand_home_path_resolves_parent_steps_that_exist() {
+        let dir = std::env::temp_dir().join(format!("khipu-expand-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        let raw = format!("{}/a/..", dir.display());
+        let got = expand_home_path(&raw).unwrap();
+        let want = std::fs::canonicalize(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, want);
+        assert_eq!(expand_home_path("/no/such/khipu/place").unwrap(), PathBuf::from("/no/such/khipu/place"));
     }
 
     #[test]
@@ -7070,7 +7478,26 @@ mod priority_and_sign_in_tests {
     }
 
     fn entry(account: &str, role: Option<&str>, until: Option<&str>) -> PriorityEntry {
-        PriorityEntry { account: account.into(), role: role.map(Into::into), until: until.map(Into::into) }
+        PriorityEntry { account: account.into(), role: role.map(Into::into), until: until.map(Into::into), level: None }
+    }
+
+    #[test]
+    fn a_priority_entrys_level_survives_a_whole_list_write() {
+        let mut with_level = entry("Codex", Some("builds"), None);
+        with_level.level = Some(PriorityLevel {
+            claim: "Opus is limited today".into(),
+            as_of: "2026-10-26T12:00:00Z".into(),
+            until: "2026-10-27T12:00:00Z".into(),
+        });
+        let argv = route_priority_argv("set", &[with_level, entry("Claude", None, None)], None, None).unwrap();
+        let json = argv.iter().find_map(|a| a.strip_prefix("--entries=")).unwrap();
+        let parsed: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed[0]["level"]["claim"], "Opus is limited today");
+        assert_eq!(parsed[0]["level"]["until"], "2026-10-27T12:00:00Z");
+        assert!(parsed[1].get("level").is_none());
+        let mut bad = entry("Codex", None, None);
+        bad.level = Some(PriorityLevel { claim: "x".into(), as_of: "--all".into(), until: "2026-10-27T12:00:00Z".into() });
+        assert!(route_priority_argv("set", &[bad], None, None).is_err());
     }
 
     #[test]

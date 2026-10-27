@@ -5,6 +5,7 @@ import pytest
 from khipu import commitments as co, db, mcp_server as srv
 from khipu import owner_act, owner_direction as od, owner_turns as ot, owner_writes as ow
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests import fact_seed
 from tests.test_owner_direction import world  # noqa: F401
 from tests.test_audit_owner_regressions import act, lose_completion, pg_world  # noqa: F401
 
@@ -17,6 +18,8 @@ def close_items(pg_world, world):
             "INSERT INTO commitments (text,project,content_hash,owner,status) "
             "VALUES (%s,'synthetic/project',%s,'user','open') RETURNING id",
             (f'synthetic follow-up {i}', f'owner-follow-up-{i}')).fetchone()[0] for i in range(2)]
+        with conn.cursor() as cur:
+            fact_seed.adopt(cur, 'commitment', ids)
     world.say('close the synthetic items')
     return ids
 

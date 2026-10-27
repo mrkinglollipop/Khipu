@@ -88,6 +88,9 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "direction.acknowledge": ((), ()),
     "direction.set": (("key", "value"), ()),
     "direction.undo": (("id",), ("holds",)),
+    "forget.send": ((), ()),
+    "forget.here": (("id",), ()),
+    "forget.not_same": (("id",), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
@@ -383,7 +386,48 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["owner-direction", "set"], [v["key"], v["value"]]
     if action == "direction.undo":
         return ["owner-direction", "undo", *_opts(v, "holds")], [v["id"]]
+    if action == "forget.send":
+        return ["episode", "forget-pending", "--send"], []
+    if action == "forget.here":
+        return ["episode", "forget-pending", f"--forget-here={v['id']}"], []
+    if action == "forget.not_same":
+        return ["episode", "forget-pending", f"--not-same={v['id']}"], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
+
+
+def owner_turn() -> bool:
+    """Whether this call comes from a conversation the owner typed in, the
+    only place a forgotten episode's summary may be shown (choosing
+    forget.here or forget.not_same). Any doubt answers no."""
+    from khipu import owner_direction
+
+    try:
+        owner_direction.check("forget.here")
+    except Exception:  # noqa: BLE001 - any doubt keeps the text back
+        return False
+    return True
+
+
+def without_summaries(out: dict) -> dict:
+    """``unsent_forgets`` output with each listed id kept and every other
+    item field (the summary) dropped; an item that is not an id entry is
+    dropped whole."""
+    return dict(out, ids=[{"id": item.get("id")} for item in out.get("ids") or [] if isinstance(item, dict)])
+
+
+def _forget_list() -> dict:
+    from khipu import forget
+
+    out = forget.unsent_forgets()
+    return out if owner_turn() else without_summaries(out)
+
+
+# Actions that only read, answered without refusing: the forgets this Mac
+# holds that the hub lacks (design 6.2), each bare id, with its hub summary
+# only when the owner-direction check passes, so the owner can choose
+# forget.here or forget.not_same. The app reads its list through
+# ``khipu episode forget-pending`` instead.
+_READS = {"forget.list": _forget_list}
 
 
 def _parsed(text: str) -> dict:
@@ -416,6 +460,11 @@ def act(action, args) -> tuple[bool, dict]:
     or (False, ``{ok: false, code, error}``) when refused."""
     from khipu import cli, owner_direction
 
+    if isinstance(action, str) and action in _READS:
+        # An inspection: never a change, a send or a direction check.
+        if not isinstance(args, dict) or args:
+            return False, _bad(f"{action} takes no arguments").refusal()
+        return True, _READS[action]()
     if not isinstance(action, str) or action not in owner_direction.ACTIONS or action not in SPECS:
         return False, {"ok": False, "code": "not_by_direction", "error": "That change can't be made by direction."}
     try:

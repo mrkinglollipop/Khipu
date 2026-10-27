@@ -415,6 +415,19 @@ class GraphDriftContentTest(unittest.TestCase):
                 clean = graph_sync.graph_drift(p)
             self.assertTrue(clean["ok"], clean)
 
+    def test_pending_excuse_is_doctors_default_and_the_sync_can_turn_it_off(self):
+        from khipu import graph_sync
+        with tempfile.TemporaryDirectory() as td:
+            p = self._sqlite(Path(td))
+            with mock.patch.object(graph_sync, "is_graph_producer", return_value=True), mock.patch.object(graph_sync, "disabled_or_unreachable_ids", return_value=set()), mock.patch.object(graph_sync, "load_sources", return_value={"sources": [{"id": "code:test", "enabled": True}]}), mock.patch.object(graph_sync, "owned_source_ids", return_value={"code:test"}), mock.patch.object(graph_sync, "_changed_since_last_mirror", return_value=True), mock.patch("khipu.db.connect", side_effect=lambda **_kw: self._Conn(self._Cur())):
+                doctor_view = graph_sync.graph_drift(p)
+                sync_view = graph_sync.graph_drift(p, excuse_pending=False)
+        self.assertTrue(doctor_view["ok"], doctor_view)
+        self.assertIn("pending", doctor_view)
+        self.assertFalse(sync_view["ok"], sync_view)
+        self.assertNotIn("pending", sync_view)
+        self.assertEqual(sync_view["nodes_content_drift"], 1)
+
     def test_corrupt_source_registry_is_explicitly_red(self):
         from khipu import graph_sync, sources
         with tempfile.TemporaryDirectory() as td:

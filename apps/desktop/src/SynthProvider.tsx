@@ -599,7 +599,7 @@ export function SynthFallbackField({
     const res = await callCli("khipu_config_set", { key: "synth_fallback", value: next });
     if (res.ok) {
       const fresh = await cfg.reload();
-      if (fresh) setPending(null);
+      if (fresh.data) setPending(null);
       await onSaved?.();
     } else {
       setErr(res.error);

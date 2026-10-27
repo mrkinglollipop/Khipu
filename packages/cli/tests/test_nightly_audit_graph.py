@@ -366,3 +366,142 @@ def test_explicit_empty_sources_export_respects_registry(tmp_path, monkeypatch,
         assert resolved.read_text() == original
         assert not sources.sources_file().exists()
         assert g._should_skip_build(resolved) == (True, "no_sources")
+
+
+def _run_nightly_with_mirror(tmp_path, monkeypatch, mirror, root_set=True):
+    g = load('graphify_nightly')
+    resolved = tmp_path / 'sources.json'
+    resolved.write_text(json.dumps({'code_roots': ['synthetic']}))
+    monkeypatch.setattr(g, '_export_sources', lambda env: resolved)
+    monkeypatch.setattr(g, '_khipu_root', lambda: tmp_path if root_set else None)
+    monkeypatch.setattr(g, '_log_path', lambda: tmp_path / 'nightly.log')
+    monkeypatch.setattr(g, 'run_step', lambda *a, **kw: 0)
+    mirror_calls = []
+    def run(argv, **kw):
+        mirror_calls.append(argv)
+        return mirror()
+    monkeypatch.setattr(g.subprocess, 'run', run)
+    return g, mirror_calls
+
+
+@pytest.mark.parametrize('failure,reason', [
+    ('stderr', 'connection timeout expired'),
+    ('json_error', 'graph.sqlite not found on the machine that builds it'),
+    ('json_drift', 'nodes_content_drift=7, edges_missing_in_pg=2'),
+    ('timeout', 'timed out'),
+    ('oserror', 'synthetic spawn failure'),
+])
+def test_failed_graph_mirror_fails_the_nightly(tmp_path, monkeypatch, capsys, failure, reason):
+    import subprocess
+    drift = {'ok': False, 'nodes_content_drift': 7, 'edges_content_drift': 0,
+             'edges_missing_in_pg': 2, 'sqlite_nodes': 100}
+    def mirror():
+        if failure == 'timeout':
+            raise subprocess.TimeoutExpired('graph-sync', 600)
+        if failure == 'oserror':
+            raise OSError('synthetic spawn failure')
+        if failure == 'json_error':
+            return subprocess.CompletedProcess(
+                [], 2, json.dumps({'ok': False, 'error': reason}, indent=2), '')
+        if failure == 'json_drift':
+            return subprocess.CompletedProcess(
+                [], 2, json.dumps({'seconds': 1.0, 'drift': drift}, indent=2), '')
+        return subprocess.CompletedProcess([], 1, '', reason)
+    g, calls = _run_nightly_with_mirror(tmp_path, monkeypatch, mirror)
+    assert g.main() != 0
+    assert len(calls) == 1
+    failed = [line for line in capsys.readouterr().out.splitlines() if 'nightly FAILED' in line]
+    assert len(failed) == 1
+    assert reason in failed[0]
+    assert not failed[0].rstrip().endswith('}')
+
+
+def test_failed_mirror_is_reported_as_a_failed_graph_job(tmp_path, monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+    from khipu import jobs
+    g, _ = _run_nightly_with_mirror(
+        tmp_path, monkeypatch,
+        lambda: subprocess.CompletedProcess([], 1, '', 'connection timeout expired'))
+    monkeypatch.setattr(jobs, 'GRAPHIFY_NIGHTLY', GRAPH / 'graphify_nightly.py')
+    monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path / 'data')
+    monkeypatch.setattr(jobs, '_log_paths', lambda stem: (tmp_path / 'out.log', tmp_path / 'err.log'))
+    monkeypatch.setattr(jobs, '_offsite_if_due', lambda: None)
+    monkeypatch.setattr(jobs.subprocess, 'Popen',
+        lambda argv, **kw: SimpleNamespace(wait=lambda *, timeout: g.main()))
+    assert jobs.run_graph_build() != 0
+    assert jobs._read_job_state('graph_build')['exit'] != 0
+
+
+@pytest.mark.parametrize('mirror_rc', [0, 2])
+def test_offsite_starts_after_mirror_finishes_and_preserves_its_exit(
+    tmp_path, monkeypatch, mirror_rc,
+):
+    import subprocess
+    from types import SimpleNamespace
+    from khipu import jobs
+
+    events = []
+    def mirror():
+        events.append('mirror finished')
+        return subprocess.CompletedProcess([], mirror_rc, '{}', '')
+
+    g, _ = _run_nightly_with_mirror(tmp_path, monkeypatch, mirror)
+    monkeypatch.setattr(jobs, 'GRAPHIFY_NIGHTLY', GRAPH / 'graphify_nightly.py')
+    monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path / 'data')
+    monkeypatch.setattr(jobs, '_log_paths', lambda stem: (tmp_path / 'out.log', tmp_path / 'err.log'))
+    def launch(argv, **kw):
+        # Only the nightly driver may be spawned; offsite stays synchronous.
+        assert argv == [sys.executable, str(GRAPH / 'graphify_nightly.py')]
+        def wait(*, timeout):
+            rc = g.main()
+            events.append('nightly finished')
+            return rc
+        return SimpleNamespace(wait=wait)
+    monkeypatch.setattr(jobs.subprocess, 'Popen', launch)
+    monkeypatch.setattr(jobs, '_offsite_if_due', lambda: events.append('offsite started'))
+
+    assert jobs.run_graph_build() == mirror_rc
+    assert events == ['mirror finished', 'nightly finished', 'offsite started']
+    assert jobs._read_job_state('graph_build')['exit'] == mirror_rc
+
+
+def test_non_producer_mirror_skip_is_logged_and_exits_zero(tmp_path, monkeypatch, capsys):
+    import subprocess
+    skipped = json.dumps({'ok': True, 'skipped': 'not the graph producer; PG is read-only'})
+    g, calls = _run_nightly_with_mirror(
+        tmp_path, monkeypatch, lambda: subprocess.CompletedProcess([], 0, skipped, ''))
+    assert g.main() == 0
+    out = capsys.readouterr().out
+    assert 'graph mirror skipped: not the graph producer' in out
+    assert 'graph mirror ok' not in out
+
+
+@pytest.mark.parametrize('root_set', [True, False])
+def test_clean_or_disabled_mirror_keeps_exit_zero(tmp_path, monkeypatch, capsys, root_set):
+    import subprocess
+    g, calls = _run_nightly_with_mirror(
+        tmp_path, monkeypatch,
+        lambda: subprocess.CompletedProcess([], 0, '{}', ''), root_set=root_set)
+    assert g.main() == 0
+    assert len(calls) == (1 if root_set else 0)
+    assert 'nightly complete' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('mirror_rc', [0, 2])
+def test_mirror_connection_retry_diagnostics_reach_nightly_log(
+    tmp_path, monkeypatch, capsys, mirror_rc,
+):
+    import subprocess
+    diagnostic = 'graph mirror connect: attempt 1/3 failed (OperationalError); retrying in 2s'
+    g, _ = _run_nightly_with_mirror(
+        tmp_path, monkeypatch,
+        lambda: subprocess.CompletedProcess(
+            [], mirror_rc, json.dumps({'error': 'synthetic connection failure'}),
+            diagnostic + '\nunrelated private diagnostic\n',
+        ),
+    )
+    assert g.main() == mirror_rc
+    output = capsys.readouterr().out
+    assert diagnostic in output
+    assert 'unrelated private diagnostic' not in output

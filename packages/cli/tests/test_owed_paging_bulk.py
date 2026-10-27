@@ -26,6 +26,7 @@ import pytest
 from khipu import cli, commitments as co, config, db, owner_writes, routing
 from khipu import mcp_server as srv
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests import fact_seed
 
 PROJECT = "acme/widget"
 DOWN = psycopg.OperationalError("connection timeout expired")
@@ -66,13 +67,15 @@ def _seed(conn, n, *, start=0, text="follow up on item {i}", kind="followup", ow
     rows = [(text.format(i=i), PROJECT, owner, kind, at + timedelta(seconds=step_s * ((i - start) // 3)),
              co.content_hash(PROJECT, text.format(i=i)), origin, label)
             for i in range(start, start + n)]
-    with conn.cursor() as cur:
+    with conn.transaction(), conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO commitments (text, project, owner, kind, opened_at, status, content_hash, origin, owner_label) "
             "VALUES (%s, %s, %s, %s, %s, 'open', %s, %s, %s)", rows)
         cur.execute("SELECT id FROM commitments WHERE content_hash = ANY(%s) ORDER BY id",
                     ([r[5] for r in rows],))
-        return [int(r[0]) for r in cur.fetchall()]
+        ids = [int(r[0]) for r in cur.fetchall()]
+        fact_seed.adopt(cur, "commitment", ids)
+        return ids
 
 
 def _status(conn, ids) -> dict[int, str]:
@@ -522,6 +525,7 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
 # batches key; its assertions are the reviewer's.
 
 import copy  # noqa: E402
+from tests.fact_seed import announce  # noqa: E402
 
 
 
@@ -691,7 +695,9 @@ def test_a_reassign_keeps_who_why_and_the_prior_owner(owed):
 def test_similar_items_of_two_owners_both_stay_linked_on_the_hub(owed):
     from unittest import mock
 
-    with owed.cursor() as cur:
+    # One transaction, as capture runs these writers in (the fact gate checks at COMMIT).
+    with owed.transaction(), owed.cursor() as cur:
+        announce(cur)
         cur.execute("INSERT INTO episodes (ts, summary, raw) VALUES (now(), 's', '{}'::jsonb) RETURNING id")
         ep = int(cur.fetchone()[0])
         base = {"project": PROJECT, "session_id": "claude_code:host-1"}

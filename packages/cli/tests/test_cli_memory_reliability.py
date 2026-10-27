@@ -80,6 +80,9 @@ class _FakeConn:
     def commit(self):
         self.committed = True
 
+    def rollback(self):
+        pass
+
     def __enter__(self):
         return self
 
@@ -239,9 +242,11 @@ class EpisodeForgetCommandTest(unittest.TestCase):
         self.addCleanup(env.stop)
 
     def _script(self, *, soft: int, vectors: int):
+        # Read twice: the set handed over to be published, then under the lock.
+        row = ("SELECT ts, summary, session_id FROM episodes",
+               {"row": ("2026-09-05T12:00:00+00:00", "a summary", "claude_code:x")})
         return _FakeCur([
-            ("SELECT ts, summary, session_id FROM episodes",
-             {"row": ("2026-09-05T12:00:00+00:00", "a summary", "claude_code:x")}),
+            row, row,
             ("UPDATE episodes SET deleted_at", {"rowcount": soft}),
             ("DELETE FROM memory_embeddings WHERE kind = 'episode'", {"rowcount": vectors}),
             ("DELETE FROM memory_embeddings WHERE kind = 'commitment'", {"rowcount": 0}),

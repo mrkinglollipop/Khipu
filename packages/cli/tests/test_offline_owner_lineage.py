@@ -10,6 +10,7 @@ import sqlite3
 from khipu import commitments as co
 from khipu import hub_snapshot as hs
 from khipu import offline_reads
+from tests.replica_copy import certify
 
 
 def _replica(monkeypatch, rows):
@@ -27,6 +28,7 @@ def _replica(monkeypatch, rows):
     con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
     hs._create_schema(con)
+    certify(con)
     hs._write_commitment_rows(con, cols, dumped)
     con.commit()
     monkeypatch.setattr(offline_reads, "_open", lambda: con)
@@ -89,6 +91,7 @@ def test_offline_owners_equal_online_owners(monkeypatch):
 def test_an_older_replica_gains_the_lineage_columns_on_its_next_pull(monkeypatch):
     con = sqlite3.connect(":memory:")
     hs._create_schema(con, version=6)
+    certify(con)
     assert "owner_reassigned_at" not in hs._snapshot_table_columns(con, "commitments")
     cols = ["id", "text", "status", "owner", "owner_reassigned_at", "owner_prior"]
     hs._write_commitment_rows(con, cols, [(1, "Rebase the branch", "open", "assistant",

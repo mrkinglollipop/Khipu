@@ -21,6 +21,9 @@ import { fmtAgoSince } from "./time";
 import type { Attention } from "./doctorAttention";
 import { accountState } from "./routing";
 import type { RouteView } from "./routing";
+import { planWord } from "./humanWords";
+import { PlanDetailSheet, useDetailHost } from "./AccountDetail";
+import { nearlyGoneWords } from "./accountDetailModel";
 
 export type UsageWindow = {
   name?: string;
@@ -179,8 +182,8 @@ export function windowLabel(w: UsageWindow): string {
 /** "Codex Pro", "Claude main Max", "Grok SuperGrok Heavy". */
 export function planName(row: UsageAccount): string {
   const label = row.account || row.harness || "Account";
-  const plan = (row.plan || "").trim();
-  return plan ? `${label} ${plan.charAt(0).toUpperCase()}${plan.slice(1)}` : label;
+  const plan = planWord(row.plan);
+  return plan ? `${label} ${plan}` : label;
 }
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -430,7 +433,7 @@ export function liveWords(row: UsageAccount): { text: string; live: boolean; che
   if (!(row.windows ?? []).some((w) => pctOf(w) != null)) {
     return { text: age ? `Checked ${age}, no figures yet` : "Checked, no figures yet", live: false, checked: true };
   }
-  return { text: age ? `Live: read ${age}` : "Live", live: true };
+  return { text: age ? `Read ${age}` : "Read just now", live: true };
 }
 
 /** The CLIs whose own login the app can start (`khipu.usage.SIGN_IN_ARGS`):
@@ -513,7 +516,7 @@ export function SignInControl({ row, onSignedIn }: { row: UsageAccount; onSigned
   );
 }
 
-function Meter({ pct, label, tone, dim }: { pct: number; label: string; tone: "err" | "warn" | null; dim?: boolean }) {
+export function Meter({ pct, label, tone, dim }: { pct: number; label: string; tone: "err" | "warn" | null; dim?: boolean }) {
   const width = Math.min(100, Math.max(0, pct));
   return (
     <span
@@ -649,7 +652,7 @@ export function planStatus(row: UsageAccount, now: Date = new Date()): PlanStatu
     return { figures, say, tone: "grey", code };
   }
   if (row.observed_at) {
-    return { figures, say: age ? `as of its last turn, ${age}` : "as of its last turn", tone: "grey", code };
+    return { figures, say: age ? `Read from its last reply, ${age}` : "Read from its last reply", tone: "grey", code };
   }
   if (row.stale && age) return { figures, say: `figures from ${age}`, tone: "grey", code };
   return { figures, say: null, tone: null, code };
@@ -665,6 +668,12 @@ export function planPauses(view: RouteView | null | undefined, now: Date = new D
     if (a.state === "paused") out.set(a.key, accountState(a, now).text);
   }
   return out;
+}
+
+/** What identifies an account across reads: its routing key, else its CLI,
+ *  login folder and name. Never its position in the list. */
+function accountIdentity(row: UsageAccount): string {
+  return row.key ?? `${row.harness ?? ""}|${row.home ?? ""}|${row.account ?? ""}`;
 }
 
 function accountName(row: UsageAccount): string {
@@ -683,31 +692,40 @@ function StatusPhrase({ status }: { status: PlanStatus }) {
 
 /** One account on Home: its tightest window still in force as a bar, and at
  *  most one status phrase, after the pause when the owner paused it. */
-function PlanRow({ row, now, pause, onSignedIn }: {
-  row: UsageAccount; now: Date; pause?: string; onSignedIn?: () => Promise<unknown> | void;
+function PlanRow({ row, now, pause, onSignedIn, onOpen }: {
+  row: UsageAccount; now: Date; pause?: string; onSignedIn?: () => Promise<unknown> | void; onOpen?: () => void;
 }) {
   const status = planStatus(row, now);
   const w = tightestWindow(row, now);
   const p = w ? pctOf(w) : null;
   const reset = w ? resetPhrase(w.resets_at, now) : null;
   const dim = status.figures === "kept";
+  const nearly = nearlyGoneWords(row, now);
   const tail = (
     <>
       {pause ? <Tag>{pause}</Tag> : null}
+      {nearly ? <span className="plan-say"><span className="hdot warn" aria-hidden="true" />{nearly}</span> : null}
       <StatusPhrase status={status} />
       <SignInControl row={row} onSignedIn={onSignedIn} />
     </>
   );
+  const plan = planWord(row.plan);
+  const left = p != null ? roundPct(Math.max(0, 100 - p)) : null;
+  const label = `${accountName(row)}${plan ? ` ${plan}` : ""}${left != null && w ? `: ${fmtPct(left)} of its ${windowLabel(w)} left${reset ? `, ${reset}` : ""}` : ""}. Open usage details`;
   return (
-    <ListRow className="plan-row">
+    <ListRow className="plan-row rowlink">
+      {/* The whole row opens the detail: the name is the button and its
+          ::after covers the row; the sign-in control stays above it. */}
       <span className="plan-name ellip">
-        {accountName(row)}
-        {row.plan ? <span className="meta"> {row.plan}</span> : null}
+        <button type="button" className="rowlink-btn" onClick={onOpen} aria-label={label} aria-haspopup="dialog">
+          {accountName(row)}
+          {plan ? <span className="meta"> {plan}</span> : null}
+        </button>
       </span>
       {w && p != null ? (
         <>
           <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={meterTone(p)} dim={dim} />
-          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{fmtPct(p)}</span>
+          <span className={`plan-pct ${meterTone(p) ?? (dim ? "dim" : "")}`}>{`${fmtPct(left!)} left`}</span>
           <span className="plan-when meta">
             {windowLabel(w)}
             {reset ? ` · ${reset}` : ""}
@@ -717,15 +735,18 @@ function PlanRow({ row, now, pause, onSignedIn }: {
       ) : (
         <span className="plan-none">{tail}</span>
       )}
+      <ChevronRight size={16} className="rowlink-chev" aria-hidden />
     </ListRow>
   );
 }
 
 /** Home → Plans: one row per account, the tightest window of each. `routing`
  *  is the routing record when it was read, for the pauses. */
-export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false, onAddAccount }: {
+export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false, onAddAccount, onRoutingChanged }: {
   state: PlanUsageState;
   routing?: RouteView | null;
+  /** Reads the routing record again after a change in the Plan detail. */
+  onRoutingChanged?: () => Promise<unknown> | void;
   onOpenAccounts?: () => void;
   /** The owner stopped tracking every account ("Read no accounts", phase 9). */
   noneTracked?: boolean;
@@ -736,6 +757,17 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
   const now = new Date();
   const pauses = planPauses(routing, now);
   const failedAge = fmtAgoSince(errorAt);
+  // The sheet remembers which account it shows, never the row it was opened
+  // with, so Refresh plan (a new report) changes what the sheet reads.
+  const detail = useDetailHost<string>();
+  const openRow = detail.target ? accounts.find((r) => accountIdentity(r) === detail.target) : undefined;
+  // An account that can't be matched any more ends the sheet for good, so it
+  // does not reopen if an account with that identity returns later.
+  const closeDetail = detail.close;
+  const hasTarget = detail.target != null;
+  useEffect(() => {
+    if (hasTarget && !openRow) closeDetail();
+  }, [hasTarget, openRow, closeDetail]);
   return (
     <div className="card plans-card">
       <div className="card-head">
@@ -782,9 +814,21 @@ export function PlansCard({ state, routing, onOpenAccounts, noneTracked = false,
       ) : (
         accounts.map((row, i) => (
           <PlanRow key={`${row.harness}|${row.home ?? ""}|${i}`} row={row} now={now}
-            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} />
+            pause={row.key ? pauses.get(row.key) : undefined} onSignedIn={reread} onOpen={() => detail.open(accountIdentity(row))} />
         ))
       )}
+      {openRow ? (
+        <PlanDetailSheet
+          row={openRow}
+          view={routing}
+          now={now}
+          onClose={detail.close}
+          onRefresh={() => void refresh()}
+          refreshing={refreshing || loading}
+          onOpenSettings={onOpenAccounts}
+          onChanged={onRoutingChanged}
+        />
+      ) : null}
     </div>
   );
 }
@@ -838,7 +882,7 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
     <section className={status.tone === "warn" ? "plan-block warn" : "plan-block"} role="group" aria-label={name}>
       <h2 className="plan-block-head">
         {name}
-        {row.plan ? <span className="meta">{`${row.plan.charAt(0).toUpperCase()}${row.plan.slice(1)} plan`}</span> : null}
+        {planWord(row.plan) ? <span className="meta">{`${planWord(row.plan)} plan`}</span> : null}
       </h2>
       {pause ? (
         <div className="plan-paused">
@@ -877,7 +921,7 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
       <div className="plan-reads">
         {status.figures === "live" && !row.observed_at && !row.stale ? (
           <Tag tone="ok" dot>
-            {triedAge ? `Live: read ${triedAge}` : "Live"}
+            {triedAge ? `Read ${triedAge}` : "Read just now"}
           </Tag>
         ) : row.source === "rollout" && windows.length && !fail?.includes("last turn") ? (
           // Codex's session-file fallback, kept for tracked accounts only (decision
@@ -1235,7 +1279,7 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       ? await callCli("khipu_config_unset", { key: "usage_accounts", expect })
       : await callCli("khipu_config_set", { key: "usage_accounts", value: JSON.stringify(list), expect });
     if (res.ok) onSaved?.();
-    await cfg.reload();
+    const fresh = await cfg.reload();
     setSaving(false);
     if (!res.ok) {
       const problem = accountsRefusal(res, (next ?? []).map(shownAs), added);
@@ -1243,6 +1287,15 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       setClash(problem.field);
       if (problem.field) (problem.field === "name" ? nameRef : homeRef).current?.focus();
       return false;
+    }
+    // `fresh.error` is set only on a real read failure; a superseded reload
+    // returns error: null even when data is null (see useCliState.reload).
+    if (fresh.error != null) {
+      setErr("Could not re-read the account list after saving. Close and reopen this section to try again.");
+      setClash(null);
+      // Save already landed; parent still needs to know the list changed.
+      void onChanged?.();
+      return true;
     }
     void onChanged?.();
     return true;
@@ -1297,6 +1350,11 @@ export function UsageAccountsField({ active, onChanged }: { active: boolean; onC
       {cfg.error && !status ? (
         <p className="set-error" role="alert">
           Could not read the account list. Close and reopen this section to try again.
+        </p>
+      ) : null}
+      {cfg.error && status ? (
+        <p className="set-error" role="alert">
+          Couldn&apos;t refresh; showing the last value: {cfg.error}
         </p>
       ) : null}
       {entries.length ? (

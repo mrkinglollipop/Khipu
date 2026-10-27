@@ -104,8 +104,7 @@ def test_reader_suppresses_row_and_history_behind_newer_tombstone(world):
 def test_full_dump_uses_one_repeatable_read_snapshot(world, monkeypatch):
     world.remove_after_rows = True
     for name in ('_insert_episodes', '_insert_topics', '_insert_topic_revisions', '_insert_nodes',
-                 '_insert_edges', '_insert_profiles', '_insert_memory_embeddings', '_insert_decisions',
-                 '_insert_deliverables', '_insert_commitments'):
+                 '_insert_edges', '_insert_profiles', '_insert_memory_embeddings'):
         monkeypatch.setattr(hs, name, lambda *_: 0)
     assert hs.refresh()['ok']
     assert world.isolation_level == IsolationLevel.REPEATABLE_READ
@@ -201,7 +200,7 @@ def test_failed_ledger_pull_does_not_advance_ledger_freshness(world, monkeypatch
     monkeypatch.setattr(hs, '_acquire_refresh_lock', lambda: None)
     world.ledger.execute("UPDATE ledger_rows SET version=2")
     out = hs.pull_changes()
-    assert not out['ok'] and {'topics', 'commitments', 'ledger'} <= set(out['failed'])
+    assert not out['ok'] and {'topics', 'ledger'} <= set(out['failed'])
     assert hs.ledger_read_snapshot('p')['as_of'] == before
 
 
@@ -286,7 +285,6 @@ def test_ledger_failure_does_not_stall_memory_or_its_freshness(world, monkeypatc
     with sqlite3.connect(hs.snapshot_path()) as con:
         assert con.execute('SELECT summary FROM episodes WHERE id=2').fetchone() == ('foreign memory',)
         assert con.execute("SELECT body FROM topics WHERE slug='probe'").fetchone() == ('corrected',)
-        assert con.execute('SELECT status FROM commitments WHERE id=1').fetchone() == ('closed',)
     assert hs.ledger_read_snapshot('p')['as_of'] == before
     assert hs._utc(hs.caught_up_at()) > hs._utc(before)
     assert hs._read_sidecar()['pull_episodes_after']

@@ -119,11 +119,11 @@ def test_missing_key_query_failure_does_not_advance_caught_up(replica, monkeypat
 def test_absent_key_result_cannot_erase_a_newer_topic_patch(replica, monkeypatch):
     real_write = hs._write_pulled_tables
 
-    def interleave(topics, commitments, aliases, **kw):
+    def interleave(topics, aliases, **kw):
         assert hs.upsert_embeddings([], topic_rows=[
             {'slug': 'purged', 'title': 'recreated', 'body': 'new live content',
              'updated_at': datetime.now(timezone.utc)}], read_at=time.time())['ok']
-        return real_write(topics, commitments, aliases, **kw)
+        return real_write(topics, aliases, **kw)
 
     monkeypatch.setattr(hs, '_write_pulled_tables', interleave)
     assert hs.pull_changes()['ok']
@@ -157,7 +157,7 @@ def test_topic_row_not_newer_than_purge_marker_stays_hidden(replica, offset):
     stamp = hs._purge_marker_stamp(hs.snapshot_path(), 'purged').timestamp() + offset
     row = {'slug': 'purged', 'title': 'stale', 'body': 'STALE PURGED topic',
            'updated_at': datetime.fromtimestamp(stamp, timezone.utc)}
-    parts = hs._write_pulled_tables([row], None, None, read_at=time.time())
+    parts = hs._write_pulled_tables([row], None, read_at=time.time())
     assert parts['topics']['ok']
     assert hs.topic_detail_snapshot('purged') is None
     assert 'purged' in hs._purged_topic_slugs()
@@ -170,7 +170,7 @@ def test_failed_recreation_keeps_purge_marker(replica):
                     "BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END")
     row = {'slug': 'purged', 'title': 'new', 'body': 'LEGIT NEW topic',
            'updated_at': datetime.now(timezone.utc) + timedelta(seconds=5)}
-    result = hs._write_pulled_tables([row], None, None, read_at=time.time())
+    result = hs._write_pulled_tables([row], None, read_at=time.time())
     assert not result['topics']['ok']
     assert 'purged' in hs._purged_topic_slugs()
     assert hs.topic_detail_snapshot('purged') is None
@@ -189,7 +189,7 @@ def test_purge_comparison_uses_database_timestamp_precision(replica, delta_us):
     stamp = datetime.fromtimestamp(marker.stat().st_mtime, timezone.utc)
     row = {'slug': 'purged', 'title': 'replacement', 'body': 'NEW topic',
            'updated_at': stamp + timedelta(microseconds=delta_us)}
-    result = hs._write_pulled_tables([row], None, None, read_at=time.time())
+    result = hs._write_pulled_tables([row], None, read_at=time.time())
     assert result['topics']['ok']
     topic = hs.topic_detail_snapshot('purged')
     if delta_us:

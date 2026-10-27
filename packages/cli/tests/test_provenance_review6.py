@@ -1,0 +1,236 @@
+"""Sixth Astra review (jobs/2026-10-23/astra-prov6), ported.
+
+The replica follows the standard snapshot contract (owner decision, Matt,
+2026-10-24; design section 6): a read that began before a forget completed
+may reflect pre-forget state; a read that begins after never does (since
+phase 7B, the copy after a forget rewrites the fact tables from the hub). Review 6's P1 (a
+materialized response keeps the rows its read saw) is accepted behaviour
+under that contract, so its tests assert the contract. The two P2s (an older
+rebuild erasing a newer ordinary pull; the explicit commitment backfill
+writing a stale hub vector) failed on 498979ec."""
+from __future__ import annotations
+
+import json
+import threading
+import time
+from unittest import mock
+
+import pytest
+
+from khipu import capture, commitments, decisions, deliverables, embed, forget, offline_reads
+from khipu import hub_snapshot as hs
+from khipu import recall_prompt as rp
+from tests.hermetic_pg import hub, pg_cluster  # noqa: F401 - fixtures
+from tests.test_provenance_forget import ALT, CANON, PROJECT, _capture, _payload, env, pg  # noqa: F401
+from tests.test_provenance_replica import _replica, _replica_readers, replica  # noqa: F401
+
+
+def _raw_fact_text() -> str:
+    """Every fact row the replica file holds, unfenced."""
+    return json.dumps([_replica("SELECT text, latest_text FROM commitments"),
+                       _replica("SELECT text FROM decisions"),
+                       _replica("SELECT title, path FROM deliverables"),
+                       _replica("SELECT chunk_text FROM memory_embeddings WHERE kind = 'commitment'")])
+
+
+@pytest.mark.parametrize("reader", ["owed", "decisions"])
+def test_offline_reads_follow_the_snapshot_contract(pg, replica, reader):
+    """Review 6 #1 (accepted): the read in flight while the forget completes
+    may return its pre-forget rows; a read begun after returns none, and the
+    replica file keeps no refused row."""
+    replica(pg)
+    pg.memory.mkdir()
+    eid = _capture(loop=CANON, decision="private decision before forget")
+    assert hs.refresh()["ok"]
+    fired = []
+    target, attr = (commitments, "finish_owed_rows") if reader == "owed" else (decisions, "state_of")
+    real = getattr(target, attr)
+
+    def interleave(*a, **kw):
+        if not fired:
+            fired.append(True)
+            assert forget.forget_everywhere(eid, memory_root=pg.memory, gateway=False)["ok"]
+            assert not hs.facts_hidden()
+        return real(*a, **kw)
+
+    def read():
+        return (offline_reads.owed(None, "open", 100) if reader == "owed"
+                else offline_reads.decisions(None, None, "standing", 100))
+
+    with mock.patch.object(target, attr, interleave):
+        read()  # in flight: may reflect pre-forget state
+    assert fired
+    assert not read()["results"]
+    assert CANON not in _raw_fact_text() and "private decision before forget" not in _raw_fact_text()
+
+
+def test_prompt_deliverable_line_follows_the_snapshot_contract(pg, replica):
+    """Review 6 #1 (accepted), prompt deliverable line."""
+    replica(pg)
+    pg.memory.mkdir()
+    eid = _capture(loop=None, title="Private release checklist")
+    assert hs.refresh()["ok"]
+    real = deliverables.line_from_rows
+    fired = []
+
+    def interleave(*a, **kw):
+        if not fired:
+            fired.append(True)
+            assert forget.forget_everywhere(eid, memory_root=pg.memory, gateway=False)["ok"]
+        return real(*a, **kw)
+
+    with mock.patch.object(deliverables, "line_from_rows", interleave):
+        rp._replica_deliverable_line(PROJECT, ["docs", "checklist"], stale_box={})
+    assert fired
+    assert not rp._replica_deliverable_line(PROJECT, ["docs", "checklist"], stale_box={})
+    assert "Private release checklist" not in _raw_fact_text()
+
+
+def test_prompt_thread_hits_after_a_forget_show_nothing(pg, replica):
+    """Review 6 #1 (accepted), prompt thread recall: a read begun after the
+    forget completed, with the hub away, shows no forgotten decision."""
+    replica(pg)
+    pg.memory.mkdir()
+    payload = _payload(loop=None, decision="Private thread decision", t3_thread_id="synthetic-thread")
+    eid = capture.write_pg(payload)["episode_id"]
+    assert hs.refresh()["ok"]
+    assert forget.forget_everywhere(eid, memory_root=pg.memory, gateway=False)["ok"]
+    with mock.patch.object(hs, "try_hub_connect", side_effect=ConnectionError("hermetic hub away")):
+        hits = rp._thread_memory_hits("synthetic-thread", progress={})
+    assert "Private thread decision" not in json.dumps(hits, default=str)
+    assert "Private thread decision" not in _raw_fact_text()
+
+
+def _older_copy_then(action):
+    """Run a copy whose hub read is followed, before it publishes, by
+    ``action`` (a newer capture and the copy it starts, on a thread)."""
+    real = hs._copy_read
+    fired: list = []
+
+    def interleave(tx, local):
+        read = real(tx, local)
+        if not fired:
+            fired.append(action())
+            time.sleep(0.5)
+        return read
+
+    return mock.patch.object(hs, "_copy_read", interleave), fired
+
+
+def test_an_older_copy_cannot_overwrite_a_newer_normal_pull(pg, replica):
+    """Review 6 #2 (P2): an ordinary pull between an older copy's hub read
+    and its publication. Copies are serial (one lock from snapshot to
+    commit, design 6.2): the pull's copy reads after the older one
+    published, so the newest decision lands."""
+    replica(pg)
+    _capture(loop=CANON)
+    assert hs.refresh()["ok"]
+    results: dict = {}
+
+    def newer():
+        _capture(loop=None, decision="new normal pull decision")
+        thread = threading.Thread(target=lambda: results.update(pull=hs.pull_changes(include_ledger=False)))
+        thread.start()
+        return thread
+
+    patch, fired = _older_copy_then(newer)
+    with patch:
+        older = hs.copy_facts()
+        fired[0].join(60)
+    assert older["ok"] and results["pull"]["facts"].get("copied"), (older, results)
+    assert "new normal pull decision" in _replica_readers(), "older copy erased a newer normal pull"
+
+
+def test_public_scrub_copy_cannot_regress_normal_pull(pg, replica):
+    """Review 6 #2 (P2), through the public scrub: an ordinary pull lands
+    while the scrub's own copy is between its hub read and its publication."""
+    replica(pg)
+    _capture(loop=CANON)
+    assert hs.refresh()["ok"]
+    results: dict = {}
+
+    def newer():
+        _capture(loop=None, decision="public scrub newest decision")
+        thread = threading.Thread(target=lambda: results.update(pull=hs.pull_changes(include_ledger=False)))
+        thread.start()
+        return thread
+
+    patch, fired = _older_copy_then(newer)
+    with patch:
+        out = hs.scrub_forgotten_snapshot()
+        fired[0].join(60)
+    assert out["ok"] and fired and results["pull"]["ok"], (out, results)
+    assert "public scrub newest decision" in _replica_readers(), \
+        "public scrub published older facts over successful normal pull"
+
+
+def test_manual_commitment_backfill_does_not_restore_old_hub_chunks(pg, replica):
+    """Review 6 #3 (P2): ``backfill(kind='commitment')`` writes a vector only
+    while the locked hub row still carries the wording it embedded."""
+    replica(pg)
+    pg.memory.mkdir()
+    a = _capture(loop=CANON)
+    _capture(loop=ALT)
+    assert hs.refresh()["ok"]
+    with pg.connect() as c:
+        _profile, dim = c.execute("SELECT id,dim FROM embedding_profiles WHERE is_active LIMIT 1").fetchone()
+        cid = c.execute("SELECT id FROM commitments").fetchone()[0]
+    vector = [1.0] + [0.0] * (dim - 1)
+    calls = []
+
+    def provider(texts, **kw):
+        calls.append(texts)
+        if len(calls) == 1:
+            assert forget.forget_everywhere(a, memory_root=pg.memory, gateway=False)["ok"]
+        return [vector for _ in texts]
+
+    with mock.patch.object(embed, "embed_batch", provider), \
+            mock.patch.object(embed, "_api_texts", side_effect=lambda p, items: [t for _, t in items]), \
+            mock.patch.object(embed, "episode_text", return_value=""):
+        embed.backfill(kind="commitment")
+        embed.embed_recent_missing(limit=1)
+    assert hs.pull_changes(include_ledger=False)["ok"]
+    with pg.connect() as c:
+        hubrows = c.execute("SELECT chunk_text FROM memory_embeddings WHERE kind='commitment' AND ref=%s",
+                            (str(cid),)).fetchall()
+    assert CANON not in str(_replica("SELECT chunk_text FROM memory_embeddings WHERE kind='commitment'"))
+    assert CANON not in str(hubrows), "manual backfill restored old wording on the hub"
+
+
+def test_a_live_patch_during_a_copy_is_never_blocked(pg, replica):
+    """The liveness edge (owner ruling 2026-10-24), on the fact copy: a copy
+    holds no replica write lock while it reads the hub, so a live capture
+    patch from another process lands at once, and the copy still
+    publishes (a live episode patch is not an invalidation)."""
+    import os
+    import subprocess
+    import sys
+
+    from khipu import tombstones
+
+    replica(pg)
+    _capture(loop=CANON)
+    assert hs.refresh()["ok"]
+    with pg.connect() as c:
+        row = c.execute("SELECT to_jsonb(e) FROM episodes e ORDER BY id DESC LIMIT 1").fetchone()[0]
+    code = ("import json;from pathlib import Path;from khipu import tombstones, hub_snapshot as hs;"
+            f"tombstones.registry_path=lambda:Path({str(tombstones.registry_path())!r});"
+            f"print(json.dumps(hs.upsert_episode(json.loads({json.dumps(json.dumps(row, default=str))}), [])))")
+    patches = []
+    real = hs._copy_read
+
+    def patch_stream(tx, local):
+        read = real(tx, local)
+        child = subprocess.run([sys.executable, "-c", code], env=os.environ.copy(),
+                               capture_output=True, text=True, timeout=30)
+        assert child.returncode == 0, child.stderr
+        patches.append(json.loads(child.stdout.strip().splitlines()[-1]))
+        return read
+
+    _capture(loop=None, decision="a decision the copy brings")
+    with mock.patch.object(hs, "_copy_read", patch_stream):
+        result = hs.copy_facts()
+    assert len(patches) == 1 and patches[0].get("ok") and not patches[0].get("deferred"), patches
+    assert result.get("copied"), result
+    assert not hs.facts_hidden()
+    assert CANON in _replica_readers()

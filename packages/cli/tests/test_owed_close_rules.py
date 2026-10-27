@@ -27,6 +27,7 @@ import pytest
 from khipu import close_rules, commitments as co, config, work
 from tests.hermetic_pg import hub, migration_sql, pg_cluster  # noqa: F401
 from tests.test_commitments import _no_cosine
+from tests.fact_seed import announce
 
 PROJECT = "acme/widget"
 BASE = {"project": PROJECT, "session_id": "conv-1"}
@@ -69,6 +70,7 @@ _EPISODES = itertools.count(1)
 
 def _episode(cur, *, summary=None, raw=None) -> int:
     summary = summary or f"episode {next(_EPISODES)}"
+    announce(cur)
     cur.execute("INSERT INTO episodes (ts, summary, raw, project) VALUES (now(), %s, %s::jsonb, %s) "
                 "RETURNING id", (summary, json.dumps(raw or {}), PROJECT))
     return int(cur.fetchone()[0])
@@ -558,6 +560,7 @@ def test_a_runner_reading_newer_than_a_merge_line_wins(hub, monkeypatch, tmp_pat
     conn = _migrated(hub)
     with conn.cursor() as cur:
         cid = _open(cur, "Follow up on PR #12 with the docs change")
+        announce(cur)
         cur.execute("INSERT INTO episodes (ts, summary, raw, project) VALUES (now() - interval '1 day', "
                     "'Merge pull request #12 from acme/docs', '{}'::jsonb, %s)", (PROJECT,))
         _runner(monkeypatch, tmp_path, [(12, "fixing")])
@@ -568,6 +571,7 @@ def test_a_runner_reading_newer_than_a_merge_line_wins(hub, monkeypatch, tmp_pat
 # ---- every close path: one guarded write, one evidence check ----------------
 
 def _episode_in(cur, session_id) -> int:
+    announce(cur)
     cur.execute("INSERT INTO episodes (ts, summary, raw, project, session_id) VALUES (now(), %s, '{}'::jsonb, "
                 "%s, %s) RETURNING id", (f"episode {next(_EPISODES)}", PROJECT, session_id))
     return int(cur.fetchone()[0])
@@ -651,7 +655,7 @@ def test_every_close_path_goes_through_the_one_guarded_close():
     writes = _functions_that(r"SET\s+status\s*=\s*'closed'")
     # close_by_rule writes the status it is given (closed, or dropped for
     # the hygiene re-judge); tests/test_owed_owner_guard.py lists every writer.
-    assert writes == {("forget", "forget_episode")}, writes
+    assert writes == {("forget", "tombstone_on_hub")}, writes
     callers = _functions_that(None, calls="close_by_rule")
     assert {("close_rules", "_close"), ("commitments", "auto_close"), ("commitments", "close_session_plan"),
             ("commitments", "open_from_episode"), ("owed_tidy", "apply")} <= callers, callers
