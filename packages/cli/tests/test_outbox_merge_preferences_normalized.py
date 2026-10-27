@@ -170,3 +170,75 @@ def test_normalized_missing_cases(line_changes, raw_changes, expected):
     raw = {**deepcopy(HUB), **raw_changes}
     view = outbox_preferences._hub_view(_line(1, summary=HUB["summary"], **line_changes))
     assert outbox_preferences.normalized_missing(raw, view) == expected
+
+
+@pytest.mark.parametrize("line_prefs, hub_prefs", [
+    # Pieces of two distinct hub preferences never stand in for a third.
+    (["Never deploy Friday, unless approved"], ["Never deploy Friday", "Ship hotfixes, unless approved"]),
+    # The comma join is ordered, the way decisions compare.
+    (["b, a"], ["a, b"]),
+])
+def test_comma_joined_preferences_must_be_an_in_order_run(line_prefs, hub_prefs):
+    raw = {**deepcopy(HUB), "preferences": hub_prefs}
+    view = outbox_preferences._hub_view(_line(1, summary=HUB["summary"], preferences=line_prefs))
+    assert outbox_preferences.normalized_missing(raw, view) == line_prefs
+
+
+@pytest.fixture
+def unordered(hub):  # noqa: F811
+    _handles_merge_sql(hub)
+    hub.episodes[1]["summary"] = hub.episodes[1]["raw"]["summary"] = "Synthetic episode 1"
+    _episode(hub, 2, preferences=["Never deploy Friday", "Ship hotfixes, unless approved"])
+    _episode(hub, 3, preferences=["a, b"])
+    hub._existing_keys = {(e["ts"], _md5(e["summary"])) for e in hub.episodes.values()}
+    hub.next_id = 100
+    return hub, {2: _queue(_line(2, preferences=["Never deploy Friday, unless approved"])),
+                 3: _queue(_line(3, preferences=["b, a"]))}
+
+
+def test_a_line_the_ordered_rule_does_not_hold_is_appended_never_archived_as_held(unordered, tmp_path,
+                                                                                    monkeypatch):
+    cur, paths = unordered
+    rc, out = _run()
+    # Held only once the append puts the line's own text on the row.
+    assert rc == 0 and out["preferences_to_add"] == 2 and out[outbox_preferences.NORMALIZED_KIND] == 0, out
+    _direction(tmp_path, monkeypatch)
+    rc, out = _run("--apply", "--owner-direction")
+    assert rc == 0 and out["episode_ids"] == [2, 3] and out["preferences_added"] == 2, out
+    # Append-only: the hub keeps its own preferences and gains the line's.
+    assert cur.episodes[2]["raw"]["preferences"] == ["Never deploy Friday", "Ship hotfixes, unless approved",
+                                                     "Never deploy Friday, unless approved"]
+    assert cur.episodes[3]["raw"]["preferences"] == ["a, b", "b, a"]
+    for record in _records().values():
+        outbox._validate_resolution(record)
+        assert record["resolution"]["kind"] == "preferences_contained"
+
+
+def test_a_stored_projection_validates_whatever_the_noise_list_and_scope_limit_become(lines, tmp_path,
+                                                                                      monkeypatch):
+    from khipu import hygiene, identity
+
+    _direction(tmp_path, monkeypatch)
+    rc, out = _run("--apply", "--owner-direction")
+    assert rc == 0, out
+    records = _records()
+    # The dropped scopes and the moved noise topics are not in the projection.
+    assert records[2]["resolution"]["normalized_projection"] == {"topics": ["outbox"]}
+    assert records[3]["resolution"]["normalized_projection"] == {"topics": ["outbox"]}
+    # Tomorrow's lists: no topic is noise, and any scope is a label.
+    monkeypatch.setattr(hygiene, "is_noise_slug", lambda _s: False)
+    monkeypatch.setattr(identity, "normalize_scope", lambda s: (s or "").strip() or None)
+    for eid in (2, 3, 4):
+        outbox._validate_resolution(records[eid])
+    # A record from before the projection was stored falls back to today's lists.
+    old = deepcopy(records[3])
+    del old["resolution"]["normalized_projection"]
+    with pytest.raises(ValueError):
+        outbox._validate_resolution(old)
+    # A stored projection still has to agree with the line and the row.
+    for bad_projection in ({"topics": ["outbox", "graph"]}, {"topics": ["outbox", "claude"], "tags": []},
+                           {"topics": ["outbox"], "scope": None, "people": []}, ["outbox"]):
+        bad = deepcopy(records[3])
+        bad["resolution"]["normalized_projection"] = bad_projection
+        with pytest.raises(ValueError):
+            outbox._validate_resolution(bad)

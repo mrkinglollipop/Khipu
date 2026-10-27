@@ -153,9 +153,12 @@ def _validate_resolution(record: Any) -> None:
     elif resolution["kind"] == "preferences_contained_normalized":
         from khipu.outbox_preferences import normalized_missing
 
+        # The projection matched at archive time, when stored, so today's
+        # noise list or scope limit never decides an old record.
         proved = (_legacy_projection_kind(record["payload"], hub_view) is None
                   and not _legacy_preferences_contained(record["payload"], hub_view)
-                  and normalized_missing(record["payload"], hub_view) == [])
+                  and normalized_missing(record["payload"], hub_view,
+                                         resolution.get("normalized_projection")) == [])
     else:
         proved = _legacy_projection_kind(record["payload"], hub_view) == resolution["kind"]
     if not proved:

@@ -163,18 +163,76 @@ def _writer_projection(raw: dict[str, Any], view: dict[str, Any]) -> dict[str, A
     return out
 
 
-def normalized_missing(raw: Any, view: dict[str, Any]) -> list[str] | None:
+PROJECTED_FIELDS = ("scope", "topics", "tags")
+
+
+def projection_of(projected: dict[str, Any]) -> dict[str, Any]:
+    """The fields ``_writer_projection`` reshapes, as matched: kept in the
+    resolved/ record so a later change to the noise list or the scope limit
+    never decides whether an old record still proves its match."""
+    return {k: projected[k] for k in PROJECTED_FIELDS if k in projected}
+
+
+def _stored_projection(raw: dict[str, Any], view: dict[str, Any], stored: Any) -> dict[str, Any] | None:
+    """The line with a record's stored projection applied, after the checks
+    that need no noise list or scope limit: every kept topic is one of the
+    line's (stripped, lowercased), the topics it moved and the line's tags are
+    all in the row's tags, and a line scope it dropped meets a null row scope."""
+    if not isinstance(stored, dict) or not set(stored) <= set(PROJECTED_FIELDS):
+        return None
+    out = {k: v for k, v in view.items() if k not in PROJECTED_FIELDS}
+    out.update(stored)
+    scope = view.get("scope")
+    if "scope" in stored:
+        if (not (isinstance(stored["scope"], str) and stored["scope"]) if isinstance(scope, str)
+                else stored["scope"] != scope):
+            return None
+    elif isinstance(scope, str) and scope.strip() and raw.get("scope") is not None:
+        return None
+    topics = view.get("topics")
+    if isinstance(topics, list) and topics:
+        if not all(isinstance(t, str) for t in topics):
+            return None
+        kept = stored.get("topics")
+        line_topics = {t.strip().lower() for t in topics} - {""}
+        if not (isinstance(kept, list) and all(isinstance(t, str) for t in kept) and set(kept) <= line_topics):
+            return None
+        moved = line_topics - set(kept)
+        if moved:
+            line_tags, hub_tags = view.get("tags") or [], raw.get("tags")
+            if not ("tags" not in stored and isinstance(line_tags, list) and isinstance(hub_tags, list)
+                    and all(isinstance(t, str) for t in [*line_tags, *hub_tags])
+                    and set(line_tags) | moved <= set(hub_tags)):
+                return None
+        elif stored.get("tags") != view.get("tags"):
+            return None
+    elif "topics" in stored and stored["topics"] != topics:
+        return None
+    return out
+
+
+def _contiguous(run: list[str], within: list[str]) -> bool:
+    n = len(run)
+    return any(within[i:i + n] == run for i in range(len(within) - n + 1))
+
+
+def normalized_missing(raw: Any, view: dict[str, Any], projection: Any = None) -> list[str] | None:
     """The line's preferences the row lacks once the line is projected the
-    way the hub's writer reshapes it (``_writer_projection``), with
-    preferences compared after the comma join decisions already use; None
-    when anything but preferences still differs. ``[]``: the row holds the
-    whole line, which this command archives as ``preferences_contained_normalized``
-    (the drain's exact check is unchanged and never lands such a line)."""
+    way the hub's writer reshapes it (``_writer_projection``, or a record's
+    stored ``projection``), each preference held only when its comma pieces
+    are a contiguous, in-order run of the row's comma-joined preferences;
+    None when anything but preferences still differs. ``[]``: the row holds
+    the whole line, which this command archives as
+    ``preferences_contained_normalized`` (the drain's exact check is
+    unchanged and never lands such a line)."""
     from khipu.capture import _legacy_comma_join, _legacy_landed_line
 
     if not isinstance(raw, dict):
         return None
-    projected = _writer_projection(raw, view)
+    if projection is None:
+        projected = _writer_projection(raw, view)
+    else:
+        projected = _stored_projection(raw, view, projection)
     if projected is None:
         return None
     line_prefs, hub_prefs = _str_list(projected.get("preferences")), _str_list(raw.get("preferences"))
@@ -182,8 +240,9 @@ def normalized_missing(raw: Any, view: dict[str, Any]) -> list[str] | None:
         return None
     if not _legacy_landed_line(raw, {k: v for k, v in projected.items() if k != "preferences"}):
         return None
-    pieces = set(_legacy_comma_join(hub_prefs))
-    return list(dict.fromkeys(p for p in line_prefs if not set(_legacy_comma_join([p])) <= pieces))
+    pieces = _legacy_comma_join(hub_prefs)
+    return list(dict.fromkeys(p for p in line_prefs
+                              if not _contiguous(_legacy_comma_join([p]), pieces)))
 
 
 def _forgotten(cur, eid: int, view: dict[str, Any]) -> bool:
@@ -378,17 +437,19 @@ def _resolution(line: dict[str, Any], final_raw: dict[str, Any]) -> tuple[dict[s
 
     queued = json.loads(line["snapshot"])
     view = _hub_view(queued["payload"])
+    extra: dict[str, Any] = {}
     if _legacy_preferences_contained(final_raw, view):
         kind = "preferences_contained"
     elif normalized_missing(final_raw, view) == []:
         kind = NORMALIZED_KIND
+        extra["normalized_projection"] = projection_of(_writer_projection(final_raw, view))
     else:
         return None
     record = {"payload": final_raw, "queued_evidence": queued,
               "resolution": {"kind": kind, "episode_id": int(line["row"][0]),
                              "original_payload_sha256": payload_sha256(final_raw),
                              "queued_payload_sha256": payload_sha256(view),
-                             "resolved_at": datetime.now(timezone.utc).isoformat()}}
+                             "resolved_at": datetime.now(timezone.utc).isoformat(), **extra}}
     return record, hashlib.sha256(line["snapshot"]).hexdigest()
 
 
