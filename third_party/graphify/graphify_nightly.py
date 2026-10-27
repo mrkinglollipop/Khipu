@@ -246,7 +246,8 @@ def main() -> int:
     rc = run_step(
         "semantic extract",
         "code_semantic_extractor.py",
-        timeout=1800,
+        # Cap so semantic+build+embed+mirror ≤ DRIVER_TIMEOUT_SECONDS (3600).
+        timeout=1100,
         env=khipu_env,
     )
     if rc != 0:

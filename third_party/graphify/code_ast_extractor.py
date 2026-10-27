@@ -48,8 +48,20 @@ SKIP_DIRS: set[str] = {
 
 
 def slug(text: str) -> str:
-    """Lowercase and replace non-alphanumeric chars with underscore."""
-    return "".join(c if c.isalnum() else "_" for c in text.lower())
+    """Lowercase path-aware slug: `/` and `\\` become `__`, other non-alnum `_`.
+
+    Path separators must stay injective so `pkg/mod.py` and `pkg_mod.py`
+    do not collapse to the same module id.
+    """
+    out: list[str] = []
+    for c in text.lower():
+        if c.isalnum():
+            out.append(c)
+        elif c in "/\\":
+            out.append("__")
+        else:
+            out.append("_")
+    return "".join(out)
 
 
 def _get_docstring_concept(
