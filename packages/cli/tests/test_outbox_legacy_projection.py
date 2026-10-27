@@ -368,3 +368,42 @@ def test_transition_reuses_only_equal_complete_envelope(world):
     with pytest.raises(FileExistsError):
         outbox._transition_destination(preferred, changed)
     assert preferred.read_bytes() == original_bytes
+
+
+SECRET = "sk-ant-" + "a1B2c3D4e5" * 3
+
+
+def _redacted_hub_projection(world, middle):
+    cur, _ = world
+    stored = deepcopy(ORIGINAL)
+    stored["decisions"] = ["Use alpha, [REDACTED], gamma"]
+    cur.episodes[1].update(stored, raw=deepcopy(stored))
+    queued = deepcopy(stored)
+    for key in ("harness", "transcript_range", "window_id", "part"):
+        queued.pop(key, None)
+    queued["decisions"] = ["Use alpha", middle, "gamma"]
+    path = queue(queued)
+    return path, outbox.drain()
+
+
+def test_a_literal_redacted_marker_projection_resolves(world):
+    _, report = _redacted_hub_projection(world, "[REDACTED]")
+    assert report.get("resolved") == 1, report
+
+
+def test_a_projection_holding_a_secret_the_hub_stored_redacted_resolves(world):
+    path, report = _redacted_hub_projection(world, SECRET)
+    assert report.get("resolved") == 1, report
+    assert not path.exists()
+    [record] = (outbox.outbox_dir() / "resolved").glob("*.json")
+    outbox._validate_resolution(json.loads(record.read_text()))
+
+
+def test_a_buried_evidence_conflict_names_retry_dead(world):
+    path = queue(deepcopy(ORIGINAL))
+    job = json.loads(path.read_text())
+    job.update(evidence_conflict=True, attempts=outbox.MAX_ATTEMPTS)
+    outbox._bury(path, job)
+    st = outbox.status()
+    assert st["pending"] == 0 and st["dead"] == 1 and st["evidence_conflicts"] >= 1, st
+    assert "khipu outbox retry-dead" in st["fix"], st["fix"]
