@@ -574,7 +574,9 @@ def gate_ignorable() -> tuple[str, ...]:
     local check doctor --quick gates on, plus pending database updates."""
     from khipu.cli import LOCAL_GATES
 
-    return (*(k[:-3] for k in LOCAL_GATES if k not in _DOCTOR_NOT_GATED), "schema_migrations")
+    # "jobs": a scheduled job's last run failed. Owner-liftable like the rest:
+    # otherwise the fix for a failing nightly could never be promoted.
+    return (*(k[:-3] for k in LOCAL_GATES if k not in _DOCTOR_NOT_GATED), "schema_migrations", "jobs")
 
 
 def _override_age_s(stored: dict[str, Any]) -> float | None:
@@ -774,17 +776,20 @@ def gate_doctor(candidate: Path) -> tuple[bool, str] | tuple[bool, str, dict[str
         problems.append(f"config: {(out.get('config') or {}).get('error')}")
     if out and not out.get("dsn_present"):
         problems.append("no DSN")
-    if out.get("job_failures"):
-        problems.append(f"jobs failing: {out['job_failures']}")
+    jobs_red = bool(out.get("job_failures"))
     if out and not out.get("synth_provider_ok", True):
         problems.append(f"summariser provider: {out.get('synth_provider')}")
     reds = [key for key, value in out.items()
             if key.endswith("_ok") and value is False and key not in _DOCTOR_NOT_GATED]
+    if jobs_red:
+        reds.append("jobs_ok")
     offline = [k[:-3] for k in reds if _offline_only(out, k)]
     ignore = set(override["checks"]) if override else set()
     ignored = [k[:-3] for k in reds if k[:-3] in ignore and k[:-3] not in offline]
     red = [k[:-3] for k in reds if k[:-3] not in offline and k[:-3] not in ignored]
     other = bool(problems) or hard
+    if "jobs" in red:
+        problems.append(f"jobs failing: {out['job_failures']}")
     if red:
         problems.append("red: " + ", ".join(red))
     if not out:
