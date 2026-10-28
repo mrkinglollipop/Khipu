@@ -690,8 +690,9 @@ def reconcile(*, dry_run: bool = False, changed_only: bool = False) -> dict[str,
     new_files_state = dict(files_state)
     written_plan: list[dict[str, Any]] = []
     # Cap the whole write loop so N stuck locks cannot each burn timeout_s; the
-    # cap is larger than one statement's bound so a slow backfill can finish.
-    deadline = time.monotonic() + max(timeout_s, 300.0)
+    # Allow one second per planned write (including redirects) for tailnet
+    # latency, while retaining an overall bound on repeated stuck locks.
+    deadline = time.monotonic() + max(timeout_s, 300.0, len(plan) + len(collision_report["redirects"]))
     with connect(statement_timeout_s=timeout_s) as conn:
         with conn.cursor() as cur:
             cur.execute(

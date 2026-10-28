@@ -350,7 +350,7 @@ def _run_script(
             # raising inside its constructor can strand a just-created child.
             with _sigterm_guard(state_name, defer=True) as termination:
                 proc = subprocess.Popen(
-                    cmd, stdout=out_f, stderr=err_f, env=os.environ.copy(),
+                    cmd, stdout=out_f, stderr=err_f, env={**os.environ, "PYTHONUNBUFFERED": "1"},
                     start_new_session=True,
                 )
                 try:
@@ -408,6 +408,16 @@ def _step_result(result: Any) -> dict[str, Any]:
             "counts": result,
             "error": result.get("error") or result.get("reason"),
         }
+        errors = result.get("errors")
+        # A step that is ok with only transient deferrals (retried next run)
+        # has nothing failed to report.
+        only_deferred = out["ok"] and isinstance(errors, list) and all(
+            isinstance(e, dict) and e.get("transient") is True for e in errors)
+        if not out["error"] and isinstance(errors, list) and errors and not only_deferred:
+            first = errors[0]
+            detail = (first.get("error") or first.get("reason") or str(first)
+                      if isinstance(first, dict) else str(first))
+            out["error"] = f"{len(errors)} failed: {detail}"
         if result.get("deferred") and isinstance(result["deferred"], str):
             out["deferred"] = result["deferred"]
         return out

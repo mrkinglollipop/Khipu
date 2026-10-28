@@ -175,19 +175,113 @@ def _validate_resolution(record: Any) -> None:
     _canonical(record)
 
 
-def _recovery_terminal(payload: dict[str, Any], stamp: dict[str, Any]) -> Path | None:
+def _directory_version(path: Path) -> tuple | None:
+    try:
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns
+    except FileNotFoundError:
+        return None
+
+
+class _RecoveryIndex:
+    """Validated hints, never authority: every selected record is read again.
+
+    Outbox writers publish by rename/unlink, so directory versions invalidate
+    membership. Rechecking selected content also catches in-place damage.
+    Building this index must happen outside the outbox lock.
+    """
+
+    def __init__(self) -> None:
+        from khipu.capture_identity import payload_sha256
+
+        self.root = outbox_dir()
+        self.version = self.current_version()
+        self.held: dict[str, list[Path]] = {}
+        self.queued: dict[str, list[Path]] = {}
+        self.payloads: dict[str, list[Path]] = {}
+        for path in dead_jobs():
+            try:
+                job = _read_job(path)
+                self.held.setdefault(_canonical({"payload": job["payload"], **{
+                    k: job[k] for k in ("origin",) if k in job}}), []).append(path)
+            except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                continue
+        for path in sorted(resolved_dir().glob("*.json")):
+            try:
+                record = json.loads(path.read_bytes())
+                _validate_resolution(record)
+                job = record["queued_evidence"]
+                key = _canonical({"payload": job["payload"], "origin": job["origin"]})
+                self.queued.setdefault(key, []).append(path)
+                for digest in {payload_sha256(record["payload"]), payload_sha256(job["payload"])}:
+                    self.payloads.setdefault(digest, []).append(path)
+            except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                continue
+
+    def current_version(self) -> tuple:
+        return (_directory_version(self.root / "dead"), _directory_version(self.root / "resolved"))
+
+    def current(self) -> bool:
+        return self.root == outbox_dir() and self.version == self.current_version()
+
+
+_RECOVERY_INDEX: _RecoveryIndex | None = None
+
+
+def _recovery_index() -> _RecoveryIndex:
+    global _RECOVERY_INDEX
+    if _RECOVERY_INDEX is None or not _RECOVERY_INDEX.current():
+        _RECOVERY_INDEX = _RecoveryIndex()
+    return _RECOVERY_INDEX
+
+
+@contextmanager
+def _locked_recovery(recovery: bool):
+    # A concurrent archive/undo/forget invalidates the hints. Build once
+    # outside the lock; if membership moved by the time the lock is held,
+    # rebuild once under it. Every membership writer takes this lock, so
+    # that index is current, and a steady writer cannot starve recovery.
+    global _RECOVERY_INDEX
+    index = _recovery_index() if recovery else None
+    with _locked_outbox() as directory:
+        if index is not None and not index.current():
+            index = _RECOVERY_INDEX = _RecoveryIndex()
+        yield directory, index
+
+
+def is_resolved_payload(payload: dict[str, Any]) -> bool:
+    """Whether validated archived evidence already accounts for this line."""
+    from khipu.capture_identity import payload_sha256
+
+    with _locked_recovery(True) as (_directory, index):
+        for path in index.payloads.get(payload_sha256(payload), ()):
+            try:
+                record = json.loads(path.read_bytes())
+                _validate_resolution(record)
+                if any(_canonical(payload) == _canonical(value) for value in (
+                        record["payload"], record["queued_evidence"]["payload"])):
+                    return True
+            except (OSError, ValueError, TypeError, KeyError, RecursionError):
+                continue
+    return False
+
+
+def _recovery_terminal(payload: dict[str, Any], stamp: dict[str, Any],
+                       index: _RecoveryIndex) -> Path | None:
     """A file sweep cannot restart held retries or recreate resolved history.
 
-    Called under the outbox lock. Direct capture enqueue and explicit owner
+    Called under the outbox lock with an index built outside it. Only matching
+    hints are revalidated here. Direct capture enqueue and explicit owner
     retry remain able to create/move separate histories.
     """
-    for path in dead_jobs():
+    key = _canonical({"payload": payload, **stamp})
+    for path in index.held.get(key, ()):
         try:
             if _same_evidence(_read_job(path), payload, stamp):
                 return path
         except (OSError, ValueError, TypeError, RecursionError):
             continue
-    for path in sorted(resolved_dir().glob("*.json")):
+    for path in index.queued.get(key, ()):
         try:
             record = json.loads(path.read_bytes())
             _validate_resolution(record)
@@ -304,8 +398,8 @@ def enqueue(payload: dict[str, Any], *, reason: str = "", origin: Any = _STAMP,
     with write_guard(payload) as allowed:
         if not allowed:
             raise ForgottenSource("queued payload belongs to a forgotten source")
-        with _locked_outbox() as d:
-            if recovery and (terminal := _recovery_terminal(payload, stamp)) is not None:
+        with _locked_recovery(recovery) as (d, index):
+            if recovery and (terminal := _recovery_terminal(payload, stamp, index)) is not None:
                 return terminal
             evidence = {"payload": payload, **stamp} if stamp else payload
             digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, ensure_ascii=False,

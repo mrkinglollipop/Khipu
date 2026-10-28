@@ -674,8 +674,12 @@ def _queue_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]]
     """``_queue_conflict`` each line ``_legacy_key_conflicts`` lists, on a
     hub with fact provenance (0047) only. Returns how many."""
     from khipu import provenance
+    from khipu.outbox import is_resolved_payload
 
     if not lines or not any(_carries_fact_items(obj) for obj, _key in lines) or not provenance.ready(cur):
+        return 0
+    lines = [(obj, key) for obj, key in lines if not is_resolved_payload(obj)]
+    if not lines:
         return 0
     conflicts = _legacy_key_conflicts(cur, lines)
     for obj in conflicts:
