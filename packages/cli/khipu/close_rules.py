@@ -811,36 +811,58 @@ def _settles(item: dict, decisions: list[tuple], threshold: float):
     return strict or loose
 
 
-def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | None,
-                   sink: dict | None = None) -> None:
-    from khipu.config import float_setting
+def _read_decisions(cur, project: str, opened_at, *, episode_id: int | None = None,
+                    decision_id: int | None = None) -> list[tuple]:
     from khipu.db import has_columns
+
+    live = "d.superseded_by IS NULL"
+    if has_columns(cur, "decisions", "retracted_at"):
+        live += " AND d.retracted_at IS NULL"
+    scope = " AND d.episode_id = %s" if episode_id is not None else ""
+    params = (project, episode_id) if episode_id is not None else (project,)
+    if decision_id is not None:
+        scope += " AND d.id = %s"
+        params += (decision_id,)
+    cur.execute(
+        f"SELECT d.id, d.text, d.episode_id, d.decided_at FROM decisions d WHERE d.project = %s{scope} "
+        f"AND {live} AND d.decided_at >= %s ORDER BY d.id",
+        (*params, opened_at),
+    )
+    return cur.fetchall()
+
+
+def _decision_rule(cur, items: list[dict], report: dict, *, episode_id: int | None,
+                   sink: dict | None = None, decision_cache: dict | None = None) -> None:
+    from khipu.config import float_setting
 
     eligible = [i for i in items if not i.get("closed") and _is_decide_item(i) and not _needs_owner(i)]
     if not eligible:
         return
     threshold = float_setting("commitment_close_similarity")
-    live = "d.superseded_by IS NULL"
-    if has_columns(cur, "decisions", "retracted_at"):
-        live += " AND d.retracted_at IS NULL"
     by_project: dict[str, list[dict]] = {}
     for item in eligible:
         by_project.setdefault(item["project"], []).append(item)
     for project, rows in by_project.items():
         # A capture settles with its own decisions; the nightly with all of
         # the project's since its oldest open item.
-        scope = " AND d.episode_id = %s" if episode_id is not None else ""
-        params = (project, episode_id) if episode_id is not None else (project,)
-        cur.execute(
-            f"SELECT d.id, d.text, d.episode_id, d.decided_at FROM decisions d WHERE d.project = %s{scope} "
-            f"AND {live} AND d.decided_at >= %s ORDER BY d.id",
-            (*params, min(r["opened_at"] for r in rows)),
-        )
-        decisions = cur.fetchall()
+        since = min(r["opened_at"] for r in rows)
+        decisions = (_read_decisions(cur, project, since, episode_id=episode_id)
+                     if decision_cache is None else [d for d in decision_cache[project] if d[3] >= since])
         if not decisions:
             continue
         for item in rows:
             hit = _settles(item, decisions, threshold)
+            if decision_cache is not None:
+                # A cached match must still be live and unchanged now. Never
+                # close or suggest from evidence withdrawn since the snapshot.
+                remaining = decisions
+                while hit is not None:
+                    current = _read_decisions(cur, project, item["opened_at"], decision_id=hit[1])
+                    expected = next(d for d in remaining if d[0] == hit[1])
+                    if current == [expected]:
+                        break
+                    remaining = [d for d in remaining if d[0] != hit[1]]
+                    hit = _settles(item, remaining, threshold)
             if hit is None:
                 continue
             if hit[0] == "strict":
@@ -922,12 +944,16 @@ def run_nightly() -> dict[str, Any]:
     is deferred to the next night, including changes to suggestions, owner,
     wording, PR requirements and reopen history. Unchanged rows are evaluated
     again against fresh SQL evidence; no proposed write survives the wait.
+    Decision lists are cached per project after the wait, with each selected
+    match revalidated in its candidate transaction. Later new decisions can
+    settle on the next run. Connection reuse never extends a transaction.
 
     This connection-owning entry point is nightly-only. Capture and planner
     callers retain their cursor-based APIs.
     """
     from khipu.db import connect
     from khipu.provenance import retryable_db_error
+    from contextlib import ExitStack
 
     report: dict[str, Any] = {"ok": True, "closed_pr": 0, "closed_decision": 0, "suggested": 0,
                               "kept_open_reopened": 0, "failed": 0}
@@ -989,26 +1015,51 @@ def run_nightly() -> dict[str, Any]:
                 if state is not None:
                     frozen.records[key] = _record(state, datetime.now(timezone.utc), "github")
 
+    decision_since = {}
     for candidate in candidates:
-        # Publish counts only after the whole candidate transaction committed:
-        # a later rule or COMMIT can still roll back an earlier close.
-        applied = {"closed_pr": 0, "closed_decision": 0, "suggested": 0,
-                   "kept_open_reopened": 0, "deferred_changed": 0}
-        try:
-            with connect() as conn:
+        if _is_decide_item(candidate) and not _needs_owner(candidate):
+            project = candidate["project"]
+            decision_since[project] = min(decision_since.get(project, candidate["opened_at"]),
+                                          candidate["opened_at"])
+    decision_cache = {}
+    with ExitStack() as connections:
+        conn = None
+        for candidate in candidates:
+            # Publish counts only after the whole candidate transaction committed:
+            # a later rule or COMMIT can still roll back an earlier close.
+            applied = {"closed_pr": 0, "closed_decision": 0, "suggested": 0,
+                       "kept_open_reopened": 0, "deferred_changed": 0}
+            try:
+                if conn is None:
+                    conn = connections.enter_context(connect())
+                project = candidate["project"]
+                if project in decision_since and project not in decision_cache:
+                    with conn.cursor() as cur:
+                        decisions = _read_decisions(cur, project, decision_since[project])
+                    conn.commit()
+                    decision_cache[project] = decisions
                 with conn.cursor() as cur:
                     current = _open_items(cur, None, commitment_id=candidate["id"], lock=True)
                     if not current or current[0] != candidate:
                         applied["deferred_changed"] = 1
                     else:
                         _pr_rule(cur, current, applied, payload=None, episode_id=None, github=frozen)
-                        _decision_rule(cur, current, applied, episode_id=None)
+                        _decision_rule(cur, current, applied, episode_id=None, decision_cache=decision_cache)
                 conn.commit()
-        except Exception as exc:  # noqa: BLE001 — one poisoned row must not block later rows
-            failed(exc, "apply", commitment_id=candidate["id"])
-            continue
-        for key, count in applied.items():
-            report[key] = report.get(key, 0) + count
+            except Exception as exc:  # noqa: BLE001 — one poisoned row must not block later rows
+                failed(exc, "apply", commitment_id=candidate["id"])
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:  # noqa: BLE001 — discard an unusable connection
+                        try:
+                            conn.close()
+                        finally:
+                            connections.close()
+                        conn = None
+                continue
+            for key, count in applied.items():
+                report[key] = report.get(key, 0) + count
     report["github_asked"] = github.asked
     report["github"] = github.unavailable
     return report
