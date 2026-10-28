@@ -92,6 +92,24 @@ def test_a_statement_timeout_from_the_hub_is_not_offline_evidence(home, monkeypa
     assert not gate["ok"], gate
 
 
+def test_a_failed_job_refuses_but_the_owner_can_skip_it_once(home, monkeypatch, tmp_path):
+    # The fix for a failing nightly must be promotable: a failed job is a red
+    # the owner can skip once, never a block nothing can lift.
+    _promotable(home, monkeypatch, tmp_path)
+    monkeypatch.setattr(pm, "hub_reachable", lambda **kw: True)
+    _doctor_says(monkeypatch, {**_BASE, "job_failures": ["nightly"], "jobs_ok": False})
+    for name in ("recall", "capture", "version"):
+        monkeypatch.setitem(pm.GATE_STEPS, name, lambda c: {"ok": True, "ms": 1, "detail": "ok"})
+    refused = pm.promote("origin/main")
+    assert not refused["ok"] and refused["gate"][0]["red_checks"] == ["jobs"]
+    assert "jobs failing" in refused["gate"][0]["detail"]
+    assert pm.gate_ignore_status()["blocked_by"] == ["jobs"]
+    pm.set_gate_ignore("jobs", by="app")
+    out = pm.promote("origin/main")
+    assert out["ok"], out
+    assert out["gate"][0]["ignored_reds"] == ["jobs"]
+
+
 # ---- the owner's one-time override ("Update anyway") -------------------------
 
 
@@ -243,7 +261,7 @@ def test_the_override_takes_only_checks_the_gate_runs(home):
     with pytest.raises(ValueError, match="not a check the gate runs: imports"):
         pm.set_gate_ignore("outbox,imports", by="app")
     assert pm.gate_ignore() == []
-    assert "outbox" in pm.gate_ignorable() and "jobs" not in pm.gate_ignorable()
+    assert "outbox" in pm.gate_ignorable() and "jobs" in pm.gate_ignorable()
 
 
 def test_the_override_is_a_setting_the_cli_writes_and_shows(home, monkeypatch):
