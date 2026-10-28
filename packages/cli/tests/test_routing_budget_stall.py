@@ -104,3 +104,17 @@ def test_delivery_with_no_new_content_stays_red(replay):
     for point in range(bound + 2):
         state = _send(out, point + 1, ack=False)
     assert "budget-stall" in health.component_health(state, T0)["reasons"]
+
+
+def test_progress_on_another_entry_does_not_keep_a_stuck_entry_green(replay):
+    """A revised account line delivered every point is not progress for a rule that never arrives."""
+    for point in range(20):
+        line = _item("account:grok", f"Grok: limited; back at {point:02d}:30Z. " + "z" * 60,
+                     "account", False, chr(97 + point % 26) + str(point), visible=True)
+        out = _plan([line, _item("rule:5", "x" * 1000, "Standing rule 5", True)])
+        state = _send(out, point)
+        if "budget-stall" in health.component_health(state, T0)["reasons"]:
+            break
+    else:
+        pytest.fail("a rule starved behind revised lines stayed green")
+    assert state["entries"]["rule:5"].get("offset", 0) == 0

@@ -203,7 +203,7 @@ def _valid_entry(entity, entry):
            ("acked", "visible", "restarted", "removed", "child_owed", "withheld")):
         return False
     for key in ("offset", "shown_offset", "pages", "width", "budget", "bound", "owed_point",
-                "owed_chars", "expired"):
+                "owed_chars", "expired", "progress_point"):
         value = entry.get(key)
         if key not in entry or (value is None and key in ("shown_offset", "bound")):
             continue
@@ -281,7 +281,7 @@ def _ledger_data(data):
                     (lambda v: isinstance(v, dict)) if key.endswith("_acked") else
                     (lambda v: isinstance(v, str)))
                 state[key] = {k: v for k, v in values.items() if valid(v)} if isinstance(values, dict) else {}
-        for key in ("acked_through", "source_version", "delivery_points", "last_progress_point", "expired", "slack"):
+        for key in ("acked_through", "source_version", "delivery_points", "expired", "slack"):
             if key in state and (type(state[key]) is not int or state[key] < 0):
                 del state[key]
         for key in ("touched", "last_delivery_point"):
@@ -1860,7 +1860,7 @@ def pull_acknowledge(session, batch, *, component="mcp", now=None):
                 previous = entry.get("shown_offset") or 0
                 entry["shown_offset"] = shown.get(item["entity"], 0) if isinstance(shown, dict) else None
                 if entry["shown_offset"] is not None and entry["shown_offset"] > previous:
-                    state["last_progress_point"] = state.get("delivery_points", 0)
+                    entry["progress_point"] = state.get("delivery_points", 0)
                 entry["pages"] = item.get("page", {}).get("n", 0)
                 entry["restarted"] = False
             batches = state.setdefault("batches", {})
@@ -1919,7 +1919,7 @@ def _acknowledge(session, changes, *, reservation=None, now=None, take=False):
             previous = e.get("shown_offset") or 0
             e["shown_offset"] = shown.get(item["entity"], 0) if isinstance(shown, dict) else None
             if e["shown_offset"] is not None and e["shown_offset"] > previous:
-                state["last_progress_point"] = state.get("delivery_points", 0)
+                e["progress_point"] = state.get("delivery_points", 0)
             e["pages"] = item.get("page", {}).get("n", 0)
             e["restarted"] = False
         batches = state.setdefault("batches", {})
