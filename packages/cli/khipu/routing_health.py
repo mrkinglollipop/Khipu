@@ -40,6 +40,10 @@ def _component_health(state, now, *, slack):
     if state.get("shown_claim_invalid"):
         reasons.append("ack-unshown")
     points = state.get("delivery_points")
+    progress = state.get("last_progress_point", 0)
+    if type(progress) is not int or progress < 0 or (isinstance(points, int) and progress > points):
+        missing.append("delivery progress history")
+        progress = 0
     if not isinstance(points, int) or not _time(state.get("last_delivery_point")):
         missing.append("delivery point history")
     done = state.get("done") or {}
@@ -71,7 +75,7 @@ def _component_health(state, now, *, slack):
         if not all(isinstance(v, int) and v >= 0 for v in
                    (points, entry.get("owed_point"), entry.get("bound"))):
             missing.append("delivery point budget")
-        elif points - entry["owed_point"] >= entry["bound"] + slack:
+        elif points - max(entry["owed_point"], progress) >= entry["bound"] + slack:
             reasons.append("budget-stall")
         expired = entry.get("expired", 0)
         if not isinstance(expired, int) or expired < 0:
