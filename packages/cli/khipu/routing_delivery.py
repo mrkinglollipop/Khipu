@@ -203,7 +203,7 @@ def _valid_entry(entity, entry):
            ("acked", "visible", "restarted", "removed", "child_owed", "withheld")):
         return False
     for key in ("offset", "shown_offset", "pages", "width", "budget", "bound", "owed_point",
-                "owed_chars", "expired"):
+                "owed_chars", "expired", "progress_point"):
         value = entry.get(key)
         if key not in entry or (value is None and key in ("shown_offset", "bound")):
             continue
@@ -595,45 +595,59 @@ def _merge(state, out):
 _POINT_PLAN_KEYS = ("harness", "slack", "page_limit", "limit")
 
 
-def _delivery_point(state, out, now, *, count=True):
-    """Budget debt when its revision first becomes owed; progress never resets its age.
+def _page_width(state, width, floor):
+    """Keep bounded, component-local capacity evidence, excluding terminal slivers."""
+    recent = state.get("page_widths")
+    recent = [w for w in recent if type(w) is int and w > 0] if isinstance(recent, list) else []
+    state["page_widths"] = [*recent[-31:], max(floor, width)]
 
-    ``count``: this is a delivery point (the agent got the answer). Not
-    ``count``: an offer the per-prompt hook may still discard; newly owed
-    debt is dated to the next point, which only a take counts
-    (``take_point``), so answers the hook never took are not points."""
+
+def _budget_debt(state, plan, point):
+    """Price the queue at its realised capacity, crediting each new revision once."""
     import math
 
+    # The configured cap, not the delivered one: a cap too small for a header
+    # and a page has no bound, so health says unknown instead of green.
+    budget = plan.get("page_limit") or plan.get("limit") or 8000
+    floor = max(1, min(PAGE_FLOOR, _capped(budget, 8000) // 5))
+    recent = state.get("page_widths")
+    widths = [w for w in recent if type(w) is int and w > 0] if isinstance(recent, list) else []
+    entries = list(state.get("entries", {}).values())
+    if not widths:
+        # Old ledgers only retain each entry's last width. A legacy frozen
+        # sliver must not survive as a permanent seven-character budget.
+        widths = [e["width"] for e in entries if type(e.get("width")) is int and e["width"] > 0]
+    narrowest = max(floor, min(widths)) if widths else None
+    entries.sort(key=lambda e: (not e["entity"].startswith("hold:"), e["whole"]))
+    ahead = new_ahead = 0
+    for entry in entries:
+        if entry.get("acked"):
+            continue
+        remaining = _size(entry["text"][entry.get("offset", 0):])
+        ahead += remaining
+        if "owed_point" not in entry:
+            entry["owed_point"] = point
+            entry["owed_chars"] = ahead
+            new_ahead += remaining
+        else:
+            entry["owed_chars"] = max(ahead, entry.get("owed_chars", ahead) + new_ahead)
+        prefix = f"{_header_label(entry['label'])}; revision {entry['revision'][:8]}; page "
+        payload = max(0, budget - _size("More routing owed.") - 2 - _size(prefix) - 24)
+        entry["budget"] = min(payload, narrowest) if narrowest else payload
+        entry["bound"] = max(1, math.ceil(entry["owed_chars"] / entry["budget"])) if entry["budget"] else None
+
+
+def _delivery_point(state, out, now, *, count=True):
+    """Date new debt at the next taken answer; discarded offers do not age it."""
     if count:
         point = state["delivery_points"] = state.get("delivery_points", 0) + 1
     else:
         point = state.setdefault("delivery_points", 0) + 1
-    # When this conversation last asked (its liveness), taken or not.
     state["last_delivery_point"] = _iso(now)
     plan = out["delivery_plan"]
     state["harness"] = health_harness(plan.get("harness"))
     state["slack"] = plan.get("slack", 2)
-    # The configured cap, not the delivered one: a cap too small for a header
-    # and a page has no bound, so health says unknown instead of green.
-    budget = plan.get("page_limit") or plan.get("limit") or 8000
-    ahead = 0
-    entries = list(state.get("entries", {}).values())
-    entries.sort(key=lambda e: not e["entity"].startswith("hold:"))
-    for entry in entries:
-        if entry.get("acked"):
-            continue
-        ahead += _size(entry["text"][entry.get("offset", 0):])
-        if "owed_point" not in entry:
-            entry["owed_point"] = point
-            entry["owed_chars"] = ahead
-            # The page header and owed tail consume the same cap as the words.
-            prefix = f"{entry['label']}; revision {entry['revision'][:8]}; page "
-            payload = budget - _size("More routing owed.") - 2 - _size(prefix) - 24
-            entry["budget"] = min(max(0, payload), entry.get("width") or max(0, payload))
-            entry["bound"] = max(1, math.ceil(ahead / entry["budget"])) if entry["budget"] else None
-        elif entry.get("width") and entry["width"] < entry.get("budget", budget):
-            entry["budget"] = entry["width"]
-            entry["bound"] = max(1, math.ceil(entry.get("owed_chars", ahead) / entry["budget"]))
+    _budget_debt(state, plan, point)
 
 
 def _expire(state, flight):
@@ -746,8 +760,8 @@ def _render(state, out, now, component, *, delivery_point=True, deferred=False):
         tail = "More routing owed."
         used = 0
         # A page narrower than this is noise; it scales down for a tiny cap.
-        floor = max(1, min(PAGE_FLOOR, cap // 5))
         page_limit = min(_capped(out["delivery_plan"]["page_limit"], cap), cap)
+        floor = max(1, min(PAGE_FLOOR, min(cap, page_limit) // 5))
         room_all = cap - _size(tail) - 2  # every body line plus its newline fits in this
         per_page = page_limit - _size(tail) - 2  # later prompts page at the page limit
 
@@ -809,7 +823,7 @@ def _render(state, out, now, component, *, delivery_point=True, deferred=False):
                 return None
             # The width follows this prompt's room; it is never frozen. It
             # only estimates the page count: later pages are cut afresh.
-            width = max(2, min(room, _top(e), per_page) - _size(prefix) - 24)
+            width = max(2, floor, available)
             e["width"] = width
             end = _cut(value, start, available)
             remaining = _pages_left(value, end, width)
@@ -900,6 +914,7 @@ def _render(state, out, now, component, *, delivery_point=True, deferred=False):
             item = dict(change=e["entity"] + "@" + e["revision"], entity=e["entity"], revision=e["revision"])
             if page:
                 item["page"] = page
+                _page_width(state, e["width"], floor)
             selected.append(item)
             progress[e["entity"]] = end
             if rendered is not None:
@@ -928,6 +943,7 @@ def _render(state, out, now, component, *, delivery_point=True, deferred=False):
                           "in_flight": len(selected), "acked_through": state.get("acked_through")}
     if selected:
         state["flight"]["out"] = copy.deepcopy(answer)
+    _budget_debt(state, out["delivery_plan"], state.get("delivery_points", 0))
     return answer
 
 def _queue_title_resolution(root):
@@ -1503,6 +1519,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
             if entry.get("width") and floor <= entry["width"] <= width:
                 width = entry["width"]  # a stored sliver, or one wider than a shrunk limit, is healed
             entry["width"] = width
+            _page_width(state, width, floor)
             end = _cut(value, start, width)
             if end == start:
                 break
@@ -1528,6 +1545,7 @@ def pull_offer(out, *, session, component="mcp", counting_component=None, now=No
                            "shown": {} if plan_data.get("gateway") else
                            _rendered_receipt(entries, progress, "\n".join(item["text"] for item in items)),
                            "plan": copy.deepcopy(plan_data)}
+        _budget_debt(state, plan_data, state.get("delivery_points", 0))
         return _projected_pages(changes), _delivery_summary(data, component, state, changes, now, counting_component)
 
 
@@ -1839,7 +1857,10 @@ def pull_acknowledge(session, batch, *, component="mcp", now=None):
                 shown = flight.get("shown")
                 # A present receipt is affirmative, including an empty one:
                 # an acknowledged entity absent from final output was not shown.
+                previous = entry.get("shown_offset") or 0
                 entry["shown_offset"] = shown.get(item["entity"], 0) if isinstance(shown, dict) else None
+                if entry["shown_offset"] is not None and entry["shown_offset"] > previous:
+                    entry["progress_point"] = state.get("delivery_points", 0)
                 entry["pages"] = item.get("page", {}).get("n", 0)
                 entry["restarted"] = False
             batches = state.setdefault("batches", {})
@@ -1895,7 +1916,10 @@ def _acknowledge(session, changes, *, reservation=None, now=None, take=False):
             shown = flight.get("shown")
             # A present receipt is affirmative, including an empty one:
             # an acknowledged entity absent from final output was not shown.
+            previous = e.get("shown_offset") or 0
             e["shown_offset"] = shown.get(item["entity"], 0) if isinstance(shown, dict) else None
+            if e["shown_offset"] is not None and e["shown_offset"] > previous:
+                e["progress_point"] = state.get("delivery_points", 0)
             e["pages"] = item.get("page", {}).get("n", 0)
             e["restarted"] = False
         batches = state.setdefault("batches", {})

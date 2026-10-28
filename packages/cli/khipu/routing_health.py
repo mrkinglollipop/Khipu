@@ -71,7 +71,7 @@ def _component_health(state, now, *, slack):
         if not all(isinstance(v, int) and v >= 0 for v in
                    (points, entry.get("owed_point"), entry.get("bound"))):
             missing.append("delivery point budget")
-        elif points - entry["owed_point"] >= entry["bound"] + slack:
+        elif points - max(entry["owed_point"], entry.get("progress_point", 0)) >= entry["bound"] + slack:
             reasons.append("budget-stall")
         expired = entry.get("expired", 0)
         if not isinstance(expired, int) or expired < 0:
