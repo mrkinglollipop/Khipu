@@ -409,7 +409,11 @@ def _step_result(result: Any) -> dict[str, Any]:
             "error": result.get("error") or result.get("reason"),
         }
         errors = result.get("errors")
-        if not out["error"] and isinstance(errors, list) and errors:
+        # A step that is ok with only transient deferrals (retried next run)
+        # has nothing failed to report.
+        only_deferred = out["ok"] and isinstance(errors, list) and all(
+            isinstance(e, dict) and e.get("transient") is True for e in errors)
+        if not out["error"] and isinstance(errors, list) and errors and not only_deferred:
             first = errors[0]
             detail = (first.get("error") or first.get("reason") or str(first)
                       if isinstance(first, dict) else str(first))

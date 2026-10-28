@@ -264,3 +264,94 @@ def test_killed_driver_keeps_unbuffered_progress(tmp_path, monkeypatch):
     assert "synthetic progress before kill" in output.read_text()
     assert "driver timed out after 2s" in error.read_text()
     assert os.environ["PYTHONUNBUFFERED"] == "0"
+
+
+def test_steady_archive_churn_cannot_starve_recovery(world, monkeypatch):
+    # Every lock-free build races one archive (a concurrent drain): the stale
+    # index is rebuilt once under the lock instead of retried without bound.
+    path, record = archive(0)
+    index = outbox._RecoveryIndex
+    builds = []
+
+    def build():
+        result = index()
+        builds.append(1)
+        if len(builds) > 4:
+            raise RuntimeError(f"still rebuilding after {len(builds)} builds")
+        if not getattr(build, "locked", False):
+            archive(len(builds))
+        return result
+
+    lock = outbox._locked_outbox
+
+    @contextmanager
+    def tracked_lock():
+        with lock() as directory:
+            build.locked = True
+            try:
+                yield directory
+            finally:
+                build.locked = False
+
+    monkeypatch.setattr(outbox, "_RECOVERY_INDEX", None)
+    monkeypatch.setattr(outbox, "_RecoveryIndex", build)
+    monkeypatch.setattr(outbox, "_locked_outbox", tracked_lock)
+    assert outbox.enqueue(record["queued_evidence"]["payload"], origin=None, recovery=True) == path
+    assert len(builds) == 2
+    builds.clear()
+    monkeypatch.setattr(outbox, "_RECOVERY_INDEX", None)
+    assert outbox.is_resolved_payload(record["queued_evidence"]["payload"])
+    assert len(builds) == 2
+
+
+def test_concurrent_archiver_does_not_starve_recovery_enqueue(world, monkeypatch):
+    import threading
+    import time
+
+    for n in range(300):
+        archive(1000 + n)
+    path, record = archive(0)
+    index = outbox._RecoveryIndex
+
+    def slow_build():
+        result = index()
+        time.sleep(0.3)  # stands in for a 12.7k-record scan
+        return result
+
+    monkeypatch.setattr(outbox, "_RECOVERY_INDEX", None)
+    monkeypatch.setattr(outbox, "_RecoveryIndex", slow_build)
+    stop = threading.Event()
+
+    def archiver():  # a drain archiving one resolution every 100 ms
+        n = 5000
+        while not stop.is_set():
+            with outbox._locked_outbox():
+                archive(n)
+            n += 1
+            time.sleep(0.1)
+
+    churn = threading.Thread(target=archiver, daemon=True)
+    churn.start()
+    done = threading.Event()
+    result = {}
+
+    def run():
+        result["path"] = outbox.enqueue(record["queued_evidence"]["payload"], origin=None, recovery=True)
+        done.set()
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    finished = done.wait(10)
+    stop.set()
+    churn.join()
+    worker.join(30)
+    assert finished, "recovery enqueue starved by a steady archiver"
+    assert result["path"] == path
+
+
+def test_step_result_ok_with_only_transient_deferrals_reports_no_failure():
+    deferred = [{"phase": "apply", "transient": True, "reason": "SerializationFailure: synthetic"}]
+    assert jobs._step_result({"ok": True, "errors": deferred})["error"] is None
+    mixed = deferred + [{"phase": "apply", "transient": False, "reason": "ValueError: synthetic"}]
+    assert jobs._step_result({"ok": False, "errors": mixed})["error"] == "2 failed: SerializationFailure: synthetic"
+    assert jobs._step_result({"ok": False, "errors": deferred})["error"] == "1 failed: SerializationFailure: synthetic"

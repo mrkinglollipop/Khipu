@@ -237,15 +237,16 @@ def _recovery_index() -> _RecoveryIndex:
 
 @contextmanager
 def _locked_recovery(recovery: bool):
-    # A concurrent archive/undo/forget invalidates the hints. Rebuild outside
-    # the lock, then check membership's version under the publication fence.
-    while True:
-        index = _recovery_index() if recovery else None
-        with _locked_outbox() as directory:
-            if index is not None and not index.current():
-                continue
-            yield directory, index
-            return
+    # A concurrent archive/undo/forget invalidates the hints. Build once
+    # outside the lock; if membership moved by the time the lock is held,
+    # rebuild once under it. Every membership writer takes this lock, so
+    # that index is current, and a steady writer cannot starve recovery.
+    global _RECOVERY_INDEX
+    index = _recovery_index() if recovery else None
+    with _locked_outbox() as directory:
+        if index is not None and not index.current():
+            index = _RECOVERY_INDEX = _RecoveryIndex()
+        yield directory, index
 
 
 def is_resolved_payload(payload: dict[str, Any]) -> bool:
