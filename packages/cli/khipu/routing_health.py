@@ -144,18 +144,17 @@ def prompt_health(now, warn_pct=1.0):
 
 
 def _ledger_quiet(data, path, now, live_after):
-    """Whether every timestamp a ledger holds is older than the live window.
+    """Whether a ledger's newest evidence is older than the live window.
 
-    A ledger with no readable timestamp falls back to its file's last write,
-    so a damaged but recently written ledger still reports its gaps."""
+    The file's last write always counts, so a recently written ledger whose
+    damage left only an old timestamp readable still reports its gaps."""
     stamps = [_time(state.get(key)) for state in data.values() if isinstance(state, dict)
-              for key in ("last_delivery_point", "at")]
+              for key in ("last_delivery_point", "touched", "at")]
     stamps = [stamp for stamp in stamps if stamp]
-    if not stamps:
-        try:
-            stamps = [datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)]
-        except (OSError, OverflowError, ValueError):
-            return False
+    try:
+        stamps.append(datetime.fromtimestamp(path.stat().st_mtime, timezone.utc))
+    except (OSError, OverflowError, ValueError):
+        return False
     return (now - max(stamps)).total_seconds() > live_after
 
 
