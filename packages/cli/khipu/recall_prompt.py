@@ -1214,7 +1214,7 @@ def _poll_once(routing, on_fold=None, on_probe=None, *, blocked_resets=None) -> 
 
     # Save the routing refold before any provider transport can stall it.
     out = routing.poll_refold(on_fold=on_fold)
-    deepseek = [a for a in usage.http_quota_accounts() if a.get("harness") == "deepseek"]
+    deepseek = [a for a in usage.all_accounts() if a.get("harness") == "deepseek"]
     if deepseek:
         if on_probe is not None:
             on_probe()
