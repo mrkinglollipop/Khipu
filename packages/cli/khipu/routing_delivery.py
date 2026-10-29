@@ -292,6 +292,26 @@ def _ledger_data(data):
     return data
 
 
+def _owe_receiptless(data):
+    """Owe once more each saved entry acknowledged before shown receipts.
+
+    Every acknowledgement since receipts exist writes ``shown_offset``, None
+    included, so a saved acknowledged entry without the key predates them and
+    nothing proves it was displayed. Only saved ledgers are migrated."""
+    for state in data.values():
+        entries = state.get("entries") if isinstance(state, dict) else None
+        if not isinstance(entries, dict):
+            continue
+        for entry in entries.values():
+            if entry.get("acked") and "shown_offset" not in entry:
+                for key in ("owed_point", "owed_chars", "budget", "bound", "progress_point", "expired", "pages"):
+                    entry.pop(key, None)
+                entry.update(offset=0, acked=False, restarted=False)
+                if not entry.get("whole"):
+                    # An agent pages an account or hold line only while child-owed.
+                    entry["child_owed"] = True
+
+
 @contextlib.contextmanager
 def _transaction(session):
     path = _path(session)
@@ -311,6 +331,7 @@ def _transaction(session):
         except (OSError, ValueError):
             data = {}
         data = _ledger_data(data)
+        _owe_receiptless(data)
         yield data
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=path.name, delete=False) as f:

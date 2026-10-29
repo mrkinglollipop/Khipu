@@ -143,6 +143,21 @@ def prompt_health(now, warn_pct=1.0):
                    warn_pct=warn_pct, longest_skip_run=longest)
 
 
+def _ledger_quiet(data, path, now, live_after):
+    """Whether a ledger's newest evidence is older than the live window.
+
+    The file's last write always counts, so a recently written ledger whose
+    damage left only an old timestamp readable still reports its gaps."""
+    stamps = [_time(state.get(key)) for state in data.values() if isinstance(state, dict)
+              for key in ("last_delivery_point", "touched", "at")]
+    stamps = [stamp for stamp in stamps if stamp]
+    try:
+        stamps.append(datetime.fromtimestamp(path.stat().st_mtime, timezone.utc))
+    except (OSError, OverflowError, ValueError):
+        return False
+    return (now - max(stamps)).total_seconds() > live_after
+
+
 def doctor_block(view, now, cfg):
     from khipu import recall_prompt, routing, routing_delivery, routing_replication
 
@@ -164,6 +179,10 @@ def doctor_block(view, now, cfg):
             missing.append("delivery ledger unreadable")
             continue
         attachment = data.get("attachment") or {}
+        if cfg["routing_delivery_live_after"] and _ledger_quiet(data, path, now, cfg["routing_delivery_live_after"]):
+            # Attachment and delivery-point evidence matters only for live
+            # work; a conversation that ended days ago has nothing in flight.
+            continue
         if not isinstance(attachment, dict):
             missing.append("current attachment capability")
             continue
@@ -242,7 +261,17 @@ def doctor_block(view, now, cfg):
                         for row in gateways]
         gateway_rows = [(epoch, revision, stamp) for epoch, revision, stamp in gateway_rows
                         if isinstance(epoch, str) and isinstance(revision, int) and stamp and stamp <= now]
-        if not gateway_rows or not isinstance(current_epoch, str) or not isinstance(current_revision, int) or current_at is None:
+        refreshed = _time(publication.get("health_refreshed_at"))
+        window = cfg["routing_cloud_copy_stale_after"] or cfg["routing_delivery_live_after"]
+        # A fresh hub client list with nobody in the live window proves a
+        # quiet gateway: no client holds a copy that could be behind.  The
+        # list must be no older than a copy may be before it counts as stale.
+        quiet = (not gateway_rows and not gateways and isinstance(publication.get("gateway_rows"), list)
+                 and refreshed is not None and refreshed <= now
+                 and (not window or (now - refreshed).total_seconds() <= window))
+        if quiet:
+            gateway = dict(status="green", quiet=True, copies=[], health_refreshed_at=publication["health_refreshed_at"])
+        elif not gateway_rows or not isinstance(current_epoch, str) or not isinstance(current_revision, int) or current_at is None:
             gateway = {"status": "unknown"}
             missing.append("gateway delivered copy revision")
         else:
