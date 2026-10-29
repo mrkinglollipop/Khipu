@@ -827,6 +827,11 @@ def text_fingerprint(role: str, text: str) -> str:
     return hashlib.sha1(f"{role}\n{text}".encode("utf-8")).hexdigest()[:16]
 
 
+def _db_step(d: dict) -> bool:
+    step = d.get("khipu_db_step")
+    return isinstance(step, int) and not isinstance(step, bool)
+
+
 def _message_identity(d: dict, role: str, fp: str) -> str | None:
     """An assistant message's API id with its text's fingerprint, kept in
     ``seen_text`` beside the fingerprints: a re-emitted copy carries the same
@@ -834,9 +839,8 @@ def _message_identity(d: dict, role: str, fp: str) -> str | None:
     (``khipu_db_step``, user or assistant) is identified the same way: a
     rewrite re-reads the stream from 0, and an untouched step keeps its index
     and text."""
-    step = d.get("khipu_db_step")
-    if role in ("user", "assistant") and isinstance(step, int) and not isinstance(step, bool):
-        return "id:" + hashlib.sha1(f"step:{step}\n{fp}".encode("utf-8")).hexdigest()[:16]
+    if role in ("user", "assistant") and _db_step(d):
+        return "id:" + hashlib.sha1(f"step:{d['khipu_db_step']}\n{fp}".encode("utf-8")).hexdigest()[:16]
     message = d.get("message") if isinstance(d.get("message"), dict) else {}
     mid = message.get("id")
     if role != "assistant" or not isinstance(mid, str) or not mid:
@@ -1016,8 +1020,10 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         streamed = isinstance(d.get("params"), dict)
         # ACP chunks are fragments of one message (" the", "\n"), never whole
         # messages, so they are not fingerprinted; nor are tool markers.
+        # A database step of any length is fingerprinted: its index proves a
+        # copy (``_message_identity``), so a short one is never guessed at.
         fp = (text_fingerprint(role, text) if known is not None and role != "tool" and not streamed
-              and len(text) >= FINGERPRINT_MIN_CHARS else None)
+              and (len(text) >= FINGERPRINT_MIN_CHARS or _db_step(d)) else None)
         entries.append((d, role, text, line_end, checkpoint, real, streamed, fp))
     # Text alone cannot tell a re-emitted copy from a person repeating
     # themselves (or an identical reply to it), so a seen message is dropped
@@ -1079,12 +1085,15 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
     printed = sorted(seen_flags)
     copied: set[int] = set(proven)
     for pos, i in enumerate(printed):
-        # Spread along a run of seen messages from each proven copy.
+        # Spread along a run of seen messages from each proven copy. A
+        # database step is a copy only by its own index (proven above): a
+        # new step repeating seen text is the person asking again.
         if i not in proven:
             continue
         for step in (-1, 1):
             p = pos + step
-            while 0 <= p < len(printed) and seen_flags[printed[p]] and printed[p] not in breaks:
+            while (0 <= p < len(printed) and seen_flags[printed[p]] and printed[p] not in breaks
+                   and not _db_step(entries[printed[p]][0])):
                 copied.add(printed[p])
                 p += step
     last_user_counted = False   # the open user block already holds a real turn
@@ -1186,7 +1195,33 @@ def _db_stream(path: Path) -> bytes | None:
     reader parses. Offsets index this stream, so every size, digest and
     unchanged-check on such a path reads it, never the file's own bytes (a WAL
     write leaves the database file's size and mtime as they were)."""
-    return antigravity_db.as_jsonl(path) if antigravity_db.is_db(path) else None
+    return _db_entry(path)[1] if antigravity_db.is_db(path) else None
+
+
+# Rebuilt streams by path, each with the file identity read before it was
+# built: one capture or sweep asks for the same stream many times.
+_DB_STREAMS: dict[str, tuple[list, bytes, str]] = {}
+_DB_STREAMS_MAX = 4
+
+
+def _db_entry(path: Path) -> tuple[list | None, bytes, str]:
+    """(file identity, stream, sha256 of the stream) of a ``.db``. The identity
+    is read before the stream, so a write landing mid-read leaves them unequal
+    and the next call rebuilds; None when the database is gone."""
+    try:
+        identity = antigravity_db.file_identity(path)
+    except OSError:
+        stream = antigravity_db.as_jsonl(path)
+        return None, stream, hashlib.sha256(stream).hexdigest()
+    key = str(path)
+    held = _DB_STREAMS.pop(key, None)
+    if held is None or held[0] != identity:
+        stream = antigravity_db.as_jsonl(path)
+        held = (identity, stream, hashlib.sha256(stream).hexdigest())
+    _DB_STREAMS[key] = held
+    while len(_DB_STREAMS) > _DB_STREAMS_MAX:
+        _DB_STREAMS.pop(next(iter(_DB_STREAMS)))
+    return held
 
 
 def _open_transcript(path: Path):
@@ -1198,26 +1233,54 @@ def _transcript_stat(path: Path) -> Any:
     """``path.stat()``, except a ``.db`` reports its stream's length as its
     size and the newer of its own and its WAL's mtime. Raises OSError."""
     info = path.stat()
-    stream = _db_stream(path)
-    if stream is None:
+    if not antigravity_db.is_db(path):
         return info
+    _, stream, digest = _db_entry(path)
     mtime_ns = info.st_mtime_ns
     try:
         mtime_ns = max(mtime_ns, Path(f"{path}-wal").stat().st_mtime_ns)
     except OSError:
         pass
     return types.SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_size=len(stream),
-                                 st_mtime_ns=mtime_ns, st_mtime=mtime_ns / 1e9,
-                                 digest=hashlib.sha256(stream).hexdigest())
+                                 st_mtime_ns=mtime_ns, st_mtime=mtime_ns / 1e9, digest=digest)
 
 
 def _stat_key(path: Path) -> list | None:
+    """A ``.db``'s key is its stream's length and its file identity, so a
+    later check compares the identity without rebuilding the stream."""
+    if antigravity_db.is_db(path):
+        try:
+            path.stat()
+        except OSError:
+            return None
+        identity, stream, _ = _db_entry(path)
+        return ["db", len(stream), *identity] if identity else None
     try:
         info = _transcript_stat(path)
     except OSError:
         return None
-    digest = getattr(info, "digest", None)
-    return [info.st_size, info.st_mtime_ns] + ([digest] if digest else [])
+    return [info.st_size, info.st_mtime_ns]
+
+
+def _stat_unchanged(stat: Any, path: Path) -> bool:
+    if isinstance(stat, list) and stat[:1] == ["db"]:
+        try:
+            return stat[2:] == antigravity_db.file_identity(path)
+        except OSError:
+            return False
+    return stat == _stat_key(path)
+
+
+def _db_read_to_end(st: dict, path: Path) -> bool:
+    """A ``.db`` captured to the end of its stream and untouched since the
+    anchor: decided from the file identity alone, without rebuilding."""
+    anchor = st.get("transcript_anchor")
+    if not (antigravity_db.is_db(path) and isinstance(anchor, dict)):
+        return False
+    stat, offset = anchor.get("stat"), int(st.get("offset", 0) or 0)
+    return (offset > 0 and anchor.get("offset") == offset and isinstance(stat, list)
+            and stat[:2] == ["db", offset] and stat[2:4] == st.get("transcript_identity")
+            and _stat_unchanged(stat, path))
 
 
 def _record_anchor(st: dict) -> None:
@@ -1258,7 +1321,7 @@ def _prefix_rewritten(st: dict, path: Path, offset: int) -> bool:
     anchor = st.get("transcript_anchor")
     if not (isinstance(anchor, dict) and anchor.get("offset") == offset and offset > 0):
         return False
-    if anchor.get("stat") and anchor["stat"] == _stat_key(path):
+    if anchor.get("stat") and _stat_unchanged(anchor["stat"], path):
         return False
     h = _prefix_hasher(path, offset)
     if h is None or h.hexdigest() != anchor.get("digest"):
@@ -3361,6 +3424,9 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                     skip("no_transcript")
                     continue
                 path = Path(st["transcript_path"])
+                if _db_read_to_end(st, path):
+                    skip("nothing_unread")
+                    continue
                 try:
                     info = _transcript_stat(path)
                 except FileNotFoundError:

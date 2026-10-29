@@ -260,3 +260,60 @@ def test_non_blob_and_oversized_payloads_are_rejected_before_any_allocation(tmp_
     big = user_payload("huge " + "h" * (adb.MAX_PAYLOAD + 10))
     path = make_db(db_path(tmp_path), [(0, 14, 50_000_000), (1, 14, big), (2, 14, user_payload("small one"))])
     assert adb.read_turns(path) == [(2, "user", "small one")]
+
+
+# ---- fix round 2 (Codex re-check 2026-10-29) ---------------------------------------
+
+def test_unchanged_sessions_are_not_reconstructed_by_later_sweeps(home, monkeypatch):
+    _capture_home(home, monkeypatch)
+    path = make_db(db_path(home), [(0, 14, user_payload("Question one " + "q" * 150)),
+                                   (1, 15, model_payload("Answer one " + "a" * 150))], wal=True)
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("INSERT INTO steps(idx, step_type, status, step_payload) VALUES (2,7,3,?)", (b"x",))
+    writer.commit()
+    assert _stop(path, 1)["due"] is True
+    calls = []
+    real = adb.as_jsonl
+    monkeypatch.setattr(adb, "as_jsonl", lambda p: calls.append(p) or real(p))
+    sc._DB_STREAMS.clear()          # a sweep is its own process: nothing cached in memory
+    for _ in range(2):
+        out = sc.sweep_idle()
+        assert out["skipped"].get("nothing_unread") == 1 and out["read"] == 0, out
+    assert calls == []
+    # A real change is still seen.
+    writer.execute("INSERT INTO steps(idx, step_type, status, step_payload) VALUES (3,14,3,?)",
+                   (user_payload("Question two " + "w" * 250),))
+    writer.commit()
+    sc._DB_STREAMS.clear()
+    assert sc.sweep_idle()["skipped"].get("nothing_unread") is None
+    writer.close()
+
+
+def test_short_retained_steps_are_not_replayed_after_a_rewrite_and_a_short_repeat_still_counts(home, monkeypatch):
+    _capture_home(home, monkeypatch)
+    path = make_db(db_path(home), [(0, 14, user_payload("Question one " + "q" * 150)),
+                                   (1, 15, model_payload("Answer one " + "a" * 150)),
+                                   (2, 14, user_payload("keep this short question")),
+                                   (3, 15, model_payload("short reply"))], wal=True)
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    assert _stop(path, 1)["due"] is True
+    writer.execute("UPDATE steps SET step_payload=? WHERE idx=1",
+                   (model_payload("Replaced answer " + "r" * 400),))
+    writer.execute("INSERT INTO steps(idx, step_type, status, step_payload) VALUES (4,14,3,?)",
+                   (user_payload("keep this short question"),))
+    writer.commit()
+    assert _stop(path, 2)["due"] is True
+    new = [t for t in _job_texts() if "Replaced answer" in t]
+    assert len(new) == 1
+    assert "Question one" not in new[0] and "short reply" not in new[0]
+    # Step 2 is a kept copy; step 4 is the person asking again.
+    assert new[0].count("keep this short question") == 1
+    writer.close()
+
+
+def test_a_request_naming_the_tag_round_trips_exactly():
+    typed = "Please explain the literal <user_request> tag and its </user_request> closer, please."
+    text = (HEADER + "<runtime_info>x</runtime_info>\n<user_request>\n" + typed + "\n</user_request>\n").encode()
+    assert adb.decode_step(adb.USER_STEP, _ld(19, _ld(2, text))) == typed

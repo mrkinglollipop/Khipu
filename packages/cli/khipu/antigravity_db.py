@@ -29,6 +29,7 @@ _MAX_DEPTH = 1  # the text sits at most one message down from the payload root
 # blob column, and a payload is copied before it is parsed.
 MAX_PAYLOAD = 8 << 20
 _OPEN, _CLOSE = "<user_request>", "</user_request>"
+_INSTRUCTIONS_END = "</t3_code_instructions>"
 
 
 def is_db(path) -> bool:
@@ -106,11 +107,13 @@ def _text(payload: bytes, *paths: tuple[int, ...]) -> str:
 def _typed_part(text: str) -> str:
     """What the person typed: T3 wraps it in its instruction block."""
     if text.lstrip().startswith("<t3_code_instructions>"):
-        # The last pair, matched from its closing tag back: the instructions
-        # before it may name the opening tag themselves.
+        # The wrapper's own pair: its opening tag is the first after the
+        # instruction block closes (the instructions may name the tag), its
+        # closing tag the last (the request itself may name either tag).
+        head = text.find(_INSTRUCTIONS_END)
+        start = text.find(_OPEN, head + len(_INSTRUCTIONS_END)) if head >= 0 else -1
         end = text.rfind(_CLOSE)
-        start = text.rfind(_OPEN, 0, end) if end >= 0 else -1
-        text = text[start + len(_OPEN):end].strip() if start >= 0 else ""
+        text = text[start + len(_OPEN):end].strip() if 0 <= start < end else ""
     from khipu.t3 import strip_handoff
     return strip_handoff(text).strip()
 
@@ -128,6 +131,20 @@ def decode_step(step_type: int, payload) -> str:
     except Exception:  # noqa: BLE001 - an unknown payload is skipped
         pass
     return ""
+
+
+def file_identity(path) -> list:
+    """Inode, size and mtime of the database and of its -wal ([] when absent):
+    every write lands in one of the two, so an equal identity means the
+    steps are as they were. Raises OSError when the database is gone."""
+    info = Path(path).stat()
+    out = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns]
+    try:
+        wal = Path(f"{path}-wal").stat()
+        out += [wal.st_ino, wal.st_size, wal.st_mtime_ns]
+    except OSError:
+        pass
+    return out
 
 
 def _wal_mode(path: Path) -> bool:
