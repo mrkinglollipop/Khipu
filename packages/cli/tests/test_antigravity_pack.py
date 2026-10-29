@@ -398,6 +398,43 @@ def test_the_real_shim_injects_and_records_once_per_user_turn(home, tmp_path):
     assert len(owner_turns.session_file("ag-1").read_text().splitlines()) == 2
 
 
+def _stop_hook(payload: dict, event: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "KHIPU_PYTHON": sys.executable, "KHIPU_ROOT": str(Path(__file__).resolve().parents[3]),
+           "KHIPU_CAPTURE_QUEUE_ONLY": "1"}                                        # no drain in a test
+    return subprocess.run(["/bin/sh", str(SHIM.parent / "khipu-stop-hook"), "--event", event],
+                          input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=60)
+
+
+def test_a_jsonl_turn_unflushed_at_pre_invocation_is_recorded_once_by_the_real_stop_hook(home, tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_AG_FLUSH_WAIT_S", "0")
+    tp = _transcript(tmp_path)
+    payload = _pre(tp)
+    assert _shim(payload).returncode == 0                                              # nothing readable yet
+    assert not owner_turns.session_file("ag-1").exists()
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>ship the late turn</USER_REQUEST>")
+    _step(tp, "PLANNER_RESPONSE", 2, "on it")
+    assert _stop_hook(payload, "PostInvocation").returncode == 0
+    assert len(owner_turns.session_file("ag-1").read_text().splitlines()) == 1          # PostInvocation recorded it
+    assert _stop_hook(payload, "Stop").returncode == 0
+    assert json.loads(_shim({**payload, "invocationNum": 2}).stdout) == {}
+    rows = [json.loads(x) for x in owner_turns.session_file("ag-1").read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["harness"] == "antigravity" and rows[0]["typed"] is True
+    assert "ship the late turn" not in owner_turns.session_file("ag-1").read_text()
+
+
+def test_a_jsonl_turn_recorded_by_stop_alone_and_left_alone_when_already_recorded(home, tmp_path):
+    tp = _transcript(tmp_path)
+    _step(tp, "USER_INPUT", 1, "first turn")
+    issuer = {"refused": "test"}
+    assert owner_turns.antigravity_late_turn(_pre(tp), "Stop", now=50.0, issuer=issuer)
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=51.0, issuer=issuer) is None
+    _step(tp, "USER_INPUT", 2, "second turn")
+    assert owner_turns.antigravity_prompt(_pre(tp), now=60.0, wait=0, issuer=issuer)["prompt"] == "second turn"
+    assert owner_turns.antigravity_late_turn(_pre(tp), "Stop", now=61.0, issuer=issuer) is None
+    rows = [json.loads(x) for x in owner_turns.session_file("ag-1").read_text().splitlines()]
+    assert [r["ts"] for r in rows] == [50.0, 60.0]
+
+
 # ---- verify -----------------------------------------------------------------------------
 
 def test_prompt_probe_proves_one_injection_per_turn(home):

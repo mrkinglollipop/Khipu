@@ -454,17 +454,27 @@ def _proc_args(pid: int) -> list[str] | None:
 
 
 PROMPT_SHIM = "khipu-prompt-recall"
+# Antigravity's PostInvocation and Stop hooks (``khipu-stop-hook --event X``)
+# record a turn no PreInvocation could read (``antigravity_late_turn``).
+STOP_SHIM = "khipu-stop-hook"
 
 
-def _runs_the_shim(args: list[str] | None) -> bool:
-    """A shell running the prompt shim as a script: ``sh <path>/khipu-prompt-recall``."""
-    return bool(args) and len(args) >= 2 and os.path.basename(args[1]) == PROMPT_SHIM
+def _runs_the_shim(args: list[str] | None, shim: str = PROMPT_SHIM) -> bool:
+    """A shell running the shim as a script: ``sh <path>/khipu-prompt-recall``."""
+    return bool(args) and len(args) >= 2 and os.path.basename(args[1]) == shim
 
 
-def _only_the_shim(args: list[str] | None) -> bool:
+def _shim_flags(words: list[str], shim: str) -> bool:
+    if shim == STOP_SHIM:
+        return len(words) == 2 and words[0] == "--event" and words[1].isalpha()
+    return all(w.startswith("--") for w in words)
+
+
+def _only_the_shim(args: list[str] | None, shim: str = PROMPT_SHIM) -> bool:
     """A harness's hook shell, ``sh -c '<path>/khipu-prompt-recall [--flag]'``
-    and nothing else. An agent's Bash tool shell runs its own command line,
-    so it never reads as this."""
+    (``<path>/khipu-stop-hook --event <Name>`` for the stop shim) and nothing
+    else. An agent's Bash tool shell runs its own command line, so it never
+    reads as this."""
     import shlex
 
     if not args or len(args) != 3 or args[1] != "-c":
@@ -473,7 +483,7 @@ def _only_the_shim(args: list[str] | None) -> bool:
         words = shlex.split(args[2])
     except ValueError:
         return False
-    return bool(words) and os.path.basename(words[0]) == PROMPT_SHIM and all(w.startswith("--") for w in words[1:])
+    return bool(words) and os.path.basename(words[0]) == shim and _shim_flags(words[1:], shim)
 
 
 def _print_mode(args: list[str] | None) -> bool:
@@ -488,9 +498,10 @@ def _print_mode(args: list[str] | None) -> bool:
     return False
 
 
-def hook_issuer() -> dict | None:
+def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
     """The process that ran this hook. The recorder's parent must be the
-    prompt shim (a shell running ``khipu-prompt-recall``); above it, only a
+    prompt shim (a shell running ``khipu-prompt-recall``; ``shim`` names
+    ``khipu-stop-hook`` for Antigravity's late record); above it, only a
     harness's own hook shell (``sh -c`` with the shim as its whole command)
     is passed over, and the first process after that is the issuer.
     ``{"pid", "start", "exe"}`` for a harness; ``{"refused": why}`` when the
@@ -513,11 +524,11 @@ def hook_issuer() -> dict | None:
         born = started
         name = os.path.basename(os.path.realpath(exe))
         if step == 0:
-            if name not in HOOK_SHELLS or not _runs_the_shim(_proc_args(pid)):
+            if name not in HOOK_SHELLS or not _runs_the_shim(_proc_args(pid), shim):
                 return {"refused": f"{name} (not the prompt hook)"}
             pid = parent
             continue
-        if (name in HOOK_SHELLS or name in REFUSED_ISSUERS) and _only_the_shim(_proc_args(pid)):
+        if (name in HOOK_SHELLS or name in REFUSED_ISSUERS) and _only_the_shim(_proc_args(pid), shim):
             pid = parent
             continue
         if _refused_issuer(name):
@@ -967,6 +978,173 @@ def _ag_flush_wait() -> float:
         return _AG_FLUSH_WAIT_S
 
 
+# A PreInvocation that cannot record leaves a stamp (its time, and the newest
+# turn it could see), so a turn recorded later by PostInvocation or Stop keeps
+# the time the owner sent it. Stop clears it: a stamp left by a model call
+# inside a turn must not date the next one.
+_AG_PENDING_KEEP_S = 3600
+
+
+def _ag_dir() -> Path:
+    directory = folder() / "antigravity"
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def _ag_pending(directory: Path, session: str) -> Path:
+    return directory / ("pending-" + hashlib.sha256(session.encode("utf-8", "replace")).hexdigest()[:40])
+
+
+def _ag_note_unseen(session: str, key: str | None, now: float) -> None:
+    """Keep the first unrecorded PreInvocation's time (never overwritten)."""
+    try:
+        fd = os.open(_ag_pending(_ag_dir(), session), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError:
+        return
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": now, "after": key}))
+
+
+def _ag_clear_unseen(session: str) -> None:
+    try:
+        _ag_pending(_ag_dir(), session).unlink()
+    except OSError:
+        pass
+
+
+def _ag_claim(session: str, key: str, now: float) -> float | None:
+    """Create the turn's once-per-turn marker. The turn's time when this call
+    created it (the pending stamp's when one was left before the turn could be
+    read), None when the turn was already handled."""
+    directory = _ag_dir()
+    marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
+    try:
+        os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except FileExistsError:
+        return None
+    for old in directory.iterdir():
+        try:
+            if now - old.stat().st_mtime > _AG_MARKER_KEEP_S:
+                old.unlink()
+        except OSError:
+            continue
+    at = now
+    pending = _ag_pending(directory, session)
+    try:
+        note = json.loads(pending.read_text(encoding="utf-8"))
+        ts = note.get("ts")
+        if note.get("after") != key and isinstance(ts, (int, float)) and now - _AG_PENDING_KEEP_S <= ts <= now:
+            at = float(ts)
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        pending.unlink()
+    except OSError:
+        pass
+    return at
+
+
+def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] | None:
+    """(session, newest user turn or None) for an Antigravity payload with no
+    prompt of its own; None for any other payload."""
+    if not isinstance(payload, dict) or hook_shape.detect(payload, os.environ)[0] != "antigravity":
+        return None
+    if isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
+        return None
+    session = hook_shape.session_id(payload).strip()
+    if not session:
+        return None
+    found = None
+    tp = hook_shape.transcript_path(payload)
+    last = payload.get("lastUserInput") or payload.get("last_user_input")
+    has_last = isinstance(last, str) and bool(last.strip())
+    if tp:
+        found = _ag_last_user_input(tp)
+        if found is None and not has_last and wait:
+            give_up = time.monotonic() + wait
+            while found is None and time.monotonic() < give_up:
+                time.sleep(_AG_FLUSH_POLL_S)
+                found = _ag_last_user_input(tp)
+    if found is None and has_last:
+        found = ("h-" + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], last.strip())
+    return session, found
+
+
+def _ag_filled(payload: dict, text: str) -> dict:
+    out = dict(payload)
+    out["prompt"] = text
+    if not isinstance(out.get("cwd"), str) or not out["cwd"]:
+        workspace = hook_shape.workspace(payload)
+        if workspace:
+            out["cwd"] = workspace
+    return out
+
+
+def _antigravity_turn(payload, now: float | None, wait: float | None):
+    """(gate answer, the new turn's time, (session, newest key) when this call
+    recorded nothing and its own turn may not be written yet)."""
+    read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait))
+    if read is None:
+        return None, None, None
+    session, found = read
+    if found is None:
+        return None, None, (session, None)
+    key, text = found
+    at = _ag_claim(session, key, time.time() if now is None else now)
+    if at is None:
+        # Already handled, or the newest step is the last turn's and this
+        # call's own turn is not written yet.
+        return {}, None, (session, key)
+    return _ag_filled(payload, text), at, None
+
+
+def antigravity_prompt(payload: dict, now: float | None = None, wait: float | None = None,
+                       issuer: dict | None = None) -> dict | None:
+    """The PreInvocation gate (``antigravity_turn``) with the new turn recorded
+    in the same process that claimed it, so no exit between the claim and the
+    record can lose the turn. A call that records nothing leaves the pending
+    stamp, so the turn's PostInvocation or Stop records it with this time.
+    Never raises."""
+    try:
+        stamp = time.time() if now is None else now
+        out, at, unseen = _antigravity_turn(payload, stamp, wait)
+        if unseen is not None:
+            _ag_note_unseen(unseen[0], unseen[1], stamp)
+        if out:
+            record(out, now=at, issuer=issuer)
+        return out
+    except Exception:  # noqa: BLE001 - the gate must never fail a prompt
+        return None
+
+
+def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
+                          issuer: dict | None = None) -> str | None:
+    """Record at PostInvocation or Stop an Antigravity turn no PreInvocation
+    could read (a one-call turn has no later PreInvocation), under the same
+    once-per-turn marker, with the time of its first unrecorded PreInvocation.
+    Returns the recorded turn's id, None when nothing was recorded. Prints
+    nothing; never raises."""
+    try:
+        read = _ag_read(payload, 0)
+        if read is None:
+            return None
+        session, found = read
+        stamp = time.time() if now is None else now
+        recorded = None
+        if found is not None:
+            at = _ag_claim(session, found[0], stamp)
+            if at is not None:
+                if issuer is None:
+                    issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}
+                recorded = record(_ag_filled(payload, found[1]), now=at, issuer=issuer)
+        if str(event).lower() == "stop":
+            _ag_clear_unseen(session)
+        return recorded
+    except Exception:  # noqa: BLE001 - a turn's end is never failed by the recorder
+        return None
+
+
 def antigravity_turn(payload: dict, now: float | None = None, wait: float | None = None) -> dict | None:
     """What the prompt hook does with one Antigravity PreInvocation payload.
 
@@ -979,53 +1157,10 @@ def antigravity_turn(payload: dict, now: float | None = None, wait: float | None
     ``{}``. Otherwise the payload with ``prompt`` (and ``cwd``) filled in
     from the transcript, for the first model call of a new turn. Before
     giving up on an unflushed transcript it re-reads for up to ``wait``
-    seconds (``KHIPU_AG_FLUSH_WAIT_S``, default 0.4). Never raises."""
+    seconds (``KHIPU_AG_FLUSH_WAIT_S``, default 0.4). It records nothing
+    (``antigravity_prompt`` does). Never raises."""
     try:
-        if not isinstance(payload, dict) or hook_shape.detect(payload, os.environ)[0] != "antigravity":
-            return None
-        if isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
-            return None
-        session = hook_shape.session_id(payload).strip()
-        if not session:
-            return None
-        found = None
-        tp = hook_shape.transcript_path(payload)
-        last = payload.get("lastUserInput") or payload.get("last_user_input")
-        has_last = isinstance(last, str) and bool(last.strip())
-        if tp:
-            found = _ag_last_user_input(tp)
-            if found is None and not has_last:
-                give_up = time.monotonic() + (_ag_flush_wait() if wait is None else max(0.0, wait))
-                while found is None and time.monotonic() < give_up:
-                    time.sleep(_AG_FLUSH_POLL_S)
-                    found = _ag_last_user_input(tp)
-        if found is None and has_last:
-            found = ("h-" + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], last.strip())
-        if found is None:
-            return None
-        key, text = found
-        directory = folder() / "antigravity"
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, 0o700)
-        marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
-        try:
-            os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
-        except FileExistsError:
-            return {}
-        stamp = time.time() if now is None else now
-        for old in directory.iterdir():
-            try:
-                if stamp - old.stat().st_mtime > _AG_MARKER_KEEP_S:
-                    old.unlink()
-            except OSError:
-                continue
-        out = dict(payload)
-        out["prompt"] = text
-        if not isinstance(out.get("cwd"), str) or not out["cwd"]:
-            workspace = hook_shape.workspace(payload)
-            if workspace:
-                out["cwd"] = workspace
-        return out
+        return _antigravity_turn(payload, now, wait)[0]
     except Exception:  # noqa: BLE001 - the gate must never fail a prompt
         return None
 
@@ -1034,10 +1169,11 @@ def main(argv: list[str]) -> int:
     """The prompt hook's recorder: the payload on stdin, prints nothing.
     Always exits 0.
 
-    ``--antigravity-turn`` is the gate in front of it (see ``antigravity_turn``):
-    it prints nothing for a payload to pass on as it is (no turn readable yet
-    included), ``{}`` only for a turn already handled, and the payload with
-    its prompt filled in for a new one."""
+    ``--antigravity-turn`` is the gate in front of it (see ``antigravity_turn``),
+    and records a new turn itself (``antigravity_prompt``): it prints nothing
+    for a payload to pass on as it is (no turn readable yet included), ``{}``
+    only for a turn already handled, and the payload with its prompt filled
+    in for a new one, already recorded."""
     import sys
 
     try:
@@ -1045,7 +1181,7 @@ def main(argv: list[str]) -> int:
     except ValueError:
         return 0
     if "--antigravity-turn" in argv:
-        turn = antigravity_turn(payload)
+        turn = antigravity_prompt(payload)
         if turn is not None:
             sys.stdout.write(json.dumps(turn, ensure_ascii=True))
         return 0
