@@ -17,7 +17,6 @@ Nothing is ever written beside the database: a WAL-mode file (or one with a
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import sqlite3
 import tempfile
@@ -26,7 +25,10 @@ from pathlib import Path
 USER_STEP = 14
 MODEL_STEP = 15
 _MAX_DEPTH = 1  # the text sits at most one message down from the payload root
-_USER_REQUEST = re.compile(r"<user_request>\n?(.*)</user_request>", re.S)
+# A step bigger than this is skipped unread: SQLite lets any value sit in the
+# blob column, and a payload is copied before it is parsed.
+MAX_PAYLOAD = 8 << 20
+_OPEN, _CLOSE = "<user_request>", "</user_request>"
 
 
 def is_db(path) -> bool:
@@ -104,16 +106,21 @@ def _text(payload: bytes, *paths: tuple[int, ...]) -> str:
 def _typed_part(text: str) -> str:
     """What the person typed: T3 wraps it in its instruction block."""
     if text.lstrip().startswith("<t3_code_instructions>"):
-        found = _USER_REQUEST.findall(text)
-        text = found[-1].strip() if found else ""
+        # The last pair, matched from its closing tag back: the instructions
+        # before it may name the opening tag themselves.
+        end = text.rfind(_CLOSE)
+        start = text.rfind(_OPEN, 0, end) if end >= 0 else -1
+        text = text[start + len(_OPEN):end].strip() if start >= 0 else ""
     from khipu.t3 import strip_handoff
     return strip_handoff(text).strip()
 
 
 def decode_step(step_type: int, payload) -> str:
     """The text of one step ('' when it carries none or cannot be decoded)."""
+    if not isinstance(payload, (bytes, bytearray, memoryview)) or len(payload) > MAX_PAYLOAD:
+        return ""
     try:
-        data = bytes(payload or b"")
+        data = bytes(payload)
         if step_type == USER_STEP:
             return _typed_part(_text(data, (19, 2), (19, 3, 1)))
         if step_type == MODEL_STEP:
@@ -136,8 +143,9 @@ def _query(uri: str) -> list[tuple]:
     conn = sqlite3.connect(uri, uri=True, timeout=0.25)
     try:
         return conn.execute(
-            "SELECT idx, step_type, step_payload FROM steps "
-            "WHERE step_type IN (?, ?) ORDER BY idx", (USER_STEP, MODEL_STEP)).fetchall()
+            "SELECT idx, step_type, step_payload FROM steps WHERE step_type IN (?, ?) "
+            "AND typeof(step_payload) = 'blob' AND length(step_payload) <= ? ORDER BY idx",
+            (USER_STEP, MODEL_STEP, MAX_PAYLOAD)).fetchall()
     finally:
         conn.close()
 
@@ -188,10 +196,12 @@ def last_user_input(path) -> tuple[str, str] | None:
 
 def as_jsonl(path) -> bytes:
     """The turns as the Antigravity JSONL lines the capture reader already
-    parses, so offsets and de-duplication work unchanged. Steps are append-only,
-    so the byte offset into this stream is stable between runs."""
+    parses, so offsets and de-duplication work unchanged. ``khipu_db_step``
+    marks a line as a database step: its index identifies the turn when a
+    rewritten row sends capture back to the stream's start."""
     lines = []
     for idx, role, text in read_turns(path):
         lines.append(json.dumps({"type": "USER_INPUT" if role == "user" else "PLANNER_RESPONSE",
-                                 "step_index": idx, "content": text}, ensure_ascii=False))
+                                 "step_index": idx, "khipu_db_step": idx, "content": text},
+                                ensure_ascii=False))
     return ("\n".join(lines) + "\n").encode("utf-8") if lines else b""

@@ -168,3 +168,95 @@ def test_status_reports_mcp_and_rule_unsupported_for_the_proven_runtime(home):
     found = ag.functions_for("inst", home)
     assert found["functions"]["mcp"] == "unsupported" and found["functions"]["capture"] == "installed"
     assert found["proof"] == {"mcp": "real-run 2026-10-29", "rule": "real-run 2026-10-29"}
+
+
+# ---- fix round 1 (Codex review 2026-10-29) -----------------------------------------
+
+AG_CONV = "ag-conv"
+
+
+def _capture_home(home, monkeypatch):
+    monkeypatch.setattr("khipu.identity.resolve_repo_root", lambda cwd: {
+        "repo_root": "/repo", "project": "acme/project", "is_worktree": False})
+
+
+def _stop(path: Path, n: int) -> dict:
+    import json
+    raw = json.dumps({"conversationId": AG_CONV, "workspacePaths": ["/work/khipu"], "transcriptPath": str(path),
+                      "executionNum": n, "terminationReason": "session_end"})
+    return sc.hook_main(raw, None, "Stop")
+
+
+def _job_texts() -> list[str]:
+    import json
+    return [json.dumps(json.loads(p.read_text(encoding="utf-8"))) for p in sc.queued_jobs()]
+
+
+def test_a_wal_rewrite_of_captured_rows_resets_capture_without_replaying_kept_turns(home, monkeypatch):
+    _capture_home(home, monkeypatch)
+    path = make_db(db_path(home), [(0, 14, user_payload("Question one " + "q" * 150)),
+                                   (1, 15, model_payload("Answer one " + "a" * 150))], wal=True)
+    writer = sqlite3.connect(path)          # stays open: every change below sits in the WAL
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    assert _stop(path, 1)["due"] is True
+    db_stat = path.stat()
+    writer.execute("UPDATE steps SET step_payload=? WHERE idx=1",
+                   (model_payload("Replaced answer " + "r" * 400),))
+    writer.commit()
+    assert (path.stat().st_size, path.stat().st_mtime_ns) == (db_stat.st_size, db_stat.st_mtime_ns)
+    out = _stop(path, 2)
+    texts = _job_texts()
+    assert out["due"] is True and len(texts) == 2, out
+    new = [t for t in texts if "Replaced answer" in t]
+    assert new and "r" * 400 in new[0]
+    assert "Question one" not in new[0]
+    # The stream shrinks (the reply is gone) and a new question follows.
+    writer.execute("DELETE FROM steps WHERE idx=1")
+    writer.execute("INSERT INTO steps(idx, step_type, status, step_payload) VALUES (2,14,3,?)",
+                   (user_payload("Question two " + "w" * 250),))
+    writer.commit()
+    assert _stop(path, 3)["due"] is True
+    texts = _job_texts()
+    assert len(texts) == 3
+    latest = [t for t in texts if "Question two" in t]
+    assert latest and "Question one" not in latest[0]
+    writer.close()
+
+
+def test_first_capture_starts_from_the_reconstructed_stream_not_the_file_size(home, monkeypatch):
+    _capture_home(home, monkeypatch)
+    path = make_db(db_path(home), [(0, 14, user_payload("Question one " + "q" * 100)),
+                                   (1, 15, model_payload("Answer one " + "a" * 1500)),
+                                   (2, 7, os.urandom(60_000))])
+    stream = len(adb.as_jsonl(path))
+    physical = path.stat().st_size
+    assert physical > 3 * stream
+    # Old start = physical - tail = stream // 2, inside the reply; the whole
+    # stream fits in the tail, so the first capture must start at 0.
+    monkeypatch.setattr(sc, "FIRST_SIGHT_TAIL", physical - stream // 2)
+    assert _stop(path, 1)["due"] is True
+    texts = _job_texts()
+    assert len(texts) == 1 and "Question one" in texts[0] and "a" * 1500 in texts[0]
+
+
+def test_only_the_last_user_request_is_taken_and_instructions_naming_the_tag_do_not_leak():
+    header = ("<t3_code_instructions>\nUse <user_request> tags. PRIVATE RULES never to be captured\n"
+              "</t3_code_instructions>\n")
+    text = (header + "<user_request>\nthe real question\n</user_request>\nTRAILING RULES\n").encode()
+    payload = _ld(19, _ld(2, text))
+    assert adb.decode_step(adb.USER_STEP, payload) == "the real question"
+
+
+def test_non_blob_and_oversized_payloads_are_rejected_before_any_allocation(tmp_path):
+    import tracemalloc
+    tracemalloc.start()
+    try:
+        assert adb.decode_step(adb.USER_STEP, 50_000_000) == ""
+        assert adb.decode_step(adb.USER_STEP, "text, not a blob") == ""
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 1_000_000
+    big = user_payload("huge " + "h" * (adb.MAX_PAYLOAD + 10))
+    path = make_db(db_path(tmp_path), [(0, 14, 50_000_000), (1, 14, big), (2, 14, user_payload("small one"))])
+    assert adb.read_turns(path) == [(2, "user", "small one")]

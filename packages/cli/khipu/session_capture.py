@@ -58,6 +58,7 @@ import base64
 import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import math
 import os
@@ -67,6 +68,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import urllib.parse
 import uuid
 from contextlib import contextmanager
@@ -751,7 +753,7 @@ def land_transcript_images(
     if not embed_media_enabled("conversation_memory"):
         return stats
     try:
-        size = path.stat().st_size
+        size = _transcript_stat(path).st_size
     except OSError as e:
         _log(f"land-images: cannot stat {path}: {e}")
         return stats
@@ -760,7 +762,7 @@ def land_transcript_images(
     if start >= end:
         return stats
     try:
-        with path.open("rb") as f:
+        with _open_transcript(path) as f:
             f.seek(start)
             data = f.read(end - start)
     except OSError as e:
@@ -828,7 +830,13 @@ def text_fingerprint(role: str, text: str) -> str:
 def _message_identity(d: dict, role: str, fp: str) -> str | None:
     """An assistant message's API id with its text's fingerprint, kept in
     ``seen_text`` beside the fingerprints: a re-emitted copy carries the same
-    id and text, a new reply a new id."""
+    id and text, a new reply a new id. A step of T3's Antigravity database
+    (``khipu_db_step``, user or assistant) is identified the same way: a
+    rewrite re-reads the stream from 0, and an untouched step keeps its index
+    and text."""
+    step = d.get("khipu_db_step")
+    if role in ("user", "assistant") and isinstance(step, int) and not isinstance(step, bool):
+        return "id:" + hashlib.sha1(f"step:{step}\n{fp}".encode("utf-8")).hexdigest()[:16]
     message = d.get("message") if isinstance(d.get("message"), dict) else {}
     mid = message.get("id")
     if role != "assistant" or not isinstance(mid, str) or not mid:
@@ -881,13 +889,9 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         size = path.stat().st_size
     except OSError:
         return msgs, offset, 0
-    if antigravity_db.is_db(path):
-        # T3's Antigravity trajectory is SQLite: read its turns as the JSONL
-        # stream below parses, so offsets (steps are append-only) work as-is.
-        stream = antigravity_db.as_jsonl(path)
+    stream = _db_stream(path)
+    if stream is not None:
         size = len(stream)
-    else:
-        stream = None
     if offset > size:  # file truncated / rotated: start over
         offset = 0
     if stream is not None:
@@ -1141,7 +1145,7 @@ def _prefix_tail_digest(path: Path, offset: int, n: int = 4096) -> str | None:
     if offset <= 0:
         return None
     try:
-        with path.open("rb") as f:
+        with _open_transcript(path) as f:
             head_n = min(n, offset)
             head = f.read(head_n)
             if offset > n:
@@ -1164,7 +1168,7 @@ def _prefix_hasher(path: Path, offset: int, hasher: Any = None, start: int = 0) 
     h = hasher if hasher is not None else hashlib.sha256()
     left = int(offset) - int(start)
     try:
-        with path.open("rb") as f:
+        with _open_transcript(path) as f:
             f.seek(int(start))
             while left > 0:
                 chunk = f.read(min(_ANCHOR_CHUNK, left))
@@ -1177,12 +1181,43 @@ def _prefix_hasher(path: Path, offset: int, hasher: Any = None, start: int = 0) 
     return h
 
 
-def _stat_key(path: Path) -> list[int] | None:
+def _db_stream(path: Path) -> bytes | None:
+    """T3's Antigravity trajectory is SQLite: its turns as the JSONL stream the
+    reader parses. Offsets index this stream, so every size, digest and
+    unchanged-check on such a path reads it, never the file's own bytes (a WAL
+    write leaves the database file's size and mtime as they were)."""
+    return antigravity_db.as_jsonl(path) if antigravity_db.is_db(path) else None
+
+
+def _open_transcript(path: Path):
+    stream = _db_stream(path)
+    return io.BytesIO(stream) if stream is not None else path.open("rb")
+
+
+def _transcript_stat(path: Path) -> Any:
+    """``path.stat()``, except a ``.db`` reports its stream's length as its
+    size and the newer of its own and its WAL's mtime. Raises OSError."""
+    info = path.stat()
+    stream = _db_stream(path)
+    if stream is None:
+        return info
+    mtime_ns = info.st_mtime_ns
     try:
-        info = path.stat()
+        mtime_ns = max(mtime_ns, Path(f"{path}-wal").stat().st_mtime_ns)
+    except OSError:
+        pass
+    return types.SimpleNamespace(st_dev=info.st_dev, st_ino=info.st_ino, st_size=len(stream),
+                                 st_mtime_ns=mtime_ns, st_mtime=mtime_ns / 1e9,
+                                 digest=hashlib.sha256(stream).hexdigest())
+
+
+def _stat_key(path: Path) -> list | None:
+    try:
+        info = _transcript_stat(path)
     except OSError:
         return None
-    return [info.st_size, info.st_mtime_ns]
+    digest = getattr(info, "digest", None)
+    return [info.st_size, info.st_mtime_ns] + ([digest] if digest else [])
 
 
 def _record_anchor(st: dict) -> None:
@@ -1238,7 +1273,7 @@ def _reset_transcript_offset(st: dict, path: Path) -> None:
     and to the content it held when the offset was saved: a rewrite in place
     keeps the path, the inode and possibly the size, so the bytes before the
     offset are checked too (``transcript_anchor``)."""
-    info = path.stat()
+    info = _transcript_stat(path)
     identity = [info.st_dev, info.st_ino]
     offset = int(st.get("offset", 0))
     rewritten = offset <= info.st_size and _prefix_rewritten(st, path, offset)
@@ -3130,7 +3165,7 @@ def hook_main(raw: str, harness: str | None = None, event: str | None = None) ->
                 # A transcript that is already large (an in-flight session at install
                 # time) is joined near its end: the job carries a bounded tail anyway.
                 try:
-                    start = max(0, path.stat().st_size - FIRST_SIGHT_TAIL)
+                    start = max(0, _transcript_stat(path).st_size - FIRST_SIGHT_TAIL)
                 except OSError:
                     start = 0
                 save_state(harness, track_sid, {"offset": start, "last_ts": 0.0,
@@ -3327,7 +3362,7 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                     continue
                 path = Path(st["transcript_path"])
                 try:
-                    info = path.stat()
+                    info = _transcript_stat(path)
                 except FileNotFoundError:
                     skip("missing_transcript")
                     continue
@@ -3382,7 +3417,7 @@ def sweep_idle(*, now: float | None = None, limit: int = SWEEP_LIMIT,
                         carried = [tuple(m) for m in st.get("carry") or []]
                         msgs = _redact_messages(carried + msgs, harness, sid)
                         chars = len(render(msgs, max_chars=10**9))
-                        latest = path.stat()
+                        latest = _transcript_stat(path)
                         if (latest.st_mtime_ns, latest.st_size) != (info.st_mtime_ns, info.st_size) \
                                 or load_state(harness, track_sid) != snapshot_state:
                             skip("changed")
