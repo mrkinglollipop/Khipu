@@ -24,15 +24,16 @@ def _result(reasons, missing, **fields):
                 reasons=list(dict.fromkeys(reasons)), missing=list(dict.fromkeys(missing)), **fields)
 
 
-def component_health(state, now, *, slack=2):
-    """Malformed evidence is unknown, never a healthy empty component."""
+def component_health(state, now, *, slack=2, child=False):
+    """Malformed evidence is unknown, never a healthy empty component.
+    ``child``: an agent component, owed only what its pages will carry."""
     try:
-        return _component_health(state, now, slack=slack)
+        return _component_health(state, now, slack=slack, child=child)
     except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
         return _result([], ["delivery ledger malformed"])
 
 
-def _component_health(state, now, *, slack):
+def _component_health(state, now, *, slack, child=False):
     """A revision's age and retries come only from its own component."""
     if not isinstance(state, dict) or not isinstance(state.get("entries"), dict):
         return _result([], ["delivery ledger"])
@@ -68,6 +69,8 @@ def _component_health(state, now, *, slack):
                 reasons.append("ack-unshown")
         if entry.get("acked"):
             continue
+        if child and not entry.get("whole") and not entry.get("child_owed"):
+            continue  # a line first seen on a tool call is never paged to a child
         if not all(isinstance(v, int) and v >= 0 for v in
                    (points, entry.get("owed_point"), entry.get("bound"))):
             missing.append("delivery point budget")
@@ -211,7 +214,8 @@ def doctor_block(view, now, cfg):
                 # outside the same liveness window as every other delivery
                 # identity, it no longer supplies gateway evidence at all.
                 gateways.append(attachment)
-            health = component_health(state, now, slack=cfg["routing_delivery_slack"])
+            health = component_health(state, now, slack=cfg["routing_delivery_slack"],
+                                      child=component.startswith("agent:"))
             rows.append(dict(identity=path.name.removesuffix(".routing.json").removeprefix("recall--"),
                              component=component,
                              harness=routing_delivery.health_harness(

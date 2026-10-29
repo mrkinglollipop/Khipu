@@ -10225,7 +10225,10 @@ def start_budget() -> float:
 
 
 def _child_page_push_inline(session_id: str, agent_id: str,
-                            now: datetime | None = None) -> dict | None:
+                            now: datetime | None = None, *, lease: bool = True) -> dict | None:
+    """The leased page, as ``child_page`` builds it. ``lease=False`` only for
+    the forked read in ``child_page_push``: its page carries the lease for
+    the hook to take, and the hook pops it before anything is printed."""
     if push_off("delegation"):
         return None
     from khipu import routing_delivery
@@ -10235,7 +10238,7 @@ def _child_page_push_inline(session_id: str, agent_id: str,
     planned = routing_delivery.plan(dict(out, kind="full"), out.view, now, settings(), session=None)
     session = routing_delivery.hook_session(session_id)
     page = routing_delivery.child_page(planned, session=session, component=f"agent:{agent_id}",
-                                       now=now, cfg=settings())
+                                       now=now, cfg=settings(), lease=lease)
     return dict(page, session=session) if page else None
 
 
@@ -10253,6 +10256,12 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
     budget = prompt_budget()
     if budget <= 0 or not hasattr(os, "fork"):
         return None
+    # As the per-prompt child does before its budget starts: the budget
+    # times the read, not a cold interpreter's imports.
+    prompt_imports()
+    from khipu import agent_view
+
+    agent_view.prepare_routing_table()
     deadline = time.monotonic() + budget
     read_fd = write_fd = None
     pid = None
@@ -10284,7 +10293,7 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
                 signal.signal(signal.SIGALRM, on_alarm)
                 signal.setitimer(signal.ITIMER_REAL,
                                  max(0.0, deadline - time.monotonic()) + 0.05)
-                page = _child_page_push_inline(session_id, agent_id, now)
+                page = _child_page_push_inline(session_id, agent_id, now, lease=False)
                 if page:
                     data = memoryview(json.dumps(page).encode("utf-8"))
                     while data:
@@ -10311,7 +10320,16 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
                 break
             chunks.append(chunk)
         page = json.loads(b"".join(chunks).decode("utf-8")) if chunks else None
-        return page if isinstance(page, dict) and page else None
+        if not isinstance(page, dict) or not page:
+            return None
+        # Only the hook that prints the page leases it: a read that came
+        # back too late leaves nothing in flight for nobody to acknowledge.
+        from khipu import routing_delivery
+
+        lease = page.pop("lease", None)
+        if not lease or not routing_delivery.lease_page(page["session"], f"agent:{agent_id}", lease, now=now):
+            return None
+        return page
     except Exception:  # noqa: BLE001 - routing never breaks the hook
         return None
     finally:
