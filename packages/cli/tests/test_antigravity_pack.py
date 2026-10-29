@@ -487,6 +487,41 @@ def test_a_jsonl_last_user_input_alias_never_swallows_a_later_identical_turn(hom
     assert _ag_ts() == [1000.0, 2000.0]
 
 
+def test_a_jsonl_alias_never_swallows_an_identical_turn_when_its_own_step_left_the_tail(home, tmp_path, monkeypatch):
+    """Codex 2026-10-29: A flushed, then more transcript than the tail read,
+    then an identical B. A's step is out of sight, so B is recorded."""
+    monkeypatch.setattr(owner_turns, "_AG_TAIL", 4096)
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
+                                          issuer=issuer)["prompt"] == "again"
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>again</USER_REQUEST>")
+    for i in range(2, 12):
+        _step(tp, "PLANNER_RESPONSE", i, "x" * 1000)
+    _step(tp, "USER_INPUT", 12, "<USER_REQUEST>again</USER_REQUEST>")
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=12), "PostInvocation", now=2000.0, issuer=issuer)
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=12), "Stop", now=2001.0, issuer=issuer) is None
+    assert _ag_ts() == [1000.0, 2000.0]
+
+
+def test_a_jsonl_alias_never_swallows_an_identical_turn_after_an_unindexed_step(home, tmp_path):
+    """Codex 2026-10-29: A flushed with no step_index, then an identical
+    indexed B. A cannot be told apart from B, so B is recorded."""
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
+                                          issuer=issuer)["prompt"] == "again"
+    with tp.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "USER_INPUT", "content": "<USER_REQUEST>again</USER_REQUEST>"}) + "\n")
+    _step(tp, "PLANNER_RESPONSE", 2, "done")
+    _step(tp, "USER_INPUT", 3, "<USER_REQUEST>again</USER_REQUEST>")
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "PostInvocation", now=2000.0, issuer=issuer)
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "Stop", now=2001.0, issuer=issuer) is None
+    assert _ag_ts() == [1000.0, 2000.0]
+
+
 # ---- verify -----------------------------------------------------------------------------
 
 def test_prompt_probe_proves_one_injection_per_turn(home):

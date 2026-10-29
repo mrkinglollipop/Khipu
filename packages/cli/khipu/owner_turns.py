@@ -971,36 +971,37 @@ def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     return None
 
 
-def _ag_first_user_step(path: str, at_least: int) -> int | None:
-    """Index of the first USER_INPUT step numbered ``at_least`` or more in a
-    transcript (a JSONL file's tail only), None when none can be read."""
+def _ag_own_step(path: str, at_least: int) -> int | None:
+    """Index of the first user step numbered ``at_least`` or more, only when
+    the whole transcript proves it: every user step read, each with an index.
+    None when any user step is unreadable or unindexed, or none qualifies."""
     if antigravity_db.is_db(path):
-        steps = [idx for idx, role, _ in antigravity_db.read_turns(path) if role == "user"]
+        steps = antigravity_db.user_steps(path)
+        if steps is None:
+            return None
     else:
+        steps = []
         try:
             with open(path, "rb") as fh:
-                fh.seek(0, os.SEEK_END)
-                start = max(0, fh.tell() - _AG_TAIL)
-                fh.seek(start)
-                data = fh.read()
+                for raw in fh:
+                    if b"USER_INPUT" not in raw:
+                        continue
+                    try:
+                        step = json.loads(raw)
+                    except ValueError:
+                        return None
+                    if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
+                        continue
+                    text = _ag_text(step.get("content"))
+                    wrapped = _AG_WRAP.match(text)
+                    if not (wrapped.group(1) if wrapped else text).strip():
+                        continue
+                    index = step.get("step_index")
+                    if not isinstance(index, int) or isinstance(index, bool):
+                        return None
+                    steps.append(index)
         except OSError:
             return None
-        lines = data.decode("utf-8", errors="replace").splitlines()
-        if start > 0 and lines:
-            lines = lines[1:]
-        steps = []
-        for line in lines:
-            try:
-                step = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
-                continue
-            index = step.get("step_index")
-            text = _ag_text(step.get("content"))
-            wrapped = _AG_WRAP.match(text)
-            if isinstance(index, int) and not isinstance(index, bool) and (wrapped.group(1) if wrapped else text).strip():
-                steps.append(index)
     later = [i for i in steps if i >= at_least]
     return min(later) if later else None
 
@@ -1136,15 +1137,16 @@ def _ag_claim(session: str, key: str, text: str, now: float, payload: dict) -> f
         start = earlier.get("from") if isinstance(earlier, dict) else None
         if not isinstance(start, int) or isinstance(start, bool) or index is None or index >= start:
             # Spent by the first step claimed at or after the turn's count. It
-            # matches only that turn's own step (the first USER_INPUT there);
-            # a step with no index cannot be bound and is recorded.
+            # matches only that turn's own step (the first USER_INPUT there),
+            # proven from the whole transcript; anything less is recorded,
+            # since a duplicate row is recoverable and a lost turn is not.
             try:
                 alias.unlink()
             except OSError:
                 pass
             tp = hook_shape.transcript_path(payload)
             if (isinstance(start, int) and index is not None and earlier.get("text") == _ag_text_hash(text)
-                    and tp and _ag_first_user_step(tp, start) == index):
+                    and tp and _ag_own_step(tp, start) == index):
                 return None
     at = now
     index = _ag_step_number(key)

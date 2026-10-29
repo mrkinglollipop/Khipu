@@ -156,25 +156,27 @@ def _wal_mode(path: Path) -> bool:
     return len(head) >= 20 and head[18] == 2 and head[19] == 2
 
 
-def _query(uri: str) -> list[tuple]:
+_TURN_ROWS = ("SELECT idx, step_type, step_payload FROM steps WHERE step_type IN (?, ?) "
+              "AND typeof(step_payload) = 'blob' AND length(step_payload) <= ? ORDER BY idx",
+              (USER_STEP, MODEL_STEP, MAX_PAYLOAD))
+
+
+def _query(uri: str, query: tuple = _TURN_ROWS) -> list[tuple]:
     conn = sqlite3.connect(uri, uri=True, timeout=0.25)
     try:
-        return conn.execute(
-            "SELECT idx, step_type, step_payload FROM steps WHERE step_type IN (?, ?) "
-            "AND typeof(step_payload) = 'blob' AND length(step_payload) <= ? ORDER BY idx",
-            (USER_STEP, MODEL_STEP, MAX_PAYLOAD)).fetchall()
+        return conn.execute(*query).fetchall()
     finally:
         conn.close()
 
 
-def _rows(path: Path) -> list[tuple]:
+def _rows(path: Path, query: tuple = _TURN_ROWS) -> list[tuple]:
     path = Path(path)
     plain = not _wal_mode(path) and not any(
         Path(f"{path}{s}").exists() for s in ("-wal", "-shm"))
     if plain:
         for mode in ("mode=ro", "immutable=1"):
             try:
-                return _query(f"file:{path.as_posix().replace('?', '%3f').replace('#', '%23')}?{mode}")
+                return _query(f"file:{path.as_posix().replace('?', '%3f').replace('#', '%23')}?{mode}", query)
             except sqlite3.Error:
                 continue
     tmp = tempfile.mkdtemp(prefix="khipu-ag-")
@@ -184,7 +186,7 @@ def _rows(path: Path) -> list[tuple]:
         wal = Path(f"{path}-wal")
         if wal.exists():
             shutil.copyfile(wal, Path(f"{copy}-wal"))
-        return _query(f"file:{copy.as_posix()}")
+        return _query(f"file:{copy.as_posix()}", query)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -201,6 +203,16 @@ def read_turns(path) -> list[tuple[int, str, str]]:
         if text:
             out.append((int(idx), "user" if step_type == USER_STEP else "assistant", text))
     return out
+
+
+def user_steps(path) -> list[int] | None:
+    """Index of every user step, readable or not, in step order; None when
+    the db cannot be read."""
+    try:
+        return [int(r[0]) for r in _rows(Path(path), ("SELECT idx FROM steps WHERE step_type = ? ORDER BY idx",
+                                                       (USER_STEP,)))]
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def last_user_input(path) -> tuple[str, str] | None:
