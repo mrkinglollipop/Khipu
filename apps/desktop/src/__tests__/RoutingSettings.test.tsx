@@ -2229,6 +2229,7 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
       routing_runner_tail_bytes: setting(524288),
       routing_runner_limited_lines: setting(200),
       routing_poll_interval: setting(10),
+      routing_ledger_keep_days: setting(7),
     });
     await page();
     await screen.findByText("512 KB");
@@ -2240,6 +2241,7 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
       ["How much of the end of a runner's events.log is read", "512 KB"],
       ["Newest limit lines kept from each runner", "200 lines"],
       ["Look at the folders and the routing table every", "10 seconds"],
+      ["Remove a conversation's delivery record after it is unused for", "7 days"],
     ]) {
       const btn = screen.getByRole("button", { name: `Change: ${name}` });
       expect(btn.closest(".route-limit")).toHaveTextContent(words);
@@ -2254,6 +2256,11 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
     fireEvent.change(screen.getByLabelText("Warn above"), { target: { value: "0.5" } });
     fireEvent.click(within(screen.getByRole("form", { name: "Change: Warn when reading before a prompt is too slow on more than" })).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(calls("khipu_config_set")[1]).toEqual({ key: "routing_slow_read_pct", value: "0.5" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change: Remove a conversation's delivery record after it is unused for" }));
+    expect(within(screen.getByLabelText("Remove after")).getByRole("option", { name: "Never" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Remove after"), { target: { value: "30" } });
+    fireEvent.click(within(screen.getByRole("form", { name: "Change: Remove a conversation's delivery record after it is unused for" })).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls("khipu_config_set")[2]).toEqual({ key: "routing_ledger_keep_days", value: "30" }));
   });
 
   it("says the master switch couldn't be read, and reads it again on Try again (finding 7)", async () => {

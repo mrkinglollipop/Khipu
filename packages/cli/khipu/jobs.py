@@ -481,6 +481,7 @@ def _run_nightly_locked() -> int:
     _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
+    _record_nightly_step(steps, "routing_ledger_prune", **_step_result(_prune_routing_ledgers()))
     completion_result = _step_result(_commitment_close_rules())
     _record_nightly_step(steps, "commitments_close_rules", **completion_result)
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
@@ -777,6 +778,20 @@ def _prune_query_cache() -> dict[str, Any]:
         out = {"ok": True, "pruned": n}
     except Exception as exc:  # noqa: BLE001
         _nightly_log(f"[khipu-embed] query cache prune skipped: {type(exc).__name__}: {exc}")
+        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return out
+
+
+def _prune_routing_ledgers() -> dict[str, Any]:
+    """Remove routing delivery ledgers unused for ``routing_ledger_keep_days``.
+    Fail-open like the query-cache prune; never run from doctor."""
+    try:
+        from khipu import routing_ledger_prune
+
+        out = routing_ledger_prune.prune()
+        _nightly_log(f"[khipu-routing] ledger prune {out}")
+    except Exception as exc:  # noqa: BLE001
+        _nightly_log(f"[khipu-routing] ledger prune skipped: {type(exc).__name__}: {exc}")
         out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return out
 

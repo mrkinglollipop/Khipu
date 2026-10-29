@@ -401,6 +401,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
                     mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                     mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
                     mock.patch("khipu.embed.prune_query_cache", return_value=0), \
+                    mock.patch("khipu.routing_ledger_prune.prune", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_commitment_close_rules", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True, "stale": 0}), \
                     mock.patch.object(jobs, "_project_renames_sweep", return_value={"ok": True}), \
@@ -411,7 +412,8 @@ class NightlyLastJsonContractTest(unittest.TestCase):
         self.assertEqual(
             names,
             {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "query_cache_prune", "commitments_close_rules", "commitments_mark_stale", "commitments_hygiene", "ledger",
+             "query_cache_prune", "routing_ledger_prune", "commitments_close_rules", "commitments_mark_stale",
+             "commitments_hygiene", "ledger",
              "project_renames", "snapshot_refresh"},
         )
         for step in payload["steps"]:
