@@ -173,6 +173,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_dispatch_scripts": ("names", [], "Your own scripts that hand work to another agent, by file name"),
     "routing_delivery_live_after": ("duration", 12 * 3600, "How long a delivery identity counts as live"),
     "routing_delivery_slack": ("count", 2, "Extra delivery points before stalled delivery turns red"),
+    "routing_ledger_keep_days": ("count", 7, "Remove a conversation's routing delivery ledger after this many unused days (0: never)"),
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit beyond the hook's own cap)"),

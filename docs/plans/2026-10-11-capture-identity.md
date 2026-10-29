@@ -464,6 +464,9 @@ words again. They are removed through the routing commands that manage them
 `khipu route priority clear`) or in Settings → Routing, not by forgetting an episode; a
 routing folder that cannot be listed still keeps the forget incomplete. This is never a
 claim that those words were forgotten. The files remain excluded from backup restore.
+The nightly `routing_ledger_prune` step deletes a delivery ledger (never its lock file) once
+nothing in it or its mtime is newer than `routing_ledger_keep_days`; that is housekeeping, not
+forgetting.
 
 Writers that hold no capture data are listed in the test's `NOT_CAPTURE` with what they write. The Work
 view and the account settings added these (2026-10-16): `config._write_config` (settings) and
