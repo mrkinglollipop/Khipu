@@ -3085,6 +3085,11 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
     help: "Conversations are told when Khipu itself has stopped updating.",
     fields: [{ key: "routing_not_refreshed_after", label: "Not refreshed after", unit: "time", options: [2 * M, 5 * M, 10 * M, 30 * M, 0], zero: "Never" }],
   },
+  {
+    name: "Remove a conversation's delivery record after it is unused for",
+    help: "The nightly run removes it; a conversation that comes back starts a fresh one.",
+    fields: [{ key: "routing_ledger_keep_days", label: "Remove after", unit: "days", options: [3, 7, 14, 30, 90, 0], zero: "Never" }],
+  },
 ];
 
 /** "11 settings, 2 changed from the default", from the values Khipu read. */

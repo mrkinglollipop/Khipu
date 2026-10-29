@@ -149,7 +149,8 @@ STORES: tuple[Store, ...] = (
           "each owner action with the owner's quoted words, and widenings waiting for a second turn",
           "owner words",
           _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private")),
-    Store("routing delivery words", "capture home state/recall--*.routing.json and their rewrite temps",
+    Store("routing delivery words", "capture home state/recall--*.routing.json and their rewrite temps; "
+          "the nightly removes a ledger unused for routing_ledger_keep_days",
           "cached routing rules, proposals and notices, including owner words and a "
           "conversation's friendly name (a T3 thread title) when Khipu knows one",
           "kept: routing words have no episode provenance; they are the owner's rules, notes, holds "
@@ -157,7 +158,7 @@ STORES: tuple[Store, ...] = (
           "(khipu route rule retire, khipu route note end, khipu route hold end, "
           "khipu route priority clear) or in Settings → Routing, not by forgetting an episode; "
           "forget lists each copy as kept and an unreadable routing folder keeps the forget open",
-          _w("routing_delivery._transaction")),
+          _w("routing_delivery._transaction", "routing_ledger_prune._remove")),
     Store("routing delivery titles", "capture home state/title-pending--*.json and "
           "title-cache--*.json beside the delivery ledgers, and their private-write temps",
           "a queued T3 title lookup holding only the conversation identity's digest (never "
