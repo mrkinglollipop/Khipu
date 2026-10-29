@@ -24,7 +24,7 @@ def test_the_read_in_the_hooks_child_process_holds_no_lease(replay, monkeypatch)
     _run(_start(), monkeypatch)
     # What the forked read returns may arrive after the hook stopped
     # waiting; it must leave nothing leased that nobody will print.
-    late = routing._child_page_push_inline("s1", "a1", replay.now)
+    late = routing._child_page_push_inline("s1", "a1", replay.now, lease=False)
     assert late and late["text"]
     assert not routing_delivery.snapshot("s1", "agent:a1").get("flight")
     replay.advance(120)
@@ -39,8 +39,8 @@ def test_a_lease_taken_by_another_hook_is_not_printed_twice(replay, monkeypatch)
     replay.configure(routing_prompt_chars=2000)
     _seed_rules(replay)
     _run(_start(), monkeypatch)
-    first = routing._child_page_push_inline("s1", "a1", replay.now)
-    second = routing._child_page_push_inline("s1", "a1", replay.now)
+    first = routing._child_page_push_inline("s1", "a1", replay.now, lease=False)
+    second = routing._child_page_push_inline("s1", "a1", replay.now, lease=False)
     session = first["session"]
     assert routing_delivery.lease_page(session, "agent:a1", first["lease"], now=replay.now)
     assert not routing_delivery.lease_page(session, "agent:a1", second["lease"], now=replay.now)
@@ -107,8 +107,25 @@ def test_a_live_child_that_never_receives_its_pages_still_goes_red(replay, monke
     for _ in range(12):
         replay.advance(70)
         # Every read arrives too late for its hook: nothing is printed.
-        routing._child_page_push_inline("s1", "a1", replay.now)
+        routing._child_page_push_inline("s1", "a1", replay.now, lease=False)
     health = _health(replay)
     assert health["status"] == "red"
     assert "budget-stall" in health["reasons"]
     assert RULES  # the deferred rules were owed throughout
+
+
+def test_a_page_read_in_process_is_leased_and_carries_no_lease_payload(replay, monkeypatch):  # noqa: F811
+    # The privacy tests read child pages in process and scan every string in
+    # them: the page is leased (so it acknowledges) and holds nothing beyond
+    # what the child is shown, no flight or delivery plan.
+    replay.configure(routing_prompt_chars=2000)
+    _seed_rules(replay)
+    _run(_start(), monkeypatch)
+    page = routing._child_page_push_inline("s1", "a1", replay.now)
+    assert page and page["text"]
+    assert "lease" not in page
+    assert routing_delivery.snapshot("s1", "agent:a1").get("flight")
+    assert routing_delivery.acknowledge(page["session"], page["routing_changes"], now=replay.now)
+    replay.advance(5)
+    printed = routing.child_page_push("s1", "a1", now=replay.now)
+    assert printed and "lease" not in printed

@@ -342,9 +342,6 @@ def test_owner_local_delivery_names_never_reach_other_surfaces(planted, monkeypa
             if not page:
                 break
             pages.append(page)
-            # The hook that prints a page takes its lease (``child_page_push``).
-            assert routing_delivery.lease_page("synthetic-recipient", "agent:synthetic", page.pop("lease"),
-                                               now=planted.now)
             assert routing_delivery.acknowledge("synthetic-recipient", page["routing_changes"], now=planted.now)
         assert start and start["text"] and pages
         output = [start, pages, routing_delivery.snapshot("synthetic-recipient", "agent:synthetic")]
