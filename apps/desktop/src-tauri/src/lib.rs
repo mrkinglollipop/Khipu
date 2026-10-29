@@ -4556,6 +4556,7 @@ const SETTABLE_SECRETS: &[&str] = &[
     "openai_compat_api_key",
     "voyage_api_key",
     "glm_api_key",
+    "kimi_api_key",
 ];
 
 #[tauri::command]
@@ -5847,6 +5848,7 @@ mod settable_secrets_tests {
                 "openai_compat_api_key",
                 "voyage_api_key",
                 "glm_api_key",
+                "kimi_api_key",
             ]
         );
     }

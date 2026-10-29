@@ -194,8 +194,11 @@ def _values(action: str, args) -> dict:
                 value = int(value.strip())
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise _bad("n must be a whole number at least 1")
-        elif action.startswith("route.cap.") and key == "window" and value not in ("weekly", "five_hour"):
-            raise _bad("window must be weekly or five_hour")
+        elif action.startswith("route.cap.") and key == "window":
+            from khipu.routing_pace import CAP_WINDOW_WORDS, cap_window
+
+            if not cap_window(value):
+                raise _bad(CAP_WINDOW_WORDS)
         elif action.startswith("route.cap.") and key == "purpose" and value not in ("job", "check"):
             raise _bad("cap purpose must be job or check")
         elif action.startswith("route.cap.") and key == "kind" \

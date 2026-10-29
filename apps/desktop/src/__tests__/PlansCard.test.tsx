@@ -34,8 +34,9 @@ import {
   usageErrorPhrase,
   usePlanAttention,
   usePlanUsage,
+  windowLabel,
 } from "../PlansCard";
-import type { PlanUsageState, UsageAccount, UsageReport } from "../PlansCard";
+import type { PlanUsageState, UsageAccount, UsageReport, UsageWindow } from "../PlansCard";
 import { HealthReportRows, plansHealthRow } from "../healthRows";
 import type { RouteView } from "../routing";
 
@@ -264,6 +265,11 @@ describe("PlansCard on Home", () => {
     await waitFor(() => expect(screen.getByText("GLM")).toBeTruthy());
     expect(within(rowFor("GLM")).getByText(/Khipu has no GLM key/)).toBeTruthy();
     expect(usageErrorPhrase("no_key")).toBe("no GLM key stored");
+    expect(usageErrorPhrase("no_key", "kimi")).toBe("no Kimi key stored");
+    expect(usageErrorPhrase("key_rejected", "kimi")).toBe("key not accepted by Kimi");
+    expect(usageErrorPhrase("no_plan", "kimi")).toBe("no Kimi Code plan on this key");
+    expect(usageErrorPhrase("timeout", "kimi")).toBe("didn't answer in time");
+    expect(windowLabel({ name: "monthly", used_pct: 35, resets_at: null } as UsageWindow)).toBe("month");
   });
 
   it("shows fresh plans by what remains and keeps the existing almost-used-up warning", async () => {

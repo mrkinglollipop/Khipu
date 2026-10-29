@@ -3252,6 +3252,7 @@ SETTABLE_SECRETS = {
     "openrouter_api_key": "openrouter_in_keychain",
     "glm_api_key": "glm_in_keychain",
     "deepseek_api_key": "deepseek_in_keychain",
+    "kimi_api_key": "kimi_in_keychain",
     "database_url": "dsn_in_keychain",
     "openai_compat_api_key": "openai_compat_in_keychain",
     "voyage_api_key": "voyage_in_keychain",
@@ -6142,7 +6143,8 @@ def build_parser() -> argparse.ArgumentParser:
     rcap = rt_sub.add_parser("cap", parents=[rt_json], help="Owner: set or remove a pace cap")
     rcap.add_argument("action", choices=("set", "remove"))
     rcap.add_argument("account")
-    rcap.add_argument("--window", default=None, choices=("weekly", "five_hour"))
+    rcap.add_argument("--window", default=None,
+                      help="The usage window: weekly, five_hour, monthly, daily, weekly_<name> or <n>_min")
     rcap.add_argument("--kind", required=True, choices=("share", "per_day", "pace_target", "spend", "concurrency"))
     rcap.add_argument("--pct", type=float, default=None)
     rcap.add_argument("--slack", type=float, default=None)

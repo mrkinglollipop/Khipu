@@ -88,7 +88,7 @@ WINDOW_SECONDS = {"five_hour": 5 * 3600, "weekly": 7 * 86400}
 HOLD_REASONS = {"machine_busy": "machine busy", "disk_low": "disk low", "keep": "keep for one purpose",
                 "outage": "outage", "other": "other"}
 DOWN_REASONS = {"not_signed_in": "not signed in", "not_installed": "not installed",
-                "out_of_service": "out of service"}
+                "out_of_service": "out of service", "key_rejected": "key rejected", "no_plan": "no plan on its key"}
 EVIDENCE_MAX = 200
 NAME_MAX = 64
 DISPATCH_SCRIPTS_MOST = 16
@@ -2228,7 +2228,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",
-                 "batch_n")
+                 "batch_n", "window_mins")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
                   "observed", "observed_turn", "session_logs", "silent", "unmatched")
@@ -3988,20 +3988,24 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if kind == "usage_sample":
             from khipu import routing_pace
 
-            window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
             witness, reset = _parse(event.get("witness_at")), _parse(event.get("resets_at"))
+            mins = event.get("window_mins") if isinstance(event.get("window_mins"), int) else None
+            window = event.get("window") if routing_pace.window_params(
+                event.get("window"), mins * 60 if mins else None, reset) else None
             used = event.get("used_pct")
             if (window and witness and reset and isinstance(event.get("account"), str)
                     and isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)):
-                pace_samples.setdefault((event["account"], window), []).append(
-                    {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
-                     "source": event.get("source") or "probe", "cycle": event.get("cycle"),
-                     "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0})
+                sample = {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
+                          "source": event.get("source") or "probe", "cycle": event.get("cycle"),
+                          "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0}
+                if mins and window not in routing_pace.WINDOWS:
+                    sample["window_s"] = mins * 60
+                pace_samples.setdefault((event["account"], window), []).append(sample)
             continue
         if kind in ("cap_set", "cap_remove"):
             from khipu import routing_pace
 
-            window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
+            window = event.get("window") if routing_pace.cap_window(event.get("window")) else None
             account = event.get("account")
             cap_kind = event.get("cap_kind") or event.get("kind")
             purpose = event.get("purpose", "job")
@@ -4407,9 +4411,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         origin = by_key[entry["key"]]
         if origin.get("matched_by"):
             entry["matched_by"] = origin["matched_by"]
-        entry["configured"] = (entry["key"] in known_keys if known_keys else not entry.get("home") and not none) \
-            and "|" in entry["key"]
         setup = usage_setup(entry["harness"], definitions["providers"].get(entry["harness"], {}))
+        # Kimi's defined accounts are read by Khipu's own Kimi reader once its key is stored.
+        entry["configured"] = ((entry["key"] in known_keys if known_keys else not entry.get("home") and not none)
+                               and "|" in entry["key"]) or (entry["harness"] == "kimi" and not setup)
         if setup:
             entry["usage_setup"] = setup
         marked = notes.get(entry["key"])
@@ -5607,8 +5612,13 @@ def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -
             continue
         costly = key.partition("|")[0] == "grok"
         for w in row.get("windows") or []:
-            if not isinstance(w, dict) or w.get("name") not in routing_pace.WINDOWS:
+            mins = w.get("window_mins") if isinstance(w, dict) else None
+            mins = mins if isinstance(mins, int) and not isinstance(mins, bool) and mins > 0 else None
+            # A window of known length and a reset time is paced, whatever its name.
+            if not isinstance(w, dict) or not routing_pace.window_params(
+                    w.get("name"), mins * 60 if mins else None, _parse(w.get("resets_at"))):
                 continue
+            named = w["name"] in routing_pace.WINDOWS
             used = w.get("used_pct")
             if isinstance(used, bool) or not isinstance(used, (int, float)):
                 continue
@@ -5617,6 +5627,8 @@ def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -
                 continue
             candidate = {"window": w["name"], "t": witness, "used": used,
                          "mac": _local_mac(), "source": "probe"}
+            if mins and not named:
+                candidate["window_s"] = mins * 60
             prior = existing.setdefault((key, w["name"]), [])
             if not routing_pace.should_sample(prior, candidate, costly=costly):
                 continue
@@ -5626,6 +5638,8 @@ def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -
             reset = _parse(w.get("resets_at"))
             if reset is not None:
                 event["resets_at"] = _iso(reset)
+            if mins and not named:
+                event["window_mins"] = mins
             prior.append(candidate)
             out.append(event)
     return out
@@ -7061,8 +7075,8 @@ _CAP_WORDS = ("a cap takes kind share or per_day (pct), pace_target (pct and sla
 def _checked_cap_or_raise(kind, fields: dict, revision, *, window):
     from khipu import routing_pace
 
-    if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
-        raise RouteError("window must be weekly or five_hour")
+    if kind in routing_pace.WINDOW_CAP_KINDS and not routing_pace.cap_window(window):
+        raise RouteError(routing_pace.CAP_WINDOW_WORDS)
     error = routing_pace.cap_scope_error(kind, fields.get("purpose", "job"),
                                          tier=fields.get("tier"), sensitive_only=fields.get("sensitive_only"))
     if error:
@@ -7121,8 +7135,8 @@ def _cap_remove_event(key: str, *, window, kind, purpose="job") -> dict:
     error = routing_pace.cap_scope_error(kind, purpose)
     if error:
         raise RouteError(error)
-    if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
-        raise RouteError("window must be weekly or five_hour")
+    if kind in routing_pace.WINDOW_CAP_KINDS and not routing_pace.cap_window(window):
+        raise RouteError(routing_pace.CAP_WINDOW_WORDS)
     event = {"type": "cap_remove", "account": key, "cap_kind": kind, "purpose": purpose}
     if kind in routing_pace.WINDOW_CAP_KINDS:
         event["window"] = window

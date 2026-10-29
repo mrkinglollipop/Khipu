@@ -10,7 +10,7 @@ import { modelCheckFor, type ModelVerifyResult } from "./modelVerify";
 import { fmtAge } from "./time";
 import "./CaptureModels.css";
 
-export type KeyId = "gemini" | "anthropic" | "openai" | "openrouter" | "openai_compat" | "glm";
+export type KeyId = "gemini" | "anthropic" | "openai" | "openrouter" | "openai_compat" | "glm" | "kimi";
 
 export type KeyInfo = {
   id: KeyId;
@@ -82,6 +82,16 @@ export const KEYS: readonly KeyInfo[] = [
     checks: [],
     optional: true,
     addLabel: "a GLM key",
+  },
+  {
+    id: "kimi",
+    name: "Kimi Code",
+    account: "kimi_api_key",
+    uses: "Reading how much of the Kimi Code plan is left (kimi.com)",
+    env: "KIMI_API_KEY",
+    checks: [],
+    optional: true,
+    addLabel: "a Kimi key",
   },
 ];
 
