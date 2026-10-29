@@ -583,6 +583,10 @@ def _merge(state, out):
                                    restarted=bool(old and not old.get("acked") and
                                                   (old.get("offset") or any(i["entity"] == entity for i in
                                                    (state.get("flight") or {}).get("out", {}).get("routing_changes", {}).get("items", [])))))
+        elif old.get("acked") and old.get("shown_offset") is None:
+            # Acknowledged before shown receipts were recorded: nothing proves
+            # it was displayed, so it is owed once more to earn a receipt.
+            entries[entity] = dict(item, offset=0, acked=False, restarted=False)
         elif not old.get("offset"):
             old.update(item)
     flight = state.get("flight")
