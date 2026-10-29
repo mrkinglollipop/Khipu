@@ -2227,7 +2227,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",
-                 "batch_n")
+                 "batch_n", "window_mins")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
                   "observed", "observed_turn", "session_logs", "silent", "unmatched")
@@ -3987,15 +3987,19 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if kind == "usage_sample":
             from khipu import routing_pace
 
-            window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
             witness, reset = _parse(event.get("witness_at")), _parse(event.get("resets_at"))
+            mins = event.get("window_mins") if isinstance(event.get("window_mins"), int) else None
+            window = event.get("window") if routing_pace.window_params(
+                event.get("window"), mins * 60 if mins else None, reset) else None
             used = event.get("used_pct")
             if (window and witness and reset and isinstance(event.get("account"), str)
                     and isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)):
-                pace_samples.setdefault((event["account"], window), []).append(
-                    {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
-                     "source": event.get("source") or "probe", "cycle": event.get("cycle"),
-                     "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0})
+                sample = {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
+                          "source": event.get("source") or "probe", "cycle": event.get("cycle"),
+                          "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0}
+                if mins and window not in routing_pace.WINDOWS:
+                    sample["window_s"] = mins * 60
+                pace_samples.setdefault((event["account"], window), []).append(sample)
             continue
         if kind in ("cap_set", "cap_remove"):
             from khipu import routing_pace
@@ -5607,8 +5611,13 @@ def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -
             continue
         costly = key.partition("|")[0] == "grok"
         for w in row.get("windows") or []:
-            if not isinstance(w, dict) or w.get("name") not in routing_pace.WINDOWS:
+            mins = w.get("window_mins") if isinstance(w, dict) else None
+            mins = mins if isinstance(mins, int) and not isinstance(mins, bool) and mins > 0 else None
+            # A window of known length and a reset time is paced, whatever its name.
+            if not isinstance(w, dict) or not routing_pace.window_params(
+                    w.get("name"), mins * 60 if mins else None, _parse(w.get("resets_at"))):
                 continue
+            named = w["name"] in routing_pace.WINDOWS
             used = w.get("used_pct")
             if isinstance(used, bool) or not isinstance(used, (int, float)):
                 continue
@@ -5617,6 +5626,8 @@ def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -
                 continue
             candidate = {"window": w["name"], "t": witness, "used": used,
                          "mac": _local_mac(), "source": "probe"}
+            if mins and not named:
+                candidate["window_s"] = mins * 60
             prior = existing.setdefault((key, w["name"]), [])
             if not routing_pace.should_sample(prior, candidate, costly=costly):
                 continue
@@ -5626,6 +5637,8 @@ def _pace_sample_events(ordered: list[dict], known: list[dict], now: datetime) -
             reset = _parse(w.get("resets_at"))
             if reset is not None:
                 event["resets_at"] = _iso(reset)
+            if mins and not named:
+                event["window_mins"] = mins
             prior.append(candidate)
             out.append(event)
     return out

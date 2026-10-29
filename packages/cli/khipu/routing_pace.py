@@ -7,7 +7,9 @@ enough from the last acknowledged one to push. It never chooses work.
 """
 from __future__ import annotations
 
+import calendar
 import math
+import re
 from datetime import datetime, timedelta, timezone
 
 WINDOWS = {
@@ -16,6 +18,55 @@ WINDOWS = {
     "five_hour": {"trailing_s": 3600, "bucket_s": 300, "sample_s": 600, "gap_s": 900, "trailing_h": 1,
                   "window_s": 18000},
 }
+
+
+def window_length(window, reset=None):
+    """A window's length in seconds from its name alone, or None: a month is
+    the calendar month (UTC) that ends at ``reset``."""
+    if window in WINDOWS:
+        return WINDOWS[window]["window_s"]
+    if not isinstance(window, str):
+        return None
+    if window == "daily":
+        return 86400
+    if window.startswith("weekly_"):
+        return WINDOWS["weekly"]["window_s"]
+    match = re.fullmatch(r"(\d+)_min", window)
+    if match and int(match.group(1)) > 0:
+        return int(match.group(1)) * 60
+    if window == "monthly" and isinstance(reset, datetime):
+        end = reset.astimezone(timezone.utc)
+        year, month = (end.year, end.month - 1) if end.month > 1 else (end.year - 1, 12)
+        start = end.replace(year=year, month=month, day=min(end.day, calendar.monthrange(year, month)[1]))
+        return int((end - start).total_seconds())
+    return None
+
+
+def window_params(window, window_s=None, reset=None):
+    """The pace parameters of one window, or None when its length is unknown.
+    A named window keeps its own. Any other window of known length (a month,
+    a day, ``<n>_min``) is paced at that length with the cadence of the named
+    window nearest in kind: a week's from two days up, else five hours'."""
+    if window in WINDOWS:
+        return WINDOWS[window]
+    length = window_s if _num(window_s) is not None and window_s > 0 else window_length(window, reset)
+    if not length or length <= 0:
+        return None
+    length = int(length)
+    style = WINDOWS["weekly" if length >= 2 * 86400 else "five_hour"]
+    trailing = min(style["trailing_s"], length)
+    hours = trailing // 3600 if trailing % 3600 == 0 else round(trailing / 3600, 2)
+    return dict(style, window_s=length, trailing_s=trailing, trailing_h=hours)
+
+
+def _sample_params(window, samples):
+    """``window_params`` from the newest sample that carries a length or reset."""
+    if window in WINDOWS:
+        return WINDOWS[window]
+    newest = max((s for s in samples if isinstance(s.get("t"), datetime)), key=lambda s: s["t"], default={})
+    return window_params(window, newest.get("window_s"), newest.get("reset"))
+
+
 # Cap kinds scoped to a usage window; the rest are account-scoped facts.
 WINDOW_CAP_KINDS = ("share", "per_day", "pace_target")
 CAP_KINDS = WINDOW_CAP_KINDS + ("spend", "concurrency")
@@ -220,7 +271,7 @@ def next_change(samples, now, window, *, day=False):
     window (or the rolling day, ``day``), or a reading witnessed ahead of the
     clock coming due. None when there is none. Continuous drift (allowances,
     needed rates) is bounded by ``REFOLD_S`` instead."""
-    params = WINDOWS.get(window)
+    params = _sample_params(window, samples)
     if params is None:
         return None
     best = newest = None
@@ -249,8 +300,8 @@ def at(pace, now):
     and the trailing average's drift is bounded by ``REFOLD_S``. A prompt's
     pace words are built from this, so a cached view says what a fold at
     the prompt would."""
-    params = WINDOWS.get(pace.get("window"))
     reset = parse(pace.get("cycle_resets_at"))
+    params = window_params(pace.get("window"), pace.get("window_s"), reset)
     used = _num(pace.get("used_pct"))
     if params is None or reset is None or used is None:
         return pace
@@ -292,13 +343,17 @@ def compute_pace(samples, caps, now, window):
     Samples carry ``t``/``reset`` datetimes, ``used``, ``mac``, ``source``,
     ``cycle`` and ``t_err``. Caps are checked cap dicts for this window.
     """
-    params = WINDOWS[window]
+    params = _sample_params(window, samples)
+    if params is None:
+        raise KeyError(window)
     trailing = params["trailing_s"]
     pace = {"window": window, "cycle_resets_at": None, "trailing_h": params["trailing_h"], "buckets": 0,
             "valid_pct": 0.0, "observed_pct": 0.0, "gappy": False, "rate_pct_per_h": None, "why": None,
             "plan": {"verdict": "unknown", "needed_pct_per_h": None, "runs_out_at": None,
                      "before_reset_s": None, "unused_at_reset_pct": None},
             "share_cap": None, "day_cap": None, "pace_target": None, "headline": "plan"}
+    if window not in WINDOWS:
+        pace["window_s"] = params["window_s"]
     samples = [s for s in samples if s.get("reset") is not None and _num(s.get("used")) is not None]
     targets = {("check_pace_target" if c.get("purpose", "job") == "check" else "pace_target"): c
                for c in caps if c.get("kind") == "pace_target"}
@@ -373,6 +428,12 @@ def compute_pace(samples, caps, now, window):
     current = [s for s in samples if s["_cycle_key"] == current_key]
     representative = min((s for s in current if s["t"] == max(x["t"] for x in current)), key=lambda x: x["reset"])["reset"]
     pace["cycle_resets_at"] = iso(representative)
+    if window not in WINDOWS:
+        # The current cycle's own length: one month is not the next.
+        own = next((s.get("window_s") for s in sorted(current, key=lambda x: x["t"], reverse=True)
+                    if _num(s.get("window_s")) is not None and s["window_s"] > 0), None)
+        params = dict(params, window_s=int(own or window_length(window, representative) or params["window_s"]))
+        pace["window_s"] = params["window_s"]
     confidence = [s for s in current if s["t"] >= now - timedelta(seconds=trailing)]
     span = ((max(s["reset"] for s in confidence) - min(s["reset"] for s in confidence)).total_seconds()
             if confidence else 0)
@@ -630,8 +691,17 @@ def compute_pace(samples, caps, now, window):
     return pace
 
 
+def _window_word(window):
+    if window in ("weekly", "five_hour"):
+        return "weekly" if window == "weekly" else "five-hour"
+    match = re.fullmatch(r"(\d+)_min", str(window))
+    if match:
+        return f"{match.group(1)}-minute"
+    return str(window).replace("_", " ")
+
+
 def pace_line(label, pace, now):
-    word = "weekly" if pace["window"] == "weekly" else "five-hour"
+    word = _window_word(pace["window"])
     rate = pace.get("rate_pct_per_h")
     rate_text = f"{_rate_words(rate)}%/h" if rate is not None else "no rate"
     headline = pace.get("headline") or "plan"
@@ -744,7 +814,8 @@ def should_push(acked, current, now):
 def should_sample(existing, candidate, *, costly=False):
     """Sampling cadence for one account window from its stored samples."""
     window = candidate["window"]
-    interval = 1800 if costly or window == "weekly" else 600
+    params = window_params(window, candidate.get("window_s"))
+    interval = 1800 if costly or window == "weekly" or (params or {}).get("sample_s", 0) >= 1800 else 600
     prior = [s for s in existing if s["window"] == window and s.get("mac") == candidate.get("mac")
              and s.get("source") == candidate.get("source")]
     if not prior:

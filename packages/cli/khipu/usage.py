@@ -1568,9 +1568,10 @@ def _kimi_pct(ratio) -> float | None:
     return round(min(100.0, float(ratio) * 100), 2)
 
 
-def _kimi_month_mins(resets_at: str | None) -> int | None:
-    """The minutes of the calendar month that ends at ``resets_at``."""
-    end = _parse_time(resets_at)
+def _kimi_month_mins(resets_at) -> int | None:
+    """The minutes of the calendar month that ends at ``resets_at``, counted
+    in the reset's own timezone (1 March in UTC+8 ends February)."""
+    end = _parse_time(resets_at if isinstance(resets_at, str) else _iso(resets_at))
     if end is None:
         return None
     import calendar
@@ -1621,7 +1622,7 @@ def parse_kimi(status: int, body: bytes) -> dict:
     pcts = [(p, m.get("reset_time")) for m in month if (p := _kimi_pct(m.get("used_ratio"))) is not None]
     if pcts:
         used, resets = max(pcts, key=lambda pr: pr[0])
-        window = _window("monthly", used, resets, _kimi_month_mins(_iso(resets)))
+        window = _window("monthly", used, resets, _kimi_month_mins(resets))
         if window:
             windows.append(window)
     for item in reply["limits"] if isinstance(reply.get("limits"), list) else []:
