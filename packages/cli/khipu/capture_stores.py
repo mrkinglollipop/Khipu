@@ -202,6 +202,11 @@ STORES: tuple[Store, ...] = (
           "kept: removed by the call that made it; one a killed call left behind is a known "
           "boundary in the scope doc",
           _w("extract._generate_claude_cli", "extract._generate_codex_cli")),
+    Store("Antigravity trajectory copy", "a private temp folder khipu-ag-*/ holding t.db and its WAL",
+          "a copy of a T3 Antigravity session database, read and removed by the call that made it",
+          "kept: removed by the call that made it; one a killed call left behind is a known "
+          "boundary in the scope doc",
+          _w("antigravity_db._rows", "antigravity_db._query")),
     Store("commitments backup", "the hygiene backup folder commitments-<time>/commitments.bin",
           "a binary copy of the commitments table, whose text a capture opened",
           "kept: closed commitments remain by design (forget's kept text)",

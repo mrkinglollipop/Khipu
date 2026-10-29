@@ -47,6 +47,11 @@ REGISTRY_NAME = "t3-antigravity-projects.json"
 # differs from the one Khipu last recorded is reported as needing a re-check;
 # the states stay "unsupported" until slice H proves otherwise on a real run.
 KNOWN_NO_INJECTION_RUNTIMES = frozenset({"1.3.0"})
+# Slice H real run (T3 Antigravity 1.3.0, 2026-10-29): the ACP runtime loaded no
+# workspace ``.agents/mcp_config.json`` and no ``.agents/rules/`` file, in a
+# trusted workspace across two sessions. The files can be present and still do nothing.
+NO_WORKSPACE_MCP_RULE_RUNTIMES = frozenset({"1.3.0"})
+PROOF = "real-run 2026-10-29"
 
 RESTART_NOTE = "If Antigravity asks whether to trust this workspace's hooks, choose Trust."
 LOCAL_FILES_NOTE = ("These files point at this Mac's Khipu install: keep them out of version control "
@@ -149,18 +154,23 @@ def folder_functions(config_dir: Path) -> dict[str, bool]:
     }
 
 
-def project_status(project: str | Path) -> dict:
+def project_status(project: str | Path, home: Path | None = None) -> dict:
     """Which of Khipu's files a project has, read with the installer's own
     reader (``integrations.antigravity_project_state``), so status can never
     disagree with what ``add`` wrote. Never raises: an unreadable file reads
-    as absent."""
+    as absent. ``mcp`` and ``rule`` say the file is present; ``unsupported``
+    lists the ones the installed runtime is proven not to load."""
     from khipu import integrations as integ
 
     root = Path(project).expanduser()
     state = integ.antigravity_project_state(str(root))
     events = set(state["events"])
     capture = {"PostInvocation", "Stop"} <= events
+    version = runtime_version(home)
+    unsupported = ["mcp", "rule"] if version in NO_WORKSPACE_MCP_RULE_RUNTIMES else []
     return {
+        "unsupported": unsupported,
+        "proof": PROOF if unsupported else None,
         "project": str(root),
         "exists": root.is_dir(),
         "capture": capture,
@@ -185,7 +195,7 @@ def functions_for(instance_id: str, home: Path | None = None) -> dict:
     installed_projects = 0
     projects = registered_projects(home)
     for project in projects:
-        status = project_status(project)
+        status = project_status(project, home)
         capture |= status["capture"]
         mcp |= status["mcp"]
         installed_projects += 1 if status["installed"] else 0
@@ -199,14 +209,16 @@ def functions_for(instance_id: str, home: Path | None = None) -> dict:
     # fine only when it is one whose behaviour was read from the binary.
     recheck = version is not None and recorded != version and (
         recorded is not None or version not in KNOWN_NO_INJECTION_RUNTIMES)
+    mcp_loaded = version in NO_WORKSPACE_MCP_RULE_RUNTIMES
     return {
         "functions": {
             "capture": "installed" if capture else "missing",
             "start_block": "unsupported",
             "prompt_recall": "unsupported",
             "delegation": "unsupported",
-            "mcp": "installed" if mcp else "missing",
+            "mcp": "unsupported" if mcp_loaded else ("installed" if mcp else "missing"),
         },
+        "proof": {"mcp": PROOF, "rule": PROOF} if mcp_loaded else {},
         "projects": {"registered": len(projects), "installed": installed_projects},
         "runtime": {"version": version, "checked_version": recorded, "recheck": recheck},
     }
@@ -256,7 +268,7 @@ def install_project(project: str, *, dry_run: bool = False, home: Path | None = 
     out = _result(integ.antigravity_project_install(str(root), dry_run=dry_run, home=home), root)
     if out["ok"] and not dry_run:
         _record(home, root, runtime_version(home))
-        out["status"] = project_status(root)
+        out["status"] = project_status(root, home)
     if out["ok"]:
         out["notes"] = [RESTART_NOTE, LOCAL_FILES_NOTE]
     return out
@@ -274,7 +286,7 @@ def uninstall_project(project: str, *, dry_run: bool = False, home: Path | None 
     out.pop("note", None)
     if out["ok"] and not dry_run:
         _record(home, root, None, remove=True)
-        out["status"] = project_status(root)
+        out["status"] = project_status(root, home)
     return out
 
 
@@ -292,7 +304,7 @@ def projects_report(home: Path | None = None) -> dict:
     added = _added_at(home)
     rows = []
     for project in registered_projects(home):
-        row = project_status(project)
+        row = project_status(project, home)
         if project in added:
             row["added_at"] = added[project]
         rows.append(row)

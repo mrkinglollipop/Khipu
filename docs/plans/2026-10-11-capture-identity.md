@@ -449,6 +449,7 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 | capture log | capture home `logs/session-capture.log` | drain and hook events: file names, counts and lengths | none: it never holds summary or transcript text |
 | conversation media | data folder `media/conversation_memory/<sha256>.<ext>` | images found in transcripts, shared by content hash | kept: content-addressed, can belong to several episodes |
 | extraction scratch | data folder `state/synth-cli/work-*/` and its output temp | a model call's working folder and output | kept: removed by the call that made it |
+| Antigravity trajectory copy | a private temp folder `khipu-ag-*/` (`t.db` and its WAL) | a copy of a T3 Antigravity session database | kept: removed by the call that made it |
 | commitments backup | hygiene backup folder `commitments-<time>/commitments.bin` | a binary copy of the commitments table | kept: closed commitments remain by design |
 | local backup | a backup folder or archive the owner chose | a copy of the data folder | kept: backups are kept for recovery; an import restores only what a store allows, through its scrub |
 
@@ -496,8 +497,8 @@ whose id the registry holds as well as rows with a forgotten source key or hash,
 `publish_imported_snapshot` applies pending erasures before the scrub. So a backup cannot bring back a
 forgotten episode id under older raw.
 
-**Known boundaries.** Conversation media is kept (shared by content hash). Extraction scratch left behind
-by a killed call is not swept. Local backups and the commitments backup are kept for recovery. Session
+**Known boundaries.** Conversation media is kept (shared by content hash). Extraction scratch and an Antigravity
+trajectory copy left behind by a killed call are not swept. Local backups and the commitments backup are kept for recovery. Session
 state carry and capture notes are not sources until a window is queued. A `khipu work` build that read the
 commitments before the forget closed them and saves after its scan can write the view once more; the next
 build replaces it.

@@ -37,7 +37,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-from khipu import hook_shape, t3
+from khipu import antigravity_db, hook_shape, t3
 from khipu.turn_text import clean_user_text, is_machine, owner_text
 
 RETENTION_S = 24 * 3600
@@ -923,7 +923,10 @@ def _ag_text(content) -> str:
 
 def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     """(step key, text) of the newest USER_INPUT step in a transcript, reading
-    only its tail. None when there is none or the file cannot be read."""
+    only its tail. None when there is none or the file cannot be read. A
+    ``.db`` path is T3's SQLite trajectory (``antigravity_db``)."""
+    if antigravity_db.is_db(path):
+        return antigravity_db.last_user_input(path)
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
