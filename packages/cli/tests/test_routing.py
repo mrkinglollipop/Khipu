@@ -2374,6 +2374,8 @@ def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_
 NOT_IN_THE_APP_YET = {
     # Slice 15a owns delivery and health controls after the slice 14 mocks.
     "routing_delivery_lease", "routing_delivery_live_after", "routing_delivery_slack",
+    # Owner-settable through `khipu config`; the nightly prune reads it.
+    "routing_ledger_keep_days",
     # Phase 7: the copy for cloud agents.
     "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
     "routing_cloud_copy_stale_after", "routing_cloud_copy_debounce",
