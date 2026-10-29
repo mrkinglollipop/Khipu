@@ -353,15 +353,12 @@ def compute_pace(samples, caps, now, window):
     ``cycle`` and ``t_err``. Caps are checked cap dicts for this window.
     """
     params = _sample_params(window, samples)
-    if params is None:
-        raise KeyError(window)
-    trailing = params["trailing_s"]
-    pace = {"window": window, "cycle_resets_at": None, "trailing_h": params["trailing_h"], "buckets": 0,
+    pace = {"window": window, "cycle_resets_at": None, "trailing_h": params["trailing_h"] if params else None, "buckets": 0,
             "valid_pct": 0.0, "observed_pct": 0.0, "gappy": False, "rate_pct_per_h": None, "why": None,
             "plan": {"verdict": "unknown", "needed_pct_per_h": None, "runs_out_at": None,
                      "before_reset_s": None, "unused_at_reset_pct": None},
             "share_cap": None, "day_cap": None, "pace_target": None, "headline": "plan"}
-    if window not in WINDOWS:
+    if window not in WINDOWS and params is not None:
         pace["window_s"] = params["window_s"]
     samples = [s for s in samples if s.get("reset") is not None and _num(s.get("used")) is not None]
     targets = {("check_pace_target" if c.get("purpose", "job") == "check" else "pace_target"): c
@@ -373,6 +370,11 @@ def compute_pace(samples, caps, now, window):
     if not samples:
         pace["why"] = "this account can't be probed"
         return pace
+    if params is None:
+        # A cap may name a month before any reading gives its length.
+        pace["why"] = "no reading yet gives this window's length"
+        return pace
+    trailing = params["trailing_s"]
     samples = _filter(samples, params)
     # A witness ahead of now is a skewed clock: within its own uncertainty
     # it is a reading for now; beyond it, it cannot be placed at all.

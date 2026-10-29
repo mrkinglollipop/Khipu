@@ -2554,10 +2554,15 @@ def probe_http_quota(account: dict, *, timeout: float = TIMEOUT_S) -> dict:
     from khipu import keychain
 
     provider = account.get("provider") or account.get("harness") or ""
-    try:
-        key = keychain.get_password(f"{provider}_api_key")
-    except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
-        key = None
+    if provider == "glm":
+        # The GLM key in the Keys card's order (env, Keychain, file), as the
+        # configured GLM account reads it.
+        key = _glm_key()
+    else:
+        try:
+            key = keychain.get_password(f"{provider}_api_key")
+        except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
+            key = None
     if not key:
         raise ProbeError(E_NO_KEY)
     try:
@@ -2587,6 +2592,21 @@ def http_quota_accounts() -> list[dict]:
                     "probe": "http-quota", "host": provider.get("host"), "provider": provider["id"],
                     "quota_key": ident})
     return out + deepseek_accounts(definitions) + kimi_accounts(definitions)
+
+
+def all_accounts() -> list[dict]:
+    """Every account a usage read covers: the configured ones, then those the
+    routing record defines with a stored key. None after the owner chose
+    "Read no accounts". GLM both configured and defined is read once, as the
+    configured account."""
+    from khipu.config import load_config
+
+    config = load_config()
+    if reads_none(config):
+        return []
+    configured = configured_accounts(config=config)
+    glm = any(a.get("harness") == "glm" and not a.get("invalid") for a in configured)
+    return [*configured, *(a for a in http_quota_accounts() if not (glm and a.get("harness") == "glm"))]
 
 
 # ---- accounts ----------------------------------------------------------------
@@ -3379,10 +3399,7 @@ def refresh_due(*, max_age: float = PERIODIC_MAX_AGE_S, timeout: float = TIMEOUT
     lock is held, so callers that race refresh once. Never raises:
     ``{"refreshed": n, "skipped": None | "fresh" | "busy" | "error"}``."""
     try:
-        discover_quota = accounts is None
-        accounts = configured_accounts() if accounts is None else accounts
-        if discover_quota:
-            accounts = [*accounts, *http_quota_accounts()]
+        accounts = all_accounts() if accounts is None else accounts
         if not _due(accounts, _load_cache(), _now(), max_age):
             return {"refreshed": 0, "skipped": "fresh"}
         fd = _try_refresh_lock()
@@ -3411,7 +3428,7 @@ def kick_refresh(*, max_age: float = PROMPT_MAX_AGE_S, spawn=None) -> bool:
         with contextlib.suppress(OSError):
             if 0 <= time.time() - stamp.stat().st_mtime < KICK_EVERY_S:
                 return False
-        if not _due([*configured_accounts(), *http_quota_accounts()], _load_cache(), _now(), max_age):
+        if not _due(all_accounts(), _load_cache(), _now(), max_age):
             return False
         fd = _try_refresh_lock()
         if fd is None:
@@ -3490,9 +3507,7 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
     A row whose figures are older than ``max_age`` (a cached row, Muse's last
     observed turn, Codex's rollout fallback), or that holds the last good
     figures after a failed probe, is marked ``stale: true``, never dropped."""
-    # The accounts Khipu reads with a stored key (GLM, DeepSeek, Kimi) are
-    # defined in the routing record, as refresh_due finds them.
-    accounts = [*configured_accounts(), *http_quota_accounts()] if accounts is None else accounts
+    accounts = all_accounts() if accounts is None else accounts
     cache = _load_cache()
     now = _now()
     rows: list[dict | None] = [None] * len(accounts)
@@ -3574,9 +3589,13 @@ def public_row(row: dict) -> dict:
 
     harness, home = row.get("harness"), row.get("home")
     out = {k: row[k] for k in _PUBLIC_ROW_FIELDS if k in row}
-    out["id"] = routing.account_id(_key({"harness": harness, "home": home}))
-    out["harness"] = harness if harness in HARNESSES else "?"
-    if routing.account_label_source(_key(row)) == "suggested":
+    # The report's own key: an account read with a stored key is known by its
+    # provider-defined id (kimi:main), which no harness and home rebuild.
+    key = row.get("key") if isinstance(row.get("key"), str) and row.get("key") \
+        else _key({"harness": harness, "home": home})
+    out["id"] = routing.account_id(key)
+    out["harness"] = harness if harness in HARNESSES or harness in KEY_READ_HARNESSES else "?"
+    if routing.account_label_source(key) == "suggested":
         out["naming_hint"] = routing.account_identity.NAME_ACCOUNT
     for field in ("error", "live_error", "last_error"):
         if field in out and out[field] is not None and not _is_code(out[field]):
