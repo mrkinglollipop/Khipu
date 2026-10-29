@@ -148,6 +148,8 @@ E_UNAVAILABLE = "account_unavailable"
 E_NO_PLAN = "no_plan"
 # z.ai refused the key: not a sign-in an owner can redo in a CLI, so it has its own code.
 E_BAD_KEY = "key_rejected"
+# Harnesses Khipu reads with a stored key, over HTTP.
+KEY_READ_HARNESSES = ("glm", "deepseek", "kimi")
 # The http-quota endpoint tried to send Khipu to a host the owner never confirmed.
 E_REDIRECT = "redirect_refused"
 HTTP_QUOTA_TIMEOUT_S = 15.0
