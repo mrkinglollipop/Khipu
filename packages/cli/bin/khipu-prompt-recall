@@ -45,11 +45,13 @@ done
 PAYLOAD=$(cat)
 # Antigravity's PreInvocation fires before every model call and carries no
 # prompt: the owner-turn script reads the newest USER_INPUT from the
-# transcript and lets only the first call of each user turn through (it prints
-# nothing for any other payload, a turn not yet flushed to the transcript
-# included, so that call goes on and a later one can still record the turn;
-# "{}" only for a turn already handled; the payload with its prompt filled in
-# for a new one).
+# transcript and lets only the first call of each user turn through, recording
+# that turn itself in the same process that claimed it (it prints nothing for
+# any other payload, a turn not yet flushed to the transcript included, so
+# that call goes on and the turn's PostInvocation or Stop records it; "{}"
+# for a turn already handled; the payload with its prompt filled in for a
+# new one, already recorded).
+RECORDED=""
 case "$PAYLOAD" in
   *'"conversationId"'*)
     if [ -f "$SELF_DIR/khipu-owner-turn.py" ]; then
@@ -57,7 +59,7 @@ case "$PAYLOAD" in
       case "$TURN" in
         "") ;;
         "{}") echo '{}'; exit 0 ;;
-        *) PAYLOAD="$TURN" ;;
+        *) PAYLOAD="$TURN"; RECORDED=1 ;;
       esac
     fi
     ;;
@@ -65,7 +67,7 @@ esac
 # Owner direction: record that the owner typed, first, on every path
 # (khipu.owner_turns). The recorder is stdlib-only, prints nothing and never
 # fails.
-if [ -f "$SELF_DIR/khipu-owner-turn.py" ]; then
+if [ -z "$RECORDED" ] && [ -f "$SELF_DIR/khipu-owner-turn.py" ]; then
   printf '%s' "$PAYLOAD" | "$PY" -S -E -B "$SELF_DIR/khipu-owner-turn.py" >/dev/null 2>&1
 fi
 if [ "${KHIPU_HARNESS:-}" = "aegis" ]; then

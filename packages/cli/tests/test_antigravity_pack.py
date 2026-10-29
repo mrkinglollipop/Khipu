@@ -398,6 +398,130 @@ def test_the_real_shim_injects_and_records_once_per_user_turn(home, tmp_path):
     assert len(owner_turns.session_file("ag-1").read_text().splitlines()) == 2
 
 
+def _stop_hook(payload: dict, event: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "KHIPU_PYTHON": sys.executable, "KHIPU_ROOT": str(Path(__file__).resolve().parents[3]),
+           "KHIPU_CAPTURE_QUEUE_ONLY": "1"}                                        # no drain in a test
+    return subprocess.run(["/bin/sh", str(SHIM.parent / "khipu-stop-hook"), "--event", event],
+                          input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=60)
+
+
+def test_a_jsonl_turn_unflushed_at_pre_invocation_is_recorded_once_by_the_real_stop_hook(home, tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_AG_FLUSH_WAIT_S", "0")
+    tp = _transcript(tmp_path)
+    payload = _pre(tp)
+    assert _shim(payload).returncode == 0                                              # nothing readable yet
+    assert not owner_turns.session_file("ag-1").exists()
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>ship the late turn</USER_REQUEST>")
+    _step(tp, "PLANNER_RESPONSE", 2, "on it")
+    assert _stop_hook(payload, "PostInvocation").returncode == 0
+    assert len(owner_turns.session_file("ag-1").read_text().splitlines()) == 1          # PostInvocation recorded it
+    assert _stop_hook(payload, "Stop").returncode == 0
+    assert json.loads(_shim({**payload, "invocationNum": 2}).stdout) == {}
+    rows = [json.loads(x) for x in owner_turns.session_file("ag-1").read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]["harness"] == "antigravity" and rows[0]["typed"] is True
+    assert "ship the late turn" not in owner_turns.session_file("ag-1").read_text()
+
+
+def test_a_jsonl_turn_recorded_by_stop_alone_and_left_alone_when_already_recorded(home, tmp_path):
+    tp = _transcript(tmp_path)
+    _step(tp, "USER_INPUT", 1, "first turn")
+    issuer = {"refused": "test"}
+    assert owner_turns.antigravity_late_turn(_pre(tp), "Stop", now=50.0, issuer=issuer)
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=51.0, issuer=issuer) is None
+    _step(tp, "USER_INPUT", 2, "second turn")
+    assert owner_turns.antigravity_prompt(_pre(tp), now=60.0, wait=0, issuer=issuer)["prompt"] == "second turn"
+    assert owner_turns.antigravity_late_turn(_pre(tp), "Stop", now=61.0, issuer=issuer) is None
+    rows = [json.loads(x) for x in owner_turns.session_file("ag-1").read_text().splitlines()]
+    assert [r["ts"] for r in rows] == [50.0, 60.0]
+
+
+def _ag_ts() -> list[float]:
+    path = owner_turns.session_file("ag-1")
+    return [json.loads(x)["ts"] for x in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_a_jsonl_pending_note_from_one_turn_never_dates_the_next(home, tmp_path):
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    _step(tp, "USER_INPUT", 1, "first")
+    assert owner_turns.antigravity_prompt(_pre(tp, initialNumSteps=1), now=1000.0, wait=0, issuer=issuer)
+    _step(tp, "PLANNER_RESPONSE", 2, "working")
+    assert owner_turns.antigravity_prompt(_pre(tp, invocationNum=2, initialNumSteps=1), now=1010.0, wait=0,
+                                          issuer=issuer) == {}
+    _step(tp, "USER_INPUT", 3, "second")
+    assert owner_turns.antigravity_prompt(_pre(tp, invocationNum=3, initialNumSteps=3), now=1100.0, wait=0,
+                                          issuer=issuer)["prompt"] == "second"
+    assert _ag_ts() == [1000.0, 1100.0]
+    # B's own unflushed call still dates B when B is recorded late.
+    assert owner_turns.antigravity_prompt(_pre(tp, invocationNum=4, initialNumSteps=4), now=1200.0, wait=0,
+                                          issuer=issuer) == {}
+    _step(tp, "USER_INPUT", 4, "third")
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1204.0, issuer=issuer)
+    assert _ag_ts() == [1000.0, 1100.0, 1200.0]
+
+
+def test_a_jsonl_turn_recorded_from_last_user_input_is_one_row_after_the_flush(home, tmp_path):
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    first = owner_turns.antigravity_prompt(_pre(tp, lastUserInput="ship it"), now=1000.0, wait=0, issuer=issuer)
+    assert first["prompt"] == "ship it" and _ag_ts() == [1000.0]
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>ship it</USER_REQUEST>")
+    _step(tp, "PLANNER_RESPONSE", 2, "shipped")
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1004.0, issuer=issuer) is None
+    assert owner_turns.antigravity_late_turn(_pre(tp), "Stop", now=1005.0, issuer=issuer) is None
+    assert _ag_ts() == [1000.0]
+
+
+def test_a_jsonl_last_user_input_alias_never_swallows_a_later_identical_turn(home, tmp_path):
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
+                                          issuer=issuer)["prompt"] == "again"
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>again</USER_REQUEST>")
+    _step(tp, "PLANNER_RESPONSE", 2, "done")
+    _step(tp, "USER_INPUT", 3, "<USER_REQUEST>again</USER_REQUEST>")
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "PostInvocation", now=2000.0, issuer=issuer)
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "Stop", now=2001.0, issuer=issuer) is None
+    assert _ag_ts() == [1000.0, 2000.0]
+
+
+def test_a_jsonl_alias_never_swallows_an_identical_turn_when_its_own_step_left_the_tail(home, tmp_path, monkeypatch):
+    """Codex 2026-10-29: A flushed, then more transcript than the tail read,
+    then an identical B. A's step is out of sight, so B is recorded."""
+    monkeypatch.setattr(owner_turns, "_AG_TAIL", 4096)
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
+                                          issuer=issuer)["prompt"] == "again"
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>again</USER_REQUEST>")
+    for i in range(2, 12):
+        _step(tp, "PLANNER_RESPONSE", i, "x" * 1000)
+    _step(tp, "USER_INPUT", 12, "<USER_REQUEST>again</USER_REQUEST>")
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=12), "PostInvocation", now=2000.0, issuer=issuer)
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=12), "Stop", now=2001.0, issuer=issuer) is None
+    assert _ag_ts() == [1000.0, 2000.0]
+
+
+def test_a_jsonl_alias_never_swallows_an_identical_turn_after_an_unindexed_step(home, tmp_path):
+    """Codex 2026-10-29: A flushed with no step_index, then an identical
+    indexed B. A cannot be told apart from B, so B is recorded."""
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
+                                          issuer=issuer)["prompt"] == "again"
+    with tp.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"type": "USER_INPUT", "content": "<USER_REQUEST>again</USER_REQUEST>"}) + "\n")
+    _step(tp, "PLANNER_RESPONSE", 2, "done")
+    _step(tp, "USER_INPUT", 3, "<USER_REQUEST>again</USER_REQUEST>")
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "PostInvocation", now=2000.0, issuer=issuer)
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "Stop", now=2001.0, issuer=issuer) is None
+    assert _ag_ts() == [1000.0, 2000.0]
+
+
 # ---- verify -----------------------------------------------------------------------------
 
 def test_prompt_probe_proves_one_injection_per_turn(home):
