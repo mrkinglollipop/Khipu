@@ -245,6 +245,22 @@ def test_a_turn_recorded_from_last_user_input_is_not_recorded_again_once_flushed
     assert [r["ts"] for r in _rows()] == [1000.0, 2000.0]
 
 
+def test_a_last_user_input_alias_never_swallows_a_later_identical_turn(home):
+    """Codex 2026-10-29: A is recorded from lastUserInput while the transcript
+    is empty; before another hook reads, A flushes at step 0 and an identical B
+    at step 2. The newest step is B's, so B is recorded, not taken for A."""
+    path = make_db(db_path(home), [], wal=True)
+    assert owner_turns.antigravity_prompt(_pre(path, lastUserInput="again"), now=1000.0, wait=0,
+                                          issuer=ISSUER)["prompt"] == "again"
+    _add(path, 0, 14, user_payload("again"))
+    _add(path, 1, 15, model_payload("done"))
+    _add(path, 2, 14, user_payload("again"))
+    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=2), "PostInvocation", now=2000.0,
+                                             issuer=ISSUER)
+    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=2), "Stop", now=2001.0, issuer=ISSUER) is None
+    assert [r["ts"] for r in _rows()] == [1000.0, 2000.0]
+
+
 def test_late_events_ignore_other_harnesses_and_prompted_payloads(home):
     path = make_db(db_path(home), [(0, 14, user_payload("fix the build"))])
     assert owner_turns.antigravity_late_turn({"session_id": "cc", "prompt": "hi", "cwd": "/w",

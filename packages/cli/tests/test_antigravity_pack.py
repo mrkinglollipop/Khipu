@@ -473,6 +473,20 @@ def test_a_jsonl_turn_recorded_from_last_user_input_is_one_row_after_the_flush(h
     assert _ag_ts() == [1000.0]
 
 
+def test_a_jsonl_last_user_input_alias_never_swallows_a_later_identical_turn(home, tmp_path):
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
+                                          issuer=issuer)["prompt"] == "again"
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>again</USER_REQUEST>")
+    _step(tp, "PLANNER_RESPONSE", 2, "done")
+    _step(tp, "USER_INPUT", 3, "<USER_REQUEST>again</USER_REQUEST>")
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "PostInvocation", now=2000.0, issuer=issuer)
+    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "Stop", now=2001.0, issuer=issuer) is None
+    assert _ag_ts() == [1000.0, 2000.0]
+
+
 # ---- verify -----------------------------------------------------------------------------
 
 def test_prompt_probe_proves_one_injection_per_turn(home):

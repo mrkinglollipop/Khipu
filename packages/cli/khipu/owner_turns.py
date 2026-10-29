@@ -971,6 +971,40 @@ def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     return None
 
 
+def _ag_first_user_step(path: str, at_least: int) -> int | None:
+    """Index of the first USER_INPUT step numbered ``at_least`` or more in a
+    transcript (a JSONL file's tail only), None when none can be read."""
+    if antigravity_db.is_db(path):
+        steps = [idx for idx, role, _ in antigravity_db.read_turns(path) if role == "user"]
+    else:
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                start = max(0, fh.tell() - _AG_TAIL)
+                fh.seek(start)
+                data = fh.read()
+        except OSError:
+            return None
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        if start > 0 and lines:
+            lines = lines[1:]
+        steps = []
+        for line in lines:
+            try:
+                step = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
+                continue
+            index = step.get("step_index")
+            text = _ag_text(step.get("content"))
+            wrapped = _AG_WRAP.match(text)
+            if isinstance(index, int) and not isinstance(index, bool) and (wrapped.group(1) if wrapped else text).strip():
+                steps.append(index)
+    later = [i for i in steps if i >= at_least]
+    return min(later) if later else None
+
+
 def _ag_flush_wait() -> float:
     try:
         return max(0.0, min(2.0, float(os.environ.get("KHIPU_AG_FLUSH_WAIT_S", _AG_FLUSH_WAIT_S))))
@@ -986,9 +1020,11 @@ def _ag_flush_wait() -> float:
 # with no matching note is dated when it is recorded. Stop clears the notes.
 _AG_PENDING_KEEP_S = 3600
 _AG_PENDING_MAX = 32
-# A turn recorded from the payload's ``lastUserInput`` (nothing in the
-# transcript yet) is keyed by its text; the alias lets the same turn's step,
-# once flushed, be known as already recorded.
+# A turn recorded from the payload's ``lastUserInput`` (no USER_INPUT step in
+# the transcript yet) is keyed by its text. Its alias keeps that text and the
+# payload's ``initialNumSteps``: the turn's own step, once flushed, is the
+# first USER_INPUT step at or after that count, and only that step is known as
+# already recorded, so a later identical turn is never taken for it.
 _AG_FALLBACK = "last-"
 
 
@@ -1066,11 +1102,11 @@ def _ag_clear_unseen(session: str) -> None:
         pass
 
 
-def _ag_claim(session: str, key: str, text: str, now: float) -> float | None:
+def _ag_claim(session: str, key: str, text: str, now: float, payload: dict) -> float | None:
     """Create the turn's once-per-turn marker. The turn's time when this call
     created it (the note's when a PreInvocation of this same turn could not
     read it), None when the turn was already handled, including a turn
-    recorded earlier from ``lastUserInput`` whose step is now flushed."""
+    recorded earlier from ``lastUserInput`` whose own step is now flushed."""
     directory = _ag_dir()
     marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
     try:
@@ -1085,20 +1121,31 @@ def _ag_claim(session: str, key: str, text: str, now: float) -> float | None:
             continue
     alias = _ag_file(directory, "alias-", session)
     if key.startswith(_AG_FALLBACK):
+        # The fallback only runs when the transcript shows no USER_INPUT step,
+        # so with no step count the turn's step is the transcript's first.
         try:
-            _ag_write(alias, _ag_text_hash(text))
+            _ag_write(alias, json.dumps({"text": _ag_text_hash(text), "from": _ag_initial_steps(payload) or 0}))
         except OSError:
             pass
     else:
-        # The first transcript step claimed after a lastUserInput turn is that
-        # turn's own step when the words match; either way the alias is spent.
         try:
-            earlier = alias.read_text(encoding="utf-8").strip()
-            alias.unlink()
-        except OSError:
+            earlier = json.loads(alias.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             earlier = None
-        if earlier == _ag_text_hash(text):
-            return None
+        index = _ag_step_number(key)
+        start = earlier.get("from") if isinstance(earlier, dict) else None
+        if not isinstance(start, int) or isinstance(start, bool) or index is None or index >= start:
+            # Spent by the first step claimed at or after the turn's count. It
+            # matches only that turn's own step (the first USER_INPUT there);
+            # a step with no index cannot be bound and is recorded.
+            try:
+                alias.unlink()
+            except OSError:
+                pass
+            tp = hook_shape.transcript_path(payload)
+            if (isinstance(start, int) and index is not None and earlier.get("text") == _ag_text_hash(text)
+                    and tp and _ag_first_user_step(tp, start) == index):
+                return None
     at = now
     index = _ag_step_number(key)
     if index is not None:
@@ -1160,7 +1207,7 @@ def _antigravity_turn(payload, now: float | None, wait: float | None):
     if found is None:
         return None, None, (session, _ag_initial_steps(payload))
     key, text = found
-    at = _ag_claim(session, key, text, time.time() if now is None else now)
+    at = _ag_claim(session, key, text, time.time() if now is None else now, payload)
     if at is None:
         # Already handled, or the newest step is the last turn's and this
         # call's own turn is not written yet.
@@ -1203,7 +1250,7 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
         stamp = time.time() if now is None else now
         recorded = None
         if found is not None:
-            at = _ag_claim(session, found[0], found[1], stamp)
+            at = _ag_claim(session, found[0], found[1], stamp, payload)
             if at is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}
