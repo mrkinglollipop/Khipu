@@ -80,8 +80,11 @@ NOT_CAPTURE = {
     # Cursor/Antigravity hooks (docs/plans/2026-10-27-cursor-antigravity-hooks.md).
     "hook_shape.claim": "an empty single-flight marker named by a hash of harness, session and event; "
                         "no capture text",
-    "owner_turns.antigravity_turn": "an empty once-per-turn gate marker named by a hash of the session and "
-                                    "the transcript step; no capture text",
+    "owner_turns._ag_claim": "an empty once-per-turn marker named by a hash of the session and the "
+                             "transcript step, and the session's alias file holding a hash of the "
+                             "prompt text and a step count; no capture text",
+    "owner_turns._ag_write": "an Antigravity session's pending-turn note (step numbers and times) or its "
+                             "alias (a hash of the prompt text and a step count); no capture text",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
                      # Grok's config.toml, a repo's AGENTS.md recall block, the Aegis [memory] marker.
