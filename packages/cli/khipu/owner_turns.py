@@ -978,11 +978,18 @@ def _ag_flush_wait() -> float:
         return _AG_FLUSH_WAIT_S
 
 
-# A PreInvocation that cannot record leaves a stamp (its time, and the newest
-# turn it could see), so a turn recorded later by PostInvocation or Stop keeps
-# the time the owner sent it. Stop clears it: a stamp left by a model call
-# inside a turn must not date the next one.
+# A PreInvocation that cannot record leaves a note of its time under the
+# payload's ``initialNumSteps``: the step count when its turn began, which is
+# the index of that turn's USER_INPUT step (T3 2026-10-29: 0 for the step-0
+# turn). Only the turn whose step index equals it takes that time, so a note
+# left by a later model call of one turn never dates the next turn; a turn
+# with no matching note is dated when it is recorded. Stop clears the notes.
 _AG_PENDING_KEEP_S = 3600
+_AG_PENDING_MAX = 32
+# A turn recorded from the payload's ``lastUserInput`` (nothing in the
+# transcript yet) is keyed by its text; the alias lets the same turn's step,
+# once flushed, be known as already recorded.
+_AG_FALLBACK = "last-"
 
 
 def _ag_dir() -> Path:
@@ -992,31 +999,78 @@ def _ag_dir() -> Path:
     return directory
 
 
-def _ag_pending(directory: Path, session: str) -> Path:
-    return directory / ("pending-" + hashlib.sha256(session.encode("utf-8", "replace")).hexdigest()[:40])
+def _ag_file(directory: Path, kind: str, session: str) -> Path:
+    return directory / (kind + hashlib.sha256(session.encode("utf-8", "replace")).hexdigest()[:40])
 
 
-def _ag_note_unseen(session: str, key: str | None, now: float) -> None:
-    """Keep the first unrecorded PreInvocation's time (never overwritten)."""
+def _ag_text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _ag_step_number(key: str) -> int | None:
+    if key.startswith("step-") and key[5:].isdigit():
+        return int(key[5:])
+    return None
+
+
+def _ag_initial_steps(payload: dict) -> int | None:
+    n = payload.get("initialNumSteps")
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+
+
+def _ag_notes(path: Path) -> dict[str, float]:
     try:
-        fd = os.open(_ag_pending(_ag_dir(), session), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except OSError:
-        return
+        notes = json.loads(path.read_text(encoding="utf-8")).get("steps")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(notes, dict):
+        return {}
+    return {k: float(v) for k, v in notes.items()
+            if isinstance(k, str) and k.isdigit() and isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+
+def _ag_write(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps({"ts": now, "after": key}))
+        fh.write(text)
+    os.replace(tmp, path)
 
 
-def _ag_clear_unseen(session: str) -> None:
+def _ag_save_notes(path: Path, notes: dict[str, float]) -> None:
     try:
-        _ag_pending(_ag_dir(), session).unlink()
+        if not notes:
+            path.unlink(missing_ok=True)
+            return
+        keep = sorted(notes, key=int)[-_AG_PENDING_MAX:]
+        _ag_write(path, json.dumps({"steps": {k: notes[k] for k in keep}}))
     except OSError:
         pass
 
 
-def _ag_claim(session: str, key: str, now: float) -> float | None:
+def _ag_note_unseen(session: str, steps: int | None, now: float) -> None:
+    """Keep the first unrecorded PreInvocation's time for the turn at step
+    ``steps`` (never overwritten). No note without a step count to bind it."""
+    if steps is None:
+        return
+    path = _ag_file(_ag_dir(), "pending-", session)
+    notes = _ag_notes(path)
+    notes.setdefault(str(steps), now)
+    _ag_save_notes(path, notes)
+
+
+def _ag_clear_unseen(session: str) -> None:
+    try:
+        _ag_file(_ag_dir(), "pending-", session).unlink()
+    except OSError:
+        pass
+
+
+def _ag_claim(session: str, key: str, text: str, now: float) -> float | None:
     """Create the turn's once-per-turn marker. The turn's time when this call
-    created it (the pending stamp's when one was left before the turn could be
-    read), None when the turn was already handled."""
+    created it (the note's when a PreInvocation of this same turn could not
+    read it), None when the turn was already handled, including a turn
+    recorded earlier from ``lastUserInput`` whose step is now flushed."""
     directory = _ag_dir()
     marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
     try:
@@ -1029,19 +1083,31 @@ def _ag_claim(session: str, key: str, now: float) -> float | None:
                 old.unlink()
         except OSError:
             continue
+    alias = _ag_file(directory, "alias-", session)
+    if key.startswith(_AG_FALLBACK):
+        try:
+            _ag_write(alias, _ag_text_hash(text))
+        except OSError:
+            pass
+    else:
+        # The first transcript step claimed after a lastUserInput turn is that
+        # turn's own step when the words match; either way the alias is spent.
+        try:
+            earlier = alias.read_text(encoding="utf-8").strip()
+            alias.unlink()
+        except OSError:
+            earlier = None
+        if earlier == _ag_text_hash(text):
+            return None
     at = now
-    pending = _ag_pending(directory, session)
-    try:
-        note = json.loads(pending.read_text(encoding="utf-8"))
-        ts = note.get("ts")
-        if note.get("after") != key and isinstance(ts, (int, float)) and now - _AG_PENDING_KEEP_S <= ts <= now:
-            at = float(ts)
-    except (OSError, ValueError, AttributeError):
-        pass
-    try:
-        pending.unlink()
-    except OSError:
-        pass
+    index = _ag_step_number(key)
+    if index is not None:
+        path = _ag_file(directory, "pending-", session)
+        notes = _ag_notes(path)
+        ts = notes.get(str(index))
+        if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
+            at = ts
+        _ag_save_notes(path, {k: v for k, v in notes.items() if int(k) > index})
     return at
 
 
@@ -1067,7 +1133,10 @@ def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] 
                 time.sleep(_AG_FLUSH_POLL_S)
                 found = _ag_last_user_input(tp)
     if found is None and has_last:
-        found = ("h-" + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], last.strip())
+        wrapped = _AG_WRAP.match(last)
+        text = (wrapped.group(1) if wrapped else last).strip()
+        if text:
+            found = (_AG_FALLBACK + _ag_text_hash(last), text)
     return session, found
 
 
@@ -1082,20 +1151,20 @@ def _ag_filled(payload: dict, text: str) -> dict:
 
 
 def _antigravity_turn(payload, now: float | None, wait: float | None):
-    """(gate answer, the new turn's time, (session, newest key) when this call
-    recorded nothing and its own turn may not be written yet)."""
+    """(gate answer, the new turn's time, (session, the payload's step count)
+    when this call recorded nothing and its own turn may not be written yet)."""
     read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait))
     if read is None:
         return None, None, None
     session, found = read
     if found is None:
-        return None, None, (session, None)
+        return None, None, (session, _ag_initial_steps(payload))
     key, text = found
-    at = _ag_claim(session, key, time.time() if now is None else now)
+    at = _ag_claim(session, key, text, time.time() if now is None else now)
     if at is None:
         # Already handled, or the newest step is the last turn's and this
         # call's own turn is not written yet.
-        return {}, None, (session, key)
+        return {}, None, (session, _ag_initial_steps(payload))
     return _ag_filled(payload, text), at, None
 
 
@@ -1122,7 +1191,8 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
                           issuer: dict | None = None) -> str | None:
     """Record at PostInvocation or Stop an Antigravity turn no PreInvocation
     could read (a one-call turn has no later PreInvocation), under the same
-    once-per-turn marker, with the time of its first unrecorded PreInvocation.
+    once-per-turn marker, with the time of the first PreInvocation of that
+    same turn that could not read it (else this call's time).
     Returns the recorded turn's id, None when nothing was recorded. Prints
     nothing; never raises."""
     try:
@@ -1133,7 +1203,7 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
         stamp = time.time() if now is None else now
         recorded = None
         if found is not None:
-            at = _ag_claim(session, found[0], stamp)
+            at = _ag_claim(session, found[0], found[1], stamp)
             if at is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}

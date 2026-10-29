@@ -189,16 +189,60 @@ def test_a_later_turn_takes_the_time_of_its_own_first_unflushed_call_not_the_las
     # More model calls of the first turn, then its Stop.
     assert owner_turns.antigravity_prompt(_pre(path, invocationNum=2), now=1005.0, wait=0, issuer=ISSUER) == {}
     owner_turns.antigravity_late_turn(_pre(path), "Stop", now=1010.0, issuer=ISSUER)
-    # The second turn's PreInvocation still sees only the first turn.
-    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=3), now=2000.0, wait=0, issuer=ISSUER) == {}
+    # The second turn's PreInvocation still sees only the first turn (its
+    # initialNumSteps is the second turn's step index, as T3 sends it).
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=3, initialNumSteps=1), now=2000.0, wait=0,
+                                          issuer=ISSUER) == {}
     _add(path, 1, 14, user_payload("second"))
     assert owner_turns.antigravity_late_turn(_pre(path), "PostInvocation", now=2003.0, issuer=ISSUER)
     assert [r["ts"] for r in _rows()] == [1000.0, 2000.0]
     # A turn claimed at its first PreInvocation keeps that call's own time.
     owner_turns.antigravity_late_turn(_pre(path), "Stop", now=2010.0, issuer=ISSUER)
     _add(path, 2, 14, user_payload("third"))
-    assert owner_turns.antigravity_prompt(_pre(path), now=3000.0, wait=0, issuer=ISSUER)["prompt"] == "third"
+    assert owner_turns.antigravity_prompt(_pre(path, initialNumSteps=2), now=3000.0, wait=0,
+                                          issuer=ISSUER)["prompt"] == "third"
     assert [r["ts"] for r in _rows()] == [1000.0, 2000.0, 3000.0]
+
+
+def test_a_pending_note_from_a_model_call_of_one_turn_never_dates_the_next_turn(home):
+    """Codex 2026-10-29: turn A at 1000, a later model call of A leaves a note at
+    1010, turn B arrives at 1100 before any Stop: B is dated 1100, not 1010."""
+    path = make_db(db_path(home), [(0, 14, user_payload("first"))], wal=True)
+    assert owner_turns.antigravity_prompt(_pre(path), now=1000.0, wait=0, issuer=ISSUER)["prompt"] == "first"
+    _add(path, 1, 15, model_payload("working"))
+    # A's later model calls: T3 counts the turn's initial steps (0), a runtime
+    # counting per call would send the steps so far (2); neither may date B.
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=2), now=1010.0, wait=0, issuer=ISSUER) == {}
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=3, initialNumSteps=2), now=1020.0, wait=0,
+                                          issuer=ISSUER) == {}
+    _add(path, 2, 15, model_payload("done"))
+    _add(path, 3, 14, user_payload("second"))
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=4, initialNumSteps=3), now=1100.0, wait=0,
+                                          issuer=ISSUER)["prompt"] == "second"
+    assert [r["ts"] for r in _rows()] == [1000.0, 1100.0]
+    # A further turn with no unflushed call of its own takes the late event's time.
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=5, initialNumSteps=3), now=1110.0, wait=0,
+                                          issuer=ISSUER) == {}
+    _add(path, 4, 14, user_payload("third"))
+    assert owner_turns.antigravity_late_turn(_pre(path), "PostInvocation", now=1200.0, issuer=ISSUER)
+    assert [r["ts"] for r in _rows()] == [1000.0, 1100.0, 1200.0]
+
+
+def test_a_turn_recorded_from_last_user_input_is_not_recorded_again_once_flushed(home):
+    path = make_db(db_path(home), [], wal=True)
+    first = owner_turns.antigravity_prompt(_pre(path, lastUserInput="fix the build"), now=1000.0, wait=0,
+                                           issuer=ISSUER)
+    assert first["prompt"] == "fix the build" and len(_rows()) == 1
+    _add(path, 0, 14, user_payload("fix the build"))
+    assert owner_turns.antigravity_late_turn(_pre(path), "PostInvocation", now=1004.0, issuer=ISSUER) is None
+    assert owner_turns.antigravity_late_turn(_pre(path), "Stop", now=1005.0, issuer=ISSUER) is None
+    assert [r["ts"] for r in _rows()] == [1000.0]
+    # The same words sent again later are a new turn.
+    _add(path, 1, 15, model_payload("done"))
+    _add(path, 2, 14, user_payload("fix the build"))
+    assert owner_turns.antigravity_prompt(_pre(path, initialNumSteps=2), now=2000.0, wait=0,
+                                          issuer=ISSUER)["prompt"] == "fix the build"
+    assert [r["ts"] for r in _rows()] == [1000.0, 2000.0]
 
 
 def test_late_events_ignore_other_harnesses_and_prompted_payloads(home):

@@ -435,6 +435,44 @@ def test_a_jsonl_turn_recorded_by_stop_alone_and_left_alone_when_already_recorde
     assert [r["ts"] for r in rows] == [50.0, 60.0]
 
 
+def _ag_ts() -> list[float]:
+    path = owner_turns.session_file("ag-1")
+    return [json.loads(x)["ts"] for x in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_a_jsonl_pending_note_from_one_turn_never_dates_the_next(home, tmp_path):
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    _step(tp, "USER_INPUT", 1, "first")
+    assert owner_turns.antigravity_prompt(_pre(tp, initialNumSteps=1), now=1000.0, wait=0, issuer=issuer)
+    _step(tp, "PLANNER_RESPONSE", 2, "working")
+    assert owner_turns.antigravity_prompt(_pre(tp, invocationNum=2, initialNumSteps=1), now=1010.0, wait=0,
+                                          issuer=issuer) == {}
+    _step(tp, "USER_INPUT", 3, "second")
+    assert owner_turns.antigravity_prompt(_pre(tp, invocationNum=3, initialNumSteps=3), now=1100.0, wait=0,
+                                          issuer=issuer)["prompt"] == "second"
+    assert _ag_ts() == [1000.0, 1100.0]
+    # B's own unflushed call still dates B when B is recorded late.
+    assert owner_turns.antigravity_prompt(_pre(tp, invocationNum=4, initialNumSteps=4), now=1200.0, wait=0,
+                                          issuer=issuer) == {}
+    _step(tp, "USER_INPUT", 4, "third")
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1204.0, issuer=issuer)
+    assert _ag_ts() == [1000.0, 1100.0, 1200.0]
+
+
+def test_a_jsonl_turn_recorded_from_last_user_input_is_one_row_after_the_flush(home, tmp_path):
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    first = owner_turns.antigravity_prompt(_pre(tp, lastUserInput="ship it"), now=1000.0, wait=0, issuer=issuer)
+    assert first["prompt"] == "ship it" and _ag_ts() == [1000.0]
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>ship it</USER_REQUEST>")
+    _step(tp, "PLANNER_RESPONSE", 2, "shipped")
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1004.0, issuer=issuer) is None
+    assert owner_turns.antigravity_late_turn(_pre(tp), "Stop", now=1005.0, issuer=issuer) is None
+    assert _ag_ts() == [1000.0]
+
+
 # ---- verify -----------------------------------------------------------------------------
 
 def test_prompt_probe_proves_one_injection_per_turn(home):
