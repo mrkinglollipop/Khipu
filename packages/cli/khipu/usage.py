@@ -1079,7 +1079,9 @@ def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S, logi
     (``usage_logins.grok_login_read``, at most every ``LOGIN_READ_MIN_S``); when that is
     off, not due or fails (a rejected login included: never refreshed), the
     Grok Build reading below, unchanged. ``login=False`` (discovery, a
-    sign-in check) never looks inside the login folder at all."""
+    sign-in check) never looks inside the login folder at all. With Cursor's
+    switch on, Cursor's reading of the same xAI limit is a second source
+    (``usage_logins.grok_with_cursor``)."""
     if not login:
         return _probe_grok_build(grok_home, timeout=timeout)
     try:
@@ -1088,14 +1090,20 @@ def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S, logi
         use_login = usage_logins.login_switch("grok")[0] and usage_logins.login_read_due("grok")
     except Exception:  # noqa: BLE001 - an unreadable setting reads as off
         use_login = False
+    own = None
     if use_login:
         try:
-            return usage_logins.grok_login_read(grok_home, LOGIN_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+            own = usage_logins.grok_login_read(grok_home, LOGIN_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
         except ProbeError:
             pass
         except (AttributeError, TypeError, KeyError, IndexError, ValueError, OverflowError):
             pass
-    return _probe_grok_build(grok_home, timeout=timeout)
+    if own is None:
+        own = _probe_grok_build(grok_home, timeout=timeout)
+    try:
+        return usage_logins.grok_with_cursor(own, timeout=timeout)
+    except Exception:  # noqa: BLE001 - Cursor's reading is a second source; Grok's own stands
+        return own
 
 
 @_guard
@@ -1767,8 +1775,9 @@ def kimi_accounts(definitions: dict) -> list[dict]:
 # this module still reads no credential by name. What stays here is what
 # every reader shares: the rows outside routing, the cadence and the notes.
 
-# Rows of their own, read only from a login, never routing accounts.
-LOGIN_READ_HARNESSES = ("cursor", "opencode")
+# Rows of their own, read only from a login, never routing accounts. Cursor
+# is not one: its reading is the Grok account's (``probe_grok``).
+LOGIN_READ_HARNESSES = ("opencode",)
 # T3's balanced cadence; one provider's login is never read more often.
 LOGIN_READ_MIN_S = 300
 LOGIN_TIMEOUT_S = 10.0
@@ -3767,8 +3776,8 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
 # added to the owner's rows later stays out until named here. Never ``home``
 # or any path: conversations reach other model providers (slice 9A).
 _PUBLIC_ROW_FIELDS = ("harness", "account", "plan", "ok", "error", "live_error", "last_error", "version",
-                      "source", "observed_at", "probed_at", "last_attempt_at", "last_good_at", "ms", "cached",
-                      "stale", "refreshing")
+                      "source", "via", "source_note", "observed_at", "probed_at", "last_attempt_at",
+                      "last_good_at", "ms", "cached", "stale", "refreshing")
 _PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model", "expired", "pace")
 INVALID_PUBLIC_NOTE = "This account entry is not valid; the owner can fix it in Khipu's Settings"
 

@@ -650,7 +650,7 @@ export const LOGIN_USAGE_SWITCHES = [
     id: "route-login-cursor",
     tool: "Cursor",
     label: "Read Cursor's usage from its Keychain login",
-    what: "Khipu reads Cursor's sign-in from the macOS Keychain and sends it only to Cursor's usage page, at most every five minutes. macOS may ask you to allow this. It never changes the login. Cursor shows as its own account under Plans; routing still counts Cursor's lanes against Grok.",
+    what: "Khipu reads Cursor's sign-in from the macOS Keychain and sends it only to Cursor's usage page, at most every five minutes. macOS may ask you to allow this. It never changes the login. Cursor's figures are the Grok account's under Plans (one xAI limit), used when Grok's own read is off, fails or is older.",
   },
   {
     key: "routing_usage_login_opencode",

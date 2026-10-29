@@ -8,8 +8,10 @@ request to the fixed host below (``usage._https_get``: no redirect, no proxy,
 no error body), and never reaches a row, the cache, a log, argv, env or an
 exception. Each provider has the owner's switch (``LOGIN_SWITCHES``, routing
 settings, so only the owner turns one on). Grok falls back to its Grok Build
-reading; Cursor and OpenCode Go are rows of their own outside routing
-(Cursor's lanes already count as the Grok account there).
+reading. Cursor is the same account as Grok (Matt 2026-10-29: one xAI
+Ultra weekly limit covers Grok Bot, Grok Build and Cursor), so its reading is
+a second source for the Grok row, never a row of its own
+(``grok_with_cursor``). OpenCode Go is a row of its own outside routing.
 """
 from __future__ import annotations
 
@@ -71,6 +73,14 @@ _OPENCODE_WINDOWS = (("rolling", "five_hour", 300), ("weekly", "weekly", 10080),
 # A stated percent above this is not a usage figure: the reply is malformed.
 _PCT_MAX = 1_000_000
 _DUE_LOCKS = {provider: threading.Lock() for provider in LOGIN_SWITCHES}
+CURSOR_SAVED_NAME = "cursor-reading.json"
+# Cursor's last reading stands in for the Grok row between its reads.
+CURSOR_KEEP_S = 30 * 60
+# Two readings of the one limit further apart than this are noted.
+DISAGREE_PTS = 5.0
+# A Cursor cycle ending this close to a Grok window's reset is that window.
+_RESET_MATCH_S = 6 * 3600
+_WEEK_MINS = 7 * 1440
 
 
 def _grok_login_file(home: str | None = None) -> Path:
@@ -138,22 +148,36 @@ def login_switches_status(config: dict | None = None) -> dict:
     return out
 
 
+def login_state_dir() -> Path:
+    """Host-local: the read stamps, their locks and Cursor's last reading.
+    Not ``data_dir()``, which the owner may move to a synced folder: there a
+    lock can stall and another Mac's stamp would skip this Mac's reads."""
+    return Path.home() / "Library" / "Caches" / "Khipu" / "login-usage"
+
+
 def login_read_due(provider: str, every: float = LOGIN_READ_MIN_S) -> bool:
     """At most one read of ``provider``'s login per ``every`` seconds, across
     every caller (the app, a reset check, the periodic refresh). The stamp is
     checked and renewed under one lock (a thread lock and ``flock`` on the
-    stamp), so two callers racing see one of them due."""
+    stamp), so two callers racing see one of them due. Neither lock is waited
+    on: a busy one (a holder suspended mid-check, say) skips this cycle."""
     import fcntl
 
-    stamp = cache_file().with_name(f"usage.login-{provider}.stamp")
-    with _DUE_LOCKS.setdefault(provider, threading.Lock()):
+    stamp = login_state_dir() / f"usage.login-{provider}.stamp"
+    thread_lock = _DUE_LOCKS.setdefault(provider, threading.Lock())
+    if not thread_lock.acquire(blocking=False):
+        return False
+    try:
         try:
-            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd = os.open(stamp.with_name(stamp.name + ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         except OSError:
             return False
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return False
             try:
                 if time.time() - stamp.stat().st_mtime < every:
                     return False
@@ -167,6 +191,8 @@ def login_read_due(provider: str, every: float = LOGIN_READ_MIN_S) -> bool:
             return True
         finally:
             os.close(fd)  # closing the descriptor releases the flock
+    finally:
+        thread_lock.release()
 
 
 def _read_login_json(path: Path) -> dict:
@@ -318,11 +344,11 @@ def parse_cursor(status: int, body: bytes) -> dict:
     ``billingCycleEnd`` (epoch ms)."""
     reply = _login_reply(status, body)
     plan = _dict(reply, "planUsage")
-    end = reply.get("billingCycleEnd")
-    if isinstance(end, str) and end.strip().isdigit():
-        end = int(end.strip())
-    resets = _iso(end) if isinstance(end, (int, float)) and not isinstance(end, bool) else None
-    mins = _kimi_month_mins(resets)
+    end, start = (_epoch_ms(reply.get(k)) for k in ("billingCycleEnd", "billingCycleStart"))
+    resets = _iso(end) if end is not None else None
+    began = _parse_time(_iso(start)) if start is not None else None
+    ends = _parse_time(resets)
+    mins = int((ends - began).total_seconds() // 60) if began and ends and ends > began else _kimi_month_mins(resets)
     windows = [w for field, name, model in _CURSOR_WINDOWS
                if (w := _window(name, _login_pct(plan.get(field)), resets, mins, model=model))]
     if not windows:
@@ -330,12 +356,13 @@ def parse_cursor(status: int, body: bytes) -> dict:
     return {"ok": True, "plan": None, "windows": windows, "credits": None, "version": None, "source": "live"}
 
 
-@_guard
-def probe_cursor(*, timeout: float = TIMEOUT_S) -> dict:
-    if not login_switch("cursor")[0]:
-        raise ProbeError(E_NO_KEY)
-    if not login_read_due("cursor"):
-        raise ProbeError(E_PENDING)
+def _epoch_ms(value):
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _cursor_read(timeout: float) -> dict:
     token = _cursor_token()
     if not token:
         raise ProbeError(E_NO_KEY)
@@ -347,6 +374,104 @@ def probe_cursor(*, timeout: float = TIMEOUT_S) -> dict:
     finally:
         token = None
     return parse_cursor(status, body)
+
+
+def _cursor_saved_file() -> Path:
+    return login_state_dir() / CURSOR_SAVED_NAME
+
+
+def _save_cursor(windows: list[dict], at: float) -> None:
+    from khipu.paths import write_sensitive_bytes
+
+    try:
+        write_sensitive_bytes(_cursor_saved_file(), json.dumps({"at": at, "windows": windows}).encode())
+    except OSError:
+        pass
+
+
+def _saved_cursor(now: float) -> tuple[list[dict], float] | None:
+    try:
+        data = json.loads(_cursor_saved_file().read_text(encoding="utf-8"))
+        at, windows = float(data["at"]), data["windows"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    if not isinstance(windows, list) or not all(isinstance(w, dict) for w in windows):
+        return None
+    return (windows, at) if 0 <= now - at <= CURSOR_KEEP_S and math.isfinite(at) else None
+
+
+def _cursor_reading(timeout: float) -> tuple[list[dict], float] | None:
+    """Cursor's windows and when they were read: a fresh read when one is
+    due, else the last one kept (at most ``CURSOR_KEEP_S`` old)."""
+    now = time.time()
+    if login_read_due("cursor"):
+        try:
+            windows = _cursor_read(timeout)["windows"]
+        except (ProbeError, AttributeError, TypeError, KeyError, IndexError, ValueError, OverflowError):
+            windows = None
+        if windows:
+            _save_cursor(windows, now)
+            return windows, now
+    return _saved_cursor(now)
+
+
+def _cursor_window(windows: list[dict], grok_windows: list[dict]) -> tuple[dict | None, dict | None]:
+    """Cursor's overall figure as a Grok window, and the Grok window it
+    matched. Its pools (Cursor's own models, other models) are Cursor's split
+    of the same limit, never a Grok window. Named for the Grok window whose
+    reset its cycle end matches; with none, weekly when the cycle is a week."""
+    total = next((w for w in windows if w.get("name") == "monthly"), None)
+    if total is None or not isinstance(total.get("used_pct"), (int, float)):
+        return None, None
+    window = {k: total[k] for k in ("used_pct", "resets_at", "window_mins") if total.get(k) is not None}
+    ends = _parse_time(total.get("resets_at"))
+    for grok in grok_windows:
+        reset = _parse_time(grok.get("resets_at"))
+        if ends and reset and abs((ends - reset).total_seconds()) <= _RESET_MATCH_S:
+            window.update(name=grok["name"], window_mins=grok.get("window_mins") or window.get("window_mins"))
+            return {k: v for k, v in window.items() if v is not None}, grok
+    mins = window.get("window_mins")
+    window["name"] = "weekly" if isinstance(mins, int) and abs(mins - _WEEK_MINS) <= 1440 else "monthly"
+    return window, None
+
+
+def _pct_words(value: float) -> str:
+    return f"{value:g}%"
+
+
+def grok_with_cursor(own: dict, *, timeout: float = TIMEOUT_S) -> dict:
+    """The Grok row with Cursor's reading as its second source, never added
+    to Grok's own: used when Grok's own read failed or is older; readings
+    further apart than ``DISAGREE_PTS`` keep the fresher and say so in the
+    row's ``source_note``. A row from Cursor carries ``via: "cursor"``."""
+    if not login_switch("cursor")[0]:
+        return own
+    reading = _cursor_reading(LOGIN_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+    if reading is None:
+        return own
+    windows, read_at = reading
+    own_ok = bool(own.get("ok")) and bool(own.get("windows"))
+    window, matched = _cursor_window(windows, own.get("windows") or [] if own_ok else [])
+    if window is None:
+        return own
+    via = {"ok": True, "plan": own.get("plan") if own_ok else None, "windows": [window], "credits": None,
+           "version": None, "source": "live", "via": "cursor"}
+    if read_at < time.time() - 1:
+        via.update(source="last_observed", observed_at=_iso(read_at))
+    if not own_ok:
+        return via
+    own_at = _parse_time(own.get("observed_at"))
+    own_ts = own_at.timestamp() if own_at else time.time()
+    kept = dict(via if read_at > own_ts else own)
+    if matched is None:
+        kept["source_note"] = (f"Cursor's billing cycle ends {window.get('resets_at') or 'at no stated time'}, "
+                               f"which does not line up with Grok's own windows")
+    elif abs(window["used_pct"] - (matched.get("used_pct") or 0)) > DISAGREE_PTS:
+        which = "Cursor's" if kept.get("via") else "Grok's own"
+        kept["source_note"] = (f"Grok's own reading says {_pct_words(matched.get('used_pct') or 0)} and Cursor's "
+                               f"{_pct_words(window['used_pct'])} for the {matched['name']} window; "
+                               f"showing the fresher ({which})")
+    return kept
 
 
 def _opencode_token() -> str:
@@ -391,15 +516,12 @@ def probe_opencode(*, timeout: float = TIMEOUT_S) -> dict:
 
 
 def login_accounts(config: dict | None = None) -> list[dict]:
-    """Cursor and OpenCode Go, each once its switch is on (OpenCode Go only
-    with its login on this Mac)."""
-    out = []
-    if login_switch("cursor", config)[0]:
-        out.append({"label": LABELS["cursor"], "harness": "cursor", "home": None})
+    """OpenCode Go once its switch is on and its login is on this Mac.
+    Cursor is never one: its reading is the Grok row's."""
     if login_switch("opencode", config)[0] and login_present("opencode"):
-        out.append({"label": LABELS["opencode"], "harness": "opencode", "home": None})
-    return out
+        return [{"label": LABELS["opencode"], "harness": "opencode", "home": None}]
+    return []
 
 
 def probe(harness: str, *, timeout: float = TIMEOUT_S) -> dict:
-    return probe_cursor(timeout=timeout) if harness == "cursor" else probe_opencode(timeout=timeout)
+    return probe_opencode(timeout=timeout)

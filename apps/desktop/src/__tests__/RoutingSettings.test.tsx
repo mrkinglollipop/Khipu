@@ -2488,7 +2488,7 @@ describe("Settings -> Accounts and routing: reading a tool's own login", () => {
     const cursor = screen.getByRole("switch", { name: "Read Cursor's usage from its Keychain login" });
     expect(cursor).not.toBeChecked();
     expect(screen.getByText(/macOS may ask you to allow this/)).toBeInTheDocument();
-    expect(screen.getByText(/routing still counts Cursor's lanes against Grok/)).toBeInTheDocument();
+    expect(screen.getByText(/Cursor's figures are the Grok account's under Plans/)).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "Read OpenCode Go's usage from its own login" })).not.toBeChecked();
     fireEvent.click(cursor);
     await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_usage_login_cursor", value: "on" }));

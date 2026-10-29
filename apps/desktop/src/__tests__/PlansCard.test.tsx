@@ -1351,6 +1351,23 @@ describe("one rule for passing gaps and codes that need the owner (shared with S
   });
 });
 
+describe("Grok's row read via Cursor (one xAI limit)", () => {
+  it("names Cursor as the source and shows a disagreement on the read line", async () => {
+    const r = realReport();
+    const grok = r.accounts!.find((a) => a.harness === "grok")!;
+    Object.assign(grok, {
+      via: "cursor",
+      source_note: "Grok's own reading says 10% and Cursor's 61% for the weekly window; showing the fresher (Cursor's)",
+    });
+    status = r;
+    render(<Settings />);
+    const block = within(await screen.findByRole("group", { name: "Grok" }));
+    expect(block.getByText(/read via Cursor/)).toBeTruthy();
+    expect(block.getByText(/showing the fresher \(Cursor's\)/)).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Cursor" })).toBeNull();
+  });
+});
+
 describe("rows read from a tool's own login (Cursor, OpenCode Go)", () => {
   it("names Cursor's pools by their model words and says a rejected login can't be read", () => {
     expect(windowLabel({ name: "monthly_cursor_models", model: "Cursor models" })).toBe("Cursor models month");

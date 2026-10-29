@@ -47,6 +47,11 @@ export type UsageAccount = {
   credits?: Record<string, unknown> | null;
   version?: string | null;
   source?: string | null;
+  /** "cursor": the Grok row's figures came from Cursor's reading of the
+   *  same xAI limit (`usage_logins.grok_with_cursor`). */
+  via?: string | null;
+  /** Two readings of the one limit disagreed; which one is shown. */
+  source_note?: string | null;
   observed_at?: string | null;
   ok?: boolean;
   error?: string | null;
@@ -898,7 +903,9 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
   const dim = status.figures === "kept" || (status.code != null && status.figures === "none");
   const triedAge = fmtAgoSince(row.last_attempt_at || row.probed_at);
   const figuresAge = fmtAgoSince(figuresAt(row));
-  const login = row.home || "default login";
+  const login = [row.home || "default login", row.via === "cursor" ? "read via Cursor" : null, row.source_note?.trim() || null]
+    .filter(Boolean)
+    .join("; ");
   return (
     <section className={status.tone === "warn" ? "plan-block warn" : "plan-block"} role="group" aria-label={name}>
       <h2 className="plan-block-head">
@@ -951,7 +958,7 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
           // Codex's session-file fallback, kept for tracked accounts only (decision
           // 21); a failure line that already says "last turn" says it once.
           <span>{figuresAge ? `From its last conversation, ${figuresAge}` : "From its last conversation"}</span>
-        ) : row.observed_at && windows.length && !fail?.includes("last turn") ? (
+        ) : row.observed_at && row.via !== "cursor" && windows.length && !fail?.includes("last turn") ? (
           <span>{figuresAge ? `As of its last turn, ${figuresAge}` : "As of its last turn"}</span>
         ) : windows.length ? (
           <span>{figuresAge ? `Figures from ${figuresAge}` : "Earlier figures"}</span>
