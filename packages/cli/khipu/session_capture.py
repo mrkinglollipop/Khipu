@@ -75,7 +75,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from khipu import hook_shape
+from khipu import antigravity_db, hook_shape
 from khipu import t3 as _t3
 from khipu import wire
 if not hasattr(_t3, 'cache_thread'):
@@ -881,11 +881,21 @@ def read_window(path: Path, offset: int, *, seen: Any = None,
         size = path.stat().st_size
     except OSError:
         return msgs, offset, 0
+    if antigravity_db.is_db(path):
+        # T3's Antigravity trajectory is SQLite: read its turns as the JSONL
+        # stream below parses, so offsets (steps are append-only) work as-is.
+        stream = antigravity_db.as_jsonl(path)
+        size = len(stream)
+    else:
+        stream = None
     if offset > size:  # file truncated / rotated: start over
         offset = 0
-    with path.open("rb") as f:
-        f.seek(offset)
-        data = f.read() if end_offset is None else f.read(max(0, end_offset - offset))
+    if stream is not None:
+        data = stream[offset:] if end_offset is None else stream[offset:max(offset, end_offset)]
+    else:
+        with path.open("rb") as f:
+            f.seek(offset)
+            data = f.read() if end_offset is None else f.read(max(0, end_offset - offset))
     end = offset + len(data)
     if data and not data.endswith(b"\n"):  # partial trailing line: leave it for next time
         cut = data.rfind(b"\n")
