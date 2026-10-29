@@ -114,7 +114,7 @@ function planReadLines(row: UsageAccount | undefined, a: RouteAccount | null | u
   if (row.source === "turn" || row.observed_at) {
     out.push({ k: "Plan read", v: `From ${name}'s last reply${read ? `, ${read}` : ""}. ${name} can only be read by using a turn.` });
   } else if (row.ok === false && !(row.windows ?? []).length) {
-    out.push({ k: "Plan read", v: `Not read: ${usageErrorPhrase(row.error)}.` });
+    out.push({ k: "Plan read", v: `Not read: ${usageErrorPhrase(row.error, row.harness)}.` });
   } else {
     out.push({ k: "Plan read", v: `${name}'s own plan check${read ? `, ${read}` : ""}${took}.` });
   }
@@ -122,7 +122,7 @@ function planReadLines(row: UsageAccount | undefined, a: RouteAccount | null | u
   if (good && row.source !== "turn") out.push({ k: "Last good read", v: good });
   const code = row.ok === false ? row.error : row.live_error;
   if (code && code !== "pending") {
-    out.push({ k: "Latest try", v: `Failed: ${usageErrorPhrase(code)}. The figures above are from ${good ?? "an earlier read"}.` });
+    out.push({ k: "Latest try", v: `Failed: ${usageErrorPhrase(code, row.harness)}. The figures above are from ${good ?? "an earlier read"}.` });
   }
   const witnessAt = a?.witness?.at;
   const probed = row.probed_at;

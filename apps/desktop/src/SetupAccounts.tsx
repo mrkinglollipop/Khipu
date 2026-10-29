@@ -121,7 +121,7 @@ export function accountLine(row: UsageAccount, now: Date = new Date()): { text: 
     return { text: "This entry in the account list isn't valid. Fix it later in Settings → Accounts and routing.", tone: "warn" };
   }
   if (code === "no_plan_limits") return { text: "Signed in, but it reports no plan limits.", tone: "warn" };
-  if (row.ok === false) return { text: `Found, but its plan can't be read just now: it ${usageErrorPhrase(code)}.`, tone: "warn" };
+  if (row.ok === false) return { text: `Found, but its plan can't be read just now: it ${usageErrorPhrase(code, row.harness)}.`, tone: "warn" };
   const windows = liveWindows(row, now);
   if (row.harness === "muse" && windows.length === 0) {
     return { text: "Found. It reports its plan after its first turn.", tone: "ok" };

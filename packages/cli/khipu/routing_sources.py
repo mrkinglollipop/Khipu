@@ -1735,7 +1735,12 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
         accounts_read += 1
         attempt = _parse(row.get("last_attempt_at") or row.get("probed_at"))
         error = None if row.get("ok") else (row.get("last_error") or row.get("error"))
-        error = next((e for e in (usage.E_SIGNIN, usage.E_NOT_INSTALLED, usage.E_REDIRECT) if e == error), None)
+        # For an account read with a stored key (GLM, DeepSeek, Kimi) a
+        # rejected key or no plan on the key is definitive: routing must not
+        # stay open on the last good figures.
+        down = (usage.E_SIGNIN, usage.E_NOT_INSTALLED, usage.E_REDIRECT) + (
+            (usage.E_BAD_KEY, usage.E_NO_PLAN) if row.get("harness") in usage.KEY_READ_HARNESSES else ())
+        error = next((e for e in down if e == error), None)
         if error is not None and attempt is not None:
             out.append({"id": "p" + _sid(key, "down", _iso(attempt)), "account": key, "runner": None, "lane": None,
                         "state": "down", "until": None, "basis": "checked", "scope": "all", "window": None,
@@ -1922,12 +1927,13 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
     # http-quota accounts live in provider facts, not in usage_accounts:
     # their cache rows are keyed by stable account id, which the known
     # definition accounts already carry (no extra read of the log here).
+    # Kimi's accounts are read by Khipu's own Kimi reader the same way.
     from khipu.routing_identity import STABLE
 
     providers = cfg.get("_providers") or {}
     configured = configured_keys(config) | {
         a.get("definition_id") or a["key"] for a in known
-        if (providers.get(a.get("harness") or "") or {}).get("probe") == "http-quota"
+        if ((providers.get(a.get("harness") or "") or {}).get("probe") == "http-quota" or a.get("harness") == "kimi")
         and STABLE.fullmatch(a.get("definition_id") or a["key"] or "")}
     usage_items, usage_status = usage_evidence(configured)
     evidence += usage_items

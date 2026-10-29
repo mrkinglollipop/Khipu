@@ -912,6 +912,24 @@ def test_usage_poll_automatically_refreshes_deepseek_without_prompt_setup(ds, mo
     assert calls == [{"accounts": [ACCOUNT], "max_age": 60, "timeout": 10}]
 
 
+def test_usage_poll_reads_no_deepseek_account_after_read_no_accounts(ds, monkeypatch):
+    from khipu import recall_prompt
+
+    requests = []
+    monkeypatch.setattr(config, "load_config", lambda *a, **k: {"usage_accounts_none": True})
+    monkeypatch.setattr(usage, "http_quota_accounts", lambda: [dict(ACCOUNT)])
+    monkeypatch.setattr(usage, "_deepseek_request", lambda *a, **k: requests.append(1) or (200, _body("100")))
+    monkeypatch.setattr(usage, "_load_cache", lambda: {})
+    monkeypatch.setattr(routing, "poll_refold", lambda **kwargs: {"valid_until": None})
+    monkeypatch.setattr(routing, "run_due_reset_checks", lambda **kwargs: [])
+    monkeypatch.setattr(recall_prompt, "_view_snapshot", lambda routing: (None, None))
+    monkeypatch.setattr(routing, "_load_view", lambda: None)
+    monkeypatch.setattr(routing, "push_off", lambda moment: None)
+    monkeypatch.setattr(routing, "settings", lambda: {"routing_reset_check": False})
+    recall_prompt._poll_once(routing)
+    assert requests == []
+
+
 def test_usage_poll_refolds_before_a_hanging_deepseek_transport(ds, monkeypatch):
     from khipu import recall_prompt
 

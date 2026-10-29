@@ -48,16 +48,17 @@ def test_malformed_definition_names_its_kind_and_required_keys(routing_module, k
 
 @pytest.mark.parametrize("facts", [None, {}])
 def test_owner_account_without_reader_remains_tracked_in_priority_and_changes(routing_module, facts):
+    # Not Kimi: Khipu reads Kimi itself once its key is stored.
     r = routing_module
-    account = {"id": "kimi:main", "label": "Kimi", "provider": "kimi"}
+    account = {"id": "mistral:main", "label": "Mistral", "provider": "mistral"}
     rows = [event("definition_set", 1, definition="account", value=account),
-            event("priority_set", 2, entries=[{"account": "kimi:main", "label": "Kimi"}])]
+            event("priority_set", 2, entries=[{"account": "mistral:main", "label": "Mistral"}])]
     view = r.fold(rows, now=NOW, cfg=r.settings({}), known=[])
-    entry = next(a for a in view["accounts"] if a["key"] == "kimi:main")
+    entry = next(a for a in view["accounts"] if a["key"] == "mistral:main")
     assert entry["configured"] is False  # A reader is still unavailable.
     assert view["priority"]["entries"][0]["in_settings"] is True
     account_line = r.account_line(entry, NOW, view=view)
-    change_line = r.change_line("account:kimi:main", view, NOW)
+    change_line = r.change_line("account:mistral:main", view, NOW)
     priority_line = r.priority_line(view["priority"], NOW, view=view, facts=facts)
     assert "no usage reader set up" in account_line
     assert "no usage reader set up" in change_line

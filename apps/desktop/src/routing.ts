@@ -400,7 +400,7 @@ export type CapStatus = {
   revision?: string | null;
   /** When you confirmed this cap (`route --json` only; absent elsewhere). */
   confirmed_at?: string | null;
-  window?: "five_hour" | "weekly" | null;
+  window?: "five_hour" | "weekly" | string | null;
   pct?: number | null;
   slack?: number | null;
   allowance_pct?: number | null;
@@ -755,7 +755,7 @@ export function midSentence(reason: string): string {
   return reason;
 }
 
-const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse", glm: "GLM", cursor: "Cursor" };
+const CLI_NAMES: Record<string, string> = { claude: "Claude", codex: "Codex", grok: "Grok", muse: "Muse", glm: "GLM", kimi: "Kimi", cursor: "Cursor" };
 
 function cliName(harness: string): string {
   return CLI_NAMES[harness] ?? harness;
@@ -855,7 +855,7 @@ function witnessWords(w: RouteWitness, harness: string, state: string): string {
 /** The plan figure an open account's row adds: "58% of its week used". */
 export type PlanFigure = { pct: number; window: string };
 
-const WINDOW_WORDS: Record<string, string> = { five_hour: "five hours", weekly: "week", daily: "day" };
+const WINDOW_WORDS: Record<string, string> = { five_hour: "five hours", weekly: "week", daily: "day", monthly: "month" };
 
 export function windowWords(name: string | undefined): string {
   return (name && WINDOW_WORDS[name]) || (name ?? "window").replace(/_/g, " ");

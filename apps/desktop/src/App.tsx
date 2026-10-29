@@ -47,6 +47,7 @@ import { buildAttention, harnessLabel, promotionAttention, routingAttention, typ
 import { HealthReportRows, TILE_HEALTH_KEYS, healthKeysForAttention, markHealthRows, snapshotNotTrusted } from "./healthRows";
 import { SummariserCalls, SynthFallbackField, SynthProviderChoices, synthModelError } from "./SynthProvider";
 import { KeysCard } from "./KeysCard";
+import { isSecretsPresence, pickSecretsPresence, type SecretsPresence } from "./secretsPresence";
 import { PlansCard, liveWords, usePlanAttention, usePlanUsage } from "./PlansCard";
 import { RoutingCard } from "./RoutingCard";
 import { owedReasonWords, toastWords } from "./humanWords";
@@ -905,58 +906,6 @@ function parseJson(raw: string): unknown {
   } catch {
     return null;
   }
-}
-
-// The summariser's API keys report from three places each (`khipu secrets`):
-// the Keychain, the environment and a key file.
-const SYNTH_KEY_FIELDS = [
-  "gemini_env",
-  "gemini_file_key_present",
-  "anthropic_in_keychain",
-  "anthropic_env",
-  "anthropic_file_key_present",
-  "openai_in_keychain",
-  "openai_env",
-  "openai_file_key_present",
-  "openrouter_in_keychain",
-  "openrouter_env",
-  "openrouter_file_key_present",
-] as const;
-
-type SecretsPresence = {
-  dsn_in_keychain?: boolean;
-  gemini_in_keychain?: boolean;
-  openai_compat_in_keychain?: boolean;
-} & Partial<Record<(typeof SYNTH_KEY_FIELDS)[number], boolean>>;
-
-const SECRET_PRESENCE_KEYS = [
-  "dsn_in_keychain",
-  "gemini_in_keychain",
-  "openai_compat_in_keychain",
-  ...SYNTH_KEY_FIELDS,
-] as const satisfies ReadonlyArray<keyof SecretsPresence>;
-
-function isSecretsPresence(value: unknown): value is SecretsPresence {
-  if (value == null || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-  const obj = value as Record<string, unknown>;
-  if ("error" in obj) {
-    return false;
-  }
-  for (const key of SECRET_PRESENCE_KEYS) {
-    const field = obj[key];
-    if (field !== undefined && typeof field !== "boolean") {
-      return false;
-    }
-  }
-  return true;
-}
-
-function pickSecretsPresence(value: SecretsPresence): SecretsPresence {
-  const out: SecretsPresence = {};
-  for (const key of SECRET_PRESENCE_KEYS) out[key] = value[key];
-  return out;
 }
 
 function presenceLabel(

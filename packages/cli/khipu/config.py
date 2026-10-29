@@ -262,6 +262,8 @@ PATH_SETTINGS: dict[str, tuple[str, ...]] = {
     # z.ai GLM Coding Plan key (a file holding only the key), read for plan usage
     "glm_key_file": ("KHIPU_GLM_KEY_FILE",),
     "deepseek_key_file": ("KHIPU_DEEPSEEK_KEY_FILE",),
+    # Kimi Code plan key (a file holding only the key), read for plan usage
+    "kimi_key_file": ("KHIPU_KIMI_KEY_FILE",),
 }
 
 
