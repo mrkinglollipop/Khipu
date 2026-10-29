@@ -1495,7 +1495,7 @@ def _grok_homes(mac, monkeypatch, account_ids):
         folders.append(folder)
         mac.session("aegis", name, login_home=str(folder))
 
-    def probe(home, timeout=None):
+    def probe(home, timeout=None, login=True):
         return {"ok": True, "plan": "SuperGrok", "windows": [],
                 "account_id": account_ids[Path(home).name]}
 
@@ -1588,7 +1588,7 @@ def test_collapsed_homes_keep_their_check_state(mac, monkeypatch):
     _grok_homes(mac, monkeypatch, {".grok-a": "acct-1", ".grok-b": "acct-1", ".grok-c": "acct-1"})
     calls = []
     inner = usage.probe_grok
-    monkeypatch.setattr(usage, "probe_grok", lambda home, timeout=None: (calls.append(Path(home).name), inner(home, timeout=timeout))[1])
+    monkeypatch.setattr(usage, "probe_grok", lambda home, timeout=None, login=True: (calls.append(Path(home).name), inner(home, timeout=timeout, login=login))[1])
     discover.discover(at=NOW)
     assert len(calls) == 3
     calls.clear()

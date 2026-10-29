@@ -201,9 +201,49 @@ def test_grok_reads_its_credits_period_with_a_length_for_pace(env):
     assert request["method"] == "GET" and request["headers"]["Authorization"] == f"Bearer {GROK_TOKEN}"
 
 
-def test_grok_with_no_percent_but_a_period_reads_zero(env):
-    env.replies["cli-chat-proxy.grok.com"] = ({"config": {"currentPeriod": GROK_REPLY["config"]["currentPeriod"]}}, 200)
-    assert _probe("grok")["windows"][0]["used_pct"] == 0.0
+GROK_BUILD_ROW = {"ok": True, "plan": None, "windows": [{"name": "weekly", "used_pct": 10, "resets_at": None}],
+                  "credits": None, "version": None, "source": "live"}
+
+
+@pytest.mark.parametrize("config", [{}, {"creditUsagePercent": None}])
+def test_grok_with_no_percent_is_a_failed_read_that_falls_back(env, monkeypatch, config):
+    period = GROK_REPLY["config"]["currentPeriod"]
+    env.replies["cli-chat-proxy.grok.com"] = ({"config": dict(config, currentPeriod=period)}, 200)
+    with pytest.raises(usage.ProbeError):
+        usage_logins.parse_grok_billing(200, json.dumps({"config": dict(config, currentPeriod=period)}).encode())
+    monkeypatch.setattr(usage, "_probe_grok_build", lambda *a, **k: dict(GROK_BUILD_ROW))
+    row = _probe("grok")
+    assert len(env.seen) == 1
+    assert row["ok"] is True and row["windows"][0]["used_pct"] == 10  # Grok Build's, never a synthetic 0%
+
+
+HUGE = int("9" * 400)
+
+
+@pytest.mark.parametrize("value", [HUGE, -HUGE, 10**7])
+def test_grok_hostile_percent_is_rejected_and_falls_back(env, monkeypatch, value):
+    env.replies["cli-chat-proxy.grok.com"] = (
+        json.dumps({"config": dict(GROK_REPLY["config"], creditUsagePercent=value)}).encode(), 200)
+    monkeypatch.setattr(usage, "_probe_grok_build", lambda *a, **k: dict(GROK_BUILD_ROW))
+    row = usage.probe_grok(None)
+    assert row["ok"] is True and row["windows"][0]["used_pct"] == 10
+
+
+@pytest.mark.parametrize("harness, host, body", [
+    ("cursor", "api2.cursor.sh", {"billingCycleEnd": str(HUGE), "planUsage": {"totalPercentUsed": HUGE}}),
+    ("cursor", "api2.cursor.sh", {"billingCycleEnd": HUGE, "planUsage": {"autoPercentUsed": 20}}),
+    ("opencode", "opencode.ai", {"usage": {"rolling": {"percent": HUGE, "resetsAt": HUGE}}}),
+    ("opencode", "opencode.ai", {"usage": {"weekly": {"percent": 5, "resetsAt": HUGE}}}),
+])
+def test_cursor_and_opencode_hostile_numbers_never_raise(env, harness, host, body):
+    _cursor_on()
+    env.replies[host] = (json.dumps(body).encode(), 200)
+    row = _probe(harness)
+    assert isinstance(row, dict) and len(env.seen) == 1
+    if row.get("ok"):
+        assert all(0 <= w["used_pct"] <= 100 for w in row["windows"])
+    else:
+        assert row["error"] in (usage.E_BAD, usage.E_NO_PLAN)
 
 
 @pytest.mark.parametrize("variable", ["XAI_API_KEY", "GROK_OIDC_ISSUER"])
@@ -319,6 +359,36 @@ def test_one_login_read_per_five_minutes_whatever_asks(env):
     _probe("grok")
     _probe("grok")
     assert len(env.seen) == 2  # the second Grok read is Grok Build's
+
+
+def test_two_callers_racing_the_cadence_send_one_request(env, monkeypatch):
+    import threading
+    import time as real_time
+    import types
+
+    # Each caller pauses right after reading the clock for its stamp check
+    # until the other has too (or 0.5 s pass: a lock keeps the other out).
+    barrier, local = threading.Barrier(2, timeout=0.5), threading.local()
+
+    def paused_time():
+        now = real_time.time()
+        if not getattr(local, "paused", False):
+            local.paused = True
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return now
+
+    monkeypatch.setattr(usage_logins, "time", types.SimpleNamespace(time=paused_time))
+    rows = []
+    threads = [threading.Thread(target=lambda: rows.append(_probe("opencode"))) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(env.seen) == 1
+    assert sorted(bool(r.get("ok")) for r in rows) == [False, True]
 
 
 # ---- pace --------------------------------------------------------------------------

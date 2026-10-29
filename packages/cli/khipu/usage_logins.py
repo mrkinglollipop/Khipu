@@ -18,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -67,6 +68,9 @@ _CURSOR_WINDOWS = (("totalPercentUsed", "monthly", None), ("autoPercentUsed", "m
 OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 OPENCODE_TIMEOUT_S = 5.0
 _OPENCODE_WINDOWS = (("rolling", "five_hour", 300), ("weekly", "weekly", 10080), ("monthly", "monthly", None))
+# A stated percent above this is not a usage figure: the reply is malformed.
+_PCT_MAX = 1_000_000
+_DUE_LOCKS = {provider: threading.Lock() for provider in LOGIN_SWITCHES}
 
 
 def _grok_login_file(home: str | None = None) -> Path:
@@ -136,20 +140,33 @@ def login_switches_status(config: dict | None = None) -> dict:
 
 def login_read_due(provider: str, every: float = LOGIN_READ_MIN_S) -> bool:
     """At most one read of ``provider``'s login per ``every`` seconds, across
-    every caller (the app, a reset check, the periodic refresh)."""
+    every caller (the app, a reset check, the periodic refresh). The stamp is
+    checked and renewed under one lock (a thread lock and ``flock`` on the
+    stamp), so two callers racing see one of them due."""
+    import fcntl
+
     stamp = cache_file().with_name(f"usage.login-{provider}.stamp")
-    try:
-        if time.time() - stamp.stat().st_mtime < every:
+    with _DUE_LOCKS.setdefault(provider, threading.Lock()):
+        try:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(stamp.with_name(stamp.name + ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError:
             return False
-    except OSError:
-        pass
-    try:
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.touch()
-        os.utime(stamp)
-    except OSError:
-        return False
-    return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                if time.time() - stamp.stat().st_mtime < every:
+                    return False
+            except OSError:
+                pass
+            try:
+                stamp.touch()
+                os.utime(stamp)
+            except OSError:
+                return False
+            return True
+        finally:
+            os.close(fd)  # closing the descriptor releases the flock
 
 
 def _read_login_json(path: Path) -> dict:
@@ -213,10 +230,15 @@ def _login_reply(status: int, body: bytes, *, no_plan: tuple[int, ...] = ()) -> 
 
 def _login_pct(value) -> float | None:
     """A percent used as the endpoint states it, clamped to 0-100 (a server
-    may report more than 100); a present non-number is a malformed reply."""
+    may report more than 100); a present non-number, a negative, a non-finite
+    or an absurdly large one (a 400-digit integer overflows a float) is a
+    malformed reply."""
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ProbeError(E_BAD)
+    # Compared before any float conversion: int-to-float comparison is exact.
+    if not 0 <= value <= _PCT_MAX or not math.isfinite(value):
         raise ProbeError(E_BAD)
     return round(min(100.0, float(value)), 2)
 
@@ -261,8 +283,8 @@ def parse_grok_billing(status: int, body: bytes) -> dict:
     start, end = _parse_time(_iso(period.get("start"))), _parse_time(_iso(period.get("end")))
     mins = int((end - start).total_seconds() // 60) if start and end and end > start else None
     used = _login_pct(config.get("creditUsagePercent"))
-    if used is None and mins:
-        used = 0.0
+    if used is None:
+        raise ProbeError(E_BAD)  # no stated figure: a failed read (Grok Build follows), never 0%
     window = _window(kind or "period", used, period.get("end"), mins)
     if not window:
         raise ProbeError(E_NO_PLAN)

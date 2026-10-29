@@ -1074,11 +1074,14 @@ def _grok_budget(timeout: float) -> float:
     return GROK_TIMEOUT_S if timeout == TIMEOUT_S else timeout
 
 
-def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
+def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S, login: bool = True) -> dict:
     """With the owner's switch on, Grok's own billing read with its login
     (``usage_logins.grok_login_read``, at most every ``LOGIN_READ_MIN_S``); when that is
     off, not due or fails (a rejected login included: never refreshed), the
-    Grok Build reading below, unchanged."""
+    Grok Build reading below, unchanged. ``login=False`` (discovery, a
+    sign-in check) never looks inside the login folder at all."""
+    if not login:
+        return _probe_grok_build(grok_home, timeout=timeout)
     try:
         from khipu import usage_logins
 
@@ -1090,7 +1093,7 @@ def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> d
             return usage_logins.grok_login_read(grok_home, LOGIN_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
         except ProbeError:
             pass
-        except (AttributeError, TypeError, KeyError, IndexError, ValueError):
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError, OverflowError):
             pass
     return _probe_grok_build(grok_home, timeout=timeout)
 
@@ -3133,7 +3136,8 @@ def _blank_row(account: dict) -> dict:
             "observed_at": None, "error": None, "note": None}
 
 
-def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = True, turn: bool = True) -> dict:
+def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = True, turn: bool = True,
+                  login: bool = True) -> dict:
     # probe_all supplies one shared run for its worker threads. A standalone
     # reset check owns one too, so a helper alarm or stop can unwind this call
     # and kill every vendor process group before the child exits.
@@ -3150,6 +3154,8 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             data = probe_deepseek(timeout=timeout)
         elif harness == "kimi":
             data = probe_kimi(timeout=timeout)
+        elif harness in LOGIN_READ_HARNESSES and not login:
+            data = {"ok": False, "error": E_PENDING}
         elif harness in LOGIN_READ_HARNESSES:
             from khipu import usage_logins
 
@@ -3167,7 +3173,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         elif harness == "codex":
             data = probe_codex(home, timeout=timeout, rollout=rollout)
         elif harness == "grok":
-            data = probe_grok(home, timeout=timeout)
+            data = probe_grok(home, timeout=timeout, login=login)
         elif harness == "muse":
             data = probe_muse(timeout=timeout, turn=turn)
         elif harness == "glm":
