@@ -205,6 +205,12 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_replication_live": ("switch", False, "Copy routing between your Macs through the hub"),
     "routing_cloud_copy_stale_after": ("duration", 600, "The copy counts as out of date after"),
     "routing_cloud_copy_debounce": ("duration", 30, "Wait for a burst of changes to end before copying"),
+    # Reading a tool's own login for its real usage limits (owner decision
+    # 2026-10-29). The value shown is usage_logins.login_switch's (its default
+    # depends on the login being on this Mac); off here is only the fallback.
+    "routing_usage_login_grok": ("switch", False, "Read Grok's own login for its usage"),
+    "routing_usage_login_cursor": ("switch", False, "Read Cursor's login from the Keychain for its usage"),
+    "routing_usage_login_opencode": ("switch", False, "Read OpenCode Go's own login for its usage"),
     # Owner-local delivery labels (survey rows 8-11): names the owner gave
     # Macs, keyed by their salted Mac id. Set only through the owner-gated
     # config path; never replicated or pushed.
@@ -476,6 +482,10 @@ def _setting_requests(config: dict) -> dict[str, dict]:
     return {k: v for k, v in raw.items() if k in SETTINGS and isinstance(v, dict)} if isinstance(raw, dict) else {}
 
 
+_LOGIN_SWITCH_KEYS = {"routing_usage_login_grok": "grok", "routing_usage_login_cursor": "cursor",
+                      "routing_usage_login_opencode": "opencode"}
+
+
 def settings_status() -> dict[str, dict]:
     """What ``khipu config`` shows: each setting's value, default, words,
     whether it comes from the file, and a conversation's change waiting for
@@ -503,7 +513,16 @@ def settings_status() -> dict[str, dict]:
             value = config.get(key) is True and waiting is None
             if config.get(key) is not None and not isinstance(config.get(key), bool):
                 source = "invalid"
-        out[key] = {"value": value, "default": default, "kind": kind, "source": source, "words": words,
+        extra = {}
+        if key in _LOGIN_SWITCH_KEYS:
+            from khipu import usage_logins
+
+            provider = _LOGIN_SWITCH_KEYS[key]
+            value, _from = usage_logins.login_switch(provider, config)
+            default = value if _from == "default" else default
+            extra = {"login_found": usage_logins.login_present(provider),
+                     "ask": _from == "default" and not value and provider != "cursor"}
+        out[key] = {**extra, "value": value, "default": default, "kind": kind, "source": source, "words": words,
                     "pending": waiting is not None,
                     "request": {"request": waiting.get("request"), "by": waiting.get("by"), "at": waiting.get("at"),
                                 "by_words": author_words(waiting.get("by") if isinstance(waiting.get("by"), dict)

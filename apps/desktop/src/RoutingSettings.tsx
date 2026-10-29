@@ -634,6 +634,65 @@ function SettingRequests({ cfg, w, reread }: { cfg: RouteConfig | null; w: Write
   );
 }
 
+/** Reading a tool's own login for its real usage limits (owner decision
+ *  2026-10-29): one switch per tool. The token goes only to that tool's own
+ *  usage page; Khipu never changes the login. */
+export const LOGIN_USAGE_SWITCHES = [
+  {
+    key: "routing_usage_login_grok",
+    id: "route-login-grok",
+    tool: "Grok",
+    label: "Read Grok's usage from its own login",
+    what: "Khipu reads the login Grok Build saved on this Mac and sends it only to Grok's billing page, at most every five minutes. It never changes the login. Off, or when that read fails, Khipu asks Grok Build as before.",
+  },
+  {
+    key: "routing_usage_login_cursor",
+    id: "route-login-cursor",
+    tool: "Cursor",
+    label: "Read Cursor's usage from its Keychain login",
+    what: "Khipu reads Cursor's sign-in from the macOS Keychain and sends it only to Cursor's usage page, at most every five minutes. macOS may ask you to allow this. It never changes the login. Cursor shows as its own account under Plans; routing still counts Cursor's lanes against Grok.",
+  },
+  {
+    key: "routing_usage_login_opencode",
+    id: "route-login-opencode",
+    tool: "OpenCode Go",
+    label: "Read OpenCode Go's usage from its own login",
+    what: "Khipu reads the key OpenCode saved on this Mac and sends it only to OpenCode's usage page, at most every five minutes. It never changes the login.",
+  },
+] as const;
+
+type LoginSetting = RouteSetting & { login_found?: boolean; ask?: boolean };
+
+export function LoginUsageSwitches({ cfg, cfgError, w, reread }: { cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
+  // An older CLI without these settings shows no row for them.
+  const rows = LOGIN_USAGE_SWITCHES.filter((s) => !cfg || cfg.routing?.[s.key] != null);
+  if (!rows.length) return null;
+  const asking = rows.filter((s) => {
+    const v = cfg?.routing?.[s.key] as LoginSetting | undefined;
+    return v?.ask === true && v.login_found === true;
+  });
+  return (
+    <div className="section-body">
+      {asking.map((s) => (
+        <p key={s.key} className="set-help" role="status">
+          {`${s.tool}'s login is on this Mac. Turn on "${s.label}" below to show its real usage limits.`}
+        </p>
+      ))}
+      {rows.map((s) => {
+        const on = cfg?.routing?.[s.key]?.value === true;
+        return (
+          <SwitchRow key={s.key} id={s.id} label={s.label} what={s.what}
+            tag={<Tag>{on ? "On" : "Off"}</Tag>} checked={on} disabled={!cfg || w.anyBusy}
+            busy={w.isBusy(s.id)}
+            read={switchRead(cfg, cfgError, reread)}
+            onChange={(next) => void w.run(s.id, "khipu_config_set", { key: s.key, value: next ? "on" : "off" }, reread)}
+            error={<WriteError w={w} id={s.id} />} />
+        );
+      })}
+    </div>
+  );
+}
+
 function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
   const enabled = cfg?.routing?.routing_reset_check?.value === true;
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
@@ -4897,12 +4956,17 @@ export function RoutingSettings({
   );
 
   const body: Record<GroupKey, ReactNode> = {
-    accounts: data ? (
-      <AccountsSection data={data} plansState={plansState} problems={overview.problems} lists={lists} active={active}
-        staleAfterS={staleAfterSeconds(settings)} w={w} now={now} reread={rereadRoute}
-        finder={finder} />
-    ) : (
-      unread
+    accounts: (
+      <>
+        {data ? (
+          <AccountsSection data={data} plansState={plansState} problems={overview.problems} lists={lists} active={active}
+            staleAfterS={staleAfterSeconds(settings)} w={w} now={now} reread={rereadRoute}
+            finder={finder} />
+        ) : (
+          unread
+        )}
+        <LoginUsageSwitches cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />
+      </>
     ),
     pace: data ? <PaceSection data={data} plans={plansState?.data ?? null} now={now} folds={folds} /> : unread,
     priority: data ? <PrioritySection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} /> : unread,

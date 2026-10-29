@@ -395,6 +395,23 @@ Usage reads normally use the CLI's usage protocol. Claude may use a tiny Haiku
 turn when its usage reply omits figures, and Muse may use a tiny turn to refresh
 stale observations, each at most once per 30 minutes per login. `khipu_usage`
 replies from cache immediately; its background refresh can use these fallbacks.
+From Muse 1.4.13, `muse usage --json` gives the figures with no turn; older Muse
+keeps the turn.
+
+Khipu can also read Grok, Cursor and OpenCode Go with each tool's own login, as
+T3 Code does, under the owner's switches `routing_usage_login_grok`,
+`routing_usage_login_cursor` and `routing_usage_login_opencode` (Settings →
+Accounts and routing → Accounts). The token is read only, sent only to that
+tool's own usage host, and never stored, logged or refreshed: a rejected login
+reads as "can't read". Each login is read at most every five minutes. Grok's
+credits period then has a length and is paced; when its read fails or the
+switch is off, Khipu asks Grok Build as before. Cursor (its macOS Keychain item,
+off by default; macOS may ask to allow it) and OpenCode Go show as rows of their
+own with a one-reading pace on each window. They are not routing accounts:
+routing still counts Cursor's lanes against Grok, so nothing is counted twice.
+On an install that already had Khipu, Grok and OpenCode Go start on when their
+login is on the Mac; a new install shows a one-line notice until the owner
+chooses.
 
 Plan usage shows on the Home screen (a Plans card) and under Settings → Accounts and routing → Accounts. You can manage tracked accounts there (up to 32). `khipu doctor` carries a cache-only plan usage block that lists a warning per window at 90% or more. Warnings never turn doctor red.
 

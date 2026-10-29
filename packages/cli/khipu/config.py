@@ -152,6 +152,13 @@ _held = threading.local()
 def _write_config(data: dict) -> Path:
     path = config_file()
     path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        # A config file Khipu creates marks a new install: reading a tool's
+        # own login (usage.login_switch) waits there for the owner's answer.
+        try:
+            path.with_name("login-usage-ask").touch()
+        except OSError:
+            pass
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)

@@ -2472,3 +2472,45 @@ describe("Settings -> Routing: an account's line opens its Routing detail (C5)",
     expect(within(band).getByRole("button", { name: "Undo" })).toBeInTheDocument();
   });
 });
+
+describe("Settings -> Accounts and routing: reading a tool's own login", () => {
+  const LOGIN = (grok: Record<string, unknown> = {}) => config({
+    routing_usage_login_grok: { ...setting(true, false), login_found: true, ask: false, ...grok },
+    routing_usage_login_cursor: { ...setting(false), login_found: true, ask: false },
+    routing_usage_login_opencode: { ...setting(false), login_found: false, ask: false },
+  });
+
+  it("shows one switch per tool, Cursor's saying macOS may ask, and writes each through the fixed command", async () => {
+    answers.khipu_config_show = LOGIN();
+    await page();
+    const grok = await screen.findByRole("switch", { name: "Read Grok's usage from its own login" });
+    expect(grok).toBeChecked();
+    const cursor = screen.getByRole("switch", { name: "Read Cursor's usage from its Keychain login" });
+    expect(cursor).not.toBeChecked();
+    expect(screen.getByText(/macOS may ask you to allow this/)).toBeInTheDocument();
+    expect(screen.getByText(/routing still counts Cursor's lanes against Grok/)).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Read OpenCode Go's usage from its own login" })).not.toBeChecked();
+    fireEvent.click(cursor);
+    await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_usage_login_cursor", value: "on" }));
+    fireEvent.click(grok);
+    await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_usage_login_grok", value: "off" }));
+  });
+
+  it("asks once in one line on a new install that has the login, and not after the owner answered", async () => {
+    answers.khipu_config_show = LOGIN({ value: false, ask: true });
+    await page();
+    expect(await screen.findByText(/Grok's login is on this Mac\. Turn on "Read Grok's usage from its own login"/)).toBeInTheDocument();
+    expect(screen.getAllByRole("status").filter((n) => /login is on this Mac/.test(n.textContent ?? ""))).toHaveLength(1);
+    cleanup();
+    answers.khipu_config_show = LOGIN({ value: false, source: "file", ask: false });
+    await page();
+    await screen.findByRole("switch", { name: "Read Grok's usage from its own login" });
+    expect(screen.queryByText(/login is on this Mac/)).toBeNull();
+  });
+
+  it("shows no login switch for a CLI that has none of these settings", async () => {
+    await page();
+    await screen.findByRole("switch", { name: "Check an account at its reset time" });
+    expect(screen.queryByRole("switch", { name: /from its own login|Keychain login/ })).toBeNull();
+  });
+});
