@@ -80,6 +80,10 @@ NOT_CAPTURE = {
     # Cursor/Antigravity hooks (docs/plans/2026-10-27-cursor-antigravity-hooks.md).
     "hook_shape.claim": "an empty single-flight marker named by a hash of harness, session and event; "
                         "no capture text",
+    "usage_logins._save_cursor": "Cursor's last usage reading (window names, percents, resets and when it was "
+                                 "read) in the host-local login-usage cache; no token, no capture text",
+    "usage_logins.login_read_due": "a per-provider read stamp and its lock file in the host-local login-usage "
+                                   "cache; empty, no token, no capture text",
     "owner_turns._ag_claim": "an empty once-per-turn marker named by a hash of the session and the "
                              "transcript step, and the session's alias file holding a hash of the "
                              "prompt text and a step count; no capture text",
