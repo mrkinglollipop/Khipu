@@ -41,6 +41,8 @@ import {
   checkedHost,
   draftFromCap,
   emptyCapDraft,
+  capWindows,
+  capWindowLabel,
   matchingCapIndex,
   movedBy,
   ownerActionId,
@@ -409,7 +411,8 @@ function CapForm({ a, cap, ctl, back, onClose, onOpenExisting }: {
 }) {
   const { w, change } = ctl;
   const base = useId().replace(/:/g, "");
-  const [d, setD] = useState<CapDraft>(() => (cap ? draftFromCap(cap) : emptyCapDraft()));
+  const windows = capWindows(a.pace, a.cap_statuses);
+  const [d, setD] = useState<CapDraft>(() => (cap ? draftFromCap(cap) : emptyCapDraft(windows)));
   const first = useRef<HTMLSelectElement>(null);
   useEffect(() => first.current?.focus(), []);
   const set = <K extends keyof CapDraft>(k: K, v: CapDraft[K]) => setD((prev) => ({ ...prev, [k]: v }));
@@ -459,9 +462,10 @@ function CapForm({ a, cap, ctl, back, onClose, onOpenExisting }: {
   const winSelect = (
     <span className="route-field">
       <label htmlFor={`${base}-win`}>Counted over</label>
-      <select id={`${base}-win`} value={d.window} disabled={editing} onChange={(e) => set("window", e.target.value as CapDraft["window"])}>
-        <option value="weekly">The week</option>
-        <option value="five_hour">The five hours</option>
+      <select id={`${base}-win`} value={d.window} disabled={editing} onChange={(e) => set("window", e.target.value)}>
+        {(windows.includes(d.window) ? windows : [d.window, ...windows]).map((name) => (
+          <option key={name} value={name}>{capWindowLabel(name)}</option>
+        ))}
       </select>
     </span>
   );

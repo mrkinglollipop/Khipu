@@ -300,3 +300,32 @@ def test_a_passed_reset_is_checked_by_khipu_not_called_untracked(replay, kimi, m
     out = routing.check_account("kimi:main", now=replay.now, in_child=True, load=lambda: 0.0)
     assert out["outcome"] == "open"
     assert next(e for e in replay.view()["accounts"] if e["key"] == "kimi:main")["state"] == routing.OPEN
+
+
+def test_the_normal_usage_report_includes_kimi(replay, kimi, monkeypatch):  # noqa: F811
+    _define_kimi(replay)
+    monkeypatch.setattr(usage, "configured_accounts", lambda config=None: [])
+    monkeypatch.setattr(usage, "_now", lambda: replay.now)
+    rows = [r for r in usage.report(fresh=True)["accounts"] if r["key"] == "kimi:main"]
+    assert len(rows) == 1 and rows[0]["ok"] is True
+    assert {w["name"] for w in rows[0]["windows"]} == {"five_hour", "monthly"}
+    _reply(kimi, b"", 401)
+    rows = [r for r in usage.report(fresh=True)["accounts"] if r["key"] == "kimi:main"]
+    assert rows[0]["ok"] is False and rows[0]["error"] == usage.E_BAD_KEY
+    assert rows[0]["stale"] is True and rows[0]["windows"]
+
+
+@pytest.mark.parametrize("failure", [(b"", 401), (b"", 403), (b"{}", 200)])
+def test_a_rejected_key_or_no_plan_closes_routing_after_a_good_read(replay, kimi, monkeypatch, failure):  # noqa: F811
+    _define_kimi(replay)
+    monkeypatch.setattr(usage, "_now", lambda: replay.now)
+    usage.refresh_due(accounts=usage.http_quota_accounts(), max_age=0)
+    assert next(e for e in replay.view()["accounts"] if e["key"] == "kimi:main")["state"] == routing.OPEN
+    replay.advance(600)
+    _reply(kimi, *failure)
+    usage.refresh_due(accounts=usage.http_quota_accounts(), max_age=0)
+    row = usage._load_cache()["kimi:main"]
+    assert row["windows"] and row["last_good_at"]  # the old figures are kept, marked as the last good read
+    entry = next(e for e in replay.view()["accounts"] if e["key"] == "kimi:main")
+    assert entry["state"] == routing.DOWN
+    assert entry["reason"] == ("no plan on its key" if failure[1] == 200 else "key rejected")

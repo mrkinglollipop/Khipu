@@ -400,7 +400,7 @@ export type CapStatus = {
   revision?: string | null;
   /** When you confirmed this cap (`route --json` only; absent elsewhere). */
   confirmed_at?: string | null;
-  window?: "five_hour" | "weekly" | null;
+  window?: "five_hour" | "weekly" | string | null;
   pct?: number | null;
   slack?: number | null;
   allowance_pct?: number | null;

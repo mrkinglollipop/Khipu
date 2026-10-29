@@ -3488,7 +3488,9 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
     A row whose figures are older than ``max_age`` (a cached row, Muse's last
     observed turn, Codex's rollout fallback), or that holds the last good
     figures after a failed probe, is marked ``stale: true``, never dropped."""
-    accounts = configured_accounts() if accounts is None else accounts
+    # The accounts Khipu reads with a stored key (GLM, DeepSeek, Kimi) are
+    # defined in the routing record, as refresh_due finds them.
+    accounts = [*configured_accounts(), *http_quota_accounts()] if accounts is None else accounts
     cache = _load_cache()
     now = _now()
     rows: list[dict | None] = [None] * len(accounts)

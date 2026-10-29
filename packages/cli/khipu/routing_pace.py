@@ -67,6 +67,15 @@ def _sample_params(window, samples):
     return window_params(window, newest.get("window_s"), newest.get("reset"))
 
 
+def cap_window(window):
+    """Whether a window cap may name ``window``: any window that can be paced
+    by its name (a month needs its reset for a length, so its name is enough)."""
+    return isinstance(window, str) and (window in WINDOWS or window == "monthly"
+                                        or window_length(window) is not None)
+
+
+CAP_WINDOW_WORDS = "window must be a usage window: weekly, five_hour, monthly, daily, weekly_<name> or <n>_min"
+
 # Cap kinds scoped to a usage window; the rest are account-scoped facts.
 WINDOW_CAP_KINDS = ("share", "per_day", "pace_target")
 CAP_KINDS = WINDOW_CAP_KINDS + ("spend", "concurrency")

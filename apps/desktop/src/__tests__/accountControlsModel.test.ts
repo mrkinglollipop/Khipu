@@ -178,3 +178,15 @@ describe("changing a cap never relaxes what it did not change", () => {
     expect(capSetArgs(draft)).toEqual({ cap: { kind: "per_day", window: "weekly", pct: 30 } });
   });
 });
+
+
+describe("caps on any paced window", () => {
+  const month = { kind: "pace_target", window: "monthly", pct: 100, slack: 0, purpose: "job" } as const;
+  it("keeps a monthly cap's window when changing, removing, matching and in words", () => {
+    expect(draftFromCap(month).window).toBe("monthly");
+    expect(capRemoveArgs(month)).toEqual({ kind: "pace_target", window: "monthly", purpose: "job" });
+    expect(matchingCapIndex([month], { kind: "pace_target", window: "weekly", purpose: "job" })).toBe(-1);
+    expect(matchingCapIndex([month], { kind: "pace_target", window: "monthly", purpose: "job" })).toBe(0);
+    expect(capSentence({ kind: "share", window: "monthly", pct: 40 })).toBe("At most 40% of the month");
+  });
+});

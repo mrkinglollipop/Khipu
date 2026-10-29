@@ -5,7 +5,7 @@
    refuses; the priority helpers rebuild the whole list with one account
    changed, because `route priority set` takes the whole list. */
 
-import type { CapStatus, RoutePriorityEntry } from "./routing";
+import { windowWords, type CapStatus, type Pace, type RoutePriorityEntry } from "./routing";
 
 // ---------------------------------------------------------------------------
 // Caps: the five sentences
@@ -14,7 +14,7 @@ import type { CapStatus, RoutePriorityEntry } from "./routing";
 export type CapSentence = "share" | "per_day" | "pace_target" | "spend" | "concurrency";
 
 export const CAP_SENTENCES: { id: CapSentence; label: string }[] = [
-  { id: "share", label: "Use at most a share of the week or the five hours" },
+  { id: "share", label: "Use at most a share of one of its windows" },
   { id: "per_day", label: "Use at most a share of the week in one day" },
   { id: "pace_target", label: "Keep to an even pace" },
   { id: "spend", label: "Spend at most some dollars over some days" },
@@ -24,7 +24,8 @@ export const CAP_SENTENCES: { id: CapSentence; label: string }[] = [
 /** Every field as the form holds it: text, so a half-typed number is kept. */
 export type CapDraft = {
   sentence: CapSentence;
-  window: "weekly" | "five_hour";
+  /** A usage window's name: weekly, five_hour, monthly, daily and so on. */
+  window: string;
   pct: string;
   /** An even-pace cap's target, kept as the cap has it (a new one starts at 100). */
   target: string;
@@ -37,10 +38,27 @@ export type CapDraft = {
   n: string;
 };
 
-export function emptyCapDraft(): CapDraft {
+/** The windows a window cap can count over: the ones Khipu paces on this
+ *  account and any a cap already names, week first; the week and the five
+ *  hours while nothing has been read. */
+export function capWindows(pace: Pace[] | null | undefined, caps: CapStatus[] | null | undefined): string[] {
+  const names = [...(pace ?? []).map((p) => p.window), ...(caps ?? []).map((c) => c.window)]
+    .filter((w): w is string => typeof w === "string" && w !== "");
+  const out = [...new Set(names)];
+  if (!out.length) return ["weekly", "five_hour"];
+  const order = (w: string) => (w === "weekly" ? 0 : w === "five_hour" ? 1 : 2);
+  return out.sort((a, b) => order(a) - order(b));
+}
+
+/** "The week", "The five hours", "The month". */
+export function capWindowLabel(name: string): string {
+  return `The ${windowWords(name)}`;
+}
+
+export function emptyCapDraft(windows: string[] = ["weekly"]): CapDraft {
   return {
     sentence: "share",
-    window: "weekly",
+    window: windows.includes("weekly") ? "weekly" : windows[0] ?? "weekly",
     pct: "",
     target: "100",
     slack: "0",
@@ -64,7 +82,7 @@ export function draftFromCap(c: CapStatus): CapDraft {
   return {
     ...base,
     sentence,
-    window: c.window === "five_hour" ? "five_hour" : "weekly",
+    window: c.window || "weekly",
     pct: sentence === "pace_target" ? "" : text(c.pct),
     target: sentence === "pace_target" && typeof c.pct === "number" ? text(c.pct) : "100",
     slack: sentence === "pace_target" ? text(c.slack ?? 0) : "0",
@@ -80,7 +98,7 @@ export function draftFromCap(c: CapStatus): CapDraft {
 /** What `khipu_route_cap` takes under `cap`. */
 export type CapArgs = {
   kind: CapSentence;
-  window?: "weekly" | "five_hour";
+  window?: string;
   pct?: number;
   slack?: number;
   usd?: number;
@@ -139,7 +157,7 @@ export function capSetArgs(d: CapDraft): { cap: CapArgs } | { error: string } {
 export function capRemoveArgs(c: CapStatus): CapArgs {
   const kind = c.kind as CapSentence;
   const cap: CapArgs = { kind };
-  if (kind === "share" || kind === "per_day" || kind === "pace_target") cap.window = c.window === "five_hour" ? "five_hour" : "weekly";
+  if (kind === "share" || kind === "per_day" || kind === "pace_target") cap.window = c.window || "weekly";
   if (kind === "pace_target") cap.purpose = c.purpose === "check" ? "check" : "job";
   return cap;
 }
@@ -149,8 +167,7 @@ export function matchingCapIndex(caps: CapStatus[], cap: CapArgs): number {
   return caps.findIndex((c) => {
     if (c.kind !== cap.kind) return false;
     if (cap.kind === "share" || cap.kind === "per_day" || cap.kind === "pace_target") {
-      const win = c.window === "five_hour" ? "five_hour" : "weekly";
-      if (win !== (cap.window ?? "weekly")) return false;
+      if ((c.window || "weekly") !== (cap.window ?? "weekly")) return false;
     }
     if (cap.kind === "pace_target") {
       const purpose = c.purpose === "check" ? "check" : "job";
@@ -163,7 +180,7 @@ export function matchingCapIndex(caps: CapStatus[], cap: CapArgs): number {
 /** A cap as one plain sentence, for the Undo bar and the remove line. */
 export function capSentence(c: CapStatus): string {
   const who = c.purpose === "check" ? "Checks" : "Jobs";
-  const win = c.window === "five_hour" ? "five hours" : "week";
+  const win = windowWords(c.window || "weekly");
   switch (c.kind) {
     case "share":
       return `At most ${c.pct ?? "?"}% of the ${win}`;

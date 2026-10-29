@@ -94,6 +94,25 @@ function sheet(v: RouteView = view(), a: RouteAccount = codex) {
 const section = (dialog: HTMLElement, name: string) => within(within(dialog).getByRole("region", { name }));
 
 describe("caps", () => {
+  it("offers the account's own windows, so a pace target can count over Kimi's month", async () => {
+    const kimi: RouteAccount = {
+      key: "kimi:main", label: "Kimi", harness: "kimi", state: "open",
+      pace: [{ window: "five_hour" }, { window: "monthly", window_s: 2678400 }] as RouteAccount["pace"],
+      cap_statuses: [],
+    };
+    const { dialog } = sheet(view({ accounts: [kimi, claude] }), kimi);
+    const caps = section(dialog, "Your caps");
+    fireEvent.click(caps.getByRole("button", { name: "Add a cap…" }));
+    fireEvent.change(caps.getByLabelText("What kind of cap"), { target: { value: "pace_target" } });
+    const win = caps.getByLabelText("Counted over") as HTMLSelectElement;
+    expect([...win.options].map((o) => [o.value, o.text])).toEqual([["five_hour", "The five hours"], ["monthly", "The month"]]);
+    fireEvent.change(win, { target: { value: "monthly" } });
+    fireEvent.click(caps.getByRole("button", { name: "Save cap" }));
+    await waitFor(() => expect(calls("khipu_route_cap")).toEqual([
+      { action: "set", account: "kimi:main", cap: { kind: "pace_target", window: "monthly", pct: 100, slack: 0, purpose: "job" } },
+    ]));
+  });
+
   it("adds an even-pace check cap, applying at once and offering Undo that undoes exactly that line", async () => {
     const { dialog, onChanged } = sheet();
     const caps = section(dialog, "Your caps");

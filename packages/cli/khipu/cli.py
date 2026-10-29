@@ -6143,7 +6143,8 @@ def build_parser() -> argparse.ArgumentParser:
     rcap = rt_sub.add_parser("cap", parents=[rt_json], help="Owner: set or remove a pace cap")
     rcap.add_argument("action", choices=("set", "remove"))
     rcap.add_argument("account")
-    rcap.add_argument("--window", default=None, choices=("weekly", "five_hour"))
+    rcap.add_argument("--window", default=None,
+                      help="The usage window: weekly, five_hour, monthly, daily, weekly_<name> or <n>_min")
     rcap.add_argument("--kind", required=True, choices=("share", "per_day", "pace_target", "spend", "concurrency"))
     rcap.add_argument("--pct", type=float, default=None)
     rcap.add_argument("--slack", type=float, default=None)

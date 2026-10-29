@@ -242,3 +242,62 @@ def test_routing_reads_kimis_month_with_pace(replay, kimi, monkeypatch):  # noqa
     assert month["used_pct"] == 33.0 and month["rate_pct_per_h"] == pytest.approx(2.0)
     line = routing_pace.pace_line("Kimi", routing_pace.at(month, replay.now), replay.now)
     assert line.startswith("Kimi monthly: ")
+
+
+def _kimi_month(replay, kimi, monkeypatch, ratios=(0.30, 0.31, 0.32, 0.33)):  # noqa: F811
+    _define_kimi(replay)
+    monkeypatch.setattr(usage, "_now", lambda: replay.now)
+    reply = json.loads(json.dumps(REPLY))
+    reply["usages"]["limit_5h"]["reset_time"] = routing._iso(T0 + timedelta(hours=4))
+    for ratio in ratios:
+        for key in ("limit_month_total", "limit_month_code"):
+            reply["usages"][key] = {"used_ratio": ratio, "reset_time": routing._iso(T0 + timedelta(days=12))}
+        _reply(kimi, reply)
+        usage.refresh_due(accounts=usage.http_quota_accounts(), max_age=0)
+        routing.record_pace_samples(replay.now)
+        replay.advance(1800)
+
+
+def _kimi_entry(replay):  # noqa: F811
+    return next(e for e in replay.view()["accounts"] if e["key"] == "kimi:main")
+
+
+def test_the_owner_sets_a_pace_target_on_the_month(replay, kimi, monkeypatch):  # noqa: F811
+    _kimi_month(replay, kimi, monkeypatch)
+    routing.set_cap("kimi:main", window="monthly", kind="pace_target", pct=100, slack=0, via="app")
+    entry = _kimi_entry(replay)
+    assert [(c["kind"], c["window"]) for c in entry["caps"]] == [("pace_target", "monthly")]
+    target = next(p for p in entry["pace"] if p["window"] == "monthly")["pace_target"]
+    assert target["pct"] == 100 and target["verdict"] != "unknown" and target["allowance_pct"] is not None
+    routing.set_cap("kimi:main", window="daily", kind="share", pct=50, via="app")
+    routing.remove_cap("kimi:main", window="monthly", kind="pace_target", via="app")
+    assert [(c["kind"], c["window"]) for c in _kimi_entry(replay)["caps"]] == [("share", "daily")]
+
+
+@pytest.mark.parametrize("window", ["fortnight", "", "0_min", "monthly; rm"])
+def test_a_window_with_no_known_length_takes_no_cap(replay, kimi, monkeypatch, window):  # noqa: F811
+    _define_kimi(replay)
+    with pytest.raises(routing.RouteError):
+        routing.set_cap("kimi:main", window=window, kind="pace_target", pct=100, slack=0, via="app")
+    with pytest.raises(routing.RouteError):
+        routing.remove_cap("kimi:main", window=window, kind="pace_target", via="app")
+
+
+def test_the_cli_and_owner_actions_take_the_month(replay, kimi, monkeypatch, khipu_app):  # noqa: F811
+    from khipu import cli, owner_act
+
+    _kimi_month(replay, kimi, monkeypatch)
+    assert cli.main(["route", "cap", "set", "kimi:main", "--kind", "pace_target", "--window", "monthly",
+                     "--pct", "100", "--slack", "5", "--from-app"]) == 0
+    assert [c["window"] for c in _kimi_entry(replay)["caps"]] == ["monthly"]
+    assert cli.main(["route", "cap", "remove", "kimi:main", "--kind", "pace_target", "--window", "monthly",
+                     "--from-app"]) == 0
+    assert "caps" not in _kimi_entry(replay)
+    values = owner_act._values("route.cap.set", {"account": "kimi:main", "kind": "pace_target",
+                                                 "window": "monthly", "pct": 100, "slack": 5})
+    head, positionals = owner_act.argv("route.cap.set", values)
+    ns = cli.build_parser().parse_args(owner_act.full_argv(head, positionals, ["--owner-direction"]))
+    assert ns.window == "monthly"
+    with pytest.raises(owner_act.Refused):
+        owner_act._values("route.cap.set", {"account": "kimi:main", "kind": "pace_target",
+                                            "window": "fortnight", "pct": 100, "slack": 5})

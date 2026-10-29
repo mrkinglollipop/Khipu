@@ -88,7 +88,7 @@ WINDOW_SECONDS = {"five_hour": 5 * 3600, "weekly": 7 * 86400}
 HOLD_REASONS = {"machine_busy": "machine busy", "disk_low": "disk low", "keep": "keep for one purpose",
                 "outage": "outage", "other": "other"}
 DOWN_REASONS = {"not_signed_in": "not signed in", "not_installed": "not installed",
-                "out_of_service": "out of service"}
+                "out_of_service": "out of service", "key_rejected": "key rejected", "no_plan": "no plan on its key"}
 EVIDENCE_MAX = 200
 NAME_MAX = 64
 DISPATCH_SCRIPTS_MOST = 16
@@ -4004,7 +4004,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if kind in ("cap_set", "cap_remove"):
             from khipu import routing_pace
 
-            window = event.get("window") if event.get("window") in routing_pace.WINDOWS else None
+            window = event.get("window") if routing_pace.cap_window(event.get("window")) else None
             account = event.get("account")
             cap_kind = event.get("cap_kind") or event.get("kind")
             purpose = event.get("purpose", "job")
@@ -7074,8 +7074,8 @@ _CAP_WORDS = ("a cap takes kind share or per_day (pct), pace_target (pct and sla
 def _checked_cap_or_raise(kind, fields: dict, revision, *, window):
     from khipu import routing_pace
 
-    if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
-        raise RouteError("window must be weekly or five_hour")
+    if kind in routing_pace.WINDOW_CAP_KINDS and not routing_pace.cap_window(window):
+        raise RouteError(routing_pace.CAP_WINDOW_WORDS)
     error = routing_pace.cap_scope_error(kind, fields.get("purpose", "job"),
                                          tier=fields.get("tier"), sensitive_only=fields.get("sensitive_only"))
     if error:
@@ -7134,8 +7134,8 @@ def _cap_remove_event(key: str, *, window, kind, purpose="job") -> dict:
     error = routing_pace.cap_scope_error(kind, purpose)
     if error:
         raise RouteError(error)
-    if kind in routing_pace.WINDOW_CAP_KINDS and window not in routing_pace.WINDOWS:
-        raise RouteError("window must be weekly or five_hour")
+    if kind in routing_pace.WINDOW_CAP_KINDS and not routing_pace.cap_window(window):
+        raise RouteError(routing_pace.CAP_WINDOW_WORDS)
     event = {"type": "cap_remove", "account": key, "cap_kind": kind, "purpose": purpose}
     if kind in routing_pace.WINDOW_CAP_KINDS:
         event["window"] = window

@@ -1735,7 +1735,11 @@ def usage_evidence(configured: set[str] | None = None) -> tuple[list[dict], dict
         accounts_read += 1
         attempt = _parse(row.get("last_attempt_at") or row.get("probed_at"))
         error = None if row.get("ok") else (row.get("last_error") or row.get("error"))
-        error = next((e for e in (usage.E_SIGNIN, usage.E_NOT_INSTALLED, usage.E_REDIRECT) if e == error), None)
+        # For Kimi a rejected key or no plan on the key
+        # is definitive: routing must not stay open on the last good figures.
+        down = (usage.E_SIGNIN, usage.E_NOT_INSTALLED, usage.E_REDIRECT) + (
+            (usage.E_BAD_KEY, usage.E_NO_PLAN) if row.get("harness") == "kimi" else ())
+        error = next((e for e in down if e == error), None)
         if error is not None and attempt is not None:
             out.append({"id": "p" + _sid(key, "down", _iso(attempt)), "account": key, "runner": None, "lane": None,
                         "state": "down", "until": None, "basis": "checked", "scope": "all", "window": None,
