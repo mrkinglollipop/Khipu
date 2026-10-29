@@ -150,6 +150,15 @@ def _queued(q):
     if not q:
         return ""
     return " queued=" + (",".join(str(x) for x in q) if isinstance(q, (list, tuple)) else str(q))
+if HOOK_EVENT:
+    # Antigravity (the only harness that names its event): a turn its
+    # PreInvocation could not read yet is recorded for owner direction here,
+    # once, under the prompt hook's own once-per-turn marker. No output.
+    try:
+        from khipu import owner_turns
+        owner_turns.antigravity_late_turn(json.loads(os.environ.get("KHIPU_HOOK_STDIN") or "{}"), HOOK_EVENT)
+    except Exception as e:  # noqa: BLE001 — fail-open, always
+        _say(f"owner turn skipped: {type(e).__name__}: {e}")
 try:
     # 1. Native capture for THIS session (harness inferred from the payload
     #    unless the pack pinned KHIPU_HARNESS). Never raises; always heartbeats.
