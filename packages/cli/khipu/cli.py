@@ -3252,6 +3252,7 @@ SETTABLE_SECRETS = {
     "openrouter_api_key": "openrouter_in_keychain",
     "glm_api_key": "glm_in_keychain",
     "deepseek_api_key": "deepseek_in_keychain",
+    "kimi_api_key": "kimi_in_keychain",
     "database_url": "dsn_in_keychain",
     "openai_compat_api_key": "openai_compat_in_keychain",
     "voyage_api_key": "voyage_in_keychain",

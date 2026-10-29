@@ -55,7 +55,9 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, localcontext
 from pathlib import Path
 
 HARNESSES = ("claude", "codex", "grok", "muse", "glm")
-LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse", "glm": "GLM"}
+LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse", "glm": "GLM",
+          # Read from provider-defined accounts, not usage_accounts: no harness entry.
+          "kimi": "Kimi"}
 # One sign-in each and no login folder: Muse's is its own login, GLM's is the
 # Coding Plan key (a Claude Code lane pointed at z.ai, not an Anthropic home).
 NO_FOLDER = ("muse", "glm")
@@ -66,6 +68,8 @@ GROK_TIMEOUT_S = 20.0
 # GLM's probe is one HTTPS call to z.ai's quota endpoint, no child process.
 GLM_TIMEOUT_S = 15.0
 GLM_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+KIMI_USAGE_URL = "https://api.kimi.com/coding/v1/usages"
+KIMI_TIMEOUT_S = 15.0
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 DEEPSEEK_HISTORY_NAME = "deepseek-balance.json"
 DEFAULT_MAX_AGE_S = 120
@@ -175,6 +179,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return _glm_note(code)
     if harness == "deepseek":
         return _deepseek_note(code)
+    if harness == "kimi":
+        return _kimi_note(code)
     if code == E_NOT_INSTALLED:
         return f"{name} is not installed on this Mac"
     if code == E_SIGNIN:
@@ -218,6 +224,25 @@ def _deepseek_note(code: str | None) -> str | None:
         return "Khipu can't reach DeepSeek from this Mac just now"
     if code in (E_BAD, E_CLI):
         return "DeepSeek answered in a way Khipu can't read; its spend is unknown"
+    return None
+
+
+def _kimi_note(code: str | None) -> str | None:
+    """Kimi has no CLI Khipu asks: its read is the usages call made with a key."""
+    if code == E_NO_KEY:
+        return "Khipu has no Kimi key; add it in Settings under Accounts and routing"
+    if code in (E_SIGNIN, E_BAD_KEY):
+        return "Kimi did not accept the key; replace it in Settings under Accounts and routing"
+    if code == E_NO_PLAN:
+        return "Kimi reports no Kimi Code plan on this key"
+    if code in (E_NOT_INSTALLED, E_TIMEOUT, E_NO_ANSWER):
+        return "Khipu can't reach Kimi from this Mac just now"
+    if code == E_BAD:
+        return "Kimi answered in a way Khipu can't read"
+    if code == E_CLI:
+        return "Kimi reported an error when asked"
+    if code == E_PENDING:
+        return "Reading for the first time; ask again in a few seconds"
     return None
 
 
@@ -1509,6 +1534,132 @@ def probe_glm(*, timeout: float = TIMEOUT_S) -> dict:
     return parse_glm(status, body)
 
 
+# ---- Kimi Code (kimi.com membership) ----------------------------------------
+#
+# Kimi Code's own CLI reads the plan from GET /coding/v1/usages with the key as
+# a Bearer token: ``usages`` holds each window's ``used_ratio`` (0-1) and
+# ``reset_time``; ``limits`` repeats the five-hour window as used/limit counts.
+# The month has two limits (all use and coding use); the tighter one binds.
+# Kimi is a provider-defined account (``kimi:main``), read like DeepSeek's.
+
+_KIMI_MONTH = ("limit_month_total", "limit_month_code")
+
+
+def _kimi_key() -> str | None:
+    from khipu import keychain
+
+    try:
+        return keychain.resolve_kimi_key() or None
+    except Exception:  # noqa: BLE001 - no key anywhere; the message is never used
+        return None
+
+
+def _kimi_request(key: str, timeout: float) -> tuple[int, bytes]:
+    """The usages call through the no-redirect, no-proxy HTTPS GET, so the key
+    can only ever reach api.kimi.com over TLS."""
+    return _https_get(KIMI_USAGE_URL, f"Bearer {key}", timeout)
+
+
+def _kimi_pct(ratio) -> float | None:
+    if ratio is None:
+        return None
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or ratio < 0:
+        raise ProbeError(E_BAD)
+    return round(min(100.0, float(ratio) * 100), 2)
+
+
+def _kimi_month_mins(resets_at: str | None) -> int | None:
+    """The minutes of the calendar month that ends at ``resets_at``."""
+    end = _parse_time(resets_at)
+    if end is None:
+        return None
+    import calendar
+
+    year, month = (end.year, end.month - 1) if end.month > 1 else (end.year - 1, 12)
+    start = end.replace(year=year, month=month, day=min(end.day, calendar.monthrange(year, month)[1]))
+    return int((end - start).total_seconds() // 60)
+
+
+def _kimi_limit_window(item) -> dict | None:
+    """One ``limits`` entry (a window length and used/limit counts) as a window."""
+    if not isinstance(item, dict):
+        raise ProbeError(E_BAD)
+    span, detail = item.get("window"), item.get("detail")
+    if not isinstance(span, dict) or not isinstance(detail, dict):
+        return None
+    unit = span.get("timeUnit")
+    duration = _number(span.get("duration"))
+    scale = {"TIME_UNIT_MINUTE": 1, "TIME_UNIT_HOUR": 60, "TIME_UNIT_DAY": 1440}.get(unit)
+    used, limit = _number(detail.get("used")), _number(detail.get("limit"))
+    if scale is None or not duration or duration <= 0 or used is None or not limit or limit <= 0 or used < 0:
+        return None
+    mins = int(duration * scale)
+    return _window(_window_name(mins), round(min(100.0, used / limit * 100), 2), detail.get("resetTime"), mins)
+
+
+def parse_kimi(status: int, body: bytes) -> dict:
+    if 300 <= status < 400:
+        raise ProbeError(E_REDIRECT)
+    if status in (401, 403):
+        raise ProbeError(E_BAD_KEY)
+    if status != 200:
+        raise ProbeError(E_CLI)
+    try:
+        reply = json.loads(body.decode("utf-8")) if body else None
+    except (ValueError, UnicodeError, RecursionError):
+        reply = None
+    if not isinstance(reply, dict):
+        raise ProbeError(E_BAD)
+    ratios = reply.get("usages") if isinstance(reply.get("usages"), dict) else {}
+    windows = []
+    five = ratios.get("limit_5h")
+    if isinstance(five, dict):
+        window = _window("five_hour", _kimi_pct(five.get("used_ratio")), five.get("reset_time"), 300)
+        if window:
+            windows.append(window)
+    month = [m for m in (ratios.get(k) for k in _KIMI_MONTH) if isinstance(m, dict)]
+    pcts = [(p, m.get("reset_time")) for m in month if (p := _kimi_pct(m.get("used_ratio"))) is not None]
+    if pcts:
+        used, resets = max(pcts, key=lambda pr: pr[0])
+        window = _window("monthly", used, resets, _kimi_month_mins(_iso(resets)))
+        if window:
+            windows.append(window)
+    for item in reply["limits"] if isinstance(reply.get("limits"), list) else []:
+        window = _kimi_limit_window(item)
+        if window and not any(w["name"] == window["name"] for w in windows):
+            windows.append(window)
+    if not windows:
+        raise ProbeError(E_NO_PLAN)
+    return {"ok": True, "plan": None, "windows": windows, "credits": None, "version": None, "source": "live"}
+
+
+@_guard
+def probe_kimi(*, timeout: float = TIMEOUT_S) -> dict:
+    """The Kimi Code plan's five-hour and monthly windows. The default
+    ``timeout`` is widened to ``KIMI_TIMEOUT_S`` (an explicit one is honoured)."""
+    key = _kimi_key()
+    if not key:
+        raise ProbeError(E_NO_KEY)
+    try:
+        status, body = _kimi_request(key, KIMI_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+    finally:
+        key = None  # the key lives only for the request above
+    return parse_kimi(status, body)
+
+
+def kimi_accounts(definitions: dict) -> list[dict]:
+    """The record's Kimi accounts, once a key makes them readable. Khipu reads
+    one Kimi key, so each defined Kimi account reads the same plan."""
+    if not _kimi_key():
+        return []
+    out = []
+    for ident, value in sorted((definitions.get("accounts") or {}).items()):
+        if (value or {}).get("provider") == "kimi":
+            out.append({"label": value.get("label") or ident, "harness": "kimi", "home": None,
+                        "provider": "kimi", "quota_key": ident})
+    return out
+
+
 # ---- DeepSeek (measured account spend) ---------------------------------------
 #
 # Balance decreases are spend; increases are top-ups and never offset spend.
@@ -2427,12 +2578,12 @@ def http_quota_accounts() -> list[dict]:
     out = []
     for ident, value in sorted((definitions.get("accounts") or {}).items()):
         provider = providers.get((value or {}).get("provider") or "")
-        if not provider or provider.get("probe") != "http-quota" or provider.get("id") == "deepseek":
+        if not provider or provider.get("probe") != "http-quota" or provider.get("id") in ("deepseek", "kimi"):
             continue
         out.append({"label": value.get("label") or ident, "harness": provider["id"], "home": None,
                     "probe": "http-quota", "host": provider.get("host"), "provider": provider["id"],
                     "quota_key": ident})
-    return out + deepseek_accounts(definitions)
+    return out + deepseek_accounts(definitions) + kimi_accounts(definitions)
 
 
 # ---- accounts ----------------------------------------------------------------
@@ -2509,6 +2660,8 @@ def available(harness: str) -> bool:
     or (GLM, which has no CLI) a key is stored."""
     if harness == "deepseek":
         return bool(_deepseek_key())
+    if harness == "kimi":
+        return bool(_kimi_key())
     return bool(_glm_key()) if harness == "glm" else bool(_command(harness))
 
 
@@ -2811,6 +2964,8 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
                     "note": f"This account entry is not valid: {account['invalid']}"}
         elif harness == "deepseek":
             data = probe_deepseek(timeout=timeout)
+        elif harness == "kimi":
+            data = probe_kimi(timeout=timeout)
         elif account.get("probe") == "http-quota" or account.get("quota_key"):
             data = probe_http_quota(account, timeout=timeout)
         elif harness in _HOME_VARS and not _login_folder_there(home or str(default_login(harness))):
@@ -2884,7 +3039,7 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
     for thread in threads:
         thread.start()
     longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"]
-                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") in ("glm", "deepseek")])
+                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") in ("glm", "deepseek", "kimi")])
     end = time.monotonic() + longest + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
@@ -3583,6 +3738,8 @@ def _window_label(window: dict) -> str:
         return "week"
     if name == "daily":
         return "day"
+    if name == "monthly":
+        return "month"
     if name.startswith("weekly_"):
         return f"week {window.get('model') or name.removeprefix('weekly_')}"
     return name.replace("_", " ")
@@ -3691,6 +3848,8 @@ def _window_words(window: dict) -> str:
         return "week"
     if name == "daily":
         return "day"
+    if name == "monthly":
+        return "month"
     if name.startswith("weekly_"):
         return f"{window.get('model') or name.removeprefix('weekly_').replace('_', ' ')} week"
     mins = re.fullmatch(r"(\d+)_min", name)

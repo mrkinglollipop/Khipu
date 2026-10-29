@@ -1922,12 +1922,13 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
     # http-quota accounts live in provider facts, not in usage_accounts:
     # their cache rows are keyed by stable account id, which the known
     # definition accounts already carry (no extra read of the log here).
+    # Kimi's accounts are read by Khipu's own Kimi reader the same way.
     from khipu.routing_identity import STABLE
 
     providers = cfg.get("_providers") or {}
     configured = configured_keys(config) | {
         a.get("definition_id") or a["key"] for a in known
-        if (providers.get(a.get("harness") or "") or {}).get("probe") == "http-quota"
+        if ((providers.get(a.get("harness") or "") or {}).get("probe") == "http-quota" or a.get("harness") == "kimi")
         and STABLE.fullmatch(a.get("definition_id") or a["key"] or "")}
     usage_items, usage_status = usage_evidence(configured)
     evidence += usage_items

@@ -339,16 +339,16 @@ describe("the More menu and See the plan", () => {
 });
 
 describe("how Khipu reads a plan (Plan detail)", () => {
-  const kimiRow = { harness: "kimi", key: "kimi:main", account: "Kimi", plan: null, windows: [], ok: false, error: "not_configured", home: null } as unknown as UsageAccount;
-  const kimi: RouteAccount = { key: "kimi:main", label: "Kimi", harness: "kimi", state: "unknown", configured: true, usage_setup: "no usage reader set up; confirm its quota host in Settings → Accounts" };
-  const kimiView = () => view({
-    accounts: [kimi],
-    definitions: { providers: { kimi: { id: "kimi", label: "Kimi", family: "Moonshot", login: "none", probe: "none", models_allowed: ["k3.1-pro"] } } },
+  const acmeRow = { harness: "acme", key: "acme:main", account: "Acme", plan: null, windows: [], ok: false, error: "not_configured", home: null } as unknown as UsageAccount;
+  const acme: RouteAccount = { key: "acme:main", label: "Acme", harness: "acme", state: "unknown", configured: true, usage_setup: "no usage reader set up; confirm its quota host in Settings → Accounts" };
+  const acmeView = () => view({
+    accounts: [acme],
+    definitions: { providers: { acme: { id: "acme", label: "Acme", family: "Acme", login: "none", probe: "none", models_allowed: ["acme-1"] } } },
   } as Partial<RouteView>);
 
   it("sets up reading: asks before sending the key to the address, then saves the provider with the reader", async () => {
     const onChanged = vi.fn();
-    render(<PlanDetailSheet row={kimiRow} view={kimiView()} now={NOW} onClose={() => {}} onChanged={onChanged} />);
+    render(<PlanDetailSheet row={acmeRow} view={acmeView()} now={NOW} onClose={() => {}} onChanged={onChanged} />);
     fireEvent.click(screen.getByRole("button", { name: "Set up reading…" }));
     fireEvent.change(screen.getByLabelText("Where Khipu asks for usage"), { target: { value: "api.example.com/usage" } });
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
@@ -356,20 +356,20 @@ describe("how Khipu reads a plan (Plan detail)", () => {
     fireEvent.change(screen.getByLabelText("Where Khipu asks for usage"), { target: { value: "https://api.example.com" } });
     fireEvent.click(screen.getByRole("button", { name: "Continue" }));
     const ask = screen.getByRole("group", { name: "Send your key to this address?" });
-    expect(ask).toHaveTextContent("Send your Kimi key to api.example.com?");
+    expect(ask).toHaveTextContent("Send your Acme key to api.example.com?");
     expect(calls("khipu_route_definition")).toEqual([]);
     fireEvent.click(within(ask).getByRole("button", { name: "Use this address" }));
     await waitFor(() => expect(calls("khipu_route_definition")).toEqual([{
       definition: "provider",
-      value: { id: "kimi", label: "Kimi", family: "Moonshot", login: "none", probe: "http-quota", models_allowed: ["k3.1-pro"], host: "api.example.com" },
+      value: { id: "acme", label: "Acme", family: "Acme", login: "none", probe: "http-quota", models_allowed: ["acme-1"], host: "api.example.com" },
     }]));
-    expect(await screen.findByText("Saved. Khipu will read Kimi's plan at api.example.com on its next check.")).toBeInTheDocument();
+    expect(await screen.findByText("Saved. Khipu will read Acme's plan at api.example.com on its next check.")).toBeInTheDocument();
     expect(onChanged).toHaveBeenCalled();
   });
 
   it("offers the host to a provider already marked http-quota that lacks one", () => {
-    const missing = view({ accounts: [kimi], definitions: { providers: { kimi: { id: "kimi", label: "Kimi", family: "Moonshot", probe: "http-quota" } } } } as Partial<RouteView>);
-    render(<PlanDetailSheet row={kimiRow} view={missing} now={NOW} onClose={() => {}} />);
+    const missing = view({ accounts: [acme], definitions: { providers: { acme: { id: "acme", label: "Acme", family: "Acme", probe: "http-quota" } } } } as Partial<RouteView>);
+    render(<PlanDetailSheet row={acmeRow} view={missing} now={NOW} onClose={() => {}} />);
     expect(screen.getByRole("button", { name: "Set up reading…" })).toBeInTheDocument();
   });
 
@@ -383,8 +383,8 @@ describe("how Khipu reads a plan (Plan detail)", () => {
   });
 
   it("offers nothing to set up for a plan that already has its reader", () => {
-    const set = view({ accounts: [{ ...kimi, usage_setup: undefined }], definitions: { providers: { kimi: { id: "kimi", label: "Kimi", family: "Moonshot", probe: "http-quota", host: "api.example.com" } } } } as Partial<RouteView>);
-    render(<PlanDetailSheet row={kimiRow} view={set} now={NOW} onClose={() => {}} />);
+    const set = view({ accounts: [{ ...acme, usage_setup: undefined }], definitions: { providers: { acme: { id: "acme", label: "Acme", family: "Acme", probe: "http-quota", host: "api.example.com" } } } } as Partial<RouteView>);
+    render(<PlanDetailSheet row={acmeRow} view={set} now={NOW} onClose={() => {}} />);
     expect(screen.queryByRole("button", { name: "Set up reading…" })).toBeNull();
   });
 
@@ -405,9 +405,30 @@ describe("how Khipu reads a plan (Plan detail)", () => {
     expect(onRefresh).toHaveBeenCalled();
   });
 
-  it("does not offer a key to replace for an account whose key the app can't store yet", () => {
+  it("offers no host for Kimi, which Khipu reads with its own reader and key", () => {
     const row = { harness: "kimi", key: "kimi:main", account: "Kimi", plan: null, windows: [], ok: false, error: "no_key", home: null } as unknown as UsageAccount;
-    render(<PlanDetailSheet row={row} view={view({ accounts: [{ ...kimi, usage_setup: undefined }] } as Partial<RouteView>)} now={NOW} onClose={() => {}} />);
+    const k: RouteAccount = { key: "kimi:main", label: "Kimi", harness: "kimi", state: "unknown", configured: false,
+      usage_setup: "add its key in Settings under Keys on this Mac" };
+    const v = view({ accounts: [k], definitions: { providers: { kimi: { id: "kimi", label: "Kimi", family: "Moonshot", probe: "none" } } } } as Partial<RouteView>);
+    render(<PlanDetailSheet row={row} view={v} now={NOW} onClose={() => {}} />);
+    expect(screen.queryByRole("button", { name: "Set up reading…" })).toBeNull();
+  });
+
+  it("replaces a Kimi key through the Keychain command, asks first, and never keeps the value", async () => {
+    const kimiRow = { harness: "kimi", key: "kimi:main", account: "Kimi", plan: null, windows: [], ok: false, error: "key_rejected", home: null } as unknown as UsageAccount;
+    render(<PlanDetailSheet row={kimiRow} view={view({ accounts: [{ key: "kimi:main", label: "Kimi", harness: "kimi", state: "unknown" }] } as Partial<RouteView>)} now={NOW} onClose={() => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: "Replace the key…" }));
+    fireEvent.change(screen.getByLabelText("New Kimi key"), { target: { value: "made-up-key-value" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(invokeMock.mock.calls.some((c) => c[0] === "set_khipu_secret")).toBe(false);
+    fireEvent.click(within(screen.getByRole("group", { name: "Replace the Kimi key?" })).getByRole("button", { name: "Replace the key" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_khipu_secret", { account: "kimi_api_key", value: "made-up-key-value" }));
+    expect(document.body.innerHTML).not.toContain("made-up-key-value");
+  });
+
+  it("does not offer a key to replace for an account whose key the app can't store yet", () => {
+    const row = { harness: "acme", key: "acme:main", account: "Acme", plan: null, windows: [], ok: false, error: "no_key", home: null } as unknown as UsageAccount;
+    render(<PlanDetailSheet row={row} view={view({ accounts: [{ ...acme, usage_setup: undefined }] } as Partial<RouteView>)} now={NOW} onClose={() => {}} />);
     expect(screen.queryByRole("button", { name: "Replace the key…" })).toBeNull();
   });
 });

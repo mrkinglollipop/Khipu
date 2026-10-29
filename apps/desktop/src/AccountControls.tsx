@@ -782,8 +782,8 @@ export function ReadingControls({ account, row, view, onChanged }: {
   // words it; a provider already marked http-quota is offered the host it lacks.
   const hostless = provider?.probe !== "http-quota" || !provider.host;
   const needsReader = !!account && account.configured !== false && !!account.usage_setup && !!provider
-    && account.harness !== "deepseek" && hostless;
-  const canReplaceKey = row.harness === "glm" && (row.error === "no_key" || row.error === "key_rejected");
+    && account.harness !== "deepseek" && account.harness !== "kimi" && hostless;
+  const canReplaceKey = (row.harness === "glm" || row.harness === "kimi") && (row.error === "no_key" || row.error === "key_rejected");
   if (!needsReader && !canReplaceKey) return null;
   return (
     <div className="ctl">
@@ -880,7 +880,7 @@ function ReplaceKey({ row, onChanged }: { row: UsageAccount; onChanged?: () => P
   const [saved, setSaved] = useState(false);
   const keyInput = useRef<HTMLInputElement>(null);
   const base = useId().replace(/:/g, "");
-  const name = row.account || "GLM";
+  const name = row.account || (row.harness === "kimi" ? "Kimi" : "GLM");
   async function send() {
     setBusy(true);
     setError(null);
@@ -890,7 +890,7 @@ function ReplaceKey({ row, onChanged }: { row: UsageAccount; onChanged?: () => P
     setValue("");
     setAsking(false);
     try {
-      const raw = await invoke<string>("set_khipu_secret", { account: "glm_api_key", value: handed });
+      const raw = await invoke<string>("set_khipu_secret", { account: row.harness === "kimi" ? "kimi_api_key" : "glm_api_key", value: handed });
       let failed: string | null = null;
       try {
         const parsed = JSON.parse(raw) as { ok?: boolean; error?: string };

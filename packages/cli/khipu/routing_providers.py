@@ -75,6 +75,10 @@ def usage_setup(harness: str, provider: dict) -> str | None:
         return None
     if harness == "deepseek":
         return "store its API key with `khipu secrets --set deepseek_api_key` or the `deepseek_key_file` setting"
+    if harness == "kimi" and usage.available("kimi"):
+        return None
+    if harness == "kimi":
+        return "add its key in Settings under Keys on this Mac"
     if harness not in usage.HARNESSES:
         return "no usage reader set up; confirm its quota host in Settings → Accounts"
     return None

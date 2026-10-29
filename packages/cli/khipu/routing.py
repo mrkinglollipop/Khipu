@@ -4406,9 +4406,10 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         origin = by_key[entry["key"]]
         if origin.get("matched_by"):
             entry["matched_by"] = origin["matched_by"]
-        entry["configured"] = (entry["key"] in known_keys if known_keys else not entry.get("home") and not none) \
-            and "|" in entry["key"]
         setup = usage_setup(entry["harness"], definitions["providers"].get(entry["harness"], {}))
+        # Kimi's defined accounts are read by Khipu's own Kimi reader once its key is stored.
+        entry["configured"] = ((entry["key"] in known_keys if known_keys else not entry.get("home") and not none)
+                               and "|" in entry["key"]) or (entry["harness"] == "kimi" and not setup)
         if setup:
             entry["usage_setup"] = setup
         marked = notes.get(entry["key"])

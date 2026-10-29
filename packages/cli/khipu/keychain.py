@@ -18,6 +18,7 @@ OPENAI_ACCOUNT = "openai_api_key"
 OPENROUTER_ACCOUNT = "openrouter_api_key"
 GLM_ACCOUNT = "glm_api_key"
 DEEPSEEK_ACCOUNT = "deepseek_api_key"
+KIMI_ACCOUNT = "kimi_api_key"
 OPENAI_COMPAT_ACCOUNT = "openai_compat_api_key"
 VOYAGE_ACCOUNT = "voyage_api_key"
 CONFIG_DIR = Path.home() / ".config" / "khipu"
@@ -279,6 +280,10 @@ def get_deepseek_key() -> str | None:
     return get_password(DEEPSEEK_ACCOUNT)
 
 
+def get_kimi_key() -> str | None:
+    return get_password(KIMI_ACCOUNT)
+
+
 def _resolve_provider_key(provider: str, *, key_file: Path | None = None) -> str:
     from khipu.config import path_setting
 
@@ -291,6 +296,7 @@ def _resolve_provider_key(provider: str, *, key_file: Path | None = None) -> str
         "openai": get_openai_key,
         "openrouter": get_openrouter_key,
         "glm": get_glm_key,
+        "kimi": get_kimi_key,
     }
     if provider not in getters:
         raise RuntimeError(f"unknown provider key: {provider}")
@@ -321,6 +327,12 @@ def resolve_glm_key(*, key_file: Path | None = None) -> str:
     """The z.ai GLM Coding Plan key: env GLM_API_KEY, Keychain ``glm_api_key``,
     then the file named by the ``glm_key_file`` setting."""
     return _resolve_provider_key("glm", key_file=key_file)
+
+
+def resolve_kimi_key(*, key_file: Path | None = None) -> str:
+    """The Kimi Code plan key: env KIMI_API_KEY, Keychain ``kimi_api_key``,
+    then the file named by the ``kimi_key_file`` setting."""
+    return _resolve_provider_key("kimi", key_file=key_file)
 
 
 def read_owner_only_key_file(path: Path) -> str | None:
@@ -463,7 +475,7 @@ def secrets_status() -> dict:
     gemini_file = _gemini_key_file()
     voyage_file = _voyage_key_file()
     provider_files = {provider: path_setting(f"{provider}_key_file")
-                      for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")}
+                      for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek", "kimi")}
     def file_has_key(path):
         return bool(path and read_owner_only_key_file(path))
     active_dir = data_dir()
@@ -479,12 +491,12 @@ def secrets_status() -> dict:
         "dsn_in_keychain": dsn_in_keychain,
         "gemini_in_keychain": bool(get_gemini_key()),
         **{f"{provider}_in_keychain": bool(get_password(f"{provider}_api_key"))
-           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")},
+           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek", "kimi")},
         **{f"{provider}_env": bool((os.environ.get(f"{provider.upper()}_API_KEY") or "").strip())
-           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")},
+           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek", "kimi")},
         **{f"{provider}_file_present": bool(provider_files[provider] and
                                             provider_files[provider].is_file())
-           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")},
+           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek", "kimi")},
         "openai_compat_in_keychain": bool(get_openai_compat_key()),
         "voyage_in_keychain": bool(get_voyage_key()),
         "voyage_env": bool((os.environ.get("VOYAGE_API_KEY") or "").strip()),
@@ -493,7 +505,7 @@ def secrets_status() -> dict:
         "gemini_file_present": bool(gemini_file and gemini_file.is_file()),
         "gemini_file_key_present": file_has_key(gemini_file),
         **{f"{provider}_file_key_present": file_has_key(provider_files[provider])
-           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek")},
+           for provider in ("anthropic", "openai", "openrouter", "glm", "deepseek", "kimi")},
         "config_dir": str(active_dir),
         "default_config_dir": str(CONFIG_DIR),
         # The file DSN is the fallback every sandboxed harness lands on, so its

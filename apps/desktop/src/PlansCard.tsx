@@ -101,7 +101,15 @@ const ERROR_PHRASE: Record<string, string> = {
   login_folder_missing: "login folder not found on this Mac",
 };
 
-export function usageErrorPhrase(code: string | null | undefined): string {
+/** Kimi's key codes name Kimi; ERROR_PHRASE's words for them name GLM. */
+const KIMI_ERROR_PHRASE: Record<string, string> = {
+  no_key: "no Kimi key stored",
+  key_rejected: "key not accepted by Kimi",
+  no_plan: "no Kimi Code plan on this key",
+};
+
+export function usageErrorPhrase(code: string | null | undefined, harness?: string | null): string {
+  if (code && harness === "kimi" && KIMI_ERROR_PHRASE[code]) return KIMI_ERROR_PHRASE[code];
   if (code && ERROR_PHRASE[code]) return ERROR_PHRASE[code];
   if (code && /^(exit|signal)_\d+$/.test(code)) return ERROR_PHRASE.no_answer;
   return "couldn't read";
@@ -173,6 +181,7 @@ export function windowLabel(w: UsageWindow): string {
   if (name === "five_hour") return "five-hour";
   if (name === "weekly") return "week";
   if (name === "daily") return "day";
+  if (name === "monthly") return "month";
   if (name.startsWith("weekly_")) return `${w.model || name.slice("weekly_".length).replace(/_/g, " ")} week`;
   const mins = /^(\d+)_min$/.exec(name);
   if (mins) return `${mins[1]} min`;
@@ -244,7 +253,7 @@ export function plansHealthDetail(report: UsageReport | null | undefined, now: D
 export function unreadAccounts(report: UsageReport | null | undefined, now: Date = new Date()): string[] {
   return (report?.accounts ?? [])
     .filter((row) => row.ok === false && liveWindows(row, now).length === 0)
-    .map((row) => `${row.account || row.harness || "Account"} (${usageErrorPhrase(row.error)})`);
+    .map((row) => `${row.account || row.harness || "Account"} (${usageErrorPhrase(row.error, row.harness)})`);
 }
 
 /** Accounts whose figures came from a fallback because the live read failed
@@ -252,7 +261,7 @@ export function unreadAccounts(report: UsageReport | null | undefined, now: Date
 export function liveReadFailures(report: UsageReport | null | undefined): string[] {
   return (report?.accounts ?? [])
     .filter((row) => row.ok !== false && row.live_error)
-    .map((row) => `${row.account || row.harness || "Account"} is showing its last turn (${usageErrorPhrase(row.live_error)})`);
+    .map((row) => `${row.account || row.harness || "Account"} is showing its last turn (${usageErrorPhrase(row.live_error, row.harness)})`);
 }
 
 /** One attention item when any window still in force is at or above 90%. */
@@ -428,7 +437,7 @@ export function liveWords(row: UsageAccount): { text: string; live: boolean; che
   if (code === "not_signed_in") return { text: "Not signed in", live: false };
   if (code === "no_plan_limits") return { text: "Signed in, but its plan figures can't be read", live: false };
   if (code === "pending") return { text: "Reading it for the first time", live: false };
-  if (row.ok === false) return { text: `Can't be read just now (${usageErrorPhrase(code)})`, live: false };
+  if (row.ok === false) return { text: `Can't be read just now (${usageErrorPhrase(code, row.harness)})`, live: false };
   const age = fmtAgoSince(row.last_attempt_at || row.probed_at);
   if (!(row.windows ?? []).some((w) => pctOf(w) != null)) {
     return { text: age ? `Checked ${age}, no figures yet` : "Checked, no figures yet", live: false, checked: true };
@@ -611,7 +620,7 @@ function failureCause(row: UsageAccount, code: string): string {
   const note = row.ok === false ? (row.note ?? "").trim().replace(/\.$/, "") : "";
   if (note) return /^(This|The) /.test(note) ? note.charAt(0).toLowerCase() + note.slice(1) : note;
   if (code === "internal_error") return ERROR_PHRASE.internal_error;
-  return `${CLI_TITLE[row.harness ?? ""] ?? "its CLI"} ${usageErrorPhrase(code)}`;
+  return `${CLI_TITLE[row.harness ?? ""] ?? "its CLI"} ${usageErrorPhrase(code, row.harness)}`;
 }
 
 /** What one account's row says, once: whether its figures are from this read,
