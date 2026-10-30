@@ -431,3 +431,124 @@ def test_a_request_naming_the_tag_round_trips_exactly():
     typed = "Please explain the literal <user_request> tag and its </user_request> closer, please."
     text = (HEADER + "<runtime_info>x</runtime_info>\n<user_request>\n" + typed + "\n</user_request>\n").encode()
     assert adb.decode_step(adb.USER_STEP, _ld(19, _ld(2, text))) == typed
+
+
+# ---- replays of the real T3 sequences (runtime 1.3.0, proof runs 1-5, 2026-10-29/30) ----------
+#
+# One PreInvocation per user turn (invocationNum 1, initialNumSteps 0), however
+# many model calls the turn makes. Its PostInvocation carries the step count at
+# the END of the invocation (4 after three tool calls), so Post's value never
+# names the turn. A single-call turn shows Pre 0 / Post 0. A Stop with no
+# invocation fields can fire before the first PreInvocation.
+
+def _stop_payload(path: Path, **extra) -> dict:
+    return {"conversationId": "ag-conv", "workspacePaths": ["/work/khipu"], "transcriptPath": str(path),
+            "executionNum": 1, "terminationReason": "session_end", "error": "", **extra}
+
+
+def _counted(now: float = 9999.0) -> list[int]:
+    """Occurrences of the rows a reader counts: a duplicate copy never counts."""
+    return [t["occurrence"] for t in owner_turns.turns("ag-conv", now) if not t.get("duplicate_of")]
+
+
+
+def test_real_multi_call_turn_pre_0_post_4_then_a_retype_records_one_row_per_typing(home):
+    path = make_db(db_path(home), [], wal=True)
+    assert owner_turns.antigravity_late_turn(_stop_payload(path), "Stop", now=998.0, issuer=ISSUER) is None
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=1, initialNumSteps=0), now=1000.0, wait=0,
+                                          issuer=ISSUER) is None
+    for idx, kind, body in ((0, 14, user_payload("ship it")), (1, 15, model_payload("calling a tool")),
+                            (2, 7, b"\x08\x07"), (3, 15, model_payload("done"))):
+        _add(path, idx, kind, body)
+    assert owner_turns.antigravity_late_turn(_pre(path, invocationNum=1, initialNumSteps=4), "PostInvocation",
+                                             now=1018.0, issuer=ISSUER)
+    assert owner_turns.antigravity_late_turn(_stop_payload(path), "Stop", now=1020.0, issuer=ISSUER) is None
+    assert [r["ts"] for r in _rows()] == [1000.0] and _counted() == [1]
+    # Turn 2 retypes the same words; its PreInvocation still sees turn 1's step.
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=2, initialNumSteps=4), now=2000.0, wait=0,
+                                          issuer=ISSUER) == {}
+    _add(path, 4, 14, user_payload("ship it"))
+    _add(path, 5, 15, model_payload("again"))
+    assert owner_turns.antigravity_late_turn(_pre(path, invocationNum=2, initialNumSteps=6), "PostInvocation",
+                                             now=2010.0, issuer=ISSUER)
+    assert owner_turns.antigravity_late_turn(_stop_payload(path), "Stop", now=2012.0, issuer=ISSUER) is None
+    assert [r["ts"] for r in _rows()] == [1000.0, 2000.0] and _counted() == [1, 2]
+
+
+def test_real_single_call_turns_pre_0_post_0_then_a_retype_records_one_row_per_typing(home):
+    path = make_db(db_path(home), [], wal=True)
+    assert owner_turns.antigravity_late_turn(_stop_payload(path), "Stop", now=999.0, issuer=ISSUER) is None
+    assert owner_turns.antigravity_prompt(_pre(path), now=1000.0, wait=0, issuer=ISSUER) is None
+    _add(path, 0, 14, user_payload("ship it"))
+    _add(path, 1, 15, model_payload("done"))
+    assert owner_turns.antigravity_late_turn(_pre(path), "PostInvocation", now=1010.0, issuer=ISSUER)
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=2, initialNumSteps=2), now=2000.0, wait=0,
+                                          issuer=ISSUER) == {}
+    _add(path, 2, 14, user_payload("ship it"))
+    _add(path, 3, 15, model_payload("done"))
+    assert owner_turns.antigravity_late_turn(_pre(path, invocationNum=2, initialNumSteps=2), "PostInvocation",
+                                             now=2010.0, issuer=ISSUER)
+    assert [r["ts"] for r in _rows()] == [1000.0, 2000.0] and _counted() == [1, 2]
+
+
+def test_real_sequence_with_last_user_input_never_binds_post_or_stop_by_their_own_step_count(home):
+    """The documented payload shape (``lastUserInput``) over the real event
+    order, transcript still unwritten at Post and Stop: Post's end-of-call 4
+    and a Stop with no step count are not new turns; each flushed step pairs
+    with its own turn's PreInvocation row."""
+    path = make_db(db_path(home), [], wal=True)
+    said = {"lastUserInput": "ship it"}
+    # A stray Stop before any PreInvocation records nothing, even with words.
+    assert owner_turns.antigravity_late_turn(_stop_payload(path, **said), "Stop", now=998.0, issuer=ISSUER) is None
+    assert owner_turns.antigravity_prompt(_pre(path, initialNumSteps=0, **said), now=1000.0, wait=0,
+                                          issuer=ISSUER)["prompt"] == "ship it"
+    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=4, **said), "PostInvocation",
+                                             now=1018.0, issuer=ISSUER) is None
+    assert owner_turns.antigravity_late_turn(_stop_payload(path, **said), "Stop", now=1020.0, issuer=ISSUER) is None
+    assert _counted() == [1]
+    _add(path, 0, 14, user_payload("ship it"))
+    _add(path, 3, 15, model_payload("done"))
+    assert owner_turns.antigravity_late_turn(_stop_payload(path, **said), "Stop", now=1030.0, issuer=ISSUER)
+    rows = _rows()
+    assert [r["occurrence"] for r in rows] == [1, 1] and rows[1]["duplicate_of"] == rows[0]["turn"]
+    # Turn 2: the same words retyped. Its PreInvocation sees turn 1's step,
+    # so it waits for its own; Post's 6 names no turn.
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=2, initialNumSteps=4, **said), now=2000.0,
+                                          wait=0, issuer=ISSUER) == {}
+    assert owner_turns.antigravity_late_turn(_pre(path, invocationNum=2, initialNumSteps=6, **said),
+                                             "PostInvocation", now=2010.0, issuer=ISSUER) is None
+    _add(path, 4, 14, user_payload("ship it"))
+    assert owner_turns.antigravity_late_turn(_stop_payload(path, **said), "Stop", now=2020.0, issuer=ISSUER)
+    rows = _rows()
+    assert [r["occurrence"] for r in rows] == [1, 1, 2] and rows[2]["ts"] == 2000.0
+    assert _counted() == [1, 2]
+
+
+def test_a_late_last_user_input_is_bound_to_the_pre_invocation_that_could_not_read_it(home):
+    """Pre had no words and no flushed step; Post brings the words with its
+    end-of-call 4. The row is bound to Pre's 0, so the flushed step 0 pairs."""
+    path = make_db(db_path(home), [], wal=True)
+    assert owner_turns.antigravity_prompt(_pre(path), now=1000.0, wait=0, issuer=ISSUER) is None
+    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=4, lastUserInput="ship it"),
+                                             "PostInvocation", now=1018.0, issuer=ISSUER)
+    _add(path, 0, 14, user_payload("ship it"))
+    assert owner_turns.antigravity_late_turn(_stop_payload(path), "Stop", now=1020.0, issuer=ISSUER)
+    assert [r["ts"] for r in _rows()] == [1000.0, 1000.0] and _counted() == [1]
+
+
+def test_several_pre_invocations_of_one_readable_turn_still_record_once(home):
+    """Not seen on 1.3.0, kept safe: a runtime firing one PreInvocation per
+    model call with growing step counts records the turn once and leaves no
+    note that dates the next turn."""
+    path = make_db(db_path(home), [(0, 14, user_payload("ship it"))], wal=True)
+    assert owner_turns.antigravity_prompt(_pre(path), now=1000.0, wait=0, issuer=ISSUER)["prompt"] == "ship it"
+    for n, at in ((2, 1005.0), (4, 1010.0)):
+        _add(path, n - 1, 15, model_payload("call"))
+        assert owner_turns.antigravity_prompt(_pre(path, invocationNum=n, initialNumSteps=n), now=at, wait=0,
+                                              issuer=ISSUER) == {}
+    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=6), "PostInvocation", now=1012.0,
+                                             issuer=ISSUER) is None
+    _add(path, 6, 14, user_payload("ship it"))
+    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=8), "PostInvocation", now=2000.0,
+                                             issuer=ISSUER)
+    assert [r["ts"] for r in _rows()] == [1000.0, 2000.0] and _counted() == [1, 2]

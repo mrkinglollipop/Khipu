@@ -3393,7 +3393,8 @@ def _probe_antigravity_prompt(command: str) -> dict:
             rc2, second = call()          # the next model call of the same turn
             turn("ok", 3)
             rc3, _third = call()          # a new user turn passes the gate again
-            gate = list((Path(td) / "kh" / "owner-turns" / "antigravity").glob("*"))
+            # Once-per-turn markers only: the pending and current-turn notes beside them have a prefix.
+            gate = [m for m in (Path(td) / "kh" / "owner-turns" / "antigravity").glob("*") if "-" not in m.name]
         steps = first.get("injectSteps")
         shaped = steps is None or (isinstance(steps, list) and all(
             isinstance(x, dict) and len(x) == 1 and next(iter(x)) in

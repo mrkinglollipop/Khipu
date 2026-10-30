@@ -916,7 +916,8 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
 # ---- Antigravity: the prompt comes from the transcript ------------------------
 #
 # Antigravity's PreInvocation payload carries no prompt text (scope doc section
-# 3.2), and it fires before EVERY model call, not once per user turn. The turn
+# 3.2). The docs fire it before every model call; T3's runtime 1.3.0 fires it
+# once per user turn (proof run 5), and both are handled. The turn
 # is the newest USER_INPUT step in the conversation's transcript, and a turn is
 # handled once: a marker per (conversation, step) is created exclusively, so the
 # first model call after a new USER_INPUT wins and every later call, or a second
@@ -1042,6 +1043,13 @@ _AG_PENDING_MAX = 32
 # it is numbered as a turn of its own: a double count is acceptable, a lost
 # turn is not.
 _AG_FALLBACK = "last-"
+# Only a PreInvocation names its turn: T3 1.3.0 fires one per user turn, and
+# PostInvocation's ``initialNumSteps`` is the step count at the END of the
+# invocation (4 after three tool calls, proof run 5), while Stop has none.
+# Every PreInvocation writes its own value as the session's current turn; a
+# late ``lastUserInput`` row is keyed by that, never by its own payload, and
+# with no PreInvocation seen yet (a Stop can fire before the first) there is
+# no turn to bind it to, so it records nothing.
 
 
 def _ag_dir() -> Path:
@@ -1107,6 +1115,26 @@ def _ag_note_unseen(session: str, steps: int | None, now: float) -> None:
     _ag_save_notes(path, notes)
 
 
+def _ag_note_turn(session: str, steps: int | None) -> None:
+    path = _ag_file(_ag_dir(), "turn-", session)
+    try:
+        if steps is None:
+            path.unlink(missing_ok=True)
+        else:
+            _ag_write(path, json.dumps({"steps": steps}))
+    except OSError:
+        pass
+
+
+def _ag_turn_steps(session: str) -> int | None:
+    """The newest PreInvocation's ``initialNumSteps``; None when none was seen."""
+    try:
+        n = json.loads(_ag_file(_ag_dir(), "turn-", session).read_text(encoding="utf-8")).get("steps")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+
+
 def _ag_clear_unseen(session: str) -> None:
     try:
         _ag_file(_ag_dir(), "pending-", session).unlink()
@@ -1143,6 +1171,12 @@ def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
         if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
             at = ts
         _ag_save_notes(path, {k: v for k, v in notes.items() if int(k) > index})
+    elif steps is not None and key.startswith(_AG_FALLBACK):
+        # A late row of a turn whose PreInvocation could not read it keeps
+        # that call's time; the note stays to date the flushed copy.
+        ts = _ag_notes(_ag_file(directory, "pending-", session)).get(str(steps))
+        if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
+            at = ts
     if key.startswith(_AG_FALLBACK):
         return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps})
     return at, (_ag_original(session, index, text, now) if index is not None else {})
@@ -1166,9 +1200,11 @@ def _ag_original(session: str, index: int, text: str, now: float) -> dict:
     return {}
 
 
-def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] | None:
-    """(session, newest user turn or None) for an Antigravity payload with no
-    prompt of its own; None for any other payload."""
+def _ag_read(payload, wait: float | None, late: bool = False) -> tuple[str, tuple[str, str] | None, int | None] | None:
+    """(session, newest user turn or None, the turn's step count) for an
+    Antigravity payload with no prompt of its own; None for any other
+    payload. ``late`` (PostInvocation, Stop): the step count is the newest
+    PreInvocation's, and ``lastUserInput`` is used only when one was seen."""
     if not isinstance(payload, dict) or hook_shape.detect(payload, os.environ)[0] != "antigravity":
         return None
     if isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
@@ -1177,6 +1213,7 @@ def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] 
     if not session:
         return None
     found = None
+    steps = _ag_turn_steps(session) if late else _ag_initial_steps(payload)
     tp = hook_shape.transcript_path(payload)
     last = payload.get("lastUserInput") or payload.get("last_user_input")
     has_last = isinstance(last, str) and bool(last.strip())
@@ -1187,14 +1224,13 @@ def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] 
             while found is None and time.monotonic() < give_up:
                 time.sleep(_AG_FLUSH_POLL_S)
                 found = _ag_last_user_input(tp)
-    if found is None and has_last:
+    if found is None and has_last and not (late and steps is None):
         wrapped = _AG_WRAP.match(last)
         text = (wrapped.group(1) if wrapped else last).strip()
         if text:
-            steps = _ag_initial_steps(payload)
             found = (_AG_FALLBACK + ("" if steps is None else f"{steps}-")
                      + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], text)
-    return session, found
+    return session, found, steps
 
 
 def _ag_filled(payload: dict, text: str) -> dict:
@@ -1214,15 +1250,15 @@ def _antigravity_turn(payload, now: float | None, wait: float | None):
     read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait))
     if read is None:
         return None, None, None, {}
-    session, found = read
+    session, found, steps = read
     if found is None:
-        return None, None, (session, _ag_initial_steps(payload)), {}
+        return None, None, (session, steps), {}
     key, text = found
-    claimed = _ag_claim(session, key, time.time() if now is None else now, _ag_initial_steps(payload), text)
+    claimed = _ag_claim(session, key, time.time() if now is None else now, steps, text)
     if claimed is None:
         # Already handled, or the newest step is the last turn's and this
         # call's own turn is not written yet.
-        return {}, None, (session, _ag_initial_steps(payload)), {}
+        return {}, None, (session, steps), {}
     return _ag_filled(payload, text), claimed[0], None, claimed[1]
 
 
@@ -1235,6 +1271,9 @@ def antigravity_prompt(payload: dict, now: float | None = None, wait: float | No
     Never raises."""
     try:
         stamp = time.time() if now is None else now
+        if isinstance(payload, dict) and hook_shape.detect(payload, os.environ)[0] == "antigravity" \
+                and hook_shape.session_id(payload).strip():
+            _ag_note_turn(hook_shape.session_id(payload).strip(), _ag_initial_steps(payload))
         out, at, unseen, extra = _antigravity_turn(payload, stamp, wait)
         if unseen is not None:
             _ag_note_unseen(unseen[0], unseen[1], stamp)
@@ -1254,14 +1293,14 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
     Returns the recorded turn's id, None when nothing was recorded. Prints
     nothing; never raises."""
     try:
-        read = _ag_read(payload, 0)
+        read = _ag_read(payload, 0, late=True)
         if read is None:
             return None
-        session, found = read
+        session, found, steps = read
         stamp = time.time() if now is None else now
         recorded = None
         if found is not None:
-            claimed = _ag_claim(session, found[0], stamp, _ag_initial_steps(payload), found[1])
+            claimed = _ag_claim(session, found[0], stamp, steps, found[1])
             if claimed is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}
