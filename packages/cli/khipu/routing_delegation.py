@@ -1075,30 +1075,57 @@ def note_brief(payload: dict, env) -> None:
 def main() -> None:
     """Entry point for ``bin/khipu-delegation-hook``. Never raises and never
     fails the call: any error prints ``{}``."""
+    started = time.monotonic()
     try:
         raw = wire.read_stdin()
     except Exception:  # noqa: BLE001
         raw = ""
     info, kind, out = None, None, {}
+    outcome = "pass"
     try:
         out, info, kind = hook_main(raw)
         # The answer is built Claude-shaped; Cursor and Antigravity read their own.
         out = hook_shape.reshape(out, hook_shape.detect(_payload(raw), os.environ)[1])
-    except Exception:  # noqa: BLE001 - the one thing this must never do is fail the call
+    except Exception as exc:  # noqa: BLE001 - the one thing this must never do is fail the call
         out = {}
+        outcome = f"error:{type(exc).__name__}"
     delivered = True
     try:
         print(wire.dumps(out, ensure_ascii=True), flush=True)
     except OSError:
         delivered = False
-    if kind is None:
-        return
-    try:
-        from khipu import recall_prompt
+    routed = ""
+    if kind is not None:
+        outcome = "pushed" if out else "delegation"
+        try:
+            from khipu import recall_prompt
 
-        routed = recall_prompt._routing_delivered(info, delivered)
-        session = hook_shape.session_id(_payload(raw)) or "?"
-        # Not the per-prompt summary line's shape, so the lane's outcome rate never counts it.
-        recall_prompt._log(f"delegation session={session} call={kind.replace(' ', '_')}{routed}")
-    except Exception:  # noqa: BLE001
+            routed = recall_prompt._routing_delivered(info, delivered)
+        except Exception:  # noqa: BLE001
+            pass
+    _log_call(raw, outcome, kind, routed, started)
+
+
+def _log_call(raw: str, outcome: str, kind: str | None, routed: str, started: float) -> None:
+    """One line per call, in prompt-recall.log under its own tag (so the
+    per-prompt lane's outcome rate never counts it): what the hook cost and
+    what it did. Runs on every tool call, so it imports nothing heavy."""
+    try:
+        from datetime import datetime, timezone
+
+        from khipu.paths import capture_home
+
+        payload = _payload(raw)
+        session = hook_shape.session_id(payload) or "?"
+        event = _event(payload) or "?"
+        tool = str(payload.get("tool_name") or payload.get("toolName") or "-").replace(" ", "_")[:40]
+        call = f" call={kind.replace(' ', '_')}" if kind else ""
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (f"{stamp} [khipu-delegation-hook] session={session} event={event} tool={tool} "
+                f"outcome={outcome}{call}{routed} ms={(time.monotonic() - started) * 1000:.1f}\n")
+        path = capture_home() / "logs" / "prompt-recall.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:  # noqa: BLE001 - logging never fails the call
         pass

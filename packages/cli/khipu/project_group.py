@@ -37,9 +37,15 @@ def _iso(value: Any) -> str | None:
     return value.isoformat() if hasattr(value, "isoformat") else (str(value) if value is not None else None)
 
 
-def _savepoint(cur, name: str, sql: str, params: tuple) -> list[tuple]:
+def _savepoint(cur, name: str, sql: str, params: tuple, known: tuple = ()) -> list[tuple]:
     """A read that must never break the caller's transaction: ``[]`` when the
-    table or column is not there (a hub older than migration 0039)."""
+    table or column is not there (a hub older than migration 0039).
+    ``known`` names the table and columns the read needs: when the schema is
+    already known to have them (``identity.schema_known``) no savepoint is
+    taken."""
+    if known and identity.schema_known(*known):
+        cur.execute(sql, params)
+        return cur.fetchall()
     try:
         cur.execute(f"SAVEPOINT {name}", ())
         cur.execute(sql, params)
@@ -119,7 +125,7 @@ def pair_rows(cur, names: list[str], *, state: str | None = None) -> list[dict]:
     if state:
         sql, params = sql + " AND state = %s", (*params, state)
     rows = _savepoint(cur, "project_group_pairs", sql + " ORDER BY (state = 'asked') DESC, state, created_at, a, b",
-                      params)
+                      params, known=("project_pairs", "a", "b", "root_commit", "state", "created_at", "decided_at"))
     return [_pair_dict(r) for r in rows]
 
 

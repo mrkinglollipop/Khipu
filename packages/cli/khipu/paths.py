@@ -136,6 +136,17 @@ def isolated_dir() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+def capture_home() -> Path:
+    """``session_capture.khipu_home``'s answer without importing that module
+    (a hook on every tool call cannot afford it): the isolated run's capture
+    folder, else KHIPU_CAPTURE_HOME / KHIPU_AEGIS_HOME, else ~/.grok/khipu."""
+    isolated = isolated_dir()
+    if isolated is not None:
+        return isolated / "capture"
+    return Path(os.environ.get("KHIPU_CAPTURE_HOME") or os.environ.get("KHIPU_AEGIS_HOME")
+                or str(Path.home() / ".grok" / "khipu"))
+
+
 class IsolatedWriteRefused(RuntimeError):
     """A live-only write (data-dir pointer, DSN, certificate, Keychain) was
     attempted inside an isolated run."""
