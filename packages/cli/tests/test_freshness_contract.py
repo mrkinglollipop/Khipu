@@ -188,6 +188,8 @@ class TopicsCatchupContractTest(unittest.TestCase):
                 if s.startswith("SELECT 'topic'") and "xmin" in s:
                     self._result = [("topic", None, slug, t["xid"])
                                     for slug, t in sorted(self.topics.items())]
+                elif s.startswith("SELECT t.slug, e.id FROM topics t JOIN episodes e"):
+                    self._result = [(r, 1) for r in params[0] if r in self.topics]
                 elif s.startswith("SELECT slug FROM topics"):
                     self._result = [(r,) for r in params[0] if r in self.topics]
                 elif s.startswith("SELECT slug, title, body FROM topics"):

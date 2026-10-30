@@ -9,8 +9,10 @@ transcript being captured, a library chunk, an image). The guard in
 ``tests/test_forget_fence.py`` fails any provider caller that calls neither.
 
 Fencing is by source episode: a text is withheld when ANY episode it derives
-from is on this Mac's forget list or queued for erasure. When the list cannot
-be read nothing episode-derived goes out. Only counts are logged.
+from is on this Mac's forget list or queued for erasure. A text with no source
+ids (a legacy row with NULL provenance) or with a malformed id cannot be proven
+live and is withheld too. When the list cannot be read nothing episode-derived
+goes out. Only counts are logged.
 """
 from __future__ import annotations
 
@@ -25,19 +27,31 @@ DERIVED_KINDS = frozenset({
     "episode", "commitment", "topic", "brief", "reflect", "rerank", "decision",
     "deliverable", "graph", "capture-edit", "capture-embed",
 })
-# Input that is not stored memory: nothing to fence by episode.
+# Input that is not stored memory: nothing to fence by episode. "payload" is
+# only the capture payload being written right now, never a stored row.
 LIVE_KINDS = frozenset({"query", "probe", "transcript", "library", "payload", "media"})
+
+
+# A memory-note topic (slug "note:...") that no episode carries was written by
+# hand, not derived from an episode: a found, empty source list is proof there
+# is nothing to forget. Any other empty list is unknown provenance (withheld).
+NOTE_ORIGIN = "note-origin"
 
 
 class SourcedText(str):
     """A text that carries the episode ids it derives from (``sources``), so a
     function that only receives strings can still reach the fence."""
 
-    sources: tuple[int, ...] | None  # None: the source is unknown (withheld)
+    sources: tuple[Any, ...] | None  # None: the source is unknown (withheld)
 
     def __new__(cls, text: Any, sources: Iterable[Any] | None = ()):
         obj = super().__new__(cls, text or "")
-        obj.sources = None if sources is None else tuple(_ids(sources))
+        if sources is None:
+            obj.sources = None
+        elif isinstance(sources, (str, bytes)) or not isinstance(sources, Iterable):
+            obj.sources = (sources,)
+        else:
+            obj.sources = tuple(sources)  # malformed ids stay, so the fence can withhold the row
         return obj
 
 
@@ -46,25 +60,41 @@ def sourced(text: Any, sources: Iterable[Any] | None = ()) -> SourcedText:
 
 
 def _ids(value: Any) -> list[int]:
+    """The well-formed ids in ``value``; malformed ones are dropped. Use
+    :func:`_parse_ids` where a malformed id must withhold the row."""
+    return _parse_ids(value)[0]
+
+
+def _parse_ids(value: Any) -> tuple[list[int], int]:
+    """``(ids, malformed)``: ``malformed`` counts entries that are not a plain
+    non-negative integer or digit string. ``NOTE_ORIGIN`` is a proven absence
+    of episode sources, not an id."""
     if value is None:
-        return []
+        return [], 0
     if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
         value = [value]
     out: list[int] = []
+    bad = 0
     for item in value:
-        try:
-            out.append(int(item))
-        except (TypeError, ValueError):
+        if item == NOTE_ORIGIN:
             continue
-    return out
+        if isinstance(item, bool):
+            bad += 1
+        elif isinstance(item, int):
+            out.append(item)
+        elif isinstance(item, str) and item.strip().isdigit():
+            out.append(int(item))
+        else:
+            bad += 1
+    return out, bad
 
 
 def fenced_texts(texts: Sequence[Any], source_ids: Sequence[Any] | None, kind: str) -> list[Any]:
     """``texts`` with each withheld entry replaced by None, same length and
     order. ``source_ids[i]`` is the episode id (or ids) text ``i`` derives
     from; None reads them from each text's ``SourcedText.sources``. A text
-    with no known source (neither an id nor a ``SourcedText``) cannot be
-    proven live, so it is withheld too. An unreadable forget list withholds
+    with no known source (neither an id nor a ``SourcedText``), an empty source
+    list, or a malformed id cannot be proven live, so it is withheld too. An unreadable forget list withholds
     every text."""
     from khipu import tombstones
 
@@ -73,16 +103,25 @@ def fenced_texts(texts: Sequence[Any], source_ids: Sequence[Any] | None, kind: s
     items = list(texts)
     if source_ids is not None and len(source_ids) != len(items):
         raise ValueError("source_ids must match texts")
-    groups: list[list[int] | None] = []
+    groups: list[list[int]] = []
+    unproven: set[int] = set()
+    malformed: set[int] = set()
     for i, text in enumerate(items):
         if source_ids is not None:
-            groups.append(None if source_ids[i] is None else _ids(source_ids[i]))
+            raw = source_ids[i]
         elif isinstance(text, SourcedText):
-            groups.append(None if text.sources is None else list(text.sources))
+            raw = text.sources
         else:
-            groups.append(None)
+            raw = None
+        ids, bad = _parse_ids(raw)
+        noted = isinstance(raw, (list, tuple)) and NOTE_ORIGIN in raw
+        if bad:
+            malformed.add(i)
+        elif not ids and not noted:
+            unproven.add(i)
+        groups.append(ids)
     rows = [{"kind": "episode", "id": eid, "slot": slot}
-            for slot, ids in enumerate(groups) for eid in (ids or [])]
+            for slot, ids in enumerate(groups) for eid in ids]
     try:
         tombstones.withheld_episode_ids()
         readable = True
@@ -93,9 +132,11 @@ def fenced_texts(texts: Sequence[Any], source_ids: Sequence[Any] | None, kind: s
         _count(kind, len(items), len(items), readable=False)
         return [None] * len(items)
     kept_rows = {id(r) for r in tombstones.withhold(rows)}
-    bad = {r["slot"] for r in rows if id(r) not in kept_rows}
-    out = [None if (groups[i] is None or i in bad) else items[i] for i in range(len(items))]
-    _count(kind, len(items), sum(1 for t in out if t is None), readable=True)
+    forgotten = {r["slot"] for r in rows if id(r) not in kept_rows}
+    out = [None if (i in unproven or i in malformed or i in forgotten) else items[i]
+           for i in range(len(items))]
+    _count(kind, len(items), sum(1 for t in out if t is None), readable=True,
+           unprovenanced=len(unproven), bad_source_id=len(malformed))
     return out
 
 
@@ -111,7 +152,7 @@ def fence_chunks(cur: Any, items: Sequence[tuple[str, str, Any]]) -> list[Any]:
             continue
         refs = [str(items[i][1]) for i in idx]
         if kind == "episode":
-            sources: list[Any] = [_ids(r) for r in refs]
+            sources: list[Any] = [[r] for r in refs]
         elif kind == "topic":
             found = episode_ids_of_topics(cur, refs)
             sources = [found.get(r) for r in refs]
@@ -127,10 +168,19 @@ def fence_chunks(cur: Any, items: Sequence[tuple[str, str, Any]]) -> list[Any]:
 
 
 def live_input(value: Any, kind: str) -> Any:
-    """``value`` unchanged: input that is not stored memory. Episode-derived
-    kinds are refused so they cannot use this door."""
+    """``value`` unchanged: input that is not stored memory. Only the explicit
+    ``LIVE_KINDS`` pass, and a value that carries source ids (a
+    ``SourcedText``) came from a stored row, so it is refused: it must go
+    through ``fenced_texts`` with those ids."""
     if kind not in LIVE_KINDS:
         raise ValueError(f"live_input is for input outside stored memory, not {kind!r}")
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, SourcedText):
+            raise ValueError("live_input refuses text that carries source episode ids")
+        if isinstance(item, (list, tuple, set, frozenset)):
+            stack.extend(item)
     return value
 
 
@@ -162,11 +212,16 @@ def episode_ids_of_topics(cur: Any, slugs: Sequence[str]) -> dict[str, list[int]
                     "WHERE t.slug = ANY(%s)", (wanted,))
         for slug, eid in cur.fetchall():
             out.setdefault(str(slug), []).append(int(eid))
+        for slug, found in out.items():
+            if not found and slug.startswith("note:"):
+                out[slug] = [NOTE_ORIGIN]
         return out
     except Exception:  # noqa: BLE001 - unknown sources are withheld
         return {}
 
 
-def _count(kind: str, offered: int, withheld: int, *, readable: bool) -> None:
-    _log.info("provider text kind=%s offered=%d withheld=%d list_readable=%s",
-              kind, offered, withheld, readable)
+def _count(kind: str, offered: int, withheld: int, *, readable: bool,
+           unprovenanced: int = 0, bad_source_id: int = 0) -> None:
+    _log.info("provider text kind=%s offered=%d withheld=%d list_readable=%s "
+              "unprovenanced=%d bad_source_id=%d",
+              kind, offered, withheld, readable, unprovenanced, bad_source_id)

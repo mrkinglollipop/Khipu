@@ -3777,7 +3777,13 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             episode_failed_refs: set[str] = set()
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
-                api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
+                # An episode forgotten since selection must not go out with
+                # its batch: fence again right before the provider call.
+                sendable = provider_text.fence_chunks(cur, [(k, r, t) for k, r, _i, t, _h in batch])
+                batch = [row for row, text in zip(batch, sendable) if text is not None]
+                if not batch:
+                    continue
+                api = _api_texts(profile, [("", text) for text in sendable if text is not None])
                 try:
                     vecs = embed_batch(api, profile=profile)
                 except RuntimeError as exc:
@@ -3867,7 +3873,12 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 if not text:
                     continue
                 chunks = chunk_text(text)
-                api = _api_texts(profile, [("", c) for c in chunks])
+                # Fence again right before the provider call: a forget since
+                # selection withholds this commitment's chunks.
+                sendable = provider_text.fence_chunks(cur, [("commitment", str(cid), c) for c in chunks])
+                if any(c is None for c in sendable):
+                    continue
+                api = _api_texts(profile, [("", c) for c in sendable])
                 try:
                     vecs = embed_batch(api, profile=profile)
                 except RuntimeError as exc:
@@ -3964,7 +3975,12 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 if current == previous:
                     continue
                 chunks = [c for _i, c in indexed_chunks]
-                api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
+                # Fence again right before the provider call: a forget since
+                # selection withholds this topic's chunks.
+                sendable = provider_text.fence_chunks(cur, [("topic", str(slug), c) for c in chunks])
+                if any(c is None for c in sendable):
+                    continue
+                api = _api_texts(profile, [(title or slug or "", c) for c in sendable])
                 try:
                     vecs = embed_batch(api, profile=profile) if api else []
                 except RuntimeError as exc:

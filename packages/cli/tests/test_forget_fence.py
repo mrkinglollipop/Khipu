@@ -431,6 +431,7 @@ def test_the_guard_finds_a_reader_by_what_it_reads(tmp_path):
 # that is not stored memory). An exemption comment does not count: only a real
 # call does, and the client functions themselves are the one layer judged by
 # their callers.
+LIVE_KINDS = {"query", "probe", "transcript", "library", "payload", "media"}
 PROVIDER_CLIENTS = {
     "embed_batch", "embed_one", "embed_batch_images", "embed_text", "_embed_query_local",
     "_generate", "_generate_local", "_generate_gemini", "_generate_cloud", "_generate_api",
@@ -438,27 +439,253 @@ PROVIDER_CLIENTS = {
     "_generate_codex_cli", "_call_model", "_call_within",
 }
 CHOKEPOINT_CALLS = {"fenced_texts", "fence_chunks", "live_input"}
+# Calls that only reshape their arguments: dirty if any argument is.
+PASSTHROUGH_CALLS = {
+    "_api_texts", "prefix_document", "prefix_query", "chunk_text", "chunk_text_indexed", "list", "tuple",
+    "sorted", "str", "zip", "enumerate", "join", "strip", "lower", "format", "dict", "set", "reversed",
+    "items", "values", "keys", "get", "append", "extend", "min", "max", "len", "range", "int", "float",
+}
+# Names that carry settings or titles, never the text itself.
+NEUTRAL_NAMES = {"profile", "model", "model_id", "title", "titles", "caller", "timeout", "retries",
+                 "delay", "input_type", "True", "False", "None"}
+TEXT_KEYWORDS = ("texts", "text", "prompt", "inputs", "input", "images", "payload", "query")
+
+
+def _terminal(node) -> str | None:
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _getattr_literal(node):
+    """The attribute name of ``getattr(x, "name")``; "" when it is computed;
+    None when ``node`` is not a getattr call."""
+    if (isinstance(node, ast.Call) and _terminal(node.func) == "getattr" and len(node.args) >= 2):
+        name = node.args[1]
+        return name.value if isinstance(name, ast.Constant) and isinstance(name.value, str) else ""
+    return None
+
+
+def _client_ref(node, clients: set[str]) -> bool:
+    """True when ``node`` evaluates to a provider client: its name, an
+    attribute chain ending in it, an alias, or a getattr that reaches it."""
+    literal = _getattr_literal(node)
+    if literal is not None:
+        return literal == "" or literal in clients
+    return _terminal(node) in clients
+
+
+class _Flow:
+    """Where the values in one function come from: every assignment to a
+    name, so a text argument can be followed back to the call that made it."""
+
+    def __init__(self, func, parent: "_Flow | None" = None):
+        self.values: dict[str, list] = {}
+        self.params: set[str] = set()
+        if parent:
+            self.values = {k: list(v) for k, v in parent.values.items()}
+        if isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = func.args
+            for a in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]:
+                if a is not None:
+                    self.params.add(a.arg)
+                    self.values.pop(a.arg, None)
+        for node in self._own_nodes(func):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    self._bind(t, node.value)
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value is not None:
+                self._bind(node.target, node.value)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                self._bind(node.target, node.iter)
+            elif isinstance(node, ast.NamedExpr):
+                self._bind(node.target, node.value)
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and node.func.attr in {"append", "extend", "add", "insert", "update"}
+                  and isinstance(node.func.value, ast.Name)):
+                self.values.setdefault(node.func.value.id, []).extend(node.args)
+
+    @staticmethod
+    def _own_nodes(func):
+        """Nodes in ``func``'s body, not inside a nested def (its own scope)."""
+        stack = list(ast.iter_child_nodes(func))
+        while stack:
+            node = stack.pop()
+            yield node
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                stack.extend(ast.iter_child_nodes(node))
+
+    def _bind(self, target, value) -> None:
+        for n in ast.walk(target):
+            if isinstance(n, ast.Name):
+                self.values.setdefault(n.id, []).append(value)
+
+    def judge(self, node, local: dict | None = None, seen: frozenset = frozenset()) -> tuple[bool, bool]:
+        """``(through_chokepoint, dirty)``: whether ``node`` is built from a
+        chokepoint call (a comprehension filtered or zipped with one counts),
+        and whether it reaches a bare parameter or a lambda with none."""
+        local = local or {}
+        if isinstance(node, ast.Constant):
+            return False, False
+        if isinstance(node, ast.Name):
+            if node.id in NEUTRAL_NAMES:
+                return False, False
+            if node.id in local:
+                return self.judge(local[node.id], {k: v for k, v in local.items() if k != node.id}, seen)
+            if node.id in seen or node.id not in self.values:
+                return False, node.id not in seen
+            return self._merge([self.judge(v, local, seen | {node.id}) for v in self.values[node.id]])
+        if isinstance(node, ast.Call):
+            if _terminal(node.func) in CHOKEPOINT_CALLS:
+                return True, False
+            parts = [*node.args, *(k.value for k in node.keywords)]
+            if isinstance(node.func, ast.Attribute):
+                parts.append(node.func.value)
+            return self._merge([self.judge(p, local, seen) for p in parts])
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp)):
+            inner = dict(local)
+            for gen in node.generators:
+                self._bind_comp(gen.target, gen.iter, inner)
+            parts = [self.judge(node.elt, inner, seen)]
+            for gen in node.generators:
+                parts.append(self.judge(gen.iter, local, seen))
+                parts.extend(self.judge(c, inner, seen) for c in gen.ifs)
+            through = any(p[0] for p in parts)
+            return through, False if through else any(p[1] for p in parts)
+        if isinstance(node, ast.Lambda):
+            return False, True
+        return self._merge([self.judge(c, local, seen) for c in ast.iter_child_nodes(node)
+                            if not isinstance(c, ast.expr_context)])
+
+    def reaches(self, node, pred, local: dict | None = None, seen: frozenset = frozenset()) -> bool:
+        """True when ``node``, followed back through assignments, contains a
+        call for which ``pred`` holds."""
+        local = local or {}
+        if isinstance(node, ast.Name):
+            if node.id in seen:
+                return False
+            return any(self.reaches(v, pred, local, seen | {node.id}) for v in self.values.get(node.id, []))
+        if isinstance(node, ast.Call) and pred(node):
+            return True
+        return any(self.reaches(c, pred, local, seen) for c in ast.iter_child_nodes(node))
+
+    @staticmethod
+    def _merge(parts: list[tuple[bool, bool]]) -> tuple[bool, bool]:
+        return any(p[0] for p in parts), any(p[1] for p in parts)
+
+    def _bind_comp(self, target, iterable, local: dict) -> None:
+        zipped = (isinstance(iterable, ast.Call) and _terminal(iterable.func) == "zip"
+                  and isinstance(target, ast.Tuple) and len(target.elts) == len(iterable.args))
+        for i, n in enumerate(target.elts if zipped else [target]):
+            source = iterable.args[i] if zipped else iterable
+            for name in ast.walk(n):
+                if isinstance(name, ast.Name):
+                    local[name.id] = source
+
+
+ROW_READS = {"fetchall", "fetchone", "fetchmany", "SourcedText", "sourced"}
+
+
+def _is_row_read(call) -> bool:
+    return _terminal(call.func) in ROW_READS
+
+
+def _module_aliases(tree, clients: set[str]) -> set[str]:
+    """Names that stand for a provider client: ``import ... as``, and any
+    assignment of a client (or getattr of one) to a name, to a fixpoint."""
+    found = set(clients)
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for a in node.names:
+                    if a.name in found and (a.asname or a.name) not in found:
+                        found.add(a.asname or a.name)
+                        changed = True
+            elif isinstance(node, ast.Assign) and _client_ref(node.value, found):
+                for t in node.targets:
+                    for n in ast.walk(t):
+                        if isinstance(n, ast.Name) and n.id not in found:
+                            found.add(n.id)
+                            changed = True
+    return found
+
+
+def _names(node) -> set[str]:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _text_arg(call):
+    if call.args:
+        return call.args[0]
+    for kw in call.keywords:
+        if kw.arg in TEXT_KEYWORDS:
+            return kw.value
+    return None
+
+
+def _calls_in(func):
+    """``(call, lambda_params)`` for the calls in ``func``'s own scope,
+    including those inside lambdas (whose parameters are unfenced input)."""
+    stack = [(n, frozenset()) for n in ast.iter_child_nodes(func)]
+    while stack:
+        node, lam = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Lambda):
+            lam = lam | {a.arg for a in [*node.args.args, *node.args.kwonlyargs, node.args.vararg,
+                                         node.args.kwarg] if a is not None}
+        if isinstance(node, ast.Call):
+            yield node, lam
+        stack.extend((c, lam) for c in ast.iter_child_nodes(node))
 
 
 def unchoked_provider_callers(root) -> list[str]:
-    """Every function under ``root`` that calls a provider client without
-    calling the chokepoint, whatever comments it carries."""
+    """Every call to a provider client (by name, alias, attribute chain,
+    getattr, or a variable bound to one) whose text argument is not built from
+    a chokepoint call in the same function, and every function that sends a
+    live_input value read from a memory table. The client functions
+    themselves are the one layer judged by their callers."""
     offenders: list[str] = []
 
-    def visit(node, path: str, inside_client: bool) -> None:
+    def visit(node, path: str, inside_client: bool, parent: _Flow | None, clients: set[str]) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 is_client = child.name in PROVIDER_CLIENTS
-                calls = _called_names(child)
-                if (not (inside_client or is_client) and calls & PROVIDER_CLIENTS
-                        and not calls & CHOKEPOINT_CALLS):
-                    offenders.append(f"{path}.{child.name}:{child.lineno}")
-                visit(child, path, inside_client or is_client)
+                flow = _Flow(child, parent)
+                if not (inside_client or is_client):
+                    seen_calls: set[int] = set()
+                    for call, lam in _calls_in(child):
+                        if id(call) in seen_calls or not _client_ref(call.func, clients):
+                            continue
+                        seen_calls.add(id(call))
+                        arg = _text_arg(call)
+                        ok = False
+                        if arg is not None:
+                            through, _dirty = flow.judge(arg)
+                            ok = through and not (lam & _names(arg))
+                        if not ok:
+                            offenders.append(f"{path}.{child.name}:{call.lineno}")
+                    for call, _lam in _calls_in(child):
+                        if _terminal(call.func) != "live_input" or not call.args:
+                            continue
+                        kind = call.args[1] if len(call.args) > 1 else None
+                        bad_kind = not (isinstance(kind, ast.Constant) and kind.value in LIVE_KINDS)
+                        # Library chunks are read from the library tables, which hold no episode text.
+                        library = isinstance(kind, ast.Constant) and kind.value == "library"
+                        if bad_kind or (not library and flow.reaches(call.args[0], _is_row_read)):
+                            offenders.append(f"{path}.{child.name}:{call.lineno} (live_input fed from a memory read)")
+                visit(child, path, inside_client or is_client, flow, clients)
             else:
-                visit(child, path, inside_client)
+                visit(child, path, inside_client, parent, clients)
 
     for file in sorted(root.glob("*.py")):
-        visit(ast.parse(file.read_text(encoding="utf-8")), file.stem, False)
+        tree = ast.parse(file.read_text(encoding="utf-8"))
+        clients = _module_aliases(tree, PROVIDER_CLIENTS)
+        visit(tree, file.stem, False, None, clients)
     return offenders
 
 
@@ -505,6 +732,57 @@ def test_the_provider_guard_finds_a_caller_that_skips_the_chokepoint(tmp_path):
     (tmp_path / "sender.py").write_text(PROVIDER_MODULE, encoding="utf-8")
     found = {name.split(":")[0] for name in unchoked_provider_callers(tmp_path)}
     assert found == {"sender.sends_rows", "sender.sends_summary", "sender._again"}
+
+
+BYPASS_MODULE = '''
+def by_alias(texts):
+    send = embed_batch
+    return send(texts)
+
+
+def by_lambda(texts):
+    safe = provider_text.fenced_texts(texts, [1], "episode")
+    go = lambda t: embed_batch(t)
+    return go(safe)
+
+
+def by_getattr(texts):
+    return getattr(embed, "embed_batch")(texts)
+
+
+def by_computed_getattr(texts, name):
+    return getattr(embed, name)(texts)
+
+
+def unrelated_chokepoint(texts, raw):
+    safe = provider_text.fenced_texts(texts, [1] * len(texts), "episode")
+    embed_batch(raw)
+    return safe
+
+
+def live_from_rows(cur):
+    cur.execute("SELECT summary FROM episodes")
+    rows = cur.fetchall()
+    return embed_one(provider_text.live_input(rows[0][0], "payload"))
+
+
+def live_wrong_kind(text):
+    return embed_one(provider_text.live_input(text, "episode"))
+
+
+def clean_through_filter(texts):
+    marks = provider_text.fenced_texts(texts, [1] * len(texts), "episode")
+    sent = [i for i, mark in enumerate(marks) if mark is not None]
+    return embed_batch([marks[i] for i in sent])
+'''
+
+
+def test_the_provider_guard_catches_alias_lambda_getattr_and_unrelated_chokepoint_bypasses(tmp_path):
+    (tmp_path / "bypass.py").write_text(BYPASS_MODULE, encoding="utf-8")
+    found = {name.split(":")[0] for name in unchoked_provider_callers(tmp_path)}
+    assert found == {"bypass.by_alias", "bypass.by_lambda", "bypass.by_getattr",
+                     "bypass.by_computed_getattr", "bypass.unrelated_chokepoint",
+                     "bypass.live_from_rows", "bypass.live_wrong_kind"}
 
 
 
@@ -720,3 +998,109 @@ def test_hygiene_and_owed_tidy_judges_send_no_forgotten_or_unsourced_commitment(
     assert not any("FORGOTTEN-JUDGE" in p or "no source at all" in p for p in sent)
     if list_state == "unreadable":
         assert sent == []
+
+
+# ---- Kimi's fifth probes: provenance, malformed ids, live door, batch race ----
+
+def test_auto_close_cosine_sends_nothing_for_a_forgotten_or_unsourced_episode(list_state):
+    from khipu import commitments
+
+    sent: list = []
+    cur = mock.MagicMock()
+    with mock.patch.object(embed, "_active_profile", return_value="p"), \
+            mock.patch.object(embed, "embed_one", side_effect=lambda t, **k: sent.append(t) or [0.0]):
+        assert commitments._cosine_scores(cur, "FORGOTTEN-EPISODE-SNIPPET", [7], 902) == {}
+        assert commitments._cosine_scores(cur, "NO-EPISODE-SNIPPET", [7], None) == {}
+    assert sent == []
+
+
+def test_auto_close_cosine_still_sends_text_from_a_live_episode():
+    from khipu import commitments
+
+    tombstones.publish_episode_ids({FORGOT})
+    sent: list = []
+    cur = mock.MagicMock()
+    cur.fetchall.return_value = []
+    with mock.patch.object(embed, "_active_profile", return_value="p"), \
+            mock.patch.object(embed, "embed_one", side_effect=lambda t, **k: sent.append(t) or [0.0]):
+        commitments._cosine_scores(cur, "live snippet", [7], 904)
+    assert sent == ["live snippet"]
+
+
+def test_live_input_refuses_text_that_carries_source_ids():
+    from khipu import provider_text
+    from khipu.provider_text import sourced
+
+    with pytest.raises(ValueError):
+        provider_text.live_input(sourced("from an episode", [904]), "payload")
+    with pytest.raises(ValueError):
+        provider_text.live_input([sourced("in a list", [904])], "query")
+    for kind in ("episode", "commitment", "topic", "deliverable", "brief"):
+        with pytest.raises(ValueError):
+            provider_text.live_input("x", kind)
+    assert provider_text.live_input("typed query", "query") == "typed query"
+
+
+def test_a_legacy_commitment_with_null_provenance_is_never_sent():
+    from khipu import provider_text
+
+    tombstones.publish_episode_ids({FORGOT})
+    cur = mock.MagicMock()
+    cur.fetchall.return_value = [(5, None, None), (6, 904, None)]
+    sources = provider_text.episode_ids_of_commitments(cur, [5, 6])
+    out = provider_text.fenced_texts(["LEGACY-UNPROVEN-SECRET", "live"], [sources.get("5"), sources.get("6")],
+                                     "commitment")
+    assert out == [None, "live"]
+    cur2 = mock.MagicMock()
+    cur2.fetchall.return_value = [(5, None, None)]
+    assert provider_text.fence_chunks(cur2, [("commitment", "5", "LEGACY-UNPROVEN-SECRET")]) == [None]
+    for kind in ("topic", "deliverable"):
+        assert provider_text.fenced_texts(["x"], [[]], kind) == [None]
+        assert provider_text.fenced_texts(["x"], [None], kind) == [None]
+
+
+def test_a_malformed_source_id_withholds_the_row(caplog):
+    import logging
+
+    from khipu import provider_text
+    from khipu.provider_text import sourced
+
+    tombstones.publish_episode_ids({FORGOT})
+    with caplog.at_level(logging.INFO, logger="khipu.provider_text"):
+        out = provider_text.fenced_texts(
+            ["SECRET", "SECRET-2", "live", "tainted"], [["abc"], [904, "x1"], [904], [None]], "episode")
+    assert out == [None, None, "live", None]
+    assert "bad_source_id=3" in caplog.text
+    assert provider_text.fenced_texts([sourced("s", ["zzz"])], None, "episode") == [None]
+    assert provider_text.fence_chunks(mock.MagicMock(), [("episode", "not-a-number", "t")]) == [None]
+
+
+def test_a_recent_catch_up_batch_is_fenced_again_right_before_the_provider_call():
+    sent: list = []
+    cur = mock.MagicMock()
+    cur.fetchall.side_effect = [[(902, "FORGOTTEN-DURING-CATCHUP", [], [], [], [])], [], []]
+    conn = mock.MagicMock()
+    conn.__enter__.return_value = conn
+    conn.cursor.return_value.__enter__.return_value = cur
+    real = embed.provider_text.fenced_texts
+    calls = {"n": 0}
+
+    def forget_after_selection(texts, sources, kind):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            tombstones.publish_episode_ids({902})
+        return real(texts, sources, kind)
+
+    with mock.patch("khipu.db.connect", return_value=conn), \
+            mock.patch("khipu.db.has_columns", return_value=False), \
+            mock.patch.object(embed, "_active_profile", return_value="p"), \
+            mock.patch.object(embed, "_existing_hashes_for_refs", return_value={}), \
+            mock.patch.object(embed.provider_text, "fenced_texts", side_effect=forget_after_selection), \
+            mock.patch.object(embed, "embed_batch", side_effect=lambda t, **k: sent.extend(t) or [[0.0] for _ in t]), \
+            mock.patch.object(embed, "_lock_live_embedding_refs", return_value=set()):
+        try:
+            embed.embed_recent_missing(limit=5)
+        except Exception:  # noqa: BLE001 - only what reached the provider matters here
+            pass
+    assert calls["n"] >= 2
+    assert not any("FORGOTTEN-DURING-CATCHUP" in t for t in sent)

@@ -41,7 +41,8 @@ class _ReflectCur(_Cur):
             self._rows = [(slug, h.bodies.get(slug, "")) for slug in params[0] if slug in h.topics]
         elif s.startswith("SELECT t.slug, e.id FROM topics t JOIN episodes e"):
             h.statements.append(s)
-            self._rows = []  # no episode carries these topics: the sources are known and none
+            self._rows = [(slug, e["id"]) for slug in params[0]
+                          for e in h.episodes.values() if slug in e["topics"]]
         else:
             super().execute(sql, params)
 

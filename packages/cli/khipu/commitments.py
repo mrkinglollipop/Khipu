@@ -1092,7 +1092,7 @@ def _near_duplicate_open(cur, scope: str | None, text: str, *,
     from khipu.config import float_setting
 
     threshold = float_setting("commitment_close_similarity")
-    cosine = _cosine_scores(cur, text, ids)
+    cosine = _cosine_scores(cur, text, ids, episode_id)
     for cid, score in sorted(cosine.items(), key=lambda kv: -kv[1]):
         if score >= threshold:
             return cid
@@ -1596,10 +1596,13 @@ def _has_commitment_embeddings(cur, commitment_ids: list[int]) -> bool:
         return False
 
 
-def _cosine_scores(cur, text: str, commitment_ids: list[int]) -> dict[int, float]:
+def _cosine_scores(cur, text: str, commitment_ids: list[int],
+                   episode_id: int | None = None) -> dict[int, float]:
     """Best-effort cosine between ``text`` and each open commitment's stored
-    embedding. Returns {} on any failure (no key, no embeddings yet, PG
-    error) so the caller falls back to Jaccard — never raises."""
+    embedding. ``text`` derives from ``episode_id``'s capture; with no episode
+    or a forgotten one it is withheld from the provider. Returns {} on any
+    failure (no key, no embeddings yet, PG error, withheld) so the caller
+    falls back to Jaccard — never raises."""
     if not commitment_ids:
         return {}
     try:
@@ -1607,7 +1610,11 @@ def _cosine_scores(cur, text: str, commitment_ids: list[int]) -> dict[int, float
         from khipu.embed import _active_profile, _vec_literal, embed_one
 
         profile = _active_profile(cur)
-        vec = embed_one(provider_text.live_input(text, "payload"), profile=profile)
+        [sendable] = provider_text.fenced_texts(
+            [text], [None if episode_id is None else [episode_id]], "commitment")
+        if sendable is None:
+            return {}
+        vec = embed_one(sendable, profile=profile)
         cur.execute(
             """
             SELECT ref, 1 - (embedding <=> %s::vector) AS score
@@ -1985,7 +1992,7 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         # 5a) and never spends an API call, and with no stored commitment
         # embeddings (fix 5b) there is nothing to score against.
         if reference is None and kind != "done" and remaining_ids and _has_commitment_embeddings(cur, remaining_ids):
-            cosine = _cosine_scores(cur, text, remaining_ids)
+            cosine = _cosine_scores(cur, text, remaining_ids, episode_id)
         else:
             cosine: dict[int, float] = {}
         best_id = None
