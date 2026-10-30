@@ -4352,6 +4352,8 @@ def _count_term_df(con: sqlite3.Connection, hidden: Iterable[int] = ()) -> tuple
     """Counts over live rows: tombstoned episodes and topics and the
     episodes in ``hidden`` (forgotten here or queued for erasure) are left
     out."""
+    # forget-fence: term-frequency counts only, no text or ids leave; forgotten and
+    # erasure-queued episodes arrive in ``hidden`` and tombstoned rows are excluded in SQL
     from khipu.search_text import text_words
 
     hidden = frozenset(int(i) for i in hidden)
