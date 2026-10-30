@@ -76,6 +76,84 @@ STATUS_DERANK = 0.5
 # matching project is not "for the current project").
 TYPE_BOOSTED = frozenset({"feedback", "user"})
 TYPE_BOOST = 1.15
+# Catch-all pages (a merged raw-memories dump, a memory summary, a status
+# board) name every word and embed near every query, so they topped unrelated
+# searches (2026-10-29). Measured on this Mac's notes: median 2.2 KB, 90th
+# percentile 6.3 KB; the catch-alls were 27 KB to 1 MB. The body length rides
+# on the row as ``page_chars`` from the metadata pass; a row without it is
+# never treated as broad.
+BROAD_PAGE_CHARS = 16_000
+BROAD_DERANK = 0.5
+# khipu.extract writes this summary when the model returned none. Every such
+# episode embeds as near-identical text and renders as a line that says
+# nothing, so automatic push de-ranks it; explicit search still finds it.
+PLACEHOLDER_SUMMARY = "Session evidence retained without a model summary."
+PUSH_PLACEHOLDER_DERANK = 0.25
+# Automatic push only: a row whose project is known and is not the session's.
+# A de-rank, never an exclusion, so a strong cross-project match still shows.
+CROSS_PROJECT_DERANK = 0.6
+
+
+def is_broad_page(row: dict[str, Any]) -> bool:
+    if row.get("kind") != "topic":
+        return False
+    try:
+        return int(row.get("page_chars") or 0) >= BROAD_PAGE_CHARS
+    except (TypeError, ValueError):
+        return False
+
+
+def is_placeholder_episode(row: dict[str, Any]) -> bool:
+    if row.get("kind") != "episode":
+        return False
+    if row.get("placeholder_summary") is True:
+        return True
+    return any(str(row.get(k) or "").strip().startswith(PLACEHOLDER_SUMMARY)
+               for k in ("label", "snippet"))
+
+
+def _project_matches(row: dict[str, Any], proj_norm: str) -> bool:
+    row_project = str(row.get("project") or "").strip().lower()
+    return bool(row_project) and proj_norm in row_project
+
+
+def apply_push_policy(
+    rows: list[dict[str, Any]], *, project: str | None = None
+) -> list[dict[str, Any]]:
+    """Selection for automatic push (the per-prompt hook and khipu_status's
+    prior_work), on top of ``apply_project_and_status``. Explicit search never
+    calls this, so everything it leaves out stays searchable.
+
+    Leaves out topics that are not current (superseded/retired/abandoned or
+    ``superseded_by`` set) and catch-all pages (``is_broad_page``). De-ranks
+    placeholder-summary episodes and rows from another known project. Rows
+    are mutated in place and returned re-sorted by score. Never raises.
+    """
+    if not rows:
+        return rows
+    from khipu.validity import topic_state
+
+    proj_norm = (project or "").strip().lower()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            if row.get("kind") == "topic":
+                validity = row.get("validity")
+                state = validity.get("state") if isinstance(validity, dict) else None
+                if state == "superseded" or topic_state(row.get("status"), row.get("superseded_by")) == "superseded":
+                    continue
+                if is_broad_page(row):
+                    continue
+            score = float(row.get("score") or 0.0)
+            if is_placeholder_episode(row):
+                score *= PUSH_PLACEHOLDER_DERANK
+            if proj_norm and row.get("project") and not _project_matches(row, proj_norm):
+                score *= CROSS_PROJECT_DERANK
+            row["score"] = round(score, 6)
+        except Exception:  # noqa: BLE001 — one bad row must not sink the push
+            pass
+        out.append(row)
+    return sorted(out, key=lambda r: -(r.get("score") or 0.0))
 
 
 def apply_project_and_status(
@@ -123,6 +201,8 @@ def apply_project_and_status(
                 status = str(row.get("status") or "").strip().lower()
                 if status in DERANKED_STATUSES or row.get("superseded_by"):
                     score *= STATUS_DERANK
+                if is_broad_page(row):
+                    score *= BROAD_DERANK
         except Exception:  # noqa: BLE001 — one bad row must not sink the search
             pass
         row["score"] = round(score, 6)

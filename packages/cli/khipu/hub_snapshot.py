@@ -7790,6 +7790,7 @@ def _topic_routing_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
 
     Imported notes already carry this boolean. Old hub rows acquire it on
     replica import as well, without adding body text to metadata or payloads.
+    Every topic with a body also gets ``_page_chars``, its length.
     """
     item = dict(row)
     if "body" not in row or "frontmatter" not in row:
@@ -7797,8 +7798,15 @@ def _topic_routing_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
     try:
         fm = row["frontmatter"]
         fm = json.loads(fm) if isinstance(fm, str) else fm
+        if fm is None:
+            fm = {}
         if not isinstance(fm, dict):
             return item
+        # The body length, for recency.is_broad_page: search reads it here,
+        # never the body itself.
+        if isinstance(row.get("body"), str):
+            fm = {**fm, "_page_chars": len(row["body"])}
+            item["frontmatter"] = fm
         if type(fm.get("_routing_state_claim")) is bool:
             return item
         if not fm.get("note_source") and not str(row.get("slug") or "").startswith("note:"):
@@ -7872,13 +7880,18 @@ def snapshot_row_metadata(
             else:
                 project_expr = "NULL"
             deleted_expr = "deleted_at" if "deleted_at" in episode_cols else "NULL"
-            for eid, ts, proj, deleted in con.execute(
-                f"SELECT CAST(id AS TEXT), {ts_expr}, {project_expr}, {deleted_expr} "
+            placeholder_expr = "summary = ?" if "summary" in episode_cols else "0"
+            from khipu.recency import PLACEHOLDER_SUMMARY
+
+            for eid, ts, proj, deleted, placeholder in con.execute(
+                f"SELECT CAST(id AS TEXT), {ts_expr}, {project_expr}, {deleted_expr}, "
+                f"{placeholder_expr} "
                 f"FROM episodes WHERE CAST(id AS TEXT) IN ({placeholders})",
-                episode_ids,
+                ([PLACEHOLDER_SUMMARY] if "summary" in episode_cols else []) + episode_ids,
             ).fetchall():
                 meta[("episode", eid)] = {
                     "ts": ts, "project": proj, "deleted": deleted is not None,
+                    "placeholder_summary": bool(placeholder),
                 }
     if topic_ids:
         topic_cols = _snapshot_table_columns(con, "topics")
@@ -7897,6 +7910,7 @@ def snapshot_row_metadata(
             ).fetchall():
                 proj = None
                 routing_claim = None
+                page_chars = None
                 if frontmatter:
                     try:
                         fm = json.loads(frontmatter)
@@ -7904,12 +7918,15 @@ def snapshot_row_metadata(
                         flag = fm.get("_routing_state_claim")
                         if type(flag) is bool:
                             routing_claim = flag
+                        size = fm.get("_page_chars")
+                        if type(size) is int:
+                            page_chars = size
                     except (ValueError, AttributeError, TypeError):
                         proj = None
                 meta[("topic", slug)] = {
                     "ts": ts, "status": status or "active", "project": proj,
                     "deleted": deleted is not None, "superseded_by": superseded_by,
-                    "_routing_state_claim": routing_claim,
+                    "_routing_state_claim": routing_claim, "page_chars": page_chars,
                 }
     for r in rows:
         row_kind = r.get("kind")
@@ -7932,6 +7949,10 @@ def snapshot_row_metadata(
             item["superseded_by"] = m["superseded_by"]
         if type(m.get("_routing_state_claim")) is bool:
             item["_routing_state_claim"] = m["_routing_state_claim"]
+        if m.get("page_chars") is not None:
+            item["page_chars"] = int(m["page_chars"])
+        if m.get("placeholder_summary"):
+            item["placeholder_summary"] = True
         out.append(item)
     return out
 
