@@ -694,7 +694,8 @@ def _capture_scan_locked(session, turns, *, now, actions):
         totals[sha] = totals.get(sha, 0) + 1
     assigned: dict[str, list[int]] = {}
     for sha, total in totals.items():
-        occs = sorted(recorded_occs.get(sha) or [])
+        # A late copy of one Antigravity typing shares its occurrence: one typing.
+        occs = sorted(set(recorded_occs.get(sha) or []))
         assigned[sha] = occs[-total:] if len(occs) >= total else list(range(1, total + 1))
     counts: dict[str, int] = {}
     for typed, at, sha in typed_turns:

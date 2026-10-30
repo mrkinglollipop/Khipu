@@ -545,8 +545,9 @@ def record(payload: dict, env: dict | None = None, now: float | None = None,
     """Record one prompt-submit turn. Returns its id, or None when nothing
     was recorded. ``issuer`` None means this process's (``hook_issuer``).
     ``extra`` (Antigravity's recorder only): ``fallback`` marks a turn read
-    from the payload's ``lastUserInput``; ``duplicate_of`` + ``occurrence``
-    make this row a late second copy of that turn, sharing its occurrence.
+    from the payload's ``lastUserInput`` (``ag_step``: that turn's
+    ``initialNumSteps``); ``duplicate_of`` + ``occurrence`` make this row a
+    late second copy of that turn, sharing its occurrence.
     Never raises."""
     try:
         return _record(payload, os.environ if env is None else env, time.time() if now is None else now, issuer,
@@ -598,6 +599,8 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
     for flag in ("fallback", "duplicate_of"):
         if extra.get(flag):
             turn[flag] = extra[flag]
+    if extra.get("fallback") and type(extra.get("ag_step")) is int:
+        turn["ag_step"] = extra["ag_step"]
     ok, why = eligible(turn, conf)
     turn["eligible"] = ok
     if why:
@@ -1031,8 +1034,12 @@ def _ag_flush_wait() -> float:
 _AG_PENDING_KEEP_S = 3600
 _AG_PENDING_MAX = 32
 # A turn recorded from the payload's ``lastUserInput`` (no USER_INPUT step in
-# the transcript yet) is keyed by its text. Its own step, once flushed, is
-# recorded again under its step key: a duplicate row is acceptable, a lost
+# the transcript yet) is keyed by its ``initialNumSteps`` and text, so the same
+# words typed in a later turn are a new turn. Its own step, once flushed, is
+# recorded again under its step key as a duplicate row. The copy shares the
+# first row's occurrence only with proof it is that turn: the step index is
+# the first row's ``initialNumSteps`` and the words match. Without that proof
+# it is numbered as a turn of its own: a double count is acceptable, a lost
 # turn is not.
 _AG_FALLBACK = "last-"
 
@@ -1107,10 +1114,14 @@ def _ag_clear_unseen(session: str) -> None:
         pass
 
 
-def _ag_claim(session: str, key: str, now: float) -> float | None:
-    """Create the turn's once-per-turn marker. The turn's time when this call
-    created it (the note's when a PreInvocation of this same turn could not
-    read it), None when the turn was already handled."""
+def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
+              text: str = "") -> tuple[float, dict] | None:
+    """Create the turn's once-per-turn marker. None when the turn was already
+    handled; else the turn's time (the note's when a PreInvocation of this
+    same turn could not read it) and what ``record`` needs to number it:
+    a ``lastUserInput`` turn is marked a fallback bound to ``steps`` (the
+    payload's ``initialNumSteps``), and the flushed step of that same turn
+    is marked its duplicate. Every Antigravity record goes through here."""
     directory = _ag_dir()
     marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
     try:
@@ -1132,7 +1143,27 @@ def _ag_claim(session: str, key: str, now: float) -> float | None:
         if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
             at = ts
         _ag_save_notes(path, {k: v for k, v in notes.items() if int(k) > index})
-    return at
+    if key.startswith(_AG_FALLBACK):
+        return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps})
+    return at, (_ag_original(session, index, text, now) if index is not None else {})
+
+
+def _ag_original(session: str, index: int, text: str, now: float) -> dict:
+    """The not yet paired ``lastUserInput`` row of the turn whose step is
+    ``index`` with the same words: its id and occurrence, so this flushed
+    copy shares its numbering. Empty when no row is that turn."""
+    typed = owner_text(text)
+    if typed is None or not typed.strip():
+        return {}
+    sha = prompt_sha256(typed)
+    rows = turns(session, now)
+    paired = {t.get("duplicate_of") for t in rows}
+    for t in rows:
+        if t.get("fallback") and type(t.get("ag_step")) is int and t["ag_step"] == index \
+                and t.get("prompt_sha256") == sha and t.get("turn") not in paired \
+                and type(t.get("occurrence")) is int:
+            return {"duplicate_of": t["turn"], "occurrence": t["occurrence"]}
+    return {}
 
 
 def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] | None:
@@ -1160,7 +1191,9 @@ def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] 
         wrapped = _AG_WRAP.match(last)
         text = (wrapped.group(1) if wrapped else last).strip()
         if text:
-            found = (_AG_FALLBACK + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], text)
+            steps = _ag_initial_steps(payload)
+            found = (_AG_FALLBACK + ("" if steps is None else f"{steps}-")
+                     + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], text)
     return session, found
 
 
@@ -1177,20 +1210,20 @@ def _ag_filled(payload: dict, text: str) -> dict:
 def _antigravity_turn(payload, now: float | None, wait: float | None):
     """(gate answer, the new turn's time, (session, the payload's step count)
     when this call recorded nothing and its own turn may not be written yet,
-    the turn's step key)."""
+    ``record``'s extra for the new turn)."""
     read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait))
     if read is None:
-        return None, None, None, ""
+        return None, None, None, {}
     session, found = read
     if found is None:
-        return None, None, (session, _ag_initial_steps(payload)), ""
+        return None, None, (session, _ag_initial_steps(payload)), {}
     key, text = found
-    at = _ag_claim(session, key, time.time() if now is None else now)
-    if at is None:
+    claimed = _ag_claim(session, key, time.time() if now is None else now, _ag_initial_steps(payload), text)
+    if claimed is None:
         # Already handled, or the newest step is the last turn's and this
         # call's own turn is not written yet.
-        return {}, None, (session, _ag_initial_steps(payload)), key
-    return _ag_filled(payload, text), at, None, key
+        return {}, None, (session, _ag_initial_steps(payload)), {}
+    return _ag_filled(payload, text), claimed[0], None, claimed[1]
 
 
 def antigravity_prompt(payload: dict, now: float | None = None, wait: float | None = None,
@@ -1202,31 +1235,14 @@ def antigravity_prompt(payload: dict, now: float | None = None, wait: float | No
     Never raises."""
     try:
         stamp = time.time() if now is None else now
-        out, at, unseen, key = _antigravity_turn(payload, stamp, wait)
+        out, at, unseen, extra = _antigravity_turn(payload, stamp, wait)
         if unseen is not None:
             _ag_note_unseen(unseen[0], unseen[1], stamp)
         if out:
-            record(out, now=at, issuer=issuer, extra={"fallback": True} if key.startswith(_AG_FALLBACK) else None)
+            record(out, now=at, issuer=issuer, extra=extra)
         return out
     except Exception:  # noqa: BLE001 - the gate must never fail a prompt
         return None
-
-
-def _ag_duplicate_of(session: str, filled: dict, now: float) -> dict | None:
-    """When this turn was already recorded from ``lastUserInput`` and not yet
-    paired with its flushed copy: that row's id and occurrence, so the copy
-    shares its numbering (a second row, but one typing)."""
-    typed = owner_text(filled["prompt"])
-    if typed is None or not typed.strip():
-        return None
-    sha = prompt_sha256(typed)
-    rows = turns(session, now)
-    paired = {t.get("duplicate_of") for t in rows}
-    for t in rows:
-        if t.get("fallback") and t.get("prompt_sha256") == sha and t.get("turn") not in paired \
-                and type(t.get("occurrence")) is int:
-            return {"duplicate_of": t["turn"], "occurrence": t["occurrence"]}
-    return None
 
 
 def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
@@ -1245,12 +1261,11 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
         stamp = time.time() if now is None else now
         recorded = None
         if found is not None:
-            at = _ag_claim(session, found[0], stamp)
-            if at is not None:
+            claimed = _ag_claim(session, found[0], stamp, _ag_initial_steps(payload), found[1])
+            if claimed is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}
-                filled = _ag_filled(payload, found[1])
-                recorded = record(filled, now=at, issuer=issuer, extra=_ag_duplicate_of(session, filled, at))
+                recorded = record(_ag_filled(payload, found[1]), now=claimed[0], issuer=issuer, extra=claimed[1])
         if str(event).lower() == "stop":
             _ag_clear_unseen(session)
         return recorded
