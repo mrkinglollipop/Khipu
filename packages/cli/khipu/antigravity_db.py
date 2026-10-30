@@ -205,16 +205,6 @@ def read_turns(path) -> list[tuple[int, str, str]]:
     return out
 
 
-def user_steps(path) -> list[int] | None:
-    """Index of every user step, readable or not, in step order; None when
-    the db cannot be read."""
-    try:
-        return [int(r[0]) for r in _rows(Path(path), ("SELECT idx FROM steps WHERE step_type = ? ORDER BY idx",
-                                                       (USER_STEP,)))]
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def last_user_input(path) -> tuple[str, str] | None:
     """(step key, text) of the newest user turn, the shape the JSONL reader returns."""
     for idx, role, text in reversed(read_turns(path)):

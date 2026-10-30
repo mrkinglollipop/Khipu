@@ -191,6 +191,17 @@ def test_a_deleted_counter_file_leaves_earlier_directions_unjoined(world):
     assert row["join"] == "unjoined" and row["status"] == "open"
 
 
+def test_a_late_copy_sharing_an_occurrence_is_one_typing_in_the_scan(world):
+    """An Antigravity turn recorded from ``lastUserInput`` and again from its
+    flushed step is two rows with one occurrence; the scan numbers it once."""
+    say(GLM)
+    second = say(GLM)
+    owner_turns.record({"session_id": SESSION, "prompt": GLM, "cwd": "/work"}, CLAUDE_ENV,
+                       extra={"duplicate_of": second, "occurrence": 2})
+    assert [r["occurrence"] for r in owner_turns.turns(SESSION)] == [1, 2, 2]
+    assert [r["occurrence"] for r in scan([GLM, GLM], actions=[])] == [1, 2]
+
+
 def test_pruned_turns_still_join_and_idle_days_keep_occurrences(world):
     say(GLM, now=T0)
     cap(1, now=T0)
