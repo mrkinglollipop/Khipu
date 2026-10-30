@@ -117,6 +117,7 @@ NOT_CAPTURE = {
                      "recall_prompt._log", "recall_prompt._prompt_routing_child",
                      "recall_prompt._query_embed_cache_connect",
                      "recall_prompt._write_session_state", "recall_rule._routing_child",
+                     "routing_delegation._log_call",
                      "session_capture._log_subagentstop_shape_once", "session_capture._write_beat",
                      "synth_cli.register", "t3._lookup_health",
                      "t3._thread_linked_capture_evidence", "t3.thread_for_session_result",
