@@ -821,11 +821,72 @@ def test_the_search_test_is_the_same_for_both_runs():
     assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, timeout>1.2s"
     off["hits"] = ["episode:1"]
     on.update(reason="ok", ms=1900.0, hits=["episode:1"], routing="full")
-    assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, 1900 ms > 1200 ms"
+    assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, 1900 ms > 1200 ms, reference 300 ms"
     on.update(reason=None)
     assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, the hook wrote no summary line"
     on.update(reason="ok", ms=900.0)
     assert pm._routing_problem("prompt 1", off, on) is None
+
+
+def _timed_hook(live_ms: float, off_ms: float, on_ms: float):
+    """A fake hook whose summary line carries a fixed time per kind of run:
+    live's, the candidate's with routing off, the candidate's with it on."""
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        if argv[1:2] == ["-c"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"push": True}) + "\n", "")
+        on = env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
+        cand = "/candidate/packages/" in argv[0]
+        ms = on_ms if on else off_ms if cand else live_ms
+        line = _summary(datetime.now(timezone.utc), "ok", ["episode:3"]).replace("ms=300.0", f"ms={ms}")
+        line += " routing=full" if on else ""
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(line + "\n")
+        return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+    return fake_run
+
+
+def test_replay_notes_slowness_live_shares_and_reports_both_medians(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _timed_hook(1300.0, 1350.0, 1350.0))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+    assert "shared slowness, not the candidate" in out["detail"]
+    assert "median 1350 ms, live 1300 ms" in out["detail"]
+
+
+def test_replay_fails_a_prompt_the_candidate_runs_300_ms_slower_than_live(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _timed_hook(1000.0, 1300.0, 1300.0))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"]
+    assert "prompt 1: 1300 ms > 1200 ms, reference 1000 ms" in out["detail"]
+
+
+def test_replay_fails_a_candidate_slower_than_live_at_the_median(home, monkeypatch):
+    # Under the budget on every prompt, so only the median test can see it.
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _timed_hook(800.0, 1050.0, 1050.0))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"]
+    assert "the candidate is slower than live by 250 ms at the median" in out["detail"]
+
+
+def test_a_timeout_reason_fails_whatever_the_references():
+    run = {"exit": 0, "valid_json": True, "reason": "timeout>1.2s", "ms": 1250.0, "hits": []}
+    assert pm._search_problem(run, (1300.0,)) == "timeout>1.2s"
+
+
+def test_replay_fails_routing_on_only_when_slower_than_both_references(home, monkeypatch):
+    candidate = _one_query(home)
+    # Slower than its own routing-off run and than live's: fails.
+    monkeypatch.setattr(pm, "_run", _timed_hook(1000.0, 1000.0, 1500.0))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"]
+    assert "with routing on, 1500 ms > 1200 ms" in out["detail"]
+    # Slower than the routing-off run but within live's slack: passes.
+    monkeypatch.setattr(pm, "_run", _timed_hook(1400.0, 1000.0, 1500.0))
+    assert pm.gate_recall_replay(candidate)["ok"]
 
 
 def _late_embedding_hook(rng, late: float):
