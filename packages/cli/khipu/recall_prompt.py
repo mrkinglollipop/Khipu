@@ -2477,6 +2477,9 @@ def _fuse_and_annotate(
     # Once, after fusion and graph expansion: candidate rows carry no signal,
     # so they can never make an otherwise empty list pass.
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
+    from khipu.summary_kind import without_verbatim_only
+
+    fused = without_verbatim_only(fused)
     fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
 
@@ -2860,7 +2863,9 @@ def _hub_hits_budgeted(
     from khipu.recency import apply_project_and_status
     from khipu.tombstones import without_hidden_episodes
 
-    fused = without_hidden_episodes(fuse_ranked_lists(lists, limit=_SEARCH_LIMIT))
+    from khipu.summary_kind import without_verbatim_only
+
+    fused = without_verbatim_only(without_hidden_episodes(fuse_ranked_lists(lists, limit=_SEARCH_LIMIT)))
     fused = _relevance_gate(fused, tokens)
     fused = apply_project_and_status(fused, project=project)
     fused = _attach_hub_routing_state(fused, deadline=deadline)
