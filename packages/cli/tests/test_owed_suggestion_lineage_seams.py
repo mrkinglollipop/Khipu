@@ -125,4 +125,6 @@ def test_lineage_comes_from_the_opening_episode_when_owed_rows_have_no_session(
         'p', activity.project_slice(project='p', host_session_id='codex:this-root'))
     assert ('(yours)' in rendered) is expected
     assert 'I will send the final report' in rendered
-    assert ('e.parent_session_id' in queries[0]) is has_parent
+    # The slice's one batched column read (information_schema) runs first by design.
+    lineage = [q for q in queries if 'information_schema' not in q]
+    assert ('e.parent_session_id' in lineage[0]) is has_parent

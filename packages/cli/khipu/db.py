@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+from typing import Any
 from pathlib import Path
 
 import psycopg
@@ -198,6 +199,28 @@ def dsn_configured() -> bool:
 
 _TABLE_COLUMNS_CACHE: dict[str, set[str]] = {}
 
+# What ``prime_table_columns`` read, per database: the process cache above is
+# not keyed by database, so a process that talks to more than one hub (the
+# warm recall daemon) must not take one hub's columns as another's.
+_SCHEMA_SEEN: dict[Any, dict[str, set[str]]] = {}
+
+
+def database_identity(conn_or_cur) -> Any:
+    """Which database a connection (or its cursor) talks to: host, port and
+    name. A stand-in without connection info is told apart by identity."""
+    conn = getattr(conn_or_cur, "connection", conn_or_cur)
+    info = getattr(conn, "info", None)
+    try:
+        return (info.host, info.port, info.dbname)
+    except AttributeError:
+        return id(conn)
+
+
+def columns_seen(cur, table: str) -> set[str] | None:
+    """``table``'s columns as ``prime_table_columns`` read them from THIS
+    cursor's database, or ``None`` when it never read that database."""
+    return _SCHEMA_SEEN.get(database_identity(cur), {}).get(table)
+
 
 def table_columns(cur, table: str) -> set[str]:
     """Column names for ``table`` on THIS connection's database, cached per
@@ -216,8 +239,11 @@ def table_columns(cur, table: str) -> set[str]:
 def prime_table_columns(conn, *tables: str) -> None:
     """``table_columns`` for every one of ``tables`` not cached yet, in one
     query instead of one each. Best-effort: an answer it can't read caches
-    nothing, and ``table_columns`` asks again table by table."""
-    missing = [t for t in tables if t not in _TABLE_COLUMNS_CACHE]
+    nothing, and ``table_columns`` asks again table by table. Call it before
+    other work in a transaction: a failed read rolls the transaction back so
+    the per-table reads can run."""
+    seen = _SCHEMA_SEEN.setdefault(database_identity(conn), {})
+    missing = [t for t in tables if t not in _TABLE_COLUMNS_CACHE or t not in seen]
     if not missing:
         return
     try:
@@ -231,8 +257,14 @@ def prime_table_columns(conn, *tables: str) -> None:
             for table, column in cur.fetchall():
                 got[table].add(column)
     except Exception:  # noqa: BLE001  (the per-table reads still answer)
+        if not getattr(conn, "autocommit", False):
+            try:
+                conn.rollback()  # a failed statement aborts the transaction
+            except Exception:  # noqa: BLE001
+                pass
         return
     _TABLE_COLUMNS_CACHE.update(got)
+    seen.update(got)
 
 
 def has_columns(cur, table: str, *names: str) -> bool:

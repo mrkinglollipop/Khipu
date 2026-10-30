@@ -285,14 +285,35 @@ def test_a_delegation_call_with_no_last_seen_version_gets_the_full_summary(home,
     assert _ctx(out) == routing.light_status()["text"]
     view = routing.read_view()
     assert _marker() == {"version": view["version"], "epoch": view["epoch"], "full_at": "2026-10-14T15:00:00Z"}
-    assert _log_lines()[-1].endswith("delegation session=" + SESSION + " call=agent routing=full")
+    assert re.search(r"\[khipu-delegation-hook\] session=" + SESSION
+                     + r" event=PreToolUse tool=Agent outcome=pushed call=agent routing=full ms=\d+\.\d$",
+                     _log_lines()[-1])
+
+
+def test_every_tool_call_logs_its_cost_and_outcome(home, monkeypatch):
+    """A plain tool call reads nothing and pushes nothing, yet its cost is
+    still one line, so the hook that runs on every Bash call is visible."""
+    out = _run(_call("Bash", {"command": "ls -la"}), monkeypatch)
+    assert out == {}
+    assert re.search(r"\[khipu-delegation-hook\] session=" + SESSION
+                     + r" event=PreToolUse tool=Bash outcome=pass ms=\d+\.\d$", _log_lines()[-1])
+    assert "[khipu-prompt-recall]" not in _log_lines()[-1]  # never counted as a per-prompt outcome
+
+
+def test_a_failed_call_logs_the_error_and_still_prints_nothing(home, monkeypatch):
+    def boom(raw, environ=None):
+        raise RuntimeError("synthetic")
+
+    monkeypatch.setattr(routing_delegation, "hook_main", boom)
+    assert _run(_call("Bash", {"command": "ls"}), monkeypatch) == {}
+    assert re.search(r"outcome=error:RuntimeError ms=\d+\.\d$", _log_lines()[-1])
 
 
 def test_the_seen_marker_is_shared_with_the_per_prompt_push(home, monkeypatch):
     _seen_now()  # the per-prompt push (or the start) delivered the current view
     out = _run(_call("Bash", {"command": "codex exec 'fix it'"}), monkeypatch)
     assert out == {}  # nothing changed since the conversation last heard
-    assert _log_lines()[-1].endswith("call=codex_exec routing=none")
+    assert re.search(r"outcome=delegation call=codex_exec routing=none ms=\d+\.\d$", _log_lines()[-1])
     home["clock"].advance(minutes=10)
     routing.report(account="Claude", state="limited", until="2h", author=ME)
     out = _run(_call("Bash", {"command": "codex exec 'fix it'"}), monkeypatch)
@@ -321,7 +342,9 @@ def test_an_unmatched_call_prints_nothing_and_leaves_the_marker(home, monkeypatc
     for call in (_call("Read", {"file_path": "/a"}), _call("Bash", {"command": "ls"})):
         assert _run(call, monkeypatch) == {}
     assert _marker() == before == {}
-    assert not any("delegation" in line for line in _log_lines())
+    # Each call is one timing line, and none names a delegation.
+    assert [re.search(r"tool=(\w+) outcome=pass ms=", line).group(1) for line in _log_lines()] == ["Read", "Bash"]
+    assert not any(" call=" in line for line in _log_lines())
 
 
 def test_a_subagents_calls_never_repeat_the_push(home, monkeypatch):
@@ -363,7 +386,7 @@ def test_a_read_past_the_time_budget_sends_nothing_and_keeps_the_marker(home, mo
     assert _run(_call("Agent"), monkeypatch) == {}
     assert time.monotonic() - started < 0.35
     assert _marker() == before
-    assert _log_lines()[-1].endswith("routing=skipped:budget")
+    assert re.search(r"outcome=delegation call=agent routing=skipped:budget ms=\d+\.\d$", _log_lines()[-1])
 
 
 def test_the_delegation_switch_turns_only_this_push_off(home, monkeypatch):
