@@ -52,9 +52,14 @@ def is_verbatim_only_hit(hit: Any) -> bool:
         return False
     if hit.get("summary_kind") == VERBATIM_ONLY:
         return True
-    text = hit.get("summary")
-    if text is None:
-        text = hit.get("snippet")
+    if "summary" in hit:
+        text = hit["summary"]
+    elif "snippet" in hit:
+        text = hit["snippet"]
+    else:
+        # A row that carries no summary text at all (a label-only ranking row)
+        # says nothing about being empty; only a present, blank summary does.
+        text = "x"
     return is_verbatim_only(text, hit.get("raw"))
 
 
