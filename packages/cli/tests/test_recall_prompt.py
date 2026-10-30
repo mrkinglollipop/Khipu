@@ -308,7 +308,7 @@ class SnapshotSearchHitsTest(unittest.TestCase):
     def test_fresh_snapshot_fuses_cosine_and_lexical_and_attaches_metadata(self):
         cosine_row = {"kind": "topic", "id": "t1", "chunk_idx": 0, "score": 0.9,
                        "label": "T1", "snippet": "topic body", "rank_text": "topic body"}
-        lexical_row = {"kind": "episode", "id": "5", "label": "ep", "snippet": "episode text"}
+        lexical_row = {"kind": "episode", "id": "5", "label": "ep topical prompt", "snippet": "episode text"}
         with mock.patch("khipu.hub_snapshot.snapshot_is_fresh", return_value=(True, {"exists": True})), \
                 mock.patch("khipu.hub_snapshot.search_snapshot", return_value=[lexical_row]), \
                 mock.patch("khipu.hub_snapshot.active_snapshot_profile", return_value="p1"), \
@@ -324,7 +324,7 @@ class SnapshotSearchHitsTest(unittest.TestCase):
         self.assertIsNone(out["degraded"])
 
     def test_a_cosine_leg_failure_degrades_to_lexical_only_not_a_raise(self):
-        lexical_row = {"kind": "episode", "id": "5", "label": "ep", "snippet": "episode text"}
+        lexical_row = {"kind": "episode", "id": "5", "label": "ep topical prompt", "snippet": "episode text"}
         with mock.patch("khipu.hub_snapshot.snapshot_is_fresh", return_value=(True, {"exists": True})), \
                 mock.patch("khipu.hub_snapshot.search_snapshot", return_value=[lexical_row]), \
                 mock.patch("khipu.hub_snapshot.active_snapshot_profile", return_value="p1"), \

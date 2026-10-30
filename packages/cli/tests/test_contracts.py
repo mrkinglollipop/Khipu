@@ -88,7 +88,9 @@ def test_khipu_search_result_is_a_superset_of_the_fixture(tmp_path):
 def test_khipu_status_light_items_variant(tmp_path):
     fixture = _load("khipu_status.light.json")["variants"]["items"]
     with corpus.installed_corpus(tmp_path):
-        actual = ms._tool_status_light({"prompt": "what did we approve for widget-batching"})
+        # Push needs per-row evidence (recency.PUSH_COVERAGE): one rare word no longer admits a row.
+        actual = ms._tool_status_light(
+            {"prompt": "what did we approve for the widget-batching endpoint pagination"})
     _assert_superset(actual, fixture, label="khipu_status.light.json[items]")
 
 

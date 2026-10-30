@@ -1146,7 +1146,9 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
                 or any(parsed.get(k) for k in ("decisions", "preferences", "open_loops",
                                                "closed_loops", "decision_details"))):
             return None
-        summary = "Session evidence retained without a model summary."
+        from khipu.recency import PLACEHOLDER_SUMMARY
+
+        summary = PLACEHOLDER_SUMMARY
         parsed["scope"] = ""
     topics: list[str] = []
     for t in _as_str_list(parsed.get("topics"), lower=True):

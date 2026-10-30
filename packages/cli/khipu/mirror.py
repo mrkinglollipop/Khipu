@@ -279,6 +279,9 @@ def _upsert_topic(
     frontmatter = safe.get("frontmatter")
     if not isinstance(frontmatter, dict):
         frontmatter = {"title": safe["title"], "status": safe["status"], "links": links}
+    # The body length, for recency.is_broad_page: search reads it here, never
+    # the body itself.
+    frontmatter = {**frontmatter, "_page_chars": len(safe.get("body") or "")}
     cur.execute("SELECT content_hash FROM topics WHERE slug = %s", (safe["slug"],))
     prev = cur.fetchone()
     # W5.3/R7: a topic's own frontmatter created/last_updated (when
