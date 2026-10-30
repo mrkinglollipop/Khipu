@@ -2428,7 +2428,7 @@ def _fuse_and_annotate(
     (2026-10-12)."""
     from khipu import hub_snapshot
     from khipu.recency import rank_for_push
-    from khipu.search_text import fuse_ranked_lists, token_hit_count
+    from khipu.search_text import fuse_ranked_lists, note_prompt_term_hits, prompt_terms, token_hit_count
 
     if not lexical_rows and not cosine_rows:
         return {"hits": [], "legs": legs, "degraded": degraded}
@@ -2459,6 +2459,7 @@ def _fuse_and_annotate(
     # scoring it twice pops rank_text on the first pass and recomputes 0
     # from the empty string on the second, erasing a real literal match.
     _scored_rows: set[int] = set()
+    terms = prompt_terms(prompt) if tokens else []
     for row_list in lists:
         for r in row_list:
             if id(r) in _scored_rows:
@@ -2466,6 +2467,7 @@ def _fuse_and_annotate(
             _scored_rows.add(id(r))
             if tokens:
                 r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
+                note_prompt_term_hits(r, r.get("rank_text") or "", terms)
             r.pop("rank_text", None)
     if not lists:
         return {"hits": [], "legs": legs, "degraded": degraded}
@@ -2843,7 +2845,7 @@ def _hub_hits_budgeted(
         try:
             from khipu.db import connect
             from khipu.cli import _literal_candidates
-            from khipu.search_text import token_hit_count
+            from khipu.search_text import note_prompt_term_hits, prompt_terms, token_hit_count
 
             with connect() as conn:
                 with conn.cursor() as cur:
@@ -2863,8 +2865,10 @@ def _hub_hits_budgeted(
                     )
                     lexical_box["project_group"] = _hub_project_group(cur, project)
             if tokens:
+                terms = prompt_terms(prompt)
                 for r in rows:
                     r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
+                    note_prompt_term_hits(r, r.get("rank_text") or "", terms)
             lexical_box["rows"] = rows
         except Exception as exc:  # noqa: BLE001 — a leg failure just means it didn't land
             lexical_box["error"] = exc

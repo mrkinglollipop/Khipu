@@ -122,8 +122,10 @@ class EmbeddingOnTimeTest(unittest.TestCase):
         # "unknown" and adds a `validity` key to every row — additive, but it
         # breaks a strict dict comparison against the pre-phase reference,
         # which never adds it. Strip it before comparing; the deadline
-        # machinery under test is unaffected either way.
-        new_hits = [{k: v for k, v in r.items() if k != "validity"} for r in new_out["hits"]]
+        # machinery under test is unaffected either way. `push_evidence`
+        # (the push route a row cleared) is additive the same way.
+        new_hits = [{k: v for k, v in r.items() if k not in ("validity", "push_evidence")}
+                    for r in new_out["hits"]]
         self.assertEqual(new_hits, old_out)
         self.assertIsNone(new_out["degraded"])
         self.assertEqual(set(new_out["legs"]), {"lexical", "cosine"})

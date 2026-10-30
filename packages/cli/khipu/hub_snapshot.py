@@ -4199,6 +4199,65 @@ def snapshot_project_group(con: sqlite3.Connection, project: str | None) -> tupl
         return project, [project]
 
 
+# How rare each word is in memory, for automatic push's coverage test. A
+# sample of the newest rows is enough for a rarity estimate and costs ~50 ms
+# to count; the table is kept per replica file for TERM_DF_MAX_AGE_S, since
+# a word's rarity hardly moves between catch-ups.
+TERM_DF_EPISODES = 3000
+TERM_DF_TOPICS = 500
+TERM_DF_MAX_AGE_S = 6 * 3600.0
+_TERM_DF_CACHE: dict[str, Any] = {}
+_TERM_DF_LOCK = threading.Lock()
+
+
+def _count_term_df(con: sqlite3.Connection) -> tuple[int, dict[str, int]] | None:
+    from khipu.search_text import TOKEN_RE
+
+    queries = []
+    ep_cols = _snapshot_table_columns(con, "episodes")
+    if "summary" in ep_cols:
+        extra = " || ' ' || COALESCE(topics, '')" if "topics" in ep_cols else ""
+        live = "WHERE deleted_at IS NULL " if "deleted_at" in ep_cols else ""
+        queries.append(f"SELECT COALESCE(summary, ''){extra} FROM episodes {live}"
+                       f"ORDER BY rowid DESC LIMIT {TERM_DF_EPISODES}")
+    if {"slug", "body"} <= _snapshot_table_columns(con, "topics"):
+        queries.append("SELECT slug || ' ' || substr(COALESCE(body, ''), 1, 2000) FROM topics "
+                       f"ORDER BY rowid DESC LIMIT {TERM_DF_TOPICS}")
+    df: dict[str, int] = {}
+    n = 0
+    for sql in queries:
+        for (text,) in con.execute(sql):
+            n += 1
+            for word in set(TOKEN_RE.findall(str(text or "").lower())):
+                df[word] = df.get(word, 0) + 1
+    return (n, df) if n else None
+
+
+def term_document_frequency(con: sqlite3.Connection | None = None) -> tuple[int, dict[str, int]] | None:
+    """``(documents counted, {word: documents naming it})`` over a sample of
+    the replica, or None without a readable replica. Opens the replica
+    read-only when ``con`` is None. Never raises."""
+    try:
+        path = str(snapshot_path())
+        if not Path(path).is_file():
+            return None
+        key = (path, os.stat(path).st_ino)
+        now = time.monotonic()
+        with _TERM_DF_LOCK:
+            if _TERM_DF_CACHE.get("key") == key and now - _TERM_DF_CACHE.get("at", -1e18) < TERM_DF_MAX_AGE_S:
+                return _TERM_DF_CACHE.get("value")
+            if con is None:
+                with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as own:
+                    value = _count_term_df(own)
+            else:
+                value = _count_term_df(con)
+            _TERM_DF_CACHE.update({"key": key, "at": now, "value": value})
+            return value
+    except Exception as exc:  # noqa: BLE001 — no table means push falls back to plain coverage
+        _log(f"term frequency table not read: {type(exc).__name__}: {exc}")
+        return None
+
+
 def snapshot_resolve_project(con: sqlite3.Connection, project: str | None) -> str | None:
     """The replica's ``identity.resolve_project_name``: a short or
     differently-cased name read as the stored project it means; an ambiguous

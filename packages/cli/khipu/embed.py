@@ -3019,7 +3019,7 @@ def hybrid_search(
     """
     from khipu.cli import _literal_candidates
     from khipu.hub_snapshot import try_hub_connect
-    from khipu.search_text import fuse_ranked_lists, search_tokens, token_hit_count
+    from khipu.search_text import fuse_ranked_lists, note_prompt_term_hits, prompt_terms, search_tokens, token_hit_count
     from khipu.topic_graph import enrich_search_results
 
     query = (query or "").strip()
@@ -3176,6 +3176,8 @@ def hybrid_search(
             # lexical_hits=0 and confidence='none'). Track by object
             # identity so each row is scored exactly once.
             _scored_rows: set[int] = set()
+            # Automatic push (``rank`` set) weighs rows against the whole prompt.
+            push_terms = prompt_terms(query) if rank is not None and tokens else []
             for row_list in lists:
                 for r in row_list:
                     if id(r) in _scored_rows:
@@ -3187,6 +3189,8 @@ def hybrid_search(
                     # matched a token literally (pure cosine neighbor).
                     if tokens:
                         r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
+                        if push_terms:
+                            note_prompt_term_hits(r, r.get("rank_text") or "", push_terms)
                     r.pop("rank_text", None)
             timing["lexical_ms"] = round((time.monotonic() - _t) * 1000, 1)
             if lib_names and kind is None:

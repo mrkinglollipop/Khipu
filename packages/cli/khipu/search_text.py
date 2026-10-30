@@ -55,7 +55,7 @@ RRF_K = 20
 _WORD_BOUNDARY = r"(?<![a-z0-9]){tok}(?![a-z0-9])"
 
 
-def search_tokens(term: str) -> list[str]:
+def search_tokens(term: str, *, limit: int = MAX_TOKENS) -> list[str]:
     """Lowercased content tokens. Length >= 3, or digits of length >= 2."""
     out: list[str] = []
     seen: set[str] = set()
@@ -67,9 +67,29 @@ def search_tokens(term: str) -> list[str]:
             continue
         seen.add(key)
         out.append(key)
-        if len(out) >= MAX_TOKENS:
+        if len(out) >= limit:
             break
     return out
+
+
+# Automatic push weighs a row against the whole prompt, not the first
+# MAX_TOKENS words a search leg queries on: a repeated template (a job
+# brief's opening lines) fills those first words, and what is new in the
+# prompt comes after them.
+PROMPT_TERMS_LIMIT = 48
+
+
+def prompt_terms(prompt: str) -> list[str]:
+    return search_tokens(prompt, limit=PROMPT_TERMS_LIMIT)
+
+
+def note_prompt_term_hits(row: dict[str, Any], text: str, terms: Sequence[str]) -> None:
+    """Record which of ``terms`` the row's full ranking text names, before
+    that text is dropped, as ``prompt_term_hits`` (a list of strings)."""
+    blob = (text or "").lower()
+    row["prompt_term_hits"] = [
+        t for t in terms if re.search(_WORD_BOUNDARY.format(tok=re.escape(t)), blob)
+    ]
 
 
 def token_hit_count(text: str, tokens: Sequence[str]) -> int:

@@ -13,6 +13,7 @@ from khipu import hub_snapshot as hs
 from khipu import recall_eval
 from khipu import recall_prompt as rp
 from khipu import recency
+from khipu.search_text import search_tokens
 
 KHIPU = "mrkinglollipop/Khipu"
 NOW = datetime.now(timezone.utc)
@@ -422,3 +423,109 @@ def test_graph_candidate_rides_on_its_seed():
     weak = {"kind": "topic", "id": "weak-seed", "score": 0.03, "project": KHIPU, "lexical_hits": 1}
     kept = recency.apply_push_policy([seed, linked, orphan, weak], project=KHIPU, tokens=tokens)
     assert [r["id"] for r in kept] == ["billing-service", "rate-limits"]
+
+
+# Fix round 3 (replay of 1530e7b4, 2026-10-30): job briefs share a template,
+# and earlier job episodes named all of a brief's first words, so 155 of 168
+# briefs that needed nothing still got a push. Coverage now weighs every
+# prompt word by how rare it is in memory. Fake template and data only.
+
+TEMPLATE = ("You are a dispatched agent on the khipu repo. Do the work yourself. First read "
+            "/Users/someone/jobs/brief.md. Oracle: run pytest from packages/cli. Never set TMPDIR. "
+            "Commit; no push. ")
+TEMPLATE_WORDS = ("dispatched agent work yourself first read users someone jobs brief oracle "
+                  "run pytest packages cli never set tmpdir commit push khipu repo").split()
+
+
+def _term_df(rare=(), n=3000):
+    df = {w: n // 2 for w in TEMPLATE_WORDS}
+    df.update({w: 2 for w in rare})
+    df.update({"review": 300, "findings": 200, "importer": 150, "fix": 600, "tidy": 100, "docs": 400})
+    return n, df
+
+
+def _row(rid, text, **extra):
+    return {"kind": "episode", "id": rid, "score": 0.05, "project": KHIPU,
+            "label": text[:80], "snippet": text, "lexical_hits": 8, **extra}
+
+
+def test_template_overlap_alone_is_not_pushed():
+    prompt = TEMPLATE + "Task: tidy the docs index."
+    old_job = _row("old-job", "Dispatched agent did the work yourself: first read the brief in "
+                   "users someone jobs, ran the oracle (pytest, packages cli), never set TMPDIR, "
+                   "commit, no push, khipu repo")
+    tokens = search_tokens(prompt)
+    # The first words a search leg sees are all template, and the row names them all.
+    assert set(tokens) <= set(TEMPLATE_WORDS) | {"you"}
+    assert [r["id"] for r in recency.apply_push_policy(
+        [dict(old_job)], project=KHIPU, tokens=tokens, prompt=prompt, term_df=None)] == ["old-job"]
+    kept = recency.apply_push_policy([old_job], project=KHIPU, tokens=tokens, prompt=prompt,
+                                     term_df=_term_df())
+    assert kept == []
+
+
+@pytest.mark.parametrize("tail, rare, text", [
+    ("Task: fix the review findings on PR 1193.", ["1193"],
+     "Dispatched agent work on PR 1193: review findings were two P2s"),
+    ("Task: fix rankForPush so the importer keeps order.", ["rankforpush"],
+     "Dispatched agent changed rankForPush in the khipu repo"),
+    ("Task: fix the zephyrine importer.", ["zephyrine"],
+     "Dispatched agent work: zephyrine importer drafted"),
+])
+def test_template_brief_sharing_a_distinctive_word_is_pushed(tail, rare, text):
+    prompt = TEMPLATE + tail
+    filler = _row("old-job", "Dispatched agent did the work: first read the brief, ran the "
+                  "oracle with pytest, never set TMPDIR, commit, no push")
+    match = _row("match", text)
+    kept = recency.apply_push_policy([filler, match], project=KHIPU, tokens=search_tokens(prompt),
+                                     prompt=prompt, term_df=_term_df(rare))
+    assert [r["id"] for r in kept] == ["match"]
+    assert kept[0]["push_evidence"] == "rare_term"
+
+
+def test_short_typed_prompt_weighs_its_rare_words():
+    prompt = "zephyrine importer review"
+    df = _term_df(["zephyrine"])
+    both = _row("both", "Review of the zephyrine importer")
+    common = _row("common", "Importer review notes")
+    kept = recency.apply_push_policy([both, common], project=KHIPU, tokens=search_tokens(prompt),
+                                     prompt=prompt, term_df=df)
+    assert [r["id"] for r in kept] == ["both"] and kept[0]["push_evidence"] == "keywords"
+
+
+def test_small_replica_falls_back_to_plain_coverage():
+    prompt = TEMPLATE + "Task: tidy the docs index."
+    row = _row("old-job", " ".join(TEMPLATE_WORDS))
+    kept = recency.apply_push_policy([row], project=KHIPU, tokens=search_tokens(prompt),
+                                     prompt=prompt, term_df=(recency.TERM_DF_MIN_DOCS - 1, {}))
+    assert [r["id"] for r in kept] == ["old-job"]
+
+
+def test_replica_brief_pushes_only_the_episode_with_its_distinctive_word(tmp_path, monkeypatch):
+    from khipu import relevance
+
+    template_summary = ("Dispatched agent did the work yourself: first read the brief in users "
+                        "someone jobs, ran the oracle with pytest in packages cli, never set "
+                        "TMPDIR, commit and no push in the khipu repo, round {i}")
+    fillers = [(1000 + i, template_summary.format(i=i), KHIPU, _days_ago(2)) for i in range(240)]
+    match = (901, "Dispatched agent work on PR 1193: review findings fixed in the importer",
+             KHIPU, _days_ago(1))
+    weak = relevance.cosine_floor()
+    _replica(tmp_path, monkeypatch, episodes=[*fillers, match],
+             cosine=[("episode", 1000, weak), ("episode", 1001, weak), ("episode", 901, weak)])
+    hs._TERM_DF_CACHE.clear()
+    out = rp.prior_work_for_prompt(TEMPLATE + "Task: fix the review findings on PR 1193.",
+                                   cwd="/khipu/worktree")
+    assert [r["id"] for r in out["hits"]] == ["901"], out
+    plain = rp.prior_work_for_prompt(TEMPLATE + "Task: tidy the docs index.", cwd="/khipu/worktree")
+    assert plain["hits"] == [], plain
+
+
+def test_term_document_frequency_counts_live_rows_and_never_raises(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch, episodes=[(1, "alpha beta", KHIPU, _days_ago(1)),
+                                              (2, "alpha gamma", KHIPU, _days_ago(1))])
+    hs._TERM_DF_CACHE.clear()
+    n, df = hs.term_document_frequency()
+    assert n == 2 and df["alpha"] == 2 and df["beta"] == 1
+    monkeypatch.setattr(hs, "snapshot_path", lambda: tmp_path / "missing.sqlite")
+    assert hs.term_document_frequency() is None

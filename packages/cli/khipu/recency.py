@@ -114,6 +114,19 @@ QUESTION_WORDS = frozenset({"what", "how", "why", "when", "where", "which", "who
 # memory as their best answer and none named the project.
 CROSS_PROJECT_COSINE_MARGIN = 0.15
 CROSS_PROJECT_MIN_TOKENS = 3
+# Coverage by rarity (2026-10-30 replay of 1530e7b4): job briefs abstained
+# correctly on 13 of 168, because each brief's first words are the same
+# template ("Do the work yourself", "First read /Users/...", oracle commands)
+# and earlier job episodes name them all. With the replica's word frequencies
+# (hub_snapshot.term_document_frequency) each of the whole prompt's words
+# weighs log((N+1)/(df+1)): a row must name PUSH_COVERAGE of the prompt's
+# weight, or name a word at most TERM_RARE_SHARE of memory names plus one
+# more word. A template's words are in every job episode and weigh little;
+# a PR number, a function name or a project's own noun weighs a lot.
+TERM_RARE_SHARE = 0.005
+# Below this many rows a word's frequency says nothing about rarity (a new
+# install, a tiny test replica), so plain coverage of ``tokens`` decides.
+TERM_DF_MIN_DOCS = 200
 
 
 def is_broad_page(row: dict[str, Any]) -> bool:
@@ -171,6 +184,59 @@ def _keyword_hits(row: dict[str, Any], tokens: list[str]) -> float:
     return float(row["lexical_hits"])
 
 
+class _TermWeights:
+    """The prompt's words weighed by rarity; ``passes(row)`` names the
+    keyword route a row clears ("keywords" or "rare_term"), or None."""
+
+    def __init__(self, terms: list[str], term_df: tuple[int, dict[str, int]]):
+        n, df = term_df
+        self.terms = terms
+        self.df = {t: int(df.get(t, 0)) for t in terms}
+        self.weight = {t: math.log((n + 1) / (self.df[t] + 1)) for t in terms}
+        self.total = sum(self.weight.values())
+        self.rare_cut = max(1.0, TERM_RARE_SHARE * n)
+
+    def passes(self, row: dict[str, Any]) -> str | None:
+        named = row.get("prompt_term_hits")
+        if not isinstance(named, list):
+            from khipu.search_text import note_prompt_term_hits
+
+            text = row.get("rank_text") or f"{row.get('label') or ''} {row.get('snippet') or ''}"
+            note_prompt_term_hits(row, text, self.terms)
+            named = row["prompt_term_hits"]
+        named = {t for t in named if t in self.weight}
+        if len(named) < min(2, len(self.terms)):
+            return None
+        if sum(self.weight[t] for t in named) >= PUSH_COVERAGE * self.total:
+            return "keywords"
+        if len(named) >= 2 and any(self.df[t] <= self.rare_cut for t in named):
+            return "rare_term"
+        return None
+
+
+def _term_weights(prompt: str | None, term_df: Any) -> _TermWeights | None:
+    if not prompt:
+        return None
+    try:
+        if term_df is _FETCH:
+            from khipu.hub_snapshot import term_document_frequency
+
+            term_df = term_document_frequency()
+        if not term_df or term_df[0] < TERM_DF_MIN_DOCS:
+            return None
+        from khipu.search_text import prompt_terms
+
+        terms = prompt_terms(prompt)
+        terms = [t for t in terms if t not in QUESTION_WORDS] or terms
+        weights = _TermWeights(terms, term_df) if terms else None
+        return weights if weights and weights.total > 0 else None
+    except Exception:  # noqa: BLE001 — no weights means plain coverage decides
+        return None
+
+
+_FETCH = object()
+
+
 def _cosine(row: dict[str, Any]) -> float | None:
     value = row.get("cosine")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -201,6 +267,7 @@ def apply_push_policy(
     rows: list[dict[str, Any]], *, project: str | None = None,
     project_group: Any = None, tokens: list[str] | None = None,
     prompt: str | None = None, aliases_for: Callable[[str], Any] | None = None,
+    term_df: Any = _FETCH,
 ) -> list[dict[str, Any]]:
     """Selection for automatic push (the per-prompt hook and khipu_status's
     prior_work), on top of ``apply_project_and_status``. Explicit search never
@@ -214,8 +281,12 @@ def apply_push_policy(
     cross-project bar. With ``tokens`` (the prompt's content tokens) it also
     leaves out every row that is not push evidence (see PUSH_COVERAGE); a
     graph candidate (``via`` set) carries no signal of its own and stays only
-    when the row it was reached from does. Rows are mutated in place and
-    returned re-sorted by score. Never raises.
+    when the row it was reached from does. With ``prompt`` and word
+    frequencies (``term_df``, read from the replica unless given; None turns
+    weighting off) the keyword test weighs every prompt word by rarity (see
+    TERM_RARE_SHARE) instead of counting ``tokens``. Each kept row's
+    ``push_evidence`` names the route it cleared. Rows are mutated in place
+    and returned re-sorted by score. Never raises.
     """
     if not rows:
         return rows
@@ -226,6 +297,7 @@ def apply_push_policy(
     n_tokens = len(tokens or ())
     need = push_coverage_need(_subject_token_count(list(tokens or ())))
     floors = _cosine_floors() if n_tokens else None
+    weights = _term_weights(prompt, term_df) if n_tokens else None
     named: dict[str, bool] = {}
     out: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -258,16 +330,23 @@ def apply_push_policy(
                           and cosine >= floor + CROSS_PROJECT_COSINE_MARGIN)
                 if not (named[row_project] or strict):
                     continue
-            if n_tokens and not (hits >= need or (cosine is not None and floor is not None
-                                                  and cosine >= floor + PUSH_COSINE_MARGIN)):
-                if row.get("via"):
-                    candidates.append(row)
-                continue
+            if n_tokens:
+                route = weights.passes(row) if weights else ("keywords" if hits >= need else None)
+                if route is None and cosine is not None and floor is not None \
+                        and cosine >= floor + PUSH_COSINE_MARGIN:
+                    route = "cosine"
+                if route is None:
+                    if row.get("via"):
+                        candidates.append(row)
+                    continue
+                row["push_evidence"] = route
         except Exception:  # noqa: BLE001 — one bad row must not sink the push
             pass
         out.append(row)
     kept = {f"{r.get('kind')}:{r.get('id')}" for r in out}
     out += [r for r in candidates if r.get("via") in kept]
+    for r in out:
+        r.pop("prompt_term_hits", None)
     return sorted(out, key=lambda r: -(r.get("score") or 0.0))
 
 
@@ -383,7 +462,7 @@ def rank_for_push(
     rows: list[dict[str, Any]], *, project: str | None = None,
     project_group: Any = None, now: datetime | None = None,
     tokens: list[str] | None = None, prompt: str | None = None,
-    aliases_for: Callable[[str], Any] | None = None,
+    aliases_for: Callable[[str], Any] | None = None, term_df: Any = _FETCH,
 ) -> list[dict[str, Any]]:
     """Automatic push's whole score pass, the one the replica lane and both
     hub lanes run so they order the same rows the same way: project boost and
@@ -401,5 +480,6 @@ def rank_for_push(
             continue
     rows = apply_project_and_status(rows, project=project, project_group=project_group)
     rows = apply_push_policy(rows, project=project, project_group=project_group,
-                             tokens=tokens, prompt=prompt, aliases_for=aliases_for)
+                             tokens=tokens, prompt=prompt, aliases_for=aliases_for,
+                             term_df=term_df)
     return apply_recency(rows, now=now)

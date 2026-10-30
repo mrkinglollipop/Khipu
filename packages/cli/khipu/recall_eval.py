@@ -863,6 +863,7 @@ def run_graded_replay(
         needs = bool(grade.get("needs_memory"))
         out_rows.append({
             "n": row.get("n"), "needs_memory": needs, "pushed": pushed, "labels": labels,
+            "evidence": {f"{h.get('kind')}:{h.get('id')}": h.get("push_evidence") for h in hits},
             "reason": reason, "ms": round((time.monotonic() - t0) * 1000, 1),
             "abstained": None if needs else not pushed,
             "ideal_hit": (any(i in ideal for i in pushed) if needs and ideal else None),
