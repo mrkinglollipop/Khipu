@@ -4203,12 +4203,15 @@ def snapshot_project_group(con: sqlite3.Connection, project: str | None) -> tupl
 # sample of the newest rows is enough for a rarity estimate and costs ~50 ms
 # to count, too much for every prompt in the one-shot hook (no warm service).
 # So the count is kept on disk beside the replica (``term_df_path``), keyed
-# by the replica's freshness stamp (``_term_df_stamp``): the first reader
-# after a catch-up recounts, every other prompt reads its own few words from
-# that file in about a millisecond. The file holds a hash of each word and
-# its count, never the word, so it holds no capture text.
+# by a stamp of the replica's file and of every forget this Mac knows
+# (``_term_df_stamp``): the first reader after a replica write or a forget
+# recounts, every other prompt reads its own few words from that file in
+# about a millisecond. The file holds a keyed hash of each word (the key is
+# a per-install secret beside it, ``_term_df_key_path``) and its count,
+# never the word, and is private to the owner; a backup carries neither.
 TERM_DF_EPISODES = 3000
 TERM_DF_TOPICS = 500
+TERM_DF_KEY_BYTES = 32
 _TERM_DF_CACHE: dict[str, Any] = {}
 _TERM_DF_LOCK = threading.Lock()
 
@@ -4218,53 +4221,150 @@ def term_df_path() -> Path:
     return path.with_name(path.name + ".term-df")
 
 
-def _term_hash(word: str) -> int:
-    return int.from_bytes(hashlib.blake2b(word.encode("utf-8"), digest_size=8).digest(), "big", signed=True)
+def _term_df_key_path() -> Path:
+    path = term_df_path()
+    return path.with_name(path.name + ".key")
 
 
-def _term_df_stamp(path: Path) -> str:
-    """The replica file's identity and how current it is: a new dump or a
-    finished catch-up changes it. Without a freshness stamp the file's
-    modification time stands in."""
+def _term_hash(word: str, key: bytes) -> int:
+    return int.from_bytes(hashlib.blake2b(word.encode("utf-8"), key=key, digest_size=8).digest(),
+                          "big", signed=True)
+
+
+def _term_df_key_check(key: bytes) -> str:
+    """Names the key a file was written with, without revealing it."""
+    return hashlib.blake2b(b"khipu-term-df", key=key, digest_size=16).hexdigest()
+
+
+def _owner_private(st: os.stat_result) -> bool:
+    import stat
+
+    return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def _term_df_folder_safe() -> bool:
+    """The replica's folder is the owner's and not world-writable; otherwise
+    nothing is read from or written beside it."""
+    try:
+        st = os.stat(term_df_path().parent)
+    except OSError:
+        return False
+    return st.st_uid == os.getuid() and not st.st_mode & 0o002
+
+
+def _read_private(path: Path) -> bytes | None:
+    """``path``'s bytes when it is a regular file the owner alone can read."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        if not _owner_private(os.fstat(fd)):
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read(TERM_DF_KEY_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _private_temp(path: Path) -> Path:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.unlink(missing_ok=True)
+    os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    return tmp
+
+
+def _term_df_key() -> bytes | None:
+    """This install's secret for the word hashes: read when it is the
+    owner's, private and whole, otherwise made new (which leaves any file
+    written with the old one unreadable, so it is rebuilt)."""
+    path = _term_df_key_path()
+    key = _read_private(path)
+    if key is not None and len(key) == TERM_DF_KEY_BYTES:
+        return key
+    key = os.urandom(TERM_DF_KEY_BYTES)
+    tmp: Path | None = None
+    try:
+        tmp = _private_temp(path)
+        with open(tmp, "wb") as fh:
+            fh.write(key)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        _log(f"term frequency key not written: {type(exc).__name__}: {exc}")
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        return None
+    return key
+
+
+def _term_df_stamp(path: Path, gate: Any = None) -> str:
+    """The replica file's identity and contents, and every forget this Mac
+    knows: a dump, a catch-up, any replica write (a tombstone, an applied
+    erasure, a topic purge), a queued erasure or a registry change changes
+    it. ``gate`` is the forgotten-source registry (read when None)."""
+    if gate is None:
+        from khipu.tombstones import read_gate
+
+        gate = read_gate()
     st = os.stat(path)
-    return f"{st.st_ino}|{caught_up_at() or st.st_mtime_ns}"
+    try:
+        wal = os.stat(path.with_name(path.name + "-wal")).st_mtime_ns
+    except OSError:
+        wal = 0
+    pending = ",".join(str(i) for i in sorted(_pending_erasure_ids(path)))
+    return (f"{st.st_ino}|{caught_up_at() or ''}|{st.st_mtime_ns}|{st.st_size}|{wal}"
+            f"|{gate.digest}|{pending}")
 
 
-def _count_term_df(con: sqlite3.Connection) -> tuple[int, dict[str, int]] | None:
-    from khipu.search_text import TOKEN_RE
+def _count_term_df(con: sqlite3.Connection, hidden: Iterable[int] = ()) -> tuple[int, dict[str, int]] | None:
+    """Counts over live rows: tombstoned episodes and topics and the
+    episodes in ``hidden`` (forgotten here or queued for erasure) are left
+    out."""
+    from khipu.search_text import text_words
 
+    hidden = frozenset(int(i) for i in hidden)
     queries = []
     ep_cols = _snapshot_table_columns(con, "episodes")
     if "summary" in ep_cols:
+        ident = "id" if "id" in ep_cols else "NULL"
         extra = " || ' ' || COALESCE(topics, '')" if "topics" in ep_cols else ""
         live = "WHERE deleted_at IS NULL " if "deleted_at" in ep_cols else ""
-        queries.append(f"SELECT COALESCE(summary, ''){extra} FROM episodes {live}"
+        queries.append(f"SELECT {ident}, COALESCE(summary, ''){extra} FROM main.episodes {live}"
                        f"ORDER BY rowid DESC LIMIT {TERM_DF_EPISODES}")
-    if {"slug", "body"} <= _snapshot_table_columns(con, "topics"):
-        queries.append("SELECT slug || ' ' || substr(COALESCE(body, ''), 1, 2000) FROM topics "
-                       f"ORDER BY rowid DESC LIMIT {TERM_DF_TOPICS}")
+    topic_cols = _snapshot_table_columns(con, "topics")
+    if {"slug", "body"} <= topic_cols:
+        live = "WHERE deleted_at IS NULL " if "deleted_at" in topic_cols else ""
+        queries.append("SELECT NULL, slug || ' ' || substr(COALESCE(body, ''), 1, 2000) FROM main.topics "
+                       f"{live}ORDER BY rowid DESC LIMIT {TERM_DF_TOPICS}")
     df: dict[str, int] = {}
     n = 0
     for sql in queries:
-        for (text,) in con.execute(sql):
+        for ident, text in con.execute(sql):
+            if ident is not None and int(ident) in hidden:
+                continue
             n += 1
-            for word in set(TOKEN_RE.findall(str(text or "").lower())):
+            for word in set(text_words(str(text or ""))):
                 df[word] = df.get(word, 0) + 1
     return (n, df) if n else None
 
 
-def _read_term_df_file(stamp: str, terms: Sequence[str]) -> tuple[int, dict[str, int]] | None:
+def _read_term_df_file(stamp: str, terms: Sequence[str], key: bytes) -> tuple[int, dict[str, int]] | None:
     """``terms``' counts from the file on disk, or None when it is missing,
-    unreadable or was counted for another stamp."""
+    unreadable, not the owner's alone, written with another key or counted
+    for another stamp."""
     path = term_df_path()
-    if not path.is_file():
-        return None
     try:
+        if not _owner_private(os.stat(path, follow_symlinks=False)):
+            return None
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
             meta_rows = dict(con.execute("SELECT k, v FROM meta"))
-            if meta_rows.get("stamp") != stamp:
+            if meta_rows.get("key") != _term_df_key_check(key) or meta_rows.get("stamp") != stamp:
                 return None
-            by_hash = {_term_hash(t): t for t in terms}
+            by_hash = {_term_hash(t, key): t for t in terms}
             df: dict[str, int] = {}
             keys = list(by_hash)
             for i in range(0, len(keys), 500):
@@ -4273,63 +4373,70 @@ def _read_term_df_file(stamp: str, terms: Sequence[str]) -> tuple[int, dict[str,
                 for h, count in con.execute(sql, part):
                     df[by_hash[h]] = int(count)
             return int(meta_rows["docs"]), df
-    except (sqlite3.Error, KeyError, ValueError):
+    except (OSError, sqlite3.Error, KeyError, ValueError, TypeError):
         return None
 
 
-def _write_term_df_file(stamp: str, value: tuple[int, dict[str, int]]) -> None:
-    """Replace the file atomically: a reader sees the old table or the new."""
+def _write_term_df_file(stamp: str, value: tuple[int, dict[str, int]], key: bytes) -> None:
+    """Replace the file atomically: a reader sees the old table or the new.
+    Created private to the owner."""
     path = term_df_path()
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     n, df = value
+    tmp: Path | None = None
     try:
+        tmp = _private_temp(path)
         with closing(sqlite3.connect(tmp)) as con:
             con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
             con.execute("CREATE TABLE df (h INTEGER PRIMARY KEY, n INTEGER) WITHOUT ROWID")
             counts: dict[int, int] = {}
             for word, count in df.items():
-                h = _term_hash(word)
+                h = _term_hash(word, key)
                 counts[h] = max(counts.get(h, 0), count)
             con.executemany("INSERT INTO df VALUES (?, ?)", counts.items())
-            con.executemany("INSERT INTO meta VALUES (?, ?)", [("stamp", stamp), ("docs", str(n))])
+            con.executemany("INSERT INTO meta VALUES (?, ?)", [
+                ("stamp", stamp), ("docs", str(n)), ("key", _term_df_key_check(key))])
             con.commit()
         os.replace(tmp, path)
     except (OSError, sqlite3.Error) as exc:
         _log(f"term frequency file not written: {type(exc).__name__}: {exc}")
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def term_document_frequency(con: sqlite3.Connection | None = None,
                             terms: Sequence[str] | None = None) -> tuple[int, dict[str, int]] | None:
     """``(documents counted, {word: documents naming it})`` over a sample of
-    the replica, or None without a readable replica. With ``terms`` the dict
-    holds only those words (one missing from it names no document), read
-    from ``term_df_path`` when that was counted for this replica's stamp.
-    Opens the replica read-only when ``con`` is None. Never raises."""
+    the replica's live rows, or None without a readable replica or a
+    readable forgotten-source registry. With ``terms`` the dict holds only
+    those words (one missing from it names no document), read from
+    ``term_df_path`` when that was counted for this stamp. Opens the replica
+    read-only when ``con`` is None. Never raises."""
     try:
+        from khipu.tombstones import read_gate
+
         path = snapshot_path()
         if not path.is_file():
             return None
-        stamp = _term_df_stamp(path)
+        gate = read_gate()
+        stamp = _term_df_stamp(path, gate)
         with _TERM_DF_LOCK:
             if _TERM_DF_CACHE.get("key") == stamp:
                 value = _TERM_DF_CACHE.get("value")
             else:
-                if terms is not None:
-                    read = _read_term_df_file(stamp, terms)
+                key = _term_df_key() if _term_df_folder_safe() else None
+                if terms is not None and key is not None:
+                    read = _read_term_df_file(stamp, terms, key)
                     if read is not None:
                         return read
+                hidden = set(gate.episode_ids) | _pending_erasure_ids(path)
                 if con is None:
                     with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as own:
-                        value = _count_term_df(own)
+                        value = _count_term_df(own, hidden)
                 else:
-                    value = _count_term_df(con)
+                    value = _count_term_df(con, hidden)
                 _TERM_DF_CACHE.update({"key": stamp, "value": value})
-                if value is not None:
-                    _write_term_df_file(stamp, value)
+                if value is not None and key is not None:
+                    _write_term_df_file(stamp, value, key)
         if value is None or terms is None:
             return value
         n, df = value

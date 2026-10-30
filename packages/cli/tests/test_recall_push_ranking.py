@@ -1,11 +1,14 @@
 """Automatic push ranking (2026-10-29): every item pushed across five prompts
 in a Khipu session was irrelevant while the right episodes existed. Each test
 rebuilds one observed case on a synthetic replica, offline."""
+import hashlib
 import json
 import os
 import socket
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -625,10 +628,237 @@ def test_term_frequency_is_kept_on_disk_by_freshness_stamp(tmp_path, monkeypatch
     assert side.is_file() and b"alpha" not in side.read_bytes()
     # A one-shot process: no table in memory, and counting would fail.
     hs._TERM_DF_CACHE.clear()
-    monkeypatch.setattr(hs, "_count_term_df", lambda con: pytest.fail("recounted"))
+    monkeypatch.setattr(hs, "_count_term_df", lambda con, hidden=(): pytest.fail("recounted"))
     assert hs.term_document_frequency(terms=["gamma", "beta"]) == (2, {"gamma": 1, "beta": 1})
     # A catch-up changes the stamp, and the next reader counts again.
     hs._TERM_DF_CACHE.clear()
     monkeypatch.setattr(hs, "caught_up_at", lambda *a, **kw: "2026-10-30T06:00:00+00:00")
-    monkeypatch.setattr(hs, "_count_term_df", lambda con: (3, {"alpha": 3}))
+    monkeypatch.setattr(hs, "_count_term_df", lambda con, hidden=(): (3, {"alpha": 3}))
     assert hs.term_document_frequency(terms=["alpha"]) == (3, {"alpha": 3})
+
+
+# Fix round 7 (Kimi review, 2026-10-30): the rarity table on disk must not
+# outlive a forget, must not be readable by others, and must not confirm a
+# word by dictionary lookup without this install's secret.
+
+class _Gate:
+    def __init__(self, digest="d0", ids=()):
+        self.digest = digest
+        self.episode_ids = frozenset(ids)
+
+
+def _df_replica(tmp_path, monkeypatch, gate):
+    from khipu import tombstones
+
+    _replica(tmp_path, monkeypatch, episodes=[(1, "alpha privatecanary", KHIPU, _days_ago(1)),
+                                              (2, "alpha gamma", KHIPU, _days_ago(1))])
+    monkeypatch.setattr(tombstones, "read_gate", lambda: gate[0])
+    hs._TERM_DF_CACHE.clear()
+
+
+def test_term_df_file_is_private_and_keyed(tmp_path, monkeypatch):
+    import stat
+
+    gate = [_Gate()]
+    _df_replica(tmp_path, monkeypatch, gate)
+    assert hs.term_document_frequency(terms=["alpha"]) == (2, {"alpha": 2})
+    side = hs.term_df_path()
+    assert stat.S_IMODE(side.stat().st_mode) == 0o600
+    key = hs._term_df_key_path()
+    assert key.is_file() and stat.S_IMODE(key.stat().st_mode) == 0o600
+    # An unkeyed hash of a guessed word finds nothing in the file.
+    plain = int.from_bytes(hashlib.blake2b(b"privatecanary", digest_size=8).digest(), "big", signed=True)
+    with closing(sqlite3.connect(side)) as con:
+        assert con.execute("SELECT count(*) FROM df WHERE h = ?", (plain,)).fetchone() == (0,)
+
+
+def test_term_df_stamp_changes_on_forget_and_drops_forgotten_rows(tmp_path, monkeypatch):
+    gate = [_Gate()]
+    _df_replica(tmp_path, monkeypatch, gate)
+    assert hs.term_document_frequency(terms=["privatecanary"]) == (2, {"privatecanary": 1})
+    # A forget this Mac holds (the registry), no replica write, no catch-up.
+    gate[0] = _Gate("d1", ids=[1])
+    hs._TERM_DF_CACHE.clear()
+    assert hs.term_document_frequency(terms=["privatecanary", "alpha"]) == (1, {"alpha": 1})
+    # A tombstone written into the replica, with the same catch-up stamp.
+    gate[0] = _Gate()
+    monkeypatch.setattr(hs, "caught_up_at", lambda *a, **kw: "2026-10-30T06:00:00+00:00")
+    hs._TERM_DF_CACHE.clear()
+    assert hs.term_document_frequency(terms=["privatecanary"]) == (2, {"privatecanary": 1})
+    with closing(sqlite3.connect(hs.snapshot_path())) as con:
+        con.execute("UPDATE episodes SET deleted_at = '2026-10-30T07:00:00+00:00' WHERE id = 1")
+        con.commit()
+    hs._TERM_DF_CACHE.clear()
+    assert hs.term_document_frequency(terms=["privatecanary", "alpha"]) == (1, {"alpha": 1})
+    # A queued erasure, not yet applied.
+    hs._TERM_DF_CACHE.clear()
+    with closing(sqlite3.connect(hs.snapshot_path())) as con:
+        con.execute("UPDATE episodes SET deleted_at = NULL WHERE id = 1")
+        con.commit()
+    assert hs.term_document_frequency(terms=["privatecanary"]) == (2, {"privatecanary": 1})
+    hs._queue_erasure(1)
+    hs._TERM_DF_CACHE.clear()
+    assert hs.term_document_frequency(terms=["privatecanary"]) == (1, {})
+
+
+def test_term_df_unreadable_registry_counts_nothing(tmp_path, monkeypatch):
+    from khipu import tombstones
+
+    _df_replica(tmp_path, monkeypatch, [_Gate()])
+
+    def broken():
+        raise RuntimeError("registry unreadable")
+
+    monkeypatch.setattr(tombstones, "read_gate", broken)
+    assert hs.term_document_frequency(terms=["alpha"]) is None
+
+
+@pytest.mark.parametrize("spoil", ["corrupt", "open_mode", "foreign", "other_key"])
+def test_term_df_bad_file_is_ignored_and_rebuilt(tmp_path, monkeypatch, spoil):
+    gate = [_Gate()]
+    _df_replica(tmp_path, monkeypatch, gate)
+    assert hs.term_document_frequency(terms=["alpha"]) == (2, {"alpha": 2})
+    side = hs.term_df_path()
+    if spoil == "corrupt":
+        side.write_bytes(b"not a database")
+    elif spoil == "open_mode":
+        with closing(sqlite3.connect(side)) as con:
+            con.execute("UPDATE df SET n = 99")
+            con.commit()
+        os.chmod(side, 0o644)
+    elif spoil == "foreign":
+        side.unlink()
+        with closing(sqlite3.connect(side)) as con:
+            con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+            con.execute("CREATE TABLE df (h INTEGER PRIMARY KEY, n INTEGER)")
+            con.execute("INSERT INTO meta VALUES ('stamp', ?), ('docs', '9')",
+                        (hs._term_df_stamp(hs.snapshot_path()),))
+            con.commit()
+        os.chmod(side, 0o600)
+    else:
+        hs._term_df_key_path().write_bytes(os.urandom(32))
+    hs._TERM_DF_CACHE.clear()
+    assert hs.term_document_frequency(terms=["alpha"]) == (2, {"alpha": 2})
+    import stat
+    assert stat.S_IMODE(side.stat().st_mode) == 0o600
+
+
+def test_term_df_bad_key_is_replaced(tmp_path, monkeypatch):
+    import stat
+
+    _df_replica(tmp_path, monkeypatch, [_Gate()])
+    key = hs._term_df_key_path()
+    key.write_bytes(b"short")
+    os.chmod(key, 0o644)
+    assert hs.term_document_frequency(terms=["alpha"]) == (2, {"alpha": 2})
+    assert stat.S_IMODE(key.stat().st_mode) == 0o600 and len(key.read_bytes()) == 32
+
+
+def test_term_df_not_written_in_a_world_writable_folder(tmp_path, monkeypatch):
+    _df_replica(tmp_path, monkeypatch, [_Gate()])
+    os.chmod(tmp_path, 0o777)
+    try:
+        assert hs.term_document_frequency(terms=["alpha"]) == (2, {"alpha": 2})
+        assert not hs.term_df_path().exists() and not hs._term_df_key_path().exists()
+    finally:
+        os.chmod(tmp_path, 0o700)
+
+
+def test_backup_never_carries_the_term_df_files(tmp_path, monkeypatch):
+    import zipfile
+
+    from khipu import paths
+
+    data = tmp_path / "data"
+    data.mkdir(mode=0o700)
+    monkeypatch.setattr(paths, "ensure_data_dir", lambda: data)
+    (data / "hub_snapshot.sqlite.term-df").write_bytes(b"x")
+    (data / "hub_snapshot.sqlite.term-df.key").write_bytes(b"k" * 32)
+    (data / "config.json").write_text("{}")
+    archive = Path(paths.backup_local(dest=tmp_path / "b.zip")["archive"])
+    names = zipfile.ZipFile(archive).namelist()
+    assert "config.json" in names
+    assert not [n for n in names if "term-df" in n], names
+
+
+# Fix round 7, prose filter: Windows paths are paths, and a line that names
+# paths keeps its prose words.
+
+def test_windows_paths_are_paths():
+    from khipu.search_text import prompt_terms
+
+    prompt = ("Read C:\\Users\\someone\\state\\kelpie.md, then state\\qx\\bramble and a\\marrow, "
+              "also D:/work/zz/qq.txt and E:/mossbank before the zephyrine importer.")
+    terms = prompt_terms(prompt)
+    for word in ("zephyrine", "importer", "read"):
+        assert word in terms, (word, terms)
+    for word in ("users", "someone", "kelpie", "qx", "bramble", "marrow", "work", "qq", "mossbank"):
+        assert word not in terms, (word, terms)
+
+
+def test_windows_path_only_prompt_pushes_nothing():
+    short = "Read qxland\\brief and mossbank\\inbox."
+    path_only = _row("path-only", "qxland brief mossbank inbox")
+    path_only.pop("lexical_hits")
+    assert recency.apply_push_policy([path_only], project=KHIPU, tokens=search_tokens(short),
+                                     prompt=short, term_df=None) == []
+
+
+def test_line_with_paths_keeps_its_prose():
+    from khipu.search_text import prompt_terms
+
+    terms = prompt_terms("Fix rankForPush src/a.py src/b.py")
+    assert "rankforpush" in terms and "fix" in terms, terms
+    assert prompt_terms("Fix rankForPush src\\a.py src\\b.py") == terms
+    # A command line still goes whole.
+    assert prompt_terms("cd packages/cli && pytest -q tests/ -k bramble") == []
+
+
+def test_real_subject_beside_paths_pushes_on_keywords():
+    prompt = "Fix rankForPush in src/a.py src/b.py"
+    match = _row("match", "Fix rankForPush ordering in the push ranking")
+    match.pop("lexical_hits")
+    kept = recency.apply_push_policy([match], project=KHIPU, tokens=search_tokens(prompt),
+                                     prompt=prompt, term_df=None)
+    assert [r["id"] for r in kept] == ["match"]
+
+
+# Fix round 7, non-English prose: other scripts count, and scripts written
+# without spaces count by character pairs.
+
+def test_non_english_words_are_prose_terms():
+    from khipu.search_text import prompt_terms, search_tokens as st, token_hit_count
+
+    terms = prompt_terms("修正の zephyrine importer, исправить импорт, la importación rápida")
+    for word in ("zephyrine", "importer", "修正", "正の", "исправить", "импорт", "importación",
+                 "rápida"):
+        assert word in terms, (word, terms)
+    assert "importaci" not in terms
+    assert st("修正の") == ["修正", "正の"]
+    # ASCII is tokenized as before.
+    assert st("openbot ingest PR 36 foo_bar") == ["openbot", "ingest", "36", "foo", "bar"]
+    # A pair matches inside a longer run; a word does not match inside a longer word.
+    assert token_hit_count("バグ修正の記録", ["修正"]) == 1
+    assert token_hit_count("импортировать", ["импорт"]) == 0
+    assert token_hit_count("новый импорт данных", ["импорт"]) == 1
+
+
+def test_japanese_only_prompt_has_a_keyword_route():
+    prompt = "検索順位の修正"
+    match = _row("match", "検索順位の修正を記録した")
+    other = _row("other", "unrelated push note")
+    for r in (match, other):
+        r.pop("lexical_hits")
+    kept = recency.apply_push_policy([match, other], project=KHIPU, tokens=search_tokens(prompt),
+                                     prompt=prompt, term_df=None)
+    assert [r["id"] for r in kept] == ["match"]
+
+
+def test_term_df_counts_non_english_words(tmp_path, monkeypatch):
+    _df_replica(tmp_path, monkeypatch, [_Gate()])
+    with closing(sqlite3.connect(hs.snapshot_path())) as con:
+        con.execute("INSERT INTO episodes(id,summary,project,ts) VALUES(3,'検索順位の修正 importación',?,?)",
+                    (KHIPU, _days_ago(1)))
+        con.commit()
+    hs._TERM_DF_CACHE.clear()
+    assert hs.term_document_frequency(terms=["修正", "importación"]) == (3, {"修正": 1, "importación": 1})

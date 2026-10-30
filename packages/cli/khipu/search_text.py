@@ -10,7 +10,14 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Sequence
 
-TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+# A word in any script: letters and digits, never the underscore. On ASCII
+# text this is ``[A-Za-z0-9]+``.
+TOKEN_RE = re.compile(r"[^\W_]+")
+# Scripts written without spaces between words (Chinese, Japanese): a run of
+# them counts by overlapping character pairs, which match inside a longer run.
+_CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+_CJK_SPLIT_RE = re.compile(f"([{_CJK}]+)")
+_CJK_RE = re.compile(f"[{_CJK}]")
 # Function words that would otherwise match almost every episode.
 STOPWORDS = frozenset(
     {
@@ -52,18 +59,51 @@ STOPWORDS = frozenset(
 )
 MAX_TOKENS = 8
 RRF_K = 20
-_WORD_BOUNDARY = r"(?<![a-z0-9]){tok}(?![a-z0-9])"
+_WORD_BOUNDARY = r"(?<![^\W_]){tok}(?![^\W_])"
+
+
+def _names(blob: str, tok: str) -> bool:
+    """Whether lowercased ``blob`` names ``tok``: a whole word, or for a
+    character pair anywhere in the text."""
+    if _CJK_RE.search(tok):
+        return tok in blob
+    return re.search(_WORD_BOUNDARY.format(tok=re.escape(tok)), blob) is not None
+
+
+def text_words(text: str) -> list[str]:
+    """``text``'s lowercased words, in order: ``TOKEN_RE`` words, with each
+    run of a script written without spaces split into character pairs (a
+    single character stays as it is)."""
+    out: list[str] = []
+    for raw in TOKEN_RE.findall((text or "").lower()):
+        if not _CJK_RE.search(raw):
+            out.append(raw)
+            continue
+        for i, part in enumerate(_CJK_SPLIT_RE.split(raw)):
+            if not part:
+                continue
+            if i % 2 == 0:
+                out.append(part)
+            elif len(part) == 1:
+                out.append(part)
+            else:
+                out.extend(part[j:j + 2] for j in range(len(part) - 1))
+    return out
+
+
+def _is_pair(word: str) -> bool:
+    return len(word) == 2 and bool(_CJK_RE.search(word))
 
 
 def search_tokens(term: str, *, limit: int = MAX_TOKENS) -> list[str]:
-    """Lowercased content tokens. Length >= 3, or digits of length >= 2."""
+    """Lowercased content tokens. Length >= 3, digits of length >= 2, or a
+    character pair of a script written without spaces."""
     out: list[str] = []
     seen: set[str] = set()
-    for raw in TOKEN_RE.findall(term or ""):
-        key = raw.lower()
+    for key in text_words(term):
         if key in seen or key in STOPWORDS:
             continue
-        if len(key) < 3 and not (key.isdigit() and len(key) >= 2):
+        if len(key) < 3 and not (key.isdigit() and len(key) >= 2) and not _is_pair(key):
             continue
         seen.add(key)
         out.append(key)
@@ -91,17 +131,18 @@ _FLAG_RE = re.compile(r"^--?[A-Za-z]")
 _EXT_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,4}$")
 
 
+_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def _is_path(chunk: str) -> bool:
-    for sep in ("/", "\\"):
-        if sep not in chunk:
-            continue
-        if chunk.startswith(("/", "~", "./", "../", ".\\", "..\\")) or chunk.endswith(sep):
-            return True
-        if chunk.count(sep) >= 2 or _EXT_RE.search(chunk):
-            return True
-        if sep == "\\" and re.match(r"^[A-Za-z]:\\", chunk):
-            return True
-    return False
+    # Prose has no backslash: any chunk with one is a Windows path (a\b too).
+    if "\\" in chunk or _DRIVE_RE.match(chunk):
+        return True
+    if "/" not in chunk:
+        return False
+    if chunk.startswith(("/", "~", "./", "../")) or chunk.endswith("/"):
+        return True
+    return chunk.count("/") >= 2 or bool(_EXT_RE.search(chunk))
 
 
 def _is_shell(chunk: str) -> bool:
@@ -125,9 +166,10 @@ def prose_text(prompt: str) -> str:
     """``prompt`` without code fences, paths, URLs and command lines.
 
     A backtick span goes when it holds a path or a shell chunk (a bare
-    identifier in backticks is prose: it is often the subject). A line goes
-    whole when at least a third of its chunks, and at least two, are paths
-    or shell chunks; otherwise only those chunks go."""
+    identifier in backticks is prose: it is often the subject). A command
+    line goes whole: at least one shell chunk, and at least a third of its
+    chunks, and two, paths or shell chunks. Otherwise only those chunks go:
+    a line naming paths keeps its prose."""
     text = _FENCE_RE.sub(" ", prompt or "")
 
     def _tick(m: re.Match[str]) -> str:
@@ -140,7 +182,7 @@ def prose_text(prompt: str) -> str:
         chunks = line.split()
         kinds = [_chunk_kind(c) for c in chunks]
         odd = sum(1 for k in kinds if k != "prose")
-        if odd >= 2 and 3 * odd >= len(chunks):
+        if "shell" in kinds and odd >= 2 and 3 * odd >= len(chunks):
             continue
         lines.append(" ".join(c for c, k in zip(chunks, kinds) if k == "prose"))
     return "\n".join(lines)
@@ -155,16 +197,14 @@ def note_prompt_term_hits(row: dict[str, Any], text: str, terms: Sequence[str]) 
     """Record which of ``terms`` the row's full ranking text names, before
     that text is dropped, as ``prompt_term_hits`` (a list of strings)."""
     blob = (text or "").lower()
-    row["prompt_term_hits"] = [
-        t for t in terms if re.search(_WORD_BOUNDARY.format(tok=re.escape(t)), blob)
-    ]
+    row["prompt_term_hits"] = [t for t in terms if _names(blob, t)]
 
 
 def token_hit_count(text: str, tokens: Sequence[str]) -> int:
     blob = (text or "").lower()
     n = 0
     for tok in tokens:
-        if re.search(_WORD_BOUNDARY.format(tok=re.escape(tok)), blob):
+        if _names(blob, tok):
             n += 1
     return n
 

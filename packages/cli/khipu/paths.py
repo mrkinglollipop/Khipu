@@ -345,6 +345,10 @@ def backup_local(*, dest: Path) -> dict:
                     if p.parent == src and (p.name == _SNAPSHOT_NAME
                                             or p.name.startswith(_SNAPSHOT_NAME + "-")):
                         continue
+                    # The replica's word-rarity table and its key are rebuilt
+                    # from the replica; a backup never carries them.
+                    if p.parent == src and p.name.startswith(_SNAPSHOT_NAME + ".term-df"):
+                        continue
                     # Another refresh's or export's temporary replica, or a
                     # sidecar of one, never went through the export.
                     if p.parent == src and (_replica_temp((p.name,)) or _EXPORT_SCRATCH.match(p.name)):
