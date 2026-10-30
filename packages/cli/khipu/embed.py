@@ -944,8 +944,13 @@ def embed_one(
     timeout: float = 120.0,
     delay: float = 2.0,
     input_type: str | None = None,
+    recheck=None,
 ) -> list[float]:
+    """``recheck``: as for ``embed_batch``; required of any caller whose text
+    derives from an episode, so a retry cannot send text forgotten meanwhile."""
     extra = {"input_type": input_type} if input_type else {}
+    if recheck is not None:
+        extra["recheck"] = recheck
     if input_type != "query":
         return embed_batch(
             [text], profile=profile, retries=retries, timeout=timeout, delay=delay, **extra,

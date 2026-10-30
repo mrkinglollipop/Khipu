@@ -95,3 +95,36 @@ def test_recheck_texts_follows_fenced_texts(registry):
     assert check() is True
     registry([42])
     assert check() is False
+
+
+def test_commitment_matching_stops_its_retry_after_a_forget(registry):
+    """The real caller: open-commitment matching embeds capture text through
+    ``embed_one``; a forget during its back-off must stop the retry too."""
+    from khipu import commitments
+
+    class Cur:
+        def execute(self, *a):
+            pass
+
+        def fetchall(self):
+            return []
+
+    sent: list[bytes] = []
+
+    def transport(url, data, headers, timeout):
+        sent.append(data)
+        if len(sent) == 1:
+            registry([42])
+            raise urllib.error.URLError("fake transient")
+        return b"{}"
+
+    spec = SimpleNamespace(provider="fake", dim=1, normalize="none")
+    with patch.object(embed, "_active_profile", return_value="fake"), \
+            patch.object(embed, "resolve_spec", return_value=spec), \
+            patch.dict(embed._BUILDERS, {"fake": lambda spec, part, it: ("fake://none", {"texts": part}, {})}), \
+            patch.object(embed, "_budget_take", return_value=None), \
+            patch.object(embed.time, "sleep", return_value=None), \
+            patch.object(embed, "_parse_vectors", return_value=[[1.0]]), \
+            patch.object(embed, "_transport", side_effect=transport):
+        assert commitments._cosine_scores(Cur(), "FAKE_SECRET_42", [7], episode_id=42) == {}
+    assert len(sent) == 1, "the retry after the forget must not send"

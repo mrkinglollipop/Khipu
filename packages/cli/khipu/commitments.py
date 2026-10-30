@@ -1614,7 +1614,8 @@ def _cosine_scores(cur, text: str, commitment_ids: list[int],
             [text], [None if episode_id is None else [episode_id]], "commitment")
         if sendable is None:
             return {}
-        vec = embed_one(sendable, profile=profile)
+        vec = embed_one(sendable, profile=profile, recheck=provider_text.recheck_texts(
+            [text], [[episode_id]], "commitment"))
         cur.execute(
             """
             SELECT ref, 1 - (embedding <=> %s::vector) AS score
