@@ -460,7 +460,9 @@ def test_a_jsonl_pending_note_from_one_turn_never_dates_the_next(home, tmp_path)
     assert _ag_ts() == [1000.0, 1100.0, 1200.0]
 
 
-def test_a_jsonl_turn_recorded_from_last_user_input_is_one_row_after_the_flush(home, tmp_path):
+def test_a_jsonl_turn_recorded_from_last_user_input_may_be_recorded_again_once_flushed(home, tmp_path):
+    """Text-alias suppression is gone on purpose: a duplicate owner-turn row is
+    acceptable, a lost one is not."""
     issuer = {"refused": "test"}
     tp = _transcript(tmp_path)
     tp.write_text("")
@@ -468,58 +470,22 @@ def test_a_jsonl_turn_recorded_from_last_user_input_is_one_row_after_the_flush(h
     assert first["prompt"] == "ship it" and _ag_ts() == [1000.0]
     _step(tp, "USER_INPUT", 1, "<USER_REQUEST>ship it</USER_REQUEST>")
     _step(tp, "PLANNER_RESPONSE", 2, "shipped")
-    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1004.0, issuer=issuer) is None
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1004.0, issuer=issuer)
     assert owner_turns.antigravity_late_turn(_pre(tp), "Stop", now=1005.0, issuer=issuer) is None
-    assert _ag_ts() == [1000.0]
+    assert _ag_ts() == [1000.0, 1004.0]
 
 
-def test_a_jsonl_last_user_input_alias_never_swallows_a_later_identical_turn(home, tmp_path):
+def test_a_jsonl_user_input_buried_under_more_than_the_chunk_is_still_recovered(home, tmp_path, monkeypatch):
+    """A USER_INPUT followed by more transcript than one read chunk before
+    PostInvocation was missed when only the tail was read."""
+    monkeypatch.setattr(owner_turns, "_AG_CHUNK", 4096)
     issuer = {"refused": "test"}
     tp = _transcript(tmp_path)
-    tp.write_text("")
-    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
-                                          issuer=issuer)["prompt"] == "again"
-    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>again</USER_REQUEST>")
-    _step(tp, "PLANNER_RESPONSE", 2, "done")
-    _step(tp, "USER_INPUT", 3, "<USER_REQUEST>again</USER_REQUEST>")
-    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "PostInvocation", now=2000.0, issuer=issuer)
-    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "Stop", now=2001.0, issuer=issuer) is None
-    assert _ag_ts() == [1000.0, 2000.0]
-
-
-def test_a_jsonl_alias_never_swallows_an_identical_turn_when_its_own_step_left_the_tail(home, tmp_path, monkeypatch):
-    """Codex 2026-10-29: A flushed, then more transcript than the tail read,
-    then an identical B. A's step is out of sight, so B is recorded."""
-    monkeypatch.setattr(owner_turns, "_AG_TAIL", 4096)
-    issuer = {"refused": "test"}
-    tp = _transcript(tmp_path)
-    tp.write_text("")
-    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
-                                          issuer=issuer)["prompt"] == "again"
-    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>again</USER_REQUEST>")
-    for i in range(2, 12):
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>find me</USER_REQUEST>")
+    for i in range(2, 30):
         _step(tp, "PLANNER_RESPONSE", i, "x" * 1000)
-    _step(tp, "USER_INPUT", 12, "<USER_REQUEST>again</USER_REQUEST>")
-    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=12), "PostInvocation", now=2000.0, issuer=issuer)
-    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=12), "Stop", now=2001.0, issuer=issuer) is None
-    assert _ag_ts() == [1000.0, 2000.0]
-
-
-def test_a_jsonl_alias_never_swallows_an_identical_turn_after_an_unindexed_step(home, tmp_path):
-    """Codex 2026-10-29: A flushed with no step_index, then an identical
-    indexed B. A cannot be told apart from B, so B is recorded."""
-    issuer = {"refused": "test"}
-    tp = _transcript(tmp_path)
-    tp.write_text("")
-    assert owner_turns.antigravity_prompt(_pre(tp, lastUserInput="again"), now=1000.0, wait=0,
-                                          issuer=issuer)["prompt"] == "again"
-    with tp.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"type": "USER_INPUT", "content": "<USER_REQUEST>again</USER_REQUEST>"}) + "\n")
-    _step(tp, "PLANNER_RESPONSE", 2, "done")
-    _step(tp, "USER_INPUT", 3, "<USER_REQUEST>again</USER_REQUEST>")
-    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "PostInvocation", now=2000.0, issuer=issuer)
-    assert owner_turns.antigravity_late_turn(_pre(tp, initialNumSteps=3), "Stop", now=2001.0, issuer=issuer) is None
-    assert _ag_ts() == [1000.0, 2000.0]
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1000.0, issuer=issuer)
+    assert _ag_ts() == [1000.0]
 
 
 # ---- verify -----------------------------------------------------------------------------

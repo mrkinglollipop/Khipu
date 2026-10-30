@@ -910,7 +910,9 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
 # to do nothing. It never depends on ``invocationNum``, which the docs count per
 # turn and the ACP runtime counts per session.
 
-_AG_TAIL = 4 << 20
+_AG_CHUNK = 4 << 20
+# Longest stretch of transcript searched for the newest USER_INPUT.
+_AG_MAX_SCAN = 512 << 20
 _AG_WRAP = re.compile(r"^\s*<USER_REQUEST>(.*)</USER_REQUEST>\s*$", re.S)
 _AG_MARKER_KEEP_S = 3 * 24 * 3600
 # PreInvocation can fire before the USER_INPUT step reaches the transcript;
@@ -933,26 +935,14 @@ def _ag_text(content) -> str:
 
 
 def _ag_last_user_input(path: str) -> tuple[str, str] | None:
-    """(step key, text) of the newest USER_INPUT step in a transcript, reading
-    only its tail. None when there is none or the file cannot be read. A
+    """(step key, text) of the newest USER_INPUT step in a transcript, read
+    from the end. None when there is none or the file cannot be read. A
     ``.db`` path is T3's SQLite trajectory (``antigravity_db``)."""
     if antigravity_db.is_db(path):
         return antigravity_db.last_user_input(path)
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            start = max(0, size - _AG_TAIL)
-            fh.seek(start)
-            data = fh.read()
-    except OSError:
-        return None
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    if start > 0 and lines:
-        lines = lines[1:]  # the first line of a mid-file read is a fragment
-    for number in range(len(lines) - 1, -1, -1):
+    for line in _ag_lines_newest_first(path):
         try:
-            step = json.loads(lines[number])
+            step = json.loads(line)
         except ValueError:
             continue
         if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
@@ -971,39 +961,29 @@ def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     return None
 
 
-def _ag_own_step(path: str, at_least: int) -> int | None:
-    """Index of the first user step numbered ``at_least`` or more, only when
-    the whole transcript proves it: every user step read, each with an index.
-    None when any user step is unreadable or unindexed, or none qualifies."""
-    if antigravity_db.is_db(path):
-        steps = antigravity_db.user_steps(path)
-        if steps is None:
-            return None
-    else:
-        steps = []
-        try:
-            with open(path, "rb") as fh:
-                for raw in fh:
-                    if b"USER_INPUT" not in raw:
-                        continue
-                    try:
-                        step = json.loads(raw)
-                    except ValueError:
-                        return None
-                    if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
-                        continue
-                    text = _ag_text(step.get("content"))
-                    wrapped = _AG_WRAP.match(text)
-                    if not (wrapped.group(1) if wrapped else text).strip():
-                        continue
-                    index = step.get("step_index")
-                    if not isinstance(index, int) or isinstance(index, bool):
-                        return None
-                    steps.append(index)
-        except OSError:
-            return None
-    later = [i for i in steps if i >= at_least]
-    return min(later) if later else None
+def _ag_lines_newest_first(path: str):
+    """Lines of a JSONL transcript, newest first, read backwards in chunks so
+    a long run of steps after the USER_INPUT does not hide it. Stops after
+    ``_AG_MAX_SCAN`` bytes; an unreadable file yields nothing."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            end = fh.tell()
+            floor = max(0, end - _AG_MAX_SCAN)
+            carry = b""
+            while end > floor:
+                start = max(floor, end - _AG_CHUNK)
+                fh.seek(start)
+                data = fh.read(end - start) + carry
+                end = start
+                parts = data.split(b"\n")
+                # The first part may be the tail of a line that began earlier.
+                carry = parts[0] if start > 0 else b""
+                for raw in reversed(parts[1:] if start > 0 else parts):
+                    if raw.strip():
+                        yield raw.decode("utf-8", errors="replace")
+    except OSError:
+        return
 
 
 def _ag_flush_wait() -> float:
@@ -1022,10 +1002,9 @@ def _ag_flush_wait() -> float:
 _AG_PENDING_KEEP_S = 3600
 _AG_PENDING_MAX = 32
 # A turn recorded from the payload's ``lastUserInput`` (no USER_INPUT step in
-# the transcript yet) is keyed by its text. Its alias keeps that text and the
-# payload's ``initialNumSteps``: the turn's own step, once flushed, is the
-# first USER_INPUT step at or after that count, and only that step is known as
-# already recorded, so a later identical turn is never taken for it.
+# the transcript yet) is keyed by its text. Its own step, once flushed, is
+# recorded again under its step key: a duplicate row is acceptable, a lost
+# turn is not.
 _AG_FALLBACK = "last-"
 
 
@@ -1038,10 +1017,6 @@ def _ag_dir() -> Path:
 
 def _ag_file(directory: Path, kind: str, session: str) -> Path:
     return directory / (kind + hashlib.sha256(session.encode("utf-8", "replace")).hexdigest()[:40])
-
-
-def _ag_text_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _ag_step_number(key: str) -> int | None:
@@ -1103,11 +1078,10 @@ def _ag_clear_unseen(session: str) -> None:
         pass
 
 
-def _ag_claim(session: str, key: str, text: str, now: float, payload: dict) -> float | None:
+def _ag_claim(session: str, key: str, now: float) -> float | None:
     """Create the turn's once-per-turn marker. The turn's time when this call
     created it (the note's when a PreInvocation of this same turn could not
-    read it), None when the turn was already handled, including a turn
-    recorded earlier from ``lastUserInput`` whose own step is now flushed."""
+    read it), None when the turn was already handled."""
     directory = _ag_dir()
     marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
     try:
@@ -1120,34 +1094,6 @@ def _ag_claim(session: str, key: str, text: str, now: float, payload: dict) -> f
                 old.unlink()
         except OSError:
             continue
-    alias = _ag_file(directory, "alias-", session)
-    if key.startswith(_AG_FALLBACK):
-        # The fallback only runs when the transcript shows no USER_INPUT step,
-        # so with no step count the turn's step is the transcript's first.
-        try:
-            _ag_write(alias, json.dumps({"text": _ag_text_hash(text), "from": _ag_initial_steps(payload) or 0}))
-        except OSError:
-            pass
-    else:
-        try:
-            earlier = json.loads(alias.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            earlier = None
-        index = _ag_step_number(key)
-        start = earlier.get("from") if isinstance(earlier, dict) else None
-        if not isinstance(start, int) or isinstance(start, bool) or index is None or index >= start:
-            # Spent by the first step claimed at or after the turn's count. It
-            # matches only that turn's own step (the first USER_INPUT there),
-            # proven from the whole transcript; anything less is recorded,
-            # since a duplicate row is recoverable and a lost turn is not.
-            try:
-                alias.unlink()
-            except OSError:
-                pass
-            tp = hook_shape.transcript_path(payload)
-            if (isinstance(start, int) and index is not None and earlier.get("text") == _ag_text_hash(text)
-                    and tp and _ag_own_step(tp, start) == index):
-                return None
     at = now
     index = _ag_step_number(key)
     if index is not None:
@@ -1185,7 +1131,7 @@ def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] 
         wrapped = _AG_WRAP.match(last)
         text = (wrapped.group(1) if wrapped else last).strip()
         if text:
-            found = (_AG_FALLBACK + _ag_text_hash(last), text)
+            found = (_AG_FALLBACK + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], text)
     return session, found
 
 
@@ -1209,7 +1155,7 @@ def _antigravity_turn(payload, now: float | None, wait: float | None):
     if found is None:
         return None, None, (session, _ag_initial_steps(payload))
     key, text = found
-    at = _ag_claim(session, key, text, time.time() if now is None else now, payload)
+    at = _ag_claim(session, key, time.time() if now is None else now)
     if at is None:
         # Already handled, or the newest step is the last turn's and this
         # call's own turn is not written yet.
@@ -1252,7 +1198,7 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
         stamp = time.time() if now is None else now
         recorded = None
         if found is not None:
-            at = _ag_claim(session, found[0], found[1], stamp, payload)
+            at = _ag_claim(session, found[0], stamp)
             if at is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}

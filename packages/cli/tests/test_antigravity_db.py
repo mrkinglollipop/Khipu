@@ -228,52 +228,17 @@ def test_a_pending_note_from_a_model_call_of_one_turn_never_dates_the_next_turn(
     assert [r["ts"] for r in _rows()] == [1000.0, 1100.0, 1200.0]
 
 
-def test_a_turn_recorded_from_last_user_input_is_not_recorded_again_once_flushed(home):
+def test_a_turn_recorded_from_last_user_input_may_be_recorded_again_once_flushed(home):
+    """Text-alias suppression is gone on purpose: a duplicate row is acceptable,
+    a lost turn is not."""
     path = make_db(db_path(home), [], wal=True)
     first = owner_turns.antigravity_prompt(_pre(path, lastUserInput="fix the build"), now=1000.0, wait=0,
                                            issuer=ISSUER)
     assert first["prompt"] == "fix the build" and len(_rows()) == 1
     _add(path, 0, 14, user_payload("fix the build"))
-    assert owner_turns.antigravity_late_turn(_pre(path), "PostInvocation", now=1004.0, issuer=ISSUER) is None
+    assert owner_turns.antigravity_late_turn(_pre(path), "PostInvocation", now=1004.0, issuer=ISSUER)
     assert owner_turns.antigravity_late_turn(_pre(path), "Stop", now=1005.0, issuer=ISSUER) is None
-    assert [r["ts"] for r in _rows()] == [1000.0]
-    # The same words sent again later are a new turn.
-    _add(path, 1, 15, model_payload("done"))
-    _add(path, 2, 14, user_payload("fix the build"))
-    assert owner_turns.antigravity_prompt(_pre(path, initialNumSteps=2), now=2000.0, wait=0,
-                                          issuer=ISSUER)["prompt"] == "fix the build"
-    assert [r["ts"] for r in _rows()] == [1000.0, 2000.0]
-
-
-def test_a_last_user_input_alias_never_swallows_a_later_identical_turn(home):
-    """Codex 2026-10-29: A is recorded from lastUserInput while the transcript
-    is empty; before another hook reads, A flushes at step 0 and an identical B
-    at step 2. The newest step is B's, so B is recorded, not taken for A."""
-    path = make_db(db_path(home), [], wal=True)
-    assert owner_turns.antigravity_prompt(_pre(path, lastUserInput="again"), now=1000.0, wait=0,
-                                          issuer=ISSUER)["prompt"] == "again"
-    _add(path, 0, 14, user_payload("again"))
-    _add(path, 1, 15, model_payload("done"))
-    _add(path, 2, 14, user_payload("again"))
-    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=2), "PostInvocation", now=2000.0,
-                                             issuer=ISSUER)
-    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=2), "Stop", now=2001.0, issuer=ISSUER) is None
-    assert [r["ts"] for r in _rows()] == [1000.0, 2000.0]
-
-
-def test_a_last_user_input_alias_never_swallows_an_identical_turn_after_an_unreadable_step(home):
-    """A's own step is in the db but its payload cannot be decoded, so the
-    first readable user step is B's; nothing proves B is A, so B is recorded."""
-    path = make_db(db_path(home), [], wal=True)
-    assert owner_turns.antigravity_prompt(_pre(path, lastUserInput="again"), now=1000.0, wait=0,
-                                          issuer=ISSUER)["prompt"] == "again"
-    _add(path, 0, 14, b"\x00\x01")
-    _add(path, 1, 15, model_payload("done"))
-    _add(path, 2, 14, user_payload("again"))
-    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=2), "PostInvocation", now=2000.0,
-                                             issuer=ISSUER)
-    assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=2), "Stop", now=2001.0, issuer=ISSUER) is None
-    assert [r["ts"] for r in _rows()] == [1000.0, 2000.0]
+    assert [r["ts"] for r in _rows()] == [1000.0, 1004.0]
 
 
 def test_late_events_ignore_other_harnesses_and_prompted_payloads(home):
