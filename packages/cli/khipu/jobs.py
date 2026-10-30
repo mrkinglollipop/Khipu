@@ -514,8 +514,8 @@ def _recall_eval_step() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - a failed measurement must not stop the nightly
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     out = {k: rec[k] for k in ("ok", "entries", "scored", "skipped_forgotten", "skipped_ids",
-                               "skipped_malformed", "truncated", "offline", "paths", "golden",
-                               "error") if k in rec}
+                               "skipped_malformed", "truncated", "stopped_child", "offline", "paths",
+                               "not_measured", "golden", "error") if k in rec}
     if rec.get("transient"):
         # No replica or no readable golden file tonight: the doctor's recall
         # row shows it yellow; the nightly step is put off, not failed.

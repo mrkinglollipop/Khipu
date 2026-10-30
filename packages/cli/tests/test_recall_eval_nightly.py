@@ -1,11 +1,15 @@
 """The nightly recall measurement: step record, doctor row thresholds,
 forgotten-id skipping and ``recall eval --install``. Fake data throughout:
-the replica is an in-memory sqlite and the scorer is stubbed."""
+the replica is an in-memory sqlite and the scorer is stubbed. Scoring runs in
+a spawned child, so stubs are installed there by module-level ``_child_*``
+functions passed as ``child_setup``; what the child saw comes back through a
+file."""
 from __future__ import annotations
 
 import json
 import sqlite3
 import stat
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -39,52 +43,70 @@ def _write_golden(path, entries):
     path.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
 
 
-def _stub_scorer(monkeypatch, hit_for=lambda entry, path: True, stale=False):
-    seen = []
-
+def _child_fake_scorer(seen_file, misses=(), stale=False, boom=()):
     def fake(entry, path, **_k):
-        seen.append((entry["query"], path))
-        hit = hit_for(entry, path)
+        if entry["query"] in boom:
+            raise ValueError("bad entry")
+        with open(seen_file, "a", encoding="utf-8") as out:
+            out.write(json.dumps([entry["query"], path]) + "\n")
+        hit = entry["query"] not in misses
         return {"expect_none": bool(entry.get("expect_none")), "hit": hit,
                 "reciprocal_rank": 1.0 if hit else 0.0, "abstain_correct": True,
                 "stale_violation": stale, "timeout": False, "error": False, "degraded": None,
                 "outcome": "match", "ms": 1.0, "payload_chars": 10}
 
-    monkeypatch.setattr(recall_eval, "eval_one_path", fake)
-    return seen
+    recall_eval.eval_one_path = fake
 
 
-def test_step_records_per_path_figures_and_golden_stat(world, monkeypatch):
+def _stub_scorer(tmp, **kwargs):
+    """A child setup that stubs the scorer, and a reader of the (query, path)
+    pairs the child scored."""
+    seen_file = tmp / f"seen-{time.monotonic_ns()}.jsonl"
+
+    def seen():
+        if not seen_file.exists():
+            return []
+        return [tuple(json.loads(line)) for line in seen_file.read_text().splitlines()]
+
+    args = (str(seen_file), tuple(kwargs.get("misses", ())), bool(kwargs.get("stale")),
+            tuple(kwargs.get("boom", ())))
+    return (_child_fake_scorer, args), seen
+
+
+def test_step_records_per_path_figures_and_golden_stat(world):
     tmp, golden = world
     _write_golden(golden, [{"query": f"q{i}", "expect": ["1"]} for i in range(4)]
                   + [{"query": "none", "expect_none": True}])
-    _stub_scorer(monkeypatch, hit_for=lambda e, p: e["query"] != "q0")
-    rec = ren.run_nightly_eval(golden=golden)
+    setup, seen = _stub_scorer(tmp, misses=("q0",))
+    rec = ren.run_nightly_eval(golden=golden, child_setup=setup)
     assert rec["ok"] and rec["entries"] == 5 and rec["scored"] == 5
-    assert set(rec["paths"]) == set(recall_eval.ALL_PATHS)
+    assert set(rec["paths"]) == set(ren.MEASURED_PATHS) and "explicit" not in rec["paths"]
+    assert rec["not_measured"] == {"explicit": {"needs_hub": 5}}
+    assert {p for _, p in seen()} == set(ren.MEASURED_PATHS)  # the search tool is never run
     assert rec["paths"]["prompt"]["hit_rate"] == 0.75
     assert rec["paths"]["prompt"]["abstain_correct"] == 1
     assert rec["golden"]["bytes"] == golden.stat().st_size and rec["golden"]["mtime"]
     assert rec["previous"] is None
-    second = ren.run_nightly_eval(golden=golden)
+    second = ren.run_nightly_eval(golden=golden, child_setup=setup)
     assert second["previous"]["paths"]["prompt"]["hit_rate"] == 0.75
 
 
-def test_history_keeps_30_records_and_never_holds_a_query(world, monkeypatch):
+def test_history_keeps_30_records_and_never_holds_a_query(world):
     tmp, golden = world
     _write_golden(golden, [{"query": "very private words", "expect": ["1"]}])
-    _stub_scorer(monkeypatch)
-    for _ in range(35):
-        ren.run_nightly_eval(golden=golden)
+    ren._write_history([{"ts": f"2026-10-{i:02d}T00:00:00+00:00", "ok": True, "paths": {}}
+                        for i in range(1, 35)])
+    setup, _ = _stub_scorer(tmp)
+    rec = ren.run_nightly_eval(golden=golden, child_setup=setup)
     hist = ren.history_path()
-    assert len(ren.read_history()) == 30
+    assert rec["scored"] == 1 and len(ren.read_history()) == 30
     assert "very private words" not in hist.read_text()
     assert stat.S_IMODE(hist.stat().st_mode) == 0o600
 
 
-def test_whole_step_makes_no_network_hub_or_provider_call(world, monkeypatch):
-    """The real scorers run end to end against a fake replica; the lowest
-    real exits are spies that must never fire, and the query never reaches one."""
+def _child_real_scorers_with_spies(calls_file):
+    """Inside the child, before its guard: the lowest real exits become spies
+    that log and raise, and the replica is the fake one."""
     import socket
     import subprocess
     import urllib.request
@@ -93,40 +115,127 @@ def test_whole_step_makes_no_network_hub_or_provider_call(world, monkeypatch):
 
     from khipu import embed, hub_reach
 
+    def spy(name):
+        def fn(*a, **_k):
+            with open(calls_file, "a", encoding="utf-8") as out:
+                out.write(name + ":" + repr(a)[:200] + "\n")
+            raise AssertionError(f"{name} reached")
+        return fn
+
+    psycopg.connect = spy("psycopg.connect")
+    socket.socket.connect = spy("socket.connect")
+    socket.socket.connect_ex = spy("socket.connect_ex")
+    socket.create_connection = spy("create_connection")
+    socket.getaddrinfo = spy("getaddrinfo")
+    subprocess.Popen = spy("Popen")
+    embed._transport = spy("embed._transport")
+    embed.embed_one = spy("embed.embed_one")
+    urllib.request.urlopen = spy("urlopen")
+    hub_reach.note_unreachable = spy("note_unreachable")
+    hub_reach.note_reachable = spy("note_reachable")
+    hub_snapshot.open_snapshot = lambda **_k: _replica()
+
+
+def test_whole_step_makes_no_network_hub_or_provider_call(world):
+    """The real scorers run end to end in the child against a fake replica;
+    the lowest real exits are spies that must never fire, and the query never
+    reaches one."""
     tmp, golden = world
     secret = "zebra-private-golden-words"
     _write_golden(golden, [{"query": secret, "expect": ["1"]},
                            {"query": secret + " two", "expect_none": True}])
-    calls: list[str] = []
-
-    def spy(name):
-        def fn(*a, **_k):
-            calls.append(name + ":" + repr(a)[:200])
-            raise AssertionError(f"{name} reached")
-        return fn
-
-    monkeypatch.setattr(psycopg, "connect", spy("psycopg.connect"))
-    monkeypatch.setattr(socket.socket, "connect", spy("socket.connect"))
-    monkeypatch.setattr(socket.socket, "connect_ex", spy("socket.connect_ex"))
-    monkeypatch.setattr(socket, "create_connection", spy("create_connection"))
-    monkeypatch.setattr(socket, "getaddrinfo", spy("getaddrinfo"))
-    monkeypatch.setattr(subprocess, "Popen", spy("Popen"))
-    monkeypatch.setattr(embed, "_transport", spy("embed._transport"))
-    monkeypatch.setattr(urllib.request, "urlopen", spy("urlopen"))
-    monkeypatch.setattr(hub_reach, "note_unreachable", spy("note_unreachable"))
-    monkeypatch.setattr(hub_reach, "note_reachable", spy("note_reachable"))
-    spies = {name: getattr(obj, name) for obj, name in (
-        (psycopg, "connect"), (socket, "getaddrinfo"), (subprocess, "Popen"))}
-
-    rec = ren.run_nightly_eval(golden=golden, budget_s=60)
-
-    assert calls == []
-    assert rec["scored"] == 2 and not rec["truncated"]
-    assert rec["offline"]["hub"] > 0  # the explicit path asked for the hub and was refused
-    assert set(rec["paths"]) == set(recall_eval.ALL_PATHS)
-    for obj, name in ((psycopg, "connect"), (socket, "getaddrinfo"), (subprocess, "Popen")):
-        assert getattr(obj, name) is spies[name]
+    calls = tmp / "calls.log"
+    rec = ren.run_nightly_eval(golden=golden, budget_s=60,
+                               child_setup=(_child_real_scorers_with_spies, (str(calls),)))
+    assert not calls.exists(), calls.read_text()
+    assert rec["ok"] and rec["scored"] == 2 and not rec["truncated"]
+    assert set(rec["paths"]) == set(ren.MEASURED_PATHS)
+    assert rec["not_measured"]["explicit"] == {"needs_hub": 2}
     assert secret not in ren.history_path().read_text()
+
+
+def _child_abandoning_scorer(marker_dir, release_at):
+    """Opus's scenario: a lookup that outlives the deadline on its own thread
+    and then makes an embedding call with the golden query. The spy stands in
+    for the real embed_one; the guard is installed over it afterwards."""
+    import pathlib
+
+    from khipu import embed
+
+    marks = pathlib.Path(marker_dir)
+
+    def real_embed(query, **_k):
+        (marks / "real-call").write_text(query)
+        return [0.0]
+
+    def stuck(query, entry, **_k):
+        (marks / "started").write_text("1")
+        while time.monotonic() < release_at:
+            time.sleep(0.05)
+        embed.embed_one(query, input_type="query")
+        return {}
+
+    embed.embed_one = real_embed
+    recall_eval._call_prompt_or_status = stuck
+
+
+def test_a_lookup_thread_outliving_the_deadline_never_reaches_a_real_exit(world):
+    tmp, golden = world
+    _write_golden(golden, [{"query": "abandoned-secret", "expect": ["1"], "paths": ["prompt"]}])
+    budget = 1.5
+    release_at = time.monotonic() + budget + 0.5
+    rec = ren.run_nightly_eval(golden=golden, budget_s=budget,
+                               child_setup=(_child_abandoning_scorer, (str(tmp), release_at)))
+    assert rec["truncated"] and rec["scored"] == 0
+    while time.monotonic() < release_at + 1.5:
+        time.sleep(0.1)
+    assert (tmp / "started").exists()  # the lookup really ran and was abandoned
+    assert not (tmp / "real-call").exists()
+    assert "abandoned-secret" not in ren.history_path().read_text()
+
+
+def _child_blocked_scorer(marker_dir):
+    import pathlib
+
+    def blocked(*_a, **_k):
+        (pathlib.Path(marker_dir) / "started").write_text("1")
+        time.sleep(60)
+
+    recall_eval.eval_one_path = blocked
+
+
+def test_a_stuck_scorer_is_killed_and_the_step_returns_by_the_deadline(world):
+    tmp, golden = world
+    _write_golden(golden, [{"query": "q", "expect": ["1"]}])
+    budget = 1.5
+    t0 = time.monotonic()
+    rec = ren.run_nightly_eval(golden=golden, budget_s=budget,
+                               child_setup=(_child_blocked_scorer, (str(tmp),)))
+    assert time.monotonic() - t0 < budget + 2
+    assert (tmp / "started").exists()
+    assert rec["truncated"] and rec["stopped_child"] and rec["scored"] == 0
+    assert ren.read_history()[-1]["truncated"] is True
+
+
+def _child_hub_fallback(_unused=None):
+    def answer(query, entry, **_k):
+        if query == "falls back":
+            hub_snapshot.try_hub_connect()  # refused by the guard: raises
+        return {"hits": [{"id": "1"}], "legs": ["lexical"]}
+
+    recall_eval._call_prompt_or_status = answer
+
+
+def test_a_lookup_that_falls_back_to_the_hub_is_not_measured_not_an_error(world):
+    tmp, golden = world
+    _write_golden(golden, [{"query": "falls back", "expect": ["1"], "paths": ["prompt", "status"]},
+                           {"query": "replica", "expect": ["1"], "paths": ["prompt", "status"]}])
+    rec = ren.run_nightly_eval(golden=golden, child_setup=(_child_hub_fallback, ()))
+    assert rec["scored"] == 2 and rec["offline"]["hub"] == 2
+    assert rec["not_measured"] == {"prompt": {"hub_fallback": 1}, "status": {"hub_fallback": 1}}
+    for p in ("prompt", "status"):
+        assert rec["paths"][p]["total"] == 1 and rec["paths"][p]["errors"] == 0
+        assert rec["paths"][p]["hit_rate"] == 1.0
 
 
 def test_offline_guard_refuses_and_counts_every_exit_then_restores(monkeypatch):
@@ -175,11 +284,11 @@ def test_entries_naming_forgotten_erased_or_deleted_ids_are_skipped_not_missed(w
         {"query": "live node", "expect": ["wiki:live-node"]},
         {"query": "library", "expect": ["library:books:doc#1"]},
     ])
-    seen = _stub_scorer(monkeypatch)
-    rec = ren.run_nightly_eval(golden=golden)
+    setup, seen = _stub_scorer(tmp)
+    rec = ren.run_nightly_eval(golden=golden, child_setup=setup)
     assert rec["skipped_forgotten"] == 4
     assert rec["skipped_ids"] == 4
-    assert {q for q, _ in seen} == {"alive", "partly", "live topic", "live node", "library"}
+    assert {q for q, _ in seen()} == {"alive", "partly", "live topic", "live node", "library"}
     assert rec["paths"]["prompt"]["hit_rate"] == 1.0
     text = ren.history_path().read_text()
     for ident in ("erased-topic-slug", "gone-topic", '"99"'):
@@ -196,30 +305,24 @@ def test_an_old_replica_without_topic_tables_judges_no_slug(world, monkeypatch):
 
     monkeypatch.setattr(hub_snapshot, "open_snapshot", bare)
     _write_golden(golden, [{"query": "slug", "expect": ["some-topic"]}])
-    _stub_scorer(monkeypatch)
-    assert ren.run_nightly_eval(golden=golden)["skipped_forgotten"] == 0
+    setup, _ = _stub_scorer(tmp)
+    assert ren.run_nightly_eval(golden=golden, child_setup=setup)["skipped_forgotten"] == 0
 
 
-def test_step_stops_at_its_time_budget(world, monkeypatch):
+def test_step_stops_at_its_time_budget(world):
     tmp, golden = world
     _write_golden(golden, [{"query": f"q{i}", "expect": ["1"]} for i in range(3)])
-    _stub_scorer(monkeypatch)
-    rec = ren.run_nightly_eval(golden=golden, budget_s=-1)
+    setup, seen = _stub_scorer(tmp)
+    rec = ren.run_nightly_eval(golden=golden, budget_s=-1, child_setup=setup)
+    assert seen() == []
     assert rec["truncated"] and rec["scored"] == 0
 
 
-def test_a_slow_entry_stops_inside_at_the_deadline(world, monkeypatch):
-    import time
-
-    tmp, golden = world
-    _write_golden(golden, [{"query": f"q{i}", "expect": ["1"], "paths": ["prompt"]} for i in range(3)])
-
+def _child_slow_lookup(durations_file):
     def slow(*_a, **_k):
-        time.sleep(1.0)
+        time.sleep(5.0)
         return {"hits": [{"id": "1"}], "legs": ["lexical"]}
 
-    monkeypatch.setattr(recall_eval, "_call_prompt_or_status", slow)
-    durations = []
     real = recall_eval.eval_one_path
 
     def timed(*a, **k):
@@ -227,17 +330,30 @@ def test_a_slow_entry_stops_inside_at_the_deadline(world, monkeypatch):
         try:
             return real(*a, **k)
         finally:
-            durations.append(time.monotonic() - t0)
+            with open(durations_file, "a", encoding="utf-8") as out:
+                out.write(f"{time.monotonic() - t0}\n")
 
-    monkeypatch.setattr(recall_eval, "eval_one_path", timed)
-    rec = ren.run_nightly_eval(golden=golden, budget_s=0.2)
+    recall_eval._call_prompt_or_status = slow
+    recall_eval.eval_one_path = timed
+
+
+def test_a_slow_entry_stops_inside_at_the_deadline(world):
+    tmp, golden = world
+    _write_golden(golden, [{"query": f"q{i}", "expect": ["1"], "paths": ["prompt"]} for i in range(3)])
+    durations = tmp / "durations.txt"
+    budget = 1.5
+    t0 = time.monotonic()
+    rec = ren.run_nightly_eval(golden=golden, budget_s=budget,
+                               child_setup=(_child_slow_lookup, (str(durations),)))
+    assert time.monotonic() - t0 < budget + 1
     assert rec["truncated"] and rec["scored"] == 0
-    assert durations and durations[0] < 0.7
-    assert rec["lingering_threads"] == 0
+    got = [float(x) for x in durations.read_text().split()]
+    assert got and got[0] < budget  # the entry stopped at the deadline, not after its 5 s lookup
+    assert rec["stopped_child"] is False  # the child stopped itself; nothing had to be killed
     assert ren.read_history()[-1]["truncated"] is True
 
 
-def test_malformed_golden_lines_are_skipped_and_counted_never_raised(world, monkeypatch):
+def test_malformed_golden_lines_are_skipped_and_counted_never_raised(world):
     tmp, golden = world
     golden.write_text("\n".join([
         json.dumps({"query": "fine", "expect": ["1"]}),
@@ -246,28 +362,20 @@ def test_malformed_golden_lines_are_skipped_and_counted_never_raised(world, monk
         "{not json",
         json.dumps({"query": "no expect"}),
     ]) + "\n", encoding="utf-8")
-    seen = _stub_scorer(monkeypatch)
-    rec = ren.run_nightly_eval(golden=golden)
+    setup, seen = _stub_scorer(tmp)
+    rec = ren.run_nightly_eval(golden=golden, child_setup=setup)
     assert rec["ok"] and rec["entries"] == 5 and rec["scored"] == 1
     assert rec["skipped_malformed"] == 4
     assert rec["malformed"] == {"bad_k": 1, "bad_paths": 1, "bad_json": 1, "bad_expect": 1}
-    assert {q for q, _ in seen} == {"fine"}
+    assert {q for q, _ in seen()} == {"fine"}
     assert "bad k" not in ren.history_path().read_text()
 
 
-def test_a_scorer_crash_skips_the_entry_and_history_is_still_written(world, monkeypatch):
+def test_a_scorer_crash_skips_the_entry_and_history_is_still_written(world):
     tmp, golden = world
     _write_golden(golden, [{"query": "boom", "expect": ["1"]}, {"query": "fine", "expect": ["1"]}])
-
-    def fake(entry, path, **_k):
-        if entry["query"] == "boom":
-            raise ValueError("bad entry")
-        return {"expect_none": False, "hit": True, "reciprocal_rank": 1.0, "abstain_correct": None,
-                "stale_violation": False, "timeout": False, "error": False, "degraded": None,
-                "outcome": "match", "ms": 1.0, "payload_chars": 1}
-
-    monkeypatch.setattr(recall_eval, "eval_one_path", fake)
-    rec = ren.run_nightly_eval(golden=golden)
+    setup, _ = _stub_scorer(tmp, boom=("boom",))
+    rec = ren.run_nightly_eval(golden=golden, child_setup=setup)
     assert rec["skipped_malformed"] == 1 and rec["scored"] == 1
     assert len(ren.read_history()) == 1
 
@@ -344,6 +452,18 @@ def test_doctor_row_levels(world, kwargs, level):
     assert row["summary"]
 
 
+def test_doctor_row_counts_hub_fallbacks_as_not_measured_never_as_failures(world):
+    rec = {"ts": (NOW - timedelta(hours=2)).isoformat(), "ok": True, "entries": 25,
+           "truncated": False, "previous": {"paths": {"prompt": {"hit_rate": 0.9}}},
+           "paths": {"prompt": {"total": 0, "hit_rate": 0.0, "abstain_total": 0,
+                                "stale_violations": 0, "errors": 0, "timeouts": 0}},
+           "not_measured": {"prompt": {"hub_fallback": 25}, "explicit": {"needs_hub": 25}}}
+    ren._write_history([rec])
+    row = ren.recall_eval_health(now=NOW)
+    assert row["level"] == "yellow" and row["ok"]
+    assert "needed the hub" in row["summary"] and "failed" not in row["summary"]
+
+
 def test_doctor_row_before_any_run_is_yellow(world, monkeypatch):
     monkeypatch.setattr("khipu.jobs._is_index_sync_host", lambda: True)
     row = ren.recall_eval_health(now=NOW)
@@ -371,8 +491,8 @@ def test_a_stopped_or_failed_run_is_never_the_baseline(world, monkeypatch):
          "paths": {"prompt": {"hit_rate": 0.1}}},
         {"ts": "2026-10-29T01:00:00+00:00", "ok": False, "paths": {}},
     ])
-    _stub_scorer(monkeypatch)
-    rec = ren.run_nightly_eval(golden=golden)
+    setup, _ = _stub_scorer(tmp)
+    rec = ren.run_nightly_eval(golden=golden, child_setup=setup)
     assert rec["previous"]["paths"]["prompt"]["hit_rate"] == 0.9
 
 

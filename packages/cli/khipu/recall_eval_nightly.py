@@ -8,24 +8,36 @@ the run adds no hub load and cannot be slowed by an outage. Entries whose
 expected ids are now forgotten, erased or deleted are skipped, never counted
 as misses (a forgotten episode that no longer answers is the forget working).
 
+Scoring runs in a spawned child process with the guard installed inside it,
+and the child is killed at the deadline: a lookup thread that outlives the
+deadline dies with the child, so it can never reach a real exit after the
+guard would have come off, and the step returns by deadline + KILL_GRACE_S.
+
 ``<data dir>/state/recall-eval-history.json`` keeps the last 30 run records:
 figures, counts and the golden file's size and mtime. It never holds a query
 or an id, so it is not owner text and forget has nothing to scan in it.
+A record's ``paths`` holds figures only for the paths the replica can answer
+(``MEASURED_PATHS``). ``not_measured`` counts lookups left out of every
+figure, by path and reason: ``needs_hub`` (the search-tool path, which only
+the hub answers, is never run) and ``hub_fallback`` (a replica lookup that
+reached for the hub, was refused and failed). Neither is a found/missed
+result or an error, so the doctor's hit rate and failure share never count
+them.
 """
 from __future__ import annotations
 
 import contextlib
 import json
+import multiprocessing
 import os
 import shutil
 import socket
 import subprocess
 import tempfile
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from khipu import recall_eval
 from khipu.lines import split_lines
@@ -35,9 +47,14 @@ BUDGET_S = 300
 MIN_ENTRIES = 20
 STALE_AFTER_H = 48
 ALLOWED_DROP = 0.05
-LINGER_WAIT_S = 30.0
+KILL_GRACE_S = 1.0
 FAILED_SHARE = 0.25
 HIT_FLOOR = 0.6
+# The search-tool path (hybrid_search) only reads the hub; offline it can only
+# fail, so the nightly never runs it and counts it under ``needs_hub``.
+MEASURED_PATHS = tuple(p for p in recall_eval.ALL_PATHS if p != recall_eval.PATH_EXPLICIT)
+_ROW_FIELDS = ("expect_none", "hit", "reciprocal_rank", "abstain_correct", "stale_violation",
+               "timeout", "error", "degraded", "outcome", "ms", "payload_chars")
 GOLDEN_TEMP_PREFIX = ".recall-golden."
 BACKUP_NAME = ".recall-golden.bak.tmp"
 _KEPT_METRICS = ("total", "hits", "hit_rate", "mrr", "abstain_total", "abstain_correct",
@@ -133,17 +150,6 @@ def _offline():
     finally:
         for obj, name, real in saved:
             setattr(obj, name, real)
-
-
-def _join_new_threads(before: set[int], wait_s: float) -> int:
-    """Wait (bounded) for threads the run started, so none is still reaching
-    for a refused path when the guard comes off. Returns how many remain."""
-    end = time.monotonic() + wait_s
-    for t in threading.enumerate():
-        if t.ident not in before and t is not threading.current_thread():
-            t.join(max(0.0, end - time.monotonic()))
-    return sum(1 for t in threading.enumerate() if t.ident not in before and t.is_alive()
-               and t is not threading.current_thread())
 
 
 def _row_exists(con, sql: str, arg: Any) -> tuple[bool, Any] | None:
@@ -274,23 +280,99 @@ def _previous_figures(history: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-def _score_entry(entry: dict[str, Any], deadline: float) -> list[tuple[str, dict[str, Any]]] | None:
-    """Every applicable path's row for one entry; None when the deadline
-    stopped it mid-entry (its partial rows are dropped, not counted)."""
-    rows = []
-    for p in recall_eval.ALL_PATHS:
+def _score_entry(entry: dict[str, Any], deadline: float,
+                 guard: _Offline) -> list[tuple[str, dict[str, Any] | None]] | None:
+    """Every measured path's row for one entry, trimmed to the summary fields
+    (no query, no id); a row is None when that lookup reached for the hub,
+    was refused and failed (not measured). None overall when the deadline
+    stopped the entry (its partial rows are dropped, not counted)."""
+    rows: list[tuple[str, dict[str, Any] | None]] = []
+    for p in MEASURED_PATHS:
         if recall_eval._entry_applies(entry, p):
+            hub_before = guard.refused["hub"]
             row = recall_eval.eval_one_path(entry, p, deadline=deadline)
             if row.get("reason") == recall_eval.DEADLINE_REASON:
                 return None
-            rows.append((p, row))
+            if guard.refused["hub"] > hub_before and (row.get("error") or row.get("timeout")):
+                rows.append((p, None))
+                continue
+            rows.append((p, {k: row.get(k) for k in _ROW_FIELDS}))
     return rows
 
 
-def run_nightly_eval(*, golden: Path | None = None, budget_s: float = BUDGET_S) -> dict[str, Any]:
+def _child_main(conn, scoring: list[dict[str, Any]], deadline: float,
+                setup: tuple[Callable[..., Any], tuple] | None) -> None:
+    """The scoring child. ``deadline`` is a ``time.monotonic`` value, which is
+    system-wide on macOS and Linux, so parent and child share it. The guard
+    is never taken off here: the child leaves through ``os._exit`` inside it,
+    so a lookup thread still running dies with the process instead of
+    reaching a restored exit. ``setup`` is a test seam run before the guard."""
+    try:
+        if setup is not None:
+            setup[0](*setup[1])
+        with _offline() as guard:
+            try:
+                for entry in scoring:
+                    if time.monotonic() >= deadline:
+                        conn.send(("stop", dict(guard.refused)))
+                        break
+                    try:
+                        got = _score_entry(entry, deadline, guard)
+                    except Exception:  # noqa: BLE001 - one bad entry is skipped, never fatal
+                        conn.send(("bad", dict(guard.refused)))
+                        continue
+                    if got is None:
+                        conn.send(("stop", dict(guard.refused)))
+                        break
+                    conn.send(("entry", got, dict(guard.refused)))
+                else:
+                    conn.send(("done", dict(guard.refused)))
+            finally:
+                os._exit(0)
+    finally:
+        os._exit(1)
+
+
+def _run_child(scoring: list[dict[str, Any]], deadline: float,
+               setup: tuple[Callable[..., Any], tuple] | None):
+    """Yield the child's messages until it finishes or deadline + grace,
+    then kill it. Yields ``("killed", None)`` when it had to be killed and
+    ``("exited", exitcode)`` when it ended without a final message."""
+    ctx = multiprocessing.get_context("spawn")
+    recv, send = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=_child_main, args=(send, scoring, deadline, setup),
+                       name="khipu-recall-eval", daemon=True)
+    proc.start()
+    send.close()
+    hard = deadline + KILL_GRACE_S
+    final = False
+    try:
+        while not final:
+            left = hard - time.monotonic()
+            if left <= 0 or not recv.poll(left):
+                break
+            try:
+                msg = recv.recv()
+            except (EOFError, OSError):
+                break
+            final = msg[0] in ("stop", "done")
+            yield msg
+    finally:
+        killed = proc.is_alive() and not final
+        if proc.is_alive():
+            proc.kill()
+        proc.join(KILL_GRACE_S)
+        recv.close()
+    if not final:
+        yield ("killed", None) if killed else ("exited", proc.exitcode)
+
+
+def run_nightly_eval(*, golden: Path | None = None, budget_s: float = BUDGET_S,
+                     child_setup: tuple[Callable[..., Any], tuple] | None = None) -> dict[str, Any]:
     """The nightly step. ``ok`` means the measurement ran; a regression is the
     doctor row's to flag. The history record is written on every outcome.
-    Returns the compact record it stored."""
+    Returns the compact record it stored. ``child_setup`` is a test seam: a
+    picklable ``(function, args)`` the scoring child runs before its guard."""
     from khipu import hub_snapshot
 
     now = datetime.now(timezone.utc)
@@ -299,7 +381,7 @@ def run_nightly_eval(*, golden: Path | None = None, budget_s: float = BUDGET_S) 
     record: dict[str, Any] = {
         "ts": now.isoformat(), "ok": True, "entries": 0, "scored": 0,
         "skipped_forgotten": 0, "skipped_ids": 0, "skipped_malformed": 0, "truncated": False,
-        "paths": {}, "previous": _previous_figures(history), "golden": _golden_stat(path),
+        "paths": {}, "not_measured": {}, "previous": _previous_figures(history), "golden": _golden_stat(path),
     }
     try:
         try:
@@ -326,14 +408,14 @@ def run_nightly_eval(*, golden: Path | None = None, budget_s: float = BUDGET_S) 
                     con.close()
                 record["skipped_ids"] = len(gone)
         if entries:
-            _score_all(entries, gone, record, budget_s)
+            _score_all(entries, gone, record, budget_s, child_setup)
     finally:
         _write_history([*history, record])
     return record
 
 
 def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, Any],
-               budget_s: float) -> None:
+               budget_s: float, child_setup: tuple[Callable[..., Any], tuple] | None = None) -> None:
     scoring: list[dict[str, Any]] = []
     for entry in entries:
         expect = [str(x) for x in (entry.get("expect") or [])]
@@ -342,29 +424,42 @@ def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, 
             continue
         scoring.append({**entry, "expect": [x for x in expect if x not in gone]}
                        if expect else entry)
+    not_measured: dict[str, dict[str, int]] = {}
+
+    def count(path: str, reason: str) -> None:
+        by_reason = not_measured.setdefault(path, {})
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+
     deadline = time.monotonic() + budget_s
-    rows: dict[str, list[dict[str, Any]]] = {p: [] for p in recall_eval.ALL_PATHS}
-    threads_before = {t.ident for t in threading.enumerate()}
-    with _offline() as guard:
-        try:
-            for entry in scoring:
-                if time.monotonic() >= deadline:
-                    record["truncated"] = True
-                    break
-                try:
-                    got = _score_entry(entry, deadline)
-                except Exception:  # noqa: BLE001 - one bad entry is skipped, never fatal
-                    record["skipped_malformed"] += 1
-                    continue
-                if got is None:
-                    record["truncated"] = True
-                    break
-                for p, row in got:
-                    rows[p].append(row)
+    rows: dict[str, list[dict[str, Any]]] = {p: [] for p in MEASURED_PATHS}
+    refused = {"hub": 0, "embed": 0, "network": 0, "process": 0}
+    record["stopped_child"] = False
+    if scoring and time.monotonic() < deadline:
+        for msg in _run_child(scoring, deadline, child_setup):
+            kind = msg[0]
+            if kind in ("entry", "bad", "stop", "done"):
+                refused = msg[-1]
+            if kind == "entry":
+                for p, row in msg[1]:
+                    if row is None:
+                        count(p, "hub_fallback")
+                    else:
+                        rows[p].append(row)
                 record["scored"] += 1
-        finally:
-            record["lingering_threads"] = _join_new_threads(threads_before, LINGER_WAIT_S)
-    record["offline"] = {**guard.refused, "cosine_skipped": guard.refused["embed"] > 0}
+            elif kind == "bad":
+                record["skipped_malformed"] += 1
+            elif kind == "stop" or kind == "killed":
+                record["truncated"] = True
+                record["stopped_child"] = kind == "killed"
+            elif kind == "exited":
+                record.update(ok=False, error=f"the recall check process ended early (exit {msg[1]})")
+    elif scoring:
+        record["truncated"] = True
+    explicit = sum(1 for e in scoring if recall_eval._entry_applies(e, recall_eval.PATH_EXPLICIT))
+    if explicit:
+        not_measured[recall_eval.PATH_EXPLICIT] = {"needs_hub": explicit}
+    record["not_measured"] = not_measured
+    record["offline"] = {**refused, "cosine_skipped": refused["embed"] > 0}
     for p, got_rows in rows.items():
         summary = recall_eval.summarize_rows(got_rows)
         record["paths"][p] = {k: summary[k] for k in _KEPT_METRICS}
@@ -433,6 +528,10 @@ def recall_eval_health(*, now: datetime | None = None) -> dict[str, Any]:
     if int(last.get("entries") or 0) < MIN_ENTRIES:
         return out("yellow", f"Only {last.get('entries') or 0} test queries in the golden set; "
                              f"{MIN_ENTRIES} are needed for a trustworthy reading.")
+    fell_back = int(((last.get("not_measured") or {}).get(recall_eval.PATH_PROMPT) or {}).get("hub_fallback") or 0)
+    if rate is None and fell_back:
+        return out("yellow", f"{fell_back} recall lookups could not be answered from this Mac's copy of "
+                             "memory and would have needed the hub, so recall is not measured.")
     if rate is None:
         return out("yellow", "The golden set has no queries for the prompt path, so recall is not measured.")
     return out("green", f"The right memory is found {_pct(rate)} of the time"
