@@ -74,6 +74,7 @@ def log_query(
     """
     try:
         from khipu.paths import ensure_data_dir
+        from khipu.tombstones import withhold
 
         ensure_data_dir()
         path = log_path()
@@ -91,7 +92,7 @@ def log_query(
             **({"offline": True} if offline else {}),
             "top": [
                 {"kind": r.get("kind"), "id": r.get("id"), "score": r.get("score")}
-                for r in (top or [])[:3]
+                for r in withhold(top or [])[:3]
             ],
         }
         with path.open("a", encoding="utf-8") as fh:

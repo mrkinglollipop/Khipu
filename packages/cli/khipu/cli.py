@@ -1687,12 +1687,11 @@ def cmd_search(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
-    from khipu.hub_snapshot import without_withheld
-    from khipu.tombstones import without_hidden_episodes
+    from khipu.tombstones import withhold
 
-    # As the MCP search: an unreadable forget list hides every episode.
-    payload["results"] = without_withheld(
-        without_hidden_episodes(payload.get("results") or []), fail_closed=False)
+    # As the MCP search: an unreadable forget list hides every row that
+    # touches an episode.
+    payload["results"] = withhold(payload.get("results") or [], fail_closed=False)
     query_log.log_query(
         args.query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
@@ -2001,6 +2000,14 @@ def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
 
 
 def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
+    """``_graph_query_unfenced`` with the forget fence applied
+    (``tombstones.withhold_graph``)."""
+    from khipu.tombstones import withhold_graph
+
+    return withhold_graph(_graph_query_unfenced(cur, node_id, hops, limit))
+
+
+def _graph_query_unfenced(cur, node_id: str, hops: int, limit: int) -> dict:
     """Neighborhood lookup for `khipu graph`.
 
     hops == 1 returns the direct edges (either direction) plus a best-effort
@@ -3323,9 +3330,9 @@ def cmd_activity(args: argparse.Namespace) -> int:
     from khipu.activity import activity_payload, episode_detail
 
     if args.show is not None:
-        from khipu.tombstones import episode_hidden
+        from khipu.tombstones import episode_withheld, withhold_detail
 
-        row = None if episode_hidden(args.show) else episode_detail(args.show)
+        row = None if episode_withheld(args.show) else withhold_detail(episode_detail(args.show))
         if row is None:
             print(f"error: episode {args.show} not found", file=sys.stderr)
             return 1
@@ -3439,9 +3446,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         if not ident.isdigit():
             print(json.dumps({"ok": False, "error": "episode id must be digits"}))
             return 2
-        from khipu.tombstones import episode_hidden
+        from khipu.tombstones import episode_withheld
 
-        row = None if episode_hidden(ident) else episode_detail(int(ident))
+        row = None if episode_withheld(ident) else episode_detail(int(ident))
     else:
         from khipu.text_pages import page_args
 
@@ -3458,7 +3465,9 @@ def cmd_get(args: argparse.Namespace) -> int:
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
-    row = dict(row)
+    from khipu.tombstones import withhold_detail
+
+    row = withhold_detail(dict(row))
     verbatim = row.pop("verbatim", None) if kind == "episode" else None
     row.pop("raw", None)
     print(json.dumps({"kind": kind, **row}, indent=2, default=str))

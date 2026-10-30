@@ -1253,7 +1253,9 @@ def _positive_id(value, field: str) -> int:
 
 
 def _detail_response(kind: str, row: dict, **metadata) -> dict:
-    row = dict(row)
+    from khipu.tombstones import withhold_detail
+
+    row = withhold_detail(dict(row))
     if kind == "episode":
         row.pop("raw", None)
     return {"kind": kind, **row, **metadata}
@@ -1317,9 +1319,10 @@ def _tool_search(args: dict) -> dict:
             since=since, until=until, project=project, session_id=session_id,
             harness=harness, t3_thread=t3_thread, via=via, tz=tz,
         )
-    from khipu.tombstones import without_hidden_episodes
+    from khipu.tombstones import withhold
 
-    payload["results"] = without_hidden_episodes(payload.get("results") or [])
+    # An unreadable forget list hides every row that touches an episode.
+    payload["results"] = withhold(payload.get("results") or [], fail_closed=False)
     query_log.log_query(
         query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
@@ -1370,9 +1373,9 @@ def _tool_get(args: dict) -> dict:
     if inferred is None:
         inferred = "episode" if ident.isdigit() else "topic"
     if inferred == "episode" and ident.isdigit():
-        from khipu.tombstones import episode_hidden
+        from khipu.tombstones import episode_withheld
 
-        if episode_hidden(ident):
+        if episode_withheld(ident):
             raise ValueError(f"episode not found: {ident}")
 
     hub_failed = False

@@ -247,8 +247,12 @@ def line_from_rows(
 ) -> str | None:
     """The "You produced ..." line for rows already read (newest first), or
     None. The one place the match rule and the rendering live, so the hub
-    reader and the replica reader cannot drift apart."""
-    match = best_match_for_tokens(rows, prompt_tokens, min_hits=min_hits)
+    reader and the replica reader cannot drift apart. Rows of an episode on
+    the forget list or queued for erasure never match; none do when that
+    list cannot be read."""
+    from khipu.tombstones import withhold
+
+    match = best_match_for_tokens(withhold(rows), prompt_tokens, min_hits=min_hits)
     return format_produced_line(match) if match else None
 
 

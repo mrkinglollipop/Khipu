@@ -276,8 +276,11 @@ def _search(question: str, project: str | None, limit: int) -> list[dict[str, An
         question, limit=limit, mode="hybrid", project_boost=project or None,
         include_libraries=False,  # reflect cites episodes, not library chunks
     )
+    from khipu.tombstones import withhold
+
     rows = [r for r in (payload.get("results") or []) if r.get("kind") in ("episode", "topic")]
-    return rows[:limit]
+    # An explicit question: an unreadable forget list leaves no episode row.
+    return withhold(rows, fail_closed=False)[:limit]
 
 
 def reflect(question: str, *, project: str | None = None, limit: int = DEFAULT_LIMIT) -> dict[str, Any]:

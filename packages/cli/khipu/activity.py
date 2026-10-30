@@ -464,11 +464,14 @@ def project_slice(
                 episodes = _annotate_episode_validity(cur, episodes)
 
             topic_slugs: list[str] = []
+            topic_episodes: dict[str, list[Any]] = {}
             for ep in episodes:
                 for t in ep.get("topics") or []:
                     slug = str(t).strip()
                     if slug and slug not in topic_slugs:
                         topic_slugs.append(slug)
+                    if slug:
+                        topic_episodes.setdefault(slug, []).append(ep.get("id"))
             # Over-fetch, THEN trim (audit 2026-09-04). Trimming the candidate
             # slugs to topic_limit before the existence lookup meant a capture
             # whose first N topics were tags or deleted pages returned fewer
@@ -493,8 +496,11 @@ def project_slice(
                 found = []
                 for slug, title, when, status in cur.fetchall():
                     age_days = (now - when).days if when is not None else None
+                    # The forget fence drops a topic only reached through
+                    # forgotten episodes (recall_rule._fenced_slice).
                     found.append({"slug": slug, "title": title, "age_days": age_days,
-                                  "status": status or "active"})
+                                  "status": status or "active",
+                                  "via_episodes": topic_episodes.get(slug, [])})
                 # R6: a superseded/retired/abandoned page never wins a slot
                 # over a current one in the same small slice, same posture
                 # as the search de-rank — it can still show, just last.

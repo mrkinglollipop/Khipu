@@ -466,8 +466,11 @@ def status_payload(
     }
     try:
         from khipu.activity import recent_episodes
+        from khipu.tombstones import withhold
 
-        out["recent_captures"] = recent_episodes(limit=5)
+        recent = recent_episodes(limit=5)
+        kept = {str(r["id"]) for r in withhold([{"kind": "episode", "id": e.get("id")} for e in recent])}
+        out["recent_captures"] = [e for e in recent if str(e.get("id")) in kept]
     except Exception as exc:  # noqa: BLE001 — status must stay resilient
         out["recent_captures_error"] = str(exc)
     try:

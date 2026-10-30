@@ -482,38 +482,17 @@ def _pending_erasure_ids(path: Path | None = None) -> set[int]:
 
 
 def withheld_episode_ids(path: Path | None = None) -> frozenset[int]:
-    """Episodes no reader may see whatever the replica's own rows say: on
-    this Mac's forget list, or queued for erasure. A forget lands here before
-    the replica's next rewrite tombstones the row. Raises when either cannot
-    be read; the caller then shows no episode."""
+    """``tombstones.withheld_episode_ids`` (the replica at ``path``)."""
     from khipu.tombstones import hidden_episode_ids
 
     return hidden_episode_ids() | frozenset(_pending_erasure_ids(path))
 
 
 def without_withheld(rows: Sequence[Any], *, fail_closed: bool = True) -> list[Any]:
-    """``rows`` minus every episode ``withheld_episode_ids`` names, and every
-    row reached through one (``via``) or linked to one (``episode_id``). When the ids cannot be read: empty, or
-    with ``fail_closed=False`` (an explicit search, whose replica views
-    already hide queued erasures) ``rows`` unchanged."""
-    try:
-        withheld = {str(i) for i in withheld_episode_ids()}
-    except Exception:  # noqa: BLE001 - an unreadable forget list pushes nothing
-        return [] if fail_closed else list(rows)
-    if not withheld:
-        return list(rows)
-    kept = []
-    for row in rows:
-        if isinstance(row, Mapping):
-            if row.get("kind") == "episode" and str(row.get("id")) in withheld:
-                continue
-            via = str(row.get("via") or "")
-            if via.startswith("episode:") and via[len("episode:"):] in withheld:
-                continue
-            if row.get("episode_id") is not None and str(row.get("episode_id")) in withheld:
-                continue
-        kept.append(row)
-    return kept
+    """``tombstones.withhold``: the one forget fence."""
+    from khipu.tombstones import withhold
+
+    return withhold(rows, fail_closed=fail_closed)
 
 
 def forget_fence_sql(con: sqlite3.Connection, table: str, episode_col: str) -> str:
@@ -6852,6 +6831,14 @@ def enrich_search_results_snapshot(
 
 
 def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, Any]:
+    """The replica's graph lookup with the forget fence applied
+    (``tombstones.withhold_graph``)."""
+    from khipu.tombstones import withhold_graph
+
+    return withhold_graph(_graph_neighbors_snapshot_unfenced(node_id, hops, limit))
+
+
+def _graph_neighbors_snapshot_unfenced(node_id: str, hops: int, limit: int) -> dict[str, Any]:
     from khipu.topic_graph import (
         PATH_PREFIX,
         TOPIC_PREFIX,
@@ -8135,6 +8122,8 @@ def search_stale_payload(
     prompt lane and the explicit hub search — it wires only the graph-
     candidates leg here, not time interpretation.
     """
+    from khipu.tombstones import withhold
+
     filters_dropped = _snapshot_filters_dropped(session_id=session_id, harness=harness)
     if semantic:
         results = semantic_search_snapshot(
@@ -8155,7 +8144,7 @@ def search_stale_payload(
             con, results, kind=kind, since=since, until=until, project=project,
             session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
         )
-        results = without_withheld(enrich_search_results_snapshot(con, results), fail_closed=False)
+        results = withhold(enrich_search_results_snapshot(con, results), fail_closed=False)
         results = _annotate_snapshot_validity(con, results)
         out = {
             "query": query,
@@ -8184,7 +8173,7 @@ def search_stale_payload(
         con, results, kind=kind, since=since, until=until, project=project,
         session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
     )
-    results = without_withheld(enrich_search_results_snapshot(con, results), fail_closed=False)
+    results = withhold(enrich_search_results_snapshot(con, results), fail_closed=False)
     results = _annotate_snapshot_validity(con, results)
     out = {
         "query": query,
