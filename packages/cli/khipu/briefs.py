@@ -247,7 +247,6 @@ def _estimate_chars(episode_chars: list[int]) -> int:
 
 
 def plan(cur, *, retry_failed: bool = False) -> dict[str, Any]:
-    # forget-fence: the build plan: topic slugs, source counts and sizes, no episode text
     """Topics whose brief is missing or stale. Stale means the hash over the
     sorted (episode id, revision, decision state) tuples of the topic's live
     source episodes differs from the stored ``source_hash``, the stored brief
@@ -264,7 +263,16 @@ def plan(cur, *, retry_failed: bool = False) -> dict[str, Any]:
         "ORDER BY t.slug, e.ts DESC, e.id DESC"
     )
     per_topic: dict[str, list[tuple[int, str, int]]] = {}
-    for slug, eid, ingested_at, summary_md5, summary_len in cur.fetchall():
+    from khipu import tombstones
+
+    fetched = cur.fetchall()
+    # Episodes on this Mac's forget list or erasure queue contribute nothing to
+    # any topic's row; an unreadable list plans no topic at all.
+    kept = {str(r["id"]) for r in tombstones.withhold(
+        [{"kind": "episode", "id": int(r[1])} for r in fetched])}
+    for slug, eid, ingested_at, summary_md5, summary_len in fetched:
+        if str(int(eid)) not in kept:
+            continue
         per_topic.setdefault(slug, []).append(
             (int(eid), _revision(ingested_at, summary_md5 or ""), int(summary_len or 0))
         )

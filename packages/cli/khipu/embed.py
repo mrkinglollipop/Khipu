@@ -1344,17 +1344,29 @@ def topic_text(slug: str, title: str | None, body: str | None) -> str:
     return f"{title or slug}\n\n{body or ''}".strip()
 
 
+def _fence_episode_rows(rows: list) -> list:
+    """``rows`` (episode id first) minus every episode on this Mac's forget
+    list or queued for erasure. An unreadable list keeps none, and records the
+    outcome through the forget-fence state."""
+    from khipu import tombstones
+
+    kept = {str(r["id"]) for r in tombstones.withhold(
+        [{"kind": "episode", "id": int(row[0])} for row in rows])}
+    return [row for row in rows if str(int(row[0])) in kept]
+
+
 def _iter_sources(
     cur, *, kind: str | None = None, refs: list[str] | None = None,
     commitment_wording: dict[str, str] | None = None,
 ) -> Iterable[tuple[str, str, str, str]]:
-    # forget-fence: embedding writer; returns no row to a reader
     """Yield (kind, ref, text, title) for every embeddable row.
 
     ``title`` is used only for gemini-embedding-2 document prefixes; stored
     ``chunk_text`` stays the unprefixed ``text``. ``refs`` (with a ``kind`` of
     episode or topic) narrows the read to those rows: episode ids as strings,
-    topic slugs.
+    topic slugs. Episodes on this Mac's forget list or erasure queue are
+    fenced out before any text is built, so none reaches a provider; when the
+    list cannot be read no episode is yielded.
     """
     if kind in (None, "episode"):
         # Tombstoned episodes (khipu episode forget) must never be re-embedded;
@@ -1374,7 +1386,7 @@ def _iter_sources(
             f"FROM episodes{live}{only} ORDER BY id",
             args,
         )
-        for row in cur.fetchall():
+        for row in _fence_episode_rows(cur.fetchall()):
             eid, summary, decisions, prefs, topics, people = row[:6]
             verbatim = row[6] if has_verbatim else None
             text = episode_text(
@@ -3668,7 +3680,6 @@ def coverage(
 
 
 def embed_recent_missing(limit: int = 10) -> dict[str, int]:
-    # forget-fence: embedding writer; returns no row to a reader
     """Embed the newest episodes that have no vector under the active profile.
 
     The tail sync embeds rows *it* inserts, but a row the legacy mirror leg wrote
@@ -3695,7 +3706,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 " ORDER BY e.ts DESC LIMIT %s",
                 (scan_limit,),
             )
-            episode_rows = list(cur.fetchall())
+            episode_rows = _fence_episode_rows(list(cur.fetchall()))
             # Preserve the old all-ages missing-row lane so a long run of
             # healthy recent episodes cannot starve an older wholly-missing row.
             cur.execute(
@@ -3708,7 +3719,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             )
             seen_episode_ids = {str(row[0]) for row in episode_rows}
             episode_rows.extend(
-                row for row in cur.fetchall() if str(row[0]) not in seen_episode_ids
+                row for row in _fence_episode_rows(list(cur.fetchall()))
+                if str(row[0]) not in seen_episode_ids
             )
             episode_existing = _existing_hashes_for_refs(
                 cur, profile, "episode", [str(row[0]) for row in episode_rows]

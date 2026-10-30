@@ -305,7 +305,7 @@ def test_every_output_builder_reaches_the_fence():
 FENCED_TABLES = ("episodes", "decisions", "decision_links", "commitments", "deliverables",
                  "briefs", "nodes", "edges")
 FENCE_CALLS = {"withhold", "withhold_graph", "withhold_detail", "episode_withheld", "_fenced_slice",
-               "without_withheld", "forget_fence_sql", "_fenced_owed_rows"}
+               "without_withheld", "forget_fence_sql", "_fenced_owed_rows", "_fence_episode_rows"}
 _READ_SQL = re.compile(r"\b(?:FROM|JOIN)\s+(?:main\.)?(?:%s)\b" % "|".join(FENCED_TABLES), re.I)
 # A SELECT of only aggregates or a constant returns no row's content.
 _AGGREGATE_SQL = re.compile(r"^\s*SELECT\s+(?:(?:COUNT|MAX|MIN|SUM|EXISTS)\s*\(|1\b|TRUE\b)", re.I)
@@ -421,3 +421,64 @@ def test_the_guard_finds_a_reader_by_what_it_reads(tmp_path):
     assert found == {"leaky.owed_for_reader", "leaky.leaky_tool"}
 
 
+
+
+# ---- embedding sources and the briefs plan --------------------------------
+
+def _episode_source_cur():
+    from unittest import mock
+
+    cur = mock.MagicMock()
+    cur.fetchall.return_value = [
+        (902, "FORGOTTEN-EMBED", [], [], ["secret-topic"], []),
+        (904, "plain live text", [], [], [], []),
+    ]
+    return cur
+
+
+def test_embedding_sources_never_yield_a_forgotten_episode(forgotten):
+    from unittest import mock
+
+    with mock.patch("khipu.db.has_columns", side_effect=lambda c, t, col: col != "verbatim"):
+        out = list(embed._iter_sources(_episode_source_cur(), kind="episode"))
+    assert [ref for _k, ref, _t, _ti in out] == ["904"]
+    assert not any("FORGOTTEN-EMBED" in text for _k, _r, text, _ti in out)
+
+
+def test_embedding_sources_yield_no_episode_when_the_list_is_unreadable():
+    from unittest import mock
+
+    _corrupt_list()
+    with mock.patch("khipu.db.has_columns", side_effect=lambda c, t, col: col != "verbatim"):
+        out = list(embed._iter_sources(_episode_source_cur(), kind="episode"))
+    assert out == []
+    state = tombstones.read_fence_state()
+    assert state is not None and state["readable"] is False
+
+
+def test_the_recent_missing_catch_up_sends_no_forgotten_text_to_the_provider(forgotten):
+    from unittest import mock
+
+    cur = mock.MagicMock()
+    cur.fetchall.side_effect = [[(902, "FORGOTTEN-EMBED", [], [], [], [])], [], []]
+    conn = mock.MagicMock()
+    conn.__enter__.return_value = conn
+    conn.cursor.return_value.__enter__.return_value = cur
+    sent: list = []
+
+    def fake_embed(texts, **kw):
+        sent.extend(texts)
+        return [[0.0] for _ in texts]
+
+    with mock.patch("khipu.db.connect", return_value=conn), \
+            mock.patch("khipu.db.has_columns", return_value=False), \
+            mock.patch.object(embed, "_active_profile", return_value="p"), \
+            mock.patch.object(embed, "_existing_hashes_for_refs", return_value={}), \
+            mock.patch.object(embed, "embed_batch", side_effect=fake_embed), \
+            mock.patch.object(embed, "_lock_live_embedding_refs", return_value=set()):
+        try:
+            embed.embed_recent_missing(limit=5)
+        except Exception:  # noqa: BLE001 - only what reached the provider matters here
+            pass
+    assert not any("FORGOTTEN-EMBED" in t for t in sent)
+    assert sent == []

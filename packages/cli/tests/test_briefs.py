@@ -991,3 +991,30 @@ class MigrationTextTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForgetFencePlanTest(unittest.TestCase):
+    """A locally forgotten episode contributes nothing to the build plan."""
+
+    def test_a_forgotten_episode_is_not_counted_in_a_topic_row(self):
+        hub = _seeded()
+        hub.episode(3, "Third note.", minutes=9)
+        with hub.cursor() as cur, mock.patch(
+                "khipu.tombstones.withheld_episode_ids", return_value=frozenset({2})):
+            rows = briefs.plan(cur)["topics"]
+        self.assertEqual([(p["topic"], p["sources"]) for p in rows], [("alpha", 2)])
+
+    def test_a_topic_whose_only_sources_are_forgotten_is_absent(self):
+        hub = _Hub()
+        hub.episode(1, "Live note.", topics=("alpha",))
+        hub.episode(2, "SECRET-FORGOTTEN-TEXT", topics=("secret-topic",), minutes=5)
+        with hub.cursor() as cur, mock.patch(
+                "khipu.tombstones.withheld_episode_ids", return_value=frozenset({2})):
+            rows = briefs.plan(cur)["topics"]
+        self.assertEqual([p["topic"] for p in rows], ["alpha"])
+
+    def test_an_unreadable_forget_list_plans_no_topic(self):
+        hub = _seeded()
+        with hub.cursor() as cur, mock.patch(
+                "khipu.tombstones.withheld_episode_ids", side_effect=OSError("no list")):
+            self.assertEqual(briefs.plan(cur)["topics"], [])
