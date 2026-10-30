@@ -56,7 +56,7 @@ _CLAUDE_RUNNING_ENV = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESS
 # request so the recall service judges the hook's identity, not its own.
 IDENTITY_ENV = ("KHIPU_HARNESS", "GROK_HOOK_NAME", "GROK_HOOK_EVENT", "CODEX_THREAD_ID", *_CLAUDE_RUNNING_ENV,
                 *_CODEX_CONFIG_ENV, "CLAUDE_PROJECT_DIR", "CURSOR_VERSION",
-                "CURSOR_PROJECT_DIR")
+                "CURSOR_PROJECT_DIR", "CLAUDE_DISPATCHED_LANE")
 
 
 def budget(shape: str) -> int:

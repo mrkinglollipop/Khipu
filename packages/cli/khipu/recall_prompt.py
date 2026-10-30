@@ -3179,7 +3179,7 @@ _OUTCOME_VALUES = frozenset({"match", "no_match", "gated", "dedup", "timeout", "
 # Mirrors mcp_server._PRIOR_WORK_GATED_REASONS — duplicated rather than
 # imported so this module (called from a UserPromptSubmit hook on every
 # prompt) never has to import mcp_server.
-_PRIOR_WORK_GATED_REASONS_FOR_OUTCOME = frozenset({"no content tokens", "trivial acknowledgment"})
+_PRIOR_WORK_GATED_REASONS_FOR_OUTCOME = frozenset({"no content tokens", "trivial acknowledgment", "dispatched lane"})
 
 
 def _outcome_for(reason: str, hits: list[Any]) -> str:
@@ -3634,6 +3634,16 @@ def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | 
              f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}{routed}")
 
 
+def dispatched_lane(environ=None) -> bool:
+    """True when the hook runs for a dispatched job (Khipu's launchers and
+    church-harness set ``CLAUDE_DISPATCHED_LANE``; unset, empty and "0" mean
+    Matt's own session). Dispatched briefs name what to read, so they get no
+    automatic prior-work push; the entrypoint is no signal (Matt's own
+    prompts arrive as "t3" and "sdk-ts")."""
+    value = (environ if environ is not None else os.environ).get("CLAUDE_DISPATCHED_LANE") or ""
+    return value.strip() not in ("", "0")
+
+
 def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
               delivery: dict[str, Any] | None = None, environ=None,
               routing_forkserver: RoutingForkServer | None = None) -> dict[str, Any]:
@@ -3665,7 +3675,12 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
     routing = _RoutingAtPrompt().begin(session_id, environ, routing_forkserver)
     options = {} if deadline is None and delivery is None else {"deadline": deadline, "delivery": delivery}
     try:
-        result = prior_work_for_prompt(prompt, cwd=cwd, session_id=session_id, **options)
+        if dispatched_lane(environ):
+            _dedup_silent_prompt(session_id)
+            result = {"context": "", "hits": [], "reason": "dispatched lane", "ms": 0.0,
+                      "legs": [], "degraded": None}
+        else:
+            result = prior_work_for_prompt(prompt, cwd=cwd, session_id=session_id, **options)
     except BaseException:
         routing._close()
         raise
