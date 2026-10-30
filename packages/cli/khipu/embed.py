@@ -40,7 +40,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from khipu import profiles as _profiles
 from khipu.lines import split_lines
@@ -2715,7 +2715,7 @@ def _apply_search_filters(
         cur.execute(
             "SELECT slug, COALESCE(event_at, updated_at, created_at), status, "
             "frontmatter->>'project', frontmatter->>'type', superseded_by, "
-            "frontmatter->'_routing_state_claim' "
+            "frontmatter->'_routing_state_claim', frontmatter->'_page_chars' "
             "FROM topics WHERE deleted_at IS NULL AND slug = ANY(%s)",
             (topic_ids,),
         )
@@ -2728,6 +2728,8 @@ def _apply_search_filters(
                 "ts": ts, "status": status, "project": proj,
                 "type": note_type, "superseded_by": superseded_by,
                 "_routing_state_claim": routing_claim,
+                # Written by the mirror; search never reads the body itself.
+                "page_chars": row[7] if len(row) > 7 else None,
             }
     if node_ids:
         cur.execute("SELECT id, built_at FROM nodes WHERE id = ANY(%s)", (node_ids,))
@@ -2808,6 +2810,9 @@ def _apply_search_filters(
                 r["superseded_by"] = superseded_by
             if type(m.get("_routing_state_claim")) is bool:
                 r["_routing_state_claim"] = m["_routing_state_claim"]
+            # Body length, so recency.is_broad_page can de-rank catch-all pages.
+            if type(m.get("page_chars")) is int:
+                r["page_chars"] = m["page_chars"]
         r["_sort_ts"] = ts
         out.append(r)
     out.sort(key=lambda r: (-(r.get("score") or 0.0), _neg_ts_sort_key(r.get("_sort_ts"))))
@@ -2915,6 +2920,25 @@ class _LibraryLegs:
         return self._result
 
 
+def _rank_search_rows(
+    fused: list[dict[str, Any]], cur: Any, *, project_boost: str | None = None,
+    rank: Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """The fused rows' score pass. ``rank`` (automatic push's hub fallback,
+    ``recall_prompt._hub_push_rank``) replaces it whole so that lane ranks the
+    way the replica lane does; explicit search passes none."""
+    if rank is not None:
+        return rank(fused, cur)
+    # Project boost + status de-rank (R5/R6) ride on the fused score
+    # BEFORE recency, same as recency itself: both are score nudges
+    # that must see the raw fused order, and both re-sort by the
+    # score they leave behind.
+    from khipu.recency import apply_project_and_status, apply_recency
+
+    fused = apply_project_and_status(fused, project=project_boost)
+    return apply_recency(fused)
+
+
 def hybrid_search(
     query: str,
     *,
@@ -2932,6 +2956,7 @@ def hybrid_search(
     tz: str | None = None,
     source: str | None = None,
     include_libraries: bool = True,
+    rank: Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
 
@@ -2994,7 +3019,7 @@ def hybrid_search(
     """
     from khipu.cli import _literal_candidates
     from khipu.hub_snapshot import try_hub_connect
-    from khipu.search_text import fuse_ranked_lists, search_tokens, token_hit_count
+    from khipu.search_text import fuse_ranked_lists, note_prompt_term_hits, prompt_terms, search_tokens, token_hit_count
     from khipu.topic_graph import enrich_search_results
 
     query = (query or "").strip()
@@ -3151,6 +3176,8 @@ def hybrid_search(
             # lexical_hits=0 and confidence='none'). Track by object
             # identity so each row is scored exactly once.
             _scored_rows: set[int] = set()
+            # Automatic push (``rank`` set) weighs rows against the whole prompt.
+            push_terms = prompt_terms(query) if rank is not None and tokens else []
             for row_list in lists:
                 for r in row_list:
                     if id(r) in _scored_rows:
@@ -3162,6 +3189,8 @@ def hybrid_search(
                     # matched a token literally (pure cosine neighbor).
                     if tokens:
                         r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
+                        if push_terms:
+                            note_prompt_term_hits(r, r.get("rank_text") or "", push_terms)
                     r.pop("rank_text", None)
             timing["lexical_ms"] = round((time.monotonic() - _t) * 1000, 1)
             if lib_names and kind is None:
@@ -3287,14 +3316,7 @@ def hybrid_search(
                 except Exception:  # noqa: BLE001 — additive, never a search failure
                     interpretation = None
 
-            # Project boost + status de-rank (R5/R6) ride on the fused score
-            # BEFORE recency, same as recency itself: both are score nudges
-            # that must see the raw fused order, and both re-sort by the
-            # score they leave behind.
-            from khipu.recency import apply_project_and_status, apply_recency
-
-            fused = apply_project_and_status(fused, project=project_boost)
-            fused = apply_recency(fused)
+            fused = _rank_search_rows(fused, cur, project_boost=project_boost, rank=rank)
             timing["fusion_ms"] = round((time.monotonic() - _t) * 1000, 1)
             _t = time.monotonic()
             fused = enrich_search_results(cur, fused)
