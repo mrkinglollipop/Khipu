@@ -1096,7 +1096,8 @@ def main() -> None:
         delivered = False
     routed = ""
     if kind is not None:
-        outcome = "pushed" if out else "delegation"
+        if outcome == "pass":  # an error stays visible
+            outcome = "pushed" if out else "delegation"
         try:
             from khipu import recall_prompt
 
@@ -1106,26 +1107,34 @@ def main() -> None:
     _log_call(raw, outcome, kind, routed, started)
 
 
+def _log_field(value: object, limit: int = 80) -> str:
+    """A value as one log token: whitespace and control characters (a newline
+    would start a forged record) become ``_``."""
+    return "".join("_" if (c.isspace() or not c.isprintable()) else c for c in str(value))[:limit]
+
+
 def _log_call(raw: str, outcome: str, kind: str | None, routed: str, started: float) -> None:
     """One line per call, in prompt-recall.log under its own tag (so the
     per-prompt lane's outcome rate never counts it): what the hook cost and
-    what it did. Runs on every tool call, so it imports nothing heavy."""
+    what it did. Runs on every tool call, so it imports nothing heavy. ``ms``
+    runs from the hook's start to just before the line is appended (it
+    includes creating the folder and opening the file, not the final write)."""
     try:
         from datetime import datetime, timezone
 
         from khipu.paths import capture_home
 
         payload = _payload(raw)
-        session = hook_shape.session_id(payload) or "?"
-        event = _event(payload) or "?"
-        tool = str(payload.get("tool_name") or payload.get("toolName") or "-").replace(" ", "_")[:40]
-        call = f" call={kind.replace(' ', '_')}" if kind else ""
+        session = _log_field(hook_shape.session_id(payload) or "?")
+        event = _log_field(_event(payload) or "?")
+        tool = _log_field(payload.get("tool_name") or payload.get("toolName") or "-", 40)
+        call = f" call={_log_field(kind)}" if kind else ""
+        outcome = _log_field(outcome)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        line = (f"{stamp} [khipu-delegation-hook] session={session} event={event} tool={tool} "
-                f"outcome={outcome}{call}{routed} ms={(time.monotonic() - started) * 1000:.1f}\n")
         path = capture_home() / "logs" / "prompt-recall.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
-            f.write(line)
+            f.write(f"{stamp} [khipu-delegation-hook] session={session} event={event} tool={tool} "
+                    f"outcome={outcome}{call}{routed} ms={(time.monotonic() - started) * 1000:.1f}\n")
     except Exception:  # noqa: BLE001 - logging never fails the call
         pass

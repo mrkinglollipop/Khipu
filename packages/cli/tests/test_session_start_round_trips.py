@@ -124,15 +124,17 @@ def test_the_group_memo_lasts_one_block_and_hands_out_copies():
 
 
 def test_a_known_schema_skips_the_savepoint_only_inside_the_memo(monkeypatch):
-    monkeypatch.setitem(db._TABLE_COLUMNS_CACHE, "project_aliases", {"alias", "project", "created_at"})
-    assert not identity.schema_known("project_aliases", "alias", "project")
     cur = _Cur()
+    monkeypatch.setitem(db._SCHEMA_SEEN, db.database_identity(cur),
+                        {"project_aliases": {"alias", "project", "created_at"}})
+    assert not identity.schema_known(cur, "project_aliases", "alias", "project")
     identity.project_group(cur, "o/x")
     assert any("SAVEPOINT" in s for s in cur.sent)
     with identity.group_memo():
-        assert identity.schema_known("project_aliases", "alias", "project")
-        assert not identity.schema_known("project_aliases", "missing_column")
-        assert not identity.schema_known("project_pairs", "a")
-        cur = _Cur()
+        assert identity.schema_known(cur, "project_aliases", "alias", "project")
+        assert not identity.schema_known(cur, "project_aliases", "missing_column")
+        assert not identity.schema_known(cur, "project_pairs", "a")
+        assert not identity.schema_known(_Cur(), "project_aliases", "alias")  # another database
+        cur.sent.clear()
         identity.project_group(cur, "o/x")
         assert not any("SAVEPOINT" in s for s in cur.sent)

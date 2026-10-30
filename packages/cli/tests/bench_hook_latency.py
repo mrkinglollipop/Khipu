@@ -120,7 +120,10 @@ def run(argv: list[str], payload: dict, env: dict, runs: int) -> tuple[list[floa
         # puts its cwd first on sys.path, so a cwd holding a ``khipu`` package
         # would run that code instead of the tree under test.
         proc = subprocess.run(argv, input=data, capture_output=True, env=env, timeout=60, cwd=payload["cwd"])
-        samples.append((time.perf_counter() - t0) * 1000)
+        elapsed = (time.perf_counter() - t0) * 1000
+        if proc.returncode != 0:
+            raise RuntimeError(f"hook exit {proc.returncode}: {proc.stderr.decode(errors='replace')[-400:]}")
+        samples.append(elapsed)
         out = proc.stdout.decode()
     return samples, out
 

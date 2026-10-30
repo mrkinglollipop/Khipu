@@ -171,22 +171,22 @@ def project_canonical_group(cur, project: str | None) -> tuple[str | None, list[
     return canonical, list(group)
 
 
-def schema_known(table: str, *columns: str) -> bool:
-    """Inside ``group_memo()`` only: whether this process's column cache
-    (``db.prime_table_columns``) already shows ``table`` with ``columns``. A
-    read that is guarded by a savepoint only for an older hub's missing table
-    can then skip the savepoint's two round trips; the memo's one reader
+def schema_known(cur, table: str, *columns: str) -> bool:
+    """Inside ``group_memo()`` only: whether ``db.prime_table_columns`` read
+    ``table`` with ``columns`` from this cursor's own database. A read that is
+    guarded by a savepoint only for an older hub's missing table can then skip
+    the savepoint's two round trips; the memo's one reader
     (``activity.project_slice``) lets any other failure end its connection."""
     if _GROUP_MEMO.get() is None:
         return False
     from khipu import db
 
-    cols = db._TABLE_COLUMNS_CACHE.get(table)
+    cols = db.columns_seen(cur, table)
     return bool(cols) and all(c in cols for c in columns)
 
 
 def _read_canonical_group(cur, project: str) -> tuple[str | None, list[str]]:
-    guarded = not schema_known("project_aliases", "alias", "project")
+    guarded = not schema_known(cur, "project_aliases", "alias", "project")
     try:
         if guarded:
             cur.execute("SAVEPOINT project_alias_group", ())

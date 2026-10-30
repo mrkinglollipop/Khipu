@@ -43,7 +43,7 @@ def _savepoint(cur, name: str, sql: str, params: tuple, known: tuple = ()) -> li
     ``known`` names the table and columns the read needs: when the schema is
     already known to have them (``identity.schema_known``) no savepoint is
     taken."""
-    if known and identity.schema_known(*known):
+    if known and identity.schema_known(cur, *known):
         cur.execute(sql, params)
         return cur.fetchall()
     try:
