@@ -541,17 +541,21 @@ def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
 
 
 def record(payload: dict, env: dict | None = None, now: float | None = None,
-           issuer: dict | None = None) -> str | None:
+           issuer: dict | None = None, extra: dict | None = None) -> str | None:
     """Record one prompt-submit turn. Returns its id, or None when nothing
     was recorded. ``issuer`` None means this process's (``hook_issuer``).
+    ``extra`` (Antigravity's recorder only): ``fallback`` marks a turn read
+    from the payload's ``lastUserInput``; ``duplicate_of`` + ``occurrence``
+    make this row a late second copy of that turn, sharing its occurrence.
     Never raises."""
     try:
-        return _record(payload, os.environ if env is None else env, time.time() if now is None else now, issuer)
+        return _record(payload, os.environ if env is None else env, time.time() if now is None else now, issuer,
+                       extra or {})
     except Exception:  # noqa: BLE001 - the recorder must never fail a prompt
         return None
 
 
-def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
+def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) -> str | None:
     if not isinstance(payload, dict):
         return None
     conf = settings()
@@ -586,7 +590,14 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
         # Section 13 E: the hash and its durable occurrence, never the text.
         sha = prompt_sha256(text)
         turn["prompt_sha256"] = sha
-        turn["occurrence"] = _next_occurrence(session, sha, now)
+        shared = extra.get("occurrence")
+        # A late duplicate of a recorded turn is the same typing: it takes
+        # that turn's occurrence rather than numbering a second one.
+        turn["occurrence"] = shared if type(shared) is int and shared >= 1 \
+            else _next_occurrence(session, sha, now)
+    for flag in ("fallback", "duplicate_of"):
+        if extra.get(flag):
+            turn[flag] = extra[flag]
     ok, why = eligible(turn, conf)
     turn["eligible"] = ok
     if why:
@@ -837,7 +848,7 @@ def counts(now: float | None = None) -> dict:
         if path.name == "briefs.jsonl":
             continue
         for t in _read_lines(path):
-            if now - float(t.get("ts") or 0) >= RETENTION_S:
+            if now - float(t.get("ts") or 0) >= RETENTION_S or t.get("duplicate_of"):
                 continue
             row = out.setdefault(str(t.get("harness") or "unknown"), {"turns": 0, "eligible": 0, "entrypoints": {}})
             row["turns"] += 1
@@ -943,7 +954,7 @@ def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     for line in _ag_lines_newest_first(path):
         try:
             step = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):  # any line that will not parse is skipped
             continue
         if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
             continue
@@ -970,20 +981,38 @@ def _ag_lines_newest_first(path: str):
             fh.seek(0, os.SEEK_END)
             end = fh.tell()
             floor = max(0, end - _AG_MAX_SCAN)
-            carry = b""
+            # Pieces of the line that started in a chunk read earlier (newer
+            # bytes first), joined once when its start is found.
+            carry: list[bytes] = []
             while end > floor:
                 start = max(floor, end - _AG_CHUNK)
                 fh.seek(start)
-                data = fh.read(end - start) + carry
+                parts = fh.read(end - start).split(b"\n")
                 end = start
-                parts = data.split(b"\n")
-                # The first part may be the tail of a line that began earlier.
-                carry = parts[0] if start > 0 else b""
-                for raw in reversed(parts[1:] if start > 0 else parts):
-                    if raw.strip():
-                        yield raw.decode("utf-8", errors="replace")
+                carry.append(parts[-1])
+                if len(parts) > 1:
+                    line = b"".join(reversed(carry))
+                    if line.strip():
+                        yield line.decode("utf-8", errors="replace")
+                    for raw in reversed(parts[1:-1]):
+                        if raw.strip():
+                            yield raw.decode("utf-8", errors="replace")
+                    carry = [parts[0]]
+                else:
+                    carry[-1:] = [parts[0]]
+            # At the cap the first piece is a whole line only when the byte
+            # before it ends a line; at the file's start it always is.
+            if carry and (floor == 0 or _byte_before(fh, floor) == b"\n"):
+                line = b"".join(reversed(carry))
+                if line.strip():
+                    yield line.decode("utf-8", errors="replace")
     except OSError:
         return
+
+
+def _byte_before(fh, offset: int) -> bytes:
+    fh.seek(offset - 1)
+    return fh.read(1)
 
 
 def _ag_flush_wait() -> float:
@@ -1147,20 +1176,21 @@ def _ag_filled(payload: dict, text: str) -> dict:
 
 def _antigravity_turn(payload, now: float | None, wait: float | None):
     """(gate answer, the new turn's time, (session, the payload's step count)
-    when this call recorded nothing and its own turn may not be written yet)."""
+    when this call recorded nothing and its own turn may not be written yet,
+    the turn's step key)."""
     read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait))
     if read is None:
-        return None, None, None
+        return None, None, None, ""
     session, found = read
     if found is None:
-        return None, None, (session, _ag_initial_steps(payload))
+        return None, None, (session, _ag_initial_steps(payload)), ""
     key, text = found
     at = _ag_claim(session, key, time.time() if now is None else now)
     if at is None:
         # Already handled, or the newest step is the last turn's and this
         # call's own turn is not written yet.
-        return {}, None, (session, _ag_initial_steps(payload))
-    return _ag_filled(payload, text), at, None
+        return {}, None, (session, _ag_initial_steps(payload)), key
+    return _ag_filled(payload, text), at, None, key
 
 
 def antigravity_prompt(payload: dict, now: float | None = None, wait: float | None = None,
@@ -1172,14 +1202,31 @@ def antigravity_prompt(payload: dict, now: float | None = None, wait: float | No
     Never raises."""
     try:
         stamp = time.time() if now is None else now
-        out, at, unseen = _antigravity_turn(payload, stamp, wait)
+        out, at, unseen, key = _antigravity_turn(payload, stamp, wait)
         if unseen is not None:
             _ag_note_unseen(unseen[0], unseen[1], stamp)
         if out:
-            record(out, now=at, issuer=issuer)
+            record(out, now=at, issuer=issuer, extra={"fallback": True} if key.startswith(_AG_FALLBACK) else None)
         return out
     except Exception:  # noqa: BLE001 - the gate must never fail a prompt
         return None
+
+
+def _ag_duplicate_of(session: str, filled: dict, now: float) -> dict | None:
+    """When this turn was already recorded from ``lastUserInput`` and not yet
+    paired with its flushed copy: that row's id and occurrence, so the copy
+    shares its numbering (a second row, but one typing)."""
+    typed = owner_text(filled["prompt"])
+    if typed is None or not typed.strip():
+        return None
+    sha = prompt_sha256(typed)
+    rows = turns(session, now)
+    paired = {t.get("duplicate_of") for t in rows}
+    for t in rows:
+        if t.get("fallback") and t.get("prompt_sha256") == sha and t.get("turn") not in paired \
+                and type(t.get("occurrence")) is int:
+            return {"duplicate_of": t["turn"], "occurrence": t["occurrence"]}
+    return None
 
 
 def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
@@ -1202,7 +1249,8 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
             if at is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}
-                recorded = record(_ag_filled(payload, found[1]), now=at, issuer=issuer)
+                filled = _ag_filled(payload, found[1])
+                recorded = record(filled, now=at, issuer=issuer, extra=_ag_duplicate_of(session, filled, at))
         if str(event).lower() == "stop":
             _ag_clear_unseen(session)
         return recorded

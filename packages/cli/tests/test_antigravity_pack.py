@@ -488,6 +488,56 @@ def test_a_jsonl_user_input_buried_under_more_than_the_chunk_is_still_recovered(
     assert _ag_ts() == [1000.0]
 
 
+def test_a_flushed_copy_of_a_last_user_input_turn_shares_its_occurrence(home, tmp_path):
+    issuer = {"refused": "test"}
+    tp = _transcript(tmp_path)
+    tp.write_text("")
+    owner_turns.antigravity_prompt(_pre(tp, lastUserInput="ship it"), now=1000.0, wait=0, issuer=issuer)
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>ship it</USER_REQUEST>")
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1004.0, issuer=issuer)
+    rows = owner_turns.turns("ag-1", now=1010.0)
+    assert [r["occurrence"] for r in rows] == [1, 1] and rows[1]["duplicate_of"] == rows[0]["turn"]
+    assert owner_turns.counts(now=1010.0)["antigravity"]["turns"] == 1
+    # A second, real typing of the same words is occurrence 2.
+    _step(tp, "USER_INPUT", 3, "<USER_REQUEST>ship it</USER_REQUEST>")
+    assert owner_turns.antigravity_late_turn(_pre(tp), "PostInvocation", now=1100.0, issuer=issuer)
+    assert [r["occurrence"] for r in owner_turns.turns("ag-1", now=1110.0)] == [1, 1, 2]
+
+
+def test_a_jsonl_line_nested_too_deep_to_parse_is_skipped_not_fatal(home, tmp_path):
+    tp = _transcript(tmp_path)
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>find me</USER_REQUEST>")
+    with tp.open("a") as f:
+        f.write("[" * 200000 + "]" * 200000 + "\n")
+    assert owner_turns._ag_last_user_input(str(tp)) == ("step-1", "find me")
+    assert owner_turns.antigravity_prompt(_pre(tp), now=1.0, wait=0, issuer={"refused": "test"})["prompt"] == "find me"
+
+
+def test_a_user_input_starting_exactly_at_the_scan_cap_is_read(home, tmp_path, monkeypatch):
+    tp = _transcript(tmp_path)
+    tp.write_text("x" * 50 + "\n")
+    _step(tp, "USER_INPUT", 1, "edge")
+    _step(tp, "PLANNER_RESPONSE", 2, "after")
+    size = tp.stat().st_size
+    first = len(("x" * 50 + "\n").encode())
+    monkeypatch.setattr(owner_turns, "_AG_MAX_SCAN", size - first)
+    assert owner_turns._ag_last_user_input(str(tp)) == ("step-1", "edge")
+    monkeypatch.setattr(owner_turns, "_AG_MAX_SCAN", size - first - 3)  # starts mid-line: truncated, gone
+    assert owner_turns._ag_last_user_input(str(tp)) is None
+
+
+def test_scanning_a_64_mib_record_is_linear(home, tmp_path, monkeypatch):
+    import time
+
+    monkeypatch.setattr(owner_turns, "_AG_CHUNK", 64 << 10)
+    tp = _transcript(tmp_path)
+    _step(tp, "USER_INPUT", 1, "<USER_REQUEST>find me</USER_REQUEST>")
+    _step(tp, "TOOL_RESULT", 2, "y" * (64 << 20))
+    t0 = time.monotonic()
+    assert owner_turns._ag_last_user_input(str(tp)) == ("step-1", "find me")
+    assert time.monotonic() - t0 < 5.0
+
+
 # ---- verify -----------------------------------------------------------------------------
 
 def test_prompt_probe_proves_one_injection_per_turn(home):
