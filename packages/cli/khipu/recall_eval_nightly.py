@@ -33,7 +33,9 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -300,6 +302,25 @@ def _score_entry(entry: dict[str, Any], deadline: float,
     return rows
 
 
+def _quiet_excepthooks() -> None:
+    """The child's stderr is the nightly's local log. A default traceback from
+    a stray scorer thread would print exception args, and those can hold a
+    golden query: write only the exception type name and a running count."""
+    count = [0]
+
+    def note(exc_type) -> None:
+        count[0] += 1
+        try:
+            sys.stderr.write(f"[khipu-recall-eval] uncaught {exc_type.__name__} "
+                             f"(#{count[0]}) in scoring child\n")
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001 - a closed stderr must not change the run
+            pass
+
+    threading.excepthook = lambda args: note(args.exc_type)
+    sys.excepthook = lambda exc_type, _value, _tb: note(exc_type)
+
+
 def _child_main(conn, scoring: list[dict[str, Any]], deadline: float,
                 setup: tuple[Callable[..., Any], tuple] | None) -> None:
     """The scoring child. ``deadline`` is a ``time.monotonic`` value, which is
@@ -308,6 +329,7 @@ def _child_main(conn, scoring: list[dict[str, Any]], deadline: float,
     so a lookup thread still running dies with the process instead of
     reaching a restored exit. ``setup`` is a test seam run before the guard."""
     try:
+        _quiet_excepthooks()
         if setup is not None:
             setup[0](*setup[1])
         with _offline() as guard:

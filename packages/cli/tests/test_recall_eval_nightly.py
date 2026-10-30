@@ -194,6 +194,27 @@ def test_a_lookup_thread_outliving_the_deadline_never_reaches_a_real_exit(world)
     assert "abandoned-secret" not in ren.history_path().read_text()
 
 
+def _child_raising_thread(query):
+    import threading
+
+    def boom():
+        raise ValueError(query)
+
+    t = threading.Thread(target=boom)
+    t.start()
+    t.join()
+
+
+def test_a_stray_thread_exception_in_the_child_logs_only_its_type(world, capfd):
+    tmp, golden = world
+    secret = "stderr-secret-golden-words"
+    _write_golden(golden, [{"query": "q", "expect": ["1"]}])
+    ren.run_nightly_eval(golden=golden, child_setup=(_child_raising_thread, (secret,)))
+    err = capfd.readouterr().err
+    assert secret not in err
+    assert "uncaught ValueError" in err
+
+
 def _child_blocked_scorer(marker_dir):
     import pathlib
 
