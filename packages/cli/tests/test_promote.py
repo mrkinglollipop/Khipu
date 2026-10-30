@@ -1532,6 +1532,7 @@ _LOCAL_FAILURES = {
     "degraded_rate_ok": ("khipu.query_log.degraded_rate", {"ok": False}),
     "launchers_ok": ("khipu.integrations.launcher_health", {"ok": False}),
     "ledger_outbox_ok": ("khipu.ledger.outbox_status", {"pending": 1, "refused": 0}),
+    "recall_eval_ok": ("khipu.recall_eval_nightly.recall_eval_health", {"ok": False, "level": "red"}),
     "disk_space_ok": ("khipu.storage.disk_space", {"ok": False, "level": "red", "volumes": []}),
 }
 

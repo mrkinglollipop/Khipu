@@ -57,6 +57,7 @@ class JobsRunTest(unittest.TestCase):
              mock.patch("khipu.session_capture.drain", return_value={"failed": 0}), \
              mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
              mock.patch.object(jobs, "_commitment_close_rules", return_value={"ok": True}), \
+             mock.patch.object(jobs, "_recall_eval_step", return_value={"ok": True}), \
              mock.patch("khipu.embed.prune_query_cache", return_value=0):
             # The nightly's own embed sweep and cache prune reach the hub;
             # they are unit-tested below and never run for real here.
@@ -98,11 +99,12 @@ class JobsRunTest(unittest.TestCase):
                     mock.patch.object(jobs, "_hygiene_commitments"), \
                     mock.patch.object(jobs, "_ledger_nightly"), \
                     mock.patch.object(jobs, "_refresh_snapshot"), \
+                    mock.patch.object(jobs, "_recall_eval_step"), \
                     mock.patch.object(jobs, "_briefs_build_if_on", return_value=None):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 12)
+            self.assertEqual(record.call_count, 13)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -124,7 +126,7 @@ class JobsRunTest(unittest.TestCase):
              "query_cache_prune", "routing_ledger_prune", "commitments_close_rules",
              "commitments_mark_stale",
              "commitments_hygiene", "ledger", "project_renames",
-             "snapshot_refresh"],
+             "recall_eval", "snapshot_refresh"],
         )
         for step in payload["steps"]:
             self.assertIn("ok", step)

@@ -212,6 +212,7 @@ LOCAL_GATES = (
     "jobs_ok", "index_freshness_ok", "synth_budget_ok", "graph_backup_ok", "bundle_seal_ok",
     "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok",
     "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok", "disk_space_ok",
+    "recall_eval_ok",
 )
 
 
@@ -434,6 +435,13 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         disk_space = storage.disk_space()
     except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
         disk_space = {"ok": False, "level": "red", "volumes": [], "error": f"{type(e).__name__}: {e}"}
+    # Recall accuracy from the nightly's golden-set run; yellow never gates.
+    try:
+        from khipu.recall_eval_nightly import recall_eval_health
+
+        recall_eval_block = recall_eval_health()
+    except Exception as e:  # noqa: BLE001  (a failed check must not look like a pass)
+        recall_eval_block = {"ok": False, "level": "red", "error": f"{type(e).__name__}: {e}"}
     # What Khipu holds and where: a line in the report, never a gate.
     try:
         from khipu import storage
@@ -458,6 +466,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
         "prompt_recall_outcomes_ok": bool(prompt_recall_outcomes_block.get("ok")),
         "recall_daemon": recall_daemon_block, "recall_daemon_ok": bool(recall_daemon_block.get("ok")),
+        "recall_eval": recall_eval_block, "recall_eval_ok": bool(recall_eval_block.get("ok")),
         "nightly_steps": nightly_steps,
         "nightly_steps_ok": all(bool(v.get("ok")) for v in nightly_steps.values()),
         "degraded_rate": degraded_rate, "degraded_rate_ok": bool(degraded_rate.get("ok")),
@@ -1091,6 +1100,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             and bool(launchers.get("ok"))
             and local["ledger_outbox_ok"]
             and local["disk_space_ok"]
+            and local["recall_eval_ok"]
             and schema_ok
         ),
         "graph_backup": _graph_backup,
@@ -1123,6 +1133,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "degraded_rate_ok": bool(degraded_rate.get("ok")),
         "launchers_ok": bool(launchers.get("ok")),
         "nightly_steps_ok": local["nightly_steps_ok"],
+        "recall_eval_ok": local["recall_eval_ok"],
         "ledger_outbox_ok": local["ledger_outbox_ok"],
         "disk_space_ok": local["disk_space_ok"],
         "schema_migrations_ok": schema_ok,
@@ -4602,6 +4613,14 @@ def cmd_recall(args: argparse.Namespace) -> int:
         allow_changes = bool(getattr(args, "allow_changes", False))
         budget_ms = int(getattr(args, "budget_ms", None) or recall_eval.DEFAULT_STATUS_BUDGET_MS)
 
+        install_from = getattr(args, "install", None)
+        if install_from:
+            from khipu import recall_eval_nightly
+
+            result = recall_eval_nightly.install_candidates(_Path(install_from), golden_path)
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("ok") else 2
+
         rerank_arg = getattr(args, "rerank", None)
         if rerank_arg:
             if (path_arg != "explicit" or record_to or compare_to or replay_from
@@ -6996,6 +7015,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Which retrieval path scores each entry: explicit=embed.hybrid_search (default, legacy "
             "behavior), prompt=recall_prompt.prior_work_for_prompt unbudgeted, status=the same "
             "budgeted (--budget-ms), all=every path. An entry's own 'paths' key narrows this further."
+        ),
+    )
+    reval.add_argument(
+        "--install", default=None, metavar="FILE",
+        help=(
+            "Merge golden candidate entries from FILE (same JSONL shape, plus optional 'n' and 'source') "
+            "into the golden file: de-duplicated by query, expected ids checked against the replica, "
+            "the previous file kept as a .bak; prints counts only"
         ),
     )
     reval.add_argument(

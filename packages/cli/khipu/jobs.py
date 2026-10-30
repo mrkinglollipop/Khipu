@@ -489,6 +489,8 @@ def _run_nightly_locked() -> int:
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
     # Before the replica refresh, so a rename found tonight reaches the replica tonight.
     _record_nightly_step(steps, "project_renames", **_step_result(_project_renames_sweep()))
+    # Reads the replica the pull timer keeps current; the full dump below stays last.
+    _record_nightly_step(steps, "recall_eval", **_step_result(_recall_eval_step()))
     _record_nightly_step(steps, "snapshot_refresh", **_step_result(_refresh_snapshot()))
     briefs_result = _briefs_build_if_on()
     if briefs_result is not None:
@@ -497,6 +499,19 @@ def _run_nightly_locked() -> int:
     final_rc = rc or (0 if drain_result["ok"] and briefs_ok and completion_result["ok"] else 1)
     _write_job_state("nightly", final_rc)
     return final_rc
+
+
+def _recall_eval_step() -> dict[str, Any]:
+    """Score the golden set against the local replica and keep the figures;
+    the doctor row reads them. Its counts hold numbers only, never a query."""
+    try:
+        from khipu import recall_eval_nightly
+
+        rec = recall_eval_nightly.run_nightly_eval()
+    except Exception as exc:  # noqa: BLE001 - a failed measurement must not stop the nightly
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {k: rec[k] for k in ("ok", "entries", "scored", "skipped_forgotten", "truncated",
+                                "paths", "golden", "error") if k in rec}
 
 
 def _project_renames_sweep() -> dict[str, Any]:
