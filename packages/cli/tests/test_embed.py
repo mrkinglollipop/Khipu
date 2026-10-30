@@ -544,6 +544,9 @@ class _CatchupCursor:
             self._result = []
         elif "FROM commitments c WHERE c.status = 'open'" in s:
             self._result = self.commitment_rows
+        elif s.startswith("SELECT id, opened_episode, closed_episode FROM commitments"):
+            # The chokepoint's source lookup: these commitments have no episode.
+            self._result = [(cid, None, None) for cid, _text in self.commitment_rows if cid in params[0]]
         elif s.startswith("SELECT id, opened_episode FROM commitments"):
             # These fixtures represent open commitments without an episode.
             # The post-provider lock reads their parent as well as their id.
@@ -1232,6 +1235,8 @@ class BackfillCommitmentKindTest(unittest.TestCase):
             self.statements.append(s)
             if "information_schema.columns" in s:
                 self._result = [(c,) for c in ("id", "summary", "deleted_at")]
+            elif s.startswith("SELECT id, opened_episode, closed_episode FROM commitments"):
+                self._result = [(7, None, None), (8, None, None)]
             elif "FROM commitments" in s:
                 self._result = [(7, "ship the merge fix"), (8, "   ")]
             elif "FROM episodes" in s:

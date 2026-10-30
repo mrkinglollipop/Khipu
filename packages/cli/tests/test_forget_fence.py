@@ -305,7 +305,7 @@ def test_every_output_builder_reaches_the_fence():
 FENCED_TABLES = ("episodes", "decisions", "decision_links", "commitments", "deliverables",
                  "briefs", "nodes", "edges")
 FENCE_CALLS = {"withhold", "withhold_graph", "withhold_detail", "episode_withheld", "_fenced_slice",
-               "without_withheld", "forget_fence_sql", "_fenced_owed_rows", "_fence_episode_rows"}
+               "without_withheld", "forget_fence_sql", "_fenced_owed_rows", "fenced_texts", "fence_chunks"}
 _READ_SQL = re.compile(r"\b(?:FROM|JOIN)\s+(?:main\.)?(?:%s)\b" % "|".join(FENCED_TABLES), re.I)
 # A SELECT of only aggregates or a constant returns no row's content.
 _AGGREGATE_SQL = re.compile(r"^\s*SELECT\s+(?:(?:COUNT|MAX|MIN|SUM|EXISTS)\s*\(|1\b|TRUE\b)", re.I)
@@ -423,6 +423,91 @@ def test_the_guard_finds_a_reader_by_what_it_reads(tmp_path):
 
 
 
+# ---- the provider guard: text reaches a provider only through the chokepoint --
+#
+# A function that calls a provider client (an embedding, summariser, rerank or
+# model call) must itself call ``provider_text.fenced_texts`` /
+# ``fence_chunks`` (text derived from stored episodes) or ``live_input`` (input
+# that is not stored memory). An exemption comment does not count: only a real
+# call does, and the client functions themselves are the one layer judged by
+# their callers.
+PROVIDER_CLIENTS = {
+    "embed_batch", "embed_one", "embed_batch_images", "embed_text", "_embed_query_local",
+    "_generate", "_generate_local", "_generate_gemini", "_generate_cloud", "_generate_api",
+    "_generate_anthropic", "_generate_openai", "_generate_openrouter", "_generate_claude_cli",
+    "_generate_codex_cli", "_call_model", "_call_within",
+}
+CHOKEPOINT_CALLS = {"fenced_texts", "fence_chunks", "live_input"}
+
+
+def unchoked_provider_callers(root) -> list[str]:
+    """Every function under ``root`` that calls a provider client without
+    calling the chokepoint, whatever comments it carries."""
+    offenders: list[str] = []
+
+    def visit(node, path: str, inside_client: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                is_client = child.name in PROVIDER_CLIENTS
+                calls = _called_names(child)
+                if (not (inside_client or is_client) and calls & PROVIDER_CLIENTS
+                        and not calls & CHOKEPOINT_CALLS):
+                    offenders.append(f"{path}.{child.name}:{child.lineno}")
+                visit(child, path, inside_client or is_client)
+            else:
+                visit(child, path, inside_client)
+
+    for file in sorted(root.glob("*.py")):
+        visit(ast.parse(file.read_text(encoding="utf-8")), file.stem, False)
+    return offenders
+
+
+def test_every_provider_caller_gets_its_text_from_the_chokepoint():
+    from pathlib import Path
+
+    offenders = unchoked_provider_callers(Path(cli.__file__).parent)
+    assert not offenders, "provider callers that skip provider_text:\n" + "\n".join(offenders)
+
+
+PROVIDER_MODULE = '''
+def sends_rows(cur):
+    # forget-fence: a writer; returns no row to a reader
+    rows = cur.fetchall()
+    return embed_batch([r[1] for r in rows])
+
+
+def sends_summary(prompt):
+    # forget-fence source: this comment grants nothing to a provider caller
+    return extract._generate(prompt)
+
+
+def fenced_sender(texts):
+    safe = provider_text.fenced_texts(texts, [1] * len(texts), "episode")
+    return embed_batch([t for t in safe if t is not None])
+
+
+def live_sender(query):
+    return embed_one(provider_text.live_input(query, "query"))
+
+
+def embed_one(text):
+    return embed_batch([text])
+
+
+def nested(texts):
+    def _again(t):
+        return _generate_gemini(t)
+    return provider_text.fenced_texts(texts, None, "reflect"), _again
+'''
+
+
+def test_the_provider_guard_finds_a_caller_that_skips_the_chokepoint(tmp_path):
+    (tmp_path / "sender.py").write_text(PROVIDER_MODULE, encoding="utf-8")
+    found = {name.split(":")[0] for name in unchoked_provider_callers(tmp_path)}
+    assert found == {"sender.sends_rows", "sender.sends_summary", "sender._again"}
+
+
+
 # ---- embedding sources and the briefs plan --------------------------------
 
 def _episode_source_cur():
@@ -482,3 +567,156 @@ def test_the_recent_missing_catch_up_sends_no_forgotten_text_to_the_provider(for
             pass
     assert not any("FORGOTTEN-EMBED" in t for t in sent)
     assert sent == []
+
+
+# ---- every provider path, in both list states (Kimi's fourth probes) --------
+
+@pytest.fixture(params=["forgotten", "unreadable"])
+def list_state(request):
+    if request.param == "forgotten":
+        tombstones.publish_episode_ids({FORGOT})
+    else:
+        _corrupt_list()
+    return request.param
+
+
+def _cursor(*answers):
+    cur = mock.MagicMock()
+    cur.fetchall.side_effect = list(answers)
+    return cur
+
+
+def test_capture_embedding_sends_nothing_for_a_forgotten_episode(list_state):
+    sent: list = []
+    row = {"id": 902, "summary": "FORGOTTEN-CAPTURE", "decisions": [], "preferences": [],
+           "topics": [], "people": []}
+    cur = mock.MagicMock()
+    cur.fetchone.return_value = (row,)
+    conn = mock.MagicMock()
+    conn.__enter__.return_value = conn
+    conn.cursor.return_value.__enter__.return_value = cur
+    with mock.patch("khipu.db.connect", return_value=conn), \
+            mock.patch.object(embed, "_active_profile", return_value="p"), \
+            mock.patch.object(embed, "embed_batch", side_effect=lambda t, **k: sent.extend(t) or []):
+        assert embed.embed_on_capture({"summary": "FORGOTTEN-CAPTURE", "ts": "2026-10-30T00:00:00Z"},
+                                      episode_id=902) is False
+    assert sent == []
+
+
+def test_episode_edit_re_embedding_sends_nothing_for_a_forgotten_episode(list_state):
+    sent: list = []
+    cur = mock.MagicMock()
+    cur.fetchone.return_value = ("FORGOTTEN-EDIT", [], [], [], [], None)
+    with mock.patch.object(cli, "_episode_live_clause", return_value=""), \
+            mock.patch.object(cli, "_episode_verbatim_select", return_value="NULL"), \
+            mock.patch.object(embed, "_active_profile", return_value="p"), \
+            mock.patch.object(embed, "embed_batch", side_effect=lambda t, **k: sent.extend(t) or []):
+        assert cli._reembed_episode(cur, 902) is False
+    assert sent == []
+
+
+def test_commitment_sources_never_yield_text_from_a_forgotten_episode(list_state):
+    cur = _cursor([(7, "FORGOTTEN-COMMITMENT")], [(7, 902, None)])
+    assert list(embed._iter_sources(cur, kind="commitment")) == []
+
+
+def test_a_commitment_from_a_live_episode_is_still_embedded():
+    tombstones.publish_episode_ids({FORGOT})
+    cur = _cursor([(8, "plain commitment")], [(8, 904, None)])
+    assert [t for _k, _r, t, _ti in embed._iter_sources(cur, kind="commitment")] == ["plain commitment"]
+
+
+def test_topic_sources_never_yield_a_topic_a_forgotten_episode_feeds(list_state):
+    cur = _cursor([("secret-topic", "secret-topic", "FORGOTTEN-TOPIC")], [("secret-topic", 902)])
+    assert list(embed._iter_sources(cur, kind="topic")) == []
+
+
+def test_a_topic_whose_sources_are_unknown_is_not_sent():
+    tombstones.publish_episode_ids({999})
+    cur = mock.MagicMock()
+    cur.fetchall.side_effect = [[("t", "t", "body")], RuntimeError("lookup failed")]
+    assert list(embed._iter_sources(cur, kind="topic")) == []
+
+
+def test_backfill_batches_pass_the_chokepoint_again(list_state):
+    cur = _cursor([("secret-topic", 902)])
+    out = embed.provider_text.fence_chunks(cur, [("topic", "secret-topic", "FORGOTTEN-TOPIC"),
+                                                 ("episode", "902", "FORGOTTEN-EPISODE")])
+    assert out == [None, None]
+
+
+def test_reflect_sends_no_source_derived_from_a_forgotten_episode(list_state):
+    from khipu import reflect
+
+    prompts: list = []
+    sources = [{"kind": "topic", "id": "secret-topic", "origin": [902], "text": "FORGOTTEN-TOPIC",
+                "summary": "FORGOTTEN-TOPIC", "decisions": []}]
+    rows = [{"kind": "topic", "id": "secret-topic"}]
+    conn = mock.MagicMock()
+    conn.__enter__.return_value = conn
+    with mock.patch.object(reflect, "_search", return_value=rows), \
+            mock.patch.object(reflect, "gather", return_value=sources), \
+            mock.patch("khipu.db.connect", return_value=conn), \
+            mock.patch("khipu.rerank._call_model", side_effect=lambda p, **k: prompts.append(p) or ("{}", "m")):
+        out = reflect.reflect("what is secret-topic?")
+    assert prompts == []
+    assert out.get("reason") == "no-sources"
+
+
+def test_rerank_shows_the_model_no_candidate_a_forgotten_episode_feeds(list_state):
+    import time
+
+    from khipu import rerank
+
+    prompts: list = []
+    rows = [{"kind": "topic", "id": "secret-topic", "snippet": "FORGOTTEN-TOPIC"},
+            {"kind": "episode", "id": "904", "snippet": "plain live text"},
+            {"kind": "episode", "id": "905", "snippet": "other live text"}]
+    with mock.patch.object(rerank, "_call_model",
+                           side_effect=lambda p, **k: prompts.append(p) or ('{"order": [0, 1]}', "m")):
+        out = rerank.rerank("q", rows, deadline=time.monotonic() + 5,
+                            topic_sources={"secret-topic": [902]})
+    assert not any("FORGOTTEN-TOPIC" in p for p in prompts)
+    if list_state == "unreadable":
+        assert prompts == [] and out["order"] is None
+    else:
+        assert out["order"] == [1, 2]
+
+
+def test_a_topic_row_with_unknown_sources_is_not_reranked():
+    import time
+
+    from khipu import rerank
+
+    tombstones.publish_episode_ids({999})
+    prompts: list = []
+    rows = [{"kind": "topic", "id": "t", "snippet": "TOPIC-TEXT"},
+            {"kind": "episode", "id": "904", "snippet": "a"}, {"kind": "episode", "id": "905", "snippet": "b"}]
+    with mock.patch.object(rerank, "_call_model",
+                           side_effect=lambda p, **k: prompts.append(p) or ('{"order": [0, 1]}', "m")):
+        out = rerank.rerank("q", rows, deadline=time.monotonic() + 5)
+    assert prompts and "TOPIC-TEXT" not in prompts[0] and out["order"] == [1, 2]
+
+
+def test_the_chokepoint_refuses_the_wrong_door():
+    from khipu import provider_text
+
+    with pytest.raises(ValueError):
+        provider_text.fenced_texts(["x"], [1], "query")
+    with pytest.raises(ValueError):
+        provider_text.live_input("x", "topic")
+
+
+def test_hygiene_and_owed_tidy_judges_send_no_forgotten_or_unsourced_commitment(list_state):
+    from khipu import hygiene, owed_tidy
+    from khipu.provider_text import sourced
+
+    sent: list = []
+    texts = [sourced("FORGOTTEN-JUDGE", [902]), sourced("live judge text", [904]), "no source at all"]
+    with mock.patch("khipu.extract._generate", side_effect=lambda p, **k: sent.append(p) or "{}"):
+        hygiene._model_judge(texts)
+        owed_tidy._model_owner_judge(texts)
+        hygiene._model_adjudicate_pairs([(texts[0], texts[1]), (texts[1], texts[2])])
+    assert not any("FORGOTTEN-JUDGE" in p or "no source at all" in p for p in sent)
+    if list_state == "unreadable":
+        assert sent == []

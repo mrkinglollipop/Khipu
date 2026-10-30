@@ -2764,12 +2764,12 @@ def cmd_decisions(args: argparse.Namespace) -> int:
 
 
 def _reembed_episode(cur, episode_id: int) -> bool:
-    # forget-fence: embedding writer; returns no row to a reader
     """Replace one episode's vectors from its current row, using the same text
     builder, profile and upsert `embed.embed_on_capture` uses — so a corrected
     summary is findable by meaning immediately instead of at the next nightly.
     The API call happens before the DELETE, so a failed embed leaves the old
     vectors in place rather than none at all."""
+    from khipu import provider_text
     from khipu.embed import (
         _active_profile,
         _api_texts,
@@ -2796,7 +2796,10 @@ def _reembed_episode(cur, episode_id: int) -> bool:
     if not chunks:
         return False
     profile = _active_profile(cur)
-    vecs = embed_batch(_api_texts(profile, [("", c) for c in chunks]), profile=profile)
+    sendable = provider_text.fenced_texts(chunks, [episode_id] * len(chunks), "capture-edit")
+    if any(c is None for c in sendable):
+        return False
+    vecs = embed_batch(_api_texts(profile, [("", c) for c in sendable]), profile=profile)
     cur.execute(
         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
         (str(episode_id),),

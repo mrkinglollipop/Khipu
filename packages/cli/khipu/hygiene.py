@@ -406,13 +406,20 @@ def _model_judge(texts: list[str]) -> list[dict[str, Any]]:
     or a transport failure leaves the items kept. This job drops rows; it must
     never drop them because a model call went sideways.
     """
+    from khipu import provider_text
     from khipu.extract import _generate, parse_model_json
 
     out: list[dict[str, Any]] = [
         {"keep": True, "reason": "model returned no verdict"} for _ in texts
     ]
+    # The chokepoint: an item derived from a forgotten episode, or with no
+    # known source, is kept and never sent.
+    marks = provider_text.fenced_texts(texts, None, "commitment")
+    sent = [i for i, mark in enumerate(marks) if mark is not None]
+    if not sent:
+        return out
     try:
-        raw = _generate(_judge_prompt(texts), timeout=90, retries=1, caller="hygiene")
+        raw = _generate(_judge_prompt([marks[i] for i in sent]), timeout=90, retries=1, caller="hygiene")
     except Exception as exc:  # noqa: BLE001 — keep everything on a failed call
         return [{"keep": True, "reason": f"judge unavailable: {type(exc).__name__}"} for _ in texts]
     parsed = parse_model_json(raw) or {}
@@ -423,7 +430,8 @@ def _model_judge(texts: list[str]) -> list[dict[str, Any]]:
             idx = int(item.get("i"))
         except (TypeError, ValueError):
             continue
-        if 0 <= idx < len(out):
+        if 0 <= idx < len(sent):
+            idx = sent[idx]
             out[idx] = {
                 "keep": bool(item.get("keep", True)),
                 "reason": str(item.get("reason") or "").strip()[:120] or "model verdict",
@@ -629,17 +637,26 @@ def _model_adjudicate_pairs(pairs: list[tuple[str, str]], *, retries: int = 1) -
     an unreadable response)."""
     if not pairs:
         return []
+    from khipu import provider_text
     from khipu.extract import _generate, parse_model_json
 
+    marks = provider_text.fenced_texts([t for pair in pairs for t in pair], None, "commitment")
+    sent = [i for i in range(len(pairs)) if marks[2 * i] is not None and marks[2 * i + 1] is not None]
+    if not sent:
+        return [False] * len(pairs)
     try:
-        raw = _generate(_adjudicate_pairs_prompt(pairs), timeout=60, retries=retries, caller="hygiene")
+        raw = _generate(_adjudicate_pairs_prompt([(marks[2 * i], marks[2 * i + 1]) for i in sent]),
+                        timeout=60, retries=retries, caller="hygiene")
     except Exception:  # noqa: BLE001
         return [False] * len(pairs)
     parsed = parse_model_json(raw) or {}
     same = parsed.get("same")
-    if not isinstance(same, list) or len(same) != len(pairs):
+    if not isinstance(same, list) or len(same) != len(sent):
         return [False] * len(pairs)
-    return [bool(x) for x in same]
+    out = [False] * len(pairs)
+    for i, answer in zip(sent, same):
+        out[i] = bool(answer)
+    return out
 
 
 def commitments_backup_dir() -> Path:
@@ -765,6 +782,11 @@ def run_commitments_hygiene(
 
     judge = judge or _model_judge
     rows = _select_open_commitments(cur, project=project, limit=limit)
+    from khipu import provider_text
+
+    origin = provider_text.episode_ids_of_commitments(cur, [r["id"] for r in rows])
+    for row in rows:
+        row["text"] = provider_text.sourced(row["text"], origin.get(str(row["id"])))
     verdicts: dict[int, dict[str, Any]] = {}
     survivors: list[dict[str, Any]] = []
     judged: list[dict[str, Any]] = []

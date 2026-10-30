@@ -260,11 +260,16 @@ def _model_owner_judge(texts: list[str]) -> list[dict[str, Any]]:
     attempt: one unit of ``owed_tidy_calls``. A retry is the plan's, and
     costs another unit. Fail-open: a failed call (marked ``failed``) or an
     unreadable answer keeps every item as the user's."""
+    from khipu import provider_text
     from khipu.extract import _generate, parse_model_json
 
     out: list[dict[str, Any]] = [{"owner": "user", "reason": "model returned no answer"} for _ in texts]
+    marks = provider_text.fenced_texts(texts, None, "commitment")
+    sent = [i for i, mark in enumerate(marks) if mark is not None]
+    if not sent:
+        return out
     try:
-        raw = _generate(_owner_judge_prompt(texts), timeout=90, retries=0, caller="hygiene")
+        raw = _generate(_owner_judge_prompt([marks[i] for i in sent]), timeout=90, retries=0, caller="hygiene")
     except Exception as exc:  # noqa: BLE001 — keep everything on a failed call
         return [{"owner": "user", "reason": f"model unavailable: {type(exc).__name__}", "failed": True}
                 for _ in texts]
@@ -276,7 +281,8 @@ def _model_owner_judge(texts: list[str]) -> list[dict[str, Any]]:
             idx = int(item.get("i"))
         except (TypeError, ValueError):
             continue
-        if 0 <= idx < len(out):
+        if 0 <= idx < len(sent):
+            idx = sent[idx]
             out[idx] = {"owner": str(item.get("owner") or "user").strip().lower(),
                         "label": item.get("label"),
                         "reason": str(item.get("reason") or "").strip()[:120] or "model answer"}
@@ -325,9 +331,15 @@ def _plan(cur, project: str, *, judge, use_model: bool) -> dict[str, Any]:
     rows = _select(cur, project)
     notes: list[str] = []
     items: dict[int, dict[str, Any]] = {}
+    from khipu import provider_text
+
+    origin = provider_text.episode_ids_of_commitments(cur, list(rows))
     for cid, row in rows.items():
         before, after, rule = _owners(row)
-        items[cid] = {"id": cid, "kind": row.get("kind"), "text": row.get("text"), "action": "keep",
+        text = row.get("text")
+        items[cid] = {"id": cid, "kind": row.get("kind"),
+                      "text": provider_text.sourced(text, origin.get(str(cid))) if text else text,
+                      "action": "keep",
                       "reason": "", "rule": rule, "before": before, "fingerprint": fingerprint(row),
                       "_after": after, "_owner": _guarded_owner(row)}
 

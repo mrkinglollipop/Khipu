@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from khipu import profiles as _profiles
+from khipu import provider_text
 from khipu.lines import split_lines
 from khipu.profiles import ProfileSpec, resolve_spec
 from khipu.search_text import hybrid_rerank
@@ -661,7 +662,7 @@ def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
             _log(f"query cache read skipped: {type(exc).__name__}")
             have_cache = False
     vec = embed_one(
-        api_q, profile=profile,
+        provider_text.live_input(api_q, "query"), profile=profile,
         retries=QUERY_EMBED_RETRIES, timeout=QUERY_EMBED_TIMEOUT_S,
         delay=QUERY_EMBED_DELAY_S, input_type="query",
     )
@@ -1274,7 +1275,7 @@ def _flush_media_batch(
     stats: dict[str, Any],
 ) -> None:
     images = [(raw, mime) for _sid, _p, _rel, mime, _sha, raw in batch]
-    vecs = embed_batch_images(images, profile=profile)
+    vecs = embed_batch_images(provider_text.live_input(images, "media"), profile=profile)
     rows: list[tuple[str, str, int, str, str, list[float]]] = []
     for (sid, _path, rel, mime, sha, raw), vec in zip(batch, vecs):
         mid = _upsert_media_asset(
@@ -1344,17 +1345,6 @@ def topic_text(slug: str, title: str | None, body: str | None) -> str:
     return f"{title or slug}\n\n{body or ''}".strip()
 
 
-def _fence_episode_rows(rows: list) -> list:
-    """``rows`` (episode id first) minus every episode on this Mac's forget
-    list or queued for erasure. An unreadable list keeps none, and records the
-    outcome through the forget-fence state."""
-    from khipu import tombstones
-
-    kept = {str(r["id"]) for r in tombstones.withhold(
-        [{"kind": "episode", "id": int(row[0])} for row in rows])}
-    return [row for row in rows if str(int(row[0])) in kept]
-
-
 def _iter_sources(
     cur, *, kind: str | None = None, refs: list[str] | None = None,
     commitment_wording: dict[str, str] | None = None,
@@ -1364,68 +1354,94 @@ def _iter_sources(
     ``title`` is used only for gemini-embedding-2 document prefixes; stored
     ``chunk_text`` stays the unprefixed ``text``. ``refs`` (with a ``kind`` of
     episode or topic) narrows the read to those rows: episode ids as strings,
-    topic slugs. Episodes on this Mac's forget list or erasure queue are
-    fenced out before any text is built, so none reaches a provider; when the
-    list cannot be read no episode is yielded.
+    topic slugs. Each kind's reader passes its texts through
+    ``provider_text.fenced_texts`` before yielding, so no text derived from a
+    forgotten episode reaches a provider; when the list cannot be read
+    nothing episode-derived is yielded.
     """
     if kind in (None, "episode"):
-        # Tombstoned episodes (khipu episode forget) must never be re-embedded;
-        # pre-0010 hubs have no deleted_at column.
-        from khipu.db import has_columns
-
-        live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
-        has_verbatim = has_columns(cur, "episodes", "verbatim")
-        verbatim_col = ", verbatim" if has_verbatim else ""
-        only = ""
-        args: tuple = ()
-        if refs is not None:
-            only = (" AND" if live else " WHERE") + " id = ANY(%s)"
-            args = ([int(r) for r in refs],)
-        cur.execute(
-            f"SELECT id, summary, decisions, preferences, topics, people{verbatim_col} "
-            f"FROM episodes{live}{only} ORDER BY id",
-            args,
-        )
-        for row in _fence_episode_rows(cur.fetchall()):
-            eid, summary, decisions, prefs, topics, people = row[:6]
-            verbatim = row[6] if has_verbatim else None
-            text = episode_text(
-                {"summary": summary, "decisions": decisions, "preferences": prefs,
-                 "topics": topics, "people": people, "verbatim": verbatim}
-            )
-            # Empty live rows still participate so a successful backfill can
-            # prune vectors left from their former non-empty contents.
-            yield "episode", str(eid), text, ""
+        yield from _episode_sources(cur, refs)
     if kind in (None, "topic"):
-        if refs is None:
-            cur.execute("SELECT slug, title, body FROM topics WHERE deleted_at IS NULL ORDER BY slug")
-        else:
-            cur.execute(
-                "SELECT slug, title, body FROM topics WHERE deleted_at IS NULL"
-                " AND slug = ANY(%s) ORDER BY slug",
-                (list(refs),),
-            )
-        for slug, title, body in cur.fetchall():
-            text = topic_text(slug, title, body)
-            if text:
-                yield "topic", slug, text, (title or slug or "")
+        yield from _topic_sources(cur, refs)
     # Commitments are OPT-IN only (`--kind commitment`), never part of the
     # default sweep: their vectors exist for commitments.auto_close, not for
     # generic search (_cosine_candidates excludes kind='commitment'), and the
     # hook's bounded catch-up normally keeps them current. This is the manual
     # heal for a hub whose catch-up fell behind (audit 2026-09-04).
     if kind == "commitment":
+        yield from _commitment_sources(cur, commitment_wording)
+
+
+def _episode_sources(cur, refs: list[str] | None) -> Iterable[tuple[str, str, str, str]]:
+    from khipu import provider_text
+    from khipu.db import has_columns
+
+    # Tombstoned episodes (khipu episode forget) must never be re-embedded;
+    # pre-0010 hubs have no deleted_at column.
+    live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
+    has_verbatim = has_columns(cur, "episodes", "verbatim")
+    verbatim_col = ", verbatim" if has_verbatim else ""
+    only = ""
+    args: tuple = ()
+    if refs is not None:
+        only = (" AND" if live else " WHERE") + " id = ANY(%s)"
+        args = ([int(r) for r in refs],)
+    cur.execute(
+        f"SELECT id, summary, decisions, preferences, topics, people{verbatim_col} "
+        f"FROM episodes{live}{only} ORDER BY id",
+        args,
+    )
+    rows = cur.fetchall()
+    texts = [episode_text({"summary": row[1], "decisions": row[2], "preferences": row[3],
+                           "topics": row[4], "people": row[5],
+                           "verbatim": row[6] if has_verbatim else None}) for row in rows]
+    kept = provider_text.fenced_texts(texts, [row[0] for row in rows], "episode")
+    for row, text in zip(rows, kept):
+        if text is not None:
+            # Empty live rows still participate so a successful backfill can
+            # prune vectors left from their former non-empty contents.
+            yield "episode", str(row[0]), text, ""
+
+
+def _topic_sources(cur, refs: list[str] | None) -> Iterable[tuple[str, str, str, str]]:
+    from khipu import provider_text
+
+    if refs is None:
+        cur.execute("SELECT slug, title, body FROM topics WHERE deleted_at IS NULL ORDER BY slug")
+    else:
         cur.execute(
-            "SELECT id, text FROM commitments WHERE status = 'open' ORDER BY id"
+            "SELECT slug, title, body FROM topics WHERE deleted_at IS NULL"
+            " AND slug = ANY(%s) ORDER BY slug",
+            (list(refs),),
         )
-        for cid, ctext in cur.fetchall():
-            text = (ctext or "").strip()
-            if text:
-                if commitment_wording is not None:
-                    # The md5 of the hub text as read, for the publication
-                    # lock's wording check (_lock_live_embedding_refs).
-                    commitment_wording[str(cid)] = _md5(ctext or "")
-                yield "commitment", str(cid), text, ""
+    rows = [(slug, title, topic_text(slug, title, body)) for slug, title, body in cur.fetchall()]
+    rows = [r for r in rows if r[2]]
+    sources = provider_text.episode_ids_of_topics(cur, [r[0] for r in rows])
+    kept = provider_text.fenced_texts([r[2] for r in rows], [sources.get(r[0]) for r in rows], "topic")
+    for (slug, title, _text), text in zip(rows, kept):
+        if text is not None:
+            yield "topic", slug, text, (title or slug or "")
+
+
+def _commitment_sources(
+    cur, commitment_wording: dict[str, str] | None
+) -> Iterable[tuple[str, str, str, str]]:
+    from khipu import provider_text
+
+    cur.execute("SELECT id, text FROM commitments WHERE status = 'open' ORDER BY id")
+    rows = [(cid, ctext, (ctext or "").strip()) for cid, ctext in cur.fetchall()]
+    rows = [r for r in rows if r[2]]
+    sources = provider_text.episode_ids_of_commitments(cur, [r[0] for r in rows])
+    kept = provider_text.fenced_texts([r[2] for r in rows], [sources.get(str(r[0])) for r in rows],
+                                      "commitment")
+    for (cid, ctext, _text), text in zip(rows, kept):
+        if text is None:
+            continue
+        if commitment_wording is not None:
+            # The md5 of the hub text as read, for the publication
+            # lock's wording check (_lock_live_embedding_refs).
+            commitment_wording[str(cid)] = _md5(ctext or "")
+        yield "commitment", str(cid), text, ""
 
 
 def _existing_hashes(cur, profile: str) -> dict[tuple[str, str, int], str]:
@@ -1955,6 +1971,10 @@ def backfill(
                         break
                     batch = todo[start : start + BATCH]
                     # todo rows: (kind, ref, idx, chunk, hash, title)
+                    sendable = provider_text.fence_chunks(cur, [(k, r, c) for k, r, _i, c, _h, _t in batch])
+                    batch = [row for row, text in zip(batch, sendable) if text is not None]
+                    if not batch:
+                        continue
                     api = _api_texts(profile, [(title, chunk) for _k, _r, _i, chunk, _h, title in batch])
                     try:
                         # Gemini answered 429 to five back-to-back 64-chunk batches
@@ -2103,7 +2123,6 @@ def activate_welcome_embed(*, provider: str, profile: str | None = None) -> dict
 
 
 def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) -> bool:
-    # forget-fence: embedding writer; returns no row to a reader
     """Embed one just-captured episode. Fail-open; returns True on success.
 
     ``episode_id`` is the row the writer reported; without one (a caller that
@@ -2145,7 +2164,11 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                 eid = str(source_row["id"])
                 source_text = episode_text(source_row)
                 chunks = chunk_text(source_text)
-                api = _api_texts(profile, [("", c) for c in chunks])
+                sendable = provider_text.fenced_texts(chunks, [eid] * len(chunks), "capture-embed")
+                if any(c is None for c in sendable):
+                    _log("embed-on-capture: episode is forgotten or the forget list is unreadable; nothing sent")
+                    return False
+                api = _api_texts(profile, [("", c) for c in sendable])
                 vecs = embed_batch(api, profile=profile)
                 cur.execute(
                     "SELECT row_to_json(e) FROM episodes e "
@@ -3303,7 +3326,10 @@ def hybrid_search(
                     from khipu import rerank as _rerank
 
                     fused, rerank_info, rerank_failed = _rerank.stage(
-                        query, fused, mode=mode, token_count=len(tokens)
+                        query, fused, mode=mode, token_count=len(tokens),
+                        topic_sources=provider_text.episode_ids_of_topics(
+                            cur, [str(r.get("id")) for r in fused[:_rerank.MAX_CANDIDATES]
+                                  if r.get("kind") == "topic"]),
                     )
                     if rerank_failed:
                         degraded_legs.append("rerank")
@@ -3706,7 +3732,7 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 " ORDER BY e.ts DESC LIMIT %s",
                 (scan_limit,),
             )
-            episode_rows = _fence_episode_rows(list(cur.fetchall()))
+            episode_rows = list(cur.fetchall())
             # Preserve the old all-ages missing-row lane so a long run of
             # healthy recent episodes cannot starve an older wholly-missing row.
             cur.execute(
@@ -3719,21 +3745,22 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             )
             seen_episode_ids = {str(row[0]) for row in episode_rows}
             episode_rows.extend(
-                row for row in _fence_episode_rows(list(cur.fetchall()))
-                if str(row[0]) not in seen_episode_ids
+                row for row in cur.fetchall() if str(row[0]) not in seen_episode_ids
             )
+            episode_texts = provider_text.fenced_texts(
+                [episode_text({"summary": r[1], "decisions": r[2], "preferences": r[3],
+                               "topics": r[4], "people": r[5],
+                               "verbatim": r[6] if has_verbatim else None}) for r in episode_rows],
+                [r[0] for r in episode_rows], "episode")
+            episode_rows = [(r, t) for r, t in zip(episode_rows, episode_texts) if t is not None]
             episode_existing = _existing_hashes_for_refs(
-                cur, profile, "episode", [str(row[0]) for row in episode_rows]
+                cur, profile, "episode", [str(row[0]) for row, _t in episode_rows]
             )
             todo: list[tuple[str, str, int, str, str]] = []
             episode_replacements = {}
             episode_snapshot_rows = []
-            for row in episode_rows:
-                eid, summary, decisions, prefs, topics, people = row[:6]
-                verbatim = row[6] if has_verbatim else None
-                text = episode_text({"summary": summary, "decisions": decisions,
-                                     "preferences": prefs, "topics": topics, "people": people,
-                                     "verbatim": verbatim})
+            for row, text in episode_rows:
+                eid = row[0]
                 chunks = chunk_text(text) if text else []
                 current = {i: _md5(chunk) for i, chunk in enumerate(chunks)}
                 previous = {i: h for (k, r, i), h in episode_existing.items() if k == "episode" and r == str(eid)}
@@ -3831,8 +3858,12 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 _log(f"commitment embed catch-up skipped: {type(exc).__name__}: {exc}")
                 commitment_rows = []
             snapshot_rows: list[dict[str, Any]] = []
-            for cid, ctext in commitment_rows:
-                text = (ctext or "").strip()
+            commitment_sources = provider_text.episode_ids_of_commitments(
+                cur, [cid for cid, _t in commitment_rows])
+            commitment_kept = provider_text.fenced_texts(
+                [(ctext or "").strip() for _cid, ctext in commitment_rows],
+                [commitment_sources.get(str(cid)) for cid, _t in commitment_rows], "commitment")
+            for (cid, ctext), text in zip(commitment_rows, commitment_kept):
                 if not text:
                     continue
                 chunks = chunk_text(text)
@@ -3916,8 +3947,13 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             topic_snapshot_rows: list[dict[str, Any]] = []
             topic_sources = []
             topic_replacements = []
-            for slug, title, body, source_row in topic_rows:
-                text = topic_text(slug, title, body)
+            topic_origin = provider_text.episode_ids_of_topics(cur, [row[0] for row in topic_rows])
+            topic_kept = provider_text.fenced_texts(
+                [topic_text(row[0], row[1], row[2]) for row in topic_rows],
+                [topic_origin.get(str(row[0])) for row in topic_rows], "topic")
+            for (slug, title, body, source_row), text in zip(topic_rows, topic_kept):
+                if text is None:
+                    continue
                 # P5 G4: section-stable idx, same scheme backfill() uses for
                 # topics — keeps this leg's rows from looking "unchanged
                 # under a different idx" (and so getting re-embedded again)

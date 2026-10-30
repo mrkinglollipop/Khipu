@@ -1603,10 +1603,11 @@ def _cosine_scores(cur, text: str, commitment_ids: list[int]) -> dict[int, float
     if not commitment_ids:
         return {}
     try:
+        from khipu import provider_text
         from khipu.embed import _active_profile, _vec_literal, embed_one
 
         profile = _active_profile(cur)
-        vec = embed_one(text, profile=profile)
+        vec = embed_one(provider_text.live_input(text, "payload"), profile=profile)
         cur.execute(
             """
             SELECT ref, 1 - (embedding <=> %s::vector) AS score

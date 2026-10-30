@@ -578,10 +578,11 @@ def _dedup_cosine_best(
     if not candidates:
         return None
     try:
+        from khipu import provider_text
         from khipu.embed import _active_profile, _vec_literal, embed_one
 
         profile = _active_profile(cur)
-        vec = embed_one(_dedup_text(payload), profile=profile)
+        vec = embed_one(provider_text.live_input(_dedup_text(payload), "payload"), profile=profile)
     except Exception:  # noqa: BLE001
         return None
     ids = [str(c["id"]) for c in candidates]

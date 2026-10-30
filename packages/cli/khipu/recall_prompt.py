@@ -2224,6 +2224,7 @@ def _cached_query_embed(prompt: str, profile: str, deadline: float | None = None
     ``deadline`` leaves at least QUERY_EMBED_RETRY_MIN_S, on a timeout that
     ends by the deadline.
     """
+    from khipu import provider_text
     from khipu.embed import embed_one, prefix_query, uses_task_prefixes
     from khipu.redact import redact_secrets
 
@@ -2237,7 +2238,7 @@ def _cached_query_embed(prompt: str, profile: str, deadline: float | None = None
     for attempt in (1, 2):
         try:
             vec = embed_one(
-                api_q, profile=profile, retries=0, timeout=timeout, delay=0, input_type="query",
+                provider_text.live_input(api_q, "query"), profile=profile, retries=0, timeout=timeout, delay=0, input_type="query",
             )
             break
         except Exception as exc:

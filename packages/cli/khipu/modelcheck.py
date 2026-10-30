@@ -36,6 +36,7 @@ from typing import Any
 from khipu import embed as embed_mod
 from khipu import keychain
 from khipu import models as models_mod
+from khipu import provider_text
 
 CHECK_IDS = (
     "gemini_embed", "gemini_generate", "openai_compat_generate",
@@ -221,7 +222,7 @@ def _check_gemini_embed(*, timeout: float) -> dict[str, Any]:
         profile, model = fallback.id, fallback.model
     start = time.monotonic()
     try:
-        embed_mod.embed_one(EMBED_PROBE_TEXT, profile=profile, retries=0, timeout=timeout)
+        embed_mod.embed_one(provider_text.live_input(EMBED_PROBE_TEXT, "probe"), profile=profile, retries=0, timeout=timeout)
     except Exception as exc:  # noqa: BLE001 - the check must not abort its siblings
         return _fail_from_embed_exc("gemini_embed", exc, model=model, start=start)
     return _pass("gemini_embed", model=model, start=start)

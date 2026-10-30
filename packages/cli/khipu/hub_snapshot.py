@@ -7496,8 +7496,10 @@ def semantic_search_snapshot(
         raise RuntimeError("offline semantic search unavailable: configured local provider and replica profile are incompatible")
     profiles.register_spec(spec)
     api_query = prefix_query(query) if uses_task_prefixes(spec.id) else query
+    from khipu import provider_text
+
     vec = embed_one(
-        api_query, profile=spec.id, retries=0, timeout=60.0, delay=0,
+        provider_text.live_input(api_query, "query"), profile=spec.id, retries=0, timeout=60.0, delay=0,
         input_type="query",
     )
     if len(vec) != spec.dim:

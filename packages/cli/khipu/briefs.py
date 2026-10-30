@@ -528,9 +528,17 @@ def build_one(cur, topic_slug: str) -> dict[str, Any]:
             and have["version"] == DERIVATION_VERSION):
         return {"topic": topic_slug, "status": "unchanged", "brief_id": have["id"]}
 
-    from khipu import extract
+    from khipu import extract, provider_text
 
-    prompt = PROMPT.format(topic=topic_slug, sources=_render_sources(gathered["offered"]))
+    # The one chokepoint again at the provider boundary: a source the gather
+    # kept but the list now withholds is dropped, and an unreadable list
+    # sends nothing.
+    marks = provider_text.fenced_texts(
+        [s["text"] for s in gathered["offered"]], [s["id"] for s in gathered["offered"]], "brief")
+    offered = [s for s, mark in zip(gathered["offered"], marks) if mark is not None]
+    if not offered:
+        return {"topic": topic_slug, "status": "withheld", "reason": "every source withheld by the forget list"}
+    prompt = PROMPT.format(topic=topic_slug, sources=_render_sources(offered))
     try:
         raw = extract._generate(prompt, timeout=120, retries=1, caller="brief")
     except Exception as exc:  # noqa: BLE001 — transport/model failure; retried next run
@@ -539,7 +547,7 @@ def build_one(cur, topic_slug: str) -> dict[str, Any]:
     if parsed is None:
         _record_failed(cur, topic_slug, gathered, "model returned non-JSON")
         return {"topic": topic_slug, "status": "failed", "reason": "model returned non-JSON"}
-    offered_ids = {s["id"] for s in gathered["offered"]}
+    offered_ids = {s["id"] for s in offered}
     raw_claims = parsed.get("claims")
     claims, removed = validate_claims(raw_claims, offered_ids)
     if not claims:
