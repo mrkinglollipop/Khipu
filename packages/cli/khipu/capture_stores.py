@@ -116,7 +116,7 @@ STORES: tuple[Store, ...] = (
           "and .recall-golden.*.tmp rewrites beside it",
           "recall test queries, which usually quote a captured episode's private text, each "
           "with the episode ids it expects", "recall golden",
-          _w("forget._scrub_golden_file"),
+          _w("forget._scrub_golden_file", "recall_eval_nightly._write_golden_atomic"),
           Restore(("recall-golden.jsonl",), "recall golden")),
     Store("work view", "data folder state/work/view.json and .view.json.*.tmp rewrites beside it; "
           "the same writer saves state/work/last/*.json, links.json and hidden.json there, which "

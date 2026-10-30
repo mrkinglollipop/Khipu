@@ -405,6 +405,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
                     mock.patch.object(jobs, "_commitment_close_rules", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True, "stale": 0}), \
                     mock.patch.object(jobs, "_project_renames_sweep", return_value={"ok": True}), \
+                    mock.patch.object(jobs, "_recall_eval_step", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_summary_kind_backfill", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}):
                 jobs.run_nightly()
@@ -415,7 +416,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
             {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "commitments_close_rules", "commitments_mark_stale",
              "commitments_hygiene", "ledger",
-             "project_renames", "snapshot_refresh"},
+             "project_renames", "snapshot_refresh", "recall_eval"},
         )
         for step in payload["steps"]:
             self.assertIn("ok", step)
