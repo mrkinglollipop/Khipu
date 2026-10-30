@@ -240,6 +240,21 @@ class LogLineTest(unittest.TestCase):
         rp.hook_main(json.dumps({"prompt": PROMPT, "session_id": "s-log"}))
         return self._summary_line(log, before)
 
+    def test_a_relevance_abstention_logs_a_parseable_ok_reason(self) -> None:
+        unrelated = _lexical_row("9", "spreadsheet macro freeze pane")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "prompt-recall.log"
+            with mock.patch.object(rp, "_log_path", return_value=log), \
+                    mock.patch.object(rp, "_load_recent_batches", return_value=[]), \
+                    mock.patch.object(rp, "_save_recent_batches"), \
+                    mock.patch.dict("os.environ", {"KHIPU_FEATURE_RELEVANCE_FLOOR": "1"}):
+                with _lane(lexical=[unrelated], cosine=lambda *_a, **_k: []):
+                    line = self._run_hook(log)
+        reason = rp._LOG_LINE_RE.match(line).group("reason")
+        self.assertEqual(reason, "ok (no relevant match)")
+        self.assertEqual(rp._classify_call_reason(reason), "ok")
+        self.assertEqual(rp._outcome_for(reason, []), "no_match")
+
     def test_ok_and_timeout_lines_still_parse_and_are_counted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "prompt-recall.log"
