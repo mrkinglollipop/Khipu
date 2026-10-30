@@ -821,11 +821,72 @@ def test_the_search_test_is_the_same_for_both_runs():
     assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, timeout>1.2s"
     off["hits"] = ["episode:1"]
     on.update(reason="ok", ms=1900.0, hits=["episode:1"], routing="full")
-    assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, 1900 ms > 1200 ms"
+    assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, 1900 ms > 1200 ms, reference 300 ms"
     on.update(reason=None)
     assert pm._routing_problem("prompt 1", off, on) == "prompt 1: with routing on, the hook wrote no summary line"
     on.update(reason="ok", ms=900.0)
     assert pm._routing_problem("prompt 1", off, on) is None
+
+
+def _timed_hook(live_ms: float, off_ms: float, on_ms: float):
+    """A fake hook whose summary line carries a fixed time per kind of run:
+    live's, the candidate's with routing off, the candidate's with it on."""
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        if argv[1:2] == ["-c"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"push": True}) + "\n", "")
+        on = env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
+        cand = "/candidate/packages/" in argv[0]
+        ms = on_ms if on else off_ms if cand else live_ms
+        line = _summary(datetime.now(timezone.utc), "ok", ["episode:3"]).replace("ms=300.0", f"ms={ms}")
+        line += " routing=full" if on else ""
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(line + "\n")
+        return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+    return fake_run
+
+
+def test_replay_notes_slowness_live_shares_and_reports_both_medians(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _timed_hook(1300.0, 1350.0, 1350.0))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+    assert "shared slowness, not the candidate" in out["detail"]
+    assert "median 1350 ms, live 1300 ms" in out["detail"]
+
+
+def test_replay_fails_a_prompt_the_candidate_runs_300_ms_slower_than_live(home, monkeypatch):
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _timed_hook(1000.0, 1300.0, 1300.0))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"]
+    assert "prompt 1: 1300 ms > 1200 ms, reference 1000 ms" in out["detail"]
+
+
+def test_replay_fails_a_candidate_slower_than_live_at_the_median(home, monkeypatch):
+    # Under the budget on every prompt, so only the median test can see it.
+    candidate = _one_query(home)
+    monkeypatch.setattr(pm, "_run", _timed_hook(800.0, 1050.0, 1050.0))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"]
+    assert "the candidate is slower than live by 250 ms at the median" in out["detail"]
+
+
+def test_a_timeout_reason_fails_whatever_the_references():
+    run = {"exit": 0, "valid_json": True, "reason": "timeout>1.2s", "ms": 1250.0, "hits": []}
+    assert pm._search_problem(run, (1300.0,)) == "timeout>1.2s"
+
+
+def test_replay_fails_routing_on_only_when_slower_than_both_references(home, monkeypatch):
+    candidate = _one_query(home)
+    # Slower than its own routing-off run and than live's: fails.
+    monkeypatch.setattr(pm, "_run", _timed_hook(1000.0, 1000.0, 1500.0))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"]
+    assert "with routing on, 1500 ms > 1200 ms" in out["detail"]
+    # Slower than the routing-off run but within live's slack: passes.
+    monkeypatch.setattr(pm, "_run", _timed_hook(1400.0, 1000.0, 1500.0))
+    assert pm.gate_recall_replay(candidate)["ok"]
 
 
 def _late_embedding_hook(rng, late: float):
@@ -1745,3 +1806,72 @@ def test_after_a_flip_the_replica_job_is_woken_to_heal_at_once(home, monkeypatch
     out = pm._after_flip()
     assert out["replica_woken"] is True
     assert wake.stat().st_mtime > 1
+
+
+_WORDS = ["alpha queue drain path", "bravo gate replay step", "charlie hook latency budget",
+          "delta recall ranking floor", "echo promote refusal rule"]
+
+
+def _five_queries(home) -> Path:
+    now = datetime.now(timezone.utc)
+    _query_log(home).write_text(
+        "\n".join(_query(now - timedelta(hours=1, minutes=i), w) for i, w in enumerate(_WORDS)) + "\n")
+    return _hooks(home)
+
+
+def _abstain_hook(cand_reason_for):
+    """Live answers one hit for every prompt; the candidate answers nothing
+    with ``cand_reason_for(prompt)`` as its summary-line reason."""
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        if argv[1:2] == ["-c"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"push": True}) + "\n", "")
+        on = env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
+        cand = "/candidate/packages/" in argv[0]
+        prompt = json.loads(input)["prompt"]
+        hits = [] if cand else ["episode:3"]
+        reason = cand_reason_for(prompt) if cand else "ok"
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"{stamp} [khipu-prompt-recall] session=s1 reason={reason} ms=300.0 hits={hits} "
+                       f"legs=['lexical', 'cosine'] degraded=None" + (" routing=full" if on else "") + "\n")
+        return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+    return fake_run
+
+
+def test_replay_notes_one_abstention_among_five(home, monkeypatch):
+    candidate = _five_queries(home)
+
+    def cand_hits_unless_first(prompt):
+        return "ok (no relevant match)" if _WORDS[0] in prompt else "ok"
+    fake = _abstain_hook(cand_hits_unless_first)
+
+    def run(argv, **kw):
+        out = fake(argv, **kw)
+        if "/candidate/packages/" in argv[0] and _WORDS[0] not in kw["input"]:
+            # The other four candidate prompts answer a hit, like live.
+            log = Path(kw["env"]["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+            log.write_text(log.read_text().replace("hits=[]", "hits=['episode:3']"))
+        return out
+    monkeypatch.setattr(pm, "_run", run)
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+    assert "1 of 5 prompt(s) where live had hits were abstentions" in out["detail"]
+    assert "abstained where live had 1 hit(s)" in out["detail"]
+
+
+def test_replay_refuses_a_candidate_that_abstained_on_every_prompt_where_live_had_hits(home, monkeypatch):
+    candidate = _five_queries(home)
+    monkeypatch.setattr(pm, "_run", _abstain_hook(lambda prompt: "ok (no relevant match)"))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "abstained by policy on all 5 replayed prompt(s) where live had hits" in out["detail"]
+
+
+def test_replay_still_refuses_an_empty_answer_whose_reason_is_plain_ok(home, monkeypatch):
+    candidate = _five_queries(home)
+    monkeypatch.setattr(pm, "_run", _abstain_hook(lambda prompt: "ok"))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "empty answer where live had 1 hit(s)" in out["detail"]
+    assert "abstained" not in out["detail"]

@@ -727,6 +727,8 @@ def _merge_into_episode(
         "payload": payload,
     })
     raw["merged_from"] = merged_from
+    if new_summary.strip() and raw.get("summary_kind") == "verbatim_only":
+        raw.pop("summary_kind")  # a real summary arrived: the row is no longer evidence only
     sets = ["topics = %s::jsonb", "decisions = %s::jsonb", "preferences = %s::jsonb",
             "people = %s::jsonb", "raw = %s::jsonb", "summary = %s"]
     params: list[Any] = [
@@ -1011,7 +1013,7 @@ def load_payload(raw: str) -> dict[str, Any]:
     # and exit with a traceback instead of the documented EX_DATAERR (audit
     # 2026-08-17).
     if not isinstance(payload, dict) or not isinstance(payload.get("summary"), str) \
-            or not payload["summary"].strip():
+            or (not payload["summary"].strip() and payload.get("summary_kind") != "verbatim_only"):
         _log("payload missing a string 'summary'")
         raise SystemExit(EX_DATAERR)
     if not isinstance(payload.get("session_id"), str) or not payload["session_id"].strip():
@@ -1316,7 +1318,7 @@ def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
     if any(held(k) != ("" if payload.get(k) is None else str(payload.get(k)))
            for k in ("harness", "session_id", "transcript_range", "window_id")):
         return None
-    return f"{summary} (part {part})"
+    return f"{summary} (part {part})".strip()
 
 
 def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:

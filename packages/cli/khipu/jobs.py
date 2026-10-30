@@ -480,6 +480,7 @@ def _run_nightly_locked() -> int:
                          counts={"rc": rc}, error=driver_error)
     _record_nightly_step(steps, "notes_reconcile", **_step_result(_reconcile_notes_if_due()))
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
+    _record_nightly_step(steps, "summary_kind_backfill", **_step_result(_summary_kind_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
     _record_nightly_step(steps, "routing_ledger_prune", **_step_result(_prune_routing_ledgers()))
     completion_result = _step_result(_commitment_close_rules())
@@ -521,6 +522,24 @@ def _recall_eval_step() -> dict[str, Any]:
         # row shows it yellow; the nightly step is put off, not failed.
         out.update(ok=True, deferred=out.pop("error", None) or "recall check skipped")
     return out
+
+
+def _summary_kind_backfill() -> dict[str, Any]:
+    """Mark the episodes stored under the old no-summary sentence as
+    verbatim-only records, at most SUMMARY_KIND_NIGHTLY_LIMIT a night. Their
+    text and evidence are not touched. Fail-open: it never fails the night."""
+    try:
+        from khipu.db import connect
+        from khipu.hygiene import apply_backfill_summary_kind
+
+        with connect() as conn:
+            with conn.cursor() as cur:
+                out = apply_backfill_summary_kind(cur)
+            conn.commit()
+        _nightly_log(f"[khipu-summary-kind] {json.dumps(out)}")
+        return {"ok": True, **out}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _project_renames_sweep() -> dict[str, Any]:

@@ -406,6 +406,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
                     mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True, "stale": 0}), \
                     mock.patch.object(jobs, "_project_renames_sweep", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_recall_eval_step", return_value={"ok": True}), \
+                    mock.patch.object(jobs, "_summary_kind_backfill", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}):
                 jobs.run_nightly()
             payload = json.loads((Path(data_td) / "nightly-last.json").read_text())
@@ -413,7 +414,7 @@ class NightlyLastJsonContractTest(unittest.TestCase):
         self.assertEqual(
             names,
             {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "query_cache_prune", "routing_ledger_prune", "commitments_close_rules", "commitments_mark_stale",
+             "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "commitments_close_rules", "commitments_mark_stale",
              "commitments_hygiene", "ledger",
              "project_renames", "snapshot_refresh", "recall_eval"},
         )

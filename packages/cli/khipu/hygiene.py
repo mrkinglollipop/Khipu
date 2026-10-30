@@ -1077,3 +1077,43 @@ def run_session_ended_pass(
         "applied": applied,
         "verdicts": listing,
     }
+
+
+# ---- summary_kind backfill (2026-10-30) -------------------------------------
+#
+# 229 episodes carry the sentence the summariser's empty replies used to be
+# stored under. They keep their text and every evidence column; each only
+# gains raw.summary_kind = "verbatim_only", the marker new captures carry, so
+# readers have one signal. Bounded per night.
+SUMMARY_KIND_NIGHTLY_LIMIT = 200
+
+
+def apply_backfill_summary_kind(cur, *, limit: int = SUMMARY_KIND_NIGHTLY_LIMIT) -> dict[str, Any]:
+    import json
+
+    from khipu.db import has_columns
+    from khipu.summary_kind import LEGACY_PLACEHOLDER, VERBATIM_ONLY
+
+    live = "AND deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
+    # A row whose raw is not a JSON object (array, scalar, NULL) has no
+    # summary_kind key to read, so it must be rewritten into an object or it is
+    # selected every night.
+    where = (f"summary LIKE %s {live}AND COALESCE(CASE WHEN jsonb_typeof(raw) = 'object' "
+             "THEN raw->>'summary_kind' END, '') <> %s")
+    params = (LEGACY_PLACEHOLDER + "%", VERBATIM_ONLY)
+    cur.execute(f"SELECT id FROM episodes WHERE {where} ORDER BY id LIMIT %s", (*params, int(limit)))
+    ids = [int(r[0]) for r in cur.fetchall()]
+    updated = 0
+    if ids:
+        # Object: merge the marker. NULL or JSON null: the marker alone. Any other
+        # shape: the marker plus the old value kept under raw_value.
+        cur.execute(
+            "UPDATE episodes SET raw = CASE "
+            "WHEN jsonb_typeof(raw) = 'object' THEN raw || %s::jsonb "
+            "WHEN raw IS NULL OR jsonb_typeof(raw) = 'null' THEN %s::jsonb "
+            "ELSE %s::jsonb || jsonb_build_object('raw_value', raw) END WHERE id = ANY(%s)",
+            (json.dumps({"summary_kind": VERBATIM_ONLY}),) * 3 + (ids,),
+        )
+        updated = cur.rowcount
+    cur.execute(f"SELECT COUNT(*) FROM episodes WHERE {where}", params)
+    return {"scanned": len(ids), "updated": updated, "remaining": int(cur.fetchone()[0])}

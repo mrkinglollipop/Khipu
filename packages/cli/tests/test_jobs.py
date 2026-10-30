@@ -41,6 +41,9 @@ class JobsRunTest(unittest.TestCase):
         patcher = mock.patch.object(jobs, "_project_renames_sweep", return_value={"ok": True})
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(jobs, "_summary_kind_backfill", return_value={"ok": True})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -123,7 +126,7 @@ class JobsRunTest(unittest.TestCase):
         self.assertEqual(
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "query_cache_prune", "routing_ledger_prune", "commitments_close_rules",
+             "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "commitments_close_rules",
              "commitments_mark_stale",
              "commitments_hygiene", "ledger", "project_renames",
              "recall_eval", "snapshot_refresh"],
