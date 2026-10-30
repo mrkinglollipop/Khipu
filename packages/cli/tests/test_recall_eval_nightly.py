@@ -588,3 +588,38 @@ def test_install_without_a_replica_refuses(world, monkeypatch):
     monkeypatch.setattr(hub_snapshot, "open_snapshot", boom)
     assert ren.install_candidates(cand, golden)["ok"] is False
     assert not golden.exists()
+
+
+def test_offline_guard_covers_every_listed_exit_and_restores_each():
+    import importlib
+
+    for obj_path, name, kind in ren.GUARDED_EXITS:
+        obj = ren._resolve(obj_path)
+        if not hasattr(obj, name):  # absent on this platform
+            continue
+        real = getattr(obj, name)
+        with ren._offline() as guard:
+            patched = getattr(obj, name)
+            assert patched is not real, f"{obj_path}.{name} is not guarded"
+            before = guard.refused[kind]
+            with pytest.raises((OSError, RuntimeError)):
+                patched()
+            assert guard.refused[kind] == before + 1
+        assert getattr(obj, name) is real, f"{obj_path}.{name} not restored"
+    importlib.invalidate_caches()
+
+
+def test_offline_guard_refuses_udp_dns_and_a_spawned_process():
+    import os
+    import socket
+
+    with ren._offline() as guard:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            with pytest.raises(ConnectionRefusedError):
+                udp.sendto(b"fake-dns", ("127.0.0.1", 9))
+        finally:
+            udp.close()
+        with pytest.raises(PermissionError):
+            os.posix_spawn("/usr/bin/true", ["true"], os.environ)
+        assert guard.refused["network"] == 1 and guard.refused["process"] == 1

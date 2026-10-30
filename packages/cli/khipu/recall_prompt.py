@@ -2068,7 +2068,7 @@ def _relevance_gate(rows: list[dict[str, Any]], tokens: list[str]) -> list[dict[
         kept, _info = relevance.gate(rows, len(tokens))
         return kept
     except Exception as exc:  # noqa: BLE001 — a policy failure must not cost the caller its hits
-        _log(f"relevance floor skipped: {type(exc).__name__}: {exc}")
+        _log(f"relevance floor skipped: {type(exc).__name__}")
         return rows
 
 
@@ -2386,7 +2386,7 @@ def _snapshot_search_hits(
                 progress["provisional"] = provisional
         except Exception as exc:  # noqa: BLE001 — the full pass below still runs and reports it
             provisional = None
-            _log(f"snapshot keyword-only result skipped: {type(exc).__name__}: {exc}")
+            _log(f"snapshot keyword-only result skipped: {type(exc).__name__}")
 
         _enter_stage(progress, "embedding-wait")
         t_cos.join(max(0.0, deadline - time.monotonic()))
@@ -2397,7 +2397,7 @@ def _snapshot_search_hits(
             exc = cosine_box["error"]
             # The scan's own deadline is lateness, not a failed embedding.
             degraded = "embedding late" if isinstance(exc, TimeoutError) else "embedding error"
-            _log(f"snapshot cosine leg skipped: {type(exc).__name__}: {exc}")
+            _log(f"snapshot cosine leg skipped: {type(exc).__name__}")
         else:
             degraded = "embedding late"
         if "rows" not in cosine_box and provisional is not None:
@@ -2505,7 +2505,7 @@ def _fuse_and_annotate(
                 legs.append("graph_candidates")
         except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
             degraded_legs.append("graph_candidates")
-            _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}: {exc}")
+            _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}")
 
     # Once, after fusion and graph expansion: candidate rows carry no signal,
     # so they can never make an otherwise empty list pass.
@@ -2529,7 +2529,7 @@ def _fuse_and_annotate(
             if interpretation:
                 fused = _timeparse.apply_time_boost(fused, interpretation)
         except Exception as exc:  # noqa: BLE001 — additive, never a search failure
-            _log(f"snapshot time interpretation skipped: {type(exc).__name__}: {exc}")
+            _log(f"snapshot time interpretation skipped: {type(exc).__name__}")
             interpretation = None
 
     # Validity annotation (Phase 2, session B): ONE indexed sqlite query
@@ -2557,7 +2557,7 @@ def _fuse_and_annotate(
             fused, historical=_validity.is_historical(prompt, hist_since, hist_until)
         )
     except Exception as exc:  # noqa: BLE001 — validity is additive, never a search failure
-        _log(f"snapshot validity annotation skipped: {type(exc).__name__}: {exc}")
+        _log(f"snapshot validity annotation skipped: {type(exc).__name__}")
 
     result_extra: dict[str, Any] = {}
     if degraded_legs:
@@ -2663,9 +2663,9 @@ def _search_hits(
         )
         return _trim_result(result, limit)
     except _SnapshotUnusable as exc:
-        _log(f"snapshot unusable ({exc}) — falling back to hub")
+        _log(f"snapshot unusable ({type(exc).__name__}) — falling back to hub")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls back
-        _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — falling back to hub")
+        _log(f"snapshot search failed ({type(exc).__name__}) — falling back to hub")
 
     skipped = _hub_known_down()
     if skipped is not None:
@@ -2705,7 +2705,7 @@ def _hub_project_group(cur, project: str | None) -> list[str]:
 
         return project_group(cur, project)
     except Exception as exc:  # noqa: BLE001 — a missed group is a ranking nudge lost, not a failure
-        _log(f"project alias group skipped: {type(exc).__name__}: {exc}")
+        _log(f"project alias group skipped: {type(exc).__name__}")
         return [project]
 
 
@@ -2797,7 +2797,7 @@ def _attach_hub_routing_state(
             else _run_with_timeout(_fetch, remaining)
         )
     except Exception as exc:  # noqa: BLE001 — advisory; never a search failure
-        _log(f"budgeted routing metadata skipped: {type(exc).__name__}: {exc}")
+        _log(f"budgeted routing metadata skipped: {type(exc).__name__}")
         return rows
     if not flags:
         return rows
@@ -2872,7 +2872,7 @@ def _hub_hits_budgeted(
             lexical_box["rows"] = rows
         except Exception as exc:  # noqa: BLE001 — a leg failure just means it didn't land
             lexical_box["error"] = exc
-            _log(f"budgeted lexical leg failed: {type(exc).__name__}: {exc}")
+            _log(f"budgeted lexical leg failed: {type(exc).__name__}")
 
     def _cosine_worker() -> None:
         try:
@@ -2886,7 +2886,7 @@ def _hub_hits_budgeted(
             cosine_box["rows"] = rows
         except Exception as exc:  # noqa: BLE001 — same posture as the lexical leg
             cosine_box["error"] = exc
-            _log(f"budgeted cosine leg failed: {type(exc).__name__}: {exc}")
+            _log(f"budgeted cosine leg failed: {type(exc).__name__}")
 
     t_lex = threading.Thread(target=_lexical_worker, daemon=True)
     t_cos = threading.Thread(target=_cosine_worker, daemon=True)
@@ -2974,7 +2974,7 @@ def _hub_hits_budgeted(
                     for r in enriched_episodes
                 }
         except Exception as exc:  # noqa: BLE001 — validity is additive, never a search failure
-            _log(f"budgeted validity counts skipped: {type(exc).__name__}: {exc}")
+            _log(f"budgeted validity counts skipped: {type(exc).__name__}")
     if episode_ids and episode_counts is None:
         degraded = degraded or "validity unknown"
     topic_meta = {
@@ -3022,9 +3022,9 @@ def _search_hits_budgeted(
         return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"],
                 **({"replica_stale": result["replica_stale"]} if "replica_stale" in result else {})}
     except _SnapshotUnusable as exc:
-        _log(f"snapshot unusable ({exc}) — hub budgeted path")
+        _log(f"snapshot unusable ({type(exc).__name__}) — hub budgeted path")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls through
-        _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — hub budgeted path")
+        _log(f"snapshot search failed ({type(exc).__name__}) — hub budgeted path")
 
     skipped = _hub_known_down()
     if skipped is not None:
@@ -3371,7 +3371,7 @@ def prior_work_for_prompt(
         if shape and not thread:
             return _gated(shape)
     except Exception as exc:  # noqa: BLE001 — fail open
-        return _gated(f"gate error: {exc}")
+        return _gated(f"gate error: {type(exc).__name__}")
     if deadline is not None and time.monotonic() >= deadline:
         return _gated("timeout>request deadline")
 
@@ -3445,7 +3445,7 @@ def prior_work_for_prompt(
             hits = []
             stage = progress.get("stage")
     except Exception as exc:  # noqa: BLE001 — fail open on any search failure
-        reason = f"error: {type(exc).__name__}: {exc}"
+        reason = f"error: {type(exc).__name__}"
         hits = []
         offline = _hub_unreachable_error(exc)
     if thread_worker is not None:
@@ -3733,7 +3733,7 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
         out = hook_main(raw, shape=want, delivery=delivery, deadline=deadline)
     except Exception as exc:  # noqa: BLE001 — the one thing this must never do is raise
         finish_delivery(delivery, delivered=False, reason="error: hook_main crashed")
-        log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}: {exc}")
+        log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}")
         out = {}
     try:
         print(wire.dumps(out, ensure_ascii=True), flush=True)

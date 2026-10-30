@@ -99,6 +99,46 @@ class _Offline:
         self.refused = {"hub": 0, "embed": 0, "network": 0, "process": 0}
 
 
+# Every exit that can leave this process, as (object path, attribute, kind).
+# The offline guard patches each one for the whole scoring run, and the test
+# iterates this list, so a new exit added later has to be listed to be covered.
+# UDP sends, name lookups, spawned processes and forks are all here because a
+# lookup that cannot connect over TCP can still leak a golden query by DNS or
+# by a helper process that makes its own connection.
+GUARDED_EXITS: tuple[tuple[str, str, str], ...] = (
+    ("socket.socket", "connect", "network"), ("socket.socket", "connect_ex", "network"),
+    ("socket.socket", "send", "network"), ("socket.socket", "sendall", "network"),
+    ("socket.socket", "sendto", "network"), ("socket.socket", "sendmsg", "network"),
+    ("socket", "create_connection", "network"), ("socket", "getaddrinfo", "network"),
+    ("socket", "gethostbyname", "network"), ("socket", "gethostbyname_ex", "network"),
+    ("subprocess", "Popen", "process"),
+    ("os", "posix_spawn", "process"), ("os", "posix_spawnp", "process"),
+    ("os", "fork", "process"), ("os", "forkpty", "process"), ("os", "system", "process"),
+    ("os", "execv", "process"), ("os", "execve", "process"), ("os", "execvp", "process"),
+    ("os", "execvpe", "process"), ("os", "execl", "process"), ("os", "execle", "process"),
+    ("os", "execlp", "process"), ("os", "execlpe", "process"),
+    ("os", "spawnv", "process"), ("os", "spawnve", "process"), ("os", "spawnvp", "process"),
+    ("os", "spawnvpe", "process"), ("os", "spawnl", "process"), ("os", "spawnle", "process"),
+    ("os", "spawnlp", "process"), ("os", "spawnlpe", "process"),
+    ("multiprocessing.process.BaseProcess", "start", "process"),
+)
+
+
+def _resolve(path: str) -> Any:
+    import importlib
+
+    parts = path.split(".")
+    for i in range(len(parts), 0, -1):
+        try:
+            obj = importlib.import_module(".".join(parts[:i]))
+        except ImportError:
+            continue
+        for attr in parts[i:]:
+            obj = getattr(obj, attr)
+        return obj
+    raise ImportError(path)
+
+
 @contextlib.contextmanager
 def _offline():
     """Every way off this Mac refuses for the run, so retrieval answers from
@@ -131,16 +171,16 @@ def _offline():
     no_embed = refuser("embed", RuntimeError, "embedding refused: the recall eval runs offline")
     no_net = refuser("network", ConnectionRefusedError, "network refused: the recall eval runs offline")
     no_proc = refuser("process", PermissionError, "subprocess refused: the recall eval runs offline")
+    by_kind = {"network": no_net, "process": no_proc, "embed": no_embed, "hub": hub}
     targets: list[tuple[Any, str, Any]] = [
         (hub_snapshot, "try_hub_connect", hub), (db, "connect", hub),
         (embed, "embed_one", no_embed), (embed, "embed_batch", no_embed),
         (embed, "embed_batch_images", no_embed), (embed, "_post_json", no_embed),
-        (socket.socket, "connect", no_net), (socket.socket, "connect_ex", no_net),
-        (socket, "create_connection", no_net), (socket, "getaddrinfo", no_net),
-        (subprocess, "Popen", no_proc),
         (hub_reach, "note_unreachable", lambda *_a, **_k: None),
         (hub_reach, "note_reachable", lambda *_a, **_k: None),
     ]
+    for obj_path, name, kind in GUARDED_EXITS:
+        targets.append((_resolve(obj_path), name, by_kind[kind]))
     if psycopg is not None:
         targets.append((psycopg, "connect", hub))
     saved = [(obj, name, getattr(obj, name)) for obj, name, _ in targets if hasattr(obj, name)]
