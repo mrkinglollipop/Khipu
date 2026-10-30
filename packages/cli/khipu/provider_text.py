@@ -243,9 +243,17 @@ def episode_ids_of_topics(cur: Any, slugs: Sequence[str]) -> dict[str, list[int]
                     "WHERE t.slug = ANY(%s)", (wanted,))
         for slug, eid in cur.fetchall():
             out.setdefault(str(slug), []).append(int(eid))
-        for slug, found in out.items():
-            if not found and slug.startswith("note:"):
-                out[slug] = [NOTE_ORIGIN]
+        uncarried = [s for s, found in out.items() if not found]
+        if uncarried:
+            # A topic page no episode ever carried (the hub never hard-deletes
+            # episodes, forgotten ones included) is an owner-written file, like
+            # a note: nothing in it derives from a capture. A slug with no
+            # topic row stays unproven and is withheld.
+            cur.execute("SELECT slug FROM topics WHERE slug = ANY(%s)", (uncarried,))
+            pages = {str(row[0]) for row in cur.fetchall()}
+            for slug in uncarried:
+                if slug in pages or slug.startswith("note:"):
+                    out[slug] = [NOTE_ORIGIN]
         return out
     except Exception:  # noqa: BLE001 - unknown sources are withheld
         return {}
