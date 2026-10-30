@@ -157,6 +157,7 @@ def filter_real_paths(rels: Iterable[str], *, repo_root: str | None = None) -> l
 
 
 def report_junk_paths(cur, *, sample_limit: int = 20) -> dict[str, Any]:
+    # forget-fence: counts path nodes; returns counts and node ids, no episode
     """Read-only: how many existing ``path:`` nodes fail :func:`is_real_path`.
 
     No ``repo_root`` context is available for a historical node (the graph
@@ -191,6 +192,7 @@ def apply_purge_junk_paths(cur) -> dict[str, Any]:
 # ---- W1.5 identity backfill -------------------------------------------------
 
 def apply_backfill_identity(cur, *, limit: int | None = None) -> dict[str, Any]:
+    # forget-fence: owner maintenance writer; returns counts
     """Destructive: derive repo_root/project (via khipu.identity, using each
     episode's absolute-path ``scope`` as a stand-in cwd) for every episode
     that has none yet, and UPDATE it in place. Must NOT be run against the
@@ -237,7 +239,10 @@ def backfill_identity_report(cur, *, sample_limit: int = 20) -> dict[str, Any]:
         """,
         (sample_limit,),
     )
-    sample = [{"id": r[0], "scope": r[1], "session_id": r[2]} for r in cur.fetchall()]
+    from khipu.tombstones import withhold
+
+    sample = withhold([{"id": r[0], "scope": r[1], "session_id": r[2]} for r in cur.fetchall()],
+                      fail_closed=False, episode_key="id")
     cur.execute(
         "SELECT COUNT(*) FROM episodes WHERE repo_root IS NULL AND scope IS NOT NULL AND scope LIKE '/%%'"
     )
@@ -272,6 +277,7 @@ def _project_from_raw(repo_root: Any, raw: Any) -> str | None:
 
 def _resolve_project_for_episode(cur, *, episode_id: int, session_id: str | None,
                                  repo_root: Any, raw: Any) -> str | None:
+    # forget-fence: resolves one project name for a backfill write
     """Best-effort project for one NULL-project episode. Never invents a
     project from a session id or free-text scope (K6's whole point)."""
     if session_id:
@@ -306,15 +312,18 @@ def backfill_project_report(cur, *, sample_limit: int = 20) -> dict[str, Any]:
             if len(sample) < sample_limit:
                 sample.append({"id": eid, "resolved_project": project})
     total = len(rows)
+    from khipu.tombstones import withhold
+
     return {
         "total_null_project": total,
         "would_resolve": resolved,
         "resolve_rate": round(resolved / total, 4) if total else 0.0,
-        "sample": sample,
+        "sample": withhold(sample, fail_closed=False, episode_key="id"),
     }
 
 
 def apply_backfill_project(cur, *, limit: int | None = None) -> dict[str, Any]:
+    # forget-fence: owner maintenance writer; returns counts
     """Destructive: write the resolved project for every NULL-project episode
     a resolver can answer for. The UPDATE's own ``WHERE ... AND project IS
     NULL`` makes "touches no row that already has a project" structural, not
@@ -423,6 +432,7 @@ def _model_judge(texts: list[str]) -> list[dict[str, Any]]:
 
 
 def _select_open_commitments(cur, *, project: str | None, limit: int | None) -> list[dict[str, Any]]:
+    # forget-fence: the hygiene pass's write input; returns no row to a reader
     clauses = ["status = 'open'"]
     params: list[Any] = []
     if project:
@@ -907,6 +917,7 @@ _SESSION_END_EVENTS_SQL = "('sessionend', 'session_end', 'session-end', 'session
 
 def _select_open_with_session(cur, *, project: str | None, limit: int | None,
                               hours: int) -> list[dict[str, Any]]:
+    # forget-fence: the hygiene pass's write input; returns no row to a reader
     from khipu.db import has_columns
 
     clauses = ["c.status = 'open'"]

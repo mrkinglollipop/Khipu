@@ -549,6 +549,7 @@ def _fact_items(payload: Any) -> set[str]:
 
 
 def _legacy_key_conflicts(cur, lines: list[tuple[dict[str, Any], tuple[str, str]]]) -> list[dict[str, Any]]:
+    # forget-fence: mirror writer's key check; returns no row to a reader
     """Of fact-bearing file lines whose legacy key ``(ts, md5(summary))`` the
     hub already holds, the ones carrying a fact item (any input the fact
     steps derive facts from, ``_FACT_KEYS``) that no episode at that key

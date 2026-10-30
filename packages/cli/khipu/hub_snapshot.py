@@ -432,6 +432,7 @@ def try_hub_connect(
 
 
 def open_snapshot(*, shared: bool = False) -> sqlite3.Connection:
+    # forget-fence: builds the replica's fenced views; returns a connection
     path = snapshot_path()
     if not path.is_file():
         raise FileNotFoundError(f"hub snapshot missing: {path}")
@@ -1204,6 +1205,7 @@ def _anchor_cols(cur) -> list[str]:
 
 
 def read_anchor_identities(cur, episode_ids: Iterable[int]) -> dict[int, frozenset[str]]:
+    # forget-fence: source identities for the forget and dedup; no text
     """Every source identity each of ``episode_ids`` represents on the hub,
     read on ``cur`` (so in its snapshot), for the replica's episode fence.
     An id the hub does not hold is left out."""
@@ -2167,6 +2169,7 @@ SELECT
 
 
 def _read_fact_rows(cur) -> dict[str, Any]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """Every hub decision and deliverable a hub reader returns (none
     anchored to a forgotten episode), read on ``cur``."""
     out: dict[str, Any] = {"decisions": [], "deliverables": []}
@@ -2188,6 +2191,7 @@ _VECTOR_LIVE = ("NOT EXISTS (SELECT 1 FROM episodes e WHERE e.id = c.opened_epis
 
 
 def _read_commitment_vectors(cur, held: Mapping[tuple, tuple]) -> tuple[dict[tuple, tuple], list[dict[str, Any]]]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """The hub's commitment vectors for the commitments the copy reads: every
     key ``(profile, ref, chunk_idx)`` with its ``(built_at, md5 of the
     commitment's text)`` in this snapshot, and the rows themselves only for
@@ -2292,6 +2296,7 @@ def _held_vectors(local: Mapping[str, Any]) -> dict[tuple, tuple]:
 
 
 def _held_commitment_vectors(con: sqlite3.Connection) -> dict[tuple, tuple]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """``{(profile, ref, chunk_idx): (built_at, md5 of the text)}`` of the
     commitment vectors the replica holds, against its commitments' text."""
     if not {"kind", "ref", "chunk_idx", "built_at"} <= _snapshot_table_columns(con, "memory_embeddings") \
@@ -2405,6 +2410,7 @@ def _insert_vector_row(con: sqlite3.Connection, erow: Mapping[str, Any]) -> None
 
 
 def _write_copy(con: sqlite3.Connection, local: Mapping[str, Any], read: Mapping[str, Any]) -> dict[str, int]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """Replace the fact tables whole with a copy's read and write its stamp,
     in the caller's publication transaction. Commitment vectors whose key,
     build time and wording the hub still has are kept; the rest are
@@ -2814,6 +2820,7 @@ def _one_exchange(cur, reads: Sequence[tuple[str, str, Sequence[Any]]], *,
 
 
 def _pull_apply(cur, state: Mapping[str, Any], limit: int, *, include_ledger: bool = True) -> dict[str, Any]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """The hub half of ``pull_changes``, on its one cursor. Everything the
     memory limit can refuse is read before the first write. Ledger failures
     are reported separately and never refuse the memory part."""
@@ -3987,6 +3994,7 @@ def _pg_columns(cur, table: str) -> set[str]:
 
 
 def _insert_episodes(cur, con: sqlite3.Connection) -> int:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     cols = [c for c in _EPISODE_COLS if c in _pg_columns(cur, "episodes")]
     sel = ", ".join(cols)
     cur.execute(f"SELECT {sel} FROM episodes ORDER BY id")
@@ -4053,6 +4061,7 @@ def _insert_topic_revisions(cur, con: sqlite3.Connection) -> int:
 
 
 def _insert_nodes(cur, con: sqlite3.Connection) -> int:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     pg_cols = _pg_columns(cur, "nodes")
     cols = [c for c in _NODE_COLS if c in pg_cols]
     sel = ", ".join(cols)
@@ -4078,6 +4087,7 @@ def _insert_nodes(cur, con: sqlite3.Connection) -> int:
 
 
 def _insert_edges(cur, con: sqlite3.Connection) -> int:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     cols = [c for c in _EDGE_COLS if c in _pg_columns(cur, "edges")]
     sel = ", ".join(cols)
     cur.execute(f"SELECT {sel} FROM edges")
@@ -4253,6 +4263,7 @@ def snapshot_resolve_project_known(con: sqlite3.Connection, project: str | None,
 
 
 def _hub_commitments(cur) -> tuple[list[str], list[Any]] | None:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """``(columns, rows)`` of every hub commitment not opened by a forgotten
     episode, or ``None`` on a hub with no ``commitments`` table. The dump
     and the pull both read them here: a commitment has no change stamp, so
@@ -4733,6 +4744,7 @@ def _tombstone_payloads_for_episode(episode_row: Mapping[str, Any]) -> list[dict
 
 
 def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """Erase every live replica episode whose source the gate refuses, with
     its vectors, commitments, decisions and deliverables, and queue its id
     for erasure. The hub can hold a forgotten source under another id
@@ -4790,6 +4802,7 @@ def _scrub_forgotten(con: sqlite3.Connection, gate: Any) -> int:
 
 
 def _rejected_episode_ids(con: sqlite3.Connection) -> set[int]:
+    # forget-fence: returns the ids derivative writers refuse
     """Rejections shared by every derivative writer, including old replicas."""
     rejected = _pending_erasure_ids()
     if "deleted_at" in _snapshot_table_columns(con, "episodes"):
@@ -4915,6 +4928,7 @@ def _upsert_episode_unfenced(
     read_at: float | None = None,
     receipts: Iterable[Sequence[Any]] = (),
 ) -> dict[str, Any]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """Incremental snapshot update: one episode + its embedding chunks
     (W2.4). One fenced write (``_replica_write_gate``): the episode is
     checked by every source identity it represents before anything is
@@ -5481,6 +5495,7 @@ def _episode_line(eid: int, vals: Sequence[tuple[str, Any]]) -> str:
 
 
 def _lag_episodes(cur, con, since, hub_now, limit, hub_dump, pending: set[int]) -> dict[str, Any]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """Episodes ingested since the cutoff, dated by their own time; then
     every live episode on both sides, compared by bucket digest of
     ``_episode_line``, which catches what no cutoff can: an edit in place,
@@ -5556,6 +5571,7 @@ def _lag_episodes(cur, con, since, hub_now, limit, hub_dump, pending: set[int]) 
 
 
 def _lag_tombstones(cur, con, since, hub_now, limit, pending: set[int]) -> dict[str, Any]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     unapplied: list[Any] = []
     checked = 0
     truncated = False
@@ -5677,6 +5693,7 @@ def _decision_digest_line(row: Sequence[Any]) -> str:
 
 
 def _lag_decisions(cur, con, since, hub_now, limit, hub_dump) -> dict[str, Any]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """Decisions changed since the cutoff, compared with the replica one by
     one and dated by their own time. Then a digest of every decision's
     tracked columns on both sides, with those changes laid over the
@@ -5745,6 +5762,7 @@ def _lag_decisions(cur, con, since, hub_now, limit, hub_dump) -> dict[str, Any]:
 
 
 def _lag_deliverables(cur, con, since, hub_now, limit) -> dict[str, Any]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     hub_cols = _pg_columns(cur, "deliverables")
     if not {"id", "created_at"} <= hub_cols:
         return {"lag_seconds": None, "not_applicable": "hub has no deliverables table"}
@@ -5851,6 +5869,7 @@ def _replica_active_profile(con: sqlite3.Connection, cols: Sequence[str]) -> dic
 
 
 def _lag_vectors(cur, con, hub_dump, hub_now, limit, pending: set[int]) -> dict[str, Any]:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """Vectors of the active profile, reconciled chunk by chunk, with no
     cutoff.
 
@@ -6361,6 +6380,7 @@ def _t3_snapshot_predicate(con, t3_thread: str | None, via: str | None) -> tuple
 
 
 def _filter_t3_snapshot_rows(con, rows, t3_thread, via):
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Recheck graph-expanded rows; graph neighbours need not share a thread."""
     if not (t3_thread or via):
         return rows
@@ -6392,6 +6412,7 @@ def search_snapshot(
     via: str | None = None,
     indexed_tokens_only: bool = False,
 ) -> list[dict[str, Any]]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """ILIKE-equivalent search over the sqlite replica (W2.3: honours at
     least kind/since/until when the hub is unreachable; fix 7 adds project/
     session_id/harness so a fallback search doesn't silently drop them).
@@ -6770,6 +6791,7 @@ def merge_outbox_episodes(
 def enrich_search_results_snapshot(
     con: sqlite3.Connection, results: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     from collections import defaultdict
 
     from khipu.topic_graph import (
@@ -6839,6 +6861,7 @@ def graph_neighbors_snapshot(node_id: str, hops: int, limit: int) -> dict[str, A
 
 
 def _graph_neighbors_snapshot_unfenced(node_id: str, hops: int, limit: int) -> dict[str, Any]:
+    # forget-fence source: hub_snapshot.graph_neighbors_snapshot fences it
     from khipu.topic_graph import (
         PATH_PREFIX,
         TOPIC_PREFIX,
@@ -6974,6 +6997,7 @@ def _graph_neighbors_snapshot_unfenced(node_id: str, hops: int, limit: int) -> d
 
 
 def episode_detail_snapshot(episode_id: int) -> dict[str, Any] | None:
+    # forget-fence source: khipu_get fences it (episode_withheld, withhold_detail)
     """A forgotten (soft-deleted) episode is not found here (B3 in
     docs/research/hindsight-plan-review-2026-09-28.md), same as the hub path
     (``activity.episode_detail``) — the replica's ``episodes`` schema always
@@ -7197,6 +7221,7 @@ def semantic_search_snapshot(
     t3_thread: str | None = None,
     via: str | None = None,
 ) -> list[dict[str, Any]]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """fix 7: project/session_id/harness, same episode-only semantics as
     ``search_snapshot`` — a topic/media hit is dropped outright when any of
     these is active (they have no such columns to filter on)."""
@@ -7873,6 +7898,7 @@ def snapshot_filter_live_sources(
 def snapshot_row_metadata(
     con: sqlite3.Connection, rows: Sequence[Mapping[str, Any]]
 ) -> list[dict[str, Any]]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Attach ts/project/status onto already-fused local-replica rows,
     mirroring ``embed._apply_search_filters``'s episode/topic metadata pass
     (project via COALESCE(project, scope) for episodes, status + the
@@ -7983,6 +8009,7 @@ def _snapshot_filters_dropped(*, session_id: str | None, harness: str | None) ->
 
 
 def _graph_candidates_snapshot(con, results: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Switch-gated graph-candidate leg shared by both ``search_stale_
     payload`` branches (Phase 3, session A: "the replica [backend] serves
     the local prompt lane and the stale-replica payload"). ``results`` is
@@ -8017,6 +8044,7 @@ def _filter_expanded_snapshot_rows(
     con, rows, *, kind=None, since=None, until=None, project=None,
     session_id=None, harness=None, t3_thread=None, via=None,
 ):
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Graph neighbours must pass the same requested filters as seed rows."""
     from khipu.search_text import parse_time_filter
 

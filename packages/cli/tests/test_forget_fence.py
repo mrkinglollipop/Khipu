@@ -7,8 +7,12 @@ search show only rows that touch no episode. Kimi's review probes, 2026-10-30.""
 from __future__ import annotations
 
 import argparse
+import ast
+import io
 import json
 import re
+import textwrap
+import tokenize
 import sqlite3
 from unittest import mock
 
@@ -280,53 +284,140 @@ FENCED_OUTPUTS = {
     "reflect._search": "khipu_reflect evidence",
 }
 
-# Producers of episode-derived rows; any function in khipu/ calling one and
-# not itself a producer must be in FENCED_OUTPUTS or INTERNAL.
-PRODUCERS = ("hybrid_search", "search_stale_payload", "project_slice", "recent_episodes",
-             "_graph_query_unfenced", "_graph_neighbors_snapshot_unfenced", "_search_hits",
-             "recent_deliverables_snapshot", "recent_deliverables")
-# Callers whose rows go on to a fenced output (named), not to a reader.
-INTERNAL = {
-    "recall_rule._pushed_memory_slice", "recall_prompt._search_hits", "recall_prompt.prior_work_for_prompt",
-    "recall_prompt._replica_deliverable_line", "deliverables.deliverable_line_for_prompt",
-    "cli._graph_query", "hub_snapshot.graph_neighbors_snapshot", "mcp_server._tool_search",
-    "cli.cmd_search",
-    # Candidate builders feeding the per-prompt push, fenced there.
-    "graph_candidates._hub_topic_recent_episodes", "graph_candidates.hub_candidates",
-    "graph_candidates._replica_topic_recent_episodes", "graph_candidates.replica_candidates",
-    "recall_prompt._snapshot_search_hits", "recall_prompt._search_hits_budgeted",
-    # Writers and checks that show no row: the mirror sync, the capture probe
-    # (looks for its own new episode), the owner's recall eval (scores ids).
-    "mirror.sync_recent_episodes", "hook_background.run", "probe.run_probe",
-    "recall_eval.eval_one", "recall_eval._call_explicit", "recall_eval._explicit_once",
-}
-
-
 def test_every_output_builder_reaches_the_fence():
     import importlib
     import inspect
 
     for name in FENCED_OUTPUTS:
         module, func = name.split(".")
-        source = inspect.getsource(getattr(importlib.import_module(f"khipu.{module}"), func))
-        assert ("withhold" in source or "_fenced_slice" in source), f"{name} bypasses the forget fence"
+        source = textwrap.dedent(inspect.getsource(getattr(importlib.import_module(f"khipu.{module}"), func)))
+        assert _called_names(ast.parse(source)) & FENCE_CALLS, f"{name} bypasses the forget fence"
 
 
-def test_no_unlisted_function_turns_episode_rows_into_output():
-    import ast
+# ---- the guard: find outputs by what they read ------------------------------
+#
+# A function that runs a SELECT on a table of episode-derived rows must call
+# the fence (a real call; the word in a comment does not count), or carry a
+# reviewed exemption comment: ``# forget-fence: <reason>`` when its rows
+# never reach a reader (a writer, a count, a check), or ``# forget-fence
+# source: <reason>`` when it hands rows to its callers, which the guard then
+# checks the same way, call by call up to an output.
+FENCED_TABLES = ("episodes", "decisions", "decision_links", "commitments", "deliverables",
+                 "briefs", "nodes", "edges")
+FENCE_CALLS = {"withhold", "withhold_graph", "withhold_detail", "episode_withheld", "_fenced_slice",
+               "without_withheld", "forget_fence_sql", "_fenced_owed_rows"}
+_READ_SQL = re.compile(r"\b(?:FROM|JOIN)\s+(?:main\.)?(?:%s)\b" % "|".join(FENCED_TABLES), re.I)
+# A SELECT of only aggregates or a constant returns no row's content.
+_AGGREGATE_SQL = re.compile(r"^\s*SELECT\s+(?:(?:COUNT|MAX|MIN|SUM|EXISTS)\s*\(|1\b|TRUE\b)", re.I)
+_WRITE_SQL = re.compile(r"^\s*(?:INSERT|UPDATE|DELETE)\b", re.I)
+_EXEMPT = re.compile(r"#\s*forget-fence:\s*\S.{9,}")
+_SOURCE = re.compile(r"#\s*forget-fence source:\s*\S.{9,}")
+
+
+def _sql_strings(node) -> list[str]:
+    doc = ast.get_docstring(node)
+    out = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Constant) and isinstance(child.value, str) and child.value != doc:
+            out.append(child.value)
+        elif isinstance(child, ast.JoinedStr):
+            out.append("".join(v.value if isinstance(v, ast.Constant) else " ? " for v in child.values))
+    return out
+
+
+def _reads_rows(sql: str) -> bool:
+    if not _READ_SQL.search(sql) or not re.search(r"\bSELECT\b", sql, re.I):
+        return False
+    if _WRITE_SQL.search(sql) and not re.search(r"\bRETURNING\b", sql, re.I):
+        return False
+    return not _AGGREGATE_SQL.search(sql)
+
+
+def _called_names(node) -> set[str]:
+    names = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            func = child.func
+            names.add(func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None))
+    return names
+
+
+def _comments(source: str) -> list[str]:
+    return [tok.string for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+            if tok.type == tokenize.COMMENT]
+
+
+def unfenced_readers(root) -> list[str]:
+    """Every function under ``root`` that reads episode-derived rows (runs a
+    SELECT on ``FENCED_TABLES``, or calls a ``forget-fence source``) and
+    neither calls the fence nor carries an exemption."""
+    funcs = {}
+    for path in sorted(root.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                source = textwrap.dedent(ast.get_source_segment(text, node) or "")
+                comments = _comments(source)
+                funcs[f"{path.stem}.{node.name}:{node.lineno}"] = {
+                    "name": node.name,
+                    "reads": bool(re.search(r"\.execute\(", source))
+                    and any(_reads_rows(s) for s in _sql_strings(node)),
+                    "calls": _called_names(node),
+                    "exempt": any(_EXEMPT.search(c) for c in comments),
+                    "source": any(_SOURCE.search(c) for c in comments),
+                }
+    sources = {f["name"] for f in funcs.values() if f["source"]}
+    offenders = []
+    for key, f in funcs.items():
+        reads = f["reads"] or bool((f["calls"] - {f["name"]}) & sources)
+        if reads and not (f["calls"] & FENCE_CALLS or f["exempt"] or f["source"]):
+            offenders.append(key)
+    return offenders
+
+
+def test_no_function_reads_episode_rows_past_the_fence():
     from pathlib import Path
 
-    root = Path(cli.__file__).parent
-    offenders = []
-    for path in sorted(root.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            name = f"{path.stem}.{node.name}"
-            body = ast.get_source_segment(path.read_text(encoding="utf-8"), node) or ""
-            calls = [p for p in PRODUCERS if p != node.name
-                     and re.search(rf"(?<![A-Za-z0-9_]){p}\(", body)]
-            if calls and name not in FENCED_OUTPUTS and name not in INTERNAL and "withhold" not in body:
-                offenders.append(f"{name} calls {calls}")
-    assert not offenders, "\n".join(offenders)
+    offenders = unfenced_readers(Path(cli.__file__).parent)
+    assert not offenders, "unfenced readers of episode-derived rows:\n" + "\n".join(offenders)
+
+
+LEAKY_MODULE = '''
+def owed_for_reader(cur):
+    # withhold is only a word here
+    cur.execute("SELECT id, text FROM commitments WHERE status = 'open'")
+    return cur.fetchall()
+
+
+def decision_rows(cur):
+    # forget-fence source: rows go to callers that fence them
+    cur.execute(f"SELECT text FROM decisions WHERE {clause}")
+    return cur.fetchall()
+
+
+def leaky_tool(cur):
+    return decision_rows(cur)
+
+
+def fenced_tool(cur):
+    return withhold(decision_rows(cur))
+
+
+def counter(cur):
+    cur.execute("SELECT COUNT(*) FROM episodes")
+    return cur.fetchone()
+
+
+def writer(cur):
+    # forget-fence: a writer; returns no row to any reader
+    cur.execute("SELECT id FROM episodes WHERE id = %s", (1,))
+    return bool(cur.fetchone())
+'''
+
+
+def test_the_guard_finds_a_reader_by_what_it_reads(tmp_path):
+    (tmp_path / "leaky.py").write_text(LEAKY_MODULE, encoding="utf-8")
+    found = {name.split(":")[0] for name in unfenced_readers(tmp_path)}
+    assert found == {"leaky.owed_for_reader", "leaky.leaky_tool"}
+
+

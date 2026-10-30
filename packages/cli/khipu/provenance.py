@@ -212,6 +212,7 @@ def backfilled(cur, project: str | None) -> bool:
 
 
 def pending_projects(cur) -> list[str | None]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """Projects with live episodes the backfill has not covered yet (None
     stands for episodes with no project)."""
     cur.execute(
@@ -300,6 +301,7 @@ def _prove_prs(cur, fact_id: int, episode_id: int, words: str, project: str | No
 
 def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]], counts: dict,
                          only: list[int] | None = None) -> set[int]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """Claims for open-loop values that exactly equal a text or restatement
     value on a commitment in the project (retired facts excluded).
 
@@ -345,6 +347,7 @@ def _witness_commitments(cur, project: str | None, items: list[tuple[int, str]],
 
 def _witness_decisions(cur, project: str | None, items: list[tuple[int, str]], counts: dict,
                        only: list[int] | None = None) -> set[int]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     if not items:
         return set()
     values = sorted({v for _e, v in items})
@@ -376,6 +379,7 @@ def _witness_decisions(cur, project: str | None, items: list[tuple[int, str]], c
 
 def _witness_deliverables(cur, project: str | None, items: list[tuple[int, tuple]], counts: dict,
                           only: list[int] | None = None) -> set[int]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     if only is not None:
         return _witness_deliverables_in(cur, project, items, counts, only)
     touched: set[int] = set()
@@ -401,6 +405,7 @@ def _witness_deliverables(cur, project: str | None, items: list[tuple[int, tuple
 
 def _witness_deliverables_in(cur, project: str | None, items: list[tuple[int, tuple]], counts: dict,
                              only: list[int]) -> set[int]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """:func:`_witness_deliverables` for a targeted backfill: the covered
     deliverables are read once and matched here with the same rule (kind,
     path and url equal, NULL equal to NULL; title too when there is neither
@@ -427,6 +432,7 @@ def _witness_deliverables_in(cur, project: str | None, items: list[tuple[int, tu
 
 def backfill_project(cur, project: str | None, *, batch: int = BACKFILL_BATCH,
                      between_batches=None, only: dict[str, Any] | None = None) -> dict[str, Any]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """Witness backfill of one project (section 4). Streams the project's
     live episodes ``batch`` at a time, selecting only their open loops,
     decisions and deliverables (their own and their merged captures'), so
@@ -613,6 +619,7 @@ def _gap_payload(raw: Any, step: str, source_id: str | None) -> dict[str, Any] |
 
 
 def replay_gaps(conn, *, limit: int = GAP_REPLAY_LIMIT) -> dict[str, Any]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """The nightly's re-run of fact steps kept as gaps (I4): for each open
     ``fact_gaps`` group (episode, step, merged capture), lock the episode,
     re-run that step on its capture and mark the gap resolved, all in one
@@ -984,6 +991,7 @@ def refusals_ready(cur) -> bool:
 
 
 def stored_identities(cur, episode_ids) -> dict[int, set[str]]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """Every identity each episode carries, in hub form, from what the hub
     stores: the registry's own functions over its raw and each merged
     payload, each receipt's id, the natural key and legacy form 0047's
@@ -1024,6 +1032,7 @@ def stored_identities(cur, episode_ids) -> dict[int, set[str]]:
 
 
 def refuse(cur, identities, *, episode_id: int | None = None, also=()) -> dict[str, Any]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """The refusal transaction (section 6.1), in the caller's READ COMMITTED
     transaction; the caller commits. Takes the identity locks sorted,
     records the refusals, then locks every live episode recorded under them
@@ -1059,6 +1068,7 @@ def _copy_ready(cur) -> tuple[str, int, int] | None:
 
 
 def _index_batch(cur, through: int, target: int, batch: int) -> dict[str, Any]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """One batch of the index pass, in the caller's transaction."""
     cur.execute("SELECT id FROM episodes WHERE id > %s AND id <= %s ORDER BY id LIMIT %s",
                 (through, target, batch))
@@ -1136,6 +1146,7 @@ def index_identities(conn, *, batch: int = INDEX_BATCH, dry_run: bool = False) -
 
 
 def _index_dry_run(conn) -> dict[str, Any]:
+    # forget-fence: provenance index and backfill writer; returns ids or counts
     """The live episodes the index pass would tombstone, from the same
     frozen set and the same identities, read without locks: an episode the
     pass has yet to index by what it stores, every other by its rows."""

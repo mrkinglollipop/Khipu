@@ -1238,6 +1238,7 @@ def _search_query(
     kind: str | None = None,
     include_nodes: bool | None = None,
 ) -> list[dict]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Deterministically-ordered, per-kind-fair ILIKE search (F7).
 
     Each active kind gets its own fair share of `limit` and its own ORDER BY,
@@ -1403,6 +1404,7 @@ def _neg_ts_sort_key(ts) -> float:
 def _literal_candidates(
     cur, term: str, limit: int, *, kind: str | None = None, filters=None, fast: bool = False
 ) -> list[dict]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Globally-ranked literal ILIKE candidates for RRF fusion (bugfix,
     reported live: "Recorded mobile followup task" — episode 11286 named the
     query verbatim in its decisions but landed at literal rank 21 because
@@ -2008,6 +2010,7 @@ def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
 
 
 def _graph_query_unfenced(cur, node_id: str, hops: int, limit: int) -> dict:
+    # forget-fence source: cli._graph_query fences it
     """Neighborhood lookup for `khipu graph`.
 
     hops == 1 returns the direct edges (either direction) plus a best-effort
@@ -2749,6 +2752,7 @@ def cmd_decisions(args: argparse.Namespace) -> int:
 
 
 def _reembed_episode(cur, episode_id: int) -> bool:
+    # forget-fence: embedding writer; returns no row to a reader
     """Replace one episode's vectors from its current row, using the same text
     builder, profile and upsert `embed.embed_on_capture` uses — so a corrected
     summary is findable by meaning immediately instead of at the next nightly.

@@ -2253,6 +2253,7 @@ def _snapshot_search_hits(
     started: float | None = None, progress: dict[str, Any] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """Lexical + cosine, RRF-fused, entirely against the local sqlite
     replica — no Postgres, no network round trip beyond one (cacheable)
     embed API call. Raises ``_SnapshotUnusable`` when the replica is
@@ -2385,6 +2386,7 @@ def _fuse_and_annotate(
     lexical_rows: list[dict[str, Any]], cosine_rows: list[dict[str, Any]],
     legs: list[str], degraded: str | None, graph: bool = True,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """Everything after the legs finish: fusion, graph candidates, the
     relevance gate, row metadata, project/status ranking, time boost and
     validity. One function for the keyword-only result and the full one, so
@@ -2598,6 +2600,7 @@ def _search_hits(
     progress: dict[str, Any] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """The gated search itself (no timeout, no dedup — those wrap this).
 
     Local snapshot first (R1 follow-up): fast, no network round trip beyond
@@ -2750,6 +2753,7 @@ def _hub_hits_budgeted(
     limit: int,
     deadline: float | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """Lexical (pg_trgm ILIKE, ``cli._literal_candidates``) and query-
     embedding + cosine (``embed._cosine_candidates``) legs run concurrently
     on daemon threads against the hub.
@@ -2773,6 +2777,7 @@ def _hub_hits_budgeted(
     cosine_box: dict[str, Any] = {}
 
     def _lexical_worker() -> None:
+        # forget-fence source: prior_work_for_prompt fences the push
         try:
             from khipu.db import connect
             from khipu.cli import _literal_candidates
@@ -2916,6 +2921,7 @@ def _search_hits_budgeted(
     project: str | None = None,
     deadline: float | None = None, progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """``khipu_status``'s ``prior_work`` path (R10 + this phase): local
     snapshot first when fresh (already sub-300ms measured — see
     ``_snapshot_search_hits``'s docstring), the concurrent hub budgeted

@@ -547,12 +547,15 @@ def episode_refs(row: Any) -> tuple[set[str], set[str]]:
     return direct, reached
 
 
-def withhold(rows: Sequence[Any], *, fail_closed: bool = True) -> list[Any]:
+def withhold(rows: Sequence[Any], *, fail_closed: bool = True,
+             episode_key: str | None = None) -> list[Any]:
     """The one forget fence for every row a reader shows, pushes or logs:
     ``rows`` minus each row that carries or derives from an episode on the
     forget list or queued for erasure (``episode_refs``), and each row only
-    reached through such episodes. When the list cannot be read: nothing
-    (``fail_closed``, every automatic push), or, for an explicit search, every
+    reached through such episodes. ``episode_key`` names a key whose value is
+    the row's own episode id, for rows that are episodes but carry no
+    ``kind`` (an activity row's ``id``). When the list cannot be read: nothing
+    (``fail_closed``, every automatic push), or, for an explicit read, every
     row that touches any episode is dropped and the rest stay."""
     try:
         withheld = {str(i) for i in withheld_episode_ids()}
@@ -564,6 +567,10 @@ def withhold(rows: Sequence[Any], *, fail_closed: bool = True) -> list[Any]:
     kept = []
     for row in rows:
         direct, reached = episode_refs(row)
+        if episode_key is not None and isinstance(row, Mapping):
+            ref = _episode_ref(row.get(episode_key))
+            if ref:
+                direct.add(ref)
         if not readable:
             if direct or reached:
                 continue

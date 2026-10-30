@@ -154,7 +154,11 @@ def _select(cur, project: str, *, ids: list[int] | None = None, lock: bool = Fal
         row.update(zip(cols, raw[:-1]))
         row["lineage"] = raw[-1]
         out[int(row["id"])] = row
-    return out
+    from khipu.commitments import _fenced_owed_rows
+
+    # The hub's deleted_at lags this Mac's forget list; an unreadable list
+    # plans and changes nothing tied to an episode.
+    return {int(row["id"]): row for row in _fenced_owed_rows(list(out.values()))}
 
 
 def _plain(value: Any) -> Any:
@@ -664,6 +668,7 @@ BULK_PRIOR_FIELDS = (*PRIOR_FIELDS, "due_after")
 
 def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
                gate: str | None, origin_correction: bool = False) -> tuple[dict[int, bool], list[str]]:
+    # forget-fence: owner bulk write; returns changed flags and batch ids (rows via the fenced _select)
     """Apply ``change(cid) -> bool`` (a close, reopen, snooze or reassign) to
     ``ids`` as undoable batches, one per project, in the caller's
     transaction. Every bulk action keeps the same record: the batch, and per

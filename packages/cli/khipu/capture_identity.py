@@ -120,6 +120,7 @@ _INSERT_COLS = ("source_key, episode_id, role, harness, session_id, transcript_r
 
 def _insert_source(cur, key: str, episode_id: int, role: str, ident: dict[str, Any],
                    ts: Any, summary: Any) -> bool:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     fields = [ident.get(k) for k in SOURCE_FIELDS]
     if role == "origin":
         # ts and summary_md5 are read off the row just written, so they are the

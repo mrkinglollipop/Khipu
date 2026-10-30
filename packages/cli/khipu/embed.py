@@ -1348,6 +1348,7 @@ def _iter_sources(
     cur, *, kind: str | None = None, refs: list[str] | None = None,
     commitment_wording: dict[str, str] | None = None,
 ) -> Iterable[tuple[str, str, str, str]]:
+    # forget-fence: embedding writer; returns no row to a reader
     """Yield (kind, ref, text, title) for every embeddable row.
 
     ``title`` is used only for gemini-embedding-2 document prefixes; stored
@@ -1454,6 +1455,7 @@ def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tup
 
 def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]], *,
                               commitment_wording: Iterable[str] | None = None) -> set[tuple[str, str]]:
+    # forget-fence: embedding writer; returns no row to a reader
     """Lock sources until the caller commits their vectors.
 
     Provider calls happen before this check. Forget/purge either wins first
@@ -1614,6 +1616,7 @@ def _plan_cache_file(cur, suffix: str = "") -> Path:
 
 
 def _row_fingerprints(cur, *, topics_only: bool = False) -> list[tuple[str, str, str]]:
+    # forget-fence: embedding writer; returns no row to a reader
     """``(kind, ref, fingerprint)`` for every row the plan covers, in plan order
     (episodes by id, then topics by slug). The fingerprint is the row version's
     ``xmin``: every UPDATE writes a new version under a new transaction id, so
@@ -2088,6 +2091,7 @@ def activate_welcome_embed(*, provider: str, profile: str | None = None) -> dict
 
 
 def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) -> bool:
+    # forget-fence: embedding writer; returns no row to a reader
     """Embed one just-captured episode. Fail-open; returns True on success.
 
     ``episode_id`` is the row the writer reported; without one (a caller that
@@ -2645,6 +2649,7 @@ def _apply_search_filters(
     via: str | None = None,
     projects: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Post-fusion metadata filter + recency tiebreak, in one place for every
     mode (W2.3). project/session_id/harness only exist on episodes — a topic
     or node row is dropped when one of those is active rather than guessed at.
@@ -2933,6 +2938,7 @@ def hybrid_search(
     source: str | None = None,
     include_libraries: bool = True,
 ) -> dict[str, Any]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
 
     mode='hybrid' (default): cosine oversample + token overlap (over the
@@ -3640,6 +3646,7 @@ def coverage(
 
 
 def embed_recent_missing(limit: int = 10) -> dict[str, int]:
+    # forget-fence: embedding writer; returns no row to a reader
     """Embed the newest episodes that have no vector under the active profile.
 
     The tail sync embeds rows *it* inserts, but a row the legacy mirror leg wrote

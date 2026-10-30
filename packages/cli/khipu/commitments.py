@@ -912,6 +912,7 @@ def _normalize_open_loop(item: Any) -> dict[str, Any] | None:
 
 
 def _open_id_for_hash(cur, scope: str | None, content_h: str) -> int | None:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """id of the open commitment with this exact content hash in this scope.
 
     fix 3: the partial unique index ``uq_commitments_open_content(project,
@@ -1111,6 +1112,7 @@ def _provenance_ready(cur) -> bool:
 
 
 def _lock_open(cur, commitment_id: int) -> bool:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """Lock a dedup target and re-check that it is still open (section 3.4):
     one that retired after it was read is not a target."""
     cur.execute(
@@ -1134,6 +1136,7 @@ def _claim_opened(cur, commitment_id: int, episode_id: int, stored_text: str, te
 
 
 def _claim_restatement(cur, commitment_id: int, episode_id: int, text: str, project: str | None) -> None:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """A later episode restating an open item claims it: its own words as a
     restatement (the projection shows the newest one that differs from the
     text as ``latest_text``), the PR numbers and repository refs those words
@@ -1422,6 +1425,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
 
 
 def _keep_pr_refs(cur, commitment_id: int, labels: list[str]) -> None:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """Add ``owner/repo#N`` labels to the item's ``pr_check["refs"]``, the
     repository/number pairs ``khipu.close_rules.item_refs`` requires."""
     cur.execute("SELECT pr_check FROM commitments WHERE id = %s FOR UPDATE", (commitment_id,))
@@ -1478,6 +1482,7 @@ def _relay_matches(cur, text: str, exact: int | None, scope: str | None,
 def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None = None,
                       episode_id: int | None = None,
                       with_origin: bool = False, with_owner: bool = False) -> list[dict[str, Any]]:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """The open items in ``scope``'s lineage: ``id`` and ``text``, with
     ``origin`` and, for ``with_owner``, the columns :func:`row_owner` reads
     (its resolved ``owner`` and ``owner_label`` replace the stored ones)."""
@@ -1760,6 +1765,7 @@ def _resolved(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def row_at_write(cur, commitment_id: int) -> dict[str, Any] | None:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """The item as it is now, its row locked for this transaction (``FOR
     UPDATE``), with the owner resolved; None when it is missing or forgotten.
     Every automatic write decides on this read, never on an earlier one."""
@@ -2068,6 +2074,7 @@ def _stale_where(has_last_seen: bool) -> str:
 
 
 def mark_stale(cur) -> int:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """Flip silent open commitments to 'stale' (see :func:`stale_sql`). Never
     silently dropped — stale stays queryable via `khipu owed --status stale`.
     Staleness is an automatic rule: each item is read again under its row
@@ -2154,6 +2161,7 @@ def _payload_event(payload: dict[str, Any]) -> str:
 
 
 def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """Open commitments opened by an episode of THIS session.
 
     Joined through ``episodes`` rather than a new column so rows written
@@ -2355,12 +2363,41 @@ def fetch_owed_rows(cur, *, project: str | None = None, parent_session_id: str |
         """,
         params,
     )
-    out = [dict(zip(select_cols, row)) for row in cur.fetchall()]
+    out = _fenced_owed_rows([dict(zip(select_cols, row)) for row in cur.fetchall()])
     if canonical:
         for row in out:
             if row.get("project"):
                 row["project"] = canonical
     return out
+
+
+def _fenced_owed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Owed rows with this Mac's forget list applied: the hub learns of a
+    forget after the list does, so ``_not_forgotten_clause`` and
+    ``settle_suggestion_sql`` alone let a just-forgotten episode's row or a
+    suggestion quoting it through. As on the hub, a row goes with its
+    opening episode; one closed by a forgotten episode stays, its close
+    reason read as 'forgotten' (``forget._clear_cited_closes``). An
+    unreadable list shows no row tied to an episode."""
+    from khipu.tombstones import episode_withheld, withhold
+
+    kept = withhold([{"episode_id": row.get("opened_episode"), "row": row} for row in rows],
+                    fail_closed=False)
+    rows = [k["row"] for k in kept]
+    for row in rows:
+        if row.get("closed_episode") is not None and row.get("close_reason") \
+                and episode_withheld(row["closed_episode"]):
+            row["close_reason"] = "forgotten"
+        suggestion = row.get("settle_suggestion")
+        if isinstance(suggestion, str):
+            try:
+                suggestion = json.loads(suggestion)
+            except ValueError:
+                suggestion = None
+        if isinstance(suggestion, dict) and suggestion.get("episode") is not None \
+                and episode_withheld(suggestion["episode"]):
+            row["settle_suggestion"] = None
+    return rows
 
 
 def finish_owed_rows(rows: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
@@ -2453,6 +2490,7 @@ def add_hub_ages(rows: list[dict[str, Any]], hub_now: Any) -> list[dict[str, Any
 
 def set_status(cur, commitment_id: int, status: str, *, reason: str | None = None,
                by: str | None = None) -> bool:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """Close, reopen, stale or drop one commitment by hand. A close keeps its
     ``reason`` (default "closed by hand") and, once migration 0034 is in,
     ``by`` (:data:`BY_APP`, :data:`BY_CONVERSATION`). A reopen restores the
@@ -2665,6 +2703,7 @@ def page_owed(rows: list[dict[str, Any]], *, owner: str | None = None, kind: str
 
 
 def owners_of(cur, ids: list[int], *, lock: bool = False) -> dict[int, dict[str, Any]]:
+    # forget-fence: owner lookup that gates a write; the caller reads only the owner
     """``{id: row}`` with the resolved owner for the given ids (forgotten
     and missing ids left out); ``lock`` holds the rows for this transaction."""
     cols = _owner_cols(cur)
@@ -2702,6 +2741,7 @@ def reassign(cur, commitment_id: int, owner: str, label: str | None = None, *,
 
 
 def _default_agent_label(cur, commitment_id: int) -> str:
+    # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """The label a reassign to ``agent`` takes when none is given: the third
     party the item's words name as their subject, else the orchestrator."""
     try:

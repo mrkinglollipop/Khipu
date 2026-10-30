@@ -293,6 +293,7 @@ def persist_topic_graph(
 
 
 def _existing_ids(cur, ids: Sequence[str]) -> set[str]:
+    # forget-fence: graph writer's dedupe; returns ids
     if not ids:
         return set()
     cur.execute("SELECT id FROM nodes WHERE id = ANY(%s)", (list(ids),))
@@ -300,6 +301,7 @@ def _existing_ids(cur, ids: Sequence[str]) -> set[str]:
 
 
 def _existing_edges(cur, edges: Sequence[tuple[str, str, str]]) -> set[tuple[str, str, str]]:
+    # forget-fence: graph writer's dedupe; returns edge keys
     if not edges:
         return set()
     srcs = list({e[0] for e in edges})
@@ -379,6 +381,8 @@ def enrich_search_results(cur, results: Sequence[Mapping[str, Any]]) -> list[dic
                 continue
             seen_nb[slug].add(other)
             neighbors_by_slug[slug].append({"id": other, "type": etype})
+    from khipu.tombstones import withhold
+
     out: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
@@ -386,7 +390,8 @@ def enrich_search_results(cur, results: Sequence[Mapping[str, Any]]) -> list[dic
         if kind == "topic":
             slug = str(item.get("id") or "")
             item["paths"] = extract_paths(bodies.get(slug, ""))
-            item["neighbors"] = neighbors_by_slug.get(slug, [])
+            # A neighbour can be an episode node; the forget list fences it.
+            item["neighbors"] = withhold(neighbors_by_slug.get(slug, []), fail_closed=False)
         elif kind == "episode":
             item["paths"] = extract_paths(str(item.get("snippet") or ""))
         elif kind == "media":

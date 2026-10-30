@@ -99,7 +99,10 @@ def _episode_sources(cur, ids: list[int]) -> dict[int, dict[str, Any]]:
         f"WHERE id = ANY(%s::bigint[]){live}",
         (ids,),
     )
-    episodes = {int(r[0]): r for r in cur.fetchall()}
+    from khipu.tombstones import episode_withheld
+
+    # The hub's deleted_at lags this Mac's forget list.
+    episodes = {int(r[0]): r for r in cur.fetchall() if not episode_withheld(r[0])}
     ready = decisions._decisions_ready(cur)
     rows = briefs._decision_rows(cur, list(episodes), with_text=True)
     out: dict[int, dict[str, Any]] = {}

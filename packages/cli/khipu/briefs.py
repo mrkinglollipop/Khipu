@@ -159,6 +159,7 @@ def source_hash(entries: list[tuple[int, str, str]]) -> str:
 
 
 def _decision_rows(cur, episode_ids: list[int], *, with_text: bool = False) -> dict[int, list[dict[str, Any]]]:
+    # forget-fence source: decision rows for the episode ids its caller passes; callers fence those ids
     """Decision rows per episode, each with its ``state`` (current |
     superseded | retracted). Empty when the decisions table is absent."""
     from khipu import decisions
@@ -246,6 +247,7 @@ def _estimate_chars(episode_chars: list[int]) -> int:
 
 
 def plan(cur, *, retry_failed: bool = False) -> dict[str, Any]:
+    # forget-fence: the build plan: topic slugs, source counts and sizes, no episode text
     """Topics whose brief is missing or stale. Stale means the hash over the
     sorted (episode id, revision, decision state) tuples of the topic's live
     source episodes differs from the stored ``source_hash``, the stored brief
@@ -319,6 +321,7 @@ def plan(cur, *, retry_failed: bool = False) -> dict[str, Any]:
 # ---- sources for one build ------------------------------------------------------
 
 def _gather(cur, slug: str) -> dict[str, Any]:
+    # forget-fence: the brief builder's input; a brief citing a forgotten episode is withheld on read (read_brief)
     """The topic's live source episodes: the fingerprint over all of them, and
     the newest cleaned subset (within ``MAX_SOURCE_CHARS``) offered to the
     model."""
@@ -433,6 +436,7 @@ def _model_label() -> str | None:
 
 
 def _current_row(cur, slug: str) -> dict[str, Any] | None:
+    # forget-fence: the stored brief's id, hash and state for the staleness check
     cur.execute(
         "SELECT id, source_hash, state, derivation_version FROM briefs "
         "WHERE topic_slug = %s AND superseded_at IS NULL AND state IN ('current', 'stale') "
@@ -601,6 +605,7 @@ def mark_stale_for_episodes(cur, episode_ids: list[int]) -> int:
 
 
 def mark_stale_for_decision(cur, decision_id: int) -> int:
+    # forget-fence: a writer: marks briefs stale; returns a count
     """Same, for the briefs citing the episode a decision came from. Fail-open:
     a decision write never fails because a brief could not be marked."""
     try:
@@ -650,13 +655,19 @@ def read_brief(cur, topic_slug: str) -> dict[str, Any]:
                 or have["state"] != "current"
                 or have["hash"] != _gather(cur, topic_slug)["hash"]):
             payload["state"] = "stale"
-    if ids and _has(cur, "episodes", "deleted_at"):
+    from khipu.tombstones import episode_withheld
+
+    # This Mac's forget list leads the hub's deleted_at; an unreadable list
+    # withholds every brief that cites an episode.
+    forgotten = any(episode_withheld(i) for i in ids)
+    if not forgotten and ids and _has(cur, "episodes", "deleted_at"):
         cur.execute(
             "SELECT id FROM episodes WHERE id = ANY(%s::bigint[]) AND deleted_at IS NOT NULL",
             (ids,),
         )
-        if cur.fetchall():
-            payload.update(state="stale", body="", claims=[], withheld="a source episode was forgotten")
+        forgotten = bool(cur.fetchall())
+    if forgotten:
+        payload.update(state="stale", body="", claims=[], withheld="a source episode was forgotten")
     return payload
 
 

@@ -1950,6 +1950,9 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
         project, rows = read["project"], read["rows"]
         canonical, project_names = read["canonical"], read["group"]
         stale = stale_fields()
+    # This Mac's forget list, whichever store answered: the hub learns of a
+    # forget after the list does.
+    rows = commitments._fenced_owed_rows(rows)
     directions = _routing_direction_rows(status, direction_filters, projects=project_names,
                                          canonical=canonical, items=direction_items)
     page = commitments.page_owed(rows + directions, **filters, limit=limit)
@@ -2435,6 +2438,11 @@ def _tool_decisions(args: dict) -> dict:
         out = offline_reads.decisions(project, since, status, limit)
         if out is None:
             raise
+    from khipu.tombstones import withhold
+
+    # The hub learns of a forget after this Mac's list does; an unreadable
+    # list shows no decision tied to an episode.
+    out["results"] = withhold(out["results"], fail_closed=False)
     if status != "conflicts":
         out.update(owner_writes.annotate(out["results"], "decisions_update"))
     return out

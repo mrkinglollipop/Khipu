@@ -1192,6 +1192,7 @@ def _field_state(row: tuple, field: str, spec: dict[str, Any]) -> str:
 
 
 def _changed_decisions(cur, eid: int, created: list[dict[str, Any]]) -> list[int]:
+    # forget-fence: returns decision ids for a write
     """The created decision rows (locked, after their episode) that changed
     since the import: gone, reworded, moved to another episode, superseded,
     retracted, in a link someone resolved (confirmed, rejected, restored), or

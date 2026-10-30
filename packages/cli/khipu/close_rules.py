@@ -216,6 +216,7 @@ def ready(cur) -> bool:
 
 
 def backfill_prs(cur, *, batch: int = BACKFILL_BATCH) -> int:
+    # forget-fence: a writer: fills prs; returns a count
     """Fill ``prs`` on rows from before migration 0034 (``prs IS NULL``), in
     batches. Returns the count filled; 0 on a hub without the column."""
     if not ready(cur):
@@ -244,6 +245,7 @@ def backfill_prs(cur, *, batch: int = BACKFILL_BATCH) -> int:
 
 
 def claim_text_prs(cur, commitment_id: int) -> int:
+    # forget-fence: a writer: claims PR numbers; returns a count
     """The PR numbers a commitment's own text names, claimed by whoever
     claims that text (its live anchor, else the owner): what
     :func:`backfill_prs` stores for a row whose ``prs`` was never parsed
@@ -409,6 +411,7 @@ def _ledger_states(cur, project: str) -> dict[EvidenceKey, dict[str, Any]]:
 
 
 def _episode_states(cur, project: str, after_episode: int) -> dict[EvidenceKey, dict[str, Any]]:
+    # forget-fence: close-rule evidence (PR states) for the rules' writes; no row reaches a reader
     """Evidence from the git and gh lines in the project's captures after
     ``after_episode`` (the nightly's view of source 3): the newest capture's
     line about each PR, with that capture's id as ``episode``."""
@@ -638,7 +641,11 @@ def _open_items(cur, project: str | None, *, commitment_id: int | None = None,
         trigger = has_future_trigger(item.get("text") or "") or bool(item.get("future_trigger"))
         item["owner"], item["owner_label"] = row_owner(item, future_trigger=trigger)
         out.append(item)
-    return out
+    from khipu.tombstones import withhold
+
+    # The hub's deleted_at lags this Mac's forget list: a close plan never
+    # shows or settles an item of a forgotten episode.
+    return withhold(out, fail_closed=False)
 
 
 def _key(ref: tuple[str | None, int], project_repo: str | None) -> EvidenceKey:
@@ -813,6 +820,7 @@ def _settles(item: dict, decisions: list[tuple], threshold: float):
 
 def _read_decisions(cur, project: str, opened_at, *, episode_id: int | None = None,
                     decision_id: int | None = None) -> list[tuple]:
+    # forget-fence: close-rule evidence for the rules' writes; no row reaches a reader
     from khipu.db import has_columns
 
     live = "d.superseded_by IS NULL"
