@@ -3302,6 +3302,7 @@ export default function App() {
   const checkForUpdates = useCallback(async () => {
     setUpdateBusy(true);
     setUpdateMsg(null);
+    let stage: "check" | "download" = "check";
     try {
       const update = await check();
       if (!update) {
@@ -3309,14 +3310,19 @@ export default function App() {
         return;
       }
       setUpdateMsg(`Downloading v${update.version}…`);
+      stage = "download";
       await update.downloadAndInstall();
       setUpdateMsg("Update installed — relaunching…");
       await relaunch();
     } catch (e) {
+      // The updater plugin rejects with plain strings as often as Errors;
+      // show the text either way, and say which step failed, so a failing
+      // Mac can be diagnosed from the message alone.
+      const text = e instanceof Error ? e.message : String(e ?? "unknown error");
       setUpdateMsg(
-        e instanceof Error
-          ? e.message
-          : "Update check failed (no release feed yet is OK).",
+        stage === "download"
+          ? `Update download or install failed: ${text}`
+          : `Update check failed: ${text}`,
       );
     } finally {
       setUpdateBusy(false);
