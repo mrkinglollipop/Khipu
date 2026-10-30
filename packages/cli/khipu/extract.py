@@ -1138,7 +1138,11 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
         try:
             retry_raw = _gemini_retry()
         except BudgetExhausted:
-            raise
+            # The retry is optional: a usable first reply is kept, not lost.
+            if parsed is None:
+                raise
+            print("[khipu-extract] empty-summary retry skipped: budget", file=sys.stderr, flush=True)
+            retry_raw = None
         except Exception:  # noqa: BLE001 — the first reply and its evidence stand
             retry_raw = None
         retried = _parse_capture(retry_raw) if retry_raw is not None else None
@@ -1156,7 +1160,10 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
         try:
             retried = _parse_capture(_generate(prompt, caller="capture"))
         except BudgetExhausted:
-            raise
+            if parsed is None:
+                raise
+            print("[khipu-extract] empty-summary retry skipped: budget", file=sys.stderr, flush=True)
+            retried = None
         except Exception:  # noqa: BLE001 — the first reply stands, kept as verbatim only
             retried = None
         if retried is not None:
