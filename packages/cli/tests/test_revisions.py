@@ -60,6 +60,13 @@ class FakeCursor:
         _db._TABLE_COLUMNS_CACHE.pop("decisions", None)
 
     def execute(self, sql, params=None):
+        if "information_schema.columns" in sql and "table_name = ANY" in sql:
+            # db.prime_table_columns: every table asked about in one query,
+            # answered out of band like the per-table ones below.
+            known = {"commitments": self.commitments_columns, "episodes": self.episodes_columns,
+                     "decisions": self.decisions_columns}
+            self._current = [(t, c) for t in params[0] for c in known.get(t, ())]
+            return
         if "information_schema.columns" in sql and tuple(params or ()) == ("commitments",):
             self._current = [(c,) for c in self.commitments_columns]
             return

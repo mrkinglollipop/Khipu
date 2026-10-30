@@ -792,3 +792,110 @@ def run_relevance_eval(
         "paths": {p: _summary(by_path[p]) for p in paths},
         "rows": rows,
     }
+
+
+# ---- graded replay (2026-10-30) ----------------------------------------------
+# Replays real {prompt, cwd} rows through automatic push
+# (``recall_prompt.prior_work_for_prompt``, no session id, so no dedup) and
+# scores the pushed ids against a grades file a reviewer wrote for the same
+# rows, joined on ``n``. A grade is ``{n, needs_memory, ideal: [ids],
+# pushed_then/pushed_now: {id: "relevant"|"irrelevant"}}`` with ids written
+# ``kind:id`` (``episode:123``, ``topic:note:x``). Both files stay outside the
+# repo: they hold the owner's prompts. ``scripts/recall_replay_grade.py`` is
+# the command.
+
+
+def load_jsonl(path: Path) -> list[dict[str, Any]]:
+    out = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            row = json.loads(line)
+            if isinstance(row, dict):
+                out.append(row)
+    return out
+
+
+def index_grades(grades: Iterable[dict[str, Any]]) -> dict[Any, dict[str, Any]]:
+    return {g["n"]: g for g in grades if isinstance(g, dict) and "n" in g}
+
+
+def grade_label(grade: dict[str, Any], hit_id: str) -> str | None:
+    """``relevant``/``irrelevant`` for an id the grader judged (an ideal id is
+    relevant), None for one never graded."""
+    if hit_id in (grade.get("ideal") or ()):
+        return "relevant"
+    for field in ("pushed_now", "pushed_then"):
+        label = (grade.get(field) or {}).get(hit_id)
+        if label in ("relevant", "irrelevant"):
+            return label
+    return None
+
+
+def _default_push(prompt: str, *, cwd: str | None) -> dict[str, Any]:
+    from khipu import recall_prompt
+
+    return recall_prompt.prior_work_for_prompt(prompt, cwd=cwd)
+
+
+def run_graded_replay(
+    rows: Iterable[dict[str, Any]], grades: dict[Any, dict[str, Any]], *, push=None,
+) -> dict[str, Any]:
+    """Score each graded row's push: relevant share of graded pushed ids,
+    abstention on ``needs_memory: false`` rows, and whether a
+    ``needs_memory: true`` row with ideal ids got at least one of them. A push
+    that raises counts as pushing nothing, with its error as the reason."""
+    push = push or _default_push
+    out_rows: list[dict[str, Any]] = []
+    ungraded_prompts = 0
+    for row in rows:
+        grade = grades.get(row.get("n"))
+        if grade is None:
+            ungraded_prompts += 1
+            continue
+        t0 = time.monotonic()
+        try:
+            result = push(row.get("prompt") or "", cwd=row.get("cwd"))
+            reason = str(result.get("reason") or "")
+            hits = result.get("hits") or []
+        except Exception as exc:  # noqa: BLE001 — one prompt must not sink the replay
+            reason, hits = f"error: {type(exc).__name__}: {exc}", []
+        pushed = [f"{h.get('kind')}:{h.get('id')}" for h in hits]
+        labels = {i: grade_label(grade, i) for i in pushed}
+        ideal = list(grade.get("ideal") or ())
+        needs = bool(grade.get("needs_memory"))
+        out_rows.append({
+            "n": row.get("n"), "needs_memory": needs, "pushed": pushed, "labels": labels,
+            "evidence": {f"{h.get('kind')}:{h.get('id')}": h.get("push_evidence") for h in hits},
+            "reason": reason, "ms": round((time.monotonic() - t0) * 1000, 1),
+            "abstained": None if needs else not pushed,
+            "ideal_hit": (any(i in ideal for i in pushed) if needs and ideal else None),
+        })
+    graded = [lab for r in out_rows for lab in r["labels"].values() if lab]
+    relevant = sum(1 for lab in graded if lab == "relevant")
+    pushed_total = sum(len(r["pushed"]) for r in out_rows)
+    no_memory = [r for r in out_rows if r["abstained"] is not None]
+    with_ideal = [r for r in out_rows if r["ideal_hit"] is not None]
+    summary = {
+        "prompts": len(out_rows), "ungraded_prompts": ungraded_prompts,
+        "pushed": pushed_total, "pushed_graded": len(graded),
+        "pushed_ungraded": pushed_total - len(graded), "pushed_relevant": relevant,
+        "relevant_share": (relevant / len(graded)) if graded else None,
+        "no_memory_prompts": len(no_memory),
+        "abstained_correctly": sum(1 for r in no_memory if r["abstained"]),
+        "memory_prompts_with_ideal": len(with_ideal),
+        "ideal_hits": sum(1 for r in with_ideal if r["ideal_hit"]),
+    }
+    return {"summary": summary, "rows": out_rows}
+
+
+def format_graded_summary(summary: dict[str, Any]) -> str:
+    share = summary["relevant_share"]
+    return "\n".join([
+        f"prompts replayed: {summary['prompts']} (no grade, skipped: {summary['ungraded_prompts']})",
+        f"pushed items relevant: {summary['pushed_relevant']}/{summary['pushed_graded']}"
+        f" ({'n/a' if share is None else f'{share:.0%}'}) relevant share;"
+        f" {summary['pushed_ungraded']} pushed items were never graded",
+        f"no memory needed, pushed nothing: {summary['abstained_correctly']}/{summary['no_memory_prompts']}",
+        f"memory needed, push held a right answer: {summary['ideal_hits']}/{summary['memory_prompts_with_ideal']}",
+    ])

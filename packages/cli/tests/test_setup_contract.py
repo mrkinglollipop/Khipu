@@ -183,6 +183,16 @@ class UpkeepAndProveWiringTest(unittest.TestCase):
     when the caller asked for a preflight (store/install_jobs/prove all
     off) — the exact shape ``khipu db preflight`` uses."""
 
+    def setUp(self) -> None:
+        # store=True writes the DSN and certificate files into the suite's
+        # shared data dir (only the Keychain call is mocked). Left behind, a
+        # later doctor test sees a configured hub and goes red.
+        from khipu.paths import dsn_file, root_cert_file
+
+        for path in (dsn_file(), root_cert_file()):
+            if not path.exists():
+                self.addCleanup(path.unlink, missing_ok=True)
+
     def test_success_pipeline_calls_ensure_scheduled_jobs_and_run_probe(self) -> None:
         with _ReachThroughGraphPatches(), \
              mock.patch("khipu.keychain.keychain_available", return_value=True), \

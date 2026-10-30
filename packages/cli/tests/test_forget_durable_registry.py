@@ -246,9 +246,13 @@ def test_hash_only_fence_uses_the_strict_wire_form_for_lone_surrogates(registry)
     assert tombstones.is_forgotten(clean(payload))
 
 
-def test_replica_fence_preserves_payload_only_hash_fields(registry):
+def test_replica_fence_preserves_payload_only_hash_fields(registry, tmp_path, monkeypatch):
     from khipu import hub_snapshot
 
+    # A refused upsert queues an erasure beside the replica; without this the
+    # queue lands in the shared hermetic home and hides episode 7 from every
+    # later test that reads a replica.
+    monkeypatch.setattr(hub_snapshot, "snapshot_path", lambda: tmp_path / "hub_snapshot.sqlite")
     payload = {"ts": "2026-10-15T12:00:00Z", "summary": "hash-only replica",
                "verbatim": {"quotes": ["retained evidence"]}}
     tombstones.publish_payloads([payload])

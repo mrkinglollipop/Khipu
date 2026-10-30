@@ -136,6 +136,17 @@ def isolated_dir() -> Path | None:
     return Path(raw).expanduser() if raw else None
 
 
+def capture_home() -> Path:
+    """``session_capture.khipu_home``'s answer without importing that module
+    (a hook on every tool call cannot afford it): the isolated run's capture
+    folder, else KHIPU_CAPTURE_HOME / KHIPU_AEGIS_HOME, else ~/.grok/khipu."""
+    isolated = isolated_dir()
+    if isolated is not None:
+        return isolated / "capture"
+    return Path(os.environ.get("KHIPU_CAPTURE_HOME") or os.environ.get("KHIPU_AEGIS_HOME")
+                or str(Path.home() / ".grok" / "khipu"))
+
+
 class IsolatedWriteRefused(RuntimeError):
     """A live-only write (data-dir pointer, DSN, certificate, Keychain) was
     attempted inside an isolated run."""
@@ -344,6 +355,10 @@ def backup_local(*, dest: Path) -> dict:
                         continue
                     if p.parent == src and (p.name == _SNAPSHOT_NAME
                                             or p.name.startswith(_SNAPSHOT_NAME + "-")):
+                        continue
+                    # The replica's word-rarity table and its key are rebuilt
+                    # from the replica; a backup never carries them.
+                    if p.parent == src and p.name.startswith(_SNAPSHOT_NAME + ".term-df"):
                         continue
                     # Another refresh's or export's temporary replica, or a
                     # sidecar of one, never went through the export.

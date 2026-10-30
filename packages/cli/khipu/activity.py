@@ -343,6 +343,10 @@ def _annotate_episode_validity(cur, episodes: list[dict]) -> list[dict]:
     return _validity.annotate(episodes, counts, None)
 
 
+_SLICE_TABLES = ("episodes", "commitments", "decisions", "decision_links", "topics", "project_aliases",
+                 "project_pairs")
+
+
 def project_slice(
     *,
     project: str | None,
@@ -417,7 +421,13 @@ def project_slice(
     episodes: list[dict[str, Any]] = []
     topics: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
-    with connect() as conn:
+    from khipu.db import prime_table_columns
+    from khipu.identity import group_memo
+
+    with connect() as conn, group_memo():
+        # The helpers below ask about these tables' columns one table at a
+        # time; one query answers them all (a round trip each to the hub).
+        prime_table_columns(conn, *_SLICE_TABLES)
         with conn.cursor() as cur:
             if project:
                 # O3: a snoozed row (due_after in the future) is parked — it
