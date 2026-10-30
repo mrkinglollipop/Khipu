@@ -13,14 +13,18 @@ and the child is killed at the deadline: a lookup thread that outlives the
 deadline dies with the child, so it can never reach a real exit after the
 guard would have come off, and the step returns by deadline + KILL_GRACE_S.
 
-Threat model: the guard defends against Khipu's OWN code reaching the network
-or a helper process by mistake (a provider, an HTTP client, a fallback path),
-not against adversarial code. Two layers: Python-level patches of every exit
-(``GUARDED_EXITS``) plus a refusal to import ``ctypes``/``cffi`` (``NATIVE_MODULES``),
-which would otherwise call libc ``sendto`` past the patches; and, when
-``/usr/bin/sandbox-exec`` exists and a probe shows it works, the child runs
-under ``(deny network*)`` so even a native call fails. The run record's
-``sandbox`` is ``os`` or ``python-only`` accordingly.
+The OS sandbox is the guard. The child is a plain subprocess started with
+``close_fds=True`` under ``/usr/bin/sandbox-exec`` with ``(deny network*)``;
+the work reaches it as JSON on stdin and only JSON lines on stdout come back,
+so it holds no descriptor of the parent's (a connected socket included). The
+child's stderr is read by the parent and reduced to a line count and exception
+type names. When sandbox-exec is missing or its probe fails, the step does not
+run: the record says ``skipped: no OS sandbox`` and the doctor row is yellow.
+The Python-level patches of every exit (``GUARDED_EXITS``) and the refusal to
+import ``ctypes``/``cffi`` (``NATIVE_MODULES``) stay as belt and braces, but
+they are NOT the guarantee: a reference taken before they were installed
+(a ctypes module, a pre-connected socket written with ``os.write``) walks past
+them, and only the sandbox stops it.
 
 ``<data dir>/state/recall-eval-history.json`` keeps the last 30 run records:
 figures, counts and the golden file's size and mtime. It never holds a query
@@ -37,8 +41,8 @@ from __future__ import annotations
 
 import contextlib
 import json
-import multiprocessing
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -93,7 +97,7 @@ def _write_history(records: list[dict[str, Any]]) -> None:
     fd, tmp = tempfile.mkstemp(prefix=".recall-eval-history.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
-            out.write(json.dumps({"records": records[-HISTORY_KEEP:]}, indent=2))
+            out.write(json.dumps({"records": records[-HISTORY_KEEP:]}, indent=2))  # text-safe: run records hold figures and counts only, never a query
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
@@ -347,7 +351,8 @@ def _golden_stat(path: Path) -> dict[str, Any]:
 
 
 def _completed(rec: dict[str, Any]) -> bool:
-    return bool(rec.get("ok", True)) and not rec.get("truncated") and bool(rec.get("paths"))
+    return (bool(rec.get("ok", True)) and not rec.get("truncated") and not rec.get("skipped")
+            and bool(rec.get("paths")))
 
 
 def _previous_figures(history: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -407,118 +412,177 @@ _SANDBOX_PROBE = (
     "except OSError:\n"
     "    print('blocked')\n"
 )
-_sandbox_cache: dict[str, str] = {}
+_sandbox_cache: dict[str, bool] = {}
+SKIPPED_NO_SANDBOX = "no OS sandbox"
 
 
-def _sandbox_mode() -> str:
-    """``os`` when sandbox-exec exists and a probe under it both starts Python
-    and finds a loopback UDP send refused; otherwise ``python-only``."""
-    if "mode" not in _sandbox_cache:
-        mode = "python-only"
+def _sandbox_available() -> bool:
+    """True when sandbox-exec exists and a probe under it both starts Python
+    and finds a loopback UDP send refused. Without it the step does not run."""
+    if "ok" not in _sandbox_cache:
+        ok = False
         if os.path.exists(SANDBOX_EXEC):
             try:
                 out = subprocess.run(
                     [SANDBOX_EXEC, "-p", SANDBOX_PROFILE, sys.executable, "-I", "-c", _SANDBOX_PROBE],
-                    capture_output=True, text=True, timeout=30)
-                if out.returncode == 0 and out.stdout.strip() == "blocked":
-                    mode = "os"
+                    capture_output=True, text=True, timeout=30, close_fds=True)
+                ok = out.returncode == 0 and out.stdout.strip() == "blocked"
             except (OSError, subprocess.SubprocessError):
                 pass
-        _sandbox_cache["mode"] = mode
-    return _sandbox_cache["mode"]
+        _sandbox_cache["ok"] = ok
+    return _sandbox_cache["ok"]
 
 
-def _sandbox_wrapper(tmp: str) -> str:
-    """A script that runs the interpreter under sandbox-exec, for spawn to use
-    as the child's executable."""
-    wrapper = Path(tmp) / "python-sandboxed"
-    wrapper.write_text(f"#!/bin/sh\nexec '{SANDBOX_EXEC}' -p '{SANDBOX_PROFILE}' "
-                       f"'{sys.executable}' \"$@\"\n")
-    wrapper.chmod(0o700)
-    return str(wrapper)
+_CHILD_BOOT = ("import sys, json; sys.path[:0] = json.loads(sys.argv[1]); "
+               "from khipu.recall_eval_nightly import _child_entry; _child_entry()")
 
 
-def _child_main(conn, scoring: list[dict[str, Any]], deadline: float,
-                setup: tuple[Callable[..., Any], tuple] | None) -> None:
-    """The scoring child. ``deadline`` is a ``time.monotonic`` value, which is
-    system-wide on macOS and Linux, so parent and child share it. The guard
-    is never taken off here: the child leaves through ``os._exit`` inside it,
-    so a lookup thread still running dies with the process instead of
-    reaching a restored exit. ``setup`` is a test seam run before the guard."""
+def _child_command() -> list[str]:
+    return [SANDBOX_EXEC, "-p", SANDBOX_PROFILE, sys.executable, "-c", _CHILD_BOOT,
+            json.dumps([p for p in sys.path if isinstance(p, str)])]
+
+
+def _setup_ref(setup: tuple[Callable[..., Any], tuple] | None) -> list[Any] | None:
+    """A test seam travels as (module, qualified name, JSON args): the child
+    imports it by name, since nothing but the stdin JSON reaches it."""
+    if setup is None:
+        return None
+    fn, args = setup
+    return [fn.__module__, fn.__qualname__, list(args)]
+
+
+def _child_entry() -> None:
+    """The scoring child's entry, started by ``_run_child`` under sandbox-exec
+    with no inherited descriptors. The work arrives as one JSON document on
+    stdin; results leave as JSON lines on a private copy of stdout (the real
+    fd 1 is pointed at stderr, so a stray print can never forge a message).
+    ``deadline`` is a ``time.monotonic`` value, which is system-wide on macOS
+    and Linux, so parent and child share it. The guard is never taken off:
+    the child leaves through ``os._exit`` inside it, so a lookup thread still
+    running dies with the process instead of reaching a restored exit."""
     try:
+        payload = json.loads(sys.stdin.buffer.read())
+        out = os.fdopen(os.dup(1), "w", encoding="utf-8")
+        os.dup2(2, 1)
+
+        def emit(*msg: Any) -> None:
+            out.write(json.dumps(msg) + "\n")  # text-safe: counts, figures and refusal tallies only
+            out.flush()
+
         _quiet_excepthooks()
-        if setup is not None:
-            setup[0](*setup[1])
+        scoring, deadline, ref = payload["entries"], payload["deadline"], payload["setup"]
+        if ref is not None:
+            import importlib
+
+            target: Any = importlib.import_module(ref[0])
+            for part in ref[1].split("."):
+                target = getattr(target, part)
+            target(*ref[2])
         with _offline() as guard:
             try:
                 for entry in scoring:
                     if time.monotonic() >= deadline:
-                        conn.send(("stop", dict(guard.refused)))
+                        emit("stop", dict(guard.refused))
                         break
                     try:
                         got = _score_entry(entry, deadline, guard)
                     except Exception:  # noqa: BLE001 - one bad entry is skipped, never fatal
-                        conn.send(("bad", dict(guard.refused)))
+                        emit("bad", dict(guard.refused))
                         continue
                     if got is None:
-                        conn.send(("stop", dict(guard.refused)))
+                        emit("stop", dict(guard.refused))
                         break
-                    conn.send(("entry", got, dict(guard.refused)))
+                    emit("entry", got, dict(guard.refused))
                 else:
-                    conn.send(("done", dict(guard.refused)))
+                    emit("done", dict(guard.refused))
             finally:
                 os._exit(0)
     finally:
         os._exit(1)
 
 
-def _run_child(scoring: list[dict[str, Any]], deadline: float,
-               setup: tuple[Callable[..., Any], tuple] | None, sandbox: str = "python-only"):
-    """Yield the child's messages until it finishes or deadline + grace,
-    then kill it. Yields ``("killed", None)`` when it had to be killed and
-    ``("exited", exitcode)`` when it ended without a final message."""
-    ctx = multiprocessing.get_context("spawn")
-    recv, send = ctx.Pipe(duplex=False)
-    proc = ctx.Process(target=_child_main, args=(send, scoring, deadline, setup),
-                       name="khipu-recall-eval", daemon=True)
-    from multiprocessing import spawn
+_STDERR_LINE = re.compile(r"^\[khipu-recall-eval\] uncaught (\w{1,80}) \(#\d+\)")
 
-    wrapper_dir = tempfile.TemporaryDirectory(prefix="khipu-recall-eval-") if sandbox == "os" else None
-    previous = spawn.get_executable()
+
+def _reduce_stderr(stream, summary: dict[str, Any]) -> None:
+    """Drain the child's stderr and keep only a line count and the exception
+    type names its excepthook announced; no other text is retained."""
+    types: dict[str, int] = {}
+    lines = 0
     try:
-        if wrapper_dir is not None:
-            spawn.set_executable(_sandbox_wrapper(wrapper_dir.name))
-        proc.start()
-    except BaseException:
-        if wrapper_dir is not None:
-            wrapper_dir.cleanup()
-        raise
-    finally:
-        spawn.set_executable(previous)
-    send.close()
+        for raw in iter(lambda: stream.readline(4096), b""):
+            lines += 1
+            match = _STDERR_LINE.match(raw.decode("utf-8", "replace"))
+            if match and (match.group(1) in types or len(types) < 20):
+                types[match.group(1)] = types.get(match.group(1), 0) + 1
+    except (OSError, ValueError):
+        pass
+    summary.update(lines=lines, types=types)
+
+
+def _run_child(scoring: list[dict[str, Any]], deadline: float,
+               setup: tuple[Callable[..., Any], tuple] | None):
+    """Yield the child's messages until it finishes or deadline + grace, then
+    kill it. The child is a plain subprocess under sandbox-exec with
+    ``close_fds=True``: nothing but the stdin JSON reaches it, and only stdout
+    JSON lines come back. Yields ``("stderr", summary)`` once it is reaped,
+    then ``("killed", None)`` if it had to be killed or ``("exited", code)``
+    if it ended without a final message."""
+    import select
+
+    payload = json.dumps({"entries": scoring, "deadline": deadline, "setup": _setup_ref(setup)}).encode()
+    proc = subprocess.Popen(_child_command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, close_fds=True)
+    err_summary: dict[str, Any] = {}
+    err_thread = threading.Thread(target=_reduce_stderr, args=(proc.stderr, err_summary), daemon=True)
+    err_thread.start()
+
+    def feed() -> None:
+        try:
+            proc.stdin.write(payload)  # text-safe: the work goes to the sandboxed child over its own stdin pipe
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    threading.Thread(target=feed, daemon=True).start()
     hard = deadline + KILL_GRACE_S
+    fd = proc.stdout.fileno()
+    buf = b""
     final = False
     try:
         while not final:
             left = hard - time.monotonic()
-            if left <= 0 or not recv.poll(left):
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
                 break
-            try:
-                msg = recv.recv()
-            except (EOFError, OSError):
+            chunk = os.read(fd, 65536)
+            if not chunk:
                 break
-            final = msg[0] in ("stop", "done")
-            yield msg
+            buf += chunk
+            while b"\n" in buf and not final:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(msg, list) or not msg:
+                    continue
+                final = msg[0] in ("stop", "done")
+                yield msg
     finally:
-        killed = proc.is_alive() and not final
-        if proc.is_alive():
+        killed = proc.poll() is None and not final
+        if proc.poll() is None:
             proc.kill()
-        proc.join(KILL_GRACE_S)
-        recv.close()
-        if wrapper_dir is not None:
-            wrapper_dir.cleanup()
+        try:
+            proc.wait(KILL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            pass
+        err_thread.join(KILL_GRACE_S)
+        for stream in (proc.stdout, proc.stderr):
+            with contextlib.suppress(OSError, ValueError):
+                stream.close()
+    yield ("stderr", dict(err_summary))
     if not final:
-        yield ("killed", None) if killed else ("exited", proc.exitcode)
+        yield ("killed", None) if killed else ("exited", proc.returncode)
 
 
 def run_nightly_eval(*, golden: Path | None = None, budget_s: float = BUDGET_S,
@@ -588,13 +652,24 @@ def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, 
     rows: dict[str, list[dict[str, Any]]] = {p: [] for p in MEASURED_PATHS}
     refused = {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0}
     record["stopped_child"] = False
+    if scoring and time.monotonic() < deadline and not _sandbox_available():
+        # No OS sandbox, no run: the Python guard is not the guarantee.
+        record["skipped"] = SKIPPED_NO_SANDBOX
+        record["stopped_child"] = False
+        record["offline"] = {**refused, "cosine_skipped": False}
+        record["not_measured"] = {}
+        return
     if scoring and time.monotonic() < deadline:
-        record["sandbox"] = _sandbox_mode()
-        for msg in _run_child(scoring, deadline, child_setup, record["sandbox"]):
+        record["sandbox"] = "os"
+        for msg in _run_child(scoring, deadline, child_setup):
             kind = msg[0]
             if kind in ("entry", "bad", "stop", "done"):
                 refused = msg[-1]
-            if kind == "entry":
+            if kind == "stderr":
+                record["child_stderr"] = msg[1]
+                for name, times in sorted((msg[1].get("types") or {}).items()):
+                    sys.stderr.write(f"[khipu-recall-eval] child stderr: uncaught {name} x{times}\n")  # text-safe: name is an exception type name matched by \\w{1,80}, times a count
+            elif kind == "entry":
                 for p, row in msg[1]:
                     if row is None:
                         count(p, "hub_fallback")
@@ -661,6 +736,9 @@ def recall_eval_health(*, now: datetime | None = None) -> dict[str, Any]:
 
     if not last.get("ok", True):
         return out("yellow", f"Tonight's recall check could not run: {last.get('error') or 'unknown reason'}.")
+    if last.get("skipped"):
+        return out("yellow", f"Tonight's recall check did not run: {last['skipped']} "
+                             "(the check only runs inside the macOS sandbox that keeps queries on this Mac).")
     if violations:
         return out("red", f"{violations} memories you forgot or replaced came back in search results. "
                           "Run `khipu recall eval --path all` to see which.")
@@ -707,7 +785,7 @@ def _write_golden_atomic(path: Path, text: str) -> None:
     fd, tmp = tempfile.mkstemp(prefix=GOLDEN_TEMP_PREFIX, suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
-            out.write(text)
+            out.write(text)  # text-safe: the golden file the maintainer asked to merge, local only
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:

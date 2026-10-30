@@ -170,7 +170,7 @@ def _log(msg: str, *, tag: str = "khipu-prompt-recall") -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            f.write(f"{stamp} [{tag}] {msg}\n")
+            f.write(f"{stamp} [{tag}] {msg}\n")  # text-safe: every _log caller passes this module's checked message text
     except Exception:  # noqa: BLE001 — logging must never break the hook
         pass
 
@@ -517,7 +517,7 @@ def _inherited_fds() -> list[int]:
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
-        view = view[os.write(fd, view):]
+        view = view[os.write(fd, view):]  # text-safe: writes the hook's own reply bytes to its stdout pipe
 
 
 def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, decided: bool = False,
@@ -2624,7 +2624,7 @@ def _hub_known_down() -> dict[str, Any] | None:
 
     memo = hub_reach.known_unreachable()
     if memo is not None:
-        _log(f"hub unreachable since {memo.get('since')} — skipping the hub leg")
+        _log(f"hub unreachable since {memo.get('since')} — skipping the hub leg")  # text-safe: a timestamp from the reachability memo
         return {"hits": [], "legs": [], "degraded": "hub unreachable", "offline": True}
     return None
 
@@ -3609,7 +3609,7 @@ def _hub_unreachable_error(exc: BaseException) -> bool:
 def log_terminal_outcome(raw: str, reason: str, *, ms: float = 0.0) -> None:
     payload = _stdin_payload(raw)
     session = hook_shape.session_id(payload) or "?"
-    _log(f"session={session} reason={reason} ms={ms:.1f} hits=[] legs=[] degraded=None")
+    _log(f"session={session} reason={reason} ms={ms:.1f} hits=[] legs=[] degraded=None")  # text-safe: session id is the harness id, reason a fixed code
 
 
 def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | None = None) -> None:
@@ -3631,7 +3631,7 @@ def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | 
         # routing= goes last, after degraded=, stage= and offline=, so every reader of
         # this line (doctor's outcome rate, the promotion gate) still parses it.
         _log(f"session={session} reason={result['reason']} ms={ms} hits={hit_ids} "
-             f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}{routed}")
+             f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}{routed}")  # text-safe: ids, fixed reason codes and leg names only; no query text
 
 
 def dispatched_lane(environ=None) -> bool:
@@ -3704,7 +3704,7 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
             f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} "
             f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
             f"{routed_log}"
-        )
+        )  # text-safe: ids, fixed reason codes and leg names only; no query text
     return hook_shape.render(shape, "UserPromptSubmit", ctx) if ctx else {}
 
 
@@ -3736,7 +3736,7 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
         log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}")
         out = {}
     try:
-        print(wire.dumps(out, ensure_ascii=True), flush=True)
+        print(wire.dumps(out, ensure_ascii=True), flush=True)  # text-safe: the hook reply for the harness on its own stdout
     except OSError:
         finish_delivery(delivery, delivered=False, reason="error: stdout delivery failed")
     else:

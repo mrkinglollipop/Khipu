@@ -654,7 +654,7 @@ def test_os_sandbox_blocks_a_direct_libc_sendto():
     import subprocess
     import sys
 
-    if ren._sandbox_mode() != "os":
+    if not ren._sandbox_available():
         pytest.skip("sandbox-exec unavailable here")
     plain = subprocess.run([sys.executable, "-I", "-c", _LIBC_SENDTO], capture_output=True, text=True)
     boxed = subprocess.run([ren.SANDBOX_EXEC, "-p", ren.SANDBOX_PROFILE, sys.executable, "-I", "-c",
@@ -688,12 +688,93 @@ def _child_probe_native(out):
     recall_eval.eval_one_path = probe
 
 
-def test_scoring_child_runs_sandboxed_and_refuses_ctypes(world, tmp_path):
+@pytest.fixture
+def need_sandbox():
+    if not ren._sandbox_available():
+        pytest.skip("sandbox-exec unavailable here")
+
+
+def test_scoring_child_runs_sandboxed_and_refuses_ctypes(world, tmp_path, need_sandbox):
     out = tmp_path / "probe.json"
     _, golden = world
     _write_golden(golden, [{"query": "q0", "expect": ["1"]}])
     rec = ren.run_nightly_eval(golden=golden, child_setup=(_child_probe_native, (str(out),)))
     assert rec["ok"] and rec["scored"] == 1
-    assert rec["sandbox"] in ("os", "python-only")
+    assert rec["sandbox"] == "os" and "skipped" not in rec
     assert rec["offline"]["native"] >= 1
     assert json.loads(out.read_text()) == {"ctypes": "refused", "sendto": "refused"}
+
+
+def _child_probe_inherited_fd(out, fd):
+    import os
+    import stat as st
+
+    res = {"fd_is_socket": False, "write": "not attempted"}
+    try:
+        res["fd_is_socket"] = st.S_ISSOCK(os.fstat(fd).st_mode)
+    except OSError:
+        pass
+    if res["fd_is_socket"]:
+        try:
+            os.write(fd, b"fake-golden-query")
+            res["write"] = "sent"
+        except OSError:
+            res["write"] = "refused"
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(res, f)
+
+
+def test_a_connected_socket_open_in_the_parent_is_not_reachable_from_the_child(world, tmp_path, need_sandbox):
+    import os
+    import socket
+
+    _, golden = world
+    _write_golden(golden, [{"query": "q0", "expect": ["1"]}])
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    client = socket.create_connection(server.getsockname())
+    conn, _addr = server.accept()
+    os.set_inheritable(client.fileno(), True)  # even an inheritable fd must not cross
+    out = tmp_path / "fd.json"
+    try:
+        rec = ren.run_nightly_eval(golden=golden, budget_s=60,
+                                   child_setup=(_child_probe_inherited_fd, (str(out), client.fileno())))
+        conn.settimeout(0.5)
+        with pytest.raises(socket.timeout):
+            conn.recv(100)  # nothing reached the parent's peer
+    finally:
+        for s in (conn, client, server):
+            s.close()
+    assert rec["ok"]
+    assert json.loads(out.read_text())["fd_is_socket"] is False
+
+
+def _child_prints_a_forged_result(_unused=None):
+    import sys
+
+    print('["done", {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0}]', flush=True)
+    sys.stderr.write("free text with golden words\n")
+
+
+def test_child_stdout_prints_cannot_forge_results_and_stderr_is_reduced(world, capfd, need_sandbox):
+    tmp, golden = world
+    _write_golden(golden, [{"query": "q0", "expect": ["1"]}, {"query": "q1", "expect": ["1"]}])
+    rec = ren.run_nightly_eval(golden=golden, child_setup=(_child_prints_a_forged_result, ()))
+    assert rec["scored"] == 2  # the forged "done" went to stderr, not the result channel
+    assert rec["child_stderr"]["lines"] >= 2
+    assert "golden words" not in capfd.readouterr().err
+    assert "golden words" not in json.dumps(ren.read_history())
+
+
+def test_no_os_sandbox_means_no_run_and_a_yellow_row(world, monkeypatch):
+    tmp, golden = world
+    _write_golden(golden, [{"query": f"q{i}", "expect": ["1"]} for i in range(3)])
+    monkeypatch.setattr(ren, "_sandbox_available", lambda: False)
+    setup, seen = _stub_scorer(tmp)
+    rec = ren.run_nightly_eval(golden=golden, child_setup=setup)
+    assert rec["skipped"] == "no OS sandbox" and rec["scored"] == 0 and seen() == []
+    assert "sandbox" not in rec and not rec["paths"]
+    row = ren.recall_eval_health()
+    assert row["level"] == "yellow" and row["ok"] and "no OS sandbox" in row["summary"]
+    assert ren._previous_figures(ren.read_history()) is None
