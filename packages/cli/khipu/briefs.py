@@ -321,11 +321,13 @@ def plan(cur, *, retry_failed: bool = False) -> dict[str, Any]:
 # ---- sources for one build ------------------------------------------------------
 
 def _gather(cur, slug: str) -> dict[str, Any]:
-    # forget-fence: the brief builder's input; a brief citing a forgotten episode is withheld on read (read_brief)
     """The topic's live source episodes: the fingerprint over all of them, and
     the newest cleaned subset (within ``MAX_SOURCE_CHARS``) offered to the
-    model."""
-    from khipu import decisions, redact
+    model. Episodes on this Mac's forget list or queued for erasure are fenced
+    out before anything is read from them, so none reaches the summariser;
+    ``fence_unreadable`` is True when the list could not be read (then no
+    episode is kept)."""
+    from khipu import decisions, redact, tombstones
 
     project = "e.project" if _has(cur, "episodes", "project") else "NULL"
     cur.execute(
@@ -334,6 +336,14 @@ def _gather(cur, slug: str) -> dict[str, Any]:
         (slug,),
     )
     episodes = cur.fetchall()
+    fence_unreadable = False
+    try:
+        tombstones.withheld_episode_ids()
+    except Exception:  # noqa: BLE001 - an unreadable forget list keeps no episode
+        fence_unreadable = True
+    kept_ids = {str(r["id"]) for r in tombstones.withhold(
+        [{"kind": "episode", "id": int(r[0])} for r in episodes])}
+    episodes = [r for r in episodes if str(int(r[0])) in kept_ids]
     registry_ready = decisions._decisions_ready(cur)
     decision_rows = _decision_rows(cur, [int(r[0]) for r in episodes], with_text=True)
 
@@ -368,6 +378,7 @@ def _gather(cur, slug: str) -> dict[str, Any]:
         "count": len(entries),
         "offered": offered,
         "project": max(projects, key=projects.get) if projects else None,
+        "fence_unreadable": fence_unreadable,
     }
 
 
@@ -500,6 +511,8 @@ def build_one(cur, topic_slug: str) -> dict[str, Any]:
     if not _ready(cur):
         return {"topic": topic_slug, "status": "unavailable", "reason": REASON_TABLE_MISSING}
     gathered = _gather(cur, topic_slug)
+    if gathered["fence_unreadable"]:
+        return {"topic": topic_slug, "status": "withheld", "reason": "forget list unreadable"}
     if not gathered["offered"]:
         return {"topic": topic_slug, "status": "no_sources", "sources": gathered["count"]}
     have = _current_row(cur, topic_slug)
@@ -557,7 +570,7 @@ def build_outcome(results: list[dict[str, Any]]) -> dict[str, Any]:
     for result in results:
         status = str(result.get("status"))
         out[status] = out.get(status, 0) + 1
-        if status in {"failed", "error", "unavailable"}:
+        if status in {"failed", "error", "unavailable", "withheld"}:
             out["ok"] = False
     return out
 

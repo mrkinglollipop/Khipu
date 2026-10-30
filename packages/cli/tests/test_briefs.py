@@ -854,6 +854,33 @@ class ForgetCascadeTest(unittest.TestCase):
         self.assertIn("forgotten", payload["withheld"])
 
 
+class ForgetFenceBuildTest(unittest.TestCase):
+    """A locally forgotten episode never reaches the summariser."""
+
+    def test_a_forgotten_episode_is_absent_from_the_text_sent_to_the_model(self):
+        hub = _Hub()
+        hub.episode(1, "Chose cursor pagination for the widget list.")
+        hub.episode(2, "SECRET-FORGOTTEN-TEXT about the widget list.", minutes=5)
+        hub.episode(3, "Shipped the widget list behind a flag.", minutes=9)
+        with mock.patch("khipu.tombstones.withheld_episode_ids", return_value=frozenset({2})):
+            out, gen = _build(hub, answer=_answer([_claim("Pagination is cursor based.", 1)]))
+        self.assertEqual(out["status"], "built")
+        sent = gen.call_args.args[0]
+        self.assertNotIn("SECRET-FORGOTTEN-TEXT", sent)
+        self.assertNotIn("[episode 2,", sent)
+        self.assertIn("[episode 1,", sent)
+
+    def test_an_unreadable_forget_list_builds_no_brief_and_calls_no_model(self):
+        hub = _seeded()
+        with mock.patch("khipu.tombstones.withheld_episode_ids", side_effect=OSError("no list")):
+            out, gen = _build(hub)
+        gen.assert_not_called()
+        self.assertEqual(out["status"], "withheld")
+        self.assertNotIn("1", [str(v) for v in out.values() if isinstance(v, int)])
+        self.assertIsNone(hub.current("alpha"))
+        self.assertFalse(briefs.build_outcome([out])["ok"])
+
+
 class ReaderAndToolTest(unittest.TestCase):
     def _call(self, hub, args, *, switch="1"):
         from khipu import mcp_server as srv
