@@ -547,6 +547,31 @@ def episode_refs(row: Any) -> tuple[set[str], set[str]]:
     return direct, reached
 
 
+def malformed_episode_refs(row: Any) -> list[Any]:
+    """Values in an episode-id slot of ``row`` that are not an episode id
+    (``episode_refs`` drops them silently). A caller that fences by these ids
+    passes them on so the row is withheld rather than shown with the ids it
+    could read."""
+    if not isinstance(row, Mapping):
+        return []
+    bad: list[Any] = []
+    if row.get("kind") == "episode" and row.get("id") is not None and _episode_ref(row.get("id")) is None:
+        bad.append(row.get("id"))
+    for key in _EPISODE_KEYS:
+        if row.get(key) is not None and _episode_ref(row.get(key)) is None:
+            bad.append(row.get(key))
+    for key in ("episode_ids", "source_episodes", *_REACHED_KEYS):
+        value = row.get(key)
+        if isinstance(value, (list, tuple, set)):
+            bad.extend(v for v in value if _episode_ref(v) is None)
+    for key in _NODE_KEYS:
+        value = row.get(key)
+        for item in (value.values() if isinstance(value, Mapping) else (value,)):
+            if isinstance(item, str) and item.strip().startswith("episode:") and _episode_ref(item) is None:
+                bad.append(item)
+    return bad
+
+
 FENCE_STATE_NAME = "forget_fence_state.json"
 _FENCE_LAST: tuple[bool, str] | None = None
 

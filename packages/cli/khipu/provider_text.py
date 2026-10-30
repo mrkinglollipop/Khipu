@@ -8,6 +8,11 @@ commitments and topics, briefs, reflect, rerank, hygiene judging) and
 transcript being captured, a library chunk, an image). The guard in
 ``tests/test_forget_fence.py`` fails any provider caller that calls neither.
 
+A ``note:`` topic that no episode carries is a file the owner or an outside
+tool wrote (no Khipu code writes a note from episode text), so it embeds. Forget
+is episode-scoped: it does not chase text the owner copied into a separate
+memory.
+
 Fencing is by source episode: a text is withheld when ANY episode it derives
 from is on this Mac's forget list or queued for erasure. A text with no source
 ids (a legacy row with NULL provenance) or with a malformed id cannot be proven
@@ -43,6 +48,13 @@ class SourcedText(str):
     function that only receives strings can still reach the fence."""
 
     sources: tuple[Any, ...] | None  # None: the source is unknown (withheld)
+
+    # str(x) and f"{x}" would otherwise hand back a plain str with the ids gone.
+    def __str__(self) -> "SourcedText":  # type: ignore[override]
+        return self
+
+    def __format__(self, spec: str) -> str:
+        return self if not spec else str.__format__(self, spec)
 
     def __new__(cls, text: Any, sources: Iterable[Any] | None = ()):
         obj = super().__new__(cls, text or "")
@@ -169,9 +181,12 @@ def fence_chunks(cur: Any, items: Sequence[tuple[str, str, Any]]) -> list[Any]:
 
 def live_input(value: Any, kind: str) -> Any:
     """``value`` unchanged: input that is not stored memory. Only the explicit
-    ``LIVE_KINDS`` pass, and a value that carries source ids (a
-    ``SourcedText``) came from a stored row, so it is refused: it must go
-    through ``fenced_texts`` with those ids."""
+    ``LIVE_KINDS`` pass, and only a plain ``str`` or ``bytes``, or a list or
+    tuple of them (an embedding batch, an image and its mime type). A value
+    that carries source ids (a ``SourcedText``) came from a stored row and is
+    refused: it must go through ``fenced_texts`` with those ids. A mapping, a
+    row object or anything else is refused too, since its text could be a
+    stored row's."""
     if kind not in LIVE_KINDS:
         raise ValueError(f"live_input is for input outside stored memory, not {kind!r}")
     stack = [value]
@@ -179,8 +194,10 @@ def live_input(value: Any, kind: str) -> Any:
         item = stack.pop()
         if isinstance(item, SourcedText):
             raise ValueError("live_input refuses text that carries source episode ids")
-        if isinstance(item, (list, tuple, set, frozenset)):
+        if isinstance(item, (list, tuple)):
             stack.extend(item)
+        elif not isinstance(item, (str, bytes)):
+            raise ValueError(f"live_input takes plain text or bytes, not {type(item).__name__}")
     return value
 
 

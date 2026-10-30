@@ -446,8 +446,10 @@ PASSTHROUGH_CALLS = {
     "items", "values", "keys", "get", "append", "extend", "min", "max", "len", "range", "int", "float",
 }
 # Names that carry settings or titles, never the text itself.
+# A typed query, question or topic slug is live input, not stored text: it may ride in a prompt beside
+# fenced text.
 NEUTRAL_NAMES = {"profile", "model", "model_id", "title", "titles", "caller", "timeout", "retries",
-                 "delay", "input_type", "True", "False", "None"}
+                 "delay", "input_type", "True", "False", "None", "query", "question", "topic", "topic_slug"}
 TEXT_KEYWORDS = ("texts", "text", "prompt", "inputs", "input", "images", "payload", "query")
 
 
@@ -474,7 +476,16 @@ def _client_ref(node, clients: set[str]) -> bool:
     literal = _getattr_literal(node)
     if literal is not None:
         return literal == "" or literal in clients
+    if _partial_of_client(node, clients):
+        return True
     return _terminal(node) in clients
+
+
+def _partial_of_client(node, clients: set[str]) -> bool:
+    """``functools.partial(<client>, ...)``: calling it later sends text the
+    guard cannot see, so it counts as the client itself."""
+    return (isinstance(node, ast.Call) and _terminal(node.func) == "partial" and bool(node.args)
+            and _client_ref(node.args[0], clients))
 
 
 class _Flow:
@@ -530,7 +541,7 @@ class _Flow:
         if isinstance(node, ast.Constant):
             return False, False
         if isinstance(node, ast.Name):
-            if node.id in NEUTRAL_NAMES:
+            if node.id in NEUTRAL_NAMES or node.id.isupper():  # a module constant such as a prompt template
                 return False, False
             if node.id in local:
                 return self.judge(local[node.id], {k: v for k, v in local.items() if k != node.id}, seen)
@@ -590,6 +601,13 @@ ROW_READS = {"fetchall", "fetchone", "fetchmany", "SourcedText", "sourced"}
 
 def _is_row_read(call) -> bool:
     return _terminal(call.func) in ROW_READS
+
+
+def _is_cast(call) -> bool:
+    """str()/repr() of a row or a sourced text hands back a plain string with
+    its source ids gone."""
+    return _terminal(call.func) in {"str", "repr"} and bool(call.args) \
+        and not isinstance(call.args[0], ast.Constant)
 
 
 def _module_aliases(tree, clients: set[str]) -> set[str]:
@@ -662,11 +680,12 @@ def unchoked_provider_callers(root) -> list[str]:
                         if id(call) in seen_calls or not _client_ref(call.func, clients):
                             continue
                         seen_calls.add(id(call))
-                        arg = _text_arg(call)
+                        arg = call.args[1] if _partial_of_client(call, clients) and len(call.args) > 1 \
+                            else None if _partial_of_client(call, clients) else _text_arg(call)
                         ok = False
                         if arg is not None:
-                            through, _dirty = flow.judge(arg)
-                            ok = through and not (lam & _names(arg))
+                            through, dirty = flow.judge(arg)
+                            ok = through and not dirty and not (lam & _names(arg))
                         if not ok:
                             offenders.append(f"{path}.{child.name}:{call.lineno}")
                     for call, _lam in _calls_in(child):
@@ -674,6 +693,8 @@ def unchoked_provider_callers(root) -> list[str]:
                             continue
                         kind = call.args[1] if len(call.args) > 1 else None
                         bad_kind = not (isinstance(kind, ast.Constant) and kind.value in LIVE_KINDS)
+                        if flow.reaches(call.args[0], _is_cast):
+                            offenders.append(f"{path}.{child.name}:{call.lineno} (live_input fed from a str() cast)")
                         # Library chunks are read from the library tables, which hold no episode text.
                         library = isinstance(kind, ast.Constant) and kind.value == "library"
                         if bad_kind or (not library and flow.reaches(call.args[0], _is_row_read)):
@@ -770,6 +791,25 @@ def live_wrong_kind(text):
     return embed_one(provider_text.live_input(text, "episode"))
 
 
+def mixed_fenced_and_raw(texts, raw):
+    safe = provider_text.fenced_texts(texts, [1] * len(texts), "episode")
+    return embed_batch([*safe, *raw])
+
+
+def partial_direct(texts):
+    return functools.partial(embed_batch)(texts)
+
+
+def partial_alias(texts):
+    safe = provider_text.fenced_texts(texts, [1] * len(texts), "episode")
+    go = partial(embed_batch, safe)
+    return go()
+
+
+def live_str_cast(row):
+    return embed_one(provider_text.live_input(str(row), "payload"))
+
+
 def clean_through_filter(texts):
     marks = provider_text.fenced_texts(texts, [1] * len(texts), "episode")
     sent = [i for i, mark in enumerate(marks) if mark is not None]
@@ -782,7 +822,8 @@ def test_the_provider_guard_catches_alias_lambda_getattr_and_unrelated_chokepoin
     found = {name.split(":")[0] for name in unchoked_provider_callers(tmp_path)}
     assert found == {"bypass.by_alias", "bypass.by_lambda", "bypass.by_getattr",
                      "bypass.by_computed_getattr", "bypass.unrelated_chokepoint",
-                     "bypass.live_from_rows", "bypass.live_wrong_kind"}
+                     "bypass.live_from_rows", "bypass.live_wrong_kind", "bypass.mixed_fenced_and_raw",
+                     "bypass.partial_direct", "bypass.partial_alias", "bypass.live_str_cast"}
 
 
 
@@ -961,6 +1002,25 @@ def test_rerank_shows_the_model_no_candidate_a_forgotten_episode_feeds(list_stat
         assert out["order"] == [1, 2]
 
 
+def test_a_rerank_candidate_with_a_malformed_source_id_is_withheld(caplog):
+    import logging
+    import time
+
+    from khipu import rerank
+
+    prompts: list = []
+    rows = [{"kind": "topic", "id": "t", "snippet": "BAD-ID-TEXT"},
+            {"kind": "episode", "id": "904", "snippet": "a"}, {"kind": "episode", "id": "905", "snippet": "b"},
+            {"kind": "episode", "id": "906", "source_episodes": [905, "x9"], "snippet": "BAD-EPISODE-TEXT"}]
+    with caplog.at_level(logging.INFO, logger="khipu.provider_text"), \
+            mock.patch.object(rerank, "_call_model",
+                              side_effect=lambda p, **k: prompts.append(p) or ('{"order": [0, 1]}', "m")):
+        out = rerank.rerank("q", rows, deadline=time.monotonic() + 5, topic_sources={"t": [904, "zz"]})
+    assert prompts and "BAD-ID-TEXT" not in prompts[0] and "BAD-EPISODE-TEXT" not in prompts[0]
+    assert out["order"] == [1, 2]
+    assert "bad_source_id=2" in caplog.text
+
+
 def test_a_topic_row_with_unknown_sources_is_not_reranked():
     import time
 
@@ -1039,6 +1099,39 @@ def test_live_input_refuses_text_that_carries_source_ids():
         with pytest.raises(ValueError):
             provider_text.live_input("x", kind)
     assert provider_text.live_input("typed query", "query") == "typed query"
+
+
+def test_live_input_refuses_mappings_row_objects_and_str_casts_of_sourced_text():
+    from khipu import provider_text
+    from khipu.provider_text import sourced
+
+    class Row:
+        episode_id = 902
+
+        def __str__(self):
+            return "FORGOTTEN-OBJECT"
+
+    row = sourced("FORGOTTEN-CAST", [902])
+    for bad in ({"text": "FORGOTTEN-DICT"}, [{"text": "FORGOTTEN-DICT"}], Row(), [Row()], str(row), f"{row}",
+                [str(row)], None, 7):
+        with pytest.raises(ValueError):
+            provider_text.live_input(bad, "payload")
+    images = [(b"\x89PNG", "image/png")]
+    assert provider_text.live_input(images, "media") is images
+    assert provider_text.live_input(["a", "b"], "library") == ["a", "b"]
+
+
+def test_a_note_topic_with_no_episode_provenance_still_embeds():
+    """Pins the documented scope: a ``note:`` topic is a file the owner or an
+    outside tool wrote, and forget does not chase text copied into one. A
+    change to this is a deliberate decision, not a side effect."""
+    from khipu import provider_text
+
+    tombstones.publish_episode_ids({FORGOT})
+    cur = mock.MagicMock()
+    cur.fetchall.return_value = []
+    assert provider_text.fence_chunks(cur, [("topic", "note:copied", "owner wrote this")]) == ["owner wrote this"]
+    assert provider_text.fence_chunks(cur, [("topic", "plain-topic", "no note prefix")]) == [None]
 
 
 def test_a_legacy_commitment_with_null_provenance_is_never_sent():

@@ -1122,6 +1122,7 @@ SUMMARY_KIND_NIGHTLY_LIMIT = 200
 
 
 def apply_backfill_summary_kind(cur, *, limit: int = SUMMARY_KIND_NIGHTLY_LIMIT) -> dict[str, Any]:
+    # forget-fence: owner maintenance writer; selects ids and writes a summary_kind marker, calls no provider
     import json
 
     from khipu.db import has_columns

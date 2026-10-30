@@ -144,19 +144,22 @@ def _call_within(prompt: str, deadline: float) -> tuple[str, str]:
     return box["ok"]
 
 
-def _row_sources(row: Mapping[str, Any], topic_sources: Mapping[str, Any] | None) -> list[int] | None:
+def _row_sources(row: Mapping[str, Any], topic_sources: Mapping[str, Any] | None) -> list[Any] | None:
     """Episode ids a candidate row derives from: the ones it carries, plus a
     topic's own source episodes. None when a topic's sources are unknown
-    (withheld: it cannot be proven free of a forgotten episode)."""
-    from khipu.tombstones import episode_refs
+    (withheld: it cannot be proven free of a forgotten episode). A malformed
+    id is kept as it came, so the chokepoint withholds the candidate instead
+    of the id being dropped before the fence."""
+    from khipu.tombstones import episode_refs, malformed_episode_refs
 
-    ids = {int(r) for r in episode_refs(row)[0] if r.isdigit()}
+    ids: list[Any] = [int(r) for r in sorted(episode_refs(row)[0])]
+    ids.extend(malformed_episode_refs(row))
     if row.get("kind") == "topic":
         known = (topic_sources or {}).get(str(row.get("id")))
         if known is None:
             return None
-        ids.update(int(i) for i in known)
-    return sorted(ids)
+        ids.extend(known if isinstance(known, (list, tuple, set, frozenset)) else [known])
+    return ids
 
 
 def rerank(
