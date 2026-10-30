@@ -490,7 +490,10 @@ def _run_nightly_locked() -> int:
     # Before the replica refresh, so a rename found tonight reaches the replica tonight.
     _record_nightly_step(steps, "project_renames", **_step_result(_project_renames_sweep()))
     # Reads the replica the pull timer keeps current; the full dump below stays last.
-    _record_nightly_step(steps, "recall_eval", **_step_result(_recall_eval_step()))
+    recall_eval_result = _recall_eval_step()
+    _record_nightly_step(steps, "recall_eval", **_step_result(recall_eval_result),
+                         deferred=recall_eval_result.get("deferred")
+                         if isinstance(recall_eval_result, dict) else None)
     _record_nightly_step(steps, "snapshot_refresh", **_step_result(_refresh_snapshot()))
     briefs_result = _briefs_build_if_on()
     if briefs_result is not None:
@@ -510,8 +513,14 @@ def _recall_eval_step() -> dict[str, Any]:
         rec = recall_eval_nightly.run_nightly_eval()
     except Exception as exc:  # noqa: BLE001 - a failed measurement must not stop the nightly
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return {k: rec[k] for k in ("ok", "entries", "scored", "skipped_forgotten", "truncated",
-                                "paths", "golden", "error") if k in rec}
+    out = {k: rec[k] for k in ("ok", "entries", "scored", "skipped_forgotten", "skipped_ids",
+                               "skipped_malformed", "truncated", "offline", "paths", "golden",
+                               "error") if k in rec}
+    if rec.get("transient"):
+        # No replica or no readable golden file tonight: the doctor's recall
+        # row shows it yellow; the nightly step is put off, not failed.
+        out.update(ok=True, deferred=out.pop("error", None) or "recall check skipped")
+    return out
 
 
 def _project_renames_sweep() -> dict[str, Any]:
