@@ -2513,7 +2513,9 @@ def _fuse_and_annotate(
     from khipu.summary_kind import without_verbatim_only
 
     fused = without_verbatim_only(fused)
+    pre_gate = bool(fused)
     fused = _relevance_gate(fused, tokens)
+    abstained = pre_gate and not fused
     fused = rank_for_push(fused, project=project,
                           project_group=hub_snapshot.snapshot_project_group(con, project)[1],
                           tokens=tokens, prompt=prompt,
@@ -2563,6 +2565,8 @@ def _fuse_and_annotate(
         _log(f"snapshot validity annotation skipped: {type(exc).__name__}: {exc}")
 
     result_extra: dict[str, Any] = {}
+    if abstained:
+        result_extra["abstained"] = True
     if degraded_legs:
         result_extra["degraded_legs"] = degraded_legs
     if interpretation:
@@ -2616,6 +2620,8 @@ def _trim_result(result: dict[str, Any], limit: int) -> dict[str, Any]:
         out["time_interpretation"] = result["time_interpretation"]
     if "replica_stale" in result:
         out["replica_stale"] = result["replica_stale"]
+    if result.get("abstained"):
+        out["abstained"] = True
     return out
 
 
@@ -2940,7 +2946,9 @@ def _hub_hits_budgeted(
     from khipu.summary_kind import without_verbatim_only
 
     fused = without_verbatim_only(without_hidden_episodes(fuse_ranked_lists(lists, limit=_CANDIDATE_LIMIT)))
+    pre_gate = bool(fused)
     fused = _relevance_gate(fused, tokens)
+    abstained = pre_gate and not fused
     # The lexical leg reads the alias group on its own connection; when that
     # leg did not land, rows from an old project name lose the boost only.
     # No cursor here: another project counts as named by its own name only.
@@ -2992,7 +3000,7 @@ def _hub_hits_budgeted(
     fused = _validity.apply_ranking(fused, historical=_validity.is_historical(prompt))
 
     hits = _apply_score_floor(fused)[:limit]
-    return {"hits": hits, "legs": legs, "degraded": degraded}
+    return {"hits": hits, "legs": legs, "degraded": degraded, **({"abstained": True} if abstained else {})}
 
 
 def _search_hits_budgeted(
@@ -3027,7 +3035,8 @@ def _search_hits_budgeted(
                                        deadline=deadline, progress=progress)
         hits = _apply_score_floor(result["hits"])[:limit]
         return {"hits": hits, "legs": result["legs"], "degraded": result["degraded"],
-                **({"replica_stale": result["replica_stale"]} if "replica_stale" in result else {})}
+                **({"replica_stale": result["replica_stale"]} if "replica_stale" in result else {}),
+                **({"abstained": True} if result.get("abstained") else {})}
     except _SnapshotUnusable as exc:
         _log(f"snapshot unusable ({exc}) — hub budgeted path")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls through
@@ -3392,6 +3401,8 @@ def prior_work_for_prompt(
     # The hub could not be reached during this call: doctor counts it as an
     # offline call, not as a failure of the lane.
     offline = False
+    # The relevance gate emptied a non-empty fused list: silence by policy.
+    abstained = False
     progress: dict[str, Any] = {}
     search_deadline = t0 + (max(0.05, budget_ms / 1000.0) + _BUDGET_SAFETY_SLACK_S
                             if budget_ms is not None else TIMEOUT_S)
@@ -3421,6 +3432,7 @@ def prior_work_for_prompt(
             degraded = result.get("degraded")
             replica_stale = result.get("replica_stale")
             reason = result.get("reason") or reason
+            abstained = bool(result.get("abstained"))
             offline = bool(result.get("offline"))
         else:
             result = _run_with_timeout(
@@ -3432,6 +3444,7 @@ def prior_work_for_prompt(
             degraded = result.get("degraded")
             degraded_legs = result.get("degraded_legs") or []
             interpretation = result.get("time_interpretation")
+            abstained = bool(result.get("abstained"))
             offline = bool(result.get("offline"))
             replica_stale = result.get("replica_stale")
     except _TimedOut:
@@ -3510,6 +3523,8 @@ def prior_work_for_prompt(
     if not hits or not context or thread:
         _dedup_silent_prompt(session_id)
     ms = round((time.monotonic() - t0) * 1000, 1)
+    if abstained and not hits and reason == "ok":
+        reason = "ok (no relevant match)"
     out = {"context": context, "hits": hits or [], "reason": reason, "ms": ms}
     out["legs"] = legs
     out["degraded"] = degraded

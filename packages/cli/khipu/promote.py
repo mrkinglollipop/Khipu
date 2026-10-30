@@ -1019,17 +1019,29 @@ def _embedding_failed(live: dict[str, Any] | None, cand: dict[str, Any]) -> bool
             and "'cosine'" in str((live or {}).get("legs") or ""))
 
 
+ABSTAINED_REASON = "ok (no relevant match)"
+
+
+def _abstained(live: dict[str, Any] | None, cand: dict[str, Any]) -> bool:
+    """Whether the candidate answered nothing where live had hits because its
+    relevance gate found nothing relevant: the hook's own summary reason says
+    so. That is policy silence (the always-push code live may still run does
+    not abstain), not breakage, unless it happens on every such prompt."""
+    return bool((live or {}).get("hits")) and not cand["hits"] and cand.get("reason") == ABSTAINED_REASON
+
+
 def _off_problem(label: str, live: dict[str, Any] | None, cand: dict[str, Any]) -> str | None:
     """Why the candidate's run with routing off fails the step, or None: its
     own search fails (``_search_problem``), or it answered nothing where the
     live code had hits, unless only its embedding was late
-    (``_empty_by_timing``). The same test for the first run and the replayed
+    (``_empty_by_timing``) or the candidate's relevance gate abstained
+    (``_abstained``). The same test for the first run and the replayed
     one."""
     what = _search_problem(cand)
     if what:
         return f"{label}: {what}"
     live_hits = (live or {}).get("hits") or []
-    if live_hits and not cand["hits"] and not _empty_by_timing(live, cand):
+    if live_hits and not cand["hits"] and not _empty_by_timing(live, cand) and not _abstained(live, cand):
         return f"{label}: empty answer where live had {len(live_hits)} hit(s)"
     return None
 
@@ -1107,6 +1119,8 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     cand_legacy = not _honours_isolation(Path(candidate))
     routed_runs = 0
     embed_failed: dict[int, bool] = {}
+    abstentions = 0
+    live_hit_prompts = 0
     for i, sample in enumerate(samples):
         live = (_recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-{i}", legacy=live_legacy, routing=False)
                 if live_hook.exists() else None)
@@ -1148,6 +1162,10 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
             continue
         overlap = len(set(live_hits) & set(cand["hits"]))
         note = f"{label}: {len(cand['hits'])} hit(s), {overlap} shared with live, {cand['ms']:.0f} ms"
+        live_hit_prompts += bool(live_hits)
+        if _abstained(live, cand):
+            abstentions += 1
+            note += f", abstained where live had {len(live_hits)} hit(s) (relevance gate: policy, not a failure)"
         if _empty_by_timing(live, cand):
             note += (f", empty where live had {len(live_hits)} hit(s) not counted (no cosine leg after a replay: "
                      f"timing, not code; degraded={cand.get('degraded')})")
@@ -1162,10 +1180,18 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         # Once in a while is the provider; on every prompt while live's
         # embedding ran is the candidate's code.
         problems.append(f"the candidate's embedding failed on all {len(samples)} prompt(s) while live's ran")
+    if live_hit_prompts and abstentions == live_hit_prompts:
+        # One abstention is the gate being selective; on every prompt where
+        # live had hits it is a gate that is broken.
+        problems.append(f"the candidate abstained by policy on all {live_hit_prompts} replayed prompt(s) "
+                        f"where live had hits")
     if problems:
         return False, "; ".join(problems)
     tail = "" if routed_runs else " (routing did not run: the candidate has no routing push, or it is switched off here)"
-    return True, f"{len(samples)} prompt(s) replayed; " + "; ".join(notes) + tail
+    head = f"{len(samples)} prompt(s) replayed; "
+    if abstentions:
+        head += f"{abstentions} of {live_hit_prompts} prompt(s) where live had hits were abstentions by the relevance gate; "
+    return True, head + "; ".join(notes) + tail
 
 
 def _fixture(candidate: Path) -> Path:
