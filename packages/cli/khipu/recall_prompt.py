@@ -2510,6 +2510,9 @@ def _fuse_and_annotate(
     # Once, after fusion and graph expansion: candidate rows carry no signal,
     # so they can never make an otherwise empty list pass.
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
+    from khipu.summary_kind import without_verbatim_only
+
+    fused = without_verbatim_only(fused)
     pre_gate = bool(fused)
     fused = _relevance_gate(fused, tokens)
     abstained = pre_gate and not fused
@@ -2695,7 +2698,9 @@ def _search_hits(
             hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
         raise
     hub_reach.note_reachable()
-    rows = _apply_score_floor(payload.get("results") or [])
+    from khipu.summary_kind import without_verbatim_only
+
+    rows = _apply_score_floor(without_verbatim_only(payload.get("results") or []))
     return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
 
 
@@ -2938,7 +2943,9 @@ def _hub_hits_budgeted(
     from khipu.recency import rank_for_push
     from khipu.tombstones import without_hidden_episodes
 
-    fused = without_hidden_episodes(fuse_ranked_lists(lists, limit=_CANDIDATE_LIMIT))
+    from khipu.summary_kind import without_verbatim_only
+
+    fused = without_verbatim_only(without_hidden_episodes(fuse_ranked_lists(lists, limit=_CANDIDATE_LIMIT)))
     pre_gate = bool(fused)
     fused = _relevance_gate(fused, tokens)
     abstained = pre_gate and not fused

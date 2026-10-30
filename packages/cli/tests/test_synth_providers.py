@@ -733,11 +733,13 @@ def test_empty_record_for_a_real_window_is_retried_once_and_a_short_one_is_not()
          mock.patch.object(extract, '_generate_gemini', return_value='not json') as gem:
         extract.extract_memory(big, cwd='/p')
     assert gem.call_count == 1
-    # Gemini itself is never retried against itself.
+    # Gemini is the default provider and has no other model to fall back to, so
+    # an empty record for a real window (>= 600 chars) gets exactly one
+    # same-provider retry: two calls in total, never a loop.
     models.set_models_merge_role('synth', provider='gemini', model_id='gemini-2.5-flash')
     with mock.patch.object(extract, '_generate_gemini', return_value=empty) as gem:
         extract.extract_memory(big, cwd='/p')
-    assert gem.call_count == 1
+    assert gem.call_count == 2
 
 
 def test_wrong_task_reply_from_a_cli_provider_falls_back_to_gemini_once():

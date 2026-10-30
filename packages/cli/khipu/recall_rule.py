@@ -380,6 +380,7 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
     try:
         from khipu import hub_snapshot
         from khipu.snippets import clip_snippet
+        from khipu.summary_kind import is_verbatim_only
 
         con = hub_snapshot.open_snapshot()
     except Exception:
@@ -406,13 +407,16 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
         group = hub_snapshot.snapshot_project_group(con, project)[1] if project else []
         for eid, summary, raw in rows:
             proj = parent = None
+            payload = None
             if raw:
                 try:
                     payload = json.loads(raw)
                     proj = payload.get("project")
                     parent = payload.get("parent_session_id")
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError, AttributeError):
+                    payload = None
+            if is_verbatim_only(summary, payload):
+                continue
             if (project and proj in group) or (host and parent == host):
                 hits.append((str(eid), summary or ""))
             if len(hits) >= 5:
