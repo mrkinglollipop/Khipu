@@ -85,10 +85,9 @@ NOT_CAPTURE = {
     "usage_logins.login_read_due": "a per-provider read stamp and its lock file in the host-local login-usage "
                                    "cache; empty, no token, no capture text",
     "owner_turns._ag_claim": "an empty once-per-turn marker named by a hash of the session and the "
-                             "transcript step, and the session's alias file holding a hash of the "
-                             "prompt text and a step count; no capture text",
-    "owner_turns._ag_write": "an Antigravity session's pending-turn note (step numbers and times) or its "
-                             "alias (a hash of the prompt text and a step count); no capture text",
+                             "transcript step; no capture text",
+    "owner_turns._ag_write": "an Antigravity session's pending-turn note (step numbers and times); "
+                             "no capture text",
     **dict.fromkeys(("config._write_config", "integrations._backup", "integrations._cursor_install",
                      "integrations._grok_bot_install", "integrations._write_json",
                      # Grok's config.toml, a repo's AGENTS.md recall block, the Aegis [memory] marker.

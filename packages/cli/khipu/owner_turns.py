@@ -541,17 +541,22 @@ def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
 
 
 def record(payload: dict, env: dict | None = None, now: float | None = None,
-           issuer: dict | None = None) -> str | None:
+           issuer: dict | None = None, extra: dict | None = None) -> str | None:
     """Record one prompt-submit turn. Returns its id, or None when nothing
     was recorded. ``issuer`` None means this process's (``hook_issuer``).
+    ``extra`` (Antigravity's recorder only): ``fallback`` marks a turn read
+    from the payload's ``lastUserInput`` (``ag_step``: that turn's
+    ``initialNumSteps``); ``duplicate_of`` + ``occurrence`` make this row a
+    late second copy of that turn, sharing its occurrence.
     Never raises."""
     try:
-        return _record(payload, os.environ if env is None else env, time.time() if now is None else now, issuer)
+        return _record(payload, os.environ if env is None else env, time.time() if now is None else now, issuer,
+                       extra or {})
     except Exception:  # noqa: BLE001 - the recorder must never fail a prompt
         return None
 
 
-def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
+def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) -> str | None:
     if not isinstance(payload, dict):
         return None
     conf = settings()
@@ -586,7 +591,16 @@ def _record(payload: dict, env, now: float, issuer: dict | None) -> str | None:
         # Section 13 E: the hash and its durable occurrence, never the text.
         sha = prompt_sha256(text)
         turn["prompt_sha256"] = sha
-        turn["occurrence"] = _next_occurrence(session, sha, now)
+        shared = extra.get("occurrence")
+        # A late duplicate of a recorded turn is the same typing: it takes
+        # that turn's occurrence rather than numbering a second one.
+        turn["occurrence"] = shared if type(shared) is int and shared >= 1 \
+            else _next_occurrence(session, sha, now)
+    for flag in ("fallback", "duplicate_of"):
+        if extra.get(flag):
+            turn[flag] = extra[flag]
+    if extra.get("fallback") and type(extra.get("ag_step")) is int:
+        turn["ag_step"] = extra["ag_step"]
     ok, why = eligible(turn, conf)
     turn["eligible"] = ok
     if why:
@@ -837,7 +851,7 @@ def counts(now: float | None = None) -> dict:
         if path.name == "briefs.jsonl":
             continue
         for t in _read_lines(path):
-            if now - float(t.get("ts") or 0) >= RETENTION_S:
+            if now - float(t.get("ts") or 0) >= RETENTION_S or t.get("duplicate_of"):
                 continue
             row = out.setdefault(str(t.get("harness") or "unknown"), {"turns": 0, "eligible": 0, "entrypoints": {}})
             row["turns"] += 1
@@ -902,7 +916,8 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
 # ---- Antigravity: the prompt comes from the transcript ------------------------
 #
 # Antigravity's PreInvocation payload carries no prompt text (scope doc section
-# 3.2), and it fires before EVERY model call, not once per user turn. The turn
+# 3.2). The docs fire it before every model call; T3's runtime 1.3.0 fires it
+# once per user turn (proof run 5), and both are handled. The turn
 # is the newest USER_INPUT step in the conversation's transcript, and a turn is
 # handled once: a marker per (conversation, step) is created exclusively, so the
 # first model call after a new USER_INPUT wins and every later call, or a second
@@ -910,7 +925,9 @@ def doctor_block(now: float | None = None, installed: list[str] | None = None) -
 # to do nothing. It never depends on ``invocationNum``, which the docs count per
 # turn and the ACP runtime counts per session.
 
-_AG_TAIL = 4 << 20
+_AG_CHUNK = 4 << 20
+# Longest stretch of transcript searched for the newest USER_INPUT.
+_AG_MAX_SCAN = 512 << 20
 _AG_WRAP = re.compile(r"^\s*<USER_REQUEST>(.*)</USER_REQUEST>\s*$", re.S)
 _AG_MARKER_KEEP_S = 3 * 24 * 3600
 # PreInvocation can fire before the USER_INPUT step reaches the transcript;
@@ -933,27 +950,15 @@ def _ag_text(content) -> str:
 
 
 def _ag_last_user_input(path: str) -> tuple[str, str] | None:
-    """(step key, text) of the newest USER_INPUT step in a transcript, reading
-    only its tail. None when there is none or the file cannot be read. A
+    """(step key, text) of the newest USER_INPUT step in a transcript, read
+    from the end. None when there is none or the file cannot be read. A
     ``.db`` path is T3's SQLite trajectory (``antigravity_db``)."""
     if antigravity_db.is_db(path):
         return antigravity_db.last_user_input(path)
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            start = max(0, size - _AG_TAIL)
-            fh.seek(start)
-            data = fh.read()
-    except OSError:
-        return None
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    if start > 0 and lines:
-        lines = lines[1:]  # the first line of a mid-file read is a fragment
-    for number in range(len(lines) - 1, -1, -1):
+    for line in _ag_lines_newest_first(path):
         try:
-            step = json.loads(lines[number])
-        except ValueError:
+            step = json.loads(line)
+        except (ValueError, RecursionError):  # any line that will not parse is skipped
             continue
         if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
             continue
@@ -971,39 +976,47 @@ def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     return None
 
 
-def _ag_own_step(path: str, at_least: int) -> int | None:
-    """Index of the first user step numbered ``at_least`` or more, only when
-    the whole transcript proves it: every user step read, each with an index.
-    None when any user step is unreadable or unindexed, or none qualifies."""
-    if antigravity_db.is_db(path):
-        steps = antigravity_db.user_steps(path)
-        if steps is None:
-            return None
-    else:
-        steps = []
-        try:
-            with open(path, "rb") as fh:
-                for raw in fh:
-                    if b"USER_INPUT" not in raw:
-                        continue
-                    try:
-                        step = json.loads(raw)
-                    except ValueError:
-                        return None
-                    if not isinstance(step, dict) or step.get("type") != "USER_INPUT":
-                        continue
-                    text = _ag_text(step.get("content"))
-                    wrapped = _AG_WRAP.match(text)
-                    if not (wrapped.group(1) if wrapped else text).strip():
-                        continue
-                    index = step.get("step_index")
-                    if not isinstance(index, int) or isinstance(index, bool):
-                        return None
-                    steps.append(index)
-        except OSError:
-            return None
-    later = [i for i in steps if i >= at_least]
-    return min(later) if later else None
+def _ag_lines_newest_first(path: str):
+    """Lines of a JSONL transcript, newest first, read backwards in chunks so
+    a long run of steps after the USER_INPUT does not hide it. Stops after
+    ``_AG_MAX_SCAN`` bytes; an unreadable file yields nothing."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            end = fh.tell()
+            floor = max(0, end - _AG_MAX_SCAN)
+            # Pieces of the line that started in a chunk read earlier (newer
+            # bytes first), joined once when its start is found.
+            carry: list[bytes] = []
+            while end > floor:
+                start = max(floor, end - _AG_CHUNK)
+                fh.seek(start)
+                parts = fh.read(end - start).split(b"\n")
+                end = start
+                carry.append(parts[-1])
+                if len(parts) > 1:
+                    line = b"".join(reversed(carry))
+                    if line.strip():
+                        yield line.decode("utf-8", errors="replace")
+                    for raw in reversed(parts[1:-1]):
+                        if raw.strip():
+                            yield raw.decode("utf-8", errors="replace")
+                    carry = [parts[0]]
+                else:
+                    carry[-1:] = [parts[0]]
+            # At the cap the first piece is a whole line only when the byte
+            # before it ends a line; at the file's start it always is.
+            if carry and (floor == 0 or _byte_before(fh, floor) == b"\n"):
+                line = b"".join(reversed(carry))
+                if line.strip():
+                    yield line.decode("utf-8", errors="replace")
+    except OSError:
+        return
+
+
+def _byte_before(fh, offset: int) -> bytes:
+    fh.seek(offset - 1)
+    return fh.read(1)
 
 
 def _ag_flush_wait() -> float:
@@ -1022,11 +1035,21 @@ def _ag_flush_wait() -> float:
 _AG_PENDING_KEEP_S = 3600
 _AG_PENDING_MAX = 32
 # A turn recorded from the payload's ``lastUserInput`` (no USER_INPUT step in
-# the transcript yet) is keyed by its text. Its alias keeps that text and the
-# payload's ``initialNumSteps``: the turn's own step, once flushed, is the
-# first USER_INPUT step at or after that count, and only that step is known as
-# already recorded, so a later identical turn is never taken for it.
+# the transcript yet) is keyed by its ``initialNumSteps`` and text, so the same
+# words typed in a later turn are a new turn. Its own step, once flushed, is
+# recorded again under its step key as a duplicate row. The copy shares the
+# first row's occurrence only with proof it is that turn: the step index is
+# the first row's ``initialNumSteps`` and the words match. Without that proof
+# it is numbered as a turn of its own: a double count is acceptable, a lost
+# turn is not.
 _AG_FALLBACK = "last-"
+# Only a PreInvocation names its turn: T3 1.3.0 fires one per user turn, and
+# PostInvocation's ``initialNumSteps`` is the step count at the END of the
+# invocation (4 after three tool calls, proof run 5), while Stop has none.
+# Every PreInvocation writes its own value as the session's current turn; a
+# late ``lastUserInput`` row is keyed by that, never by its own payload, and
+# with no PreInvocation seen yet (a Stop can fire before the first) there is
+# no turn to bind it to, so it records nothing.
 
 
 def _ag_dir() -> Path:
@@ -1038,10 +1061,6 @@ def _ag_dir() -> Path:
 
 def _ag_file(directory: Path, kind: str, session: str) -> Path:
     return directory / (kind + hashlib.sha256(session.encode("utf-8", "replace")).hexdigest()[:40])
-
-
-def _ag_text_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _ag_step_number(key: str) -> int | None:
@@ -1096,6 +1115,26 @@ def _ag_note_unseen(session: str, steps: int | None, now: float) -> None:
     _ag_save_notes(path, notes)
 
 
+def _ag_note_turn(session: str, steps: int | None) -> None:
+    path = _ag_file(_ag_dir(), "turn-", session)
+    try:
+        if steps is None:
+            path.unlink(missing_ok=True)
+        else:
+            _ag_write(path, json.dumps({"steps": steps}))
+    except OSError:
+        pass
+
+
+def _ag_turn_steps(session: str) -> int | None:
+    """The newest PreInvocation's ``initialNumSteps``; None when none was seen."""
+    try:
+        n = json.loads(_ag_file(_ag_dir(), "turn-", session).read_text(encoding="utf-8")).get("steps")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else None
+
+
 def _ag_clear_unseen(session: str) -> None:
     try:
         _ag_file(_ag_dir(), "pending-", session).unlink()
@@ -1103,11 +1142,14 @@ def _ag_clear_unseen(session: str) -> None:
         pass
 
 
-def _ag_claim(session: str, key: str, text: str, now: float, payload: dict) -> float | None:
-    """Create the turn's once-per-turn marker. The turn's time when this call
-    created it (the note's when a PreInvocation of this same turn could not
-    read it), None when the turn was already handled, including a turn
-    recorded earlier from ``lastUserInput`` whose own step is now flushed."""
+def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
+              text: str = "") -> tuple[float, dict] | None:
+    """Create the turn's once-per-turn marker. None when the turn was already
+    handled; else the turn's time (the note's when a PreInvocation of this
+    same turn could not read it) and what ``record`` needs to number it:
+    a ``lastUserInput`` turn is marked a fallback bound to ``steps`` (the
+    payload's ``initialNumSteps``), and the flushed step of that same turn
+    is marked its duplicate. Every Antigravity record goes through here."""
     directory = _ag_dir()
     marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
     try:
@@ -1120,34 +1162,6 @@ def _ag_claim(session: str, key: str, text: str, now: float, payload: dict) -> f
                 old.unlink()
         except OSError:
             continue
-    alias = _ag_file(directory, "alias-", session)
-    if key.startswith(_AG_FALLBACK):
-        # The fallback only runs when the transcript shows no USER_INPUT step,
-        # so with no step count the turn's step is the transcript's first.
-        try:
-            _ag_write(alias, json.dumps({"text": _ag_text_hash(text), "from": _ag_initial_steps(payload) or 0}))
-        except OSError:
-            pass
-    else:
-        try:
-            earlier = json.loads(alias.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            earlier = None
-        index = _ag_step_number(key)
-        start = earlier.get("from") if isinstance(earlier, dict) else None
-        if not isinstance(start, int) or isinstance(start, bool) or index is None or index >= start:
-            # Spent by the first step claimed at or after the turn's count. It
-            # matches only that turn's own step (the first USER_INPUT there),
-            # proven from the whole transcript; anything less is recorded,
-            # since a duplicate row is recoverable and a lost turn is not.
-            try:
-                alias.unlink()
-            except OSError:
-                pass
-            tp = hook_shape.transcript_path(payload)
-            if (isinstance(start, int) and index is not None and earlier.get("text") == _ag_text_hash(text)
-                    and tp and _ag_own_step(tp, start) == index):
-                return None
     at = now
     index = _ag_step_number(key)
     if index is not None:
@@ -1157,12 +1171,40 @@ def _ag_claim(session: str, key: str, text: str, now: float, payload: dict) -> f
         if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
             at = ts
         _ag_save_notes(path, {k: v for k, v in notes.items() if int(k) > index})
-    return at
+    elif steps is not None and key.startswith(_AG_FALLBACK):
+        # A late row of a turn whose PreInvocation could not read it keeps
+        # that call's time; the note stays to date the flushed copy.
+        ts = _ag_notes(_ag_file(directory, "pending-", session)).get(str(steps))
+        if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
+            at = ts
+    if key.startswith(_AG_FALLBACK):
+        return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps})
+    return at, (_ag_original(session, index, text, now) if index is not None else {})
 
 
-def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] | None:
-    """(session, newest user turn or None) for an Antigravity payload with no
-    prompt of its own; None for any other payload."""
+def _ag_original(session: str, index: int, text: str, now: float) -> dict:
+    """The not yet paired ``lastUserInput`` row of the turn whose step is
+    ``index`` with the same words: its id and occurrence, so this flushed
+    copy shares its numbering. Empty when no row is that turn."""
+    typed = owner_text(text)
+    if typed is None or not typed.strip():
+        return {}
+    sha = prompt_sha256(typed)
+    rows = turns(session, now)
+    paired = {t.get("duplicate_of") for t in rows}
+    for t in rows:
+        if t.get("fallback") and type(t.get("ag_step")) is int and t["ag_step"] == index \
+                and t.get("prompt_sha256") == sha and t.get("turn") not in paired \
+                and type(t.get("occurrence")) is int:
+            return {"duplicate_of": t["turn"], "occurrence": t["occurrence"]}
+    return {}
+
+
+def _ag_read(payload, wait: float | None, late: bool = False) -> tuple[str, tuple[str, str] | None, int | None] | None:
+    """(session, newest user turn or None, the turn's step count) for an
+    Antigravity payload with no prompt of its own; None for any other
+    payload. ``late`` (PostInvocation, Stop): the step count is the newest
+    PreInvocation's, and ``lastUserInput`` is used only when one was seen."""
     if not isinstance(payload, dict) or hook_shape.detect(payload, os.environ)[0] != "antigravity":
         return None
     if isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
@@ -1171,6 +1213,7 @@ def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] 
     if not session:
         return None
     found = None
+    steps = _ag_turn_steps(session) if late else _ag_initial_steps(payload)
     tp = hook_shape.transcript_path(payload)
     last = payload.get("lastUserInput") or payload.get("last_user_input")
     has_last = isinstance(last, str) and bool(last.strip())
@@ -1181,12 +1224,13 @@ def _ag_read(payload, wait: float | None) -> tuple[str, tuple[str, str] | None] 
             while found is None and time.monotonic() < give_up:
                 time.sleep(_AG_FLUSH_POLL_S)
                 found = _ag_last_user_input(tp)
-    if found is None and has_last:
+    if found is None and has_last and not (late and steps is None):
         wrapped = _AG_WRAP.match(last)
         text = (wrapped.group(1) if wrapped else last).strip()
         if text:
-            found = (_AG_FALLBACK + _ag_text_hash(last), text)
-    return session, found
+            found = (_AG_FALLBACK + ("" if steps is None else f"{steps}-")
+                     + hashlib.sha256(last.encode("utf-8", "replace")).hexdigest()[:16], text)
+    return session, found, steps
 
 
 def _ag_filled(payload: dict, text: str) -> dict:
@@ -1201,20 +1245,21 @@ def _ag_filled(payload: dict, text: str) -> dict:
 
 def _antigravity_turn(payload, now: float | None, wait: float | None):
     """(gate answer, the new turn's time, (session, the payload's step count)
-    when this call recorded nothing and its own turn may not be written yet)."""
+    when this call recorded nothing and its own turn may not be written yet,
+    ``record``'s extra for the new turn)."""
     read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait))
     if read is None:
-        return None, None, None
-    session, found = read
+        return None, None, None, {}
+    session, found, steps = read
     if found is None:
-        return None, None, (session, _ag_initial_steps(payload))
+        return None, None, (session, steps), {}
     key, text = found
-    at = _ag_claim(session, key, text, time.time() if now is None else now, payload)
-    if at is None:
+    claimed = _ag_claim(session, key, time.time() if now is None else now, steps, text)
+    if claimed is None:
         # Already handled, or the newest step is the last turn's and this
         # call's own turn is not written yet.
-        return {}, None, (session, _ag_initial_steps(payload))
-    return _ag_filled(payload, text), at, None
+        return {}, None, (session, steps), {}
+    return _ag_filled(payload, text), claimed[0], None, claimed[1]
 
 
 def antigravity_prompt(payload: dict, now: float | None = None, wait: float | None = None,
@@ -1226,11 +1271,14 @@ def antigravity_prompt(payload: dict, now: float | None = None, wait: float | No
     Never raises."""
     try:
         stamp = time.time() if now is None else now
-        out, at, unseen = _antigravity_turn(payload, stamp, wait)
+        if isinstance(payload, dict) and hook_shape.detect(payload, os.environ)[0] == "antigravity" \
+                and hook_shape.session_id(payload).strip():
+            _ag_note_turn(hook_shape.session_id(payload).strip(), _ag_initial_steps(payload))
+        out, at, unseen, extra = _antigravity_turn(payload, stamp, wait)
         if unseen is not None:
             _ag_note_unseen(unseen[0], unseen[1], stamp)
         if out:
-            record(out, now=at, issuer=issuer)
+            record(out, now=at, issuer=issuer, extra=extra)
         return out
     except Exception:  # noqa: BLE001 - the gate must never fail a prompt
         return None
@@ -1245,18 +1293,18 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
     Returns the recorded turn's id, None when nothing was recorded. Prints
     nothing; never raises."""
     try:
-        read = _ag_read(payload, 0)
+        read = _ag_read(payload, 0, late=True)
         if read is None:
             return None
-        session, found = read
+        session, found, steps = read
         stamp = time.time() if now is None else now
         recorded = None
         if found is not None:
-            at = _ag_claim(session, found[0], found[1], stamp, payload)
-            if at is not None:
+            claimed = _ag_claim(session, found[0], stamp, steps, found[1])
+            if claimed is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}
-                recorded = record(_ag_filled(payload, found[1]), now=at, issuer=issuer)
+                recorded = record(_ag_filled(payload, found[1]), now=claimed[0], issuer=issuer, extra=claimed[1])
         if str(event).lower() == "stop":
             _ag_clear_unseen(session)
         return recorded

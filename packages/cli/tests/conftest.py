@@ -221,8 +221,8 @@ def _owner_turns_from_a_fake_harness(monkeypatch):
 
     real_record, real_chain = owner_turns.record, owner_direction._caller_chain
 
-    def record(payload, env=None, now=None, issuer=None):
-        return real_record(payload, env, now, dict(FAKE_HOOK_ISSUER) if issuer is None else issuer)
+    def record(payload, env=None, now=None, issuer=None, extra=None):
+        return real_record(payload, env, now, dict(FAKE_HOOK_ISSUER) if issuer is None else issuer, extra)
 
     monkeypatch.setattr(owner_turns, "record", record)
     monkeypatch.setattr(owner_direction, "_caller_chain",
