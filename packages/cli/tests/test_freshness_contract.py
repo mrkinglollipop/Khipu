@@ -150,7 +150,7 @@ class TopicsCatchupContractTest(unittest.TestCase):
         with mock.patch("khipu.db.connect", return_value=_Conn(cur)), \
                 mock.patch.object(em, "_active_profile", return_value="prof-1"), \
                 mock.patch.object(em, "embed_batch",
-                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+                                   side_effect=lambda api, profile, **_kw: [[0.0] * em.DIM for _ in api]):
             out = em.embed_recent_missing(limit=10)
         self.assertEqual(out["topics_embedded"], 1)
         self.assertTrue(any(p[1] == "topic" and p[2] == "note:fresh" for p in cur.inserts))
@@ -256,7 +256,7 @@ class TopicsCatchupContractTest(unittest.TestCase):
                 mock.patch.object(em, "_active_profile", return_value="prof-1"), \
                 mock.patch("khipu.hub_snapshot.upsert_embeddings", return_value={"ok": True}), \
                 mock.patch.object(em, "embed_batch",
-                                  side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+                                  side_effect=lambda api, profile, **_kw: [[0.0] * em.DIM for _ in api]):
             counts = [em.embed_recent_missing(limit=10)["topics_embedded"] for _ in range(12)]
         self.assertEqual(cur.stale(), [])
         self.assertEqual(sum(counts), 51)
@@ -367,7 +367,7 @@ class PerChunkIsolationContractTest(unittest.TestCase):
         cur = _Cur(rows)
         calls = {"n": 0}
 
-        def _embed(api, profile, retries=None, delay=None):
+        def _embed(api, profile, retries=None, delay=None, recheck=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("embed HTTP 503: unavailable")

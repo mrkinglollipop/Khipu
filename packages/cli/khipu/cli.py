@@ -2810,7 +2810,13 @@ def _reembed_episode(cur, episode_id: int) -> bool:
     sendable = provider_text.fenced_texts(chunks, [episode_id] * len(chunks), "capture-edit")
     if any(c is None for c in sendable):
         return False
-    vecs = embed_batch(_api_texts(profile, [("", c) for c in sendable]), profile=profile)
+    from khipu.embed import WithheldDuringSend
+
+    try:
+        vecs = embed_batch(_api_texts(profile, [("", c) for c in sendable]), profile=profile,
+                           recheck=provider_text.recheck_texts(chunks, [episode_id] * len(chunks), "capture-edit"))
+    except WithheldDuringSend:
+        return False
     cur.execute(
         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
         (str(episode_id),),

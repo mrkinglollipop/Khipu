@@ -179,6 +179,20 @@ def fence_chunks(cur: Any, items: Sequence[tuple[str, str, Any]]) -> list[Any]:
     return out
 
 
+def recheck_chunks(cur: Any, items: Sequence[tuple[str, str, Any]]):
+    """A callable for ``embed_batch(recheck=...)``: True while every item
+    still passes ``fence_chunks``. Called before each send attempt, so a
+    forget that lands during a retry back-off stops the retry."""
+    frozen = list(items)
+    return lambda: all(t is not None for t in fence_chunks(cur, frozen))
+
+
+def recheck_texts(texts: Sequence[Any], source_ids: Sequence[Any] | None, kind: str):
+    """``recheck_chunks`` for texts fenced with ``fenced_texts``."""
+    frozen, ids = list(texts), (list(source_ids) if source_ids is not None else None)
+    return lambda: all(t is not None for t in fenced_texts(frozen, ids, kind))
+
+
 def live_input(value: Any, kind: str) -> Any:
     """``value`` unchanged: input that is not stored memory. Only the explicit
     ``LIVE_KINDS`` pass, and only a plain ``str`` or ``bytes``, or a list or

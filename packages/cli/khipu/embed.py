@@ -840,16 +840,26 @@ def _redact_provider_diagnostic(text: str, headers: dict[str, str]) -> str:
     )
 
 
+class WithheldDuringSend(RuntimeError):
+    """A source of the batch was forgotten (or the forget list became
+    unreadable) between the fence and a send attempt: nothing was sent."""
+
+
 def _post_json(
     url: str, body: dict[str, Any], headers: dict[str, str], *,
     provider: str, retries: int, timeout: float, delay: float, transport=None,
-    budget: str = "memory",
+    budget: str = "memory", recheck=None,
 ) -> dict[str, Any]:
     """POST ``body`` with the retry ladder every provider shares: 429/5xx and
-    network errors back off ``delay`` doubling; anything else raises at once."""
+    network errors back off ``delay`` doubling; anything else raises at once.
+    ``recheck`` (episode-derived batches) is called before every attempt,
+    retries included; False raises ``WithheldDuringSend`` before any byte goes
+    out, because a forget can land during the back-off."""
     data = json.dumps(body).encode("utf-8")
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
+        if recheck is not None and not recheck():
+            raise WithheldDuringSend("embed withheld: a source was forgotten before the send")
         deadline = time.monotonic() + max(0, timeout)
         _budget_take(deadline=deadline, scope=budget)
         remaining = deadline - time.monotonic()
@@ -892,6 +902,7 @@ def embed_batch(
     transport=None,
     input_type: str | None = None,
     budget: str = "memory",
+    recheck=None,
 ) -> list[list[float]]:
     """Embed texts under ``profile``'s provider; dim-checked, L2-normalized when
     the profile says ``normalize='l2'`` (every shipped profile does).
@@ -915,6 +926,7 @@ def embed_batch(
         payload = _post_json(
             url, body, headers, provider=spec.provider,
             retries=retries, timeout=timeout, delay=delay, transport=transport, budget=budget,
+            recheck=recheck,
         )
         vecs = _parse_vectors(spec.provider, payload)
         if len(vecs) != len(part):
@@ -1983,7 +1995,9 @@ def backfill(
                         # let one nightly finish instead of leaving a third of the
                         # topics for tomorrow.
                         vecs = embed_batch(api, profile=profile, retries=BACKFILL_RETRIES,
-                                           delay=BACKFILL_DELAY_S)
+                                           delay=BACKFILL_DELAY_S,
+                                           recheck=provider_text.recheck_chunks(
+                                               cur, [(k, r, c) for k, r, _i, c, _h, _t in batch]))
                     except RuntimeError as exc:
                         msg = str(exc)
                         if "budget exhausted" in msg:
@@ -2169,7 +2183,12 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                     _log("embed-on-capture: episode is forgotten or the forget list is unreadable; nothing sent")
                     return False
                 api = _api_texts(profile, [("", c) for c in sendable])
-                vecs = embed_batch(api, profile=profile)
+                try:
+                    vecs = embed_batch(api, profile=profile, recheck=provider_text.recheck_texts(
+                        chunks, [eid] * len(chunks), "capture-embed"))
+                except WithheldDuringSend:
+                    _log("embed-on-capture: episode forgotten during the send; nothing sent")
+                    return False
                 cur.execute(
                     "SELECT row_to_json(e) FROM episodes e "
                     "WHERE e.id = %s AND e.deleted_at IS NULL FOR SHARE",
@@ -3785,7 +3804,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     continue
                 api = _api_texts(profile, [("", text) for text in sendable if text is not None])
                 try:
-                    vecs = embed_batch(api, profile=profile)
+                    vecs = embed_batch(api, profile=profile, recheck=provider_text.recheck_chunks(
+                        cur, [(k, r, t) for k, r, _i, t, _h in batch]))
                 except RuntimeError as exc:
                     msg = str(exc)
                     if "budget exhausted" in msg or "network error after" in msg:
@@ -3880,7 +3900,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     continue
                 api = _api_texts(profile, [("", c) for c in sendable])
                 try:
-                    vecs = embed_batch(api, profile=profile)
+                    vecs = embed_batch(api, profile=profile, recheck=provider_text.recheck_chunks(
+                        cur, [("commitment", str(cid), c) for c in chunks]))
                 except RuntimeError as exc:
                     msg = str(exc)
                     if "budget exhausted" in msg or "network error after" in msg:
@@ -3982,7 +4003,8 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                     continue
                 api = _api_texts(profile, [(title or slug or "", c) for c in sendable])
                 try:
-                    vecs = embed_batch(api, profile=profile) if api else []
+                    vecs = embed_batch(api, profile=profile, recheck=provider_text.recheck_chunks(
+                        cur, [("topic", str(slug), c) for c in chunks])) if api else []
                 except RuntimeError as exc:
                     if "budget exhausted" in str(exc):
                         raise
