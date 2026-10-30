@@ -17,6 +17,8 @@ stay cheap, dependency-free, and safe to run inside Aegis's sandbox: only
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import re
@@ -135,6 +137,22 @@ def _resolve_project_alias(cur, project: str) -> str | None:
         return None
 
 
+# One read (the session-start slice) asks for the same project's group from
+# several helpers (owed, decisions, episodes, pairs), three round trips each.
+# Inside ``group_memo()`` the answer is kept per connection and project for
+# the rest of that block only; outside it every call reads the hub.
+_GROUP_MEMO: "contextvars.ContextVar[dict | None]" = contextvars.ContextVar("khipu_group_memo", default=None)
+
+
+@contextlib.contextmanager
+def group_memo():
+    token = _GROUP_MEMO.set({})
+    try:
+        yield
+    finally:
+        _GROUP_MEMO.reset(token)
+
+
 def project_canonical_group(cur, project: str | None) -> tuple[str | None, list[str]]:
     """``(canonical, group)`` for ``project`` through ``project_aliases``: the
     canonical project is the alias's target (or ``project`` itself), and the
@@ -143,21 +161,51 @@ def project_canonical_group(cur, project: str | None) -> tuple[str | None, list[
     ``(project, [project])``; unexpected database failures propagate."""
     if not project:
         return project, [project] if project else []
+    memo = _GROUP_MEMO.get()
+    if memo is None:
+        return _read_canonical_group(cur, project)
+    key = (id(getattr(cur, "connection", cur)), project)
+    if key not in memo:
+        memo[key] = _read_canonical_group(cur, project)
+    canonical, group = memo[key]
+    return canonical, list(group)
+
+
+def schema_known(cur, table: str, *columns: str) -> bool:
+    """Inside ``group_memo()`` only: whether ``db.prime_table_columns`` read
+    ``table`` with ``columns`` from this cursor's own database. A read that is
+    guarded by a savepoint only for an older hub's missing table can then skip
+    the savepoint's two round trips; the memo's one reader
+    (``activity.project_slice``) lets any other failure end its connection."""
+    if _GROUP_MEMO.get() is None:
+        return False
+    from khipu import db
+
+    cols = db.columns_seen(cur, table)
+    return bool(cols) and all(c in cols for c in columns)
+
+
+def _read_canonical_group(cur, project: str) -> tuple[str | None, list[str]]:
+    guarded = not schema_known(cur, "project_aliases", "alias", "project")
     try:
-        cur.execute("SAVEPOINT project_alias_group", ())
+        if guarded:
+            cur.execute("SAVEPOINT project_alias_group", ())
         cur.execute(
             "WITH c AS (SELECT COALESCE((SELECT project FROM project_aliases WHERE alias = %s), %s) AS p) "
             "SELECT c.p, a.alias FROM c LEFT JOIN project_aliases a ON a.project = c.p ORDER BY a.alias",
             (project, project),
         )
         rows = cur.fetchall()
-        cur.execute("RELEASE SAVEPOINT project_alias_group", ())
+        if guarded:
+            cur.execute("RELEASE SAVEPOINT project_alias_group", ())
         if not rows:
             return project, [project]
         canonical = str(rows[0][0])
         group = [canonical] + [str(r[1]) for r in rows if r[1] and str(r[1]) != canonical]
         return canonical, group
     except Exception as exc:  # compatibility only for an older schema
+        if not guarded:
+            raise
         try:
             cur.execute("ROLLBACK TO SAVEPOINT project_alias_group", ())
             cur.execute("RELEASE SAVEPOINT project_alias_group", ())
