@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import threading
 import time
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -313,13 +314,38 @@ def _outcome(
     return timeout, error, degraded, reason, outcome, completed
 
 
+DEADLINE_REASON = "timeout: eval deadline"
+
+
+def _call_by_deadline(call, deadline: float) -> dict[str, Any] | None:
+    """Run ``call`` on a daemon thread and wait no later than ``deadline``
+    (a ``time.monotonic`` value). None means the deadline came first; the
+    abandoned call finishes on its own thread."""
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["payload"] = call()
+        except Exception as exc:  # noqa: BLE001 — same fail-open contract as the caller
+            box["payload"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+    worker = threading.Thread(target=run, name="khipu-recall-eval-entry", daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    return None if worker.is_alive() else box.get("payload", {"error": "no result"})
+
+
 def eval_one_path(
-    entry: dict[str, Any], path: str, *, budget_ms: int = DEFAULT_STATUS_BUDGET_MS
+    entry: dict[str, Any], path: str, *, budget_ms: int = DEFAULT_STATUS_BUDGET_MS,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """Score one golden entry against one retrieval path (explicit / prompt /
     status). Same fail-open contract as eval_one — a broken line/path is a
     miss, never a crash — plus the abstention, staleness and outcome
-    accounting a single hybrid_search score has no way to express."""
+    accounting a single hybrid_search score has no way to express.
+
+    ``deadline`` (``time.monotonic``) stops a slow call inside the entry: the
+    row comes back as a timeout with reason ``DEADLINE_REASON``."""
     query = str(entry["query"])
     mode = str(entry.get("mode") or "hybrid")
     k = int(entry.get("k") or DEFAULT_K)
@@ -329,19 +355,32 @@ def eval_one_path(
     expect_none = bool(entry.get("expect_none"))
     stale = {str(x) for x in (entry.get("stale") or [])}
 
-    t0 = time.monotonic()
-    try:
+    if deadline is not None and path == PATH_STATUS:
+        budget_ms = max(1, min(budget_ms, int((deadline - time.monotonic()) * 1000)))
+
+    def call() -> dict[str, Any]:
         if path == PATH_EXPLICIT:
-            payload = _call_explicit(query, entry, mode=mode, k=k)
-        else:
-            payload = _call_prompt_or_status(query, entry, path=path, budget_ms=budget_ms)
-    except Exception as exc:  # noqa: BLE001 — a broken line/path scores a miss, not a crash
-        payload = {"error": f"{type(exc).__name__}: {exc}"}
+            return _call_explicit(query, entry, mode=mode, k=k)
+        return _call_prompt_or_status(query, entry, path=path, budget_ms=budget_ms)
+
+    t0 = time.monotonic()
+    deadline_hit = False
+    if deadline is None:
+        try:
+            payload = call()
+        except Exception as exc:  # noqa: BLE001 — a broken line/path scores a miss, not a crash
+            payload = {"error": f"{type(exc).__name__}: {exc}"}
+    else:
+        got_payload = _call_by_deadline(call, deadline) if time.monotonic() < deadline else None
+        deadline_hit = got_payload is None
+        payload = {} if deadline_hit else got_payload
     ms = round((time.monotonic() - t0) * 1000, 1)
     payload_chars = len(json.dumps(payload, default=str))
 
     got = _extract_got(payload, path, k)
     timeout, error, degraded, reason, outcome, completed = _outcome(payload, path, got)
+    if deadline_hit:
+        timeout, error, reason, outcome, completed = True, False, DEADLINE_REASON, "timeout", False
 
     hit = False
     reciprocal_rank = 0.0
