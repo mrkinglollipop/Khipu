@@ -3385,6 +3385,11 @@ def prior_work_for_prompt(
             reason = "ok"
         if thread_worker.is_alive():
             degraded_legs.append("t3_thread")
+    # Every lane's rows, read against the forget list now: the replica drops a
+    # forgotten episode only at its next rewrite.
+    from khipu.hub_snapshot import without_withheld
+
+    hits = without_withheld(hits or [])
     produced = ""
     produced_box: dict[str, Any] = {}
     remaining = min(DELIVERABLE_LINE_TIMEOUT_S, max(0, deadline - time.monotonic()))

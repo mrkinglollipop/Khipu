@@ -481,12 +481,46 @@ def _pending_erasure_ids(path: Path | None = None) -> set[int]:
         return set()
 
 
+def withheld_episode_ids(path: Path | None = None) -> frozenset[int]:
+    """Episodes no reader may see whatever the replica's own rows say: on
+    this Mac's forget list, or queued for erasure. A forget lands here before
+    the replica's next rewrite tombstones the row. Raises when either cannot
+    be read; the caller then shows no episode."""
+    from khipu.tombstones import hidden_episode_ids
+
+    return hidden_episode_ids() | frozenset(_pending_erasure_ids(path))
+
+
+def without_withheld(rows: Sequence[Any], *, fail_closed: bool = True) -> list[Any]:
+    """``rows`` minus every episode ``withheld_episode_ids`` names, and every
+    row reached through one (``via``). When the ids cannot be read: empty, or
+    with ``fail_closed=False`` (an explicit search, whose replica views
+    already hide queued erasures) ``rows`` unchanged."""
+    try:
+        withheld = {str(i) for i in withheld_episode_ids()}
+    except Exception:  # noqa: BLE001 - an unreadable forget list pushes nothing
+        return [] if fail_closed else list(rows)
+    if not withheld:
+        return list(rows)
+    kept = []
+    for row in rows:
+        if isinstance(row, Mapping):
+            if row.get("kind") == "episode" and str(row.get("id")) in withheld:
+                continue
+            via = str(row.get("via") or "")
+            if via.startswith("episode:") and via[len("episode:"):] in withheld:
+                continue
+        kept.append(row)
+    return kept
+
+
 def forget_fence_sql(con: sqlite3.Connection, table: str, episode_col: str) -> str:
     """The one forget fence for a replica read of rows linked to an episode
     (commitments, decisions, deliverables): an ``" AND (...)"`` clause that
-    leaves out rows of an episode marked forgotten in the replica and rows of
-    an episode whose erasure is queued but not yet applied (the same ids
-    ``open_snapshot``'s views hide). ``table`` is the name or alias the query
+    leaves out rows of an episode marked forgotten in the replica or on this
+    Mac's forget list and rows of an episode whose erasure is queued but not
+    yet applied (``withheld_episode_ids``); no row when that list cannot be
+    read. ``table`` is the name or alias the query
     uses for the linked table. Rows with no episode, or whose episode the
     replica does not hold, stay. It reads ``main.episodes``, never the view,
     so it holds on a connection from ``open_snapshot`` or a plain one.
@@ -495,7 +529,10 @@ def forget_fence_sql(con: sqlite3.Connection, table: str, episode_col: str) -> s
     it (tests/test_replica_forget_fence.py)."""
     col = f"{table}.{episode_col}"
     parts: list[str] = []
-    pending = _pending_erasure_ids()
+    try:
+        pending = withheld_episode_ids()
+    except Exception:  # noqa: BLE001 - an unreadable forget list shows no row
+        return " AND 0"
     if pending:
         parts.append(f"{col} NOT IN ({', '.join(str(int(i)) for i in sorted(pending))})")
     if "deleted_at" in _snapshot_table_columns(con, "episodes"):
@@ -8116,7 +8153,7 @@ def search_stale_payload(
             con, results, kind=kind, since=since, until=until, project=project,
             session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
         )
-        results = enrich_search_results_snapshot(con, results)
+        results = without_withheld(enrich_search_results_snapshot(con, results), fail_closed=False)
         results = _annotate_snapshot_validity(con, results)
         out = {
             "query": query,
@@ -8145,7 +8182,7 @@ def search_stale_payload(
         con, results, kind=kind, since=since, until=until, project=project,
         session_id=session_id, harness=harness, t3_thread=t3_thread, via=via,
     )
-    results = enrich_search_results_snapshot(con, results)
+    results = without_withheld(enrich_search_results_snapshot(con, results), fail_closed=False)
     results = _annotate_snapshot_validity(con, results)
     out = {
         "query": query,

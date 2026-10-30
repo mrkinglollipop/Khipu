@@ -446,6 +446,32 @@ def episode_hidden(episode_id: Any) -> bool:
         return True
 
 
+_HIDDEN_CACHE: tuple[Any, frozenset[int]] | None = None
+
+
+def hidden_episode_ids() -> frozenset[int]:
+    """The episode ids on this Mac's forget list, read for every automatic
+    push. The parse is reused while the file's identity (inode, size, mtime,
+    ctime) is unchanged; every publication replaces the file, so a new forget
+    is seen on the next call. Raises ``RegistryError`` when it cannot be
+    read: the caller must then push no episode at all."""
+    global _HIDDEN_CACHE
+    path = registry_path()
+    try:
+        st = os.lstat(path)
+        key: Any = (str(path), st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode)
+    except FileNotFoundError:
+        return read_gate().episode_ids
+    except OSError as exc:
+        raise RegistryError(f"tombstone registry unavailable: {type(exc).__name__}") from exc
+    cached = _HIDDEN_CACHE
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    ids = read_gate().episode_ids
+    _HIDDEN_CACHE = (key, ids)
+    return ids
+
+
 def without_hidden_episodes(results: list[Any]) -> list[Any]:
     """``results`` minus every hub episode hit ``episode_hidden`` names."""
     try:
