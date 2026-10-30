@@ -205,3 +205,69 @@ def test_recall_eval_prompt_path_on_a_fake_golden_set(tmp_path, monkeypatch):
     report = recall_eval.run_eval_paths(recall_eval.load_golden(golden), ("prompt",))
     row = report["rows"][0]
     assert row["hit"] and row["reciprocal_rank"] == 1.0 and not row["stale_violation"], row
+
+
+# ---- fix round 1 (Kimi review of b68952cb) ----------------------------------
+
+
+def test_recency_reorders_but_never_drops_a_hit_that_cleared_the_floor():
+    # A fresh hit's recency bonus must not lift the relative floor over an
+    # older hit that cleared it on relevance alone.
+    fresh = {"kind": "episode", "id": "fresh-relevant", "score": 0.0564, "recency": 0.0164}
+    old = {"kind": "episode", "id": "old-relevant", "score": 0.025, "recency": 0.00001}
+    kept = rp._apply_score_floor([fresh, old])
+    assert [r["id"] for r in kept] == ["fresh-relevant", "old-relevant"]
+
+
+def test_episode_under_an_old_project_name_is_same_project(tmp_path, monkeypatch):
+    _replica(
+        tmp_path, monkeypatch,
+        episodes=[(60, "Recall ranking alias fix for the hook", "mrkinglollipop/alzy", _days_ago(3)),
+                  (61, "Recall ranking alias fix for the hook", "mrkinglollipop/aegis", _days_ago(3))],
+        cosine=[("episode", 61, 0.80), ("episode", 60, 0.79)],
+    )
+    con = sqlite3.connect(hs.snapshot_path())
+    con.execute("INSERT INTO project_aliases(alias, project) VALUES(?, ?)",
+                ("mrkinglollipop/alzy", KHIPU))
+    con.commit()
+    con.close()
+    out = rp.prior_work_for_prompt("recall ranking alias fix", cwd="/khipu/worktree")
+    assert [r["id"] for r in out["hits"]][:1] == ["60"], out
+
+
+def test_alias_group_is_neither_deranked_nor_unboosted():
+    rows = [{"kind": "episode", "id": "same-project-old-alias", "score": 0.04, "project": "Khipu-old"},
+            {"kind": "episode", "id": "other", "score": 0.04, "project": "mrkinglollipop/aegis"}]
+    ranked = recency.rank_for_push(rows, project=KHIPU, project_group=[KHIPU, "Khipu-old"])
+    assert ranked[0]["id"] == "same-project-old-alias"
+    assert ranked[0]["score"] == pytest.approx(0.04 * recency.PROJECT_BOOST)
+
+
+def _order_fixture():
+    return [
+        {"kind": "episode", "id": "fresh-other", "score": 0.05, "project": "mrkinglollipop/aegis",
+         "ts": _days_ago(0)},
+        {"kind": "episode", "id": "old-current", "score": 0.042, "project": KHIPU,
+         "ts": _days_ago(400)},
+    ]
+
+
+def test_replica_and_hub_fallback_rank_the_same_fixture_identically(monkeypatch):
+    from khipu import embed
+
+    local = rp._trim_result({"hits": recency.rank_for_push(_order_fixture(), project=KHIPU),
+                             "legs": [], "degraded": None}, rp.TOP_N)
+
+    def fake_hybrid_search(query, *, project_boost=None, rank=None, **kw):
+        # The real search's ranking step, on rows its candidate legs would return.
+        return {"results": embed._rank_search_rows(_order_fixture(), None,
+                                                   project_boost=project_boost, rank=rank)}
+
+    monkeypatch.setattr(embed, "hybrid_search", fake_hybrid_search)
+    monkeypatch.setattr(rp, "_snapshot_search_hits",
+                        lambda *a, **kw: (_ for _ in ()).throw(rp._SnapshotUnusable("test")))
+    monkeypatch.setattr(rp, "_hub_known_down", lambda: None)
+    monkeypatch.setattr("khipu.hub_reach.note_reachable", lambda: None)
+    hub = rp._search_hits("recall ranking order", cwd="/khipu/worktree", limit=rp.TOP_N)
+    assert [r["id"] for r in hub["hits"]] == [r["id"] for r in local["hits"]]
+    assert [r["score"] for r in hub["hits"]] == [r["score"] for r in local["hits"]]

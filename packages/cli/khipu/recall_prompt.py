@@ -2009,14 +2009,21 @@ def _enter_stage(progress: dict[str, Any] | None, stage: str) -> None:
 # ---- search + render --------------------------------------------------------
 
 
+def _floor_score(row: dict[str, Any]) -> float:
+    """A row's score without its recency bonus: recency may reorder hits, but
+    a fresh hit's bonus must not lift the floor over an older hit that cleared
+    it on relevance alone (review of 2026-10-30)."""
+    return float(row.get("score") or 0.0) - float(row.get("recency") or 0.0)
+
+
 def _apply_score_floor(rows: list[dict[str, Any]], *, ratio: float = SCORE_FLOOR_RATIO) -> list[dict[str, Any]]:
     if not rows:
         return rows
-    top = max(float(r.get("score") or 0.0) for r in rows)
+    top = max(_floor_score(r) for r in rows)
     if top <= 0:
         return rows
     floor = top * ratio
-    return [r for r in rows if float(r.get("score") or 0.0) >= floor]
+    return [r for r in rows if _floor_score(r) >= floor]
 
 
 def _relevance_gate(rows: list[dict[str, Any]], tokens: list[str]) -> list[dict[str, Any]]:
@@ -2401,7 +2408,7 @@ def _fuse_and_annotate(
     expansion twice pushed the lane past its budget on a busy Mac
     (2026-10-12)."""
     from khipu import hub_snapshot
-    from khipu.recency import apply_project_and_status, apply_push_policy, apply_recency
+    from khipu.recency import rank_for_push
     from khipu.search_text import fuse_ranked_lists, token_hit_count
 
     if not lexical_rows and not cosine_rows:
@@ -2483,8 +2490,8 @@ def _fuse_and_annotate(
     # so they can never make an otherwise empty list pass.
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
     fused = _relevance_gate(fused, tokens)
-    fused = apply_project_and_status(fused, project=project)
-    fused = apply_recency(apply_push_policy(fused, project=project))
+    fused = rank_for_push(fused, project=project,
+                          project_group=hub_snapshot.snapshot_project_group(con, project)[1])
 
     # Time interpretation (Phase 3, session A): switch-gated. This lane never
     # receives an explicit since/until from its caller (the per-prompt hook
@@ -2652,17 +2659,43 @@ def _search_hits(
     try:
         payload = hybrid_search(
             sanitized, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
-            include_libraries=False,
+            include_libraries=False, rank=_hub_push_rank(project),
         )
     except Exception as exc:
         if hub_snapshot.hub_connection_failed(exc):
             hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
         raise
     hub_reach.note_reachable()
-    from khipu.recency import apply_push_policy
-
-    rows = _apply_score_floor(apply_push_policy(payload.get("results") or [], project=project))
+    rows = _apply_score_floor(payload.get("results") or [])
     return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
+
+
+def _hub_project_group(cur, project: str | None) -> list[str]:
+    """The project's alias group read on the hub, ``[project]`` when it has
+    none, there is no cursor, or the read fails (grouping is best-effort)."""
+    if not project:
+        return []
+    if cur is None:
+        return [project]
+    try:
+        from khipu.identity import project_group
+
+        return project_group(cur, project)
+    except Exception as exc:  # noqa: BLE001 — a missed group is a ranking nudge lost, not a failure
+        _log(f"project alias group skipped: {type(exc).__name__}: {exc}")
+        return [project]
+
+
+def _hub_push_rank(project: str | None):
+    """``hybrid_search``'s ``rank`` for the hub fallback: the same
+    ``rank_for_push`` pass the replica lane runs, with the alias group read
+    on the search's own cursor."""
+    from khipu.recency import rank_for_push
+
+    def rank(rows: list[dict[str, Any]], cur) -> list[dict[str, Any]]:
+        return rank_for_push(rows, project=project, project_group=_hub_project_group(cur, project))
+
+    return rank
 
 
 # ---- budgeted hub search (khipu_status's prior_work, R10 + this phase) ------
@@ -2802,6 +2835,7 @@ def _hub_hits_budgeted(
                     rows = _literal_candidates(
                         cur, prompt, _SEARCH_LIMIT, kind=None, filters=None, fast=True
                     )
+                    lexical_box["project_group"] = _hub_project_group(cur, project)
             if tokens:
                 for r in rows:
                     r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
@@ -2865,13 +2899,15 @@ def _hub_hits_budgeted(
         return out
 
     from khipu.search_text import fuse_ranked_lists
-    from khipu.recency import apply_project_and_status, apply_push_policy, apply_recency
+    from khipu.recency import rank_for_push
     from khipu.tombstones import without_hidden_episodes
 
     fused = without_hidden_episodes(fuse_ranked_lists(lists, limit=_CANDIDATE_LIMIT))
     fused = _relevance_gate(fused, tokens)
-    fused = apply_project_and_status(fused, project=project)
-    fused = apply_recency(apply_push_policy(fused, project=project))
+    # The lexical leg reads the alias group on its own connection; when that
+    # leg did not land, rows from an old project name lose the boost only.
+    fused = rank_for_push(fused, project=project,
+                          project_group=lexical_box.get("project_group") or ([project] if project else []))
     fused = _attach_hub_routing_state(fused, deadline=deadline)
 
     # Validity annotation (Phase 2, session B): one counts query for the

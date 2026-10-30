@@ -112,13 +112,24 @@ def is_placeholder_episode(row: dict[str, Any]) -> bool:
                for k in ("label", "snippet"))
 
 
-def _project_matches(row: dict[str, Any], proj_norm: str) -> bool:
+def _group_norm(project_group: Any) -> frozenset[str]:
+    try:
+        return frozenset(str(p).strip().lower() for p in (project_group or ()) if p)
+    except TypeError:
+        return frozenset()
+
+
+def _project_matches(row: dict[str, Any], proj_norm: str, group: frozenset[str] = frozenset()) -> bool:
+    """The session's project: the same substring test as the ``project=``
+    filter, or an exact member of its alias group (a name recorded before a
+    rename), matched exactly as the search filter matches alias members."""
     row_project = str(row.get("project") or "").strip().lower()
-    return bool(row_project) and proj_norm in row_project
+    return bool(row_project) and (proj_norm in row_project or row_project in group)
 
 
 def apply_push_policy(
-    rows: list[dict[str, Any]], *, project: str | None = None
+    rows: list[dict[str, Any]], *, project: str | None = None,
+    project_group: Any = None,
 ) -> list[dict[str, Any]]:
     """Selection for automatic push (the per-prompt hook and khipu_status's
     prior_work), on top of ``apply_project_and_status``. Explicit search never
@@ -134,6 +145,7 @@ def apply_push_policy(
     from khipu.validity import topic_state
 
     proj_norm = (project or "").strip().lower()
+    group = _group_norm(project_group)
     out: list[dict[str, Any]] = []
     for row in rows:
         try:
@@ -147,7 +159,7 @@ def apply_push_policy(
             score = float(row.get("score") or 0.0)
             if is_placeholder_episode(row):
                 score *= PUSH_PLACEHOLDER_DERANK
-            if proj_norm and row.get("project") and not _project_matches(row, proj_norm):
+            if proj_norm and row.get("project") and not _project_matches(row, proj_norm, group):
                 score *= CROSS_PROJECT_DERANK
             row["score"] = round(score, 6)
         except Exception:  # noqa: BLE001 — one bad row must not sink the push
@@ -157,7 +169,8 @@ def apply_push_policy(
 
 
 def apply_project_and_status(
-    rows: list[dict[str, Any]], *, project: str | None = None
+    rows: list[dict[str, Any]], *, project: str | None = None,
+    project_group: Any = None,
 ) -> list[dict[str, Any]]:
     """Ranking-only project boost (R5) + topic status de-rank (R6).
 
@@ -176,6 +189,9 @@ def apply_project_and_status(
     multiplicatively so it composes with the project boost and with
     ``apply_recency``'s additive bonus in any order.
 
+    ``project_group`` (automatic push only) is the project's alias group; a
+    row recorded under one of those names matches too.
+
     Rows are mutated in place and returned re-sorted by score desc (stable
     on ties). Never raises — a bad row's score defaults to 0.0 rather than
     aborting the whole list.
@@ -183,6 +199,7 @@ def apply_project_and_status(
     if not rows:
         return rows
     proj_norm = (project or "").strip().lower()
+    group = _group_norm(project_group)
     for row in rows:
         try:
             score = float(row.get("score") or 0.0)
@@ -190,8 +207,7 @@ def apply_project_and_status(
             score = 0.0
         try:
             if proj_norm:
-                row_project = str(row.get("project") or "").strip().lower()
-                if row_project and proj_norm in row_project:
+                if _project_matches(row, proj_norm, group):
                     score *= PROJECT_BOOST
                     if row.get("kind") == "topic":
                         note_type = str(row.get("type") or "").strip().lower()
@@ -244,3 +260,26 @@ def apply_recency(
             continue
 
     return sorted(rows, key=lambda r: -(r.get("score") or 0.0))
+
+
+def rank_for_push(
+    rows: list[dict[str, Any]], *, project: str | None = None,
+    project_group: Any = None, now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Automatic push's whole score pass, the one the replica lane and both
+    hub lanes run so they order the same rows the same way: project boost and
+    status de-rank, then the push policy, then recency last (the review of
+    2026-10-30 found the hub fallback applying recency before the policy, so
+    the cross-project de-rank also shrank the recency bonus there). A recency
+    bonus already on a row is taken off first, so a pass is never counted
+    twice. Never raises."""
+    for row in rows or ():
+        try:
+            bonus = row.pop("recency", None)
+            if bonus:
+                row["score"] = round(float(row.get("score") or 0.0) - float(bonus), 6)
+        except Exception:  # noqa: BLE001 — one bad row must not sink the push
+            continue
+    rows = apply_project_and_status(rows, project=project, project_group=project_group)
+    rows = apply_push_policy(rows, project=project, project_group=project_group)
+    return apply_recency(rows, now=now)

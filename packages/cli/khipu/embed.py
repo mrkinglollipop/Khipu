@@ -40,7 +40,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from khipu import profiles as _profiles
 from khipu.lines import split_lines
@@ -2920,6 +2920,25 @@ class _LibraryLegs:
         return self._result
 
 
+def _rank_search_rows(
+    fused: list[dict[str, Any]], cur: Any, *, project_boost: str | None = None,
+    rank: Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """The fused rows' score pass. ``rank`` (automatic push's hub fallback,
+    ``recall_prompt._hub_push_rank``) replaces it whole so that lane ranks the
+    way the replica lane does; explicit search passes none."""
+    if rank is not None:
+        return rank(fused, cur)
+    # Project boost + status de-rank (R5/R6) ride on the fused score
+    # BEFORE recency, same as recency itself: both are score nudges
+    # that must see the raw fused order, and both re-sort by the
+    # score they leave behind.
+    from khipu.recency import apply_project_and_status, apply_recency
+
+    fused = apply_project_and_status(fused, project=project_boost)
+    return apply_recency(fused)
+
+
 def hybrid_search(
     query: str,
     *,
@@ -2937,6 +2956,7 @@ def hybrid_search(
     tz: str | None = None,
     source: str | None = None,
     include_libraries: bool = True,
+    rank: Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
 
@@ -3292,14 +3312,7 @@ def hybrid_search(
                 except Exception:  # noqa: BLE001 — additive, never a search failure
                     interpretation = None
 
-            # Project boost + status de-rank (R5/R6) ride on the fused score
-            # BEFORE recency, same as recency itself: both are score nudges
-            # that must see the raw fused order, and both re-sort by the
-            # score they leave behind.
-            from khipu.recency import apply_project_and_status, apply_recency
-
-            fused = apply_project_and_status(fused, project=project_boost)
-            fused = apply_recency(fused)
+            fused = _rank_search_rows(fused, cur, project_boost=project_boost, rank=rank)
             timing["fusion_ms"] = round((time.monotonic() - _t) * 1000, 1)
             _t = time.monotonic()
             fused = enrich_search_results(cur, fused)
