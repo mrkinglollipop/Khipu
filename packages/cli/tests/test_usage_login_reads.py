@@ -552,6 +552,19 @@ def test_a_saved_cursor_reading_older_than_grok_own_loses_and_is_noted(env):
     assert "61%" in row["source_note"] and "42.5%" in row["source_note"]
 
 
+def test_a_failed_grok_read_with_only_a_saved_cursor_reading_stays_failed(env):
+    # A kept Cursor reading is no evidence the account is open now: when
+    # Grok's own read fails and Cursor is not read afresh, the failure stands.
+    _cursor_on()
+    _set("routing_usage_login_grok", False)
+    env.replies["api2.cursor.sh"] = (_cursor_reply(30), 200)
+    assert _probe("grok")["via"] == "cursor"  # read just now: it may stand in
+    _set("routing_usage_login_grok", True)
+    env.replies["cli-chat-proxy.grok.com"] = (b"", 401)
+    row = _probe("grok")  # Cursor not due again: only its saved reading exists
+    assert row["ok"] is False and "via" not in row
+
+
 def test_a_saved_cursor_reading_expires(env, monkeypatch):
     _cursor_on()
     _set("routing_usage_login_grok", False)

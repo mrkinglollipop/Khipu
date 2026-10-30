@@ -400,9 +400,10 @@ def _saved_cursor(now: float) -> tuple[list[dict], float] | None:
     return (windows, at) if 0 <= now - at <= CURSOR_KEEP_S and math.isfinite(at) else None
 
 
-def _cursor_reading(timeout: float) -> tuple[list[dict], float] | None:
-    """Cursor's windows and when they were read: a fresh read when one is
-    due, else the last one kept (at most ``CURSOR_KEEP_S`` old)."""
+def _cursor_reading(timeout: float) -> tuple[list[dict], float, bool] | None:
+    """Cursor's windows, when they were read, and whether this call read them:
+    a fresh read when one is due, else the last one kept (at most
+    ``CURSOR_KEEP_S`` old)."""
     now = time.time()
     if login_read_due("cursor"):
         try:
@@ -411,8 +412,9 @@ def _cursor_reading(timeout: float) -> tuple[list[dict], float] | None:
             windows = None
         if windows:
             _save_cursor(windows, now)
-            return windows, now
-    return _saved_cursor(now)
+            return windows, now, True
+    saved = _saved_cursor(now)
+    return (*saved, False) if saved else None
 
 
 def _cursor_window(windows: list[dict], grok_windows: list[dict]) -> tuple[dict | None, dict | None]:
@@ -449,17 +451,19 @@ def grok_with_cursor(own: dict, *, timeout: float = TIMEOUT_S) -> dict:
     reading = _cursor_reading(LOGIN_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
     if reading is None:
         return own
-    windows, read_at = reading
+    windows, read_at, fresh = reading
     own_ok = bool(own.get("ok")) and bool(own.get("windows"))
     window, matched = _cursor_window(windows, own.get("windows") or [] if own_ok else [])
     if window is None:
         return own
     via = {"ok": True, "plan": own.get("plan") if own_ok else None, "windows": [window], "credits": None,
            "version": None, "source": "live", "via": "cursor"}
-    if read_at < time.time() - 1:
+    if not fresh:
         via.update(source="last_observed", observed_at=_iso(read_at))
     if not own_ok:
-        return via
+        # A failed Grok read stays failed unless Cursor was read just now: a
+        # kept reading is no evidence the account is open at this moment.
+        return via if fresh else own
     own_at = _parse_time(own.get("observed_at"))
     own_ts = own_at.timestamp() if own_at else time.time()
     kept = dict(via if read_at > own_ts else own)
