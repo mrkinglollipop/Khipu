@@ -167,11 +167,12 @@ def test_same_project_episode_beats_old_pages_from_other_projects(tmp_path, monk
     assert [r["id"] for r in out["hits"]][:1] == ["30"], out
 
 
-def test_cross_project_row_is_deranked_not_dropped():
+def test_cross_project_row_is_not_pushed_by_default():
+    # Matt 2026-10-30: same project by default.
     rows = [{"kind": "topic", "id": "note:frost-line-system", "score": 0.04, "project": "mrkinglollipop/frost-line"},
             {"kind": "episode", "id": "1", "score": 0.03, "project": KHIPU}]
     ranked = recency.apply_push_policy(rows, project=KHIPU)
-    assert [r["id"] for r in ranked] == ["1", "note:frost-line-system"]
+    assert [r["id"] for r in ranked] == ["1"]
 
 
 def test_superseded_topic_is_not_pushed_but_stays_searchable(tmp_path, monkeypatch):
@@ -246,16 +247,22 @@ def test_alias_group_is_neither_deranked_nor_unboosted():
 def _order_fixture():
     return [
         {"kind": "episode", "id": "fresh-other", "score": 0.05, "project": "mrkinglollipop/aegis",
-         "ts": _days_ago(0)},
+         "ts": _days_ago(0), "label": "recall ranking order"},
         {"kind": "episode", "id": "old-current", "score": 0.042, "project": KHIPU,
-         "ts": _days_ago(400)},
+         "ts": _days_ago(400), "label": "recall ranking order"},
+        {"kind": "episode", "id": "unrelated", "score": 0.045, "project": KHIPU,
+         "ts": _days_ago(1), "label": "nothing in common"},
     ]
 
 
 def test_replica_and_hub_fallback_rank_the_same_fixture_identically(monkeypatch):
     from khipu import embed
 
-    local = rp._trim_result({"hits": recency.rank_for_push(_order_fixture(), project=KHIPU),
+    from khipu.search_text import search_tokens
+
+    query = "recall ranking order"
+    local = rp._trim_result({"hits": recency.rank_for_push(_order_fixture(), project=KHIPU,
+                                                           tokens=search_tokens(query), prompt=query),
                              "legs": [], "degraded": None}, rp.TOP_N)
 
     def fake_hybrid_search(query, *, project_boost=None, rank=None, **kw):
@@ -268,6 +275,150 @@ def test_replica_and_hub_fallback_rank_the_same_fixture_identically(monkeypatch)
                         lambda *a, **kw: (_ for _ in ()).throw(rp._SnapshotUnusable("test")))
     monkeypatch.setattr(rp, "_hub_known_down", lambda: None)
     monkeypatch.setattr("khipu.hub_reach.note_reachable", lambda: None)
-    hub = rp._search_hits("recall ranking order", cwd="/khipu/worktree", limit=rp.TOP_N)
+    hub = rp._search_hits(query, cwd="/khipu/worktree", limit=rp.TOP_N)
+    assert [r["id"] for r in local["hits"]] == ["old-current"]
     assert [r["id"] for r in hub["hits"]] == [r["id"] for r in local["hits"]]
     assert [r["score"] for r in hub["hits"]] == [r["score"] for r in local["hits"]]
+
+
+# ---- fix round 2 (graded replay of 418 real prompts, 2026-10-30) -------------
+# Only 4% of pushed items were relevant; 251 of 267 prompts that needed no
+# memory still got a push. Fake data only: the graded prompts are private.
+
+FROST = "mrkinglollipop/frost-line"
+
+
+def test_long_self_contained_prompt_pushes_nothing(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch,
+             episodes=[(70, "Recall ranking fix round for the push hook", KHIPU, _days_ago(1))])
+    brief = ("You are a dispatched agent. Recall ranking fix round for the push hook. "
+             + "Read the scope doc first and follow every step in it exactly. " * 15)
+    assert len(brief) > rp.LONG_PROMPT_CHARS
+    out = rp.prior_work_for_prompt(brief, cwd="/khipu/worktree")
+    assert out["hits"] == [] and out["context"] == "", out
+    assert out["reason"] == "self-contained prompt"
+    short = rp.prior_work_for_prompt("recall ranking fix round push hook", cwd="/khipu/worktree")
+    assert [r["id"] for r in short["hits"]] == ["70"], short
+
+
+def test_harness_message_prompt_pushes_nothing(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch,
+             episodes=[(71, "Task notification for the recall ranking job finished", KHIPU, _days_ago(1))])
+    out = rp.prior_work_for_prompt(
+        "<task-notification>\n<task-id>b1</task-id> recall ranking job finished</task-notification>",
+        cwd="/khipu/worktree")
+    assert out["hits"] == [] and out["reason"] == "harness message", out
+
+
+def test_shape_gate_is_an_abstention_not_a_gate_for_status_clients(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch, episodes=[(72, "Unrelated episode", KHIPU, _days_ago(1))])
+    out = rp.prior_work_for_prompt("word " * 300, cwd="/khipu/worktree", budget_ms=300)
+    assert out["prior_work_meta"]["outcome"] == "no_match", out
+
+
+def test_row_with_thin_keyword_coverage_is_not_pushed(tmp_path, monkeypatch):
+    # Six content tokens: a push needs five of them (or a clear cosine match).
+    _replica(tmp_path, monkeypatch,
+             episodes=[(73, "Installed the update for the phone simulator", KHIPU, _days_ago(1))],
+             cosine=[("episode", 73, 0.60)])
+    out = rp.prior_work_for_prompt("installing update phone sorry quick moment", cwd="/khipu/worktree")
+    assert out["hits"] == [], out
+
+
+def test_row_covering_most_prompt_words_is_pushed(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch,
+             episodes=[(74, "Olive video jump glitch on scroll fixed after refresh", KHIPU, _days_ago(1))],
+             cosine=[("episode", 74, 0.60)])
+    out = rp.prior_work_for_prompt("video jump glitch scroll refresh", cwd="/khipu/worktree")
+    assert [r["id"] for r in out["hits"]] == ["74"], out
+
+
+def test_push_cosine_bar_sits_above_the_search_floor():
+    from khipu import relevance
+
+    bar = relevance.cosine_floor() + recency.PUSH_COSINE_MARGIN
+    tokens = ["alpha", "beta", "gamma", "delta"]
+    rows = [{"kind": "episode", "id": "clear", "score": 0.04, "project": KHIPU,
+             "cosine": bar + 0.01, "lexical_hits": 1},
+            {"kind": "episode", "id": "near", "score": 0.05, "project": KHIPU,
+             "cosine": bar - 0.02, "lexical_hits": 1}]
+    kept = recency.apply_push_policy(rows, project=KHIPU, tokens=tokens)
+    assert [r["id"] for r in kept] == ["clear"]
+
+
+def test_other_project_strong_match_is_not_pushed_unless_named(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch,
+             episodes=[(75, "Frost line snow shader tuning for the ridge", FROST, _days_ago(1))],
+             cosine=[("episode", 75, 0.78)])
+    out = rp.prior_work_for_prompt("snow shader tuning ridge", cwd="/khipu/worktree")
+    assert out["hits"] == [], out
+    named = rp.prior_work_for_prompt("snow shader tuning ridge in frost-line", cwd="/khipu/worktree")
+    assert [r["id"] for r in named["hits"]] == ["75"], named
+
+
+def test_other_project_named_by_its_alias_is_pushed(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch,
+             episodes=[(76, "Snow shader tuning for the ridge", FROST, _days_ago(1))],
+             cosine=[("episode", 76, 0.72)])
+    con = sqlite3.connect(hs.snapshot_path())
+    con.execute("INSERT INTO project_aliases(alias, project) VALUES(?, ?)",
+                ("mrkinglollipop/icecap", FROST))
+    con.commit()
+    con.close()
+    out = rp.prior_work_for_prompt("icecap snow shader tuning ridge", cwd="/khipu/worktree")
+    assert [r["id"] for r in out["hits"]] == ["76"], out
+
+
+def test_other_project_clears_only_the_much_stricter_bar():
+    from khipu import relevance
+
+    strict = relevance.cosine_floor() + recency.CROSS_PROJECT_COSINE_MARGIN
+    tokens = ["snow", "shader", "ridge"]
+    base = {"kind": "episode", "score": 0.05, "project": FROST, "lexical_hits": 3}
+    rows = [{**base, "id": "exceptional", "cosine": strict + 0.01},
+            {**base, "id": "merely-good", "cosine": strict - 0.03},
+            {**base, "id": "partial", "cosine": strict + 0.05, "lexical_hits": 2}]
+    kept = recency.apply_push_policy(rows, project=KHIPU, tokens=tokens)
+    assert [r["id"] for r in kept] == ["exceptional"]
+
+
+def test_placeholder_episode_is_never_pushed(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch,
+             episodes=[(77, recency.PLACEHOLDER_SUMMARY, KHIPU, _days_ago(0),
+                        "dispatch the recall ranking job")],
+             cosine=[("episode", 77, 0.90)])
+    out = rp.prior_work_for_prompt("dispatch the recall ranking job", cwd="/khipu/worktree")
+    assert out["hits"] == [], out
+
+
+def test_validity_derank_keeps_the_floor_on_pre_recency_relevance(monkeypatch):
+    # Opus P3: the floor took the full recency bonus off a score the validity
+    # step had already halved, so a fresh superseded episode went below zero.
+    from khipu import validity
+
+    monkeypatch.setenv("KHIPU_FEATURE_VALIDITY_RANKING", "1")
+    top = {"kind": "episode", "id": "top", "score": 0.025, "recency": 0.0}
+    sup = {"kind": "episode", "id": "sup-fresh", "score": 0.03 + 0.047619, "recency": 0.047619,
+           "validity": {"state": "superseded"}}
+    ranked = validity.apply_ranking([top, sup])
+    sup_after = next(r for r in ranked if r["id"] == "sup-fresh")
+    assert rp._floor_score(sup_after) == pytest.approx(0.03 * recency.STATUS_DERANK, abs=1e-6)
+    assert sorted(r["id"] for r in rp._apply_score_floor(ranked)) == ["sup-fresh", "top"]
+
+
+def test_question_words_do_not_count_toward_coverage():
+    tokens = ["what", "approve", "widget", "batching", "endpoint", "pagination"]
+    row = {"kind": "episode", "id": "1", "score": 0.05, "project": KHIPU, "lexical_hits": 4}
+    assert [r["id"] for r in recency.apply_push_policy([row], project=KHIPU, tokens=tokens)] == ["1"]
+
+
+def test_graph_candidate_rides_on_its_seed():
+    tokens = ["billing", "service", "module"]
+    seed = {"kind": "topic", "id": "billing-service", "score": 0.05, "project": KHIPU, "lexical_hits": 3}
+    linked = {"kind": "topic", "id": "rate-limits", "score": 0.04, "project": KHIPU,
+              "lexical_hits": 0, "via": "topic:billing-service"}
+    orphan = {"kind": "topic", "id": "orphan", "score": 0.04, "project": KHIPU,
+              "lexical_hits": 0, "via": "topic:weak-seed"}
+    weak = {"kind": "topic", "id": "weak-seed", "score": 0.03, "project": KHIPU, "lexical_hits": 1}
+    kept = recency.apply_push_policy([seed, linked, orphan, weak], project=KHIPU, tokens=tokens)
+    assert [r["id"] for r in kept] == ["billing-service", "rate-limits"]

@@ -137,6 +137,25 @@ def _is_trivial(tokens: list[str]) -> bool:
     return bool(tokens) and set(tokens) <= _ACK_WORDS
 
 
+# Prompt shapes that carry their own context, from 418 graded real prompts
+# (2026-10-30): typed prompts over 500 characters needed memory 9 times in 62,
+# and long job briefs and lane checks restate the state they need. Above
+# LONG_PROMPT_CHARS automatic push abstains (here 51 more right abstentions
+# for 5 right answers lost). A harness message (a task notification or other
+# tagged envelope) is not something the user asked. Both are abstentions
+# (outcome no_match), not gates: the prompt was read and needs nothing.
+LONG_PROMPT_CHARS = 800
+_HARNESS_MESSAGE_RE = re.compile(r"\s*<[A-Za-z][\w-]*>")
+
+
+def _self_contained(prompt: str) -> str | None:
+    if len(prompt) > LONG_PROMPT_CHARS:
+        return "self-contained prompt"
+    if _HARNESS_MESSAGE_RE.match(prompt):
+        return "harness message"
+    return None
+
+
 def _log_path() -> Path:
     from khipu.session_capture import khipu_home
 
@@ -2491,7 +2510,9 @@ def _fuse_and_annotate(
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
     fused = _relevance_gate(fused, tokens)
     fused = rank_for_push(fused, project=project,
-                          project_group=hub_snapshot.snapshot_project_group(con, project)[1])
+                          project_group=hub_snapshot.snapshot_project_group(con, project)[1],
+                          tokens=tokens, prompt=prompt,
+                          aliases_for=lambda p: hub_snapshot.snapshot_project_group(con, p)[1])
 
     # Time interpretation (Phase 3, session A): switch-gated. This lane never
     # receives an explicit since/until from its caller (the per-prompt hook
@@ -2659,7 +2680,7 @@ def _search_hits(
     try:
         payload = hybrid_search(
             sanitized, limit=_SEARCH_LIMIT, mode="semantic", project_boost=project,
-            include_libraries=False, rank=_hub_push_rank(project),
+            include_libraries=False, rank=_hub_push_rank(project, prompt=prompt),
         )
     except Exception as exc:
         if hub_snapshot.hub_connection_failed(exc):
@@ -2686,14 +2707,19 @@ def _hub_project_group(cur, project: str | None) -> list[str]:
         return [project]
 
 
-def _hub_push_rank(project: str | None):
+def _hub_push_rank(project: str | None, *, prompt: str | None = None):
     """``hybrid_search``'s ``rank`` for the hub fallback: the same
-    ``rank_for_push`` pass the replica lane runs, with the alias group read
+    ``rank_for_push`` pass the replica lane runs, with the alias groups read
     on the search's own cursor."""
     from khipu.recency import rank_for_push
+    from khipu.search_text import search_tokens
+
+    tokens = search_tokens(prompt) if prompt else None
 
     def rank(rows: list[dict[str, Any]], cur) -> list[dict[str, Any]]:
-        return rank_for_push(rows, project=project, project_group=_hub_project_group(cur, project))
+        return rank_for_push(rows, project=project, project_group=_hub_project_group(cur, project),
+                             tokens=tokens, prompt=prompt,
+                             aliases_for=lambda p: _hub_project_group(cur, p))
 
     return rank
 
@@ -2906,8 +2932,10 @@ def _hub_hits_budgeted(
     fused = _relevance_gate(fused, tokens)
     # The lexical leg reads the alias group on its own connection; when that
     # leg did not land, rows from an old project name lose the boost only.
+    # No cursor here: another project counts as named by its own name only.
     fused = rank_for_push(fused, project=project,
-                          project_group=lexical_box.get("project_group") or ([project] if project else []))
+                          project_group=lexical_box.get("project_group") or ([project] if project else []),
+                          tokens=tokens, prompt=prompt)
     fused = _attach_hub_routing_state(fused, deadline=deadline)
 
     # Validity annotation (Phase 2, session B): one counts query for the
@@ -3335,6 +3363,9 @@ def prior_work_for_prompt(
             return _gated("no content tokens")
         if _is_trivial(tokens) and not thread:
             return _gated("trivial acknowledgment")
+        shape = _self_contained(prompt)
+        if shape and not thread:
+            return _gated(shape)
     except Exception as exc:  # noqa: BLE001 — fail open
         return _gated(f"gate error: {exc}")
     if deadline is not None and time.monotonic() >= deadline:
@@ -3365,7 +3396,7 @@ def prior_work_for_prompt(
         thread_worker = threading.Thread(target=read_thread, daemon=True)
         thread_worker.start()
     try:
-        if thread and (not tokens or _is_trivial(tokens)):
+        if thread and (not tokens or _is_trivial(tokens) or shape):
             hits = []
         elif budget_ms is not None:
             outer_timeout = max(0, deadline - time.monotonic())

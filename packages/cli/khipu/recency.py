@@ -5,9 +5,11 @@ a small, exponentially-decaying bonus to the fused score.
 """
 from __future__ import annotations
 
+import math
 import os
+import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 # Phase 2, session B: khipu.validity is the single source of truth for the
 # not-current status set; recency's own DERANKED_STATUSES below is an alias
@@ -86,12 +88,32 @@ BROAD_PAGE_CHARS = 16_000
 BROAD_DERANK = 0.5
 # khipu.extract writes this summary when the model returned none. Every such
 # episode embeds as near-identical text and renders as a line that says
-# nothing, so automatic push de-ranks it; explicit search still finds it.
+# nothing (none of 288 graded pushes was relevant), so automatic push leaves
+# it out; explicit search still finds it.
 PLACEHOLDER_SUMMARY = "Session evidence retained without a model summary."
-PUSH_PLACEHOLDER_DERANK = 0.25
-# Automatic push only: a row whose project is known and is not the session's.
-# A de-rank, never an exclusion, so a strong cross-project match still shows.
-CROSS_PROJECT_DERANK = 0.6
+# Automatic push only, measured on 418 graded real prompts (2026-10-30): 4%
+# of pushed rows were relevant and 251 of 267 prompts that needed no memory
+# still got a push, so a push of nothing is the preferred outcome when no row
+# is clear evidence. A row is pushed only when it names at least
+# PUSH_COVERAGE of the prompt's content tokens (at least two) or its cosine
+# clears the search floor by PUSH_COSINE_MARGIN. On that data this kept 60%
+# relevant (from 12%) and abstained on 249 of 267, for 43 of 131 right-answer
+# hits instead of 55. Cosine alone stays a weak signal: catch-all pages and
+# placeholder summaries scored highest of all.
+PUSH_COVERAGE = 0.75
+PUSH_COSINE_MARGIN = 0.05
+# Question words describe the asking, not the subject: "what did we approve
+# for X" is about X. They do not count toward the tokens a row must cover.
+QUESTION_WORDS = frozenset({"what", "how", "why", "when", "where", "which", "who", "whom", "whose"})
+# Another project's row (Matt, 2026-10-30): same project by default; another
+# project only when the prompt names it or one of its aliases, or the row
+# covers every content token of a prompt of at least
+# CROSS_PROJECT_MIN_TOKENS and its cosine clears the floor by
+# CROSS_PROJECT_COSINE_MARGIN. None of the 413 cross-project rows pushed in
+# the graded set cleared that bar; 12 of 418 prompts had another project's
+# memory as their best answer and none named the project.
+CROSS_PROJECT_COSINE_MARGIN = 0.15
+CROSS_PROJECT_MIN_TOKENS = 3
 
 
 def is_broad_page(row: dict[str, Any]) -> bool:
@@ -127,18 +149,73 @@ def _project_matches(row: dict[str, Any], proj_norm: str, group: frozenset[str] 
     return bool(row_project) and (proj_norm in row_project or row_project in group)
 
 
+def push_coverage_need(token_count: int) -> int:
+    """Content tokens a row must name to be pushed on keywords alone."""
+    n = int(token_count)
+    return min(n, max(2, math.ceil(PUSH_COVERAGE * n))) if n > 0 else 0
+
+
+def _subject_token_count(tokens: list[str]) -> int:
+    subject = sum(1 for t in tokens if t not in QUESTION_WORDS)
+    return subject or len(tokens)
+
+
+def _keyword_hits(row: dict[str, Any], tokens: list[str]) -> float:
+    hits = row.get("lexical_hits")
+    if isinstance(hits, (int, float)) and not isinstance(hits, bool):
+        return float(hits)
+    from khipu.search_text import token_hit_count
+
+    text = row.get("rank_text") or f"{row.get('label') or ''} {row.get('snippet') or ''}"
+    row["lexical_hits"] = token_hit_count(text, tokens)
+    return float(row["lexical_hits"])
+
+
+def _cosine(row: dict[str, Any]) -> float | None:
+    value = row.get("cosine")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _words(text: str) -> str:
+    return " " + re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip() + " "
+
+
+def prompt_names_project(prompt: str | None, names: Any) -> bool:
+    """Whether ``prompt`` names any of ``names`` (``owner/repo`` or a bare
+    name) as whole words, case-, hyphen- and underscore-insensitive: "frost
+    line" and "frost-line" both name ``mrkinglollipop/frost-line``. A name
+    under three characters never counts."""
+    said = _words(prompt or "")
+    if said.strip() == "":
+        return False
+    for name in names or ():
+        word = _words(str(name or "").rsplit("/", 1)[-1]).strip()
+        if len(word) >= 3 and f" {word} " in said:
+            return True
+    return False
+
+
 def apply_push_policy(
     rows: list[dict[str, Any]], *, project: str | None = None,
-    project_group: Any = None,
+    project_group: Any = None, tokens: list[str] | None = None,
+    prompt: str | None = None, aliases_for: Callable[[str], Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Selection for automatic push (the per-prompt hook and khipu_status's
     prior_work), on top of ``apply_project_and_status``. Explicit search never
     calls this, so everything it leaves out stays searchable.
 
     Leaves out topics that are not current (superseded/retired/abandoned or
-    ``superseded_by`` set) and catch-all pages (``is_broad_page``). De-ranks
-    placeholder-summary episodes and rows from another known project. Rows
-    are mutated in place and returned re-sorted by score. Never raises.
+    ``superseded_by`` set), catch-all pages (``is_broad_page``) and
+    placeholder-summary episodes. Leaves out another known project's rows
+    unless ``prompt`` names that project or one of its aliases
+    (``aliases_for(project)``, best-effort) or the row clears the
+    cross-project bar. With ``tokens`` (the prompt's content tokens) it also
+    leaves out every row that is not push evidence (see PUSH_COVERAGE); a
+    graph candidate (``via`` set) carries no signal of its own and stays only
+    when the row it was reached from does. Rows are mutated in place and
+    returned re-sorted by score. Never raises.
     """
     if not rows:
         return rows
@@ -146,7 +223,12 @@ def apply_push_policy(
 
     proj_norm = (project or "").strip().lower()
     group = _group_norm(project_group)
+    n_tokens = len(tokens or ())
+    need = push_coverage_need(_subject_token_count(list(tokens or ())))
+    floors = _cosine_floors() if n_tokens else None
+    named: dict[str, bool] = {}
     out: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for row in rows:
         try:
             if row.get("kind") == "topic":
@@ -156,16 +238,51 @@ def apply_push_policy(
                     continue
                 if is_broad_page(row):
                     continue
-            score = float(row.get("score") or 0.0)
             if is_placeholder_episode(row):
-                score *= PUSH_PLACEHOLDER_DERANK
-            if proj_norm and row.get("project") and not _project_matches(row, proj_norm, group):
-                score *= CROSS_PROJECT_DERANK
-            row["score"] = round(score, 6)
+                continue
+            hits = _keyword_hits(row, tokens) if n_tokens else 0.0
+            cosine = _cosine(row)
+            floor = _row_floor(row, floors) if floors else None
+            row_project = str(row.get("project") or "").strip()
+            if proj_norm and row_project and not _project_matches(row, proj_norm, group):
+                if row_project not in named:
+                    names = [row_project]
+                    if aliases_for is not None:
+                        try:
+                            names += list(aliases_for(row_project) or ())
+                        except Exception:  # noqa: BLE001 — aliases are best-effort
+                            pass
+                    named[row_project] = prompt_names_project(prompt, names)
+                strict = (floor is not None and n_tokens >= CROSS_PROJECT_MIN_TOKENS
+                          and hits >= n_tokens and cosine is not None
+                          and cosine >= floor + CROSS_PROJECT_COSINE_MARGIN)
+                if not (named[row_project] or strict):
+                    continue
+            if n_tokens and not (hits >= need or (cosine is not None and floor is not None
+                                                  and cosine >= floor + PUSH_COSINE_MARGIN)):
+                if row.get("via"):
+                    candidates.append(row)
+                continue
         except Exception:  # noqa: BLE001 — one bad row must not sink the push
             pass
         out.append(row)
+    kept = {f"{r.get('kind')}:{r.get('id')}" for r in out}
+    out += [r for r in candidates if r.get("via") in kept]
     return sorted(out, key=lambda r: -(r.get("score") or 0.0))
+
+
+def _cosine_floors() -> tuple[float, dict[str, float]] | None:
+    try:
+        from khipu import relevance
+
+        return relevance.cosine_floor(), relevance.cosine_floor_by_profile()
+    except Exception:  # noqa: BLE001 — no floor means keywords alone decide
+        return None
+
+
+def _row_floor(row: dict[str, Any], floors: tuple[float, dict[str, float]]) -> float:
+    default, by_profile = floors
+    return by_profile.get(row.get("profile") or "", default)
 
 
 def apply_project_and_status(
@@ -265,14 +382,16 @@ def apply_recency(
 def rank_for_push(
     rows: list[dict[str, Any]], *, project: str | None = None,
     project_group: Any = None, now: datetime | None = None,
+    tokens: list[str] | None = None, prompt: str | None = None,
+    aliases_for: Callable[[str], Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Automatic push's whole score pass, the one the replica lane and both
     hub lanes run so they order the same rows the same way: project boost and
     status de-rank, then the push policy, then recency last (the review of
-    2026-10-30 found the hub fallback applying recency before the policy, so
-    the cross-project de-rank also shrank the recency bonus there). A recency
-    bonus already on a row is taken off first, so a pass is never counted
-    twice. Never raises."""
+    2026-10-30 found the hub fallback applying recency before the policy).
+    ``tokens``, ``prompt`` and ``aliases_for`` feed the policy's evidence
+    floor and cross-project test. A recency bonus already on a row is taken
+    off first, so a pass is never counted twice. Never raises."""
     for row in rows or ():
         try:
             bonus = row.pop("recency", None)
@@ -281,5 +400,6 @@ def rank_for_push(
         except Exception:  # noqa: BLE001 — one bad row must not sink the push
             continue
     rows = apply_project_and_status(rows, project=project, project_group=project_group)
-    rows = apply_push_policy(rows, project=project, project_group=project_group)
+    rows = apply_push_policy(rows, project=project, project_group=project_group,
+                             tokens=tokens, prompt=prompt, aliases_for=aliases_for)
     return apply_recency(rows, now=now)

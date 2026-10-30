@@ -26,7 +26,7 @@ from khipu import recall_prompt as rp
 
 
 def _fresh_lexical_row() -> dict:
-    return {"kind": "episode", "id": "5", "label": "ep", "snippet": "episode text"}
+    return {"kind": "episode", "id": "5", "label": "ep topical prompt", "snippet": "episode text"}
 
 
 def _fresh_cosine_row() -> dict:
