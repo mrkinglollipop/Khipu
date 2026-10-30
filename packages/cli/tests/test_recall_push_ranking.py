@@ -529,3 +529,106 @@ def test_term_document_frequency_counts_live_rows_and_never_raises(tmp_path, mon
     assert n == 2 and df["alpha"] == 2 and df["beta"] == 1
     monkeypatch.setattr(hs, "snapshot_path", lambda: tmp_path / "missing.sqlite")
     assert hs.term_document_frequency() is None
+
+
+# Fix round 4 (replay of c78a418f, 2026-10-30): 413 pushes on job briefs that
+# needed nothing were admitted by rare words from the brief's own file paths.
+# A path, URL or command line names something to open or run; only prose
+# counts. Fake briefs and data only.
+
+PATH_BRIEF = ("You are a dispatched agent on the khipu repo. Do the work yourself. First read "
+              "/Users/someone/state/RULES.md, then your brief "
+              "/Users/someone/state/jobs/qx-land-7731-0412/brief.md and re-read "
+              "/Users/someone/state/jobs/qx-land-7731-0412/inbox.md before each step. "
+              "Oracle: run pytest from packages/cli. Never set TMPDIR. Commit; no push. ")
+PATH_WORDS = ["rules", "md", "state", "qx", "land", "7731", "0412", "inbox", "users", "someone",
+              "jobs"]
+# The brief's prose words, all common in an agent's memory.
+BRIEF_PROSE = "you then your re each step oracle follow both fully task".split()
+
+
+def _brief_df(rare):
+    n, df = _term_df(rare=rare)
+    df.update({w: n // 3 for w in BRIEF_PROSE})
+    return n, df
+
+
+def test_prose_text_drops_paths_urls_and_command_lines():
+    from khipu.search_text import prompt_terms
+
+    prompt = ("Fix the zephyrine importer, see https://example.test/zz/qq?id=9 and "
+              "~/notes/kelpie.md, and run `env -u FOO_URL HOME=$(mktemp -d) pytest -q -k bramble`.\n"
+              "env -u FOO_URL BAR=1 python3 -m pytest -q -p no:cacheprovider tests/ -k \"marrow\"\n"
+              "Keep `rankForPush` and vendor.py as they are; and/or ask owner/repo.")
+    terms = prompt_terms(prompt)
+    for word in ("zephyrine", "importer", "rankforpush", "vendor", "owner", "repo", "keep"):
+        assert word in terms, (word, terms)
+    for word in ("example", "zz", "qq", "notes", "kelpie", "mktemp", "bramble", "marrow",
+                 "foo_url", "cacheprovider"):
+        assert word not in terms, (word, terms)
+
+
+def test_brief_whose_rare_words_are_only_in_paths_pushes_nothing():
+    prompt = PATH_BRIEF + "Follow both fully."
+    df = _brief_df(PATH_WORDS)
+    old_job = _row("old-job", "Dispatched agent work: read RULES.md and the qx land 7731 0412 "
+                   "brief, inbox checked, khipu repo")
+    kept = recency.apply_push_policy([old_job], project=KHIPU, tokens=search_tokens(prompt),
+                                     prompt=prompt, term_df=df)
+    assert kept == []
+    # The plain-count fallback (no rarity table) counts prose words only, too.
+    short = "Read /Users/someone/state/jobs/qx-land-7731-0412/brief.md and follow it."
+    path_only = _row("path-only", "users someone state jobs qx land 7731 0412 brief")
+    path_only.pop("lexical_hits")
+    assert recency.apply_push_policy([path_only], project=KHIPU, tokens=search_tokens(short),
+                                     prompt=short, term_df=None) == []
+
+
+def test_same_brief_with_a_distinctive_prose_term_pushes_the_match():
+    prompt = PATH_BRIEF + "Task: fix the zephyrine importer."
+    df = _brief_df([*PATH_WORDS, "zephyrine"])
+    old_job = _row("old-job", "Dispatched agent work: read RULES.md and the qx land 7731 0412 "
+                   "brief, inbox checked, khipu repo")
+    match = _row("match", "Dispatched agent work: zephyrine importer drafted")
+    kept = recency.apply_push_policy([old_job, match], project=KHIPU, tokens=search_tokens(prompt),
+                                     prompt=prompt, term_df=df)
+    assert [r["id"] for r in kept] == ["match"]
+    assert kept[0]["push_evidence"] == "rare_term"
+
+
+def test_replica_path_brief_pushes_only_on_its_prose_term(tmp_path, monkeypatch):
+    from khipu import relevance
+
+    fillers = [(1000 + i, "Dispatched agent did the work yourself: first read your brief, then "
+                f"each step, oracle run, fix task, khipu repo, round {i}", KHIPU, _days_ago(2))
+               for i in range(240)]
+    path_twin = (900, "Read RULES.md and inbox for qx land 7731 0412, dispatched agent", KHIPU,
+                 _days_ago(1))
+    match = (901, "Dispatched agent work: zephyrine importer drafted", KHIPU, _days_ago(1))
+    weak = relevance.cosine_floor()
+    _replica(tmp_path, monkeypatch, episodes=[*fillers, path_twin, match],
+             cosine=[("episode", 900, weak), ("episode", 901, weak), ("episode", 1000, weak)])
+    hs._TERM_DF_CACHE.clear()
+    assert rp.prior_work_for_prompt(PATH_BRIEF + "Follow both fully.",
+                                    cwd="/khipu/worktree")["hits"] == []
+    out = rp.prior_work_for_prompt(PATH_BRIEF + "Task: fix the zephyrine importer.",
+                                   cwd="/khipu/worktree")
+    assert [r["id"] for r in out["hits"]] == ["901"], out
+
+
+def test_term_frequency_is_kept_on_disk_by_freshness_stamp(tmp_path, monkeypatch):
+    _replica(tmp_path, monkeypatch, episodes=[(1, "alpha beta", KHIPU, _days_ago(1)),
+                                              (2, "alpha gamma", KHIPU, _days_ago(1))])
+    hs._TERM_DF_CACHE.clear()
+    assert hs.term_document_frequency(terms=["alpha", "beta", "delta"]) == (2, {"alpha": 2, "beta": 1})
+    side = hs.term_df_path()
+    assert side.is_file() and b"alpha" not in side.read_bytes()
+    # A one-shot process: no table in memory, and counting would fail.
+    hs._TERM_DF_CACHE.clear()
+    monkeypatch.setattr(hs, "_count_term_df", lambda con: pytest.fail("recounted"))
+    assert hs.term_document_frequency(terms=["gamma", "beta"]) == (2, {"gamma": 1, "beta": 1})
+    # A catch-up changes the stamp, and the next reader counts again.
+    hs._TERM_DF_CACHE.clear()
+    monkeypatch.setattr(hs, "caught_up_at", lambda *a, **kw: "2026-10-30T06:00:00+00:00")
+    monkeypatch.setattr(hs, "_count_term_df", lambda con: (3, {"alpha": 3}))
+    assert hs.term_document_frequency(terms=["alpha"]) == (3, {"alpha": 3})

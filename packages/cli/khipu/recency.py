@@ -123,6 +123,11 @@ CROSS_PROJECT_MIN_TOKENS = 3
 # weight, or name a word at most TERM_RARE_SHARE of memory names plus one
 # more word. A template's words are in every job episode and weigh little;
 # a PR number, a function name or a project's own noun weighs a lot.
+# Only the prompt's prose counts (search_text.prompt_terms): in the replay of
+# c78a418f, 413 brief pushes were admitted by rare words of the brief's own
+# file paths. One rare prose word plus one more stays enough: on the typed
+# rows, the rows whose snippet showed exactly one rare word were 14 right
+# answers to 3 unwanted, so asking for two would lose more than it saves.
 TERM_RARE_SHARE = 0.005
 # Below this many rows a word's frequency says nothing about rarity (a new
 # install, a tiny test replica), so plain coverage of ``tokens`` decides.
@@ -184,6 +189,16 @@ def _keyword_hits(row: dict[str, Any], tokens: list[str]) -> float:
     return float(row["lexical_hits"])
 
 
+def _prose_hits(row: dict[str, Any], prose_tokens: list[str]) -> int:
+    named = row.get("prompt_term_hits")
+    if isinstance(named, list):
+        return len(set(named) & set(prose_tokens))
+    from khipu.search_text import token_hit_count
+
+    text = row.get("rank_text") or f"{row.get('label') or ''} {row.get('snippet') or ''}"
+    return token_hit_count(text, prose_tokens)
+
+
 class _TermWeights:
     """The prompt's words weighed by rarity; ``passes(row)`` names the
     keyword route a row clears ("keywords" or "rare_term"), or None."""
@@ -218,17 +233,19 @@ def _term_weights(prompt: str | None, term_df: Any) -> _TermWeights | None:
     if not prompt:
         return None
     try:
-        if term_df is _FETCH:
-            from khipu.hub_snapshot import term_document_frequency
-
-            term_df = term_document_frequency()
-        if not term_df or term_df[0] < TERM_DF_MIN_DOCS:
-            return None
         from khipu.search_text import prompt_terms
 
         terms = prompt_terms(prompt)
         terms = [t for t in terms if t not in QUESTION_WORDS] or terms
-        weights = _TermWeights(terms, term_df) if terms else None
+        if not terms:
+            return None
+        if term_df is _FETCH:
+            from khipu.hub_snapshot import term_document_frequency
+
+            term_df = term_document_frequency(terms=terms)
+        if not term_df or term_df[0] < TERM_DF_MIN_DOCS:
+            return None
+        weights = _TermWeights(terms, term_df)
         return weights if weights and weights.total > 0 else None
     except Exception:  # noqa: BLE001 — no weights means plain coverage decides
         return None
@@ -298,6 +315,15 @@ def apply_push_policy(
     need = push_coverage_need(_subject_token_count(list(tokens or ())))
     floors = _cosine_floors() if n_tokens else None
     weights = _term_weights(prompt, term_df) if n_tokens else None
+    prose_tokens = list(tokens or ())
+    if n_tokens and weights is None and prompt:
+        # Plain coverage counts prose words too: a word only a path or a
+        # command line names is not evidence (see search_text.prose_text).
+        from khipu.search_text import prompt_terms
+
+        prose = set(prompt_terms(prompt))
+        prose_tokens = [t for t in prose_tokens if t in prose]
+        need = push_coverage_need(_subject_token_count(prose_tokens)) if prose_tokens else 0
     named: dict[str, bool] = {}
     out: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
@@ -331,7 +357,11 @@ def apply_push_policy(
                 if not (named[row_project] or strict):
                     continue
             if n_tokens:
-                route = weights.passes(row) if weights else ("keywords" if hits >= need else None)
+                if weights:
+                    route = weights.passes(row)
+                else:
+                    kw = hits if len(prose_tokens) == n_tokens else _prose_hits(row, prose_tokens)
+                    route = "keywords" if prose_tokens and kw >= need else None
                 if route is None and cosine is not None and floor is not None \
                         and cosine >= floor + PUSH_COSINE_MARGIN:
                     route = "cosine"

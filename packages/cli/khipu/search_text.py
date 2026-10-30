@@ -78,9 +78,77 @@ def search_tokens(term: str, *, limit: int = MAX_TOKENS) -> list[str]:
 # prompt comes after them.
 PROMPT_TERMS_LIMIT = 48
 
+# A path, URL or command line names something to open or run, not what the
+# prompt is about: the 2026-10-30 replay of c78a418f pushed 413 rows on job
+# briefs with no memory to recall, admitted by rare words from the brief's
+# own file paths. Push weighs only the prompt's prose (``prose_text``).
+_FENCE_RE = re.compile(r"```.*?(?:```|\Z)", re.S)
+_TICK_RE = re.compile(r"`([^`\n]+)`")
+_URL_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://\S+")
+_EDGE_PUNCT = "\"'()[]{}<>,;:!?`"
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S")
+_FLAG_RE = re.compile(r"^--?[A-Za-z]")
+_EXT_RE = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,4}$")
+
+
+def _is_path(chunk: str) -> bool:
+    for sep in ("/", "\\"):
+        if sep not in chunk:
+            continue
+        if chunk.startswith(("/", "~", "./", "../", ".\\", "..\\")) or chunk.endswith(sep):
+            return True
+        if chunk.count(sep) >= 2 or _EXT_RE.search(chunk):
+            return True
+        if sep == "\\" and re.match(r"^[A-Za-z]:\\", chunk):
+            return True
+    return False
+
+
+def _is_shell(chunk: str) -> bool:
+    """A flag, an ``NAME=value`` assignment or a ``$`` expansion."""
+    return bool(_FLAG_RE.match(chunk) or _ASSIGN_RE.match(chunk) or chunk.startswith("$")
+                or "$(" in chunk or "${" in chunk)
+
+
+def _chunk_kind(raw: str) -> str:
+    chunk = raw.strip(_EDGE_PUNCT).rstrip(".")
+    if not chunk:
+        return "prose"
+    if _URL_RE.search(chunk) or _is_path(chunk):
+        return "path"
+    if _is_shell(chunk) or chunk in {"|", "||", "&&", ">", ">>", "2>&1"}:
+        return "shell"
+    return "prose"
+
+
+def prose_text(prompt: str) -> str:
+    """``prompt`` without code fences, paths, URLs and command lines.
+
+    A backtick span goes when it holds a path or a shell chunk (a bare
+    identifier in backticks is prose: it is often the subject). A line goes
+    whole when at least a third of its chunks, and at least two, are paths
+    or shell chunks; otherwise only those chunks go."""
+    text = _FENCE_RE.sub(" ", prompt or "")
+
+    def _tick(m: re.Match[str]) -> str:
+        inner = m.group(1)
+        return " " if any(_chunk_kind(c) != "prose" for c in inner.split()) else f" {inner} "
+
+    text = _TICK_RE.sub(_tick, text)
+    lines = []
+    for line in text.splitlines():
+        chunks = line.split()
+        kinds = [_chunk_kind(c) for c in chunks]
+        odd = sum(1 for k in kinds if k != "prose")
+        if odd >= 2 and 3 * odd >= len(chunks):
+            continue
+        lines.append(" ".join(c for c, k in zip(chunks, kinds) if k == "prose"))
+    return "\n".join(lines)
+
 
 def prompt_terms(prompt: str) -> list[str]:
-    return search_tokens(prompt, limit=PROMPT_TERMS_LIMIT)
+    """The prompt's prose words automatic push weighs a row against."""
+    return search_tokens(prose_text(prompt), limit=PROMPT_TERMS_LIMIT)
 
 
 def note_prompt_term_hits(row: dict[str, Any], text: str, terms: Sequence[str]) -> None:

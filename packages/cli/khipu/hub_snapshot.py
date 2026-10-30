@@ -4201,13 +4201,33 @@ def snapshot_project_group(con: sqlite3.Connection, project: str | None) -> tupl
 
 # How rare each word is in memory, for automatic push's coverage test. A
 # sample of the newest rows is enough for a rarity estimate and costs ~50 ms
-# to count; the table is kept per replica file for TERM_DF_MAX_AGE_S, since
-# a word's rarity hardly moves between catch-ups.
+# to count, too much for every prompt in the one-shot hook (no warm service).
+# So the count is kept on disk beside the replica (``term_df_path``), keyed
+# by the replica's freshness stamp (``_term_df_stamp``): the first reader
+# after a catch-up recounts, every other prompt reads its own few words from
+# that file in about a millisecond. The file holds a hash of each word and
+# its count, never the word, so it holds no capture text.
 TERM_DF_EPISODES = 3000
 TERM_DF_TOPICS = 500
-TERM_DF_MAX_AGE_S = 6 * 3600.0
 _TERM_DF_CACHE: dict[str, Any] = {}
 _TERM_DF_LOCK = threading.Lock()
+
+
+def term_df_path() -> Path:
+    path = snapshot_path()
+    return path.with_name(path.name + ".term-df")
+
+
+def _term_hash(word: str) -> int:
+    return int.from_bytes(hashlib.blake2b(word.encode("utf-8"), digest_size=8).digest(), "big", signed=True)
+
+
+def _term_df_stamp(path: Path) -> str:
+    """The replica file's identity and how current it is: a new dump or a
+    finished catch-up changes it. Without a freshness stamp the file's
+    modification time stands in."""
+    st = os.stat(path)
+    return f"{st.st_ino}|{caught_up_at() or st.st_mtime_ns}"
 
 
 def _count_term_df(con: sqlite3.Connection) -> tuple[int, dict[str, int]] | None:
@@ -4233,26 +4253,87 @@ def _count_term_df(con: sqlite3.Connection) -> tuple[int, dict[str, int]] | None
     return (n, df) if n else None
 
 
-def term_document_frequency(con: sqlite3.Connection | None = None) -> tuple[int, dict[str, int]] | None:
-    """``(documents counted, {word: documents naming it})`` over a sample of
-    the replica, or None without a readable replica. Opens the replica
-    read-only when ``con`` is None. Never raises."""
+def _read_term_df_file(stamp: str, terms: Sequence[str]) -> tuple[int, dict[str, int]] | None:
+    """``terms``' counts from the file on disk, or None when it is missing,
+    unreadable or was counted for another stamp."""
+    path = term_df_path()
+    if not path.is_file():
+        return None
     try:
-        path = str(snapshot_path())
-        if not Path(path).is_file():
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as con:
+            meta_rows = dict(con.execute("SELECT k, v FROM meta"))
+            if meta_rows.get("stamp") != stamp:
+                return None
+            by_hash = {_term_hash(t): t for t in terms}
+            df: dict[str, int] = {}
+            keys = list(by_hash)
+            for i in range(0, len(keys), 500):
+                part = keys[i:i + 500]
+                sql = f"SELECT h, n FROM df WHERE h IN ({','.join('?' * len(part))})"
+                for h, count in con.execute(sql, part):
+                    df[by_hash[h]] = int(count)
+            return int(meta_rows["docs"]), df
+    except (sqlite3.Error, KeyError, ValueError):
+        return None
+
+
+def _write_term_df_file(stamp: str, value: tuple[int, dict[str, int]]) -> None:
+    """Replace the file atomically: a reader sees the old table or the new."""
+    path = term_df_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    n, df = value
+    try:
+        with closing(sqlite3.connect(tmp)) as con:
+            con.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+            con.execute("CREATE TABLE df (h INTEGER PRIMARY KEY, n INTEGER) WITHOUT ROWID")
+            counts: dict[int, int] = {}
+            for word, count in df.items():
+                h = _term_hash(word)
+                counts[h] = max(counts.get(h, 0), count)
+            con.executemany("INSERT INTO df VALUES (?, ?)", counts.items())
+            con.executemany("INSERT INTO meta VALUES (?, ?)", [("stamp", stamp), ("docs", str(n))])
+            con.commit()
+        os.replace(tmp, path)
+    except (OSError, sqlite3.Error) as exc:
+        _log(f"term frequency file not written: {type(exc).__name__}: {exc}")
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def term_document_frequency(con: sqlite3.Connection | None = None,
+                            terms: Sequence[str] | None = None) -> tuple[int, dict[str, int]] | None:
+    """``(documents counted, {word: documents naming it})`` over a sample of
+    the replica, or None without a readable replica. With ``terms`` the dict
+    holds only those words (one missing from it names no document), read
+    from ``term_df_path`` when that was counted for this replica's stamp.
+    Opens the replica read-only when ``con`` is None. Never raises."""
+    try:
+        path = snapshot_path()
+        if not path.is_file():
             return None
-        key = (path, os.stat(path).st_ino)
-        now = time.monotonic()
+        stamp = _term_df_stamp(path)
         with _TERM_DF_LOCK:
-            if _TERM_DF_CACHE.get("key") == key and now - _TERM_DF_CACHE.get("at", -1e18) < TERM_DF_MAX_AGE_S:
-                return _TERM_DF_CACHE.get("value")
-            if con is None:
-                with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as own:
-                    value = _count_term_df(own)
+            if _TERM_DF_CACHE.get("key") == stamp:
+                value = _TERM_DF_CACHE.get("value")
             else:
-                value = _count_term_df(con)
-            _TERM_DF_CACHE.update({"key": key, "at": now, "value": value})
+                if terms is not None:
+                    read = _read_term_df_file(stamp, terms)
+                    if read is not None:
+                        return read
+                if con is None:
+                    with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as own:
+                        value = _count_term_df(own)
+                else:
+                    value = _count_term_df(con)
+                _TERM_DF_CACHE.update({"key": stamp, "value": value})
+                if value is not None:
+                    _write_term_df_file(stamp, value)
+        if value is None or terms is None:
             return value
+        n, df = value
+        return n, {t: df[t] for t in terms if t in df}
     except Exception as exc:  # noqa: BLE001 — no table means push falls back to plain coverage
         _log(f"term frequency table not read: {type(exc).__name__}: {exc}")
         return None
