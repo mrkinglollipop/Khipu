@@ -210,6 +210,14 @@ def apply_ranking(rows: list[dict[str, Any]], historical: bool = False) -> list[
         except (TypeError, ValueError):
             score = 0.0
         row["score"] = round(score * STATUS_DERANK, 6)
+        # The recency bonus inside the score shrinks with it, so the score
+        # floor (recall_prompt._floor_score: score minus recency) still sees
+        # the de-ranked relevance, never a negative number.
+        try:
+            if row.get("recency"):
+                row["recency"] = round(float(row["recency"]) * STATUS_DERANK, 6)
+        except (TypeError, ValueError):
+            row.pop("recency", None)
         changed = True
     if not changed:
         return rows

@@ -91,7 +91,7 @@ def _second_call_slow():
 
 
 def _strip_validity(rows: list[dict]) -> list[dict]:
-    return [{k: v for k, v in r.items() if k != "validity"} for r in rows]
+    return [{k: v for k, v in r.items() if k not in ("validity", "push_evidence")} for r in rows]
 
 
 class BothLegsOnTimeTest(unittest.TestCase):

@@ -2150,3 +2150,39 @@ def test_transport_oversize_repacks_the_reserved_changes(home, monkeypatch):
     assert not _marker().get("owed")
     assert _marker()["version"] == routing.read_view()["version"]
     assert _last_log().endswith(" routing=full")
+
+
+# ---- dispatched lanes: no automatic prior-work push ---------------------------------------------
+
+
+@pytest.mark.parametrize("value,dispatched", [("1", True), ("claude-second", True), ("0", False), ("", False), (None, False)])
+def test_dispatched_lane_variable_decides_whether_prior_work_is_pushed(home, monkeypatch, value, dispatched):
+    if value is None:
+        monkeypatch.delenv("CLAUDE_DISPATCHED_LANE", raising=False)
+    else:
+        monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", value)
+    assert recall_prompt.dispatched_lane() is dispatched
+    out = _cold(monkeypatch)
+    assert ("## Prior work" in _ctx(out)) is (not dispatched)
+    assert (" reason=dispatched lane " in _last_log()) is dispatched
+
+
+def test_dispatched_lane_skips_the_search_but_still_pushes_routing_and_logs(home, monkeypatch):
+    _record()
+    _push_on(monkeypatch)
+    monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", "1")
+    calls = []
+    monkeypatch.setattr(recall_prompt, "_search_hits", lambda *a, **k: calls.append(1) or {"hits": []})
+    out = _cold(monkeypatch)
+    assert calls == []
+    assert "## Prior work" not in _ctx(out) and FULL in _ctx(out)
+    line = _last_log()
+    assert "reason=dispatched lane" in line and "hits=[]" in line and "routing=" in line
+    assert recall_prompt._outcome_for("dispatched lane", []) == "gated"
+
+
+def test_dispatched_lane_is_read_from_the_hooks_environment_not_the_services(home, monkeypatch):
+    monkeypatch.delenv("CLAUDE_DISPATCHED_LANE", raising=False)
+    assert recall_prompt.dispatched_lane(recall_prompt.caller_environ({"CLAUDE_DISPATCHED_LANE": "1"}))
+    monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", "1")
+    assert not recall_prompt.dispatched_lane(recall_prompt.caller_environ({"KHIPU_HARNESS": "x"}))

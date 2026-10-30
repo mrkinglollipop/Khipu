@@ -1453,10 +1453,13 @@ class _ClaudeHomesCase(_TempHomeCase):
     inherits it) is cleared so no real home can ever be reached."""
 
     def setUp(self):
-        super().setUp()
+        # Snapshot the environment BEFORE the base class sets KHIPU_DATA_DIR:
+        # this cleanup runs after tearDown, so a later snapshot would restore
+        # the base class's value and leak it into every test that follows.
         env = mock.patch.dict(os.environ)
         env.start()
         self.addCleanup(env.stop)
+        super().setUp()
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
         self.default = self.home / ".claude"
         self.second = self.home / ".claude-t3-second"

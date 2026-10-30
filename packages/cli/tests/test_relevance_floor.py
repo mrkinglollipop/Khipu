@@ -142,10 +142,12 @@ def test_the_switch_defaults_off_and_the_capability_is_advertised():
 
 # ---- local prompt lane ---------------------------------------------------------
 
-def test_the_local_lane_returns_the_nearest_neighbours_with_the_switch_off(tmp_path):
+def test_the_local_lane_abstains_on_an_unrelated_prompt_with_the_switch_off(tmp_path):
+    # Automatic push has its own per-row evidence floor (recency.PUSH_COVERAGE,
+    # 2026-10-30): a nearest neighbour no longer survives with the switch off.
     with corpus.installed_corpus(tmp_path):
         result = rp.prior_work_for_prompt(UNRELATED, cwd=None)
-    assert result["hits"], "the gap this switch closes: a nearest neighbour survives the relative floor"
+    assert result["hits"] == []
 
 
 def test_the_local_lane_abstains_on_an_unrelated_prompt_with_the_switch_on(tmp_path, monkeypatch):
@@ -194,8 +196,10 @@ def test_a_failing_gate_costs_the_local_lane_nothing(tmp_path, monkeypatch):
     _on(monkeypatch)
     with corpus.installed_corpus(tmp_path):
         with mock.patch.object(relevance, "gate", side_effect=RuntimeError("bug")):
-            result = rp.prior_work_for_prompt(UNRELATED, cwd=None)
-    assert result["hits"], "fail open: the rows come back untouched"
+            result = rp.prior_work_for_prompt(
+                "what did we approve for the widget-batching endpoint pagination", cwd=None)
+    assert any(h["kind"] == "episode" and h["id"] == "1" for h in result["hits"]), \
+        "fail open: the gate's failure costs the lane nothing"
 
 
 # ---- budgeted hub lane ---------------------------------------------------------
@@ -220,27 +224,30 @@ def _hub(lex, cos, *, tokens=("gateway", "budget")):
         )
 
 
-def test_the_hub_lane_keeps_every_row_with_the_switch_off():
-    out = _hub([_lex("1", "gateway only")], [_cos("2", 0.3), _cos("3", 0.3)])
-    assert {h["id"] for h in out["hits"]} == {"1", "2", "3"}
+# The switch's gate is all or nothing; automatic push then keeps only the rows
+# that are evidence themselves (recency.apply_push_policy, 2026-10-30).
+
+def test_the_hub_lane_keeps_only_evidence_rows_with_the_switch_off():
+    out = _hub([_lex("1")], [_cos("2", 0.3), _cos("3", 0.3)])
+    assert {h["id"] for h in out["hits"]} == {"1"}
 
 
-def test_the_hub_lane_returns_the_whole_list_when_one_row_covers_the_query(monkeypatch):
+def test_the_hub_lane_keeps_the_row_that_covers_the_query(monkeypatch):
     _on(monkeypatch)
     out = _hub([_lex("1")], [_cos("2", 0.3), _cos("3", 0.3)])
-    assert {h["id"] for h in out["hits"]} == {"1", "2", "3"}
+    assert {h["id"] for h in out["hits"]} == {"1"}
 
 
-def test_the_hub_lane_returns_the_whole_list_when_one_row_has_a_high_cosine(monkeypatch):
+def test_the_hub_lane_keeps_the_row_with_a_high_cosine(monkeypatch):
     _on(monkeypatch)
     out = _hub([_lex("1", "gateway only")], [_cos("2", 0.3), _cos("4", 0.9)])
-    assert {h["id"] for h in out["hits"]} == {"1", "2", "4"}
+    assert {h["id"] for h in out["hits"]} == {"4"}
 
 
 def test_the_hub_lane_counts_keywords_on_a_cosine_only_row(monkeypatch):
     _on(monkeypatch)
     out = _hub([], [_cos("2", 0.3, rank_text="the gateway budget plan"), _cos("3", 0.3)])
-    assert {h["id"] for h in out["hits"]} == {"2", "3"}
+    assert {h["id"] for h in out["hits"]} == {"2"}
 
 
 def test_the_hub_lane_abstains_when_one_common_word_is_all_there_is(monkeypatch):

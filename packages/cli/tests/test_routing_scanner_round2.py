@@ -83,7 +83,7 @@ def test_replica_write_and_search_only_carry_boolean(monkeypatch, tmp_path, capl
     assert topic == before
     stored_body, fm = con.execute('SELECT body, frontmatter FROM topics').fetchone()
     assert stored_body == body  # The existing body column is unchanged.
-    assert json.loads(fm) == {**topic['frontmatter'], '_routing_state_claim': True}
+    assert json.loads(fm) == {**topic['frontmatter'], '_routing_state_claim': True, '_page_chars': len(body)}
     assert 'BODY_ONLY_CANARY' not in fm
     no_body_reads(con)
     calls = []

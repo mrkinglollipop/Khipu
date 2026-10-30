@@ -32,7 +32,8 @@ _LEDGER = "the work ledger's own rows and outcomes, not captures"
 _ROUTING = "the account routing record and its views, not captures"
 _NOTES = "memory notes and their index, written by the owner and models, not capture sources"
 _TOOLS = "a downloaded tool, a gate fixture or a scratch drill folder, not captures"
-_REPLICA_META = "replica bookkeeping: meta, freshness, erasure and purge markers holding ids or hashes"
+_REPLICA_META = ("replica bookkeeping: meta, freshness, erasure and purge markers, "
+                 "holding ids or hashes")
 _REGISTRY = "the forgotten-source registry: identities and ids, never text"
 
 NOT_CAPTURE = {
@@ -156,6 +157,15 @@ NOT_CAPTURE = {
                      "hub_snapshot._write_last_known", "hub_snapshot._write_meta",
                      "hub_snapshot._queue_missed_patch", "hub_snapshot._clear_missed_patches"),
                     _REPLICA_META),
+    # hub_snapshot.sqlite.term-df: keyed hashes of words in live replica rows
+    # and their counts, never a word. It is rebuilt whenever the replica is
+    # written or a forget is registered or queued, which leaves out the
+    # forgotten rows; it is private to the owner and a backup never carries it.
+    **dict.fromkeys(("hub_snapshot._write_term_df_file", "hub_snapshot._private_temp"),
+                    "word-rarity table: keyed (HMAC) word hashes and document counts over live replica "
+                    "rows only; rebuilt on any replica write or forget; 0600; never in a backup"),
+    "hub_snapshot._term_df_key": "the word-rarity table's per-install random key, 0600; no capture text; "
+                                 "never in a backup",
     **dict.fromkeys(("tombstones._atomic_write", "tombstones._locked_registry",
                      "tombstones.publish_identities", "tombstones.drop_episode_id"), _REGISTRY),
 }
