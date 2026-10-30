@@ -623,3 +623,77 @@ def test_offline_guard_refuses_udp_dns_and_a_spawned_process():
         with pytest.raises(PermissionError):
             os.posix_spawn("/usr/bin/true", ["true"], os.environ)
         assert guard.refused["network"] == 1 and guard.refused["process"] == 1
+
+
+def test_ctypes_import_is_refused_counted_and_restored():
+    import sys
+
+    import ctypes  # noqa: F401  (already imported: must be purged, then restored)
+
+    original = sys.modules["ctypes"]
+    with ren._offline() as guard:
+        assert "ctypes" not in sys.modules
+        for name in ("ctypes", "_ctypes", "cffi", "_cffi_backend"):
+            with pytest.raises(ImportError, match="refused"):
+                __import__(name)
+        assert guard.refused["native"] == 4
+    assert sys.modules["ctypes"] is original
+    assert not any(type(f).__name__ == "_NativeBlocker" for f in sys.meta_path)
+
+
+_LIBC_SENDTO = (
+    "import socket, struct, ctypes, ctypes.util\n"
+    "libc = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)\n"
+    "fd = libc.socket(2, 2, 0)\n"
+    "sa = struct.pack('BBH4s8s', 16, 2, socket.htons(9), bytes([127, 0, 0, 1]), b'\\0' * 8)\n"
+    "print('RESULT', libc.sendto(fd, b'x', 1, 0, sa, 16))\n"
+)
+
+
+def test_os_sandbox_blocks_a_direct_libc_sendto():
+    import subprocess
+    import sys
+
+    if ren._sandbox_mode() != "os":
+        pytest.skip("sandbox-exec unavailable here")
+    plain = subprocess.run([sys.executable, "-I", "-c", _LIBC_SENDTO], capture_output=True, text=True)
+    boxed = subprocess.run([ren.SANDBOX_EXEC, "-p", ren.SANDBOX_PROFILE, sys.executable, "-I", "-c",
+                            _LIBC_SENDTO], capture_output=True, text=True)
+    assert "RESULT 1" in plain.stdout  # the call itself works without the sandbox
+    assert "RESULT -1" in boxed.stdout
+
+
+def _child_probe_native(out):
+    def probe(entry, path, **_k):
+        import socket
+
+        res = {}
+        try:
+            import ctypes  # noqa: F401
+            res["ctypes"] = "imported"
+        except ImportError:
+            res["ctypes"] = "refused"
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.sendto(b"x", ("127.0.0.1", 9))
+            res["sendto"] = "sent"
+        except OSError:
+            res["sendto"] = "refused"
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(res, f)
+        return {"expect_none": False, "hit": True, "reciprocal_rank": 1.0, "abstain_correct": True,
+                "stale_violation": False, "timeout": False, "error": False, "degraded": None,
+                "outcome": "match", "ms": 1.0, "payload_chars": 1}
+
+    recall_eval.eval_one_path = probe
+
+
+def test_scoring_child_runs_sandboxed_and_refuses_ctypes(world, tmp_path):
+    out = tmp_path / "probe.json"
+    _, golden = world
+    _write_golden(golden, [{"query": "q0", "expect": ["1"]}])
+    rec = ren.run_nightly_eval(golden=golden, child_setup=(_child_probe_native, (str(out),)))
+    assert rec["ok"] and rec["scored"] == 1
+    assert rec["sandbox"] in ("os", "python-only")
+    assert rec["offline"]["native"] >= 1
+    assert json.loads(out.read_text()) == {"ctypes": "refused", "sendto": "refused"}

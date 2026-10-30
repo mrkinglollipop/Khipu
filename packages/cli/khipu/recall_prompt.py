@@ -2686,7 +2686,7 @@ def _search_hits(
         )
     except Exception as exc:
         if hub_snapshot.hub_connection_failed(exc):
-            hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+            hub_reach.note_unreachable(type(exc).__name__)
         raise
     hub_reach.note_reachable()
     rows = _apply_score_floor(payload.get("results") or [])
@@ -3566,7 +3566,7 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None,
         try:
             local = _replica_deliverable_line(project, tokens, stale_box=stale_box)
         except Exception as exc:  # noqa: BLE001 — an unusable replica falls back to the hub
-            _log(f"deliverable replica unusable ({type(exc).__name__}: {exc})")
+            _log(f"deliverable replica unusable ({type(exc).__name__})")
             local = None
         if local is not None:
             return local
@@ -3583,7 +3583,7 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None,
                     cur, tokens, project=project
                 ) or ""
     except Exception as exc:  # noqa: BLE001 — fail open, same as _search_hits callers
-        _log(f"deliverable line skipped ({type(exc).__name__}: {exc})")
+        _log(f"deliverable line skipped ({type(exc).__name__})")
         return ""
 
 

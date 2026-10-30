@@ -13,6 +13,15 @@ and the child is killed at the deadline: a lookup thread that outlives the
 deadline dies with the child, so it can never reach a real exit after the
 guard would have come off, and the step returns by deadline + KILL_GRACE_S.
 
+Threat model: the guard defends against Khipu's OWN code reaching the network
+or a helper process by mistake (a provider, an HTTP client, a fallback path),
+not against adversarial code. Two layers: Python-level patches of every exit
+(``GUARDED_EXITS``) plus a refusal to import ``ctypes``/``cffi`` (``NATIVE_MODULES``),
+which would otherwise call libc ``sendto`` past the patches; and, when
+``/usr/bin/sandbox-exec`` exists and a probe shows it works, the child runs
+under ``(deny network*)`` so even a native call fails. The run record's
+``sandbox`` is ``os`` or ``python-only`` accordingly.
+
 ``<data dir>/state/recall-eval-history.json`` keeps the last 30 run records:
 figures, counts and the golden file's size and mtime. It never holds a query
 or an id, so it is not owner text and forget has nothing to scan in it.
@@ -96,7 +105,27 @@ class _Offline:
     """What the offline guard refused during one run, by kind. Counts only."""
 
     def __init__(self) -> None:
-        self.refused = {"hub": 0, "embed": 0, "network": 0, "process": 0}
+        self.refused = {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0}
+
+
+# Foreign-function modules that reach libc directly, past every patch below.
+NATIVE_MODULES = ("ctypes", "_ctypes", "cffi", "_cffi_backend")
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+SANDBOX_PROFILE = "(version 1)(allow default)(deny network*)"
+
+
+class _NativeBlocker:
+    """Meta-path finder that refuses the foreign-function modules and counts
+    each refusal."""
+
+    def __init__(self, guard: _Offline) -> None:
+        self.guard = guard
+
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in NATIVE_MODULES:
+            self.guard.refused["native"] += 1
+            raise ImportError(f"{name} refused: the recall eval runs offline")
+        return None
 
 
 # Every exit that can leave this process, as (object path, attribute, kind).
@@ -187,9 +216,18 @@ def _offline():
     for obj, name, fake in targets:
         if hasattr(obj, name):
             setattr(obj, name, fake)
+    # Already-imported foreign-function modules come out of sys.modules so a
+    # re-import reaches the finder; the originals go back on exit.
+    purged = {m: sys.modules.pop(m) for m in list(sys.modules)
+              if m.split(".")[0] in NATIVE_MODULES}
+    blocker = _NativeBlocker(guard)
+    sys.meta_path.insert(0, blocker)
     try:
         yield guard
     finally:
+        with contextlib.suppress(ValueError):
+            sys.meta_path.remove(blocker)
+        sys.modules.update(purged)
         for obj, name, real in saved:
             setattr(obj, name, real)
 
@@ -361,6 +399,45 @@ def _quiet_excepthooks() -> None:
     sys.excepthook = lambda exc_type, _value, _tb: note(exc_type)
 
 
+_SANDBOX_PROBE = (
+    "import socket\n"
+    "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n"
+    "try:\n"
+    "    s.sendto(b'x', ('127.0.0.1', 9))\n"
+    "except OSError:\n"
+    "    print('blocked')\n"
+)
+_sandbox_cache: dict[str, str] = {}
+
+
+def _sandbox_mode() -> str:
+    """``os`` when sandbox-exec exists and a probe under it both starts Python
+    and finds a loopback UDP send refused; otherwise ``python-only``."""
+    if "mode" not in _sandbox_cache:
+        mode = "python-only"
+        if os.path.exists(SANDBOX_EXEC):
+            try:
+                out = subprocess.run(
+                    [SANDBOX_EXEC, "-p", SANDBOX_PROFILE, sys.executable, "-I", "-c", _SANDBOX_PROBE],
+                    capture_output=True, text=True, timeout=30)
+                if out.returncode == 0 and out.stdout.strip() == "blocked":
+                    mode = "os"
+            except (OSError, subprocess.SubprocessError):
+                pass
+        _sandbox_cache["mode"] = mode
+    return _sandbox_cache["mode"]
+
+
+def _sandbox_wrapper(tmp: str) -> str:
+    """A script that runs the interpreter under sandbox-exec, for spawn to use
+    as the child's executable."""
+    wrapper = Path(tmp) / "python-sandboxed"
+    wrapper.write_text(f"#!/bin/sh\nexec '{SANDBOX_EXEC}' -p '{SANDBOX_PROFILE}' "
+                       f"'{sys.executable}' \"$@\"\n")
+    wrapper.chmod(0o700)
+    return str(wrapper)
+
+
 def _child_main(conn, scoring: list[dict[str, Any]], deadline: float,
                 setup: tuple[Callable[..., Any], tuple] | None) -> None:
     """The scoring child. ``deadline`` is a ``time.monotonic`` value, which is
@@ -396,7 +473,7 @@ def _child_main(conn, scoring: list[dict[str, Any]], deadline: float,
 
 
 def _run_child(scoring: list[dict[str, Any]], deadline: float,
-               setup: tuple[Callable[..., Any], tuple] | None):
+               setup: tuple[Callable[..., Any], tuple] | None, sandbox: str = "python-only"):
     """Yield the child's messages until it finishes or deadline + grace,
     then kill it. Yields ``("killed", None)`` when it had to be killed and
     ``("exited", exitcode)`` when it ended without a final message."""
@@ -404,7 +481,20 @@ def _run_child(scoring: list[dict[str, Any]], deadline: float,
     recv, send = ctx.Pipe(duplex=False)
     proc = ctx.Process(target=_child_main, args=(send, scoring, deadline, setup),
                        name="khipu-recall-eval", daemon=True)
-    proc.start()
+    from multiprocessing import spawn
+
+    wrapper_dir = tempfile.TemporaryDirectory(prefix="khipu-recall-eval-") if sandbox == "os" else None
+    previous = spawn.get_executable()
+    try:
+        if wrapper_dir is not None:
+            spawn.set_executable(_sandbox_wrapper(wrapper_dir.name))
+        proc.start()
+    except BaseException:
+        if wrapper_dir is not None:
+            wrapper_dir.cleanup()
+        raise
+    finally:
+        spawn.set_executable(previous)
     send.close()
     hard = deadline + KILL_GRACE_S
     final = False
@@ -425,6 +515,8 @@ def _run_child(scoring: list[dict[str, Any]], deadline: float,
             proc.kill()
         proc.join(KILL_GRACE_S)
         recv.close()
+        if wrapper_dir is not None:
+            wrapper_dir.cleanup()
     if not final:
         yield ("killed", None) if killed else ("exited", proc.exitcode)
 
@@ -494,10 +586,11 @@ def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, 
 
     deadline = time.monotonic() + budget_s
     rows: dict[str, list[dict[str, Any]]] = {p: [] for p in MEASURED_PATHS}
-    refused = {"hub": 0, "embed": 0, "network": 0, "process": 0}
+    refused = {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0}
     record["stopped_child"] = False
     if scoring and time.monotonic() < deadline:
-        for msg in _run_child(scoring, deadline, child_setup):
+        record["sandbox"] = _sandbox_mode()
+        for msg in _run_child(scoring, deadline, child_setup, record["sandbox"]):
             kind = msg[0]
             if kind in ("entry", "bad", "stop", "done"):
                 refused = msg[-1]
