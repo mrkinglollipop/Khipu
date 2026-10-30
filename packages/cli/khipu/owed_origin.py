@@ -52,7 +52,9 @@ def _rows(cur, project=None, *, ids=None, lock=False):
         row.update(lineage=parent, session=session, episode_deleted=deleted,
                    ownership_floor=ownership_floor, migration_at=cutoff, has_claims=claims, conflicting_claims=conflict, history=history)
         rows.append(row)
-    return rows
+    # The hub's deleted_at lags this Mac's forget list; an unreadable list
+    # plans and changes nothing tied to an episode.
+    return co._fenced_owed_rows(rows)
 
 
 def _ownership_established(row):

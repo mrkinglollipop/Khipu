@@ -84,6 +84,7 @@ def _claim_identities(cur, project: Any, items: list[tuple[str, str | None, str 
 
 
 def insert_deliverables_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
+    # forget-fence: a writer; returns a count
     """One row per item in ``payload['deliverables']`` (the shape
     ``khipu.extract.extract_deliverables`` returns). Dedup: the same
     (project, kind, path, url) already on file is skipped; title identifies
@@ -166,6 +167,7 @@ def _not_forgotten_clause(cur) -> str | None:
 
 
 def recent_deliverables(cur, *, project: str, limit: int = 200) -> list[dict[str, Any]]:
+    # forget-fence source: deliverables.line_from_rows fences the produced line
     if not project or not _deliverables_ready(cur):
         return []
     forgotten_clause = _not_forgotten_clause(cur)
@@ -180,6 +182,7 @@ def recent_deliverables(cur, *, project: str, limit: int = 200) -> list[dict[str
 
 
 def deliverables_for_episode(cur, episode_id: int) -> list[dict[str, Any]] | None:
+    # forget-fence: replica copy and sync writer; the replica's readers apply forget_fence_sql
     """The rows the hub holds for one episode, or None when the table is not
     there (or the read fails). Runs in a SAVEPOINT so a failure cannot abort
     the caller's transaction. Used to mirror them into the local replica."""
@@ -247,14 +250,19 @@ def line_from_rows(
 ) -> str | None:
     """The "You produced ..." line for rows already read (newest first), or
     None. The one place the match rule and the rendering live, so the hub
-    reader and the replica reader cannot drift apart."""
-    match = best_match_for_tokens(rows, prompt_tokens, min_hits=min_hits)
+    reader and the replica reader cannot drift apart. Rows of an episode on
+    the forget list or queued for erasure never match; none do when that
+    list cannot be read."""
+    from khipu.tombstones import withhold
+
+    match = best_match_for_tokens(withhold(rows), prompt_tokens, min_hits=min_hits)
     return format_produced_line(match) if match else None
 
 
 def deliverable_line_for_prompt(
     cur, prompt_tokens: Sequence[str], *, project: str | None, min_hits: int = 2
 ) -> str | None:
+    # forget-fence: builds its line through line_from_rows, which fences it
     """The "You produced …" line for a prompt, or None. Never raises."""
     if not project or not prompt_tokens:
         return None

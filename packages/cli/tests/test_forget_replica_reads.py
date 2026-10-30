@@ -285,5 +285,6 @@ class PendingCaptureOfAForgottenSourceStaysHiddenOfflineTest(unittest.TestCase):
         found = self.summaries()
         self.assertNotIn(self.PENDING_LIVE["summary"], found)
         self.assertNotIn(self.PENDING_GONE["summary"], found)
+        # As the MCP search: an unreadable forget list shows no episode row.
         out = hs.search_stale_payload("alpha billing", 20)
-        self.assertTrue(any(str(r.get("id")) == "1" for r in out["results"]), out["results"])
+        self.assertFalse(any(r.get("kind") == "episode" for r in out["results"]), out["results"])

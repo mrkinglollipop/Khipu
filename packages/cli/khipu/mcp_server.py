@@ -1253,7 +1253,9 @@ def _positive_id(value, field: str) -> int:
 
 
 def _detail_response(kind: str, row: dict, **metadata) -> dict:
-    row = dict(row)
+    from khipu.tombstones import withhold_detail
+
+    row = withhold_detail(dict(row))
     if kind == "episode":
         row.pop("raw", None)
     return {"kind": kind, **row, **metadata}
@@ -1317,9 +1319,10 @@ def _tool_search(args: dict) -> dict:
             since=since, until=until, project=project, session_id=session_id,
             harness=harness, t3_thread=t3_thread, via=via, tz=tz,
         )
-    from khipu.tombstones import without_hidden_episodes
+    from khipu.tombstones import withhold
 
-    payload["results"] = without_hidden_episodes(payload.get("results") or [])
+    # An unreadable forget list hides every row that touches an episode.
+    payload["results"] = withhold(payload.get("results") or [], fail_closed=False)
     query_log.log_query(
         query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
@@ -1370,9 +1373,9 @@ def _tool_get(args: dict) -> dict:
     if inferred is None:
         inferred = "episode" if ident.isdigit() else "topic"
     if inferred == "episode" and ident.isdigit():
-        from khipu.tombstones import episode_hidden
+        from khipu.tombstones import episode_withheld
 
-        if episode_hidden(ident):
+        if episode_withheld(ident):
             raise ValueError(f"episode not found: {ident}")
 
     hub_failed = False
@@ -1947,6 +1950,9 @@ def owed_listing(args: dict, *, hub_ages: bool = False) -> dict:
         project, rows = read["project"], read["rows"]
         canonical, project_names = read["canonical"], read["group"]
         stale = stale_fields()
+    # This Mac's forget list, whichever store answered: the hub learns of a
+    # forget after the list does.
+    rows = commitments._fenced_owed_rows(rows)
     directions = _routing_direction_rows(status, direction_filters, projects=project_names,
                                          canonical=canonical, items=direction_items)
     page = commitments.page_owed(rows + directions, **filters, limit=limit)
@@ -2432,6 +2438,11 @@ def _tool_decisions(args: dict) -> dict:
         out = offline_reads.decisions(project, since, status, limit)
         if out is None:
             raise
+    from khipu.tombstones import withhold
+
+    # The hub learns of a forget after this Mac's list does; an unreadable
+    # list shows no decision tied to an episode.
+    out["results"] = withhold(out["results"], fail_closed=False)
     if status != "conflicts":
         out.update(owner_writes.annotate(out["results"], "decisions_update"))
     return out

@@ -100,6 +100,7 @@ def _legacy_drift_errors(memory_root: Path) -> list[str]:
 
 def episodes_missing_in_pg(cur, keys: list[tuple[str, str]], *,
                            live_only: bool = False) -> list[tuple[str, str]]:
+    # forget-fence: the mirror's drift keys (ts, summary hash), no text
     """File-episode keys with no PG row — the directional drift signal.
 
     P2b replaced count-delta drift (pg - file) with this check: PG legitimately
@@ -466,8 +467,11 @@ def status_payload(
     }
     try:
         from khipu.activity import recent_episodes
+        from khipu.tombstones import withhold
 
-        out["recent_captures"] = recent_episodes(limit=5)
+        recent = recent_episodes(limit=5)
+        kept = {str(r["id"]) for r in withhold([{"kind": "episode", "id": e.get("id")} for e in recent])}
+        out["recent_captures"] = [e for e in recent if str(e.get("id")) in kept]
     except Exception as exc:  # noqa: BLE001 — status must stay resilient
         out["recent_captures_error"] = str(exc)
     try:
@@ -528,6 +532,7 @@ def _table_exists(cur, table: str) -> bool:
 
 
 def _one_episode_session_ratio(cur) -> dict:
+    # forget-fence: a doctor ratio
     cur.execute(
         """
         WITH s AS (
@@ -549,6 +554,7 @@ def _one_episode_session_ratio(cur) -> dict:
 
 
 def _cross_session_pairs_5min(cur) -> dict:
+    # forget-fence: a doctor ratio
     has_project = _has_column(cur, "episodes", "project")
     has_parent = _has_column(cur, "episodes", "parent_session_id")
     if not (has_project and has_parent):
@@ -595,6 +601,7 @@ def _cross_session_pairs_5min(cur) -> dict:
 
 
 def _dangling_topic_ratio(cur) -> dict:
+    # forget-fence: a doctor ratio
     if not _has_column(cur, "episodes", "tags"):
         return _metric(None, 0.05, ok=True, note="episodes.tags not present yet (pre-0010)")
     cur.execute(
@@ -627,6 +634,7 @@ def _junk_path_ratio(cur) -> dict:
 
 
 def _commitments_counts(cur) -> tuple[dict, dict]:
+    # forget-fence: doctor counts
     if not _table_exists(cur, "commitments"):
         na = _metric(None, None, ok=True, note="commitments table not present yet (pre-0009)")
         return na, na

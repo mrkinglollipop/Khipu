@@ -472,12 +472,7 @@ def _child_entry() -> None:
         _quiet_excepthooks()
         scoring, deadline, ref = payload["entries"], payload["deadline"], payload["setup"]
         if ref is not None:
-            import importlib
-
-            target: Any = importlib.import_module(ref[0])
-            for part in ref[1].split("."):
-                target = getattr(target, part)
-            target(*ref[2])
+            _resolve(f"{ref[0]}.{ref[1]}")(*ref[2])
         with _offline() as guard:
             try:
                 for entry in scoring:

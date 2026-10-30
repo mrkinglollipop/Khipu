@@ -75,6 +75,7 @@ def owed_resolve_project_known(project: str | None) -> tuple[str | None, bool]:
 
 
 def _cited_forgotten(con, rows: list[dict[str, Any]]) -> set[Any]:
+    # forget-fence: returns the ids whose suggestion is blanked
     """Ids of ``rows`` whose ``settle_suggestion`` cites, as its evidence, an
     episode the replica holds forgotten or queued for erasure, or a decision
     of one, or cites a decision without naming its source episode: that

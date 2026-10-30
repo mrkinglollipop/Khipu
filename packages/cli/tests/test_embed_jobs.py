@@ -203,7 +203,7 @@ class MemoryBackfillJobHookTest(unittest.TestCase):
         conn = te._BackfillConn(cur)
         calls = {"n": 0}
 
-        def _embed(api, profile, retries=None, delay=None):
+        def _embed(api, profile, retries=None, delay=None, recheck=None):
             calls["n"] += 1
             return [[0.0] * embed.DIM for _ in api]
 
@@ -233,7 +233,7 @@ class MemoryBackfillJobHookTest(unittest.TestCase):
         cur = te._BackfillCursor(rows)
         job = StubJob()
 
-        def _embed(api, profile, retries=None, delay=None):
+        def _embed(api, profile, retries=None, delay=None, recheck=None):
             raise RuntimeError("embed HTTP 500: nope")
 
         with mock.patch("khipu.db.connect", return_value=te._BackfillConn(cur)), \

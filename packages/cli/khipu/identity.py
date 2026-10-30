@@ -275,6 +275,7 @@ def resolve_project_name(cur, project: str | None) -> str | None:
 
 def resolve_project(cur, project: str | None, *,
                     also_visible: Iterable[str] = ()) -> tuple[str | None, bool]:
+    # forget-fence: resolves the name the caller typed; the rows it scopes are fenced where read
     """``resolve_project_name`` and whether the answer is a visible project.
     ``False`` means an unknown name -- including an exact alias of a project
     that exists only through forgotten episodes -- which a caller must not

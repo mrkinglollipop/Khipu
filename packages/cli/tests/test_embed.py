@@ -544,10 +544,15 @@ class _CatchupCursor:
             self._result = []
         elif "FROM commitments c WHERE c.status = 'open'" in s:
             self._result = self.commitment_rows
+        elif s.startswith("SELECT id, opened_episode, closed_episode FROM commitments"):
+            # The chokepoint's source lookup: a commitment with no episode is
+            # unprovenanced and never sent, so these are opened in live episode 904.
+            self._result = [(cid, 904, None) for cid, _text in self.commitment_rows if cid in params[0]]
         elif s.startswith("SELECT id, opened_episode FROM commitments"):
-            # These fixtures represent open commitments without an episode.
             # The post-provider lock reads their parent as well as their id.
-            self._result = [(cid, None) for cid, _text in self.commitment_rows if cid in params[0]]
+            self._result = [(cid, 904) for cid, _text in self.commitment_rows if cid in params[0]]
+        elif s.startswith("SELECT id FROM episodes") and "FOR SHARE" in s:
+            self._result = [(904,)]
         elif "FROM topics t WHERE t.deleted_at IS NULL" in s:
             self._result = [(slug, title, body, {"slug": slug, "title": title, "body": body})
                             for slug, title, body in self.topic_rows]
@@ -681,7 +686,7 @@ class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
         with mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch.object(em, "_active_profile", return_value="prof-1"), \
                 mock.patch.object(em, "embed_batch",
-                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+                                   side_effect=lambda api, profile, **_kw: [[0.0] * em.DIM for _ in api]):
             out = em.embed_recent_missing(limit=10)
         return out, cur
 
@@ -731,7 +736,7 @@ class EmbedRecentMissingCommitmentsTest(unittest.TestCase):
         with mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch.object(em, "_active_profile", return_value="prof-1"), \
                 mock.patch.object(em, "embed_batch",
-                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]), \
+                                   side_effect=lambda api, profile, **_kw: [[0.0] * em.DIM for _ in api]), \
                 mock.patch("khipu.hub_snapshot.upsert_embeddings",
                            return_value={"ok": True}) as m_snap:
             em.embed_recent_missing(limit=10)
@@ -818,7 +823,7 @@ class BackfillPerChunkIsolationTest(unittest.TestCase):
         conn = _BackfillConn(cur)
         calls = {"n": 0}
 
-        def _embed(api, profile, retries=None, delay=None):
+        def _embed(api, profile, retries=None, delay=None, recheck=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("embed HTTP 500: server error")
@@ -840,7 +845,7 @@ class BackfillPerChunkIsolationTest(unittest.TestCase):
         cur = _BackfillCursor(rows)
         conn = _BackfillConn(cur)
 
-        def _embed(api, profile, retries=None, delay=None):
+        def _embed(api, profile, retries=None, delay=None, recheck=None):
             raise RuntimeError("Gemini API key not found (Keychain / env / file)")
 
         with mock.patch("khipu.db.connect", return_value=conn), \
@@ -906,7 +911,7 @@ class BackfillPerChunkIsolationTest(unittest.TestCase):
         cur = _BackfillCursor(rows)
         conn = _BackfillConn(cur)
 
-        def _embed(api, profile, retries=None, delay=None):
+        def _embed(api, profile, retries=None, delay=None, recheck=None):
             raise RuntimeError("budget exhausted for today")
 
         with mock.patch("khipu.db.connect", return_value=conn), \
@@ -931,7 +936,7 @@ class EmbedRecentMissingTopicsTest(unittest.TestCase):
         with mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch.object(em, "_active_profile", return_value="prof-1"), \
                 mock.patch.object(em, "embed_batch",
-                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]):
+                                   side_effect=lambda api, profile, **_kw: [[0.0] * em.DIM for _ in api]):
             out = em.embed_recent_missing(limit=10)
         return out, cur
 
@@ -985,7 +990,7 @@ class EmbedRecentMissingTopicsTest(unittest.TestCase):
         with mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch.object(em, "_active_profile", return_value="prof-1"), \
                 mock.patch.object(em, "embed_batch",
-                                   side_effect=lambda api, profile: [[0.0] * em.DIM for _ in api]), \
+                                   side_effect=lambda api, profile, **_kw: [[0.0] * em.DIM for _ in api]), \
                 mock.patch("khipu.hub_snapshot.upsert_embeddings",
                            return_value={"ok": True}) as m_snap:
             em.embed_recent_missing(limit=10)
@@ -1232,6 +1237,8 @@ class BackfillCommitmentKindTest(unittest.TestCase):
             self.statements.append(s)
             if "information_schema.columns" in s:
                 self._result = [(c,) for c in ("id", "summary", "deleted_at")]
+            elif s.startswith("SELECT id, opened_episode, closed_episode FROM commitments"):
+                self._result = [(7, 904, None), (8, 904, None)]
             elif "FROM commitments" in s:
                 self._result = [(7, "ship the merge fix"), (8, "   ")]
             elif "FROM episodes" in s:

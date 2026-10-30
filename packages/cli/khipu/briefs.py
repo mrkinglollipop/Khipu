@@ -159,6 +159,7 @@ def source_hash(entries: list[tuple[int, str, str]]) -> str:
 
 
 def _decision_rows(cur, episode_ids: list[int], *, with_text: bool = False) -> dict[int, list[dict[str, Any]]]:
+    # forget-fence source: decision rows for the episode ids its caller passes; callers fence those ids
     """Decision rows per episode, each with its ``state`` (current |
     superseded | retracted). Empty when the decisions table is absent."""
     from khipu import decisions
@@ -262,7 +263,16 @@ def plan(cur, *, retry_failed: bool = False) -> dict[str, Any]:
         "ORDER BY t.slug, e.ts DESC, e.id DESC"
     )
     per_topic: dict[str, list[tuple[int, str, int]]] = {}
-    for slug, eid, ingested_at, summary_md5, summary_len in cur.fetchall():
+    from khipu import tombstones
+
+    fetched = cur.fetchall()
+    # Episodes on this Mac's forget list or erasure queue contribute nothing to
+    # any topic's row; an unreadable list plans no topic at all.
+    kept = {str(r["id"]) for r in tombstones.withhold(
+        [{"kind": "episode", "id": int(r[1])} for r in fetched])}
+    for slug, eid, ingested_at, summary_md5, summary_len in fetched:
+        if str(int(eid)) not in kept:
+            continue
         per_topic.setdefault(slug, []).append(
             (int(eid), _revision(ingested_at, summary_md5 or ""), int(summary_len or 0))
         )
@@ -321,8 +331,11 @@ def plan(cur, *, retry_failed: bool = False) -> dict[str, Any]:
 def _gather(cur, slug: str) -> dict[str, Any]:
     """The topic's live source episodes: the fingerprint over all of them, and
     the newest cleaned subset (within ``MAX_SOURCE_CHARS``) offered to the
-    model."""
-    from khipu import decisions, redact
+    model. Episodes on this Mac's forget list or queued for erasure are fenced
+    out before anything is read from them, so none reaches the summariser;
+    ``fence_unreadable`` is True when the list could not be read (then no
+    episode is kept)."""
+    from khipu import decisions, redact, tombstones
 
     project = "e.project" if _has(cur, "episodes", "project") else "NULL"
     cur.execute(
@@ -331,6 +344,14 @@ def _gather(cur, slug: str) -> dict[str, Any]:
         (slug,),
     )
     episodes = cur.fetchall()
+    fence_unreadable = False
+    try:
+        tombstones.withheld_episode_ids()
+    except Exception:  # noqa: BLE001 - an unreadable forget list keeps no episode
+        fence_unreadable = True
+    kept_ids = {str(r["id"]) for r in tombstones.withhold(
+        [{"kind": "episode", "id": int(r[0])} for r in episodes])}
+    episodes = [r for r in episodes if str(int(r[0])) in kept_ids]
     registry_ready = decisions._decisions_ready(cur)
     decision_rows = _decision_rows(cur, [int(r[0]) for r in episodes], with_text=True)
 
@@ -365,6 +386,7 @@ def _gather(cur, slug: str) -> dict[str, Any]:
         "count": len(entries),
         "offered": offered,
         "project": max(projects, key=projects.get) if projects else None,
+        "fence_unreadable": fence_unreadable,
     }
 
 
@@ -433,6 +455,7 @@ def _model_label() -> str | None:
 
 
 def _current_row(cur, slug: str) -> dict[str, Any] | None:
+    # forget-fence: the stored brief's id, hash and state for the staleness check
     cur.execute(
         "SELECT id, source_hash, state, derivation_version FROM briefs "
         "WHERE topic_slug = %s AND superseded_at IS NULL AND state IN ('current', 'stale') "
@@ -496,6 +519,8 @@ def build_one(cur, topic_slug: str) -> dict[str, Any]:
     if not _ready(cur):
         return {"topic": topic_slug, "status": "unavailable", "reason": REASON_TABLE_MISSING}
     gathered = _gather(cur, topic_slug)
+    if gathered["fence_unreadable"]:
+        return {"topic": topic_slug, "status": "withheld", "reason": "forget list unreadable"}
     if not gathered["offered"]:
         return {"topic": topic_slug, "status": "no_sources", "sources": gathered["count"]}
     have = _current_row(cur, topic_slug)
@@ -503,9 +528,17 @@ def build_one(cur, topic_slug: str) -> dict[str, Any]:
             and have["version"] == DERIVATION_VERSION):
         return {"topic": topic_slug, "status": "unchanged", "brief_id": have["id"]}
 
-    from khipu import extract
+    from khipu import extract, provider_text
 
-    prompt = PROMPT.format(topic=topic_slug, sources=_render_sources(gathered["offered"]))
+    # The one chokepoint again at the provider boundary: a source the gather
+    # kept but the list now withholds is dropped, and an unreadable list
+    # sends nothing.
+    marks = provider_text.fenced_texts(
+        [s["text"] for s in gathered["offered"]], [s["id"] for s in gathered["offered"]], "brief")
+    offered = [s for s, mark in zip(gathered["offered"], marks) if mark is not None]
+    if not offered:
+        return {"topic": topic_slug, "status": "withheld", "reason": "every source withheld by the forget list"}
+    prompt = PROMPT.format(topic=topic_slug, sources=_render_sources(offered))
     try:
         raw = extract._generate(prompt, timeout=120, retries=1, caller="brief")
     except Exception as exc:  # noqa: BLE001 — transport/model failure; retried next run
@@ -514,7 +547,7 @@ def build_one(cur, topic_slug: str) -> dict[str, Any]:
     if parsed is None:
         _record_failed(cur, topic_slug, gathered, "model returned non-JSON")
         return {"topic": topic_slug, "status": "failed", "reason": "model returned non-JSON"}
-    offered_ids = {s["id"] for s in gathered["offered"]}
+    offered_ids = {s["id"] for s in offered}
     raw_claims = parsed.get("claims")
     claims, removed = validate_claims(raw_claims, offered_ids)
     if not claims:
@@ -553,7 +586,7 @@ def build_outcome(results: list[dict[str, Any]]) -> dict[str, Any]:
     for result in results:
         status = str(result.get("status"))
         out[status] = out.get(status, 0) + 1
-        if status in {"failed", "error", "unavailable"}:
+        if status in {"failed", "error", "unavailable", "withheld"}:
             out["ok"] = False
     return out
 
@@ -601,6 +634,7 @@ def mark_stale_for_episodes(cur, episode_ids: list[int]) -> int:
 
 
 def mark_stale_for_decision(cur, decision_id: int) -> int:
+    # forget-fence: a writer: marks briefs stale; returns a count
     """Same, for the briefs citing the episode a decision came from. Fail-open:
     a decision write never fails because a brief could not be marked."""
     try:
@@ -650,13 +684,19 @@ def read_brief(cur, topic_slug: str) -> dict[str, Any]:
                 or have["state"] != "current"
                 or have["hash"] != _gather(cur, topic_slug)["hash"]):
             payload["state"] = "stale"
-    if ids and _has(cur, "episodes", "deleted_at"):
+    from khipu.tombstones import episode_withheld
+
+    # This Mac's forget list leads the hub's deleted_at; an unreadable list
+    # withholds every brief that cites an episode.
+    forgotten = any(episode_withheld(i) for i in ids)
+    if not forgotten and ids and _has(cur, "episodes", "deleted_at"):
         cur.execute(
             "SELECT id FROM episodes WHERE id = ANY(%s::bigint[]) AND deleted_at IS NOT NULL",
             (ids,),
         )
-        if cur.fetchall():
-            payload.update(state="stale", body="", claims=[], withheld="a source episode was forgotten")
+        forgotten = bool(cur.fetchall())
+    if forgotten:
+        payload.update(state="stale", body="", claims=[], withheld="a source episode was forgotten")
     return payload
 
 

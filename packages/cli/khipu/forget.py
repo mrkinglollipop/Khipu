@@ -130,6 +130,7 @@ _FACT_TABLES = (("commitment", "commitments"), ("decision", "decisions"), ("deli
 
 
 def _forget_claims(cur, episode_id: int) -> dict[str, Any]:
+    # forget-fence: the forget itself: reads what it hides
     """Section 3.4's forget: the episode row is already locked FOR UPDATE.
     Lock every fact the episode claims or anchors in ``(kind, id)`` order,
     run the witness backfill of those facts when the project's has not run
@@ -209,6 +210,7 @@ def _briefs_ready(cur) -> bool:
 
 
 def _clear_cited_suggestions(cur, episode_id: int) -> int:
+    # forget-fence: the forget itself: reads what it hides
     """Clear every commitment's "Looks done" / "Looks settled" suggestion
     (``settle_suggestion``) that cites the episode as its evidence, or a
     decision the episode wrote or claimed: the suggestion quotes that
@@ -236,6 +238,7 @@ def _clear_cited_suggestions(cur, episode_id: int) -> int:
 
 
 def _clear_cited_closes(cur, episode_id: int) -> int:
+    # forget-fence: the forget itself: reads what it hides
     """Replace ``close_reason`` with 'forgotten' and drop ``close_evidence``
     on every commitment the episode closed, or closed citing a decision the
     episode wrote or claimed: a rule close quotes that evidence's words. The
@@ -348,6 +351,7 @@ def tombstone_on_hub(cur, episode_id: int) -> dict[str, Any]:
 
 
 def _forget_read(cur, episode_id: int, *, lock: bool, refusals: bool) -> dict[str, Any] | None:
+    # forget-fence: the forget itself: reads what it hides
     """The episode's identity and every source a forget publishes, as the
     hub holds them now; ``lock`` takes its row FOR UPDATE first (a merge
     takes the same lock). ``hub``: every identity it carries (section 6.1)."""
@@ -374,6 +378,7 @@ def _forget_read(cur, episode_id: int, *, lock: bool, refusals: bool) -> dict[st
 
 
 def owner_refusal(cur, episode_id: int, owner: str | None) -> dict[str, Any] | None:
+    # forget-fence: the forget itself: reads what it hides
     """None when ``owner`` may forget the episode, else the refusal result.
     ``owner`` None is this machine's owner, who owns everything. A gateway
     caller (``gateway:<label>``) owns only rows the server stamped with that
@@ -608,6 +613,7 @@ def _payload_identities(payloads: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _column_identity(cur, episode_id: int) -> dict[str, Any] | None:
+    # forget-fence: the forget itself: reads what it hides
     """The natural source identity the episode's own columns hold (harness,
     session id, transcript range, window id), or None when they name none.
     Source rows fail open and raw can be partial, so a forget may find the
@@ -649,6 +655,7 @@ def _natural_identities(raw: Any, column: dict[str, Any] | None) -> list[dict[st
 
 
 def _read_forget_sources(cur, episode_id: int, live: dict[str, Any]) -> dict[str, Any]:
+    # forget-fence: the forget itself: reads what it hides
     """raw, the source rows, every legacy identity candidate and the payloads
     to tombstone, as the hub holds them now."""
     # Every legacy line this episode may have left behind, in order: its live
@@ -835,6 +842,7 @@ def _same_identity(a: dict[str, Any], b: dict[str, Any]) -> bool:
 
 def _held_elsewhere(cur, episode_id: int, identities: list[dict[str, Any]], *,
                     sources: bool) -> list[dict[str, Any]]:
+    # forget-fence: the forget itself: reads what it hides
     """The identities some other live episode also holds: as its live row, its
     raw origin, a raw merge receipt, or (with ``sources``) a source row. The
     database matches on summary md5; the time is compared here as an instant,
@@ -933,6 +941,7 @@ def _candidate_hashes(candidates: list[dict[str, Any]], source_rows: list[dict[s
 
 
 def _owned_elsewhere(cur, episode_id: int, hashes: set[str], *, sources: bool) -> set[str]:
+    # forget-fence: the forget itself: reads what it hides
     """The payload hashes some other live episode holds: as a raw merge
     receipt's source id or (with ``sources``) a source row's payload hash or
     source key."""
@@ -1650,6 +1659,7 @@ def _session_forms(session_id: str) -> set[str]:
 
 def _owner_sessions_held_elsewhere(cur, episode_id: int, sessions: list[str], *,
                                   sources: bool) -> list[str]:
+    # forget-fence: the forget itself: reads what it hides
     """Session-scoped words stay while another live episode holds that session.
 
     Columns, raw origins, merge receipts and live source rows all count;

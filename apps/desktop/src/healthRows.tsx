@@ -85,6 +85,7 @@ const LABELS: Record<string, string> = {
   degraded_rate_ok: "Search rarely falls back to keyword-only",
   prompt_recall_outcomes_ok: "Recall answers before each prompt in time",
   prompt_recall_snapshot_ok: "Recall before each prompt reads this Mac's copy",
+  forget_list_ok: "Forget list readable",
   // Not a doctor field: read from `khipu usage --json` (plansHealthRow).
   plans: "Plans",
   // Not a doctor field: read from `khipu route --json` (routingHealthRow).
@@ -302,6 +303,10 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
   if (key === "disk_space_ok") {
     const ds = parsed.disk_space as { level?: string; message?: string } | undefined;
     return ds?.level === "amber" && ds.message ? ds.message : undefined;
+  }
+  if (key === "forget_list_ok") {
+    const fl = parsed.forget_list as { ok?: boolean; error?: string } | undefined;
+    return fl?.ok === false && typeof fl.error === "string" ? fl.error : undefined;
   }
   if (key === "prompt_recall_snapshot_ok") {
     const prs = parsed.prompt_recall_snapshot as ReplicaTrust | undefined;

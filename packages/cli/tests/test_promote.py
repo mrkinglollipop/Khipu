@@ -1589,6 +1589,7 @@ _LOCAL_FAILURES = {
     "prompt_recall_snapshot_ok": ("khipu.hub_snapshot.prompt_recall_snapshot_status", {"ok": False}),
     "prompt_recall_outcomes_ok": ("khipu.recall_prompt.prompt_recall_outcomes", {"ok": False}),
     "recall_daemon_ok": ("khipu.recall_daemon.daemon_health", {"ok": False}),
+    "forget_list_ok": ("khipu.tombstones.forget_list_health", {"ok": False}),
     "nightly_steps_ok": ("khipu.jobs.nightly_step_health", {"notes_reconcile_ok": {"ok": False}}),
     "degraded_rate_ok": ("khipu.query_log.degraded_rate", {"ok": False}),
     "launchers_ok": ("khipu.integrations.launcher_health", {"ok": False}),

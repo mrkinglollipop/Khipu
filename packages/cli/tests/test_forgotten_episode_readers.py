@@ -251,7 +251,7 @@ class EpisodeEditReembedTest(_CacheCase):
         upserts: list = []
         with mock.patch("khipu.embed._active_profile", return_value="p"), \
                 mock.patch("khipu.embed._api_texts", side_effect=lambda _p, items: items), \
-                mock.patch("khipu.embed.embed_batch", side_effect=lambda texts, profile: [[0.0]] * len(texts)), \
+                mock.patch("khipu.embed.embed_batch", side_effect=lambda texts, profile, **_kw: [[0.0]] * len(texts)), \
                 mock.patch("khipu.embed._upsert_chunks", side_effect=lambda _c, _p, rows: upserts.extend(rows)):
             return cli._reembed_episode(cur, eid), upserts
 

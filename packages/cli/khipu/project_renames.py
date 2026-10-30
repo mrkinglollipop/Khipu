@@ -85,6 +85,7 @@ def _write_last(result: dict[str, Any]) -> None:
 
 
 def sweep(conn: Any = None, lookup: Callable[[str], tuple[str | None, str | None]] | None = None) -> dict[str, Any]:
+    # forget-fence: a writer; returns the sweep's outcome
     """One pass. ``result`` is ``ok``, ``skipped`` (with ``reason``) or ``failed``
     (with ``error``). Pairs the owner has not decided come first, then the
     most recently active GitHub-shaped canonical projects, up to ``SWEEP_LIMIT``

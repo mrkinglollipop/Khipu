@@ -134,6 +134,7 @@ def load_golden(path: Path) -> list[dict[str, Any]]:
 
 
 def eval_one(entry: dict[str, Any]) -> dict[str, Any]:
+    # forget-fence: the owner's recall eval scores hit ids against a golden set; shows no row
     """Run one golden entry through hybrid_search; returns the scored row.
     Any search failure (hub unreachable, bad mode) is recorded as a miss
     rather than raised, so one bad line does not abort the whole eval."""
@@ -242,6 +243,7 @@ def _percentile(values: list[float], pct: float) -> float:
 
 
 def _call_explicit(query: str, entry: dict[str, Any], *, mode: str, k: int) -> dict[str, Any]:
+    # forget-fence: the owner's recall eval scores hit ids against a golden set; shows no row
     from khipu.embed import hybrid_search
 
     return hybrid_search(
@@ -677,6 +679,7 @@ def _rank_of(expect: set[str], payload: dict[str, Any]) -> int | None:
 
 
 def _explicit_once(entry: dict[str, Any], *, rerank: bool) -> dict[str, Any]:
+    # forget-fence: the owner's recall eval scores hit ids against a golden set; shows no row
     """One explicit search with the rerank switch forced on or off through its
     environment leg (never config.json), restored afterwards."""
     import os

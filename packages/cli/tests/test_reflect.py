@@ -39,6 +39,10 @@ class _ReflectCur(_Cur):
         elif s.startswith("SELECT slug, body FROM topics"):
             h.statements.append(s)
             self._rows = [(slug, h.bodies.get(slug, "")) for slug in params[0] if slug in h.topics]
+        elif s.startswith("SELECT t.slug, e.id FROM topics t JOIN episodes e"):
+            h.statements.append(s)
+            self._rows = [(slug, e["id"]) for slug in params[0]
+                          for e in h.episodes.values() if slug in e["topics"]]
         else:
             super().execute(sql, params)
 

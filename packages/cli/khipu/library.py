@@ -39,6 +39,7 @@ from typing import Any, Iterator
 
 from khipu import embed
 from khipu import profiles
+from khipu import provider_text
 
 NAME_RE = re.compile(r"^[a-z0-9_-]{1,40}$")
 EXTENSIONS = (".txt", ".md")
@@ -720,7 +721,7 @@ def backfill(conn, name: str, *, limit: int | None = None, stale: bool = False,
                 api = embed._api_texts(src.profile, [(r[4] or "", r[2]) for r in batch])
                 try:
                     vecs = embed.embed_batch(
-                        api, profile=src.profile, retries=embed.BACKFILL_RETRIES,
+                        provider_text.live_input(api, "library"), profile=src.profile, retries=embed.BACKFILL_RETRIES,
                         delay=embed.BACKFILL_DELAY_S, input_type="document", budget="library",
                     )
                     for v in vecs:

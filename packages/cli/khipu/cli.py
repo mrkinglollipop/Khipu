@@ -210,7 +210,7 @@ _QUICK_IMPORTS = (
 LOCAL_GATES = (
     "outbox_ok", "capture_liveness_ok", "git_sync_ok", "dsn_file_ok", "synth_provider_ok",
     "jobs_ok", "index_freshness_ok", "synth_budget_ok", "graph_backup_ok", "bundle_seal_ok",
-    "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok",
+    "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok", "forget_list_ok",
     "nightly_steps_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok", "disk_space_ok",
     "recall_eval_ok",
 )
@@ -371,6 +371,14 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         prompt_recall_outcomes_block = prompt_recall_outcomes()
     except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
         prompt_recall_outcomes_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    # The forget fence's last outcome: red when it could not read this Mac's
+    # forget list, because then pushes send nothing and rows are hidden.
+    try:
+        from khipu.tombstones import forget_list_health
+
+        forget_list_block = forget_list_health()
+    except Exception as e:  # noqa: BLE001 — a failed check must not look like a pass
+        forget_list_block = {"ok": False, "error": f"{type(e).__name__}: {e}"}
     # The warm recall service behind the per-prompt hook. Not running is fine
     # (the hook falls back to the one-shot path); running on different code
     # than the disk for over a minute is not — it should have restarted itself.
@@ -466,6 +474,7 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
         "prompt_recall_outcomes_ok": bool(prompt_recall_outcomes_block.get("ok")),
         "recall_daemon": recall_daemon_block, "recall_daemon_ok": bool(recall_daemon_block.get("ok")),
+        "forget_list": forget_list_block, "forget_list_ok": bool(forget_list_block.get("ok")),
         "recall_eval": recall_eval_block, "recall_eval_ok": bool(recall_eval_block.get("ok")),
         "nightly_steps": nightly_steps,
         "nightly_steps_ok": all(bool(v.get("ok")) for v in nightly_steps.values()),
@@ -876,12 +885,12 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     (outbox, outbox_ok, git_sync, secrets, dsn_file_ok, synth_provider, synth_provider_ok, jobs,
      known_job_failures, jobs_ok, index_fresh, index_freshness_ok, synth_budget, synth_budget_ok,
      prompt_recall_snapshot, prompt_recall_outcomes_block, recall_daemon_block, bundle_seal_block,
-     nightly_steps, degraded_rate, launchers) = (local[k] for k in (
+     nightly_steps, degraded_rate, launchers, forget_list_block) = (local[k] for k in (
         "outbox", "outbox_ok", "git_sync", "secrets", "dsn_file_ok", "synth_provider",
         "synth_provider_ok", "jobs", "job_failures", "jobs_ok", "index_freshness",
         "index_freshness_ok", "synth_budget", "synth_budget_ok", "prompt_recall_snapshot",
         "prompt_recall_outcomes", "recall_daemon", "bundle_seal", "nightly_steps", "degraded_rate",
-        "launchers"))
+        "launchers", "forget_list"))
     if drift_future is not None:
         drift = drift_future.result()
     # P2b gate: directional. Every file episode must exist in PG by identity
@@ -1015,6 +1024,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "prompt_recall_snapshot": prompt_recall_snapshot,
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
         "recall_daemon": recall_daemon_block,
+        "forget_list": forget_list_block,
         "recall_probe": recall_probe,
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
@@ -1090,6 +1100,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
             and bool(prompt_recall_snapshot.get("ok"))
             and bool(prompt_recall_outcomes_block.get("ok"))
             and bool(recall_daemon_block.get("ok"))
+            and bool(forget_list_block.get("ok"))
             and all(bool(v.get("ok")) for v in nightly_steps.values())
             and bool(topics_lag.get("ok"))
             and bool(degraded_rate.get("ok"))
@@ -1125,6 +1136,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "prompt_recall_snapshot_ok": bool(prompt_recall_snapshot.get("ok")),
         "prompt_recall_outcomes_ok": bool(prompt_recall_outcomes_block.get("ok")),
         "recall_daemon_ok": bool(recall_daemon_block.get("ok")),
+        "forget_list_ok": bool(forget_list_block.get("ok")),
         "notes_reconcile_ok": bool(nightly_steps.get("notes_reconcile_ok", {}).get("ok")),
         "embed_provider_ok": bool(nightly_steps.get("embed_provider_ok", {}).get("ok")),
         "commitments_hygiene_ok": bool(nightly_steps.get("commitments_hygiene_ok", {}).get("ok")),
@@ -1249,6 +1261,7 @@ def _search_query(
     kind: str | None = None,
     include_nodes: bool | None = None,
 ) -> list[dict]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Deterministically-ordered, per-kind-fair ILIKE search (F7).
 
     Each active kind gets its own fair share of `limit` and its own ORDER BY,
@@ -1414,6 +1427,7 @@ def _neg_ts_sort_key(ts) -> float:
 def _literal_candidates(
     cur, term: str, limit: int, *, kind: str | None = None, filters=None, fast: bool = False
 ) -> list[dict]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Globally-ranked literal ILIKE candidates for RRF fusion (bugfix,
     reported live: "Recorded mobile followup task" — episode 11286 named the
     query verbatim in its decisions but landed at literal rank 21 because
@@ -1698,6 +1712,11 @@ def cmd_search(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
+    from khipu.tombstones import withhold
+
+    # As the MCP search: an unreadable forget list hides every row that
+    # touches an episode.
+    payload["results"] = withhold(payload.get("results") or [], fail_closed=False)
     query_log.log_query(
         args.query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
@@ -2006,6 +2025,15 @@ def cmd_embed_media_backfill(args: argparse.Namespace) -> int:
 
 
 def _graph_query(cur, node_id: str, hops: int, limit: int) -> dict:
+    """``_graph_query_unfenced`` with the forget fence applied
+    (``tombstones.withhold_graph``)."""
+    from khipu.tombstones import withhold_graph
+
+    return withhold_graph(_graph_query_unfenced(cur, node_id, hops, limit))
+
+
+def _graph_query_unfenced(cur, node_id: str, hops: int, limit: int) -> dict:
+    # forget-fence source: cli._graph_query fences it
     """Neighborhood lookup for `khipu graph`.
 
     hops == 1 returns the direct edges (either direction) plus a best-effort
@@ -2752,6 +2780,7 @@ def _reembed_episode(cur, episode_id: int) -> bool:
     summary is findable by meaning immediately instead of at the next nightly.
     The API call happens before the DELETE, so a failed embed leaves the old
     vectors in place rather than none at all."""
+    from khipu import provider_text
     from khipu.embed import (
         _active_profile,
         _api_texts,
@@ -2778,7 +2807,16 @@ def _reembed_episode(cur, episode_id: int) -> bool:
     if not chunks:
         return False
     profile = _active_profile(cur)
-    vecs = embed_batch(_api_texts(profile, [("", c) for c in chunks]), profile=profile)
+    sendable = provider_text.fenced_texts(chunks, [episode_id] * len(chunks), "capture-edit")
+    if any(c is None for c in sendable):
+        return False
+    from khipu.embed import WithheldDuringSend
+
+    try:
+        vecs = embed_batch(_api_texts(profile, [("", c) for c in sendable]), profile=profile,
+                           recheck=provider_text.recheck_texts(chunks, [episode_id] * len(chunks), "capture-edit"))
+    except WithheldDuringSend:
+        return False
     cur.execute(
         "DELETE FROM memory_embeddings WHERE kind = 'episode' AND ref = %s",
         (str(episode_id),),
@@ -3328,9 +3366,9 @@ def cmd_activity(args: argparse.Namespace) -> int:
     from khipu.activity import activity_payload, episode_detail
 
     if args.show is not None:
-        from khipu.tombstones import episode_hidden
+        from khipu.tombstones import episode_withheld, withhold_detail
 
-        row = None if episode_hidden(args.show) else episode_detail(args.show)
+        row = None if episode_withheld(args.show) else withhold_detail(episode_detail(args.show))
         if row is None:
             print(f"error: episode {args.show} not found", file=sys.stderr)
             return 1
@@ -3444,9 +3482,9 @@ def cmd_get(args: argparse.Namespace) -> int:
         if not ident.isdigit():
             print(json.dumps({"ok": False, "error": "episode id must be digits"}))
             return 2
-        from khipu.tombstones import episode_hidden
+        from khipu.tombstones import episode_withheld
 
-        row = None if episode_hidden(ident) else episode_detail(int(ident))
+        row = None if episode_withheld(ident) else episode_detail(int(ident))
     else:
         from khipu.text_pages import page_args
 
@@ -3463,7 +3501,9 @@ def cmd_get(args: argparse.Namespace) -> int:
     if row is None:
         print(json.dumps({"ok": False, "error": f"{kind} not found: {ident}"}))
         return 1
-    row = dict(row)
+    from khipu.tombstones import withhold_detail
+
+    row = withhold_detail(dict(row))
     verbatim = row.pop("verbatim", None) if kind == "episode" else None
     row.pop("raw", None)
     print(json.dumps({"kind": kind, **row}, indent=2, default=str))
