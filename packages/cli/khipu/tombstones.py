@@ -461,6 +461,7 @@ def hidden_episode_ids() -> frozenset[int]:
         st = os.lstat(path)
         key: Any = (str(path), st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode)
     except FileNotFoundError:
+        # A missing list reads as empty, as read_gate does (no forget yet).
         return read_gate().episode_ids
     except OSError as exc:
         raise RegistryError(f"tombstone registry unavailable: {type(exc).__name__}") from exc

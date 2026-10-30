@@ -493,7 +493,7 @@ def withheld_episode_ids(path: Path | None = None) -> frozenset[int]:
 
 def without_withheld(rows: Sequence[Any], *, fail_closed: bool = True) -> list[Any]:
     """``rows`` minus every episode ``withheld_episode_ids`` names, and every
-    row reached through one (``via``). When the ids cannot be read: empty, or
+    row reached through one (``via``) or linked to one (``episode_id``). When the ids cannot be read: empty, or
     with ``fail_closed=False`` (an explicit search, whose replica views
     already hide queued erasures) ``rows`` unchanged."""
     try:
@@ -509,6 +509,8 @@ def without_withheld(rows: Sequence[Any], *, fail_closed: bool = True) -> list[A
                 continue
             via = str(row.get("via") or "")
             if via.startswith("episode:") and via[len("episode:"):] in withheld:
+                continue
+            if row.get("episode_id") is not None and str(row.get("episode_id")) in withheld:
                 continue
         kept.append(row)
     return kept

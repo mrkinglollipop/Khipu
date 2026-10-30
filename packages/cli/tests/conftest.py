@@ -162,6 +162,18 @@ def _isolate_tombstone_registry(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_erasure_queue():
+    """Every automatic push and search withholds an episode queued for
+    erasure next to the replica. A test that leaves one queued in the shared
+    hermetic home must not hide that id from a later test."""
+    from khipu import hub_snapshot
+
+    queue = hub_snapshot._pending_erasure_dir()
+    if os.environ.get("KHIPU_LIVE_TESTS") != "1" and queue.is_relative_to(_HERMETIC_HOME):
+        shutil.rmtree(queue, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
 def _forget_hub_unreachable_memo():
     # A test that lets a hub connect fail writes the reachability memo into the
     # shared test data dir; the next test's hub leg would then be skipped.

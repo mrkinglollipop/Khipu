@@ -115,3 +115,44 @@ def test_the_replica_deliverable_fence_reads_the_forget_list(replica):
     assert "902" in hs.forget_fence_sql(con, "deliverables", "episode_id")
     tombstones.registry_path().write_text("{not json")
     assert hs.forget_fence_sql(con, "deliverables", "episode_id") == " AND 0"
+
+
+def test_a_decision_or_commitment_of_a_withheld_episode_is_dropped(replica):
+    tombstones.publish_episode_ids({902})
+    rows = [{"kind": "decision", "id": "5", "episode_id": 902},
+            {"kind": "commitment", "id": "6", "episode_id": "902"},
+            {"kind": "decision", "id": "7", "episode_id": 904}]
+    assert [r["id"] for r in hs.without_withheld(rows)] == ["7"]
+
+
+def test_cli_search_with_an_unreadable_forget_list_shows_and_logs_no_episode(replica, monkeypatch, capsys):
+    import argparse
+
+    from khipu import cli, query_log
+
+    rows = [{"kind": "episode", "id": "902"}, {"kind": "decision", "id": "5", "episode_id": 902}]
+    monkeypatch.setattr("khipu.embed.hybrid_search", lambda *_a, **_k: {"results": [dict(r) for r in rows]})
+    logged: list = []
+    monkeypatch.setattr(query_log, "log_query", lambda *_a, **kw: logged.append(kw.get("top")))
+    tombstones.registry_path().parent.mkdir(parents=True, exist_ok=True)
+    tombstones.registry_path().write_text("{not json")
+    assert cli.cmd_search(argparse.Namespace(query=PROMPT, limit=10)) == 0
+    shown = json.loads(capsys.readouterr().out)["results"]
+    assert all(r.get("kind") != "episode" for r in shown)
+    assert all(r.get("kind") != "episode" for r in logged[0])
+
+
+def test_cli_search_never_logs_a_forgotten_episode(replica, monkeypatch, capsys):
+    import argparse
+
+    from khipu import cli, query_log
+
+    rows = [{"kind": "episode", "id": "902"}, {"kind": "decision", "id": "5", "episode_id": 902},
+            {"kind": "episode", "id": "904"}]
+    monkeypatch.setattr("khipu.embed.hybrid_search", lambda *_a, **_k: {"results": [dict(r) for r in rows]})
+    logged: list = []
+    monkeypatch.setattr(query_log, "log_query", lambda *_a, **kw: logged.append(kw.get("top")))
+    tombstones.publish_episode_ids({902})
+    assert cli.cmd_search(argparse.Namespace(query=PROMPT, limit=10)) == 0
+    assert [r["id"] for r in json.loads(capsys.readouterr().out)["results"]] == ["904"]
+    assert [r["id"] for r in logged[0]] == ["904"]

@@ -1687,6 +1687,12 @@ def cmd_search(args: argparse.Namespace) -> int:
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err)}))
             return 2
+    from khipu.hub_snapshot import without_withheld
+    from khipu.tombstones import without_hidden_episodes
+
+    # As the MCP search: an unreadable forget list hides every episode.
+    payload["results"] = without_withheld(
+        without_hidden_episodes(payload.get("results") or []), fail_closed=False)
     query_log.log_query(
         args.query, mode=mode,
         filters={"kind": kind, "project": project, "since": since, "until": until,
