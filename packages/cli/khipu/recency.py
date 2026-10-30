@@ -120,15 +120,16 @@ CROSS_PROJECT_MIN_TOKENS = 3
 # and earlier job episodes name them all. With the replica's word frequencies
 # (hub_snapshot.term_document_frequency) each of the whole prompt's words
 # weighs log((N+1)/(df+1)): a row must name PUSH_COVERAGE of the prompt's
-# weight, or name a word at most TERM_RARE_SHARE of memory names plus one
-# more word. A template's words are in every job episode and weigh little;
-# a PR number, a function name or a project's own noun weighs a lot.
+# weight. A template's words are in every job episode and weigh little; a PR
+# number, a function name or a project's own noun weighs a lot.
 # Only the prompt's prose counts (search_text.prompt_terms): in the replay of
 # c78a418f, 413 brief pushes were admitted by rare words of the brief's own
-# file paths. One rare prose word plus one more stays enough: on the typed
-# rows, the rows whose snippet showed exactly one rare word were 14 right
-# answers to 3 unwanted, so asking for two would lose more than it saves.
-TERM_RARE_SHARE = 0.005
+# file paths.
+# No route admits a row on one rare word plus one more: in the replay of
+# ed760233 that route still admitted 412 unwanted brief pushes, because a
+# brief's template prose ("orchestrator", "dispatched", a project's own name)
+# is rare across memory yet named by every earlier job episode of that
+# project, and on typed prompts it cost 8 correct abstentions for 1 ideal hit.
 # Below this many rows a word's frequency says nothing about rarity (a new
 # install, a tiny test replica), so plain coverage of ``tokens`` decides.
 TERM_DF_MIN_DOCS = 200
@@ -200,8 +201,8 @@ def _prose_hits(row: dict[str, Any], prose_tokens: list[str]) -> int:
 
 
 class _TermWeights:
-    """The prompt's words weighed by rarity; ``passes(row)`` names the
-    keyword route a row clears ("keywords" or "rare_term"), or None."""
+    """The prompt's words weighed by rarity; ``passes(row)`` is "keywords"
+    when a row names PUSH_COVERAGE of the prompt's weight, else None."""
 
     def __init__(self, terms: list[str], term_df: tuple[int, dict[str, int]]):
         n, df = term_df
@@ -209,7 +210,6 @@ class _TermWeights:
         self.df = {t: int(df.get(t, 0)) for t in terms}
         self.weight = {t: math.log((n + 1) / (self.df[t] + 1)) for t in terms}
         self.total = sum(self.weight.values())
-        self.rare_cut = max(1.0, TERM_RARE_SHARE * n)
 
     def passes(self, row: dict[str, Any]) -> str | None:
         named = row.get("prompt_term_hits")
@@ -224,8 +224,6 @@ class _TermWeights:
             return None
         if sum(self.weight[t] for t in named) >= PUSH_COVERAGE * self.total:
             return "keywords"
-        if len(named) >= 2 and any(self.df[t] <= self.rare_cut for t in named):
-            return "rare_term"
         return None
 
 
@@ -300,8 +298,8 @@ def apply_push_policy(
     graph candidate (``via`` set) carries no signal of its own and stays only
     when the row it was reached from does. With ``prompt`` and word
     frequencies (``term_df``, read from the replica unless given; None turns
-    weighting off) the keyword test weighs every prompt word by rarity (see
-    TERM_RARE_SHARE) instead of counting ``tokens``. Each kept row's
+    weighting off) the keyword test weighs every prompt word by rarity
+    instead of counting ``tokens``. Each kept row's
     ``push_evidence`` names the route it cleared. Rows are mutated in place
     and returned re-sorted by score. Never raises.
     """

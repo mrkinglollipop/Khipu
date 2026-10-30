@@ -472,15 +472,16 @@ def test_template_overlap_alone_is_not_pushed():
     ("Task: fix the zephyrine importer.", ["zephyrine"],
      "Dispatched agent work: zephyrine importer drafted"),
 ])
-def test_template_brief_sharing_a_distinctive_word_is_pushed(tail, rare, text):
+def test_one_rare_word_plus_one_more_is_not_pushed(tail, rare, text):
+    # Fix round 5 (replay of ed760233): one rare word plus one more admitted
+    # 412 unwanted brief pushes, so a row must cover the prompt's weight.
     prompt = TEMPLATE + tail
     filler = _row("old-job", "Dispatched agent did the work: first read the brief, ran the "
                   "oracle with pytest, never set TMPDIR, commit, no push")
     match = _row("match", text)
     kept = recency.apply_push_policy([filler, match], project=KHIPU, tokens=search_tokens(prompt),
                                      prompt=prompt, term_df=_term_df(rare))
-    assert [r["id"] for r in kept] == ["match"]
-    assert kept[0]["push_evidence"] == "rare_term"
+    assert kept == []
 
 
 def test_short_typed_prompt_weighs_its_rare_words():
@@ -501,7 +502,7 @@ def test_small_replica_falls_back_to_plain_coverage():
     assert [r["id"] for r in kept] == ["old-job"]
 
 
-def test_replica_brief_pushes_only_the_episode_with_its_distinctive_word(tmp_path, monkeypatch):
+def test_replica_template_brief_pushes_nothing_on_keywords(tmp_path, monkeypatch):
     from khipu import relevance
 
     template_summary = ("Dispatched agent did the work yourself: first read the brief in users "
@@ -516,7 +517,7 @@ def test_replica_brief_pushes_only_the_episode_with_its_distinctive_word(tmp_pat
     hs._TERM_DF_CACHE.clear()
     out = rp.prior_work_for_prompt(TEMPLATE + "Task: fix the review findings on PR 1193.",
                                    cwd="/khipu/worktree")
-    assert [r["id"] for r in out["hits"]] == ["901"], out
+    assert out["hits"] == [], out
     plain = rp.prior_work_for_prompt(TEMPLATE + "Task: tidy the docs index.", cwd="/khipu/worktree")
     assert plain["hits"] == [], plain
 
@@ -584,7 +585,7 @@ def test_brief_whose_rare_words_are_only_in_paths_pushes_nothing():
                                      prompt=short, term_df=None) == []
 
 
-def test_same_brief_with_a_distinctive_prose_term_pushes_the_match():
+def test_same_brief_with_one_rare_prose_term_pushes_nothing():
     prompt = PATH_BRIEF + "Task: fix the zephyrine importer."
     df = _brief_df([*PATH_WORDS, "zephyrine"])
     old_job = _row("old-job", "Dispatched agent work: read RULES.md and the qx land 7731 0412 "
@@ -592,11 +593,10 @@ def test_same_brief_with_a_distinctive_prose_term_pushes_the_match():
     match = _row("match", "Dispatched agent work: zephyrine importer drafted")
     kept = recency.apply_push_policy([old_job, match], project=KHIPU, tokens=search_tokens(prompt),
                                      prompt=prompt, term_df=df)
-    assert [r["id"] for r in kept] == ["match"]
-    assert kept[0]["push_evidence"] == "rare_term"
+    assert kept == []
 
 
-def test_replica_path_brief_pushes_only_on_its_prose_term(tmp_path, monkeypatch):
+def test_replica_path_brief_pushes_nothing(tmp_path, monkeypatch):
     from khipu import relevance
 
     fillers = [(1000 + i, "Dispatched agent did the work yourself: first read your brief, then "
@@ -613,7 +613,7 @@ def test_replica_path_brief_pushes_only_on_its_prose_term(tmp_path, monkeypatch)
                                     cwd="/khipu/worktree")["hits"] == []
     out = rp.prior_work_for_prompt(PATH_BRIEF + "Task: fix the zephyrine importer.",
                                    cwd="/khipu/worktree")
-    assert [r["id"] for r in out["hits"]] == ["901"], out
+    assert out["hits"] == [], out
 
 
 def test_term_frequency_is_kept_on_disk_by_freshness_stamp(tmp_path, monkeypatch):
