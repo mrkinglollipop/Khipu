@@ -2692,7 +2692,9 @@ def _search_hits(
             hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
         raise
     hub_reach.note_reachable()
-    rows = _apply_score_floor(payload.get("results") or [])
+    from khipu.summary_kind import without_verbatim_only
+
+    rows = _apply_score_floor(without_verbatim_only(payload.get("results") or []))
     return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
 
 

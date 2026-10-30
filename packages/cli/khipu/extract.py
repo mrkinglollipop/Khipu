@@ -1055,6 +1055,19 @@ EMPTY_REPLY_MIN_CHARS = 600
 _ITEM_KEYS = ("decisions", "preferences", "open_loops", "closed_loops")
 
 
+def _merge_items(first: dict[str, Any], retried: dict[str, Any]) -> dict[str, Any]:
+    """``first`` with any list items only ``retried`` found appended; a blank
+    retry never drops what the first reply extracted."""
+    merged = dict(first)
+    for key in (*_ITEM_KEYS, "preferences", "decision_details", "topics", "people"):
+        a, b = first.get(key), retried.get(key)
+        if isinstance(a, list) and isinstance(b, list):
+            merged[key] = a + [x for x in b if x not in a]
+        elif not a and b:
+            merged[key] = b
+    return merged
+
+
 def _empty_summary(parsed: dict[str, Any]) -> bool:
     summary = parsed.get("summary")
     if isinstance(summary, list):
@@ -1121,10 +1134,19 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
         # transcript twice in 15 windows), and an empty record for a window
         # with real content (Luna at low effort emptied a 14,000-char window
         # full of decisions). An empty record the retry confirms is kept.
-        retry_raw = _gemini_retry()
         used_fallback = True
-        retried = _parse_capture(retry_raw)
-        if retried is not None or parsed is None:
+        try:
+            retry_raw = _gemini_retry()
+        except BudgetExhausted:
+            raise
+        except Exception:  # noqa: BLE001 — the first reply and its evidence stand
+            retry_raw = None
+        retried = _parse_capture(retry_raw) if retry_raw is not None else None
+        if retried is not None and parsed is not None and _empty_summary(retried):
+            # Both replies are blank: nothing was summarised, so keep what
+            # either reply extracted instead of losing the first one's items.
+            parsed = _merge_items(parsed, retried)
+        elif retry_raw is not None and (retried is not None or parsed is None):
             raw, parsed = retry_raw, retried
     elif blank and not used_fallback:
         # No Gemini to stand in (the provider is Gemini, cloud or local, or
@@ -1137,8 +1159,8 @@ def extract_memory(transcript: str, *, cwd: str = "", job: bool = False) -> dict
             raise
         except Exception:  # noqa: BLE001 — the first reply stands, kept as verbatim only
             retried = None
-        if retried is not None and not _empty_summary(retried):
-            parsed = retried
+        if retried is not None:
+            parsed = retried if not _empty_summary(retried) else _merge_items(parsed, retried)
     if parsed is None and _capture_reply_error(raw) == "invalid capture schema":
         # Exactly one corrective call per window, including when the bad
         # schema came from the transport/empty/JSON fallback above. Repeat

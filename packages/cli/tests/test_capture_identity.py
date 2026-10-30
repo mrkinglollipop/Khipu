@@ -537,7 +537,7 @@ class VerbatimOnlyCaptureTest(unittest.TestCase):
             def _todo(self):
                 return [i for i, r in self.rows.items()
                         if r["summary"].startswith(VerbatimOnlyCaptureTest.LEGACY)
-                        and r["raw"].get("summary_kind") != "verbatim_only"]
+                        and not (isinstance(r["raw"], dict) and r["raw"].get("summary_kind") == "verbatim_only")]
 
             def execute(self, sql, params=()):
                 if "information_schema" in sql or "pg_attribute" in sql:
@@ -545,7 +545,7 @@ class VerbatimOnlyCaptureTest(unittest.TestCase):
                 elif sql.startswith("SELECT id"):
                     self.result = [(i,) for i in self._todo()[:params[-1]]]
                 elif sql.startswith("UPDATE episodes SET raw"):
-                    marker, ids = json.loads(params[0]), params[1]
+                    marker, ids = json.loads(params[0]), params[-1]
                     for i in ids:
                         self.rows[i]["raw"].update(marker)
                     self.rowcount = len(ids)
@@ -567,6 +567,87 @@ class VerbatimOnlyCaptureTest(unittest.TestCase):
         self.assertEqual(cur.rows[1]["summary"], self.LEGACY)  # evidence untouched
         self.assertEqual((second["scanned"], second["updated"]), (0, 0))
         self.assertEqual(cur.rows[3]["raw"], {})
+
+    def _backfill_cursor(self, raws):
+        legacy = self.LEGACY
+
+        class Cur:
+            def __init__(self):
+                self.rows = {i: {"summary": legacy, "raw": r} for i, r in raws.items()}
+                self.result, self.rowcount = [], 0
+
+            def _todo(self):
+                return [i for i, r in self.rows.items()
+                        if not (isinstance(r["raw"], dict) and r["raw"].get("summary_kind") == "verbatim_only")]
+
+            def execute(self, sql, params=()):
+                if sql.startswith("SELECT id"):
+                    self.result = [(i,) for i in self._todo()[:params[-1]]]
+                elif sql.startswith("UPDATE episodes SET raw"):
+                    marker, ids = json.loads(params[0]), params[-1]
+                    for i in ids:
+                        old = self.rows[i]["raw"]
+                        if isinstance(old, dict):
+                            old.update(marker)
+                        elif old is None:
+                            self.rows[i]["raw"] = dict(marker)
+                        else:
+                            self.rows[i]["raw"] = {**marker, "raw_value": old}
+                    self.rowcount = len(ids)
+                elif sql.startswith("SELECT COUNT"):
+                    self.result = [(len(self._todo()),)]
+
+            def fetchall(self):
+                return self.result
+
+            def fetchone(self):
+                return self.result[0]
+
+        return Cur()
+
+    def test_backfill_wraps_non_object_raw_so_a_second_pass_updates_nothing(self):
+        from khipu import hygiene
+
+        cur = self._backfill_cursor({1: [1, 2], 2: None, 3: "text", 4: {"a": 1}})
+        with mock.patch("khipu.db.has_columns", return_value=True):
+            first = hygiene.apply_backfill_summary_kind(cur)
+            second = hygiene.apply_backfill_summary_kind(cur)
+        self.assertEqual((first["updated"], first["remaining"]), (4, 0))
+        self.assertEqual(cur.rows[1]["raw"], {"summary_kind": "verbatim_only", "raw_value": [1, 2]})
+        self.assertEqual(cur.rows[2]["raw"], {"summary_kind": "verbatim_only"})
+        self.assertEqual(cur.rows[3]["raw"], {"summary_kind": "verbatim_only", "raw_value": "text"})
+        self.assertEqual((second["scanned"], second["updated"]), (0, 0))
+
+    def test_gemini_retry_failure_keeps_the_first_reply(self):
+        from khipu import extract
+
+        first = json.dumps({"summary": "", "decisions": ["Use port 5433"]})
+        with mock.patch.object(extract, "_generate", return_value=first), \
+                mock.patch.object(extract, "_fallback_applies", return_value=True), \
+                mock.patch.object(extract, "_generate_gemini", side_effect=RuntimeError("gemini down")):
+            payload = extract.extract_memory(self.WINDOW)
+        self.assertEqual(payload["decisions"], ["Use port 5433"])
+        self.assertEqual(payload["summary_kind"], "verbatim_only")
+
+    def test_a_blank_retry_keeps_the_first_replys_items(self):
+        for applies in (True, False):
+            first = {"summary": "", "decisions": ["Use port 5433"], "preferences": ["Terse"]}
+            retry = {"summary": "", "decisions": ["Ship Friday"]}
+            payload, _calls = self._extract([first, retry], applies=applies)
+            self.assertEqual(payload["decisions"], ["Use port 5433", "Ship Friday"], applies)
+            self.assertEqual(payload["preferences"], ["Terse"], applies)
+            self.assertEqual(payload["summary_kind"], "verbatim_only")
+
+    def test_hub_fallback_drops_verbatim_only_rows(self):
+        from khipu import recall_prompt as rp
+
+        rows = [{"kind": "episode", "id": "99", "score": 0.9, "snippet": self.LEGACY},
+                {"kind": "episode", "id": "98", "score": 0.9, "snippet": "", "summary_kind": "verbatim_only"},
+                {"kind": "episode", "id": "7", "score": 0.9, "snippet": "Rolled out the change."}]
+        with mock.patch.object(rp, "_snapshot_search_hits", side_effect=rp._SnapshotUnusable("missing")), \
+                mock.patch("khipu.embed.hybrid_search", return_value={"results": rows}):
+            out = rp._search_hits("a topical prompt", cwd=None)
+        self.assertEqual([h["id"] for h in out["hits"]], ["7"])
 
 
 if __name__ == "__main__":

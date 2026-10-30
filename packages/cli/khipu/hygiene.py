@@ -1095,15 +1095,24 @@ def apply_backfill_summary_kind(cur, *, limit: int = SUMMARY_KIND_NIGHTLY_LIMIT)
     from khipu.summary_kind import LEGACY_PLACEHOLDER, VERBATIM_ONLY
 
     live = "AND deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
-    where = (f"summary LIKE %s {live}AND COALESCE(raw->>'summary_kind', '') <> %s")
+    # A row whose raw is not a JSON object (array, scalar, NULL) has no
+    # summary_kind key to read, so it must be rewritten into an object or it is
+    # selected every night.
+    where = (f"summary LIKE %s {live}AND COALESCE(CASE WHEN jsonb_typeof(raw) = 'object' "
+             "THEN raw->>'summary_kind' END, '') <> %s")
     params = (LEGACY_PLACEHOLDER + "%", VERBATIM_ONLY)
     cur.execute(f"SELECT id FROM episodes WHERE {where} ORDER BY id LIMIT %s", (*params, int(limit)))
     ids = [int(r[0]) for r in cur.fetchall()]
     updated = 0
     if ids:
+        # Object: merge the marker. NULL or JSON null: the marker alone. Any other
+        # shape: the marker plus the old value kept under raw_value.
         cur.execute(
-            "UPDATE episodes SET raw = COALESCE(raw, '{}'::jsonb) || %s::jsonb WHERE id = ANY(%s)",
-            (json.dumps({"summary_kind": VERBATIM_ONLY}), ids),
+            "UPDATE episodes SET raw = CASE "
+            "WHEN jsonb_typeof(raw) = 'object' THEN raw || %s::jsonb "
+            "WHEN raw IS NULL OR jsonb_typeof(raw) = 'null' THEN %s::jsonb "
+            "ELSE %s::jsonb || jsonb_build_object('raw_value', raw) END WHERE id = ANY(%s)",
+            (json.dumps({"summary_kind": VERBATIM_ONLY}),) * 3 + (ids,),
         )
         updated = cur.rowcount
     cur.execute(f"SELECT COUNT(*) FROM episodes WHERE {where}", params)
