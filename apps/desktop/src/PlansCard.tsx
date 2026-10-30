@@ -32,6 +32,8 @@ export type UsageWindow = {
   window_mins?: number;
   model?: string;
   slot?: string;
+  /** One reading's pace, for a row routing does not pace (Cursor, OpenCode Go). */
+  pace?: { words?: string; verdict?: string; allowance_pct?: number } | null;
 };
 
 export type UsageAccount = {
@@ -45,6 +47,11 @@ export type UsageAccount = {
   credits?: Record<string, unknown> | null;
   version?: string | null;
   source?: string | null;
+  /** "cursor": the Grok row's figures came from Cursor's reading of the
+   *  same xAI limit (`usage_logins.grok_with_cursor`). */
+  via?: string | null;
+  /** Two readings of the one limit disagreed; which one is shown. */
+  source_note?: string | null;
   observed_at?: string | null;
   ok?: boolean;
   error?: string | null;
@@ -108,8 +115,17 @@ const KIMI_ERROR_PHRASE: Record<string, string> = {
   no_plan: "no Kimi Code plan on this key",
 };
 
+/** Cursor and OpenCode Go are read from their own login, never a stored key. */
+const LOGIN_ERROR_PHRASE: Record<string, string> = {
+  no_key: "can't read its login (switch off or no login here)",
+  key_rejected: "can't read: its login was not accepted",
+  no_plan: "no usage plan on this login",
+  pending: "read less than five minutes ago",
+};
+
 export function usageErrorPhrase(code: string | null | undefined, harness?: string | null): string {
   if (code && harness === "kimi" && KIMI_ERROR_PHRASE[code]) return KIMI_ERROR_PHRASE[code];
+  if (code && (harness === "cursor" || harness === "opencode") && LOGIN_ERROR_PHRASE[code]) return LOGIN_ERROR_PHRASE[code];
   if (code && ERROR_PHRASE[code]) return ERROR_PHRASE[code];
   if (code && /^(exit|signal)_\d+$/.test(code)) return ERROR_PHRASE.no_answer;
   return "couldn't read";
@@ -183,6 +199,7 @@ export function windowLabel(w: UsageWindow): string {
   if (name === "daily") return "day";
   if (name === "monthly") return "month";
   if (name.startsWith("weekly_")) return `${w.model || name.slice("weekly_".length).replace(/_/g, " ")} week`;
+  if (name.startsWith("monthly_")) return `${w.model || name.slice("monthly_".length).replace(/_/g, " ")} month`;
   const mins = /^(\d+)_min$/.exec(name);
   if (mins) return `${mins[1]} min`;
   return name.replace(/_/g, " ");
@@ -886,7 +903,9 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
   const dim = status.figures === "kept" || (status.code != null && status.figures === "none");
   const triedAge = fmtAgoSince(row.last_attempt_at || row.probed_at);
   const figuresAge = fmtAgoSince(figuresAt(row));
-  const login = row.home || "default login";
+  const login = [row.home || "default login", row.via === "cursor" ? "read via Cursor" : null, row.source_note?.trim() || null]
+    .filter(Boolean)
+    .join("; ");
   return (
     <section className={status.tone === "warn" ? "plan-block warn" : "plan-block"} role="group" aria-label={name}>
       <h2 className="plan-block-head">
@@ -910,7 +929,10 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
                 <span className="plan-wname">{windowLabel(w)}</span>
                 <Meter pct={p} label={`${planName(row)} ${windowLabel(w)}`} tone={tone} dim={dim} />
                 <span className={`plan-pct ${tone ?? (dim ? "dim" : "")}`}>{fmtPct(p)}</span>
-                <span className="plan-reset">{reset ?? "no reset reported"}</span>
+                <span className="plan-reset">
+                  {reset ?? "no reset reported"}
+                  {w.pace?.words ? `; ${w.pace.words}` : ""}
+                </span>
               </li>
             );
           })}
@@ -936,7 +958,7 @@ export function PlanBlock({ row, now, pause, onSignedIn }: {
           // Codex's session-file fallback, kept for tracked accounts only (decision
           // 21); a failure line that already says "last turn" says it once.
           <span>{figuresAge ? `From its last conversation, ${figuresAge}` : "From its last conversation"}</span>
-        ) : row.observed_at && windows.length && !fail?.includes("last turn") ? (
+        ) : row.observed_at && row.via !== "cursor" && windows.length && !fail?.includes("last turn") ? (
           <span>{figuresAge ? `As of its last turn, ${figuresAge}` : "As of its last turn"}</span>
         ) : windows.length ? (
           <span>{figuresAge ? `Figures from ${figuresAge}` : "Earlier figures"}</span>

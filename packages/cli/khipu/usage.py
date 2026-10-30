@@ -42,6 +42,7 @@ import math
 import os
 import re
 import select
+import shutil
 import signal
 import stat
 import subprocess
@@ -57,7 +58,9 @@ from pathlib import Path
 HARNESSES = ("claude", "codex", "grok", "muse", "glm")
 LABELS = {"claude": "Claude", "codex": "Codex", "grok": "Grok", "muse": "Muse", "glm": "GLM",
           # Read from provider-defined accounts, not usage_accounts: no harness entry.
-          "kimi": "Kimi"}
+          "kimi": "Kimi",
+          # Read from the tool's own login, once the owner's switch is on.
+          "cursor": "Cursor", "opencode": "OpenCode Go"}
 # One sign-in each and no login folder: Muse's is its own login, GLM's is the
 # Coding Plan key (a Claude Code lane pointed at z.ai, not an Anthropic home).
 NO_FOLDER = ("muse", "glm")
@@ -183,6 +186,8 @@ def _note(code: str | None, harness: str | None = None, home: str | None = None)
         return _deepseek_note(code)
     if harness == "kimi":
         return _kimi_note(code)
+    if harness in LOGIN_READ_HARNESSES:
+        return _login_note(code, harness)
     if code == E_NOT_INSTALLED:
         return f"{name} is not installed on this Mac"
     if code == E_SIGNIN:
@@ -1069,8 +1074,40 @@ def _grok_budget(timeout: float) -> float:
     return GROK_TIMEOUT_S if timeout == TIMEOUT_S else timeout
 
 
+def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S, login: bool = True) -> dict:
+    """With the owner's switch on, Grok's own billing read with its login
+    (``usage_logins.grok_login_read``, at most every ``LOGIN_READ_MIN_S``); when that is
+    off, not due or fails (a rejected login included: never refreshed), the
+    Grok Build reading below, unchanged. ``login=False`` (discovery, a
+    sign-in check) never looks inside the login folder at all. With Cursor's
+    switch on, Cursor's reading of the same xAI limit is a second source
+    (``usage_logins.grok_with_cursor``)."""
+    if not login:
+        return _probe_grok_build(grok_home, timeout=timeout)
+    try:
+        from khipu import usage_logins
+
+        use_login = usage_logins.login_switch("grok")[0] and usage_logins.login_read_due("grok")
+    except Exception:  # noqa: BLE001 - an unreadable setting reads as off
+        use_login = False
+    own = None
+    if use_login:
+        try:
+            own = usage_logins.grok_login_read(grok_home, LOGIN_TIMEOUT_S if timeout == TIMEOUT_S else timeout)
+        except ProbeError:
+            pass
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError, OverflowError):
+            pass
+    if own is None:
+        own = _probe_grok_build(grok_home, timeout=timeout)
+    try:
+        return usage_logins.grok_with_cursor(own, timeout=timeout)
+    except Exception:  # noqa: BLE001 - Cursor's reading is a second source; Grok's own stands
+        return own
+
+
 @_guard
-def probe_grok(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
+def _probe_grok_build(grok_home: str | None = None, *, timeout: float = TIMEOUT_S) -> dict:
     """Grok Build's ``_x.ai/billing`` (ACP, undocumented) for the login in
     ``grok_home`` (``GROK_HOME``; None = the default ``~/.grok``). See
     ``_GROK_ENV``: Grok cannot be started with no MCP servers at all.
@@ -1381,6 +1418,71 @@ def _muse_carry(row: dict, prev: dict | None, refusal: tuple[str, str] | None, n
     return out
 
 
+# ``muse usage --json`` (Muse 1.4.13 on) reads the allowance with no model
+# turn. Older Muse has no such command, so Khipu keeps its turn path there.
+MUSE_CLI_MIN_VERSION = (1, 4, 13)
+MUSE_CLI_TIMEOUT_S = 4.0
+
+
+def _muse_run(binary: str, args: list[str], env: dict[str, str]) -> str | None:
+    try:
+        done = subprocess.run([binary, *args], env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                              timeout=MUSE_CLI_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    try:
+        return done.stdout[:LOGIN_FILE_MAX].decode("utf-8")
+    except UnicodeError:
+        return None
+
+
+def muse_cli_version(text: str | None) -> tuple[int, int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def parse_muse_cli(text: str | None) -> dict | None:
+    """``muse usage --json``'s documented fields only: ``schemaVersion`` 1,
+    ``allowance.{asOfMs, tier, window.{usedPercent, resetsAtMs},
+    weekly.{usedPercent, resetsAtMs}}``. The session window is five hours
+    (the CLI omits its length). ``allowance: null`` or any other shape is no
+    reading, never an error."""
+    try:
+        data = json.loads(text or "")
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or data.get("schemaVersion") != 1 or not isinstance(data.get("allowance"), dict):
+        return None
+    allowance = data["allowance"]
+    windows = []
+    for field, name, mins in (("window", "five_hour", 300), ("weekly", "weekly", 10080)):
+        item = allowance.get(field)
+        used = _number(item.get("usedPercent")) if isinstance(item, dict) else None
+        if used is None or used < 0:
+            continue
+        resets = item.get("resetsAtMs")
+        resets = resets if isinstance(resets, (int, float)) and not isinstance(resets, bool) else None
+        windows.append({"name": name, "used_pct": used, "resets_at": _iso(resets), "window_mins": mins})
+    if not windows:
+        return None
+    as_of = allowance.get("asOfMs")
+    as_of = as_of if isinstance(as_of, (int, float)) and not isinstance(as_of, bool) else None
+    return {"ok": True, "plan": _text(allowance.get("tier")), "windows": windows, "source": "live",
+            "observed_at": _iso(as_of) or _iso(_now().timestamp())}
+
+
+def _muse_cli_usage(binary: str, env: dict[str, str]) -> dict | None:
+    """The allowance from ``muse usage --json`` when this Muse has it, else
+    None (the turn path follows)."""
+    version = muse_cli_version(_muse_run(binary, ["--version"], env))
+    if version is None or version < MUSE_CLI_MIN_VERSION:
+        return None
+    row = parse_muse_cli(_muse_run(binary, ["usage", "--json"], env))
+    return dict(row, version=".".join(map(str, version))) if row else None
+
+
 @_guard
 def probe_muse(*, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
     """Muse's ``usage/read``, then (a fresh host having observed nothing)
@@ -1397,13 +1499,17 @@ def probe_muse(*, timeout: float = TIMEOUT_S, turn: bool = True) -> dict:
         {"jsonrpc": "2.0", "id": 2, "method": "usage/read", "params": {}},
     ]
     env = probe_environment("muse", None, binary)
+    now = _now()
+    prev = _load_cache().get(MUSE_TURN_KEY)
+    if _muse_stale(prev, now):
+        cli = _muse_cli_usage(binary, env)
+        if cli:
+            return cli
     frames = _converse([binary, "serve", "--no-session-log"], messages, lambda f: f.get("id") == 2,
                        env=env, deadline=time.monotonic() + timeout, close_stdin=True)
     row = parse_muse(frames)
     if row["windows"]:
         return row
-    now = _now()
-    prev = _load_cache().get(MUSE_TURN_KEY)
     refusal = _muse_log_refusal()
     if turn and "KHIPU_ISOLATED_DIR" not in os.environ \
             and _muse_limit(prev, refusal, now) is None and _muse_stale(prev, now) \
@@ -1661,6 +1767,70 @@ def kimi_accounts(definitions: dict) -> list[dict]:
             out.append({"label": value.get("label") or ident, "harness": "kimi", "home": None,
                         "provider": "kimi", "quota_key": ident})
     return out
+
+
+# ---- The tools' own logins (Grok, Cursor, OpenCode Go) ------------------------
+#
+# The token readers live in ``usage_logins`` (owner decision 2026-10-29), so
+# this module still reads no credential by name. What stays here is what
+# every reader shares: the rows outside routing, the cadence and the notes.
+
+# Rows of their own, read only from a login, never routing accounts. Cursor
+# is not one: its reading is the Grok account's (``probe_grok``).
+LOGIN_READ_HARNESSES = ("opencode",)
+# T3's balanced cadence; one provider's login is never read more often.
+LOGIN_READ_MIN_S = 300
+LOGIN_TIMEOUT_S = 10.0
+LOGIN_FILE_MAX = 64 * 1024
+
+
+def _login_accounts(config: dict) -> list[dict]:
+    from khipu import usage_logins
+
+    return usage_logins.login_accounts(config)
+
+
+def _login_note(code: str | None, harness: str) -> str | None:
+    name = LABELS[harness]
+    if code == E_NO_KEY:
+        return (f"Khipu can't read {name}'s login: its switch is off or no login is on this Mac; "
+                "see Settings under Accounts and routing")
+    if code in (E_SIGNIN, E_BAD_KEY):
+        return f"Khipu can't read {name}'s usage: {name} did not accept its saved login; sign in to {name} again"
+    if code == E_NO_PLAN:
+        return f"{name} reports no usage plan on this login"
+    if code in (E_NOT_INSTALLED, E_TIMEOUT, E_NO_ANSWER):
+        return f"Khipu can't reach {name} from this Mac just now"
+    if code == E_REDIRECT:
+        return f"{name} tried to send Khipu somewhere else, so Khipu did not follow"
+    if code == E_BAD:
+        return f"{name} answered in a way Khipu can't read"
+    if code == E_CLI:
+        return f"{name} reported an error when asked"
+    if code == E_PENDING:
+        return "Read less than five minutes ago; the next read follows"
+    return None
+
+
+def even_pace(window: dict, now: datetime) -> dict | None:
+    """One reading's pace: the share of the window an even pace would have
+    used by now, against what is used. None without a length and reset."""
+    from khipu import routing_pace
+
+    mins, used = window.get("window_mins"), window.get("used_pct")
+    reset = _parse_time(window.get("resets_at"))
+    params = routing_pace.window_params(window.get("name"), mins * 60 if _mins(mins) else None, reset)
+    if not params or reset is None or not isinstance(used, (int, float)) or isinstance(used, bool):
+        return None
+    length = params["window_s"]
+    elapsed = length - (reset - now).total_seconds()
+    if not 0 < elapsed < length:
+        return None
+    allowance = round(elapsed / length * 100, 1)
+    verdict = "ahead" if used > allowance + 1 else "under" if used < allowance - 1 else "on"
+    words = {"ahead": "ahead of an even pace", "under": "under an even pace", "on": "on an even pace"}[verdict]
+    return {"allowance_pct": allowance, "verdict": verdict,
+            "words": f"{words} ({round(float(used), 1):g}% used against a {allowance:g}% allowance)"}
 
 
 # ---- DeepSeek (measured account spend) ---------------------------------------
@@ -2347,11 +2517,12 @@ def _http_quota_request(key: str, host: str, timeout: float) -> tuple[int, bytes
     return _https_get(f"https://{host}/", key, timeout)
 
 
-def _https_get(url: str, authorization: str, timeout: float) -> tuple[int, bytes]:
-    """One HTTPS GET to exactly ``url`` with ``authorization`` as its
-    Authorization header: no redirect is followed (a 3xx is E_REDIRECT), no
-    proxy is used, no error body is read, and ``timeout`` is one overall
-    deadline."""
+def _https_get(url: str, authorization: str, timeout: float, *, body: bytes | None = None,
+               headers: dict[str, str] | None = None) -> tuple[int, bytes]:
+    """One HTTPS GET (a POST when ``body`` is given) to exactly ``url`` with
+    ``authorization`` as its Authorization header: no redirect is followed (a
+    3xx is E_REDIRECT), no proxy is used, no error body is read, and
+    ``timeout`` is one overall deadline."""
     import http.client
     import socket as socket_module
     import urllib.error
@@ -2359,8 +2530,9 @@ def _https_get(url: str, authorization: str, timeout: float) -> tuple[int, bytes
 
     if not url.startswith("https://"):
         raise ProbeError(E_BAD)
-    request = urllib.request.Request(url, headers={"Authorization": authorization,
-                                                   "Accept": "application/json"})
+    request = urllib.request.Request(url, data=body, method="POST" if body is not None else "GET",
+                                     headers={**(headers or {}), "Authorization": authorization,
+                                              "Accept": "application/json"})
     deadline = time.monotonic() + timeout
 
     # One watchdog deadline covers connect, TLS, the status line, the
@@ -2606,7 +2778,8 @@ def all_accounts() -> list[dict]:
         return []
     configured = configured_accounts(config=config)
     glm = any(a.get("harness") == "glm" and not a.get("invalid") for a in configured)
-    return [*configured, *(a for a in http_quota_accounts() if not (glm and a.get("harness") == "glm"))]
+    return [*configured, *(a for a in http_quota_accounts() if not (glm and a.get("harness") == "glm")),
+            *_login_accounts(config)]
 
 
 # ---- accounts ----------------------------------------------------------------
@@ -2972,7 +3145,8 @@ def _blank_row(account: dict) -> dict:
             "observed_at": None, "error": None, "note": None}
 
 
-def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = True, turn: bool = True) -> dict:
+def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = True, turn: bool = True,
+                  login: bool = True) -> dict:
     # probe_all supplies one shared run for its worker threads. A standalone
     # reset check owns one too, so a helper alarm or stop can unwind this call
     # and kill every vendor process group before the child exits.
@@ -2989,6 +3163,12 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
             data = probe_deepseek(timeout=timeout)
         elif harness == "kimi":
             data = probe_kimi(timeout=timeout)
+        elif harness in LOGIN_READ_HARNESSES and not login:
+            data = {"ok": False, "error": E_PENDING}
+        elif harness in LOGIN_READ_HARNESSES:
+            from khipu import usage_logins
+
+            data = usage_logins.probe(harness, timeout=timeout)
         elif account.get("probe") == "http-quota" or account.get("quota_key"):
             data = probe_http_quota(account, timeout=timeout)
         elif harness in _HOME_VARS and not _login_folder_there(home or str(default_login(harness))):
@@ -3002,7 +3182,7 @@ def probe_account(account: dict, *, timeout: float = TIMEOUT_S, rollout: bool = 
         elif harness == "codex":
             data = probe_codex(home, timeout=timeout, rollout=rollout)
         elif harness == "grok":
-            data = probe_grok(home, timeout=timeout)
+            data = probe_grok(home, timeout=timeout, login=login)
         elif harness == "muse":
             data = probe_muse(timeout=timeout, turn=turn)
         elif harness == "glm":
@@ -3062,7 +3242,9 @@ def probe_all(accounts: list[dict], *, timeout: float = TIMEOUT_S) -> list[dict]
     for thread in threads:
         thread.start()
     longest = max([timeout] + [_grok_budget(timeout) for a in accounts if a.get("harness") == "grok"]
-                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") in ("glm", "deepseek", "kimi")])
+                  + [GLM_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts if a.get("harness") in ("glm", "deepseek", "kimi")]
+                  + [LOGIN_TIMEOUT_S if timeout == TIMEOUT_S else timeout for a in accounts
+                     if a.get("harness") in ("grok", *LOGIN_READ_HARNESSES)])
     end = time.monotonic() + longest + OVERALL_GRACE_S
     for thread in threads:
         thread.join(max(0.0, end - time.monotonic()))
@@ -3280,8 +3462,9 @@ def _store(accounts: list[dict], rows: list[dict]) -> list[dict]:
         # still running when its account was stopped or moved writes no row
         # under a key the list no longer holds. Read unsettled: an account
         # change takes this cache's lock after the routing lock.
-        current = configured_keys(read_config_unsettled()) | {
-            _key(a) for a in accounts if a.get("quota_key")}
+        config = read_config_unsettled()
+        current = configured_keys(config) | {
+            _key(a) for a in accounts if a.get("quota_key")} | {_key(a) for a in _login_accounts(config)}
         merged = []
         for account, row in zip(accounts, rows):
             key = _key(account)
@@ -3374,6 +3557,12 @@ def _age_limit_for(account: dict, cached: dict, now: datetime, max_age: float) -
     return max_age
 
 
+def _login_read_young(account: dict, attempted: datetime, now: datetime) -> bool:
+    """A Cursor or OpenCode Go login read less than ``LOGIN_READ_MIN_S`` ago
+    is never due again, whatever asks (cadence 5 minutes or slower)."""
+    return account.get("harness") in LOGIN_READ_HARNESSES and 0 <= (now - attempted).total_seconds() < LOGIN_READ_MIN_S
+
+
 def _due(accounts: list[dict], cache: dict[str, dict], now: datetime, max_age: float) -> list[dict]:
     """The valid accounts whose last attempt is older than ``max_age`` (or
     that were never read)."""
@@ -3384,6 +3573,8 @@ def _due(accounts: list[dict], cache: dict[str, dict], now: datetime, max_age: f
         cached = cache.get(_key(account)) or {}
         attempted = _parse_time(cached.get("last_attempt_at") or cached.get("probed_at"))
         age_limit = _age_limit_for(account, cached, now, max_age)
+        if attempted is not None and _login_read_young(account, attempted, now):
+            continue
         if attempted is None or _future_times(cached, now) or _reset_due(cached, now) or ((now - attempted).total_seconds() >= age_limit
                                  if account.get("harness") == "deepseek"
                                  else (now - attempted).total_seconds() > age_limit):
@@ -3520,9 +3711,13 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
         attempted = _parse_time((cached or {}).get("last_attempt_at") or (cached or {}).get("probed_at"))
         young = bool(cached and attempted and 0 <= (now - attempted).total_seconds() <= max_age
                      and not _future_times(cached, now) and not _reset_due(cached, now))
-        if fresh or not young:
+        if cached and attempted and _login_read_young(account, attempted, now):
+            young, held = True, True
+        else:
+            held = False
+        if (fresh and not held) or not young:
             due.append(i)
-        if cached and (background or (young and not fresh)):
+        if cached and (background or (young and (held or not fresh))):
             rows[i] = dict(cached, account=account["label"], home=account.get("home"), cached=True)
     refreshing = False
     if due and background:
@@ -3567,6 +3762,12 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
         row["stale"] = _stale_figures(row, now, max_age)
         row["windows"] = [dict(w, used_pct=None, expired=True) if _expired_window(w, now) else dict(w)
                           for w in row.get("windows") or []]
+        if row.get("harness") in LOGIN_READ_HARNESSES:
+            # Routing paces its own accounts; these rows are outside it.
+            for window in row["windows"]:
+                pace = None if window.get("expired") else even_pace(window, now)
+                if pace:
+                    window["pace"] = pace
     return {"generated_at": _iso(now.timestamp()), "max_age_s": max_age, "refreshing": refreshing,
             "accounts": rows, "summary_text": [summary_line(r) for r in rows]}
 
@@ -3575,9 +3776,9 @@ def report(*, fresh: bool = False, max_age: float = DEFAULT_MAX_AGE_S, timeout: 
 # added to the owner's rows later stays out until named here. Never ``home``
 # or any path: conversations reach other model providers (slice 9A).
 _PUBLIC_ROW_FIELDS = ("harness", "account", "plan", "ok", "error", "live_error", "last_error", "version",
-                      "source", "observed_at", "probed_at", "last_attempt_at", "last_good_at", "ms", "cached",
-                      "stale", "refreshing")
-_PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model", "expired")
+                      "source", "via", "source_note", "observed_at", "probed_at", "last_attempt_at",
+                      "last_good_at", "ms", "cached", "stale", "refreshing")
+_PUBLIC_WINDOW_FIELDS = ("name", "used_pct", "resets_at", "window_mins", "model", "expired", "pace")
 INVALID_PUBLIC_NOTE = "This account entry is not valid; the owner can fix it in Khipu's Settings"
 
 
@@ -3594,7 +3795,7 @@ def public_row(row: dict) -> dict:
     key = row.get("key") if isinstance(row.get("key"), str) and row.get("key") \
         else _key({"harness": harness, "home": home})
     out["id"] = routing.account_id(key)
-    out["harness"] = harness if harness in HARNESSES or harness in KEY_READ_HARNESSES else "?"
+    out["harness"] = harness if harness in (*HARNESSES, *KEY_READ_HARNESSES, *LOGIN_READ_HARNESSES) else "?"
     if routing.account_label_source(key) == "suggested":
         out["naming_hint"] = routing.account_identity.NAME_ACCOUNT
     for field in ("error", "live_error", "last_error"):

@@ -1059,6 +1059,10 @@ const ROUTING_SWITCH_KEYS: &[&str] = &[
     "routing_pace_order",
     "routing_proposal_text_between_macs",
     "routing_replication_live",
+    // Reading a tool's own login for its usage (owner decision 2026-10-29).
+    "routing_usage_login_grok",
+    "routing_usage_login_cursor",
+    "routing_usage_login_opencode",
 ];
 /// The owner's own dispatch scripts, by file name (phase 6).
 const ROUTING_DISPATCH_SCRIPTS_KEY: &str = "routing_dispatch_scripts";
@@ -8535,6 +8539,11 @@ mod work_command_tests {
             }
         }
         assert_eq!(config_set_argv("owed_pr_check_github", "off").unwrap(), v(&["config", "--set", "owed_pr_check_github", "off"]));
+        assert_eq!(
+            config_set_argv("routing_usage_login_cursor", "on").unwrap(),
+            v(&["config", "--from-app", "--set", "routing_usage_login_cursor", "on"])
+        );
+        assert!(config_set_argv("routing_usage_login_grok", "yes").is_err());
         assert_eq!(config_set_argv("owed_pr_check_github", " on ").unwrap(), v(&["config", "--set", "owed_pr_check_github", "on"]));
         assert!(config_set_argv("owed_pr_check_github", "maybe").is_err());
         assert_eq!(config_unset_argv("owed_pr_check_github").unwrap(), v(&["config", "--unset=owed_pr_check_github"]));

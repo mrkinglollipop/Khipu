@@ -1039,11 +1039,11 @@ def _check_one(rec: dict, *, run: "usage._Run", end: float) -> tuple[str, str | 
         plan = None
         if state == SIGNED_IN and end - time.monotonic() > 0.5:
             row = usage.probe_account({"label": usage.LABELS[cli], "harness": cli, "home": home},
-                                      timeout=left(), rollout=False, turn=False)
+                                      timeout=left(), rollout=False, turn=False, login=False)
             plan = row.get("plan") if row.get("ok") else None
         return state, reason, plan
     if cli in ("grok", "muse"):
-        data = usage.probe_grok(home, timeout=left()) if cli == "grok" else \
+        data = usage.probe_grok(home, timeout=left(), login=False) if cli == "grok" else \
             usage.probe_muse(timeout=left(), turn=False)
         digest = data.get("account_digest")
         subscription = digest if isinstance(digest, str) and digest \
@@ -1492,5 +1492,5 @@ def try_account(harness: str, folder: str | None = None, *, timeout: float = usa
             return {"ok": False, "error": "folder_not_found"}
         home = None if identity(path) == identity(default_folder(harness)) else str(path)
     row = usage.probe_account({"label": usage.LABELS[harness], "harness": harness, "home": home},
-                              timeout=timeout, rollout=False)
+                              timeout=timeout, rollout=False, login=False)
     return {"ok": bool(row.get("ok")), "default": home is None, "row": row}
