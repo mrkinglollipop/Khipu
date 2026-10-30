@@ -307,7 +307,9 @@ class ProjectSliceTest(unittest.TestCase):
             out, cur = self._run([[], [episode_row], []], project="acme/widget")
         episodes_call = cur.statements[1]
         self.assertIn("scope = %s", episodes_call)
-        self.assertNotIn("COALESCE", episodes_call)
+        # The project fallback is the point; the summary filter's own
+        # COALESCE(raw->>'summary_kind', '') is allowed.
+        self.assertNotIn("COALESCE(project", episodes_call)
         self.assertEqual(out["episodes"][0]["id"], 7)
 
     def test_note_topics_query_runs_even_with_no_episode_linked_topic_slugs(self):

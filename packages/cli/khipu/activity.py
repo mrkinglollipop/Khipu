@@ -6,6 +6,7 @@ from typing import Any
 
 from khipu.db import connect
 from khipu.snippets import SNIPPET_LIMIT, clip_snippet
+from khipu.summary_kind import VERBATIM_ONLY_SQL
 from khipu.text_pages import PAGE_BYTES_DEFAULT, db_start, fetch_bytes, page_args, page_utf8
 
 
@@ -97,13 +98,19 @@ def episode_detail(episode_id: int) -> dict | None:
             r = cur.fetchone()
     if not r:
         return None
+    from khipu.summary_kind import NO_SUMMARY_LABEL, VERBATIM_ONLY, is_verbatim_only
+
+    no_summary = is_verbatim_only(r[5], r[11])
     return {
         "id": r[0],
         "ts": r[1].isoformat() if r[1] else None,
         "ingested_at": r[2].isoformat() if r[2] else None,
         "session_id": r[3],
         "scope": r[4],
-        "summary": r[5],
+        # An episode the summariser left empty says so, rather than showing a
+        # stand-in sentence as if a model had written it.
+        "summary": NO_SUMMARY_LABEL if no_summary else r[5],
+        **({"summary_kind": VERBATIM_ONLY} if no_summary else {}),
         "topics": r[6],
         "people": r[7],
         "decisions": r[8],
@@ -474,6 +481,7 @@ def project_slice(
                     SELECT id, ts, summary, topics
                     FROM episodes
                     WHERE ({' OR '.join(clauses)}) {deleted_clause}
+                      AND NOT {VERBATIM_ONLY_SQL}
                     ORDER BY ts DESC
                     LIMIT %s
                     """,
