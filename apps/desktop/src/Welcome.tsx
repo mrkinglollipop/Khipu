@@ -133,6 +133,7 @@ const UNMAPPED_DOCTOR_FAILURES = [
   "prompt_recall_snapshot_ok",
   "prompt_recall_outcomes_ok",
   "recall_daemon_ok",
+  "forget_list_ok",
   "launchers_ok",
   "notes_reconcile_ok",
   "embed_provider_ok",

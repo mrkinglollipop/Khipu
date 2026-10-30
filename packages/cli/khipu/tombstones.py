@@ -547,6 +547,103 @@ def episode_refs(row: Any) -> tuple[set[str], set[str]]:
     return direct, reached
 
 
+FENCE_STATE_NAME = "forget_fence_state.json"
+_FENCE_LAST: tuple[bool, str] | None = None
+
+
+def fence_state_path() -> Path:
+    from khipu.paths import ensure_data_dir
+
+    return ensure_data_dir() / FENCE_STATE_NAME
+
+
+def _reason_word(exc: BaseException) -> str:
+    """One word for why the forget list could not be read: ``malformed`` when
+    its contents failed to parse or validate, else ``unreadable``."""
+    text = str(exc)
+    return "malformed" if ("corrupt" in text or "ValueError" in text
+                           or "JSONDecodeError" in text or "UnicodeError" in text
+                           or "UnicodeDecodeError" in text) else "unreadable"
+
+
+def read_fence_state() -> dict[str, Any] | None:
+    """The last recorded fence outcome (``readable``, ``reason``, ``withheld``,
+    ``at``), or None when none was recorded or the file is unusable."""
+    try:
+        value = json.loads(fence_state_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - no usable record reads as none
+        return None
+    if (isinstance(value, dict) and isinstance(value.get("readable"), bool)
+            and isinstance(value.get("reason"), str)):
+        return value
+    return None
+
+
+def _record_fence(readable: bool, reason: str, withheld: int) -> None:
+    """Record the fence's outcome for doctor and the log, once per process per
+    change of outcome. Counts and a reason word only: no text, no ids. Never
+    raises: recording must not fail the read it describes."""
+    global _FENCE_LAST
+    outcome = (readable, reason)
+    if _FENCE_LAST == outcome:
+        return
+    first = _FENCE_LAST is None
+    _FENCE_LAST = outcome
+    try:
+        prior = read_fence_state()
+        if first and prior is not None and (prior["readable"], prior["reason"]) == outcome:
+            return
+        from datetime import datetime, timezone
+
+        path = fence_state_path()
+        state = {"readable": readable, "reason": reason, "withheld": int(withheld),
+                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, sort_keys=True, separators=(",", ":"))
+            os.replace(name, path)
+        finally:
+            try:
+                os.unlink(name)
+            except FileNotFoundError:
+                pass
+        if not readable:
+            from khipu.paths import capture_home
+
+            log = capture_home() / "logs" / "prompt-recall.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(f"{state['at']} [khipu-forget-fence] unreadable: {reason} "
+                             f"withheld={int(withheld)}\n")
+    except Exception:  # noqa: BLE001 - recording never fails the fence
+        pass
+
+
+def forget_list_health() -> dict[str, Any]:
+    """Doctor's ``forget_list`` block. Red when the last fence use could not
+    read this Mac's forget list (automatic pushes then send nothing and
+    explicit reads hide every episode-linked row); not applicable when no
+    list exists and no fence outcome was ever recorded."""
+    state = read_fence_state()
+    if state is not None:
+        if state["readable"]:
+            return {"ok": True, "applicable": True}
+        reason = state["reason"] or "unreadable"
+        return {"ok": False, "applicable": True, "reason": reason,
+                "withheld": state.get("withheld"),
+                "error": (f"forget list {reason}: automatic pushes send nothing and "
+                          "episode-linked rows are hidden")}
+    try:
+        exists = registry_path().exists()
+    except OSError:
+        exists = True
+    if not exists:
+        return {"ok": True, "applicable": False}
+    return {"ok": True, "applicable": True}
+
+
 def withhold(rows: Sequence[Any], *, fail_closed: bool = True,
              episode_key: str | None = None) -> list[Any]:
     """The one forget fence for every row a reader shows, pushes or logs:
@@ -560,8 +657,10 @@ def withhold(rows: Sequence[Any], *, fail_closed: bool = True,
     try:
         withheld = {str(i) for i in withheld_episode_ids()}
         readable = True
-    except Exception:  # noqa: BLE001 - an unreadable forget list shows no episode
+    except Exception as exc:  # noqa: BLE001 - an unreadable forget list shows no episode
+        reason = _reason_word(exc)
         if fail_closed:
+            _record_fence(False, reason, len(rows))
             return []
         withheld, readable = set(), False
     kept = []
@@ -577,6 +676,7 @@ def withhold(rows: Sequence[Any], *, fail_closed: bool = True,
         elif direct & withheld or (reached and reached <= withheld):
             continue
         kept.append(row)
+    _record_fence(readable, "" if readable else reason, len(rows) - len(kept) if not readable else 0)
     return kept
 
 
