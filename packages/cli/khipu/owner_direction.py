@@ -53,6 +53,9 @@ _SESSION_VARS = ("KHIPU_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"
 
 _clock = time.time
 
+_DISPATCHED_WHY = ("This call comes from a dispatched job, which can never make an owner's change. Ask the owner to "
+                   "say it in the conversation they are typing in.")
+
 
 class DirectionRefused(Exception):
     """The direction was not accepted; ``message`` is plain English the agent
@@ -130,11 +133,10 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     if not conf["enabled"] and action != "direction.on":
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
-    if owner_turns.dispatched_lane(os.environ if env is None else env):
-        raise DirectionRefused("no_recorded_turn", "This call comes from a dispatched job, which can never make an "
-                                                   "owner's change. Ask the owner to say it in the conversation "
-                                                   "they are typing in.")
+    environ = os.environ if env is None else env
     session = session_of(env)
+    if owner_turns.dispatched_job(environ, session):
+        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     if not session:
         raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't tell "
                                                    "whether the owner is in it.")
@@ -145,6 +147,10 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
                                                    "whether the owner is in the one asking. Ask the owner to say it "
                                                    "in the conversation they are typing in.")
     turn = _recent_turn(session, conf, now)
+    # A turn recorded before the T3 child test existed carries no mark, so a
+    # T3 turn is looked at again here.
+    if turn.get("entrypoint") == "t3" and owner_turns.dispatched_job(environ, session, t3_thread=True):
+        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     _from_the_hook(turn)
     return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
             "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),

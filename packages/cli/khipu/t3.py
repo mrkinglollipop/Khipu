@@ -146,6 +146,17 @@ def thread_for_session_result(sid: str, *, whole_table: bool = False) -> tuple[s
         con.execute("PRAGMA busy_timeout = 2")
         deadline = time.monotonic() + 0.05
         con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        if whole_table:
+            # Only the full exact-match scan, so it has the whole deadline: a
+            # native id naming two distinct threads anywhere is ambiguous
+            # (None), and an interrupted scan is a failure, not a miss.
+            rows = con.execute(
+                "SELECT DISTINCT thread_id FROM orchestration_v2_projection_provider_threads "
+                "WHERE CASE WHEN json_valid(payload_json) THEN "
+                "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?",
+                (sid,),
+            ).fetchall()
+            return _distinct_threads(rows), True
         indexed = con.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'index' "
             "AND tbl_name = 'orchestration_v2_projection_provider_threads' "
@@ -177,16 +188,6 @@ def thread_for_session_result(sid: str, *, whole_table: bool = False) -> tuple[s
             if "rowid" not in str(exc).lower():
                 raise
             rows = _fallback_window_rows(con, sid)
-        if whole_table:
-            # Every row, even after a window hit: one native id naming a
-            # recent thread and a different older one is ambiguous and must
-            # fail closed (an interrupted scan is a failure, not a hit).
-            rows = con.execute(
-                "SELECT thread_id FROM orchestration_v2_projection_provider_threads "
-                "WHERE CASE WHEN json_valid(payload_json) THEN "
-                "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?",
-                (sid,),
-            ).fetchall()
         return _distinct_threads(rows), True
     except (OSError, ValueError, sqlite3.Error):
         return None, False
@@ -208,6 +209,64 @@ def thread_for_session(sid: str) -> str | None:
     """
     thread, _definitive = thread_for_session_result(sid)
     return thread
+
+
+DELEGATED_THREAD_PREFIX = "thread:delegated-task:"
+
+
+def _names_parent(mapping) -> bool:
+    return isinstance(mapping, dict) and any(
+        "parent" in str(key).lower() and value not in (None, "", [], {})
+        for key, value in mapping.items())
+
+
+def delegated_thread_result(thread_id: str) -> tuple[bool, bool]:
+    """``(delegated, definitive)``: whether a T3 thread is a delegated child
+    (a job another thread started), never the owner's own conversation.
+
+    A ``thread:delegated-task:`` id is a child without any read. Otherwise
+    the thread's projection rows are read: a non-empty column or top-level
+    payload key naming a parent marks a child. ``definitive`` is False when
+    the read did not complete, so a caller deciding permission fails closed.
+    """
+    if not isinstance(thread_id, str) or not thread_id:
+        return False, False
+    if thread_id.startswith(DELEGATED_THREAD_PREFIX):
+        return True, True
+    path = _thread_db_path()
+    if not path.is_file():
+        return False, False
+    con = None
+    try:
+        con = sqlite3.connect(_readonly_uri(path), uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 2")
+        deadline = time.monotonic() + 0.05
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table in ("orchestration_v2_projection_threads",
+                      "orchestration_v2_projection_provider_threads"):
+            if table not in tables:
+                continue
+            cur = con.execute(f"SELECT * FROM {table} WHERE thread_id = ?", (thread_id,))
+            cols = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                record = dict(zip(cols, row))
+                if _names_parent(record):
+                    return True, True
+                payload = record.get("payload_json")
+                if isinstance(payload, str):
+                    try:
+                        if _names_parent(json.loads(payload)):
+                            return True, True
+                    except ValueError:
+                        pass
+        return False, True
+    except (OSError, ValueError, sqlite3.Error):
+        return False, False
+    finally:
+        if con is not None:
+            con.close()
 
 
 def thread_title(thread_id: str) -> str | None:

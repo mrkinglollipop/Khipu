@@ -36,6 +36,9 @@ def folders(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
     monkeypatch.setenv("KHIPU_DATA_DIR", str(data))
     monkeypatch.delenv("KHIPU_ISOLATED_DIR", raising=False)
+    for name in ("KHIPU_JOB", "KHIPU_PARENT_SESSION", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_HOST_SESSION_ID",
+                 "CLAUDE_DISPATCHED_LANE"):
+        monkeypatch.delenv(name, raising=False)
     return {"home": home, "data": data}
 
 
@@ -320,6 +323,7 @@ def test_t3_handoff_history_marker_never_puts_history_on_disk(hooked):
 
     hooked.setattr(t3, "thread_for_session", lambda session: "t3-thread")
     hooked.setattr(t3, "thread_for_session_result", lambda session, **_kw: ("t3-thread", True))
+    hooked.setattr(t3, "delegated_thread_result", lambda thread: (False, True))
     prompt = (
         "Context handoff (compact):\n"
         "Provider context handoff. Thread: t3-thread.\n"

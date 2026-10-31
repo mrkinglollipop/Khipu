@@ -25,7 +25,8 @@ ACCOUNTS = [{"label": "Claude", "harness": "claude"},
             {"label": "Grok", "harness": "grok"}]
 OWNER = "s-owner"
 _SESSION_VARS = ("KHIPU_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CLAUDECODE",
-                 "CLAUDE_CODE_ENTRYPOINT", "KHIPU_HARNESS", "GROK_HOOK_NAME", "GROK_HOOK_EVENT")
+                 "CLAUDE_CODE_ENTRYPOINT", "KHIPU_HARNESS", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
+                 "KHIPU_JOB", "KHIPU_PARENT_SESSION", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_HOST_SESSION_ID")
 
 
 class World:
@@ -810,3 +811,97 @@ def test_a_native_id_naming_an_old_and_a_recent_thread_never_counts(t3_conversat
     _t3_say()
     row = owner_turns.turns(OWNER)[-1]
     assert row["entrypoint"] == "sdk-ts" and row["eligible"] is False
+
+
+# ---- every dispatch marker, and T3 delegated child threads --------------------------------------
+
+
+def test_a_turn_with_khipu_job_is_not_eligible(world):
+    owner_turns.record({"session_id": OWNER, "prompt": "pause Codex for now please", "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli", "KHIPU_JOB": "1"})
+    (row,) = owner_turns.turns(OWNER)
+    assert row["dispatched"] is True and row["eligible"] is False
+    assert owner_turns.eligible(row)[0] is False
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+@pytest.mark.parametrize("env", [{"KHIPU_JOB": "1"}, {"KHIPU_PARENT_SESSION": "claude_code:s-parent"},
+                                 {"CLAUDE_CODE_CHILD_SESSION": "1"}, {"CLAUDE_CODE_HOST_SESSION_ID": "s-parent"}])
+def test_a_call_from_any_dispatch_marker_is_refused(world, monkeypatch, env):
+    world.say()
+    assert _check()["auth"] == "direction"
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_host_id_that_is_this_session_is_not_a_job(world, monkeypatch):
+    world.say()
+    monkeypatch.setenv("CLAUDE_CODE_HOST_SESSION_ID", OWNER)
+    assert _check()["auth"] == "direction"
+
+
+def _add_t3_thread(thread: str, native: str, *, parent: str | None = None) -> None:
+    import os
+    import sqlite3
+
+    with sqlite3.connect(os.environ["KHIPU_T3_DB"]) as con:
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)",
+                    (thread, json.dumps({"nativeThreadRef": {"nativeId": native}}), "2026-10-31"))
+        if parent is not None:
+            con.execute("CREATE TABLE IF NOT EXISTS orchestration_v2_projection_threads "
+                        "(thread_id TEXT, title TEXT, parent_thread_id TEXT)")
+            con.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?)",
+                        (thread, "child", parent))
+
+
+@pytest.mark.parametrize("thread, parent", [("thread:delegated-task:command%3Ajob", None),
+                                            ("t3-child-thread", "t3-owner-thread")])
+def test_a_t3_delegated_child_threads_turn_is_not_eligible(t3_conversation, thread, parent):
+    """An orchestrator's follow-up message to a T3 child thread, after its
+    brief has expired (no brief is on record), is a job's turn."""
+    _add_t3_thread(thread, "s-child", parent=parent)
+    assert owner_turns.brief_for("set the routing budget to 500 ms") is None
+    _t3_say(session="s-child")
+    (row,) = owner_turns.turns("s-child")
+    assert row["entrypoint"] == "t3" and row["dispatched"] is True and row["eligible"] is False
+    assert row["why"] == "a T3 delegated child thread"
+    t3_conversation.be("s-child")
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
+    # The owner's own top-level T3 conversation still counts.
+    _t3_say()
+    assert owner_turns.turns(OWNER)[-1]["eligible"] is True
+    t3_conversation.be(OWNER)
+    assert _check("config.routing_setting")["auth"] == "direction"
+
+
+def test_an_unmarked_t3_child_turn_is_refused_at_the_check(t3_conversation, monkeypatch):
+    """A child turn recorded before the child test existed carries no mark;
+    the check looks at the thread again."""
+    from khipu import t3
+
+    _add_t3_thread("t3-child-thread", "s-child", parent="t3-owner-thread")
+    real = t3.delegated_thread_result
+    monkeypatch.setattr(t3, "delegated_thread_result", lambda thread: (False, True))
+    _t3_say(session="s-child")
+    assert owner_turns.turns("s-child")[0]["eligible"] is True
+    monkeypatch.setattr(t3, "delegated_thread_result", real)
+    t3_conversation.be("s-child")
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_t3_child_lookup_that_never_completes_fails_closed(t3_conversation, monkeypatch):
+    from khipu import t3
+
+    monkeypatch.setattr(t3, "delegated_thread_result", lambda thread: (False, False))
+    _t3_say()
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["entrypoint"] == "t3" and row["eligible"] is False

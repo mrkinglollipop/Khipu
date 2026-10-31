@@ -55,6 +55,35 @@ def test_mapping_child_and_miss(t3_db):
     assert t3.thread_for_session('absent') is None
 
 
+def test_whole_table_runs_only_the_full_scan(t3_db, monkeypatch):
+    """With ``whole_table`` the bounded window query is never issued, so the
+    one exact-match scan has the whole deadline to itself."""
+    statements, real = [], sqlite3.connect
+
+    def traced(*args, **kwargs):
+        con = real(*args, **kwargs)
+        con.set_trace_callback(statements.append)
+        return con
+
+    monkeypatch.setattr(t3.sqlite3, 'connect', traced)
+    assert t3.thread_for_session_result('claude-one', whole_table=True) == (THREAD, True)
+    reads = [s for s in statements if 'orchestration_v2_projection_provider_threads' in s]
+    assert len(reads) == 1, reads
+    assert 'rowid' not in reads[0].lower() and 'LIMIT' not in reads[0]
+    assert t3.thread_for_session_result('child', whole_table=True) == \
+        ('thread:delegated-task:command%3Achild', True)
+
+
+def test_whole_table_interrupted_scan_is_a_failure(t3_db, monkeypatch):
+    with sqlite3.connect(t3_db) as con:
+        con.executemany('INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)',
+                        [(f't-{i}', json.dumps({'nativeThreadRef': {'nativeId': f's-{i}'}}), '2026-10-08')
+                         for i in range(2000)])
+    clock = iter([0.0] + [10.0] * 1000)
+    monkeypatch.setattr(t3.time, 'monotonic', lambda: next(clock))
+    assert t3.thread_for_session_result('claude-one', whole_table=True) == (None, False)
+
+
 @pytest.mark.parametrize('payload', ['{', '{}', '[]', 'null', '{"nativeThreadRef":[]}'])
 def test_mapping_malformed_row_does_not_poison_hits(t3_db, payload):
     with sqlite3.connect(t3_db) as con:
