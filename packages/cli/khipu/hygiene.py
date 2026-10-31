@@ -157,6 +157,7 @@ def filter_real_paths(rels: Iterable[str], *, repo_root: str | None = None) -> l
 
 
 def report_junk_paths(cur, *, sample_limit: int = 20) -> dict[str, Any]:
+    # forget-fence: counts path nodes; returns counts and node ids, no episode
     """Read-only: how many existing ``path:`` nodes fail :func:`is_real_path`.
 
     No ``repo_root`` context is available for a historical node (the graph
@@ -191,6 +192,7 @@ def apply_purge_junk_paths(cur) -> dict[str, Any]:
 # ---- W1.5 identity backfill -------------------------------------------------
 
 def apply_backfill_identity(cur, *, limit: int | None = None) -> dict[str, Any]:
+    # forget-fence: owner maintenance writer; returns counts
     """Destructive: derive repo_root/project (via khipu.identity, using each
     episode's absolute-path ``scope`` as a stand-in cwd) for every episode
     that has none yet, and UPDATE it in place. Must NOT be run against the
@@ -237,7 +239,10 @@ def backfill_identity_report(cur, *, sample_limit: int = 20) -> dict[str, Any]:
         """,
         (sample_limit,),
     )
-    sample = [{"id": r[0], "scope": r[1], "session_id": r[2]} for r in cur.fetchall()]
+    from khipu.tombstones import withhold
+
+    sample = withhold([{"id": r[0], "scope": r[1], "session_id": r[2]} for r in cur.fetchall()],
+                      fail_closed=False, episode_key="id")
     cur.execute(
         "SELECT COUNT(*) FROM episodes WHERE repo_root IS NULL AND scope IS NOT NULL AND scope LIKE '/%%'"
     )
@@ -272,6 +277,7 @@ def _project_from_raw(repo_root: Any, raw: Any) -> str | None:
 
 def _resolve_project_for_episode(cur, *, episode_id: int, session_id: str | None,
                                  repo_root: Any, raw: Any) -> str | None:
+    # forget-fence: resolves one project name for a backfill write
     """Best-effort project for one NULL-project episode. Never invents a
     project from a session id or free-text scope (K6's whole point)."""
     if session_id:
@@ -306,15 +312,18 @@ def backfill_project_report(cur, *, sample_limit: int = 20) -> dict[str, Any]:
             if len(sample) < sample_limit:
                 sample.append({"id": eid, "resolved_project": project})
     total = len(rows)
+    from khipu.tombstones import withhold
+
     return {
         "total_null_project": total,
         "would_resolve": resolved,
         "resolve_rate": round(resolved / total, 4) if total else 0.0,
-        "sample": sample,
+        "sample": withhold(sample, fail_closed=False, episode_key="id"),
     }
 
 
 def apply_backfill_project(cur, *, limit: int | None = None) -> dict[str, Any]:
+    # forget-fence: owner maintenance writer; returns counts
     """Destructive: write the resolved project for every NULL-project episode
     a resolver can answer for. The UPDATE's own ``WHERE ... AND project IS
     NULL`` makes "touches no row that already has a project" structural, not
@@ -397,13 +406,20 @@ def _model_judge(texts: list[str]) -> list[dict[str, Any]]:
     or a transport failure leaves the items kept. This job drops rows; it must
     never drop them because a model call went sideways.
     """
+    from khipu import provider_text
     from khipu.extract import _generate, parse_model_json
 
     out: list[dict[str, Any]] = [
         {"keep": True, "reason": "model returned no verdict"} for _ in texts
     ]
+    # The chokepoint: an item derived from a forgotten episode, or with no
+    # known source, is kept and never sent.
+    marks = provider_text.fenced_texts(texts, None, "commitment")
+    sent = [i for i, mark in enumerate(marks) if mark is not None]
+    if not sent:
+        return out
     try:
-        raw = _generate(_judge_prompt(texts), timeout=90, retries=1, caller="hygiene")
+        raw = _generate(_judge_prompt([marks[i] for i in sent]), timeout=90, retries=1, caller="hygiene")
     except Exception as exc:  # noqa: BLE001 — keep everything on a failed call
         return [{"keep": True, "reason": f"judge unavailable: {type(exc).__name__}"} for _ in texts]
     parsed = parse_model_json(raw) or {}
@@ -414,7 +430,8 @@ def _model_judge(texts: list[str]) -> list[dict[str, Any]]:
             idx = int(item.get("i"))
         except (TypeError, ValueError):
             continue
-        if 0 <= idx < len(out):
+        if 0 <= idx < len(sent):
+            idx = sent[idx]
             out[idx] = {
                 "keep": bool(item.get("keep", True)),
                 "reason": str(item.get("reason") or "").strip()[:120] or "model verdict",
@@ -423,6 +440,7 @@ def _model_judge(texts: list[str]) -> list[dict[str, Any]]:
 
 
 def _select_open_commitments(cur, *, project: str | None, limit: int | None) -> list[dict[str, Any]]:
+    # forget-fence: the hygiene pass's write input; returns no row to a reader
     clauses = ["status = 'open'"]
     params: list[Any] = []
     if project:
@@ -619,17 +637,26 @@ def _model_adjudicate_pairs(pairs: list[tuple[str, str]], *, retries: int = 1) -
     an unreadable response)."""
     if not pairs:
         return []
+    from khipu import provider_text
     from khipu.extract import _generate, parse_model_json
 
+    marks = provider_text.fenced_texts([t for pair in pairs for t in pair], None, "commitment")
+    sent = [i for i in range(len(pairs)) if marks[2 * i] is not None and marks[2 * i + 1] is not None]
+    if not sent:
+        return [False] * len(pairs)
     try:
-        raw = _generate(_adjudicate_pairs_prompt(pairs), timeout=60, retries=retries, caller="hygiene")
+        raw = _generate(_adjudicate_pairs_prompt([(marks[2 * i], marks[2 * i + 1]) for i in sent]),
+                        timeout=60, retries=retries, caller="hygiene")
     except Exception:  # noqa: BLE001
         return [False] * len(pairs)
     parsed = parse_model_json(raw) or {}
     same = parsed.get("same")
-    if not isinstance(same, list) or len(same) != len(pairs):
+    if not isinstance(same, list) or len(same) != len(sent):
         return [False] * len(pairs)
-    return [bool(x) for x in same]
+    out = [False] * len(pairs)
+    for i, answer in zip(sent, same):
+        out[i] = bool(answer)
+    return out
 
 
 def commitments_backup_dir() -> Path:
@@ -755,6 +782,11 @@ def run_commitments_hygiene(
 
     judge = judge or _model_judge
     rows = _select_open_commitments(cur, project=project, limit=limit)
+    from khipu import provider_text
+
+    origin = provider_text.episode_ids_of_commitments(cur, [r["id"] for r in rows])
+    for row in rows:
+        row["text"] = provider_text.sourced(row["text"], origin.get(str(row["id"])))
     verdicts: dict[int, dict[str, Any]] = {}
     survivors: list[dict[str, Any]] = []
     judged: list[dict[str, Any]] = []
@@ -907,6 +939,7 @@ _SESSION_END_EVENTS_SQL = "('sessionend', 'session_end', 'session-end', 'session
 
 def _select_open_with_session(cur, *, project: str | None, limit: int | None,
                               hours: int) -> list[dict[str, Any]]:
+    # forget-fence: the hygiene pass's write input; returns no row to a reader
     from khipu.db import has_columns
 
     clauses = ["c.status = 'open'"]
@@ -1077,3 +1110,44 @@ def run_session_ended_pass(
         "applied": applied,
         "verdicts": listing,
     }
+
+
+# ---- summary_kind backfill (2026-10-30) -------------------------------------
+#
+# 229 episodes carry the sentence the summariser's empty replies used to be
+# stored under. They keep their text and every evidence column; each only
+# gains raw.summary_kind = "verbatim_only", the marker new captures carry, so
+# readers have one signal. Bounded per night.
+SUMMARY_KIND_NIGHTLY_LIMIT = 200
+
+
+def apply_backfill_summary_kind(cur, *, limit: int = SUMMARY_KIND_NIGHTLY_LIMIT) -> dict[str, Any]:
+    # forget-fence: owner maintenance writer; selects ids and writes a summary_kind marker, calls no provider
+    import json
+
+    from khipu.db import has_columns
+    from khipu.summary_kind import LEGACY_PLACEHOLDER, VERBATIM_ONLY
+
+    live = "AND deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
+    # A row whose raw is not a JSON object (array, scalar, NULL) has no
+    # summary_kind key to read, so it must be rewritten into an object or it is
+    # selected every night.
+    where = (f"summary LIKE %s {live}AND COALESCE(CASE WHEN jsonb_typeof(raw) = 'object' "
+             "THEN raw->>'summary_kind' END, '') <> %s")
+    params = (LEGACY_PLACEHOLDER + "%", VERBATIM_ONLY)
+    cur.execute(f"SELECT id FROM episodes WHERE {where} ORDER BY id LIMIT %s", (*params, int(limit)))
+    ids = [int(r[0]) for r in cur.fetchall()]
+    updated = 0
+    if ids:
+        # Object: merge the marker. NULL or JSON null: the marker alone. Any other
+        # shape: the marker plus the old value kept under raw_value.
+        cur.execute(
+            "UPDATE episodes SET raw = CASE "
+            "WHEN jsonb_typeof(raw) = 'object' THEN raw || %s::jsonb "
+            "WHEN raw IS NULL OR jsonb_typeof(raw) = 'null' THEN %s::jsonb "
+            "ELSE %s::jsonb || jsonb_build_object('raw_value', raw) END WHERE id = ANY(%s)",
+            (json.dumps({"summary_kind": VERBATIM_ONLY}),) * 3 + (ids,),
+        )
+        updated = cur.rowcount
+    cur.execute(f"SELECT COUNT(*) FROM episodes WHERE {where}", params)
+    return {"scanned": len(ids), "updated": updated, "remaining": int(cur.fetchone()[0])}

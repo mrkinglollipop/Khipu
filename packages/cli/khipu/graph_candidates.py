@@ -160,6 +160,7 @@ def _seeds(fused: Sequence[Mapping[str, Any]]) -> list[tuple[int, Mapping[str, A
 
 
 def _hub_topic_wiki(cur, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     from khipu import topic_graph
 
     aliases = topic_graph.topic_aliases(slug)
@@ -191,6 +192,7 @@ def _hub_topic_wiki(cur, slug: str, *, seed_rank: int, seed_key: str) -> list[di
 
 
 def _hub_topic_recent_episodes(cur, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     from khipu.db import has_columns
 
     live = "deleted_at IS NULL AND " if has_columns(cur, "episodes", "deleted_at") else ""
@@ -223,6 +225,7 @@ def _hub_topic_recent_episodes(cur, slug: str, *, seed_rank: int, seed_key: str)
 
 
 def _hub_episode_topics(cur, episode_id: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     from khipu import topic_graph
 
     from khipu.db import has_columns
@@ -261,6 +264,7 @@ def _hub_episode_topics(cur, episode_id: str, *, seed_rank: int, seed_key: str) 
 def hub_candidates(
     cur, fused: Sequence[Mapping[str, Any]], *, deadline: float
 ) -> tuple[list[dict[str, Any]], bool]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     """``(candidates, missed)`` for the hub (PostgreSQL) leg. ``deadline`` is
     an absolute ``time.monotonic()`` value the caller computes (typically
     ``time.monotonic() + HUB_LEG_DEADLINE_S``), so a test can pass an
@@ -324,6 +328,7 @@ def hub_candidates(
 
 
 def _replica_topic_wiki(con, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     from khipu import topic_graph
 
     aliases = topic_graph.topic_aliases(slug)
@@ -357,6 +362,7 @@ def _replica_topic_wiki(con, slug: str, *, seed_rank: int, seed_key: str) -> lis
 
 
 def _replica_episode_topics(con, episode_id: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     import json
 
     from khipu import topic_graph
@@ -434,6 +440,7 @@ def _slug_map_key() -> tuple[Any, ...] | None:
 
 
 def _build_slug_map() -> dict[str, list[tuple[Any, Any, Any]]]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     from khipu import hub_snapshot, topic_graph
 
     con = hub_snapshot.open_snapshot()
@@ -456,6 +463,7 @@ def _build_slug_map() -> dict[str, list[tuple[Any, Any, Any]]]:
 
 
 def _rebuild_slug_map(key: tuple[Any, ...]) -> None:
+    # forget-fence: caches the slug map the candidate builders read; returns nothing
     global _SLUG_RELOADING
     try:
         by_slug = _build_slug_map()
@@ -490,6 +498,7 @@ def _episode_slug_map() -> dict[str, list[tuple[Any, Any, Any]]] | None:
 
 
 def _replica_topic_recent_episodes(con, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     from khipu.hub_snapshot import _snapshot_table_columns
     from khipu import topic_graph
 
@@ -551,6 +560,7 @@ def _recent_episode_row(eid, ts, summary, *, seed_rank: int, seed_key: str) -> d
 def replica_candidates(
     con, fused: Sequence[Mapping[str, Any]], *, deadline: float
 ) -> tuple[list[dict[str, Any]], bool]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
     """``(candidates, missed)`` for the replica (SQLite) leg — same contract
     as ``hub_candidates``, see its docstring for the deadline convention."""
     exclude = {(str(r.get("kind")), str(r.get("id"))) for r in fused}

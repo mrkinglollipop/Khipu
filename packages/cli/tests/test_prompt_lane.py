@@ -492,3 +492,22 @@ class DoctorOutcomesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_a_snapshot_failure_logs_the_exception_type_never_the_prompt(tmp_path, monkeypatch):
+    from khipu import recall_prompt
+
+    secret = "fake golden query about the sealed vault"
+    log = tmp_path / "prompt-recall.log"
+    monkeypatch.setattr(recall_prompt, "_log_path", lambda: log)
+    monkeypatch.setattr(recall_prompt, "_project_for_cwd", lambda _cwd: None)
+
+    def boom(prompt, **_k):
+        raise RuntimeError(prompt)
+
+    monkeypatch.setattr(recall_prompt, "_snapshot_search_hits", boom)
+    monkeypatch.setattr(recall_prompt, "_hub_known_down", lambda: {"hits": [], "legs": [], "degraded": None})
+    recall_prompt._search_hits(secret, cwd=None)
+    recall_prompt._search_hits_budgeted(secret, cwd=None, budget_ms=500)
+    text = log.read_text()
+    assert "RuntimeError" in text and secret not in text

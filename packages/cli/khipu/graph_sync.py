@@ -114,6 +114,7 @@ def _node_owned(node: dict[str, Any], owned: set[str], doc: dict | None = None) 
 
 
 def _read_sqlite(path: Path) -> tuple[list[tuple], list[tuple]]:
+    # forget-fence: graphify mirror sync and its drift check; returns counts
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         con.row_factory = sqlite3.Row
@@ -176,6 +177,7 @@ def _connect_graph_mirror():
 def sync_from_sqlite(
     sqlite_path: Path | None = None, *, dry_run: bool = False
 ) -> dict[str, Any]:
+    # forget-fence: graphify mirror sync and its drift check; returns counts
     """Mirror graphify's graph.sqlite into PG. Idempotent; one transaction.
 
     Returns counts plus the post-sync drift so a caller can assert zero."""
@@ -431,6 +433,7 @@ def graph_drift(
     sqlite_path: Path | None = None, *, sample: int = 5, excuse_pending: bool = True,
     mirror_connections: bool = False,
 ) -> dict[str, Any]:
+    # forget-fence: graphify mirror sync and its drift check; returns counts
     """Compare graphify rows with PG by identity and normalized content.
 
     ``excuse_pending`` lets a difference that appeared after the last good
@@ -476,6 +479,7 @@ def graph_drift(
     establish = _connect_graph_mirror if mirror_connections else connect
 
     def _pg_nodes() -> tuple[list[dict[str, Any]], int]:
+        # forget-fence: graphify mirror sync and its drift check; returns counts
         with establish() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -501,6 +505,7 @@ def graph_drift(
                 return rows, cur.fetchone()[0]
 
     def _pg_edges() -> dict[tuple, tuple]:
+        # forget-fence: graphify mirror sync and its drift check; returns counts
         with establish() as conn:
             with conn.cursor() as cur:
                 cur.execute(

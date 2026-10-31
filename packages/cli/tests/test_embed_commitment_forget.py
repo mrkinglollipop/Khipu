@@ -46,6 +46,8 @@ class EmbedConnection:
         self.rowcount = 0
         if s.startswith('SELECT c.id, c.text FROM commitments') or s.startswith('SELECT id, text FROM commitments'):
             self.rows = [(42, 'SYNTHETIC-FORGOTTEN-COMMITMENT')] if self.world['commitment_open'] else []
+        elif s.startswith('SELECT id, opened_episode, closed_episode FROM commitments'):
+            self.rows = [(42, self.world.get('opened_episode', 7), None)] if self.world['commitment_open'] else []
         elif s.startswith('SELECT id, opened_episode FROM commitments'):
             if self.world['commitment_open']:
                 self.rows = [(42, self.world.get('opened_episode', 7))]

@@ -384,6 +384,7 @@ def _recent_conversation_use(path: Path) -> tuple[bool | None, str | None]:
 
 
 def _thread_linked_capture_evidence() -> tuple[str | None, str | None, int, bool]:
+    # forget-fence: doctor check: newest t3 capture time, harness and count
     """Newest stored capture explicitly stamped ``via:t3`` with a thread id.
 
     Doctor has already refreshed the local hub replica when the hub is

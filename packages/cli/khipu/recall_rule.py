@@ -380,6 +380,7 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
     try:
         from khipu import hub_snapshot
         from khipu.snippets import clip_snippet
+        from khipu.summary_kind import is_verbatim_only
 
         con = hub_snapshot.open_snapshot()
     except Exception:
@@ -406,13 +407,16 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
         group = hub_snapshot.snapshot_project_group(con, project)[1] if project else []
         for eid, summary, raw in rows:
             proj = parent = None
+            payload = None
             if raw:
                 try:
                     payload = json.loads(raw)
                     proj = payload.get("project")
                     parent = payload.get("parent_session_id")
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError, AttributeError):
+                    payload = None
+            if is_verbatim_only(summary, payload):
+                continue
             if (project and proj in group) or (host and parent == host):
                 hits.append((str(eid), summary or ""))
             if len(hits) >= 5:
@@ -421,6 +425,10 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
         return ""
     finally:
         con.close()
+    from khipu.tombstones import withhold
+
+    kept = {str(r["id"]) for r in withhold([{"kind": "episode", "id": eid} for eid, _ in hits])}
+    hits = [(eid, summary) for eid, summary in hits if eid in kept]
     if not hits:
         return ""
     lines = [
@@ -431,6 +439,31 @@ def _stale_project_slice(project: str | None, host: str | None) -> str:
     for eid, summary in hits:
         lines.append(f"- episode `{eid}`: {clip_snippet(summary, 200)}")
     return "\n".join(lines)
+
+
+def _fenced_slice(slice_data: dict) -> dict:
+    """``slice_data`` with the forget fence (``tombstones.withhold``) applied
+    to every list drawn from an episode: commitments, decisions, episodes,
+    and the topics those episodes link to. Nothing from them when the forget
+    list cannot be read."""
+    from khipu.tombstones import withhold
+
+    out = dict(slice_data)
+    episodes = [{"kind": "episode", **ep} for ep in slice_data.get("episodes") or []]
+    topics = []
+    for topic in slice_data.get("topics") or []:
+        topic = dict(topic)
+        if "via_episodes" not in topic:
+            links = [ep.get("id") for ep in episodes
+                     if topic.get("slug") in {str(t).strip() for t in ep.get("topics") or []}]
+            if links:
+                topic["via_episodes"] = links
+        topics.append(topic)
+    for key, rows in (("commitments", slice_data.get("commitments") or []),
+                      ("decisions", slice_data.get("decisions") or []),
+                      ("episodes", episodes), ("topics", topics)):
+        out[key] = withhold(rows)
+    return out
 
 
 def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
@@ -480,6 +513,8 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             # repeat live DB work through the cwd and recents fallbacks.
             _ = exc
             return ""
+        if slice_data:
+            slice_data = _fenced_slice(slice_data)
         # Routing directions (slice 19a) never carry the owner's words
         # into a slice: a job's slice names none at all, and another
         # project's slice names none either. This project's own slice
@@ -525,6 +560,9 @@ def _pushed_memory_slice(cwd: str | None, *, job: bool = False) -> str:
             }
             for r in activity.recent_episodes(limit=5)
         ]
+    from khipu.tombstones import withhold
+
+    rows = withhold(rows)
     if not rows:
         return ""
     lines = [

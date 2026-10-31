@@ -148,12 +148,14 @@ def _stale_briefs(cur, decision_id: int) -> None:
 
 
 def _lock_decision_row(cur, decision_id: int) -> None:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     cur.execute("SELECT id, project, superseded_by FROM decisions WHERE id = %s FOR UPDATE",
                 (decision_id,))
     cur.fetchone()
 
 
 def _fetch_decision_row(cur, decision_id: int) -> dict[str, Any] | None:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     cols = ["id", "project", "superseded_by"]
     if _evidence_ready(cur):
         cols.append("retracted_at")
@@ -168,6 +170,7 @@ def _fetch_decision_row(cur, decision_id: int) -> dict[str, Any] | None:
 
 
 def _chain_leads_to(cur, start_id: int, target_id: int, *, max_depth: int = 100) -> bool:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     """True when walking ``superseded_by`` forward from ``start_id`` reaches
     ``target_id`` — i.e. ``target_id`` already (transitively) supersedes
     ``start_id``. Used to refuse a supersede that would close a cycle.
@@ -220,6 +223,7 @@ def _project_match(cur, project: str | None) -> tuple[str, Any]:
 
 
 def _find_recent_duplicate(cur, project: str | None, norm_text: str, decided_at: Any) -> int | None:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     """id of an existing decision in ``project`` with the same normalised text,
     decided within ``DEDUP_WINDOW_DAYS`` before (or at) ``decided_at`` — or
     None. A reversal restated in the same conversation, or a fact repeated
@@ -432,6 +436,7 @@ def _standing_before_clause(cur, evidence_ready: bool, project: str | None) -> t
 
 def _best_reversal_match_sql(cur, *, project, exclude_id, before, reverses_text,
                               evidence_ready) -> tuple[int, float] | None:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     """pg_trgm path: let the hub's trigram index rank every standing decision
     in the project against ``reverses_text`` and return the single best
     match. No 200-row cap here — that bound is the Python fallback's own,
@@ -450,6 +455,7 @@ def _best_reversal_match_sql(cur, *, project, exclude_id, before, reverses_text,
 
 def _best_reversal_match_python(cur, *, project, exclude_id, before, reverses_text,
                                  evidence_ready) -> tuple[int, float] | None:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     """Fallback when pg_trgm is unavailable: the 200 most recent standing
     decisions of the project, scored in Python with the same token-overlap
     ratio ``khipu.commitments`` already uses for paraphrase dedup (shared,
@@ -471,6 +477,7 @@ def _best_reversal_match_python(cur, *, project, exclude_id, before, reverses_te
 
 
 def detect_reversals_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     """Conservative capture-time reversal detection (Evidence rule #7,
     docs/plans/2026-09-27-memory-reasoning-scope.md): for each decision this
     capture just inserted whose ``decision_details`` entry names an earlier
@@ -598,7 +605,11 @@ def list_decisions(cur, *, project: str | None = None, since: Any = None,
         """,
         params,
     )
-    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    from khipu.tombstones import withhold
+
+    # The hub learns of a forget after this Mac's list does: the list is the
+    # fence, and an unreadable one shows no decision tied to an episode.
+    rows = withhold([dict(zip(cols, row)) for row in cur.fetchall()], fail_closed=False)
     for row in rows:
         row["state"] = state_of(row)
         if canonical and row.get("project"):
@@ -608,6 +619,7 @@ def list_decisions(cur, *, project: str | None = None, since: Any = None,
 
 def supersede(cur, old_id: int, new_id: int, *, source: str = "manual",
               reason: str | None = None, force: bool = False) -> bool:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     """Mark ``old_id`` superseded by ``new_id``. A reversal or correction
     then outranks the original in every reader instead of sitting beside it
     forever (O2's root complaint).
@@ -808,6 +820,7 @@ def create_decision(cur, *, project: str | None, text: str, session_id: str | No
 def add_link(cur, old_id: int, new_id: int, *, kind: str = "supersedes",
              confidence: float | None = None, source: str = "manual",
              reason: str | None = None) -> int | None:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     """Insert (or return the id of) a candidate link — a detector's proposal
     that changes nothing until ``resolve_link`` confirms it (Evidence rule
     #7). None on a pre-migration hub (no ``decision_links`` table)."""
@@ -870,7 +883,7 @@ def list_links(cur, *, state: str | None = None, project: str | None = None,
     cur.execute(
         f"""
         SELECT l.id, l.old_id, l.new_id, l.kind, l.confidence, l.source, l.reason,
-               l.state, l.created_at, l.resolved_at, o.text, n.text
+               l.state, l.created_at, l.resolved_at, o.text, n.text, o.episode_id, n.episode_id
         FROM decision_links l
         JOIN decisions o ON o.id = l.old_id
         JOIN decisions n ON n.id = l.new_id
@@ -880,9 +893,16 @@ def list_links(cur, *, state: str | None = None, project: str | None = None,
         """,
         params,
     )
+    from khipu.tombstones import withhold
+
     cols = ("id", "old_id", "new_id", "kind", "confidence", "source", "reason",
             "state", "created_at", "resolved_at", "old_text", "new_text")
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+    # A link quotes both decisions: it goes when either one's episode is
+    # on the forget list (any episode when the list can't be read).
+    fetched = [(dict(zip(cols, row)), row[12:14]) for row in cur.fetchall()]
+    kept = withhold([{"row": row, "episode_ids": [e for e in eps if e is not None]}
+                     for row, eps in fetched], fail_closed=False)
+    return [k["row"] for k in kept]
 
 
 def candidate_link_count() -> dict[str, Any]:
@@ -908,6 +928,7 @@ def candidate_link_count() -> dict[str, Any]:
 
 
 def resolve_link(cur, link_id: int, action: str, *, source: str = "manual") -> dict[str, Any]:
+    # forget-fence: decision writer or write check; returns ids or the write's outcome
     """Confirm or reject one candidate link. Confirming a ``supersedes``
     candidate applies the supersession via ``supersede`` (cross-project
     forced, since a detector's own scope check already ran when it proposed
@@ -961,6 +982,7 @@ def resolve_link(cur, link_id: int, action: str, *, source: str = "manual") -> d
 
 
 def decision_states_for_episode(episode_id: int) -> dict[str, Any]:
+    # forget-fence: decision states for the one episode khipu_get has already fenced
     """``decision_states``/``validity`` for ``khipu_get``'s episode payload:
     ``{"decision_states": [{"id", "text", "state", "superseded_by"}, ...],
     "validity": {"current": n, "superseded": n, "retracted": n}}``. Opens its
@@ -995,6 +1017,7 @@ def decision_states_for_episode(episode_id: int) -> dict[str, Any]:
 
 
 def enrich_search_results(cur, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # forget-fence: adds decision counts to the caller's search rows; adds no row
     """Additive ``decisions_current`` / ``decisions_superseded`` /
     ``decisions_retracted`` counts on episode-kind search rows (the third
     added Phase 2, session B so ``khipu.validity.episode_state`` has the same
@@ -1070,6 +1093,7 @@ def standing_decisions(cur, *, project: str, since: Any, limit: int = 5) -> list
 # ---- backfill (O2) ----------------------------------------------------------
 
 def backfill_decisions(cur, *, apply: bool = False, limit: int | None = None) -> dict[str, Any]:
+    # forget-fence: owner maintenance writer; returns counts
     """Walk existing episodes' ``decisions`` JSONB arrays into the table.
 
     Batch, idempotent (the same 30-day-window dedup ``insert_decisions_from_episode``

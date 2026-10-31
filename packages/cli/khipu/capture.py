@@ -195,6 +195,7 @@ class CaptureEvidenceConflict(RuntimeError):
 def _receipt_match(cur, payload: dict[str, Any],
                    source: dict[str, Any] | None, *,
                    live_only: bool = False) -> tuple[int, str] | None:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """The episode this capture was already merged into, and how that merge
     matched: identity only when its receipt says so."""
     live = " AND deleted_at IS NULL" if live_only else ""
@@ -215,6 +216,7 @@ def _receipt_match(cur, payload: dict[str, Any],
 def _dedup_exact_window(cur, payload: dict[str, Any], *,
                         source: dict[str, Any] | None = None,
                         live_only: bool = False) -> int | None:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """K3: every sibling PART of one split window shares the same (harness,
     session_id, transcript_range) — that alone would match the FIRST part
     inserted and silently skip every part after it as an "exact window"
@@ -458,6 +460,7 @@ def _note_project_root(cur, payload: dict[str, Any]) -> None:
 
 
 def _inherit_project(cur, payload: dict[str, Any]) -> None:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """W1.2b: identity.resolve_repo_root cannot resolve a scratchpad/`/tmp`
     cwd — repo_root and project both come back None, which is exactly the
     dispatched-child-session shape the origin audit found (episode 11286).
@@ -508,6 +511,7 @@ def _inherit_project(cur, payload: dict[str, Any]) -> None:
 
 
 def _dedup_candidates(cur, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """Candidate rows for the similarity leg, grouped the same way a caller
     would filter for "this same conversation": by project when it is known,
     else by parent_session_id (a dispatched child with no resolvable project
@@ -574,10 +578,11 @@ def _dedup_cosine_best(
     if not candidates:
         return None
     try:
+        from khipu import provider_text
         from khipu.embed import _active_profile, _vec_literal, embed_one
 
         profile = _active_profile(cur)
-        vec = embed_one(_dedup_text(payload), profile=profile)
+        vec = embed_one(provider_text.live_input(_dedup_text(payload), "payload"), profile=profile)
     except Exception:  # noqa: BLE001
         return None
     ids = [str(c["id"]) for c in candidates]
@@ -651,6 +656,7 @@ def _merge_into_episode(
     cur, target_id: int, payload: dict[str, Any], *, matched_via: str, score: float,
     source: dict[str, Any] | None = None, match: str = MATCH_SIMILARITY,
 ) -> bool:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """Fold a near-duplicate capture into the episode it matched.
 
     Audit 2026-09-04: the merge used to union topics/decisions/preferences
@@ -727,6 +733,8 @@ def _merge_into_episode(
         "payload": payload,
     })
     raw["merged_from"] = merged_from
+    if new_summary.strip() and raw.get("summary_kind") == "verbatim_only":
+        raw.pop("summary_kind")  # a real summary arrived: the row is no longer evidence only
     sets = ["topics = %s::jsonb", "decisions = %s::jsonb", "preferences = %s::jsonb",
             "people = %s::jsonb", "raw = %s::jsonb", "summary = %s"]
     params: list[Any] = [
@@ -981,6 +989,7 @@ def _redact_capture_values(value: Any) -> Any:
 
 
 def _refresh_merged_episode(cur, episode_id: int) -> None:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """Embedding's separate connection must see the complete committed target."""
     try:
         cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (episode_id,))
@@ -1011,7 +1020,7 @@ def load_payload(raw: str) -> dict[str, Any]:
     # and exit with a traceback instead of the documented EX_DATAERR (audit
     # 2026-08-17).
     if not isinstance(payload, dict) or not isinstance(payload.get("summary"), str) \
-            or not payload["summary"].strip():
+            or (not payload["summary"].strip() and payload.get("summary_kind") != "verbatim_only"):
         _log("payload missing a string 'summary'")
         raise SystemExit(EX_DATAERR)
     if not isinstance(payload.get("session_id"), str) or not payload["session_id"].strip():
@@ -1090,6 +1099,7 @@ def _refusals_settled(cur) -> bool | None:
 
 def _forgotten_result(cur, payload: dict[str, Any], source: dict[str, Any], *,
                       dedup: dict[str, Any] | None = None) -> dict[str, Any]:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """The terminal outcome for a forgotten source: nothing written. The id
     is the tombstoned row holding its legacy identity, when there is one."""
     cur.execute("SELECT id FROM episodes WHERE ts = %s::timestamptz AND md5(summary) = %s",
@@ -1275,6 +1285,7 @@ def _legacy_projection_kind(original: Any, incoming: dict[str, Any]) -> str | No
 
 
 def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """The summary a multi-part capture lands under when a sibling part holds
     its legacy key, else None.
 
@@ -1316,10 +1327,11 @@ def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
     if any(held(k) != ("" if payload.get(k) is None else str(payload.get(k)))
            for k in ("harness", "session_id", "transcript_range", "window_id")):
         return None
-    return f"{summary} (part {part})"
+    return f"{summary} (part {part})".strip()
 
 
 def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
     Returns ``episode_id`` (the row this capture landed on: inserted, merged

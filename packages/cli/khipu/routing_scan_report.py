@@ -69,6 +69,7 @@ def global_files(home: Path | None = None) -> list[Path]:
 
 
 def known_project_roots() -> list[Path]:
+    # forget-fence: repo roots for the routing scan; no episode text
     """Repo roots Khipu already knows as projects, from its own records.
 
     Capture records each episode's ``repo_root``; the local hub snapshot

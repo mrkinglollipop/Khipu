@@ -194,7 +194,8 @@ class _BackfillCursor:
             self._result = []
         elif statement.startswith("SELECT slug, title, body FROM topics"):
             self._result = self.rows
-        elif statement.startswith("SELECT slug FROM topics") and "FOR SHARE" in statement:
+        elif statement.startswith("SELECT slug FROM topics") and (
+                "FOR SHARE" in statement or "slug = ANY" in statement):
             self._result = [(slug,) for slug, _title, _body in self.rows if slug in params[0]]
         elif statement.startswith("DELETE FROM memory_embeddings"):
             self.rowcount = 0
@@ -784,6 +785,10 @@ class CatchupStalenessTest(unittest.TestCase):
                     self.result = [("topic", "stale", 0, "old")]
                 elif "FROM episodes e" in text or "FROM commitments c" in text:
                     self.result = []
+                elif "JOIN episodes e ON e.topics" in text:
+                    self.result = []
+                elif text.startswith("SELECT slug FROM topics WHERE slug = ANY"):
+                    self.result = [(s,) for s in params[0]]
                 elif "FROM topics t" in text:
                     self.topic_sql.append(text)
                     self.result = [("stale", "Title", "new body", {"slug": "stale", "title": "Title", "body": "new body"})] if "NOT EXISTS" not in text else []
@@ -943,7 +948,9 @@ class ReplicaCatchupTest(unittest.TestCase):
                 def execute(self, sql, params=None):
                     calls.append((sql, params))
                     self.rows = []
-                    if "FROM topics t" in sql and "NOT EXISTS" not in sql:
+                    if sql.startswith("SELECT slug FROM topics WHERE slug = ANY"):
+                        self.rows = [(s,) for s in params[0]]
+                    if "FROM topics t" in sql and "NOT EXISTS" not in sql and "JOIN episodes e" not in sql:
                         row = ("note", "Title", "A")
                         if "row_to_json(t)" in sql:
                             row += ({"slug": "note", "title": "Title", "body": "A", "status": "active", "frontmatter": {"project": "p"}},)

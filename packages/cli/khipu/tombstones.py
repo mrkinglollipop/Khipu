@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any, Iterator
 
 
@@ -444,6 +445,310 @@ def episode_hidden(episode_id: Any) -> bool:
         return int(episode_id) in read_gate().episode_ids
     except Exception:  # noqa: BLE001 - an unreadable registry shows no episode
         return True
+
+
+_HIDDEN_CACHE: tuple[Any, frozenset[int]] | None = None
+
+
+def hidden_episode_ids() -> frozenset[int]:
+    """The episode ids on this Mac's forget list, read for every automatic
+    push. The parse is reused while the file's identity (inode, size, mtime,
+    ctime) is unchanged; every publication replaces the file, so a new forget
+    is seen on the next call. Raises ``RegistryError`` when it cannot be
+    read: the caller must then push no episode at all."""
+    global _HIDDEN_CACHE
+    path = registry_path()
+    try:
+        st = os.lstat(path)
+        key: Any = (str(path), st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_mode)
+    except FileNotFoundError:
+        # A missing list reads as empty, as read_gate does (no forget yet).
+        return read_gate().episode_ids
+    except OSError as exc:
+        raise RegistryError(f"tombstone registry unavailable: {type(exc).__name__}") from exc
+    cached = _HIDDEN_CACHE
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    ids = read_gate().episode_ids
+    _HIDDEN_CACHE = (key, ids)
+    return ids
+
+
+def withheld_episode_ids() -> frozenset[int]:
+    """Episodes no reader may see whatever a store's own rows say: on this
+    Mac's forget list, or queued for erasure in the replica. A forget lands
+    here before the replica's next rewrite tombstones the row and before
+    the hub learns of it. Raises when either cannot be read."""
+    from khipu.hub_snapshot import _pending_erasure_ids
+
+    return hidden_episode_ids() | frozenset(_pending_erasure_ids())
+
+
+# Keys whose value names one episode a row was written from or about.
+_EPISODE_KEYS = ("episode_id", "opened_episode", "closed_episode", "source_episode",
+                 "source_episode_id", "episode")
+# Keys holding node ids or edge ends; an "episode:N" value names episode N.
+_NODE_KEYS = ("via", "seed", "src", "dst", "node", "node_id", "id")
+# A row reached through these episodes (a topic an episode links to): it
+# goes only when every one of them is withheld.
+_REACHED_KEYS = ("via_episodes",)
+
+
+def _episode_ref(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("episode:"):
+            text = text[len("episode:"):]
+        return text if text.isdigit() else None
+    if isinstance(value, Mapping):
+        return _episode_ref(value.get("id"))
+    return None
+
+
+def episode_refs(row: Any) -> tuple[set[str], set[str]]:
+    """(episodes ``row`` carries or derives from, episodes it was only
+    reached through). Every row shape a push, search, graph or log builds:
+    an episode hit, a decision/commitment/deliverable (``episode_id``,
+    ``opened_episode``...), a graph candidate (``via`` as ``"episode:N"`` or
+    ``{"seed": "episode:N"}``), a graph edge or walk row (``src``/``dst``/
+    ``node_id``), a slice topic (``via_episodes``)."""
+    direct: set[str] = set()
+    reached: set[str] = set()
+    if not isinstance(row, Mapping):
+        return direct, reached
+    if row.get("kind") == "episode":
+        ref = _episode_ref(row.get("id"))
+        if ref:
+            direct.add(ref)
+    for key in _EPISODE_KEYS:
+        ref = _episode_ref(row.get(key))
+        if ref:
+            direct.add(ref)
+    for key in ("episode_ids", "source_episodes"):
+        value = row.get(key)
+        if isinstance(value, (list, tuple, set)):
+            direct.update(r for r in (_episode_ref(v) for v in value) if r)
+    for key in _NODE_KEYS:
+        value = row.get(key)
+        values = value.values() if isinstance(value, Mapping) else (value,)
+        for item in values:
+            if isinstance(item, str) and item.strip().startswith("episode:"):
+                ref = _episode_ref(item)
+                if ref:
+                    direct.add(ref)
+    for key in _REACHED_KEYS:
+        value = row.get(key)
+        if isinstance(value, (list, tuple, set)):
+            reached.update(r for r in (_episode_ref(v) for v in value) if r)
+    return direct, reached
+
+
+def malformed_episode_refs(row: Any) -> list[Any]:
+    """Values in an episode-id slot of ``row`` that are not an episode id
+    (``episode_refs`` drops them silently). A caller that fences by these ids
+    passes them on so the row is withheld rather than shown with the ids it
+    could read."""
+    if not isinstance(row, Mapping):
+        return []
+    bad: list[Any] = []
+    if row.get("kind") == "episode" and row.get("id") is not None and _episode_ref(row.get("id")) is None:
+        bad.append(row.get("id"))
+    for key in _EPISODE_KEYS:
+        if row.get(key) is not None and _episode_ref(row.get(key)) is None:
+            bad.append(row.get(key))
+    for key in ("episode_ids", "source_episodes", *_REACHED_KEYS):
+        value = row.get(key)
+        if isinstance(value, (list, tuple, set)):
+            bad.extend(v for v in value if _episode_ref(v) is None)
+    for key in _NODE_KEYS:
+        value = row.get(key)
+        for item in (value.values() if isinstance(value, Mapping) else (value,)):
+            if isinstance(item, str) and item.strip().startswith("episode:") and _episode_ref(item) is None:
+                bad.append(item)
+    return bad
+
+
+FENCE_STATE_NAME = "forget_fence_state.json"
+_FENCE_LAST: tuple[bool, str] | None = None
+
+
+def fence_state_path() -> Path:
+    from khipu.paths import ensure_data_dir
+
+    return ensure_data_dir() / FENCE_STATE_NAME
+
+
+def _reason_word(exc: BaseException) -> str:
+    """One word for why the forget list could not be read: ``malformed`` when
+    its contents failed to parse or validate, else ``unreadable``."""
+    text = str(exc)
+    return "malformed" if ("corrupt" in text or "ValueError" in text
+                           or "JSONDecodeError" in text or "UnicodeError" in text
+                           or "UnicodeDecodeError" in text) else "unreadable"
+
+
+def read_fence_state() -> dict[str, Any] | None:
+    """The last recorded fence outcome (``readable``, ``reason``, ``withheld``,
+    ``at``), or None when none was recorded or the file is unusable."""
+    try:
+        value = json.loads(fence_state_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - no usable record reads as none
+        return None
+    if (isinstance(value, dict) and isinstance(value.get("readable"), bool)
+            and isinstance(value.get("reason"), str)):
+        return value
+    return None
+
+
+def _record_fence(readable: bool, reason: str, withheld: int) -> None:
+    """Record the fence's outcome for doctor and the log, once per process per
+    change of outcome. Counts and a reason word only: no text, no ids. Never
+    raises: recording must not fail the read it describes."""
+    global _FENCE_LAST
+    outcome = (readable, reason)
+    if _FENCE_LAST == outcome:
+        return
+    first = _FENCE_LAST is None
+    _FENCE_LAST = outcome
+    try:
+        prior = read_fence_state()
+        if first and prior is not None and (prior["readable"], prior["reason"]) == outcome:
+            return
+        from datetime import datetime, timezone
+
+        path = fence_state_path()
+        state = {"readable": readable, "reason": reason, "withheld": int(withheld),
+                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, sort_keys=True, separators=(",", ":"))
+            os.replace(name, path)
+        finally:
+            try:
+                os.unlink(name)
+            except FileNotFoundError:
+                pass
+        if not readable:
+            from khipu.paths import capture_home
+
+            log = capture_home() / "logs" / "prompt-recall.log"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write(f"{state['at']} [khipu-forget-fence] unreadable: {reason} "
+                             f"withheld={int(withheld)}\n")
+    except Exception:  # noqa: BLE001 - recording never fails the fence
+        pass
+
+
+def forget_list_health() -> dict[str, Any]:
+    """Doctor's ``forget_list`` block. Red when the last fence use could not
+    read this Mac's forget list (automatic pushes then send nothing and
+    explicit reads hide every episode-linked row); not applicable when no
+    list exists and no fence outcome was ever recorded."""
+    state = read_fence_state()
+    if state is not None:
+        if state["readable"]:
+            return {"ok": True, "applicable": True}
+        reason = state["reason"] or "unreadable"
+        return {"ok": False, "applicable": True, "reason": reason,
+                "withheld": state.get("withheld"),
+                "error": (f"forget list {reason}: automatic pushes send nothing and "
+                          "episode-linked rows are hidden")}
+    try:
+        exists = registry_path().exists()
+    except OSError:
+        exists = True
+    if not exists:
+        return {"ok": True, "applicable": False}
+    return {"ok": True, "applicable": True}
+
+
+def withhold(rows: Sequence[Any], *, fail_closed: bool = True,
+             episode_key: str | None = None) -> list[Any]:
+    """The one forget fence for every row a reader shows, pushes or logs:
+    ``rows`` minus each row that carries or derives from an episode on the
+    forget list or queued for erasure (``episode_refs``), and each row only
+    reached through such episodes. ``episode_key`` names a key whose value is
+    the row's own episode id, for rows that are episodes but carry no
+    ``kind`` (an activity row's ``id``). When the list cannot be read: nothing
+    (``fail_closed``, every automatic push), or, for an explicit read, every
+    row that touches any episode is dropped and the rest stay."""
+    try:
+        withheld = {str(i) for i in withheld_episode_ids()}
+        readable = True
+    except Exception as exc:  # noqa: BLE001 - an unreadable forget list shows no episode
+        reason = _reason_word(exc)
+        if fail_closed:
+            _record_fence(False, reason, len(rows))
+            return []
+        withheld, readable = set(), False
+    kept = []
+    for row in rows:
+        direct, reached = episode_refs(row)
+        if episode_key is not None and isinstance(row, Mapping):
+            ref = _episode_ref(row.get(episode_key))
+            if ref:
+                direct.add(ref)
+        if not readable:
+            if direct or reached:
+                continue
+        elif direct & withheld or (reached and reached <= withheld):
+            continue
+        kept.append(row)
+    _record_fence(readable, "" if readable else reason, len(rows) - len(kept) if not readable else 0)
+    return kept
+
+
+def episode_withheld(episode_id: Any) -> bool:
+    """Whether a reader must treat ``episode_id`` as not found: on the forget
+    list or queued for erasure. True for any id when the list can't be read."""
+    ref = _episode_ref(episode_id)
+    if ref is None:
+        return False
+    try:
+        return int(ref) in withheld_episode_ids()
+    except Exception:  # noqa: BLE001 - an unreadable list shows no episode
+        return True
+
+
+def withhold_graph(out: dict[str, Any]) -> dict[str, Any]:
+    """A graph lookup's answer with the fence applied: a withheld episode
+    reads as missing with no edges, and every edge or walk row with a
+    withheld episode at either end is dropped (any episode end when the list
+    cannot be read)."""
+    root = str(out.get("id") or "").strip()
+    root_ref = _episode_ref(root) if (root.isdigit() or root.startswith("episode:")) else None
+    if root_ref is not None and episode_withheld(root_ref):
+        hidden = {key: value for key, value in out.items()
+                  if key not in ("edges", "graph_table", "neighbors", "nodes", "walk", "episode")}
+        hidden.update({key: [] for key in ("edges", "graph_table") if key in out})
+        hidden.setdefault("edges", [])
+        if "episode" in out or root.isdigit():
+            hidden["episode"] = {"id": int(root_ref), "missing": True, "topics": []}
+        return hidden
+    fenced = dict(out)
+    for key, value in out.items():
+        if isinstance(value, list) and any(isinstance(v, Mapping) for v in value):
+            fenced[key] = withhold(value, fail_closed=False)
+    return fenced
+
+
+def withhold_detail(row: Any) -> Any:
+    """A ``get`` answer with the fence applied to every list of rows it
+    carries (a topic's linked episodes, an episode's decisions)."""
+    if not isinstance(row, dict):
+        return row
+    fenced = dict(row)
+    for key, value in row.items():
+        if isinstance(value, list) and any(isinstance(v, Mapping) for v in value):
+            fenced[key] = withhold(value, fail_closed=False)
+    return fenced
 
 
 def without_hidden_episodes(results: list[Any]) -> list[Any]:

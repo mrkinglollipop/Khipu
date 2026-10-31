@@ -51,6 +51,7 @@ def _now_iso() -> str:
 
 
 def _find_episode_id(session_id: str) -> int | None:
+    # forget-fence: the capture probe looks for its own new episode's id
     from khipu.db import connect
 
     with connect() as conn:
@@ -179,6 +180,7 @@ def run_probe(
     poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> dict[str, Any]:
+    # forget-fence: the capture probe looks for its own nonce episode; reports ids and timings
     """Write a nonce episode via the normal capture path, poll default hybrid
     search until it lands in the top 3 (or ``timeout_s`` elapses), forget it,
     and persist ``{ts, harness, ok, seconds, episode_id, error}`` to the state

@@ -6,6 +6,7 @@ from typing import Any
 
 from khipu.db import connect
 from khipu.snippets import SNIPPET_LIMIT, clip_snippet
+from khipu.summary_kind import VERBATIM_ONLY_SQL
 from khipu.text_pages import PAGE_BYTES_DEFAULT, db_start, fetch_bytes, page_args, page_utf8
 
 
@@ -27,6 +28,7 @@ def _live_where(cur) -> str:
 
 
 def _recent_rows(cur, limit: int) -> list[dict]:
+    # forget-fence source: activity_payload and recent_episodes' callers fence these rows
     """Recent live episodes on a cursor the caller already owns, so a payload
     that needs several queries opens one connection instead of one per query."""
     cur.execute(
@@ -64,12 +66,14 @@ def _recent_rows(cur, limit: int) -> list[dict]:
 
 
 def recent_episodes(*, limit: int = 40) -> list[dict]:
+    # forget-fence source: khipu_status and session start fence these rows
     with connect() as conn:
         with conn.cursor() as cur:
             return _recent_rows(cur, limit)
 
 
 def episode_detail(episode_id: int) -> dict | None:
+    # forget-fence source: khipu get and khipu activity --show fence the episode and its linked rows
     """A forgotten (soft-deleted) episode is not found here (B3 in
     docs/research/hindsight-plan-review-2026-09-28.md: this used to return a
     forgotten episode in full), gated on ``episodes.deleted_at`` being
@@ -94,13 +98,19 @@ def episode_detail(episode_id: int) -> dict | None:
             r = cur.fetchone()
     if not r:
         return None
+    from khipu.summary_kind import NO_SUMMARY_LABEL, VERBATIM_ONLY, is_verbatim_only
+
+    no_summary = is_verbatim_only(r[5], r[11])
     return {
         "id": r[0],
         "ts": r[1].isoformat() if r[1] else None,
         "ingested_at": r[2].isoformat() if r[2] else None,
         "session_id": r[3],
         "scope": r[4],
-        "summary": r[5],
+        # An episode the summariser left empty says so, rather than showing a
+        # stand-in sentence as if a model had written it.
+        "summary": NO_SUMMARY_LABEL if no_summary else r[5],
+        **({"summary_kind": VERBATIM_ONLY} if no_summary else {}),
         "topics": r[6],
         "people": r[7],
         "decisions": r[8],
@@ -277,7 +287,11 @@ def activity_payload(*, limit: int = 40) -> dict:
                             else None,
                         }
                     )
-            recent = _recent_rows(cur, limit)
+            # The hub's deleted_at lags this Mac's forget list; an
+            # unreadable list shows no episode.
+            from khipu.tombstones import withhold
+
+            recent = withhold(_recent_rows(cur, limit), fail_closed=False, episode_key="id")
     try:
         from khipu.keychain import secrets_status
 
@@ -300,6 +314,7 @@ def activity_payload(*, limit: int = 40) -> dict:
 
 
 def _annotate_episode_validity(cur, episodes: list[dict]) -> list[dict]:
+    # forget-fence: adds decision counts to the caller's rows; adds no row
     """``khipu.validity.annotate`` for the session-start slice's own recent-
     episode rows — one bounded query (WHERE episode_id = ANY(...), already
     small: at most ``episode_limit``), gated on ``khipu.db.has_columns``, the
@@ -350,6 +365,7 @@ def project_slice(
     decision_limit: int = 5,
     job: bool = False,
 ) -> dict[str, Any]:
+    # forget-fence source: session start fences the slice (recall_rule._fenced_slice)
     """W4 pushed-slice reads for a resolved repo: open commitments, recent
     episodes for the project, the topic pages those episodes actually link
     to (their already-hygiene-resolved ``topics`` array — real graph edges,
@@ -379,6 +395,7 @@ def project_slice(
     from khipu.embed import _episode_schema_flags
 
     def mark_same_session_lineage(rows: list[dict[str, Any]]) -> None:
+        # forget-fence: marks the caller's rows; adds no row
         """Mark assistant rows from this session or one of its direct children.
 
         Project Owed deliberately contains every assistant's work.  The
@@ -464,6 +481,7 @@ def project_slice(
                     SELECT id, ts, summary, topics
                     FROM episodes
                     WHERE ({' OR '.join(clauses)}) {deleted_clause}
+                      AND NOT {VERBATIM_ONLY_SQL}
                     ORDER BY ts DESC
                     LIMIT %s
                     """,
@@ -474,11 +492,14 @@ def project_slice(
                 episodes = _annotate_episode_validity(cur, episodes)
 
             topic_slugs: list[str] = []
+            topic_episodes: dict[str, list[Any]] = {}
             for ep in episodes:
                 for t in ep.get("topics") or []:
                     slug = str(t).strip()
                     if slug and slug not in topic_slugs:
                         topic_slugs.append(slug)
+                    if slug:
+                        topic_episodes.setdefault(slug, []).append(ep.get("id"))
             # Over-fetch, THEN trim (audit 2026-09-04). Trimming the candidate
             # slugs to topic_limit before the existence lookup meant a capture
             # whose first N topics were tags or deleted pages returned fewer
@@ -503,8 +524,11 @@ def project_slice(
                 found = []
                 for slug, title, when, status in cur.fetchall():
                     age_days = (now - when).days if when is not None else None
+                    # The forget fence drops a topic only reached through
+                    # forgotten episodes (recall_rule._fenced_slice).
                     found.append({"slug": slug, "title": title, "age_days": age_days,
-                                  "status": status or "active"})
+                                  "status": status or "active",
+                                  "via_episodes": topic_episodes.get(slug, [])})
                 # R6: a superseded/retired/abandoned page never wins a slot
                 # over a current one in the same small slice, same posture
                 # as the search de-rank — it can still show, just last.

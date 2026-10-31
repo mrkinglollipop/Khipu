@@ -130,6 +130,32 @@ class CaptureSchemaRetryTest(unittest.TestCase):
                 extract.extract_memory("t")
 
 
+class EmptySummaryRetryBudgetTest(unittest.TestCase):
+    FIRST = '{"summary": "", "decisions": ["use sqlite"], "topics": ["db"]}'
+
+    def _run(self, fallback, first):
+        from khipu.embed import BudgetExhausted
+
+        with mock.patch.object(extract, "_fallback_applies", return_value=fallback), \
+                mock.patch.object(extract, "_generate_gemini", side_effect=BudgetExhausted("cap")), \
+                mock.patch.object(extract, "_generate",
+                                  side_effect=[first, BudgetExhausted("cap")]):
+            return extract.extract_memory("x" * (extract.EMPTY_REPLY_MIN_CHARS + 1))
+
+    def test_budget_refused_retry_keeps_the_usable_first_reply(self):
+        for fallback in (True, False):
+            with self.subTest(fallback=fallback):
+                result = self._run(fallback, self.FIRST)
+                self.assertEqual(result["decisions"], ["use sqlite"])
+                self.assertEqual(result.get("summary_kind"), extract.VERBATIM_ONLY)
+
+    def test_budget_refusal_still_raises_without_a_usable_first_reply(self):
+        from khipu.embed import BudgetExhausted
+
+        with self.assertRaises(BudgetExhausted):
+            self._run(True, "not JSON")
+
+
 class AsStrListTest(unittest.TestCase):
     def test_non_list_is_empty(self):
         for v in (None, "a", 5, {"a": 1}):

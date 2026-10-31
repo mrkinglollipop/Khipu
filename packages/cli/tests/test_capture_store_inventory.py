@@ -37,12 +37,16 @@ _REPLICA_META = ("replica bookkeeping: meta, freshness, erasure and purge marker
 _REGISTRY = "the forgotten-source registry: identities and ids, never text"
 
 NOT_CAPTURE = {
+    "tombstones._record_fence": "the forget fence's last outcome: readable flag, a reason word and counts only; "
+                                "no capture text",
     "session_capture._write_claim_owner": "PID and kernel process birth metadata only; no capture text",
     "hub_snapshot._write_endpoint_file": "the hub endpoint's sha256 fingerprint (host, port, database, role) "
                                          "and its generation counter; no capture text",
     "usage._log_attempt": "usage-probe attempt log: time, account key, ok flag, error code and milliseconds only; "
                           "no capture text",
     "usage._rotate_attempts": "renames that same attempts log when it grows large; writes no text of its own",
+    "recall_eval_nightly._write_history": "the nightly recall check's figures (rates, counts, golden file size and "
+                                          "mtime); never a query or an id",
     "session_capture._write_retry_state":"attempt count, backoff time, held flag and an error kind only; no capture text",
     **dict.fromkeys(("hub_snapshot._acquire_refresh_lock", "hub_snapshot._purge_marker_lock",
                      "hub_snapshot._fact_copy_lock",

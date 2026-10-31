@@ -99,7 +99,10 @@ def _episode_sources(cur, ids: list[int]) -> dict[int, dict[str, Any]]:
         f"WHERE id = ANY(%s::bigint[]){live}",
         (ids,),
     )
-    episodes = {int(r[0]): r for r in cur.fetchall()}
+    from khipu.tombstones import episode_withheld
+
+    # The hub's deleted_at lags this Mac's forget list.
+    episodes = {int(r[0]): r for r in cur.fetchall() if not episode_withheld(r[0])}
     ready = decisions._decisions_ready(cur)
     rows = briefs._decision_rows(cur, list(episodes), with_text=True)
     out: dict[int, dict[str, Any]] = {}
@@ -110,7 +113,7 @@ def _episode_sources(cur, ids: list[int]) -> dict[int, dict[str, Any]]:
         counts = [sum(1 for r in mine if r["state"] == s) for s in ("current", "superseded", "retracted")]
         state = validity.episode_state(*counts) if ready and not unknown else "unknown"
         out[eid] = {
-            "kind": "episode", "id": eid, "date": _iso(ts)[:10], "validity": state,
+            "origin": [eid], "kind": "episode", "id": eid, "date": _iso(ts)[:10], "validity": state,
             "summary": _clean(summary), "decisions": [ln for ln in lines if ln],
         }
     return out
@@ -119,8 +122,9 @@ def _episode_sources(cur, ids: list[int]) -> dict[int, dict[str, Any]]:
 def _topic_sources(cur, slugs: list[str]) -> dict[str, dict[str, Any]]:
     """Topic text by slug: the current brief when it is usable, otherwise the
     page body."""
-    from khipu import briefs, features
+    from khipu import briefs, features, provider_text
 
+    origin = provider_text.episode_ids_of_topics(cur, slugs)
     bodies: dict[str, str] = {}
     live = " AND deleted_at IS NULL" if _has(cur, "topics", "deleted_at") else ""
     cur.execute(f"SELECT slug, body FROM topics WHERE slug = ANY(%s){live}", (slugs,))
@@ -141,7 +145,7 @@ def _topic_sources(cur, slugs: list[str]) -> dict[str, dict[str, Any]]:
                 brief = {}
             if brief.get("found") and brief.get("state") == "current" and (brief.get("body") or "").strip():
                 text = brief["body"]
-        out[slug] = {"kind": "topic", "id": slug, "summary": _clean(text), "decisions": []}
+        out[slug] = {"origin": origin.get(slug), "kind": "topic", "id": slug, "summary": _clean(text), "decisions": []}
     return out
 
 
@@ -276,8 +280,11 @@ def _search(question: str, project: str | None, limit: int) -> list[dict[str, An
         question, limit=limit, mode="hybrid", project_boost=project or None,
         include_libraries=False,  # reflect cites episodes, not library chunks
     )
+    from khipu.tombstones import withhold
+
     rows = [r for r in (payload.get("results") or []) if r.get("kind") in ("episode", "topic")]
-    return rows[:limit]
+    # An explicit question: an unreadable forget list leaves no episode row.
+    return withhold(rows, fail_closed=False)[:limit]
 
 
 def reflect(question: str, *, project: str | None = None, limit: int = DEFAULT_LIMIT) -> dict[str, Any]:
@@ -305,6 +312,15 @@ def reflect(question: str, *, project: str | None = None, limit: int = DEFAULT_L
                 sources = gather(cur, rows)
     except Exception:  # noqa: BLE001 — the hub is the only place sources are read
         return _result(started, reason="hub-unavailable")
+    if not sources:
+        return _result(started, reason="no-sources")
+    from khipu import provider_text
+
+    # The chokepoint at the provider boundary: a source derived from a
+    # forgotten episode, or any source when the list is unreadable, is not sent.
+    marks = provider_text.fenced_texts([s["text"] for s in sources], [s.get("origin") for s in sources],
+                                       "reflect")
+    sources = [s for s, mark in zip(sources, marks) if mark is not None]
     if not sources:
         return _result(started, reason="no-sources")
 

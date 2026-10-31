@@ -37,6 +37,8 @@ class _RaceHub:
             self._result = [(slug, slug, f"{slug} body", {"slug": slug, "title": slug,
                                                          "body": f"{slug} body"})
                             for slug in sorted(self.live)]
+        elif s.startswith("SELECT slug FROM topics WHERE slug = ANY"):
+            self._result = [(slug,) for slug in params[0] if slug in self.live]
         elif s.startswith("SELECT 1 FROM topics") and "FOR SHARE" in s:
             self._result = [(1,)] if params[0] in self.live else []
         elif s.startswith("INSERT INTO memory_embeddings"):
@@ -92,7 +94,7 @@ class TopicPurgeRaceTest(unittest.TestCase):
     def test_a_purge_between_read_and_write_leaves_no_copy_anywhere(self):
         hub = _RaceHub()
 
-        def embed_then_purge(api, profile):
+        def embed_then_purge(api, profile, **_kw):
             # The purge commits while catch-up waits on the embedding API.
             if hub.live and _PURGED in hub.live and any(_PURGED in str(a) for a in api):
                 hub.live.discard(_PURGED)

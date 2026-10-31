@@ -144,8 +144,27 @@ def _call_within(prompt: str, deadline: float) -> tuple[str, str]:
     return box["ok"]
 
 
+def _row_sources(row: Mapping[str, Any], topic_sources: Mapping[str, Any] | None) -> list[Any] | None:
+    """Episode ids a candidate row derives from: the ones it carries, plus a
+    topic's own source episodes. None when a topic's sources are unknown
+    (withheld: it cannot be proven free of a forgotten episode). A malformed
+    id is kept as it came, so the chokepoint withholds the candidate instead
+    of the id being dropped before the fence."""
+    from khipu.tombstones import episode_refs, malformed_episode_refs
+
+    ids: list[Any] = [int(r) for r in sorted(episode_refs(row)[0])]
+    ids.extend(malformed_episode_refs(row))
+    if row.get("kind") == "topic":
+        known = (topic_sources or {}).get(str(row.get("id")))
+        if known is None:
+            return None
+        ids.extend(known if isinstance(known, (list, tuple, set, frozenset)) else [known])
+    return ids
+
+
 def rerank(
-    query: str, rows: Sequence[Mapping[str, Any]], *, deadline: float
+    query: str, rows: Sequence[Mapping[str, Any]], *, deadline: float,
+    topic_sources: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Ask the synth provider to order ``rows[:MAX_CANDIDATES]`` for ``query``.
 
@@ -165,11 +184,20 @@ def rerank(
 
     if len(pool) < 2:
         return _finish("too-few-candidates")
+    from khipu import provider_text
     from khipu.redact import redact_secrets
 
+    # Only candidates the chokepoint releases are shown to the model; the
+    # model's order is mapped back to positions in the full pool.
+    marks = provider_text.fenced_texts(
+        [row.get("snippet") or row.get("label") or "" for row in pool],
+        [_row_sources(row, topic_sources) for row in pool], "rerank")
+    keep = [i for i, mark in enumerate(marks) if mark is not None]
+    if len(keep) < 2:
+        return _finish("too-few-candidates")
     prompt = _PROMPT.format(
         query=redact_secrets(" ".join(query.split()))[0],
-        candidates=_candidate_lines(pool), last=len(pool) - 1,
+        candidates=_candidate_lines([pool[i] for i in keep]), last=len(keep) - 1,
     )
     try:
         text, out["model"] = _call_within(prompt, deadline)
@@ -179,10 +207,10 @@ def rerank(
         return _finish("timeout")
     except Exception:  # noqa: BLE001 — a provider failure drops the stage, never the search
         return _finish("provider-error")
-    order = parse_order(text, len(pool))
+    order = parse_order(text, len(keep))
     if order is None:
         return _finish("parse-error")
-    out["order"] = order
+    out["order"] = [keep[i] for i in order]
     return _finish()
 
 
@@ -212,6 +240,7 @@ def stage(
     mode: str,
     token_count: int,
     deadline_s: float = DEADLINE_S,
+    topic_sources: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
     """The whole stage for ``hybrid_search``: ``(rows, payload, degraded)``.
 
@@ -230,7 +259,7 @@ def stage(
     if skip:
         return fused, {"applied": False, "model": None, "ms": 0.0,
                        "candidates": 0, "reason": skip}, False
-    result = rerank(query, fused, deadline=time.monotonic() + deadline_s)
+    result = rerank(query, fused, deadline=time.monotonic() + deadline_s, topic_sources=topic_sources)
     payload = {"applied": False, "model": result["model"], "ms": result["ms"],
                "candidates": result["candidates"], "reason": result["reason"]}
     if result["order"] is None:

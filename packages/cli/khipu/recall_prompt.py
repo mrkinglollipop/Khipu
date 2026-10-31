@@ -170,7 +170,7 @@ def _log(msg: str, *, tag: str = "khipu-prompt-recall") -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding="utf-8") as f:
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            f.write(f"{stamp} [{tag}] {msg}\n")
+            f.write(f"{stamp} [{tag}] {msg}\n")  # text-safe: every _log caller passes this module's checked message text
     except Exception:  # noqa: BLE001 — logging must never break the hook
         pass
 
@@ -517,7 +517,7 @@ def _inherited_fds() -> list[int]:
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
-        view = view[os.write(fd, view):]
+        view = view[os.write(fd, view):]  # text-safe: writes the hook's own reply bytes to its stdout pipe
 
 
 def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, decided: bool = False,
@@ -2068,7 +2068,7 @@ def _relevance_gate(rows: list[dict[str, Any]], tokens: list[str]) -> list[dict[
         kept, _info = relevance.gate(rows, len(tokens))
         return kept
     except Exception as exc:  # noqa: BLE001 — a policy failure must not cost the caller its hits
-        _log(f"relevance floor skipped: {type(exc).__name__}: {exc}")
+        _log(f"relevance floor skipped: {type(exc).__name__}")
         return rows
 
 
@@ -2224,6 +2224,7 @@ def _cached_query_embed(prompt: str, profile: str, deadline: float | None = None
     ``deadline`` leaves at least QUERY_EMBED_RETRY_MIN_S, on a timeout that
     ends by the deadline.
     """
+    from khipu import provider_text
     from khipu.embed import embed_one, prefix_query, uses_task_prefixes
     from khipu.redact import redact_secrets
 
@@ -2237,7 +2238,7 @@ def _cached_query_embed(prompt: str, profile: str, deadline: float | None = None
     for attempt in (1, 2):
         try:
             vec = embed_one(
-                api_q, profile=profile, retries=0, timeout=timeout, delay=0, input_type="query",
+                provider_text.live_input(api_q, "query"), profile=profile, retries=0, timeout=timeout, delay=0, input_type="query",
             )
             break
         except Exception as exc:
@@ -2284,6 +2285,7 @@ def _snapshot_search_hits(
     started: float | None = None, progress: dict[str, Any] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """Lexical + cosine, RRF-fused, entirely against the local sqlite
     replica — no Postgres, no network round trip beyond one (cacheable)
     embed API call. Raises ``_SnapshotUnusable`` when the replica is
@@ -2386,7 +2388,7 @@ def _snapshot_search_hits(
                 progress["provisional"] = provisional
         except Exception as exc:  # noqa: BLE001 — the full pass below still runs and reports it
             provisional = None
-            _log(f"snapshot keyword-only result skipped: {type(exc).__name__}: {exc}")
+            _log(f"snapshot keyword-only result skipped: {type(exc).__name__}")
 
         _enter_stage(progress, "embedding-wait")
         t_cos.join(max(0.0, deadline - time.monotonic()))
@@ -2397,7 +2399,7 @@ def _snapshot_search_hits(
             exc = cosine_box["error"]
             # The scan's own deadline is lateness, not a failed embedding.
             degraded = "embedding late" if isinstance(exc, TimeoutError) else "embedding error"
-            _log(f"snapshot cosine leg skipped: {type(exc).__name__}: {exc}")
+            _log(f"snapshot cosine leg skipped: {type(exc).__name__}")
         else:
             degraded = "embedding late"
         if "rows" not in cosine_box and provisional is not None:
@@ -2416,6 +2418,7 @@ def _fuse_and_annotate(
     lexical_rows: list[dict[str, Any]], cosine_rows: list[dict[str, Any]],
     legs: list[str], degraded: str | None, graph: bool = True,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """Everything after the legs finish: fusion, graph candidates, the
     relevance gate, row metadata, project/status ranking, time boost and
     validity. One function for the keyword-only result and the full one, so
@@ -2505,11 +2508,14 @@ def _fuse_and_annotate(
                 legs.append("graph_candidates")
         except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
             degraded_legs.append("graph_candidates")
-            _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}: {exc}")
+            _log(f"snapshot graph-candidates leg skipped: {type(exc).__name__}")
 
     # Once, after fusion and graph expansion: candidate rows carry no signal,
     # so they can never make an otherwise empty list pass.
     fused = hub_snapshot.snapshot_row_metadata(con, fused)
+    from khipu.summary_kind import without_verbatim_only
+
+    fused = without_verbatim_only(fused)
     pre_gate = bool(fused)
     fused = _relevance_gate(fused, tokens)
     abstained = pre_gate and not fused
@@ -2531,7 +2537,7 @@ def _fuse_and_annotate(
             if interpretation:
                 fused = _timeparse.apply_time_boost(fused, interpretation)
         except Exception as exc:  # noqa: BLE001 — additive, never a search failure
-            _log(f"snapshot time interpretation skipped: {type(exc).__name__}: {exc}")
+            _log(f"snapshot time interpretation skipped: {type(exc).__name__}")
             interpretation = None
 
     # Validity annotation (Phase 2, session B): ONE indexed sqlite query
@@ -2559,7 +2565,7 @@ def _fuse_and_annotate(
             fused, historical=_validity.is_historical(prompt, hist_since, hist_until)
         )
     except Exception as exc:  # noqa: BLE001 — validity is additive, never a search failure
-        _log(f"snapshot validity annotation skipped: {type(exc).__name__}: {exc}")
+        _log(f"snapshot validity annotation skipped: {type(exc).__name__}")
 
     result_extra: dict[str, Any] = {}
     if abstained:
@@ -2630,7 +2636,7 @@ def _hub_known_down() -> dict[str, Any] | None:
 
     memo = hub_reach.known_unreachable()
     if memo is not None:
-        _log(f"hub unreachable since {memo.get('since')} — skipping the hub leg")
+        _log(f"hub unreachable since {memo.get('since')} — skipping the hub leg")  # text-safe: a timestamp from the reachability memo
         return {"hits": [], "legs": [], "degraded": "hub unreachable", "offline": True}
     return None
 
@@ -2640,6 +2646,7 @@ def _search_hits(
     progress: dict[str, Any] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """The gated search itself (no timeout, no dedup — those wrap this).
 
     Local snapshot first (R1 follow-up): fast, no network round trip beyond
@@ -2669,9 +2676,9 @@ def _search_hits(
         )
         return _trim_result(result, limit)
     except _SnapshotUnusable as exc:
-        _log(f"snapshot unusable ({exc}) — falling back to hub")
+        _log(f"snapshot unusable ({type(exc).__name__}) — falling back to hub")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls back
-        _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — falling back to hub")
+        _log(f"snapshot search failed ({type(exc).__name__}) — falling back to hub")
 
     skipped = _hub_known_down()
     if skipped is not None:
@@ -2692,10 +2699,12 @@ def _search_hits(
         )
     except Exception as exc:
         if hub_snapshot.hub_connection_failed(exc):
-            hub_reach.note_unreachable(f"{type(exc).__name__}: {exc}")
+            hub_reach.note_unreachable(type(exc).__name__)
         raise
     hub_reach.note_reachable()
-    rows = _apply_score_floor(payload.get("results") or [])
+    from khipu.summary_kind import without_verbatim_only
+
+    rows = _apply_score_floor(without_verbatim_only(payload.get("results") or []))
     return {"hits": rows[:limit], "legs": ["hub"], "degraded": None}
 
 
@@ -2711,7 +2720,7 @@ def _hub_project_group(cur, project: str | None) -> list[str]:
 
         return project_group(cur, project)
     except Exception as exc:  # noqa: BLE001 — a missed group is a ranking nudge lost, not a failure
-        _log(f"project alias group skipped: {type(exc).__name__}: {exc}")
+        _log(f"project alias group skipped: {type(exc).__name__}")
         return [project]
 
 
@@ -2803,7 +2812,7 @@ def _attach_hub_routing_state(
             else _run_with_timeout(_fetch, remaining)
         )
     except Exception as exc:  # noqa: BLE001 — advisory; never a search failure
-        _log(f"budgeted routing metadata skipped: {type(exc).__name__}: {exc}")
+        _log(f"budgeted routing metadata skipped: {type(exc).__name__}")
         return rows
     if not flags:
         return rows
@@ -2825,6 +2834,7 @@ def _hub_hits_budgeted(
     limit: int,
     deadline: float | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """Lexical (pg_trgm ILIKE, ``cli._literal_candidates``) and query-
     embedding + cosine (``embed._cosine_candidates``) legs run concurrently
     on daemon threads against the hub.
@@ -2848,6 +2858,7 @@ def _hub_hits_budgeted(
     cosine_box: dict[str, Any] = {}
 
     def _lexical_worker() -> None:
+        # forget-fence source: prior_work_for_prompt fences the push
         try:
             from khipu.db import connect
             from khipu.cli import _literal_candidates
@@ -2878,7 +2889,7 @@ def _hub_hits_budgeted(
             lexical_box["rows"] = rows
         except Exception as exc:  # noqa: BLE001 — a leg failure just means it didn't land
             lexical_box["error"] = exc
-            _log(f"budgeted lexical leg failed: {type(exc).__name__}: {exc}")
+            _log(f"budgeted lexical leg failed: {type(exc).__name__}")
 
     def _cosine_worker() -> None:
         try:
@@ -2892,7 +2903,7 @@ def _hub_hits_budgeted(
             cosine_box["rows"] = rows
         except Exception as exc:  # noqa: BLE001 — same posture as the lexical leg
             cosine_box["error"] = exc
-            _log(f"budgeted cosine leg failed: {type(exc).__name__}: {exc}")
+            _log(f"budgeted cosine leg failed: {type(exc).__name__}")
 
     t_lex = threading.Thread(target=_lexical_worker, daemon=True)
     t_cos = threading.Thread(target=_cosine_worker, daemon=True)
@@ -2938,7 +2949,9 @@ def _hub_hits_budgeted(
     from khipu.recency import rank_for_push
     from khipu.tombstones import without_hidden_episodes
 
-    fused = without_hidden_episodes(fuse_ranked_lists(lists, limit=_CANDIDATE_LIMIT))
+    from khipu.summary_kind import without_verbatim_only
+
+    fused = without_verbatim_only(without_hidden_episodes(fuse_ranked_lists(lists, limit=_CANDIDATE_LIMIT)))
     pre_gate = bool(fused)
     fused = _relevance_gate(fused, tokens)
     abstained = pre_gate and not fused
@@ -2982,7 +2995,7 @@ def _hub_hits_budgeted(
                     for r in enriched_episodes
                 }
         except Exception as exc:  # noqa: BLE001 — validity is additive, never a search failure
-            _log(f"budgeted validity counts skipped: {type(exc).__name__}: {exc}")
+            _log(f"budgeted validity counts skipped: {type(exc).__name__}")
     if episode_ids and episode_counts is None:
         degraded = degraded or "validity unknown"
     topic_meta = {
@@ -3001,6 +3014,7 @@ def _search_hits_budgeted(
     project: str | None = None,
     deadline: float | None = None, progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: prior_work_for_prompt fences the push
     """``khipu_status``'s ``prior_work`` path (R10 + this phase): local
     snapshot first when fresh (already sub-300ms measured — see
     ``_snapshot_search_hits``'s docstring), the concurrent hub budgeted
@@ -3031,9 +3045,9 @@ def _search_hits_budgeted(
                 **({"replica_stale": result["replica_stale"]} if "replica_stale" in result else {}),
                 **({"abstained": True} if result.get("abstained") else {})}
     except _SnapshotUnusable as exc:
-        _log(f"snapshot unusable ({exc}) — hub budgeted path")
+        _log(f"snapshot unusable ({type(exc).__name__}) — hub budgeted path")
     except Exception as exc:  # noqa: BLE001 — any other snapshot failure also falls through
-        _log(f"snapshot search failed ({type(exc).__name__}: {exc}) — hub budgeted path")
+        _log(f"snapshot search failed ({type(exc).__name__}) — hub budgeted path")
 
     skipped = _hub_known_down()
     if skipped is not None:
@@ -3380,7 +3394,7 @@ def prior_work_for_prompt(
         if shape and not thread:
             return _gated(shape)
     except Exception as exc:  # noqa: BLE001 — fail open
-        return _gated(f"gate error: {exc}")
+        return _gated(f"gate error: {type(exc).__name__}")
     if deadline is not None and time.monotonic() >= deadline:
         return _gated("timeout>request deadline")
 
@@ -3458,7 +3472,7 @@ def prior_work_for_prompt(
             hits = []
             stage = progress.get("stage")
     except Exception as exc:  # noqa: BLE001 — fail open on any search failure
-        reason = f"error: {type(exc).__name__}: {exc}"
+        reason = f"error: {type(exc).__name__}"
         hits = []
         offline = _hub_unreachable_error(exc)
     if thread_worker is not None:
@@ -3478,6 +3492,12 @@ def prior_work_for_prompt(
             reason = "ok"
         if thread_worker.is_alive():
             degraded_legs.append("t3_thread")
+    # Every lane's rows, read against the forget list now: the replica drops a
+    # forgotten episode only at its next rewrite. The produced line is fenced
+    # where it is built (deliverables.line_from_rows).
+    from khipu.tombstones import withhold
+
+    hits = withhold(hits or [])
     produced = ""
     produced_box: dict[str, Any] = {}
     remaining = min(DELIVERABLE_LINE_TIMEOUT_S, max(0, deadline - time.monotonic()))
@@ -3581,7 +3601,7 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None,
         try:
             local = _replica_deliverable_line(project, tokens, stale_box=stale_box)
         except Exception as exc:  # noqa: BLE001 — an unusable replica falls back to the hub
-            _log(f"deliverable replica unusable ({type(exc).__name__}: {exc})")
+            _log(f"deliverable replica unusable ({type(exc).__name__})")
             local = None
         if local is not None:
             return local
@@ -3598,7 +3618,7 @@ def _deliverable_context_line(tokens: list[str], *, cwd: str | None,
                     cur, tokens, project=project
                 ) or ""
     except Exception as exc:  # noqa: BLE001 — fail open, same as _search_hits callers
-        _log(f"deliverable line skipped ({type(exc).__name__}: {exc})")
+        _log(f"deliverable line skipped ({type(exc).__name__})")
         return ""
 
 
@@ -3624,7 +3644,7 @@ def _hub_unreachable_error(exc: BaseException) -> bool:
 def log_terminal_outcome(raw: str, reason: str, *, ms: float = 0.0) -> None:
     payload = _stdin_payload(raw)
     session = hook_shape.session_id(payload) or "?"
-    _log(f"session={session} reason={reason} ms={ms:.1f} hits=[] legs=[] degraded=None")
+    _log(f"session={session} reason={reason} ms={ms:.1f} hits=[] legs=[] degraded=None")  # text-safe: session id is the harness id, reason a fixed code
 
 
 def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | None = None) -> None:
@@ -3646,7 +3666,7 @@ def finish_delivery(delivery: dict[str, Any], *, delivered: bool, reason: str | 
         # routing= goes last, after degraded=, stage= and offline=, so every reader of
         # this line (doctor's outcome rate, the promotion gate) still parses it.
         _log(f"session={session} reason={result['reason']} ms={ms} hits={hit_ids} "
-             f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}{routed}")
+             f"legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}{routed}")  # text-safe: ids, fixed reason codes and leg names only; no query text
 
 
 def dispatched_lane(environ=None) -> bool:
@@ -3719,7 +3739,7 @@ def hook_main(raw: str, *, shape: str = "claude", deadline: float | None = None,
             f"session={session_id or '?'} reason={result['reason']} ms={result['ms']} "
             f"hits={hit_ids} legs={result.get('legs') or []} degraded={result.get('degraded')}{stage}"
             f"{routed_log}"
-        )
+        )  # text-safe: ids, fixed reason codes and leg names only; no query text
     return hook_shape.render(shape, "UserPromptSubmit", ctx) if ctx else {}
 
 
@@ -3748,10 +3768,10 @@ def prompt_recall_main(*, shape: str | None = None) -> None:
         out = hook_main(raw, shape=want, delivery=delivery, deadline=deadline)
     except Exception as exc:  # noqa: BLE001 — the one thing this must never do is raise
         finish_delivery(delivery, delivered=False, reason="error: hook_main crashed")
-        log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}: {exc}")
+        log_terminal_outcome(raw, f"error: hook_main crashed: {type(exc).__name__}")
         out = {}
     try:
-        print(wire.dumps(out, ensure_ascii=True), flush=True)
+        print(wire.dumps(out, ensure_ascii=True), flush=True)  # text-safe: the hook reply for the harness on its own stdout
     except OSError:
         finish_delivery(delivery, delivered=False, reason="error: stdout delivery failed")
     else:

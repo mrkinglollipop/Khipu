@@ -53,7 +53,8 @@ class RaceConnection:
         if sql.startswith("SELECT e.id, e.summary"):
             self.result = [(7, self.payload["summary"], [], [], [], [])] if not self.deleted else []
         elif sql.startswith("SELECT t.slug"):
-            self.result = []
+            # The topic's source episodes: episode 7 feeds it, so a forget of 7 withholds it.
+            self.result = [(slug, 7) for slug in params[0]]
         elif "FROM episodes" in sql or "FROM topics" in sql:
             if "FOR SHARE" in sql or "FOR UPDATE" in sql:
                 self.locked = not self.deleted

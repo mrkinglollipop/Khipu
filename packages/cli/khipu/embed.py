@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from khipu import profiles as _profiles
+from khipu import provider_text
 from khipu.lines import split_lines
 from khipu.profiles import ProfileSpec, resolve_spec
 from khipu.search_text import hybrid_rerank
@@ -661,7 +662,7 @@ def _query_vec(cur, conn, profile: str, api_q: str) -> tuple[list[float], str]:
             _log(f"query cache read skipped: {type(exc).__name__}")
             have_cache = False
     vec = embed_one(
-        api_q, profile=profile,
+        provider_text.live_input(api_q, "query"), profile=profile,
         retries=QUERY_EMBED_RETRIES, timeout=QUERY_EMBED_TIMEOUT_S,
         delay=QUERY_EMBED_DELAY_S, input_type="query",
     )
@@ -839,16 +840,26 @@ def _redact_provider_diagnostic(text: str, headers: dict[str, str]) -> str:
     )
 
 
+class WithheldDuringSend(RuntimeError):
+    """A source of the batch was forgotten (or the forget list became
+    unreadable) between the fence and a send attempt: nothing was sent."""
+
+
 def _post_json(
     url: str, body: dict[str, Any], headers: dict[str, str], *,
     provider: str, retries: int, timeout: float, delay: float, transport=None,
-    budget: str = "memory",
+    budget: str = "memory", recheck=None,
 ) -> dict[str, Any]:
     """POST ``body`` with the retry ladder every provider shares: 429/5xx and
-    network errors back off ``delay`` doubling; anything else raises at once."""
+    network errors back off ``delay`` doubling; anything else raises at once.
+    ``recheck`` (episode-derived batches) is called before every attempt,
+    retries included; False raises ``WithheldDuringSend`` before any byte goes
+    out, because a forget can land during the back-off."""
     data = json.dumps(body).encode("utf-8")
     payload: dict[str, Any] = {}
     for attempt in range(retries + 1):
+        if recheck is not None and not recheck():
+            raise WithheldDuringSend("embed withheld: a source was forgotten before the send")
         deadline = time.monotonic() + max(0, timeout)
         _budget_take(deadline=deadline, scope=budget)
         remaining = deadline - time.monotonic()
@@ -891,6 +902,7 @@ def embed_batch(
     transport=None,
     input_type: str | None = None,
     budget: str = "memory",
+    recheck=None,
 ) -> list[list[float]]:
     """Embed texts under ``profile``'s provider; dim-checked, L2-normalized when
     the profile says ``normalize='l2'`` (every shipped profile does).
@@ -914,6 +926,7 @@ def embed_batch(
         payload = _post_json(
             url, body, headers, provider=spec.provider,
             retries=retries, timeout=timeout, delay=delay, transport=transport, budget=budget,
+            recheck=recheck,
         )
         vecs = _parse_vectors(spec.provider, payload)
         if len(vecs) != len(part):
@@ -931,8 +944,13 @@ def embed_one(
     timeout: float = 120.0,
     delay: float = 2.0,
     input_type: str | None = None,
+    recheck=None,
 ) -> list[float]:
+    """``recheck``: as for ``embed_batch``; required of any caller whose text
+    derives from an episode, so a retry cannot send text forgotten meanwhile."""
     extra = {"input_type": input_type} if input_type else {}
+    if recheck is not None:
+        extra["recheck"] = recheck
     if input_type != "query":
         return embed_batch(
             [text], profile=profile, retries=retries, timeout=timeout, delay=delay, **extra,
@@ -1274,7 +1292,7 @@ def _flush_media_batch(
     stats: dict[str, Any],
 ) -> None:
     images = [(raw, mime) for _sid, _p, _rel, mime, _sha, raw in batch]
-    vecs = embed_batch_images(images, profile=profile)
+    vecs = embed_batch_images(provider_text.live_input(images, "media"), profile=profile)
     rows: list[tuple[str, str, int, str, str, list[float]]] = []
     for (sid, _path, rel, mime, sha, raw), vec in zip(batch, vecs):
         mid = _upsert_media_asset(
@@ -1353,66 +1371,94 @@ def _iter_sources(
     ``title`` is used only for gemini-embedding-2 document prefixes; stored
     ``chunk_text`` stays the unprefixed ``text``. ``refs`` (with a ``kind`` of
     episode or topic) narrows the read to those rows: episode ids as strings,
-    topic slugs.
+    topic slugs. Each kind's reader passes its texts through
+    ``provider_text.fenced_texts`` before yielding, so no text derived from a
+    forgotten episode reaches a provider; when the list cannot be read
+    nothing episode-derived is yielded.
     """
     if kind in (None, "episode"):
-        # Tombstoned episodes (khipu episode forget) must never be re-embedded;
-        # pre-0010 hubs have no deleted_at column.
-        from khipu.db import has_columns
-
-        live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
-        has_verbatim = has_columns(cur, "episodes", "verbatim")
-        verbatim_col = ", verbatim" if has_verbatim else ""
-        only = ""
-        args: tuple = ()
-        if refs is not None:
-            only = (" AND" if live else " WHERE") + " id = ANY(%s)"
-            args = ([int(r) for r in refs],)
-        cur.execute(
-            f"SELECT id, summary, decisions, preferences, topics, people{verbatim_col} "
-            f"FROM episodes{live}{only} ORDER BY id",
-            args,
-        )
-        for row in cur.fetchall():
-            eid, summary, decisions, prefs, topics, people = row[:6]
-            verbatim = row[6] if has_verbatim else None
-            text = episode_text(
-                {"summary": summary, "decisions": decisions, "preferences": prefs,
-                 "topics": topics, "people": people, "verbatim": verbatim}
-            )
-            # Empty live rows still participate so a successful backfill can
-            # prune vectors left from their former non-empty contents.
-            yield "episode", str(eid), text, ""
+        yield from _episode_sources(cur, refs)
     if kind in (None, "topic"):
-        if refs is None:
-            cur.execute("SELECT slug, title, body FROM topics WHERE deleted_at IS NULL ORDER BY slug")
-        else:
-            cur.execute(
-                "SELECT slug, title, body FROM topics WHERE deleted_at IS NULL"
-                " AND slug = ANY(%s) ORDER BY slug",
-                (list(refs),),
-            )
-        for slug, title, body in cur.fetchall():
-            text = topic_text(slug, title, body)
-            if text:
-                yield "topic", slug, text, (title or slug or "")
+        yield from _topic_sources(cur, refs)
     # Commitments are OPT-IN only (`--kind commitment`), never part of the
     # default sweep: their vectors exist for commitments.auto_close, not for
     # generic search (_cosine_candidates excludes kind='commitment'), and the
     # hook's bounded catch-up normally keeps them current. This is the manual
     # heal for a hub whose catch-up fell behind (audit 2026-09-04).
     if kind == "commitment":
+        yield from _commitment_sources(cur, commitment_wording)
+
+
+def _episode_sources(cur, refs: list[str] | None) -> Iterable[tuple[str, str, str, str]]:
+    from khipu import provider_text
+    from khipu.db import has_columns
+
+    # Tombstoned episodes (khipu episode forget) must never be re-embedded;
+    # pre-0010 hubs have no deleted_at column.
+    live = " WHERE deleted_at IS NULL" if has_columns(cur, "episodes", "deleted_at") else ""
+    has_verbatim = has_columns(cur, "episodes", "verbatim")
+    verbatim_col = ", verbatim" if has_verbatim else ""
+    only = ""
+    args: tuple = ()
+    if refs is not None:
+        only = (" AND" if live else " WHERE") + " id = ANY(%s)"
+        args = ([int(r) for r in refs],)
+    cur.execute(
+        f"SELECT id, summary, decisions, preferences, topics, people{verbatim_col} "
+        f"FROM episodes{live}{only} ORDER BY id",
+        args,
+    )
+    rows = cur.fetchall()
+    texts = [episode_text({"summary": row[1], "decisions": row[2], "preferences": row[3],
+                           "topics": row[4], "people": row[5],
+                           "verbatim": row[6] if has_verbatim else None}) for row in rows]
+    kept = provider_text.fenced_texts(texts, [row[0] for row in rows], "episode")
+    for row, text in zip(rows, kept):
+        if text is not None:
+            # Empty live rows still participate so a successful backfill can
+            # prune vectors left from their former non-empty contents.
+            yield "episode", str(row[0]), text, ""
+
+
+def _topic_sources(cur, refs: list[str] | None) -> Iterable[tuple[str, str, str, str]]:
+    from khipu import provider_text
+
+    if refs is None:
+        cur.execute("SELECT slug, title, body FROM topics WHERE deleted_at IS NULL ORDER BY slug")
+    else:
         cur.execute(
-            "SELECT id, text FROM commitments WHERE status = 'open' ORDER BY id"
+            "SELECT slug, title, body FROM topics WHERE deleted_at IS NULL"
+            " AND slug = ANY(%s) ORDER BY slug",
+            (list(refs),),
         )
-        for cid, ctext in cur.fetchall():
-            text = (ctext or "").strip()
-            if text:
-                if commitment_wording is not None:
-                    # The md5 of the hub text as read, for the publication
-                    # lock's wording check (_lock_live_embedding_refs).
-                    commitment_wording[str(cid)] = _md5(ctext or "")
-                yield "commitment", str(cid), text, ""
+    rows = [(slug, title, topic_text(slug, title, body)) for slug, title, body in cur.fetchall()]
+    rows = [r for r in rows if r[2]]
+    sources = provider_text.episode_ids_of_topics(cur, [r[0] for r in rows])
+    kept = provider_text.fenced_texts([r[2] for r in rows], [sources.get(r[0]) for r in rows], "topic")
+    for (slug, title, _text), text in zip(rows, kept):
+        if text is not None:
+            yield "topic", slug, text, (title or slug or "")
+
+
+def _commitment_sources(
+    cur, commitment_wording: dict[str, str] | None
+) -> Iterable[tuple[str, str, str, str]]:
+    from khipu import provider_text
+
+    cur.execute("SELECT id, text FROM commitments WHERE status = 'open' ORDER BY id")
+    rows = [(cid, ctext, (ctext or "").strip()) for cid, ctext in cur.fetchall()]
+    rows = [r for r in rows if r[2]]
+    sources = provider_text.episode_ids_of_commitments(cur, [r[0] for r in rows])
+    kept = provider_text.fenced_texts([r[2] for r in rows], [sources.get(str(r[0])) for r in rows],
+                                      "commitment")
+    for (cid, ctext, _text), text in zip(rows, kept):
+        if text is None:
+            continue
+        if commitment_wording is not None:
+            # The md5 of the hub text as read, for the publication
+            # lock's wording check (_lock_live_embedding_refs).
+            commitment_wording[str(cid)] = _md5(ctext or "")
+        yield "commitment", str(cid), text, ""
 
 
 def _existing_hashes(cur, profile: str) -> dict[tuple[str, str, int], str]:
@@ -1454,6 +1500,7 @@ def _existing_hashes_many(cur, profiles: list[str] | None) -> dict[str, dict[tup
 
 def _lock_live_embedding_refs(cur, refs: Iterable[tuple[str, str]], *,
                               commitment_wording: Iterable[str] | None = None) -> set[tuple[str, str]]:
+    # forget-fence: embedding writer; returns no row to a reader
     """Lock sources until the caller commits their vectors.
 
     Provider calls happen before this check. Forget/purge either wins first
@@ -1614,6 +1661,7 @@ def _plan_cache_file(cur, suffix: str = "") -> Path:
 
 
 def _row_fingerprints(cur, *, topics_only: bool = False) -> list[tuple[str, str, str]]:
+    # forget-fence: embedding writer; returns no row to a reader
     """``(kind, ref, fingerprint)`` for every row the plan covers, in plan order
     (episodes by id, then topics by slug). The fingerprint is the row version's
     ``xmin``: every UPDATE writes a new version under a new transaction id, so
@@ -1940,6 +1988,10 @@ def backfill(
                         break
                     batch = todo[start : start + BATCH]
                     # todo rows: (kind, ref, idx, chunk, hash, title)
+                    sendable = provider_text.fence_chunks(cur, [(k, r, c) for k, r, _i, c, _h, _t in batch])
+                    batch = [row for row, text in zip(batch, sendable) if text is not None]
+                    if not batch:
+                        continue
                     api = _api_texts(profile, [(title, chunk) for _k, _r, _i, chunk, _h, title in batch])
                     try:
                         # Gemini answered 429 to five back-to-back 64-chunk batches
@@ -1948,7 +2000,9 @@ def backfill(
                         # let one nightly finish instead of leaving a third of the
                         # topics for tomorrow.
                         vecs = embed_batch(api, profile=profile, retries=BACKFILL_RETRIES,
-                                           delay=BACKFILL_DELAY_S)
+                                           delay=BACKFILL_DELAY_S,
+                                           recheck=provider_text.recheck_chunks(
+                                               cur, [(k, r, c) for k, r, _i, c, _h, _t in batch]))
                     except RuntimeError as exc:
                         msg = str(exc)
                         if "budget exhausted" in msg:
@@ -2129,8 +2183,17 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
                 eid = str(source_row["id"])
                 source_text = episode_text(source_row)
                 chunks = chunk_text(source_text)
-                api = _api_texts(profile, [("", c) for c in chunks])
-                vecs = embed_batch(api, profile=profile)
+                sendable = provider_text.fenced_texts(chunks, [eid] * len(chunks), "capture-embed")
+                if any(c is None for c in sendable):
+                    _log("embed-on-capture: episode is forgotten or the forget list is unreadable; nothing sent")
+                    return False
+                api = _api_texts(profile, [("", c) for c in sendable])
+                try:
+                    vecs = embed_batch(api, profile=profile, recheck=provider_text.recheck_texts(
+                        chunks, [eid] * len(chunks), "capture-embed"))
+                except WithheldDuringSend:
+                    _log("embed-on-capture: episode forgotten during the send; nothing sent")
+                    return False
                 cur.execute(
                     "SELECT row_to_json(e) FROM episodes e "
                     "WHERE e.id = %s AND e.deleted_at IS NULL FOR SHARE",
@@ -2645,6 +2708,7 @@ def _apply_search_filters(
     via: str | None = None,
     projects: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Post-fusion metadata filter + recency tiebreak, in one place for every
     mode (W2.3). project/session_id/harness only exist on episodes — a topic
     or node row is dropped when one of those is active rather than guessed at.
@@ -2958,6 +3022,7 @@ def hybrid_search(
     include_libraries: bool = True,
     rank: Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
+    # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
     """Default retrieval engine (W2.1-W2.3): fused hybrid, or single-mode.
 
     mode='hybrid' (default): cosine oversample + token overlap (over the
@@ -3285,7 +3350,10 @@ def hybrid_search(
                     from khipu import rerank as _rerank
 
                     fused, rerank_info, rerank_failed = _rerank.stage(
-                        query, fused, mode=mode, token_count=len(tokens)
+                        query, fused, mode=mode, token_count=len(tokens),
+                        topic_sources=provider_text.episode_ids_of_topics(
+                            cur, [str(r.get("id")) for r in fused[:_rerank.MAX_CANDIDATES]
+                                  if r.get("kind") == "topic"]),
                     )
                     if rerank_failed:
                         degraded_legs.append("rerank")
@@ -3703,18 +3771,20 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             episode_rows.extend(
                 row for row in cur.fetchall() if str(row[0]) not in seen_episode_ids
             )
+            episode_texts = provider_text.fenced_texts(
+                [episode_text({"summary": r[1], "decisions": r[2], "preferences": r[3],
+                               "topics": r[4], "people": r[5],
+                               "verbatim": r[6] if has_verbatim else None}) for r in episode_rows],
+                [r[0] for r in episode_rows], "episode")
+            episode_rows = [(r, t) for r, t in zip(episode_rows, episode_texts) if t is not None]
             episode_existing = _existing_hashes_for_refs(
-                cur, profile, "episode", [str(row[0]) for row in episode_rows]
+                cur, profile, "episode", [str(row[0]) for row, _t in episode_rows]
             )
             todo: list[tuple[str, str, int, str, str]] = []
             episode_replacements = {}
             episode_snapshot_rows = []
-            for row in episode_rows:
-                eid, summary, decisions, prefs, topics, people = row[:6]
-                verbatim = row[6] if has_verbatim else None
-                text = episode_text({"summary": summary, "decisions": decisions,
-                                     "preferences": prefs, "topics": topics, "people": people,
-                                     "verbatim": verbatim})
+            for row, text in episode_rows:
+                eid = row[0]
                 chunks = chunk_text(text) if text else []
                 current = {i: _md5(chunk) for i, chunk in enumerate(chunks)}
                 previous = {i: h for (k, r, i), h in episode_existing.items() if k == "episode" and r == str(eid)}
@@ -3731,9 +3801,16 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             episode_failed_refs: set[str] = set()
             for start in range(0, len(todo), BATCH):
                 batch = todo[start : start + BATCH]
-                api = _api_texts(profile, [("", t) for _, _, _, t, _ in batch])
+                # An episode forgotten since selection must not go out with
+                # its batch: fence again right before the provider call.
+                sendable = provider_text.fence_chunks(cur, [(k, r, t) for k, r, _i, t, _h in batch])
+                batch = [row for row, text in zip(batch, sendable) if text is not None]
+                if not batch:
+                    continue
+                api = _api_texts(profile, [("", text) for text in sendable if text is not None])
                 try:
-                    vecs = embed_batch(api, profile=profile)
+                    vecs = embed_batch(api, profile=profile, recheck=provider_text.recheck_chunks(
+                        cur, [(k, r, t) for k, r, _i, t, _h in batch]))
                 except RuntimeError as exc:
                     msg = str(exc)
                     if "budget exhausted" in msg or "network error after" in msg:
@@ -3812,14 +3889,24 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 _log(f"commitment embed catch-up skipped: {type(exc).__name__}: {exc}")
                 commitment_rows = []
             snapshot_rows: list[dict[str, Any]] = []
-            for cid, ctext in commitment_rows:
-                text = (ctext or "").strip()
+            commitment_sources = provider_text.episode_ids_of_commitments(
+                cur, [cid for cid, _t in commitment_rows])
+            commitment_kept = provider_text.fenced_texts(
+                [(ctext or "").strip() for _cid, ctext in commitment_rows],
+                [commitment_sources.get(str(cid)) for cid, _t in commitment_rows], "commitment")
+            for (cid, ctext), text in zip(commitment_rows, commitment_kept):
                 if not text:
                     continue
                 chunks = chunk_text(text)
-                api = _api_texts(profile, [("", c) for c in chunks])
+                # Fence again right before the provider call: a forget since
+                # selection withholds this commitment's chunks.
+                sendable = provider_text.fence_chunks(cur, [("commitment", str(cid), c) for c in chunks])
+                if any(c is None for c in sendable):
+                    continue
+                api = _api_texts(profile, [("", c) for c in sendable])
                 try:
-                    vecs = embed_batch(api, profile=profile)
+                    vecs = embed_batch(api, profile=profile, recheck=provider_text.recheck_chunks(
+                        cur, [("commitment", str(cid), c) for c in chunks]))
                 except RuntimeError as exc:
                     msg = str(exc)
                     if "budget exhausted" in msg or "network error after" in msg:
@@ -3897,8 +3984,13 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
             topic_snapshot_rows: list[dict[str, Any]] = []
             topic_sources = []
             topic_replacements = []
-            for slug, title, body, source_row in topic_rows:
-                text = topic_text(slug, title, body)
+            topic_origin = provider_text.episode_ids_of_topics(cur, [row[0] for row in topic_rows])
+            topic_kept = provider_text.fenced_texts(
+                [topic_text(row[0], row[1], row[2]) for row in topic_rows],
+                [topic_origin.get(str(row[0])) for row in topic_rows], "topic")
+            for (slug, title, body, source_row), text in zip(topic_rows, topic_kept):
+                if text is None:
+                    continue
                 # P5 G4: section-stable idx, same scheme backfill() uses for
                 # topics — keeps this leg's rows from looking "unchanged
                 # under a different idx" (and so getting re-embedded again)
@@ -3909,9 +4001,15 @@ def embed_recent_missing(limit: int = 10) -> dict[str, int]:
                 if current == previous:
                     continue
                 chunks = [c for _i, c in indexed_chunks]
-                api = _api_texts(profile, [(title or slug or "", c) for c in chunks])
+                # Fence again right before the provider call: a forget since
+                # selection withholds this topic's chunks.
+                sendable = provider_text.fence_chunks(cur, [("topic", str(slug), c) for c in chunks])
+                if any(c is None for c in sendable):
+                    continue
+                api = _api_texts(profile, [(title or slug or "", c) for c in sendable])
                 try:
-                    vecs = embed_batch(api, profile=profile) if api else []
+                    vecs = embed_batch(api, profile=profile, recheck=provider_text.recheck_chunks(
+                        cur, [("topic", str(slug), c) for c in chunks])) if api else []
                 except RuntimeError as exc:
                     if "budget exhausted" in str(exc):
                         raise
