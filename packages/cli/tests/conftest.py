@@ -77,7 +77,7 @@ if os.environ.get("KHIPU_LIVE_TESTS") != "1":
     for _name in ("GEMINI_API_KEY", "VOYAGE_API_KEY", "GROK_HOOK_NAME", "GROK_HOOK_EVENT",
                   "CLAUDE_CODE_HOST_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CONFIG_DIR",
                   "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CODEX_THREAD_ID",
-                  "CLAUDE_DISPATCHED_LANE"):
+                  "CLAUDE_DISPATCHED_LANE", "CLAUDE_CODE_CHILD_SESSION"):
         os.environ.pop(_name, None)
     for _name in ("CODEX_HOME", "CODEX_SANDBOX", "CLAUDE_PROJECT_DIR"):
         os.environ.pop(_name, None)
