@@ -1242,7 +1242,10 @@ def print_summary(out_path: Path) -> None:
         import tempfile
         # Self-clean: drop prior staged summaries (~140MB each). Patched
         # 2026-05-08 after sandbox-bloat audit. Throwaway copies.
-        for stale in _glob.glob("/tmp/graph_summary_*.sqlite"):
+        # mkstemp writes to tempfile.gettempdir() ($TMPDIR on macOS, not
+        # /tmp), so the sweep looks there; the copy is also removed after
+        # the read below.
+        for stale in _glob.glob(os.path.join(tempfile.gettempdir(), "graph_summary_*.sqlite")):
             try:
                 os.unlink(stale)
             except OSError:
@@ -1253,7 +1256,22 @@ def print_summary(out_path: Path) -> None:
             shutil.copyfile(str(out_path), tmp_str)
             read_path = Path(tmp_str)
         except Exception:
+            try:
+                os.unlink(tmp_str)
+            except OSError:
+                pass
             return  # non-fatal — skip the summary print
+    try:
+        _print_counts(out_path, read_path)
+    finally:
+        if read_path != out_path:
+            try:
+                os.unlink(read_path)
+            except OSError:
+                pass
+
+
+def _print_counts(out_path: Path, read_path: Path) -> None:
     conn = sqlite3.connect(str(read_path))
     try:
         c = conn.cursor()
