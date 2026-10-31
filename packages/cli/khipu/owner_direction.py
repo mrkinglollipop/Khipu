@@ -135,8 +135,10 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
                                                 "terminal can make this change.")
     environ = os.environ if env is None else env
     session = session_of(env)
-    if owner_turns.dispatched_job(environ, session):
+    if owner_turns.job_marker(environ):
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
+    # Lineage markers outside T3; a T3 turn is decided by T3's record below.
+    lineage_job = owner_turns.dispatched_job(environ, session)
     if not session:
         raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't tell "
                                                    "whether the owner is in it.")
@@ -146,10 +148,18 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
         raise DirectionRefused("no_recorded_turn", "This call names more than one conversation, so Khipu can't tell "
                                                    "whether the owner is in the one asking. Ask the owner to say it "
                                                    "in the conversation they are typing in.")
-    turn = _recent_turn(session, conf, now)
+    try:
+        turn = _recent_turn(session, conf, now)
+    except DirectionRefused:
+        if lineage_job:
+            raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY) from None
+        raise
     # A turn recorded before the T3 child test existed carries no mark, so a
-    # T3 turn is looked at again here.
-    if turn.get("entrypoint") == "t3" and owner_turns.dispatched_job(environ, session, t3_thread=True):
+    # T3 turn is looked at again here; outside T3 the lineage markers stand.
+    if turn.get("entrypoint") == "t3":
+        if owner_turns.dispatched_job(environ, session, t3_thread=True):
+            raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
+    elif lineage_job:
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     _from_the_hook(turn)
     return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],

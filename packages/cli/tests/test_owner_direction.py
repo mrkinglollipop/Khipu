@@ -898,6 +898,76 @@ def test_an_unmarked_t3_child_turn_is_refused_at_the_check(t3_conversation, monk
     assert err.value.code == "no_recorded_turn"
 
 
+# T3's Agent SDK sets these for the owner's own top-level threads (measured
+# 2026-10-31 on the owner's T3 conversation).
+_T3_SDK_ENV = {"CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDE_CODE_HOST_SESSION_ID": "s-t3-host"}
+
+
+def _be_with(world, session, monkeypatch, env):
+    world.be(session)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_a_t3_top_level_thread_with_the_sdk_child_markers_passes(t3_conversation, monkeypatch):
+    _t3_say(**_T3_SDK_ENV)
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["entrypoint"] == "t3" and row["eligible"] is True and not row.get("dispatched")
+    _be_with(t3_conversation, OWNER, monkeypatch, _T3_SDK_ENV)
+    assert _check("config.routing_setting")["auth"] == "direction"
+
+
+def test_a_t3_delegated_child_with_the_sdk_child_markers_is_refused(t3_conversation, monkeypatch):
+    _add_t3_thread("thread:delegated-task:command%3Ajob", "s-child")
+    _t3_say(session="s-child", **_T3_SDK_ENV)
+    (row,) = owner_turns.turns("s-child")
+    assert row["eligible"] is False and row["why"] == "a T3 delegated child thread"
+    _be_with(t3_conversation, "s-child", monkeypatch, _T3_SDK_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
+
+
+@pytest.mark.parametrize("marker", [{"KHIPU_JOB": "1"}, {"KHIPU_PARENT_SESSION": "claude_code:s-parent"},
+                                    {"CLAUDE_DISPATCHED_LANE": "claude-second"}])
+def test_a_t3_top_level_thread_with_a_job_marker_is_refused(t3_conversation, monkeypatch, marker):
+    _t3_say(**_T3_SDK_ENV, **marker)
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["eligible"] is False and row["why"] == "a dispatched job's turn"
+    # A clean owner turn on record does not let a marked call through.
+    _t3_say(**_T3_SDK_ENV)
+    _be_with(t3_conversation, OWNER, monkeypatch, {**_T3_SDK_ENV, **marker})
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_non_t3_session_with_the_sdk_child_markers_is_still_refused(world, monkeypatch):
+    owner_turns.record({"session_id": OWNER, "prompt": "pause Codex for now please", "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts", **_T3_SDK_ENV})
+    (row,) = owner_turns.turns(OWNER)
+    assert row["entrypoint"] == "sdk-ts" and row["dispatched"] is True and row["eligible"] is False
+    world.say()
+    _be_with(world, OWNER, monkeypatch, {"CLAUDE_CODE_CHILD_SESSION": "1"})
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check()
+    assert err.value.code == "no_recorded_turn" and "dispatched job" in err.value.message
+
+
+def test_a_t3_lookup_failure_with_the_sdk_child_markers_is_refused(t3_conversation, monkeypatch):
+    from khipu import t3
+
+    _t3_say(**_T3_SDK_ENV)
+    assert owner_turns.turns(OWNER)[-1]["eligible"] is True
+    monkeypatch.setattr(t3, "delegated_thread_result", lambda thread: (False, False))
+    _be_with(t3_conversation, OWNER, monkeypatch, _T3_SDK_ENV)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
+    _t3_say(**_T3_SDK_ENV)
+    assert owner_turns.turns(OWNER)[-1]["eligible"] is False
+
+
 def test_a_t3_child_lookup_that_never_completes_fails_closed(t3_conversation, monkeypatch):
     from khipu import t3
 
