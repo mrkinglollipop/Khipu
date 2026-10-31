@@ -71,6 +71,41 @@ class ReplicaDepthTest(unittest.TestCase):
             out = rp.prior_work_for_prompt(PROMPT)
         self.assertLessEqual(len(out["hits"]), rp.TOP_N)
 
+    def test_a_tail_row_the_graph_returns_keeps_its_evidence_and_votes_once(self) -> None:
+        from unittest import mock
+
+        seen: dict = {}
+
+        def candidates(_con, seeds, deadline=None):
+            seen["seeds"] = [s["id"] for s in seeds]
+            return [{"kind": "episode", "id": "105", "via": {"seed": "topic:x", "relation": "r"},
+                     "label": "linked", "snippet": "linked"}], False
+
+        def keep(_con, rows):
+            return rows
+
+        captured: dict = {}
+
+        def metadata(_con, fused):
+            captured["rows"] = [dict(r) for r in fused]
+            return fused
+
+        with _lane(keyword=self._keyword,
+                   cosine=lambda *_a, **_k: [{**_episode("105", "gateway restart rollout notes 5"),
+                                              "chunk_idx": 0, "score": 0.7, "cosine": 0.7,
+                                              "rank_text": "gateway restart rollout notes 5"}],
+                   metadata=metadata), \
+                mock.patch("khipu.features.enabled", side_effect=lambda n: n == "graph_candidates"), \
+                mock.patch("khipu.graph_candidates.replica_candidates", side_effect=candidates), \
+                mock.patch("khipu.hub_snapshot.snapshot_filter_live_sources", side_effect=keep):
+            rp._snapshot_search_hits(PROMPT, project=None, started=__import__("time").monotonic(),
+                                     progress={})
+        rows = [r for r in captured["rows"] if r["id"] == "105"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["via"], "topic:x")
+        self.assertEqual(rows[0]["cosine"], 0.7)
+        self.assertGreaterEqual(rows[0].get("lexical_hits", 0), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

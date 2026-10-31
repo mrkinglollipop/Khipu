@@ -2528,7 +2528,20 @@ def _fuse_and_annotate(
                 # A candidate from the tail votes once, as a candidate (as it
                 # did when the fused list was _CANDIDATE_LIMIT long): keeping
                 # its tail vote too let linked notes outrank direct hits.
-                cand_keys = {(r.get("kind"), str(r.get("id"))) for r in cand_rows}
+                # Its retrieval evidence (cosine, profile, lexical and
+                # prompt-term hits) stays on the candidate row, so the
+                # relevance gate and push ranking still see it; the candidate's
+                # own fields, `via` included, win.
+                tail_by_key = {(r.get("kind"), str(r.get("id"))): r for r in fused}
+                cand_keys = set()
+                for r in cand_rows:
+                    k = (r.get("kind"), str(r.get("id")))
+                    cand_keys.add(k)
+                    orig = tail_by_key.get(k)
+                    if orig:
+                        for f, v in orig.items():
+                            if f not in ("via", "score") and r.get(f) is None:
+                                r[f] = v
                 fused = [r for r in fused if (r.get("kind"), str(r.get("id"))) not in cand_keys]
                 fused = fuse_ranked_lists([fused, cand_rows], limit=_REPLICA_DEPTH)
                 legs.append("graph_candidates")
