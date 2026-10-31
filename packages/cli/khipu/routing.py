@@ -5381,6 +5381,14 @@ def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     folded = _parse(view.get("folded_at"))
     if folded is not None and (folded - now).total_seconds() > CLOCK_TOLERANCE:
         return False  # folded at a time further ahead of this clock than it trusts: fold again at now
+    # A kept job attachment ends at its own expiry even when every input file
+    # is unchanged, so the equal-fingerprint path cannot skip this check.
+    kept = (view.get("source_cache") or {}).get("captures")
+    for entry in (kept.values() if isinstance(kept, dict) else ()):
+        if isinstance(entry, dict) and entry.get("until"):
+            until = _parse(entry["until"])
+            if until is None or now >= until:
+                return False
     due = _parse(view.get("valid_until"))
     return due is None or now < due
 

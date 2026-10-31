@@ -90,6 +90,22 @@ def test_a_joined_capture_ages_out_on_time(record):
     assert not routing._fresh(view, fingerprint, T0 + timedelta(seconds=61))
 
 
+def test_an_unchanged_view_goes_stale_when_its_attachment_expires(record):
+    seen = T0 - timedelta(seconds=session_capture.LOGIN_HOME_KEEP_S - 60)
+    (record / "claude_code--job-one.json").write_text(json.dumps({"origin": "job", "seen_ts": seen.timestamp()}))
+    routing.read_view(now=T0)
+    view, fingerprint = routing._load_view(), routing._inputs()[0]
+    until = routing._parse(view["source_cache"]["captures"]["runner"]["until"])
+    assert view["fingerprint"] == fingerprint
+    assert routing._fresh(view, fingerprint, until - timedelta(seconds=1))
+    assert not routing._fresh(view, fingerprint, until + timedelta(seconds=1))
+    # With no attachment kept, nothing but valid_until bounds the view.
+    view["source_cache"]["captures"] = {}
+    view["source_cache"]["runners"] = {}
+    view["valid_until"] = None
+    assert routing._fresh(view, fingerprint, until + timedelta(seconds=1))
+
+
 def _rows(rnd, n, dim):
     rows = []
     for i in range(n):
