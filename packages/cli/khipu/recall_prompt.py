@@ -2506,7 +2506,13 @@ def _fuse_and_annotate(
             from khipu import graph_candidates as _gc
 
             gc_deadline = time.monotonic() + _gc.REPLICA_LEG_DEADLINE_S
-            cand_rows, missed = _gc.replica_candidates(con, fused, deadline=gc_deadline)
+            # Only the head of the fused list is excluded from candidacy: at
+            # _REPLICA_DEPTH an indirectly linked row usually sits somewhere
+            # in the tail, and excluding it there dropped the graph's vote
+            # for it (and its `via`) entirely.
+            cand_rows, missed = _gc.replica_candidates(
+                con, fused[:_CANDIDATE_LIMIT], deadline=gc_deadline
+            )
             if missed:
                 degraded_legs.append("graph_candidates")
             elif cand_rows:
@@ -2519,6 +2525,11 @@ def _fuse_and_annotate(
                     if isinstance(via, dict):
                         r["via"] = via.get("seed")
                 cand_rows = hub_snapshot.snapshot_filter_live_sources(con, cand_rows)
+                # A candidate from the tail votes once, as a candidate (as it
+                # did when the fused list was _CANDIDATE_LIMIT long): keeping
+                # its tail vote too let linked notes outrank direct hits.
+                cand_keys = {(r.get("kind"), str(r.get("id"))) for r in cand_rows}
+                fused = [r for r in fused if (r.get("kind"), str(r.get("id"))) not in cand_keys]
                 fused = fuse_ranked_lists([fused, cand_rows], limit=_REPLICA_DEPTH)
                 legs.append("graph_candidates")
         except Exception as exc:  # noqa: BLE001 — a candidate-leg failure must not sink the search
