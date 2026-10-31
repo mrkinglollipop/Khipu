@@ -4662,6 +4662,13 @@ def cmd_recall(args: argparse.Namespace) -> int:
             print(json.dumps(result, indent=2))
             return 0 if result.get("ok") else 2
 
+        if getattr(args, "refresh_vectors", False):
+            from khipu import recall_eval_nightly
+
+            result = recall_eval_nightly.refresh_vectors(golden_path)
+            print(json.dumps(result, indent=2))
+            return 0 if result.get("ok") else 2
+
         rerank_arg = getattr(args, "rerank", None)
         if rerank_arg:
             if (path_arg != "explicit" or record_to or compare_to or replay_from
@@ -7064,6 +7071,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Merge golden candidate entries from FILE (same JSONL shape, plus optional 'n' and 'source') "
             "into the golden file: de-duplicated by query, expected ids checked against the replica, "
             "the previous file kept as a .bak; prints counts only"
+        ),
+    )
+    reval.add_argument(
+        "--refresh-vectors", action="store_true",
+        help=(
+            "Embed the golden queries (outside the nightly's sandbox) into the local 0600 vector store "
+            "the nightly recall check reads, so its prompt path runs with semantic search; "
+            "prints counts only"
         ),
     )
     reval.add_argument(

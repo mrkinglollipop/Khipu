@@ -778,3 +778,112 @@ def test_no_os_sandbox_means_no_run_and_a_yellow_row(world, monkeypatch):
     row = ren.recall_eval_health()
     assert row["level"] == "yellow" and row["ok"] and "no OS sandbox" in row["summary"]
     assert ren._previous_figures(ren.read_history()) is None
+
+
+# ---- golden-query vectors for the push's cosine leg ----------------------------
+
+PROFILE = "prof-test"
+
+
+def _child_embed_probe(out_file):
+    """The scorer stub asks the push's own embed function for each prompt-path
+    query, as the cosine worker does, and logs what came back."""
+    def fake(entry, path, **_k):
+        from khipu import recall_prompt
+
+        if path == "prompt":
+            try:
+                got = list(recall_prompt._cached_query_embed(entry["query"], "prof-test"))
+            except RuntimeError as exc:
+                got = str(exc)
+            with open(out_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps([entry["query"], got]) + "\n")
+        return {"expect_none": False, "hit": True, "reciprocal_rank": 1.0, "abstain_correct": True,
+                "stale_violation": False, "timeout": False, "error": False, "degraded": None,
+                "outcome": "match", "ms": 1.0, "payload_chars": 10}
+
+    recall_eval.eval_one_path = fake
+
+
+def _store(path, vectors):
+    import sqlite3
+
+    from khipu import recall_prompt
+
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE query_embed_cache (key TEXT PRIMARY KEY, vector BLOB NOT NULL, created REAL NOT NULL)")
+    for query, vec in vectors.items():
+        con.execute("INSERT INTO query_embed_cache VALUES (?, ?, 0)",
+                    (recall_prompt._query_embed_cache_key(PROFILE, query), recall_prompt._pack_vector(vec)))
+    con.commit()
+    con.close()
+
+
+def test_stored_vectors_feed_the_cosine_leg_and_the_doctor_says_so(world, monkeypatch, need_sandbox):
+    tmp, golden = world
+    store, out = tmp / "vectors.sqlite3", tmp / "embed.jsonl"
+    _store(store, {f"q{i}": [0.25, float(i)] for i in range(20)})
+    monkeypatch.setattr(ren, "vectors_path", lambda: store)
+    monkeypatch.setattr("khipu.jobs._is_index_sync_host", lambda: True)
+    _write_golden(golden, [{"query": f"q{i}", "expect": ["1"]} for i in range(20)])
+    rec = ren.run_nightly_eval(golden=golden, child_setup=(_child_embed_probe, (str(out),)))
+    assert dict(map(tuple, map(json.loads, out.read_text().splitlines()))) == {f"q{i}": [0.25, float(i)] for i in range(20)}
+    assert rec["offline"]["cosine_missing"] == 0 and rec["offline"]["cosine_skipped"] is False
+    assert rec["offline"]["embed"] == 0 and rec["offline"]["network"] == 0
+    assert "with semantic search" in ren.recall_eval_health(now=datetime.fromisoformat(rec["ts"]))["summary"]
+
+
+def test_a_missing_vector_stays_keyword_only_counted_and_labelled(world, monkeypatch, need_sandbox):
+    tmp, golden = world
+    store, out = tmp / "vectors.sqlite3", tmp / "embed.jsonl"
+    _store(store, {f"q{i}": [0.25, 0.5] for i in range(19)})
+    monkeypatch.setattr(ren, "vectors_path", lambda: store)
+    monkeypatch.setattr("khipu.jobs._is_index_sync_host", lambda: True)
+    _write_golden(golden, [{"query": f"q{i}", "expect": ["1"]} for i in range(20)])
+    rec = ren.run_nightly_eval(golden=golden, child_setup=(_child_embed_probe, (str(out),)))
+    got = dict(map(tuple, map(json.loads, out.read_text().splitlines())))
+    assert got["q0"] == [0.25, 0.5] and "no stored vector" in got["q19"]
+    assert rec["offline"]["cosine_missing"] == 1 and rec["offline"]["cosine_skipped"] is True
+    assert rec["offline"]["embed"] == 0 and rec["scored"] == 20
+    row = ren.recall_eval_health(now=datetime.fromisoformat(rec["ts"]))
+    assert "keyword only, 1 vectors missing" in row["summary"]
+
+
+def test_no_store_at_all_is_every_vector_missing(world, monkeypatch, need_sandbox):
+    tmp, golden = world
+    monkeypatch.setattr(ren, "vectors_path", lambda: tmp / "absent.sqlite3")
+    _write_golden(golden, [{"query": "q0", "expect": ["1"]}])
+    rec = ren.run_nightly_eval(golden=golden, child_setup=(_child_embed_probe, (str(tmp / "o.jsonl"),)))
+    assert rec["offline"]["cosine_missing"] == 1 and rec["offline"]["cosine_skipped"] is True
+
+
+def test_the_sandbox_profile_still_denies_network_and_adds_no_allowance():
+    assert ren.SANDBOX_PROFILE == "(version 1)(allow default)(deny network*)"
+
+
+def test_refresh_vectors_fills_the_store_outside_the_nightly_0600_without_query_text(world, monkeypatch):
+    import sqlite3
+
+    from khipu import recall_prompt
+
+    tmp, golden = world
+    store = tmp / "state" / "vec.sqlite3"
+    monkeypatch.setattr(hub_snapshot, "active_snapshot_profile", lambda: PROFILE)
+    calls = []
+
+    def fake_embed(prompt, profile, deadline=None):
+        calls.append((prompt, profile))
+        if prompt == "bad words":
+            raise RuntimeError("provider down")
+        return [float(len(prompt)), 0.5]
+
+    monkeypatch.setattr(recall_prompt, "_cached_query_embed", fake_embed)
+    _write_golden(golden, [{"query": "very private words", "expect": ["1"]},
+                           {"query": "bad words", "expect": ["1"]}])
+    res = ren.refresh_vectors(golden, store=store)
+    assert res == {"ok": False, "stored": 1, "failed": 1, "queries": 2}
+    assert stat.S_IMODE(store.stat().st_mode) == 0o600
+    assert b"very private words" not in store.read_bytes()
+    rows = sqlite3.connect(store).execute("SELECT key, vector FROM query_embed_cache").fetchall()
+    assert [r[0] for r in rows] == [recall_prompt._query_embed_cache_key(PROFILE, "very private words")]
+    assert recall_prompt._unpack_vector(rows[0][1]) == [18.0, 0.5]
