@@ -130,6 +130,10 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     if not conf["enabled"] and action != "direction.on":
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
+    if owner_turns.dispatched_lane(os.environ if env is None else env):
+        raise DirectionRefused("no_recorded_turn", "This call comes from a dispatched job, which can never make an "
+                                                   "owner's change. Ask the owner to say it in the conversation "
+                                                   "they are typing in.")
     session = session_of(env)
     if not session:
         raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't tell "
