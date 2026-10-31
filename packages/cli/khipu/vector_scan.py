@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import heapq
 import operator
 import math
 import time
@@ -108,6 +109,15 @@ def _blas_shortlist(
             doc = struct.unpack(f"{dim}f", blob[:dim * 4])
             max_doc = max(max_doc, abs(min(doc)), abs(max(doc)))
         packed[i * dim * 4 : (i + 1) * dim * 4] = blob[: dim * 4]
+    approx = _sgemv_scores(sgemv, packed, n, dim, query)
+    _check_deadline(deadline)
+    return _shortlist(approx, valid, query, dim, shortlist_n, max_doc,
+                      entity_key=entity_key, deadline=deadline)
+
+
+def _sgemv_scores(sgemv: Any, packed, n: int, dim: int, query: Sequence[float]) -> list[float]:
+    """Float32 dot products of the ``n`` rows packed in ``packed`` (a
+    writable buffer of ``n * dim`` float32s) with ``query``."""
     a_buf = (ctypes.c_float * (n * dim)).from_buffer(packed)
     x_buf = (ctypes.c_float * dim)(*[float(v) for v in query])
     y_buf = (ctypes.c_float * n)()
@@ -115,26 +125,130 @@ def _blas_shortlist(
         _CBLAS_ROW_MAJOR, _CBLAS_NO_TRANS, n, dim,
         1.0, a_buf, dim, x_buf, 1, 0.0, y_buf, 1,
     )
-    _check_deadline(deadline)
-    approx = list(y_buf)
+    return list(y_buf)
+
+
+def _all_finite(values: list[float]) -> bool:
+    # A finite sum of finite floats needs no per-value check; an infinite or
+    # NaN sum (an overflow included) falls back to checking each value.
+    return math.isfinite(sum(values)) or all(math.isfinite(v) for v in values)
+
+
+def _shortlist(
+    approx: list[float], valid: list[tuple[int, Any, Any]], query: Sequence[float], dim: int,
+    shortlist_n: int, max_doc: float, *, entity_key=None, deadline: float | None = None,
+) -> list[tuple[int, Any, Any]]:
+    """The rows of ``valid`` whose float32 score ``approx`` (same order) is
+    within the error bound of the ``shortlist_n``-th entity's."""
+    n = len(valid)
     # Covers float32 query conversion, multiply/add rounding, float64
     # reference accumulation, and implementations that flush subnormals.
     nu = (2 * dim + 2) * 2.0 ** -24
-    if nu >= 0.5 or not all(math.isfinite(v) for v in approx):
+    if nu >= 0.5 or not _all_finite(approx):
         return valid
     error = (2 * nu / (1 - nu) * max_doc * sum(abs(v) for v in query)
              + 4 * dim * 2.0 ** -126 * (max_doc + 1))
-    order = sorted(range(n), key=lambda i: (-approx[i], valid[i][0]))
-    seen = set()
     cutoff = -math.inf
-    for i in order:
+    # The walk below visits rows best first (score, then position). It reads
+    # only a prefix of that order: every row scoring at least the k-th best
+    # score, which is that order's first rows exactly. A prefix that holds
+    # too few entities is widened until it is the whole list.
+    k = min(n, max(shortlist_n * _SHORTLIST_MULTIPLIER, _SHORTLIST_FLOOR))
+    while True:
         _check_deadline(deadline)
-        identity = entity_key(valid[i][1]) if entity_key else valid[i][0]
-        seen.add(identity)
-        if len(seen) >= shortlist_n:
-            cutoff = approx[i] - 2 * error
+        floor = heapq.nlargest(k, approx)[-1] if k < n else -math.inf
+        order = sorted((i for i in range(n) if approx[i] >= floor),
+                       key=lambda i: (-approx[i], valid[i][0]))
+        seen = set()
+        for i in order:
+            identity = entity_key(valid[i][1]) if entity_key else valid[i][0]
+            seen.add(identity)
+            if len(seen) >= shortlist_n:
+                cutoff = approx[i] - 2 * error
+                break
+        if cutoff != -math.inf or k >= n:
             break
+        k = min(n, k * 4)
+    _check_deadline(deadline)
     return [row for i, row in enumerate(valid) if approx[i] >= cutoff]
+
+
+class PackedRows:
+    """One generation of rows, ``(key, blob)``, every blob exactly
+    ``dim * 4`` bytes, packed once into one float32 matrix so a scan does not
+    copy every vector again. ``rows`` hold views into that matrix, not
+    copies. ``index`` maps a row's key to its row in the matrix (keys are
+    unique). Built by ``pack``; None when the rows are not uniform."""
+
+    __slots__ = ("buf", "dim", "n", "index", "rows")
+
+    def __init__(self, buf: bytearray, dim: int, rows: list, index: dict):
+        self.buf, self.dim, self.n, self.rows, self.index = buf, dim, len(rows), rows, index
+
+
+def pack(rows: Sequence[tuple[Any, ...]], *, key_at: int = 0, blob_at: int = -1) -> "PackedRows | None":
+    """Pack ``rows`` (tuples carrying a unique key at ``key_at`` and a
+    float32 blob at ``blob_at``) into a ``PackedRows`` whose ``rows`` are the
+    same tuples with each blob replaced by a view into the matrix, or None
+    when any blob is missing, of another length, or a key repeats."""
+    if not rows:
+        return None
+    try:
+        size = len(rows[0][blob_at])
+        if size == 0 or size % 4:
+            return None
+        blobs = [r[blob_at] for r in rows]
+        if any(not isinstance(b, (bytes, bytearray, memoryview)) or len(b) != size for b in blobs):
+            return None
+        index = {r[key_at]: i for i, r in enumerate(rows)}
+        if len(index) != len(rows):
+            return None
+        buf = bytearray().join(blobs)
+        del blobs
+        view = memoryview(buf)
+        blob_pos = blob_at % len(rows[0])
+        out = [(*r[:blob_pos], view[i * size:(i + 1) * size], *r[blob_pos + 1:]) for i, r in enumerate(rows)]
+        return PackedRows(buf, size // 4, out, index)
+    except (TypeError, IndexError, ValueError):
+        return None
+
+
+def top_k_packed(
+    query: Sequence[float],
+    rows: Sequence[tuple[Any, Any]],
+    packed: PackedRows,
+    limit: int,
+    *,
+    entity_key=None,
+    deadline: float | None = None,
+    max_abs_component: float,
+) -> list[tuple[Any, float]]:
+    """``top_k_by_dot(query, rows, limit, ...)`` (same answer) where every
+    row of ``rows`` (``(key, blob)``) is a row of ``packed``, in the
+    matrix's order: one ``cblas_sgemv`` over the packed matrix, with no
+    per-prompt copy of the vectors. Falls back to ``top_k_by_dot`` whenever
+    that would not take its accelerated path."""
+    dim = len(query)
+    limit = max(0, int(limit))
+    sgemv = _cblas_sgemv() if dim == packed.dim else None
+    if (sgemv is None or not rows or limit == 0 or dim == 0
+            or len(rows) <= max(_SHORTLIST_FLOOR, _SHORTLIST_MULTIPLIER * limit)):
+        return top_k_by_dot(query, rows, limit, entity_key=entity_key, deadline=deadline,
+                            max_abs_component=max_abs_component)
+    _check_deadline(deadline)
+    valid = [(pos, key, blob) for pos, (key, blob) in enumerate(rows)]
+    try:
+        full = _sgemv_scores(sgemv, packed.buf, packed.n, dim, query)
+        _check_deadline(deadline)
+        index = packed.index
+        approx = [full[index[key]] for _pos, key, _blob in valid]
+        candidates = _shortlist(approx, valid, query, dim, limit, max_abs_component or 0.0,
+                                entity_key=entity_key, deadline=deadline)
+    except TimeoutError:
+        raise
+    except Exception:  # noqa: BLE001 — native failures use the exact fallback
+        candidates = valid
+    return _exact_top(tuple(query), candidates, dim, f"{dim}f", limit, entity_key=entity_key, deadline=deadline)
 
 
 def _check_deadline(deadline: float | None) -> None:
@@ -188,6 +302,13 @@ def top_k_by_dot(
             raise
         except Exception:  # noqa: BLE001 — native failures use the exact fallback
             candidates = valid
+    return _exact_top(q, candidates, dim, fmt, limit, entity_key=entity_key, deadline=deadline)
+
+
+def _exact_top(q: tuple, candidates: list, dim: int, fmt: str, limit: int, *,
+               entity_key=None, deadline: float | None = None) -> list[tuple[Any, float]]:
+    """The best ``limit`` of ``candidates`` (``(pos, key, blob)``) by exact
+    score, one per entity, ties by position."""
     scored = []
     for pos, key, blob in candidates:
         _check_deadline(deadline)

@@ -1843,8 +1843,48 @@ def read_table(path: str | None) -> dict | None:
 # ---- all sources --------------------------------------------------------------------
 
 
-def job_identities(cache: dict, known: list[dict], now: datetime) -> dict:
-    """Join a runner's LAUNCH reference to the job's own captured login."""
+def attachment_refs(cache: dict) -> set[str]:
+    """The capture references a runner's LAUNCH lines name (its cache)."""
+    events = (cache.get("events") or {}).get("data") or {}
+    return {row["attachment_ref"] for row in events.get("launches", []) if row.get("attachment_ref")}
+
+
+def capture_inputs(refs) -> list:
+    """What ``job_identities`` can read from the capture state folder for a
+    runner whose launches name ``refs``: the stat of each state file one of
+    them names, and of the Forget stamp. Stat only, through the folder's
+    descriptor; [] when ``refs`` is empty (nothing there is read then).
+
+    The folder itself changes on every prompt (the recall hook keeps each
+    session's state and routing ledger there), so the view's freshness
+    compares these instead of the folder's own stat (2026-10-31: every
+    prompt refolded the whole record)."""
+    refs = set(refs or ())
+    if not refs:
+        return []
+    from khipu import session_capture as sc
+
+    out = []
+    with sc._state_dir_fd() as dfd:
+        if dfd is None:
+            return [None]
+        for name in [*sc._state_names(dfd), sc.LOGIN_FORGOTTEN_STAMP]:
+            if name != sc.LOGIN_FORGOTTEN_STAMP:
+                harness, sep, sid = name.removesuffix(".json").partition("--")
+                if not sep or _sid(harness, sid) not in refs:
+                    continue
+            # A file's name holds a session id: the view keeps only its hash.
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                out.append([_sid(name), st.st_mtime_ns, st.st_size, st.st_ino])
+            except OSError:
+                out.append([_sid(name), None])
+    return out
+
+
+def job_identities(cache: dict, known: list[dict], now: datetime, expiry: list | None = None) -> dict:
+    """Join a runner's LAUNCH reference to the job's own captured login.
+    ``expiry`` (a list) gets the time each join found ends by age alone."""
     events = (cache.get("events") or {}).get("data") or {}
     launches = [row for row in events.get("launches", []) if row.get("attachment_ref")]
     if not launches:
@@ -1867,6 +1907,8 @@ def job_identities(cache: dict, known: list[dict], now: datetime) -> dict:
         # identifies the payer (for example GLM through Claude Code).
         binding = routing.login_binding({"login_home": state.get(sc.LOGIN_HOME_FIELD)}, known)
         attachments[ref] = dict(binding, source="job_attachment")
+        if expiry is not None:
+            expiry.append(seen + timedelta(seconds=sc.LOGIN_HOME_KEEP_S))
     out = {}
     for row in sorted(launches, key=lambda x: x["at"]):
         if row["attachment_ref"] in attachments:
@@ -1874,9 +1916,10 @@ def job_identities(cache: dict, known: list[dict], now: datetime) -> dict:
     return out
 
 
-def lane_witnesses(cache: dict, known: list[dict], now: datetime, status: dict) -> dict:
+def lane_witnesses(cache: dict, known: list[dict], now: datetime, status: dict,
+                   expiry: list | None = None) -> dict:
     heartbeat = (cache.get("heartbeat") or {}).get("data") or {}
-    identities = job_identities(cache, known, now)
+    identities = job_identities(cache, known, now, expiry)
     # The current heartbeat outranks a historical captured launch.
     if not status.get("silent") and not (cache.get("heartbeat") or {}).get("since"):
         identities.update({lane: dict(binding, source="heartbeat") for lane, binding in heartbeat.get("lanes", {}).items()
@@ -1897,7 +1940,7 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
         prev_cache = {}
     lane_map = cfg.get("routing_lane_map") or {}
     runners: list[dict] = []
-    cache: dict[str, Any] = {"runners": {}, "redaction": REDACTION}
+    cache: dict[str, Any] = {"runners": {}, "captures": {}, "redaction": REDACTION}
     evidence: list[dict] = []
     for entry in entries:
         status, kept = read_runner(entry, now, (prev_cache.get("runners") or {}).get(entry["name"]),
@@ -1905,7 +1948,13 @@ def collect(config: dict, cfg: dict, now: datetime, prev_cache: dict | None) -> 
                                    cfg.get("routing_runner_tail_bytes", TAIL_BYTES),
                                    cfg.get("routing_runner_limited_lines", KEEP_LINES["LIMITED"]))
         specs = ((kept.get("config") or {}).get("data") or {}).get("lanes") or {}
-        identities = lane_witnesses(kept, known, now, status)
+        # Stat before the read: a capture file saved during it refolds next time.
+        refs = attachment_refs(kept)
+        stamp = capture_inputs(refs)
+        expiry: list = []
+        identities = lane_witnesses(kept, known, now, status, expiry)
+        cache["captures"][entry["name"]] = {"refs": sorted(refs), "files": stamp,
+                                            "until": routing._iso(min(expiry)) if expiry else None}
         matches = {lane: routing.resolve_lane(entry["name"], lane, lane_map, known, specs.get(lane),
                                              cfg.get("_providers"), identities.get(lane))
                    for lane in status["lanes"]}
