@@ -119,7 +119,22 @@ class _Offline:
 
     def __init__(self) -> None:
         self.refused = {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0,
-                        "cosine_missing": 0}
+                        "cosine_missing": 0, "no_profile": 0}
+        # The path being scored (set by the scorer), and the cosine leg's
+        # outcome per path: query keys with no stored vector (a set, because
+        # one query is scored on both paths), lookups whose cosine scan
+        # returned, and lookups whose cosine leg ran out of time.
+        self.path = ""
+        self.missing: dict[str, set[str]] = {}
+        self.used: dict[str, int] = {}
+        self.timeouts: dict[str, int] = {}
+
+    def snapshot(self) -> dict[str, Any]:
+        """Counts only, shipped to the parent after every entry."""
+        every: set[str] = set().union(*self.missing.values()) if self.missing else set()
+        return {**self.refused, "cosine_missing": len(every),
+                "cosine_missing_by_path": {p: len(s) for p, s in self.missing.items()},
+                "cosine_used": dict(self.used), "cosine_timeouts": dict(self.timeouts)}
 
 
 # Foreign-function modules that reach libc directly, past every patch below.
@@ -235,10 +250,32 @@ def _offline(vectors: dict[str, list[float]] | None = None):
             vec = vectors.get(recall_prompt._query_embed_cache_key(profile, prompt))
             if vec:
                 return vec
-            guard.refused["cosine_missing"] += 1
+            guard.missing.setdefault(guard.path, set()).add(
+                recall_prompt._query_embed_cache_key(profile, prompt))
             raise RuntimeError("no stored vector: the recall eval runs offline")
 
+        real_profile = hub_snapshot.active_snapshot_profile
+        real_cosine = hub_snapshot.cosine_candidates_snapshot
+
+        def counted_profile(*a: Any, **k: Any):
+            profile = real_profile(*a, **k)
+            if not profile:
+                guard.refused["no_profile"] += 1
+            return profile
+
+        def counted_cosine(*a: Any, **k: Any):
+            path = guard.path
+            try:
+                rows = real_cosine(*a, **k)
+            except TimeoutError:
+                guard.timeouts[path] = guard.timeouts.get(path, 0) + 1
+                raise
+            guard.used[path] = guard.used.get(path, 0) + 1
+            return rows
+
         targets.append((recall_prompt, "_cached_query_embed", stored_query_embed))
+        targets.append((hub_snapshot, "active_snapshot_profile", counted_profile))
+        targets.append((hub_snapshot, "cosine_candidates_snapshot", counted_cosine))
     saved = [(obj, name, getattr(obj, name)) for obj, name, _ in targets if hasattr(obj, name)]
     for obj, name, fake in targets:
         if hasattr(obj, name):
@@ -398,7 +435,16 @@ def _score_entry(entry: dict[str, Any], deadline: float,
     for p in MEASURED_PATHS:
         if recall_eval._entry_applies(entry, p):
             hub_before = guard.refused["hub"]
+            guard.path = p
+            seen = (guard.used.get(p, 0), len(guard.missing.get(p, ())), guard.timeouts.get(p, 0))
             row = recall_eval.eval_one_path(entry, p, deadline=deadline)
+            if (str(row.get("degraded") or "").startswith("embedding")
+                    and seen == (guard.used.get(p, 0), len(guard.missing.get(p, ())),
+                                 guard.timeouts.get(p, 0))
+                    and not guard.refused["no_profile"]):
+                # The embedding or scan did not come back before the lookup's
+                # own deadline, so the wrapper never saw it finish.
+                guard.timeouts[p] = guard.timeouts.get(p, 0) + 1
             if row.get("reason") == recall_eval.DEADLINE_REASON:
                 return None
             if guard.refused["hub"] > hub_before and (row.get("error") or row.get("timeout")):
@@ -587,19 +633,19 @@ def _child_entry() -> None:
             try:
                 for entry in scoring:
                     if time.monotonic() >= deadline:
-                        emit("stop", dict(guard.refused))
+                        emit("stop", guard.snapshot())
                         break
                     try:
                         got = _score_entry(entry, deadline, guard)
                     except Exception:  # noqa: BLE001 - one bad entry is skipped, never fatal
-                        emit("bad", dict(guard.refused))
+                        emit("bad", guard.snapshot())
                         continue
                     if got is None:
-                        emit("stop", dict(guard.refused))
+                        emit("stop", guard.snapshot())
                         break
-                    emit("entry", got, dict(guard.refused))
+                    emit("entry", got, guard.snapshot())
                 else:
-                    emit("done", dict(guard.refused))
+                    emit("done", guard.snapshot())
             finally:
                 os._exit(0)
     finally:
@@ -738,6 +784,18 @@ def run_nightly_eval(*, golden: Path | None = None, budget_s: float = BUDGET_S,
     return record
 
 
+def _cosine_skipped(refused: dict[str, Any], rows: dict[str, list[Any]]) -> bool:
+    """True unless the push's cosine leg actually ran and returned: it needs an
+    active profile, no missing vector, no cosine timeout, and at least one
+    returned cosine scan on every path that has scored rows."""
+    used = refused.get("cosine_used") or {}
+    return bool(
+        refused.get("embed") or refused.get("cosine_missing") or refused.get("no_profile")
+        or sum((refused.get("cosine_timeouts") or {}).values())
+        or any(got and not used.get(p) for p, got in rows.items())
+    )
+
+
 def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, Any],
                budget_s: float, child_setup: tuple[Callable[..., Any], tuple] | None = None) -> None:
     scoring: list[dict[str, Any]] = []
@@ -795,7 +853,7 @@ def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, 
     if explicit:
         not_measured[recall_eval.PATH_EXPLICIT] = {"needs_hub": explicit}
     record["not_measured"] = not_measured
-    record["offline"] = {**refused, "cosine_skipped": refused["embed"] > 0 or refused["cosine_missing"] > 0}
+    record["offline"] = {**refused, "cosine_skipped": _cosine_skipped(refused, rows)}
     for p, got_rows in rows.items():
         summary = recall_eval.summarize_rows(got_rows)
         record["paths"][p] = {k: summary[k] for k in _KEPT_METRICS}
@@ -812,8 +870,15 @@ def _measured_with(last: dict[str, Any]) -> str:
     off = last.get("offline") if isinstance(last.get("offline"), dict) else {}
     if not off.get("cosine_skipped"):
         return "with semantic search"
-    missing = int(off.get("cosine_missing") or 0)
-    return f"keyword only, {missing} vectors missing" if missing else "keyword only"
+    why = []
+    if off.get("no_profile"):
+        why.append("no active embedding profile")
+    if int(off.get("cosine_missing") or 0):
+        why.append(f"{int(off['cosine_missing'])} vectors missing")
+    timeouts = sum((off.get("cosine_timeouts") or {}).values())
+    if timeouts:
+        why.append(f"{timeouts} cosine timeouts")
+    return "keyword only, " + ", ".join(why) if why else "keyword only"
 
 
 def recall_eval_health(*, now: datetime | None = None) -> dict[str, Any]:

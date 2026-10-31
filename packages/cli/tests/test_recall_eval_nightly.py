@@ -786,22 +786,28 @@ PROFILE = "prof-test"
 
 
 def _child_embed_probe(out_file):
-    """The scorer stub asks the push's own embed function for each prompt-path
-    query, as the cosine worker does, and logs what came back."""
+    """The scorer stub asks the push's own embed function for each query on both
+    measured paths, then runs a fake cosine scan, as the cosine worker does; the
+    prompt path logs what the embed returned."""
+    from khipu import hub_snapshot
+
+    hub_snapshot.active_snapshot_profile = lambda: "prof-test"
+    hub_snapshot.cosine_candidates_snapshot = lambda *_a, **_k: []
+
     def fake(entry, path, **_k):
         from khipu import recall_prompt
 
+        try:
+            got = list(recall_prompt._cached_query_embed(entry["query"], "prof-test"))
+            hub_snapshot.cosine_candidates_snapshot(got, "prof-test")
+        except RuntimeError as exc:
+            got = str(exc)
         if path == "prompt":
-            try:
-                got = list(recall_prompt._cached_query_embed(entry["query"], "prof-test"))
-            except RuntimeError as exc:
-                got = str(exc)
             with open(out_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps([entry["query"], got]) + "\n")
         return {"expect_none": False, "hit": True, "reciprocal_rank": 1.0, "abstain_correct": True,
                 "stale_violation": False, "timeout": False, "error": False, "degraded": None,
                 "outcome": "match", "ms": 1.0, "payload_chars": 10}
-
     recall_eval.eval_one_path = fake
 
 
@@ -887,3 +893,82 @@ def test_refresh_vectors_fills_the_store_outside_the_nightly_0600_without_query_
     rows = sqlite3.connect(store).execute("SELECT key, vector FROM query_embed_cache").fetchall()
     assert [r[0] for r in rows] == [recall_prompt._query_embed_cache_key(PROFILE, "very private words")]
     assert recall_prompt._unpack_vector(rows[0][1]) == [18.0, 0.5]
+
+
+# ---- what makes a figure "with semantic search" --------------------------------
+
+def _guard_run(profile, lookups, vectors=None):
+    """Drive the offline guard in-process with fakes: ``lookups`` is a list of
+    (path, query, cosine_outcome), outcome 'ok' or 'timeout'. Returns the guard
+    snapshot."""
+    from khipu import hub_snapshot, recall_prompt
+
+    saved = (hub_snapshot.active_snapshot_profile, hub_snapshot.cosine_candidates_snapshot)
+    hub_snapshot.active_snapshot_profile = lambda: profile
+    outcome = {}
+
+    def cosine(*_a, **_k):
+        if outcome["v"] == "timeout":
+            raise TimeoutError("scan deadline")
+        return []
+
+    hub_snapshot.cosine_candidates_snapshot = cosine
+    try:
+        with ren._offline(vectors or {}) as guard:
+            for path, query, out in lookups:
+                guard.path = path
+                outcome["v"] = out
+                if not hub_snapshot.active_snapshot_profile():
+                    continue
+                try:
+                    vec = recall_prompt._cached_query_embed(query, PROFILE)
+                    hub_snapshot.cosine_candidates_snapshot(vec, PROFILE)
+                except (RuntimeError, TimeoutError):
+                    pass
+            return guard.snapshot()
+    finally:
+        hub_snapshot.active_snapshot_profile, hub_snapshot.cosine_candidates_snapshot = saved
+
+
+def _vec(query):
+    from khipu import recall_prompt
+
+    return {recall_prompt._query_embed_cache_key(PROFILE, query): [0.5, 0.5]}
+
+
+ROWS = {"prompt": [{}], "status": [{}]}
+
+
+def test_one_missing_vector_scored_on_both_paths_is_one_missing_query():
+    snap = _guard_run(PROFILE, [("prompt", "q", "ok"), ("status", "q", "ok")])
+    assert snap["cosine_missing"] == 1
+    assert snap["cosine_missing_by_path"] == {"prompt": 1, "status": 1}
+    assert ren._cosine_skipped(snap, ROWS) is True
+
+
+def test_no_active_profile_is_keyword_only_with_the_reason():
+    snap = _guard_run(None, [("prompt", "q", "ok"), ("status", "q", "ok")], _vec("q"))
+    assert snap["no_profile"] == 2 and snap["cosine_missing"] == 0
+    assert ren._cosine_skipped(snap, ROWS) is True
+    label = ren._measured_with({"offline": {**snap, "cosine_skipped": True}})
+    assert label == "keyword only, no active embedding profile"
+
+
+def test_a_cosine_timeout_is_keyword_only_with_the_count():
+    snap = _guard_run(PROFILE, [("prompt", "q", "timeout"), ("status", "q", "ok")], _vec("q"))
+    assert snap["cosine_timeouts"] == {"prompt": 1} and snap["cosine_missing"] == 0
+    assert ren._cosine_skipped(snap, ROWS) is True
+    label = ren._measured_with({"offline": {**snap, "cosine_skipped": True}})
+    assert label == "keyword only, 1 cosine timeouts"
+
+
+def test_every_vector_present_and_scan_returned_is_semantic():
+    snap = _guard_run(PROFILE, [("prompt", "q", "ok"), ("status", "q", "ok")], _vec("q"))
+    assert snap["cosine_used"] == {"prompt": 1, "status": 1}
+    assert ren._cosine_skipped(snap, ROWS) is False
+    assert ren._measured_with({"offline": {**snap, "cosine_skipped": False}}) == "with semantic search"
+
+
+def test_a_path_whose_cosine_never_returned_is_not_semantic():
+    snap = _guard_run(PROFILE, [("prompt", "q", "ok")], _vec("q"))
+    assert ren._cosine_skipped(snap, ROWS) is True
