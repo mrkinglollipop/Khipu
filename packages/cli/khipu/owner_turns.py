@@ -194,6 +194,56 @@ def dispatched_lane(env: dict) -> bool:
     return (env.get("CLAUDE_DISPATCHED_LANE") or "").strip() not in ("", "0")
 
 
+# T3's Agent SDK sets these for its own top-level threads too, so inside T3
+# they are not evidence of a job; T3's delegated-thread record decides.
+_T3_SDK_LINEAGE = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_HOST_SESSION_ID")
+
+
+def job_marker(env: dict) -> bool:
+    """A job marker that holds in every harness, T3 included: the runner's
+    lane marker, ``KHIPU_JOB=1`` or a parent session."""
+    return _marked(env, "", t3_thread=True)
+
+
+def _marked(env: dict, session: str, *, t3_thread: bool) -> bool:
+    from khipu import routing_advice
+
+    if dispatched_lane(env):
+        return True
+    # The lane marker's meaning ("0" is the owner's) is ``dispatched_lane``'s.
+    own = {k: v for k, v in env.items()
+           if k != "CLAUDE_DISPATCHED_LANE" and not (t3_thread and k in _T3_SDK_LINEAGE)}
+    if session and not (own.get("CLAUDE_CODE_SESSION_ID") or "").strip():
+        own["CLAUDE_CODE_SESSION_ID"] = session
+    return routing_advice.is_dispatched(own)
+
+
+def dispatched_job(env: dict, session: str = "", *, t3_thread: bool = False) -> str | None:
+    """Why this context is a dispatched job's, never the owner's, or None.
+
+    One test for the recorder and the owner-direction check: the runner's
+    lane marker, then the lineage markers ``routing_advice.is_dispatched``
+    reads (``KHIPU_JOB=1``, a parent session, a Claude Code child, a host
+    session id that is not this session's), with ``session`` standing in
+    for an own id the environment does not name. ``t3_thread``: the session
+    runs in T3, where the Claude Code child and host-id markers are set for
+    the owner's own threads too, so they are skipped and T3's record of a
+    delegated child thread decides; a lookup that does not complete fails
+    closed."""
+    if _marked(env, session, t3_thread=t3_thread):
+        return "a dispatched job's turn"
+    if t3_thread:
+        thread = _t3_thread(session) if session else None
+        if not thread:
+            return "a T3 thread Khipu could not look up, so it can't tell it is not a job"
+        for _ in range(2):
+            delegated, definitive = t3.delegated_thread_result(thread)
+            if definitive:
+                return "a T3 delegated child thread" if delegated else None
+        return "a T3 thread Khipu could not look up, so it can't tell it is not a job"
+    return None
+
+
 def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: dict | None = None) -> str:
     if harness == "aegis":
         return "aegis"
@@ -407,7 +457,7 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
     if turn.get("helper"):
         return False, "a T3 helper session"
     if turn.get("dispatched"):
-        return False, "a dispatched job's turn"
+        return False, turn.get("job") or "a dispatched job's turn"
     if turn.get("delegated"):
         return False, "a dispatched job's brief"
     if not turn.get("typed", bool((turn.get("text") or "").strip())):
@@ -603,8 +653,10 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
         "typed": bool(text.strip()) and not machine,
         "machine": machine, "wrapped": wrapped, "helper": t3.is_helper_session(cwd), "issuer": issuer,
     }
-    if dispatched_lane(env):
+    job = dispatched_job(env, session, t3_thread=turn["entrypoint"] == "t3")
+    if job:
         turn["dispatched"] = True
+        turn["job"] = job
     brief = None if machine else brief_for(text, now)
     turn["delegated"] = brief is not None
     if brief is not None:
