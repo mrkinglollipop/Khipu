@@ -1025,6 +1025,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "prompt_recall_outcomes": prompt_recall_outcomes_block,
         "recall_daemon": recall_daemon_block,
         "forget_list": forget_list_block,
+        "recall_eval": local["recall_eval"],
         "recall_probe": recall_probe,
         "recall_quality": recall_quality_block,
         "bundle_seal": bundle_seal_block,
