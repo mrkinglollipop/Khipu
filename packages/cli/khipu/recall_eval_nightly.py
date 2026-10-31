@@ -13,6 +13,15 @@ and the child is killed at the deadline: a lookup thread that outlives the
 deadline dies with the child, so it can never reach a real exit after the
 guard would have come off, and the step returns by deadline + KILL_GRACE_S.
 
+The push's cosine leg needs a query vector, and embedding is refused in the
+sandbox. The child is therefore handed the golden queries' vectors from a local
+0600 store (``vectors_path``), keyed like the push's own query cache
+(``recall_prompt._query_embed_cache_key``, active profile). Only the owner-run
+``khipu recall eval --refresh-vectors`` fills it, outside the sandbox through
+the normal query-embedding client; the nightly never does. A query with no
+stored vector stays a keyword-only lookup and is counted as ``cosine_missing``;
+the doctor row says whether tonight's figure was measured with semantic search.
+
 The OS sandbox is the guard. The child is a plain subprocess started with
 ``close_fds=True`` under ``/usr/bin/sandbox-exec`` with ``(deny network*)``;
 the work reaches it as JSON on stdin and only JSON lines on stdout come back,
@@ -109,7 +118,23 @@ class _Offline:
     """What the offline guard refused during one run, by kind. Counts only."""
 
     def __init__(self) -> None:
-        self.refused = {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0}
+        self.refused = {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0,
+                        "cosine_missing": 0, "no_profile": 0}
+        # The path being scored (set by the scorer), and the cosine leg's
+        # outcome per path: query keys with no stored vector (a set, because
+        # one query is scored on both paths), lookups whose cosine scan
+        # returned, and lookups whose cosine leg ran out of time.
+        self.path = ""
+        self.missing: dict[str, set[str]] = {}
+        self.used: dict[str, int] = {}
+        self.timeouts: dict[str, int] = {}
+
+    def snapshot(self) -> dict[str, Any]:
+        """Counts only, shipped to the parent after every entry."""
+        every: set[str] = set().union(*self.missing.values()) if self.missing else set()
+        return {**self.refused, "cosine_missing": len(every),
+                "cosine_missing_by_path": {p: len(s) for p, s in self.missing.items()},
+                "cosine_used": dict(self.used), "cosine_timeouts": dict(self.timeouts)}
 
 
 # Foreign-function modules that reach libc directly, past every patch below.
@@ -173,7 +198,7 @@ def _resolve(path: str) -> Any:
 
 
 @contextlib.contextmanager
-def _offline():
+def _offline(vectors: dict[str, list[float]] | None = None):
     """Every way off this Mac refuses for the run, so retrieval answers from
     the replica alone and no golden query leaves the machine: hub connects
     (``try_hub_connect``, ``db.connect`` and ``psycopg.connect`` underneath
@@ -216,6 +241,41 @@ def _offline():
         targets.append((_resolve(obj_path), name, by_kind[kind]))
     if psycopg is not None:
         targets.append((psycopg, "connect", hub))
+    if vectors is not None:
+        from khipu import recall_prompt
+        from khipu.redact import redact_secrets
+
+        def stored_query_embed(prompt: str, profile: str, deadline: float | None = None) -> list[float]:
+            prompt, _ = redact_secrets(prompt)
+            vec = vectors.get(recall_prompt._query_embed_cache_key(profile, prompt))
+            if vec:
+                return vec
+            guard.missing.setdefault(guard.path, set()).add(
+                recall_prompt._query_embed_cache_key(profile, prompt))
+            raise RuntimeError("no stored vector: the recall eval runs offline")
+
+        real_profile = hub_snapshot.active_snapshot_profile
+        real_cosine = hub_snapshot.cosine_candidates_snapshot
+
+        def counted_profile(*a: Any, **k: Any):
+            profile = real_profile(*a, **k)
+            if not profile:
+                guard.refused["no_profile"] += 1
+            return profile
+
+        def counted_cosine(*a: Any, **k: Any):
+            path = guard.path
+            try:
+                rows = real_cosine(*a, **k)
+            except TimeoutError:
+                guard.timeouts[path] = guard.timeouts.get(path, 0) + 1
+                raise
+            guard.used[path] = guard.used.get(path, 0) + 1
+            return rows
+
+        targets.append((recall_prompt, "_cached_query_embed", stored_query_embed))
+        targets.append((hub_snapshot, "active_snapshot_profile", counted_profile))
+        targets.append((hub_snapshot, "cosine_candidates_snapshot", counted_cosine))
     saved = [(obj, name, getattr(obj, name)) for obj, name, _ in targets if hasattr(obj, name)]
     for obj, name, fake in targets:
         if hasattr(obj, name):
@@ -375,7 +435,16 @@ def _score_entry(entry: dict[str, Any], deadline: float,
     for p in MEASURED_PATHS:
         if recall_eval._entry_applies(entry, p):
             hub_before = guard.refused["hub"]
+            guard.path = p
+            seen = (guard.used.get(p, 0), len(guard.missing.get(p, ())), guard.timeouts.get(p, 0))
             row = recall_eval.eval_one_path(entry, p, deadline=deadline)
+            if (str(row.get("degraded") or "").startswith("embedding")
+                    and seen == (guard.used.get(p, 0), len(guard.missing.get(p, ())),
+                                 guard.timeouts.get(p, 0))
+                    and not guard.refused["no_profile"]):
+                # The embedding or scan did not come back before the lookup's
+                # own deadline, so the wrapper never saw it finish.
+                guard.timeouts[p] = guard.timeouts.get(p, 0) + 1
             if row.get("reason") == recall_eval.DEADLINE_REASON:
                 return None
             if guard.refused["hub"] > hub_before and (row.get("error") or row.get("timeout")):
@@ -451,6 +520,93 @@ def _setup_ref(setup: tuple[Callable[..., Any], tuple] | None) -> list[Any] | No
     return [fn.__module__, fn.__qualname__, list(args)]
 
 
+VECTORS_NAME = "recall-eval-vectors.sqlite3"
+
+
+def vectors_path() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / "state" / VECTORS_NAME
+
+
+def _read_vectors(path: Any) -> dict[str, list[float]]:
+    """The stored golden-query vectors by cache key, read in the child. A
+    missing or unreadable store is an empty one: every lookup is then counted
+    as ``cosine_missing`` and stays keyword-only."""
+    import sqlite3
+
+    from khipu import recall_prompt
+
+    if not path:
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+        try:
+            rows = con.execute("SELECT key, vector FROM query_embed_cache").fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+    out: dict[str, list[float]] = {}
+    for key, blob in rows:
+        vec = recall_prompt._unpack_vector(blob) if blob else []
+        if vec:
+            out[str(key)] = vec
+    return out
+
+
+def refresh_vectors(golden: Path | None = None, *, store: Path | None = None) -> dict[str, Any]:
+    """The owner-run step (outside the sandbox, never the nightly): embed each
+    golden query the prompt path scores through the push's own query-embedding
+    client and rewrite the store to hold exactly those vectors (keys only, no
+    query text), mode 0600. Returns counts only."""
+    from khipu import hub_snapshot, recall_prompt
+    from khipu.redact import redact_secrets
+
+    path = golden or recall_eval.default_golden_path()
+    target = store or vectors_path()
+    try:
+        entries, _ = _load_entries(path)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"golden file unreadable ({type(exc).__name__})"}
+    profile = hub_snapshot.active_snapshot_profile()
+    if not profile:
+        return {"ok": False, "error": "no active embedding profile on this Mac's replica"}
+    queries = sorted({str(e["query"]) for e in entries
+                      if recall_eval._entry_applies(e, recall_eval.PATH_PROMPT)})
+    vectors: dict[str, list[float]] = {}
+    failed = 0
+    for query in queries:
+        try:
+            vec = recall_prompt._cached_query_embed(query, profile)
+        except Exception:  # noqa: BLE001 - one failed embed leaves that query keyword-only
+            failed += 1
+            continue
+        key = recall_prompt._query_embed_cache_key(profile, redact_secrets(query)[0])
+        vectors[key] = vec
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".recall-eval-vectors.", suffix=".tmp", dir=target.parent)
+    os.close(fd)
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(tmp)
+        try:
+            con.execute("CREATE TABLE query_embed_cache (key TEXT PRIMARY KEY, "
+                        "vector BLOB NOT NULL, created REAL NOT NULL)")
+            con.executemany("INSERT INTO query_embed_cache VALUES (?, ?, ?)",
+                            [(k, recall_prompt._pack_vector(v), time.time()) for k, v in vectors.items()])
+            con.commit()
+        finally:
+            con.close()
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return {"ok": failed == 0, "stored": len(vectors), "failed": failed, "queries": len(queries)}
+
+
 def _child_entry() -> None:
     """The scoring child's entry, started by ``_run_child`` under sandbox-exec
     with no inherited descriptors. The work arrives as one JSON document on
@@ -473,23 +629,23 @@ def _child_entry() -> None:
         scoring, deadline, ref = payload["entries"], payload["deadline"], payload["setup"]
         if ref is not None:
             _resolve(f"{ref[0]}.{ref[1]}")(*ref[2])
-        with _offline() as guard:
+        with _offline(_read_vectors(payload.get("vectors"))) as guard:
             try:
                 for entry in scoring:
                     if time.monotonic() >= deadline:
-                        emit("stop", dict(guard.refused))
+                        emit("stop", guard.snapshot())
                         break
                     try:
                         got = _score_entry(entry, deadline, guard)
                     except Exception:  # noqa: BLE001 - one bad entry is skipped, never fatal
-                        emit("bad", dict(guard.refused))
+                        emit("bad", guard.snapshot())
                         continue
                     if got is None:
-                        emit("stop", dict(guard.refused))
+                        emit("stop", guard.snapshot())
                         break
-                    emit("entry", got, dict(guard.refused))
+                    emit("entry", got, guard.snapshot())
                 else:
-                    emit("done", dict(guard.refused))
+                    emit("done", guard.snapshot())
             finally:
                 os._exit(0)
     finally:
@@ -516,7 +672,7 @@ def _reduce_stderr(stream, summary: dict[str, Any]) -> None:
 
 
 def _run_child(scoring: list[dict[str, Any]], deadline: float,
-               setup: tuple[Callable[..., Any], tuple] | None):
+               setup: tuple[Callable[..., Any], tuple] | None, vectors: Path | None = None):
     """Yield the child's messages until it finishes or deadline + grace, then
     kill it. The child is a plain subprocess under sandbox-exec with
     ``close_fds=True``: nothing but the stdin JSON reaches it, and only stdout
@@ -525,7 +681,8 @@ def _run_child(scoring: list[dict[str, Any]], deadline: float,
     if it ended without a final message."""
     import select
 
-    payload = json.dumps({"entries": scoring, "deadline": deadline, "setup": _setup_ref(setup)}).encode()
+    payload = json.dumps({"entries": scoring, "deadline": deadline, "setup": _setup_ref(setup),
+                          "vectors": str(vectors) if vectors else None}).encode()
     proc = subprocess.Popen(_child_command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, close_fds=True)
     err_summary: dict[str, Any] = {}
@@ -627,6 +784,18 @@ def run_nightly_eval(*, golden: Path | None = None, budget_s: float = BUDGET_S,
     return record
 
 
+def _cosine_skipped(refused: dict[str, Any], rows: dict[str, list[Any]]) -> bool:
+    """True unless the push's cosine leg actually ran and returned: it needs an
+    active profile, no missing vector, no cosine timeout, and at least one
+    returned cosine scan on every path that has scored rows."""
+    used = refused.get("cosine_used") or {}
+    return bool(
+        refused.get("embed") or refused.get("cosine_missing") or refused.get("no_profile")
+        or sum((refused.get("cosine_timeouts") or {}).values())
+        or any(got and not used.get(p) for p, got in rows.items())
+    )
+
+
 def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, Any],
                budget_s: float, child_setup: tuple[Callable[..., Any], tuple] | None = None) -> None:
     scoring: list[dict[str, Any]] = []
@@ -645,7 +814,7 @@ def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, 
 
     deadline = time.monotonic() + budget_s
     rows: dict[str, list[dict[str, Any]]] = {p: [] for p in MEASURED_PATHS}
-    refused = {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0}
+    refused = {"hub": 0, "embed": 0, "network": 0, "process": 0, "native": 0, "cosine_missing": 0}
     record["stopped_child"] = False
     if scoring and time.monotonic() < deadline and not _sandbox_available():
         # No OS sandbox, no run: the Python guard is not the guarantee.
@@ -656,7 +825,7 @@ def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, 
         return
     if scoring and time.monotonic() < deadline:
         record["sandbox"] = "os"
-        for msg in _run_child(scoring, deadline, child_setup):
+        for msg in _run_child(scoring, deadline, child_setup, vectors_path()):
             kind = msg[0]
             if kind in ("entry", "bad", "stop", "done"):
                 refused = msg[-1]
@@ -684,7 +853,7 @@ def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, 
     if explicit:
         not_measured[recall_eval.PATH_EXPLICIT] = {"needs_hub": explicit}
     record["not_measured"] = not_measured
-    record["offline"] = {**refused, "cosine_skipped": refused["embed"] > 0}
+    record["offline"] = {**refused, "cosine_skipped": _cosine_skipped(refused, rows)}
     for p, got_rows in rows.items():
         summary = recall_eval.summarize_rows(got_rows)
         record["paths"][p] = {k: summary[k] for k in _KEPT_METRICS}
@@ -694,6 +863,22 @@ def _score_all(entries: list[dict[str, Any]], gone: set[str], record: dict[str, 
 
 def _pct(x: float) -> str:
     return f"{round(x * 100)}%"
+
+
+def _measured_with(last: dict[str, Any]) -> str:
+    """Which figure the record holds: the push with its cosine leg, or keyword only."""
+    off = last.get("offline") if isinstance(last.get("offline"), dict) else {}
+    if not off.get("cosine_skipped"):
+        return "with semantic search"
+    why = []
+    if off.get("no_profile"):
+        why.append("no active embedding profile")
+    if int(off.get("cosine_missing") or 0):
+        why.append(f"{int(off['cosine_missing'])} vectors missing")
+    timeouts = sum((off.get("cosine_timeouts") or {}).values())
+    if timeouts:
+        why.append(f"{timeouts} cosine timeouts")
+    return "keyword only, " + ", ".join(why) if why else "keyword only"
 
 
 def recall_eval_health(*, now: datetime | None = None) -> dict[str, Any]:
@@ -747,10 +932,10 @@ def recall_eval_health(*, now: datetime | None = None) -> dict[str, Any]:
                              "so tonight's figures are not compared.")
     if rate is not None and isinstance(prev_rate, (int, float)) and rate < prev_rate - ALLOWED_DROP - 1e-9:
         return out("red", f"Recall got worse: the right memory is found {_pct(rate)} of the time, "
-                          f"down from {_pct(prev_rate)} the run before.")
+                          f"down from {_pct(prev_rate)} the run before ({_measured_with(last)}).")
     if rate is not None and rate < HIT_FLOOR:
         return out("red", f"Recall is below the {_pct(HIT_FLOOR)} floor: the right memory is found "
-                          f"{_pct(rate)} of the time.")
+                          f"{_pct(rate)} of the time ({_measured_with(last)}).")
     if age_h is None or age_h > STALE_AFTER_H:
         return out("yellow", "The recall check has not run in over 48 hours.")
     if int(last.get("entries") or 0) < MIN_ENTRIES:
@@ -762,7 +947,7 @@ def recall_eval_health(*, now: datetime | None = None) -> dict[str, Any]:
                              "memory and would have needed the hub, so recall is not measured.")
     if rate is None:
         return out("yellow", "The golden set has no queries for the prompt path, so recall is not measured.")
-    return out("green", f"The right memory is found {_pct(rate)} of the time"
+    return out("green", f"The right memory is found {_pct(rate)} of the time, {_measured_with(last)}"
                         + (f" (was {_pct(prev_rate)})." if isinstance(prev_rate, (int, float)) else "."))
 
 
