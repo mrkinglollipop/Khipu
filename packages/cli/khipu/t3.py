@@ -117,7 +117,7 @@ def _fallback_window_rows(con, sid: str):
         ).fetchall()
 
 
-def thread_for_session_result(sid: str) -> tuple[str | None, bool]:
+def thread_for_session_result(sid: str, *, whole_table: bool = False) -> tuple[str | None, bool]:
     """``(thread, definitive)`` for a native session id.
 
     ``definitive`` is True only when a query actually completed: a row was
@@ -126,6 +126,10 @@ def thread_for_session_result(sid: str) -> tuple[str | None, bool]:
     zero rows. A missing database, a lock or timeout, an interrupted or
     otherwise failing query is ``(None, False)`` — a failure, not a miss —
     so callers must not treat it as a settled negative answer.
+
+    ``whole_table``: every row is checked, under the same deadline, so an
+    old row counts and a native id naming two threads anywhere is ambiguous. A conversation T3 started long ago (its
+    row behind the newest ``_LOOKUP_WINDOW``) is still T3's.
     """
     if not sid:
         return None, True
@@ -173,6 +177,16 @@ def thread_for_session_result(sid: str) -> tuple[str | None, bool]:
             if "rowid" not in str(exc).lower():
                 raise
             rows = _fallback_window_rows(con, sid)
+        if whole_table:
+            # Every row, even after a window hit: one native id naming a
+            # recent thread and a different older one is ambiguous and must
+            # fail closed (an interrupted scan is a failure, not a hit).
+            rows = con.execute(
+                "SELECT thread_id FROM orchestration_v2_projection_provider_threads "
+                "WHERE CASE WHEN json_valid(payload_json) THEN "
+                "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?",
+                (sid,),
+            ).fetchall()
         return _distinct_threads(rows), True
     except (OSError, ValueError, sqlite3.Error):
         return None, False

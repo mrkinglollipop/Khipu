@@ -175,6 +175,25 @@ def _codex_originator(transcript: str) -> str | None:
     return originator if isinstance(originator, str) and originator else None
 
 
+def _t3_thread(session: str) -> str | None:
+    """The T3 thread running ``session``, from T3's own record. Every row is
+    looked at (a long-running conversation's row falls behind the newest
+    window as other threads start), and a failed read (a lock, the deadline)
+    is tried once more; a second failure means no thread."""
+    for _ in range(2):
+        thread, definitive = t3.thread_for_session_result(session, whole_table=True)
+        if definitive:
+            return thread
+    return None
+
+
+def dispatched_lane(env: dict) -> bool:
+    """A dispatched job's environment (Khipu's launchers and church-harness
+    set ``CLAUDE_DISPATCHED_LANE``; unset, empty and "0" mean the owner's own
+    session), as ``recall_prompt.dispatched_lane`` reads it."""
+    return (env.get("CLAUDE_DISPATCHED_LANE") or "").strip() not in ("", "0")
+
+
 def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: dict | None = None) -> str:
     if harness == "aegis":
         return "aegis"
@@ -187,19 +206,19 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
             return "sdk-cli"
         # T3 Code drives Claude through the Agent SDK; a session it runs has
         # a T3 thread. ``claude -p`` (sdk-cli) never counts as T3.
-        if entry.startswith("sdk-") and entry != "sdk-cli" and t3.thread_for_session(session):
+        if entry.startswith("sdk-") and entry != "sdk-cli" and _t3_thread(session):
             return "t3"
         return entry
     if harness == "codex":
         origin = _codex_originator(str(payload.get("transcript_path") or ""))
-        if origin != "codex_exec" and t3.thread_for_session(session):
+        if origin != "codex_exec" and _t3_thread(session):
             return "t3"
         return origin or "unknown"
     if harness == "cursor":
-        return "t3" if t3.thread_for_session(session) else hook_shape.cursor_entrypoint(payload)
+        return "t3" if _t3_thread(session) else hook_shape.cursor_entrypoint(payload)
     if harness == "antigravity":
         surface = hook_shape.antigravity_entrypoint(payload)
-        return "t3" if surface == "unknown" and t3.thread_for_session(session) else surface
+        return "t3" if surface == "unknown" and _t3_thread(session) else surface
     return "unknown"
 
 
@@ -387,6 +406,8 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
         return False, "a wrapper away from its harness's place, so the typed words can't be told apart"
     if turn.get("helper"):
         return False, "a T3 helper session"
+    if turn.get("dispatched"):
+        return False, "a dispatched job's turn"
     if turn.get("delegated"):
         return False, "a dispatched job's brief"
     if not turn.get("typed", bool((turn.get("text") or "").strip())):
@@ -582,6 +603,8 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
         "typed": bool(text.strip()) and not machine,
         "machine": machine, "wrapped": wrapped, "helper": t3.is_helper_session(cwd), "issuer": issuer,
     }
+    if dispatched_lane(env):
+        turn["dispatched"] = True
     brief = None if machine else brief_for(text, now)
     turn["delegated"] = brief is not None
     if brief is not None:

@@ -359,6 +359,100 @@ def test_a_piped_yes_without_direction_is_still_refused(world, monkeypatch):
     assert not routing.events_file().exists()
 
 
+# ---- a T3 Code conversation (the 2026-10-31 refusal) -------------------------------------------
+
+
+@pytest.fixture
+def t3_conversation(world, tmp_path, monkeypatch):
+    """A fake T3 state database where the owner's conversation started long
+    ago: its row is the first, behind more than the newest 1024 rows other
+    threads have written since (the 2026-10-31 conversation was row 6 of
+    1062)."""
+    import sqlite3
+
+    path = tmp_path / "statev2.sqlite"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE orchestration_v2_projection_provider_threads "
+                "(thread_id TEXT, payload_json TEXT, updated_at TEXT)")
+    rows = [("t3-owner-thread", OWNER)] + [(f"t3-thread-{i}", f"s-job-{i}") for i in range(1100)]
+    con.executemany("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)",
+                    [(t, json.dumps({"nativeThreadRef": {"nativeId": s}}), "2026-10-31") for t, s in rows])
+    con.commit()
+    con.close()
+    monkeypatch.setenv("KHIPU_T3_DB", str(path))
+    return world
+
+
+def _t3_say(session: str = OWNER, *, ago: float = 0.0, **env) -> None:
+    """The owner types in a T3 Code conversation: Claude Code under T3's
+    Agent SDK runs the prompt hook with entrypoint ``sdk-ts``."""
+    owner_turns.record({"session_id": session, "prompt": "set the routing budget to 500 ms", "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts", **env}, now=time.time() - ago)
+
+
+def test_a_t3_conversation_the_owner_typed_in_passes(t3_conversation):
+    from khipu import t3
+
+    assert t3.thread_for_session(OWNER) is None  # behind the newest window
+    _t3_say()
+    (row,) = owner_turns.turns(OWNER)
+    assert row["entrypoint"] == "t3" and row["eligible"] is True
+    rc, out = t3_conversation.run(["config", "--set", "routing_prompt_budget_ms", "500"], True)
+    assert rc == 0, out
+    assert _check("config.routing_setting")["auth"] == "direction"
+
+
+def test_a_t3_lookup_that_fails_once_is_tried_again(t3_conversation, monkeypatch):
+    from khipu import t3
+
+    real, calls = t3.thread_for_session_result, []
+
+    def flaky(sid, **kw):
+        calls.append(sid)
+        return (None, False) if len(calls) == 1 else real(sid, **kw)
+
+    monkeypatch.setattr(t3, "thread_for_session_result", flaky)
+    _t3_say()
+    assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3"
+    # Two failed reads settle nothing: the turn is not T3's and never counts.
+    monkeypatch.setattr(t3, "thread_for_session_result", lambda sid, **kw: (None, False))
+    _t3_say()
+    assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "sdk-ts"
+
+
+def test_a_t3_conversation_on_a_dispatched_lane_is_refused(t3_conversation, monkeypatch):
+    _t3_say(CLAUDE_DISPATCHED_LANE="1")
+    (row,) = owner_turns.turns(OWNER)
+    assert row["dispatched"] is True and row["eligible"] is False
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
+    # The owner's own turn, but the call comes from a dispatched job.
+    _t3_say()
+    assert _check("config.routing_setting")["auth"] == "direction"
+    monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", "1")
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
+    monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", "0")
+    assert _check("config.routing_setting")["auth"] == "direction"
+
+
+def test_another_t3_conversations_turn_is_refused(t3_conversation):
+    _t3_say(session="s-job-7")
+    assert owner_turns.turns("s-job-7")[0]["entrypoint"] == "t3"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
+
+
+def test_a_stale_t3_turn_is_refused(t3_conversation):
+    _t3_say(ago=7 * 3600)
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "stale"
+
+
 # ---- apply, log, undo --------------------------------------------------------------------------
 
 
@@ -698,3 +792,21 @@ def test_app_click_operation_retries_the_same_rule_through_the_cli(world, khipu_
     assert second["entity"] == first["entity"] and second["id"] == first["id"]
     assert len(routing.read_view()["rules"]) == 1
     assert routing.read_events()[0][0]["op"] == "synthetic-app-click"
+
+
+def test_a_native_id_naming_an_old_and_a_recent_thread_never_counts(t3_conversation):
+    """One native id on the old row and on a different recent thread is
+    ambiguous across the whole table: it fails closed even though the recent
+    row alone would have matched inside the newest window (Codex review)."""
+    import os
+    import sqlite3
+
+    from khipu import t3
+
+    with sqlite3.connect(os.environ["KHIPU_T3_DB"]) as con:
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)",
+                    ("t3-other-thread", json.dumps({"nativeThreadRef": {"nativeId": OWNER}}), "2026-10-31"))
+    assert t3.thread_for_session_result(OWNER, whole_table=True) == (None, True)
+    _t3_say()
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["entrypoint"] == "sdk-ts" and row["eligible"] is False

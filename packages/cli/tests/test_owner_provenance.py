@@ -319,6 +319,7 @@ def test_t3_handoff_history_marker_never_puts_history_on_disk(hooked):
     from khipu import t3
 
     hooked.setattr(t3, "thread_for_session", lambda session: "t3-thread")
+    hooked.setattr(t3, "thread_for_session_result", lambda session, **_kw: ("t3-thread", True))
     prompt = (
         "Context handoff (compact):\n"
         "Provider context handoff. Thread: t3-thread.\n"
