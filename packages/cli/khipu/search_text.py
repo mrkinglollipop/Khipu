@@ -67,6 +67,11 @@ def _names(blob: str, tok: str) -> bool:
     character pair anywhere in the text."""
     if _CJK_RE.search(tok):
         return tok in blob
+    # The pattern matches ``tok`` literally, so a blob without it as a plain
+    # substring cannot match; skipping the lookaround scan there keeps the
+    # push lane's per-row counting inside its deadline.
+    if tok not in blob:
+        return False
     return re.search(_WORD_BOUNDARY.format(tok=re.escape(tok)), blob) is not None
 
 
