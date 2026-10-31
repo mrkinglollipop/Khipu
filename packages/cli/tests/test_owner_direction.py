@@ -792,3 +792,21 @@ def test_app_click_operation_retries_the_same_rule_through_the_cli(world, khipu_
     assert second["entity"] == first["entity"] and second["id"] == first["id"]
     assert len(routing.read_view()["rules"]) == 1
     assert routing.read_events()[0][0]["op"] == "synthetic-app-click"
+
+
+def test_a_native_id_naming_an_old_and_a_recent_thread_never_counts(t3_conversation):
+    """One native id on the old row and on a different recent thread is
+    ambiguous across the whole table: it fails closed even though the recent
+    row alone would have matched inside the newest window (Codex review)."""
+    import os
+    import sqlite3
+
+    from khipu import t3
+
+    with sqlite3.connect(os.environ["KHIPU_T3_DB"]) as con:
+        con.execute("INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)",
+                    ("t3-other-thread", json.dumps({"nativeThreadRef": {"nativeId": OWNER}}), "2026-10-31"))
+    assert t3.thread_for_session_result(OWNER, whole_table=True) == (None, True)
+    _t3_say()
+    row = owner_turns.turns(OWNER)[-1]
+    assert row["entrypoint"] == "sdk-ts" and row["eligible"] is False

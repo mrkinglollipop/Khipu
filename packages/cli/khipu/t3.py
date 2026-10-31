@@ -127,8 +127,8 @@ def thread_for_session_result(sid: str, *, whole_table: bool = False) -> tuple[s
     otherwise failing query is ``(None, False)`` — a failure, not a miss —
     so callers must not treat it as a settled negative answer.
 
-    ``whole_table``: a miss in the newest window is checked against every
-    row, under the same deadline. A conversation T3 started long ago (its
+    ``whole_table``: every row is checked, under the same deadline, so an
+    old row counts and a native id naming two threads anywhere is ambiguous. A conversation T3 started long ago (its
     row behind the newest ``_LOOKUP_WINDOW``) is still T3's.
     """
     if not sid:
@@ -177,7 +177,10 @@ def thread_for_session_result(sid: str, *, whole_table: bool = False) -> tuple[s
             if "rowid" not in str(exc).lower():
                 raise
             rows = _fallback_window_rows(con, sid)
-        if not rows and whole_table:
+        if whole_table:
+            # Every row, even after a window hit: one native id naming a
+            # recent thread and a different older one is ambiguous and must
+            # fail closed (an interrupted scan is a failure, not a hit).
             rows = con.execute(
                 "SELECT thread_id FROM orchestration_v2_projection_provider_threads "
                 "WHERE CASE WHEN json_valid(payload_json) THEN "
