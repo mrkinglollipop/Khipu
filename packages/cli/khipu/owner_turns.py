@@ -48,17 +48,26 @@ RETENTION_S = 24 * 3600
 # extension; "remote", "remote_desktop" and "remote_mobile" a cloud session
 # typed in from the web, desktop or mobile app), Codex's originator
 # ("codex_cli_rs" the terminal, "codex_desktop" the app, "codex_vscode" the
-# extension), "t3" for a session T3 Code runs, and "aegis" for the Aegis pack
-# (Grok Build included). Never trusted: "sdk-cli" (``claude -p``), "sdk-ts"
-# and "sdk-py" (the Agent SDK), "mcp", "local-agent" and the "remote_*"
-# triggers, Slack and Teams, "codex_exec" (``codex exec``) and "codex_sdk_ts".
+# extension), "t3" for a session T3 Code runs, "aegis" for the Aegis pack
+# (Grok Build included), Cursor's "ide" (the app, its hook run from inside a
+# Cursor app bundle) and "cli" (``cursor-agent`` on a terminal, no print
+# flag), and Antigravity's "app" and "ide". Never trusted: "sdk-cli"
+# (``claude -p``), "sdk-ts" and "sdk-py" (the Agent SDK), "mcp",
+# "local-agent" and the "remote_*" triggers, Slack and Teams, "codex_exec"
+# (``codex exec``), "codex_sdk_ts", "cursor_print" (``cursor-agent -p`` or
+# off a terminal), "cursor_sdk" (``@cursor/sdk`` outside T3), "aegis_print"
+# (``grok -p``) and "antigravity_print". Antigravity's "cli" is not trusted by
+# default: nothing Khipu can read tells ``agy``'s headless mode from a person
+# typing on a terminal.
 DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:claude-desktop", "claude_code:claude-desktop-3p",
                    "claude_code:claude-vscode", "claude_code:remote", "claude_code:remote_desktop",
                    "claude_code:remote_mobile", "claude_code:t3", "codex:codex_cli_rs", "codex:codex_desktop",
-                   "codex:codex_vscode", "codex:t3", "aegis:aegis")
+                   "codex:codex_vscode", "codex:t3", "aegis:aegis", "cursor:ide", "cursor:cli",
+                   "antigravity:app", "antigravity:ide")
 # Entrypoints a job runs as, not a person: a refusal never suggests trusting them.
 MACHINE_ENTRYPOINTS = ("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action", "local-agent",
-                       "remote_trigger", "remote_cowork_trigger", "codex_exec", "codex_sdk_ts", "unknown")
+                       "remote_trigger", "remote_cowork_trigger", "codex_exec", "codex_sdk_ts", "cursor_print",
+                       "cursor_sdk", "aegis_print", "antigravity_print", "unknown")
 DEFAULTS = {
     "enabled": True,
     "latest_window_h": 6.0,
@@ -268,9 +277,30 @@ def dispatched_job(env: dict, session: str = "", *, t3_thread: bool = False) -> 
     return None
 
 
+def _interactive(issuer: dict | None) -> bool:
+    """The issuer ran on a terminal (stdin and stdout both one) with no
+    print or headless flag: cursor-agent's own test for its interactive
+    mode. An issuer that could not be read is not interactive."""
+    issuer = issuer or {}
+    return issuer.get("tty") is True and not issuer.get("headless") and not issuer.get("print")
+
+
+def _cursor_app(issuer: dict | None) -> bool:
+    """The hook was run from inside a Cursor app bundle (the IDE). The
+    ``@cursor/sdk`` reports a plain version too ("1.0.0" unless its
+    environment says otherwise), so the version alone can't tell the IDE
+    from a script."""
+    app = (issuer or {}).get("app")
+    return isinstance(app, str) and app.lower().startswith("cursor") and app.endswith(".app")
+
+
 def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: dict | None = None) -> str:
     if harness == "aegis":
-        return _t3_entry(session, "aegis")
+        entry = _t3_entry(session, "aegis")
+        # ``grok -p``: only when the hook's issuer is that process. A
+        # shared Grok leader runs the hooks for every client, so a headless
+        # client of a leader is not seen here.
+        return "aegis_print" if entry == "aegis" and (issuer or {}).get("headless") else entry
     if harness == "claude_code":
         entry = (env.get("CLAUDE_CODE_ENTRYPOINT") or "unknown").strip() or "unknown"
         # Claude Code turns only "cli" into "sdk-cli" for ``claude -p``: a
@@ -286,10 +316,21 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         origin = _codex_originator(str(payload.get("transcript_path") or ""))
         return "codex_exec" if origin == "codex_exec" else _t3_entry(session, origin or "unknown")
     if harness == "cursor":
-        return _t3_entry(session, hook_shape.cursor_entrypoint(payload))
+        native = hook_shape.cursor_entrypoint(payload)
+        entry = _t3_entry(session, native)
+        if entry != native:
+            return entry
+        if native == "cli":
+            return "cli" if _interactive(issuer) else "cursor_print"
+        if native == "ide":
+            return "ide" if _cursor_app(issuer) else "cursor_sdk"
+        return native
     if harness == "antigravity":
         surface = hook_shape.antigravity_entrypoint(payload)
-        return _t3_entry(session, surface)
+        entry = _t3_entry(session, surface)
+        if entry == "cli" and not _interactive(issuer):
+            return "antigravity_print"
+        return entry
     return "unknown"
 
 
@@ -600,6 +641,66 @@ def _print_mode(args: list[str] | None) -> bool:
     return False
 
 
+_SHORT_FLAGS = re.compile(r"-[A-Za-z]{2,}")
+
+
+def _headless_args(args: list[str] | None) -> bool:
+    """A command line run headless: ``-p``/``--print`` (Claude Code,
+    cursor-agent, Grok Build), ``--single`` (Grok Build), or ``-p`` inside a
+    group of short flags (``-fp``), which cursor-agent's and Grok's parsers
+    both accept."""
+    if not args:
+        return False
+    for a in args[1:]:
+        if a == "--":
+            return False
+        if a in ("-p", "--print", "--single") or a.startswith(("--print=", "--single=")):
+            return True
+        if _SHORT_FLAGS.fullmatch(a) and "p" in a[1:]:
+            return True
+    return False
+
+
+def _fd_is_tty(lib, pid: int, fd: int) -> bool | None:
+    import ctypes
+
+    size = 1200  # struct vnode_fdinfowithpath; the path starts at 176
+    buf = ctypes.create_string_buffer(size)
+    n = lib.proc_pidfdinfo(pid, fd, 2, buf, size)  # PROC_PIDFDVNODEPATHINFO
+    if n == 0:
+        return False  # not a vnode: a pipe or a socket
+    if n != size:
+        return None
+    path = buf.raw[176:size].split(b"\0", 1)[0]
+    return path.startswith(b"/dev/tty")
+
+
+def _on_terminal(pid: int) -> bool | None:
+    """Whether a process's stdin and stdout are both terminals, read from
+    the kernel; None when that can't be read."""
+    if sys.platform != "darwin" or pid <= 0:
+        return None
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+        both = [_fd_is_tty(lib, pid, fd) for fd in (0, 1)]
+    except (OSError, AttributeError, ValueError):
+        return None
+    if None in both:
+        return None
+    return all(both)
+
+
+def _app_bundle(exe: str) -> str | None:
+    """The outermost ``.app`` bundle a process runs from (``Cursor.app`` for
+    every Cursor helper), or None."""
+    for part in Path(exe).parts:
+        if part.endswith(".app"):
+            return part
+    return None
+
+
 def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
     """The process that ran this hook. The recorder's parent must be the
     prompt shim (a shell running ``khipu-prompt-recall``; ``shim`` names
@@ -636,8 +737,17 @@ def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
         if _refused_issuer(name):
             return {"refused": name}
         out = {"pid": pid, "start": started, "exe": name}
-        if _print_mode(_proc_args(pid)):
+        args = _proc_args(pid)
+        if _print_mode(args):
             out["print"] = True
+        if _headless_args(args):
+            out["headless"] = True
+        tty = _on_terminal(pid)
+        if tty is not None:
+            out["tty"] = tty
+        app = _app_bundle(exe)
+        if app:
+            out["app"] = app
         return out
     return None
 

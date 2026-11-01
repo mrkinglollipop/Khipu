@@ -481,3 +481,144 @@ def test_a_settled_miss_keeps_the_native_entrypoint_on_a_mac_with_t3(home, monke
     monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
     monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", lambda sid, **kw: ([], True))
     assert owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION) == "cli"
+
+
+# ---- Cursor, Antigravity and Grok Build front ends (2026-11-01) ---------------------
+
+TTY = {"pid": 4242, "start": 1.0, "exe": "node", "tty": True}
+CURSOR_APP = {"pid": 4242, "start": 1.0, "exe": "Cursor Helper (Plugin)", "app": "Cursor.app"}
+
+
+def _cursor(prompt: str, version: str, issuer: dict, session: str = SESSION):
+    payload = {"hook_event_name": "beforeSubmitPrompt", "conversation_id": session, "session_id": session,
+               "generation_id": "g1", "cursor_version": version, "workspace_roots": ["/work/project-a"],
+               "prompt": prompt, "transcript_path": f"/x/.cursor/projects/p/agent-transcripts/{session}.jsonl"}
+    return owner_turns.record(payload, env={}, now=T0, issuer=issuer)
+
+
+def _antigravity(prompt: str, app_dir: str, issuer: dict, session: str = SESSION):
+    payload = {"conversationId": session, "workspacePaths": ["/work/project-a"], "prompt": prompt,
+               "transcriptPath": f"/Users/u/{app_dir}/brain/{session}/.system_generated/logs/transcript.jsonl"}
+    return owner_turns.record(payload, env={}, now=T0, issuer=issuer)
+
+
+def _grok(prompt: str, issuer: dict, session: str = SESSION):
+    payload = {"hook_event_name": "UserPromptSubmit", "session_id": session, "prompt": prompt,
+               "cwd": "/work/project-a"}
+    env = {"KHIPU_HARNESS": "aegis", "GROK_HOOK_EVENT": "UserPromptSubmit"}
+    return owner_turns.record(payload, env=env, now=T0, issuer=issuer)
+
+
+def _front_end() -> tuple:
+    turn = _last()
+    return turn["harness"], turn["entrypoint"], turn["eligible"]
+
+
+def test_a_cursor_ide_turn_is_the_owner(home):
+    assert _cursor("pause Codex until 5pm", "3.26.13", CURSOR_APP)
+    assert _front_end() == ("cursor", "ide", True)
+
+
+def test_the_cursor_sdk_reporting_a_plain_version_outside_cursor_is_a_machine(home):
+    # @cursor/sdk sends cursor_version "1.0.0" unless its environment says otherwise.
+    assert _cursor("pause Codex until 5pm", "1.0.0", {**TTY, "exe": "node"})
+    assert _front_end() == ("cursor", "cursor_sdk", False)
+    assert "machine entrypoint" in owner_turns.eligible(_last())[1]
+
+
+def test_an_interactive_cursor_agent_turn_is_the_owner(home):
+    assert _cursor("pause Codex until 5pm", "2026.10.22-27dcf5f", TTY)
+    assert _front_end() == ("cursor", "cli", True)
+
+
+@pytest.mark.parametrize("issuer", [
+    {**TTY, "headless": True},          # cursor-agent -p, typed on a terminal or not
+    {**TTY, "tty": False},              # stdin or stdout not a terminal: headless without -p
+    {"pid": 4242, "start": 1.0, "exe": "node"},  # the terminal could not be read
+    {"refused": "unknown"},
+])
+def test_a_headless_cursor_agent_turn_is_a_machine_and_refused(home, issuer):
+    assert _cursor("pause Codex until 5pm", "2026.10.22-27dcf5f", issuer)
+    assert _front_end() == ("cursor", "cursor_print", False)
+    assert owner_turns.untrusted_front_end([_last()]) is None
+
+
+@pytest.mark.parametrize("app_dir,entry", [(".gemini/antigravity", "app"), (".gemini/antigravity-ide", "ide")])
+def test_antigravity_app_and_ide_turns_are_the_owner(home, app_dir, entry):
+    assert _antigravity("pause Codex until 5pm", app_dir, {"pid": 4242, "start": 1.0, "exe": "language_server"})
+    assert _front_end() == ("antigravity", entry, True)
+
+
+@pytest.mark.parametrize("issuer,entry", [
+    ({**TTY, "headless": True}, "antigravity_print"),
+    ({**TTY, "tty": False}, "antigravity_print"),
+    (TTY, "cli"),                       # on a terminal: still not trusted by default
+])
+def test_the_antigravity_cli_is_refused(home, issuer, entry):
+    assert _antigravity("pause Codex until 5pm", ".gemini/antigravity-cli", issuer)
+    assert _front_end() == ("antigravity", entry, False)
+
+
+def test_an_interactive_grok_build_turn_records_as_aegis_and_is_the_owner(home):
+    assert _grok("pause Codex until 5pm", {**TTY, "exe": "grok"})
+    assert _front_end() == ("aegis", "aegis", True)
+
+
+@pytest.mark.parametrize("args", [["grok", "-p", "pause Codex"], ["grok", "--single", "pause Codex"],
+                                  ["grok", "--yolo", "--print", "x"], ["grok", "-yp", "x"]])
+def test_grok_p_is_a_machine_and_refused(home, args):
+    assert owner_turns._headless_args(args)
+    assert _grok("pause Codex until 5pm", {**TTY, "exe": "grok", "headless": True})
+    assert _front_end() == ("aegis", "aegis_print", False)
+
+
+@pytest.mark.parametrize("args", [["grok"], ["node", "--use-system-ca", "/v/index.js"],
+                                  ["node", "/v/index.js", "explain the -p flag"], ["grok", "--", "-p"]])
+def test_an_interactive_command_line_is_not_headless(args):
+    assert not owner_turns._headless_args(args)
+
+
+def test_a_cursor_session_in_a_t3_thread_is_t3_whatever_it_reports(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    for version, issuer in (("1.0.0", {"refused": "unknown"}), ("3.26.13", CURSOR_APP),
+                            ("2026.10.22-27dcf5f", TTY)):
+        assert _cursor("pause Codex until 5pm", version, issuer)
+        assert _front_end() == ("cursor", "t3", False)
+
+
+@pytest.mark.parametrize("app_dir", [".gemini/antigravity", ".gemini/antigravity-ide", ".gemini/antigravity-cli",
+                                     ".gemini/antigravity-acp"])
+def test_an_antigravity_session_in_a_t3_thread_is_t3(home, monkeypatch, app_dir):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    assert _antigravity("pause Codex until 5pm", app_dir, {**TTY, "tty": False})
+    assert _front_end() == ("antigravity", "t3", False)
+
+
+def test_the_new_front_ends_are_trusted_by_default_and_headless_ones_are_machines():
+    for key in ("cursor:ide", "cursor:cli", "antigravity:app", "antigravity:ide", "aegis:aegis"):
+        assert key in owner_turns.DEFAULT_TRUSTED
+    assert "antigravity:cli" not in owner_turns.DEFAULT_TRUSTED
+    for entry in ("cursor_print", "cursor_sdk", "aegis_print", "antigravity_print"):
+        assert entry in owner_turns.MACHINE_ENTRYPOINTS
+
+
+def test_the_issuer_terminal_check_reads_the_kernel(home):
+    if sys.platform != "darwin":
+        pytest.skip("libproc is macOS only")
+    import pty
+
+    main, sub = pty.openpty()
+    try:
+        on = subprocess.Popen(["sleep", "2"], stdin=sub, stdout=sub)
+        off = subprocess.Popen(["sleep", "2"], stdin=sub, stdout=subprocess.PIPE)
+        try:
+            assert owner_turns._on_terminal(on.pid) is True
+            assert owner_turns._on_terminal(off.pid) is False
+        finally:
+            on.kill()
+            off.kill()
+            on.wait()
+            off.wait()
+    finally:
+        os.close(main)
+        os.close(sub)

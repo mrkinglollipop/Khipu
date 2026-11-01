@@ -110,6 +110,8 @@ def _tree(monkeypatch, chain: dict, args: dict) -> None:
     monkeypatch.setattr(owner_turns, "_proc_info", lambda pid: chain.get(pid))
     monkeypatch.setattr(owner_turns, "_proc_args", lambda pid: args.get(pid))
     monkeypatch.setattr(owner_turns.os, "getpid", lambda: 100)
+    # The fake tree's pids are not real processes: their terminals are unread.
+    monkeypatch.setattr(owner_turns, "_on_terminal", lambda pid: None)
 
 
 def test_a_turn_records_the_process_that_ran_the_hook(folders, monkeypatch):

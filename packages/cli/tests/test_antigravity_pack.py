@@ -355,9 +355,10 @@ def test_gate_falls_back_to_last_user_input_and_reads_only_the_tail(home, tmp_pa
     assert owner_turns.antigravity_turn(_pre(big, "ag-big"))["prompt"] == "newest turn"
 
 
-def test_trusted_list_does_not_include_antigravity_turns(home):
-    # Decision 6.2: record the turns, trust them only after the real run and Matt's word.
-    assert not [e for e in owner_turns.DEFAULT_TRUSTED if e.startswith(("antigravity", "cursor"))]
+def test_trusted_list_holds_the_antigravity_app_and_ide_only(home):
+    # Matt, 2026-11-01: the App and IDE count; the CLI's headless mode can't be told apart.
+    assert [e for e in owner_turns.DEFAULT_TRUSTED if e.startswith("antigravity")] == \
+        ["antigravity:app", "antigravity:ide"]
     assert owner_turns.settings()["trusted"] == list(owner_turns.DEFAULT_TRUSTED)
 
 
