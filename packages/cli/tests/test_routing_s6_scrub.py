@@ -66,13 +66,13 @@ def test_forked_prompt_never_shows_resolved_login_alias(replay, monkeypatch, ref
         original_write = recall_prompt._write_all
         original_prepare = agent_view.prepare_routing_table
 
-        def prepare(*, refresh=False):
+        def prepare(*, refresh=False, **options):
             if refresh and not allow_refresh.exists():
                 return
             if refresh:
-                original_prepare(refresh=True)
+                original_prepare(refresh=True, **options)
             else:
-                original_prepare()
+                original_prepare(**options)
             if refresh:
                 table = agent_view._TABLE.get("helper_table")
                 word = "SecretNewYYY" if added == "configured" else "codex-SideKKK"

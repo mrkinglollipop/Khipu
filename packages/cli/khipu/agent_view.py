@@ -617,8 +617,20 @@ def _bounded_inventory(call, budget):
             signal.setitimer(signal.ITIMER_REAL, max(0.000001, timer[0] - (time.monotonic() - began)), timer[1])
 
 
-def prepare_routing_table(*, refresh=False) -> None:
+# A cold one-shot prompt child must fold the whole routing events log before it
+# can build (about 220-260 ms at 7.6 MB, 2026-11-01); the warm helper pays that
+# fold once. Only that fold gets this extra time: it reads the events log and
+# resolves no login, so the alias and inventory work below keeps 250 ms, and a
+# stalled volume or a huge view still withholds as fast as before.
+COLD_FOLD_BUDGET_S = 0.5
+_BUILD_BUDGET_S = 0.25
+
+
+def prepare_routing_table(*, refresh=False, cold=False) -> None:
     """Rebuild the helper's full inventory within 250 ms, retrying failed starts.
+
+    ``cold``: first warm the routing events-log fold within
+    ``COLD_FOLD_BUDGET_S``, so the bounded build finds it cached.
 
     Prompt children inherit ``prepared`` even after a timeout. Only successful
     full builds renew the two-second freshness window.
@@ -626,6 +638,11 @@ def prepare_routing_table(*, refresh=False) -> None:
     if not refresh and _TABLE.get("prepared"):
         return
     _TABLE["prepared"] = True
+    if cold:
+        with contextlib.suppress(Exception):
+            from khipu import routing
+
+            _bounded_inventory(routing._entry_cache, COLD_FOLD_BUDGET_S)
 
     def rebuild():
         previous = getattr(_FORM_CACHE, "current", None)
@@ -643,7 +660,7 @@ def prepare_routing_table(*, refresh=False) -> None:
             _FORM_CACHE.current = previous
 
     with contextlib.suppress(InventoryUnavailable):
-        _bounded_inventory(rebuild, 0.25)
+        _bounded_inventory(rebuild, _BUILD_BUDGET_S)
 
 
 def _login_signature(sig):
