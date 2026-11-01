@@ -1372,6 +1372,7 @@ def _verbatim_contained(stored: Any, incoming: dict[str, Any]) -> bool:
 
 
 def _verbatim_stored(cur, episode_id: int | None, verbatim: Any) -> bool:
+    # forget-fence: capture writer: read-back of the row this capture just wrote or matched; returns a bool, never row text
     """Whether the live row ``episode_id`` holds every piece of ``verbatim``,
     read back inside the caller's transaction before it commits. False when
     there is nothing to confirm or the read fails: the caller must then keep
