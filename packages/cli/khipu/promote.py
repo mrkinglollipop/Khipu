@@ -1220,7 +1220,10 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
             withheld_runs += 1
             note += f", routing withheld ({ROUTING_WITHHOLD}: no complete inventory in time under load)"
         elif on.get("routing"):
-            routed_runs += 1
+            # Only a read that delivered counts as routed: a benign skip
+            # (ROUTING_SKIPS_OK) passes but proves nothing about the inventory.
+            if not str(on["routing"]).startswith("skipped:"):
+                routed_runs += 1
             on_ms = f"{on['ms']:.0f} ms" if on.get("ms") is not None else "no time"
             note += f", {on_ms} with routing on (routing={on['routing']})"
             shared = _shared_slowness_note(on, (cand.get("ms"), live_ms))

@@ -1937,3 +1937,14 @@ def test_replay_still_fails_a_timeout_beside_withholds(home, monkeypatch):
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"], out
     assert "timeout>1.2s" in out["detail"]
+
+
+@pytest.mark.parametrize("benign", ["skipped:fold-busy", "skipped:unsaved"])
+def test_replay_fails_when_withholds_sit_beside_only_a_benign_skip(home, monkeypatch, benign):
+    # A benign skip passes on its own but delivered no routing, so it cannot
+    # stand in for the one routed run the withhold rule needs.
+    candidate = _many_queries(home, 3)
+    monkeypatch.setattr(pm, "_run", _scripted_routing([WITHHOLD, WITHHOLD, benign]))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "none routed" in out["detail"]
