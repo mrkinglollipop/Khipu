@@ -1786,13 +1786,27 @@ _GATE = (
 )
 
 
+# The last line the legacy file writer printed on stderr, kept so a caller that
+# only sees its exit code (the queue drain) can log why it refused.
+last_child_reason: str = ""
+
+
 def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
+    global last_child_reason
+    last_child_reason = ""
     from khipu.paths import isolated_dir
 
     if isolated_dir() is not None:
         # The promotion gate's capture: the hub row is the thing under test,
         # and the live file wiki must not gain (or later lose) its line.
         _log("isolated run (KHIPU_ISOLATED_DIR): file wiki leg skipped")
+        return 0
+    if not str(payload.get("summary") or "").strip():
+        # The legacy writer rejects an empty summary (exit 65), and a
+        # verbatim_only capture has none by design: its content is the
+        # verbatim/deliverables fields on the hub row, which has already been
+        # written. Retrying the file leg would hold the job forever.
+        _log("empty summary (verbatim_only): file wiki leg skipped")
         return 0
     capture_v2 = _capture_v2()
     if capture_v2 is None:
@@ -1847,6 +1861,7 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
         print(proc.stdout.rstrip())
     if proc.stderr.strip():
         print(proc.stderr.rstrip(), file=sys.stderr)
+        last_child_reason = proc.stderr.strip().splitlines()[-1][:160]
     return proc.returncode
 
 

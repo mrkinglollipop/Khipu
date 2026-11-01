@@ -3826,7 +3826,11 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             out["failed"] += 1
             _capture_failure(jp, job, f"capture rc={rc}", out, free_first=True)
             _record_drain(harness, captured=False, error=f"capture rc={rc}")
-            _log(f"drain: capture rc={rc} for {original.name}; kept")
+            from khipu import capture as _cap
+
+            reason = getattr(_cap, "last_child_reason", "") if rc == 65 else ""
+            _log(f"drain: capture rc={rc} for {original.name}; kept"
+                 + (f" (child: {reason})" if reason else ""))
             continue
         _discard_claim(jp)
         out["captured"] += 1

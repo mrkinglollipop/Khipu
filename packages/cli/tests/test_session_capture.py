@@ -162,6 +162,17 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         self.assertIn("note", self.capture.call_args.args[0]["verbatim"])
         self.assertTrue(self.capture.call_args.args[0]["deliverables"])
 
+    def test_rc65_log_line_keeps_the_capture_childs_reason(self):
+        from khipu import capture as cap
+
+        self.enqueue(extracted_payload={"summary": "cached"})
+        self.capture.return_value = 65
+        with mock.patch.object(cap, "last_child_reason", "[capture_v2] synthetic refusal"), \
+             mock.patch.object(sc, "_log") as log:
+            sc.drain(limit=1)
+        lines = [c.args[0] for c in log.call_args_list]
+        self.assertTrue(any("capture rc=65" in l and "synthetic refusal" in l for l in lines), lines)
+
     def test_delivery_exception_is_also_bounded(self):
         first, _ = self.enqueue(extracted_payload={"summary": "cached"})
         self.capture.side_effect = RuntimeError("delivery rejected")

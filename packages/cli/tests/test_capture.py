@@ -244,6 +244,22 @@ class PayloadRobustnessTest(unittest.TestCase):
                 rc = cap.run_capture_v2({"summary": "s"}, suppress_mirror=True)
         self.assertEqual(rc, cap.EX_SOFTWARE)
 
+    def test_verbatim_only_empty_summary_skips_the_file_leg_instead_of_failing(self):
+        # The legacy writer exits 65 on an empty summary; a verbatim_only
+        # capture has none by design, so the leg must be skipped, not retried.
+        with mock.patch.object(cap, "_capture_v2", side_effect=AssertionError("child must not run")):
+            rc = cap.run_capture_v2({"summary": "", "summary_kind": "verbatim_only"}, suppress_mirror=True)
+        self.assertEqual(rc, 0)
+
+    def test_child_rejection_reason_is_kept_for_the_caller(self):
+        with tempfile.TemporaryDirectory() as td:
+            fake = pathlib.Path(td) / "capture_v2.py"
+            fake.write_text("import sys\nprint('[capture_v2] synthetic refusal', file=sys.stderr)\nsys.exit(65)\n")
+            with mock.patch.object(cap, "_capture_v2", return_value=fake):
+                rc = cap.run_capture_v2({"summary": "s"}, suppress_mirror=True)
+        self.assertEqual(rc, 65)
+        self.assertEqual(cap.last_child_reason, "[capture_v2] synthetic refusal")
+
     def test_an_unrunnable_capture_v2_returns_a_code_not_a_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             fake = pathlib.Path(td) / "capture_v2.py"
