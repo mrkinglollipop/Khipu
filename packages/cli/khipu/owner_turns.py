@@ -48,7 +48,9 @@ RETENTION_S = 24 * 3600
 # extension; "remote", "remote_desktop" and "remote_mobile" a cloud session
 # typed in from the web, desktop or mobile app), Codex's originator
 # ("codex_cli_rs" the terminal, "codex_desktop" the app, "codex_vscode" the
-# extension), "t3" for a session T3 Code runs, "aegis" for the Aegis pack
+# extension), "t3" for a session T3 Code runs, whichever agent T3 runs it on
+# (Claude Code, Codex, Cursor or Antigravity: a T3 conversation is proven by
+# T3's own message rows, not by the agent's front end), "aegis" for the Aegis pack
 # (Grok Build included), Cursor's "ide" (the app, its hook run from inside a
 # Cursor app bundle) and "cli" (``cursor-agent`` on a terminal, no print
 # flag), and Antigravity's "app" and "ide". Never trusted: "sdk-cli"
@@ -70,8 +72,8 @@ RETENTION_S = 24 * 3600
 DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:claude-desktop", "claude_code:claude-desktop-3p",
                    "claude_code:claude-vscode", "claude_code:remote", "claude_code:remote_desktop",
                    "claude_code:remote_mobile", "claude_code:t3", "codex:codex_cli_rs", "codex:codex_desktop",
-                   "codex:codex_vscode", "codex:t3", "aegis:aegis", "cursor:ide", "cursor:cli",
-                   "antigravity:app", "antigravity:ide")
+                   "codex:codex_vscode", "codex:t3", "cursor:t3", "antigravity:t3", "aegis:aegis",
+                   "cursor:ide", "cursor:cli", "antigravity:app", "antigravity:ide")
 # Entrypoints a job runs as, not a person: a refusal never suggests trusting them.
 MACHINE_ENTRYPOINTS = ("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action", "local-agent",
                        "remote_trigger", "remote_cowork_trigger", "codex_exec", "codex_sdk_ts", "cursor_print",

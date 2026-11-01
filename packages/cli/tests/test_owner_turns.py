@@ -854,7 +854,8 @@ LEGACY = list(owner_turns._DEFAULTS_BEFORE_2026_11_01)
 def test_a_list_saved_before_the_new_defaults_gets_them(home, kernel):
     _save({"enabled": True, "latest_window_h": 6.0, "session_binding": True, "trusted": LEGACY})
     trusted = owner_turns.settings()["trusted"]
-    assert trusted == [*LEGACY, "cursor:ide", "cursor:cli", "antigravity:app", "antigravity:ide"]
+    assert trusted == [*LEGACY, "cursor:t3", "antigravity:t3", "cursor:ide", "cursor:cli", "antigravity:app",
+                       "antigravity:ide"]
     kernel(CURSOR_HELPER, [CURSOR_HELPER, "--type=utility"], False)
     assert _cursor("pause Codex until 5pm", IDE_VERSION)
     assert _front_end() == ("cursor", "ide", True)
@@ -864,6 +865,22 @@ def test_an_old_explicit_off_survives(home):
     _save({"enabled": True, "trusted": [t for t in LEGACY if t != "codex:t3"]})
     trusted = owner_turns.settings()["trusted"]
     assert "codex:t3" not in trusted and "cursor:ide" in trusted
+
+
+# The default list #467 saved (``trusted_defaults`` recorded), before cursor:t3 and antigravity:t3.
+DEFAULTS_467 = [*LEGACY, "cursor:ide", "cursor:cli", "antigravity:app", "antigravity:ide"]
+
+
+def test_a_list_saved_before_the_t3_agents_gains_them_and_keeps_an_explicit_off(home):
+    off = [t for t in DEFAULTS_467 if t != "cursor:cli"]
+    _save({"enabled": True, "trusted": off, "trusted_defaults": DEFAULTS_467})
+    trusted = owner_turns.settings()["trusted"]
+    assert trusted == [*off, "cursor:t3", "antigravity:t3"]
+    _save({"enabled": True, "trusted": [t for t in LEGACY if t != "codex:t3"]})     # no marker: the old 13
+    trusted = owner_turns.settings()["trusted"]
+    assert "cursor:t3" in trusted and "antigravity:t3" in trusted and "codex:t3" not in trusted
+    owner_turns.write_settings({"trusted": [t for t in trusted if t != "antigravity:t3"]})
+    assert "antigravity:t3" not in owner_turns.settings()["trusted"]
 
 
 def test_an_unmarked_list_with_an_entry_beyond_the_old_defaults_gets_nothing_added(home):

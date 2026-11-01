@@ -357,8 +357,9 @@ def test_gate_falls_back_to_last_user_input_and_reads_only_the_tail(home, tmp_pa
 
 def test_trusted_list_holds_the_antigravity_app_and_ide_only(home):
     # Matt, 2026-11-01: the App and IDE count; the CLI's headless mode can't be told apart.
-    assert [e for e in owner_turns.DEFAULT_TRUSTED if e.startswith("antigravity")] == \
-        ["antigravity:app", "antigravity:ide"]
+    # antigravity:t3 is a T3 conversation, proven by T3's own message rows.
+    assert sorted(e for e in owner_turns.DEFAULT_TRUSTED if e.startswith("antigravity")) == \
+        ["antigravity:app", "antigravity:ide", "antigravity:t3"]
     assert owner_turns.settings()["trusted"] == list(owner_turns.DEFAULT_TRUSTED)
 
 

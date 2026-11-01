@@ -488,8 +488,12 @@ def _ask_boundary(old, turns_: list[dict], now: float, session: str) -> dict:
 
 def _late_copy(turn: dict) -> bool:
     """A row recorded after its turn or as a copy of one (``owner_turns.record``:
-    ``fallback``, ``late``, ``duplicate_of``): never the owner's reply."""
-    return bool(turn.get("fallback") or turn.get("late")) or turn.get("duplicate_of") is not None
+    ``late``, ``duplicate_of``): never the owner's reply. A ``fallback`` row
+    alone is Antigravity's submit-time read of ``lastUserInput`` by the
+    PreInvocation hook (``antigravity_prompt``), so it is the current turn; the
+    PostInvocation and Stop recorders always add ``late``, and a flushed copy of
+    a fallback turn gets ``late: "flush"``."""
+    return bool(turn.get("late")) or turn.get("duplicate_of") is not None
 
 
 def _after_ask(turn: dict, boundary) -> bool:

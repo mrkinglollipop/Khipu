@@ -418,14 +418,15 @@ def test_a_cursor_prompt_is_recorded_under_cursor_and_trusted_from_the_ide(home)
     assert "cursor:ide" in owner_turns.DEFAULT_TRUSTED
 
 
-def test_an_antigravity_t3_prompt_is_recorded_under_antigravity_and_not_trusted(home):
+def test_an_antigravity_t3_prompt_is_recorded_under_antigravity_and_t3_is_trusted(home):
     start = time.time()
     payload = {**AG_ACP, "prompt": "pause Grok please"}
     assert owner_turns.record(payload, env={}, now=start, issuer={"name": "agy", "pid": 1, "start": "x"}) is not None
     turn = owner_turns.turns("ag-conv-0001", now=start + 1)[-1]
     assert (turn["harness"], turn["entrypoint"], turn["cwd"]) == ("antigravity", "t3", "")
-    assert turn["eligible"] is False
-    assert "antigravity:t3" not in owner_turns.DEFAULT_TRUSTED
+    assert turn["eligible"] is False        # an issuer that can't be read is a machine one
+    # A T3 conversation is proven by T3's own message rows, whichever agent T3 runs.
+    assert "antigravity:t3" in owner_turns.DEFAULT_TRUSTED
 
 
 def test_a_codex_job_launched_from_claude_code_is_recorded_as_codex(home):

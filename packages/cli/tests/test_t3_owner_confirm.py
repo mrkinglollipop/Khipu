@@ -908,3 +908,85 @@ def test_a_boundary_that_would_drop_a_live_exclusion_refuses(world):
     assert not ok and out["code"] == "ask_limit", out
     (row,) = owner_direction._read_requests(path)
     assert len(row["asks"]["s-front"]["turns"]) == 201
+
+
+# ---- Antigravity's submit-time fallback, and T3 running other agents ------------------------------
+
+
+def test_an_antigravity_confirm_from_a_submit_time_fallback_turn(world):
+    # The transcript is not written yet when the PreInvocation hook runs, so it
+    # records the reply from lastUserInput: that is the current turn.
+    session = "ag-fallback"
+    path = _ag_transcript(world, session)
+    _ag_turn(world, session, ago=60)
+    _be(world, session, "KHIPU_SESSION_ID")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    assert ok and out["pending"], out
+    request = out["request"]
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=2, lastUserInput="yes"),
+                                   now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER))
+    reply = owner_turns.turns(session, time.time() + 2)[-1]
+    assert reply["fallback"] and reply["ag_step"] == 2 and "late" not in reply and reply["eligible"], reply
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == reply["turn"]
+
+
+def test_an_antigravity_fallback_turn_from_before_the_ask_never_confirms(world):
+    session = "ag-fallback"
+    path = _ag_transcript(world, session)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, lastUserInput=OWNER_WORDS),
+                                   now=time.time() - 30, wait=0, issuer=dict(AG_ISSUER))
+    _be(world, session, "KHIPU_SESSION_ID")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    assert ok and out["pending"], out
+    ok, out = _confirm_id(out["request"])
+    assert not ok and out["code"] == "not_confirmed" and not _paused(), out
+
+
+def test_an_antigravity_flushed_copy_from_a_later_preinvocation_never_confirms(world):
+    # The ask turn was read from lastUserInput; a later PreInvocation of the
+    # same turn reads its flushed step. That copy is late even though no
+    # PostInvocation or Stop recorded it.
+    session = "ag-flush"
+    path = _ag_transcript(world, session)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, lastUserInput=OWNER_WORDS),
+                                   now=time.time() - 30, wait=0, issuer=dict(AG_ISSUER))
+    _be(world, session, "KHIPU_SESSION_ID")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    assert ok and out["pending"], out
+    path.write_text(json.dumps({"type": "USER_INPUT", "step_index": 1, "content": OWNER_WORDS}) + "\n")
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, invocationNum=2),
+                                   now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER))
+    copy = owner_turns.turns(session, time.time() + 2)[-1]
+    assert copy.get("late") == "flush" and not copy.get("fallback"), copy
+    ok, out = _confirm_id(out["request"])
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+
+
+def _t3_agent_turn(harness: str) -> None:
+    """The prompt hook of the agent T3 runs (Cursor or Antigravity) records the owner's turn."""
+    if harness == "cursor":
+        payload = {"hook_event_name": "beforeSubmitPrompt", "conversation_id": T3_SESSION, "session_id": T3_SESSION,
+                   "generation_id": "g1", "cursor_version": "3.26.13", "workspace_roots": ["/repo"],
+                   "prompt": OWNER_WORDS,
+                   "transcript_path": f"/x/.cursor/projects/p/agent-transcripts/{T3_SESSION}.jsonl"}
+    else:
+        payload = {"conversationId": T3_SESSION, "workspacePaths": ["/repo"], "prompt": OWNER_WORDS,
+                   "transcriptPath": f"/x/.gemini/antigravity/brain/{T3_SESSION}/.system_generated/logs/"
+                                     "transcript.jsonl"}
+    owner_turns.record(payload, env={})
+
+
+@pytest.mark.parametrize("harness", ["cursor", "antigravity"])
+def test_a_t3_confirm_in_a_conversation_t3_runs_on_cursor_or_antigravity(world, harness):
+    request = _hold_in_t3(world)
+    mid = world["t3"].message(THREAD, time.time() + 1)
+    _t3_agent_turn(harness)
+    latest = owner_turns.turns(T3_SESSION)[-1]
+    assert (latest["harness"], latest["entrypoint"]) == (harness, "t3"), latest
+    _be(world, T3_SESSION, "KHIPU_SESSION_ID")
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["source"] == "t3" and out["confirmed"]["message"] == mid
