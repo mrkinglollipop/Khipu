@@ -1786,14 +1786,39 @@ _GATE = (
 )
 
 
-# The last line the legacy file writer printed on stderr, kept so a caller that
-# only sees its exit code (the queue drain) can log why it refused.
-last_child_reason: str = ""
+# Why one capture call failed, as a fixed code a caller may log. Never child
+# output or capture text: the drain log is outside forget's coverage
+# (khipu/capture_stores.py), so it may only ever hold one of these strings.
+REASON_CODES = frozenset({
+    "file_leg_empty_summary", "invalid_json", "file_leg_rejected",
+    "file_leg_not_configured", "file_leg_timeout", "file_leg_unrunnable",
+    "tombstone_registry_unavailable", "invalid_timestamp", "identity_conflict",
+    "memory_lock_unavailable", "hub_pending", "legacy_verbatim_only_unstorable",
+    "unknown",
+})
+
+# The legacy writer's own stderr prefixes for its exit-65 refusals, matched to
+# choose a code; the text itself is never kept.
+_CHILD_REFUSALS = (
+    ("[capture_v2] payload missing 'summary'", "file_leg_empty_summary"),
+    ("[capture_v2] invalid JSON", "invalid_json"),
+)
 
 
-def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
-    global last_child_reason
-    last_child_reason = ""
+def _set_reason(outcome: dict[str, Any] | None, code: str) -> None:
+    if outcome is not None:
+        outcome["reason"] = code if code in REASON_CODES else "unknown"
+
+
+def _verbatim_only_empty(payload: dict[str, Any]) -> bool:
+    return (payload.get("summary_kind") == "verbatim_only"
+            and not str(payload.get("summary") or "").strip())
+
+
+def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool,
+                   outcome: dict[str, Any] | None = None) -> int:
+    """Run the legacy file writer. On a non-zero return, ``outcome["reason"]``
+    (when given) holds a code from REASON_CODES for this call only."""
     from khipu.paths import isolated_dir
 
     if isolated_dir() is not None:
@@ -1801,20 +1826,15 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
         # and the live file wiki must not gain (or later lose) its line.
         _log("isolated run (KHIPU_ISOLATED_DIR): file wiki leg skipped")
         return 0
-    if not str(payload.get("summary") or "").strip():
-        # The legacy writer rejects an empty summary (exit 65), and a
-        # verbatim_only capture has none by design: its content is the
-        # verbatim/deliverables fields on the hub row, which has already been
-        # written. Retrying the file leg would hold the job forever.
-        _log("empty summary (verbatim_only): file wiki leg skipped")
-        return 0
     capture_v2 = _capture_v2()
     if capture_v2 is None:
         _log("capture_v2 not configured (khipu config --set capture_v2 PATH); "
              "file wiki not written")
+        _set_reason(outcome, "file_leg_not_configured")
         return EX_SOFTWARE
     if not capture_v2.is_file():
         _log(f"capture_v2 not found at {capture_v2} (khipu config --set capture_v2 PATH)")
+        _set_reason(outcome, "file_leg_not_configured")
         return EX_SOFTWARE
     env = dict(os.environ)
     if suppress_mirror:
@@ -1850,18 +1870,27 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
                 # PG-failure path has already queued to the outbox — so a hung file leg
                 # is a bad exit code, never an uncaught traceback out of the hook.
                 _log(f"capture_v2 timed out after 300s ({capture_v2})")
+                _set_reason(outcome, "file_leg_timeout")
                 return EX_SOFTWARE
             except OSError as exc:
                 _log(f"capture_v2 could not run: {type(exc).__name__}: {exc}")
+                _set_reason(outcome, "file_leg_unrunnable")
                 return EX_SOFTWARE
     except RegistryError as exc:
         _log(f"tombstone registry unavailable; file wiki leg refused ({exc})")
+        _set_reason(outcome, "tombstone_registry_unavailable")
         return EX_SOFTWARE
     if proc.stdout.strip():
         print(proc.stdout.rstrip())
     if proc.stderr.strip():
         print(proc.stderr.rstrip(), file=sys.stderr)
-        last_child_reason = proc.stderr.strip().splitlines()[-1][:160]
+    if proc.returncode != 0:
+        code = "file_leg_rejected"
+        for prefix, known in _CHILD_REFUSALS:
+            if prefix in proc.stderr:
+                code = known
+                break
+        _set_reason(outcome, code)
     return proc.returncode
 
 
@@ -1880,6 +1909,7 @@ def capture(payload: dict[str, Any], *, mode: str | None = None,
             return _capture(payload, mode=mode, result=result)
     except memory_lock.MemoryLockError as exc:
         _log(f"memory lock unavailable; capture refused ({exc})")
+        _set_reason(result, "memory_lock_unavailable")
         return EX_SOFTWARE
 
 
@@ -1890,6 +1920,7 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
         _validate_timestamp(payload)
     except ValueError as exc:
         _log(str(exc))
+        _set_reason(result, "invalid_timestamp")
         return EX_DATAERR
     _redact_capture_values(payload)
     if payload.get("scope") == "trivial":
@@ -1917,7 +1948,13 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
 
     if mode == "legacy":
         _log("mode=legacy → capture_v2 only")
-        return run_capture_v2(payload, suppress_mirror=False)
+        if _verbatim_only_empty(payload):
+            # The file writer is the only leg here and refuses an empty
+            # summary, so this capture cannot be stored: fail and stay queued.
+            _log("mode=legacy cannot store a verbatim_only capture; not stored")
+            _set_reason(result, "legacy_verbatim_only_unstorable")
+            return EX_DATAERR
+        return run_capture_v2(payload, suppress_mirror=False, outcome=result)
 
     # dual + hub: PG first, durably. If PG is unreachable the payload goes to the
     # outbox (replayed by the next Stop hook / nightly / `khipu outbox drain`)
@@ -1935,6 +1972,7 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
             return 0
     except CaptureIdentityConflict as exc:
         _log(str(exc))
+        _set_reason(result, "identity_conflict")
         return EX_SOFTWARE
     except Exception as exc:  # noqa: BLE001 — surfaced, queued, never swallowed
         from khipu.outbox import enqueue
@@ -1951,10 +1989,13 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
         # lands the row now, and if not it re-queues the same identity (no dup).
         if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
             _log(f"hub delivery pending; durable_outbox={queued}")
+            _set_reason(result, "hub_pending")
             return EX_SOFTWARE
-        rc = run_capture_v2(payload, suppress_mirror=False)
+        rc = run_capture_v2(payload, suppress_mirror=False, outcome=result)
         if rc != 0:
             return rc
+        if not queued:
+            _set_reason(result, "hub_pending")
         return 0 if queued else EX_SOFTWARE
     _log(
         f"mode={mode} pg ok episode_inserted={stats['episode_inserted']} "
@@ -1974,7 +2015,12 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
     # turns the reverse mirror off in hub for a future all-PG world.
     if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
         return 0
-    rc = run_capture_v2(payload, suppress_mirror=True)
+    if _verbatim_only_empty(payload):
+        # The hub row above is durable and is this capture's whole content;
+        # the legacy writer would refuse the empty summary (exit 65) forever.
+        _log("verbatim_only capture stored on the hub; file wiki leg skipped")
+        return 0
+    rc = run_capture_v2(payload, suppress_mirror=True, outcome=result)
     return rc
 
 
