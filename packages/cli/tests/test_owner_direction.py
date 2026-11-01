@@ -430,10 +430,11 @@ def test_a_t3_lookup_that_fails_once_is_tried_again(t3_conversation, monkeypatch
     monkeypatch.setattr(t3, "thread_for_session_result", flaky)
     _t3_say()
     assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3"
-    # Two failed reads settle nothing: the turn is not T3's and never counts.
+    # Two failed reads settle nothing: unverified, and it never counts.
     monkeypatch.setattr(t3, "thread_for_session_result", lambda sid, **kw: (None, False))
     _t3_say()
-    assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "sdk-ts"
+    assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3-unverified"
+    assert owner_turns.turns(OWNER)[-1]["eligible"] is False
 
 
 def test_a_t3_conversation_on_a_dispatched_lane_is_refused(t3_conversation, monkeypatch):

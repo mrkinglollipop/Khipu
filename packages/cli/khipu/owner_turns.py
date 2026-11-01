@@ -187,6 +187,29 @@ def _t3_thread(session: str) -> str | None:
     return None
 
 
+def _t3_membership(session: str) -> str:
+    """"t3" when T3 runs ``session``, "none" when T3's record settles that it
+    does not (or there is no T3 on this Mac), "unverified" when the record
+    exists but could not be read twice. Owner eligibility must not treat a
+    failed read as "not T3": that would hand a T3 session its native, trusted
+    entrypoint back."""
+    if not session:
+        return "none"
+    path = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
+    if not path.is_file():
+        return "none"
+    for _ in range(2):
+        thread, definitive = t3.thread_for_session_result(session, whole_table=True)
+        if definitive:
+            return "t3" if thread else "none"
+    return "unverified"
+
+
+def _t3_entry(session: str, native: str) -> str:
+    member = _t3_membership(session)
+    return {"t3": "t3", "unverified": "t3-unverified"}.get(member, native)
+
+
 def dispatched_lane(env: dict) -> bool:
     """A dispatched job's environment (Khipu's launchers and church-harness
     set ``CLAUDE_DISPATCHED_LANE``; unset, empty and "0" mean the owner's own
@@ -246,7 +269,7 @@ def dispatched_job(env: dict, session: str = "", *, t3_thread: bool = False) -> 
 
 def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: dict | None = None) -> str:
     if harness == "aegis":
-        return "aegis"
+        return _t3_entry(session, "aegis")
     if harness == "claude_code":
         entry = (env.get("CLAUDE_CODE_ENTRYPOINT") or "unknown").strip() or "unknown"
         # Claude Code turns only "cli" into "sdk-cli" for ``claude -p``: a
@@ -257,19 +280,15 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         # A session T3 Code runs has a T3 thread, whatever entrypoint it
         # reports: T3 turns are never owner turns, so membership decides, not
         # the native entrypoint. ``claude -p`` (sdk-cli) stays a machine.
-        if entry != "sdk-cli" and _t3_thread(session):
-            return "t3"
-        return entry
+        return entry if entry == "sdk-cli" else _t3_entry(session, entry)
     if harness == "codex":
         origin = _codex_originator(str(payload.get("transcript_path") or ""))
-        if origin != "codex_exec" and _t3_thread(session):
-            return "t3"
-        return origin or "unknown"
+        return "codex_exec" if origin == "codex_exec" else _t3_entry(session, origin or "unknown")
     if harness == "cursor":
-        return "t3" if _t3_thread(session) else hook_shape.cursor_entrypoint(payload)
+        return _t3_entry(session, hook_shape.cursor_entrypoint(payload))
     if harness == "antigravity":
         surface = hook_shape.antigravity_entrypoint(payload)
-        return "t3" if _t3_thread(session) else surface
+        return _t3_entry(session, surface)
     return "unknown"
 
 
@@ -463,6 +482,9 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
         return False, "a dispatched job's brief"
     if not turn.get("typed", bool((turn.get("text") or "").strip())):
         return False, "no typed text"
+    if turn.get("entrypoint") == "t3-unverified":
+        return False, ("Khipu could not read T3's record to rule out a T3 conversation; "
+                       "try again, or confirm owner changes in the Khipu app")
     if turn.get("entrypoint") == "t3":
         # T3 hands the hook only the prompt text, never which delivery fired it,
         # so a scheduled task's or relayed message with the owner's words can't

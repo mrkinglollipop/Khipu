@@ -441,3 +441,26 @@ def test_doctor_row_counts_per_harness_and_reds_a_silent_hook(home):
     assert row["ok"] is False and row["missing"] == ["codex"]
     assert any("Codex" in w for w in row["warnings"])
     assert owner_turns.doctor_block(installed=["claude_code"])["ok"] is True
+
+
+@pytest.mark.parametrize("harness,env,native", [
+    ("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, "cli"),
+    ("aegis", {}, "aegis"),
+])
+def test_a_failed_t3_lookup_never_hands_back_a_trusted_entrypoint(home, monkeypatch, harness, env, native):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    monkeypatch.setattr(owner_turns.t3, "thread_for_session_result", lambda sid, **kw: (None, False))
+    entry = owner_turns.entrypoint_of(harness, env, {}, SESSION)
+    assert entry == "t3-unverified"
+    ok, why = owner_turns.eligible({"entrypoint": entry, "harness": harness, "typed": True, "text": "x"})
+    assert not ok and why.startswith("Khipu could not read T3's record")
+
+
+def test_no_t3_database_keeps_the_native_entrypoint(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(home["tmp"] / "no-such-t3.sqlite"))
+    assert owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION) == "cli"
+
+
+def test_an_aegis_session_in_a_t3_thread_is_t3(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    assert owner_turns.entrypoint_of("aegis", {}, {}, SESSION) == "t3"
