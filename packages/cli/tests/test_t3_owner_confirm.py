@@ -1,10 +1,11 @@
 """Owner changes held for the owner to confirm (the owner's rule, 2026-11-01):
 an agent asks, Khipu holds the change and says what to ask ("Confirm ...?"),
-and the confirm applies it only when the confirming conversation's own record
-shows a message the owner typed after the latest ask Khipu recorded for that
-conversation (at the hold, and on every confirm that found no reply). No age
-limit, no codes, no word matching. T3's record is its message rows; every other trusted
-front end's is the prompt hook's eligible turns.
+and the confirm applies it only when the turn the owner's reply started is
+proved: outside T3 the current turn the direction check verifies, later than
+the latest ask Khipu recorded for that conversation and never a late copy; in
+T3 a call from the conversation's own harness with an owner message in T3's
+record that the thread's ask snapshot does not hold. No age limit, no codes,
+no word matching.
 
 Hermetic: a temp data dir and capture home, and a synthetic T3 database
 (``KHIPU_T3_DB``) with provider-thread, thread and message tables. Nothing
@@ -252,11 +253,11 @@ def test_an_unreadable_t3_database_is_refused(world, monkeypatch):
 
     request = _hold_in_t3(world)
     world["t3"].message(THREAD, time.time() + 1)
-    real = t3.owner_message_after
-    monkeypatch.setattr(t3, "owner_message_after", lambda thread, since: (None, False))
+    real = t3.owner_reply_read
+    monkeypatch.setattr(t3, "owner_reply_read", lambda thread, seen, since: (None, False))
     ok, out = _confirm_id(request)
     assert not ok and out["code"] == "t3_unreadable"
-    monkeypatch.setattr(t3, "owner_message_after", real)
+    monkeypatch.setattr(t3, "owner_reply_read", real)
     world["t3"].path.write_bytes(b"not a database")
     ok, out = _confirm_id(request)
     assert not ok and out["code"] == "t3_unreadable", out
@@ -267,7 +268,7 @@ def test_the_message_reader_on_a_broken_file_is_not_definitive(world):
     from khipu import t3
 
     world["t3"].path.write_bytes(b"not a database")
-    assert t3.owner_message_after(THREAD, 0.0) == (None, False)
+    assert t3.owner_reply_read(THREAD, (), None) == (None, False)
 
 
 @pytest.mark.parametrize("thread, parent, relationship", [
@@ -331,7 +332,7 @@ def test_a_two_day_old_request_confirms_on_a_later_owner_turn(world, front):
     # The turn the request was made on is past the recorder's retention by now.
     request = _hold_by_request(world, front, "s-front", ago=2 * DAY)
     ok, out = _confirm_id(request)
-    assert not ok and out["code"] == "not_confirmed" and not _paused()
+    assert not ok and out["code"] == "no_recorded_turn" and not _paused()
     _front_end_turn(world, front, "s-front")
     ok, out = _confirm_id(request)
     assert ok, out
@@ -340,14 +341,15 @@ def test_a_two_day_old_request_confirms_on_a_later_owner_turn(world, front):
 
 @pytest.mark.parametrize("front", FRONTS)
 def test_a_two_day_old_owner_turn_is_past_retention_so_the_confirm_asks_again(world, front):
-    # The proof is the owner's reply to the latest ask, so turns keep the normal
-    # one-day retention: an older turn is gone, and the confirm asks again.
+    # The proof is the current turn, so turns keep the normal one-day
+    # retention: an older turn is gone, and the confirm is refused until the
+    # owner types again.
     request = _hold_by_request(world, front, "s-front", ago=3 * DAY)
     _front_end_turn(world, front, "s-front", ago=2 * DAY)
     owner_turns.sweep()
     assert owner_turns.turns("s-front") == []
     ok, out = _confirm_id(request)
-    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"]
+    assert not ok and out["code"] == "no_recorded_turn" and not _paused()
     _front_end_turn(world, front, "s-front")
     ok, out = _confirm_id(request)
     assert ok, out
@@ -537,12 +539,15 @@ def test_review_p2_forget_while_applying_then_a_failed_command_keeps_the_request
     assert "Codex" not in owner_direction.requests_path().read_text()
 
 
-def test_review_p2_a_t3_confirm_needs_no_hook_turn_from_the_last_day(world):
-    # T3 confirm went through _t3_bound -> turns() (24 h), so a 2-day-old hook
-    # turn was invisible -> no_recorded_turn. T3's record is the proof.
+def test_a_t3_confirm_on_a_two_day_old_request_needs_the_replys_hook_turn(world):
+    # T3's record proves the reply; the hook turn the reply records binds the
+    # call to the conversation's harness, so a 2-day-old hold needs no older turn.
     request = _hold_in_t3(world, ago=2 * DAY)
     assert owner_turns.turns(T3_SESSION) == []
     mid = world["t3"].message(THREAD, time.time() + 1)
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "no_recorded_turn" and not _paused()
+    _t3_hook_turn()
     ok, out = _confirm_id(request)
     assert ok, out
     assert _paused() and out["confirmed"]["message"] == mid
@@ -550,12 +555,12 @@ def test_review_p2_a_t3_confirm_needs_no_hook_turn_from_the_last_day(world):
 
 def test_review_p2_the_30_day_cap_no_longer_deletes_proof_of_a_waiting_request(world):
     # The 30-day evidence cap deleted proof while the request stayed pending.
-    # Now proof is the reply to the latest ask: the confirm asks, the reply passes.
+    # Now proof is the current turn: refused until the owner types, then it passes.
     request = _hold_by_request(world, "claude_code:cli", "s-front", ago=35 * DAY)
     _front_end_turn(world, "claude_code:cli", "s-front", ago=31 * DAY)
     owner_turns.sweep()
     ok, out = _confirm_id(request)
-    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"], out
+    assert not ok and out["code"] == "no_recorded_turn", out
     (row,) = owner_direction._read_requests(owner_direction.requests_path())
     assert row["state"] == "pending"
     _front_end_turn(world, "claude_code:cli", "s-front")
@@ -638,7 +643,7 @@ def test_the_owner_replies_after_an_ask_on_a_40_day_old_request_outside_t3(world
     request = _hold_by_request(world, "claude_code:cli", "s-front", ago=40 * DAY)
     owner_turns.sweep()
     ok, out = _confirm_id(request)
-    assert not ok and "Ask the owner to confirm now" in out["error"]
+    assert not ok and out["code"] == "no_recorded_turn"
     _front_end_turn(world, "claude_code:cli", "s-front")
     ok, out = _confirm_id(request)
     assert ok, out
@@ -649,8 +654,9 @@ def test_the_owner_replies_after_an_ask_on_a_40_day_old_request_in_t3(world):
     request = _hold_in_t3(world, ago=40 * DAY)
     owner_turns.sweep()
     ok, out = _confirm_id(request)
-    assert not ok and "Ask the owner to confirm now" in out["error"]
+    assert not ok and out["code"] == "no_recorded_turn"
     mid = world["t3"].message(THREAD, time.time() + 1)
+    _t3_hook_turn()
     ok, out = _confirm_id(request)
     assert ok, out
     assert _paused() and out["confirmed"]["message"] == mid
@@ -677,3 +683,228 @@ def test_a_confirm_with_no_reply_moves_the_ask_boundary(world):
     assert not ok
     (after,) = owner_direction._read_requests(owner_direction.requests_path())
     assert after["asks"]["s-front"]["ts"] > before["asks"]["s-front"]["ts"]
+
+
+# ---- review 2026-11-01 (Astra whole-branch review at add8406d): the six scenarios ----------------
+#
+# The proof is the current turn (outside T3) or a new owner message in T3's
+# record, never a search of stored turns; boundaries only grow.
+
+AG_ISSUER = {"pid": 4_000_000, "start": 1.0, "exe": "language_server_macos_arm", "app": "Antigravity.app",
+             "headless": False, "tty": False}
+
+
+def _ag_transcript(world, session: str):
+    path = world["tmp"] / ".gemini" / "antigravity" / "brain" / session / ".system_generated" / "logs" / "transcript.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+    return path
+
+
+def _ag_payload(path, session: str, **extra) -> dict:
+    return {"conversationId": session, "workspacePaths": ["/repo"], "transcriptPath": str(path),
+            "invocationNum": 1, "initialNumSteps": 0, **extra}
+
+
+def _ag_turn(world, session: str, prompt: str = OWNER_WORDS, *, ago: float = 0.0) -> None:
+    """The owner types in the Antigravity App: what its prompt hook records."""
+    path = _ag_transcript(world, session)
+    owner_turns.record({**_ag_payload(path, session), "prompt": prompt}, env={}, now=time.time() - ago,
+                       issuer=dict(AG_ISSUER))
+
+
+def test_review2_p1_a_duplicate_after_the_prune_never_confirms(world):
+    # A confirm after the 24 h prune replaced the boundary with the turns then
+    # kept, losing the held turn's id and occurrence; a delayed duplicate of it
+    # then confirmed.
+    _front_end_turn(world, "claude_code:cli", "s-front", ago=25 * 3600)
+    (held,) = owner_turns.turns("s-front", time.time() - 25 * 3600 + 1)
+    _be(world, "s-front")
+    real = owner_direction._clock
+    world["mp"].setattr(owner_direction, "_clock", lambda: real() - 25 * 3600 + 2)
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    world["mp"].setattr(owner_direction, "_clock", real)
+    assert ok and out["pending"], out
+    request = out["request"]
+    assert owner_turns.turns("s-front") == []
+    ok, out = _confirm_id(request)
+    assert not ok and not _paused()
+    owner_turns.record({"session_id": "s-front", "prompt": OWNER_WORDS, "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}, now=time.time() + 1,
+                       extra={"duplicate_of": held["turn"], "occurrence": held["occurrence"]})
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert held["turn"] in {e[0] for e in row["asks"]["s-front"]["turns"]}
+
+
+def test_review2_p1_an_antigravity_postinvocation_flush_copy_never_confirms(world):
+    # The turn was recorded from lastUserInput at PreInvocation; its flushed
+    # step, recorded at PostInvocation, could not be paired with it
+    # (occurrence 2, no duplicate_of) and confirmed as a new owner reply.
+    session = "ag-owner"
+    path = _ag_transcript(world, session)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, lastUserInput=OWNER_WORDS),
+                                   now=time.time() - 30, wait=0, issuer=dict(AG_ISSUER))
+    (first,) = owner_turns.turns(session)
+    assert first["fallback"] and first["eligible"], first
+    _be(world, session, "KHIPU_SESSION_ID")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    assert ok and out["pending"], out
+    path.write_text(json.dumps({"type": "USER_INPUT", "step_index": 0, "content": OWNER_WORDS}) + "\n")
+    assert owner_turns.antigravity_late_turn(_ag_payload(path, session), "PostInvocation",
+                                             now=time.time() + 1, issuer=dict(AG_ISSUER))
+    copy = owner_turns.turns(session, time.time() + 2)[-1]
+    assert copy["occurrence"] == 2 and "duplicate_of" not in copy and copy["eligible"], copy
+    ok, out = _confirm_id(out["request"])
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+
+
+def test_review2_p2_a_t3_confirm_from_a_process_inheriting_the_session_is_refused(world):
+    # A different harness (its own PID and start) that inherits the T3
+    # session's id is not the hook that recorded the conversation's turn.
+    request = _hold_in_t3(world)
+    world["t3"].message(THREAD, time.time() + 1)
+    _t3_hook_turn()
+    world["mp"].setattr(owner_direction, "_caller_chain", lambda: [(4_200_000, 7.0, "claude")])
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_from_the_hook", out
+    assert not _paused()
+
+
+def test_review2_p2_a_t3_confirm_needs_t3_trusted_now(world):
+    request = _hold_in_t3(world)
+    world["t3"].message(THREAD, time.time() + 1)
+    _t3_hook_turn()
+    owner_turns.write_settings({"trusted": []})
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and "claude_code:t3" in out["error"], out
+    assert not _paused()
+
+
+def test_review2_p2_forget_scrubs_a_conversations_boundaries_on_another_conversations_request(world):
+    from khipu import forget
+
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=60)
+    _front_end_turn(world, "claude_code:cli", "s-other", ago=30)
+    _be(world, "s-other")
+    ok, out = _confirm_id(request)                      # records s-other's ask on s-front's request
+    assert not ok
+    world["t3"].message(THREAD, time.time() - 20)
+    _t3_hook_turn()
+    _be(world, T3_SESSION)
+    ok, out = _confirm_id(request)                      # records the T3 thread's snapshot on it
+    assert not ok
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert set(row["asks"]) == {"s-front", "s-other"} and list(row["t3_snapshots"]) == [THREAD]
+    assert forget._owner_words_scan("claude_code:s-other", gateway=False)["ok"]
+    assert forget._owner_words_scan(T3_SESSION, gateway=False)["ok"]
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert row["state"] == "pending" and list(row["asks"]) == ["s-front"], row
+    assert THREAD not in row.get("t3_snapshots", {}) and "msg-1" not in owner_direction.requests_path().read_text()
+
+
+def test_review2_p2_a_hold_racing_forget_never_writes_its_words_back(world):
+    import threading
+
+    from khipu import forget
+
+    _front_end_turn(world, "claude_code:cli", "s-front")
+    _be(world, "s-front")
+    real_ask = owner_direction.ask_line
+    done = threading.Event()
+
+    def racing(action, args):
+        # Forget runs to the end while the hold is between admission and save.
+        worker = threading.Thread(target=lambda: (forget._owner_words_scan("claude_code:s-front", gateway=False),
+                                                  done.set()))
+        worker.start()
+        worker.join(1.0)
+        return real_ask(action, args)
+
+    world["mp"].setattr(owner_direction, "ask_line", racing)
+    owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    assert done.wait(5.0)
+    rows = owner_direction._read_requests(owner_direction.requests_path())
+    assert all(r["state"] == "withdrawn" and "args" not in r and "ask" not in r for r in rows), rows
+    assert "Codex" not in owner_direction.requests_path().read_text()
+
+
+def test_review2_p2_a_reply_landing_during_a_no_reply_confirm_is_not_swallowed(world):
+    # The new snapshot came from a second read, so an owner message landing
+    # between the no-reply read and it was taken into the snapshot.
+    from khipu import t3
+
+    request = _hold_in_t3(world)
+    real = t3._read_messages
+    landed = []
+
+    def read_then_land(thread_id, read):
+        out = real(thread_id, read)
+        if not landed:
+            landed.append(world["t3"].message(THREAD, time.time() + 1))
+        return out
+
+    world["mp"].setattr(t3, "_read_messages", read_then_land)
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed", out
+    world["mp"].setattr(t3, "_read_messages", real)
+    _t3_hook_turn()
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == landed[0]
+
+
+# ---- the current turn from each front end ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("front", ["claude_code:cli", "codex:codex_desktop", "antigravity:app"])
+def test_a_confirm_from_the_current_turn_of_each_front_end(world, front):
+    if front.startswith("antigravity:"):
+        _ag_turn(world, "s-cur", ago=60)
+        _be(world, "s-cur", "KHIPU_SESSION_ID")
+    else:
+        _front_end_turn(world, front, "s-cur", ago=60)
+        _be_front(world, front, "s-cur")
+    assert owner_turns.turns("s-cur")[-1]["eligible"], owner_turns.turns("s-cur")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    assert ok and out["pending"], out
+    request = out["request"]
+    ok, out = _confirm_id(request)                       # the same turn as the ask
+    assert not ok and out["code"] == "not_confirmed" and not _paused()
+    if front.startswith("antigravity:"):
+        _ag_turn(world, "s-cur", prompt="yes")
+    else:
+        _front_end_turn(world, front, "s-cur")
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["source"] == "hook"
+    assert out["confirmed"]["message"] == owner_turns.turns("s-cur")[-1]["turn"]
+
+
+def test_an_older_eligible_turn_never_confirms_when_the_current_turn_is_a_late_copy(world):
+    # A real reply recorded after the ask, then a late copy as the current
+    # turn: the current turn is what is proved, and it is a copy.
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=60)
+    _front_end_turn(world, "claude_code:cli", "s-front", ago=10)
+    (reply,) = [t for t in owner_turns.turns("s-front") if t["ts"] > time.time() - 30]
+    owner_turns.record({"session_id": "s-front", "prompt": OWNER_WORDS, "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}, now=time.time(),
+                       extra={"duplicate_of": reply["turn"], "occurrence": reply["occurrence"]})
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and not _paused()
+
+
+def test_a_boundary_that_would_drop_a_live_exclusion_refuses(world):
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=60)
+    path = owner_direction.requests_path()
+    data = json.loads(path.read_text())
+    future = time.time() + 3600
+    data["requests"][0]["asks"]["s-front"]["turns"] = [[f"t{i}", future] for i in range(201)]
+    path.write_text(json.dumps(data))
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "ask_limit", out
+    (row,) = owner_direction._read_requests(path)
+    assert len(row["asks"]["s-front"]["turns"]) == 201

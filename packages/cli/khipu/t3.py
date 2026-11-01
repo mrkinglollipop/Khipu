@@ -353,55 +353,53 @@ def _owner_payload(payload_json, thread_id: str) -> dict | None:
     return payload if is_owner_message(payload, thread_id) else None
 
 
-def thread_snapshot(thread_id: str) -> tuple[dict | None, bool]:
-    """``(snapshot, definitive)``: what ``thread_id`` holds now, by T3's own
-    record: the ids of the owner's messages already in it and its latest
-    message's ``created_at`` (``latest_at``, and ``latest_ts`` in epoch
-    seconds; both None for an empty thread). A confirm is later proved only
-    by an owner message outside it, so T3's clock is compared with T3's."""
+def owner_reply_read(thread_id: str, seen, since) -> tuple[dict | None, bool]:
+    """``(read, definitive)`` from ONE read of T3's message rows for
+    ``thread_id``, inside one read transaction, so every part comes from the
+    same rows:
+
+    - ``message``: the newest message the owner typed whose id is not in
+      ``seen`` and that T3 dated after ``since`` (T3's epoch seconds; None:
+      no bound), as ``{id, at, ts, text}`` (the text is for hashing only),
+      or None;
+    - what the thread held in that read, for the next ask boundary:
+      ``owners``, the ``[id, ts]`` of every owner message T3 dated, and
+      ``latest_at`` / ``latest_ts``, its newest message of any kind (both
+      None for an empty thread).
+
+    T3's clock is only ever compared with T3's."""
+    if since is not None and (isinstance(since, bool) or not isinstance(since, (int, float))
+                              or since != since or since in (float("inf"), float("-inf"))):
+        return None, False
+    try:
+        seen = {str(i) for i in seen}
+    except TypeError:
+        return None, False
+
     def read(con):
+        con.execute("BEGIN")
         latest = con.execute(
             "SELECT created_at FROM orchestration_v2_projection_messages WHERE thread_id = ? "
             "ORDER BY created_at DESC LIMIT 1", (thread_id,)).fetchone()
-        ids = sorted(str(message_id) for message_id, payload_json in con.execute(
-            "SELECT message_id, payload_json FROM orchestration_v2_projection_messages "
-            f"WHERE thread_id = :thread AND {_owner_rows_sql()}", {"thread": thread_id})
-            if _owner_payload(payload_json, thread_id) is not None)
         latest_at = latest[0] if latest else None
         latest_ts = None if latest_at is None else _epoch(latest_at)
         if latest_at is not None and latest_ts is None:
             raise ValueError("unreadable message time")
-        return {"ids": ids, "latest_at": latest_at, "latest_ts": latest_ts}
-
-    return _read_messages(thread_id, read)
-
-
-def owner_message_after(thread_id: str, snapshot: dict) -> tuple[dict | None, bool]:
-    """``(message, definitive)``: the newest message the owner typed in
-    ``thread_id`` that ``snapshot`` (``thread_snapshot``) does not hold:
-    its id is not among the snapshot's and T3 dated it after the snapshot's
-    latest message. ``{id, at, ts, text}``; the text is for hashing only."""
-    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("ids"), list):
-        return None, False
-    seen = {str(i) for i in snapshot["ids"]}
-    boundary = snapshot.get("latest_ts")
-    if boundary is not None and not isinstance(boundary, (int, float)):
-        return None, False
-
-    def read(con):
-        # No row limit: the cursor is read until a match, inside the read's
+        message, owners = None, []
+        # No row limit: the cursor is read to its end inside the read's
         # deadline (past it the read is not definitive and the caller refuses).
         for message_id, created_at, payload_json in con.execute(
                 "SELECT message_id, created_at, payload_json FROM orchestration_v2_projection_messages "
                 f"WHERE thread_id = :thread AND {_owner_rows_sql()} ORDER BY created_at DESC",
                 {"thread": thread_id}):
             ts = _epoch(created_at)
-            if str(message_id) in seen or ts is None or (boundary is not None and ts <= boundary):
+            payload = None if ts is None else _owner_payload(payload_json, thread_id)
+            if payload is None:
                 continue
-            payload = _owner_payload(payload_json, thread_id)
-            if payload is not None:
-                return {"id": str(message_id), "at": str(created_at), "ts": ts, "text": payload["text"]}
-        return None
+            owners.append([str(message_id), ts])
+            if message is None and str(message_id) not in seen and (since is None or ts > since):
+                message = {"id": str(message_id), "at": str(created_at), "ts": ts, "text": payload["text"]}
+        return {"message": message, "owners": owners, "latest_at": latest_at, "latest_ts": latest_ts}
 
     return _read_messages(thread_id, read)
 
