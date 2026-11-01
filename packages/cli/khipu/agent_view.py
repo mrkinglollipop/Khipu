@@ -617,8 +617,15 @@ def _bounded_inventory(call, budget):
             signal.setitimer(signal.ITIMER_REAL, max(0.000001, timer[0] - (time.monotonic() - began)), timer[1])
 
 
-def prepare_routing_table(*, refresh=False) -> None:
-    """Rebuild the helper's full inventory within 250 ms, retrying failed starts.
+# A cold one-shot prompt child folds the whole routing events log before it can
+# build (about 220-260 ms at 7.6 MB, 2026-11-01), so it gets more room than the
+# warm helper, which pays that fold once. Still well inside the hook's 1.2 s.
+COLD_BUILD_BUDGET_S = 0.75
+
+
+def prepare_routing_table(*, refresh=False, budget: float = 0.25) -> None:
+    """Rebuild the helper's full inventory within ``budget`` seconds (250 ms for
+    the warm helper), retrying failed starts.
 
     Prompt children inherit ``prepared`` even after a timeout. Only successful
     full builds renew the two-second freshness window.
@@ -643,7 +650,7 @@ def prepare_routing_table(*, refresh=False) -> None:
             _FORM_CACHE.current = previous
 
     with contextlib.suppress(InventoryUnavailable):
-        _bounded_inventory(rebuild, 0.25)
+        _bounded_inventory(rebuild, budget)
 
 
 def _login_signature(sig):
