@@ -432,7 +432,7 @@ class JobDetectionTest(unittest.TestCase):
                         "scope": "", "edges": [], "topic_pages": []}
 
             with mock.patch("khipu.extract.extract_memory", fake_extract), \
-                    mock.patch("khipu.capture.capture", lambda p, mode=None: captured.append(p) or 0), \
+                    mock.patch("khipu.capture.capture", lambda p, mode=None, **_: captured.append(p) or 0), \
                     mock.patch("khipu.config.capture_mode", lambda: "dual"):
                 ac.drain()
         self.assertEqual(calls, [{"job": True}])

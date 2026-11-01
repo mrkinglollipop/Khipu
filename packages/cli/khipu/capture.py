@@ -1330,6 +1330,73 @@ def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
     return f"{summary} (part {part})".strip()
 
 
+def _paragraphs(text: str) -> str:
+    # The writer's paragraph form (_append_summary): blank paragraphs dropped.
+    return "\n\n".join(p for p in text.strip().split("\n\n") if p.strip())
+
+
+def _note_held(stored: Any, incoming: str) -> bool:
+    # A merge appends a note as its own paragraph (_append_summary).
+    if not isinstance(stored, str):
+        return False
+    if not incoming.strip():
+        # Nothing for a merge to normalise: only the exact text confirms it.
+        return stored == incoming
+    stored, incoming = _paragraphs(stored), _paragraphs(incoming)
+    if not stored:
+        return False
+    if stored == incoming:
+        return True
+    return ("\n\n" + stored + "\n\n").find("\n\n" + incoming + "\n\n") != -1
+
+
+def _verbatim_contained(stored: Any, incoming: dict[str, Any]) -> bool:
+    if not isinstance(stored, dict):
+        return False
+    for key, value in incoming.items():
+        if value in (None, "", [], {}):
+            continue
+        have = stored.get(key)
+        if isinstance(value, list):
+            if not isinstance(have, list):
+                return False
+            norm = {json.dumps(v, sort_keys=True, ensure_ascii=False) for v in have}
+            if any(json.dumps(v, sort_keys=True, ensure_ascii=False) not in norm for v in value):
+                return False
+        elif key == "note" and isinstance(value, str):
+            if not _note_held(have, value):
+                return False
+        elif json.dumps(have, sort_keys=True) != json.dumps(value, sort_keys=True):
+            return False
+    return True
+
+
+def _verbatim_stored(cur, episode_id: int | None, verbatim: Any) -> bool:
+    """Whether the live row ``episode_id`` holds every piece of ``verbatim``,
+    read back inside the caller's transaction before it commits. False when
+    there is nothing to confirm or the read fails: the caller must then keep
+    the capture rather than acknowledge it."""
+    if episode_id is None or not isinstance(verbatim, dict):
+        return False
+    if not any(v not in (None, "", [], {}) for v in verbatim.values()):
+        return False
+    cur.execute("SAVEPOINT capture_verbatim_check")
+    try:
+        cur.execute("SELECT to_jsonb(e) FROM episodes e WHERE id = %s", (episode_id,))
+        row = cur.fetchone()
+    except Exception as exc:  # noqa: BLE001 — unconfirmed, never a failed write
+        cur.execute("ROLLBACK TO SAVEPOINT capture_verbatim_check")
+        _log(f"verbatim read-back failed ({type(exc).__name__}); not confirmed")
+        return False
+    cur.execute("RELEASE SAVEPOINT capture_verbatim_check")
+    target = row[0] if row else None
+    if not isinstance(target, dict) or target.get("deleted_at"):
+        return False
+    raw = target.get("raw") if isinstance(target.get("raw"), dict) else {}
+    return (_verbatim_contained(target.get("verbatim"), verbatim)
+            or _verbatim_contained(raw.get("verbatim"), verbatim))
+
+
 def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
     # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
@@ -1339,6 +1406,10 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
     identity), ``episode_inserted`` and ``source_key`` (the capture's key from
     capture_identity.source_key), plus ``topics_written`` and ``dedup``.
     Callers take the id from here; none re-selects by (ts, md5(summary)).
+    For an empty-summary ``verbatim_only`` capture it also returns
+    ``verbatim_stored``: True only when the row it inserted or matched was
+    read back in this transaction, before the commit, holding this payload's
+    verbatim evidence.
 
     Runs the same three steps for every writer that reaches here (the native
     extractor via session_capture.drain, the legacy capture_v2-shaped payload
@@ -1364,6 +1435,11 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
     from khipu.capture_identity import payload_sha256, source_identity
 
     source = source_identity(payload)
+    # Snapshotted with the source: enrichment below may rewrite the payload.
+    from copy import deepcopy
+
+    verbatim_check = (deepcopy(payload.get("verbatim"))
+                      if _verbatim_only_empty(payload) else None)
     topics_written = 0
     episode_id: int | None = None
     from khipu import memory_lock
@@ -1502,16 +1578,20 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                                 raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                         else:
                             cur.execute("RELEASE SAVEPOINT capture_claim")
-                    conn.commit()
-                    if dedup["action"] == "merge":
-                        _refresh_merged_episode(cur, dedup["matched_episode"])
-                    return {
+                    skipped: dict[str, Any] = {
                         "episode_inserted": False,
                         "topics_written": 0,
                         "episode_id": dedup.get("matched_episode"),
                         "source_key": source["source_key"],
                         "dedup": dedup,
                     }
+                    if verbatim_check is not None:
+                        skipped["verbatim_stored"] = _verbatim_stored(
+                            cur, dedup.get("matched_episode"), verbatim_check)
+                    conn.commit()
+                    if dedup["action"] == "merge":
+                        _refresh_merged_episode(cur, dedup["matched_episode"])
+                    return skipped
 
                 # W5.1: classify capture topics into topic-slugs vs noise-tags
                 # (khipu.hygiene.classify_topics — see its docstring for the
@@ -1669,14 +1749,17 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                         cur, parsed, str(path), source="capture", note="khipu capture"
                     ):
                         topics_written += 1
+                written: dict[str, Any] = {
+                    "episode_inserted": inserted,
+                    "topics_written": topics_written,
+                    "episode_id": episode_id,
+                    "source_key": source["source_key"],
+                    "dedup": dedup,
+                }
+                if verbatim_check is not None:
+                    written["verbatim_stored"] = _verbatim_stored(cur, episode_id, verbatim_check)
             conn.commit()
-        return {
-            "episode_inserted": inserted,
-            "topics_written": topics_written,
-            "episode_id": episode_id,
-            "source_key": source["source_key"],
-            "dedup": dedup,
-        }
+        return written
     except FactStepDeferred:
         raise
     except Exception as exc:
@@ -1786,7 +1869,39 @@ _GATE = (
 )
 
 
-def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
+# Why one capture call failed, as a fixed code a caller may log. Never child
+# output or capture text: the drain log is outside forget's coverage
+# (khipu/capture_stores.py), so it may only ever hold one of these strings.
+REASON_CODES = frozenset({
+    "file_leg_empty_summary", "invalid_json", "file_leg_rejected",
+    "file_leg_not_configured", "file_leg_timeout", "file_leg_unrunnable",
+    "tombstone_registry_unavailable", "invalid_timestamp", "identity_conflict",
+    "memory_lock_unavailable", "hub_pending", "legacy_verbatim_only_unstorable",
+    "verbatim_only_unconfirmed", "unknown",
+})
+
+# The legacy writer's own stderr prefixes for its exit-65 refusals, matched to
+# choose a code; the text itself is never kept.
+_CHILD_REFUSALS = (
+    ("[capture_v2] payload missing 'summary'", "file_leg_empty_summary"),
+    ("[capture_v2] invalid JSON", "invalid_json"),
+)
+
+
+def _set_reason(outcome: dict[str, Any] | None, code: str) -> None:
+    if outcome is not None:
+        outcome["reason"] = code if code in REASON_CODES else "unknown"
+
+
+def _verbatim_only_empty(payload: dict[str, Any]) -> bool:
+    return (payload.get("summary_kind") == "verbatim_only"
+            and not str(payload.get("summary") or "").strip())
+
+
+def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool,
+                   outcome: dict[str, Any] | None = None) -> int:
+    """Run the legacy file writer. On a non-zero return, ``outcome["reason"]``
+    (when given) holds a code from REASON_CODES for this call only."""
     from khipu.paths import isolated_dir
 
     if isolated_dir() is not None:
@@ -1798,9 +1913,11 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
     if capture_v2 is None:
         _log("capture_v2 not configured (khipu config --set capture_v2 PATH); "
              "file wiki not written")
+        _set_reason(outcome, "file_leg_not_configured")
         return EX_SOFTWARE
     if not capture_v2.is_file():
         _log(f"capture_v2 not found at {capture_v2} (khipu config --set capture_v2 PATH)")
+        _set_reason(outcome, "file_leg_not_configured")
         return EX_SOFTWARE
     env = dict(os.environ)
     if suppress_mirror:
@@ -1836,17 +1953,27 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool) -> int:
                 # PG-failure path has already queued to the outbox — so a hung file leg
                 # is a bad exit code, never an uncaught traceback out of the hook.
                 _log(f"capture_v2 timed out after 300s ({capture_v2})")
+                _set_reason(outcome, "file_leg_timeout")
                 return EX_SOFTWARE
             except OSError as exc:
                 _log(f"capture_v2 could not run: {type(exc).__name__}: {exc}")
+                _set_reason(outcome, "file_leg_unrunnable")
                 return EX_SOFTWARE
     except RegistryError as exc:
         _log(f"tombstone registry unavailable; file wiki leg refused ({exc})")
+        _set_reason(outcome, "tombstone_registry_unavailable")
         return EX_SOFTWARE
-    if proc.stdout.strip():
-        print(proc.stdout.rstrip())
-    if proc.stderr.strip():
-        print(proc.stderr.rstrip(), file=sys.stderr)
+    # The child's own stdout/stderr are never forwarded: they can echo capture
+    # text, and our stderr lands in stop-hook.log and the drain log, which
+    # forget does not cover (khipu/capture_stores.py). Only a fixed code is.
+    if proc.returncode != 0:
+        code = "file_leg_rejected"
+        for prefix, known in _CHILD_REFUSALS:
+            if prefix in (proc.stderr or ""):
+                code = known
+                break
+        _set_reason(outcome, code)
+        _log(f"capture_v2 exited {proc.returncode} (reason: {code})")
     return proc.returncode
 
 
@@ -1865,6 +1992,7 @@ def capture(payload: dict[str, Any], *, mode: str | None = None,
             return _capture(payload, mode=mode, result=result)
     except memory_lock.MemoryLockError as exc:
         _log(f"memory lock unavailable; capture refused ({exc})")
+        _set_reason(result, "memory_lock_unavailable")
         return EX_SOFTWARE
 
 
@@ -1875,6 +2003,7 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
         _validate_timestamp(payload)
     except ValueError as exc:
         _log(str(exc))
+        _set_reason(result, "invalid_timestamp")
         return EX_DATAERR
     _redact_capture_values(payload)
     if payload.get("scope") == "trivial":
@@ -1902,7 +2031,13 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
 
     if mode == "legacy":
         _log("mode=legacy → capture_v2 only")
-        return run_capture_v2(payload, suppress_mirror=False)
+        if _verbatim_only_empty(payload):
+            # The file writer is the only leg here and refuses an empty
+            # summary, so this capture cannot be stored: fail and stay queued.
+            _log("mode=legacy cannot store a verbatim_only capture; not stored")
+            _set_reason(result, "legacy_verbatim_only_unstorable")
+            return EX_DATAERR
+        return run_capture_v2(payload, suppress_mirror=False, outcome=result)
 
     # dual + hub: PG first, durably. If PG is unreachable the payload goes to the
     # outbox (replayed by the next Stop hook / nightly / `khipu outbox drain`)
@@ -1920,6 +2055,7 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
             return 0
     except CaptureIdentityConflict as exc:
         _log(str(exc))
+        _set_reason(result, "identity_conflict")
         return EX_SOFTWARE
     except Exception as exc:  # noqa: BLE001 — surfaced, queued, never swallowed
         from khipu.outbox import enqueue
@@ -1936,10 +2072,13 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
         # lands the row now, and if not it re-queues the same identity (no dup).
         if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
             _log(f"hub delivery pending; durable_outbox={queued}")
+            _set_reason(result, "hub_pending")
             return EX_SOFTWARE
-        rc = run_capture_v2(payload, suppress_mirror=False)
+        rc = run_capture_v2(payload, suppress_mirror=False, outcome=result)
         if rc != 0:
             return rc
+        if not queued:
+            _set_reason(result, "hub_pending")
         return 0 if queued else EX_SOFTWARE
     _log(
         f"mode={mode} pg ok episode_inserted={stats['episode_inserted']} "
@@ -1957,9 +2096,20 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
     # files"). Same call either way — the legacy consumers (nightly consolidate,
     # topic amend, MEMORY.md) keep working in both modes. KHIPU_HUB_FILE_MIRROR=0
     # turns the reverse mirror off in hub for a future all-PG world.
+    if _verbatim_only_empty(payload):
+        # The legacy writer refuses an empty summary (exit 65), so the hub row
+        # is this capture's only store. Acknowledge only when write_pg read
+        # that row back, before committing, holding this payload's verbatim
+        # evidence; a dedup onto a row without it must keep the job queued.
+        if stats.get("verbatim_stored") is not True:
+            _log("verbatim_only capture not confirmed on the hub row; kept")
+            _set_reason(result, "verbatim_only_unconfirmed")
+            return EX_DATAERR
+        _log("verbatim_only capture confirmed on the hub row; file wiki leg skipped")
+        return 0
     if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
         return 0
-    rc = run_capture_v2(payload, suppress_mirror=True)
+    rc = run_capture_v2(payload, suppress_mirror=True, outcome=result)
     return rc
 
 

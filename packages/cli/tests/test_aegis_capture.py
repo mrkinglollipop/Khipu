@@ -214,7 +214,7 @@ class DrainTest(unittest.TestCase):
 
             captured = []
             with mock.patch("khipu.extract.extract_memory", fake_extract), \
-                    mock.patch("khipu.capture.capture", lambda p, mode=None: captured.append(p) or 0), \
+                    mock.patch("khipu.capture.capture", lambda p, mode=None, **_: captured.append(p) or 0), \
                     mock.patch("khipu.config.capture_mode", lambda: "dual"):
                 out = ac.drain()
             self.assertEqual((out["captured"], out["empty"], out["failed"]), (1, 1, 1))
@@ -247,7 +247,7 @@ class DrainTest(unittest.TestCase):
                         "preferences": [], "scope": "", "edges": [], "topic_pages": []}
 
             with mock.patch("khipu.extract.extract_memory", slow), \
-                    mock.patch("khipu.capture.capture", lambda p, mode=None: captured.append(p) or 0), \
+                    mock.patch("khipu.capture.capture", lambda p, mode=None, **_: captured.append(p) or 0), \
                     mock.patch("khipu.config.capture_mode", lambda: "dual"):
                 threads = [threading.Thread(target=lambda: results.append(ac.drain())) for _ in range(3)]
                 [t.start() for t in threads]
@@ -287,7 +287,7 @@ class DrainTest(unittest.TestCase):
             with mock.patch("khipu.extract.extract_memory", lambda t, *, cwd="", **kw: {
                     "summary": "s", "topics": [], "decisions": [], "preferences": [],
                     "scope": "", "edges": [], "topic_pages": []}), \
-                    mock.patch("khipu.capture.capture", lambda p, mode=None: captured.append(p) or 0), \
+                    mock.patch("khipu.capture.capture", lambda p, mode=None, **_: captured.append(p) or 0), \
                     mock.patch("khipu.config.capture_mode", lambda: "dual"):
                 ac.drain()
             self.assertEqual(len(captured), 1)

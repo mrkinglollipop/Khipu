@@ -3810,7 +3810,8 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
         except Exception as e:  # noqa: BLE001 — a direction scan never blocks capture
             _log(f"drain: routing direction scan skipped for {original.name}: {type(e).__name__}: {e}")
         try:
-            rc = capture(payload, mode=mode)
+            outcome: dict = {}
+            rc = capture(payload, mode=mode, result=outcome)
         except BudgetExhausted:
             _release(jp)
             out["synth_budget_exhausted"] = True
@@ -3826,7 +3827,12 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             out["failed"] += 1
             _capture_failure(jp, job, f"capture rc={rc}", out, free_first=True)
             _record_drain(harness, captured=False, error=f"capture rc={rc}")
-            _log(f"drain: capture rc={rc} for {original.name}; kept")
+            from khipu.capture import REASON_CODES
+
+            # A fixed code only: this log is outside forget's coverage.
+            reason = outcome.get("reason")
+            reason = reason if reason in REASON_CODES else "unknown"
+            _log(f"drain: capture rc={rc} for {original.name}; kept (reason: {reason})")
             continue
         _discard_claim(jp)
         out["captured"] += 1

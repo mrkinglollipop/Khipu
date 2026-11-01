@@ -162,6 +162,59 @@ class PersistentCaptureRetryTest(unittest.TestCase):
         self.assertIn("note", self.capture.call_args.args[0]["verbatim"])
         self.assertTrue(self.capture.call_args.args[0]["deliverables"])
 
+    def test_failed_capture_logs_only_a_fixed_reason_code(self):
+        from khipu import capture as cap
+
+        secret = "sk-synthetic-NOTREAL-0000"
+        td = tempfile.TemporaryDirectory(prefix="fake-v2-")
+        self.addCleanup(td.cleanup)
+        fake = Path(td.name) / "capture_v2.py"
+        fake.write_text("import sys\nprint('[capture_v2] payload missing \\'summary\\' "
+                        f"synthetic-capture-text {secret}', file=sys.stderr)\nsys.exit(65)\n")
+
+        def real_file_leg(payload, *, mode=None, result=None):
+            with mock.patch.object(cap, "_capture_v2", return_value=fake):
+                return cap.run_capture_v2(payload, suppress_mirror=True, outcome=result)
+
+        self.enqueue(extracted_payload={"summary": "synthetic-capture-text"})
+        self.capture.side_effect = real_file_leg
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sc, "_log") as log, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            sc.drain(limit=1)
+        lines = [c.args[0] for c in log.call_args_list if "capture rc=" in c.args[0]]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].endswith("; kept (reason: file_leg_empty_summary)"), lines)
+        # The whole drain log, and everything the drain wrote to its own
+        # stdout/stderr (stop-hook.log in production), is free of child text.
+        everything = "\n".join([*(str(c.args[0]) for c in log.call_args_list),
+                                out.getvalue(), err.getvalue()])
+        self.assertNotIn(secret, everything)
+        self.assertNotIn("synthetic-capture-text", everything)
+
+    def test_reason_does_not_carry_over_to_a_later_job(self):
+        reasons = iter(["invalid_timestamp", None])
+
+        def fail(payload, *, mode=None, result=None):
+            code = next(reasons)
+            if code:
+                result["reason"] = code
+            return 65
+
+        self.enqueue(extracted_payload={"summary": "cached"})
+        self.capture.side_effect = fail
+        with mock.patch.object(sc, "_log") as log:
+            sc.drain(limit=1)
+            self.now += 10 ** 6  # past any retry backoff
+            sc.drain(limit=1)
+        lines = [c.args[0] for c in log.call_args_list if "capture rc=" in c.args[0]]
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("(reason: invalid_timestamp)", lines[0])
+        self.assertIn("(reason: unknown)", lines[1])
+
     def test_delivery_exception_is_also_bounded(self):
         first, _ = self.enqueue(extracted_payload={"summary": "cached"})
         self.capture.side_effect = RuntimeError("delivery rejected")

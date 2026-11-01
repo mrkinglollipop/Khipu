@@ -169,7 +169,7 @@ class LiveEmbedOnCaptureTest(unittest.TestCase):
         # hub reverse-mirrors to the legacy file (2026-08-17): never write a
         # probe line into the real episodes.jsonl from a test — stub the leg.
         from unittest import mock as _mock
-        file_leg = _mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror: 0)
+        file_leg = _mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror, **_: 0)
         file_leg.start()
         self.addCleanup(file_leg.stop)
         try:

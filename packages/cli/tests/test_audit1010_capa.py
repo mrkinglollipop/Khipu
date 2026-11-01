@@ -240,7 +240,7 @@ class CaptureCapaTest(unittest.TestCase):
                                               "preferences": [], "scope": "", "edges": [], "topic_pages": []}})
             captured = []
             with mock.patch("khipu.extract.extract_memory", side_effect=AssertionError("second model call")), \
-                    mock.patch("khipu.capture.capture", lambda payload, mode=None: captured.append(payload) or 0), \
+                    mock.patch("khipu.capture.capture", lambda payload, mode=None, **_: captured.append(payload) or 0), \
                     mock.patch("khipu.config.capture_mode", lambda: "hub"):
                 self.assertEqual(sc.drain()["captured"], 1)
             self.assertEqual(captured[0]["summary"], "cached")
@@ -276,7 +276,7 @@ class CaptureCapaTest(unittest.TestCase):
             first_open = threading.Event()
             close_first = threading.Event()
 
-            def capture(payload, mode=None):
+            def capture(payload, mode=None, **_):
                 part = payload["part"]
                 effects.append(f"open:{part}")
                 if part == "1/2":

@@ -109,7 +109,7 @@ class RoutingTest(unittest.TestCase):
         )
         self.p_v2 = mock.patch.object(
             cap, "run_capture_v2",
-            side_effect=lambda payload, *, suppress_mirror: self.calls.append(("v2", {"suppress": suppress_mirror})) or 0,
+            side_effect=lambda payload, *, suppress_mirror, **_: self.calls.append(("v2", {"suppress": suppress_mirror})) or 0,
         )
         self.p_pg.start()
         self.p_v2.start()
@@ -182,7 +182,7 @@ class LiveHubWriteTest(unittest.TestCase):
         md = hashlib.md5(summary.encode()).hexdigest()
         # hub now reverse-mirrors to the legacy file (2026-08-17); a test must
         # never write a probe line into the real episodes.jsonl, so stub the leg.
-        file_leg = mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror: 0)
+        file_leg = mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror, **_: 0)
         file_leg.start()
         self.addCleanup(file_leg.stop)
         try:
@@ -244,6 +244,33 @@ class PayloadRobustnessTest(unittest.TestCase):
                 rc = cap.run_capture_v2({"summary": "s"}, suppress_mirror=True)
         self.assertEqual(rc, cap.EX_SOFTWARE)
 
+    def test_child_rejection_gives_a_fixed_code_never_its_text(self):
+        # Synthetic secret and capture-shaped text on the child's stderr.
+        secret = "sk-synthetic-NOTREAL-0000"
+        with tempfile.TemporaryDirectory() as td:
+            fake = pathlib.Path(td) / "capture_v2.py"
+            fake.write_text("import sys\nprint('[capture_v2] payload missing \\'summary\\' "
+                            f"summary=synthetic-capture-text {secret}', file=sys.stderr)\nsys.exit(65)\n")
+            other = pathlib.Path(td) / "other.py"
+            other.write_text("import sys\nprint('synthetic odd failure', file=sys.stderr)\nsys.exit(65)\n")
+            first: dict = {}
+            with mock.patch.object(cap, "_capture_v2", return_value=fake):
+                rc = cap.run_capture_v2({"summary": "s"}, suppress_mirror=True, outcome=first)
+            second: dict = {}
+            with mock.patch.object(cap, "_capture_v2", return_value=other):
+                cap.run_capture_v2({"summary": "s"}, suppress_mirror=True, outcome=second)
+            third: dict = {}
+            ok = pathlib.Path(td) / "ok.py"
+            ok.write_text("import sys\nsys.exit(0)\n")
+            with mock.patch.object(cap, "_capture_v2", return_value=ok):
+                self.assertEqual(cap.run_capture_v2({"summary": "s"}, suppress_mirror=True, outcome=third), 0)
+        self.assertEqual(rc, 65)
+        self.assertEqual(first, {"reason": "file_leg_empty_summary"})
+        # No carry-over: each call reports only its own reason.
+        self.assertEqual(second, {"reason": "file_leg_rejected"})
+        self.assertEqual(third, {})
+        self.assertFalse(hasattr(cap, "last_child_reason"))
+
     def test_an_unrunnable_capture_v2_returns_a_code_not_a_traceback(self):
         with tempfile.TemporaryDirectory() as td:
             fake = pathlib.Path(td) / "capture_v2.py"
@@ -252,6 +279,73 @@ class PayloadRobustnessTest(unittest.TestCase):
                  mock.patch.object(cap, "_run_legacy_group", side_effect=OSError("exec format error")):
                 rc = cap.run_capture_v2({"summary": "s"}, suppress_mirror=True)
         self.assertEqual(rc, cap.EX_SOFTWARE)
+
+    def test_run_capture_v2_no_longer_skips_an_empty_summary_itself(self):
+        # The skip lives in _capture, gated on a durable hub row; the file
+        # leg alone must never report success for a payload it did not store.
+        out: dict = {}
+        with mock.patch.object(cap, "_capture_v2", return_value=None):
+            rc = cap.run_capture_v2({"summary": "", "summary_kind": "verbatim_only"},
+                                    suppress_mirror=True, outcome=out)
+        self.assertEqual(rc, cap.EX_SOFTWARE)
+        self.assertEqual(out, {"reason": "file_leg_not_configured"})
+
+
+class VerbatimOnlyFileLegTest(unittest.TestCase):
+    """The file leg is skipped only for an empty verbatim_only summary whose
+    hub row was durably written in the same capture."""
+
+    def setUp(self):
+        self.v2 = mock.Mock(return_value=0)
+        self.pg = mock.Mock(return_value={"episode_inserted": False, "topics_written": 0})
+        for patch in (mock.patch.object(cap, "run_capture_v2", self.v2),
+                      mock.patch.object(cap, "write_pg", self.pg),
+                      mock.patch("khipu.t3.thread_for_session", return_value=None),
+                      mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "1"})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def payload(self, **kw):
+        base = {"summary": "", "summary_kind": "verbatim_only", "scope": "general",
+                "ts": "2026-10-31T12:00:00Z", "session_id": "synthetic:s1",
+                "verbatim": {"note": "synthetic note"}}
+        base.update(kw)
+        return base
+
+    def test_a_hub_write_without_confirmation_keeps_the_job(self):
+        # write_pg returned no verbatim_stored: nothing proves the note landed.
+        result: dict = {}
+        self.assertEqual(cap._capture(self.payload(), mode="hub", result=result), cap.EX_DATAERR)
+        self.assertEqual(result["reason"], "verbatim_only_unconfirmed")
+        self.pg.assert_called_once()
+        self.v2.assert_not_called()
+
+    def test_hub_write_failed_still_runs_the_file_leg(self):
+        self.pg.side_effect = RuntimeError("synthetic pg down")
+        with mock.patch("khipu.outbox.enqueue"):
+            cap._capture(self.payload(), mode="dual", result={})
+        self.v2.assert_called_once()
+
+    def test_legacy_verbatim_only_fails_and_is_not_dropped(self):
+        result: dict = {}
+        rc = cap._capture(self.payload(), mode="legacy", result=result)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(result["reason"], "legacy_verbatim_only_unstorable")
+        self.v2.assert_not_called()
+        self.pg.assert_not_called()
+
+    def test_legacy_whitespace_summary_with_decisions_still_reaches_the_file_writer(self):
+        p = {"summary": "   ", "scope": "general", "ts": "2026-10-31T12:00:00Z",
+             "session_id": "synthetic:s2", "decisions": ["synthetic decision"]}
+        self.assertEqual(cap._capture(p, mode="legacy", result={}), 0)
+        self.v2.assert_called_once()
+        self.assertEqual(self.v2.call_args.args[0]["decisions"], ["synthetic decision"])
+
+    def test_whitespace_summary_without_verbatim_kind_keeps_the_file_leg_in_hub(self):
+        p = self.payload(summary="   ", decisions=["synthetic decision"])
+        p.pop("summary_kind")
+        cap._capture(p, mode="hub", result={})
+        self.v2.assert_called_once()
 
 class _EpisodesFakeCursor:
     """Enough of a Postgres cursor to exercise write_pg's own orchestration
@@ -447,6 +541,150 @@ class _FakeConn:
 
     def __exit__(self, *a):
         return False
+
+
+class NoteHeldNormalisationTest(unittest.TestCase):
+    """A stored note confirms through the writer's paragraph normalisation."""
+
+    def test_blank_paragraphs_normalised_by_a_merge_still_confirm(self):
+        original = "First\n\n\n\nSecond"
+        merged = cap._append_summary(cap._append_summary("", original), "Third")
+        self.assertTrue(cap._note_held(original, original))
+        self.assertTrue(cap._note_held(merged, original))
+
+    def test_whitespace_only_note_confirms_only_when_stored_unchanged(self):
+        self.assertTrue(cap._note_held("  \n ", "  \n "))
+        self.assertFalse(cap._note_held("", "  \n "))
+        self.assertFalse(cap._note_held("other", "  \n "))
+
+    def test_a_different_or_partial_note_still_fails(self):
+        self.assertFalse(cap._note_held("First\n\nSecond", "Firs"))
+        self.assertFalse(cap._note_held("First\n\nSecond", "Second\n\nFirst"))
+        self.assertFalse(cap._note_held(None, "First"))
+
+
+class VerbatimOnlyRealWritePgTest(unittest.TestCase):
+    """The file-leg skip for an empty verbatim_only summary, through the real
+    write_pg on the fake hub: acknowledged only when the row it inserted or
+    matched holds this payload's verbatim evidence."""
+
+    NOTE = "synthetic verbatim note"
+
+    def setUp(self):
+        self.v2 = mock.Mock(return_value=0)
+        for patch in (
+                mock.patch.object(cap, "run_capture_v2", self.v2),
+                mock.patch("khipu.topic_graph.persist_capture_graph",
+                           return_value={"nodes_minted": 0, "edges_minted": 0}),
+                mock.patch("khipu.config.path_setting", return_value=None),
+                mock.patch("khipu.embed.embed_one", side_effect=RuntimeError("no key in test")),
+                mock.patch("khipu.embed.embed_on_capture"),
+                mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)),
+                mock.patch("khipu.t3.thread_for_session", return_value=None),
+                mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "1"})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def payload(self):
+        return {"ts": "2026-10-31T12:05:00Z", "session_id": "cursor:synthetic-1",
+                "summary": "", "summary_kind": "verbatim_only", "scope": "general",
+                "harness": "cursor", "transcript_range": "0:100", "project": "acme/widget",
+                "verbatim": {"note": self.NOTE}}
+
+    def existing(self, raw):
+        return {1: {
+            "ts": "2026-10-31T12:00:00Z", "session_id": "cursor:synthetic-1", "summary": "",
+            "topics": [], "decisions": [], "preferences": [], "raw": raw,
+            "harness": "cursor", "repo_root": "/r", "project": "acme/widget",
+            "parent_session_id": None, "transcript_range": "0:100", "tags": [],
+        }}
+
+    def run_capture(self, cur, mode):
+        result: dict = {}
+        with mock.patch("khipu.db.connect", return_value=_FakeConn(cur)):
+            rc = cap._capture(self.payload(), mode=mode, result=result)
+        return rc, result
+
+    def test_exact_window_row_without_the_note_keeps_the_job(self):
+        for mode in ("hub", "dual"):
+            with self.subTest(mode=mode):
+                self.v2.reset_mock()
+                cur = _EpisodesFakeCursor(self.existing({"summary_kind": "verbatim_only"}))
+                rc, result = self.run_capture(cur, mode)
+                self.assertEqual(result["dedup"]["matched_via"], "exact_window")
+                self.assertFalse(result["verbatim_stored"])
+                self.assertEqual(rc, cap.EX_DATAERR)
+                self.assertEqual(rc, 65)
+                self.assertEqual(result["reason"], "verbatim_only_unconfirmed")
+                self.v2.assert_not_called()
+                self.assertEqual(len(cur.episodes), 1)
+
+    def test_exact_window_row_holding_the_same_note_succeeds(self):
+        # The retry: an earlier attempt already wrote this capture's row.
+        for mode in ("hub", "dual"):
+            with self.subTest(mode=mode):
+                self.v2.reset_mock()
+                cur = _EpisodesFakeCursor(self.existing(
+                    {"summary_kind": "verbatim_only", "verbatim": {"note": self.NOTE}}))
+                rc, result = self.run_capture(cur, mode)
+                self.assertEqual(result["dedup"]["matched_via"], "exact_window")
+                self.assertTrue(result["verbatim_stored"])
+                self.assertEqual(rc, 0)
+                self.assertNotIn("reason", result)
+                self.v2.assert_not_called()
+
+    def test_exact_window_row_holding_a_different_note_keeps_the_job(self):
+        cur = _EpisodesFakeCursor(self.existing(
+            {"summary_kind": "verbatim_only", "verbatim": {"note": "another synthetic note"}}))
+        rc, result = self.run_capture(cur, "hub")
+        self.assertEqual(rc, 65)
+        self.assertEqual(result["reason"], "verbatim_only_unconfirmed")
+
+    def test_fresh_insert_succeeds_and_skips_the_file_leg(self):
+        for mode in ("hub", "dual"):
+            with self.subTest(mode=mode):
+                self.v2.reset_mock()
+                cur = _EpisodesFakeCursor()
+                rc, result = self.run_capture(cur, mode)
+                self.assertTrue(result["episode_inserted"])
+                self.assertTrue(result["verbatim_stored"])
+                self.assertEqual(rc, 0)
+                self.v2.assert_not_called()
+                (row,) = cur.episodes.values()
+                self.assertEqual(row["raw"]["verbatim"]["note"], self.NOTE)
+
+    def test_hub_without_the_file_mirror_still_needs_confirmation(self):
+        cur = _EpisodesFakeCursor(self.existing({"summary_kind": "verbatim_only"}))
+        with mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "0"}):
+            rc, result = self.run_capture(cur, "hub")
+        self.assertEqual(rc, 65)
+        self.assertEqual(result["reason"], "verbatim_only_unconfirmed")
+
+
+def test_child_output_never_reaches_our_stdout_or_stderr(capfd):
+    # Synthetic secret and capture-shaped text from a fake legacy writer, on
+    # both streams, for a refusal and for a success.
+    secret = "sk-synthetic-NOTREAL-1111"
+    text = "summary=synthetic-capture-text"
+    with tempfile.TemporaryDirectory() as td:
+        bad = pathlib.Path(td) / "bad.py"
+        bad.write_text(f"import sys\nprint('{text} {secret}')\n"
+                       f"print('[capture_v2] invalid JSON {text} {secret}', file=sys.stderr)\n"
+                       "sys.exit(65)\n")
+        good = pathlib.Path(td) / "good.py"
+        good.write_text(f"import sys\nprint('{text} {secret}')\n"
+                        f"print('{text} {secret}', file=sys.stderr)\n")
+        first: dict = {}
+        with mock.patch.object(cap, "_capture_v2", return_value=bad):
+            assert cap.run_capture_v2({"summary": "s"}, suppress_mirror=True, outcome=first) == 65
+        with mock.patch.object(cap, "_capture_v2", return_value=good):
+            assert cap.run_capture_v2({"summary": "s"}, suppress_mirror=True) == 0
+    captured = capfd.readouterr()
+    assert first == {"reason": "invalid_json"}
+    for stream in (captured.out, captured.err):
+        assert secret not in stream
+        assert "synthetic-capture-text" not in stream
+    assert "capture_v2 exited 65 (reason: invalid_json)" in captured.err
 
 
 class WritePgOrchestrationTest(unittest.TestCase):

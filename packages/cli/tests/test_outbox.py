@@ -105,7 +105,7 @@ class OutboxUnitTest(unittest.TestCase):
         payload = {"ts": "2026-08-17T18:00:00Z", "summary": "queued one", "topics": []}
         ran = []
         with mock.patch.object(cap, "write_pg", side_effect=RuntimeError("pg down")), \
-                mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror: ran.append(suppress_mirror) or 0):
+                mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror, **_: ran.append(suppress_mirror) or 0):
             self.assertEqual(cap.capture(payload, mode="dual"), 0)
             self.assertEqual(cap.capture(payload, mode="hub"), 0)
         self.assertEqual(ran, [False, False])              # file leg ran, mirror left ON
@@ -116,7 +116,7 @@ class OutboxUnitTest(unittest.TestCase):
 
         ran = []
         with mock.patch.object(cap, "write_pg", return_value={"episode_inserted": False, "topics_written": 0}), \
-                mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror: ran.append(suppress_mirror) or 0):
+                mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror, **_: ran.append(suppress_mirror) or 0):
             self.assertEqual(cap.capture({"summary": "x", "ts": "2026-10-10T00:00:00Z"}, mode="hub"), 0)
             with mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "0"}):
                 self.assertEqual(cap.capture({"summary": "x", "ts": "2026-10-10T00:00:00Z"}, mode="hub"), 0)
@@ -211,7 +211,7 @@ class LiveOutageTest(unittest.TestCase):
             try:
                 with mock.patch.dict(os.environ, {"KHIPU_DATABASE_URL":
                                                   "postgresql://nobody@127.0.0.1:1/none?connect_timeout=2"}), \
-                        mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror: 0):
+                        mock.patch.object(cap, "run_capture_v2", lambda p, suppress_mirror, **_: 0):
                     self.assertEqual(cap.capture(payload, mode="hub"), 0)   # outage: queued, not failed
                 self.assertEqual(outbox.status()["pending"], 1)
                 out = outbox.drain()                                          # PG is back
