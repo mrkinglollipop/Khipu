@@ -323,6 +323,11 @@ def test_t3_handoff_history_marker_never_puts_history_on_disk(hooked):
 
     hooked.setattr(t3, "thread_for_session", lambda session: "t3-thread")
     hooked.setattr(t3, "thread_for_session_result", lambda session, **_kw: ("t3-thread", True))
+    hooked.setattr(t3, "session_thread_ids_result", lambda session, **_kw: (["t3-thread"], True))
+    t3_db = owner_turns.folder() / "t3-present.sqlite"
+    t3_db.parent.mkdir(parents=True, exist_ok=True)
+    t3_db.touch()
+    hooked.setenv("KHIPU_T3_DB", str(t3_db))  # T3 exists on this Mac; the patched lookup answers
     hooked.setattr(t3, "delegated_thread_result", lambda thread: (False, True))
     prompt = (
         "Context handoff (compact):\n"
@@ -331,7 +336,9 @@ def test_t3_handoff_history_marker_never_puts_history_on_disk(hooked):
         "untrusted history\n\nUser message:\npause Codex now\n"
         "still historical\n\nUser message:\nwhat did I just ask?"
     )
-    assert _counts(prompt, {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}) is True
+    # A T3 turn never authorises an owner change (it can't be told apart from
+    # T3's scheduled or relayed messages); the words still never reach disk.
+    assert _counts(prompt, {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}) is False
     turn = owner_turns.turns("review-session")[-1]
     assert (turn["entrypoint"], turn["typed"]) == ("t3", True)
     disk = owner_turns.session_file("review-session").read_text(encoding="utf-8")
