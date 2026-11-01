@@ -696,6 +696,8 @@ def test_a_helper_bundle_inside_cursor_is_trusted(home, kernel):
 
 def test_cursor_in_the_users_own_applications_is_trusted(home, kernel, monkeypatch, tmp_path):
     user = tmp_path / "user"
+    (user / "Applications").mkdir(parents=True)
+    (tmp_path / "someone-else/Applications").mkdir(parents=True)
     monkeypatch.setattr(owner_turns, "_real_home", lambda: str(user))
     exe = str(user / "Applications/Cursor.app/Contents/MacOS/Cursor")
     kernel(exe, [exe], False)
@@ -704,6 +706,78 @@ def test_cursor_in_the_users_own_applications_is_trusted(home, kernel, monkeypat
     # $HOME is not the user's home: a bundle under it alone is not installed.
     monkeypatch.setattr(owner_turns, "_real_home", lambda: str(tmp_path / "someone-else"))
     assert owner_turns._app_bundle(exe) == ""
+
+
+# Review round 3: on a case-insensitive volume the place is judged by the
+# directory it is on disk, and the bundle name without case.
+
+def _case_insensitive(path) -> bool:
+    return os.path.exists(str(path).swapcase())
+
+
+def test_a_case_variant_path_to_the_trusted_place_is_trusted(home, kernel, monkeypatch, tmp_path):
+    user = tmp_path / "user"
+    (user / "Applications").mkdir(parents=True)
+    if not _case_insensitive(user / "Applications"):
+        pytest.skip("this volume is case-sensitive")
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(user))
+    exe = str(user / "applications/cursor.app/Contents/MacOS/Cursor")
+    assert owner_turns._app_bundle(exe) == "Cursor.app"
+    assert owner_turns._app_bundle(str(user / "APPLICATIONS/ANTIGRAVITY.APP/node")) == "Antigravity.app"
+    kernel(exe, [exe], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+
+
+def test_a_case_variant_path_to_the_system_applications_is_trusted(home, kernel):
+    if not _case_insensitive("/Applications"):
+        pytest.skip("/Applications is on a case-sensitive volume")
+    exe = "/applications/cursor.app/Contents/MacOS/Cursor"
+    assert owner_turns._app_bundle(exe) == "Cursor.app"
+    kernel(exe, [exe], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+
+
+@pytest.mark.parametrize("rel", ["applications/cursor.app/Contents/MacOS/Cursor",
+                                 "Applications/CURSOR.APP/Contents/MacOS/Cursor",
+                                 "x/Applications/cursor.app/Contents/MacOS/Cursor"])
+def test_a_case_variant_look_alike_outside_the_trusted_places_is_refused(home, kernel, monkeypatch,
+                                                                          tmp_path, rel):
+    fake = tmp_path / "fake"
+    (fake / "Applications").mkdir(parents=True)
+    (fake / "x/Applications").mkdir(parents=True)
+    (tmp_path / "user/Applications").mkdir(parents=True)
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(tmp_path / "user"))
+    exe = str(fake / rel)
+    assert owner_turns._app_bundle(exe) == ""
+    kernel(exe, [exe, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "cursor_sdk", False)
+
+
+@pytest.mark.parametrize("name", ["Curſor.app", "CursorEvil.app", "Cursor.app.app", "cursor .app"])
+def test_a_look_alike_name_in_a_trusted_place_is_not_the_app(monkeypatch, tmp_path, name):
+    (tmp_path / "Applications").mkdir()
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(tmp_path))
+    assert owner_turns._app_bundle(str(tmp_path / "Applications" / name / "node")) == name
+
+
+@pytest.mark.parametrize("error", [KeyError("uid"), OSError("pwd")])
+def test_a_failed_home_lookup_only_drops_the_users_applications(home, kernel, monkeypatch, tmp_path, error):
+    def broken():
+        raise error
+
+    (tmp_path / "Applications").mkdir()
+    monkeypatch.setattr(owner_turns, "_real_home", broken)
+    exe = "/Applications/Cursor.app/Contents/MacOS/Cursor"
+    assert owner_turns._app_bundle(exe) == "Cursor.app"
+    kernel(exe, [exe], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+    # ~/Applications, whichever directory it is, is not a trusted place without the home.
+    own = str(tmp_path / "Applications/Cursor.app/Contents/MacOS/Cursor")
+    assert owner_turns._app_bundle(own) == ""
 
 
 @pytest.mark.parametrize("args,tty,entry", [

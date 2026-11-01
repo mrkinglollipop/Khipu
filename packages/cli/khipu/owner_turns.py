@@ -764,19 +764,45 @@ def _app_bundle(exe: str) -> str | None:
     every Cursor helper), "" when it runs from none, None when its path is
     unknown. Symlinks are resolved first, and a bundle counts only when it
     is the outermost one and sits directly in /Applications or the user's
-    own ~/Applications; anywhere else the process runs from no bundle."""
+    own ~/Applications; anywhere else the process runs from no bundle.
+    Names and places are matched as a case-insensitive volume would: the
+    name without case (ASCII only, so no Unicode fold makes a look-alike
+    match), the place by the directory it is on disk, never by spelling."""
     if not exe:
         return None
     try:
         path = Path(os.path.realpath(exe))
-        places = {Path(os.path.realpath("/Applications")),
-                  Path(os.path.realpath(os.path.join(_real_home(), "Applications")))}
-    except (OSError, KeyError, ValueError):
+    except (OSError, ValueError):
         return None
     for i, part in enumerate(path.parts):
-        if part.endswith(".app"):
-            return part if Path(*path.parts[:i]) in places else ""
+        if part.casefold().endswith(".app"):
+            if not _in_trusted_place(Path(*path.parts[:i])):
+                return ""
+            for names in TRUSTED_BUNDLES.values():
+                for name in names:
+                    if part.isascii() and part.casefold() == name.casefold():
+                        return name
+            return part
     return ""
+
+
+def _in_trusted_place(parent: Path) -> bool:
+    """``parent`` is /Applications or the real user's ~/Applications, by
+    filesystem identity. /Applications is checked first and alone: a failed
+    home lookup only means ~/Applications is not a trusted place."""
+    try:
+        if os.path.samefile(parent, "/Applications"):
+            return True
+    except (OSError, ValueError):
+        pass
+    try:
+        home = _real_home()
+    except (KeyError, OSError, ValueError):
+        return False
+    try:
+        return os.path.samefile(parent, os.path.join(home, "Applications"))
+    except (OSError, ValueError):
+        return False
 
 
 def _real_home() -> str:
