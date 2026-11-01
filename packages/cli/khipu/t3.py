@@ -290,13 +290,23 @@ def is_owner_message(payload, thread_id: str) -> bool:
             and isinstance(payload.get("text"), str))
 
 
-def owner_message_after(thread_id: str, since: float) -> tuple[dict | None, bool]:
-    """``(message, definitive)``: the newest message the owner typed in
-    ``thread_id`` created after ``since`` (epoch seconds), as ``{id, at,
-    ts, text}``, from one read-only bounded read of T3's message
-    projection. The text is returned for hashing only. A missing database,
-    lock, timeout or failing query is ``(None, False)``: a caller deciding
-    permission refuses on it."""
+# Owner-shaped rows, filtered in SQL so machine traffic can't push the
+# owner's message out of a bounded read. ``CASE`` keeps a malformed payload
+# from failing the whole query; ``is_owner_message`` still decides each row.
+_OWNER_ROWS_SQL = (
+    "role = 'user' AND CASE WHEN json_valid(payload_json) THEN "
+    "json_extract(payload_json, '$.createdBy') = 'user' "
+    "AND json_extract(payload_json, '$.creationSource') IN ('web', 'mobile') "
+    + "".join(f"AND IFNULL(json_extract(payload_json, '$.{key}'), '') IN ('', '{{}}', '[]') "
+              for key in MACHINE_MESSAGE_KEYS)
+    + "ELSE 0 END"
+)
+
+
+def _read_messages(thread_id: str, read):
+    """``(read(con), True)`` from one read-only bounded read of T3's message
+    projection, or ``(None, False)`` on a missing database, lock, timeout or
+    failing query: a caller deciding permission refuses on it."""
     if not isinstance(thread_id, str) or not thread_id:
         return None, False
     path = _thread_db_path()
@@ -308,27 +318,71 @@ def owner_message_after(thread_id: str, since: float) -> tuple[dict | None, bool
         con.execute("PRAGMA busy_timeout = 2")
         deadline = time.monotonic() + 0.05
         con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
-        rows = con.execute(
-            "SELECT message_id, created_at, payload_json FROM orchestration_v2_projection_messages "
-            "WHERE thread_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT ?",
-            (thread_id, _MESSAGE_SCAN),
-        ).fetchall()
-        for message_id, created_at, payload_json in rows:
-            ts = _epoch(created_at)
-            if ts is None or ts <= since:
-                continue
-            try:
-                payload = json.loads(payload_json) if isinstance(payload_json, str) else None
-            except ValueError:
-                continue
-            if is_owner_message(payload, thread_id):
-                return {"id": str(message_id), "at": str(created_at), "ts": ts, "text": payload["text"]}, True
-        return None, True
+        return read(con), True
     except (OSError, ValueError, sqlite3.Error):
         return None, False
     finally:
         if con is not None:
             con.close()
+
+
+def _owner_payload(payload_json, thread_id: str) -> dict | None:
+    try:
+        payload = json.loads(payload_json) if isinstance(payload_json, str) else None
+    except ValueError:
+        return None
+    return payload if is_owner_message(payload, thread_id) else None
+
+
+def thread_snapshot(thread_id: str) -> tuple[dict | None, bool]:
+    """``(snapshot, definitive)``: what ``thread_id`` holds now, by T3's own
+    record: the ids of the owner's messages already in it and its latest
+    message's ``created_at`` (``latest_at``, and ``latest_ts`` in epoch
+    seconds; both None for an empty thread). A confirm is later proved only
+    by an owner message outside it, so T3's clock is compared with T3's."""
+    def read(con):
+        latest = con.execute(
+            "SELECT created_at FROM orchestration_v2_projection_messages WHERE thread_id = ? "
+            "ORDER BY created_at DESC LIMIT 1", (thread_id,)).fetchone()
+        ids = sorted(str(message_id) for message_id, payload_json in con.execute(
+            "SELECT message_id, payload_json FROM orchestration_v2_projection_messages "
+            f"WHERE thread_id = ? AND {_OWNER_ROWS_SQL}", (thread_id,))
+            if _owner_payload(payload_json, thread_id) is not None)
+        latest_at = latest[0] if latest else None
+        latest_ts = None if latest_at is None else _epoch(latest_at)
+        if latest_at is not None and latest_ts is None:
+            raise ValueError("unreadable message time")
+        return {"ids": ids, "latest_at": latest_at, "latest_ts": latest_ts}
+
+    return _read_messages(thread_id, read)
+
+
+def owner_message_after(thread_id: str, snapshot: dict) -> tuple[dict | None, bool]:
+    """``(message, definitive)``: the newest message the owner typed in
+    ``thread_id`` that ``snapshot`` (``thread_snapshot``) does not hold:
+    its id is not among the snapshot's and T3 dated it after the snapshot's
+    latest message. ``{id, at, ts, text}``; the text is for hashing only."""
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("ids"), list):
+        return None, False
+    seen = {str(i) for i in snapshot["ids"]}
+    boundary = snapshot.get("latest_ts")
+    if boundary is not None and not isinstance(boundary, (int, float)):
+        return None, False
+
+    def read(con):
+        for message_id, created_at, payload_json in con.execute(
+                "SELECT message_id, created_at, payload_json FROM orchestration_v2_projection_messages "
+                f"WHERE thread_id = ? AND {_OWNER_ROWS_SQL} ORDER BY created_at DESC LIMIT ?",
+                (thread_id, _MESSAGE_SCAN)):
+            ts = _epoch(created_at)
+            if str(message_id) in seen or ts is None or (boundary is not None and ts <= boundary):
+                continue
+            payload = _owner_payload(payload_json, thread_id)
+            if payload is not None:
+                return {"id": str(message_id), "at": str(created_at), "ts": ts, "text": payload["text"]}
+        return None
+
+    return _read_messages(thread_id, read)
 
 
 def delegated_thread_result(thread_id: str) -> tuple[bool, bool]:

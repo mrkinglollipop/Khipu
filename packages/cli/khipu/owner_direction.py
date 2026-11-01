@@ -205,6 +205,8 @@ def _recent_turn(session: str, conf: dict, now: float) -> dict:
 _HOLD_WHY = ("This is a T3 conversation, so the change waits for the owner to confirm it. Ask for it with "
              "khipu_owner_act: Khipu holds it and tells you what to ask the owner.")
 _NOT_SINCE = "no message you typed in this conversation since this request was made"
+_ASK_NOW = ("Not confirmed yet: nothing was changed. Ask the owner to confirm now, in this conversation, then "
+            "call direction.confirm again.")
 
 
 def _usable_t3_turn(t: dict) -> bool:
@@ -319,8 +321,10 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None) -> dict
     environ = os.environ if env is None else env
     session = _caller_session(environ)
     turns_ = owner_turns.turns(session, now)
+    extra = {}
     if any(t.get("entrypoint") == "t3" for t in turns_):
-        _t3_bound(environ, session, now)
+        thread, _ = _t3_bound(environ, session, now)
+        extra["t3_snapshots"] = {thread: _t3_snapshot(thread)}
     else:
         if owner_turns.dispatched_job(environ, session):
             raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
@@ -331,8 +335,10 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None) -> dict
                                    "The owner has not typed in this conversation, so it can't ask for an owner's "
                                    "change (a background or dispatched job never can).")
         _from_the_hook(usable[-1])
+        extra["held_turn"] = usable[-1].get("turn")
     request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
-               "created_ts": now, "created_at": _iso(now), "session": session, "ask": ask_line(action, args)}
+               "created_ts": now, "created_at": _iso(now), "session": session, "ask": ask_line(action, args),
+               **extra}
     try:
         with _requests_locked() as path:
             rows = _read_requests(path)
@@ -358,12 +364,30 @@ def _caller_session(environ) -> str:
     return session
 
 
-def _proof(environ, session: str, since: float, now: float) -> dict:
-    """The auth stamp for a confirm: the owner typed in this conversation
-    after ``since``, from this front end's own record, re-read now."""
+def _t3_snapshot(thread: str) -> dict:
+    """``t3.thread_snapshot`` with one retry, or ``DirectionRefused``."""
     from khipu import t3
 
-    turns_ = owner_turns.turns(session, now)
+    for _ in range(2):
+        snapshot, definitive = t3.thread_snapshot(thread)
+        if definitive:
+            return snapshot
+    raise DirectionRefused("t3_unreadable", "Khipu could not read T3's record of this conversation's messages, "
+                                            "so nothing was held or changed. Try again.")
+
+
+def _proof(environ, session: str, request: dict, now: float) -> dict | None:
+    """The auth stamp for a confirm: the owner typed in this conversation
+    after the request was made, from this front end's own record, re-read
+    now. In T3 "after" is causal, never a clock comparison with Khipu's:
+    an owner message outside the snapshot of this thread taken when the
+    request was held here, or on this thread's first confirm attempt
+    (stored in ``request``; that attempt returns None and proves nothing).
+    Elsewhere the hook's own times are compared with the request's."""
+    from khipu import t3
+
+    since = _float(request.get("created_ts"))
+    turns_ = owner_turns.turns(session, now, evidence=True)
     member = owner_turns._t3_membership(session)
     if member == "unverified":
         raise DirectionRefused("t3_unreadable", "Khipu could not read T3's record to tell whether this is a T3 "
@@ -371,8 +395,15 @@ def _proof(environ, session: str, since: float, now: float) -> dict:
                                                 "again.")
     if member == "t3":
         thread, bound = _t3_bound(environ, session, now)
+        snapshots = request.get("t3_snapshots")
+        if not isinstance(snapshots, dict):
+            snapshots = request["t3_snapshots"] = {}
+        snapshot = snapshots.get(thread)
+        if not isinstance(snapshot, dict):
+            snapshots[thread] = _t3_snapshot(thread)
+            return None
         for _ in range(2):
-            message, definitive = t3.owner_message_after(thread, since)
+            message, definitive = t3.owner_message_after(thread, snapshot)
             if definitive:
                 break
         else:
@@ -392,7 +423,8 @@ def _proof(environ, session: str, since: float, now: float) -> dict:
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     conf = owner_turns.settings()
     recorded = [t for t in turns_ if owner_turns.eligible(t, conf)[0]]
-    usable = [t for t in recorded if _float(t.get("ts")) > since]
+    held = (request.get("session"), request.get("held_turn"))
+    usable = [t for t in recorded if _float(t.get("ts")) > since and (t.get("session"), t.get("turn")) != held]
     if not usable:
         untrusted = owner_turns.untrusted_front_end(turns_, conf)
         if untrusted and not recorded:
@@ -426,7 +458,11 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
             if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
-            stamp = _proof(environ, session, _float(request.get("created_ts")), now)
+            stamp = _proof(environ, session, request, now)
+            if stamp is None:
+                # This thread's first attempt: only its snapshot was taken.
+                _save_requests(path, rows, now)
+                raise DirectionRefused("not_confirmed", _ASK_NOW)
             stamp["confirmed"]["request"] = request_id
             request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session))
             _save_requests(path, rows, now)
@@ -446,6 +482,49 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
                 if not ok and isinstance(result, dict):
                     row["error"] = str(result.get("error") or result.get("code") or "refused")[:300]
         _save_requests(path, rows, now)
+
+
+def oldest_pending_ts() -> float | None:
+    """When the oldest request still waiting (or applying) was made, so the
+    turn recorder keeps the evidence a confirm needs. None when there is
+    none or the file can't be read (the normal retention applies)."""
+    try:
+        rows = _read_requests(requests_path())
+    except (OSError, ValueError):
+        return None
+    times = [_float(r.get("created_ts")) for r in rows if r.get("state") in ("pending", "applying")]
+    times = [t for t in times if t > 0]
+    return min(times) if times else None
+
+
+_REQUEST_WORDS = ("args", "ask", "error")
+
+
+def forget_requests(sessions, *, protected_sessions=(), now: float | None = None) -> dict:
+    """Forget's owner words scan on the held requests these sessions made:
+    a pending one is withdrawn (reason "forgotten"), and every one loses
+    its words (the action's args, the ask line, an error). Ids, times and
+    hashes stay. Raises OSError when the file can't be read or rewritten."""
+    now = _clock() if now is None else now
+    names = set(sessions) - set(protected_sessions)
+    out = {"requests_withdrawn": 0, "requests_scrubbed": 0}
+    if not names or not requests_path().exists():
+        return out
+    with _requests_locked() as path:
+        rows = _read_requests(path)
+        for row in rows:
+            if row.get("session") not in names:
+                continue
+            if row.get("state") == "pending":
+                row.update(state="withdrawn", reason="forgotten", settled_ts=now, settled_at=_iso(now))
+                out["requests_withdrawn"] += 1
+            elif any(k in row for k in _REQUEST_WORDS):
+                out["requests_scrubbed"] += 1
+            for key in _REQUEST_WORDS:
+                row.pop(key, None)
+        if any(out.values()):
+            _save_requests(path, rows, now)
+    return out
 
 
 @contextlib.contextmanager

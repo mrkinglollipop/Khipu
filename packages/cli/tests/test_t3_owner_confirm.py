@@ -201,6 +201,35 @@ def test_machine_messages_after_the_request_never_confirm(world, by, source, ext
     assert not _paused()
 
 
+def test_an_owner_message_skewed_ahead_of_khipus_clock_before_the_request_is_refused(world):
+    # Review 2026-11-01 P1: T3 stamped the owner's earlier message 60 s ahead of
+    # Khipu's clock. It was in the thread when the request was held, so it
+    # never confirms; only a new owner message does.
+    world["t3"].message(THREAD, time.time() + 60)
+    request = _hold_in_t3(world)
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+    mid = world["t3"].message(THREAD, time.time() + 90)
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == mid
+
+
+def test_500_machine_rows_after_the_owners_yes_do_not_hide_it(world):
+    # Review 2026-11-01 P2: machine traffic must not push the owner's message
+    # out of the bounded read.
+    request = _hold_in_t3(world)
+    mid = world["t3"].message(THREAD, time.time() + 1)
+    for i in range(500):
+        world["t3"].message(THREAD, time.time() + 2 + i / 1000, text="wake", by="agent", source="mcp",
+                            scheduledTaskId=f"task-{i}")
+    _t3_hook_turn()
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == mid
+
+
 def test_an_owner_message_in_a_different_thread_is_refused(world):
     request = _hold_in_t3(world)
     world["t3"].message(OTHER_THREAD, time.time() + 1)
@@ -310,6 +339,30 @@ def test_a_two_day_old_request_confirms_on_a_later_owner_turn(world, front):
 
 
 @pytest.mark.parametrize("front", FRONTS)
+def test_a_three_day_old_request_confirms_on_a_two_day_old_owner_turn(world, front):
+    # Review 2026-11-01 P2: the owner turn proving the confirm is kept while the
+    # request waits, past the recorder's one-day retention.
+    request = _hold_by_request(world, front, "s-front", ago=3 * DAY)
+    _front_end_turn(world, front, "s-front", ago=2 * DAY)
+    owner_turns.sweep()
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["source"] == "hook"
+    # Nothing waits any more: the normal retention applies again.
+    owner_turns.sweep()
+    assert owner_turns.turns("s-front", evidence=True) == []
+
+
+def test_turns_kept_for_a_waiting_request_are_capped_at_30_days(world):
+    _hold_by_request(world, "claude_code:cli", "s-front", ago=40 * DAY)
+    _front_end_turn(world, "claude_code:cli", "s-front", ago=31 * DAY)
+    _front_end_turn(world, "claude_code:cli", "s-front", ago=29 * DAY)
+    kept = owner_turns.turns("s-front", evidence=True)
+    assert len(kept) == 1 and time.time() - kept[0]["ts"] < 30 * DAY
+    assert owner_turns.turns("s-front") == []
+
+
+@pytest.mark.parametrize("front", FRONTS)
 def test_only_a_turn_older_than_the_request_is_refused(world, front):
     request = _hold_by_request(world, front, "s-front", ago=2 * 3600)
     _front_end_turn(world, front, "s-front", ago=3 * 3600)
@@ -330,14 +383,25 @@ def test_a_t3_request_confirms_from_claude_code_or_codex(world, front):
 
 
 @pytest.mark.parametrize("front", ["claude_code:cli", "codex:codex_desktop"])
-def test_a_claude_code_or_codex_request_confirms_from_t3(world, front):
+def test_a_claude_code_or_codex_request_confirms_from_t3_after_its_snapshot(world, front):
+    # Review 2026-11-01 (cross-conversation): T3 holds no snapshot for a request
+    # made elsewhere, so the first confirm only takes one; an owner message
+    # already in the thread never confirms.
     request = _hold_by_request(world, front, "s-elsewhere", ago=DAY)
     world["t3"].message(THREAD, time.time() - 1)
     _t3_hook_turn()
     _be(world, T3_SESSION)
     ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"], out
+    assert not _paused()
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert row["state"] == "pending" and list(row["t3_snapshots"]) == [THREAD]
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and not _paused()
+    mid = world["t3"].message(THREAD, time.time() + 1)
+    ok, out = _confirm_id(request)
     assert ok, out
-    assert _paused() and out["confirmed"]["source"] == "t3"
+    assert _paused() and out["confirmed"]["source"] == "t3" and out["confirmed"]["message"] == mid
 
 
 @pytest.mark.parametrize("front", ["claude_code:cli", "claude_code:claude-desktop", "codex:codex_cli_rs",
@@ -376,3 +440,45 @@ def test_the_audit_line_names_the_confirming_message_by_id_time_and_hash_only(wo
                                  "message_sha256": hashlib.sha256(canonical.encode()).hexdigest()}
     assert words not in owner_direction.log_path().read_text()
     assert words not in owner_direction.requests_path().read_text()
+
+
+# ---- Forget -------------------------------------------------------------------------------------------
+
+
+def test_forget_withdraws_a_held_request_and_removes_its_words(world):
+    # Review 2026-11-01 P2: owner-word cleanup covers the session's held requests.
+    from khipu import forget
+
+    request = _hold_in_t3(world)
+    out = forget._owner_words_scan(T3_SESSION, gateway=False)
+    assert out["ok"], out
+    assert out["removed"]["requests_withdrawn"] == 1 and out["removed"]["requests_scrubbed"] == 0
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert (row["id"], row["state"], row["reason"]) == (request, "withdrawn", "forgotten")
+    assert "args" not in row and "ask" not in row
+    assert "Codex" not in owner_direction.requests_path().read_text()
+    world["t3"].message(THREAD, time.time() + 1)
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_pending" and not _paused()
+
+
+def test_forget_removes_a_settled_requests_words_and_counts_it(world):
+    from khipu import forget
+
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=3600)
+    _front_end_turn(world, "claude_code:cli", "s-front")
+    ok, out = _confirm_id(request)
+    assert ok, out
+    out = forget._owner_words_scan("claude_code:s-front", gateway=False)
+    assert out["ok"] and out["removed"]["requests_scrubbed"] == 1 and out["removed"]["requests_withdrawn"] == 0
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert row["state"] == "applied" and "args" not in row and "ask" not in row
+    assert "Codex" not in owner_direction.requests_path().read_text()
+
+
+def test_a_request_pending_past_30_days_stays_pending(world):
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=45 * DAY)
+    owner_turns.sweep()
+    _front_end_turn(world, "claude_code:cli", "s-front")
+    ok, out = _confirm_id(request)
+    assert ok, out

@@ -1697,7 +1697,9 @@ def _owner_words_scan(session_id: str | None, *, gateway: bool,
     """The owner's typed words recorded for the episode's session: its turn
     files and briefs (``owner_turns.forget_sessions``), the old widenings
     file, the words in its owner-actions lines (scrubbed, the chain and Undo
-    kept), and every rewrite temp a crash left that could hold them
+    kept), the requests it held for the owner to confirm (a pending one
+    withdrawn, every one's words removed: ``owner_direction.forget_requests``),
+    and every rewrite temp a crash left that could hold them
     (``owner_files.clean_temps``). Local files only: on the gateway there are none, and nothing remote
     is touched. A part that can't be done keeps the forget open."""
     place = "owner words"
@@ -1742,6 +1744,10 @@ def _owner_words_scan(session_id: str | None, *, gateway: bool,
             removed["pending"] = attempt("old widenings", owner_direction.remove_old_widenings)
         removed["log_lines"] = attempt("owner-actions log", lambda: owner_direction.scrub_words(
             forms, **({"protected_sessions": protected} if protected else {})))
+        requests = attempt("held owner requests", lambda: owner_direction.forget_requests(
+            forms, **({"protected_sessions": protected} if protected else {})))
+        if requests is not None:
+            removed.update(requests)
         temps = attempt("rewrite temps", lambda: owner_files.clean_temps(
             forms, **({"protected_sessions": protected} if protected else {})))
         if temps is not None:

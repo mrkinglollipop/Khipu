@@ -86,8 +86,9 @@ NOT_CAPTURE = {
                                     "writes nothing",
     "t3.delegated_thread_result": "opens T3's thread database read-only to tell a delegated child thread from the "
                                   "owner's own; writes nothing",
-    "t3.owner_message_after": "opens T3's thread database read-only to find a message the owner typed after a "
-                              "held request; writes nothing (the caller keeps only its id, time and hash)",
+    "t3._read_messages": "opens T3's thread database read-only to snapshot a thread or find a message the owner "
+                         "typed outside a held request's snapshot; writes nothing (the caller keeps only message "
+                         "ids, T3's times and a hash)",
     "recall_eval_nightly.refresh_vectors": "the recall check's golden-query embedding vectors keyed by a hash of the "
                                            "redacted query (mode 0600); no query text, no capture text",
     # Cursor/Antigravity hooks (docs/plans/2026-10-27-cursor-antigravity-hooks.md).
