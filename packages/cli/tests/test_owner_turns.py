@@ -638,6 +638,74 @@ def test_an_antigravity_app_or_ide_path_outside_the_bundle_or_headless_is_a_mach
     assert _front_end() == ("antigravity", "antigravity_print", False)
 
 
+# Review round 2: only the real bundle, installed directly in /Applications or
+# ~/Applications and judged by its real path, is inside the app.
+
+FAKE_CURSOR = ["/tmp/Cursor.app/Contents/MacOS/Cursor",
+               "/tmp/CursorHelper.app/node",
+               "/tmp/Cursor Evil.app/node",
+               "/Applications/CursorHelper.app/Contents/MacOS/node",
+               "/Applications/Cursor Evil.app/Contents/MacOS/node",
+               "/Applications/Evil.app/Contents/Cursor.app/Contents/MacOS/Cursor",
+               "/tmp/Fake.app/Applications/Cursor.app/Contents/MacOS/Cursor",
+               "/Applications/Sub/Cursor.app/Contents/MacOS/Cursor"]
+FAKE_ANTIGRAVITY = ["/tmp/Antigravity.app/node",
+                    "/tmp/Antigravity Evil.app/node",
+                    "/Applications/Antigravity Evil.app/Contents/MacOS/node",
+                    "/Applications/Evil.app/Contents/Antigravity.app/Contents/MacOS/node"]
+
+
+@pytest.mark.parametrize("exe", FAKE_CURSOR)
+def test_a_fake_cursor_bundle_is_not_inside_the_app(home, kernel, exe):
+    kernel(exe, [exe, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "cursor_sdk", False)
+    assert _last()["issuer"]["app"] != "Cursor.app"
+
+
+@pytest.mark.parametrize("app_dir", [".gemini/antigravity", ".gemini/antigravity-ide"])
+@pytest.mark.parametrize("exe", FAKE_ANTIGRAVITY)
+def test_a_fake_antigravity_bundle_is_not_inside_the_app(home, kernel, exe, app_dir):
+    kernel(exe, [exe, "--enable_lsp"], False)
+    assert _antigravity("pause Codex until 5pm", app_dir)
+    assert _front_end() == ("antigravity", "antigravity_print", False)
+
+
+def test_a_symlink_is_judged_by_its_real_path(home, kernel, tmp_path):
+    into = tmp_path / "Cursor.app"
+    into.symlink_to("/Applications/Cursor.app")
+    exe = str(into / "Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper")
+    assert owner_turns._app_bundle(exe) == "Cursor.app"
+    kernel(exe, [exe, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+    # And the other way: a link named like the app, in /Applications's place, to a folder in /tmp.
+    fake = tmp_path / "apps"
+    (fake / "Cursor.app").mkdir(parents=True)
+    out = tmp_path / "out.app"
+    out.symlink_to(fake / "Cursor.app")
+    assert owner_turns._app_bundle(str(out / "Contents/MacOS/Cursor")) == ""
+
+
+def test_a_helper_bundle_inside_cursor_is_trusted(home, kernel):
+    exe = "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper"
+    kernel(exe, [exe, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+
+
+def test_cursor_in_the_users_own_applications_is_trusted(home, kernel, monkeypatch, tmp_path):
+    user = tmp_path / "user"
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(user))
+    exe = str(user / "Applications/Cursor.app/Contents/MacOS/Cursor")
+    kernel(exe, [exe], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+    # $HOME is not the user's home: a bundle under it alone is not installed.
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(tmp_path / "someone-else"))
+    assert owner_turns._app_bundle(exe) == ""
+
+
 @pytest.mark.parametrize("args,tty,entry", [
     (["/usr/local/bin/agy", "-p", "x"], True, "antigravity_print"),
     (["/usr/local/bin/agy"], False, "antigravity_print"),
@@ -718,12 +786,27 @@ def test_a_list_saved_before_the_new_defaults_gets_them(home, kernel):
     assert _front_end() == ("cursor", "ide", True)
 
 
-def test_an_old_explicit_off_survives_and_an_old_explicit_trust_stays(home):
-    saved = [t for t in LEGACY if t != "codex:t3"] + ["antigravity:cli"]
-    _save({"enabled": True, "trusted": saved})
+def test_an_old_explicit_off_survives(home):
+    _save({"enabled": True, "trusted": [t for t in LEGACY if t != "codex:t3"]})
     trusted = owner_turns.settings()["trusted"]
-    assert "codex:t3" not in trusted
-    assert "antigravity:cli" in trusted and "cursor:ide" in trusted
+    assert "codex:t3" not in trusted and "cursor:ide" in trusted
+
+
+def test_an_unmarked_list_with_an_entry_beyond_the_old_defaults_gets_nothing_added(home):
+    # Without trusted_defaults, only a list made of the old 13 is known to predate the new ones.
+    saved = [*LEGACY, "antigravity:cli"]
+    _save({"enabled": True, "trusted": saved})
+    assert owner_turns.settings()["trusted"] == saved
+
+
+@pytest.mark.parametrize("marker", [None, [], 7, ["claude_code:cli", 3], "cursor:cli"])
+def test_malformed_trusted_defaults_keep_an_explicit_off(home, marker):
+    saved = [t for t in owner_turns.DEFAULT_TRUSTED if t != "cursor:cli"]
+    _save({"enabled": True, "trusted": saved, "trusted_defaults": marker})
+    assert owner_turns.settings()["trusted"] == saved
+    legacy_off = [t for t in LEGACY if t != "codex:t3"]
+    _save({"enabled": True, "trusted": legacy_off, "trusted_defaults": marker})
+    assert owner_turns.settings()["trusted"] == legacy_off
 
 
 def test_a_new_default_switched_off_stays_off_and_a_later_default_still_arrives(home, monkeypatch):

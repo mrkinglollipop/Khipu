@@ -63,7 +63,10 @@ RETENTION_S = 24 * 3600
 # the same for every front end, Claude Code's "cli" and Codex's terminal
 # included: the standard headless and scripted modes are refused, and a
 # program that drives an interactive session through a pseudo-terminal to
-# pass as a person is out of reach.
+# pass as a person is out of reach. The threat model is standard automation
+# (headless modes, SDKs, dispatched jobs, injected text); a process that
+# forges hook payloads or front-end markers is out of reach, the same as for
+# Claude Code's CLAUDE_CODE_ENTRYPOINT.
 DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:claude-desktop", "claude_code:claude-desktop-3p",
                    "claude_code:claude-vscode", "claude_code:remote", "claude_code:remote_desktop",
                    "claude_code:remote_mobile", "claude_code:t3", "codex:codex_cli_rs", "codex:codex_desktop",
@@ -159,10 +162,18 @@ def settings() -> dict:
         if isinstance(data.get("trusted"), list) and out["trusted"] == data["trusted"]:
             # A default added after this file was saved is trusted; one the
             # owner had and switched off stays off.
-            seen = data.get("trusted_defaults")
-            if not (isinstance(seen, list) and all(isinstance(v, str) for v in seen)):
-                seen = _DEFAULTS_BEFORE_2026_11_01
-            out["trusted"] += [d for d in DEFAULT_TRUSTED if d not in seen and d not in out["trusted"]]
+            # Metadata that is malformed, empty (write_settings always records
+            # the defaults) or missing from a list holding anything beyond
+            # the old defaults never widens trust.
+            if "trusted_defaults" not in data:
+                old = set(_DEFAULTS_BEFORE_2026_11_01)
+                seen = _DEFAULTS_BEFORE_2026_11_01 if all(t in old for t in out["trusted"]) else None
+            else:
+                seen = data["trusted_defaults"]
+                if not (isinstance(seen, list) and seen and all(isinstance(v, str) for v in seen)):
+                    seen = None
+            if seen is not None:
+                out["trusted"] += [d for d in DEFAULT_TRUSTED if d not in seen and d not in out["trusted"]]
     return out
 
 
@@ -317,13 +328,17 @@ def _interactive(issuer: dict | None) -> bool:
     return issuer.get("tty") is True and _not_headless(issuer)
 
 
-def _in_app(issuer: dict | None, prefix: str) -> bool:
-    """The hook was run from inside an app bundle named ``<prefix>...app``
-    by a process with no print or headless flag."""
+# The installed bundles a front end is trusted from. ``_app_bundle`` names
+# one only when it sits directly in /Applications or ~/Applications.
+TRUSTED_BUNDLES = {"cursor": ("Cursor.app",), "antigravity": ("Antigravity.app",)}
+
+
+def _in_app(issuer: dict | None, front_end: str) -> bool:
+    """The hook was run from inside ``front_end``'s installed app bundle by
+    a process with no print or headless flag."""
     issuer = issuer or {}
     app = issuer.get("app")
-    return isinstance(app, str) and app != UNKNOWN and app.lower().startswith(prefix) \
-        and app.endswith(".app") and _not_headless(issuer)
+    return isinstance(app, str) and app in TRUSTED_BUNDLES[front_end] and _not_headless(issuer)
 
 
 def _cursor_ide_version(payload: dict) -> bool:
@@ -747,13 +762,28 @@ def _on_terminal(pid: int) -> bool | None:
 def _app_bundle(exe: str) -> str | None:
     """The outermost ``.app`` bundle a process runs from (``Cursor.app`` for
     every Cursor helper), "" when it runs from none, None when its path is
-    unknown."""
+    unknown. Symlinks are resolved first, and a bundle counts only when it
+    is the outermost one and sits directly in /Applications or the user's
+    own ~/Applications; anywhere else the process runs from no bundle."""
     if not exe:
         return None
-    for part in Path(exe).parts:
+    try:
+        path = Path(os.path.realpath(exe))
+        places = {Path(os.path.realpath("/Applications")),
+                  Path(os.path.realpath(os.path.join(_real_home(), "Applications")))}
+    except (OSError, KeyError, ValueError):
+        return None
+    for i, part in enumerate(path.parts):
         if part.endswith(".app"):
-            return part
+            return part if Path(*path.parts[:i]) in places else ""
     return ""
+
+
+def _real_home() -> str:
+    """This user's home from the account database, not from $HOME."""
+    import pwd
+
+    return pwd.getpwuid(os.getuid()).pw_dir
 
 
 def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
