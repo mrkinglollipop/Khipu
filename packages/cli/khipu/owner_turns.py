@@ -254,9 +254,10 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         # session's entrypoint, so the issuer's own command line decides.
         if (issuer or {}).get("print") and not entry.startswith("sdk-"):
             return "sdk-cli"
-        # T3 Code drives Claude through the Agent SDK; a session it runs has
-        # a T3 thread. ``claude -p`` (sdk-cli) never counts as T3.
-        if entry.startswith("sdk-") and entry != "sdk-cli" and _t3_thread(session):
+        # A session T3 Code runs has a T3 thread, whatever entrypoint it
+        # reports: T3 turns are never owner turns, so membership decides, not
+        # the native entrypoint. ``claude -p`` (sdk-cli) stays a machine.
+        if entry != "sdk-cli" and _t3_thread(session):
             return "t3"
         return entry
     if harness == "codex":
@@ -268,7 +269,7 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         return "t3" if _t3_thread(session) else hook_shape.cursor_entrypoint(payload)
     if harness == "antigravity":
         surface = hook_shape.antigravity_entrypoint(payload)
-        return "t3" if surface == "unknown" and _t3_thread(session) else surface
+        return "t3" if _t3_thread(session) else surface
     return "unknown"
 
 

@@ -128,6 +128,23 @@ def test_a_session_t3_runs_is_the_t3_front_end_and_is_never_eligible(home, monke
     assert turn_id == turn["turn"]
 
 
+@pytest.mark.parametrize("entry", ["cli", "claude-desktop", "claude-vscode", "remote_mobile"])
+def test_a_t3_session_reporting_a_trusted_claude_entrypoint_is_still_t3(home, monkeypatch, entry):
+    # Membership in a T3 thread decides, not the entrypoint the session reports.
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    _record("pause Codex until 5pm", env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": entry})
+    turn = _last()
+    assert (turn["entrypoint"], turn["eligible"]) == ("t3", False)
+    assert not owner_turns.eligible(turn, {**owner_turns.settings(),
+                                           "trusted": [*owner_turns.DEFAULT_TRUSTED, f"claude_code:{entry}"]})[0]
+
+
+def test_an_antigravity_session_in_a_t3_thread_is_t3_whatever_its_surface(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    monkeypatch.setattr(owner_turns.hook_shape, "antigravity_entrypoint", lambda payload: "cli")
+    assert owner_turns.entrypoint_of("antigravity", {}, {}, SESSION) == "t3"
+
+
 def test_claude_p_is_never_the_owner_even_in_a_t3_thread(home, monkeypatch):
     monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
     assert _record("pause Codex until 5pm", env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-cli"})
