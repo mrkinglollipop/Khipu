@@ -269,15 +269,18 @@ def _t3_bound(environ, session: str, now: float) -> tuple[str, dict]:
 # it. The confirm is made during the agent turn the owner's reply started,
 # so that turn is what is proved, never a search of stored turns:
 #
-# - outside T3, the current turn ``check`` verifies (the session's latest
-#   eligible turn, on a trusted front end, inside the window, recorded by the
-#   hook above this call) must be later than the latest ask Khipu recorded
-#   for this conversation, never a late or flushed copy (``_late_copy``),
-#   and none of the turns that ask excludes;
+# - outside T3, the session's latest recorded row of any kind must be an
+#   eligible turn (on a trusted front end, inside the window, recorded by
+#   the hook above this call; a copy stands in for its original only as
+#   ``_current_turn`` says), later than the latest ask Khipu recorded for
+#   this conversation, never a late record (``_late_copy``), and none of the
+#   turns that ask excludes; in Antigravity its words must not be any the
+#   conversation had said when asked (``ag_words``);
 # - in T3, the call must come from the conversation's harness (its latest
-#   hook turn, of any kind, was recorded by the hook above this call), T3
-#   must still be a trusted front end, and T3's record must hold an owner
-#   message the thread's ask snapshot does not.
+#   hook turn, of any kind, was recorded by the hook above this call, and
+#   its issuer traces to the T3 Code app), that turn must be typed, T3 must
+#   still be a trusted front end, and T3's record must hold an owner message
+#   the thread's ask snapshot does not.
 #
 # Every time Khipu tells the agent to ask (the hold, and a confirm that finds
 # no reply) it records an ask boundary for that conversation on the request:
@@ -485,60 +488,66 @@ def _ask_boundary(old, turns_: list[dict], now: float, session: str) -> dict:
     copies_in += [[t["prompt_sha256"], t["occurrence"], _float(t.get("ts"))] for t in turns_
                   if isinstance(t.get("prompt_sha256"), str) and type(t.get("occurrence")) is int]
     out = {"by": session, "ts": since, "turns": _bounded(turns_in, since), "copies": _bounded(copies_in, since)}
-    old_ag = _ag_exclusions(old) if isinstance(old, dict) else (set(), set())
-    if old_ag is None:
-        raise DirectionRefused("ask_limit", _ASK_LIMIT)
-    steps, hashes = old_ag
-    for t in turns_:
-        if t.get("harness") != "antigravity":
-            continue
-        if type(t.get("ag_step")) is int:
-            steps.add(t["ag_step"])
-        elif t.get("fallback") and isinstance(t.get("prompt_sha256"), str):
-            hashes.add(t["prompt_sha256"])
-    if len(steps) > _BOUNDARY_MOST or len(hashes) > _BOUNDARY_MOST:
-        raise DirectionRefused("ask_limit", _ASK_LIMIT)
-    if steps or hashes:
-        out["ag_steps"], out["ag_hashes"] = sorted(steps), sorted(hashes)
+    has_words = isinstance(old, dict) and _AG_WORDS in old
+    if has_words or any(t.get("harness") == "antigravity" for t in turns_):
+        words = _ag_words(old) if has_words else set()
+        if words is None:
+            raise DirectionRefused("ask_limit", _ASK_LIMIT)
+        words |= {t["prompt_sha256"] for t in turns_ if isinstance(t.get("prompt_sha256"), str)}
+        if len(words) > _BOUNDARY_MOST:
+            raise DirectionRefused("ask_limit", _ASK_LIMIT)
+        out[_AG_WORDS] = sorted(words)
     return out
 
 
-# Antigravity's turn identity: a turn read again (from the transcript after
-# its submit-time ``lastUserInput`` row, or after the 24 h prune dropped that
-# row) is a new row with a new id and occurrence, so the turn ids and copies
-# above can't exclude it. Its transcript step id can: every Antigravity step
-# the conversation had recorded when it was asked (``ag_steps``), and the
-# prompt hash of each submit-time row that had no step (``ag_hashes``), kept
-# in the boundary with no time, so the prune never drops them and the cap
-# refuses instead.
+# Antigravity's turn identity is its words. Its step numbers are not stable
+# (a submit-time row and its flushed step can disagree, a transcript can be
+# renumbered, a turn's model calls repeat its PreInvocation), and a turn read
+# again is a new row with a new id and occurrence. So an Antigravity ask
+# boundary keeps the prompt hash of every turn the conversation had recorded
+# when it was asked (``ag_words``), with no time: the 24 h prune never drops
+# them, refreshes only add to them, and the cap refuses. A reply whose words
+# were said before the question never confirms; a boundary saved before it
+# kept them (no ``ag_words``) is unknown, never empty.
+_AG_WORDS = "ag_words"
+_AG_SAID_BEFORE = ("Not confirmed yet: the reply's words were already said in this conversation, so Khipu can't "
+                   "tell it is a new reply, and nothing was changed. The reply must differ from anything said in "
+                   "this conversation before the question. Ask the owner to confirm now, in this conversation, "
+                   "in other words (for example \"yes, pause it\"), then call direction.confirm again.")
+_AG_LEGACY = ("Not confirmed yet: this request was held before Khipu kept what this conversation had said when it "
+              "was asked, so nothing was changed. Ask the owner to confirm now, in this conversation, in words "
+              "that differ from anything said here before, then call direction.confirm again.")
 
 
-def _ag_exclusions(boundary: dict) -> tuple[set[int], set[str]] | None:
-    """(excluded step ids, excluded step-less prompt hashes) of an ask
-    boundary; None when either is malformed."""
-    steps, hashes = boundary.get("ag_steps", []), boundary.get("ag_hashes", [])
-    if not isinstance(steps, list) or not isinstance(hashes, list) \
-            or not all(type(s) is int for s in steps) or not all(isinstance(h, str) for h in hashes):
+def _ag_words(boundary) -> set[str] | None:
+    """The prompt hashes an Antigravity ask boundary excludes; None when it
+    has none (saved before they were kept) or they are malformed."""
+    words = boundary.get(_AG_WORDS) if isinstance(boundary, dict) else None
+    if not isinstance(words, list) or not all(isinstance(h, str) for h in words):
         return None
-    return set(steps), set(hashes)
+    return set(words)
 
 
-def _ag_replayed(turn: dict, boundary) -> bool:
-    """Whether an Antigravity ``turn`` may be a turn the ask already saw:
-    its step is excluded, it was read from the transcript with the words of
-    an excluded step-less row, or it is a transcript row with no step id."""
-    if turn.get("harness") != "antigravity":
-        return False
-    found = _ag_exclusions(boundary) if isinstance(boundary, dict) else (set(), set())
-    if found is None:
-        return True
-    steps, hashes = found
-    step = turn.get("ag_step")
-    if type(step) is int and step in steps:
-        return True
-    if turn.get("ag_transcript"):
-        return type(step) is not int or turn.get("prompt_sha256") in hashes
-    return False
+def _current_turn(recorded: list[dict], conf: dict) -> dict | None:
+    """The turn a confirm may take as the owner's reply: the session's latest
+    recorded row of any kind, when it is eligible. In Antigravity a copy of a
+    turn (``duplicate_of``: its flushed step) stands in for its original when
+    every row after that original is a copy of it: the original is then the
+    turn judged, by its own id and time. None otherwise."""
+    if not recorded or not owner_turns.eligible(recorded[-1], conf)[0]:
+        return None
+    latest = recorded[-1]
+    if latest.get("duplicate_of") is None or latest.get("harness") != "antigravity":
+        return latest
+    for i in range(len(recorded) - 2, -1, -1):
+        row = recorded[i]
+        if row.get("turn") == latest["duplicate_of"]:
+            later = recorded[i + 1:]
+            if all(r.get("duplicate_of") == row["turn"] for r in later) \
+                    and owner_turns.eligible(row, conf)[0] and row.get("harness") == latest.get("harness"):
+                return row
+            return None
+    return None
 
 
 def _late_copy(turn: dict) -> bool:
@@ -613,10 +622,10 @@ def _t3_boundary(old, read: dict, session: str) -> dict:
             "latest_at": latest_at, "latest_ts": latest}
 
 
-def _proof(environ, session: str, request: dict, now: float) -> dict | None:
-    """The auth stamp for a confirm (the rules above this section), or None
-    when this turn is no reply to the latest ask: the boundary is then grown
-    in ``request`` from the same read, and the agent asks again."""
+def _proof(environ, session: str, request: dict, now: float) -> dict | str:
+    """The auth stamp for a confirm (the rules above this section), or the
+    message telling the agent to ask again when this turn is no reply to the
+    latest ask: the boundary is then grown in ``request`` from the same read."""
     member = owner_turns._t3_membership(session)
     if member == "unverified":
         raise DirectionRefused("t3_unreadable", "Khipu could not read T3's record to tell whether this is a T3 "
@@ -635,15 +644,22 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
                                                    "so it can't tell this call comes from it. Nothing was changed; "
                                                    "it works once the owner replies here.")
     latest = recorded[-1]
-    # The hook turn's own entrypoint: a headless or SDK process that inherits
-    # the session records a machine entrypoint (``claude -p`` is sdk-cli,
-    # any of MACHINE_ENTRYPOINTS), or a print or headless issuer when T3
-    # membership made it "t3". Only T3's own hook turn names the harness.
-    issuer = latest.get("issuer") if isinstance(latest.get("issuer"), dict) else {}
-    if latest.get("entrypoint") != "t3" or issuer.get("print") is True or issuer.get("headless") is True:
+    # The hook turn's own entrypoint (``claude -p`` is sdk-cli, a machine),
+    # and its issuer's place in the process tree: T3's own agent is a child
+    # of the T3 Code app with no shell, interpreter or headless launcher in
+    # between. A process that only inherits the session is neither. How T3
+    # starts Codex, Cursor or Antigravity is not known here, so on those
+    # only the Khipu app confirms.
+    if latest.get("entrypoint") != "t3" or not owner_turns.t3_launched(latest.get("issuer")):
         raise DirectionRefused("not_from_the_hook",
-                               "This conversation's latest hook turn came from a headless or scripted process, not "
-                               "T3's own agent, so it can't confirm. Nothing was changed.")
+                               "This conversation's latest hook turn did not come from T3's own agent (a headless "
+                               "or scripted process, or one Khipu could not trace to the T3 Code app), so it can't "
+                               "confirm. Nothing was changed.")
+    if latest.get("harness") != "claude_code":
+        raise DirectionRefused("not_from_the_hook",
+                               f"Khipu can't yet tell T3's own {latest.get('harness')} agent apart from a scripted "
+                               "process, so a held change in this conversation is confirmed in the Khipu app. "
+                               "Nothing was changed.")
     front = f"{latest.get('harness')}:t3"
     if front not in owner_turns.settings()["trusted"]:
         raise DirectionRefused("not_confirmed", f"Not confirmed: {owner_turns.untrusted_why(front)}.")
@@ -655,37 +671,57 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
     parts = _t3_parts(old)
     read = _t3_read(thread, [e[0] for e in parts[0]] if parts else (), parts[1] if parts else None)
     message = read["message"] if parts is not None else None
-    if message is not None:
+    # The current turn is the latest hook row: a machine one (a notification,
+    # a wake) never borrows an owner message from before it.
+    if message is not None and latest.get("typed") and not latest.get("machine"):
         sha = owner_turns.prompt_sha256(message["text"])
         return {"auth": "direction", "harness": "t3", "session": session, "turn": message["id"],
                 "prompt_sha256": sha, "binding": "t3",
                 "confirmed": {"source": "t3", "message": message["id"], "message_at": message["at"],
                               "message_sha256": sha}}
     snapshots[thread] = _t3_boundary(old, read, session)
-    return None
+    return _ASK_NOW
 
 
-def _turn_proof(environ, session: str, request: dict, now: float) -> dict | None:
+def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     recorded = owner_turns.turns(session, now)
     if any(t.get("entrypoint") in ("t3", "t3-unverified") for t in recorded):
         raise DirectionRefused("no_recorded_turn", "This conversation's turns were recorded as T3's, but T3's "
                                                    "record no longer shows it, so Khipu can't confirm here.")
     if owner_turns.dispatched_job(environ, session):
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
-    turn = _recent_turn(session, owner_turns.settings(), now, recorded)
-    _from_the_hook(turn)
+    conf = owner_turns.settings()
+    # The refusals a change has (no owner turn, an untrusted front end, a
+    # stale conversation), then the current turn: only the latest row.
+    usable = _recent_turn(session, conf, now, recorded)
+    turn = _current_turn(recorded, conf)
+    if turn is not None and now - _float(turn.get("ts")) > conf["latest_window_h"] * 3600:
+        turn = None
+    _from_the_hook(turn or usable)
     asks = request.get("asks")
     if not isinstance(asks, dict):
         asks = request["asks"] = {}
     old = asks.get(session)
-    if not _late_copy(turn) and _after_ask(turn, old) and not _ag_replayed(turn, old):
+    why = _ASK_NOW
+    if turn is not None and not _late_copy(turn) and _after_ask(turn, old):
+        if turn.get("harness") == "antigravity":
+            words = _ag_words(old)
+            if words is None:
+                why = _AG_LEGACY
+            elif not isinstance(turn.get("prompt_sha256"), str) or turn["prompt_sha256"] in words:
+                why = _AG_SAID_BEFORE
+            else:
+                why = None
+        else:
+            why = None
+    if why is None:
         return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
                 "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
                 "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook",
                 "confirmed": {"source": "hook", "message": turn["turn"], "message_at": turn.get("at"),
                               "message_sha256": turn.get("prompt_sha256")}}
     asks[session] = _ask_boundary(old, recorded, now, session)
-    return None
+    return why
 
 
 def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dict, dict]:
@@ -710,9 +746,9 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
             stamp = _proof(environ, session, request, now)
-            if stamp is None:
+            if isinstance(stamp, str):
                 _save(path, state, now)
-                raise DirectionRefused("not_confirmed", _ASK_NOW)
+                raise DirectionRefused("not_confirmed", stamp)
             stamp["confirmed"]["request"] = request_id
             request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session))
             _save(path, state, now)

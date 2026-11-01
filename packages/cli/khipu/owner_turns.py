@@ -814,6 +814,72 @@ def _real_home() -> str:
     return pwd.getpwuid(os.getuid()).pw_dir
 
 
+# T3 Code's app bundle ("T3 Code.app", "T3 Code (Beta).app"), matched as
+# ``_app_bundle`` matches: the outermost bundle, its name without case
+# (ASCII only), directly in /Applications or ~/Applications by identity.
+_T3_BUNDLE_PREFIX = "t3 code"
+_T3_TREE_MOST = 16
+
+
+def _t3_app(exe: str) -> bool:
+    try:
+        path = Path(os.path.realpath(exe))
+    except (OSError, ValueError):
+        return False
+    for i, part in enumerate(path.parts):
+        if part.casefold().endswith(".app"):
+            return part.isascii() and part.casefold().startswith(_T3_BUNDLE_PREFIX) \
+                and _in_trusted_place(Path(*path.parts[:i]))
+    return False
+
+
+def _scripted_launcher(name: str, args: list[str] | None) -> bool:
+    """A process that runs an agent headless or from a script: a shell or an
+    interpreter, a print or headless command line (``claude -p``,
+    ``cursor-agent -p``), ``codex exec``; an unread command line too."""
+    if args is None or _refused_issuer(name) or _headless_args(args):
+        return True
+    if name.lower().startswith("codex"):
+        words = [a for a in args[1:] if not a.startswith("-")]
+        return bool(words) and words[0] in ("exec", "e")
+    return False
+
+
+def t3_launched(issuer) -> bool:
+    """Whether a hook's issuer is T3 Code's own agent, read live from the
+    kernel: the process with the recorded pid and start time, whose parent
+    chain reaches a process running from T3 Code's app bundle with no
+    scripted launcher (``_scripted_launcher``) on the way, the issuer
+    itself included. Anything unreadable, or a reused process number, is
+    False."""
+    if not isinstance(issuer, dict) or type(issuer.get("pid")) is not int:
+        return False
+    start = issuer.get("start")
+    if isinstance(start, bool) or not isinstance(start, (int, float)):
+        return False
+    pid = issuer["pid"]
+    info = _proc_info(pid)
+    if info is None or info[2] != start:
+        return False
+    born = start
+    for _ in range(_T3_TREE_MOST):
+        parent, exe, started = info
+        if started > born:
+            return False  # the number went to a newer process
+        born = started
+        if pid != issuer["pid"] and _t3_app(exe):
+            return True
+        if _scripted_launcher(os.path.basename(os.path.realpath(exe)), _proc_args(pid)):
+            return False
+        if parent <= 1:
+            return False
+        pid = parent
+        info = _proc_info(pid)
+        if info is None:
+            return False
+    return False
+
+
 def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
     """The process that ran this hook. The recorder's parent must be the
     prompt shim (a shell running ``khipu-prompt-recall``; ``shim`` names
@@ -868,9 +934,7 @@ def record(payload: dict, env: dict | None = None, now: float | None = None,
     was recorded. ``issuer`` None means this process's (``hook_issuer``).
     ``extra`` (Antigravity's recorder only): ``fallback`` marks a turn read
     from the payload's ``lastUserInput`` (``ag_step``: that turn's
-    ``initialNumSteps``), ``ag_transcript`` one read from the transcript
-    (``ag_step``: its USER_INPUT step index, absent when the step has
-    none); ``duplicate_of`` + ``occurrence`` make this row a
+    ``initialNumSteps``); ``duplicate_of`` + ``occurrence`` make this row a
     late second copy of that turn, sharing its occurrence; ``late`` marks a
     row recorded after its turn by a later hook ("PostInvocation", "Stop",
     or "flush" for the flushed step of a turn first read from
@@ -930,9 +994,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
     for flag in ("fallback", "duplicate_of", "late"):
         if extra.get(flag):
             turn[flag] = extra[flag]
-    if extra.get("ag_transcript"):
-        turn["ag_transcript"] = True
-    if (extra.get("fallback") or extra.get("ag_transcript")) and type(extra.get("ag_step")) is int:
+    if extra.get("fallback") and type(extra.get("ag_step")) is int:
         turn["ag_step"] = extra["ag_step"]
     ok, why = eligible(turn, conf)
     turn["eligible"] = ok
@@ -1313,8 +1375,9 @@ def _ag_past_transcript(path: str, steps: int) -> bool:
     """Whether step ``steps`` is past the transcript's newest step (of any
     type) that carries a step index. False when no step index can be read."""
     if antigravity_db.is_db(path):
-        rows = antigravity_db.read_turns(path)
-        return bool(rows) and rows[-1][0] < steps
+        # Every step type: tool steps are past the turn's own USER_INPUT too.
+        last = antigravity_db.last_step(path)
+        return last is not None and last < steps
     for line in _ag_lines_newest_first(path):
         try:
             step = json.loads(line)
@@ -1501,7 +1564,10 @@ def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
     payload's ``initialNumSteps``), and the flushed step of that same turn
     is marked its duplicate. Every Antigravity record goes through here."""
     directory = _ag_dir()
-    marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
+    # The words are part of the mark: a reused step index with new words
+    # (a rewritten or renumbered transcript) is a new turn, not this one.
+    words = prompt_sha256(text)
+    marker = directory / hashlib.sha256(f"{session}\0{key}\0{words}".encode("utf-8", "replace")).hexdigest()[:40]
     try:
         os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     except FileExistsError:
@@ -1529,9 +1595,7 @@ def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
             at = ts
     if key.startswith(_AG_FALLBACK):
         return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps})
-    if index is None:
-        return at, {"ag_transcript": True}
-    return at, {**_ag_original(session, index, text, now), "ag_transcript": True, "ag_step": index}
+    return at, (_ag_original(session, index, text, now) if index is not None else {})
 
 
 def _ag_original(session: str, index: int, text: str, now: float) -> dict:

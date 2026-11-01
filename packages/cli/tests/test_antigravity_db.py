@@ -554,3 +554,33 @@ def test_several_pre_invocations_of_one_readable_turn_still_record_once(home):
     assert owner_turns.antigravity_late_turn(_pre(path, initialNumSteps=8), "PostInvocation", now=2000.0,
                                              issuer=ISSUER)
     assert [r["ts"] for r in _rows()] == [1000.0, 2000.0] and _counted() == [1, 2]
+
+
+def test_review4_repeated_pre_invocations_past_tool_steps_add_no_turn(home):
+    """Review 4 (P1, SQLite variant): a turn's later PreInvocation with the
+    same lastUserInput and initialNumSteps 2, after tool steps 1 and 2, read
+    only user/assistant rows (newest 0) and recorded a second turn."""
+    path = make_db(db_path(home), [(0, 14, user_payload("ship it"))], wal=True)
+    said = {"lastUserInput": "ship it"}
+    assert owner_turns.antigravity_prompt(_pre(path, **said), now=1000.0, wait=0,
+                                          issuer=ISSUER)["prompt"] == "ship it"
+    _add(path, 1, 7, b"\x08\x07")
+    _add(path, 2, 7, b"\x08\x07")
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=2, initialNumSteps=2, **said), now=1005.0,
+                                          wait=0, issuer=ISSUER) == {}
+    capture_users = [t for t in adb.read_turns(path) if t[1] == "user"]
+    assert _counted() == [1] and len(capture_users) == 1
+    assert adb.last_step(path) == 2 and adb.last_step(home / "missing.db") is None
+
+
+def test_review4_a_reused_db_step_index_with_new_words_is_recorded(home):
+    path = make_db(db_path(home), [(0, 14, user_payload("first words"))], wal=True)
+    assert owner_turns.antigravity_prompt(_pre(path), now=1000.0, wait=0, issuer=ISSUER)["prompt"] == "first words"
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE steps SET step_payload=? WHERE idx=0", (user_payload("other words"),))
+    conn.commit()
+    conn.close()
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=2), now=2000.0, wait=0,
+                                          issuer=ISSUER)["prompt"] == "other words"
+    assert owner_turns.antigravity_prompt(_pre(path, invocationNum=3), now=2001.0, wait=0, issuer=ISSUER) == {}
+    assert _counted() == [1, 1]
