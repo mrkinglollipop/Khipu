@@ -58,7 +58,12 @@ RETENTION_S = 24 * 3600
 # off a terminal), "cursor_sdk" (``@cursor/sdk`` outside T3), "aegis_print"
 # (``grok -p``) and "antigravity_print". Antigravity's "cli" is not trusted by
 # default: nothing Khipu can read tells ``agy``'s headless mode from a person
-# typing on a terminal.
+# typing on a terminal. An issuer whose command line, terminal or app bundle
+# can't be read makes a Cursor or Antigravity turn a machine one. The bar is
+# the same for every front end, Claude Code's "cli" and Codex's terminal
+# included: the standard headless and scripted modes are refused, and a
+# program that drives an interactive session through a pseudo-terminal to
+# pass as a person is out of reach.
 DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:claude-desktop", "claude_code:claude-desktop-3p",
                    "claude_code:claude-vscode", "claude_code:remote", "claude_code:remote_desktop",
                    "claude_code:remote_mobile", "claude_code:t3", "codex:codex_cli_rs", "codex:codex_desktop",
@@ -68,6 +73,19 @@ DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:claude-desktop", "claude_code
 MACHINE_ENTRYPOINTS = ("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action", "local-agent",
                        "remote_trigger", "remote_cowork_trigger", "codex_exec", "codex_sdk_ts", "cursor_print",
                        "cursor_sdk", "aegis_print", "antigravity_print", "unknown")
+# The default trusted list every settings file saved before ``trusted_defaults``
+# was stored was written against: entries added to DEFAULT_TRUSTED after it
+# reach those files' owners too.
+_DEFAULTS_BEFORE_2026_11_01 = ("claude_code:cli", "claude_code:claude-desktop", "claude_code:claude-desktop-3p",
+                               "claude_code:claude-vscode", "claude_code:remote", "claude_code:remote_desktop",
+                               "claude_code:remote_mobile", "claude_code:t3", "codex:codex_cli_rs",
+                               "codex:codex_desktop", "codex:codex_vscode", "codex:t3", "aegis:aegis")
+# An issuer fact (its command line, terminal or app bundle) that could not be read.
+UNKNOWN = "unknown"
+# Cursor's IDE reports a three-part version from this major up (3.26.13);
+# the ``@cursor/sdk`` falls back to "1.0.0".
+_CURSOR_IDE_MAJOR = 3
+_CURSOR_IDE_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 DEFAULTS = {
     "enabled": True,
     "latest_window_h": 6.0,
@@ -138,6 +156,13 @@ def settings() -> dict:
             elif isinstance(default, list) and isinstance(value, list) \
                     and all(isinstance(v, str) for v in value):
                 out[key] = list(value)
+        if isinstance(data.get("trusted"), list) and out["trusted"] == data["trusted"]:
+            # A default added after this file was saved is trusted; one the
+            # owner had and switched off stays off.
+            seen = data.get("trusted_defaults")
+            if not (isinstance(seen, list) and all(isinstance(v, str) for v in seen)):
+                seen = _DEFAULTS_BEFORE_2026_11_01
+            out["trusted"] += [d for d in DEFAULT_TRUSTED if d not in seen and d not in out["trusted"]]
     return out
 
 
@@ -152,6 +177,7 @@ def write_settings(values: dict) -> dict:
         values = dict(values, latest_window_h=value)
     current = settings()
     current.update(values)
+    current["trusted_defaults"] = list(DEFAULT_TRUSTED)
     _write_private(_ensure_folder() / "settings.json", json.dumps(current, indent=2, allow_nan=False) + "\n")
     return settings()
 
@@ -277,21 +303,43 @@ def dispatched_job(env: dict, session: str = "", *, t3_thread: bool = False) -> 
     return None
 
 
+def _not_headless(issuer: dict) -> bool:
+    """The issuer's command line was read and carries no print or headless
+    flag. Unread (``UNKNOWN`` or missing) is never "not headless"."""
+    return issuer.get("headless") is False and issuer.get("print") is not True
+
+
 def _interactive(issuer: dict | None) -> bool:
     """The issuer ran on a terminal (stdin and stdout both one) with no
     print or headless flag: cursor-agent's own test for its interactive
     mode. An issuer that could not be read is not interactive."""
     issuer = issuer or {}
-    return issuer.get("tty") is True and not issuer.get("headless") and not issuer.get("print")
+    return issuer.get("tty") is True and _not_headless(issuer)
 
 
-def _cursor_app(issuer: dict | None) -> bool:
-    """The hook was run from inside a Cursor app bundle (the IDE). The
-    ``@cursor/sdk`` reports a plain version too ("1.0.0" unless its
-    environment says otherwise), so the version alone can't tell the IDE
-    from a script."""
-    app = (issuer or {}).get("app")
-    return isinstance(app, str) and app.lower().startswith("cursor") and app.endswith(".app")
+def _in_app(issuer: dict | None, prefix: str) -> bool:
+    """The hook was run from inside an app bundle named ``<prefix>...app``
+    by a process with no print or headless flag."""
+    issuer = issuer or {}
+    app = issuer.get("app")
+    return isinstance(app, str) and app != UNKNOWN and app.lower().startswith(prefix) \
+        and app.endswith(".app") and _not_headless(issuer)
+
+
+def _cursor_ide_version(payload: dict) -> bool:
+    """A Cursor IDE version: three numbers, the major at least the IDE's.
+    The ``@cursor/sdk`` reports "1.0.0" unless its environment says
+    otherwise, so a lower or other-shaped version is never the IDE."""
+    version = payload.get("cursor_version") if isinstance(payload, dict) else None
+    match = _CURSOR_IDE_VERSION.fullmatch(version.strip()) if isinstance(version, str) else None
+    return match is not None and int(match.group(1)) >= _CURSOR_IDE_MAJOR
+
+
+def _cursor_ide(issuer: dict | None, payload: dict) -> bool:
+    """The Cursor IDE: run from inside a Cursor app bundle, no headless
+    flag, an IDE-shaped version. The bundle or the version alone is not
+    enough: a script can run Cursor's own binaries or send any version."""
+    return _in_app(issuer, "cursor") and _cursor_ide_version(payload)
 
 
 def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: dict | None = None) -> str:
@@ -300,7 +348,7 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         # ``grok -p``: only when the hook's issuer is that process. A
         # shared Grok leader runs the hooks for every client, so a headless
         # client of a leader is not seen here.
-        return "aegis_print" if entry == "aegis" and (issuer or {}).get("headless") else entry
+        return "aegis_print" if entry == "aegis" and (issuer or {}).get("headless") is True else entry
     if harness == "claude_code":
         entry = (env.get("CLAUDE_CODE_ENTRYPOINT") or "unknown").strip() or "unknown"
         # Claude Code turns only "cli" into "sdk-cli" for ``claude -p``: a
@@ -323,12 +371,16 @@ def entrypoint_of(harness: str, env: dict, payload: dict, session: str, issuer: 
         if native == "cli":
             return "cli" if _interactive(issuer) else "cursor_print"
         if native == "ide":
-            return "ide" if _cursor_app(issuer) else "cursor_sdk"
+            return "ide" if _cursor_ide(issuer, payload) else "cursor_sdk"
         return native
     if harness == "antigravity":
         surface = hook_shape.antigravity_entrypoint(payload)
         entry = _t3_entry(session, surface)
         if entry == "cli" and not _interactive(issuer):
+            return "antigravity_print"
+        # The transcript path names the surface but anything can write one:
+        # the App and the IDE are trusted only from inside their app bundle.
+        if entry in ("app", "ide") and not _in_app(issuer, "antigravity"):
             return "antigravity_print"
         return entry
     return "unknown"
@@ -694,11 +746,14 @@ def _on_terminal(pid: int) -> bool | None:
 
 def _app_bundle(exe: str) -> str | None:
     """The outermost ``.app`` bundle a process runs from (``Cursor.app`` for
-    every Cursor helper), or None."""
+    every Cursor helper), "" when it runs from none, None when its path is
+    unknown."""
+    if not exe:
+        return None
     for part in Path(exe).parts:
         if part.endswith(".app"):
             return part
-    return None
+    return ""
 
 
 def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
@@ -740,14 +795,11 @@ def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
         args = _proc_args(pid)
         if _print_mode(args):
             out["print"] = True
-        if _headless_args(args):
-            out["headless"] = True
+        out["headless"] = UNKNOWN if args is None else _headless_args(args)
         tty = _on_terminal(pid)
-        if tty is not None:
-            out["tty"] = tty
+        out["tty"] = UNKNOWN if tty is None else tty
         app = _app_bundle(exe)
-        if app:
-            out["app"] = app
+        out["app"] = UNKNOWN if app is None else (app or None)
         return out
     return None
 

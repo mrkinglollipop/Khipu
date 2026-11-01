@@ -121,11 +121,13 @@ def test_a_turn_records_the_process_that_ran_the_hook(folders, monkeypatch):
     chain = {100: (90, "/usr/bin/python3", 1.0), 90: (80, "/bin/bash", 1.0), 80: (70, "/opt/harness/claude", 1.0)}
     args = {90: SHIM_ARGS}
     _tree(monkeypatch, chain, args)
-    assert owner_turns.hook_issuer() == {"pid": 80, "start": 1.0, "exe": "claude"}
+    assert owner_turns.hook_issuer() == {"pid": 80, "start": 1.0, "exe": "claude", "headless": "unknown",
+                                        "tty": "unknown", "app": None}
     chain[90] = (85, "/bin/bash", 1.0)
     chain[85] = (80, "/bin/sh", 1.0)
     args[85] = ["/bin/sh", "-c", "/live/packages/cli/bin/khipu-prompt-recall"]
-    assert owner_turns.hook_issuer() == {"pid": 80, "start": 1.0, "exe": "claude"}
+    assert owner_turns.hook_issuer() == {"pid": 80, "start": 1.0, "exe": "claude", "headless": "unknown",
+                                        "tty": "unknown", "app": None}
     chain[80] = (70, "/bin/zsh", 1.0)
     assert owner_turns.hook_issuer() == {"refused": "zsh"}
     chain[80] = (70, "/opt/homebrew/bin/python3.11", 1.0)

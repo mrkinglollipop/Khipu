@@ -366,7 +366,8 @@ def test_gated_payload_is_recorded_as_an_antigravity_owner_turn(home, tmp_path):
     tp = _transcript(tmp_path)
     _step(tp, "USER_INPUT", 1, "ship it")
     turn = owner_turns.antigravity_turn(_pre(tp))
-    owner_turns.record(turn, env={}, issuer={"refused": "test"})
+    owner_turns.record(turn, env={}, issuer={"pid": 1, "start": 1.0, "exe": "language_server_macos_arm",
+                                             "app": "Antigravity.app", "headless": False, "tty": False})
     rows = [json.loads(x) for x in owner_turns.session_file("ag-1").read_text().splitlines()]
     assert len(rows) == 1 and rows[0]["harness"] == "antigravity" and rows[0]["entrypoint"] == "app"
     assert "ship it" not in owner_turns.session_file("ag-1").read_text()               # facts, never the words

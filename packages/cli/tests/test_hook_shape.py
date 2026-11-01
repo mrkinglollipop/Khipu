@@ -410,7 +410,8 @@ def test_a_cursor_prompt_is_recorded_under_cursor_and_trusted_from_the_ide(home)
     start = time.time()
     payload = CURSOR_PAYLOADS["beforeSubmitPrompt"]
     assert owner_turns.record(payload, env={"CLAUDE_PROJECT_DIR": "/work/khipu"}, now=start,
-                              issuer={"exe": "Cursor", "pid": 1, "start": 1.0, "app": "Cursor.app"}) is not None
+                              issuer={"exe": "Cursor", "pid": 1, "start": 1.0, "app": "Cursor.app",
+                                      "headless": False, "tty": False}) is not None
     turn = owner_turns.turns(hook_shape.session_id(payload), now=start + 1)[-1]
     assert (turn["harness"], turn["entrypoint"], turn["session"]) == ("cursor", "ide", payload["session_id"])
     assert turn["eligible"] is True        # Matt, 2026-11-01: Cursor users make owner changes too
