@@ -613,6 +613,10 @@ def _t3_parts(snapshot) -> tuple[list[list], float | None, str | None] | None:
     if latest is not None and (isinstance(latest, bool) or not isinstance(latest, (int, float))
                                or not math.isfinite(latest)):
         return None
+    if not ids and latest is None:
+        # An older stored shape of the unknown snapshot: no message at all,
+        # so it bounds nothing and must never act as an empty exclusion.
+        return None
     return ids, latest, snapshot.get("latest_at")
 
 

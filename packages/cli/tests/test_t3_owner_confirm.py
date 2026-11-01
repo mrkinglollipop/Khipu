@@ -1472,6 +1472,22 @@ def test_review5_p1_a_hold_on_an_empty_t3_projection_is_unknown_and_never_confir
     assert ok and _paused() and out["confirmed"]["message"] == mid, out
 
 
+def test_an_older_stored_empty_t3_snapshot_is_unknown_and_never_confirms(world):
+    # The shape an empty snapshot was stored in before the "unknown" flag:
+    # no ids and no time. It must still bound nothing.
+    request = _hold_in_t3(world, request_message=False)
+    path = owner_direction.requests_path()
+    state = owner_direction._load(path)
+    state["requests"][0]["t3_snapshots"][THREAD] = {"by": [T3_SESSION], "ids": [], "latest_at": None,
+                                                    "latest_ts": None}
+    path.write_text(json.dumps(state))
+    world["t3"].message(THREAD, time.time() - 30)
+    _t3_hook_turn()
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"], out
+    assert not _paused()
+
+
 def test_review5_p2_a_repeat_preinvocation_of_a_captured_step_records_one_row(world):
     # One user step "pause Codex", captured; assistant step 1; a repeat
     # PreInvocation with initialNumSteps=2 and lastUserInput unchanged. It was
