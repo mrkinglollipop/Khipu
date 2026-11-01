@@ -7947,8 +7947,10 @@ def _load_matrix(
 def _reload_matrix(path: Path, profile: str, kind: str | None, key: tuple[Any, ...]) -> None:
     global _MATRIX_RELOADING
     reader: dict[str, Any] = {}
+    packed = None
     try:
         rows, by_rowid = _load_matrix(path, profile, kind, reader=reader)
+        rows, packed = _pack_matrix(rows)
     except Exception as exc:  # noqa: BLE001 — the stale generation keeps serving
         _log(f"replica matrix background reload failed: {type(exc).__name__}: {exc}")
         rows = None
@@ -7958,7 +7960,8 @@ def _reload_matrix(path: Path, profile: str, kind: str | None, key: tuple[Any, .
         # meanwhile; only a newer generation of the same one is swapped in.
         if rows is not None and old is not None and old[0] == key[0] and old[3:] == key[3:]:
             _close_matrix_reader(_MATRIX_CACHE.get("reader"))
-            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid, "reader": reader})
+            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid, "reader": reader,
+                                  "packed": packed})
         else:
             _close_matrix_reader(reader)
         _MATRIX_RELOADING = False
@@ -8002,14 +8005,36 @@ def _matrix_rows(
                     _MATRIX_CACHE["by_rowid"])
         reader: dict[str, Any] = {}
         rows, by_rowid = _load_matrix(path, profile, kind, deadline=deadline, reader=reader)
+        rows, packed = _pack_matrix(rows)
         _MATRIX_CACHE.clear()
         if key is not None:
-            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid, "reader": reader})
+            _MATRIX_CACHE.update({"key": key, "rows": rows, "by_rowid": by_rowid, "reader": reader,
+                                  "packed": packed})
         else:
             _close_matrix_reader(reader)
         return _current_matrix_rows(path, rows, reader), by_rowid
     finally:
         _MATRIX_LOCK.release()
+
+
+def _pack_matrix(rows: list) -> tuple[list, Any]:
+    """(rows, packed): one generation's vectors packed once into one float32
+    matrix (``vector_scan.pack``) with each row's blob a view into it, so a
+    scan copies no vectors and the generation holds them only once; the rows
+    as loaded and None when they cannot be packed."""
+    from khipu import vector_scan
+
+    packed = vector_scan.pack(rows, key_at=0, blob_at=5)
+    return (packed.rows, packed) if packed is not None else (rows, None)
+
+
+def _matrix_packed(by_rowid: dict) -> Any:
+    """The packed matrix of the generation ``by_rowid`` belongs to, or None
+    when it was not packed or another generation replaced it since."""
+    with _MATRIX_LOCK:
+        if _MATRIX_CACHE.get("by_rowid") is by_rowid:
+            return _MATRIX_CACHE.get("packed")
+    return None
 
 
 def warm_matrix(profile: str, kind: str | None = None) -> None:
@@ -8042,7 +8067,7 @@ def cosine_candidates_snapshot(
     4-decimal scores and order are unchanged from before.
     """
     from khipu.snippets import LABEL_LIMIT, SNIPPET_LIMIT, clip_snippet
-    from khipu.vector_scan import top_k_by_dot
+    from khipu.vector_scan import top_k_by_dot, top_k_packed
 
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("replica scan deadline expired")
@@ -8066,11 +8091,22 @@ def cosine_candidates_snapshot(
     qvec = tuple(x / qn for x in vec)
 
     wanted = max(1, int(limit))
-    winners = top_k_by_dot(
-        qvec, ((rowid, blob) for rowid, _knd, _ref, _idx, _text, blob in rows),
-        wanted, entity_key=lambda rowid: by_rowid[rowid][:2], deadline=deadline,
-        max_abs_component=1.0,
-    )
+    packed = _matrix_packed(by_rowid)
+    if packed is not None:
+        # The generation's vectors were packed once when it loaded: the same
+        # answer as top_k_by_dot, without copying every vector per prompt
+        # (most of the scan's time under load, 2026-10-31).
+        winners = top_k_packed(
+            qvec, [(rowid, blob) for rowid, _knd, _ref, _idx, _text, blob in rows], packed,
+            wanted, entity_key=lambda rowid: by_rowid[rowid][:2], deadline=deadline,
+            max_abs_component=1.0,
+        )
+    else:
+        winners = top_k_by_dot(
+            qvec, ((rowid, blob) for rowid, _knd, _ref, _idx, _text, blob in rows),
+            wanted, entity_key=lambda rowid: by_rowid[rowid][:2], deadline=deadline,
+            max_abs_component=1.0,
+        )
     if not winners:
         return []
 

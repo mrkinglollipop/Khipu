@@ -5327,8 +5327,46 @@ def _save_view(view: dict) -> None:
         raise
 
 
+def _captures_unchanged(view: dict, fingerprint: dict, now: datetime) -> bool:
+    """Whether ``fingerprint`` differs from the view's only in the capture
+    state folder's stat while nothing the fold read there changed: each
+    runner's own capture files (``routing_sources.capture_inputs``) are as
+    the fold found them and no join it made has aged out. The recall hook
+    writes that folder on every prompt; its own files are never read by the
+    fold."""
+    old = view.get("fingerprint")
+    if not isinstance(old, dict) or not isinstance(old.get("sources"), dict) \
+            or not isinstance(fingerprint.get("sources"), dict):
+        return False
+    if {k: v for k, v in old.items() if k != "sources"} != {k: v for k, v in fingerprint.items() if k != "sources"}:
+        return False
+    if {k: v for k, v in old["sources"].items() if k != "captures"} != \
+            {k: v for k, v in fingerprint["sources"].items() if k != "captures"}:
+        return False
+    cache = view.get("source_cache") or {}
+    kept = cache.get("captures")
+    runners = cache.get("runners") or {}
+    if not isinstance(kept, dict) or set(kept) != set(runners):
+        return False  # a view folded before these were kept: refold once
+    from khipu import routing_sources
+
+    for name, entry in kept.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("refs"), list):
+            return False
+        if sorted(routing_sources.attachment_refs(runners[name])) != entry["refs"]:
+            return False
+        until = _parse(entry.get("until")) if entry.get("until") else None
+        if entry.get("until") and (until is None or now >= until):
+            return False
+        if routing_sources.capture_inputs(entry["refs"]) != entry.get("files"):
+            return False
+    return True
+
+
 def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
-    if (not view or view.get("fingerprint") != fingerprint or "priority_version" not in view
+    if not view or (view.get("fingerprint") != fingerprint and not _captures_unchanged(view, fingerprint, now)):
+        return False
+    if ("priority_version" not in view
             or "priority_owner_revision" not in view or "priority_stored" not in view
             or view.get("event_identity") != 2
             or view.get("proposal_schema") != 1 or view.get("fold_audit_schema") != 1
@@ -5343,6 +5381,14 @@ def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
     folded = _parse(view.get("folded_at"))
     if folded is not None and (folded - now).total_seconds() > CLOCK_TOLERANCE:
         return False  # folded at a time further ahead of this clock than it trusts: fold again at now
+    # A kept job attachment ends at its own expiry even when every input file
+    # is unchanged, so the equal-fingerprint path cannot skip this check.
+    kept = (view.get("source_cache") or {}).get("captures")
+    for entry in (kept.values() if isinstance(kept, dict) else ()):
+        if isinstance(entry, dict) and entry.get("until"):
+            until = _parse(entry["until"])
+            if until is None or now >= until:
+                return False
     due = _parse(view.get("valid_until"))
     return due is None or now < due
 
