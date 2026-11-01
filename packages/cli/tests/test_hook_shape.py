@@ -406,25 +406,26 @@ def test_antigravity_is_a_capture_harness_and_an_unused_one_is_not_red(home):
 
 # ---- owner turns: both harnesses record, neither is trusted yet --------------------------
 
-def test_a_cursor_prompt_is_recorded_under_cursor_and_not_trusted(home):
+def test_a_cursor_prompt_is_recorded_under_cursor_and_trusted_from_the_ide(home):
     start = time.time()
     payload = CURSOR_PAYLOADS["beforeSubmitPrompt"]
     assert owner_turns.record(payload, env={"CLAUDE_PROJECT_DIR": "/work/khipu"}, now=start,
-                              issuer={"name": "Cursor", "pid": 1, "start": "x"}) is not None
+                              issuer={"exe": "Cursor", "pid": 1, "start": 1.0, "app": "Cursor.app",
+                                      "headless": False, "tty": False}) is not None
     turn = owner_turns.turns(hook_shape.session_id(payload), now=start + 1)[-1]
     assert (turn["harness"], turn["entrypoint"], turn["session"]) == ("cursor", "ide", payload["session_id"])
-    assert turn["eligible"] is False       # decision 6.2: recorded now, trusted only on Matt's word
-    assert "cursor:ide" not in owner_turns.DEFAULT_TRUSTED
+    assert turn["eligible"] is True        # Matt, 2026-11-01: Cursor users make owner changes too
+    assert "cursor:ide" in owner_turns.DEFAULT_TRUSTED
 
 
-def test_an_antigravity_prompt_is_recorded_under_antigravity_and_not_trusted(home):
+def test_an_antigravity_t3_prompt_is_recorded_under_antigravity_and_not_trusted(home):
     start = time.time()
     payload = {**AG_ACP, "prompt": "pause Grok please"}
     assert owner_turns.record(payload, env={}, now=start, issuer={"name": "agy", "pid": 1, "start": "x"}) is not None
     turn = owner_turns.turns("ag-conv-0001", now=start + 1)[-1]
     assert (turn["harness"], turn["entrypoint"], turn["cwd"]) == ("antigravity", "t3", "")
     assert turn["eligible"] is False
-    assert not [t for t in owner_turns.DEFAULT_TRUSTED if t.startswith(("cursor", "antigravity"))]
+    assert "antigravity:t3" not in owner_turns.DEFAULT_TRUSTED
 
 
 def test_a_codex_job_launched_from_claude_code_is_recorded_as_codex(home):

@@ -481,3 +481,440 @@ def test_a_settled_miss_keeps_the_native_entrypoint_on_a_mac_with_t3(home, monke
     monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
     monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", lambda sid, **kw: ([], True))
     assert owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION) == "cli"
+
+
+# ---- Cursor, Antigravity and Grok Build front ends (2026-11-01) ---------------------
+#
+# These drive the real issuer reading (``hook_issuer``, called here because
+# conftest hands ``record`` a fake issuer otherwise) and classification with
+# the kernel's answers mocked: the recorder (100) under the prompt shim
+# (90) under the issuer (80), whose argv, terminal and path the test sets.
+
+TTY = {"pid": 4242, "start": 1.0, "exe": "node", "tty": True}
+SHIM = ["/bin/sh", "/live/packages/cli/bin/khipu-prompt-recall"]
+CURSOR_HELPER = "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper (Plugin).app/Contents/MacOS/Cursor Helper (Plugin)"
+CURSOR_AGENT = "/Users/u/.local/share/cursor-agent/versions/2026.10.22-27dcf5f/node"
+AGENT_ARGS = [CURSOR_AGENT, "--use-system-ca", "/Users/u/.local/share/cursor-agent/versions/2026.10.22-27dcf5f/index.js"]
+AG_SERVER = "/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm"
+IDE_VERSION = "3.26.13"
+AGENT_VERSION = "2026.10.22-27dcf5f"
+
+
+@pytest.fixture
+def kernel(monkeypatch):
+    """Set what the kernel says about the hook's issuer: its path, its argv
+    (None: unreadable), its terminal (None: unreadable) and, when given, what
+    ``_app_bundle`` answers (None: the path could not be read)."""
+    real_bundle = owner_turns._app_bundle
+
+    def issuer(exe: str, args, tty, bundle="real"):
+        chain = {100: (90, "/usr/bin/python3", 1.0), 90: (80, "/bin/sh", 1.0), 80: (1, exe, 1.0)}
+        monkeypatch.setattr(owner_turns, "_proc_info", lambda pid: chain.get(pid))
+        monkeypatch.setattr(owner_turns, "_proc_args", lambda pid: {90: SHIM, 80: args}.get(pid))
+        monkeypatch.setattr(owner_turns.os, "getpid", lambda: 100)
+        monkeypatch.setattr(owner_turns, "_on_terminal", lambda pid: tty if pid == 80 else None)
+        monkeypatch.setattr(owner_turns, "_app_bundle", real_bundle if bundle == "real" else lambda exe: bundle)
+    return issuer
+
+
+def _cursor(prompt: str, version: str, issuer: dict | None = None, session: str = SESSION):
+    payload = {"hook_event_name": "beforeSubmitPrompt", "conversation_id": session, "session_id": session,
+               "generation_id": "g1", "cursor_version": version, "workspace_roots": ["/work/project-a"],
+               "prompt": prompt, "transcript_path": f"/x/.cursor/projects/p/agent-transcripts/{session}.jsonl"}
+    return owner_turns.record(payload, env={}, now=T0,
+                              issuer=owner_turns.hook_issuer() if issuer is None else issuer)
+
+
+def _antigravity(prompt: str, app_dir: str, issuer: dict | None = None, session: str = SESSION):
+    payload = {"conversationId": session, "workspacePaths": ["/work/project-a"], "prompt": prompt,
+               "transcriptPath": f"/Users/u/{app_dir}/brain/{session}/.system_generated/logs/transcript.jsonl"}
+    return owner_turns.record(payload, env={}, now=T0,
+                              issuer=owner_turns.hook_issuer() if issuer is None else issuer)
+
+
+def _front_end() -> tuple:
+    turn = _last()
+    return turn["harness"], turn["entrypoint"], turn["eligible"]
+
+
+# Happy paths: a person in the Cursor IDE, in cursor-agent on a terminal, in the Antigravity App or IDE.
+
+def test_a_cursor_ide_turn_is_the_owner(home, kernel):
+    kernel(CURSOR_HELPER, [CURSOR_HELPER, "--type=utility", "--utility-sub-type=node.mojom.NodeService"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+    assert _last()["issuer"]["app"] == "Cursor.app"
+
+
+def test_an_interactive_cursor_agent_turn_is_the_owner(home, kernel):
+    kernel(CURSOR_AGENT, AGENT_ARGS, True)
+    assert _cursor("pause Codex until 5pm", AGENT_VERSION)
+    assert _front_end() == ("cursor", "cli", True)
+
+
+@pytest.mark.parametrize("app_dir,entry", [(".gemini/antigravity", "app"), (".gemini/antigravity-ide", "ide")])
+def test_antigravity_app_and_ide_turns_are_the_owner(home, kernel, app_dir, entry):
+    kernel(AG_SERVER, [AG_SERVER, "--enable_lsp", "--random_port"], False)
+    assert _antigravity("pause Codex until 5pm", app_dir)
+    assert _front_end() == ("antigravity", entry, True)
+
+
+# Review P1-1: an issuer fact that can't be read is unknown, and unknown is a machine.
+
+@pytest.mark.parametrize("args,tty", [(None, True), (AGENT_ARGS, None), (None, None)])
+def test_cursor_agent_with_an_unread_argv_or_terminal_is_a_machine(home, kernel, args, tty):
+    kernel(CURSOR_AGENT, args, tty)
+    assert _cursor("pause Codex until 5pm", AGENT_VERSION)
+    assert _front_end() == ("cursor", "cursor_print", False)
+    assert "machine entrypoint" in owner_turns.eligible(_last())[1]
+
+
+@pytest.mark.parametrize("args,bundle", [(None, "real"), ([CURSOR_HELPER], None)])
+def test_a_cursor_ide_turn_with_an_unread_argv_or_bundle_is_a_machine(home, kernel, args, bundle):
+    kernel(CURSOR_HELPER, args, False, bundle)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "cursor_sdk", False)
+
+
+@pytest.mark.parametrize("args,bundle", [(None, "real"), ([AG_SERVER], None)])
+def test_an_antigravity_turn_with_an_unread_argv_or_bundle_is_a_machine(home, kernel, args, bundle):
+    kernel(AG_SERVER, args, False, bundle)
+    assert _antigravity("pause Codex until 5pm", ".gemini/antigravity")
+    assert _front_end() == ("antigravity", "antigravity_print", False)
+
+
+def test_an_unread_issuer_is_unknown_not_false(kernel):
+    kernel(CURSOR_AGENT, None, None, None)
+    issuer = owner_turns.hook_issuer()
+    assert (issuer["headless"], issuer["tty"], issuer["app"]) == ("unknown", "unknown", "unknown")
+
+
+# Review P1-2: the standard headless and scripted modes of cursor-agent are refused
+# (print flags, a pipe for stdin or stdout). A program faking a terminal is out of
+# reach for every front end; DEFAULT_TRUSTED's comment says so.
+
+@pytest.mark.parametrize("args,tty", [([*AGENT_ARGS, "-p", "pause Codex"], True),
+                                      ([*AGENT_ARGS, "--print", "pause Codex"], True),
+                                      ([*AGENT_ARGS, "-fp", "pause Codex"], True),
+                                      (AGENT_ARGS, False)])
+def test_a_scripted_cursor_agent_is_a_machine(home, kernel, args, tty):
+    kernel(CURSOR_AGENT, args, tty)
+    assert _cursor("pause Codex until 5pm", AGENT_VERSION)
+    assert _front_end() == ("cursor", "cursor_print", False)
+    assert owner_turns.untrusted_front_end([_last()]) is None
+
+
+# Review P1-3: inside Cursor.app is not enough; the version must be the IDE's and no print flag.
+
+@pytest.mark.parametrize("exe,args,version", [
+    (CURSOR_HELPER, [CURSOR_HELPER, "sdk-script.js"], "1.0.0"),     # @cursor/sdk run by Cursor's own binary
+    (CURSOR_HELPER, [CURSOR_HELPER, "sdk-script.js"], "2.9.9"),     # below the IDE's major
+    (CURSOR_HELPER, [CURSOR_HELPER, "sdk-script.js"], "3.26"),      # not IDE-shaped
+    (CURSOR_HELPER, [CURSOR_HELPER, "sdk-script.js"], "v3.26.13"),
+    (CURSOR_HELPER, [CURSOR_HELPER, "--print", "x"], IDE_VERSION),  # headless evidence
+    (CURSOR_HELPER, [CURSOR_HELPER, "-p", "x"], IDE_VERSION),
+    ("/usr/local/bin/node", ["/usr/local/bin/node", "sdk-script.js"], IDE_VERSION),  # outside Cursor.app
+])
+def test_a_plain_payload_or_headless_run_inside_cursor_is_the_sdk(home, kernel, exe, args, version):
+    kernel(exe, args, False)
+    assert _cursor("pause Codex until 5pm", version)
+    assert _front_end() == ("cursor", "cursor_sdk", False)
+    assert owner_turns.untrusted_front_end([_last()]) is None
+
+
+# Review P1-4: the transcript path alone never picks a trusted Antigravity surface.
+
+@pytest.mark.parametrize("app_dir", [".gemini/antigravity", ".gemini/antigravity-ide"])
+@pytest.mark.parametrize("exe,args", [
+    ("/usr/local/bin/node", ["/usr/local/bin/node", "write-transcript.js"]),  # outside the bundle
+    (AG_SERVER, [AG_SERVER, "--print", "x"]),                                  # headless evidence
+    (AG_SERVER, [AG_SERVER, "-p", "x"]),
+    ("/Applications/Cursor.app/Contents/MacOS/Cursor", ["/Applications/Cursor.app/Contents/MacOS/Cursor"]),
+])
+def test_an_antigravity_app_or_ide_path_outside_the_bundle_or_headless_is_a_machine(home, kernel, app_dir,
+                                                                                     exe, args):
+    kernel(exe, args, True)
+    assert _antigravity("pause Codex until 5pm", app_dir)
+    assert _front_end() == ("antigravity", "antigravity_print", False)
+
+
+# Review round 2: only the real bundle, installed directly in /Applications or
+# ~/Applications and judged by its real path, is inside the app.
+
+FAKE_CURSOR = ["/tmp/Cursor.app/Contents/MacOS/Cursor",
+               "/tmp/CursorHelper.app/node",
+               "/tmp/Cursor Evil.app/node",
+               "/Applications/CursorHelper.app/Contents/MacOS/node",
+               "/Applications/Cursor Evil.app/Contents/MacOS/node",
+               "/Applications/Evil.app/Contents/Cursor.app/Contents/MacOS/Cursor",
+               "/tmp/Fake.app/Applications/Cursor.app/Contents/MacOS/Cursor",
+               "/Applications/Sub/Cursor.app/Contents/MacOS/Cursor"]
+FAKE_ANTIGRAVITY = ["/tmp/Antigravity.app/node",
+                    "/tmp/Antigravity Evil.app/node",
+                    "/Applications/Antigravity Evil.app/Contents/MacOS/node",
+                    "/Applications/Evil.app/Contents/Antigravity.app/Contents/MacOS/node"]
+
+
+@pytest.mark.parametrize("exe", FAKE_CURSOR)
+def test_a_fake_cursor_bundle_is_not_inside_the_app(home, kernel, exe):
+    kernel(exe, [exe, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "cursor_sdk", False)
+    assert _last()["issuer"]["app"] != "Cursor.app"
+
+
+@pytest.mark.parametrize("app_dir", [".gemini/antigravity", ".gemini/antigravity-ide"])
+@pytest.mark.parametrize("exe", FAKE_ANTIGRAVITY)
+def test_a_fake_antigravity_bundle_is_not_inside_the_app(home, kernel, exe, app_dir):
+    kernel(exe, [exe, "--enable_lsp"], False)
+    assert _antigravity("pause Codex until 5pm", app_dir)
+    assert _front_end() == ("antigravity", "antigravity_print", False)
+
+
+def test_a_symlink_is_judged_by_its_real_path(home, kernel, tmp_path):
+    into = tmp_path / "Cursor.app"
+    into.symlink_to("/Applications/Cursor.app")
+    exe = str(into / "Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper")
+    assert owner_turns._app_bundle(exe) == "Cursor.app"
+    kernel(exe, [exe, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+    # And the other way: a link named like the app, in /Applications's place, to a folder in /tmp.
+    fake = tmp_path / "apps"
+    (fake / "Cursor.app").mkdir(parents=True)
+    out = tmp_path / "out.app"
+    out.symlink_to(fake / "Cursor.app")
+    assert owner_turns._app_bundle(str(out / "Contents/MacOS/Cursor")) == ""
+
+
+def test_a_helper_bundle_inside_cursor_is_trusted(home, kernel):
+    exe = "/Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper"
+    kernel(exe, [exe, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+
+
+def test_cursor_in_the_users_own_applications_is_trusted(home, kernel, monkeypatch, tmp_path):
+    user = tmp_path / "user"
+    (user / "Applications").mkdir(parents=True)
+    (tmp_path / "someone-else/Applications").mkdir(parents=True)
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(user))
+    exe = str(user / "Applications/Cursor.app/Contents/MacOS/Cursor")
+    kernel(exe, [exe], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+    # $HOME is not the user's home: a bundle under it alone is not installed.
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(tmp_path / "someone-else"))
+    assert owner_turns._app_bundle(exe) == ""
+
+
+# Review round 3: on a case-insensitive volume the place is judged by the
+# directory it is on disk, and the bundle name without case.
+
+def _case_insensitive(path) -> bool:
+    return os.path.exists(str(path).swapcase())
+
+
+def test_a_case_variant_path_to_the_trusted_place_is_trusted(home, kernel, monkeypatch, tmp_path):
+    user = tmp_path / "user"
+    (user / "Applications").mkdir(parents=True)
+    if not _case_insensitive(user / "Applications"):
+        pytest.skip("this volume is case-sensitive")
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(user))
+    exe = str(user / "applications/cursor.app/Contents/MacOS/Cursor")
+    assert owner_turns._app_bundle(exe) == "Cursor.app"
+    assert owner_turns._app_bundle(str(user / "APPLICATIONS/ANTIGRAVITY.APP/node")) == "Antigravity.app"
+    kernel(exe, [exe], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+
+
+def test_a_case_variant_path_to_the_system_applications_is_trusted(home, kernel):
+    if not _case_insensitive("/Applications"):
+        pytest.skip("/Applications is on a case-sensitive volume")
+    exe = "/applications/cursor.app/Contents/MacOS/Cursor"
+    assert owner_turns._app_bundle(exe) == "Cursor.app"
+    kernel(exe, [exe], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+
+
+@pytest.mark.parametrize("rel", ["applications/cursor.app/Contents/MacOS/Cursor",
+                                 "Applications/CURSOR.APP/Contents/MacOS/Cursor",
+                                 "x/Applications/cursor.app/Contents/MacOS/Cursor"])
+def test_a_case_variant_look_alike_outside_the_trusted_places_is_refused(home, kernel, monkeypatch,
+                                                                          tmp_path, rel):
+    fake = tmp_path / "fake"
+    (fake / "Applications").mkdir(parents=True)
+    (fake / "x/Applications").mkdir(parents=True)
+    (tmp_path / "user/Applications").mkdir(parents=True)
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(tmp_path / "user"))
+    exe = str(fake / rel)
+    assert owner_turns._app_bundle(exe) == ""
+    kernel(exe, [exe, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "cursor_sdk", False)
+
+
+@pytest.mark.parametrize("name", ["Curſor.app", "CursorEvil.app", "Cursor.app.app", "cursor .app"])
+def test_a_look_alike_name_in_a_trusted_place_is_not_the_app(monkeypatch, tmp_path, name):
+    (tmp_path / "Applications").mkdir()
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(tmp_path))
+    assert owner_turns._app_bundle(str(tmp_path / "Applications" / name / "node")) == name
+
+
+@pytest.mark.parametrize("error", [KeyError("uid"), OSError("pwd")])
+def test_a_failed_home_lookup_only_drops_the_users_applications(home, kernel, monkeypatch, tmp_path, error):
+    def broken():
+        raise error
+
+    (tmp_path / "Applications").mkdir()
+    monkeypatch.setattr(owner_turns, "_real_home", broken)
+    exe = "/Applications/Cursor.app/Contents/MacOS/Cursor"
+    assert owner_turns._app_bundle(exe) == "Cursor.app"
+    kernel(exe, [exe], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+    # ~/Applications, whichever directory it is, is not a trusted place without the home.
+    own = str(tmp_path / "Applications/Cursor.app/Contents/MacOS/Cursor")
+    assert owner_turns._app_bundle(own) == ""
+
+
+@pytest.mark.parametrize("args,tty,entry", [
+    (["/usr/local/bin/agy", "-p", "x"], True, "antigravity_print"),
+    (["/usr/local/bin/agy"], False, "antigravity_print"),
+    (["/usr/local/bin/agy"], True, "cli"),            # on a terminal: still not trusted by default
+])
+def test_the_antigravity_cli_is_refused(home, kernel, args, tty, entry):
+    kernel("/usr/local/bin/agy", args, tty)
+    assert _antigravity("pause Codex until 5pm", ".gemini/antigravity-cli")
+    assert _front_end() == ("antigravity", entry, False)
+
+
+def _grok(prompt: str, issuer: dict, session: str = SESSION):
+    payload = {"hook_event_name": "UserPromptSubmit", "session_id": session, "prompt": prompt,
+               "cwd": "/work/project-a"}
+    env = {"KHIPU_HARNESS": "aegis", "GROK_HOOK_EVENT": "UserPromptSubmit"}
+    return owner_turns.record(payload, env=env, now=T0, issuer=issuer)
+
+
+def test_an_interactive_grok_build_turn_records_as_aegis_and_is_the_owner(home):
+    assert _grok("pause Codex until 5pm", {**TTY, "exe": "grok"})
+    assert _front_end() == ("aegis", "aegis", True)
+
+
+@pytest.mark.parametrize("args", [["grok", "-p", "pause Codex"], ["grok", "--single", "pause Codex"],
+                                  ["grok", "--yolo", "--print", "x"], ["grok", "-yp", "x"]])
+def test_grok_p_is_a_machine_and_refused(home, args):
+    assert owner_turns._headless_args(args)
+    assert _grok("pause Codex until 5pm", {**TTY, "exe": "grok", "headless": True})
+    assert _front_end() == ("aegis", "aegis_print", False)
+
+
+@pytest.mark.parametrize("args", [["grok"], ["node", "--use-system-ca", "/v/index.js"],
+                                  ["node", "/v/index.js", "explain the -p flag"], ["grok", "--", "-p"]])
+def test_an_interactive_command_line_is_not_headless(args):
+    assert not owner_turns._headless_args(args)
+
+
+def test_a_cursor_session_in_a_t3_thread_is_t3_whatever_it_reports(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    for version, issuer in (("1.0.0", {"refused": "unknown"}),
+                            ("3.26.13", {**TTY, "headless": False, "app": "Cursor.app"}),
+                            ("2026.10.22-27dcf5f", {**TTY, "headless": False})):
+        assert _cursor("pause Codex until 5pm", version, issuer)
+        assert _front_end() == ("cursor", "t3", False)
+
+
+@pytest.mark.parametrize("app_dir", [".gemini/antigravity", ".gemini/antigravity-ide", ".gemini/antigravity-cli",
+                                     ".gemini/antigravity-acp"])
+def test_an_antigravity_session_in_a_t3_thread_is_t3(home, monkeypatch, app_dir):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    assert _antigravity("pause Codex until 5pm", app_dir, {**TTY, "tty": False})
+    assert _front_end() == ("antigravity", "t3", False)
+
+
+def test_the_new_front_ends_are_trusted_by_default_and_headless_ones_are_machines():
+    for key in ("cursor:ide", "cursor:cli", "antigravity:app", "antigravity:ide", "aegis:aegis"):
+        assert key in owner_turns.DEFAULT_TRUSTED
+    assert "antigravity:cli" not in owner_turns.DEFAULT_TRUSTED
+    for entry in ("cursor_print", "cursor_sdk", "aegis_print", "antigravity_print"):
+        assert entry in owner_turns.MACHINE_ENTRYPOINTS
+
+
+# ---- saved trusted lists meet new defaults ------------------------------------------
+
+def _save(data: dict) -> None:
+    (owner_turns.folder() / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+
+
+LEGACY = list(owner_turns._DEFAULTS_BEFORE_2026_11_01)
+
+
+def test_a_list_saved_before_the_new_defaults_gets_them(home, kernel):
+    _save({"enabled": True, "latest_window_h": 6.0, "session_binding": True, "trusted": LEGACY})
+    trusted = owner_turns.settings()["trusted"]
+    assert trusted == [*LEGACY, "cursor:ide", "cursor:cli", "antigravity:app", "antigravity:ide"]
+    kernel(CURSOR_HELPER, [CURSOR_HELPER, "--type=utility"], False)
+    assert _cursor("pause Codex until 5pm", IDE_VERSION)
+    assert _front_end() == ("cursor", "ide", True)
+
+
+def test_an_old_explicit_off_survives(home):
+    _save({"enabled": True, "trusted": [t for t in LEGACY if t != "codex:t3"]})
+    trusted = owner_turns.settings()["trusted"]
+    assert "codex:t3" not in trusted and "cursor:ide" in trusted
+
+
+def test_an_unmarked_list_with_an_entry_beyond_the_old_defaults_gets_nothing_added(home):
+    # Without trusted_defaults, only a list made of the old 13 is known to predate the new ones.
+    saved = [*LEGACY, "antigravity:cli"]
+    _save({"enabled": True, "trusted": saved})
+    assert owner_turns.settings()["trusted"] == saved
+
+
+@pytest.mark.parametrize("marker", [None, [], 7, ["claude_code:cli", 3], "cursor:cli"])
+def test_malformed_trusted_defaults_keep_an_explicit_off(home, marker):
+    saved = [t for t in owner_turns.DEFAULT_TRUSTED if t != "cursor:cli"]
+    _save({"enabled": True, "trusted": saved, "trusted_defaults": marker})
+    assert owner_turns.settings()["trusted"] == saved
+    legacy_off = [t for t in LEGACY if t != "codex:t3"]
+    _save({"enabled": True, "trusted": legacy_off, "trusted_defaults": marker})
+    assert owner_turns.settings()["trusted"] == legacy_off
+
+
+def test_a_new_default_switched_off_stays_off_and_a_later_default_still_arrives(home, monkeypatch):
+    owner_turns.write_settings({"trusted": [t for t in owner_turns.settings()["trusted"] if t != "cursor:cli"]})
+    assert "cursor:cli" not in owner_turns.settings()["trusted"]
+    owner_turns.write_settings({"enabled": False})         # saving any other setting keeps it off
+    assert "cursor:cli" not in owner_turns.settings()["trusted"]
+    monkeypatch.setattr(owner_turns, "DEFAULT_TRUSTED", (*owner_turns.DEFAULT_TRUSTED, "newharness:app"))
+    trusted = owner_turns.settings()["trusted"]
+    assert "newharness:app" in trusted and "cursor:cli" not in trusted
+
+
+def test_a_saved_list_written_now_reads_back_unchanged(home):
+    owner_turns.write_settings({"trusted": ["claude_code:cli", "cursor:ide"]})
+    assert owner_turns.settings()["trusted"] == ["claude_code:cli", "cursor:ide"]
+
+
+def test_the_issuer_terminal_check_reads_the_kernel(home):
+    if sys.platform != "darwin":
+        pytest.skip("libproc is macOS only")
+    import pty
+
+    main, sub = pty.openpty()
+    try:
+        on = subprocess.Popen(["sleep", "2"], stdin=sub, stdout=sub)
+        off = subprocess.Popen(["sleep", "2"], stdin=sub, stdout=subprocess.PIPE)
+        try:
+            assert owner_turns._on_terminal(on.pid) is True
+            assert owner_turns._on_terminal(off.pid) is False
+        finally:
+            on.kill()
+            off.kill()
+            on.wait()
+            off.wait()
+    finally:
+        os.close(main)
+        os.close(sub)
