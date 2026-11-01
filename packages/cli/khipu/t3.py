@@ -248,9 +248,87 @@ DELEGATED_THREAD_PREFIX = "thread:delegated-task:"
 
 
 def _names_parent(mapping) -> bool:
-    return isinstance(mapping, dict) and any(
+    # T3 keeps a child's link nested (``lineage.parentThreadId``,
+    # ``lineage.relationshipToParent``); a top-level thread has both null.
+    return isinstance(mapping, dict) and (any(
         "parent" in str(key).lower() and value not in (None, "", [], {})
-        for key, value in mapping.items())
+        for key, value in mapping.items()) or (
+        isinstance(mapping.get("lineage"), dict) and _names_parent(mapping["lineage"])))
+
+
+# A message the owner typed: T3's own author fields. ``createdBy`` "user"
+# alone is not enough (resume prompts and delegated briefs are user/server),
+# and any of the delivery keys marks a wake, a relay, a notification or a
+# child's completion.
+OWNER_SOURCES = ("web", "mobile")
+MACHINE_MESSAGE_KEYS = ("scheduledTaskId", "senderThreadId", "notification", "delegatedCompletion")
+_MESSAGE_SCAN = 500
+
+
+def _epoch(value) -> float | None:
+    from datetime import datetime, timezone
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        when = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp()
+
+
+def is_owner_message(payload, thread_id: str) -> bool:
+    """Whether a message row's payload is one the owner typed in ``thread_id``."""
+    if not isinstance(payload, dict):
+        return False
+    return (payload.get("createdBy") == "user" and payload.get("creationSource") in OWNER_SOURCES
+            and all(payload.get(key) in (None, "", {}, []) for key in MACHINE_MESSAGE_KEYS)
+            and not payload.get("workflowScript")
+            and payload.get("threadId") in (None, thread_id)
+            and isinstance(payload.get("text"), str))
+
+
+def owner_message_after(thread_id: str, since: float) -> tuple[dict | None, bool]:
+    """``(message, definitive)``: the newest message the owner typed in
+    ``thread_id`` created after ``since`` (epoch seconds), as ``{id, at,
+    ts, text}``, from one read-only bounded read of T3's message
+    projection. The text is returned for hashing only. A missing database,
+    lock, timeout or failing query is ``(None, False)``: a caller deciding
+    permission refuses on it."""
+    if not isinstance(thread_id, str) or not thread_id:
+        return None, False
+    path = _thread_db_path()
+    if not path.is_file():
+        return None, False
+    con = None
+    try:
+        con = sqlite3.connect(_readonly_uri(path), uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 2")
+        deadline = time.monotonic() + 0.05
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        rows = con.execute(
+            "SELECT message_id, created_at, payload_json FROM orchestration_v2_projection_messages "
+            "WHERE thread_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT ?",
+            (thread_id, _MESSAGE_SCAN),
+        ).fetchall()
+        for message_id, created_at, payload_json in rows:
+            ts = _epoch(created_at)
+            if ts is None or ts <= since:
+                continue
+            try:
+                payload = json.loads(payload_json) if isinstance(payload_json, str) else None
+            except ValueError:
+                continue
+            if is_owner_message(payload, thread_id):
+                return {"id": str(message_id), "at": str(created_at), "ts": ts, "text": payload["text"]}, True
+        return None, True
+    except (OSError, ValueError, sqlite3.Error):
+        return None, False
+    finally:
+        if con is not None:
+            con.close()
 
 
 def delegated_thread_result(thread_id: str) -> tuple[bool, bool]:

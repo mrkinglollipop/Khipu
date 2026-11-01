@@ -600,7 +600,7 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
         # be told apart from the owner typing (three attempts, 2026-11-01). Not
         # a setting: switching it on would reopen that.
         return False, ("a T3 conversation can't be told apart from T3's own scheduled or relayed messages; "
-                       "confirm owner changes in the Khipu app")
+                       "a change asked for there waits for the owner to confirm it")
     key = f"{turn.get('harness')}:{turn.get('entrypoint')}"
     if key not in conf["trusted"]:
         return False, untrusted_why(key)

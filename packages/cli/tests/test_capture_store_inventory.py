@@ -57,7 +57,7 @@ NOT_CAPTURE = {
                      "usage._open_lock", "discover._try_lock", "config.config_write_lock",
                      "accounts._declined_lock", "signin._lock", "work._view_lock",
                      "routing_delivery._batch_owned_elsewhere", "routing_replication._sync_lock",
-                     "routing_directions._store_lock"), _LOCKS),
+                     "routing_directions._store_lock", "owner_direction._requests_locked"), _LOCKS),
     # Account discovery (9A): which login folders exist and when they were checked,
     # and a throwaway folder a status check runs in. Folder names and counts only.
     "identity.observe_checkout": "per checkout key: its root commit; a hash and the key, no capture text",
@@ -86,6 +86,8 @@ NOT_CAPTURE = {
                                     "writes nothing",
     "t3.delegated_thread_result": "opens T3's thread database read-only to tell a delegated child thread from the "
                                   "owner's own; writes nothing",
+    "t3.owner_message_after": "opens T3's thread database read-only to find a message the owner typed after a "
+                              "held request; writes nothing (the caller keeps only its id, time and hash)",
     "recall_eval_nightly.refresh_vectors": "the recall check's golden-query embedding vectors keyed by a hash of the "
                                            "redacted query (mode 0600); no query text, no capture text",
     # Cursor/Antigravity hooks (docs/plans/2026-10-27-cursor-antigravity-hooks.md).

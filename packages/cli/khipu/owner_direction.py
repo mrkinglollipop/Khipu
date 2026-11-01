@@ -148,9 +148,19 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
         raise DirectionRefused("no_recorded_turn", "This call names more than one conversation, so Khipu can't tell "
                                                    "whether the owner is in the one asking. Ask the owner to say it "
                                                    "in the conversation they are typing in.")
+    confirmed = _CONFIRMED.get()
+    if confirmed is not None and confirmed["action"] == action and confirmed["stamp"]["session"] == session:
+        # The replay of a held request ``confirm`` proved the owner confirmed.
+        return dict(confirmed["stamp"])
     try:
         turn = _recent_turn(session, conf, now)
     except DirectionRefused:
+        if any(t.get("entrypoint") == "t3" for t in owner_turns.turns(session, now)):
+            # A T3 conversation: its turns never count directly, so the
+            # change is held for the owner to confirm (``hold``, ``confirm``).
+            # T3's own record decides whether it is a job (``_t3_bound``).
+            _t3_bound(environ, session, now)
+            raise DirectionRefused("confirm_needed", _HOLD_WHY) from None
         if lineage_job:
             raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY) from None
         raise
@@ -190,6 +200,263 @@ def _recent_turn(session: str, conf: dict, now: float) -> dict:
                                "so it can't make an owner's change now. It works again once the owner sends a "
                                "message here.")
     return turn
+
+
+_HOLD_WHY = ("This is a T3 conversation, so the change waits for the owner to confirm it. Ask for it with "
+             "khipu_owner_act: Khipu holds it and tells you what to ask the owner.")
+_NOT_SINCE = "no message you typed in this conversation since this request was made"
+
+
+def _usable_t3_turn(t: dict) -> bool:
+    return t.get("entrypoint") == "t3" and not any(
+        t.get(k) for k in ("dispatched", "helper", "wrapped", "delegated", "machine"))
+
+
+def _t3_thread_of(session: str) -> str:
+    """This conversation's one T3 thread, re-read from T3's record (one
+    retry), or ``DirectionRefused``."""
+    from khipu import t3
+
+    for _ in range(2):
+        threads, definitive = t3.session_thread_ids_result(session)
+        if definitive:
+            break
+    else:
+        raise DirectionRefused("t3_unreadable", "Khipu could not read T3's record of this conversation, so it "
+                                                "can't tell whether the owner is in it. Nothing was changed; try "
+                                                "again.")
+    if not threads:
+        raise DirectionRefused("no_recorded_turn", "T3's record no longer shows this conversation, so Khipu can't "
+                                                   "tell whether the owner is in it. Nothing was changed.")
+    if len(threads) > 1:
+        raise DirectionRefused("no_recorded_turn", "T3's record names more than one thread for this conversation, "
+                                                   "so Khipu can't tell which one the owner is in. Nothing was "
+                                                   "changed.")
+    return threads[0]
+
+
+def _t3_bound(environ, session: str, now: float) -> tuple[str, dict]:
+    """(T3 thread, the hook turn binding this call to it): every refusal
+    that holds before the owner's confirmation is looked at. A job or a
+    delegated child thread, an unreadable or ambiguous record, or no turn
+    T3's prompt hook recorded above this call is refused."""
+    thread = _t3_thread_of(session)
+    if owner_turns.dispatched_job(environ, session, t3_thread=True):
+        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
+    usable = [t for t in owner_turns.turns(session, now) if _usable_t3_turn(t)]
+    if not usable:
+        raise DirectionRefused("no_recorded_turn",
+                               "The owner has not typed in this conversation, so it can't make an owner's change "
+                               "(a background or dispatched job never can).")
+    _from_the_hook(usable[-1])
+    return thread, usable[-1]
+
+
+# ---- held requests and the owner's confirmation ---------------------------------------------
+#
+# A change held for the owner to confirm (2026-11-01: "all we need is the
+# confirmation step"). It has no age limit, and any conversation can confirm
+# it; what counts is a message the owner typed in the confirming
+# conversation after the request was made, read from that front end's own
+# record at confirm time: T3's message rows for a T3 conversation, the
+# prompt hook's eligible turns anywhere else. No codes, and the owner's
+# words are never read: the agent asks "Confirm ...?" and calls confirm
+# once the owner answers.
+
+REQUESTS_NAME = "owner-requests.json"
+_REQUESTS_KEPT_S = 30 * 24 * 3600  # settled requests; a pending or applying one is never dropped
+_CONFIRMED: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_owner_confirmed", default=None)
+
+
+def requests_path() -> Path:
+    from khipu.paths import data_dir
+
+    return data_dir() / REQUESTS_NAME
+
+
+@contextlib.contextmanager
+def _requests_locked():
+    import fcntl
+
+    path = requests_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(path.with_name(f".{path.name}.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield path
+    finally:
+        os.close(lock_fd)
+
+
+def _read_requests(path: Path) -> list[dict]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    rows = data.get("requests") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise OSError("the held owner requests can't be read")
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def _save_requests(path: Path, rows: list[dict], now: float) -> None:
+    kept = [r for r in rows if r.get("settled_ts") is None or now - _float(r.get("settled_ts")) < _REQUESTS_KEPT_S]
+    _write_private(path, json.dumps({"requests": kept}, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def ask_line(action: str, args: dict) -> str:
+    what = ", ".join(f"{k}: {json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v}"
+                     for k, v in sorted(args.items()))
+    return f"Confirm {action}" + (f" ({what})" if what else "") + "?"
+
+
+def hold(action: str, args: dict, *, env=None, now: float | None = None) -> dict:
+    """Hold ``action`` with its checked ``args`` for the owner to confirm.
+    Only a conversation that passes every refusal but the owner's
+    confirmation can hold one: a job, a child thread or a call its
+    conversation's hook did not record is refused as for a change."""
+    now = _clock() if now is None else now
+    environ = os.environ if env is None else env
+    session = _caller_session(environ)
+    turns_ = owner_turns.turns(session, now)
+    if any(t.get("entrypoint") == "t3" for t in turns_):
+        _t3_bound(environ, session, now)
+    else:
+        if owner_turns.dispatched_job(environ, session):
+            raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
+        conf = owner_turns.settings()
+        usable = [t for t in turns_ if owner_turns.eligible(t, conf)[0]]
+        if not usable:
+            raise DirectionRefused("no_recorded_turn",
+                                   "The owner has not typed in this conversation, so it can't ask for an owner's "
+                                   "change (a background or dispatched job never can).")
+        _from_the_hook(usable[-1])
+    request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
+               "created_ts": now, "created_at": _iso(now), "session": session, "ask": ask_line(action, args)}
+    try:
+        with _requests_locked() as path:
+            rows = _read_requests(path)
+            rows.append(request)
+            _save_requests(path, rows, now)
+    except OSError as err:
+        raise DirectionRefused("log_unwritable", f"Khipu can't keep the request ({err}), so nothing was held or "
+                                                 "changed. Try again once the disk can be written.") from None
+    return request
+
+
+def _caller_session(environ) -> str:
+    """The calling conversation, after the refusals that need no record."""
+    if owner_turns.job_marker(environ):
+        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
+    session = session_of(environ)
+    if not session:
+        raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't tell "
+                                                   "whether the owner is in it.")
+    if len(_sessions_named(environ)) > 1:
+        raise DirectionRefused("no_recorded_turn", "This call names more than one conversation, so Khipu can't tell "
+                                                   "whether the owner is in the one asking.")
+    return session
+
+
+def _proof(environ, session: str, since: float, now: float) -> dict:
+    """The auth stamp for a confirm: the owner typed in this conversation
+    after ``since``, from this front end's own record, re-read now."""
+    from khipu import t3
+
+    turns_ = owner_turns.turns(session, now)
+    member = owner_turns._t3_membership(session)
+    if member == "unverified":
+        raise DirectionRefused("t3_unreadable", "Khipu could not read T3's record to tell whether this is a T3 "
+                                                "conversation, so it can't confirm. Nothing was changed; try "
+                                                "again.")
+    if member == "t3":
+        thread, bound = _t3_bound(environ, session, now)
+        for _ in range(2):
+            message, definitive = t3.owner_message_after(thread, since)
+            if definitive:
+                break
+        else:
+            raise DirectionRefused("t3_unreadable", "Khipu could not read T3's record of this conversation's "
+                                                    "messages, so it can't confirm. Nothing was changed; try again.")
+        if message is None:
+            raise DirectionRefused("not_confirmed", f"Not confirmed: {_NOT_SINCE}.")
+        sha = owner_turns.prompt_sha256(message["text"])
+        return {"auth": "direction", "harness": bound.get("harness"), "session": session, "turn": bound["turn"],
+                "prompt_sha256": sha, "binding": "hook",
+                "confirmed": {"source": "t3", "message": message["id"], "message_at": message["at"],
+                              "message_sha256": sha}}
+    if any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_):
+        raise DirectionRefused("no_recorded_turn", "This conversation's turns were recorded as T3's, but T3's "
+                                                   "record no longer shows it, so Khipu can't confirm here.")
+    if owner_turns.dispatched_job(environ, session):
+        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
+    conf = owner_turns.settings()
+    recorded = [t for t in turns_ if owner_turns.eligible(t, conf)[0]]
+    usable = [t for t in recorded if _float(t.get("ts")) > since]
+    if not usable:
+        untrusted = owner_turns.untrusted_front_end(turns_, conf)
+        if untrusted and not recorded:
+            raise DirectionRefused("not_confirmed", f"Not confirmed: {owner_turns.untrusted_why(untrusted)}.")
+        raise DirectionRefused("not_confirmed", f"Not confirmed: {_NOT_SINCE}.")
+    turn = usable[-1]
+    _from_the_hook(turn)
+    return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
+            "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
+            "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook",
+            "confirmed": {"source": "hook", "message": turn["turn"], "message_at": turn.get("at"),
+                          "message_sha256": turn.get("prompt_sha256")}}
+
+
+def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dict, dict]:
+    """(the held request, its confirm stamp), claimed for applying, or
+    ``DirectionRefused``. Every refusal a change has runs first; then the
+    proof (``_proof``). The request is marked ``applying`` under the lock,
+    so two confirms never apply it twice; ``settle`` records the outcome."""
+    now = _clock() if now is None else now
+    environ = os.environ if env is None else env
+    session = _caller_session(environ)
+    try:
+        with _requests_locked() as path:
+            rows = _read_requests(path)
+            request = next((r for r in rows if r.get("id") == request_id), None)
+            if request is None:
+                raise DirectionRefused("not_found", "There is no held request with that id.")
+            if request.get("state") != "pending":
+                raise DirectionRefused("not_pending", f"That request is already {request.get('state')}.")
+            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
+                raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
+                                                        "typed on a terminal can make this change.")
+            stamp = _proof(environ, session, _float(request.get("created_ts")), now)
+            stamp["confirmed"]["request"] = request_id
+            request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session))
+            _save_requests(path, rows, now)
+    except OSError as err:
+        raise DirectionRefused("log_unwritable", f"Khipu can't read or write the held requests ({err}), so nothing "
+                                                 "was changed.") from None
+    return request, stamp
+
+
+def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float | None = None) -> None:
+    now = _clock() if now is None else now
+    with _requests_locked() as path:
+        rows = _read_requests(path)
+        for row in rows:
+            if row.get("id") == request_id:
+                row.update(state="applied" if ok else "failed", settled_ts=now, settled_at=_iso(now))
+                if not ok and isinstance(result, dict):
+                    row["error"] = str(result.get("error") or result.get("code") or "refused")[:300]
+        _save_requests(path, rows, now)
+
+
+@contextlib.contextmanager
+def confirmed_replay(action: str, stamp: dict):
+    """While the held request's own command runs, the check returns the
+    confirm stamp for that action in that conversation, and nothing else."""
+    token = _CONFIRMED.set({"action": action, "stamp": dict(stamp)})
+    try:
+        yield
+    finally:
+        _CONFIRMED.reset(token)
 
 
 _CHAIN_MOST = 16
@@ -1000,7 +1267,7 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
         if want.get("facts"):
             line["facts"] = want["facts"]
     for key in ("words", "harness", "session", "via_session", "turn", "prompt_sha256", "occurrence",
-                "binding", "auth_chain"):
+                "binding", "auth_chain", "confirmed"):
         if stamp.get(key) is not None:
             line[key] = stamp[key]
     line["state"] = "pending"

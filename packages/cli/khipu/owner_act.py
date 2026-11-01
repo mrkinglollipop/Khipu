@@ -474,23 +474,88 @@ def _parsed(text: str) -> dict:
 def act(action, args) -> tuple[bool, dict]:
     """Run one owner action by direction. (ok, the command's JSON answer),
     or (False, ``{ok: false, code, error}``) when refused."""
-    from khipu import cli, owner_direction
+    from khipu import owner_direction
 
     if isinstance(action, str) and action in _READS:
         # An inspection: never a change, a send or a direction check.
         if not isinstance(args, dict) or args:
             return False, _bad(f"{action} takes no arguments").refusal()
         return True, _READS[action]()
+    if action == CONFIRM:
+        return _confirm(args)
+    held = action == REQUEST
+    if held:
+        if not isinstance(args, dict) or set(args) - {"action", "args"} or not isinstance(args.get("action"), str):
+            return False, _bad(f"{REQUEST} takes action and args, the change to hold").refusal()
+        action, args = args["action"], args.get("args") or {}
     if not isinstance(action, str) or action not in owner_direction.ACTIONS or action not in SPECS:
         return False, {"ok": False, "code": "not_by_direction", "error": "That change can't be made by direction."}
     try:
-        head, positionals = argv(action, _values(action, args))
-    except Refused as err:
-        return False, err.refusal()
-    try:
+        values = _values(action, args)
+        head, positionals = argv(action, values)
         full = full_argv(head, positionals, ["--owner-direction"])
     except Refused as err:
         return False, err.refusal()
+    if not held:
+        try:
+            owner_direction.check(action)
+        except owner_direction.DirectionRefused as refused:
+            # Anything but a T3 conversation's hold runs the command as before.
+            held = refused.code == "confirm_needed"
+    if held:
+        return _hold(action, values)
+    return _run(action, full)
+
+
+# A change held for the owner to confirm, and its confirmation
+# (``owner_direction.hold`` / ``confirm``). Not owner actions themselves:
+# a hold changes nothing, and a confirm applies the held action, which is
+# logged as that action with the confirming message named.
+REQUEST, CONFIRM = "direction.request", "direction.confirm"
+
+
+def _hold(action: str, values: dict) -> tuple[bool, dict]:
+    from khipu import owner_direction
+
+    try:
+        request = owner_direction.hold(action, values)
+    except owner_direction.DirectionRefused as refused:
+        return False, refused.refusal()
+    return True, {"ok": True, "applied": False, "pending": True, "request": request["id"], "ask": request["ask"],
+                  "line": (f"Nothing is changed yet. Ask the owner: \"{request['ask']}\" Once they answer in this "
+                           f"conversation, call khipu_owner_act with {CONFIRM} and "
+                           f"{{\"request\": \"{request['id']}\"}}. It can be confirmed later, from any "
+                           "conversation the owner types in.")}
+
+
+def _confirm(args) -> tuple[bool, dict]:
+    from khipu import owner_direction
+
+    if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
+        return False, _bad(f"{CONFIRM} takes request, the held request's id").refusal()
+    try:
+        request, stamp = owner_direction.confirm(args["request"])
+    except owner_direction.DirectionRefused as refused:
+        return False, refused.refusal()
+    action, ok, result = request["action"], False, None
+    try:
+        head, positionals = argv(action, _values(action, request.get("args") or {}))
+        full = full_argv(head, positionals, ["--owner-direction"])
+        with owner_direction.confirmed_replay(action, stamp):
+            ok, result = _run(action, full)
+    except Refused as err:
+        result = err.refusal()
+    finally:
+        try:
+            owner_direction.settle(request["id"], ok, result)
+        except OSError:
+            pass
+    return ok, dict(result or {}, request=request["id"], confirmed=stamp["confirmed"])
+
+
+def _run(action: str, full: list[str]) -> tuple[bool, dict]:
+    from khipu import cli
+
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         try:
