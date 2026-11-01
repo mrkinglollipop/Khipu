@@ -82,6 +82,10 @@ NOT_CAPTURE = {
     "storage.trim_synth_usage": "the summariser's token counts, rewritten without old lines",
     "hub_reach.note_unreachable": "the hub-unreachable memo: two times and a short error word, no capture text",
     "t3._recent_conversation_use": "opens T3's thread database read-only to inspect its newest message time; writes nothing",
+    "t3.delegated_thread_result": "opens T3's thread database read-only to tell a delegated child thread from the "
+                                  "owner's own; writes nothing",
+    "recall_eval_nightly.refresh_vectors": "the recall check's golden-query embedding vectors keyed by a hash of the "
+                                           "redacted query (mode 0600); no query text, no capture text",
     # Cursor/Antigravity hooks (docs/plans/2026-10-27-cursor-antigravity-hooks.md).
     "hook_shape.claim": "an empty single-flight marker named by a hash of harness, session and event; "
                         "no capture text",
