@@ -262,6 +262,8 @@ Khipu invokes the corresponding CLI command with `--owner-direction`. The check 
 
 The answer is the command’s own result, or a tool error `{ok: false, code, error}`. On a refusal, report the reason to the owner. Every action is logged and can be undone from Settings > Owner actions or by requesting `direction.undo` with its id.
 
+Known limits. Khipu trusts each app's prompt hook: it can't tell apart a hook delivery that the app itself replays or reorders, or a process that impersonates the app's own agent. In T3, a held change is confirmed by the owner's latest reply after the question. T3 conversations running Codex, Cursor or Antigravity can't confirm a held change yet; confirm it in the Khipu app.
+
 ### khipu_project
 
 Read one project’s canonical name, grouped names, evidence and dates, counts per name and in total, and same-project pairs awaiting an answer or kept separate. Parameter: `name` (required). The answer is the same for every grouped name. Project merges and keep-separate choices belong to the owner, through `khipu_owner_act` actions `project.merge` and `project.keep_separate`.

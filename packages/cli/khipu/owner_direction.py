@@ -556,8 +556,16 @@ def _late_copy(turn: dict) -> bool:
     alone is Antigravity's submit-time read of ``lastUserInput`` by the
     PreInvocation hook (``antigravity_prompt``), so it is the current turn; the
     PostInvocation and Stop recorders always add ``late``, and a flushed copy of
-    a fallback turn gets ``late: "flush"``."""
-    return bool(turn.get("late")) or turn.get("duplicate_of") is not None
+    a fallback turn gets ``late: "flush"``. A turn no PreInvocation could read,
+    first recorded at PostInvocation or Stop and dated by that PreInvocation
+    (``ag_invoked``, set only when it is no copy of a recorded row), is its
+    own turn, not a late copy: ``_after_ask`` and ``ag_words`` still judge it."""
+    if turn.get("duplicate_of") is not None:
+        return True
+    if turn.get("harness") == "antigravity" and turn.get("ag_invoked") is True \
+            and turn.get("late") in ("PostInvocation", "Stop"):
+        return False
+    return bool(turn.get("late"))
 
 
 def _after_ask(turn: dict, boundary) -> bool:
@@ -593,8 +601,9 @@ def _t3_read(thread: str, seen, since) -> dict:
 
 def _t3_parts(snapshot) -> tuple[list[list], float | None, str | None] | None:
     """(owner message entries, latest message's T3 time and text form) of a
-    stored T3 ask snapshot, or None when there is none or it can't be read."""
-    if not isinstance(snapshot, dict):
+    stored T3 ask snapshot, or None when there is none, it can't be read or
+    it is unknown (``_t3_boundary``)."""
+    if not isinstance(snapshot, dict) or snapshot.get("unknown"):
         return None
     try:
         ids = _entries(snapshot["ids"], 1)
@@ -610,15 +619,23 @@ def _t3_parts(snapshot) -> tuple[list[list], float | None, str | None] | None:
 def _t3_boundary(old, read: dict, session: str) -> dict:
     """The T3 ask snapshot, grown from ``old`` with ``read`` (the read that
     found no reply): the owner message ids either holds and the later of the
-    two latest-message times (T3's clock), by the conversations that made it."""
+    two latest-message times (T3's clock), by the conversations that made it.
+
+    A snapshot holding no message at all is unknown, never an empty
+    exclusion: T3's projection can lag, so the owner's earlier messages may
+    not be in it yet, and a confirm on an unknown snapshot only takes a fresh
+    one. Once the agent's own question is in the projection it is not empty."""
     parts = _t3_parts(old)
     ids, latest, latest_at = parts if parts is not None else ([], None, None)
     if read["latest_ts"] is not None and (latest is None or read["latest_ts"] > latest):
         latest, latest_at = read["latest_ts"], read["latest_at"]
     entries = ids + [[str(i), float(ts)] for i, ts in read["owners"]]
+    makers = sorted(set(_makers(old)) | {session})
+    if not entries and latest is None:
+        return {"by": makers, "unknown": True}
     # A confirm accepts an unseen message dated at the snapshot's time, so
     # the ids tied with it are kept: only older ones may be dropped.
-    return {"by": sorted(set(_makers(old)) | {session}), "ids": _bounded(entries, latest, keep_ties=True),
+    return {"by": makers, "ids": _bounded(entries, latest, keep_ties=True),
             "latest_at": latest_at, "latest_ts": latest}
 
 

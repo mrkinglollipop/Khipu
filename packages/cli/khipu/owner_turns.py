@@ -991,7 +991,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
         # that turn's occurrence rather than numbering a second one.
         turn["occurrence"] = shared if type(shared) is int and shared >= 1 \
             else _next_occurrence(session, sha, now)
-    for flag in ("fallback", "duplicate_of", "late"):
+    for flag in ("fallback", "duplicate_of", "late", "ag_invoked"):
         if extra.get(flag):
             turn[flag] = extra[flag]
     if extra.get("fallback") and type(extra.get("ag_step")) is int:
@@ -1555,6 +1555,56 @@ def _ag_clear_unseen(session: str) -> None:
         pass
 
 
+def _ag_marker(directory: Path, session: str, key: str, text: str) -> Path:
+    # The words are part of the mark: a reused step index with new words
+    # (a rewritten or renumbered transcript) is a new turn, not this one.
+    words = prompt_sha256(text)
+    return directory / hashlib.sha256(f"{session}\0{key}\0{words}".encode("utf-8", "replace")).hexdigest()[:40]
+
+
+def _ag_ended_file(session: str) -> Path:
+    return _ag_file(_ag_dir(), "ended-", session)
+
+
+def _ag_note_ended(session: str) -> None:
+    try:
+        _ag_write(_ag_ended_file(session), "{}")
+    except OSError:
+        pass
+
+
+def _ag_turn_ended(session: str, take: bool) -> bool:
+    """Whether a Stop came since the last PreInvocation (``take``: and clear it,
+    for the PreInvocation that starts the next turn)."""
+    path = _ag_ended_file(session)
+    if not take:
+        return path.exists()
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _ag_same_turn(session: str, found: tuple[str, str], last: str, now: float) -> bool:
+    """Whether a PreInvocation whose ``lastUserInput`` is ``last`` repeats the
+    turn of the transcript's newest user step ``found``: the same words, that
+    step already recorded (its marker), and the session's latest recorded
+    typed row holding those words. A later model call of one turn then names
+    a higher step count with no new user step written, and is not a turn.
+    After a Stop the next PreInvocation is a new turn, so it never asks this."""
+    wrapped = _AG_WRAP.match(last)
+    text = owner_text((wrapped.group(1) if wrapped else last).strip())
+    seen = owner_text(found[1])
+    if not text or not text.strip() or seen is None or prompt_sha256(text) != prompt_sha256(seen):
+        return False
+    sha = prompt_sha256(text)
+    if not _ag_marker(_ag_dir(), session, found[0], found[1]).exists():
+        return False
+    latest = next((t for t in reversed(turns(session, now)) if isinstance(t.get("prompt_sha256"), str)), None)
+    return latest is not None and latest["prompt_sha256"] == sha
+
+
 def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
               text: str = "") -> tuple[float, dict] | None:
     """Create the turn's once-per-turn marker. None when the turn was already
@@ -1564,10 +1614,7 @@ def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
     payload's ``initialNumSteps``), and the flushed step of that same turn
     is marked its duplicate. Every Antigravity record goes through here."""
     directory = _ag_dir()
-    # The words are part of the mark: a reused step index with new words
-    # (a rewritten or renumbered transcript) is a new turn, not this one.
-    words = prompt_sha256(text)
-    marker = directory / hashlib.sha256(f"{session}\0{key}\0{words}".encode("utf-8", "replace")).hexdigest()[:40]
+    marker = _ag_marker(directory, session, key, text)
     try:
         os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     except FileExistsError:
@@ -1578,24 +1625,28 @@ def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
                 old.unlink()
         except OSError:
             continue
-    at = now
+    at, invoked = now, {}
     index = _ag_step_number(key)
     if index is not None:
         path = _ag_file(directory, "pending-", session)
         notes = _ag_notes(path)
         ts = notes.get(str(index))
         if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
-            at = ts
+            at, invoked = ts, {"ag_invoked": True}
         _ag_save_notes(path, {k: v for k, v in notes.items() if int(k) > index})
     elif steps is not None and key.startswith(_AG_FALLBACK):
         # A late row of a turn whose PreInvocation could not read it keeps
         # that call's time; the note stays to date the flushed copy.
         ts = _ag_notes(_ag_file(directory, "pending-", session)).get(str(steps))
         if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
-            at = ts
+            at, invoked = ts, {"ag_invoked": True}
+    # ``ag_invoked``: dated by the PreInvocation of this same turn that could
+    # not read it, so a row first recorded at PostInvocation or Stop is that
+    # turn's own record (``antigravity_late_turn`` keeps it only for a row that
+    # is no copy of a recorded one).
     if key.startswith(_AG_FALLBACK):
-        return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps})
-    return at, (_ag_original(session, index, text, now) if index is not None else {})
+        return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps}) | invoked
+    return at, (_ag_original(session, index, text, now) if index is not None else {}) | invoked
 
 
 def _ag_original(session: str, index: int, text: str, now: float) -> dict:
@@ -1619,11 +1670,13 @@ def _ag_original(session: str, index: int, text: str, now: float) -> dict:
     return late
 
 
-def _ag_read(payload, wait: float | None, late: bool = False) -> tuple[str, tuple[str, str] | None, int | None] | None:
+def _ag_read(payload, wait: float | None, late: bool = False, now: float | None = None,
+             ended: bool | None = None) -> tuple[str, tuple[str, str] | None, int | None] | None:
     """(session, newest user turn or None, the turn's step count) for an
     Antigravity payload with no prompt of its own; None for any other
     payload. ``late`` (PostInvocation, Stop): the step count is the newest
-    PreInvocation's, and ``lastUserInput`` is used only when one was seen."""
+    PreInvocation's, and ``lastUserInput`` is used only when one was seen.
+    ``ended``: a Stop came since the last PreInvocation (None: read it)."""
     if not isinstance(payload, dict) or hook_shape.detect(payload, os.environ)[0] != "antigravity":
         return None
     if isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
@@ -1644,7 +1697,9 @@ def _ag_read(payload, wait: float | None, late: bool = False) -> tuple[str, tupl
                 time.sleep(_AG_FLUSH_POLL_S)
                 found = _ag_last_user_input(tp)
     if found is not None and has_last and not late and steps is not None \
-            and (_ag_step_number(found[0]) or 0) < steps and _ag_past_transcript(tp, steps):
+            and (_ag_step_number(found[0]) or 0) < steps and _ag_past_transcript(tp, steps) \
+            and not ((_ag_turn_ended(session, False) if ended is None else ended) is False
+                     and _ag_same_turn(session, found, last, time.time() if now is None else now)):
         # The submit names a step the transcript has not reached: its newest
         # USER_INPUT is an earlier turn's, already handled, and this turn is
         # the payload's lastUserInput.
@@ -1668,11 +1723,11 @@ def _ag_filled(payload: dict, text: str) -> dict:
     return out
 
 
-def _antigravity_turn(payload, now: float | None, wait: float | None):
+def _antigravity_turn(payload, now: float | None, wait: float | None, ended: bool | None = None):
     """(gate answer, the new turn's time, (session, the payload's step count)
     when this call recorded nothing and its own turn may not be written yet,
     ``record``'s extra for the new turn)."""
-    read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait))
+    read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait), now=now, ended=ended)
     if read is None:
         return None, None, None, {}
     session, found, steps = read
@@ -1696,10 +1751,12 @@ def antigravity_prompt(payload: dict, now: float | None = None, wait: float | No
     Never raises."""
     try:
         stamp = time.time() if now is None else now
+        ended = None
         if isinstance(payload, dict) and hook_shape.detect(payload, os.environ)[0] == "antigravity" \
                 and hook_shape.session_id(payload).strip():
+            ended = _ag_turn_ended(hook_shape.session_id(payload).strip(), True)
             _ag_note_turn(hook_shape.session_id(payload).strip(), _ag_initial_steps(payload))
-        out, at, unseen, extra = _antigravity_turn(payload, stamp, wait)
+        out, at, unseen, extra = _antigravity_turn(payload, stamp, wait, ended)
         if unseen is not None:
             _ag_note_unseen(unseen[0], unseen[1], stamp)
         if out:
@@ -1729,10 +1786,14 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
             if claimed is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}
+                extra = dict(claimed[1])
+                if extra.get("duplicate_of") is not None or extra.get("late"):
+                    extra.pop("ag_invoked", None)  # a copy of a recorded row stays a late copy
                 recorded = record(_ag_filled(payload, found[1]), now=claimed[0], issuer=issuer,
-                                  extra={**claimed[1], "late": str(event) or "late"})
+                                  extra={**extra, "late": str(event) or "late"})
         if str(event).lower() == "stop":
             _ag_clear_unseen(session)
+            _ag_note_ended(session)
         return recorded
     except Exception:  # noqa: BLE001 - a turn's end is never failed by the recorder
         return None

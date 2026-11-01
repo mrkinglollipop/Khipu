@@ -72,6 +72,11 @@ class T3:
                         (mid, thread, "run", "node", "user", _iso(ts), _iso(ts), json.dumps(payload)))
         return mid
 
+    def count(self, thread: str) -> int:
+        with sqlite3.connect(self.path) as con:
+            return con.execute("SELECT COUNT(*) FROM orchestration_v2_projection_messages WHERE thread_id = ?",
+                               (thread,)).fetchone()[0]
+
 
 T3_CLAUDE_ARGS = ["claude", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose",
                   "--resume=3f1c"]
@@ -172,8 +177,13 @@ def _paused() -> bool:
     return next(a for a in routing.read_view()["accounts"] if a["key"] == "codex|")["state"] == "paused"
 
 
-def _hold_in_t3(world, *, ago: float = 0.0) -> str:
-    """The agent in the owner's T3 conversation asks for a pause: it is held."""
+def _hold_in_t3(world, *, ago: float = 0.0, request_message: bool = True) -> str:
+    """The agent in the owner's T3 conversation asks for a pause: it is held.
+    The owner's own request is in T3's projection first when the thread has
+    no message yet (``request_message``): a hold on an empty projection is
+    unknown, so a confirm only takes a fresh snapshot."""
+    if request_message and not world["t3"].count(THREAD):
+        world["t3"].message(THREAD, time.time() - ago - 1, text="pause Codex")
     _t3_hook_turn(ago=ago)
     _be(world, T3_SESSION)
     real = owner_direction._clock
@@ -1253,8 +1263,8 @@ def test_review4_p1_repeated_pre_invocations_of_one_turn_never_confirm(world):
     owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=2, invocationNum=2,
                                                lastUserInput=OWNER_WORDS),
                                    now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER))
-    again = owner_turns.turns(session, time.time() + 2)[-1]
-    assert again["fallback"] and again["ag_step"] == 2 and again["occurrence"] == 2, again
+    # Review 5: the repeat is the same turn, so it records nothing.
+    assert len(owner_turns.turns(session, time.time() + 2)) == 1
     ok, out = _confirm_id(request)
     assert not ok and out["code"] == "not_confirmed", out
     assert not _paused()
@@ -1434,6 +1444,90 @@ def test_a_machine_hook_turn_in_t3_never_borrows_the_owners_message(world):
     world["t3"].message(THREAD, time.time() + 1)
     _t3_hook_turn(prompt=TASK_NOTE)
     assert owner_turns.turns(T3_SESSION)[-1]["machine"]
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+
+
+# ---- review 5 (Astra on 1ef4b999): the last fix round -------------------------------------------------
+
+
+def test_review5_p1_a_hold_on_an_empty_t3_projection_is_unknown_and_never_confirms(world):
+    # T3's projection was empty at the hold; the owner's earlier message then
+    # appeared, stamped 30 s before the hold. An empty snapshot is unknown, so
+    # the confirm takes a fresh one and asks the owner now.
+    request = _hold_in_t3(world, request_message=False)
+    (held,) = owner_direction._read_requests(owner_direction.requests_path())
+    world["t3"].message(THREAD, time.time() - 30)
+    _t3_hook_turn()
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"], out
+    assert not _paused()
+    assert held["t3_snapshots"][THREAD] == {"by": [T3_SESSION], "unknown": True}, held
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert "unknown" not in row["t3_snapshots"][THREAD] and len(row["t3_snapshots"][THREAD]["ids"]) == 1, row
+    mid = world["t3"].message(THREAD, time.time() + 1)
+    _t3_hook_turn()
+    ok, out = _confirm_id(request)
+    assert ok and _paused() and out["confirmed"]["message"] == mid, out
+
+
+def test_review5_p2_a_repeat_preinvocation_of_a_captured_step_records_one_row(world):
+    # One user step "pause Codex", captured; assistant step 1; a repeat
+    # PreInvocation with initialNumSteps=2 and lastUserInput unchanged. It was
+    # recorded again from lastUserInput (occurrences [1, 2]), so capture
+    # recorded the direction twice.
+    session = "ag-r5-repeat"
+    path = _ag_transcript(world, session)
+    _ag_user_step(path, 0, "pause Codex")
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=0, lastUserInput="pause Codex"),
+                                   now=time.time() - 30, wait=0, issuer=dict(AG_ISSUER))
+    (first,) = owner_turns.turns(session)
+    assert not first.get("fallback") and first["eligible"], first
+    _ag_user_step(path, 0, "pause Codex", then=1)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=2, invocationNum=2,
+                                               lastUserInput="pause Codex"),
+                                   now=time.time(), wait=0, issuer=dict(AG_ISSUER))
+    rows = owner_turns.turns(session, time.time() + 1)
+    assert [t["occurrence"] for t in rows] == [1], rows
+
+
+def test_review5_p2_a_fresh_antigravity_reply_first_recorded_at_postinvocation_confirms(world):
+    # The reply's PreInvocation could not read it (no transcript step, no
+    # lastUserInput) and left its time; PostInvocation then recorded it, dated
+    # by that PreInvocation. It was marked late and refused.
+    session = "ag-r5-post"
+    _ag_turn(world, session, ago=60)
+    path = _ag_transcript(world, session)
+    request = _ag_request(world, session)
+    assert owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, invocationNum=2),
+                                          now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER)) is None
+    _ag_user_step(path, 1, "yes, pause Codex")
+    assert owner_turns.antigravity_late_turn(_ag_payload(path, session), "PostInvocation", now=time.time() + 3,
+                                             issuer=dict(AG_ISSUER))
+    reply = owner_turns.turns(session, time.time() + 4)[-1]
+    assert reply["late"] == "PostInvocation" and reply["ag_invoked"] is True and "duplicate_of" not in reply, reply
+    ok, out = _confirm_id(request)
+    assert ok and _paused(), out
+    assert out["confirmed"]["message"] == reply["turn"]
+
+
+def test_review5_a_late_copy_of_an_earlier_antigravity_row_stays_refused(world):
+    # A lastUserInput row from before the ask; after the ask a PreInvocation
+    # of that turn could not read it and left its time; PostInvocation reads
+    # the flushed step: a copy of the earlier row, never the current turn.
+    session = "ag-r5-copy"
+    path = _ag_transcript(world, session)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, lastUserInput=OWNER_WORDS),
+                                   now=time.time() - 30, wait=0, issuer=dict(AG_ISSUER))
+    request = _ag_request(world, session)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, invocationNum=2),
+                                   now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER))
+    _ag_user_step(path, 1)
+    assert owner_turns.antigravity_late_turn(_ag_payload(path, session), "PostInvocation", now=time.time() + 3,
+                                             issuer=dict(AG_ISSUER))
+    copy = owner_turns.turns(session, time.time() + 4)[-1]
+    assert copy.get("duplicate_of") and "ag_invoked" not in copy, copy
     ok, out = _confirm_id(request)
     assert not ok and out["code"] == "not_confirmed", out
     assert not _paused()
