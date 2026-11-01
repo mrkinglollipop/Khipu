@@ -312,9 +312,11 @@ class VerbatimOnlyFileLegTest(unittest.TestCase):
         base.update(kw)
         return base
 
-    def test_hub_row_written_skips_the_file_leg(self):
+    def test_a_hub_write_without_confirmation_keeps_the_job(self):
+        # write_pg returned no verbatim_stored: nothing proves the note landed.
         result: dict = {}
-        self.assertEqual(cap._capture(self.payload(), mode="hub", result=result), 0)
+        self.assertEqual(cap._capture(self.payload(), mode="hub", result=result), cap.EX_DATAERR)
+        self.assertEqual(result["reason"], "verbatim_only_unconfirmed")
         self.pg.assert_called_once()
         self.v2.assert_not_called()
 
@@ -539,6 +541,130 @@ class _FakeConn:
 
     def __exit__(self, *a):
         return False
+
+
+class VerbatimOnlyRealWritePgTest(unittest.TestCase):
+    """The file-leg skip for an empty verbatim_only summary, through the real
+    write_pg on the fake hub: acknowledged only when the row it inserted or
+    matched holds this payload's verbatim evidence."""
+
+    NOTE = "synthetic verbatim note"
+
+    def setUp(self):
+        self.v2 = mock.Mock(return_value=0)
+        for patch in (
+                mock.patch.object(cap, "run_capture_v2", self.v2),
+                mock.patch("khipu.topic_graph.persist_capture_graph",
+                           return_value={"nodes_minted": 0, "edges_minted": 0}),
+                mock.patch("khipu.config.path_setting", return_value=None),
+                mock.patch("khipu.embed.embed_one", side_effect=RuntimeError("no key in test")),
+                mock.patch("khipu.embed.embed_on_capture"),
+                mock.patch("khipu.hygiene.classify_topics", return_value=([], [], False)),
+                mock.patch("khipu.t3.thread_for_session", return_value=None),
+                mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "1"})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def payload(self):
+        return {"ts": "2026-10-31T12:05:00Z", "session_id": "cursor:synthetic-1",
+                "summary": "", "summary_kind": "verbatim_only", "scope": "general",
+                "harness": "cursor", "transcript_range": "0:100", "project": "acme/widget",
+                "verbatim": {"note": self.NOTE}}
+
+    def existing(self, raw):
+        return {1: {
+            "ts": "2026-10-31T12:00:00Z", "session_id": "cursor:synthetic-1", "summary": "",
+            "topics": [], "decisions": [], "preferences": [], "raw": raw,
+            "harness": "cursor", "repo_root": "/r", "project": "acme/widget",
+            "parent_session_id": None, "transcript_range": "0:100", "tags": [],
+        }}
+
+    def run_capture(self, cur, mode):
+        result: dict = {}
+        with mock.patch("khipu.db.connect", return_value=_FakeConn(cur)):
+            rc = cap._capture(self.payload(), mode=mode, result=result)
+        return rc, result
+
+    def test_exact_window_row_without_the_note_keeps_the_job(self):
+        for mode in ("hub", "dual"):
+            with self.subTest(mode=mode):
+                self.v2.reset_mock()
+                cur = _EpisodesFakeCursor(self.existing({"summary_kind": "verbatim_only"}))
+                rc, result = self.run_capture(cur, mode)
+                self.assertEqual(result["dedup"]["matched_via"], "exact_window")
+                self.assertFalse(result["verbatim_stored"])
+                self.assertEqual(rc, cap.EX_DATAERR)
+                self.assertEqual(rc, 65)
+                self.assertEqual(result["reason"], "verbatim_only_unconfirmed")
+                self.v2.assert_not_called()
+                self.assertEqual(len(cur.episodes), 1)
+
+    def test_exact_window_row_holding_the_same_note_succeeds(self):
+        # The retry: an earlier attempt already wrote this capture's row.
+        for mode in ("hub", "dual"):
+            with self.subTest(mode=mode):
+                self.v2.reset_mock()
+                cur = _EpisodesFakeCursor(self.existing(
+                    {"summary_kind": "verbatim_only", "verbatim": {"note": self.NOTE}}))
+                rc, result = self.run_capture(cur, mode)
+                self.assertEqual(result["dedup"]["matched_via"], "exact_window")
+                self.assertTrue(result["verbatim_stored"])
+                self.assertEqual(rc, 0)
+                self.assertNotIn("reason", result)
+                self.v2.assert_not_called()
+
+    def test_exact_window_row_holding_a_different_note_keeps_the_job(self):
+        cur = _EpisodesFakeCursor(self.existing(
+            {"summary_kind": "verbatim_only", "verbatim": {"note": "another synthetic note"}}))
+        rc, result = self.run_capture(cur, "hub")
+        self.assertEqual(rc, 65)
+        self.assertEqual(result["reason"], "verbatim_only_unconfirmed")
+
+    def test_fresh_insert_succeeds_and_skips_the_file_leg(self):
+        for mode in ("hub", "dual"):
+            with self.subTest(mode=mode):
+                self.v2.reset_mock()
+                cur = _EpisodesFakeCursor()
+                rc, result = self.run_capture(cur, mode)
+                self.assertTrue(result["episode_inserted"])
+                self.assertTrue(result["verbatim_stored"])
+                self.assertEqual(rc, 0)
+                self.v2.assert_not_called()
+                (row,) = cur.episodes.values()
+                self.assertEqual(row["raw"]["verbatim"]["note"], self.NOTE)
+
+    def test_hub_without_the_file_mirror_still_needs_confirmation(self):
+        cur = _EpisodesFakeCursor(self.existing({"summary_kind": "verbatim_only"}))
+        with mock.patch.dict(os.environ, {"KHIPU_HUB_FILE_MIRROR": "0"}):
+            rc, result = self.run_capture(cur, "hub")
+        self.assertEqual(rc, 65)
+        self.assertEqual(result["reason"], "verbatim_only_unconfirmed")
+
+
+def test_child_output_never_reaches_our_stdout_or_stderr(capfd):
+    # Synthetic secret and capture-shaped text from a fake legacy writer, on
+    # both streams, for a refusal and for a success.
+    secret = "sk-synthetic-NOTREAL-1111"
+    text = "summary=synthetic-capture-text"
+    with tempfile.TemporaryDirectory() as td:
+        bad = pathlib.Path(td) / "bad.py"
+        bad.write_text(f"import sys\nprint('{text} {secret}')\n"
+                       f"print('[capture_v2] invalid JSON {text} {secret}', file=sys.stderr)\n"
+                       "sys.exit(65)\n")
+        good = pathlib.Path(td) / "good.py"
+        good.write_text(f"import sys\nprint('{text} {secret}')\n"
+                        f"print('{text} {secret}', file=sys.stderr)\n")
+        first: dict = {}
+        with mock.patch.object(cap, "_capture_v2", return_value=bad):
+            assert cap.run_capture_v2({"summary": "s"}, suppress_mirror=True, outcome=first) == 65
+        with mock.patch.object(cap, "_capture_v2", return_value=good):
+            assert cap.run_capture_v2({"summary": "s"}, suppress_mirror=True) == 0
+    captured = capfd.readouterr()
+    assert first == {"reason": "invalid_json"}
+    for stream in (captured.out, captured.err):
+        assert secret not in stream
+        assert "synthetic-capture-text" not in stream
+    assert "capture_v2 exited 65 (reason: invalid_json)" in captured.err
 
 
 class WritePgOrchestrationTest(unittest.TestCase):

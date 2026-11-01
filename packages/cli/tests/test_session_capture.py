@@ -178,13 +178,22 @@ class PersistentCaptureRetryTest(unittest.TestCase):
 
         self.enqueue(extracted_payload={"summary": "synthetic-capture-text"})
         self.capture.side_effect = real_file_leg
-        with mock.patch.object(sc, "_log") as log:
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sc, "_log") as log, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             sc.drain(limit=1)
         lines = [c.args[0] for c in log.call_args_list if "capture rc=" in c.args[0]]
         self.assertEqual(len(lines), 1, lines)
         self.assertTrue(lines[0].endswith("; kept (reason: file_leg_empty_summary)"), lines)
-        self.assertNotIn(secret, lines[0])
-        self.assertNotIn("synthetic-capture-text", lines[0])
+        # The whole drain log, and everything the drain wrote to its own
+        # stdout/stderr (stop-hook.log in production), is free of child text.
+        everything = "\n".join([*(str(c.args[0]) for c in log.call_args_list),
+                                out.getvalue(), err.getvalue()])
+        self.assertNotIn(secret, everything)
+        self.assertNotIn("synthetic-capture-text", everything)
 
     def test_reason_does_not_carry_over_to_a_later_job(self):
         reasons = iter(["invalid_timestamp", None])
