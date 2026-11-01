@@ -511,16 +511,18 @@ def test_real_sequence_with_last_user_input_never_binds_post_or_stop_by_their_ow
     assert owner_turns.antigravity_late_turn(_stop_payload(path, **said), "Stop", now=1030.0, issuer=ISSUER)
     rows = _rows()
     assert [r["occurrence"] for r in rows] == [1, 1] and rows[1]["duplicate_of"] == rows[0]["turn"]
-    # Turn 2: the same words retyped. Its PreInvocation sees turn 1's step,
-    # so it waits for its own; Post's 6 names no turn.
+    # Turn 2: the same words retyped. Its PreInvocation names step 4, past the
+    # transcript's last step (3), so it records lastUserInput now (review 3);
+    # Post's 6 names no turn; the flushed step 4 pairs with that row.
     assert owner_turns.antigravity_prompt(_pre(path, invocationNum=2, initialNumSteps=4, **said), now=2000.0,
-                                          wait=0, issuer=ISSUER) == {}
+                                          wait=0, issuer=ISSUER)["prompt"] == "ship it"
     assert owner_turns.antigravity_late_turn(_pre(path, invocationNum=2, initialNumSteps=6, **said),
                                              "PostInvocation", now=2010.0, issuer=ISSUER) is None
     _add(path, 4, 14, user_payload("ship it"))
     assert owner_turns.antigravity_late_turn(_stop_payload(path, **said), "Stop", now=2020.0, issuer=ISSUER)
     rows = _rows()
-    assert [r["occurrence"] for r in rows] == [1, 1, 2] and rows[2]["ts"] == 2000.0
+    assert [r["occurrence"] for r in rows] == [1, 1, 2, 2] and rows[2]["ts"] == 2000.0
+    assert rows[2]["ag_step"] == 4 and rows[3]["duplicate_of"] == rows[2]["turn"]
     assert _counted() == [1, 2]
 
 

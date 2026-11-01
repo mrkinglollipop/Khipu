@@ -990,3 +990,152 @@ def test_a_t3_confirm_in_a_conversation_t3_runs_on_cursor_or_antigravity(world, 
     ok, out = _confirm_id(request)
     assert ok, out
     assert _paused() and out["confirmed"]["source"] == "t3" and out["confirmed"]["message"] == mid
+
+
+# ---- review 3: Antigravity turn identity, a foreign headless process, a stale step, a tied time -------
+
+
+def _ag_request(world, session: str, account: str = "Codex") -> str:
+    _be(world, session, "KHIPU_SESSION_ID")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": account}})
+    assert ok and out["pending"], out
+    return out["request"]
+
+
+def _ag_user_step(path, index: int, text: str = OWNER_WORDS, *, then: int | None = None) -> None:
+    lines = [{"type": "USER_INPUT", "step_index": index, "content": text}]
+    if then is not None:
+        lines.append({"type": "PLANNER_RESPONSE", "step_index": then, "content": "ok"})
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+
+def test_review3_p1a_a_stepless_fallback_read_again_from_the_transcript_never_confirms(world):
+    # A PreInvocation with no initialNumSteps records a fallback with no step;
+    # the request is held; a later PreInvocation reads the same words from the
+    # transcript. Pairing can't bind them, so the copy got occurrence 2 with no
+    # late and no duplicate_of, and confirmed.
+    session = "ag-p1a"
+    path = _ag_transcript(world, session)
+    payload = _ag_payload(path, session, lastUserInput=OWNER_WORDS)
+    del payload["initialNumSteps"]
+    owner_turns.antigravity_prompt(payload, now=time.time() - 30, wait=0, issuer=dict(AG_ISSUER))
+    (first,) = owner_turns.turns(session)
+    assert first["fallback"] and "ag_step" not in first and first["eligible"], first
+    request = _ag_request(world, session)
+    _ag_user_step(path, 0)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=0, invocationNum=2),
+                                   now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER))
+    copy = owner_turns.turns(session, time.time() + 2)[-1]
+    assert copy["occurrence"] == 2 and not copy.get("late") and "duplicate_of" not in copy and copy["eligible"], copy
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+
+
+def test_review3_p1b_a_fallback_step_read_again_after_the_prune_never_confirms(world):
+    # A fallback with ag_step=1; the request is held; after 25 h a later
+    # PreInvocation reads step 1 from the transcript, and pairing searched the
+    # pruned history, so the copy confirmed.
+    session = "ag-p1b"
+    path = _ag_transcript(world, session)
+    then = time.time() - 25 * 3600
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, lastUserInput=OWNER_WORDS),
+                                   now=then, wait=0, issuer=dict(AG_ISSUER))
+    real = owner_direction._clock
+    world["mp"].setattr(owner_direction, "_clock", lambda: then + 2)
+    request = _ag_request(world, session)
+    world["mp"].setattr(owner_direction, "_clock", real)
+    assert owner_turns.turns(session) == []
+    _ag_user_step(path, 1)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1, invocationNum=2),
+                                   now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER))
+    copy = owner_turns.turns(session, time.time() + 2)[-1]
+    assert copy["occurrence"] == 2 and not copy.get("late") and "duplicate_of" not in copy and copy["eligible"], copy
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+
+
+def _grok_paused() -> bool:
+    return next(a for a in routing.read_view()["accounts"] if a["key"] == "grok|")["state"] == "paused"
+
+
+def test_review3_a_second_antigravity_yes_for_a_new_request_with_a_new_step_confirms(world):
+    session = "ag-again"
+    path = _ag_transcript(world, session)
+    _ag_turn(world, session, ago=60)
+    first = _ag_request(world, session)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=2, lastUserInput="yes"),
+                                   now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER))
+    ok, out = _confirm_id(first)
+    assert ok and _paused(), out
+    _ag_user_step(path, 2, "yes", then=3)
+    second = _ag_request(world, session, "Grok")
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=4, lastUserInput="yes"),
+                                   now=time.time() + 2, wait=0, issuer=dict(AG_ISSUER))
+    reply = owner_turns.turns(session, time.time() + 3)[-1]
+    assert reply["fallback"] and reply["ag_step"] == 4 and reply["occurrence"] == 2, reply
+    ok, out = _confirm_id(second)
+    assert ok, out
+    assert _grok_paused() and out["confirmed"]["message"] == reply["turn"]
+
+
+def test_review3_p2_a_foreign_headless_process_recording_its_own_hook_turn_in_t3_is_refused(world):
+    # A different headless process inherits the T3 session and records its own
+    # hook turn (sdk-cli, print, headless, not eligible): it is the nearest
+    # harness, so _from_the_hook matched it, and the trust key became
+    # claude_code:t3.
+    request = _hold_in_t3(world)
+    world["t3"].message(THREAD, time.time() + 1)
+    owner_turns.record({"session_id": T3_SESSION, "prompt": OWNER_WORDS, "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}, now=time.time() + 2,
+                       issuer={"pid": 4_000_000, "start": 1.0, "exe": "claude", "print": True, "headless": True, "tty": False, "app": None})
+    latest = owner_turns.turns(T3_SESSION, time.time() + 3)[-1]
+    assert latest["entrypoint"] == "sdk-cli" and latest["eligible"] is False, latest
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_from_the_hook", out
+    assert not _paused()
+
+
+def test_review3_p2_an_antigravity_reply_while_the_transcript_ends_at_the_previous_step_confirms(world):
+    # The previous turn's step 1 was recorded from the transcript; the reply's
+    # PreInvocation names step 2 while the transcript still ends at step 1, so
+    # the recorder re-selected the claimed step 1 and recorded nothing.
+    session = "ag-stale"
+    path = _ag_transcript(world, session)
+    _ag_user_step(path, 1)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=1),
+                                   now=time.time() - 30, wait=0, issuer=dict(AG_ISSUER))
+    assert len(owner_turns.turns(session)) == 1
+    request = _ag_request(world, session)
+    owner_turns.antigravity_prompt(_ag_payload(path, session, initialNumSteps=2, lastUserInput="yes"),
+                                   now=time.time() + 1, wait=0, issuer=dict(AG_ISSUER))
+    rows = owner_turns.turns(session, time.time() + 2)
+    assert len(rows) == 2, rows
+    reply = rows[-1]
+    assert reply["fallback"] and reply["ag_step"] == 2, reply
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == reply["turn"]
+
+
+def test_review3_p2_a_t3_reply_tied_with_the_snapshot_time_confirms(world):
+    at = time.time() - 60
+    world["t3"].message(THREAD, at)
+    request = _hold_in_t3(world)
+    mid = world["t3"].message(THREAD, at)
+    _t3_hook_turn()
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == mid
+
+
+def test_review3_p2_a_snapshot_that_cannot_keep_its_tied_ids_refuses(world):
+    at = time.time() - 60
+    for _ in range(owner_direction._BOUNDARY_MOST + 1):
+        world["t3"].message(THREAD, at)
+    _t3_hook_turn()
+    _be(world, T3_SESSION)
+    ok, out = owner_act.act("route.pause", {"account": "Codex"})
+    assert not ok and out["code"] == "ask_limit", out
+    assert not _paused()

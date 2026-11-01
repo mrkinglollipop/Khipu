@@ -433,11 +433,12 @@ def _entries(raw, width: int) -> list[list]:
     return out
 
 
-def _bounded(entries: list[list], since: float | None) -> list[list]:
+def _bounded(entries: list[list], since: float | None, *, keep_ties: bool = False) -> list[list]:
     """``entries`` (``[*key, ts]``, old ones first) as one set, newest first,
     at most ``_BOUNDARY_MOST``. Only an entry the boundary's time already
-    excludes (dated at or before ``since``) is ever left out; when the bound
-    would drop any other, ``DirectionRefused`` instead of forgetting it."""
+    excludes (dated at or before ``since``; before it with ``keep_ties``) is
+    ever left out; when the bound would drop any other, ``DirectionRefused``
+    instead of forgetting it."""
     best: dict[tuple, list] = {}
     for entry in entries:
         key, ts = tuple(entry[:-1]), entry[-1]
@@ -446,7 +447,7 @@ def _bounded(entries: list[list], since: float | None) -> list[list]:
             best[key] = list(entry)
     ordered = sorted(best.values(), key=lambda e: (e[-1] is not None, -(e[-1] or 0.0)))
     dropped = ordered[_BOUNDARY_MOST:]
-    if any(e[-1] is None or since is None or e[-1] > since for e in dropped):
+    if any(e[-1] is None or since is None or e[-1] > since or (keep_ties and e[-1] == since) for e in dropped):
         raise DirectionRefused("ask_limit", _ASK_LIMIT)
     return ordered[:_BOUNDARY_MOST]
 
@@ -483,7 +484,61 @@ def _ask_boundary(old, turns_: list[dict], now: float, session: str) -> dict:
     turns_in += [[t["turn"], _float(t.get("ts"))] for t in turns_ if isinstance(t.get("turn"), str) and t["turn"]]
     copies_in += [[t["prompt_sha256"], t["occurrence"], _float(t.get("ts"))] for t in turns_
                   if isinstance(t.get("prompt_sha256"), str) and type(t.get("occurrence")) is int]
-    return {"by": session, "ts": since, "turns": _bounded(turns_in, since), "copies": _bounded(copies_in, since)}
+    out = {"by": session, "ts": since, "turns": _bounded(turns_in, since), "copies": _bounded(copies_in, since)}
+    old_ag = _ag_exclusions(old) if isinstance(old, dict) else (set(), set())
+    if old_ag is None:
+        raise DirectionRefused("ask_limit", _ASK_LIMIT)
+    steps, hashes = old_ag
+    for t in turns_:
+        if t.get("harness") != "antigravity":
+            continue
+        if type(t.get("ag_step")) is int:
+            steps.add(t["ag_step"])
+        elif t.get("fallback") and isinstance(t.get("prompt_sha256"), str):
+            hashes.add(t["prompt_sha256"])
+    if len(steps) > _BOUNDARY_MOST or len(hashes) > _BOUNDARY_MOST:
+        raise DirectionRefused("ask_limit", _ASK_LIMIT)
+    if steps or hashes:
+        out["ag_steps"], out["ag_hashes"] = sorted(steps), sorted(hashes)
+    return out
+
+
+# Antigravity's turn identity: a turn read again (from the transcript after
+# its submit-time ``lastUserInput`` row, or after the 24 h prune dropped that
+# row) is a new row with a new id and occurrence, so the turn ids and copies
+# above can't exclude it. Its transcript step id can: every Antigravity step
+# the conversation had recorded when it was asked (``ag_steps``), and the
+# prompt hash of each submit-time row that had no step (``ag_hashes``), kept
+# in the boundary with no time, so the prune never drops them and the cap
+# refuses instead.
+
+
+def _ag_exclusions(boundary: dict) -> tuple[set[int], set[str]] | None:
+    """(excluded step ids, excluded step-less prompt hashes) of an ask
+    boundary; None when either is malformed."""
+    steps, hashes = boundary.get("ag_steps", []), boundary.get("ag_hashes", [])
+    if not isinstance(steps, list) or not isinstance(hashes, list) \
+            or not all(type(s) is int for s in steps) or not all(isinstance(h, str) for h in hashes):
+        return None
+    return set(steps), set(hashes)
+
+
+def _ag_replayed(turn: dict, boundary) -> bool:
+    """Whether an Antigravity ``turn`` may be a turn the ask already saw:
+    its step is excluded, it was read from the transcript with the words of
+    an excluded step-less row, or it is a transcript row with no step id."""
+    if turn.get("harness") != "antigravity":
+        return False
+    found = _ag_exclusions(boundary) if isinstance(boundary, dict) else (set(), set())
+    if found is None:
+        return True
+    steps, hashes = found
+    step = turn.get("ag_step")
+    if type(step) is int and step in steps:
+        return True
+    if turn.get("ag_transcript"):
+        return type(step) is not int or turn.get("prompt_sha256") in hashes
+    return False
 
 
 def _late_copy(turn: dict) -> bool:
@@ -552,7 +607,9 @@ def _t3_boundary(old, read: dict, session: str) -> dict:
     if read["latest_ts"] is not None and (latest is None or read["latest_ts"] > latest):
         latest, latest_at = read["latest_ts"], read["latest_at"]
     entries = ids + [[str(i), float(ts)] for i, ts in read["owners"]]
-    return {"by": sorted(set(_makers(old)) | {session}), "ids": _bounded(entries, latest),
+    # A confirm accepts an unseen message dated at the snapshot's time, so
+    # the ids tied with it are kept: only older ones may be dropped.
+    return {"by": sorted(set(_makers(old)) | {session}), "ids": _bounded(entries, latest, keep_ties=True),
             "latest_at": latest_at, "latest_ts": latest}
 
 
@@ -578,6 +635,15 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
                                                    "so it can't tell this call comes from it. Nothing was changed; "
                                                    "it works once the owner replies here.")
     latest = recorded[-1]
+    # The hook turn's own entrypoint: a headless or SDK process that inherits
+    # the session records a machine entrypoint (``claude -p`` is sdk-cli,
+    # any of MACHINE_ENTRYPOINTS), or a print or headless issuer when T3
+    # membership made it "t3". Only T3's own hook turn names the harness.
+    issuer = latest.get("issuer") if isinstance(latest.get("issuer"), dict) else {}
+    if latest.get("entrypoint") != "t3" or issuer.get("print") is True or issuer.get("headless") is True:
+        raise DirectionRefused("not_from_the_hook",
+                               "This conversation's latest hook turn came from a headless or scripted process, not "
+                               "T3's own agent, so it can't confirm. Nothing was changed.")
     front = f"{latest.get('harness')}:t3"
     if front not in owner_turns.settings()["trusted"]:
         raise DirectionRefused("not_confirmed", f"Not confirmed: {owner_turns.untrusted_why(front)}.")
@@ -612,7 +678,7 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | None
     if not isinstance(asks, dict):
         asks = request["asks"] = {}
     old = asks.get(session)
-    if not _late_copy(turn) and _after_ask(turn, old):
+    if not _late_copy(turn) and _after_ask(turn, old) and not _ag_replayed(turn, old):
         return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
                 "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
                 "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook",

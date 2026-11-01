@@ -359,7 +359,7 @@ def owner_reply_read(thread_id: str, seen, since) -> tuple[dict | None, bool]:
     same rows:
 
     - ``message``: the newest message the owner typed whose id is not in
-      ``seen`` and that T3 dated after ``since`` (T3's epoch seconds; None:
+      ``seen`` and that T3 dated at or after ``since`` (T3's epoch seconds; None:
       no bound), as ``{id, at, ts, text}`` (the text is for hashing only),
       or None;
     - what the thread held in that read, for the next ask boundary:
@@ -397,7 +397,8 @@ def owner_reply_read(thread_id: str, seen, since) -> tuple[dict | None, bool]:
             if payload is None:
                 continue
             owners.append([str(message_id), ts])
-            if message is None and str(message_id) not in seen and (since is None or ts > since):
+            # At ``since`` too: the snapshot keeps every id tied with its time.
+            if message is None and str(message_id) not in seen and (since is None or ts >= since):
                 message = {"id": str(message_id), "at": str(created_at), "ts": ts, "text": payload["text"]}
         return {"message": message, "owners": owners, "latest_at": latest_at, "latest_ts": latest_ts}
 

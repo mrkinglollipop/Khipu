@@ -868,7 +868,9 @@ def record(payload: dict, env: dict | None = None, now: float | None = None,
     was recorded. ``issuer`` None means this process's (``hook_issuer``).
     ``extra`` (Antigravity's recorder only): ``fallback`` marks a turn read
     from the payload's ``lastUserInput`` (``ag_step``: that turn's
-    ``initialNumSteps``); ``duplicate_of`` + ``occurrence`` make this row a
+    ``initialNumSteps``), ``ag_transcript`` one read from the transcript
+    (``ag_step``: its USER_INPUT step index, absent when the step has
+    none); ``duplicate_of`` + ``occurrence`` make this row a
     late second copy of that turn, sharing its occurrence; ``late`` marks a
     row recorded after its turn by a later hook ("PostInvocation", "Stop",
     or "flush" for the flushed step of a turn first read from
@@ -928,7 +930,9 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
     for flag in ("fallback", "duplicate_of", "late"):
         if extra.get(flag):
             turn[flag] = extra[flag]
-    if extra.get("fallback") and type(extra.get("ag_step")) is int:
+    if extra.get("ag_transcript"):
+        turn["ag_transcript"] = True
+    if (extra.get("fallback") or extra.get("ag_transcript")) and type(extra.get("ag_step")) is int:
         turn["ag_step"] = extra["ag_step"]
     ok, why = eligible(turn, conf)
     turn["eligible"] = ok
@@ -1305,6 +1309,23 @@ def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     return None
 
 
+def _ag_past_transcript(path: str, steps: int) -> bool:
+    """Whether step ``steps`` is past the transcript's newest step (of any
+    type) that carries a step index. False when no step index can be read."""
+    if antigravity_db.is_db(path):
+        rows = antigravity_db.read_turns(path)
+        return bool(rows) and rows[-1][0] < steps
+    for line in _ag_lines_newest_first(path):
+        try:
+            step = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        index = step.get("step_index") if isinstance(step, dict) else None
+        if isinstance(index, int) and not isinstance(index, bool):
+            return index < steps
+    return False
+
+
 def _ag_lines_newest_first(path: str):
     """Lines of a JSONL transcript, newest first, read backwards in chunks so
     a long run of steps after the USER_INPUT does not hide it. Stops after
@@ -1508,7 +1529,9 @@ def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
             at = ts
     if key.startswith(_AG_FALLBACK):
         return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps})
-    return at, (_ag_original(session, index, text, now) if index is not None else {})
+    if index is None:
+        return at, {"ag_transcript": True}
+    return at, {**_ag_original(session, index, text, now), "ag_transcript": True, "ag_step": index}
 
 
 def _ag_original(session: str, index: int, text: str, now: float) -> dict:
@@ -1556,6 +1579,12 @@ def _ag_read(payload, wait: float | None, late: bool = False) -> tuple[str, tupl
             while found is None and time.monotonic() < give_up:
                 time.sleep(_AG_FLUSH_POLL_S)
                 found = _ag_last_user_input(tp)
+    if found is not None and has_last and not late and steps is not None \
+            and (_ag_step_number(found[0]) or 0) < steps and _ag_past_transcript(tp, steps):
+        # The submit names a step the transcript has not reached: its newest
+        # USER_INPUT is an earlier turn's, already handled, and this turn is
+        # the payload's lastUserInput.
+        found = None
     if found is None and has_last and not (late and steps is None):
         wrapped = _AG_WRAP.match(last)
         text = (wrapped.group(1) if wrapped else last).strip()
