@@ -421,17 +421,17 @@ def test_the_same_words_from_a_trusted_non_t3_front_end_still_pass(world):
 def test_a_t3_lookup_that_fails_once_is_tried_again(t3_conversation, monkeypatch):
     from khipu import t3
 
-    real, calls = t3.thread_for_session_result, []
+    real, calls = t3.session_thread_ids_result, []
 
     def flaky(sid, **kw):
         calls.append(sid)
         return (None, False) if len(calls) == 1 else real(sid, **kw)
 
-    monkeypatch.setattr(t3, "thread_for_session_result", flaky)
+    monkeypatch.setattr(t3, "session_thread_ids_result", flaky)
     _t3_say()
     assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3"
     # Two failed reads settle nothing: unverified, and it never counts.
-    monkeypatch.setattr(t3, "thread_for_session_result", lambda sid, **kw: (None, False))
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
     _t3_say()
     assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3-unverified"
     assert owner_turns.turns(OWNER)[-1]["eligible"] is False
@@ -831,7 +831,8 @@ def test_a_native_id_naming_an_old_and_a_recent_thread_never_counts(t3_conversat
     assert t3.thread_for_session_result(OWNER, whole_table=True) == (None, True)
     _t3_say()
     row = owner_turns.turns(OWNER)[-1]
-    assert row["entrypoint"] == "sdk-ts" and row["eligible"] is False
+    # Ambiguous is still a T3 session, never its native entrypoint, and never counts.
+    assert row["entrypoint"] == "t3" and row["eligible"] is False
 
 
 # ---- every dispatch marker, and T3 delegated child threads --------------------------------------

@@ -199,9 +199,10 @@ def _t3_membership(session: str) -> str:
     if not path.is_file():
         return "none"
     for _ in range(2):
-        thread, definitive = t3.thread_for_session_result(session, whole_table=True)
+        threads, definitive = t3.session_thread_ids_result(session)
         if definitive:
-            return "t3" if thread else "none"
+            # Any match, two distinct threads included, means T3 runs it.
+            return "t3" if threads else "none"
     return "unverified"
 
 

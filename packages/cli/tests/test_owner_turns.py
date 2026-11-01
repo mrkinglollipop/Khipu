@@ -449,7 +449,7 @@ def test_doctor_row_counts_per_harness_and_reds_a_silent_hook(home):
 ])
 def test_a_failed_t3_lookup_never_hands_back_a_trusted_entrypoint(home, monkeypatch, harness, env, native):
     monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
-    monkeypatch.setattr(owner_turns.t3, "thread_for_session_result", lambda sid, **kw: (None, False))
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
     entry = owner_turns.entrypoint_of(harness, env, {}, SESSION)
     assert entry == "t3-unverified"
     ok, why = owner_turns.eligible({"entrypoint": entry, "harness": harness, "typed": True, "text": "x"})
@@ -464,3 +464,20 @@ def test_no_t3_database_keeps_the_native_entrypoint(home, monkeypatch):
 def test_an_aegis_session_in_a_t3_thread_is_t3(home, monkeypatch):
     monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
     assert owner_turns.entrypoint_of("aegis", {}, {}, SESSION) == "t3"
+
+
+@pytest.mark.parametrize("harness,env", [
+    ("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}),
+    ("aegis", {}),
+])
+def test_a_session_two_t3_threads_name_is_t3_not_unknown(home, monkeypatch, harness, env):
+    # An ambiguous native id is still a T3 session: it never gets its trusted entrypoint back.
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", lambda sid, **kw: (["thread-a", "thread-b"], True))
+    assert owner_turns.entrypoint_of(harness, env, {}, SESSION) == "t3"
+
+
+def test_a_settled_miss_keeps_the_native_entrypoint_on_a_mac_with_t3(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", lambda sid, **kw: ([], True))
+    assert owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION) == "cli"
