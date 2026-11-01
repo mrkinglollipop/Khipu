@@ -391,34 +391,50 @@ def _t3_say(session: str = OWNER, *, ago: float = 0.0, **env) -> None:
                        {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts", **env}, now=time.time() - ago)
 
 
-def test_a_t3_conversation_the_owner_typed_in_passes(t3_conversation):
+_T3_WHY = ("a T3 conversation can't be told apart from T3's own scheduled or relayed messages; "
+           "confirm owner changes in the Khipu app")
+
+
+def test_a_t3_conversation_the_owner_typed_in_is_refused(t3_conversation):
     from khipu import t3
 
     assert t3.thread_for_session(OWNER) is None  # behind the newest window
     _t3_say()
     (row,) = owner_turns.turns(OWNER)
-    assert row["entrypoint"] == "t3" and row["eligible"] is True
+    assert row["entrypoint"] == "t3" and row["eligible"] is False and row["why"] == _T3_WHY
+    assert not row.get("dispatched")
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
     rc, out = t3_conversation.run(["config", "--set", "routing_prompt_budget_ms", "500"], True)
-    assert rc == 0, out
+    assert rc != 0, out
+
+
+def test_the_same_words_from_a_trusted_non_t3_front_end_still_pass(world):
+    owner_turns.record({"session_id": OWNER, "prompt": "set the routing budget to 500 ms", "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
+    (row,) = owner_turns.turns(OWNER)
+    assert row["entrypoint"] == "cli" and row["eligible"] is True
     assert _check("config.routing_setting")["auth"] == "direction"
 
 
 def test_a_t3_lookup_that_fails_once_is_tried_again(t3_conversation, monkeypatch):
     from khipu import t3
 
-    real, calls = t3.thread_for_session_result, []
+    real, calls = t3.session_thread_ids_result, []
 
     def flaky(sid, **kw):
         calls.append(sid)
         return (None, False) if len(calls) == 1 else real(sid, **kw)
 
-    monkeypatch.setattr(t3, "thread_for_session_result", flaky)
+    monkeypatch.setattr(t3, "session_thread_ids_result", flaky)
     _t3_say()
     assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3"
-    # Two failed reads settle nothing: the turn is not T3's and never counts.
-    monkeypatch.setattr(t3, "thread_for_session_result", lambda sid, **kw: (None, False))
+    # Two failed reads settle nothing: unverified, and it never counts.
+    monkeypatch.setattr(t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
     _t3_say()
-    assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "sdk-ts"
+    assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3-unverified"
+    assert owner_turns.turns(OWNER)[-1]["eligible"] is False
 
 
 def test_a_t3_conversation_on_a_dispatched_lane_is_refused(t3_conversation, monkeypatch):
@@ -428,15 +444,19 @@ def test_a_t3_conversation_on_a_dispatched_lane_is_refused(t3_conversation, monk
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
     assert err.value.code == "no_recorded_turn"
-    # The owner's own turn, but the call comes from a dispatched job.
+    # An unmarked T3 turn is refused too, and so is a call from a dispatched job.
     _t3_say()
-    assert _check("config.routing_setting")["auth"] == "direction"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
     monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", "1")
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
     assert err.value.code == "no_recorded_turn"
     monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", "0")
-    assert _check("config.routing_setting")["auth"] == "direction"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
 
 
 def test_another_t3_conversations_turn_is_refused(t3_conversation):
@@ -451,7 +471,8 @@ def test_a_stale_t3_turn_is_refused(t3_conversation):
     _t3_say(ago=7 * 3600)
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
-    assert err.value.code == "stale"
+    # No T3 turn is eligible, so the refusal is decided before the age check.
+    assert err.value.code == "no_recorded_turn"
 
 
 # ---- apply, log, undo --------------------------------------------------------------------------
@@ -810,7 +831,8 @@ def test_a_native_id_naming_an_old_and_a_recent_thread_never_counts(t3_conversat
     assert t3.thread_for_session_result(OWNER, whole_table=True) == (None, True)
     _t3_say()
     row = owner_turns.turns(OWNER)[-1]
-    assert row["entrypoint"] == "sdk-ts" and row["eligible"] is False
+    # Ambiguous is still a T3 session, never its native entrypoint, and never counts.
+    assert row["entrypoint"] == "t3" and row["eligible"] is False
 
 
 # ---- every dispatch marker, and T3 delegated child threads --------------------------------------
@@ -874,11 +896,14 @@ def test_a_t3_delegated_child_threads_turn_is_not_eligible(t3_conversation, thre
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
     assert err.value.code == "no_recorded_turn"
-    # The owner's own top-level T3 conversation still counts.
+    # The owner's own top-level T3 conversation is refused as well.
     _t3_say()
-    assert owner_turns.turns(OWNER)[-1]["eligible"] is True
+    last = owner_turns.turns(OWNER)[-1]
+    assert last["eligible"] is False and last["why"] == _T3_WHY
     t3_conversation.be(OWNER)
-    assert _check("config.routing_setting")["auth"] == "direction"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
 
 
 def test_an_unmarked_t3_child_turn_is_refused_at_the_check(t3_conversation, monkeypatch):
@@ -890,7 +915,8 @@ def test_an_unmarked_t3_child_turn_is_refused_at_the_check(t3_conversation, monk
     real = t3.delegated_thread_result
     monkeypatch.setattr(t3, "delegated_thread_result", lambda thread: (False, True))
     _t3_say(session="s-child")
-    assert owner_turns.turns("s-child")[0]["eligible"] is True
+    first = owner_turns.turns("s-child")[0]
+    assert first["eligible"] is False and first["why"] == _T3_WHY
     monkeypatch.setattr(t3, "delegated_thread_result", real)
     t3_conversation.be("s-child")
     with pytest.raises(owner_direction.DirectionRefused) as err:
@@ -909,12 +935,15 @@ def _be_with(world, session, monkeypatch, env):
         monkeypatch.setenv(name, value)
 
 
-def test_a_t3_top_level_thread_with_the_sdk_child_markers_passes(t3_conversation, monkeypatch):
+def test_a_t3_top_level_thread_with_the_sdk_child_markers_is_refused(t3_conversation, monkeypatch):
     _t3_say(**_T3_SDK_ENV)
     row = owner_turns.turns(OWNER)[-1]
-    assert row["entrypoint"] == "t3" and row["eligible"] is True and not row.get("dispatched")
+    assert row["entrypoint"] == "t3" and row["eligible"] is False and row["why"] == _T3_WHY
+    assert not row.get("dispatched")
     _be_with(t3_conversation, OWNER, monkeypatch, _T3_SDK_ENV)
-    assert _check("config.routing_setting")["auth"] == "direction"
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        _check("config.routing_setting")
+    assert err.value.code == "no_recorded_turn"
 
 
 def test_a_t3_delegated_child_with_the_sdk_child_markers_is_refused(t3_conversation, monkeypatch):
@@ -958,7 +987,7 @@ def test_a_t3_lookup_failure_with_the_sdk_child_markers_is_refused(t3_conversati
     from khipu import t3
 
     _t3_say(**_T3_SDK_ENV)
-    assert owner_turns.turns(OWNER)[-1]["eligible"] is True
+    assert owner_turns.turns(OWNER)[-1]["eligible"] is False
     monkeypatch.setattr(t3, "delegated_thread_result", lambda thread: (False, False))
     _be_with(t3_conversation, OWNER, monkeypatch, _T3_SDK_ENV)
     with pytest.raises(owner_direction.DirectionRefused) as err:

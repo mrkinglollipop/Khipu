@@ -196,6 +196,39 @@ def thread_for_session_result(sid: str, *, whole_table: bool = False) -> tuple[s
             con.close()
 
 
+def session_thread_ids_result(sid: str) -> tuple[list[str] | None, bool]:
+    """``(thread ids, definitive)``: every distinct T3 thread whose provider
+    row names native session ``sid``, from one whole-table read-only scan
+    under the same deadline as ``thread_for_session_result``. Unlike that
+    lookup, two matching threads stay two (not None), so a caller deciding
+    permission can tell "no thread" from "ambiguous". A missing database,
+    lock, timeout or failing query is ``(None, False)``."""
+    if not sid:
+        return [], True
+    path = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
+    if not path.is_file():
+        return None, False
+    con = None
+    try:
+        mode = "?mode=ro" if Path(f"{path}-wal").exists() else "?mode=ro&immutable=1"
+        con = sqlite3.connect(path.absolute().as_uri() + mode, uri=True, timeout=0.5)
+        con.execute("PRAGMA busy_timeout = 2")
+        deadline = time.monotonic() + 0.05
+        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        rows = con.execute(
+            "SELECT DISTINCT thread_id FROM orchestration_v2_projection_provider_threads "
+            "WHERE CASE WHEN json_valid(payload_json) THEN "
+            "json_extract(payload_json, '$.nativeThreadRef.nativeId') END = ?",
+            (sid,),
+        ).fetchall()
+        return sorted({str(r[0]) for r in rows if r and r[0]}), True
+    except (OSError, ValueError, sqlite3.Error):
+        return None, False
+    finally:
+        if con is not None:
+            con.close()
+
+
 def thread_for_session(sid: str) -> str | None:
     """A bounded read of T3's provider projection; failures mean no mapping.
 

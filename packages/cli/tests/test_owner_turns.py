@@ -119,12 +119,30 @@ def _t3_db(tmp: Path, native: str) -> Path:
     return db
 
 
-def test_a_session_t3_runs_is_the_t3_front_end(home, monkeypatch):
+def test_a_session_t3_runs_is_the_t3_front_end_and_is_never_eligible(home, monkeypatch):
     monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
     turn_id = _record(handoff_wrapper("lift Codex"), env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"})
     turn = _last()
-    assert (turn["entrypoint"], turn["eligible"], turn["typed"]) == ("t3", True, True)
+    assert (turn["entrypoint"], turn["eligible"], turn["typed"]) == ("t3", False, True)
+    assert owner_turns.eligible(turn)[1].startswith("a T3 conversation can't be told apart")
     assert turn_id == turn["turn"]
+
+
+@pytest.mark.parametrize("entry", ["cli", "claude-desktop", "claude-vscode", "remote_mobile"])
+def test_a_t3_session_reporting_a_trusted_claude_entrypoint_is_still_t3(home, monkeypatch, entry):
+    # Membership in a T3 thread decides, not the entrypoint the session reports.
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    _record("pause Codex until 5pm", env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": entry})
+    turn = _last()
+    assert (turn["entrypoint"], turn["eligible"]) == ("t3", False)
+    assert not owner_turns.eligible(turn, {**owner_turns.settings(),
+                                           "trusted": [*owner_turns.DEFAULT_TRUSTED, f"claude_code:{entry}"]})[0]
+
+
+def test_an_antigravity_session_in_a_t3_thread_is_t3_whatever_its_surface(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    monkeypatch.setattr(owner_turns.hook_shape, "antigravity_entrypoint", lambda payload: "cli")
+    assert owner_turns.entrypoint_of("antigravity", {}, {}, SESSION) == "t3"
 
 
 def test_claude_p_is_never_the_owner_even_in_a_t3_thread(home, monkeypatch):
@@ -423,3 +441,43 @@ def test_doctor_row_counts_per_harness_and_reds_a_silent_hook(home):
     assert row["ok"] is False and row["missing"] == ["codex"]
     assert any("Codex" in w for w in row["warnings"])
     assert owner_turns.doctor_block(installed=["claude_code"])["ok"] is True
+
+
+@pytest.mark.parametrize("harness,env,native", [
+    ("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, "cli"),
+    ("aegis", {}, "aegis"),
+])
+def test_a_failed_t3_lookup_never_hands_back_a_trusted_entrypoint(home, monkeypatch, harness, env, native):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", lambda sid, **kw: (None, False))
+    entry = owner_turns.entrypoint_of(harness, env, {}, SESSION)
+    assert entry == "t3-unverified"
+    ok, why = owner_turns.eligible({"entrypoint": entry, "harness": harness, "typed": True, "text": "x"})
+    assert not ok and why.startswith("Khipu could not read T3's record")
+
+
+def test_no_t3_database_keeps_the_native_entrypoint(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(home["tmp"] / "no-such-t3.sqlite"))
+    assert owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION) == "cli"
+
+
+def test_an_aegis_session_in_a_t3_thread_is_t3(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    assert owner_turns.entrypoint_of("aegis", {}, {}, SESSION) == "t3"
+
+
+@pytest.mark.parametrize("harness,env", [
+    ("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}),
+    ("aegis", {}),
+])
+def test_a_session_two_t3_threads_name_is_t3_not_unknown(home, monkeypatch, harness, env):
+    # An ambiguous native id is still a T3 session: it never gets its trusted entrypoint back.
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", lambda sid, **kw: (["thread-a", "thread-b"], True))
+    assert owner_turns.entrypoint_of(harness, env, {}, SESSION) == "t3"
+
+
+def test_a_settled_miss_keeps_the_native_entrypoint_on_a_mac_with_t3(home, monkeypatch):
+    monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
+    monkeypatch.setattr(owner_turns.t3, "session_thread_ids_result", lambda sid, **kw: ([], True))
+    assert owner_turns.entrypoint_of("claude_code", {"CLAUDE_CODE_ENTRYPOINT": "cli"}, {}, SESSION) == "cli"
