@@ -145,8 +145,9 @@ STORES: tuple[Store, ...] = (
           "owner words",
           _w("owner_turns._record", "owner_turns._write_private", "routing_mismatches._write_event")),
     Store("owner actions", "data folder owner-actions.jsonl, its head owner-actions.head.json and lock, "
-          "owner-direction-pending.json and their .tmp rewrites (owner_files.PATTERNS)",
-          "each owner action with the owner's quoted words, and widenings waiting for a second turn",
+          "owner-direction-pending.json, owner-requests.json and their .tmp rewrites (owner_files.PATTERNS)",
+          "each owner action with the owner's quoted words, widenings waiting for a second turn, and "
+          "changes held for the owner to confirm (the action and its arguments)",
           "owner words",
           _w("owner_direction._append", "owner_direction._log_locked", "owner_direction._write_private")),
     Store("routing delivery words", "capture home state/recall--*.routing.json and their rewrite temps; "

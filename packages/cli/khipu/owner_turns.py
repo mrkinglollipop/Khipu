@@ -48,7 +48,9 @@ RETENTION_S = 24 * 3600
 # extension; "remote", "remote_desktop" and "remote_mobile" a cloud session
 # typed in from the web, desktop or mobile app), Codex's originator
 # ("codex_cli_rs" the terminal, "codex_desktop" the app, "codex_vscode" the
-# extension), "t3" for a session T3 Code runs, "aegis" for the Aegis pack
+# extension), "t3" for a session T3 Code runs, whichever agent T3 runs it on
+# (Claude Code, Codex, Cursor or Antigravity: a T3 conversation is proven by
+# T3's own message rows, not by the agent's front end), "aegis" for the Aegis pack
 # (Grok Build included), Cursor's "ide" (the app, its hook run from inside a
 # Cursor app bundle) and "cli" (``cursor-agent`` on a terminal, no print
 # flag), and Antigravity's "app" and "ide". Never trusted: "sdk-cli"
@@ -70,8 +72,8 @@ RETENTION_S = 24 * 3600
 DEFAULT_TRUSTED = ("claude_code:cli", "claude_code:claude-desktop", "claude_code:claude-desktop-3p",
                    "claude_code:claude-vscode", "claude_code:remote", "claude_code:remote_desktop",
                    "claude_code:remote_mobile", "claude_code:t3", "codex:codex_cli_rs", "codex:codex_desktop",
-                   "codex:codex_vscode", "codex:t3", "aegis:aegis", "cursor:ide", "cursor:cli",
-                   "antigravity:app", "antigravity:ide")
+                   "codex:codex_vscode", "codex:t3", "cursor:t3", "antigravity:t3", "aegis:aegis",
+                   "cursor:ide", "cursor:cli", "antigravity:app", "antigravity:ide")
 # Entrypoints a job runs as, not a person: a refusal never suggests trusting them.
 MACHINE_ENTRYPOINTS = ("sdk-cli", "sdk-ts", "sdk-py", "mcp", "claude-code-github-action", "local-agent",
                        "remote_trigger", "remote_cowork_trigger", "codex_exec", "codex_sdk_ts", "cursor_print",
@@ -600,7 +602,7 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
         # be told apart from the owner typing (three attempts, 2026-11-01). Not
         # a setting: switching it on would reopen that.
         return False, ("a T3 conversation can't be told apart from T3's own scheduled or relayed messages; "
-                       "confirm owner changes in the Khipu app")
+                       "a change asked for there waits for the owner to confirm it")
     key = f"{turn.get('harness')}:{turn.get('entrypoint')}"
     if key not in conf["trusted"]:
         return False, untrusted_why(key)
@@ -812,6 +814,72 @@ def _real_home() -> str:
     return pwd.getpwuid(os.getuid()).pw_dir
 
 
+# T3 Code's app bundle ("T3 Code.app", "T3 Code (Beta).app"), matched as
+# ``_app_bundle`` matches: the outermost bundle, its name without case
+# (ASCII only), directly in /Applications or ~/Applications by identity.
+_T3_BUNDLE_PREFIX = "t3 code"
+_T3_TREE_MOST = 16
+
+
+def _t3_app(exe: str) -> bool:
+    try:
+        path = Path(os.path.realpath(exe))
+    except (OSError, ValueError):
+        return False
+    for i, part in enumerate(path.parts):
+        if part.casefold().endswith(".app"):
+            return part.isascii() and part.casefold().startswith(_T3_BUNDLE_PREFIX) \
+                and _in_trusted_place(Path(*path.parts[:i]))
+    return False
+
+
+def _scripted_launcher(name: str, args: list[str] | None) -> bool:
+    """A process that runs an agent headless or from a script: a shell or an
+    interpreter, a print or headless command line (``claude -p``,
+    ``cursor-agent -p``), ``codex exec``; an unread command line too."""
+    if args is None or _refused_issuer(name) or _headless_args(args):
+        return True
+    if name.lower().startswith("codex"):
+        words = [a for a in args[1:] if not a.startswith("-")]
+        return bool(words) and words[0] in ("exec", "e")
+    return False
+
+
+def t3_launched(issuer) -> bool:
+    """Whether a hook's issuer is T3 Code's own agent, read live from the
+    kernel: the process with the recorded pid and start time, whose parent
+    chain reaches a process running from T3 Code's app bundle with no
+    scripted launcher (``_scripted_launcher``) on the way, the issuer
+    itself included. Anything unreadable, or a reused process number, is
+    False."""
+    if not isinstance(issuer, dict) or type(issuer.get("pid")) is not int:
+        return False
+    start = issuer.get("start")
+    if isinstance(start, bool) or not isinstance(start, (int, float)):
+        return False
+    pid = issuer["pid"]
+    info = _proc_info(pid)
+    if info is None or info[2] != start:
+        return False
+    born = start
+    for _ in range(_T3_TREE_MOST):
+        parent, exe, started = info
+        if started > born:
+            return False  # the number went to a newer process
+        born = started
+        if pid != issuer["pid"] and _t3_app(exe):
+            return True
+        if _scripted_launcher(os.path.basename(os.path.realpath(exe)), _proc_args(pid)):
+            return False
+        if parent <= 1:
+            return False
+        pid = parent
+        info = _proc_info(pid)
+        if info is None:
+            return False
+    return False
+
+
 def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
     """The process that ran this hook. The recorder's parent must be the
     prompt shim (a shell running ``khipu-prompt-recall``; ``shim`` names
@@ -867,7 +935,10 @@ def record(payload: dict, env: dict | None = None, now: float | None = None,
     ``extra`` (Antigravity's recorder only): ``fallback`` marks a turn read
     from the payload's ``lastUserInput`` (``ag_step``: that turn's
     ``initialNumSteps``); ``duplicate_of`` + ``occurrence`` make this row a
-    late second copy of that turn, sharing its occurrence.
+    late second copy of that turn, sharing its occurrence; ``late`` marks a
+    row recorded after its turn by a later hook ("PostInvocation", "Stop",
+    or "flush" for the flushed step of a turn first read from
+    ``lastUserInput``). A held change's confirm never counts such a row.
     Never raises."""
     try:
         return _record(payload, os.environ if env is None else env, time.time() if now is None else now, issuer,
@@ -920,7 +991,7 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
         # that turn's occurrence rather than numbering a second one.
         turn["occurrence"] = shared if type(shared) is int and shared >= 1 \
             else _next_occurrence(session, sha, now)
-    for flag in ("fallback", "duplicate_of"):
+    for flag in ("fallback", "duplicate_of", "late", "ag_invoked"):
         if extra.get(flag):
             turn[flag] = extra[flag]
     if extra.get("fallback") and type(extra.get("ag_step")) is int:
@@ -1300,6 +1371,24 @@ def _ag_last_user_input(path: str) -> tuple[str, str] | None:
     return None
 
 
+def _ag_past_transcript(path: str, steps: int) -> bool:
+    """Whether step ``steps`` is past the transcript's newest step (of any
+    type) that carries a step index. False when no step index can be read."""
+    if antigravity_db.is_db(path):
+        # Every step type: tool steps are past the turn's own USER_INPUT too.
+        last = antigravity_db.last_step(path)
+        return last is not None and last < steps
+    for line in _ag_lines_newest_first(path):
+        try:
+            step = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        index = step.get("step_index") if isinstance(step, dict) else None
+        if isinstance(index, int) and not isinstance(index, bool):
+            return index < steps
+    return False
+
+
 def _ag_lines_newest_first(path: str):
     """Lines of a JSONL transcript, newest first, read backwards in chunks so
     a long run of steps after the USER_INPUT does not hide it. Stops after
@@ -1466,6 +1555,56 @@ def _ag_clear_unseen(session: str) -> None:
         pass
 
 
+def _ag_marker(directory: Path, session: str, key: str, text: str) -> Path:
+    # The words are part of the mark: a reused step index with new words
+    # (a rewritten or renumbered transcript) is a new turn, not this one.
+    words = prompt_sha256(text)
+    return directory / hashlib.sha256(f"{session}\0{key}\0{words}".encode("utf-8", "replace")).hexdigest()[:40]
+
+
+def _ag_ended_file(session: str) -> Path:
+    return _ag_file(_ag_dir(), "ended-", session)
+
+
+def _ag_note_ended(session: str) -> None:
+    try:
+        _ag_write(_ag_ended_file(session), "{}")
+    except OSError:
+        pass
+
+
+def _ag_turn_ended(session: str, take: bool) -> bool:
+    """Whether a Stop came since the last PreInvocation (``take``: and clear it,
+    for the PreInvocation that starts the next turn)."""
+    path = _ag_ended_file(session)
+    if not take:
+        return path.exists()
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _ag_same_turn(session: str, found: tuple[str, str], last: str, now: float) -> bool:
+    """Whether a PreInvocation whose ``lastUserInput`` is ``last`` repeats the
+    turn of the transcript's newest user step ``found``: the same words, that
+    step already recorded (its marker), and the session's latest recorded
+    typed row holding those words. A later model call of one turn then names
+    a higher step count with no new user step written, and is not a turn.
+    After a Stop the next PreInvocation is a new turn, so it never asks this."""
+    wrapped = _AG_WRAP.match(last)
+    text = owner_text((wrapped.group(1) if wrapped else last).strip())
+    seen = owner_text(found[1])
+    if not text or not text.strip() or seen is None or prompt_sha256(text) != prompt_sha256(seen):
+        return False
+    sha = prompt_sha256(text)
+    if not _ag_marker(_ag_dir(), session, found[0], found[1]).exists():
+        return False
+    latest = next((t for t in reversed(turns(session, now)) if isinstance(t.get("prompt_sha256"), str)), None)
+    return latest is not None and latest["prompt_sha256"] == sha
+
+
 def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
               text: str = "") -> tuple[float, dict] | None:
     """Create the turn's once-per-turn marker. None when the turn was already
@@ -1475,7 +1614,7 @@ def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
     payload's ``initialNumSteps``), and the flushed step of that same turn
     is marked its duplicate. Every Antigravity record goes through here."""
     directory = _ag_dir()
-    marker = directory / hashlib.sha256(f"{session}\0{key}".encode("utf-8", "replace")).hexdigest()[:40]
+    marker = _ag_marker(directory, session, key, text)
     try:
         os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
     except FileExistsError:
@@ -1486,49 +1625,58 @@ def _ag_claim(session: str, key: str, now: float, steps: int | None = None,
                 old.unlink()
         except OSError:
             continue
-    at = now
+    at, invoked = now, {}
     index = _ag_step_number(key)
     if index is not None:
         path = _ag_file(directory, "pending-", session)
         notes = _ag_notes(path)
         ts = notes.get(str(index))
         if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
-            at = ts
+            at, invoked = ts, {"ag_invoked": True}
         _ag_save_notes(path, {k: v for k, v in notes.items() if int(k) > index})
     elif steps is not None and key.startswith(_AG_FALLBACK):
         # A late row of a turn whose PreInvocation could not read it keeps
         # that call's time; the note stays to date the flushed copy.
         ts = _ag_notes(_ag_file(directory, "pending-", session)).get(str(steps))
         if ts is not None and now - _AG_PENDING_KEEP_S <= ts <= now:
-            at = ts
+            at, invoked = ts, {"ag_invoked": True}
+    # ``ag_invoked``: dated by the PreInvocation of this same turn that could
+    # not read it, so a row first recorded at PostInvocation or Stop is that
+    # turn's own record (``antigravity_late_turn`` keeps it only for a row that
+    # is no copy of a recorded one).
     if key.startswith(_AG_FALLBACK):
-        return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps})
-    return at, (_ag_original(session, index, text, now) if index is not None else {})
+        return at, ({"fallback": True} if steps is None else {"fallback": True, "ag_step": steps}) | invoked
+    return at, (_ag_original(session, index, text, now) if index is not None else {}) | invoked
 
 
 def _ag_original(session: str, index: int, text: str, now: float) -> dict:
     """The not yet paired ``lastUserInput`` row of the turn whose step is
     ``index`` with the same words: its id and occurrence, so this flushed
-    copy shares its numbering. Empty when no row is that turn."""
+    copy shares its numbering. Empty when no row is that turn. Marked
+    ``late`` whenever a ``lastUserInput`` row was recorded for a turn at
+    this step, paired or not: it may be that turn's copy."""
     typed = owner_text(text)
-    if typed is None or not typed.strip():
-        return {}
-    sha = prompt_sha256(typed)
+    sha = prompt_sha256(typed) if typed is not None and typed.strip() else None
     rows = turns(session, now)
     paired = {t.get("duplicate_of") for t in rows}
+    late = {}
     for t in rows:
-        if t.get("fallback") and type(t.get("ag_step")) is int and t["ag_step"] == index \
-                and t.get("prompt_sha256") == sha and t.get("turn") not in paired \
+        if not (t.get("fallback") and type(t.get("ag_step")) is int and t["ag_step"] == index):
+            continue
+        late = {"late": "flush"}
+        if sha is not None and t.get("prompt_sha256") == sha and t.get("turn") not in paired \
                 and type(t.get("occurrence")) is int:
-            return {"duplicate_of": t["turn"], "occurrence": t["occurrence"]}
-    return {}
+            return {"duplicate_of": t["turn"], "occurrence": t["occurrence"], **late}
+    return late
 
 
-def _ag_read(payload, wait: float | None, late: bool = False) -> tuple[str, tuple[str, str] | None, int | None] | None:
+def _ag_read(payload, wait: float | None, late: bool = False, now: float | None = None,
+             ended: bool | None = None) -> tuple[str, tuple[str, str] | None, int | None] | None:
     """(session, newest user turn or None, the turn's step count) for an
     Antigravity payload with no prompt of its own; None for any other
     payload. ``late`` (PostInvocation, Stop): the step count is the newest
-    PreInvocation's, and ``lastUserInput`` is used only when one was seen."""
+    PreInvocation's, and ``lastUserInput`` is used only when one was seen.
+    ``ended``: a Stop came since the last PreInvocation (None: read it)."""
     if not isinstance(payload, dict) or hook_shape.detect(payload, os.environ)[0] != "antigravity":
         return None
     if isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
@@ -1548,6 +1696,14 @@ def _ag_read(payload, wait: float | None, late: bool = False) -> tuple[str, tupl
             while found is None and time.monotonic() < give_up:
                 time.sleep(_AG_FLUSH_POLL_S)
                 found = _ag_last_user_input(tp)
+    if found is not None and has_last and not late and steps is not None \
+            and (_ag_step_number(found[0]) or 0) < steps and _ag_past_transcript(tp, steps) \
+            and not ((_ag_turn_ended(session, False) if ended is None else ended) is False
+                     and _ag_same_turn(session, found, last, time.time() if now is None else now)):
+        # The submit names a step the transcript has not reached: its newest
+        # USER_INPUT is an earlier turn's, already handled, and this turn is
+        # the payload's lastUserInput.
+        found = None
     if found is None and has_last and not (late and steps is None):
         wrapped = _AG_WRAP.match(last)
         text = (wrapped.group(1) if wrapped else last).strip()
@@ -1567,11 +1723,11 @@ def _ag_filled(payload: dict, text: str) -> dict:
     return out
 
 
-def _antigravity_turn(payload, now: float | None, wait: float | None):
+def _antigravity_turn(payload, now: float | None, wait: float | None, ended: bool | None = None):
     """(gate answer, the new turn's time, (session, the payload's step count)
     when this call recorded nothing and its own turn may not be written yet,
     ``record``'s extra for the new turn)."""
-    read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait))
+    read = _ag_read(payload, _ag_flush_wait() if wait is None else max(0.0, wait), now=now, ended=ended)
     if read is None:
         return None, None, None, {}
     session, found, steps = read
@@ -1595,10 +1751,12 @@ def antigravity_prompt(payload: dict, now: float | None = None, wait: float | No
     Never raises."""
     try:
         stamp = time.time() if now is None else now
+        ended = None
         if isinstance(payload, dict) and hook_shape.detect(payload, os.environ)[0] == "antigravity" \
                 and hook_shape.session_id(payload).strip():
+            ended = _ag_turn_ended(hook_shape.session_id(payload).strip(), True)
             _ag_note_turn(hook_shape.session_id(payload).strip(), _ag_initial_steps(payload))
-        out, at, unseen, extra = _antigravity_turn(payload, stamp, wait)
+        out, at, unseen, extra = _antigravity_turn(payload, stamp, wait, ended)
         if unseen is not None:
             _ag_note_unseen(unseen[0], unseen[1], stamp)
         if out:
@@ -1628,9 +1786,14 @@ def antigravity_late_turn(payload: dict, event: str, now: float | None = None,
             if claimed is not None:
                 if issuer is None:
                     issuer = hook_issuer(STOP_SHIM) or {"refused": "unknown"}
-                recorded = record(_ag_filled(payload, found[1]), now=claimed[0], issuer=issuer, extra=claimed[1])
+                extra = dict(claimed[1])
+                if extra.get("duplicate_of") is not None or extra.get("late"):
+                    extra.pop("ag_invoked", None)  # a copy of a recorded row stays a late copy
+                recorded = record(_ag_filled(payload, found[1]), now=claimed[0], issuer=issuer,
+                                  extra={**extra, "late": str(event) or "late"})
         if str(event).lower() == "stop":
             _ag_clear_unseen(session)
+            _ag_note_ended(session)
         return recorded
     except Exception:  # noqa: BLE001 - a turn's end is never failed by the recorder
         return None

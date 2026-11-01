@@ -45,6 +45,7 @@ PATTERNS: tuple[tuple[str, str, str], ...] = (
     ("log", "data", "owner-actions.jsonl"),
     ("head", "data", "owner-actions.head.json"),
     ("pending", "data", "owner-direction-pending.json"),
+    ("requests", "data", "owner-requests.json"),
     ("unknown", "data", "owner-*"),
     ("unknown", "data", ".owner-*"),
     ("unknown", "turns", "*"),
