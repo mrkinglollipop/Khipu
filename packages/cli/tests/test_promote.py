@@ -1876,3 +1876,64 @@ def test_replay_still_refuses_an_empty_answer_whose_reason_is_plain_ok(home, mon
     assert not out["ok"], out
     assert "empty answer where live had 1 hit(s)" in out["detail"]
     assert "abstained" not in out["detail"]
+
+
+def _many_queries(home, n: int) -> Path:
+    now = datetime.now(timezone.utc)
+    _query_log(home).write_text("\n".join(
+        _query(now - timedelta(hours=i + 1), f"distinct routing gate question {i}") for i in range(n)) + "\n")
+    return _hooks(home)
+
+
+def _scripted_routing(statuses: list[str]):
+    """A routing hook whose k-th run with routing on logs ``statuses[k]``
+    (the last one repeats)."""
+    inner = _routing_hook([], on_status="full")
+    seen = {"on": 0}
+
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        r = inner(argv, env=env, input=input, cwd=cwd, timeout=timeout)
+        if argv[1:2] != ["-c"] and env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1":
+            status = statuses[min(seen["on"], len(statuses) - 1)]
+            seen["on"] += 1
+            log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+            log.write_text(log.read_text().replace("routing=full", f"routing={status}"))
+        return r
+    return fake_run
+
+
+WITHHOLD = "skipped:error-InventoryUnavailable"
+
+
+def test_replay_passes_with_a_note_when_some_routing_reads_withhold_and_one_routed(home, monkeypatch):
+    candidate = _many_queries(home, 3)
+    monkeypatch.setattr(pm, "_run", _scripted_routing([WITHHOLD, WITHHOLD, "full"]))
+    out = pm.gate_recall_replay(candidate)
+    assert out["ok"], out
+    assert "2 of 3 prompt(s) withheld routing" in out["detail"]
+    assert "1 routed" in out["detail"]
+
+
+def test_replay_fails_when_every_routing_read_withholds(home, monkeypatch):
+    candidate = _many_queries(home, 3)
+    monkeypatch.setattr(pm, "_run", _scripted_routing([WITHHOLD]))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "withheld" in out["detail"] and "all 3 replayed prompt(s) and none routed" in out["detail"]
+
+
+def test_replay_still_fails_a_typeerror_routing_read_beside_withholds(home, monkeypatch):
+    candidate = _many_queries(home, 3)
+    monkeypatch.setattr(pm, "_run", _scripted_routing(["full", WITHHOLD, "skipped:error-TypeError"]))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "routing=skipped:error-TypeError" in out["detail"]
+
+
+def test_replay_still_fails_a_timeout_beside_withholds(home, monkeypatch):
+    candidate = _many_queries(home, 2)
+    monkeypatch.setattr(pm, "_run", _routing_hook([], on_status=WITHHOLD, on_reason="timeout>1.2s", on_ms=1200.0,
+                                                 off_hits=(), on_hits=()))
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "timeout>1.2s" in out["detail"]

@@ -93,6 +93,10 @@ _LEGS_RE = re.compile(r" legs=(?P<legs>\[.*?\]) degraded=")
 # budget, the routing code failed, or its child died before it answered
 # (``no-answer``), which on a live Mac skips routing on every prompt.
 ROUTING_SKIPS_OK = ("skipped:fold-busy", "skipped:unsaved")
+# The designed fail-closed withhold: the cold one-shot routing child could not
+# build a complete inventory inside its bound. Under load that happens to a
+# sound candidate, so it passes with a note unless no routing-on run routed.
+ROUTING_WITHHOLD = "skipped:error-InventoryUnavailable"
 # The routing record's own files, copied into a replay's isolated dir so the
 # candidate reads a record of the live size (never written back).
 ROUTING_RECORD_FILES = ("events.jsonl", "view.json")
@@ -975,7 +979,7 @@ def _probe_answer(r: subprocess.CompletedProcess) -> bool | None:
 
 def _routing_skip_problem(status: str) -> str | None:
     """Why a run with routing on that logged ``status`` fails, or None."""
-    if not status.startswith("skipped:") or status.startswith(ROUTING_SKIPS_OK):
+    if not status.startswith("skipped:") or status.startswith(ROUTING_SKIPS_OK) or status == ROUTING_WITHHOLD:
         return None
     if status == "skipped:budget":
         return "its routing read ran out of its budget"
@@ -1151,6 +1155,7 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     live_legacy = live_root is None or not _honours_isolation(live_root)
     cand_legacy = not _honours_isolation(Path(candidate))
     routed_runs = 0
+    withheld_runs = 0
     embed_failed: dict[int, bool] = {}
     abstentions = 0
     live_hit_prompts = 0
@@ -1211,7 +1216,10 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         if _empty_by_timing(live, cand):
             note += (f", empty where live had {len(live_hits)} hit(s) not counted (no cosine leg after a replay: "
                      f"timing, not code; degraded={cand.get('degraded')})")
-        if on.get("routing"):
+        if on.get("routing") == ROUTING_WITHHOLD:
+            withheld_runs += 1
+            note += f", routing withheld ({ROUTING_WITHHOLD}: no complete inventory in time under load)"
+        elif on.get("routing"):
             routed_runs += 1
             on_ms = f"{on['ms']:.0f} ms" if on.get("ms") is not None else "no time"
             note += f", {on_ms} with routing on (routing={on['routing']})"
@@ -1230,6 +1238,9 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         # live had hits it is a gate that is broken.
         problems.append(f"the candidate abstained by policy on all {live_hit_prompts} replayed prompt(s) "
                         f"where live had hits")
+    if withheld_runs and not routed_runs:
+        problems.append(f"with routing on, the routing read withheld ({ROUTING_WITHHOLD}) on all {withheld_runs} "
+                        f"replayed prompt(s) and none routed")
     medians = ""
     if cand_times:
         cand_median, live_median = statistics.median(cand_times), statistics.median(live_times)
@@ -1241,6 +1252,8 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         return False, "; ".join(problems)
     tail = "" if routed_runs else " (routing did not run: the candidate has no routing push, or it is switched off here)"
     head = f"{len(samples)} prompt(s) replayed; {medians}"
+    if withheld_runs:
+        head += f"{withheld_runs} of {len(samples)} prompt(s) withheld routing ({ROUTING_WITHHOLD}), {routed_runs} routed; "
     if abstentions:
         head += f"{abstentions} of {live_hit_prompts} prompt(s) where live had hits were abstentions by the relevance gate; "
     return True, head + "; ".join(notes) + tail
