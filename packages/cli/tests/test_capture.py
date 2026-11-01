@@ -543,6 +543,26 @@ class _FakeConn:
         return False
 
 
+class NoteHeldNormalisationTest(unittest.TestCase):
+    """A stored note confirms through the writer's paragraph normalisation."""
+
+    def test_blank_paragraphs_normalised_by_a_merge_still_confirm(self):
+        original = "First\n\n\n\nSecond"
+        merged = cap._append_summary(cap._append_summary("", original), "Third")
+        self.assertTrue(cap._note_held(original, original))
+        self.assertTrue(cap._note_held(merged, original))
+
+    def test_whitespace_only_note_confirms_only_when_stored_unchanged(self):
+        self.assertTrue(cap._note_held("  \n ", "  \n "))
+        self.assertFalse(cap._note_held("", "  \n "))
+        self.assertFalse(cap._note_held("other", "  \n "))
+
+    def test_a_different_or_partial_note_still_fails(self):
+        self.assertFalse(cap._note_held("First\n\nSecond", "Firs"))
+        self.assertFalse(cap._note_held("First\n\nSecond", "Second\n\nFirst"))
+        self.assertFalse(cap._note_held(None, "First"))
+
+
 class VerbatimOnlyRealWritePgTest(unittest.TestCase):
     """The file-leg skip for an empty verbatim_only summary, through the real
     write_pg on the fake hub: acknowledged only when the row it inserted or

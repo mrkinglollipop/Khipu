@@ -1330,11 +1330,20 @@ def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
     return f"{summary} (part {part})".strip()
 
 
+def _paragraphs(text: str) -> str:
+    # The writer's paragraph form (_append_summary): blank paragraphs dropped.
+    return "\n\n".join(p for p in text.strip().split("\n\n") if p.strip())
+
+
 def _note_held(stored: Any, incoming: str) -> bool:
     # A merge appends a note as its own paragraph (_append_summary).
-    stored = (stored or "").strip() if isinstance(stored, str) else ""
-    incoming = incoming.strip()
-    if not stored or not incoming:
+    if not isinstance(stored, str):
+        return False
+    if not incoming.strip():
+        # Nothing for a merge to normalise: only the exact text confirms it.
+        return stored == incoming
+    stored, incoming = _paragraphs(stored), _paragraphs(incoming)
+    if not stored:
         return False
     if stored == incoming:
         return True
