@@ -1,8 +1,9 @@
 """Owner changes held for the owner to confirm (the owner's rule, 2026-11-01):
 an agent asks, Khipu holds the change and says what to ask ("Confirm ...?"),
 and the confirm applies it only when the confirming conversation's own record
-shows a message the owner typed after the request was made. No age limit, no
-codes, no word matching. T3's record is its message rows; every other trusted
+shows a message the owner typed after the latest ask Khipu recorded for that
+conversation (at the hold, and on every confirm that found no reply). No age
+limit, no codes, no word matching. T3's record is its message rows; every other trusted
 front end's is the prompt hook's eligible turns.
 
 Hermetic: a temp data dir and capture home, and a synthetic T3 database
@@ -179,8 +180,7 @@ def test_an_owner_message_only_before_the_request_is_refused(world):
     world["t3"].message(THREAD, time.time() - 120)
     request = _hold_in_t3(world)
     ok, out = _confirm_id(request)
-    assert not ok and out["code"] == "not_confirmed"
-    assert "no message you typed in this conversation since this request was made" in out["error"]
+    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"]
     assert not _paused()
 
 
@@ -339,27 +339,19 @@ def test_a_two_day_old_request_confirms_on_a_later_owner_turn(world, front):
 
 
 @pytest.mark.parametrize("front", FRONTS)
-def test_a_three_day_old_request_confirms_on_a_two_day_old_owner_turn(world, front):
-    # Review 2026-11-01 P2: the owner turn proving the confirm is kept while the
-    # request waits, past the recorder's one-day retention.
+def test_a_two_day_old_owner_turn_is_past_retention_so_the_confirm_asks_again(world, front):
+    # The proof is the owner's reply to the latest ask, so turns keep the normal
+    # one-day retention: an older turn is gone, and the confirm asks again.
     request = _hold_by_request(world, front, "s-front", ago=3 * DAY)
     _front_end_turn(world, front, "s-front", ago=2 * DAY)
     owner_turns.sweep()
+    assert owner_turns.turns("s-front") == []
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"]
+    _front_end_turn(world, front, "s-front")
     ok, out = _confirm_id(request)
     assert ok, out
     assert _paused() and out["confirmed"]["source"] == "hook"
-    # Nothing waits any more: the normal retention applies again.
-    owner_turns.sweep()
-    assert owner_turns.turns("s-front", evidence=True) == []
-
-
-def test_turns_kept_for_a_waiting_request_are_capped_at_30_days(world):
-    _hold_by_request(world, "claude_code:cli", "s-front", ago=40 * DAY)
-    _front_end_turn(world, "claude_code:cli", "s-front", ago=31 * DAY)
-    _front_end_turn(world, "claude_code:cli", "s-front", ago=29 * DAY)
-    kept = owner_turns.turns("s-front", evidence=True)
-    assert len(kept) == 1 and time.time() - kept[0]["ts"] < 30 * DAY
-    assert owner_turns.turns("s-front") == []
 
 
 @pytest.mark.parametrize("front", FRONTS)
@@ -367,16 +359,21 @@ def test_only_a_turn_older_than_the_request_is_refused(world, front):
     request = _hold_by_request(world, front, "s-front", ago=2 * 3600)
     _front_end_turn(world, front, "s-front", ago=3 * 3600)
     ok, out = _confirm_id(request)
-    assert not ok and out["code"] == "not_confirmed"
-    assert "no message you typed in this conversation since this request was made" in out["error"]
+    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"]
     assert not _paused()
 
 
 @pytest.mark.parametrize("front", ["claude_code:cli", "codex:codex_desktop"])
 def test_a_t3_request_confirms_from_claude_code_or_codex(world, front):
+    # No ask was made in the confirming conversation yet: its first confirm
+    # records one, and the owner's reply after it confirms.
     request = _hold_in_t3(world, ago=DAY)
     _front_end_turn(world, front, "s-elsewhere")
     _be_front(world, front, "s-elsewhere")
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"]
+    assert not _paused()
+    _front_end_turn(world, front, "s-elsewhere")
     ok, out = _confirm_id(request)
     assert ok, out
     assert _paused() and out["confirmed"]["source"] == "hook"
@@ -482,3 +479,201 @@ def test_a_request_pending_past_30_days_stays_pending(world):
     _front_end_turn(world, "claude_code:cli", "s-front")
     ok, out = _confirm_id(request)
     assert ok, out
+
+
+# ---- review 2026-11-01 (Sol re-check of 6686fc1d): the seven scenarios ---------------------------
+
+
+def test_review_p1_a_delayed_duplicate_of_the_held_turn_never_confirms(world):
+    # A delayed duplicate turn (new id, later ts, same occurrence,
+    # duplicate_of=held_turn; e.g. PostInvocation flush) must not pass the
+    # held turn's exclusion: there is no new owner message.
+    _front_end_turn(world, "claude_code:cli", "s-front", ago=60)
+    (held,) = owner_turns.turns("s-front")
+    _be(world, "s-front")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    assert ok and out["pending"], out
+    owner_turns.record({"session_id": "s-front", "prompt": OWNER_WORDS, "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}, now=time.time() + 1,
+                       extra={"duplicate_of": held["turn"], "occurrence": held["occurrence"]})
+    dup = owner_turns.turns("s-front", time.time() + 2)[-1]
+    assert dup["turn"] != held["turn"] and dup["occurrence"] == held["occurrence"] and dup["eligible"], dup
+    ok, out = _confirm_id(out["request"])
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+
+
+def test_a_copy_sharing_an_excluded_turns_occurrence_never_confirms(world):
+    _front_end_turn(world, "claude_code:cli", "s-front", ago=60)
+    (held,) = owner_turns.turns("s-front")
+    _be(world, "s-front")
+    ok, out = owner_act.act("direction.request", {"action": "route.pause", "args": {"account": "Codex"}})
+    owner_turns.record({"session_id": "s-front", "prompt": OWNER_WORDS, "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"}, now=time.time() + 1,
+                       extra={"occurrence": held["occurrence"]})
+    ok, out = _confirm_id(out["request"])
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+
+
+def test_review_p2_forget_while_applying_then_a_failed_command_keeps_the_request_scrubbed(world, monkeypatch):
+    # Forget during the applying window, then the command fails: settle() must
+    # not write the arg back via the error.
+    from khipu import forget
+
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=3600)
+    _front_end_turn(world, "claude_code:cli", "s-front")
+
+    def run(action, full):
+        assert forget._owner_words_scan("claude_code:s-front", gateway=False)["ok"]
+        return False, {"ok": False, "error": "Codex: account Codex can't be paused", "code": "bad_account"}
+
+    monkeypatch.setattr(owner_act, "_run", run)
+    ok, out = _confirm_id(request)
+    assert not ok
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert row["state"] == "failed" and row["error_code"] == "bad_account", row
+    assert "args" not in row and "ask" not in row and "asks" not in row
+    assert "Codex" not in owner_direction.requests_path().read_text()
+
+
+def test_review_p2_a_t3_confirm_needs_no_hook_turn_from_the_last_day(world):
+    # T3 confirm went through _t3_bound -> turns() (24 h), so a 2-day-old hook
+    # turn was invisible -> no_recorded_turn. T3's record is the proof.
+    request = _hold_in_t3(world, ago=2 * DAY)
+    assert owner_turns.turns(T3_SESSION) == []
+    mid = world["t3"].message(THREAD, time.time() + 1)
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == mid
+
+
+def test_review_p2_the_30_day_cap_no_longer_deletes_proof_of_a_waiting_request(world):
+    # The 30-day evidence cap deleted proof while the request stayed pending.
+    # Now proof is the reply to the latest ask: the confirm asks, the reply passes.
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=35 * DAY)
+    _front_end_turn(world, "claude_code:cli", "s-front", ago=31 * DAY)
+    owner_turns.sweep()
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"], out
+    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert row["state"] == "pending"
+    _front_end_turn(world, "claude_code:cli", "s-front")
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused()
+
+
+def test_review_p2_500_workflow_script_rows_after_the_owners_yes_do_not_hide_it(world):
+    # The SQL filter didn't mirror is_owner_message (workflowScript): 500 such
+    # rows filled the limit and hid the proof.
+    request = _hold_in_t3(world)
+    mid = world["t3"].message(THREAD, time.time() + 1)
+    for i in range(500):
+        world["t3"].message(THREAD, time.time() + 2 + i / 1000, text="run step", workflowScript=f"step-{i}")
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == mid
+
+
+@pytest.mark.parametrize("payload, owner", [
+    ({"workflowScript": "x"}, False), ({"workflowScript": ""}, True), ({"workflowScript": {}}, True),
+    ({"notification": "{}"}, False), ({"notification": []}, True), ({"notification": None}, True),
+    ({"notification": 0}, False), ({"scheduledTaskId": False}, False), ({"threadId": OTHER_THREAD}, False),
+    ({"threadId": None}, True), ({"text": 5}, False), ({"creationSource": "server"}, False),
+    ({"createdBy": "agent"}, False), ({}, True),
+])
+def test_the_sql_filter_and_is_owner_message_agree(world, payload, owner):
+    from khipu import t3
+
+    mid = world["t3"].message(THREAD, time.time(), **payload)
+    with sqlite3.connect(world["t3"].path) as con:
+        (raw,) = con.execute("SELECT payload_json FROM orchestration_v2_projection_messages WHERE message_id = ?",
+                             (mid,)).fetchone()
+        sql = con.execute("SELECT COUNT(*) FROM orchestration_v2_projection_messages WHERE message_id = :mid "
+                          f"AND thread_id = :thread AND {t3._owner_rows_sql()}",
+                          {"mid": mid, "thread": THREAD}).fetchone()[0]
+    assert t3.is_owner_message(json.loads(raw), THREAD) is owner
+    assert bool(sql) is owner
+
+
+def test_review_p2_forget_removes_t3_snapshots_and_ask_boundaries(world):
+    # Forget left t3_snapshots (thread id, message ids, time).
+    from khipu import forget
+
+    world["t3"].message(THREAD, time.time() - 60)
+    _hold_in_t3(world)
+    other = _hold_by_request(world, "claude_code:cli", "s-front", ago=60)
+    assert forget._owner_words_scan(T3_SESSION, gateway=False)["ok"]
+    assert forget._owner_words_scan("claude_code:s-front", gateway=False)["ok"]
+    rows = owner_direction._read_requests(owner_direction.requests_path())
+    assert all("t3_snapshots" not in r and "asks" not in r for r in rows), rows
+    text = owner_direction.requests_path().read_text()
+    assert THREAD not in text and "msg-1" not in text
+    assert {r["id"] for r in rows if r["state"] == "withdrawn"} >= {other}
+
+
+@pytest.mark.parametrize("where", ["t3", "claude_code:cli"])
+def test_review_p3_hold_refuses_when_owner_direction_is_off(world, where):
+    if where == "t3":
+        _t3_hook_turn()
+        _be(world, T3_SESSION)
+    else:
+        _front_end_turn(world, where, "s-front")
+        _be(world, "s-front")
+    owner_turns.write_settings({"enabled": False})
+    with pytest.raises(owner_direction.DirectionRefused) as refused:
+        owner_direction.hold("route.pause", {"account": "Codex"})
+    assert refused.value.code == "direction_off"
+    with pytest.raises(owner_direction.DirectionRefused) as checked:
+        owner_direction.check("route.pause")
+    assert refused.value.message == checked.value.message
+    assert not owner_direction.requests_path().exists()
+
+
+# ---- the ask boundary ------------------------------------------------------------------------------
+
+
+def test_the_owner_replies_after_an_ask_on_a_40_day_old_request_outside_t3(world):
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=40 * DAY)
+    owner_turns.sweep()
+    ok, out = _confirm_id(request)
+    assert not ok and "Ask the owner to confirm now" in out["error"]
+    _front_end_turn(world, "claude_code:cli", "s-front")
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["source"] == "hook"
+
+
+def test_the_owner_replies_after_an_ask_on_a_40_day_old_request_in_t3(world):
+    request = _hold_in_t3(world, ago=40 * DAY)
+    owner_turns.sweep()
+    ok, out = _confirm_id(request)
+    assert not ok and "Ask the owner to confirm now" in out["error"]
+    mid = world["t3"].message(THREAD, time.time() + 1)
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == mid
+
+
+def test_an_owner_turn_after_the_hold_but_before_the_latest_ask_is_refused(world):
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=3600)
+    _front_end_turn(world, "claude_code:cli", "s-other", ago=60)   # after the hold
+    _be(world, "s-other")
+    ok, out = _confirm_id(request)                                 # the latest ask here
+    assert not ok and "Ask the owner to confirm now" in out["error"]
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed" and not _paused()
+    _front_end_turn(world, "claude_code:cli", "s-other")
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused()
+
+
+def test_a_confirm_with_no_reply_moves_the_ask_boundary(world):
+    request = _hold_by_request(world, "claude_code:cli", "s-front", ago=3600)
+    (before,) = owner_direction._read_requests(owner_direction.requests_path())
+    ok, out = _confirm_id(request)
+    assert not ok
+    (after,) = owner_direction._read_requests(owner_direction.requests_path())
+    assert after["asks"]["s-front"]["ts"] > before["asks"]["s-front"]["ts"]

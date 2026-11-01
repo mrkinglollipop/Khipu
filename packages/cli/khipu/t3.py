@@ -259,10 +259,11 @@ def _names_parent(mapping) -> bool:
 # A message the owner typed: T3's own author fields. ``createdBy`` "user"
 # alone is not enough (resume prompts and delegated briefs are user/server),
 # and any of the delivery keys marks a wake, a relay, a notification or a
-# child's completion.
+# child's completion, or a workflow's script. ``is_owner_message`` and the
+# SQL filter (``_owner_rows_sql``) are both built from these two lists.
 OWNER_SOURCES = ("web", "mobile")
-MACHINE_MESSAGE_KEYS = ("scheduledTaskId", "senderThreadId", "notification", "delegatedCompletion")
-_MESSAGE_SCAN = 500
+MACHINE_MESSAGE_KEYS = ("scheduledTaskId", "senderThreadId", "notification", "delegatedCompletion",
+                        "workflowScript")
 
 
 def _epoch(value) -> float | None:
@@ -284,23 +285,41 @@ def is_owner_message(payload, thread_id: str) -> bool:
     if not isinstance(payload, dict):
         return False
     return (payload.get("createdBy") == "user" and payload.get("creationSource") in OWNER_SOURCES
-            and all(payload.get(key) in (None, "", {}, []) for key in MACHINE_MESSAGE_KEYS)
-            and not payload.get("workflowScript")
-            and payload.get("threadId") in (None, thread_id)
+            and all(_empty(payload.get(key)) for key in MACHINE_MESSAGE_KEYS)
+            and (payload.get("threadId") is None or payload.get("threadId") == thread_id)
             and isinstance(payload.get("text"), str))
 
 
-# Owner-shaped rows, filtered in SQL so machine traffic can't push the
-# owner's message out of a bounded read. ``CASE`` keeps a malformed payload
-# from failing the whole query; ``is_owner_message`` still decides each row.
-_OWNER_ROWS_SQL = (
-    "role = 'user' AND CASE WHEN json_valid(payload_json) THEN "
-    "json_extract(payload_json, '$.createdBy') = 'user' "
-    "AND json_extract(payload_json, '$.creationSource') IN ('web', 'mobile') "
-    + "".join(f"AND IFNULL(json_extract(payload_json, '$.{key}'), '') IN ('', '{{}}', '[]') "
-              for key in MACHINE_MESSAGE_KEYS)
-    + "ELSE 0 END"
-)
+def _empty(value) -> bool:
+    return value is None or (type(value) in (str, dict, list) and not value)
+
+
+def _owner_rows_sql() -> str:
+    """``is_owner_message`` as a SQL condition on a message row, from the same
+    lists (``:thread`` is the thread id). ``CASE`` keeps a malformed payload
+    from failing the whole query; ``is_owner_message`` still decides each
+    row, and readers go on past a row it rejects, so no number of rows the
+    SQL lets through can hide the owner's message."""
+    def typ(key):
+        return f"json_type(payload_json, '$.{key}')"
+
+    def val(key):
+        return f"json_extract(payload_json, '$.{key}')"
+
+    sources = ", ".join(f"'{s}'" for s in OWNER_SOURCES)
+    empty = "".join(
+        f"AND ({typ(k)} IS NULL OR {typ(k)} = 'null' OR ({typ(k)} = 'text' AND {val(k)} = '') "
+        f"OR ({typ(k)} = 'object' AND {val(k)} = '{{}}') OR ({typ(k)} = 'array' AND {val(k)} = '[]')) "
+        for k in MACHINE_MESSAGE_KEYS)
+    return ("role = 'user' AND CASE WHEN json_valid(payload_json) THEN "
+            "json_type(payload_json) = 'object' "
+            f"AND {typ('createdBy')} = 'text' AND {val('createdBy')} = 'user' "
+            f"AND {typ('creationSource')} = 'text' AND {val('creationSource')} IN ({sources}) "
+            + empty +
+            f"AND ({typ('threadId')} IS NULL OR {typ('threadId')} = 'null' "
+            f"OR ({typ('threadId')} = 'text' AND {val('threadId')} = :thread)) "
+            f"AND {typ('text')} = 'text' "
+            "ELSE 0 END")
 
 
 def _read_messages(thread_id: str, read):
@@ -346,7 +365,7 @@ def thread_snapshot(thread_id: str) -> tuple[dict | None, bool]:
             "ORDER BY created_at DESC LIMIT 1", (thread_id,)).fetchone()
         ids = sorted(str(message_id) for message_id, payload_json in con.execute(
             "SELECT message_id, payload_json FROM orchestration_v2_projection_messages "
-            f"WHERE thread_id = ? AND {_OWNER_ROWS_SQL}", (thread_id,))
+            f"WHERE thread_id = :thread AND {_owner_rows_sql()}", {"thread": thread_id})
             if _owner_payload(payload_json, thread_id) is not None)
         latest_at = latest[0] if latest else None
         latest_ts = None if latest_at is None else _epoch(latest_at)
@@ -370,10 +389,12 @@ def owner_message_after(thread_id: str, snapshot: dict) -> tuple[dict | None, bo
         return None, False
 
     def read(con):
+        # No row limit: the cursor is read until a match, inside the read's
+        # deadline (past it the read is not definitive and the caller refuses).
         for message_id, created_at, payload_json in con.execute(
                 "SELECT message_id, created_at, payload_json FROM orchestration_v2_projection_messages "
-                f"WHERE thread_id = ? AND {_OWNER_ROWS_SQL} ORDER BY created_at DESC LIMIT ?",
-                (thread_id, _MESSAGE_SCAN)):
+                f"WHERE thread_id = :thread AND {_owner_rows_sql()} ORDER BY created_at DESC",
+                {"thread": thread_id}):
             ts = _epoch(created_at)
             if str(message_id) in seen or ts is None or (boundary is not None and ts <= boundary):
                 continue

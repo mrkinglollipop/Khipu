@@ -41,10 +41,6 @@ from khipu import antigravity_db, hook_shape, t3
 from khipu.turn_text import clean_user_text, is_machine, owner_text
 
 RETENTION_S = 24 * 3600
-# While an owner request waits for its confirm, the turns made since it was
-# held are its evidence (``owner_direction.confirm``): they are kept past the
-# day, up to this cap, with only the metadata a turn line has.
-EVIDENCE_MAX_S = 30 * 24 * 3600
 # Front ends whose typed turns are the owner's. ``harness:entrypoint``, where
 # the entrypoint is Claude Code's CLAUDE_CODE_ENTRYPOINT ("cli" a terminal,
 # Remote Control and the JetBrains plugin included; "claude-desktop" and
@@ -939,16 +935,14 @@ def _record(payload: dict, env, now: float, issuer: dict | None, extra: dict) ->
     # when its oldest line has passed the retention, and other sessions' old
     # files are swept only then or when this session's file is new.
     oldest = _first_ts(path)
-    pending_since = _pending_since() if oldest is not None and now - oldest >= RETENTION_S else None
-    stale = oldest is not None and not _kept({"ts": oldest}, now, pending_since)
-    if stale:
-        kept = [t for t in _read_lines(path) if _kept(t, now, pending_since)]
+    if oldest is not None and now - oldest >= RETENTION_S:
+        kept = [t for t in _read_lines(path) if now - float(t.get("ts") or 0) < RETENTION_S]
         _write_private(path, "".join(json.dumps(t, ensure_ascii=False) + "\n" for t in kept) + line)
     else:
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(line)
-    if oldest is None or stale:
+    if oldest is None or now - oldest >= RETENTION_S:
         _sweep(now)
     return turn["turn"]
 
@@ -970,22 +964,7 @@ def _ts(row: dict) -> float:
         return 0.0
 
 
-def _pending_since() -> float | None:
-    from khipu import owner_direction
-
-    try:
-        return owner_direction.oldest_pending_ts()
-    except Exception:  # noqa: BLE001 - the normal retention applies
-        return None
-
-
-def _kept(row: dict, now: float, pending_since: float | None) -> bool:
-    age = now - _ts(row)
-    return age < RETENTION_S or (pending_since is not None and _ts(row) > pending_since
-                                 and age < EVIDENCE_MAX_S)
-
-
-def _prune(path: Path, now: float, pending_since: float | None = None) -> int:
+def _prune(path: Path, now: float) -> int:
     """Drop the lines of one file older than the retention, by each line's
     own time (a file's mtime says nothing about its oldest line); delete the
     file when none remain. Words an older line still holds (a brief's
@@ -995,9 +974,7 @@ def _prune(path: Path, now: float, pending_since: float | None = None) -> int:
     except FileNotFoundError:
         return 0
     rows = _read_lines(path) if raw else []
-    if path.name == "briefs.jsonl":
-        pending_since = None
-    kept = [r for r in rows if _kept(r, now, pending_since)]
+    kept = [r for r in rows if now - _ts(r) < RETENTION_S]
     gone = len(raw.splitlines()) - len(kept)
     if any("head" in r or "text" in r for r in kept):
         kept = [{k: v for k, v in r.items() if k not in ("head", "text")} for r in kept]
@@ -1017,10 +994,9 @@ def _sweep(now: float) -> dict:
         paths = sorted(folder().glob("*.jsonl"))
     except OSError as err:
         return {"ok": False, "lines": 0, "errors": [f"{folder()}: {err}"]}
-    pending_since = _pending_since()
     for path in paths:
         try:
-            out["lines"] += _prune(path, now, pending_since)
+            out["lines"] += _prune(path, now)
         except OSError as err:
             out["ok"] = False
             out["errors"].append(f"{path.name}: {err.strerror or err}")
@@ -1030,8 +1006,7 @@ def _sweep(now: float) -> dict:
 def sweep(now: float | None = None) -> dict:
     """The retention, applied on a timer (the replica-refresh job and the
     capture hook's storage sweep), so a turn's record goes a day after it
-    was typed (or, while an owner request waits, once it is older than that
-    request or 30 days) even when no later prompt or read comes: every turn file and
+    was typed even when no later prompt or read comes: every turn file and
     briefs.jsonl line by line (a line a crash cut short goes too), the
     rewrite temps a crash left, and the old widenings file. Local
     files only. Never raises; ``ok`` false names what could not be pruned."""
@@ -1178,21 +1153,18 @@ def forget_sessions(sessions, *, protected_sessions=()) -> dict:
     return out
 
 
-def turns(session: str, now: float | None = None, *, evidence: bool = False) -> list[dict]:
-    """The session's recorded turns, oldest first, within the day; with
-    ``evidence``, also the older ones kept for a waiting owner request."""
+def turns(session: str, now: float | None = None) -> list[dict]:
+    """The session's recorded turns, oldest first, within the retention."""
     now = time.time() if now is None else now
     path = session_file(session)
     rows = _read_lines(path)
-    pending_since = _pending_since() if any(now - _ts(t) >= RETENTION_S for t in rows) else None
-    if any(not _kept(t, now, pending_since) for t in rows):
+    if any(now - _ts(t) >= RETENTION_S for t in rows):
         # Retention is a deadline on the words, not a filter on the read.
         try:
-            _prune(path, now, pending_since)
+            _prune(path, now)
         except OSError:
             pass
-    return [t for t in rows if t.get("session") == session
-            and (_kept(t, now, pending_since) if evidence else now - _ts(t) < RETENTION_S)]
+    return [t for t in rows if t.get("session") == session and now - _ts(t) < RETENTION_S]
 
 
 def counts(now: float | None = None) -> dict:
