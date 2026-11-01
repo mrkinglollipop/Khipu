@@ -462,6 +462,13 @@ def eligible(turn: dict, conf: dict | None = None) -> tuple[bool, str]:
         return False, "a dispatched job's brief"
     if not turn.get("typed", bool((turn.get("text") or "").strip())):
         return False, "no typed text"
+    if turn.get("entrypoint") == "t3":
+        # T3 hands the hook only the prompt text, never which delivery fired it,
+        # so a scheduled task's or relayed message with the owner's words can't
+        # be told apart from the owner typing (three attempts, 2026-11-01). Not
+        # a setting: switching it on would reopen that.
+        return False, ("a T3 conversation can't be told apart from T3's own scheduled or relayed messages; "
+                       "confirm owner changes in the Khipu app")
     key = f"{turn.get('harness')}:{turn.get('entrypoint')}"
     if key not in conf["trusted"]:
         return False, untrusted_why(key)

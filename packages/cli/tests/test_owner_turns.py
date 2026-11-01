@@ -119,11 +119,12 @@ def _t3_db(tmp: Path, native: str) -> Path:
     return db
 
 
-def test_a_session_t3_runs_is_the_t3_front_end(home, monkeypatch):
+def test_a_session_t3_runs_is_the_t3_front_end_and_is_never_eligible(home, monkeypatch):
     monkeypatch.setenv("KHIPU_T3_DB", str(_t3_db(home["tmp"], SESSION)))
     turn_id = _record(handoff_wrapper("lift Codex"), env={"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"})
     turn = _last()
-    assert (turn["entrypoint"], turn["eligible"], turn["typed"]) == ("t3", True, True)
+    assert (turn["entrypoint"], turn["eligible"], turn["typed"]) == ("t3", False, True)
+    assert owner_turns.eligible(turn)[1].startswith("a T3 conversation can't be told apart")
     assert turn_id == turn["turn"]
 
 
