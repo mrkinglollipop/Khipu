@@ -18,10 +18,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from khipu.paths import DEFAULT_DIR, ensure_data_dir
 
@@ -463,6 +464,17 @@ def run_nightly() -> int:
 
 def _run_nightly_locked() -> int:
     steps: list[dict[str, Any]] = []
+    # Capture last night's briefs outcome before this run overwrites the
+    # receipt: a second night of lock-held deferral goes red.
+    prev_briefs: dict[str, Any] | None = None
+    try:
+        prev = nightly_last()
+        if isinstance(prev, dict) and isinstance(prev.get("steps"), list):
+            for entry in prev["steps"]:
+                if isinstance(entry, dict) and entry.get("name") == "briefs_build":
+                    prev_briefs = entry
+    except Exception:  # noqa: BLE001
+        prev_briefs = None
     drain_result = _step_result(_drain_sessions())
     _record_nightly_step(steps, "sessions_drain", **drain_result)
     driver_error = None
@@ -482,7 +494,10 @@ def _run_nightly_locked() -> int:
     _record_nightly_step(steps, "embed_backfill", **_step_result(_embed_backfill()))
     _record_nightly_step(steps, "summary_kind_backfill", **_step_result(_summary_kind_backfill()))
     _record_nightly_step(steps, "query_cache_prune", **_step_result(_prune_query_cache()))
-    _record_nightly_step(steps, "routing_ledger_prune", **_step_result(_prune_routing_ledgers()))
+    prune_result = _prune_routing_ledgers()
+    _record_nightly_step(steps, "routing_ledger_prune", **_step_result(prune_result),
+                         deferred=prune_result.get("deferred")
+                         if isinstance(prune_result, dict) else None)
     completion_result = _step_result(_commitment_close_rules())
     _record_nightly_step(steps, "commitments_close_rules", **completion_result)
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
@@ -496,9 +511,12 @@ def _run_nightly_locked() -> int:
                          deferred=recall_eval_result.get("deferred")
                          if isinstance(recall_eval_result, dict) else None)
     _record_nightly_step(steps, "snapshot_refresh", **_step_result(_refresh_snapshot()))
-    briefs_result = _briefs_build_if_on()
+    briefs_result = _briefs_build_if_on(previous=prev_briefs)
     if briefs_result is not None:
-        _record_nightly_step(steps, "briefs_build", **_step_result(briefs_result))
+        briefs_step = _step_result(briefs_result)
+        _record_nightly_step(steps, "briefs_build", **briefs_step,
+                             deferred=briefs_result.get("deferred")
+                             if isinstance(briefs_result, dict) else None)
     briefs_ok = briefs_result is None or _step_result(briefs_result)["ok"]
     final_rc = rc or (0 if drain_result["ok"] and briefs_ok and completion_result["ok"] else 1)
     _write_job_state("nightly", final_rc)
@@ -570,6 +588,35 @@ def _ledger_nightly() -> dict[str, Any]:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+# Brief lock contention: retry a few times, then wait for the holder the way
+# replica heal skips an overlapping dump (action=skipped, not a failure).
+_REFRESH_BUSY_RETRIES = 3
+_REFRESH_BUSY_SLEEP_S = 0.5
+_REFRESH_IDLE_WAIT_S = 30.0
+# A replica this young was refreshed by the overlapping holder.
+_REFRESH_HELD_FRESH_S = 15 * 60
+
+
+def _refresh_busy(out: Mapping[str, Any] | None) -> bool:
+    err = str((out or {}).get("error") or "").lower()
+    return "in progress" in err or "already in progress" in err
+
+
+def _wait_refresh_idle(deadline_s: float = _REFRESH_IDLE_WAIT_S) -> bool:
+    """True when the refresh lock is free before ``deadline_s`` elapses."""
+    from khipu import hub_snapshot
+
+    end = time.monotonic() + max(0.0, deadline_s)
+    while True:
+        lock = hub_snapshot._acquire_refresh_lock()
+        if lock is not None:
+            hub_snapshot._release_refresh_lock(lock)
+            return True
+        if time.monotonic() >= end:
+            return False
+        time.sleep(min(0.2, max(0.0, end - time.monotonic())))
+
+
 def _refresh_snapshot() -> dict[str, Any]:
     """Full dump of the hub into the local replica, after the steps whose
     output the replica carries (reconciled notes, backfilled vectors,
@@ -577,11 +624,44 @@ def _refresh_snapshot() -> dict[str, Any]:
     doctor stopped refreshing as a side-effect (CLI-6, 2026-10-10) nothing
     else does, and the per-prompt recall hook stops trusting the replica
     24 h after the last dump. Fail-open: a miss is reported in the step record
-    and doctor's hub_snapshot row, and tried again tomorrow."""
-    try:
-        from khipu.hub_snapshot import refresh
+    and doctor's hub_snapshot row, and tried again tomorrow.
 
-        out = refresh()
+    An overlapping dump (``already in progress``) is a deferral, the way
+    replica heal skips it — retried a few times, then waited out. A failure
+    is recorded only when the replica is still stale after the holder
+    finishes."""
+    try:
+        from khipu import hub_snapshot
+
+        out = hub_snapshot.refresh()
+        for _ in range(_REFRESH_BUSY_RETRIES):
+            if not _refresh_busy(out):
+                break
+            time.sleep(_REFRESH_BUSY_SLEEP_S)
+            out = hub_snapshot.refresh()
+        if _refresh_busy(out):
+            idle = _wait_refresh_idle()
+            health = hub_snapshot.snapshot_health()
+            age = health.get("age_seconds")
+            fresh = isinstance(age, (int, float)) and 0 <= age <= _REFRESH_HELD_FRESH_S
+            if idle and fresh:
+                return {"ok": True, "deferred": "hub snapshot refresh already in progress; "
+                        "another dump finished and the replica is fresh"}
+            if idle:
+                out = hub_snapshot.refresh()
+                if _refresh_busy(out):
+                    return {"ok": True, "deferred": "hub snapshot refresh already in progress"}
+                if not out.get("ok"):
+                    # Holder finished but the replica is still stale and our
+                    # own dump could not run: that is tonight's failure.
+                    age = (hub_snapshot.snapshot_health() or {}).get("age_seconds")
+                    still_stale = age is None or (isinstance(age, (int, float)) and age > _REFRESH_HELD_FRESH_S)
+                    if still_stale:
+                        return {"ok": False, "error": "replica still stale after overlapping refresh: "
+                                + str(out.get("error") or "refresh failed")}
+                # Fall through to the normal ok / facts handling below.
+            else:
+                return {"ok": True, "deferred": "hub snapshot refresh already in progress"}
         res = {"ok": bool(out.get("ok")), **{k: v for k, v in out.items() if k != "path"}}
         # The dump is only half of this step: the fact copy that follows it
         # must not fail unseen behind an ok dump. A copy that gave up because
@@ -620,13 +700,16 @@ def _drain_sessions() -> dict[str, Any]:
 BRIEFS_NIGHTLY_LIMIT = 40
 
 
-def _briefs_build_if_on() -> dict[str, Any] | None:
+def _briefs_build_if_on(*, previous: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
     """Rebuild the stale or missing source-backed briefs, at most
     BRIEFS_NIGHTLY_LIMIT a night. ``None`` (no step recorded) while the
     `briefs` switch is off, so an unswitched nightly is unchanged. The
     advisory lock is the same one `khipu briefs build` takes: a manual build
-    in flight means this one builds nothing rather than racing it. Fail-open
-    like every step here: it never raises."""
+    in flight means this one builds nothing rather than racing it. A lock
+    held is a deferral (not "built 0" green); two nights running still
+    deferred goes red. ``previous`` is last night's briefs step (captured
+    before this run overwrites the receipt). Fail-open like every step here:
+    it never raises."""
     try:
         from khipu import briefs, features
 
@@ -637,8 +720,25 @@ def _briefs_build_if_on() -> dict[str, Any] | None:
         with connect() as conn:
             with conn.cursor() as cur:
                 if not briefs.acquire_build_lock(cur):
-                    _nightly_log("[khipu-briefs] another build holds the lock; built 0")
-                    return {"ok": True, "built": 0, "reason": "lock held"}
+                    _nightly_log("[khipu-briefs] another build holds the lock; deferred")
+                    prev = previous
+                    if prev is None:
+                        try:
+                            data = nightly_last() or {}
+                            if isinstance(data.get("steps"), list):
+                                for entry in data["steps"]:
+                                    if isinstance(entry, dict) and entry.get("name") == "briefs_build":
+                                        prev = entry
+                        except Exception:  # noqa: BLE001 — a broken receipt must not fail the night
+                            prev = None
+                    again = bool(prev and (prev.get("deferred") or (
+                        isinstance(prev.get("counts"), dict) and prev["counts"].get("reason") == "lock held")
+                        or prev.get("reason") == "lock held"))
+                    msg = "briefs build deferred: advisory lock held"
+                    if again:
+                        return {"ok": False, "built": 0, "deferred": msg + " again",
+                                "error": msg + " two nights running", "reason": "lock held"}
+                    return {"ok": True, "built": 0, "deferred": msg, "reason": "lock held"}
                 try:
                     chosen = briefs.select_for_build(cur, None, BRIEFS_NIGHTLY_LIMIT)
                     if not chosen.get("available"):
@@ -827,11 +927,21 @@ def _prune_query_cache() -> dict[str, Any]:
 
 def _prune_routing_ledgers() -> dict[str, Any]:
     """Remove routing delivery ledgers unused for ``routing_ledger_keep_days``.
-    Fail-open like the query-cache prune; never run from doctor."""
+    Fail-open like the query-cache prune; never run from doctor. A prune that
+    hits its time budget having removed nothing, or that skips oversized
+    ledgers, is recorded as deferred so doctor can see it."""
     try:
         from khipu import routing_ledger_prune
 
         out = routing_ledger_prune.prune()
+        if out.get("time_budget_exhausted") or (
+                int(out.get("skipped") or 0) > 0 and int(out.get("removed") or 0) == 0):
+            reasons = []
+            if out.get("time_budget_exhausted"):
+                reasons.append("time budget exhausted")
+            if int(out.get("skipped") or 0) > 0:
+                reasons.append(f"{out['skipped']} oversized ledger(s) skipped")
+            out = {**out, "deferred": "routing ledger prune: " + "; ".join(reasons)}
         _nightly_log(f"[khipu-routing] ledger prune {out}")
     except Exception as exc:  # noqa: BLE001
         _nightly_log(f"[khipu-routing] ledger prune skipped: {type(exc).__name__}: {exc}")
@@ -1103,8 +1213,16 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
         "check the embedding provider key/credentials, then run `khipu jobs install nightly`"
         " or wait for the next nightly",
     ),
+    "summary_kind_backfill_ok": (
+        "summary_kind_backfill",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
     "query_cache_prune_ok": (
         "query_cache_prune",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "routing_ledger_prune_ok": (
+        "routing_ledger_prune",
         "run `khipu jobs install nightly` or wait for the next nightly",
     ),
     "commitments_close_rules_ok": (
@@ -1122,6 +1240,10 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     "ledger_ok": (
         "ledger",
         "run `khipu ledger drain` and check the error",
+    ),
+    "project_renames_ok": (
+        "project_renames",
+        "run `khipu project renames` and check the error",
     ),
     "snapshot_refresh_ok": (
         "snapshot_refresh",

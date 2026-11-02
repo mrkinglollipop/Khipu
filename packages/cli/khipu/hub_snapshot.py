@@ -1339,6 +1339,12 @@ class _SourceFence:
                 self.scrub()
 
 
+# Bound on the memory-lock wait while a dump already holds the refresh lock:
+# a forget must not keep every overlapping refresh "already in progress"
+# until it finishes.
+REFRESH_MEMORY_LOCK_WAIT_S = float(os.environ.get("KHIPU_REFRESH_MEMORY_LOCK_WAIT_S", "30"))
+
+
 @contextmanager
 def _replica_write_gate(path: Path | None = None, *, target: Path | None = None,
                         con: sqlite3.Connection | None = None, refresh_lock_held: bool = False,
@@ -1349,11 +1355,13 @@ def _replica_write_gate(path: Path | None = None, *, target: Path | None = None,
     replica, or a staged copy; or the caller's open ``con``) guarded by a
     ``_SourceFence``, the pre-commit registry re-check, the commit, then
     ``on_commit`` (a dump's replace) before the lease is released.
-    ``RegistryError`` propagates."""
+    ``RegistryError`` propagates. When ``refresh_lock_held``, the memory
+    lock is waited for at most ``REFRESH_MEMORY_LOCK_WAIT_S``."""
     from khipu.tombstones import write_gate
 
     path = path or snapshot_path()
-    with write_gate() as gate:
+    mem_wait = REFRESH_MEMORY_LOCK_WAIT_S if refresh_lock_held else None
+    with write_gate(wait=mem_wait) as gate:
         lock = None
         if not refresh_lock_held:
             lock = _acquire_refresh_lock()
@@ -4866,16 +4874,98 @@ def _sweep_stale_temps_locked(directory: Path) -> list[str]:
     return removed
 
 
-def sweep_stale_temps() -> dict[str, Any]:
-    """Remove leftover temporary replica files under the refresh lock; a dump
-    in progress means nothing is checked this time."""
+def _graph_temp_dirs() -> list[Path]:
+    """Directories where a killed graph build leaves ``graph_build_*.sqlite``.
+    Exact paths from ``third_party/graphify/build_graph.py`` staging."""
+    return [Path("/tmp"), Path("/var/tmp")]
+
+
+def _is_open_by_live_refresher(path: Path) -> bool:
+    """True when ``path`` looks like a temp a live dump still holds open:
+    another process holds the refresh lock and this file's mtime is young
+    enough that a dump could still be writing it. Age alone already keeps
+    young files; this refuses to unlink a borderline one while the lock is
+    held."""
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    if age >= STALE_TEMP_AGE_S:
+        return False
     lock = _acquire_refresh_lock()
     if lock is None:
-        return {"ok": True, "removed": [], "skipped": "a replica refresh is running"}
+        return True
+    _release_refresh_lock(lock)
+    return False
+
+
+def _sweep_graph_build_temps(directories: list[Path] | None = None,
+                             *, now: float | None = None) -> tuple[list[str], int]:
+    """Remove ``graph_build_*.sqlite`` past the age limit. Returns
+    (removed names, how many matching files were left). Never touches any
+    other pattern."""
+    now = time.time() if now is None else now
+    removed: list[str] = []
+    left = 0
+    for directory in directories if directories is not None else _graph_temp_dirs():
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            name = entry.name
+            if not (name.startswith("graph_build_") and name.endswith(".sqlite")):
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    left += 1
+                    continue
+                age = now - entry.stat().st_mtime
+                if age < STALE_TEMP_AGE_S:
+                    left += 1
+                    continue
+                Path(entry.path).unlink(missing_ok=True)
+                removed.append(name)
+            except OSError:
+                left += 1
+                continue
+    return removed, left
+
+
+def sweep_stale_temps() -> dict[str, Any]:
+    """Remove leftover temporary replica files and killed graph-build temps
+    by age. Does not need the refresh lock. Never deletes a temp a live
+    refresher still holds open, and never anything but the exact patterns
+    (``.hub_snapshot.*.sqlite`` sidecars; ``graph_build_*.sqlite``). Reports
+    how many matching files were left behind."""
+    removed: list[str] = []
+    left = 0
+    directory = snapshot_path().parent
+    for path in stale_replica_temps(directory):
+        if _is_open_by_live_refresher(path):
+            left += 1
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            removed.append(path.name)
+        except OSError:
+            left += 1
+    # Young replica temps (under the age limit) count as left, not removed.
     try:
-        return {"ok": True, "removed": _sweep_stale_temps_locked(snapshot_path().parent)}
-    finally:
-        _release_refresh_lock(lock)
+        for entry in os.scandir(directory):
+            if is_replica_temp(entry.name):
+                try:
+                    if entry.is_file(follow_symlinks=False) and (
+                            time.time() - entry.stat().st_mtime < STALE_TEMP_AGE_S):
+                        left += 1
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    graph_removed, graph_left = _sweep_graph_build_temps()
+    removed.extend(graph_removed)
+    left += graph_left
+    return {"ok": True, "removed": removed, "left": left}
 
 
 def _acquire_refresh_lock():

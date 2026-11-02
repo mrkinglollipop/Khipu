@@ -77,10 +77,11 @@ class BriefsBuildStepTest(unittest.TestCase):
         ])
         self.assertFalse(self._run(build=errored)[0]["ok"])
 
-    def test_lock_held_builds_nothing_and_is_ok(self):
+    def test_lock_held_builds_nothing_and_is_deferred(self):
         out, _, _, m_release, select, build = self._run(lock=False)
         self.assertTrue(out["ok"])
         self.assertEqual(out["built"], 0)
+        self.assertIn("lock", str(out.get("deferred") or "").lower())
         select.assert_not_called()
         build.assert_not_called()
         m_release.assert_not_called()

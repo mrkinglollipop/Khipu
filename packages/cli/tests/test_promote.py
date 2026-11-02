@@ -521,8 +521,9 @@ def test_replay_reads_only_the_query_log_and_never_a_credential(home, monkeypatc
     assert "2 prompt(s) replayed" in out["detail"]
     # Live, and the candidate with routing off and on, for each of the two distinct queries
     # (the candidate's routing probe is not a hook run).
-    assert len(envs) == 6
-    assert sorted(env["KHIPU_FEATURE_ROUTING_PUSH"] for env in envs) == ["0"] * 4 + ["1"] * 2
+    # Live off + candidate off + candidate on + live on, for each of two queries.
+    assert len(envs) == 8
+    assert sorted(env["KHIPU_FEATURE_ROUTING_PUSH"] for env in envs) == ["0"] * 4 + ["1"] * 4
     for env in envs:
         assert not [k for k in env if "KEY" in k or "TOKEN" in k], env
         assert env["KHIPU_RECALL_DAEMON"] == "0"
@@ -705,8 +706,11 @@ def test_replay_fails_a_candidate_whose_routing_read_is_over_budget(home, monkey
     assert not out["ok"]
     assert "with routing on, its routing read ran out of its budget (routing=skipped:budget)" in out["detail"]
     # Run out twice: the failing pair was replayed once more before the step failed.
-    assert [r[:2] for r in runs if r[0] != "prefold"] == [("off", False), ("off", True), ("on", True),
-                                                          ("off", True), ("on", True)]
+    # Live's routing-on run is compared too (off-live, off-cand, on-cand, on-live, …).
+    assert [r[:2] for r in runs if r[0] != "prefold"] == [
+        ("off", False), ("off", True), ("on", True), ("on", False),
+        ("off", True), ("on", True), ("on", False),
+    ]
 
 
 def test_replay_passes_a_candidate_whose_routing_read_ran_out_once_only(home, monkeypatch):
@@ -770,12 +774,14 @@ def test_replay_fails_a_candidate_whose_search_answers_differ_with_routing_on(ho
     assert not out["ok"]
     assert "the search answer changed with routing on" in out["detail"]
     # The differing pair was replayed once more before the step failed.
-    assert [r[:2] for r in runs if r[0] != "prefold"] == [("off", False), ("off", True), ("on", True),
-                                                          ("off", True), ("on", True)]
+    assert [r[:2] for r in runs if r[0] != "prefold"] == [
+        ("off", False), ("off", True), ("on", True), ("on", False),
+        ("off", True), ("on", True), ("on", False),
+    ]
 
 
 @pytest.mark.parametrize(("reason", "ms", "hits", "expect"), [
-    ("timeout>1.2s", 1200.0, (), "with routing on, timeout>1.2s"),
+    ("timeout>1.2s", 1400.0, (), "with routing on, timeout>1.2s"),
     ("error:RuntimeError", 40.0, (), "with routing on, error:RuntimeError"),
     ("ok", 1900.0, ("episode:3",), "with routing on, 1900 ms > 1200 ms"),
 ])
@@ -792,11 +798,11 @@ def test_replay_fails_a_candidate_whose_search_with_routing_on_times_out_fails_o
     assert not out["ok"], out
     assert expect in out["detail"]
     # The failing pair was replayed once more before the step failed.
-    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "off", "on"]
+    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "on", "off", "on", "on"]
 
 
 @pytest.mark.parametrize(("again_off", "expect"), [
-    (("timeout>1.2s", 1200.0, ()), "prompt 1: timeout>1.2s"),
+    (("timeout>1.2s", 1400.0, ()), "prompt 1: timeout>1.2s"),
     (("ok", 300.0, ()), "prompt 1: empty answer where live had 1 hit(s)"),
 ])
 def test_replay_holds_the_replayed_run_with_routing_off_to_the_same_tests(home, monkeypatch, again_off, expect):
@@ -811,7 +817,7 @@ def test_replay_holds_the_replayed_run_with_routing_off_to_the_same_tests(home, 
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"], out
     assert expect in out["detail"]
-    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "off", "on"]
+    assert [r[0] for r in runs if r[0] != "prefold"] == ["off", "off", "on", "on", "off", "on", "on"]
 
 
 def test_the_search_test_is_the_same_for_both_runs():
@@ -872,9 +878,12 @@ def test_replay_fails_a_candidate_slower_than_live_at_the_median(home, monkeypat
     assert "the candidate is slower than live by 250 ms at the median" in out["detail"]
 
 
-def test_a_timeout_reason_fails_whatever_the_references():
+def test_a_timeout_reason_uses_the_live_slack():
     run = {"exit": 0, "valid_json": True, "reason": "timeout>1.2s", "ms": 1250.0, "hits": []}
-    assert pm._search_problem(run, (1300.0,)) == "timeout>1.2s"
+    # Live was also past the budget: shared load, not a refuse.
+    assert pm._search_problem(run, (1300.0,)) is None
+    # Live succeeded well under the budget: the candidate's timeout refuses.
+    assert pm._search_problem(run, (300.0,)) == "timeout>1.2s"
 
 
 def test_replay_fails_routing_on_only_when_slower_than_both_references(home, monkeypatch):
@@ -1886,14 +1895,16 @@ def _many_queries(home, n: int) -> Path:
 
 
 def _scripted_routing(statuses: list[str]):
-    """A routing hook whose k-th run with routing on logs ``statuses[k]``
-    (the last one repeats)."""
+    """A routing hook whose k-th *candidate* run with routing on logs
+    ``statuses[k]`` (the last one repeats). Live's routing-on runs stay
+    ``full`` so a withhold can be judged against live."""
     inner = _routing_hook([], on_status="full")
     seen = {"on": 0}
 
     def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
         r = inner(argv, env=env, input=input, cwd=cwd, timeout=timeout)
-        if argv[1:2] != ["-c"] and env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1":
+        if (argv[1:2] != ["-c"] and env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1"
+                and "/candidate/packages/" in argv[0]):
             status = statuses[min(seen["on"], len(statuses) - 1)]
             seen["on"] += 1
             log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
@@ -1919,7 +1930,7 @@ def test_replay_fails_when_every_routing_read_withholds(home, monkeypatch):
     monkeypatch.setattr(pm, "_run", _scripted_routing([WITHHOLD]))
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"], out
-    assert "withheld" in out["detail"] and "all 3 replayed prompt(s) and none routed" in out["detail"]
+    assert "withheld" in out["detail"] and "where live routed" in out["detail"]
 
 
 def test_replay_still_fails_a_typeerror_routing_read_beside_withholds(home, monkeypatch):
@@ -1932,7 +1943,7 @@ def test_replay_still_fails_a_typeerror_routing_read_beside_withholds(home, monk
 
 def test_replay_still_fails_a_timeout_beside_withholds(home, monkeypatch):
     candidate = _many_queries(home, 2)
-    monkeypatch.setattr(pm, "_run", _routing_hook([], on_status=WITHHOLD, on_reason="timeout>1.2s", on_ms=1200.0,
+    monkeypatch.setattr(pm, "_run", _routing_hook([], on_status=WITHHOLD, on_reason="timeout>1.2s", on_ms=1400.0,
                                                  off_hits=(), on_hits=()))
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"], out
@@ -1947,4 +1958,4 @@ def test_replay_fails_when_withholds_sit_beside_only_a_benign_skip(home, monkeyp
     monkeypatch.setattr(pm, "_run", _scripted_routing([WITHHOLD, WITHHOLD, benign]))
     out = pm.gate_recall_replay(candidate)
     assert not out["ok"], out
-    assert "none routed" in out["detail"]
+    assert "where live routed" in out["detail"] or "none routed" in out["detail"]

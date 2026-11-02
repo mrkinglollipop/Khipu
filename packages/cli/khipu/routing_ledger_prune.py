@@ -126,6 +126,15 @@ def prune(*, keep_days=None, now=None, folder=None, budget_s=TIME_BUDGET_S):
             state = "errors"
         out[state if state in counts else "errors"] += 1
     out["ok"] = out["errors"] == 0
+    # Hitting the budget with nothing removed, or skipping oversized ledgers
+    # forever, must not read as a silent green success: surface it.
+    if out.get("time_budget_exhausted") or (out["skipped"] and not out["removed"]):
+        reasons = []
+        if out.get("time_budget_exhausted"):
+            reasons.append("time budget exhausted")
+        if out["skipped"]:
+            reasons.append(f"{out['skipped']} oversized ledger(s) skipped")
+        out["deferred"] = "routing ledger prune: " + "; ".join(reasons)
     return out
 
 

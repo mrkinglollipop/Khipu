@@ -315,7 +315,8 @@ class DoctorOutcomesTest(unittest.TestCase):
         self.assertLess(out["timeout_rate"], 0.5)
 
     def test_unhealthy_log(self) -> None:
-        """The production shape finding B10 measured: most calls time out."""
+        """Timeouts alone under load are yellow (not a hard red promote block);
+        a mix with real errors still refuses."""
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)
         lines = []
         for i in range(25):
@@ -324,9 +325,20 @@ class DoctorOutcomesTest(unittest.TestCase):
             lines.append(_log_line(ts, reason, 1200.0))
         self._write(lines)
         out = rp.prompt_recall_outcomes(now=now)
-        self.assertFalse(out["ok"])
-        self.assertFalse(out["insufficient"])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out.get("level"), "amber")
+        self.assertTrue(out.get("timeout_only"))
         self.assertGreaterEqual(out["timeout_rate"], 0.5)
+        # Real errors mixed in stay a hard red.
+        err_lines = []
+        for i in range(25):
+            ts = (now - timedelta(minutes=2 * i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            reason = "ok" if i % 10 == 0 else "error:boom"
+            err_lines.append(_log_line(ts, reason, 40.0))
+        self._write(err_lines)
+        bad = rp.prompt_recall_outcomes(now=now)
+        self.assertFalse(bad["ok"])
+        self.assertFalse(bad["insufficient"])
 
     def test_short_log_is_insufficient(self) -> None:
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)
@@ -334,8 +346,10 @@ class DoctorOutcomesTest(unittest.TestCase):
         lines = [_log_line(ts, "ok", 500.0) for _ in range(5)]
         self._write(lines)
         out = rp.prompt_recall_outcomes(now=now)
-        self.assertFalse(out["ok"])
+        # Thin sample is yellow, not a hard red.
+        self.assertTrue(out["ok"])
         self.assertTrue(out["insufficient"])
+        self.assertEqual(out.get("level"), "amber")
         self.assertEqual(out["count"], 5)
 
     def test_missing_log_is_insufficient(self) -> None:
@@ -355,9 +369,12 @@ class DoctorOutcomesTest(unittest.TestCase):
         ]
         self._write(lines)
         out = rp.prompt_recall_outcomes()
-        self.assertFalse(out["ok"])
+        # No searched calls at all: still insufficient; yellow when the file
+        # exists but holds nothing countable, hard red only when missing.
         self.assertTrue(out["insufficient"])
         self.assertEqual(out["count"], 0)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out.get("level"), "amber")
 
     def test_calls_outside_the_7_day_window_are_excluded(self) -> None:
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)
@@ -418,12 +435,13 @@ class DoctorOutcomesTest(unittest.TestCase):
             lines.append(_log_line(ts, "ok", 500.0))
         for i in range(rp._OUTCOMES_MAX_CALLS):
             ts = (now - timedelta(minutes=200 - i)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            lines.append(_log_line(ts, "timeout>1.2s", 1200.0))
+            # Real errors (not timeout-only load) stay a hard red.
+            lines.append(_log_line(ts, "error:boom", 40.0))
         self._write(lines)
         out = rp.prompt_recall_outcomes(now=now, window_s=rp._OUTCOMES_WINDOW_S)
         self.assertFalse(out["ok"])
-        self.assertEqual(out["timeout_rate"], 1.0)
-        self.assertIn("deadline", out["reason"])
+        self.assertEqual(out["error_rate"], 1.0)
+        self.assertIn("failed", out["reason"])
         self.assertIn("Refresh offline copy", out["fix"])
         self.assertNotIn("khipu ", out["fix"])
 
@@ -445,11 +463,12 @@ class DoctorOutcomesTest(unittest.TestCase):
         self.assertEqual(out["count"], 0)
         self.assertEqual(out["window_minutes"], 60)
 
-    def test_recent_timeouts_stay_red(self) -> None:
+    def test_recent_timeouts_stay_amber_not_a_hard_red(self) -> None:
         now = datetime(2026, 10, 16, 14, 0, tzinfo=timezone.utc)
         self._write(self._timeouts(now, minutes_ago=5))
         out = rp.prompt_recall_outcomes(now=now, window_s=3600)
-        self.assertFalse(out["ok"])
+        self.assertTrue(out["ok"])
+        self.assertEqual(out.get("level"), "amber")
         self.assertEqual(out["count"], 100)
         self.assertEqual(out["timeout_rate"], 1.0)
 
@@ -477,7 +496,9 @@ class DoctorOutcomesTest(unittest.TestCase):
         with mock.patch("khipu.config.minute_setting", return_value=180) as setting:
             out = rp.prompt_recall_outcomes(now=now)
         setting.assert_called_with("doctor_rate_window_minutes")
-        self.assertFalse(out["ok"])
+        # Timeouts alone under the widened window are yellow, not hard red.
+        self.assertTrue(out["ok"])
+        self.assertEqual(out.get("level"), "amber")
         self.assertEqual(out["window_minutes"], 180)
 
     def test_doctor_never_raises_on_an_unreadable_directory(self) -> None:
