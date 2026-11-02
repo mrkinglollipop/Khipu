@@ -992,7 +992,10 @@ def test_a_t3_lookup_failure_with_the_sdk_child_markers_is_refused(t3_conversati
     _be_with(t3_conversation, OWNER, monkeypatch, _T3_SDK_ENV)
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
-    assert err.value.code == "no_recorded_turn"
+    # A failed T3 read is not evidence of a dispatched job: refuse as unreadable.
+    assert err.value.code == "t3_unreadable"
+    assert "dispatched job" not in err.value.message.lower()
+    assert "could not read" in err.value.message.lower()
     _t3_say(**_T3_SDK_ENV)
     assert owner_turns.turns(OWNER)[-1]["eligible"] is False
 

@@ -55,6 +55,10 @@ _clock = time.time
 
 _DISPATCHED_WHY = ("This call comes from a dispatched job, which can never make an owner's change. Ask the owner to "
                    "say it in the conversation they are typing in.")
+_T3_UNREADABLE_WHY = ("Khipu could not read T3's record of this conversation, so it can't tell whether the owner is "
+                      "in it. Nothing was changed; try again.")
+# Owner hold/confirm: a few bounded retries under the longer T3 read budget.
+_OWNER_T3_ATTEMPTS = 4
 
 
 class DirectionRefused(Exception):
@@ -152,6 +156,8 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     if confirmed is not None and confirmed["action"] == action and confirmed["stamp"]["session"] == session:
         # The replay of a held request ``confirm`` proved the owner confirmed.
         return dict(confirmed["stamp"])
+    from khipu import t3
+
     try:
         turn = _recent_turn(session, conf, now)
     except DirectionRefused:
@@ -159,7 +165,8 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
             # A T3 conversation: its turns never count directly, so the
             # change is held for the owner to confirm (``hold``, ``confirm``).
             # T3's own record decides whether it is a job (``_t3_bound``).
-            _t3_bound(environ, session, now)
+            with t3.owner_read_budget():
+                _t3_bound(environ, session, now)
             raise DirectionRefused("confirm_needed", _HOLD_WHY) from None
         if lineage_job:
             raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY) from None
@@ -167,7 +174,11 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     # A turn recorded before the T3 child test existed carries no mark, so a
     # T3 turn is looked at again here; outside T3 the lineage markers stand.
     if turn.get("entrypoint") == "t3":
-        if owner_turns.dispatched_job(environ, session, t3_thread=True):
+        with t3.owner_read_budget():
+            why = owner_turns.dispatched_job(environ, session, t3_thread=True)
+        if why:
+            if _t3_lookup_failed(why):
+                raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
             raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     elif lineage_job:
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
@@ -216,18 +227,17 @@ def _usable_t3_turn(t: dict) -> bool:
 
 
 def _t3_thread_of(session: str) -> str:
-    """This conversation's one T3 thread, re-read from T3's record (one
-    retry), or ``DirectionRefused``."""
+    """This conversation's one T3 thread, re-read from T3's record (a few
+    bounded retries under the owner read budget), or ``DirectionRefused``."""
     from khipu import t3
 
-    for _ in range(2):
+    attempts = _OWNER_T3_ATTEMPTS if t3.owner_read_active() else 2
+    for _ in range(attempts):
         threads, definitive = t3.session_thread_ids_result(session)
         if definitive:
             break
     else:
-        raise DirectionRefused("t3_unreadable", "Khipu could not read T3's record of this conversation, so it "
-                                                "can't tell whether the owner is in it. Nothing was changed; try "
-                                                "again.")
+        raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
     if not threads:
         raise DirectionRefused("no_recorded_turn", "T3's record no longer shows this conversation, so Khipu can't "
                                                    "tell whether the owner is in it. Nothing was changed.")
@@ -238,12 +248,22 @@ def _t3_thread_of(session: str) -> str:
     return threads[0]
 
 
+def _t3_lookup_failed(why: str | None) -> bool:
+    """True when ``dispatched_job`` refused for lack of a readable T3 record,
+    not because the record showed a job."""
+    return isinstance(why, str) and "could not look up" in why
+
+
 def _t3_refusals(environ, session: str) -> str:
     """This conversation's T3 thread, after the refusals T3's own record
     decides: an unreadable or ambiguous record, and a job or a delegated
-    child thread, are refused."""
+    child thread, are refused. A failed lookup says Khipu could not read
+    T3's record (try again); "dispatched job" only when the evidence shows one."""
     thread = _t3_thread_of(session)
-    if owner_turns.dispatched_job(environ, session, t3_thread=True):
+    why = owner_turns.dispatched_job(environ, session, t3_thread=True)
+    if why:
+        if _t3_lookup_failed(why):
+            raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     return thread
 
@@ -355,6 +375,8 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None) -> dict
     conversation's hook did not record is refused as for a change. The
     admission and the save run under the requests lock Forget takes, and a
     Forget since the hold began (``erased``) refuses it."""
+    from khipu import t3
+
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
     conf = owner_turns.settings()
@@ -368,8 +390,9 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None) -> dict
             turns_ = owner_turns.turns(session, now)
             extra = {}
             if any(t.get("entrypoint") == "t3" for t in turns_):
-                thread, _ = _t3_bound(environ, session, now)
-                extra["t3_snapshots"] = {thread: _t3_boundary(None, _t3_read(thread, (), None), session)}
+                with t3.owner_read_budget():
+                    thread, _ = _t3_bound(environ, session, now)
+                    extra["t3_snapshots"] = {thread: _t3_boundary(None, _t3_read(thread, (), None), session)}
             else:
                 if owner_turns.dispatched_job(environ, session):
                     raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
@@ -588,10 +611,12 @@ def _after_ask(turn: dict, boundary) -> bool:
 
 
 def _t3_read(thread: str, seen, since) -> dict:
-    """``t3.owner_reply_read`` with one retry, or ``DirectionRefused``."""
+    """``t3.owner_reply_read`` with a few bounded retries under the owner
+    read budget, or ``DirectionRefused``."""
     from khipu import t3
 
-    for _ in range(2):
+    attempts = _OWNER_T3_ATTEMPTS if t3.owner_read_active() else 2
+    for _ in range(attempts):
         read, definitive = t3.owner_reply_read(thread, seen, since)
         if definitive:
             return read
@@ -752,6 +777,8 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
     grows the ask boundary and says to ask the owner now. The request is
     marked ``applying`` under the lock, so two confirms never apply it
     twice; ``settle`` records the outcome."""
+    from khipu import t3
+
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
     session = _caller_session(environ)
@@ -766,7 +793,8 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
             if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
-            stamp = _proof(environ, session, request, now)
+            with t3.owner_read_budget():
+                stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
                 raise DirectionRefused("not_confirmed", stamp)

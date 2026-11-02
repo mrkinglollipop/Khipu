@@ -82,13 +82,8 @@ NOT_CAPTURE = {
     "storage.trim_synth_usage": "the summariser's token counts, rewritten without old lines",
     "hub_reach.note_unreachable": "the hub-unreachable memo: two times and a short error word, no capture text",
     "t3._recent_conversation_use": "opens T3's thread database read-only to inspect its newest message time; writes nothing",
-    "t3.session_thread_ids_result": "opens T3's thread database read-only to list the threads naming a session; "
-                                    "writes nothing",
-    "t3.delegated_thread_result": "opens T3's thread database read-only to tell a delegated child thread from the "
-                                  "owner's own; writes nothing",
-    "t3._read_messages": "opens T3's thread database read-only to snapshot a thread or find a message the owner "
-                         "typed outside a held request's snapshot; writes nothing (the caller keeps only message "
-                         "ids, T3's times and a hash)",
+    "t3._connect_readonly": "opens T3's thread database read-only (every T3 thread and message lookup goes "
+                            "through it); writes nothing",
     "recall_eval_nightly.refresh_vectors": "the recall check's golden-query embedding vectors keyed by a hash of the "
                                            "redacted query (mode 0600); no query text, no capture text",
     # Cursor/Antigravity hooks (docs/plans/2026-10-27-cursor-antigravity-hooks.md).
@@ -133,7 +128,7 @@ NOT_CAPTURE = {
                      "routing_delegation._log_call",
                      "session_capture._log_subagentstop_shape_once", "session_capture._write_beat",
                      "synth_cli.register", "t3._lookup_health",
-                     "t3._thread_linked_capture_evidence", "t3.thread_for_session_result",
+                     "t3._thread_linked_capture_evidence",
                      "topic_hits._write_offset", "usage._converse", "usage._deepseek_locked", "usage._deepseek_write", "usage._save_cache", "usage._turn_due",
                      "components_matrix.refresh_matrix_cache"), _COUNTERS),
     **dict.fromkeys(("query_log._rotate_if_needed", "query_log.log_query"),

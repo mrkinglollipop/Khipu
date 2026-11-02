@@ -54,7 +54,8 @@ def test_f1_queued_mcp_rule_request_prepared_against_an_old_revision_is_crossed(
     routing.edit_rule(1, "Owner newer.", via="app")
     out = mcp_server._tool_route_rule({"text": "Stale proposal.", "rule": 1,
                                        "owner_request": "change the rule", "base": observed})
-    assert out["ok"]
+    assert out["ok"] is False and out.get("status") == "crossed", out
+    assert "never took effect" in (out.get("error") or "")
     view = routing.read_view()
     assert view["rules"][0]["text"] == "Owner newer."
     assert view["rules"][0]["pending"] is False
@@ -70,7 +71,8 @@ def test_f1_queued_mcp_priority_request_prepared_against_an_old_revision_is_cros
                          expect=routing.priority_version())
     out = mcp_server._tool_route_priority({"entries": [{"account": "Grok", "role": "stale"}],
                                            "owner_request": "use Grok first", "base": observed})
-    assert out["ok"]
+    assert out["ok"] is False and out.get("status") == "crossed", out
+    assert "never took effect" in (out.get("error") or "")
     view = routing.read_view()
     assert [e["label"] for e in view["priority"]["entries"]] == ["Codex"]
     assert view["priority"]["pending"] is False
