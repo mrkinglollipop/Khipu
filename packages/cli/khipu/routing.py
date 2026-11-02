@@ -2359,10 +2359,24 @@ def _typed_id(value) -> bool:
         _TYPED_UUID.fullmatch(value) or (not _dangerous(value) and _SAFE_ID.fullmatch(value)))
 
 
+def _checked_share_pct(value) -> float | int | None:
+    """An exception's optional allowed share of its window (1–100), or None
+    when absent. Never derived from free text."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    pct = float(value)
+    if not (0 < pct <= 100):
+        return None
+    return int(pct) if pct == int(pct) else pct
+
+
 def _checked_exceptions(raw) -> list[dict] | None:
     """An entry's exceptions as Khipu writes them (``id``, the owner's
     ``text``, the ``until`` that is required, and when, by whom and from what
-    it was ``at`` recorded); None when they are not."""
+    it was ``at`` recorded; optional structured ``share_pct``); None when
+    they are not."""
     if raw is None:
         return []
     if not isinstance(raw, list) or len(raw) > EXCEPTION_MOST:
@@ -2383,6 +2397,11 @@ def _checked_exceptions(raw) -> list[dict] | None:
             if value is not None and not isinstance(value, str):
                 return None
             row[field] = _no_surrogates(value) if value else None
+        if "share_pct" in item and item.get("share_pct") is not None:
+            share = _checked_share_pct(item.get("share_pct"))
+            if share is None:
+                return None
+            row["share_pct"] = share
         out.append(row)
     if len({x["id"] for x in out}) != len(out):
         return None  # ending one id must end one exception
@@ -3815,9 +3834,15 @@ def _fold_priority(priority: dict | None, now: datetime, labels: dict, in_settin
 
 
 def _effective_priority(priority: dict) -> dict:
+    def exception_row(x: dict) -> list:
+        row = [x["text"], x["until"]]
+        if x.get("share_pct") is not None:
+            row.append(x["share_pct"])
+        return row
+
     def rows(entries: list[dict]) -> list[list]:
         return [[e["label"], e["role"], e["until"], e["in_settings"], *([e["level"]] if e.get("level") else []),
-                 *([{"exceptions": [[x["text"], x["until"]] for x in e["exceptions"]]}] if e.get("exceptions") else [])]
+                 *([{"exceptions": [exception_row(x) for x in e["exceptions"]]}] if e.get("exceptions") else [])]
                 for e in entries]
 
     replaced = priority.get("replaced")
@@ -4473,10 +4498,15 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         windows = sorted({w for (a, w) in pace_samples if a == entry["key"]}
                          | {w for (a, w, _k2, _purpose) in pace_caps if a == entry["key"] and w})
         if windows:
-            entry["pace"] = [_pace.compute_pace(pace_samples.get((entry["key"], w), []),
-                                                 [c for (a, ww, _k2, _purpose), c in pace_caps.items()
-                                                  if a == entry["key"] and ww == w], now, w)
-                              for w in windows]
+            # ``priority`` is the held record; share_pct is read from live
+            # exceptions here because the folded priority is built later.
+            entry["pace"] = [_pace.compute_pace(
+                pace_samples.get((entry["key"], w), []),
+                _caps_with_exception_share(
+                    [c for (a, ww, _k2, _purpose), c in pace_caps.items()
+                     if a == entry["key"] and ww == w],
+                    priority, entry["key"], now),
+                now, w) for w in windows]
         mine = [c for (a, _w, _k2, _purpose), c in sorted(pace_caps.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2], kv[0][3] != "job"))
                 if a == entry["key"]]
         if mine:
@@ -7551,9 +7581,10 @@ def _default_exception_end(key: str, now: datetime) -> tuple[datetime, str]:
 
 
 def _new_exception(key: str, text, until, *, now: datetime, conversation: bool, by: str, source: str,
-                   taken: set[str] = frozenset()) -> tuple[dict, str | None]:
+                   taken: set[str] = frozenset(), share_pct=None) -> tuple[dict, str | None]:
     """(the exception to record, a line saying how its end was chosen when
-    none was given)."""
+    none was given). ``share_pct`` is an optional structured allowed share
+    of the account's window; never parsed from ``text``."""
     words = _one_line(text)
     if not words:
         raise RouteError("the exception's words are empty")
@@ -7569,20 +7600,87 @@ def _new_exception(key: str, text, until, *, now: datetime, conversation: bool, 
         note = f"No end was given, so the exception ends at {_iso(end)}: {how}."
     row = {"id": _exception_id(set(taken)), "text": _clean(words, 0) if conversation else words,
            "until": _iso(end), "at": _iso(now), "by": by, "source": source}
+    if share_pct is not None:
+        checked = _checked_share_pct(share_pct)
+        if checked is None:
+            raise RouteError("share_pct must be a percentage from 1 to 100")
+        row["share_pct"] = checked
     return row, note
+
+
+def exception_change_sentence(label: str, exception: dict) -> str:
+    """One short whole sentence naming a new or changed exception: account,
+    the exception's own words, and until when. Uses the stored until (not
+    clock wording) so delivery does not restart when the day rolls."""
+    until = exception.get("until") or ""
+    words = _one_line(exception.get("text") or "")
+    return f"Exception on {label} until {until}: {words}."
+
+
+def _exception_share_pct(priority: dict | None, account_key: str, now: datetime) -> float | int | None:
+    """The highest live structured share_pct on ``account_key``, or None.
+
+    Accepts either a folded priority view or the held record: ended whole
+    priorities, ended entries and ended exceptions are skipped."""
+    if not priority:
+        return None
+    whole = _parse(priority.get("until"))
+    if whole is not None and whole <= now:
+        return None
+    best = None
+    for entry in priority.get("entries") or []:
+        if entry.get("account") != account_key:
+            continue
+        entry_until = _parse(entry.get("until"))
+        if entry_until is not None and entry_until <= now:
+            continue
+        for exc in entry.get("exceptions") or []:
+            ends = _parse(exc.get("until"))
+            if ends is not None and ends <= now:
+                continue
+            pct = _checked_share_pct(exc.get("share_pct"))
+            if pct is None:
+                continue
+            best = pct if best is None else max(best, pct)
+    return best
+
+
+def _caps_with_exception_share(caps: list[dict], priority: dict | None, account_key: str,
+                               now: datetime) -> list[dict]:
+    """Owner caps for one account with a live exception's ``share_pct`` used
+    in place of any share cap. No structured field (or after it ends) leaves
+    the caps unchanged. Never parses a percentage out of free text."""
+    pct = _exception_share_pct(priority, account_key, now)
+    if pct is None:
+        return [dict(c) for c in caps]
+    out: list[dict] = []
+    seen_share = False
+    for cap in caps:
+        if cap.get("kind") == "share":
+            seen_share = True
+            out.append(dict(cap, pct=pct, exception_share=True))
+        else:
+            out.append(dict(cap))
+    if not seen_share:
+        window = next((c.get("window") for c in caps if c.get("window")), None)
+        out.append({"kind": "share", "window": window, "pct": pct, "revision": "priority-exception",
+                    "exception_share": True})
+    return out
 
 
 def _amended_priority(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
                       now: datetime, conversation: bool, by: str = "owner",
-                      source: str = "") -> tuple[list[dict], str | None, dict]:
+                      source: str = "", share_pct=None) -> tuple[list[dict], str | None, dict]:
     """(the priority's entries with the one account's changed, the priority's
     own end, what the change recorded), read from the held priority's stored
     line, not its folded view: every other entry (an ended one, a level not
     yet started, one the view leaves out, its exceptions ended or not) is
     carried over exactly as stored. The changed entry keeps only its live
     exceptions; the record keeps the ended ones. With ``exception``,
-    ``until`` is that exception's end, not the entry's. The caller holds the
-    routing lock."""
+    ``until`` is that exception's end, not the entry's. ``share_pct`` is
+    only valid with ``exception``. The caller holds the routing lock."""
+    if share_pct is not None and exception is None:
+        raise RouteError("share_pct belongs on an exception; pass it with exception")
     if sum(v is not None for v in (append, role, exception, end_exception)) != 1:
         raise RouteError("amend takes the words to add (append), the role's new words (role), an exception "
                          "(exception, with its until) or an exception to end (end_exception), one of the four")
@@ -7613,10 +7711,11 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
                     raise RouteError(f"{row['label']} already has {EXCEPTION_MOST} exceptions; end one first")
                 made, note = _new_exception(key, exception, until, now=now, conversation=conversation, by=by,
                                             taken={x["id"] for x in item.get("exceptions") or []},
-                                            source=source)
+                                            source=source, share_pct=share_pct)
                 row["exceptions"] = [*row.get("exceptions", []), made]
                 done = {"exception_id": made["id"], "exception_until": made["until"],
-                        **({"exception_until_default": note} if note else {})}
+                        **({"exception_until_default": note} if note else {}),
+                        **({"share_pct": made["share_pct"]} if made.get("share_pct") is not None else {})}
             elif end_exception is not None:
                 left = [x for x in row.get("exceptions", []) if x["id"] != str(end_exception).strip()]
                 if len(left) == len(row.get("exceptions", [])):
@@ -7644,11 +7743,13 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
 
 
 def amend_priority(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
-                   via: str, now: datetime | None = None, expect=None, holds: dict | None = None) -> dict:
+                   via: str, now: datetime | None = None, expect=None, holds: dict | None = None,
+                   share_pct=None) -> dict:
     """The owner's change to one account's entry in the priority (words added
     to its role, or its role replaced, and optionally its end; or an
     exception that lapses on its own, or the end of one), confirmed at once
     like ``set_priority``. Every other entry is left as it is.
+    ``share_pct`` is an optional structured allowed share on a new exception.
     ``expect`` is required, as for a set."""
     _needs_version(expect)
     now = now or _now()
@@ -7661,7 +7762,7 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
                              "before amending it")
         rows, whole, done = _amended_priority(account, append=append, role=role, until=until, exception=exception,
                                               end_exception=end_exception, now=now, conversation=False,
-                                              by="owner", source=str(via))
+                                              by="owner", source=str(via), share_pct=share_pct)
         _check_role_budget(rows, now)
         # ``holds``: end or keep for each hold on an account it names, as a
         # set takes them (``_require_hold_choices``).
@@ -7712,7 +7813,8 @@ def restore_priority(stored: dict, *, via: str, holds: dict | None = None, now: 
 
 def request_priority_amend(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
                            owner_request: str | None = None, author: dict | None = None, via: str = "mcp",
-                           now: datetime | None = None, expect=None, base: str | None = None) -> dict:
+                           now: datetime | None = None, expect=None, base: str | None = None,
+                           share_pct=None) -> dict:
     """A conversation's change to one account's entry, at the owner's
     request: live at once and unconfirmed, as ``request_priority``."""
     if not isinstance(base, str) or not base.strip():
@@ -7728,7 +7830,8 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
         _check_priority(expect, now)
         rows, whole, done = _amended_priority(account, append=append, role=role, until=until, exception=exception,
                                               end_exception=end_exception, now=now, conversation=True,
-                                              by=author_words(by, push=True), source=_clean(request_words, 0))
+                                              by=author_words(by, push=True), source=_clean(request_words, 0),
+                                              share_pct=share_pct)
         _check_role_budget(rows, now)
         observed = _observed_base("priority", base=base, expect=expect)
         written, view = _write({"type": "priority_set", "entries": rows, "until": whole, "pending": True,
@@ -8472,7 +8575,10 @@ def _priority_items(entries: list[dict], now: datetime, *, theirs: bool, view: d
         for exception in item.get("exceptions") or []:
             words = their_words(exception["text"]) if theirs else exception["text"]
             ends = _parse(exception.get("until"))
-            text += f" (exception until {_clock(ends, now)}: {words})" if ends else f" (exception: {words})"
+            share = exception.get("share_pct")
+            share_bit = f", share {share:g}%" if isinstance(share, (int, float)) else ""
+            text += (f" (exception until {_clock(ends, now)}{share_bit}: {words})" if ends
+                     else f" (exception{share_bit}: {words})")
         holds = _account_holds(view, item["account"])
         if holds:
             text += f" (contradicts active hold {holds[0]['id']}; end it: {_end_hold_route(holds[0])})"
@@ -10031,8 +10137,16 @@ def gateway_projection(view: dict | None = None, *, now: datetime | None = None,
                 # Each with its end, so a gateway read filters it by the
                 # clock (``routing_gateway_copy.answer``); never baked into
                 # the line, which the hub keeps until the next publish.
-                exceptions = [{"text": x["text"], "until": x["until"]} for x in entry.get("exceptions") or []
-                              if isinstance(x, dict) and x.get("text") and x.get("until")]
+                exceptions = []
+                for x in entry.get("exceptions") or []:
+                    if not isinstance(x, dict) or not x.get("text") or not x.get("until"):
+                        continue
+                    exc = {"text": x["text"], "until": x["until"]}
+                    if x.get("id"):
+                        exc["id"] = x["id"]
+                    if x.get("share_pct") is not None:
+                        exc["share_pct"] = x["share_pct"]
+                    exceptions.append(exc)
                 if exceptions:
                     row["exceptions"] = exceptions
                 out_rows.append(row)
@@ -10205,7 +10319,7 @@ def _conversation_priority_answer(written: dict, now: datetime | None) -> dict:
 
 def conversation_priority_amend(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
                                 owner_request: str, author: dict, expect, base: str, now: datetime | None = None,
-                                lock_wait: float | None = CONVERSATION_LOCK_BUDGET) -> dict:
+                                lock_wait: float | None = CONVERSATION_LOCK_BUDGET, share_pct=None) -> dict:
     """What MCP ``khipu_route_priority`` writes for one account's entry
     (``request_priority_amend``), answered as ``conversation_priority``."""
     by = dict(author or {})
@@ -10217,6 +10331,7 @@ def conversation_priority_amend(account, *, append=None, role=None, until=None, 
                 written = request_priority_amend(account, append=append, role=role, until=until,
                                                  exception=exception, end_exception=end_exception,
                                                  owner_request=owner_request, author=by, via="mcp", now=now,
+                                                 share_pct=share_pct,
                                                  expect=expect, base=base)
         except LockBusy:
             raise RouteError("Khipu's routing record is busy; try again in a moment") from None
@@ -10874,7 +10989,10 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
                      for item in _priority_push(view, now, changed="priority" in changed["entities"], changed_lines=changed)]
     conflicting = any(_account_holds(view, item.get("account"))
                       for item in (view.get("priority") or {}).get("entries") or [])
-    head = priority_head + head if conflicting else head + priority_head
+    # An unacknowledged priority change goes ahead of older owed rules and
+    # notes (account lines stay in ``others`` and keep same-version precedence).
+    priority_first = conflicting or "priority" in changed["entities"] or "priority" in owed_set
+    head = priority_head + head if priority_first else head + priority_head
     # What the owner did since (by direction, in the app, on a terminal),
     # each named once and first among the budgeted lines: Khipu's fixed words (``direction_line``).
     others = [(None, _push_clip(line, width, view)) for line in changed.get("directions") or []]
@@ -11557,6 +11675,7 @@ def _priority_cli(args, now: datetime) -> int:
             _print_json(request_priority_amend(
                 args.accounts[0], append=args.append, role=args.role, until=args.until,
                 exception=getattr(args, "exception", None), end_exception=getattr(args, "end_exception", None),
+                share_pct=getattr(args, "share_pct", None),
                 owner_request=args.at_owner_request, author=conversation_author(), via="cli", now=now,
                 expect=getattr(args, "expect", None), base=getattr(args, "base", None)))
             return 0
@@ -11581,8 +11700,9 @@ def _priority_cli(args, now: datetime) -> int:
     elif action == "amend":
         out = amend_priority(args.accounts[0], append=args.append, role=args.role, until=args.until,
                              exception=getattr(args, "exception", None),
-                             end_exception=getattr(args, "end_exception", None), via=via, now=now, expect=expect,
-                             holds=_holds_arg(args))
+                             end_exception=getattr(args, "end_exception", None),
+                             share_pct=getattr(args, "share_pct", None),
+                             via=via, now=now, expect=expect, holds=_holds_arg(args))
     elif action == "confirm":
         out = confirm_priority(via=via, now=now, expect=expect, holds=_holds_arg(args))
     elif action == "undo":
@@ -11671,6 +11791,7 @@ def _priority_intent(args, action: str) -> dict | None:
                                                                ("until", args.until),
                                                                ("exception", getattr(args, "exception", None)),
                                                                ("end_exception", getattr(args, "end_exception", None)),
+                                                               ("share_pct", getattr(args, "share_pct", None)),
                                                                ("holds", _holds_arg(args)))
                                              if v is not None})
     if action != "set":

@@ -40,7 +40,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.set": (("entries",), ("until", "expect", "holds")),
     # One account's entry only: ``append`` words to its role or ``role`` in its place (one of the two).
     # ``exception`` (with ``until`` as its end) adds a direction that lapses on its own; ``end_exception`` ends one.
-    "route.priority.amend": (("account", "expect"), ("append", "role", "until", "exception", "end_exception", "holds")),
+    "route.priority.amend": (("account", "expect"), ("append", "role", "until", "exception", "end_exception",
+                                                     "share_pct", "holds")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
@@ -311,7 +312,8 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
             raise _bad("route.priority.amend takes append (words added to the role), role (its new words), "
                        "exception (a direction with an end, with until) or end_exception (an exception's id), one of the four")
         return ["route", "priority", "amend",
-                *_opts(v, "append", "role", "until", "exception", "end_exception", "holds", "expect")], [v["account"]]
+                *_opts(v, "append", "role", "until", "exception", "end_exception", "share_pct", "holds",
+                       "expect")], [v["account"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":

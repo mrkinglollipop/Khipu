@@ -6162,6 +6162,9 @@ def build_parser() -> argparse.ArgumentParser:
     rprio.add_argument("--exception", default=None, metavar="TEXT",
                        help="amend: a direction with an end, in your words; --until is its end (default: the account's "
                             "next weekly reset, else 7 days). It lapses on its own")
+    rprio.add_argument("--share-pct", default=None, type=float, metavar="N", dest="share_pct",
+                       help="amend with --exception: optional structured allowed share of the account's window "
+                            "(1-100). Pace and advice use it in place of the share cap while the exception is live")
     rprio.add_argument("--end-exception", default=None, metavar="ID", dest="end_exception",
                        help="amend: end one exception early (its id is in the amend result and `route priority --json`)")
     rprio.add_argument("--entries", default=None, metavar="JSON",

@@ -381,7 +381,8 @@ def plan(out, view, now, cfg, *, session=None, project=None):
     shown = set(out.get("shown_entities") or [])
     for entity in entities:
         rule = rules.get(entity)
-        whole = entity in ("note", "priority") or entity.startswith("rule:")
+        whole = (entity in ("note", "priority") or entity.startswith("rule:")
+                 or entity.startswith("priority-exception:"))
         if rule:
             line = r.rule_line(rule, view=view, facts=facts)
             label = f"Standing rule {rule['n']}"
@@ -422,9 +423,18 @@ def plan(out, view, now, cfg, *, session=None, project=None):
             expected = tuple(agent_view.redact_owner_tokens(value, words)
                              for value in (item["text"], item["label"]))
             item["withheld"] = (line, label) != expected
-        # Relative account ages are presentation, not a new change. Whole
-        # entries also depend on their safe text and rendered suffixes.
-        fingerprint = [effective, line, label] if item["entity"].startswith("rule:") or item["entity"] in ("note", "priority") else effective
+        # Relative account ages are presentation, not a new change. The
+        # priority's revision hashes its stable content (entries, exception
+        # text, until), never clock wording in the rendered line, so a day
+        # rollover does not restart every conversation at page 1. Rules and
+        # notes still fingerprint their safe text and rendered suffixes.
+        entity = item["entity"]
+        if entity == "priority" or entity.startswith("priority-exception:"):
+            fingerprint = effective
+        elif entity.startswith("rule:") or entity == "note":
+            fingerprint = [effective, line, label]
+        else:
+            fingerprint = effective
         revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
         item.update(text=line, label=label, revision=revision)
         # Rules and notes require their complete words. Accounts and holds
@@ -435,6 +445,28 @@ def plan(out, view, now, cfg, *, session=None, project=None):
             clipped = line[:max(0, width - 3)].rstrip() + "." * min(width, 3) if width and len(line) > width else line
             visible = bool(line and (line in text or clipped in text or r._clip(line, width) in text))
         item["visible"] = visible
+    # Each new or changed live exception gets one short whole sentence ahead
+    # of the paged priority body. A partial page never counts as delivered;
+    # an ended exception is simply absent from the plan.
+    held = view.get("priority")
+    if held:
+        for entry in held.get("entries") or []:
+            for exc in entry.get("exceptions") or []:
+                ends = r._parse(exc.get("until"))
+                if ends is not None and ends <= now:
+                    continue
+                if not isinstance(exc.get("id"), str) or not exc.get("text"):
+                    continue
+                sentence = r.exception_change_sentence(entry.get("label") or entry.get("account") or "account", exc)
+                line = (project([sentence])[0] if project else r._for_agents(sentence, view))
+                fingerprint = {"id": exc["id"], "text": exc["text"], "until": exc.get("until"),
+                               "share_pct": exc.get("share_pct"), "account": entry.get("account")}
+                revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False)
+                                          .encode()).hexdigest()[:16]
+                items.append(dict(entity="priority-exception:" + exc["id"], text=line,
+                                  label=f"Exception on {entry.get('label') or 'account'}",
+                                  revision=revision, whole=True,
+                                  visible=line in text, removed=False))
     notices = r._replacement_notices(view, now, session)
     for _kind, raw, ident in notices:
         line = r._for_agents(raw, view)
@@ -472,6 +504,23 @@ def plan(out, view, now, cfg, *, session=None, project=None):
 
 
 PAGE_FLOOR = 300  # UTF-16 units; narrower pages are never sent
+
+
+def _due_rank(entry):
+    """Delivery order: holds, then ordinary account/pace lines (same-version
+    debt), then an unacknowledged priority change or its exception sentence
+    ahead of older owed rules and notes."""
+    entity = entry.get("entity") or ""
+    if entity.startswith("hold:"):
+        return (0, 0, entity)
+    if not entry.get("whole"):
+        return (1, 0, entity)
+    if entity.startswith("priority-exception:"):
+        return (2, 0, entity)
+    if entity == "priority":
+        return (2, 1, entity)
+    return (3, 0, entity)
+
 
 # A line's owner travels from its producer to ``plan`` as a keyed digest of
 # its entity, never the entity id itself (an account's id can name a login
@@ -568,9 +617,15 @@ def _merge(state, out):
     planned = {i["entity"] for i in items}
     current = set(plan.get("current_entities", entries))
     # Notice debt ends with its seven-day window or a receipt through an
-    # alternate identity. It has no removal message to deliver.
+    # alternate identity. It has no removal message to deliver. An ended
+    # priority exception stops being shown the same way.
+    planned_exceptions = {i["entity"] for i in items if i["entity"].startswith("priority-exception:")}
     for entity in list(entries):
         if entity.startswith("notice:") and not entries[entity].get("acked") and entity not in plan.get("notices", []):
+            del entries[entity]
+            replaced.add(entity)
+        elif (entity.startswith("priority-exception:") and not entries[entity].get("acked")
+              and entity not in planned_exceptions):
             del entries[entity]
             replaced.add(entity)
     # A pace or advice forecast is an offer, never part of the routing view:
@@ -601,10 +656,22 @@ def _merge(state, out):
         old = entries.get(entity)
         if old is None or old["revision"] != item["revision"]:
             replaced.add(entity)
-            entries[entity] = dict(item, offset=0, acked=False,
-                                   restarted=bool(old and not old.get("acked") and
-                                                  (old.get("offset") or any(i["entity"] == entity for i in
-                                                   (state.get("flight") or {}).get("out", {}).get("routing_changes", {}).get("items", [])))))
+            offset = 0
+            restarted = bool(old and not old.get("acked") and
+                             (old.get("offset") or any(i["entity"] == entity for i in
+                              (state.get("flight") or {}).get("out", {}).get("routing_changes", {}).get("items", []))))
+            # Do not reset a conversation's offset unless the text it has yet
+            # to read actually changed (a stable-hash miss or a real edit of
+            # the unread suffix). An append past the cursor keeps the offset.
+            if old is not None and old.get("revision") != item["revision"]:
+                old_off = old.get("offset", 0) or 0
+                old_text, new_text = old.get("text") or "", item.get("text") or ""
+                if old_off and old_off <= len(old_text) and old_off <= len(new_text):
+                    if new_text[old_off:] == old_text[old_off:] or new_text.startswith(old_text[:old_off]):
+                        offset = old_off
+                        if new_text[old_off:] == old_text[old_off:]:
+                            restarted = False
+            entries[entity] = dict(item, offset=offset, acked=False, restarted=restarted)
         elif not old.get("offset"):
             old.update(item)
     flight = state.get("flight")
@@ -780,8 +847,9 @@ def _render(state, out, now, component, *, delivery_point=True, deferred=False):
             if len(lines) <= 1 and out.get("kind") == "changes":
                 out.update(kind="none", text=None, count=0)
     due = [e for e in entries.values() if not e.get("acked")]
-    # A new hold must precede the remaining pages of an older, long rule.
-    due.sort(key=lambda e: not e["entity"].startswith("hold:"))
+    # Holds first; then an unacknowledged priority change or its exception
+    # sentence ahead of older owed rules and notes; then other lines.
+    due.sort(key=_due_rank)
     if not due:
         # Informational full/stale blocks have no change debt to reserve.
         answer = {k: v for k, v in out.items() if k not in
@@ -896,7 +964,7 @@ def _render(state, out, now, component, *, delivery_point=True, deferred=False):
         # it. Everything due either fits whole or becomes the head in turn,
         # so all of it is shown in a bounded number of prompts. The state
         # lines come next, within half the cap; then the other due lines.
-        order = sorted(due, key=lambda e: (not e["entity"].startswith("hold:"), e["whole"]))
+        order = sorted(due, key=_due_rank)
         head = order[0]
         lead = next((e for e in order if e["whole"]), None)
         hard = (_need(head) or 0) + 1

@@ -38,7 +38,7 @@ FIELDS = {
     "note": {"text", "at"},
     "priority": set("entries until pending revision line".split()),
     "entries": {"account", "label", "role", "until", "level", "exceptions"},
-    "exceptions": {"text", "until"},
+    "exceptions": {"text", "until", "id", "share_pct"},
     "level": {"claim", "as_of", "until"},
     "pace": set(routing._GATEWAY_PACE_FIELDS) | {"plan", "share_cap", "day_cap"},
     "plan": set(routing._GATEWAY_PLAN_FIELDS),

@@ -252,7 +252,7 @@ Record an owner-requested standing rule, or a change to rule number `rule`. Para
 
 ### khipu_route_priority
 
-Record the owner’s account order. Parameters: `entries` (the accounts in the owner’s order, with his words for each role), `owner_request` and `base` (the observed owner revision) are required; `until` is optional. Each entry may have its own `until`, in addition to the whole-priority expiry. A request that crosses a later owner change is recorded as crossed and never made live, and the write answers that it did not take effect. Otherwise it is live at once and marked unconfirmed until the owner confirms or undoes it in Settings > Accounts and routing or through owner direction. This tool cannot confirm, undo or clear a priority.
+Record the owner’s account order. Parameters: `entries` (the accounts in the owner’s order, with his words for each role), `owner_request` and `base` (the observed owner revision) are required; `until` is optional. Each entry may have its own `until`, in addition to the whole-priority expiry. To change one account’s entry, give `account` with `append`, `role`, `exception` or `end_exception` (and `expect`) in place of `entries`. An `exception` may also carry structured `share_pct` (1–100): while that exception is live, pace and `khipu_route_advise` use it in place of the account’s share cap; it is never parsed from the exception’s free text. A request that crosses a later owner change is recorded as crossed and never made live, and the write answers that it did not take effect. Otherwise it is live at once and marked unconfirmed until the owner confirms or undoes it in Settings > Accounts and routing or through owner direction. This tool cannot confirm, undo or clear a priority.
 
 ### khipu_owner_act
 
