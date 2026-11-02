@@ -123,18 +123,21 @@ class _Offline:
         # The path being scored (set by the scorer), and the cosine leg's
         # outcome per path: query keys with no stored vector (a set, because
         # one query is scored on both paths), lookups whose cosine scan
-        # returned, and lookups whose cosine leg ran out of time.
+        # returned, lookups whose cosine leg ran out of time, and lookups
+        # whose scan module could not load (separate from a real timeout).
         self.path = ""
         self.missing: dict[str, set[str]] = {}
         self.used: dict[str, int] = {}
         self.timeouts: dict[str, int] = {}
+        self.load_failures: dict[str, int] = {}
 
     def snapshot(self) -> dict[str, Any]:
         """Counts only, shipped to the parent after every entry."""
         every: set[str] = set().union(*self.missing.values()) if self.missing else set()
         return {**self.refused, "cosine_missing": len(every),
                 "cosine_missing_by_path": {p: len(s) for p, s in self.missing.items()},
-                "cosine_used": dict(self.used), "cosine_timeouts": dict(self.timeouts)}
+                "cosine_used": dict(self.used), "cosine_timeouts": dict(self.timeouts),
+                "cosine_load_failures": dict(self.load_failures)}
 
 
 # Foreign-function modules that reach libc directly, past every patch below.
@@ -270,6 +273,11 @@ def _offline(vectors: dict[str, list[float]] | None = None):
             except TimeoutError:
                 guard.timeouts[path] = guard.timeouts.get(path, 0) + 1
                 raise
+            except ImportError:
+                # The scan module (or a native dependency) failed to load —
+                # not a deadline miss, not a missing stored vector.
+                guard.load_failures[path] = guard.load_failures.get(path, 0) + 1
+                raise
             guard.used[path] = guard.used.get(path, 0) + 1
             return rows
 
@@ -280,6 +288,11 @@ def _offline(vectors: dict[str, list[float]] | None = None):
     for obj, name, fake in targets:
         if hasattr(obj, name):
             setattr(obj, name, fake)
+    # The replica cosine scan imports ctypes at module load. Load it before
+    # the native ban so scoring can use the already-bound BLAS helpers; a
+    # fresh ctypes/cffi import is still refused below (belt and braces). The
+    # OS sandbox remains the network guarantee.
+    import khipu.vector_scan  # noqa: F401
     # Already-imported foreign-function modules come out of sys.modules so a
     # re-import reaches the finder; the originals go back on exit.
     purged = {m: sys.modules.pop(m) for m in list(sys.modules)
@@ -419,7 +432,9 @@ def _previous_figures(history: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The last completed run's figures: a stopped or failed run is no baseline."""
     for rec in reversed(history):
         if _completed(rec) and isinstance(rec.get("paths"), dict):
-            return {"ts": rec.get("ts"), "paths": {
+            off = rec.get("offline") if isinstance(rec.get("offline"), dict) else {}
+            return {"ts": rec.get("ts"), "cosine_skipped": bool(off.get("cosine_skipped")),
+                    "paths": {
                 p: {"hit_rate": m.get("hit_rate"), "mrr": m.get("mrr")}
                 for p, m in rec["paths"].items() if isinstance(m, dict)}}
     return None
@@ -436,15 +451,21 @@ def _score_entry(entry: dict[str, Any], deadline: float,
         if recall_eval._entry_applies(entry, p):
             hub_before = guard.refused["hub"]
             guard.path = p
-            seen = (guard.used.get(p, 0), len(guard.missing.get(p, ())), guard.timeouts.get(p, 0))
+            seen = (guard.used.get(p, 0), len(guard.missing.get(p, ())),
+                    guard.timeouts.get(p, 0), guard.load_failures.get(p, 0))
             row = recall_eval.eval_one_path(entry, p, deadline=deadline)
-            if (str(row.get("degraded") or "").startswith("embedding")
+            degraded = str(row.get("degraded") or "")
+            if (degraded.startswith("embedding")
                     and seen == (guard.used.get(p, 0), len(guard.missing.get(p, ())),
-                                 guard.timeouts.get(p, 0))
+                                 guard.timeouts.get(p, 0), guard.load_failures.get(p, 0))
                     and not guard.refused["no_profile"]):
-                # The embedding or scan did not come back before the lookup's
-                # own deadline, so the wrapper never saw it finish.
-                guard.timeouts[p] = guard.timeouts.get(p, 0) + 1
+                # The wrapper never saw the cosine leg finish. A real deadline
+                # miss is "embedding late"; anything else (load failure, other
+                # error) is not a timeout.
+                if "late" in degraded:
+                    guard.timeouts[p] = guard.timeouts.get(p, 0) + 1
+                else:
+                    guard.load_failures[p] = guard.load_failures.get(p, 0) + 1
             if row.get("reason") == recall_eval.DEADLINE_REASON:
                 return None
             if guard.refused["hub"] > hub_before and (row.get("error") or row.get("timeout")):
@@ -630,6 +651,16 @@ def _child_entry() -> None:
         if ref is not None:
             _resolve(f"{ref[0]}.{ref[1]}")(*ref[2])
         with _offline(_read_vectors(payload.get("vectors"))) as guard:
+            # Cold matrix load can spend most of the 0.95 s cosine budget; warm
+            # it once before any golden lookup so scoring measures the scan.
+            try:
+                from khipu import hub_snapshot as _hs
+
+                profile = _hs.active_snapshot_profile()
+                if profile:
+                    _hs.warm_matrix(profile)
+            except Exception:  # noqa: BLE001 — scoring still runs; a cold load may time out
+                pass
             try:
                 for entry in scoring:
                     if time.monotonic() >= deadline:
@@ -786,12 +817,18 @@ def run_nightly_eval(*, golden: Path | None = None, budget_s: float = BUDGET_S,
 
 def _cosine_skipped(refused: dict[str, Any], rows: dict[str, list[Any]]) -> bool:
     """True unless the push's cosine leg actually ran and returned: it needs an
-    active profile, no missing vector, no cosine timeout, and at least one
-    returned cosine scan on every path that has scored rows."""
+    active profile, no missing vector, no cosine timeout or load failure, and
+    at least one returned cosine scan on every path that has scored rows.
+    Keyword-only runs are never a semantic recall measurement."""
     used = refused.get("cosine_used") or {}
+    if not any(used.values()):
+        # Nothing used cosine: keyword-only even when counters look clean
+        # (e.g. no scored rows yet, or every path skipped the leg silently).
+        return True
     return bool(
         refused.get("embed") or refused.get("cosine_missing") or refused.get("no_profile")
         or sum((refused.get("cosine_timeouts") or {}).values())
+        or sum((refused.get("cosine_load_failures") or {}).values())
         or any(got and not used.get(p) for p, got in rows.items())
     )
 
@@ -878,6 +915,9 @@ def _measured_with(last: dict[str, Any]) -> str:
     timeouts = sum((off.get("cosine_timeouts") or {}).values())
     if timeouts:
         why.append(f"{timeouts} cosine timeouts")
+    loads = sum((off.get("cosine_load_failures") or {}).values())
+    if loads:
+        why.append(f"{loads} cosine load failures")
     return "keyword only, " + ", ".join(why) if why else "keyword only"
 
 
@@ -930,9 +970,22 @@ def recall_eval_health(*, now: datetime | None = None) -> dict[str, Any]:
     if total and failed > FAILED_SHARE * total:
         return out("yellow", f"{failed} of {total} recall lookups failed or timed out, "
                              "so tonight's figures are not compared.")
-    if rate is not None and isinstance(prev_rate, (int, float)) and rate < prev_rate - ALLOWED_DROP - 1e-9:
+    off = last.get("offline") if isinstance(last.get("offline"), dict) else {}
+    cosine_skipped = bool(off.get("cosine_skipped"))
+    # A keyword-only figure is not a recall measurement: do not gate on the
+    # 60% floor or treat it as comparable to a semantic run.
+    if cosine_skipped and rate is not None:
+        return out("yellow", f"Tonight's recall check ran without semantic search "
+                             f"({_measured_with(last)}). The {_pct(rate)} hit rate is "
+                             "keyword only, not a recall measurement.")
+    prev_off = last.get("previous") if isinstance(last.get("previous"), dict) else {}
+    # Only compare against a previous semantic figure. A keyword-only baseline
+    # (or tonight keyword-only, handled above) is a different measurement.
+    prev_was_keyword = prev_off.get("cosine_skipped") is True
+    comparable_prev = prev_rate if (isinstance(prev_rate, (int, float)) and not prev_was_keyword) else None
+    if rate is not None and comparable_prev is not None and rate < comparable_prev - ALLOWED_DROP - 1e-9:
         return out("red", f"Recall got worse: the right memory is found {_pct(rate)} of the time, "
-                          f"down from {_pct(prev_rate)} the run before ({_measured_with(last)}).")
+                          f"down from {_pct(comparable_prev)} the run before ({_measured_with(last)}).")
     if rate is not None and rate < HIT_FLOOR:
         return out("red", f"Recall is below the {_pct(HIT_FLOOR)} floor: the right memory is found "
                           f"{_pct(rate)} of the time ({_measured_with(last)}).")
@@ -948,7 +1001,7 @@ def recall_eval_health(*, now: datetime | None = None) -> dict[str, Any]:
     if rate is None:
         return out("yellow", "The golden set has no queries for the prompt path, so recall is not measured.")
     return out("green", f"The right memory is found {_pct(rate)} of the time, {_measured_with(last)}"
-                        + (f" (was {_pct(prev_rate)})." if isinstance(prev_rate, (int, float)) else "."))
+                        + (f" (was {_pct(comparable_prev)})." if comparable_prev is not None else "."))
 
 
 # ---- khipu recall eval --install ----------------------------------------------

@@ -3140,6 +3140,35 @@ def hybrid_search(
     )
 
     cosine_rows: list[dict[str, Any]] = []
+    literal_rows: list[dict[str, Any]] = []
+    # Hybrid: run literal on its own hub connection beside embed+vector scan.
+    # A psycopg connection is not shared across threads (same posture as
+    # ``_LibraryLegs``). Literal-only stays on the main connection below;
+    # semantic has no literal leg.
+    literal_box: dict[str, Any] = {}
+    literal_thread: threading.Thread | None = None
+    want_literal = mode in ("hybrid", "literal") and kind != LIBRARY_KIND
+    if mode == "hybrid" and want_literal:
+        literal_kind = kind if kind in _LITERAL_KINDS else None
+
+        def _literal_worker() -> None:
+            _t = time.monotonic()
+            try:
+                with try_hub_connect() as lit_conn:
+                    with lit_conn.cursor() as lit_cur:
+                        literal_box["rows"] = _literal_candidates(
+                            lit_cur, query, oversample, kind=literal_kind, filters=filters
+                        )
+            except BaseException as exc:  # noqa: BLE001 — memory answer must not sink on literal
+                literal_box["error"] = f"{type(exc).__name__}: {exc}"[:120]
+            finally:
+                literal_box["ms"] = round((time.monotonic() - _t) * 1000, 1)
+
+        literal_thread = threading.Thread(
+            target=_literal_worker, name="khipu-hybrid-literal", daemon=True,
+        )
+        literal_thread.start()
+
     # kind="node" (only valid for hybrid/literal, never semantic — checked
     # above) has nothing to contribute to the cosine list: nodes are never
     # embedded. Skip cosine entirely rather than let semantic_kind=None fall
@@ -3167,10 +3196,19 @@ def hybrid_search(
                 degraded = "no-embedding"
             timing["embed_error"] = msg[:120]
 
+    if literal_thread is not None:
+        literal_thread.join()
+        if "ms" in literal_box:
+            timing["literal_ms"] = literal_box["ms"]
+        if literal_box.get("error"):
+            timing["literal_error"] = literal_box["error"]
+            degraded_legs.append("literal:error")
+        else:
+            literal_rows = list(literal_box.get("rows") or [])
+
     with try_hub_connect() as conn:
         with conn.cursor() as cur:
-            literal_rows: list[dict[str, Any]] = []
-            if mode in ("hybrid", "literal") and kind != LIBRARY_KIND:
+            if mode == "literal" and want_literal:
                 literal_kind = kind if kind in _LITERAL_KINDS else None
                 _t = time.monotonic()
                 literal_rows = _literal_candidates(

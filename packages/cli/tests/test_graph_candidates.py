@@ -145,6 +145,31 @@ def test_an_expired_deadline_drops_the_whole_leg(tmp_path):
     assert candidates == []
 
 
+def test_replica_keeps_finished_expansions_when_a_later_seed_misses(tmp_path):
+    with corpus.installed_corpus(tmp_path):
+        con = hs.open_snapshot()
+        fused = [
+            {"kind": "topic", "id": "billing-service", "score": 1.0},
+            {"kind": "topic", "id": "sync-job", "score": 0.5},
+        ]
+        real_wiki = gc._replica_topic_wiki
+        calls = {"n": 0}
+
+        def wiki_then_miss(con_arg, slug, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_wiki(con_arg, slug, **kw)
+            raise gc.DeadlineMissed()
+
+        with mock.patch.object(gc, "_replica_topic_wiki", side_effect=wiki_then_miss), \
+             mock.patch.object(gc, "_replica_topic_recent_episodes", return_value=[]):
+            candidates, missed = gc.replica_candidates(
+                con, fused, deadline=time.monotonic() + gc.REPLICA_LEG_DEADLINE_S
+            )
+    assert missed is True
+    assert any(c["id"] == "rate-limits" for c in candidates)
+
+
 def test_no_topic_or_episode_seeds_is_a_no_op():
     candidates, missed = gc.replica_candidates(
         None, [{"kind": "node", "id": "path:foo/bar", "score": 1.0}],

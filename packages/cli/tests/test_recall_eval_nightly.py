@@ -972,3 +972,124 @@ def test_every_vector_present_and_scan_returned_is_semantic():
 def test_a_path_whose_cosine_never_returned_is_not_semantic():
     snap = _guard_run(PROFILE, [("prompt", "q", "ok")], _vec("q"))
     assert ren._cosine_skipped(snap, ROWS) is True
+
+
+def test_nothing_used_cosine_is_always_skipped():
+    snap = {"cosine_used": {}, "cosine_missing": 0, "no_profile": 0, "embed": 0,
+            "cosine_timeouts": {}, "cosine_load_failures": {}}
+    assert ren._cosine_skipped(snap, {"prompt": [], "status": []}) is True
+
+
+def test_a_cosine_load_failure_is_keyword_only_not_a_timeout():
+    from khipu import hub_snapshot, recall_prompt
+
+    saved = hub_snapshot.cosine_candidates_snapshot
+
+    def boom(*_a, **_k):
+        raise ImportError("ctypes refused: the recall eval runs offline")
+
+    hub_snapshot.cosine_candidates_snapshot = boom
+    try:
+        with ren._offline(_vec("q")) as guard:
+            guard.path = "prompt"
+            try:
+                vec = recall_prompt._cached_query_embed("q", PROFILE)
+                hub_snapshot.cosine_candidates_snapshot(vec, PROFILE)
+            except ImportError:
+                pass
+            snap = guard.snapshot()
+    finally:
+        hub_snapshot.cosine_candidates_snapshot = saved
+    assert snap["cosine_load_failures"] == {"prompt": 1}
+    assert snap["cosine_timeouts"] == {}
+    assert ren._cosine_skipped(snap, ROWS) is True
+    label = ren._measured_with({"offline": {**snap, "cosine_skipped": True}})
+    assert "1 cosine load failures" in label
+    assert "timeout" not in label
+
+
+def test_real_blocker_and_fake_replica_cosine_lookup_uses_cosine(tmp_path, monkeypatch):
+    """Under the real NativeBlocker, a golden vector against a fake replica must
+    actually run the BLAS scan (cosine_used nonzero). Stubbing the scan hid the
+    ctypes-at-import failure that made the nightly keyword-only."""
+    import sys
+
+    from khipu import recall_prompt
+
+    profile = "local-model@2"
+    snap = tmp_path / "hub_snapshot.sqlite"
+    con = sqlite3.connect(snap)
+    hub_snapshot._create_schema(con)
+    con.execute(
+        "INSERT INTO embedding_profiles (id, provider, model, dim, normalize, is_active) "
+        "VALUES (?, 'openai-compatible', 'local-model', 2, 'l2', 1)",
+        (profile,),
+    )
+    con.execute(
+        "INSERT INTO snapshot_meta VALUES (?, ?)",
+        (f"embedding_profile:{profile}",
+         json.dumps({"id": profile, "provider": "openai-compatible", "model": "local-model",
+                     "dim": 2, "normalize": "l2", "endpoint": "http://127.0.0.1:11434"})),
+    )
+    con.execute(
+        "INSERT INTO episodes (id, ts, summary, topics) VALUES (1, '2026-10-30T00:00:00Z', "
+        "'golden otter memory', '[]')"
+    )
+    con.execute(
+        "INSERT INTO memory_embeddings (profile, kind, ref, chunk_idx, chunk_text, embedding) "
+        "VALUES (?, 'episode', '1', 0, 'golden otter memory', ?)",
+        (profile, hub_snapshot._vector_to_blob([1.0, 0.0])),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setattr(hub_snapshot, "snapshot_path", lambda: snap)
+    monkeypatch.setattr(hub_snapshot, "meta_path", lambda: tmp_path / "meta.json")
+    hub_snapshot._MATRIX_CACHE.clear()
+    # Force a fresh vector_scan import under the guard (the bug: ctypes banned).
+    for name in list(sys.modules):
+        if name == "khipu.vector_scan" or name.startswith("khipu.vector_scan."):
+            del sys.modules[name]
+    query = "golden otter"
+    vectors = {recall_prompt._query_embed_cache_key(profile, query): [1.0, 0.0]}
+    with ren._offline(vectors) as guard:
+        # ctypes still refused for a fresh import (offline guard intact).
+        with pytest.raises(ImportError, match="refused"):
+            __import__("ctypes")
+        guard.path = "prompt"
+        assert hub_snapshot.active_snapshot_profile() == profile
+        vec = recall_prompt._cached_query_embed(query, profile)
+        rows = hub_snapshot.cosine_candidates_snapshot(vec, profile, limit=4)
+        snap_out = guard.snapshot()
+    assert rows and rows[0]["id"] == "1"
+    assert snap_out["cosine_used"].get("prompt", 0) >= 1
+    assert snap_out["cosine_timeouts"] == {}
+    assert snap_out["cosine_load_failures"] == {}
+    assert ren._cosine_skipped(snap_out, {"prompt": [{}], "status": []}) is False
+
+
+def test_keyword_only_doctor_row_is_yellow_not_a_floor_or_regression(world):
+    prompt = {"total": 20, "hit_rate": 0.65, "abstain_total": 0, "stale_violations": 0,
+              "errors": 0, "timeouts": 0}
+    rec = {"ts": (NOW - timedelta(hours=2)).isoformat(), "ok": True, "entries": 25,
+           "truncated": False, "paths": {"prompt": prompt},
+           "offline": {"cosine_skipped": True, "cosine_missing": 3, "cosine_used": {}},
+           "previous": {"cosine_skipped": False, "paths": {"prompt": {"hit_rate": 0.9}}}}
+    ren._write_history([rec])
+    row = ren.recall_eval_health(now=NOW)
+    assert row["level"] == "yellow" and row["ok"]
+    assert "keyword only" in row["summary"]
+    assert "not a recall measurement" in row["summary"]
+
+
+def test_keyword_only_is_not_compared_to_a_semantic_previous(world):
+    """A semantic→keyword (or keyword→semantic) change is not a hit-rate regression."""
+    prompt = {"total": 20, "hit_rate": 0.9, "abstain_total": 0, "stale_violations": 0,
+              "errors": 0, "timeouts": 0}
+    # Tonight semantic, previous keyword-only with a "higher" rate — must not red.
+    rec = {"ts": (NOW - timedelta(hours=2)).isoformat(), "ok": True, "entries": 25,
+           "truncated": False, "paths": {"prompt": prompt},
+           "offline": {"cosine_skipped": False, "cosine_used": {"prompt": 1}},
+           "previous": {"cosine_skipped": True, "paths": {"prompt": {"hit_rate": 0.99}}}}
+    ren._write_history([rec])
+    row = ren.recall_eval_health(now=NOW)
+    assert row["level"] == "green" and "was" not in row["summary"]
