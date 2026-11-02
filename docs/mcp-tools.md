@@ -248,11 +248,11 @@ A time you give is recorded as a guess. A hold ends after 24 hours unless `until
 
 ### khipu_route_rule
 
-Record an owner-requested standing rule, or a change to rule number `rule`. Parameters: `text` and `owner_request` (both required), `rule` (optional), and `holds` (an optional map of hold ids to `end` or `keep`). Changing an existing rule also requires `base`, the owner revision observed when preparing the request. A request that crosses a later owner change is recorded as crossed and never made live. Otherwise the wording is live at once but stays pending until the owner confirms it in Settings > Accounts and routing, through owner direction, or at a terminal. This tool cannot confirm, retire, dismiss or undo a rule.
+Record an owner-requested standing rule, or a change to rule number `rule`. Parameters: `text` and `owner_request` (both required), `rule` (optional), and `holds` (an optional map of hold ids to `end` or `keep`). Changing an existing rule also requires `base`, the owner revision observed when preparing the request; a `base` on an addition is ignored (an addition has nothing to be stale against). A change that crosses a later owner revision is recorded as crossed and never made live, and the write answers that it did not take effect. Otherwise the wording is live at once but stays pending until the owner confirms it in Settings > Accounts and routing, through owner direction, or at a terminal. This tool cannot confirm, retire, dismiss or undo a rule.
 
 ### khipu_route_priority
 
-Record the owner’s account order. Parameters: `entries` (the accounts in the owner’s order, with his words for each role), `owner_request` and `base` (the observed owner revision) are required; `until` is optional. Each entry may have its own `until`, in addition to the whole-priority expiry. A request that crosses a later owner change is recorded as crossed and never made live. Otherwise it is live at once and marked unconfirmed until the owner confirms or undoes it in Settings > Accounts and routing or through owner direction. This tool cannot confirm, undo or clear a priority.
+Record the owner’s account order. Parameters: `entries` (the accounts in the owner’s order, with his words for each role), `owner_request` and `base` (the observed owner revision) are required; `until` is optional. Each entry may have its own `until`, in addition to the whole-priority expiry. A request that crosses a later owner change is recorded as crossed and never made live, and the write answers that it did not take effect. Otherwise it is live at once and marked unconfirmed until the owner confirms or undoes it in Settings > Accounts and routing or through owner direction. This tool cannot confirm, undo or clear a priority.
 
 ### khipu_owner_act
 
@@ -262,7 +262,7 @@ Khipu invokes the corresponding CLI command with `--owner-direction`. The check 
 
 The answer is the command’s own result, or a tool error `{ok: false, code, error}`. On a refusal, report the reason to the owner. Every action is logged and can be undone from Settings > Owner actions or by requesting `direction.undo` with its id.
 
-Known limits. Khipu trusts each app's prompt hook: it can't tell apart a hook delivery that the app itself replays or reorders, or a process that impersonates the app's own agent. In T3, a held change is confirmed by the owner's latest reply after the question. T3 conversations running Codex, Cursor or Antigravity can't confirm a held change yet; confirm it in the Khipu app.
+Known limits. Khipu trusts each app's prompt hook: it can't tell apart a hook delivery that the app itself replays or reorders, or a process that impersonates the app's own agent. In T3, a held change is confirmed by the owner's latest reply after the question. T3 conversations running Codex, Cursor or Antigravity can't confirm a held change yet; confirm it in the Khipu app. Owner hold and confirm give T3's database a longer read budget with a few retries; if that read still fails, the refusal says Khipu could not read T3's record and to try again (not that the call was a dispatched job).
 
 ### khipu_project
 

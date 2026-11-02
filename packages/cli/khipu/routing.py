@@ -2194,6 +2194,11 @@ def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = No
         entity = event_identity.entity(event)
         if entity:
             event.setdefault("entity", entity)
+            # A pending addition has no owner revision underneath it: never
+            # record a caller-sent base (any real value would cross against
+            # "0" in the fold). Edits and priority still carry their base.
+            if kind == "rule_add" and event.get("pending"):
+                event.pop("base", None)
             event.setdefault("base", revisions.get(entity, "0"))
             if not event.get("pending"):
                 revisions[entity] = event["id"]
@@ -3903,7 +3908,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         record = {"id": key, "entity": entity_key, "kind": kind, "base": base,
                   "author": info["written_by"], "written_by": info["written_by"],
                   "at": _iso(info["at"]), "notify": None,
-                  "n": event.get("n") or (rules.get(entity_key) or {}).get("n")}
+                  "n": event.get("n") or (rules.get(entity_key) or {}).get("n"),
+                  "owner_request": event.get("owner_request") if isinstance(event.get("owner_request"), str) else None}
         if base is not None and base != owner_revision:
             proposals[key] = dict(record, status="crossed", notify=info["written_by"], ended_at=_iso(info["at"]))
             return False
@@ -6375,6 +6381,23 @@ def _io_phrase(exc: OSError, verb: str) -> str:
     return f"can't {verb} it"
 
 
+def _crossed_write(written: dict, view: dict) -> dict | None:
+    """When the just-written pending request was crossed and never took
+    effect: the plain words the write must answer with, else None."""
+    if not written.get("pending"):
+        return None
+    key = written.get("proposal") or written.get("id")
+    proposal = (view.get("proposals") or {}).get(key) if key else None
+    if not proposal or proposal.get("status") != "crossed":
+        return None
+    words = proposal.get("owner_request")
+    what = "This request"
+    if isinstance(words, str) and words.strip():
+        what = f"This request ({words.strip()})"
+    return {"status": "crossed",
+            "error": f"{what} was crossed by a newer owner revision and never took effect."}
+
+
 def _done(written: dict, view: dict, **extra) -> dict:
     out = {"ok": True, "id": written["id"], **extra, "version": view.get("version")}
     if written.get("type") == "hold":
@@ -6384,6 +6407,10 @@ def _done(written: dict, view: dict, **extra) -> dict:
         out["revision"] = written["id"]
     if view.get("saved") is False:
         out["saved"] = False
+    crossed = _crossed_write(written, view)
+    if crossed:
+        out["ok"] = False
+        out.update(crossed)
     return out
 
 
@@ -6890,7 +6917,8 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     read. The receipt only verifies that revision was shown;
     an owner write after that read crosses the request.
     """
-    if (n is not None or base is not None) and (not isinstance(base, str) or not base.strip()):
+    # An addition has nothing to be stale against: never require or record base.
+    if n is not None and (not isinstance(base, str) or not base.strip()):
         raise RouteError("base must be the owner revision the request was prepared against")
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
@@ -6913,7 +6941,6 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
                                     "source": "added at the owner's request", "date": now.date().isoformat(),
                                     "seeded": False, "pending": True, "owner_request": request_words,
                                     "written_by": by, "via": via, "op": op,
-                                    **({"base": base} if base is not None else {}),
                                     **({"holds": holds} if holds is not None else {})})
         rule = next((r for r in view.get("rules", []) if r["entity"] == written["entity"]), None)
         return dict(_done(written, view), n=rule["n"] if rule else _rule_number(written))
@@ -8701,9 +8728,11 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
             what = "priority"
         else:
             what = f"rule {item['n']}" if item.get("n") is not None else "new rule (number pending)"
+        request = item.get("owner_request")
+        named = f" ({request})" if isinstance(request, str) and request.strip() else ""
         suffix = ("was replaced by a newer proposal." if item["status"] == "replaced" else
                   "was crossed by a newer owner revision and never took effect.")
-        items.append(("notice", f"A {what} proposal by {who} {suffix}", item["id"]))
+        items.append(("notice", f"A {what} proposal{named} by {who} {suffix}", item["id"]))
     return items
 
 
@@ -9325,7 +9354,8 @@ _LANE_FIELDS = ("runner", "lane", "state", "until", "basis", "at", "id", "reason
 _RUNNER_FIELDS = ("name", "heartbeat_at", "interval", "silent", "silent_deadline", "unreadable",
                   "unreadable_since", "lanes", "unmatched_lanes", "lane_matches")
 _TABLE_FIELDS = ("hash", "stamped_at", "changed_at", "error")
-_WRITE_FIELDS = ("ok", "id", "entity", "revision", "state", "until", "basis", "ended", "version", "saved")
+_WRITE_FIELDS = ("ok", "id", "entity", "revision", "state", "until", "basis", "ended", "version", "saved",
+                 "status", "error")
 
 
 _ID_SALTS: dict[str, bytes] = {}

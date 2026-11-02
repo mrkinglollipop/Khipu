@@ -952,10 +952,13 @@ TOOLS: list[dict] = [
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
         "description": (
             "Record the owner's request to add a standing rule, or to change "
-            "one when `rule` names its number. The wording is live for every "
-            "conversation immediately (unless `base` is stale: then it is "
-            "recorded as crossed and never applied), marked with this "
-            "conversation as the requester, and remains pending until the owner confirms it in "
+            "one when `rule` names its number. An addition is live for every "
+            "conversation immediately (a `base` on an add is ignored: an "
+            "addition has nothing to be stale against). A change to an "
+            "existing rule is live unless `base` is stale: then it is "
+            "recorded as crossed and never applied, and the write answers "
+            "that it did not take effect. Marked with this conversation as "
+            "the requester, and remains pending until the owner confirms it in "
             "Settings -> Routing or with a terminal confirmation. This tool "
             "cannot confirm, retire, dismiss or undo a rule."
         ),
@@ -970,9 +973,10 @@ TOOLS: list[dict] = [
                 "holds": {"type": "object", "additionalProperties": {"type": "string", "enum": ["end", "keep"]},
                           "description": "Explicit end-or-keep choices for held or paused accounts"},
                 "base": {"type": "string", "minLength": 1, "maxLength": 256,
-                         "description": "A rule owner revision this conversation was shown by khipu_route "
-                                        "when this request was prepared; a request delivered after the owner "
-                                        "changed the rule is recorded as crossed, never made live"},
+                         "description": "When changing an existing rule: the owner revision this conversation "
+                                        "was shown by khipu_route when this request was prepared; a request "
+                                        "delivered after the owner changed the rule is recorded as crossed, "
+                                        "never made live. Ignored when adding a new rule."},
                 "owner_request": {"type": "string", "description": "This conversation's one-line words describing the owner's request"},
             },
             "required": ["text", "owner_request"],
@@ -987,7 +991,8 @@ TOOLS: list[dict] = [
             "of accounts he wants used first (each by its label or its id, as "
             "khipu_route lists them), with his words for each one's role and an "
             "optional end. It is live for every conversation at once (unless `base` is stale: "
-            "then it is recorded as crossed and never applied), marked "
+            "then it is recorded as crossed and never applied, and the write "
+            "answers that it did not take effect), marked "
             "with this conversation and unconfirmed, with the priority it "
             "replaced shown beside it, until the owner confirms or undoes it "
             "in Settings -> Routing. Khipu keeps his order as given and never "
@@ -2909,12 +2914,13 @@ def _tool_route_rule(args: dict) -> dict:
     if not isinstance(text, str):
         raise ValueError("text must be text")
     base = args.get("base")
-    if (args.get("rule") is not None or base is not None) and (not isinstance(base, str) or not base.strip()):
+    number = args.get("rule")
+    # An addition never records base; only a change to an existing rule needs it.
+    if number is not None and (not isinstance(base, str) or not base.strip()):
         raise routing.RouteError("base must be the owner revision the request was prepared against")
     owner_request = args.get("owner_request")
     if not isinstance(owner_request, str) or not owner_request.strip() or "\n" in owner_request or "\r" in owner_request:
         raise ValueError("owner_request must be one line of text")
-    number = args.get("rule")
     if number is not None and (type(number) is not int or number < 1):
         raise ValueError("rule must be a positive integer")
     holds = args.get("holds")
@@ -2922,7 +2928,8 @@ def _tool_route_rule(args: dict) -> dict:
                                                                       for hold, choice in holds.items())):
         raise ValueError('holds must map each hold id to "end" or "keep"')
     return routing.request_rule(text, n=number, owner_request=owner_request,
-                                author=routing.conversation_author(), via="mcp", holds=holds, base=base)
+                                author=routing.conversation_author(), via="mcp", holds=holds,
+                                base=base if number is not None else None)
 
 
 @_with_route_receipts

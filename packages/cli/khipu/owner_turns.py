@@ -223,12 +223,17 @@ def _codex_originator(transcript: str) -> str | None:
     return originator if isinstance(originator, str) and originator else None
 
 
+def _t3_attempts() -> int:
+    """Owner hold/confirm lengthen T3 waits and get a few more tries; hooks stay at two."""
+    return 4 if t3.owner_read_active() else 2
+
+
 def _t3_thread(session: str) -> str | None:
     """The T3 thread running ``session``, from T3's own record. Every row is
     looked at (a long-running conversation's row falls behind the newest
-    window as other threads start), and a failed read (a lock, the deadline)
-    is tried once more; a second failure means no thread."""
-    for _ in range(2):
+    window as other threads start). Failed reads are retried a bounded
+    number of times; then no thread."""
+    for _ in range(_t3_attempts()):
         thread, definitive = t3.thread_for_session_result(session, whole_table=True)
         if definitive:
             return thread
@@ -238,15 +243,15 @@ def _t3_thread(session: str) -> str | None:
 def _t3_membership(session: str) -> str:
     """"t3" when T3 runs ``session``, "none" when T3's record settles that it
     does not (or there is no T3 on this Mac), "unverified" when the record
-    exists but could not be read twice. Owner eligibility must not treat a
-    failed read as "not T3": that would hand a T3 session its native, trusted
-    entrypoint back."""
+    exists but could not be read after the bounded retries. Owner eligibility
+    must not treat a failed read as "not T3": that would hand a T3 session
+    its native, trusted entrypoint back."""
     if not session:
         return "none"
     path = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")
     if not path.is_file():
         return "none"
-    for _ in range(2):
+    for _ in range(_t3_attempts()):
         threads, definitive = t3.session_thread_ids_result(session)
         if definitive:
             # Any match, two distinct threads included, means T3 runs it.
@@ -308,7 +313,7 @@ def dispatched_job(env: dict, session: str = "", *, t3_thread: bool = False) -> 
         thread = _t3_thread(session) if session else None
         if not thread:
             return "a T3 thread Khipu could not look up, so it can't tell it is not a job"
-        for _ in range(2):
+        for _ in range(_t3_attempts()):
             delegated, definitive = t3.delegated_thread_result(thread)
             if definitive:
                 return "a T3 delegated child thread" if delegated else None

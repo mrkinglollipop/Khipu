@@ -17,6 +17,8 @@ a missing file, bad JSON or a changed shape is "nothing found", never an error.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import hashlib
 import json
 import os
@@ -31,6 +33,51 @@ from typing import Any
 
 # T3 starts its title-generating Claude sessions in temp folders with this name.
 HELPER_CWD_MARKER = "t3code-claude-title-"
+
+# Hook paths keep a tight SQLite budget (prompt recall has a time budget).
+# Owner hold/confirm paths opt into a longer one via ``owner_read_budget``.
+_HOOK_BUSY_MS = 2
+_HOOK_DEADLINE_S = 0.05
+_HOOK_CONNECT_S = 0.5
+_OWNER_BUSY_MS = 1000
+_OWNER_DEADLINE_S = 2.0
+_OWNER_CONNECT_S = 2.0
+_owner_read = contextvars.ContextVar("t3_owner_read", default=False)
+
+
+@contextlib.contextmanager
+def owner_read_budget():
+    """Longer T3 SQLite waits for owner hold/confirm. Hook lookups stay tight."""
+    token = _owner_read.set(True)
+    try:
+        yield
+    finally:
+        _owner_read.reset(token)
+
+
+def owner_read_active() -> bool:
+    return bool(_owner_read.get())
+
+
+def _read_budget() -> tuple[float, int, float]:
+    """``(connect_timeout_s, busy_timeout_ms, deadline_s)`` for one T3 open."""
+    if _owner_read.get():
+        return _OWNER_CONNECT_S, _OWNER_BUSY_MS, _OWNER_DEADLINE_S
+    return _HOOK_CONNECT_S, _HOOK_BUSY_MS, _HOOK_DEADLINE_S
+
+
+def _bind_read_budget(con: sqlite3.Connection) -> None:
+    """Apply the active busy timeout and VM deadline to an open connection."""
+    _connect_s, busy_ms, deadline_s = _read_budget()
+    con.execute(f"PRAGMA busy_timeout = {busy_ms}")
+    deadline = time.monotonic() + deadline_s
+    con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+
+
+def _connect_readonly(path: Path) -> sqlite3.Connection:
+    """Read-only open with the active connect timeout (hook or owner)."""
+    connect_s, _busy_ms, _deadline_s = _read_budget()
+    return sqlite3.connect(_readonly_uri(path), uri=True, timeout=connect_s)
 
 # ContextHandoffDelivery.ts opens the hand-over with "Context handoff (<strategy>):"
 # and ProviderTurnStartService.ts joins it to the typed text as
@@ -140,12 +187,10 @@ def thread_for_session_result(sid: str, *, whole_table: bool = False) -> tuple[s
     try:
         # With T3 closed there is no -wal file, and even a mode=ro open of a
         # WAL database would create -wal/-shm beside it; immutable reads the
-        # file as is and leaves T3's folder untouched.
-        mode = "?mode=ro" if Path(f"{path}-wal").exists() else "?mode=ro&immutable=1"
-        con = sqlite3.connect(path.absolute().as_uri() + mode, uri=True, timeout=0.5)
-        con.execute("PRAGMA busy_timeout = 2")
-        deadline = time.monotonic() + 0.05
-        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        # file as is and leaves T3's folder untouched. Owner hold/confirm
+        # lengthen the budget; hooks keep the tight one.
+        con = _connect_readonly(path)
+        _bind_read_budget(con)
         if whole_table:
             # Only the full exact-match scan, so it has the whole deadline: a
             # native id naming two distinct threads anywhere is ambiguous
@@ -210,11 +255,8 @@ def session_thread_ids_result(sid: str) -> tuple[list[str] | None, bool]:
         return None, False
     con = None
     try:
-        mode = "?mode=ro" if Path(f"{path}-wal").exists() else "?mode=ro&immutable=1"
-        con = sqlite3.connect(path.absolute().as_uri() + mode, uri=True, timeout=0.5)
-        con.execute("PRAGMA busy_timeout = 2")
-        deadline = time.monotonic() + 0.05
-        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        con = _connect_readonly(path)
+        _bind_read_budget(con)
         rows = con.execute(
             "SELECT DISTINCT thread_id FROM orchestration_v2_projection_provider_threads "
             "WHERE CASE WHEN json_valid(payload_json) THEN "
@@ -333,10 +375,8 @@ def _read_messages(thread_id: str, read):
         return None, False
     con = None
     try:
-        con = sqlite3.connect(_readonly_uri(path), uri=True, timeout=0.5)
-        con.execute("PRAGMA busy_timeout = 2")
-        deadline = time.monotonic() + 0.05
-        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        con = _connect_readonly(path)
+        _bind_read_budget(con)
         return read(con), True
     except (OSError, ValueError, sqlite3.Error):
         return None, False
@@ -423,10 +463,8 @@ def delegated_thread_result(thread_id: str) -> tuple[bool, bool]:
         return False, False
     con = None
     try:
-        con = sqlite3.connect(_readonly_uri(path), uri=True, timeout=0.5)
-        con.execute("PRAGMA busy_timeout = 2")
-        deadline = time.monotonic() + 0.05
-        con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+        con = _connect_readonly(path)
+        _bind_read_budget(con)
         tables = {row[0] for row in con.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
         for table in ("orchestration_v2_projection_threads",
