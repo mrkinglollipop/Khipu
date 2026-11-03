@@ -22,7 +22,11 @@ def build(monkeypatch):
         return {}
 
     def signature(keys):
-        # Without the warmed fold, the build itself pays it.
+        # Without the warmed fold, the build needs it: under parse_deferred
+        # (a cold child) it asks for it at once, as inventory_accounts does;
+        # otherwise the build itself pays it.
+        if not state["folded"] and getattr(routing._PARSE_DEFERRED, "on", False):
+            raise routing.ParseWanted()
         time.sleep(state["signature_s"] if state["folded"] else 0.35)
         return ("sig", "inventory-key")
 
