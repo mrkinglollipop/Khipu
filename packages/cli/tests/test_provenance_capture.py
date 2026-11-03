@@ -33,9 +33,10 @@ _N = itertools.count(1)
 
 
 @pytest.fixture
-def pg(hub, monkeypatch):  # noqa: F811
+def pg(hub, monkeypatch, tmp_path):  # noqa: F811
     from khipu import db, embed, topic_graph
 
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "state"))
     hub.migrate()
     db._TABLE_COLUMNS_CACHE.clear()
     monkeypatch.setattr(db, "connect", lambda *a, **kw: hub.connect())
