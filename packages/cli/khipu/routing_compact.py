@@ -708,7 +708,9 @@ def _generation(data: bytes) -> str | None:
         row = json.loads(data.partition(b"\n")[0])
     except ValueError:
         return None
-    if not isinstance(row, dict) or set(row) != {"type", "generation", "written_at"} or row["type"] != GENERATION_TYPE:
+    if not isinstance(row, dict) or set(row) != {"type", "generation", "written_at", "seq"} or row["type"] != GENERATION_TYPE:
+        return None
+    if type(row["seq"]) is not int or row["seq"] != 0:
         return None
     value = row["generation"]
     return value if isinstance(value, str) and len(value) == 32 and all(c in "0123456789abcdef" for c in value) else None
@@ -958,7 +960,9 @@ def _replace(path: Path, body: bytes, name: str, archive_body: bytes) -> None:
     header, *left_out = gzip.decompress(archive_body).split(b"\n")[:-1]
     meta = dict(json.loads(header), generation_id=generation, previous_generation_id=previous)
     archive_body = gzip.compress(b"\n".join([json.dumps(meta, sort_keys=True).encode(), *left_out, b""]), 9, mtime=0)
-    marker = json.dumps({"type": GENERATION_TYPE, "generation": generation,
+    # Sequence zero is below every upload cursor, including the legacy
+    # cursor. Metadata must never acknowledge a real event on its behalf.
+    marker = json.dumps({"type": GENERATION_TYPE, "generation": generation, "seq": 0,
                          "written_at": meta["compacted_at"]}, sort_keys=True).encode() + b"\n"
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
