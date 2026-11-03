@@ -6229,9 +6229,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "(1-100). Pace and advice use it in place of the share cap while the exception is live")
     rprio.add_argument("--end-exception", default=None, metavar="ID", dest="end_exception",
                        help="amend: end one exception early (its id is in the amend result and `route priority --json`)")
-    rprio.add_argument("--confirm-pending", action="store_true", dest="confirm_pending",
-                       help="amend while a conversation's request waits: confirm that request (pinned by --expect) "
-                            "and apply the amendment, in one write")
+    rprio.add_argument("--confirm-pending", default=None, metavar="PIN", dest="confirm_pending",
+                       help="amend while a conversation's request waits: confirm that request as the held ask "
+                            "showed it (PIN, with --expect) and apply the amendment, in one write. Only the "
+                            "replay of a held amend the owner confirmed may pass it")
     rprio.add_argument("--entries", default=None, metavar="JSON",
                        help='set: [{"account": "...", "role": "your words", "until": "T"}, ...] in your order')
     rprio.add_argument("--until", default=None, metavar="T", help="set: when the whole priority ends")

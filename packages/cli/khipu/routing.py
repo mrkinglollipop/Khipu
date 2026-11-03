@@ -7994,63 +7994,180 @@ def pending_amend_refusal(version: str, *, combine: bool = True) -> str:
 PENDING_ASK_MOST = 1600
 
 
-def _live_exceptions(entry: dict, now: datetime) -> dict:
-    return {x.get("id"): x for x in entry.get("exceptions") or []
-            if isinstance(x, dict) and (_parse(x.get("until")) or now) > now}
+# What an entry, its level and its exceptions hold as a priority line stores
+# them: the fields the change list below has words for. A field outside
+# these (one a later version adds) is never passed over: the change list
+# names it as a change it has no words for, and an amend's ask refuses to
+# confirm the request with it (``pending_priority_unnamed``).
+_ENTRY_FIELDS = ("account", "label", "role", "until", "level", "exceptions")
+_LEVEL_FIELDS = ("claim", "as_of", "until")
+_EXCEPTION_WORDS = {"text": "words", "until": "until", "share_pct": "share", "at": "recorded at", "by": "by",
+                    "source": "from"}
 
 
-def pending_priority_changes(view: dict, now: datetime | None = None) -> list[str] | None:
-    """What confirming a conversation's waiting priority request makes the
-    owner's, against the priority it replaced, each change in its full words
-    (never clipped): an account added or removed, a role, an end, a level, an
-    exception added, changed or ended, the order and the whole priority's
-    end. None when nothing is waiting."""
-    now = now or _now()
+def _level_words(level: dict) -> str:
+    return f"\"{level.get('claim')}\" from {level.get('as_of')} until {level.get('until')}"
+
+
+def _exception_words(exc: dict, now: datetime) -> str:
+    share = exc.get("share_pct")
+    lapsed = (_parse(exc.get("until")) or now) <= now
+    return (f"until {exc.get('until')}" + (" (already ended)" if lapsed else "")
+            + (f", share {share:g}%" if isinstance(share, (int, float)) and not isinstance(share, bool) else "")
+            + f": \"{exc.get('text')}\"")
+
+
+def _exception_value(field: str, value) -> str:
+    if value is None:
+        return "none"
+    if field == "share_pct" and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:g}%"
+    return f"\"{value}\"" if field in ("text", "by", "source") else str(value)
+
+
+def _entry_changes(name: str, old: dict | None, new: dict, now: datetime) -> tuple[list[str], list[str]]:
+    """(each change ``new`` makes to ``old`` in words, each field that differs
+    with no words for it). ``old`` None: the entry is added, every field it
+    holds named."""
+    out: list[str] = []
+    unnamed: list[str] = []
+    was = old or {}
+    for field in sorted((set(was) | set(new)) - set(_ENTRY_FIELDS)):
+        if old is None or was.get(field) != new.get(field):
+            unnamed.append(f"{name}'s {field}")
+    if old is None:
+        out.append(f"add {name}" + (f": \"{new['role']}\"" if new.get("role") else "")
+                   + (f", until {new['until']}" if new.get("until") else ""))
+    else:
+        if (was.get("label") or None) != (new.get("label") or None):
+            out.append(f"{was.get('label') or name} now named {name}")
+        if (was.get("role") or "") != (new.get("role") or ""):
+            out.append(f"{name}'s role: \"{new.get('role') or ''}\"")
+        if was.get("until") != new.get("until"):
+            out.append(f"{name} until {new.get('until') or 'no end'}")
+    before, after = was.get("level"), new.get("level")
+    if before != after:
+        odd = [lv for lv in (before, after) if lv is not None
+               and (not isinstance(lv, dict) or set(lv) - set(_LEVEL_FIELDS))]
+        if odd:
+            unnamed.append(f"{name}'s level")
+        elif after is None:
+            out.append(f"{name} level removed (was {_level_words(before)})")
+        elif before is None:
+            out.append(f"{name} level: {_level_words(after)}")
+        else:
+            out.append(f"{name} level: {_level_words(after)} (was {_level_words(before)})")
+    old_x, new_x = was.get("exceptions") or [], new.get("exceptions") or []
+    if old_x != new_x:
+        rows = [old_x, new_x]
+        shaped = all(isinstance(r, list) and all(isinstance(x, dict) and isinstance(x.get("id"), str)
+                                                 and not set(x) - set(_EXCEPTION_WORDS) - {"id"} for x in r)
+                     and len({x["id"] for x in r}) == len(r) for r in rows)
+        if not shaped:
+            unnamed.append(f"{name}'s exceptions")
+        else:
+            gone = {x["id"]: x for x in old_x}
+            for exc in new_x:
+                prior = gone.get(exc["id"])
+                if prior is None:
+                    out.append(f"{name} exception {_exception_words(exc, now)}")
+                elif prior != exc:
+                    diffs = [f"{_EXCEPTION_WORDS[f]} {_exception_value(f, exc.get(f))} "
+                             f"(was {_exception_value(f, prior.get(f))})"
+                             for f in _EXCEPTION_WORDS if prior.get(f) != exc.get(f)]
+                    out.append(f"{name} exception \"{prior.get('text')}\" changed: " + ", ".join(diffs))
+            kept = {x["id"] for x in new_x}
+            for exc in old_x:
+                if exc["id"] not in kept:
+                    lapsed = (_parse(exc.get("until")) or now) <= now
+                    out.append(f"{name} exception ended" + (" (it had already lapsed)" if lapsed else "")
+                               + f": \"{exc.get('text')}\"")
+            common = [x["id"] for x in new_x if x["id"] in gone]
+            if common != [x["id"] for x in old_x if x["id"] in kept]:
+                out.append(f"{name} exceptions in a new order")
+    return out, unnamed
+
+
+def _pending_priority_diff(view: dict, now: datetime) -> tuple[list[str], list[str]] | None:
+    """(what confirming the waiting request writes over the priority it
+    replaced, in words; what differs that has no words). Every field of
+    every stored entry is compared, not a chosen few: the confirm writes the
+    request's stored entries whole. None when nothing is waiting."""
     stored = view.get("priority_stored") or {}
     if not stored.get("pending"):
         return None
     replaced = stored.get("replaced") or {}
-    now_rows = [e for e in stored.get("entries") or [] if isinstance(e, dict)]
-    was_rows = [e for e in replaced.get("entries") or [] if isinstance(e, dict)]
-    was = {e.get("account"): e for e in was_rows}
     out: list[str] = []
+    unnamed: list[str] = []
+    lines = {"request": stored.get("entries") or [], "replaced": replaced.get("entries") or []}
+    for side, rows in lines.items():
+        accounts_ = [e.get("account") for e in rows if isinstance(e, dict)]
+        if len(accounts_) != len(rows) or len(set(accounts_)) != len(rows) \
+                or not all(isinstance(a, str) and a for a in accounts_):
+            unnamed.append(f"the {side}'s entries")
+    if unnamed:
+        return out, unnamed
+    now_rows, was_rows = lines["request"], lines["replaced"]
+    was = {e["account"]: e for e in was_rows}
 
     def label(entry: dict) -> str:
         return str(entry.get("label") or _label_for_key(str(entry.get("account"))))
 
     for entry in now_rows:
-        name, old = label(entry), was.get(entry.get("account"))
-        if old is None:
-            out.append(f"add {name}" + (f": \"{entry['role']}\"" if entry.get("role") else "")
-                       + (f", until {entry['until']}" if entry.get("until") else ""))
-        else:
-            if (old.get("role") or "") != (entry.get("role") or ""):
-                out.append(f"{name}'s role: \"{entry.get('role') or ''}\"")
-            if old.get("until") != entry.get("until"):
-                out.append(f"{name} until {entry.get('until') or 'no end'}")
-        if (old or {}).get("level") != entry.get("level") and entry.get("level"):
-            out.append(f"{name} level: {entry['level'].get('claim')}")
-        before, after = _live_exceptions(old or {}, now), _live_exceptions(entry, now)
-        for key, exc in after.items():
-            if before.get(key) != exc:
-                share = exc.get("share_pct")
-                out.append(f"{name} exception until {exc.get('until')}"
-                           + (f", share {share:g}%" if isinstance(share, (int, float)) else "")
-                           + f": \"{exc.get('text')}\"")
-        out += [f"{name} exception ended: \"{exc.get('text')}\"" for key, exc in before.items() if key not in after]
-    named = {e.get("account") for e in now_rows}
-    out += [f"remove {label(e)}" for e in was_rows if e.get("account") not in named]
-    common = [e.get("account") for e in now_rows if e.get("account") in was]
-    if common != [e.get("account") for e in was_rows if e.get("account") in named]:
+        said, missing = _entry_changes(label(entry), was.get(entry["account"]), entry, now)
+        out += said
+        unnamed += missing
+    named = {e["account"] for e in now_rows}
+    out += [f"remove {label(e)}" for e in was_rows if e["account"] not in named]
+    common = [e["account"] for e in now_rows if e["account"] in was]
+    if common != [e["account"] for e in was_rows if e["account"] in named]:
         out.append("order: " + ", ".join(label(e) for e in now_rows))
-    if was_rows and stored.get("until") != replaced.get("until"):
+    if stored.get("until") != replaced.get("until"):
         out.append(f"whole priority until {stored.get('until') or 'no end'}")
+    return out, unnamed
+
+
+def pending_priority_changes(view: dict, now: datetime | None = None) -> list[str] | None:
+    """What confirming a conversation's waiting priority request makes the
+    owner's, against the priority it replaced, each change in its full words
+    (never clipped): an account added, removed or renamed, a role, an end, a
+    level added, removed or changed (its claim, start and end), an exception
+    added, changed (any of its fields) or ended, the order and the whole
+    priority's end. A difference it has no words for is named as such. None
+    when nothing is waiting."""
+    diff = _pending_priority_diff(view, now or _now())
+    if diff is None:
+        return None
+    out, unnamed = diff
+    out = out + [f"a change to {what} that can't be put in words" for what in unnamed]
     return out or ["no change to the priority it replaced"]
+
+
+def pending_priority_unnamed(view: dict, now: datetime | None = None) -> list[str]:
+    """What the waiting request changes that ``pending_priority_changes`` has
+    no words for: never confirmed through an ask that can't show it."""
+    diff = _pending_priority_diff(view, now or _now())
+    return [] if diff is None else diff[1]
+
+
+def pending_priority_pin(view: dict) -> str:
+    """The waiting request and the priority it replaced, exactly as stored
+    (and the owner revision under them): what an amend's ask showed. Held
+    with the amend and checked under the lock at the confirm, so a change to
+    either, even one the version doesn't move for (an owner write from
+    another Mac that sorts before the request), is refused, never confirmed
+    unseen."""
+    stored = view.get("priority_stored") or {}
+    body = {"version": view.get("priority_version"), "owner_revision": view.get("priority_owner_revision"),
+            "entries": stored.get("entries"), "until": stored.get("until"), "replaced": stored.get("replaced"),
+            "owner_request": stored.get("owner_request"), "written_by": stored.get("written_by"),
+            "pending_by": (view.get("priority") or {}).get("pending_by")}
+    return "pp-" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
 
 def amend_priority(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
                    via: str, now: datetime | None = None, expect=None, holds: dict | None = None,
-                   share_pct=None, confirm_pending: bool = False) -> dict:
+                   share_pct=None, confirm_pending: str | None = None) -> dict:
     """The owner's change to one account's entry in the priority (words added
     to its role, or its role replaced, and optionally its end; or an
     exception that lapses on its own, or the end of one), confirmed at once
@@ -8061,20 +8178,38 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
     While a conversation's request waits, an owner write would confirm every
     entry of it, which the owner may never have seen: refused, unless
     ``confirm_pending`` says the owner's yes covered that request too (the
-    held ask named its changes). Then ``expect`` pins the request as shown, so
-    a newer one is refused, never confirmed unseen, and the confirm and the
-    amendment are written as one batch under the lock."""
+    held ask named its changes). It is the ask's ``pending_priority_pin``,
+    only ever taken from the replay of a held amend the owner confirmed
+    (``owner_direction.replaying``): never from a command a conversation
+    runs itself. ``expect`` and the pin hold the request and the priority it
+    replaced to what the ask showed, so a newer one or a changed one is
+    refused, never confirmed unseen, and the confirm and the amendment are
+    written as one batch under the lock."""
     _needs_version(expect)
     now = now or _now()
+    if confirm_pending is not None:
+        from khipu import owner_direction
+
+        if not owner_direction.replaying("route.priority.amend"):
+            raise RouteError("confirm_pending only comes from the owner's yes to a held amend whose ask named the "
+                             "waiting request (khipu_owner_act route.priority.amend, then direction.confirm)")
+        if not isinstance(confirm_pending, str) or not confirm_pending.strip():
+            raise RouteError("confirm_pending is the waiting request as the held ask showed it")
     with _lock():
         _check_priority(expect, now)
-        held = read_view(now).get("priority") or {}
-        if held.get("pending") and not confirm_pending:
+        current = read_view(now)
+        held = current.get("priority") or {}
+        if held.get("pending") and confirm_pending is None:
             raise RouteError(pending_amend_refusal(str(expect).strip()))
-        if confirm_pending and not held.get("pending"):
+        if confirm_pending is not None and not held.get("pending"):
             raise RouteError("nothing is waiting for your confirmation: amend without confirm_pending")
-        if confirm_pending and held.get("proposal_withheld"):
+        if confirm_pending is not None and held.get("proposal_withheld"):
             raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
+        if confirm_pending is not None and confirm_pending.strip() != pending_priority_pin(current):
+            raise PriorityMoved("the waiting request or the priority it replaced changed after the owner was "
+                                "asked; read it again and ask again")
+        if confirm_pending is not None and pending_priority_unnamed(current, now):
+            raise RouteError(pending_amend_refusal(str(expect).strip(), combine=False))
         rows, whole, done = _amended_priority(account, append=append, role=role, until=until, exception=exception,
                                               end_exception=end_exception, now=now, conversation=False,
                                               by="owner", source=str(via), share_pct=share_pct)
@@ -8082,7 +8217,7 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
         # ``holds``: end or keep for each hold on an account it names, as a
         # set takes them (``_require_hold_choices``).
         choices = {"holds": holds} if holds is not None else {}
-        if not confirm_pending:
+        if confirm_pending is None:
             out = _owner_write({"type": "priority_set", "entries": rows, "until": whole, **choices}, via)
             return dict(out, entries=[e["label"] for e in rows], **done)
         view = read_view(now)
@@ -12470,7 +12605,7 @@ def _priority_cli(args, now: datetime) -> int:
                              end_exception=getattr(args, "end_exception", None),
                              share_pct=getattr(args, "share_pct", None),
                              via=via, now=now, expect=expect, holds=_holds_arg(args),
-                             confirm_pending=bool(getattr(args, "confirm_pending", False)))
+                             confirm_pending=getattr(args, "confirm_pending", None))
     elif action == "confirm":
         out = confirm_priority(via=via, now=now, expect=expect, holds=_holds_arg(args))
     elif action == "undo":
@@ -12562,8 +12697,7 @@ def _priority_intent(args, action: str) -> dict | None:
                                                                ("share_pct", getattr(args, "share_pct", None)),
                                                                ("holds", _holds_arg(args)),
                                                                ("confirm_pending",
-                                                                True if getattr(args, "confirm_pending", False)
-                                                                else None))
+                                                                getattr(args, "confirm_pending", None)))
                                              if v is not None})
     if action != "set":
         return owner_direction.intent(f"route.priority.{action}", "priority")

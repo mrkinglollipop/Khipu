@@ -1000,6 +1000,15 @@ def confirmed_replay(action: str, stamp: dict):
         _CONFIRMED.reset(token)
 
 
+def replaying(action: str) -> bool:
+    """Whether this runs inside the replay of a held request for ``action``
+    that ``confirm`` proved the owner confirmed (``confirmed_replay``): a
+    context of this process, never something a command's caller can pass."""
+    confirmed = _CONFIRMED.get()
+    return (confirmed is not None and confirmed.get("action") == action
+            and bool(((confirmed.get("stamp") or {}).get("confirmed") or {}).get("request")))
+
+
 _CHAIN_MOST = 16
 # Processes that sit between a harness and the command it runs (its shells,
 # Khipu's own Python, a launcher), passed over to find the harness that

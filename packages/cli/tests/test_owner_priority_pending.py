@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -82,7 +83,8 @@ def test_an_amend_while_a_request_waits_is_held_with_an_ask_naming_both_and_one_
     assert "give Codex the release work this week" in ask, ask
     assert "route.priority.amend" in ask and "and the docs" in ask, ask
     (row,) = owner_direction._read_requests(owner_direction.requests_path())
-    assert row["args"]["confirm_pending"] is True and row["args"]["expect"] == version
+    assert row["args"]["confirm_pending"] == routing.pending_priority_pin(routing.read_view())
+    assert row["args"]["confirm_pending"].startswith("pp-") and row["args"]["expect"] == version
     assert routing.read_view()["priority"]["pending"] is True  # nothing changed yet
     _owner_says_yes(world)
     ok, out = _confirm_id(out["request"])
@@ -138,7 +140,7 @@ def test_an_owners_instant_amend_while_a_request_waits_is_held_not_applied(world
 
 def test_confirm_pending_with_nothing_waiting_is_refused(world):
     _owner_priority()
-    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "x", "confirm_pending": True,
+    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "x", "confirm_pending": "pp-0",
                                                          "expect": routing.priority_version()})
     assert not ok and out["code"] == "bad_args", out
 
@@ -276,3 +278,214 @@ def test_a_since_read_without_the_priority_records_nothing(world):
     with pytest.raises(routing.RouteError, match="not shown"):
         mcp_server._tool_route_priority({"account": "Codex", "append": "and tests", "owner_request": "tests too",
                                          "base": revision, "expect": routing.priority_version()})
+
+
+# ---- 5. the ask names every change the yes confirms (security review, 2026-11-03) ---------------
+
+LEVEL = {"claim": "Max 20x", "as_of": "2029-01-01T00:00:00Z", "until": "2029-12-01T00:00:00Z"}
+
+
+def _owner_then_request(world, owner: list, request: list, *, until=None) -> str:
+    """The owner's priority, then another conversation's whole-priority
+    request over it (at the owner's request). The priority's version."""
+    routing.set_priority(owner, via="app", expect=routing.priority_version())
+    _be(world, OTHER)
+    shown = routing.conversation_view()
+    out = routing.request_priority(request, until=until, owner_request="same priority please",
+                                   author=routing.conversation_author(), via="mcp",
+                                   expect=shown["priority"]["version"], base=shown["priority_owner_revision"])
+    assert out["ok"] is True, out
+    assert routing.read_view()["priority"]["pending"] is True
+    return routing.priority_version()
+
+
+def test_a_level_the_request_drops_is_named_in_the_ask_never_no_change(world):
+    """The reviewer's repro: the owner gave Codex a level; a conversation's
+    request resubmits the same entries without it. The amend's ask must say
+    the level goes, with its claim and window, and the yes then removes it
+    as shown."""
+    version = _owner_then_request(world, [{"account": "Claude", "role": "main work"},
+                                          {"account": "Codex", "role": "reviews", "level": LEVEL}],
+                                  [{"account": "Claude", "role": "main work"}, {"account": "Codex", "role": "reviews"}])
+    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "x", "expect": version})
+    assert ok and out["pending"] is True, out
+    ask = out["ask"]
+    assert "no change" not in ask, ask
+    assert "Codex level removed" in ask and "Max 20x" in ask, ask
+    assert LEVEL["as_of"] in ask and LEVEL["until"] in ask, ask
+    _owner_says_yes(world)
+    ok, done = _confirm_id(out["request"])
+    assert ok, done
+    codex = next(e for e in routing.read_view()["priority_stored"]["entries"] if e["label"] == "Codex")
+    assert "level" not in codex and routing.read_view()["priority"]["pending"] is False
+
+
+def test_a_first_priority_requests_end_is_named(world):
+    """No priority before the request: its end is still a change the yes
+    makes the owner's."""
+    _be(world, OTHER)
+    shown = routing.conversation_view()
+    out = routing.request_priority([{"account": "Claude", "role": "main work"}], until="2029-06-01T00:00:00Z",
+                                   owner_request="claude first", author=routing.conversation_author(), via="mcp",
+                                   expect=routing.priority_version(), base=shown["priority_owner_revision"])
+    assert out["ok"] is True, out
+    changes = routing.pending_priority_changes(routing.read_view())
+    assert "whole priority until 2029-06-01T00:00:00Z" in changes, changes
+    ok, held = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "x",
+                                                          "expect": routing.priority_version()})
+    assert ok and "whole priority until 2029-06-01T00:00:00Z" in held["ask"], held
+
+
+NOW = datetime(2026, 11, 3, tzinfo=timezone.utc)
+PAST = "2026-10-01T00:00:00Z"
+EXC = {"id": "x1", "text": "release work", "until": "2030-01-01T00:00:00Z", "at": PAST, "by": "a conversation",
+       "source": "please"}
+
+
+def _entry(**fields) -> dict:
+    return {"account": "codex|", "label": "Codex", "role": "reviews", "until": None, **fields}
+
+
+def _diff(old: list, new: list, *, until=None, was_until=None, replaced=True):
+    view = {"priority_stored": {"pending": True, "entries": new, "until": until,
+                                "replaced": {"entries": old, "until": was_until} if replaced else None}}
+    return routing.pending_priority_changes(view, NOW), routing.pending_priority_unnamed(view, NOW)
+
+
+@pytest.mark.parametrize("old, new, words", [
+    (_entry(), _entry(role="everything"), "Codex's role: \"everything\""),
+    (_entry(), _entry(until="2030-02-01T00:00:00Z"), "Codex until 2030-02-01T00:00:00Z"),
+    (_entry(until="2030-02-01T00:00:00Z"), _entry(), "Codex until no end"),
+    (_entry(label="Old name"), _entry(), "Old name now named Codex"),
+    (_entry(level=LEVEL), _entry(), "Codex level removed (was \"Max 20x\" from 2029-01-01T00:00:00Z until "
+                                    "2029-12-01T00:00:00Z)"),
+    (_entry(), _entry(level=LEVEL), "Codex level: \"Max 20x\" from 2029-01-01T00:00:00Z until 2029-12-01T00:00:00Z"),
+    (_entry(level=LEVEL), _entry(level=dict(LEVEL, claim="Pro")), "Codex level: \"Pro\" from"),
+    (_entry(level=LEVEL), _entry(level=dict(LEVEL, as_of="2029-03-01T00:00:00Z")),
+     "from 2029-03-01T00:00:00Z until 2029-12-01T00:00:00Z (was \"Max 20x\" from 2029-01-01T00:00:00Z"),
+    (_entry(level=LEVEL), _entry(level=dict(LEVEL, until="2029-06-01T00:00:00Z")),
+     "until 2029-06-01T00:00:00Z (was \"Max 20x\""),
+    (_entry(), _entry(exceptions=[dict(EXC, share_pct=40)]),
+     "Codex exception until 2030-01-01T00:00:00Z, share 40%: \"release work\""),
+    (_entry(exceptions=[EXC]), _entry(exceptions=[dict(EXC, until="2031-01-01T00:00:00Z")]),
+     "Codex exception \"release work\" changed: until 2031-01-01T00:00:00Z (was 2030-01-01T00:00:00Z)"),
+    (_entry(exceptions=[dict(EXC, share_pct=40)]), _entry(exceptions=[dict(EXC, share_pct=50)]),
+     "share 50% (was 40%)"),
+    (_entry(exceptions=[dict(EXC, share_pct=40)]), _entry(exceptions=[EXC]), "share none (was 40%)"),
+    (_entry(exceptions=[EXC]), _entry(exceptions=[dict(EXC, text="all the work")]),
+     "words \"all the work\" (was \"release work\")"),
+    (_entry(exceptions=[EXC]), _entry(exceptions=[dict(EXC, by="the owner")]), "by \"the owner\""),
+    (_entry(exceptions=[EXC]), _entry(), "Codex exception ended: \"release work\""),
+    (_entry(exceptions=[dict(EXC, until=PAST)]), _entry(), "ended (it had already lapsed)"),
+])
+def test_every_field_the_confirm_writes_is_named(old, new, words):
+    changes, unnamed = _diff([old], [new])
+    assert any(words in c for c in changes), changes
+    assert unnamed == [] and "no change to the priority it replaced" not in changes
+
+
+def test_an_ended_entry_dropped_and_the_order_are_named():
+    claude = {"account": "claude|", "label": "Claude", "role": "main work", "until": None}
+    gone = {"account": "gemini|", "label": "Gemini", "role": "old", "until": PAST}
+    changes, unnamed = _diff([claude, gone, _entry()], [_entry(), claude])
+    assert "remove Gemini" in changes and "order: Codex, Claude" in changes, changes
+    assert unnamed == []
+
+
+def test_the_whole_priority_end_is_named_with_or_without_a_priority_replaced():
+    assert "whole priority until no end" in _diff([_entry()], [_entry()], was_until=PAST)[0]
+    changes, _ = _diff([], [_entry()], until="2030-01-01T00:00:00Z", replaced=False)
+    assert "add Codex: \"reviews\"" in changes and "whole priority until 2030-01-01T00:00:00Z" in changes
+
+
+def test_an_identical_request_is_no_change():
+    entry = _entry(level=LEVEL, exceptions=[EXC])
+    assert _diff([entry], [dict(entry)]) == (["no change to the priority it replaced"], [])
+
+
+@pytest.mark.parametrize("old, new, what", [
+    (_entry(), _entry(colour="red"), "Codex's colour"),
+    (_entry(level=LEVEL), _entry(level=dict(LEVEL, tier=2)), "Codex's level"),
+    (_entry(exceptions=[EXC]), _entry(exceptions=[dict(EXC, weight=3)]), "Codex's exceptions"),
+])
+def test_a_difference_with_no_words_is_named_as_such_never_dropped(old, new, what):
+    changes, unnamed = _diff([old], [new])
+    assert unnamed == [what], unnamed
+    assert any(what in c and "can't be put in words" in c for c in changes), changes
+
+
+def test_an_amend_whose_request_has_a_change_with_no_words_is_refused_at_ask_time(world, monkeypatch):
+    version = _pending_request(world)
+    real = routing.read_view
+
+    def odd(*a, **k):
+        view = real(*a, **k)
+        stored = view.get("priority_stored")
+        if stored and stored.get("pending"):
+            stored["entries"] = [dict(e, colour="red") for e in stored["entries"]]
+        return view
+
+    monkeypatch.setattr(routing, "read_view", odd)
+    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "x", "expect": version})
+    assert not ok and out["code"] == "priority_pending", out
+    assert "route.priority.confirm" in out["error"] and "route.priority.undo" in out["error"], out
+    assert "colour" in out["error"], out
+    assert not owner_direction.requests_path().exists()
+
+
+# ---- 6. the pin covers the priority the request replaced ---------------------------------------
+
+
+def test_the_priority_replaced_changing_under_an_unmoved_version_is_refused_at_the_confirm(world):
+    """An owner write from another Mac that sorts before a waiting request
+    (here one written without a base, as an older Khipu writes it) changes
+    the priority it replaced, and so the ask's changes, without moving the
+    version: the yes is refused, never applied to what the ask didn't show."""
+    from khipu import routing_events
+
+    _pending_request(world)
+    path = routing.events_file()
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    owner, waiting = rows[0], rows[1]
+    waiting.pop("base")
+    waiting["hlc"] = dict(waiting["hlc"], wall=owner["hlc"]["wall"] + 10, counter=0)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    version = routing.priority_version()
+    ok, out = _ask_in_t3(world, "route.priority.amend", {"account": "Claude", "append": "and docs",
+                                                         "expect": version})
+    assert ok and out["pending"] is True, out
+    assert "Codex takes the release work this week" in out["ask"]
+    other = dict(owner, id=routing_events.uuid7(), op=routing_events.uuid7(), mac="c" * 32, seq=1, base=owner["id"],
+                 hlc={"wall": owner["hlc"]["wall"] + 5, "counter": 0, "mac": "c" * 32},
+                 entries=[{"account": "codex|", "label": "Codex", "role": "everything", "until": None}])
+    with path.open("a") as f:
+        f.write(json.dumps(other) + "\n")
+    view = routing.read_view()
+    assert view["priority_version"] == version and view["priority"]["pending"] is True
+    assert view["priority_stored"]["replaced"]["entries"] == other["entries"]  # what the ask showed is gone
+    _be(world, T3_SESSION)
+    _owner_says_yes(world)
+    ok, refused = _confirm_id(out["request"])
+    assert not ok, refused
+    assert routing.read_view()["priority"]["pending"] is True and _roles()["Claude"] == "main work"
+
+
+# ---- 7. confirm_pending only from a confirmed hold's replay ------------------------------------
+
+
+def test_confirm_pending_on_an_owner_turn_without_an_ask_is_refused(world):
+    """A conversation on a turn that passes the owner check runs the amend
+    itself with confirm_pending: refused, the waiting request untouched."""
+    version = _pending_request(world)
+    pin = routing.pending_priority_pin(routing.read_view())
+    _front_end_turn(world, "claude_code:cli", "s-direct")
+    _be_front(world, "claude_code:cli", "s-direct")
+    owner_direction.check("route.priority.amend", instant=True)  # the turn is the owner's
+    head, positionals = owner_act.argv("route.priority.amend", {"account": "Claude", "append": "x",
+                                                                "expect": version, "confirm_pending": pin})
+    ok, out = owner_act._run("route.priority.amend", owner_act.full_argv(head, positionals, ["--owner-direction"]))
+    assert not ok, out
+    assert "confirm_pending only comes from" in json.dumps(out), out
+    with pytest.raises(routing.RouteError, match="confirm_pending only comes from"):
+        routing.amend_priority("Claude", append="x", via="app", expect=version, confirm_pending=pin)
+    assert routing.read_view()["priority"]["pending"] is True and _roles()["Claude"] == "main work"

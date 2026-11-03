@@ -41,7 +41,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     # One account's entry only: ``append`` words to its role or ``role`` in its place (one of the two).
     # ``exception`` (with ``until`` as its end) adds a direction that lapses on its own; ``end_exception`` ends one.
     # ``confirm_pending``: the owner's one yes also confirms the conversation's request waiting in the priority,
-    # pinned by ``expect``; added by the hold itself when a request waits, so its ask names that request.
+    # as the ask showed it (``routing.pending_priority_pin``, with ``expect``); always set by the hold itself
+    # when a request waits, so its ask names that request, and only a confirmed hold's replay may pass it.
     "route.priority.amend": (("account", "expect"), ("append", "role", "until", "exception", "end_exception",
                                                      "share_pct", "holds", "confirm_pending")),
     "route.priority.confirm": ((), ("expect",)),
@@ -102,8 +103,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions",
-          "confirm_pending"}
+_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -524,7 +524,8 @@ def act(action, args) -> tuple[bool, dict]:
 
 def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
     """For a priority amend while a conversation's request waits in the
-    priority: (its values with ``confirm_pending``, the ask naming every
+    priority: (its values with ``confirm_pending``, the pin of the request
+    and the priority it replaced as shown, the ask naming every
     change that request makes the owner's and the amendment), so one yes
     settles both. The amend's ``expect`` must be the version the ask shows:
     a newer request is refused at the confirm, never confirmed unseen.
@@ -547,6 +548,12 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
     changes = routing.pending_priority_changes(view)
     if held.get("proposal_withheld") or not changes:
         raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False))
+    unnamed = routing.pending_priority_unnamed(view)
+    if unnamed:
+        # The yes would confirm what the ask can't show: never combined.
+        raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False)
+                      + f"; it changes {', '.join(unnamed)} in a way the ask can't put in words, so the amend "
+                        "can't confirm it too")
     words = "; ".join(changes)
     if len(words) > routing.PENDING_ASK_MOST:
         raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False)
@@ -558,7 +565,8 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
     ask = (f"A priority request from {held.get('pending_by') or 'a conversation'} is waiting for you (version "
            f"{version}" + (f", asked as \"{asked}\"" if asked else "") + f"). Confirming it makes these yours: "
            f"{words}. Confirm that request, then " + amend[len("Confirm "):])
-    return dict(values, confirm_pending=True), ask
+    # Whatever the caller passed, the pin is the request as this ask shows it.
+    return dict(values, confirm_pending=routing.pending_priority_pin(view)), ask
 
 
 def apply_request(kind: str, out, *, only: str | None = None) -> dict:
