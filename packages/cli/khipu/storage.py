@@ -366,20 +366,40 @@ def _gb(n: int) -> str:
     return f"{n / GB:.1f} GB"
 
 
-def disk_space(limits: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Free space on the disk that holds Khipu's data and on the one that
-    holds temporary files (one row when they are the same disk). Red below
-    the fail thresholds, which holds back an update; amber below the warning
-    ones, which never does."""
+def _disk_write_targets() -> list[tuple[str, Path]]:
+    """Every distinct place Khipu writes that can sit on its own volume:
+    the data dir, the process temp dir, graph-build staging dirs, and the
+    inactive live slot."""
     import tempfile
 
     from khipu.paths import data_dir
 
+    targets: list[tuple[str, Path]] = [
+        ("Khipu's data", data_dir()),
+        ("temporary files", Path(tempfile.gettempdir())),
+        ("/tmp staging", Path("/tmp")),
+        ("/var/tmp staging", Path("/var/tmp")),
+    ]
+    try:
+        from khipu import promote
+
+        targets.append(("inactive live slot", promote.inactive_slot()))
+    except Exception:  # noqa: BLE001 — a missing slot must not break the check
+        pass
+    return targets
+
+
+def disk_space(limits: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Free space on every distinct device Khipu writes (data dir, temp,
+    graph-build staging, the inactive live slot, and a configured worktree
+    root when one is set). One row per device. Red below the fail
+    thresholds, which holds back an update; amber below the warning ones,
+    which never does. The fullest (worst) volume decides."""
     limits = limits or settings()
     volumes: list[dict[str, Any]] = []
     errors: list[str] = []
     seen: set[int] = set()
-    for label, path in (("Khipu's data", data_dir()), ("temporary files", Path(tempfile.gettempdir()))):
+    for label, path in _disk_write_targets():
         try:
             probe = _existing(path)
             device = probe.stat().st_dev

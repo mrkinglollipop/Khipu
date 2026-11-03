@@ -3965,7 +3965,18 @@ def prompt_recall_outcomes(*, now: datetime | None = None,
     if total < _OUTCOMES_MIN_CALLS:
         if lookback >= _OUTCOMES_MIN_CALLS:
             return {**base, "ok": True, "insufficient": True, "quiet": True}
-        return {**base, "ok": False, "insufficient": True}
+        if total == 0:
+            # Nothing was searched in the window and the week was not busy
+            # enough to call the lane merely quiet: there is nothing to
+            # measure, and a check that could not measure must not read ok.
+            return {**base, "ok": False, "insufficient": True, "unmeasured": True,
+                    "error": "no recall calls to measure in the last 7 days",
+                    "fix": "check the prompt-recall hook is installed and firing"}
+        # A thin but nonzero sample (< 20 searched calls in seven days) is
+        # yellow, not a hard red that alone blocks a promote.
+        return {**base, "ok": True, "insufficient": True, "level": "amber",
+                "message": f"only {total} recall call(s) to judge so far (fewer than "
+                           f"{_OUTCOMES_MIN_CALLS}); the lane has barely been exercised"}
 
     timeouts = sum(1 for category, _ms in calls if category == "timeout")
     errors = sum(1 for category, _ms in calls if category == "error")
@@ -3978,16 +3989,30 @@ def prompt_recall_outcomes(*, now: datetime | None = None,
         if len(ms_values) % 2
         else (ms_values[mid - 1] + ms_values[mid]) / 2
     )
+    # Timeouts alone under the budget wall are the live hook under load:
+    # yellow, not a hard red that blocks a promote of an unrelated candidate.
+    # Real errors (or a mix that is not timeout-only) still refuse.
+    timeout_only = timeouts > 0 and errors == 0 and failure_rate >= _OUTCOMES_TIMEOUT_RATE_RED
+    hard_red = failure_rate >= _OUTCOMES_TIMEOUT_RATE_RED and not timeout_only
     out: dict[str, Any] = {
         **base,
-        "ok": failure_rate < _OUTCOMES_TIMEOUT_RATE_RED,
+        "ok": not hard_red,
         "insufficient": False,
         "timeout_rate": round(timeout_rate, 4),
         "error_rate": round(errors / total, 4),
         "failure_rate": round(failure_rate, 4),
         "median_ms": round(median_ms, 1),
     }
-    if not out["ok"]:
+    if timeout_only:
+        out["level"] = "amber"
+        out["timeout_only"] = True
+        out["message"] = (f"{timeouts} of the last {total} recall calls missed the deadline "
+                          f"(timeouts only, under load)")
+        out["reason"] = (
+            f"{timeouts} of the last {total} recall attempts in the last "
+            f"{window_minutes} minutes missed the deadline under load (timeouts only; not a hard red)"
+        )
+    elif not out["ok"]:
         out["reason"] = (
             f"{timeouts + errors} of the last {total} recall attempts in the last "
             f"{window_minutes} minutes failed: {errors} errors and {timeouts} missed the deadline"

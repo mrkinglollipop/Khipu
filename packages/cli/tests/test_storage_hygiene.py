@@ -73,7 +73,8 @@ def test_the_sweep_keeps_a_young_temp_and_never_the_replica(data_dir):
 
     out = hs.sweep_stale_temps()
 
-    assert out == {"ok": True, "removed": [old.name]}
+    assert out["ok"] is True and out["removed"] == [old.name]
+    assert out.get("left", 0) >= 1  # the young staged temp is left alone
     assert young.exists() and replica.exists() and meta.exists()
 
 

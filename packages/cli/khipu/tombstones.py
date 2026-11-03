@@ -373,17 +373,20 @@ class Gate:
 
 
 @contextmanager
-def write_gate() -> Iterator[Gate]:
+def write_gate(wait: float | None = None) -> Iterator[Gate]:
     """Hold the registry flock once for many source checks and their writes.
 
     Callers keep this open until their atomic replace or SQLite commit
     completes, exactly as ``write_guard`` requires for a single payload.
+    ``wait`` bounds the memory-lock wait (seconds); ``None`` waits without
+    a deadline. A refresh that already holds the refresh lock must pass a
+    deadline so a forget cannot keep every other dump "in progress".
     """
     from khipu import memory_lock
 
     # The memory lock first: it orders every writer against a whole forget,
     # and it is always taken before any other Khipu lock.
-    with memory_lock.shared(), _locked_registry() as (_path, value, lease):
+    with memory_lock.shared(wait=wait), _locked_registry() as (_path, value, lease):
         token = _OWNED_WRITER_LOCK.set(lease) if not lease.borrowed else None
         try:
             yield Gate(value)

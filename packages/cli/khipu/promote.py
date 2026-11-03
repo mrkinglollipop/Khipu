@@ -1012,18 +1012,29 @@ def _shared_slowness_note(run: dict[str, Any], refs: tuple[Any, ...]) -> str | N
     return f"{ms:.0f} ms, reference {max(given):.0f} ms: shared slowness, not the candidate"
 
 
-def _search_problem(run: dict[str, Any], refs: tuple[Any, ...] = ()) -> str | None:
+def _search_problem(run: dict[str, Any], refs: tuple[Any, ...] = (),
+                    live: dict[str, Any] | None = None) -> str | None:
     """Why one replayed run's own search fails the step, or None: the hook
     exited non-zero or wrote no JSON, wrote no summary line, timed out or
     failed, or took longer than ``RECALL_BUDGET_MS`` and longer than every
     reference time in ``refs`` plus ``SLOWNESS_SLACK_MS`` (``_slower_than``).
-    The same test for the run with routing off and the run with routing on."""
+    The same test for the run with routing off and the run with routing on.
+
+    A candidate ``timeout>…`` is forgiven only when ``live`` (the live
+    hook's own run on the same prompt) timed out too: shared load, not the
+    candidate. A live that answered, however slowly, makes the candidate's
+    timeout a refusal; so does no live run to compare with."""
     if run["exit"] != 0 or not run["valid_json"]:
         return f"hook exit {run['exit']}, valid_json={run['valid_json']}"
     reason = run.get("reason")
     if reason is None:
         return "the hook wrote no summary line"
-    if reason.startswith(("timeout", "error", "gate error")):
+    if reason.startswith(("error", "gate error")):
+        return reason
+    if isinstance(reason, str) and reason.startswith("timeout"):
+        live_reason = (live or {}).get("reason")
+        if isinstance(live_reason, str) and live_reason.startswith("timeout"):
+            return None
         return reason
     if _slower_than(run, refs):
         given = [r for r in refs if r is not None]
@@ -1069,7 +1080,7 @@ def _off_problem(label: str, live: dict[str, Any] | None, cand: dict[str, Any]) 
     (``_empty_by_timing``) or the candidate's relevance gate abstained
     (``_abstained``). The same test for the first run and the replayed
     one."""
-    what = _search_problem(cand, ((live or {}).get("ms"),))
+    what = _search_problem(cand, ((live or {}).get("ms"),), live)
     if what:
         return f"{label}: {what}"
     live_hits = (live or {}).get("hits") or []
@@ -1101,7 +1112,7 @@ def _routing_problem(label: str, off: dict[str, Any], on: dict[str, Any],
         return f"{label}: with routing on, {what} (routing={status})"
     if on.get("push") is True and not status and on.get("reason") is not None:
         return f"{label}: with routing on, the candidate's push is on but its hook logged no routing status"
-    what = _search_problem(on, (off.get("ms"), (live or {}).get("ms")))
+    what = _search_problem(on, (off.get("ms"), (live or {}).get("ms")), live)
     if what:
         return f"{label}: with routing on, {what}"
     if _comparable(off, on) and on["hits"] != off["hits"]:
@@ -1156,6 +1167,8 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
     cand_legacy = not _honours_isolation(Path(candidate))
     routed_runs = 0
     withheld_runs = 0
+    live_routed_runs = 0
+    live_withheld_runs = 0
     embed_failed: dict[int, bool] = {}
     abstentions = 0
     live_hit_prompts = 0
@@ -1182,6 +1195,9 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
             continue
         on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}", legacy=cand_legacy, routing=True,
                           root=Path(candidate))
+        live_on = (_recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-route-{i}", legacy=live_legacy,
+                                routing=True, root=live_root)
+                   if live_hook.exists() else None)
         problem = _routing_problem(label, cand, on, live)
         if problem or not _comparable(cand, on):
             # Once more, both ways, before the step fails or the answers go
@@ -1193,6 +1209,9 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
                                 routing=False)
             on = _recall_once(cand_hook, sample, f"khipu-gate-{nonce}-route-{i}-again", legacy=cand_legacy,
                               routing=True, root=Path(candidate))
+            if live_hook.exists():
+                live_on = _recall_once(live_hook, sample, f"khipu-gate-{nonce}-live-route-{i}-again",
+                                       legacy=live_legacy, routing=True, root=live_root)
             # Both replayed runs are tested: the one with routing off
             # replaces the first, so it is held to the first one's tests.
             problem = _off_problem(label, live, cand) or _routing_problem(label, cand, on, live)
@@ -1216,6 +1235,11 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         if _empty_by_timing(live, cand):
             note += (f", empty where live had {len(live_hits)} hit(s) not counted (no cosine leg after a replay: "
                      f"timing, not code; degraded={cand.get('degraded')})")
+        live_routing = (live_on or {}).get("routing") if live_on else None
+        if live_routing == ROUTING_WITHHOLD:
+            live_withheld_runs += 1
+        elif live_routing and not str(live_routing).startswith("skipped:"):
+            live_routed_runs += 1
         if on.get("routing") == ROUTING_WITHHOLD:
             withheld_runs += 1
             note += f", routing withheld ({ROUTING_WITHHOLD}: no complete inventory in time under load)"
@@ -1241,9 +1265,16 @@ def gate_recall_replay(candidate: Path, n: int = 5) -> tuple[bool, str]:
         # live had hits it is a gate that is broken.
         problems.append(f"the candidate abstained by policy on all {live_hit_prompts} replayed prompt(s) "
                         f"where live had hits")
+    # Withhold under load is shared when live also withholds; refuse only when
+    # the candidate withheld every routing-on run and live routed at least one
+    # (or live had no routing run to compare and the candidate routed none).
     if withheld_runs and not routed_runs:
-        problems.append(f"with routing on, the routing read withheld ({ROUTING_WITHHOLD}) on all {withheld_runs} "
-                        f"replayed prompt(s) and none routed")
+        if live_routed_runs:
+            problems.append(f"with routing on, the routing read withheld ({ROUTING_WITHHOLD}) on all "
+                            f"{withheld_runs} replayed prompt(s) where live routed")
+        elif not live_withheld_runs:
+            problems.append(f"with routing on, the routing read withheld ({ROUTING_WITHHOLD}) on all "
+                            f"{withheld_runs} replayed prompt(s) and none routed")
     medians = ""
     if cand_times:
         cand_median, live_median = statistics.median(cand_times), statistics.median(live_times)
