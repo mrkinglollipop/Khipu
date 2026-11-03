@@ -1442,6 +1442,118 @@ class SearchTimingTest(unittest.TestCase):
         self.assertIn("embed_ms", timing)
         self.assertIn("cosine_ms", timing)
 
+    def test_hybrid_literal_runs_beside_cosine_on_its_own_connection(self):
+        """Literal must not wait for embed+scan: own connection, own thread."""
+        import contextlib
+        import threading
+        from unittest import mock
+
+        order: list[str] = []
+        release_cosine = threading.Event()
+        literal_started = threading.Event()
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                pass
+
+            def fetchall(self):
+                return []
+
+            def fetchone(self):
+                return (False,)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class FakeConn:
+            def cursor(self_inner):
+                return FakeCur()
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+        @contextlib.contextmanager
+        def _hub():
+            yield FakeConn()
+
+        def slow_cosine(query, **kw):
+            order.append("cosine-enter")
+            self.assertTrue(literal_started.wait(2), "literal should start before cosine finishes")
+            order.append("cosine-done")
+            release_cosine.set()
+            return []
+
+        def tracking_literal(cur, query, limit, **kw):
+            order.append("literal-enter")
+            literal_started.set()
+            return [{"kind": "episode", "id": "1", "score": 1.0, "label": "khipu",
+                     "snippet": "khipu", "rank_text": "khipu"}]
+
+        with mock.patch("khipu.hub_snapshot.try_hub_connect", _hub), \
+                mock.patch.object(em, "_cosine_candidates", side_effect=slow_cosine), \
+                mock.patch("khipu.cli._literal_candidates", side_effect=tracking_literal), \
+                mock.patch.object(em, "_apply_search_filters", side_effect=lambda c, rows, **k: list(rows)), \
+                mock.patch("khipu.topic_graph.enrich_search_results",
+                           side_effect=lambda c, rows: list(rows)), \
+                mock.patch("khipu.relevance.is_evidence", return_value=True):
+            out = em.hybrid_search("khipu", limit=5, mode="hybrid", include_libraries=False)
+        self.assertEqual(order[0], "literal-enter")
+        self.assertIn("cosine-enter", order)
+        self.assertLess(order.index("literal-enter"), order.index("cosine-done"))
+        self.assertEqual([r["id"] for r in out["results"]], ["1"])
+        self.assertIn("literal_ms", out["timing"])
+
+    def test_hybrid_literal_leg_exception_degrades_instead_of_failing(self):
+        import contextlib
+        from unittest import mock
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                pass
+
+            def fetchall(self):
+                return []
+
+            def fetchone(self):
+                return (False,)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class FakeConn:
+            def cursor(self_inner):
+                return FakeCur()
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+        @contextlib.contextmanager
+        def _hub():
+            yield FakeConn()
+
+        with mock.patch("khipu.hub_snapshot.try_hub_connect", _hub), \
+                mock.patch.object(em, "_cosine_candidates", return_value=[]), \
+                mock.patch("khipu.cli._literal_candidates", side_effect=RuntimeError("literal boom")), \
+                mock.patch.object(em, "_apply_search_filters", side_effect=lambda c, rows, **k: list(rows)), \
+                mock.patch("khipu.topic_graph.enrich_search_results",
+                           side_effect=lambda c, rows: list(rows)), \
+                mock.patch("khipu.relevance.is_evidence", return_value=True):
+            out = em.hybrid_search("khipu", limit=5, mode="hybrid", include_libraries=False)
+        self.assertIn("literal:error", out["degraded_legs"])
+        self.assertIn("literal boom", out["timing"]["literal_error"])
+
 
 class QueryEmbedBudgetTest(unittest.TestCase):
     """The interactive query path must not inherit the backfill client's

@@ -456,9 +456,10 @@ class CandidateDeadlineTest(unittest.TestCase):
     def test_hub_applies_remaining_statement_timeout_and_restores_it(self):
         from khipu import graph_candidates as gc
         cur = mock.Mock()
-        cur.fetchone.side_effect = [("9s",), ("9s",)]
+        cur.fetchone.side_effect = lambda: ("9s",)
         cur.fetchall.return_value = []
-        rows, missed = gc.hub_candidates(cur, [{"kind":"topic", "id":"x"}], deadline=time.monotonic() + 1)
+        with mock.patch.object(gc, "_hub_episode_slug_map", return_value={}):
+            rows, missed = gc.hub_candidates(cur, [{"kind":"topic", "id":"x"}], deadline=time.monotonic() + 1)
         self.assertFalse(missed)
         self.assertEqual(rows, [])
         calls = [(" ".join(c.args[0].split()), c.args[1] if len(c.args)>1 else None) for c in cur.execute.call_args_list]
@@ -496,6 +497,139 @@ class CandidateDeadlineTest(unittest.TestCase):
         self.assertIn("ROLLBACK TO SAVEPOINT khipu_graph_candidates_deadline", sql)
         self.assertIn("RELEASE SAVEPOINT khipu_graph_candidates_deadline", sql)
         self.assertEqual(cur.calls[-2][1], ("9s",))
+
+    def test_hub_keeps_finished_wiki_hits_when_a_later_expansion_misses(self):
+        from khipu import graph_candidates as gc
+
+        class Cur:
+            def __init__(self):
+                self.calls = []
+                self.rows = []
+            def execute(self, sql, params=None):
+                flat = " ".join(sql.split())
+                self.calls.append(flat)
+                if "current_setting" in flat:
+                    self.rows = [("9s",)]
+                else:
+                    self.rows = []
+            def fetchone(self): return self.rows[0] if self.rows else None
+            def fetchall(self): return list(self.rows)
+
+        wiki_hit = [{
+            "kind": "topic", "id": "kept-neighbor", "label": "kept",
+            "snippet": "kept", "_seed_rank": 0, "_seed_key": "topic:seed",
+            "_relation": "wiki_link", "_recency": 1.0,
+        }]
+        def boom(*_a, **_k):
+            raise gc.DeadlineMissed()
+
+        cur = Cur()
+        with mock.patch.object(gc, "_hub_topic_wiki", return_value=wiki_hit), \
+             mock.patch.object(gc, "_hub_topic_recent_episodes", side_effect=boom):
+            rows, missed = gc.hub_candidates(
+                cur, [{"kind": "topic", "id": "seed"}], deadline=time.monotonic() + 1
+            )
+        self.assertTrue(missed)
+        self.assertEqual([r["id"] for r in rows], ["kept-neighbor"])
+
+    def test_hub_slug_map_serves_recent_episodes_without_per_seed_json_scan(self):
+        from khipu import graph_candidates as gc
+
+        gc._HUB_SLUG_CACHE.clear()
+        class Cur:
+            def __init__(self):
+                self.sql = []
+            def execute(self, sql, params=None):
+                self.sql.append(" ".join(sql.split()))
+            def fetchone(self):
+                last = self.sql[-1] if self.sql else ""
+                if "max(ts)" in last:
+                    return ("2026-10-30T00:00:00Z",)
+                return None
+            def fetchall(self):
+                last = self.sql[-1] if self.sql else ""
+                if "ORDER BY ts DESC" in last:
+                    return [(7, "2026-10-30T00:00:00Z", "named", ["Billing Service"])]
+                return []
+        cur = Cur()
+        with mock.patch("khipu.db.has_columns", return_value=False):
+            rows = gc._hub_topic_recent_episodes(
+                cur, "billing-service", seed_rank=0, seed_key="topic:billing-service")
+            self.assertEqual([r["id"] for r in rows], ["7"])
+            self.assertFalse(any("jsonb_array_elements_text" in s for s in cur.sql))
+            self.assertTrue(any("ORDER BY ts DESC" in s for s in cur.sql))
+            builds = sum(1 for s in cur.sql if "ORDER BY ts DESC" in s)
+            again = gc._hub_topic_recent_episodes(
+                cur, "billing-service", seed_rank=0, seed_key="topic:billing-service")
+            self.assertEqual([r["id"] for r in again], ["7"])
+            # Cache hit inside the TTL: no second full build.
+            self.assertEqual(sum(1 for s in cur.sql if "ORDER BY ts DESC" in s), builds)
+
+    def test_hub_slug_build_is_bounded_and_cheap_stamped(self):
+        from khipu import graph_candidates as gc
+
+        gc._HUB_SLUG_CACHE.clear()
+
+        class Cur:
+            def __init__(self):
+                self.sql = []
+            def execute(self, sql, params=None):
+                self.sql.append(" ".join(sql.split()))
+            def fetchone(self):
+                return ("2026-10-30T00:00:00Z",)
+            def fetchall(self):
+                return []
+        cur = Cur()
+        with mock.patch("khipu.db.has_columns", return_value=False):
+            gc._hub_episode_slug_map(cur)
+        joined = " ".join(cur.sql)
+        self.assertNotIn("count(*)", joined)
+        self.assertIn("SELECT max(ts) FROM episodes", joined)
+        self.assertIn("left(summary, 200)", joined)
+        self.assertIn("LIMIT", joined)
+        # Within the TTL a second call issues no query at all.
+        before = len(cur.sql)
+        gc._hub_episode_slug_map(cur)
+        self.assertEqual(len(cur.sql), before)
+
+    def test_hub_slug_build_failure_reports_missed_and_keeps_wiki_hits(self):
+        from khipu import graph_candidates as gc
+
+        gc._HUB_SLUG_CACHE.clear()
+
+        class Cur:
+            def __init__(self):
+                self.sql = []
+                self.rows = []
+            def execute(self, sql, params=None):
+                flat = " ".join(sql.split())
+                self.sql.append(flat)
+                if "current_setting" in flat:
+                    self.rows = [("9s",)]
+                elif "max(ts)" in flat:
+                    self.rows = [("2026-10-30T00:00:00Z",)]
+                elif "ORDER BY ts DESC" in flat:
+                    raise RuntimeError("canceling statement due to statement timeout")
+                else:
+                    self.rows = []
+            def fetchone(self): return self.rows[0] if self.rows else None
+            def fetchall(self): return list(self.rows)
+
+        wiki_hit = [{
+            "kind": "topic", "id": "kept-neighbor", "label": "kept",
+            "snippet": "kept", "_seed_rank": 0, "_seed_key": "topic:seed",
+            "_relation": "wiki_link", "_recency": 1.0,
+        }]
+        cur = Cur()
+        with mock.patch("khipu.db.has_columns", return_value=False), \
+             mock.patch.object(gc, "_hub_topic_wiki", return_value=wiki_hit):
+            rows, missed = gc.hub_candidates(
+                cur, [{"kind": "topic", "id": "seed"}], deadline=time.monotonic() + 1)
+        self.assertTrue(missed)
+        self.assertEqual([r["id"] for r in rows], ["kept-neighbor"])
+        self.assertIn("ROLLBACK TO SAVEPOINT khipu_graph_candidates_deadline", cur.sql)
+        self.assertTrue(cur.sql[-1].startswith("RELEASE SAVEPOINT"))
+        self.assertEqual(gc._HUB_SLUG_CACHE, {})
 
 
 class EpisodeCollapseTest(unittest.TestCase):

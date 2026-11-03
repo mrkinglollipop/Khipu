@@ -9,20 +9,22 @@ Two backends behind one shape, not one shared query: the hub (PostgreSQL,
 ``replica_candidates``) serves the local prompt lane and the stale-replica
 payload. Both take the caller's already-fused list, seed from its top 5
 rows, and return additional candidate rows plus whether the leg missed its
-own deadline — never a partial leg (finding 7, docs/research/hindsight-
-plan-review-2026-09-28.md: no episode nodes, no persisted episode-to-topic
-edge, and never the unstable SQL/PGQ path — every expansion below is a
-plain join or EXISTS/unnest against ``edges``/``topics``/``episodes``).
+own deadline. Finished expansions are kept when a later one misses (a miss
+no longer drops wiki hits already fetched). Finding 7
+(docs/research/hindsight-plan-review-2026-09-28.md): no episode nodes, no
+persisted episode-to-topic edge, and never the unstable SQL/PGQ path —
+every expansion below is a plain join or EXISTS/unnest against
+``edges``/``topics``/``episodes``, with the hub's reverse topic→episode
+lookup served from an in-process slug map (no migration) like the replica.
 
 Expansions, each a plain join:
   (a) topic seed  -> topics it links to/from via ``wiki_link``
   (b) episode seed -> topic pages named in its own ``topics`` array
   (c) topic seed  -> most recent episodes that name it (the reverse of (b);
-      there is no persisted index for this direction, so the join text-
-      matches the same slug form ``topic_graph.topic_slug_from_label``
-      produces — one Python function on the replica leg, via
-      ``sqlite3.Connection.create_function``; a hand-mirrored SQL expression
-      on the hub leg, which cannot call into Python mid-query)
+      served from an in-process slug map on both legs — the replica builds
+      it in the background, the hub builds it from the most recent episodes
+      (bounded, short TTL, newest-ts stamp) under the leg deadline; a build
+      that fails or times out reports ``missed``)
 
 A caller is responsible for the ``graph_candidates`` switch check
 (``khipu.features.enabled``) and for feeding the result back into
@@ -191,37 +193,97 @@ def _hub_topic_wiki(cur, slug: str, *, seed_rank: int, seed_key: str) -> list[di
     return out
 
 
-def _hub_topic_recent_episodes(cur, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
+# Hub-side slug -> recent episodes, same role as the replica's ``_SLUG_CACHE``:
+# one in-process map so topic→episode expansion is a bounded lookup instead of
+# an unindexed JSONB scan per seed inside the 400 ms hub budget. No migration.
+_HUB_SLUG_LOCK = threading.Lock()
+_HUB_SLUG_CACHE: dict[str, Any] = {}
+# A reused map is trusted this long without any query; after it, one cheap
+# ``max(ts)`` stamp decides between refreshing the age and rebuilding.
+_HUB_SLUG_TTL_S = 5.0
+# The build reads only the most recent live episodes (older ones are a rarer
+# reverse-lookup target and each slug keeps just PER_SEED_CAP of them anyway).
+_HUB_SLUG_BUILD_LIMIT = 2000
+
+
+def _hub_slug_map_key(cur) -> str | None:
+    """Cheap generation stamp: newest episode ts (no full count, no new index)."""
+    try:
+        cur.execute("SELECT max(ts) FROM episodes")
+        row = cur.fetchone()
+    except Exception:  # noqa: BLE001 — caller treats None as a failed stamp
+        return None
+    if not row:
+        return None
+    return str(row[0]) if row[0] is not None else ""
+
+
+def _build_hub_slug_map(cur) -> dict[str, list[tuple[Any, Any, Any]]]:
     # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
+    from khipu import topic_graph
     from khipu.db import has_columns
 
-    live = "deleted_at IS NULL AND " if has_columns(cur, "episodes", "deleted_at") else ""
-    # Mirrors khipu.topic_graph.topic_slug_from_label byte-for-byte: lower,
-    # collapse a run of non-alphanumerics to one '-', strip leading/trailing
-    # '-', cap at 80 chars. This leg cannot call the Python function
-    # mid-query (unlike the replica leg below, via create_function), so the
-    # two must be kept in sync by hand — a mismatch here only misses a
-    # candidate, it can never mint or corrupt anything. ``episodes.topics``
-    # is JSONB (migration 0001), not a native array, so this unnests with
-    # ``jsonb_array_elements_text`` rather than ``unnest``.
+    live = "WHERE deleted_at IS NULL " if has_columns(cur, "episodes", "deleted_at") else ""
     cur.execute(
-        f"SELECT id, ts, summary FROM episodes e WHERE {live} EXISTS ("
-        "  SELECT 1 FROM jsonb_array_elements_text(e.topics) AS label WHERE "
-        "  left(trim(both '-' from regexp_replace(lower(trim(label)), "
-        "  '[^a-z0-9]+', '-', 'g')), 80) = %(slug)s"
-        ") ORDER BY ts DESC LIMIT %(cap)s",
-        {"slug": slug, "cap": PER_SEED_CAP},
+        "SELECT id, ts, left(summary, 200), topics FROM episodes "
+        f"{live}ORDER BY ts DESC LIMIT %(cap)s",
+        {"cap": _HUB_SLUG_BUILD_LIMIT},
     )
-    out = []
-    for eid, ts, summary in cur.fetchall():
-        out.append({
+    out: dict[str, list[tuple[Any, Any, Any]]] = {}
+    for eid, ts, summary, topics in cur.fetchall():
+        labels = topics or []
+        if isinstance(labels, str):
+            try:
+                labels = json.loads(labels)
+            except (ValueError, TypeError):
+                continue
+        for slug in {topic_graph.topic_slug_from_label(str(label)) for label in labels or []}:
+            if not slug:
+                continue
+            bucket = out.setdefault(slug, [])
+            if len(bucket) < PER_SEED_CAP:
+                bucket.append((ts, eid, summary))
+    return out
+
+
+def _hub_episode_slug_map(cur) -> dict[str, list[tuple[Any, Any, Any]]]:
+    """Process-local hub slug map, shared by every seed in a leg. A stamp or
+    build that fails or runs out of budget raises ``DeadlineMissed`` so the
+    leg reports ``missed`` instead of silently returning an empty expansion."""
+    now = time.monotonic()
+    with _HUB_SLUG_LOCK:
+        cached = dict(_HUB_SLUG_CACHE)
+    if cached.get("map") is not None and now - cached.get("at", 0.0) < _HUB_SLUG_TTL_S:
+        return cached["map"]
+    key = _hub_slug_map_key(cur)
+    if key is None:
+        raise DeadlineMissed()
+    if cached.get("map") is not None and cached.get("key") == key:
+        with _HUB_SLUG_LOCK:
+            _HUB_SLUG_CACHE["at"] = now
+        return cached["map"]
+    try:
+        by_slug = _build_hub_slug_map(cur)
+    except Exception as exc:  # noqa: BLE001 — a failed/timed-out build is a miss
+        raise DeadlineMissed() from exc
+    with _HUB_SLUG_LOCK:
+        _HUB_SLUG_CACHE.update({"key": key, "map": by_slug, "at": time.monotonic()})
+    return by_slug
+
+
+def _hub_topic_recent_episodes(cur, slug: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
+    # forget-fence source: per-prompt push candidates; prior_work_for_prompt fences them
+    by_slug = _hub_episode_slug_map(cur)
+    return [
+        {
             "kind": "episode", "id": str(eid), "label": (summary or "")[:200],
             "snippet": (summary or "")[:4000],
             "_seed_rank": seed_rank, "_seed_key": seed_key,
             "_relation": _CAPTURE_TOPIC_RELATION,
             "_recency": _ts_key(ts),
-        })
-    return out
+        }
+        for ts, eid, summary in by_slug.get(slug, [])
+    ]
 
 
 def _hub_episode_topics(cur, episode_id: str, *, seed_rank: int, seed_key: str) -> list[dict[str, Any]]:
@@ -268,9 +330,10 @@ def hub_candidates(
     """``(candidates, missed)`` for the hub (PostgreSQL) leg. ``deadline`` is
     an absolute ``time.monotonic()`` value the caller computes (typically
     ``time.monotonic() + HUB_LEG_DEADLINE_S``), so a test can pass an
-    already-expired one to force the miss path deterministically. A miss
-    drops the WHOLE leg — ``candidates`` is always ``[]`` when
-    ``missed`` is ``True``, never a partial list."""
+    already-expired one to force the miss path deterministically. When a
+    later expansion misses the deadline, finished expansions are kept
+    (``missed`` is still ``True``); only a miss before any expansion returns
+    an empty candidate list."""
     exclude = {(str(r.get("kind")), str(r.get("id"))) for r in fused}
     seeds = _seeds(fused)
     if not seeds:
@@ -279,6 +342,8 @@ def hub_candidates(
     savepoint = "khipu_graph_candidates_deadline"
     savepoint_started = False
     needs_rollback = False
+    raw: list[dict[str, Any]] = []
+    missed = False
     try:
         _check_deadline(deadline)
         cur.execute(f"SAVEPOINT {savepoint}")
@@ -287,31 +352,38 @@ def hub_candidates(
         row = cur.fetchone()
         previous_timeout = str(row[0]) if row else "0"
         bounded_cur = _PgDeadlineCursor(cur, deadline)
-        raw: list[dict[str, Any]] = []
         for rank, seed in seeds:
-            _check_deadline(deadline)
-            skind, sid = seed.get("kind"), str(seed.get("id"))
-            seed_key = f"{skind}:{sid}"
-            if skind == "topic":
-                raw.extend(_hub_topic_wiki(bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
+            try:
                 _check_deadline(deadline)
-                raw.extend(_hub_topic_recent_episodes(bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
-            else:
-                raw.extend(_hub_episode_topics(bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
-            _check_deadline(deadline)
+                skind, sid = seed.get("kind"), str(seed.get("id"))
+                seed_key = f"{skind}:{sid}"
+                if skind == "topic":
+                    raw.extend(_hub_topic_wiki(bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
+                    _check_deadline(deadline)
+                    raw.extend(_hub_topic_recent_episodes(
+                        bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
+                else:
+                    raw.extend(_hub_episode_topics(
+                        bounded_cur, sid, seed_rank=rank, seed_key=seed_key))
+                _check_deadline(deadline)
+            except DeadlineMissed:
+                needs_rollback = True
+                missed = True
+                break
+            except Exception as exc:
+                timed_out = (
+                    time.monotonic() >= deadline
+                    or exc.__class__.__name__ in {"QueryCanceled", "QueryCanceledError"}
+                    or "statement timeout" in str(exc).lower()
+                )
+                needs_rollback = savepoint_started
+                if timed_out:
+                    missed = True
+                    break
+                raise
     except DeadlineMissed:
         needs_rollback = True
         return [], True
-    except Exception as exc:
-        timed_out = (
-            time.monotonic() >= deadline
-            or exc.__class__.__name__ in {"QueryCanceled", "QueryCanceledError"}
-            or "statement timeout" in str(exc).lower()
-        )
-        needs_rollback = savepoint_started
-        if timed_out:
-            return [], True
-        raise
     finally:
         if savepoint_started and needs_rollback:
             cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -321,7 +393,7 @@ def hub_candidates(
                 (previous_timeout,),
             )
             cur.execute(f"RELEASE SAVEPOINT {savepoint}")
-    return _select_candidates(raw, exclude=exclude), False
+    return _select_candidates(raw, exclude=exclude), missed
 
 
 # ---- replica (SQLite) ---------------------------------------------------
@@ -579,24 +651,32 @@ def replica_candidates(
         # own handler before returning.
         con.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 100)
         raw: list[dict[str, Any]] = []
+        missed = False
         for rank, seed in seeds:
-            _check_deadline(deadline)
-            skind, sid = seed.get("kind"), str(seed.get("id"))
-            seed_key = f"{skind}:{sid}"
-            if skind == "topic":
-                raw.extend(_replica_topic_wiki(bounded_con, sid, seed_rank=rank, seed_key=seed_key))
+            try:
                 _check_deadline(deadline)
-                raw.extend(_replica_topic_recent_episodes(bounded_con, sid, seed_rank=rank, seed_key=seed_key))
-            else:
-                raw.extend(_replica_episode_topics(bounded_con, sid, seed_rank=rank, seed_key=seed_key))
-            _check_deadline(deadline)
+                skind, sid = seed.get("kind"), str(seed.get("id"))
+                seed_key = f"{skind}:{sid}"
+                if skind == "topic":
+                    raw.extend(_replica_topic_wiki(bounded_con, sid, seed_rank=rank, seed_key=seed_key))
+                    _check_deadline(deadline)
+                    raw.extend(_replica_topic_recent_episodes(
+                        bounded_con, sid, seed_rank=rank, seed_key=seed_key))
+                else:
+                    raw.extend(_replica_episode_topics(
+                        bounded_con, sid, seed_rank=rank, seed_key=seed_key))
+                _check_deadline(deadline)
+            except DeadlineMissed:
+                missed = True
+                break
+            except sqlite3.OperationalError as exc:
+                if any(token in str(exc).lower() for token in ("interrupted", "locked", "busy")):
+                    missed = True
+                    break
+                raise
     except DeadlineMissed:
         return [], True
-    except sqlite3.OperationalError as exc:
-        if any(token in str(exc).lower() for token in ("interrupted", "locked", "busy")):
-            return [], True
-        raise
     finally:
         con.set_progress_handler(None, 0)
         con.execute(f"PRAGMA busy_timeout={previous_busy}")
-    return _select_candidates(raw, exclude=exclude), False
+    return _select_candidates(raw, exclude=exclude), missed
