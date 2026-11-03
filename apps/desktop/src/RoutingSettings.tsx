@@ -31,9 +31,12 @@ import type { PlanUsageState, UsageAccount, UsageReport } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
 import { PlanDetailSheet, RoutingDetailSheet, useDetailHost } from "./AccountDetail";
 import { AccountsRequestBand } from "./AccountControls";
+import { NeedsYou } from "./NeedsYou";
+import { accountsCard, decideCards } from "./routingNeeds";
+import type { RouteSetting } from "./routingNeeds";
 import { priorityItems } from "./accountControlsModel";
 import type { PriorityItem } from "./accountControlsModel";
-import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
+import { GROUPS, oldFileRules, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import { paceModel } from "./routingPace";
 import type { PaceTrend, PaceWindow } from "./routingPace";
@@ -69,7 +72,6 @@ import {
   modelDisagreementWords,
   pastWords,
   ROUTE_READ_FAILED,
-  priorityPendingWords,
   ruleResultLines,
   saidWhen,
   useRouting,
@@ -104,19 +106,6 @@ import {
 } from "./routingWords";
 import type { ChangeRow, LimitUnit } from "./routingWords";
 
-/** A conversation's change to a routing setting at your request, made and
- *  marked until you confirm it or undo it (the CLI's ``request``). */
-type SettingRequest = { request?: string | null; by_words?: string | null; at?: string | null; prior?: unknown };
-type RouteSetting = {
-  value: unknown;
-  default: unknown;
-  kind: string;
-  source: string;
-  words?: string;
-  request?: SettingRequest | null;
-  /** A conversation's change is waiting for the owner; `value` is still the live state. */
-  pending?: boolean;
-};
 type RouteConfig = { routing?: Record<string, RouteSetting> };
 
 /** Where focus goes when the control that made a change is gone. */
@@ -597,43 +586,6 @@ export function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer;
   );
 }
 
-/** Each routing setting a conversation changed at your request: what it
- *  said you asked, and Confirm or Undo (the value it replaced comes back). */
-function SettingRequests({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
-  const waiting = Object.entries(cfg?.routing ?? {}).filter(([, s]) => s.request);
-  if (!waiting.length) return null;
-  return (
-    <>
-      {waiting.map(([key, s]) => (
-        <div key={key} className="route-disagree" role="group" aria-label={`A conversation changed: ${s.words ?? key}`}
-          data-route-item={`setting:${key}`} tabIndex={-1}>
-          <span>
-            <b>
-              {s.words ?? key}: changed by {s.request?.by_words || "a conversation"} at your request; you haven't
-              confirmed it yet.
-            </b>
-          </span>
-          {s.request?.request ? <span>What it said you asked: “{s.request.request}”</span> : null}
-          <div className="toolbar">
-            <button type="button" className="sm primary" disabled={w.isBusy(`setting:${key}:confirm`)}
-              onClick={() => void w.run(`setting:${key}:confirm`, "khipu_config_request", { key, action: "confirm" }, reread)}>
-              <Busy on={w.isBusy(`setting:${key}:confirm`)} />
-              Confirm
-            </button>
-            <button type="button" className="sm" disabled={w.isBusy(`setting:${key}:undo`)}
-              onClick={() => void w.run(`setting:${key}:undo`, "khipu_config_request", { key, action: "undo" }, reread)}>
-              <Busy on={w.isBusy(`setting:${key}:undo`)} />
-              Undo
-            </button>
-          </div>
-          <WriteError w={w} id={`setting:${key}:confirm`} />
-          <WriteError w={w} id={`setting:${key}:undo`} />
-        </div>
-      ))}
-    </>
-  );
-}
-
 /** Reading a tool's own login for its real usage limits (owner decision
  *  2026-10-29): one switch per tool. The token goes only to that tool's own
  *  usage page; Khipu never changes the login. */
@@ -915,34 +867,9 @@ function PrioritySection({
         for you; if the first account is limited, paused or down, conversations hear that beside it.
       </p>
       {p?.pending ? (
-        <div className="route-disagree" role="group" aria-label="A conversation set your priority"
-          data-route-item="priority:pending" tabIndex={-1}>
-          <span>
-            <b>{priorityPendingWords(p)}</b>
-          </span>
-          {p.owner_request && !p.proposal_withheld ? <span>What it said you asked: “{p.owner_request}”</span> : null}
-          <span>
-            It replaced:{" "}
-            {p.replaced?.entries.length
-              ? p.replaced.entries.map((e, i) => `${i + 1}. ${e.label}${e.role ? `: ${e.role}` : ""}`).join("; ")
-              : "no priority"}
-            .
-          </span>
-          <div className="toolbar">
-            <button type="button" className="sm primary" disabled={w.isBusy("priority:confirm")}
-              onClick={() => void eok.attempt("priority:confirm", "khipu_route_priority", { action: "confirm", expect })}>
-              <Busy on={w.isBusy("priority:confirm")} />
-              Confirm
-            </button>
-            <button type="button" className="sm" disabled={w.isBusy("priority:undo")}
-              onClick={() => void w.run("priority:undo", "khipu_route_priority", { action: "undo", expect }, null, () => addSelect.current)}>
-              <Busy on={w.isBusy("priority:undo")} />
-              Undo
-            </button>
-          </div>
-          <WriteError w={w} id="priority:confirm" />
-          <WriteError w={w} id="priority:undo" />
-        </div>
+        <p className="set-help" data-route-item="priority:pending" tabIndex={-1}>
+          A conversation changed this order and it waits for your answer under Needs you, at the top of this page.
+        </p>
       ) : null}
       {eok.ask ? (
         <EndOrKeepChoices view={data} ask={eok.ask} now={now} busy={w.anyBusy} saveLabel="Save priority"
@@ -1262,7 +1189,6 @@ function AccountsSection({
   const names = (plans ? rows.map((r) => r.account || r.harness || "an account") : accounts.map((a) => a.label)).join(", ");
   return (
     <div className="section-body">
-      {finder ? <AccountsRequestBand support={finder.support} reload={finder.reload} onChanged={() => void reread()} /> : null}
       {finder ? <FinderTop finder={finder} rows={rows} /> : null}
       <AddProviderAccount data={data} w={w} />
       {accounts.length ? (
@@ -1513,7 +1439,7 @@ type RuleAsk = { id: string; kind: "confirm" | "edit" | "remove" } | null;
 
 /** A replicated rule can be live before it has a display number. Its entity
  * is the stable CLI target for every action during that interval. */
-function ruleTarget(r: RouteRule): Record<string, unknown> {
+export function ruleTarget(r: RouteRule): Record<string, unknown> {
   return r.number_pending && r.entity ? { entity: r.entity } : { n: r.n };
 }
 
@@ -2108,54 +2034,11 @@ function proposalEndsAt(at: string | null | undefined): string | null {
   return new Date(d.getTime() + 7 * 24 * 3600 * 1000).toISOString();
 }
 
-function ProposalRowView({
-  row,
-  data,
-  w,
-  attempt,
-  ask,
-  setAsk,
-  now,
-}: {
-  row: ProposalRow;
-  data: RouteView;
-  w: Writer;
-  attempt: (id: string, command: string, args: Record<string, unknown>, after?: (() => Promise<unknown>) | null, back?: Back, onRetrySuccess?: () => void) => Promise<boolean>;
-  ask: string | null;
-  setAsk: (a: string | null) => void;
-  now: Date;
-}) {
+function ProposalRowView({ row, data, now }: { row: ProposalRow; data: RouteView; now: Date }) {
   const p = row.proposal;
   const live = p.status === "live";
-  const [draft, setDraft] = useState(row.proposed ?? "");
-  const [editConfirm, setEditConfirm] = useState(false);
-  const confirmId = `proposal:confirm:${p.id}`;
-  const dismissId = `proposal:dismiss:${p.id}`;
-  const editId = `proposal:edit:${p.id}`;
   const rule = p.kind === "rule" ? (data.rules ?? []).find((r) => r.entity === p.entity) ?? (data.rules ?? []).find((r) => r.n === p.n) : undefined;
-  const expect = data.priority?.version ?? data.priority_version ?? null;
   const ends = proposalEndsAt(p.at);
-  const close = () => {
-    setAsk(null);
-    setEditConfirm(false);
-  };
-  const ruleMissing = p.kind === "rule" && !rule;
-  const refuse = (id: string) => {
-    w.fail(id, "That rule isn't in this read, so nothing was sent. Read the routing record again, then try again.");
-    return Promise.resolve(false);
-  };
-  const confirm = () =>
-    ruleMissing
-      ? refuse(confirmId)
-      : p.kind === "rule" && rule
-        ? attempt(confirmId, "khipu_route_rule", { action: "confirm", ...ruleTarget(rule), expect: rule.revision })
-        : attempt(confirmId, "khipu_route_priority", { action: "confirm", expect });
-  const dismiss = () =>
-    ruleMissing
-      ? refuse(dismissId)
-      : p.kind === "rule" && rule
-        ? w.run(dismissId, "khipu_route_rule", { action: "dismiss", ...ruleTarget(rule) })
-        : w.run(dismissId, "khipu_route_priority", { action: "undo", expect });
   return (
     <div className="mrow prop" role="listitem" data-route-item={`proposal:${p.id}`} tabIndex={-1}>
       <span className="name">{row.name}</span>
@@ -2169,6 +2052,7 @@ function ProposalRowView({
             {p.kind === "priority" && !row.withheld && data.priority?.owner_request ? (
               <> What it said you asked: “{data.priority.owner_request}”</>
             ) : null}
+            {" "}Answer it under Needs you, at the top of this page.
           </>
         ) : p.status === "crossed" ? (
           <>{row.by}. It was written against an older version, so it never took effect. Its author was told.</>
@@ -2176,7 +2060,7 @@ function ProposalRowView({
           <>{row.by}. You replaced it with your own write, so it has ended.</>
         )}
       </span>
-      {live && ruleMissing ? (
+      {live && p.kind === "rule" && !rule ? (
         <span>That rule isn't in this read, so this proposal can't be confirmed or dismissed here. Read the routing record again, then try again.</span>
       ) : null}
       <span className="end">
@@ -2194,88 +2078,12 @@ function ProposalRowView({
           </div>
         </div>
       ) : null}
-      {live && !ruleMissing ? (
-        <div className="acts">
-          {!row.withheld ? (
-            <button type="button" className="sm primary" disabled={w.isBusy(confirmId)}
-              aria-label={`Confirm the proposed ${row.name.toLowerCase()}`} onClick={() => void confirm()}>
-              <Busy on={w.isBusy(confirmId)} />
-              Confirm
-            </button>
-          ) : null}
-          {p.kind === "rule" && !row.withheld ? (
-            <button type="button" className="sm" aria-expanded={ask === "edit"}
-              aria-label={`Edit the proposed ${row.name.toLowerCase()}`} onClick={() => { setDraft(row.proposed ?? ""); setEditConfirm(false); setAsk(ask === "edit" ? null : "edit"); }}>
-              Edit, then confirm
-            </button>
-          ) : null}
-          <button type="button" className="sm" aria-expanded={ask === "dismiss"}
-            aria-label={`Dismiss the proposed ${row.name.toLowerCase()}`} onClick={() => setAsk(ask === "dismiss" ? null : "dismiss")}>
-            Dismiss
-          </button>
-        </div>
-      ) : null}
-      {live && ask === "dismiss" ? (
-        <ConfirmGroup label={`Dismiss the proposed ${row.name.toLowerCase()}?`} onClose={close} back={() => null}>
-          <span>
-            Dismiss this proposal? {row.owner ? "Your words stay as they are." : "Nothing is added."} The conversation
-            that proposed it is told.
-          </span>
-          <WriteError w={w} id={dismissId} />
-          <div className="toolbar">
-            <button type="button" className="sm danger" disabled={w.isBusy(dismissId)}
-              onClick={async () => { if (await dismiss()) close(); }}>
-              <Busy on={w.isBusy(dismissId)} />
-              Dismiss it
-            </button>
-            <button type="button" className="sm link" onClick={close}>
-              Keep it
-            </button>
-          </div>
-        </ConfirmGroup>
-      ) : null}
-      {live && ask === "edit" && rule ? (
-        <form className={editConfirm ? "route-confirm" : "route-pause"} aria-label={`Edit the proposed ${row.name.toLowerCase()}`}
-          onKeyDown={escapeCloses(close)}
-          onSubmit={async (e) => {
-            e.preventDefault();
-            if (!draft.trim()) {
-              w.fail(editId, "Write the words first.");
-              return;
-            }
-            if (!editConfirm) {
-              w.fail(editId, null);
-              setEditConfirm(true);
-              return;
-            }
-            if (await attempt(editId, "khipu_route_rule", { action: "edit", ...ruleTarget(rule), text: draft }, null, undefined, close)) close();
-          }}>
-          <div className="toolbar">
-            <label htmlFor={editId}>Words</label>
-            <input id={editId} value={draft} autoFocus autoComplete="off" readOnly={editConfirm} onChange={(e) => setDraft(e.target.value)} />
-          </div>
-          {editConfirm ? <span>Make these your words for {row.name.toLowerCase()}? They replace the proposal.</span> : null}
-          <WriteError w={w} id={editId} />
-          <div className="toolbar">
-            <button type="submit" className="primary sm" disabled={w.isBusy(editId)}>
-              <Busy on={w.isBusy(editId)} />
-              {editConfirm ? "Make them mine" : "Save…"}
-            </button>
-            <button type="button" className="sm link" onClick={close}>
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : null}
-      <WriteError w={w} id={confirmId} />
     </div>
   );
 }
 
-function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }) {
+function ProposalsSection({ data, now }: { data: RouteView; now: Date }) {
   const model = proposalsModel(data, now);
-  const eok = useEndOrKeep(w);
-  const [ask, setAsk] = useState<{ id: string; kind: string } | null>(null);
   const [showEnded, setShowEnded] = useState(false);
   const ended = model.ended;
   const endedCounts = ended
@@ -2294,9 +2102,7 @@ function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: D
       {rows.length ? (
         <div className="mrows" role="list" aria-label="Proposals">
           {rows.map((row) => (
-            <ProposalRowView key={row.proposal.id} row={row} data={data} w={w} attempt={eok.attempt} now={now}
-              ask={ask?.id === row.proposal.id ? ask.kind : null}
-              setAsk={(kind) => setAsk(kind ? { id: row.proposal.id, kind } : null)} />
+            <ProposalRowView key={row.proposal.id} row={row} data={data} now={now} />
           ))}
         </div>
       ) : (
@@ -2305,10 +2111,6 @@ function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: D
           <span>When a conversation proposes a change to a rule, your note or your priority, it shows here beside your words.</span>
         </div>
       )}
-      {eok.ask ? (
-        <EndOrKeepChoices view={data} ask={eok.ask} now={now} busy={w.anyBusy} saveLabel="Save and confirm"
-          onCancel={() => eok.setAsk(null)} />
-      ) : null}
       {ended.length ? (
         <p className="set-help">
           {anyDatedEnd ? (
@@ -4933,6 +4735,9 @@ export function RoutingSettings({
   const nFound = foundCount(finder.disc.data);
   const foundTag: ShownTag | null = nFound && !finder.disc.looking ? { text: `${nFound} found`, tone: "accent" } : null;
   const needs = overview.problems.filter((p) => p.needs);
+  const cards = decideCards(data, config.data?.routing, now);
+  const accountsWaiting = finder.support.state === "here" && !!accountsCard(finder.support.status, now);
+  const anyNeeds = needs.length > 0 || cards.length > 0 || accountsWaiting;
   // "Nothing here needs you" only once every read the problems come from is
   // in: the record, the settings (lanes, folders) and plan usage (plans,
   // sign-ins). A read still under way says so; a failed one says which
@@ -4949,7 +4754,7 @@ export function RoutingSettings({
       ? READING_NEEDS
       : notRun.length
         ? `Khipu couldn't read ${notRun.join(" or ")}, so some checks didn't run.`
-        : needs.length
+        : anyNeeds
           ? null
           : "Nothing here needs you.";
 
@@ -5004,7 +4809,7 @@ export function RoutingSettings({
     ),
     holds: data ? (
       <>
-        <ProposalsSection data={data} w={w} now={now} />
+        <ProposalsSection data={data} now={now} />
         <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
       </>
     ) : unread,
@@ -5060,7 +4865,6 @@ export function RoutingSettings({
           </button>
         </div>
       </div>
-      <SettingRequests cfg={config.data} w={w} reread={rereadConfig} />
       {route.error ? (
         <div className="set-error err-inline" role="alert">
           <span>
@@ -5105,22 +4909,12 @@ export function RoutingSettings({
           </div>
         </div>
       ) : null}
-      {needs.length ? (
-        <div className="callout warn needs" role="region" aria-label="Needs you">
-          <div className="txt">
-            <b>Needs you</b>
-            <ul>
-              {needs.map((p) => (
-                <li key={p.key}>
-                  <span>{p.needs}</span>
-                  <button type="button" className="sm" aria-label={`Show ${p.show ?? "it"}`} onClick={() => show(p)}>
-                    Show
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        </div>
+      {anyNeeds ? (
+        <NeedsYou cards={cards} problems={needs} seeded={data ? oldFileRules(data) : []} data={data} w={w} reread={rereadConfig}
+          onShow={show} back={() => document.querySelector<HTMLElement>(".route-settings .needs button:not(:disabled), .route-settings .fold-btn")}
+          accounts={accountsWaiting ? (
+            <AccountsRequestBand support={finder.support} reload={finder.reload} onChanged={() => void route.load(true)} />
+          ) : null} />
       ) : null}
       {needsNote ? (
         <p className="needs-none" role={needsNote === READING_NEEDS ? "status" : undefined}>

@@ -352,7 +352,7 @@ describe("Accounts: Sort by and Show accounts", () => {
     await page();
     expect(names()).toHaveLength(1);
     const needs = await screen.findByRole("region", { name: "Needs you" });
-    fireEvent.click(within(needs).getAllByRole("button", { name: /^Show / })[0]!);
+    fireEvent.click(within(needs).getAllByRole("button", { name: /^(Compare|Go to sign in|See the account): / })[0]!);
     await waitFor(() => expect(names()).toHaveLength(4));
     expect(JSON.parse(store.get(LISTS_KEY)!).accountFilter).toBe("all");
     await waitFor(() => expect(document.activeElement?.getAttribute("data-route-item") ?? "").toMatch(/^account:/));

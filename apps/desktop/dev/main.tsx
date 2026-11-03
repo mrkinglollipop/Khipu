@@ -37,6 +37,10 @@ import { PlanBlock } from "../src/PlansCard";
 import { ProjectsSettings } from "../src/ProjectsSettings";
 import type { ProjectsList } from "../src/ProjectsSettings";
 import { useCliState } from "../src/settingsCli";
+import { invoke } from "./fakeTauri";
+import { RoutingCard } from "../src/RoutingCard";
+import { useRouting } from "../src/routing";
+import type { UsageReport } from "../src/PlansCard";
 import type { UsageAccount } from "../src/PlansCard";
 import { PaceSection } from "../src/RoutingSettings";
 import { paceModel } from "../src/routingPace";
@@ -268,7 +272,30 @@ function RoutingProposals() {
   );
 }
 
+/** Needs you with every kind of item, at the Settings pane's width (`?pane=`). */
+function RoutingNeeds() {
+  const pane = Number(new URLSearchParams(window.location.search).get("pane")) || 760;
+  const [plans, setPlans] = useState<UsageReport | null>(null);
+  useEffect(() => {
+    void invoke<string>("khipu_usage_status").then((text) => setPlans(JSON.parse(text) as UsageReport));
+  }, []);
+  return (
+    <div className="settings-pane" style={{ width: pane, maxWidth: "100%" }}>
+      <RoutingSettings active plansState={{ data: plans, error: null, reread: async () => {} } as never}
+        deliveryHealth={{ status: "red", identities: [{ identity: "codex:abc", component: "main", status: "red", owed: 3 }] } as never} />
+    </div>
+  );
+}
+
+/** Home's routing card with a priority a conversation set. */
+function HomeNeeds() {
+  const route = useRouting(true);
+  return <RoutingCard state={route} />;
+}
+
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
+  "routing-needs": { title: "Needs you: every kind of item (settings reorg slice A)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
+  "home-needs": { title: "Home: Confirm a priority a conversation set", fake: { routeNeeds: true, nineB: true }, render: () => <HomeNeeds /> },
   pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
   delivery: { title: "Telling conversations (fictional delivery evidence)", fake: { route15a: true }, render: () => <RoutingDelivery /> },
   "delivery-unknown": { title: "Telling conversations (missing evidence)", fake: { route15a: true }, render: () => <RoutingDelivery health={{ status: "unknown", identities: [], missing: ["live delivery identities"], replication: { status: "unknown" }, gateway: { status: "unknown" } }} /> },
@@ -383,7 +410,7 @@ function Page() {
       </main>
     );
   }
-  if (hash === "routing-proposals" || hash === "routing-replication") {
+  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs") {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return (
       <main style={{ padding: 24 }} data-state={hash}>

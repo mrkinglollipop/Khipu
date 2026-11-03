@@ -5,7 +5,7 @@ import { CLIENT, TRACKED, discovery, liveRow, status9B } from "../src/__tests__/
 import type { DiscoverResult } from "../src/accountsApi";
 import { DELIVERY_VIEW } from "./deliveryFake";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeReplication?: boolean };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; routeReplication?: boolean };
 
 /** Fictional routing record for the Proposals and holds group (slice 15b),
  *  shaped as `khipu route --json` prints it. */
@@ -53,6 +53,75 @@ function route15b() {
   };
 }
 
+/** Every kind of Needs you item at once (settings reorg slice A), with long
+ *  words where the owner's can be long. Fictional. */
+function routeNeeds() {
+  const ago = (min: number) => new Date(Date.now() - min * 60000).toISOString();
+  const setting = (value: unknown, kind = "x") => ({ value, default: value, kind, source: "default" });
+  return {
+    view: {
+      record: true, version: 12, checked_at: ago(1),
+      accounts: [
+        { key: "codex|", label: "Codex", harness: "codex", state: "open", models: [], witness: null, disagreement: null, last_seen: null },
+        { key: "claude|", label: "Claude", harness: "claude", state: "open", models: [], witness: null, disagreement: null, last_seen: null },
+        { key: "claude|~/.second", label: "Claude second", harness: "claude", state: "limited", until: new Date(Date.now() + 3 * 3600000).toISOString(), models: [],
+          witness: { id: "w1", source: "probe", by: "Khipu usage probe", at: ago(20) },
+          disagreement: { id: "d1", state: "open", source: "conversation", by: "a Claude Code conversation in project-b", at: ago(9) }, last_seen: null },
+      ],
+      holds: [
+        { id: "h-grok", scope_label: "Grok", reason: "keep", text: "Keep Grok for reviews only.", until: null, owner: true, by: "you", at: ago(60 * 24 * 92), remind: true },
+      ],
+      rules: [
+        { n: 1, entity: "rule-a", text: "Reviews can use Claude second after the first limit, and only for the repositories whose owners have said in writing that a second reviewer is fine.", pending: true, pending_kind: "changed",
+          pending_by: "a Claude Code conversation in project-b", prior_text: "Reviews stay on Claude.", revision: "r1", at: ago(40) },
+        { n: 2, entity: "rule-b", text: "Docs may go to Grok.", pending: true, pending_kind: "added", pending_by: "a Codex conversation in project-a", revision: "r2", at: ago(90) },
+        { n: 3, entity: "rule-c", text: "Never a -fast tier.", seeded: true, confirmed: false, revision: "r3" },
+        { n: 4, entity: "rule-d", text: "Nothing goes through Cursor.", seeded: true, confirmed: false, revision: "r4" },
+      ],
+      priority: {
+        entries: [
+          { account: "codex|", label: "Codex", role: "builds" },
+          { account: "claude|", label: "Claude", role: "design and review" },
+          { account: "grok|", label: "Grok", role: "second opinions" },
+        ],
+        pending: true, pending_by: "a Codex conversation", pending_author: { kind: "conversation", harness: "codex", project: "project-c" },
+        owner_request: "put codex first", at: ago(70),
+        replaced: { entries: [{ account: "claude|", label: "Claude", role: "design and review" }, { account: "codex|", label: "Codex", role: "builds" }], until: null },
+        version: "p3",
+      },
+      priority_version: "p3",
+      proposals: {
+        "prop-prio": { id: "prop-prio", entity: "priority", kind: "priority", status: "live", at: ago(70), author: { kind: "conversation", harness: "codex", project: "project-c" } },
+        "prop-rule": { id: "prop-rule", entity: "rule-a", kind: "rule", n: 1, status: "live", at: ago(40), author: { kind: "conversation", harness: "claude_code", project: "project-b" } },
+        "prop-new": { id: "prop-new", entity: "rule-b", kind: "rule", n: 2, status: "live", at: ago(90), author: { kind: "conversation", harness: "codex", project: "project-a" } },
+      },
+      sources: {
+        runners: [{ name: "Project B", silent: true, heartbeat_at: ago(95), lanes: ["opus-batch"] }],
+      },
+      unmatched: [{ runner: "Project B", lane: "opus-batch" }],
+      changes: [],
+    },
+    config: {
+      routing: {
+        routing_push_start: setting(true, "switch"),
+        routing_push_prompt: { value: false, default: true, kind: "switch", source: "file", words: "Tell conversations before each prompt", pending: true,
+          request: { request: "stop the per-prompt updates", by: { kind: "conversation", harness: "codex", project: "project-a" }, by_words: "a Codex conversation", at: ago(30), prior: true } },
+        routing_line_chars: { value: 0, default: 200, kind: "count", source: "file", words: "Longest line, rules and note aside (0: no limit)", pending: true,
+          request: { by_words: "a Claude Code conversation", at: ago(15), prior: null } },
+        routing_lane_map: { value: { "Project B": { "opus-batch": "claude|" } }, default: {}, kind: "lane_map", source: "file", words: "Which account each job lane uses", pending: true,
+          request: { request: "send opus-batch to Claude", by_words: "a Grok Build conversation", at: ago(12), prior: {} } },
+        routing_replication_live: { value: false, default: false, kind: "switch", source: "file", words: "Copy routing between your Macs through the hub", pending: true,
+          request: { request: "turn on copying", by_words: "a Codex conversation", at: ago(5), prior: null } },
+        routing_delivery_live_after: setting(43200),
+      },
+    },
+    usage: { accounts: [
+      { harness: "codex", account: "Codex", home: null, key: "codex|", ok: true, plan: "plus", windows: [] },
+      { harness: "codex", account: "Codex second", home: "~/.codex-second", key: "codex|~/.codex-second", ok: false, error: "not_signed_in", windows: [] },
+    ] },
+  };
+}
+
 /** Fictional routing record with the Mac-to-Mac replication switch on. */
 function routeReplication() {
   const base = route15b();
@@ -97,10 +166,15 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         return f.disc ?? discovery();
       case "khipu_accounts_status":
         if (!f.nineB) throw new Error("Command khipu_accounts_status not found");
+        if (f.routeNeeds) {
+          return status9B({ accounts: TRACKED, request: { request: "track my Muse account", at: new Date(Date.now() - 8 * 60000).toISOString(),
+            by: { kind: "conversation", harness: "codex", project: "project-a" }, prior: TRACKED.slice(0, -1) } } as never);
+        }
         return status9B({ none: !!f.none });
       case "khipu_accounts_try":
         return { ok: true, default: false, row: liveRow({ account: String(args?.harness ?? "claude") }) };
       case "khipu_config_show":
+        if (f.routeNeeds) return routeNeeds().config;
         if (f.routeReplication) return routeReplication().config;
         if (f.route15a) return route15a().config;
         if (f.route15b) return route15b().config;
@@ -115,12 +189,14 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         };
       case "khipu_usage_status":
       case "khipu_usage_refresh":
+        if (f.routeNeeds) return routeNeeds().usage;
         return f.usage ?? { accounts: [{ harness: "claude", account: "Claude Code", home: null, ok: true, plan: "max", windows: [] }] };
       case "khipu_features_show":
         return { features: { routing_push: { enabled: true, source: "default" } } };
       case "khipu_projects_list":
         return { ok: true, ...(f.projects as object) };
       case "khipu_route_view":
+        if (f.routeNeeds) return routeNeeds().view;
         if (f.routeReplication) return routeReplication().view;
         if (f.route15a) return route15a().view;
         if (f.route15b) return route15b().view;

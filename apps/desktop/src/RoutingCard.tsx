@@ -23,13 +23,14 @@ import {
   modelDisagreementWords,
   holdWords,
   notRefreshedWords,
-  priorityPendingWords,
   whenLocal,
   windowWords,
 } from "./routing";
 import type { PlanFigure, RouteAccount, RoutePriority, RoutingState, RouteView } from "./routing";
 import { callCli } from "./settingsCli";
 import { holdChoiceIds, holdChoiceTargets } from "./routingProposals";
+import { priorityCard } from "./routingNeeds";
+import { DecideWords } from "./DecideWords";
 
 const NO_RECORD_HINT =
   "Khipu starts one when a plan check, a job runner folder or a conversation reports on an account. Until then no account is shown as open.";
@@ -113,13 +114,15 @@ function AccountRow({
 }
 
 /** The owner's priority at the top of the card, in his order. One a
- *  conversation set at his request carries its mark and Confirm or Undo. */
+ *  conversation set at his request says what changed, who asked, and buttons
+ *  that name the result (routingNeeds.ts). */
 function PriorityRow({ p, view, now, reload, onOpen }: { p: RoutePriority; view: RouteView; now: Date; reload: () => Promise<void>; onOpen: (key: string) => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [holdIds, setHoldIds] = useState<string[] | null>(null);
   const [holds, setHolds] = useState<Record<string, "end" | "keep">>({});
   const targets = holdIds ? holdChoiceTargets(view, holdIds, now) : [];
+  const card = priorityCard(view, now);
   const act = async (action: "confirm" | "undo", choices?: Record<string, "end" | "keep">) => {
     if (busy) return;
     setBusy(action);
@@ -158,22 +161,23 @@ function PriorityRow({ p, view, now, reload, onOpen }: { p: RoutePriority; view:
         ))}
         {p.until ? ` (all of it until ${whenLocal(p.until, now)})` : ""}
       </span>
-      {p.pending ? (
+      {card ? (
         <>
-          <span className="route-note">
-            <Tag tone="warn" dot>
-              Not confirmed
-            </Tag>
-            <span>{priorityPendingWords(p)}</span>
-          </span>
-          <span className="route-acts">
-            <button type="button" className="sm" disabled={busy !== null} onClick={() => void act("confirm")}>
-              {busy === "confirm" ? "Confirming…" : "Confirm"}
-            </button>
-            <button type="button" className="sm" disabled={busy !== null} onClick={() => void act("undo")}>
-              {busy === "undo" ? "Undoing…" : "Undo"}
-            </button>
-          </span>
+          <div className="needs-card route-priority-decide">
+            <DecideWords card={card} />
+            <div className="needs-acts">
+              {card.keep ? (
+                <button type="button" className="sm primary" disabled={busy !== null} onClick={() => void act("confirm")}>
+                  {busy === "confirm" ? "Keeping…" : card.keep}
+                </button>
+              ) : null}
+              {card.back ? (
+                <button type="button" className="sm" disabled={busy !== null} onClick={() => void act("undo")}>
+                  {busy === "undo" ? "Going back…" : card.back}
+                </button>
+              ) : null}
+            </div>
+          </div>
           {error ? (
             <span className="set-error" role="alert">
               Khipu didn't make that change: {error}

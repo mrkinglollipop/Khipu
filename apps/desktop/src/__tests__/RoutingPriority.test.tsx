@@ -199,16 +199,18 @@ describe("the priority on Home", () => {
     expect(screen.queryByRole("button", { name: "Confirm" })).toBeNull();
   });
 
-  it("marks one a conversation set, with Confirm and Undo", async () => {
+  it("says what a conversation set, who asked and what each button does, before either is clicked", async () => {
     const load = vi.fn(async () => undefined);
     const pending = { ...PRIORITY, pending: true, confirmed: false, pending_by: "a Claude Code conversation", via: "mcp" };
     render(<RoutingCard state={stateOf(view(pending), load)} />);
-    expect(screen.getByText("Not confirmed")).toBeTruthy();
-    expect(screen.getByText("Set by a Claude Code conversation at your request; you haven't confirmed it yet.")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(screen.getByText("A conversation set your order of accounts")).toBeTruthy();
+    expect(screen.getByText(/^A Claude Code conversation/)).toBeTruthy();
+    expect(screen.getByText("You had no order set.", { exact: false })).toBeTruthy();
+    expect(screen.getByText(/The new order stays in use/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Keep the new order" }));
     await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "confirm", expect: "p7" }]));
     await waitFor(() => expect(load).toHaveBeenCalledWith(true));
-    fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove this order" }));
     await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo", expect: "p7" }));
   });
 
@@ -221,7 +223,7 @@ describe("the priority on Home", () => {
     const data = view(pending);
     data.holds = [{ id: "h1", scope_label: "Claude", reason: "keep", owner: true, until: null }];
     render(<RoutingCard state={stateOf(data, load)} />);
-    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep the new order" }));
     await screen.findByRole("group", { name: "End or keep each hold" });
     fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
     fireEvent.click(screen.getByRole("button", { name: "Save and confirm" }));
@@ -296,12 +298,12 @@ describe("the priority and the pace in Settings -> Routing", () => {
   it("clears the whole priority after asking, and confirms or undoes one a conversation set", async () => {
     await page({ ...view(), priority: { ...PRIORITY, pending: true, confirmed: false, pending_by: "a Codex conversation",
       owner_request: "the owner asked for Codex first", replaced: { entries: [PRIORITY.entries[2]] } } });
-    expect(screen.getByText("What it said you asked: “the owner asked for Codex first”")).toBeTruthy();
-    expect(screen.getByText(/It replaced: 1\. Claude: orchestration only/)).toBeTruthy();
-    const group = screen.getByRole("group", { name: "A conversation set your priority" });
-    fireEvent.click(within(group).getByRole("button", { name: "Confirm" }));
+    const group = screen.getByRole("article", { name: /^A conversation put / });
+    expect(group).toHaveTextContent("“the owner asked for Codex first”");
+    expect(group).toHaveTextContent("Your order before1. Claude: orchestration only");
+    fireEvent.click(within(group).getByRole("button", { name: "Keep the new order" }));
     await waitFor(() => expect(sent()).toEqual([{ action: "confirm", expect: "p7" }]));
-    fireEvent.click(within(group).getByRole("button", { name: "Undo" }));
+    fireEvent.click(within(group).getByRole("button", { name: "Go back to my order" }));
     await waitFor(() => expect(sent()[1]).toEqual({ action: "undo", expect: "p7" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear the priority" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear it" }));

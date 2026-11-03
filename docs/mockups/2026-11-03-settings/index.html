@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Khipu mock: Accounts and routing, reorganized (fictional data, 2026-11-03)</title>
+<style>
+:root {
+  --bg: #faf9f7;
+  --surface: #ffffff;
+  --surface-2: #f5f3f0;
+  --rail: #f3f1ed;
+  --border: #e5e1db;
+  --border-strong: #d5d0c8;
+  --text: #201d1a;
+  --text-2: #55504a;
+  --muted: #6e6860;
+  --accent: #a63a1e;
+  --accent-hover: #8f2f16;
+  --accent-text: #8c2d14;
+  --accent-soft: #f6e9e3;
+  --on-accent: #ffffff;
+  --ok: #2e7d43;
+  --ok-soft: #eaf5ec;
+  --warn: #96660a;
+  --warn-soft: #fbf3e0;
+  --err: #b3261e;
+  --err-soft: #fbebea;
+  --ring: rgba(166, 58, 30, 0.35);
+  --shadow-sm: 0 1px 2px rgba(32, 29, 26, 0.06);
+  --shadow-md: 0 4px 16px rgba(32, 29, 26, 0.08);
+
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+    sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", monospace;
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+
+  /* Spacing scale — 4/8/12/16/20/24/32. Before this the file picked its own
+     number per rule (7 gap values, 10 padding values). New and touched rules
+     use these; nothing else was rewritten blind. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s8: 32px;
+
+  /* Type scale — 11/12/13/15/18/22, replacing 13 literal sizes. */
+  --t-xs: 11px;
+  --t-sm: 12px;
+  --t-md: 13px;
+  --t-lg: 15px;
+  --t-xl: 18px;
+  --t-2xl: 22px;
+
+  /* One modal backdrop, not two independent rgba literals. */
+  --backdrop: rgba(32, 29, 26, 0.45);
+
+  color: var(--text);
+  background: var(--bg);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16130f;
+    --surface: #1f1b17;
+    --surface-2: #262119;
+    --rail: #1a1713;
+    --border: #332d26;
+    --border-strong: #453d33;
+    --text: #ede8e1;
+    --text-2: #b8b0a5;
+    --muted: #857d72;
+    --accent: #e0703f;
+    --accent-hover: #ea8153;
+    --accent-text: #ed9067;
+    --accent-soft: rgba(224, 112, 63, 0.14);
+    --on-accent: #1f0e06;
+    --ok: #63c982;
+    --ok-soft: rgba(99, 201, 130, 0.12);
+    --warn: #e3b241;
+    --warn-soft: rgba(227, 178, 65, 0.12);
+    --err: #f27059;
+    --err-soft: rgba(242, 112, 89, 0.12);
+    --ring: rgba(224, 112, 63, 0.4);
+    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+    --shadow-md: 0 6px 24px rgba(0, 0, 0, 0.5);
+    --backdrop: rgba(0, 0, 0, 0.55);
+  }
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;background:var(--bg)}
+button{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:30px;padding:0 12px;border-radius:var(--r-sm);border:1px solid var(--border);background:var(--surface);color:var(--text);font:inherit;font-weight:500;cursor:pointer;transition:background 140ms ease,border-color 140ms ease,color 140ms ease}
+button:hover{border-color:var(--border-strong);background:var(--surface-2)}
+button:focus-visible,input:focus-visible,a:focus-visible,select:focus-visible{outline:none;box-shadow:0 0 0 3px var(--ring)}
+button:disabled{opacity:.5;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--on-accent);font-weight:600;box-shadow:var(--shadow-sm)}
+button.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+button.sm{height:26px;padding:0 10px;font-size:var(--t-sm)}
+button.link{border-color:transparent;background:transparent;color:var(--accent-text);padding:0 var(--s1);height:26px}
+button.link:hover{background:transparent;border-color:transparent;text-decoration:underline}
+input[type=search],input[type=text]{height:30px;padding:0 10px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--surface);color:var(--text);font:inherit;min-width:0}
+input::placeholder{color:var(--muted)}
+.shell{display:grid;grid-template-columns:216px 1fr;height:100%}
+.rail{display:flex;flex-direction:column;background:var(--rail);border-right:1px solid var(--border);overflow:hidden;position:relative;user-select:none}
+.rail-drag{height:44px;flex:none}
+.brand{display:flex;align-items:center;gap:8px;padding:0 16px 16px}
+.brand img{display:block;border-radius:22.5%}
+.brand-name{font-size:14px;font-weight:700;letter-spacing:.02em}
+.rail-nav{flex:1;overflow-y:auto;padding:0 8px 12px;display:flex;flex-direction:column;gap:16px}
+.nav-group{display:flex;flex-direction:column;gap:2px}
+button.nav{position:relative;display:flex;align-items:center;justify-content:flex-start;gap:8px;width:100%;height:auto;padding:8px 10px;border:0;border-radius:var(--r-sm);background:transparent;color:var(--text-2);font:inherit;font-weight:500;text-align:left}
+button.nav:hover{background:var(--surface-2);color:var(--text)}
+button.nav.active{background:var(--accent-soft);color:var(--accent-text);font-weight:600}
+button.nav.active::before{content:"";position:absolute;left:0;top:6px;bottom:6px;width:2px;border-radius:2px;background:var(--accent)}
+.rail-foot{flex:none;display:flex;flex-direction:column;gap:var(--s3);padding:var(--s3) var(--s4);border-top:1px solid var(--border)}
+.rail-health{display:flex;align-items:center;gap:var(--s2);font-size:var(--t-sm);color:var(--text-2)}
+.mock-chip{font-size:var(--t-xs);color:var(--muted)}
+.main{position:relative;min-height:0;height:100%;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
+.panel-head{flex:none;padding:16px 24px 12px;background:var(--bg);border-bottom:1px solid var(--border)}
+.panel-head h1{margin:0;font-size:17px;font-weight:650;letter-spacing:-.01em}
+.panel-head .lede{margin:2px 0 0;font-size:12px;color:var(--muted);max-width:64ch}
+.main-content{position:relative;min-height:0;flex:1 1 auto;overflow-y:auto}
+.panel-body{padding:20px 24px 32px}
+.split{display:flex;align-items:flex-start;gap:var(--s5);min-width:0}
+.subnav-wrap{width:190px;flex:none;position:sticky;top:20px;display:flex;flex-direction:column;gap:var(--s3)}
+.find{position:relative}
+.find input{width:100%}
+.find-results{position:absolute;z-index:20;top:34px;left:0;width:330px;max-height:340px;overflow:auto;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-md);box-shadow:var(--shadow-md);padding:4px;display:flex;flex-direction:column;gap:1px}
+.find-results[hidden]{display:none}
+.find-results button{height:auto;min-height:30px;padding:6px 8px;border:0;background:transparent;display:block;text-align:left;width:100%;font-size:var(--t-sm)}
+.find-results button:hover,.find-results button:focus-visible{background:var(--surface-2)}
+.find-results small{display:block;color:var(--muted);font-size:var(--t-xs);font-weight:400}
+.find-none{padding:6px 8px;font-size:var(--t-sm);color:var(--text-2)}
+.subnav{display:flex;flex-direction:column;gap:2px}
+.subnav button{justify-content:flex-start;height:auto;min-height:30px;padding:5px 10px;line-height:1.3;border-color:transparent;background:transparent;color:var(--text-2);font-weight:500;font-size:var(--t-md);text-align:left;width:100%}
+.subnav button:hover{background:var(--surface);border-color:transparent}
+.subnav button[aria-selected=true]{background:var(--surface-2);color:var(--text);font-weight:600}
+.subnav .sep{height:1px;background:var(--border);margin:var(--s2) 6px}
+.nav-count{margin-left:auto;font-size:var(--t-xs);font-weight:600;color:var(--on-accent);background:var(--accent);border-radius:999px;padding:0 7px;line-height:17px;flex:none}
+.nav-count.quiet{background:var(--surface-2);color:var(--text-2);border:1px solid var(--border);line-height:15px}
+.subnav button[aria-selected=true] .nav-count.quiet{background:var(--surface)}
+.pane{flex:1;min-width:0;max-width:720px;display:flex;flex-direction:column;gap:var(--s4)}
+.pane[hidden]{display:none}
+.pane h2{margin:0;font-size:var(--t-lg);font-weight:650;letter-spacing:-.005em;outline:none}
+.pane-intro{margin:2px 0 0;color:var(--text-2);font-size:var(--t-md);line-height:1.5}
+.set-help{margin:0;color:var(--text-2);font-size:var(--t-sm);line-height:1.45}
+.band-h{margin:var(--s2) 0 calc(-1 * var(--s2));font-size:var(--t-md);font-weight:650;color:var(--text);display:flex;gap:var(--s2);align-items:baseline}
+.band-h small{font-size:var(--t-sm);font-weight:400;color:var(--text-2)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);box-shadow:var(--shadow-sm);overflow:hidden}
+.card-head{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600;padding:12px 16px;border-bottom:1px solid var(--border)}
+.card-head .spacer{flex:1}
+.card-body{padding:12px 16px 16px;display:flex;flex-direction:column;gap:var(--s2)}
+.tag{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 var(--s2);border-radius:999px;font-size:var(--t-xs);font-weight:600;border:1px solid var(--border);color:var(--text-2);background:var(--surface-2);white-space:nowrap;flex:none}
+.tag .dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+.tag.ok{color:var(--ok);background:var(--ok-soft);border-color:transparent}
+.tag.warn{color:var(--warn);background:var(--warn-soft);border-color:transparent}
+.tag.err{color:var(--err);background:var(--err-soft);border-color:transparent}
+.tag.accent{color:var(--accent-text);background:var(--accent-soft);border-color:transparent}
+.hdot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none;background:var(--border-strong)}
+.hdot.ok{background:var(--ok)}.hdot.warn{background:var(--warn)}.hdot.err{background:var(--err)}
+/* at a glance */
+.glance{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:var(--s2)}
+.glance button{height:auto;display:flex;flex-direction:column;align-items:flex-start;gap:1px;padding:8px 12px;text-align:left;box-shadow:var(--shadow-sm)}
+.glance .k{font-size:var(--t-xs);color:var(--muted);font-weight:500}
+.glance .v{font-size:var(--t-md);font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px}
+/* decide cards */
+.dcard{background:var(--surface);border:1px solid color-mix(in srgb,var(--warn) 45%,transparent);border-left:3px solid var(--warn);border-radius:var(--r-md);box-shadow:var(--shadow-sm);padding:12px 16px;display:flex;flex-direction:column;gap:var(--s2)}
+.dcard h4{margin:0;font-size:14px;font-weight:650;line-height:1.35}
+.ba{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:var(--s2)}
+.ba>div{background:var(--surface-2);border-radius:var(--r-sm);padding:8px 10px;font-size:var(--t-md);line-height:1.45;white-space:pre-line}
+.ba .cap{display:block;font-size:var(--t-xs);font-weight:600;color:var(--text-2);white-space:normal}
+.facts{margin:0;display:grid;grid-template-columns:auto 1fr;gap:1px var(--s3);font-size:var(--t-sm);line-height:1.45}
+.facts dt{color:var(--muted)}.facts dd{margin:0;color:var(--text)}
+.acts{display:flex;gap:var(--s2);flex-wrap:wrap;margin-top:2px}
+.done{display:flex;align-items:center;gap:var(--s3);padding:8px 16px;background:var(--ok-soft);border-radius:var(--r-md);font-size:var(--t-md)}
+.done span{flex:1}
+/* rows */
+.rowlist{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);box-shadow:var(--shadow-sm);overflow:hidden}
+.r{display:flex;gap:var(--s3);align-items:center;padding:10px 16px;border-bottom:1px solid var(--border)}
+.r:last-child{border-bottom:0}
+.r .t{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.r .t b{font-size:var(--t-md);font-weight:600}
+.r .t span{font-size:var(--t-sm);color:var(--text-2);line-height:1.4}
+.r .e{flex:none;display:flex;gap:var(--s2);align-items:center}
+.r.stack{flex-wrap:wrap}
+.num{font-variant-numeric:tabular-nums}
+.v{font-size:var(--t-sm);color:var(--text);white-space:nowrap}
+/* accounts */
+.acct{display:grid;grid-template-columns:118px 150px 1fr auto;gap:var(--s3);align-items:center;padding:9px 16px;border-bottom:1px solid var(--border);font-size:var(--t-md)}
+.acct:last-child{border-bottom:0}
+.acct .nm{font-weight:600}
+.acct .st{display:flex;align-items:center;gap:6px;font-size:var(--t-sm)}
+.acct .rm{display:flex;flex-direction:column;gap:3px;font-size:var(--t-sm);color:var(--text-2)}
+.meter{display:block;height:6px;border-radius:3px;background:color-mix(in srgb,var(--text-2) 25%,var(--surface-2));overflow:hidden;max-width:180px}
+.meter i{display:block;height:100%;background:var(--accent);border-radius:3px}
+.meter.warn i{background:var(--warn)}
+/* switches, from the app */
+input.switch{appearance:none;-webkit-appearance:none;position:relative;flex:none;width:36px;height:20px;min-width:0;padding:0;margin:2px 0 0;border-radius:999px;border:1px solid var(--text-2);background:var(--surface-2);cursor:pointer;transition:background 140ms ease,border-color 140ms ease}
+input.switch::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--text-2);transition:transform 140ms ease}
+input.switch:checked{background:var(--accent);border-color:var(--accent)}
+input.switch:checked::after{transform:translateX(16px);background:var(--on-accent)}
+@media (prefers-reduced-motion:reduce){input.switch,input.switch::after,button{transition:none}}
+.opt-row{display:flex;align-items:flex-start;gap:var(--s3);padding:var(--s3) var(--s4);border-bottom:1px solid var(--border)}
+.opt-row:last-child{border-bottom:0}
+.opt-text{display:flex;flex-direction:column;gap:var(--s1);flex:1;min-width:0}
+.opt-title{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap}
+.opt-name{font-size:var(--t-md);font-weight:600;color:var(--text);cursor:pointer}
+.opt-what{margin:0;color:var(--text-2);font-size:var(--t-sm);line-height:1.45}
+.highlight{animation:flash 1.6s ease-out 1}
+@keyframes flash{0%,40%{box-shadow:inset 0 0 0 2px var(--accent)}100%{box-shadow:inset 0 0 0 2px transparent}}
+@media (prefers-reduced-motion:reduce){.highlight{animation:none;box-shadow:inset 0 0 0 2px var(--accent)}}
+/* differences */
+.diff-head{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) minmax(0,1fr);gap:var(--s3);padding:6px 16px;background:var(--surface-2);border-bottom:1px solid var(--border);font-size:var(--t-xs);font-weight:600;color:var(--text-2)}
+.diff{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) minmax(0,1fr);gap:var(--s2) var(--s3);padding:10px 16px;border-bottom:1px solid var(--border);align-items:start}
+.diff:last-child{border-bottom:0}
+.diff .n b{display:block;font-size:var(--t-md);font-weight:600}
+.diff .n span{font-size:var(--t-sm);color:var(--text-2);line-height:1.4;display:block}
+.diff .c{display:flex;flex-direction:column;align-items:flex-start;gap:6px;font-size:var(--t-md)}
+.diff .vline{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px}
+/* folds, only on Rarely needed */
+.fold-btn{display:flex;align-items:center;justify-content:flex-start;gap:var(--s2);width:100%;height:auto;min-height:44px;padding:11px 16px;border:0;border-radius:0;background:transparent;text-align:left;font-size:var(--t-md)}
+.fold-btn:hover{background:var(--surface-2)}
+.fold-btn svg{flex:none;transition:transform 140ms ease}
+.fold-btn[aria-expanded=true] svg{transform:rotate(90deg)}
+.fold-btn .nm{font-weight:600;font-size:14px}
+.fold-btn .ln{color:var(--text-2);font-size:var(--t-sm);font-weight:400}
+.fold-body[hidden]{display:none}
+.fold-body{border-top:1px solid var(--border)}
+.fold+.fold{border-top:1px solid var(--border)}
+.rare-rule{height:0}
+.note-q{margin:0;padding:8px 12px;border-left:2px solid var(--border-strong);font-size:var(--t-md);line-height:1.5}
+.toolbar{display:flex;gap:var(--s2);align-items:center;flex-wrap:wrap}
+.toolbar input{flex:1 1 200px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{height:24px;border-radius:999px;padding:0 10px;font-size:var(--t-sm);border:1px solid var(--border);background:var(--surface);color:var(--text-2)}
+.chip[aria-pressed=true]{background:var(--accent-soft);color:var(--accent-text);border-color:transparent;font-weight:600}
+.when{font-size:var(--t-sm);color:var(--muted);width:66px;flex:none}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@media (max-width:1040px){.subnav-wrap{width:164px}.split{gap:var(--s4)}.acct{grid-template-columns:100px 120px 1fr auto}.panel-body{padding:16px 16px 28px}}
+</style>
+</head>
+<body>
+<div class="shell">
+<nav class="rail" aria-label="Primary">
+  <div class="rail-drag"></div>
+  <div class="brand"><img src="data:image/png;base64,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" width="26" height="26" alt=""><span class="brand-name">Khipu</span></div>
+  <div class="rail-nav">
+    <div class="nav-group">
+      <button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5 8 4l5 4.5V13H3z"/></svg>Home</button>
+      <button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h10v10H3zM8 3v10M3 8h10"/></svg>Work</button>
+      <button type="button" class="nav active" aria-current="page"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h10M3 8h10M3 12h6"/><path d="m11 10.5 1.5 1.5 2-2.5"/></svg>Accounts and routing</button>
+      <button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4"/><path d="m10 10 3.5 3.5"/></svg>Recall</button>
+      <button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.5"/></svg>Activity</button>
+      <button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3v3M11 3v3M3 6h10v3a5 5 0 0 1-10 0z"/><path d="M8 11v3"/></svg>Harnesses</button>
+      <button type="button" class="nav"><svg viewBox="0 0 16 16" aria-hidden="true" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h10M3 11h10"/><circle cx="6" cy="5" r="1.5"/><circle cx="10" cy="11" r="1.5"/></svg>Settings</button>
+    </div>
+  </div>
+  <div class="rail-foot">
+    <div class="rail-health"><span class="hdot ok" aria-hidden="true"></span><span>All harnesses recording</span></div>
+    <span class="mock-chip">Mock. All names and numbers are made up.</span>
+  </div>
+</nav>
+<main class="main">
+  <header class="panel-head">
+    <h1>Accounts and routing</h1>
+    <p class="lede">Khipu tells your conversations which accounts have room and what you want. Your agents decide where work goes.</p>
+  </header>
+  <div class="main-content" id="scroller">
+  <div class="panel-body">
+  <div class="split">
+    <div class="subnav-wrap">
+      <div class="find">
+        <label class="sr-only" for="find">Find a setting</label>
+        <input id="find" type="search" placeholder="Find a setting" autocomplete="off" aria-controls="find-results">
+        <div id="find-results" class="find-results" hidden></div>
+      </div>
+      <div class="subnav" role="tablist" aria-orientation="vertical" aria-label="Accounts and routing sections">
+        <button type="button" role="tab" id="tab-needs" aria-controls="needs" data-go="needs">Needs you <span class="nav-count" id="count-needs">8</span></button>
+        <button type="button" role="tab" id="tab-accounts" aria-controls="accounts" data-go="accounts">Your accounts <span class="nav-count quiet" aria-label="2 need a look">2</span></button>
+        <button type="button" role="tab" id="tab-work" aria-controls="work" data-go="work">Who gets what work</button>
+        <button type="button" role="tab" id="tab-macs" aria-controls="macs" data-go="macs">Your Macs <span class="nav-count quiet" id="count-macs" aria-label="2 settings differ">2</span></button>
+        <button type="button" role="tab" id="tab-convos" aria-controls="convos" data-go="convos">Conversations <span class="nav-count quiet" aria-label="1 is behind">1</span></button>
+        <button type="button" role="tab" id="tab-changes" aria-controls="changes" data-go="changes">What changed</button>
+        <button type="button" role="tab" id="tab-wrong" aria-controls="wrong" data-go="wrong">Something's wrong <span class="nav-count quiet" aria-label="3 to look at">3</span></button>
+        <div class="sep" role="presentation"></div>
+        <button type="button" role="tab" id="tab-rare" aria-controls="rare" data-go="rare">Rarely needed</button>
+      </div>
+    </div>
+
+    <!-- NEEDS YOU -->
+    <section class="pane" id="needs" role="tabpanel" aria-labelledby="tab-needs">
+      <h2 tabindex="-1">Needs you</h2>
+      <div class="glance">
+        <button type="button" data-go="accounts"><span class="k">Your accounts</span><span class="v"><span class="hdot warn" aria-hidden="true"></span>3 of 7 have room</span></button>
+        <button type="button" data-go="work"><span class="k">First in line</span><span class="v">Codex, then Claude</span></button>
+        <button type="button" data-go="macs"><span class="k">Your Macs</span><span class="v" id="glance-macs"><span class="hdot warn" aria-hidden="true"></span>2 settings differ</span></button>
+      </div>
+
+      <h3 class="band-h">Decide <small>A conversation changed something. It is in use now.</small></h3>
+
+      <article class="dcard" data-item>
+        <h4>A conversation put Codex ahead of Claude</h4>
+        <div class="ba">
+          <div><span class="cap">Your order before</span>1. Claude: design and review
+2. Codex: builds</div>
+          <div><span class="cap">The order in use now</span>1. Codex: builds
+2. Claude: design and review
+3. Grok: second opinions</div>
+        </div>
+        <dl class="facts">
+          <dt>Who</dt><dd>A Codex conversation in project-c, today at 12:51 PM</dd>
+          <dt>It says you asked</dt><dd>“put codex first”</dd>
+          <dt>If you do nothing</dt><dd>The new order stays in use until Nov 10, then your order comes back.</dd>
+        </dl>
+        <div class="acts">
+          <button type="button" class="primary sm" data-done="Kept the new order: Codex first.">Keep the new order</button>
+          <button type="button" class="sm" data-done="Went back to your order: Claude first.">Go back to my order</button>
+        </div>
+      </article>
+
+      <article class="dcard" data-item>
+        <h4>A conversation turned off routing news before each prompt</h4>
+        <div class="ba">
+          <div><span class="cap">Before</span>On: a running conversation hears about a change before your next prompt.</div>
+          <div><span class="cap">In use now</span>Off: it hears only when it starts, after it compacts, or when it hands work on.</div>
+        </div>
+        <dl class="facts">
+          <dt>Who</dt><dd>A Codex conversation in project-a, today at 3:30 PM</dd>
+          <dt>It says you asked</dt><dd>“stop the per-prompt updates”</dd>
+          <dt>If you do nothing</dt><dd>It stays off, and this stays here until you answer.</dd>
+        </dl>
+        <div class="acts">
+          <button type="button" class="primary sm" data-done="Kept it off.">Keep it off</button>
+          <button type="button" class="sm" data-done="Turned it back on.">Turn it back on</button>
+        </div>
+      </article>
+
+      <article class="dcard" data-item>
+        <h4>A conversation reworded your rule about reviews</h4>
+        <div class="ba">
+          <div><span class="cap">Your words</span>Reviews stay on Claude.</div>
+          <div><span class="cap">The words in use now</span>Reviews can use Claude second after the first limit.</div>
+        </div>
+        <dl class="facts">
+          <dt>Who</dt><dd>A Claude Code conversation in project-b, 40 min ago</dd>
+          <dt>If you do nothing</dt><dd>The new words stay in use until Nov 10, then your words come back.</dd>
+        </dl>
+        <div class="acts">
+          <button type="button" class="primary sm" data-done="Kept the new words.">Keep the new words</button>
+          <button type="button" class="sm" data-go="work">Edit them first</button>
+          <button type="button" class="sm" data-done="Kept your words.">Keep my words</button>
+        </div>
+      </article>
+
+      <h3 class="band-h">Fix <small>Something isn't working. Nothing was stopped.</small></h3>
+      <div class="rowlist">
+        <div class="r" data-item id="fix-macs"><span class="hdot warn" aria-hidden="true"></span><span class="t"><b>Your Macs differ on 2 settings</b><span>You changed them on MacBook Air last night while the two Macs weren't in touch.</span></span><span class="e"><button type="button" class="sm" data-go="macs">Compare</button></span></div>
+        <div class="r" data-item><span class="hdot warn" aria-hidden="true"></span><span class="t"><b>Claude second: two reports disagree</b><span>Its plan check says it's at its limit until 6:24 PM. A conversation in project-b said it was open 9 min ago.</span></span><span class="e"><button type="button" class="sm" data-go="accounts">Compare</button></span></div>
+        <div class="r" data-item><span class="hdot warn" aria-hidden="true"></span><span class="t"><b>Codex second isn't signed in</b><span>Khipu can't see how much is left, so conversations hear “don't know”.</span></span><span class="e"><button type="button" class="sm" data-go="accounts">Sign in…</button></span></div>
+        <div class="r" data-item><span class="hdot err" aria-hidden="true"></span><span class="t"><b>The job runner in Project B stopped reporting at 2:32 PM</b><span>Limits it finds won't reach your conversations until it runs again.</span></span><span class="e"><button type="button" class="sm" data-go="wrong">Look into it</button></span></div>
+        <div class="r" data-item><span class="hdot err" aria-hidden="true"></span><span class="t"><b>project-c on MacBook Air hasn't heard your last 3 changes</b><span>It may still be using an older picture of your accounts.</span></span><span class="e"><button type="button" class="sm" data-go="convos">See who has what</button></span></div>
+      </div>
+
+      <h3 class="band-h">When you have time <small>Nothing is wrong. These can wait.</small></h3>
+      <div class="rowlist">
+        <div class="r stack">
+          <span class="t"><b>2 rules copied from your old routing file were never reviewed</b><span>They are in use either way. Reviewing only marks them as yours.</span></span>
+          <span class="e"><button type="button" class="sm" aria-expanded="false" aria-controls="old-rules" data-toggle="old-rules">Read them</button></span>
+          <div id="old-rules" hidden style="flex-basis:100%">
+            <div class="r" style="padding:8px 0"><span class="t"><b>Never a -fast tier.</b></span><span class="e"><button type="button" class="sm">Keep as written</button><button type="button" class="sm">Edit</button><button type="button" class="sm">Remove</button></span></div>
+            <div class="r" style="padding:8px 0"><span class="t"><b>Nothing goes through Cursor.</b></span><span class="e"><button type="button" class="sm">Keep as written</button><button type="button" class="sm">Edit</button><button type="button" class="sm">Remove</button></span></div>
+          </div>
+        </div>
+        <div class="r"><span class="t"><b>Your instruction about Grok has been on for 3 months</b><span>“Keep Grok for reviews only.” You set it Aug 3, with no end date.</span></span><span class="e"><button type="button" class="sm">Still needed</button><button type="button" class="sm">End it</button></span></div>
+      </div>
+    </section>
+
+    <!-- ACCOUNTS -->
+    <section class="pane" id="accounts" role="tabpanel" aria-labelledby="tab-accounts" hidden>
+      <div class="toolbar"><div style="flex:1"><h2 tabindex="-1">Your accounts</h2><p class="pane-intro">Who has room right now, and when that changes.</p></div><button type="button" class="sm">Check all now</button><button type="button" class="sm primary">Add an account…</button></div>
+      <div class="rowlist" role="list" aria-label="Accounts">
+        <div class="acct" role="listitem"><span class="nm">Codex</span><span class="st"><span class="hdot ok" aria-hidden="true"></span>Open</span><span class="rm"><span class="meter" role="img" aria-label="41 percent of its week left"><i style="width:41%"></i></span>41% of its week left, resets Thu 6:11 PM</span><button type="button" class="sm link" aria-label="Details for Codex">Details</button></div>
+        <div class="acct" role="listitem"><span class="nm">Claude</span><span class="st"><span class="hdot ok" aria-hidden="true"></span>Open</span><span class="rm"><span class="meter" role="img" aria-label="69 percent of its week left"><i style="width:69%"></i></span>69% of its week left, resets Sat 3:31 AM</span><button type="button" class="sm link" aria-label="Details for Claude">Details</button></div>
+        <div class="acct" role="listitem"><span class="nm">Grok</span><span class="st"><span class="hdot" aria-hidden="true"></span>Paused by you</span><span class="rm">Until Thu 9:51 AM</span><button type="button" class="sm link" aria-label="Details for Grok">Details</button></div>
+        <div class="acct" role="listitem"><span class="nm">Claude second</span><span class="st"><span class="hdot warn" aria-hidden="true"></span>At its limit</span><span class="rm">Back at 6:24 PM. <span>Two reports disagree.</span></span><button type="button" class="sm link" aria-label="Details for Claude second">Details</button></div>
+        <div class="acct" role="listitem"><span class="nm">Codex second</span><span class="st"><span class="hdot warn" aria-hidden="true"></span>Not signed in</span><span class="rm">Khipu can't see how much is left</span><button type="button" class="sm link" aria-label="Sign in to Codex second">Sign in…</button></div>
+        <div class="acct" role="listitem"><span class="nm">GLM</span><span class="st"><span class="hdot ok" aria-hidden="true"></span>Open</span><span class="rm">Its plan can't be read; job runners report for it</span><button type="button" class="sm link" aria-label="Details for GLM">Details</button></div>
+        <div class="acct" role="listitem"><span class="nm">DeepSeek</span><span class="st"><span class="hdot" aria-hidden="true"></span>Don't know</span><span class="rm">Its last report is out of date</span><button type="button" class="sm link" aria-label="Details for DeepSeek">Details</button></div>
+      </div>
+      <p class="set-help">Use Details to pause an account, set a cap, say what it's for, or see how fast it's being used. Khipu checks each one again at its reset time.</p>
+    </section>
+
+    <!-- WORK -->
+    <section class="pane" id="work" role="tabpanel" aria-labelledby="tab-work" hidden>
+      <div><h2 tabindex="-1">Who gets what work</h2><p class="pane-intro">Conversations read this first, in your words. Khipu never decides for them.</p></div>
+      <div class="card"><div class="card-head">The order you'd like accounts used <span class="spacer"></span><button type="button" class="sm">Add…</button></div>
+        <div class="r"><span class="t"><b>1. Codex</b><span>builds · no end date</span></span><span class="e"><button type="button" class="sm" disabled aria-label="Move Codex up">Up</button><button type="button" class="sm" aria-label="Move Codex down">Down</button><button type="button" class="sm" aria-label="Change Codex">Change…</button></span></div>
+        <div class="r"><span class="t"><b>2. Claude</b><span>design and review · no end date</span></span><span class="e"><button type="button" class="sm" aria-label="Move Claude up">Up</button><button type="button" class="sm" aria-label="Move Claude down">Down</button><button type="button" class="sm" aria-label="Change Claude">Change…</button></span></div>
+        <div class="r"><span class="t"><b>3. Grok</b><span>second opinions · no end date</span></span><span class="e"><button type="button" class="sm" aria-label="Move Grok up">Up</button><button type="button" class="sm" disabled aria-label="Move Grok down">Down</button><button type="button" class="sm" aria-label="Change Grok">Change…</button></span></div>
+      </div>
+      <div class="card"><div class="card-head">Your note to every conversation <span class="spacer"></span><button type="button" class="sm">Edit note</button></div>
+        <div class="card-body"><blockquote class="note-q">“Use Codex for builds this week. Save Claude for design and review.”</blockquote></div></div>
+      <div class="card" id="rules"><div class="card-head">Your rules <span class="tag">14 rules</span></div>
+        <div class="card-body"><div class="toolbar"><label class="sr-only" for="add-rule">New rule</label><input id="add-rule" type="text" placeholder="Add a rule every conversation sees first…"><button type="button" class="sm">Add rule…</button></div></div>
+        <div class="r"><span class="t"><b>Builds go to Codex first.</b></span><span class="e"><button type="button" class="sm">Edit</button><button type="button" class="sm">Remove</button></span></div>
+        <div class="r"><span class="t"><b>Claude keeps design and review.</b></span><span class="e"><button type="button" class="sm">Edit</button><button type="button" class="sm">Remove</button></span></div>
+        <div class="r"><span class="t"><b>Never the paid xAI API.</b><span>Khipu checks this one in your job runners' settings: nothing wrong found.</span></span><span class="e"><button type="button" class="sm">Edit</button><button type="button" class="sm">Remove</button></span></div>
+        <div class="r"><span class="t"><span>11 more</span></span><span class="e"><button type="button" class="sm link">Show all 14</button></span></div>
+      </div>
+      <div class="card"><div class="card-head">Temporary instructions <span class="spacer"></span><button type="button" class="sm">Add…</button></div>
+        <div class="r"><span class="t"><b>This Mac: no new launches while the Mac is busy</b><span>Set by a Claude Code conversation in project-a · ends 9:10 PM</span></span><span class="e"><button type="button" class="sm">End now</button></span></div>
+        <div class="r"><span class="t"><b>Grok: keep for reviews only</b><span>Set by you Aug 3 · until you end it</span></span><span class="e"><button type="button" class="sm">End now</button></span></div>
+      </div>
+    </section>
+
+    <!-- MACS -->
+    <section class="pane" id="macs" role="tabpanel" aria-labelledby="tab-macs" hidden>
+      <div><h2 tabindex="-1">Your Macs</h2><p class="pane-intro" id="macs-verdict" role="status">This Mac and MacBook Air differ on 2 settings. Everything else matches.</p></div>
+
+      <div class="card" id="sync-card">
+        <div class="opt-row" id="row-sync">
+          <input id="sync" class="switch" type="checkbox" role="switch" checked aria-describedby="sync-what sync-status">
+          <div class="opt-text">
+            <div class="opt-title"><label class="opt-name" for="sync">Keep settings the same on my Macs</label></div>
+            <p class="opt-what" id="sync-what">Copies your routing (rules, note, order, pauses) and your settings through your hub, so a change on one Mac reaches the other. This replaces the old switch, “Copy routing between your Macs through the hub”.</p>
+            <p class="opt-what" id="sync-status">On here and on MacBook Air. Last copied 7 min ago.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="diff-card">
+        <div class="card-head">Where your Macs differ <span class="tag warn" id="diff-tag"><span class="dot"></span>2 settings</span></div>
+        <div class="card-body" style="padding-bottom:8px"><p class="set-help">Khipu kept the change you made last. The other one is still here until you choose. Nothing about your work stopped.</p>
+          <div class="toolbar"><button type="button" class="sm" data-pick-all="1">Use this Mac's for all</button><button type="button" class="sm" data-pick-all="1">Use MacBook Air's for all</button></div></div>
+        <div class="diff-head"><span>Setting</span><span>This Mac</span><span>MacBook Air</span></div>
+        <div class="diff" data-diff>
+          <div class="n"><b>Longest update before a prompt</b><span>You changed both while the Macs weren't in touch. MacBook Air's is later, so both Macs use it now.</span></div>
+          <div class="c"><span>400 characters</span><span class="set-help">Changed Mon 4:02 PM</span><button type="button" class="sm" data-pick="400 characters">Use this one</button></div>
+          <div class="c"><span class="vline">800 characters <span class="tag ok"><span class="dot"></span>In use</span></span><span class="set-help">Changed Mon 9:14 PM</span><button type="button" class="sm" data-pick="800 characters">Keep this one</button></div>
+        </div>
+        <div class="diff" data-diff>
+          <div class="n"><b>Remind me about my own instructions after</b><span>You changed both while the Macs weren't in touch. MacBook Air's is later, so both Macs use it now.</span></div>
+          <div class="c"><span>90 days</span><span class="set-help">Changed Sun 11:20 AM</span><button type="button" class="sm" data-pick="90 days">Use this one</button></div>
+          <div class="c"><span class="vline">30 days <span class="tag ok"><span class="dot"></span>In use</span></span><span class="set-help">Changed Mon 9:16 PM</span><button type="button" class="sm" data-pick="30 days">Keep this one</button></div>
+        </div>
+      </div>
+      <div class="done" id="diff-done" hidden role="status"><span>Your Macs match. Every shared setting is the same on both.</span></div>
+
+      <div class="card">
+        <div class="card-head">The two Macs</div>
+        <div class="r"><span class="hdot ok" aria-hidden="true"></span><span class="t"><b>This Mac</b><span id="here-line">MacBook Pro. Keeping settings the same is on.</span></span><span class="e"><span class="tag">You're here</span></span></div>
+        <div class="r"><span class="hdot warn" id="air-dot" aria-hidden="true"></span><span class="t"><b>MacBook Air</b><span id="air-age">Its copy is 7 min old.</span></span><span class="e"><span class="tag warn" id="air-tag"><span class="dot"></span>2 differ</span></span></div>
+        <div class="r"><span class="hdot ok" aria-hidden="true"></span><span class="t"><b>Copy for cloud agents</b><span>A separate copy with less in it. It is 2 min old.</span></span><span class="e"><span class="tag ok"><span class="dot"></span>Up to date</span></span></div>
+      </div>
+
+      <div class="card">
+        <button type="button" class="fold-btn" aria-expanded="false" aria-controls="never-copies" data-toggle="never-copies">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 3 5 5-5 5"/></svg>
+          <span class="nm">What stays on each Mac</span><span class="ln">Never copied, on purpose</span>
+        </button>
+        <div class="fold-body" id="never-copies" hidden>
+          <div class="r"><span class="t"><b>Keys, passwords and logins</b><span>Never leave the Mac they're on.</span></span><span class="tag">This Mac only</span></div>
+          <div class="r"><span class="t"><b>Folders and files</b><span>Job runner folders, your old routing file, login folders. Each Mac's are its own.</span></span><span class="tag">This Mac only</span></div>
+          <div class="r"><span class="t"><b>How hard this Mac may work</b><span>Busy limits and time allowed before a prompt. A faster Mac can take more.</span></span><span class="tag">This Mac only</span></div>
+          <div class="r"><span class="t"><b>What this Mac may send out</b><span>This switch, sharing a conversation's proposed words, and reading usage from logins. Another Mac can't turn these on for you.</span></span><span class="tag">This Mac only</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="opt-row" id="row-words">
+          <input id="words" class="switch" type="checkbox" role="switch" checked aria-describedby="words-what">
+          <div class="opt-text">
+            <div class="opt-title"><label class="opt-name" for="words">Share a conversation's proposed words between my Macs</label><span class="tag">This Mac only</span></div>
+            <p class="opt-what" id="words-what">So you can read and answer them on either Mac. Off, you can only read them on the Mac they came from. They never go to cloud agents.</p>
+          </div>
+        </div>
+      </div>
+      <p class="set-help">Setting up a new Mac? That's in Settings, under Another Mac.</p>
+    </section>
+
+    <!-- CONVOS -->
+    <section class="pane" id="convos" role="tabpanel" aria-labelledby="tab-convos" hidden>
+      <div><h2 tabindex="-1">What conversations know</h2><p class="pane-intro">Whether your running conversations have heard your latest changes.</p></div>
+      <div class="card"><div class="card-head">Running now</div>
+        <div class="r"><span class="hdot ok" aria-hidden="true"></span><span class="t"><b>project-a</b><span>Claude Code · This Mac · last prompt 3 min ago</span></span><span class="tag ok"><span class="dot"></span>Up to date</span></div>
+        <div class="r"><span class="hdot ok" aria-hidden="true"></span><span class="t"><b>project-b</b><span>Codex · This Mac · last prompt 14 min ago</span></span><span class="tag ok"><span class="dot"></span>Up to date</span></div>
+        <div class="r"><span class="hdot err" aria-hidden="true"></span><span class="t"><b>project-c</b><span>Codex · MacBook Air · last prompt 55 min ago</span></span><span class="tag err"><span class="dot"></span>3 changes behind</span></div>
+      </div>
+      <div class="card"><div class="card-head">When they hear</div>
+        <div class="opt-row" id="row-tell"><input id="tell" class="switch" type="checkbox" role="switch" checked aria-describedby="tell-what"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="tell">Tell conversations about routing</label></div><p class="opt-what" id="tell-what">Turns all of it on or off. Conversations can always ask.</p></div></div>
+        <div class="opt-row"><input id="m1" class="switch" type="checkbox" role="switch" checked><div class="opt-text"><div class="opt-title"><label class="opt-name" for="m1">When a conversation starts, and after it compacts</label></div></div></div>
+        <div class="opt-row"><input id="m2" class="switch" type="checkbox" role="switch"><div class="opt-text"><div class="opt-title"><label class="opt-name" for="m2">Before each prompt</label><span class="tag warn">Waiting for your answer</span></div></div></div>
+        <div class="opt-row"><input id="m3" class="switch" type="checkbox" role="switch" checked><div class="opt-text"><div class="opt-title"><label class="opt-name" for="m3">Before it hands work to another agent</label></div></div></div>
+      </div>
+    </section>
+
+    <!-- CHANGES -->
+    <section class="pane" id="changes" role="tabpanel" aria-labelledby="tab-changes" hidden>
+      <div><h2 tabindex="-1">What changed</h2><p class="pane-intro">Every change to your accounts and rules, newest first, and who made it.</p></div>
+      <div class="chips" role="group" aria-label="Changes by"><button type="button" class="chip" aria-pressed="true">Everyone</button><button type="button" class="chip" aria-pressed="false">You</button><button type="button" class="chip" aria-pressed="false">Conversations</button><button type="button" class="chip" aria-pressed="false">Khipu</button></div>
+      <div class="rowlist">
+        <div class="r"><span class="when">3:31 PM</span><span class="t"><b>Rule 9 reworded</b><span>A Claude Code conversation in project-b</span></span></div>
+        <div class="r"><span class="when">12:51 PM</span><span class="t"><b>Order changed: Codex first</b><span>A Codex conversation in project-c</span></span></div>
+        <div class="r"><span class="when">9:20 AM</span><span class="t"><b>Claude second reached its limit</b><span>Khipu's plan check</span></span></div>
+        <div class="r"><span class="when">Mon 9:14 PM</span><span class="t"><b>Longest update set to 800 characters</b><span>You, on MacBook Air</span></span></div>
+      </div>
+      <div><button type="button" class="sm">Show earlier days</button></div>
+    </section>
+
+    <!-- WRONG -->
+    <section class="pane" id="wrong" role="tabpanel" aria-labelledby="tab-wrong" hidden>
+      <div><h2 tabindex="-1">Something's wrong</h2><p class="pane-intro">Khipu checks these all the time. None of them stops any work.</p></div>
+      <div class="rowlist">
+        <div class="r"><span class="hdot err" aria-hidden="true"></span><span class="t"><b>Job runners</b><span>Project B stopped reporting at 2:32 PM. Project A is fine.</span></span><span class="e"><button type="button" class="sm">Open it</button></span></div>
+        <div class="r"><span class="hdot warn" aria-hidden="true"></span><span class="t"><b>Job slots with no account</b><span>“review” in Project A and “opus-batch” in Project B. Their limits count for nobody.</span></span><span class="e"><button type="button" class="sm">Match them</button></span></div>
+        <div class="r"><span class="hdot warn" aria-hidden="true"></span><span class="t"><b>Old routing words in your files</b><span>3 lines in 2 files. Conversations are told Khipu's record wins.</span></span><span class="e"><button type="button" class="sm">See them</button></span></div>
+        <div class="r"><span class="hdot ok" aria-hidden="true"></span><span class="t"><b>Rules that look broken</b><span>None. 3 of your rules can be checked.</span></span></div>
+        <div class="r"><span class="hdot ok" aria-hidden="true"></span><span class="t"><b>Rules that contradict each other</b><span>None found.</span></span></div>
+      </div>
+    </section>
+
+    <!-- RARE -->
+    <section class="pane" id="rare" role="tabpanel" aria-labelledby="tab-rare" hidden>
+      <div><h2 tabindex="-1">Rarely needed</h2><p class="pane-intro">Technical settings. The defaults are fine; nothing here has to be touched. Each one says whether your Macs share it.</p></div>
+      <div class="card" id="rare-list"></div>
+    </section>
+  </div>
+  </div>
+  </div>
+</main>
+</div>
+<div class="sr-only" id="live" role="status" aria-live="polite"></div>
+<script>
+(function(){
+var CHEV='<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 3 5 5-5 5"/></svg>';
+var SAME='<span class="tag">Same on my Macs</span>', HERE='<span class="tag">This Mac only</span>';
+var RARE=[
+ ['lengths','How long things can be','9 settings, 1 changed',[
+  ['Longest summary at the start of a conversation','1,500 characters',1],['Longest update before a prompt','800 characters',1],['Longest routing block for a helper agent','4,000 characters',1],['Longest line','200 characters',1],['Longest rule','600 characters',1],['Most rules','40 rules',1],['Longest note','1,500 characters',1],['Longest words in a temporary instruction','300 characters',1],['Most of your rules, note and order shown at the start','2,000 characters',1]]],
+ ['timing','Timing','7 settings',[
+  ['Time allowed before a prompt','50 ms',0],['Time allowed at the start of a conversation','1 second',0],['Send everything again when a conversation is this far behind','20 changes or 6 hours',1],['Treat a report as out of date after','12 hours',1],['How long a limit reported without a time lasts','30 minutes',1],['Remove a conversation\'s delivery record after','7 days',0],['How long a conversation\'s instruction lasts','24 hours, at most 7 days',1]]],
+ ['warnings','When to warn you','5 settings',[
+  ['Warn when reading before a prompt is too slow on more than','1% of prompts',1],['Warn when two reports disagree for','30 minutes',1],['Say the record is not refreshed after','5 minutes',1],['Warn when an order a conversation set is unconfirmed after','1 day',1],['Remind me about my own instructions after','30 days',1]]],
+ ['resets','Checking accounts when they reset','On, up to 3 checks',[
+  ['Check an account at its reset time','On',1],['Wait after the reset time','2 minutes',1],['Try again after','10 and 30 minutes',1],['Wait while this Mac is busy','Over load 75, 5 minutes, 3 tries',0]]],
+ ['runners','Job runners and job slots','2 folders, 6 slots',[
+  ['Job runner folders','Project A, Project B',0],['Which account each job slot uses','4 of 6 matched',1],['Providers','5 providers',1],['Your own scripts that hand work on','None',1]]],
+ ['reading','Reading usage from logins','3 switches, all off',[
+  ['Read Grok\'s usage from its own login','Off',0],['Read Cursor\'s usage from its Keychain login','Off',0],['Read OpenCode Go\'s usage from its own login','Off',0]]],
+ ['oldfile','Old routing file','ROUTING-NOW.md, read only',[
+  ['Old routing table file','ROUTING-NOW.md',0]]]
+];
+var list=document.getElementById('rare-list');
+RARE.forEach(function(g){
+  var f=document.createElement('div');f.className='fold';
+  var rows=g[3].map(function(r,i){return '<div class="r" id="rare-'+g[0]+'-'+i+'"><span class="t"><b>'+r[0]+'</b></span><span class="e"><span class="v">'+r[1]+'</span>'+(r[2]?SAME:HERE)+'<button type="button" class="sm" aria-label="Change: '+r[0]+'">Change…</button></span></div>';}).join('');
+  f.innerHTML='<button type="button" class="fold-btn" aria-expanded="false" aria-controls="rf-'+g[0]+'" data-toggle="rf-'+g[0]+'">'+CHEV+'<span class="nm">'+g[1]+'</span><span class="ln">'+g[2]+'</span></button><div class="fold-body" id="rf-'+g[0]+'" hidden>'+rows+'</div>';
+  list.appendChild(f);
+});
+var FIND=[
+ ['Keep settings the same on my Macs','Your Macs','macs','row-sync'],
+ ['Copy routing between your Macs through the hub (now part of Keep settings the same)','Your Macs','macs','row-sync'],
+ ['Share a conversation\'s proposed words between my Macs','Your Macs','macs','row-words'],
+ ['What stays on each Mac','Your Macs','macs','never-copies'],
+ ['Tell conversations about routing','What conversations know','convos','row-tell'],
+ ['Your rules: add or change a rule','Who gets what work','work','rules'],
+ ['The order you\'d like accounts used (priority)','Who gets what work','work',null],
+ ['Your note to every conversation','Who gets what work','work',null],
+ ['Temporary instructions (holds)','Who gets what work','work',null],
+ ['Pause an account, set a cap','Your accounts','accounts',null],
+ ['Add an account','Your accounts','accounts',null]
+];
+RARE.forEach(function(g){g[3].forEach(function(r,i){FIND.push([r[0],'Rarely needed, '+g[1],'rare','rare-'+g[0]+'-'+i,'rf-'+g[0]]);});});
+var tabs=[].slice.call(document.querySelectorAll('[role=tab]'));
+var panes=[].slice.call(document.querySelectorAll('[role=tabpanel]'));
+var scroller=document.getElementById('scroller');
+function go(id,focus){
+  panes.forEach(function(p){p.hidden=p.id!==id;});
+  tabs.forEach(function(t){var on=t.dataset.go===id;t.setAttribute('aria-selected',on);t.tabIndex=on?0:-1;});
+  scroller.scrollTop=0;
+  if(location.hash!=='#/'+id){try{history.replaceState(null,'','#/'+id);}catch(e){}}
+  if(focus){var h=document.querySelector('#'+id+' h2');if(h)h.focus();}
+}
+document.addEventListener('click',function(e){
+  var b=e.target.closest('button');if(!b)return;
+  if(b.dataset.go){go(b.dataset.go,true);return;}
+  if(b.dataset.toggle){var body=document.getElementById(b.dataset.toggle);var open=b.getAttribute('aria-expanded')==='true';b.setAttribute('aria-expanded',!open);body.hidden=open;return;}
+  if(b.dataset.done){answer(b);return;}
+  if(b.dataset.pick){pick(b);return;}
+  if(b.dataset.pickAll){[].slice.call(document.querySelectorAll('[data-pick]')).forEach(pick);return;}
+});
+function answer(b){
+  var card=b.closest('[data-item]');var words=b.dataset.done;
+  var d=document.createElement('div');d.className='done';d.setAttribute('role','status');
+  d.innerHTML='<span>'+words+'</span><button type="button" class="sm">Undo</button>';
+  card.replaceWith(d);
+  d.querySelector('button').addEventListener('click',function(){d.replaceWith(card);bump(1);});
+  bump(-1);
+}
+function bump(n){var c=document.getElementById('count-needs');c.textContent=Math.max(0,+c.textContent+n);}
+function pick(b){
+  var row=b.closest('[data-diff]');row.remove();
+  var left=document.querySelectorAll('[data-diff]').length;
+  document.getElementById('diff-tag').lastChild.textContent=left===1?'1 setting':left+' settings';
+  var cm=document.getElementById('count-macs');cm.textContent=left;cm.setAttribute('aria-label',left+(left===1?' setting differs':' settings differ'));
+  if(left){setMacs(left);}else{cm.remove();document.getElementById('diff-card').hidden=true;document.getElementById('diff-card').style.display='none';document.getElementById('diff-done').hidden=false;setMacs(0);var fx=document.getElementById('fix-macs');if(fx){fx.remove();bump(-1);}}
+}
+function setMacs(n){
+  var v=document.getElementById('macs-verdict'),g=document.getElementById('glance-macs'),t=document.getElementById('air-tag'),dot=document.getElementById('air-dot');
+  if(n){v.textContent='This Mac and MacBook Air differ on '+n+(n===1?' setting':' settings')+'. Everything else matches.';g.innerHTML='<span class="hdot warn" aria-hidden="true"></span>'+n+(n===1?' setting differs':' settings differ');t.innerHTML='<span class="dot"></span>'+n+' differ'+(n===1?'s':'');}
+  else{v.textContent='This Mac and MacBook Air match.';g.innerHTML='<span class="hdot ok" aria-hidden="true"></span>Same on both';t.className='tag ok';t.innerHTML='<span class="dot"></span>Same';dot.className='hdot ok';}
+}
+var sync=document.getElementById('sync');
+sync.addEventListener('change',function(){
+  var on=sync.checked,st=document.getElementById('sync-status'),v=document.getElementById('macs-verdict'),age=document.getElementById('air-age'),t=document.getElementById('air-tag'),g=document.getElementById('glance-macs'),diff=document.getElementById('diff-card');
+  var cm0=document.getElementById('count-macs');document.getElementById('here-line').textContent=on?'MacBook Pro. Keeping settings the same is on.':'MacBook Pro. Keeping settings the same is off.';if(cm0)cm0.hidden=!on;var fx0=document.getElementById('fix-macs');if(fx0&&fx0.hidden===on){fx0.hidden=!on;bump(on?1:-1);}
+  if(on){st.textContent='On here and on MacBook Air. Last copied 7 min ago.';age.textContent='Its copy is 7 min old.';diff.style.display=document.querySelectorAll('[data-diff]').length?'':'none';var n=document.querySelectorAll('[data-diff]').length;t.className=n?'tag warn':'tag ok';setMacs(n);}
+  else{st.textContent='Off on this Mac. Changes you make here stay here, and this Mac stops receiving changes from your other Macs.';v.textContent='Your Macs aren\'t sharing. Each one keeps its own routing and settings.';age.textContent='Not comparing while this is off.';t.className='tag';t.innerHTML='Not sharing';document.getElementById('air-dot').className='hdot';g.innerHTML='<span class="hdot" aria-hidden="true"></span>Not sharing';diff.style.display='none';}
+});
+// Keyboard: arrows walk the section list, as the app's list does.
+document.querySelector('[role=tablist]').addEventListener('keydown',function(e){
+  var i=tabs.indexOf(document.activeElement);if(i<0)return;
+  var n=e.key==='ArrowDown'?i+1:e.key==='ArrowUp'?i-1:e.key==='Home'?0:e.key==='End'?tabs.length-1:-1;
+  if(n<0&&e.key!=='ArrowUp')return;e.preventDefault();n=(n+tabs.length)%tabs.length;tabs[n].focus();go(tabs[n].dataset.go,false);
+});
+// Find a setting
+var fi=document.getElementById('find'),fr=document.getElementById('find-results');
+fi.addEventListener('input',function(){
+  var q=fi.value.trim().toLowerCase();fr.innerHTML='';
+  if(!q){fr.hidden=true;return;}
+  var hits=FIND.filter(function(f){return (f[0]+' '+f[1]).toLowerCase().indexOf(q)>=0;}).slice(0,8);
+  if(!hits.length){fr.innerHTML='<div class="find-none" role="status">No setting has those words.</div>';}
+  hits.forEach(function(h){var b=document.createElement('button');b.type='button';b.innerHTML=h[0]+'<small>'+h[1]+'</small>';b.addEventListener('click',function(){jump(h);});fr.appendChild(b);});
+  fr.hidden=false;
+});
+fi.addEventListener('keydown',function(e){if(e.key==='Escape'){fi.value='';fr.hidden=true;}if(e.key==='ArrowDown'){var b=fr.querySelector('button');if(b){e.preventDefault();b.focus();}}});
+function jump(h){
+  fr.hidden=true;fi.value='';go(h[2],false);
+  if(h[4]){var fb=document.querySelector('[data-toggle="'+h[4]+'"]');if(fb&&fb.getAttribute('aria-expanded')!=='true')fb.click();}
+  if(h[3]){var t=document.getElementById(h[3]);if(t){var fbn=document.querySelector('[data-toggle="'+h[3]+'"]');if(fbn&&fbn.getAttribute('aria-expanded')!=='true')fbn.click();t.scrollIntoView({block:'center'});t.classList.add('highlight');setTimeout(function(){t.classList.remove('highlight');},1700);}}
+  else{var hd=document.querySelector('#'+h[2]+' h2');if(hd)hd.focus();}
+}
+document.addEventListener('click',function(e){if(!e.target.closest('.find'))fr.hidden=true;});
+var start=location.hash.replace('#/','');
+go(document.getElementById(start)&&start?start:'needs',false);
+})();
+</script>
+</body>
+</html>

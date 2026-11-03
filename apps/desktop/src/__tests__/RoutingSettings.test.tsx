@@ -449,7 +449,7 @@ describe("Settings -> Routing: standing rules", () => {
     // The stable entity is the write target; the accessible name stays in
     // owner-readable rule words while its display number is pending.
     fireEvent.click(screen.getByRole("button", { name: "Confirm rule Keep reviews local." }));
-    const provisionalRow = screen.getByText("Keep reviews local.").closest<HTMLElement>(".route-rule")!;
+    const provisionalRow = screen.getAllByText("Keep reviews local.").map((el) => el.closest<HTMLElement>(".route-rule")).find(Boolean)!;
     expect(within(provisionalRow).queryAllByRole("button", { name: /null/i })).toHaveLength(0);
     const confirm = await screen.findByRole("group", { name: "Confirm rule Keep reviews local.?" });
     fireEvent.click(within(confirm).getByRole("button", { name: "Confirm rule Keep reviews local." }));
@@ -483,7 +483,7 @@ describe("Settings -> Routing: standing rules", () => {
       ? { ok: true }
       : { ok: false, error: "say end or keep in holds for: h1" };
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm the proposed a rule" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep this rule" }));
     await screen.findByRole("group", { name: "End or keep each hold" });
     expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:proposal-1", expect: "shown-proposal-1" });
     fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
@@ -1460,8 +1460,8 @@ describe("Settings -> Routing: providers and lanes", () => {
     expect(within(row("Lanes", "main-opus")).getByText("Conflict")).toBeInTheDocument();
     expect(row("Lanes", "main-opus")).toHaveTextContent("Fix the runner's settings, or pick the account here.");
     const needs = screen.getByRole("region", { name: "Needs you" });
-    expect(within(needs).getByText("Lane claude in project-a matches two accounts")).toBeInTheDocument();
-    expect(within(needs).getByText("Lane review-2 in project-a has no account")).toBeInTheDocument();
+    expect(within(needs).getByText("Job slot claude in project-a matches two accounts")).toBeInTheDocument();
+    expect(within(needs).getByText("Job slot review-2 in project-a has no account")).toBeInTheDocument();
     expect(within(needs).queryByText(/main-opus/)).toBeNull();
     expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("2 lanes without an account");
     expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("1 lane conflicts");
@@ -1714,7 +1714,7 @@ describe("Settings -> Routing: checks and copies", () => {
     expect(within(needs).getByText("Priority 2 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
     expect(within(needs).getByText("Priority 3 names Antigravity, which Khipu doesn't track")).toBeInTheDocument();
     expect(within(needs).queryByText(/Rule 9|Rules 3 and 6|edit to rule 7/)).toBeNull();
-    fireEvent.click(within(needs).getByRole("button", { name: "Show Priority 2 names Grok Build, which you paused until Fri 9:00 AM" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Look at it: Priority 2 names Grok Build, which you paused until Fri 9:00 AM" }));
     const target = document.querySelector<HTMLElement>('[data-route-item="check:account_state:grok:main:priority-1:0"]')!;
     await waitFor(() => expect(document.activeElement).toBe(target));
   });
@@ -2374,23 +2374,25 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
   it("shows a conversation's change to a routing setting and answers it as the owner", async () => {
     const lanes = setting({ jobs: { r: "codex|" } }, {});
     answers.khipu_config_show = config({
-      routing_lane_map: { ...lanes, words: "Which account each job lane uses",
+      routing_lane_map: { ...lanes, kind: "lane_map", words: "Which account each job lane uses",
         request: { request: "send lane r to Codex", by_words: "a Claude Code conversation in project-a", prior: {} } },
     });
     await page();
-    const box = screen.getByRole("group", { name: "A conversation changed: Which account each job lane uses" });
-    expect(box).toHaveTextContent("changed by a Claude Code conversation in project-a at your request");
-    expect(box).toHaveTextContent("What it said you asked: “send lane r to Codex”");
-    fireEvent.click(within(box).getByRole("button", { name: "Undo" }));
+    const box = screen.getByRole("article", { name: "A conversation changed “Which account each job slot uses”" });
+    expect(box).toHaveTextContent("A Claude Code conversation in project-a");
+    expect(box).toHaveTextContent("It says you asked“send lane r to Codex”");
+    expect(box).toHaveTextContent("BeforeNo job slots matched");
+    expect(box).not.toHaveTextContent("{");
+    fireEvent.click(within(box).getByRole("button", { name: "Go back to the old value" }));
     await waitFor(() => expect(calls("khipu_config_request")).toEqual([{ key: "routing_lane_map", action: "undo" }]));
-    fireEvent.click(within(box).getByRole("button", { name: "Confirm" }));
+    fireEvent.click(within(box).getByRole("button", { name: "Keep the new value" }));
     await waitFor(() => expect(calls("khipu_config_request")).toHaveLength(2));
     expect(calls("khipu_config_request")[1]).toEqual({ key: "routing_lane_map", action: "confirm" });
   });
 
   it("shows no request box when nothing waits", async () => {
     await page();
-    expect(screen.queryByRole("group", { name: /^A conversation changed:/ })).toBeNull();
+    expect(screen.queryByRole("article", { name: /^A conversation / })).toBeNull();
   });
 });
 
@@ -2464,12 +2466,13 @@ describe("Settings -> Routing: an account's line opens its Routing detail (C5)",
     expect(within(dialog).queryByRole("button", { name: "More" })).toBeNull();
   });
 
-  it("shows Keep and Undo for a conversation's change to the accounts, above the list", async () => {
+  it("shows a conversation's change to the accounts under Needs you, and doesn't say nothing needs you", async () => {
     answers.khipu_accounts_status = status({ request: { request: "track my Kimi account", by: { label: "a Codex conversation" } } });
     await page();
-    const band = await screen.findByRole("group", { name: "A conversation changed your accounts" });
-    expect(within(band).getByRole("button", { name: "Keep" })).toBeInTheDocument();
-    expect(within(band).getByRole("button", { name: "Undo" })).toBeInTheDocument();
+    const band = await within(screen.getByRole("region", { name: "Needs you" })).findByRole("article", { name: "A conversation changed which accounts Khipu reads" });
+    expect(within(band).getByRole("button", { name: "Keep the new list" })).toBeInTheDocument();
+    expect(within(band).getByRole("button", { name: "Go back to the old list" })).toBeInTheDocument();
+    expect(screen.queryByText("Nothing here needs you.")).toBeNull();
   });
 });
 

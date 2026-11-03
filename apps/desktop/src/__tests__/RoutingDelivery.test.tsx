@@ -130,7 +130,7 @@ describe("Telling conversations: delivery and health", () => {
     const needs = model.problems.map((item) => item.needs).join(" ");
     expect(needs).toContain("Conversation 2");
     expect(needs).toContain("Codex");
-    expect(needs).toContain("2 changes owed");
+    expect(needs).toContain("last 2 changes");
     for (const pattern of SESSION_ID_SHAPED) expect(needs).not.toMatch(pattern);
     expect(model.tags.telling.every((tag) => tag.tone === "err")).toBe(true);
   });

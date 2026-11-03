@@ -298,6 +298,7 @@ export type RoutePriority = {
   pending?: boolean;
   confirmed?: boolean;
   pending_by?: string | null;
+  pending_author?: RouteAuthor | null;
   proposal_withheld?: boolean;
   owner_request?: string | null;
   replaced?: { entries: RoutePriorityEntry[]; until?: string | null } | null;
@@ -1330,11 +1331,6 @@ export function priorityOrder(p: RoutePriority, now: Date): string {
 export function priorityHeadline(p: RoutePriority, now: Date): string {
   const whole = p.until ? ` (all of it until ${whenLocal(p.until, now)})` : "";
   return `Priority: ${priorityOrder(p, now)}${whole}`;
-}
-
-/** Who set a priority that waits for the owner, in his words. */
-export function priorityPendingWords(p: RoutePriority): string {
-  return `Set by ${p.pending_by || "a conversation"} at your request; you haven't confirmed it yet.`;
 }
 
 /** "when read 1 h ago" for figures that may be out of date. */

@@ -51,14 +51,41 @@
 .route-sub-fold > .fold-btn .sline { font-weight: 400; color: var(--text-2); }
 .route-sub-fold > .fold-body { padding-bottom: var(--s2); }
 
-/* Needs you, or the grey line that nothing does. */
-.route-settings .needs { padding: 6px var(--s4); border-radius: var(--r-md); }
-.needs .txt { gap: 2px; }
-.route-settings .needs b { font-size: var(--t-sm); line-height: 1.4; }
-.needs ul { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px var(--s5); }
-.needs li { display: flex; align-items: center; gap: var(--s3); min-height: 26px; font-size: var(--t-sm); line-height: 1.3; color: var(--text); }
-.needs li > span { flex: 1; min-width: 0; color: var(--text); }
-.needs li button { flex: none; }
+/* Needs you, or the grey line that nothing does (settings reorg slice A; mock
+   docs/mockups/2026-11-03-settings/index.html ".dcard", ".ba", ".facts", ".r"). */
+.needs { display: flex; flex-direction: column; gap: var(--s2); margin: 0; }
+.needs-head { margin: 0; font-size: var(--t-md, 13px); font-weight: 650; color: var(--text); }
+.needs-band { margin: var(--s2) 0 0; font-size: var(--t-sm); font-weight: 650; color: var(--text); line-height: 1.4; }
+.needs-band small { margin-left: var(--s1); font-size: var(--t-sm); font-weight: 400; color: var(--text-2); }
+.needs-card {
+  display: flex; flex-direction: column; gap: var(--s2); min-width: 0; padding: var(--s3) var(--s4);
+  background: var(--surface); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-left: 3px solid var(--warn); border-radius: var(--r-md); overflow-wrap: anywhere;
+}
+.needs-card:focus:not(:focus-visible) { outline: none; }
+.needs-title { margin: 0; font-size: var(--t-md, 13px); font-weight: 650; line-height: 1.35; color: var(--text); }
+.needs-ba { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: var(--s2); }
+.needs-ba > div {
+  min-width: 0; padding: var(--s2) var(--s3); background: var(--surface-2); border-radius: var(--r-sm);
+  font-size: var(--t-sm); line-height: 1.45; color: var(--text); white-space: pre-line;
+}
+.needs-ba .cap { display: block; font-size: var(--t-xs); font-weight: 600; color: var(--text-2); white-space: normal; }
+.needs-facts { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 2px var(--s3); margin: 0; font-size: var(--t-sm); line-height: 1.45; }
+.needs-facts dt { color: var(--muted); }
+.needs-facts dd { margin: 0; min-width: 0; color: var(--text); }
+.needs-acts { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.needs-rows { list-style: none; margin: 0; padding: 0; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md); }
+.needs-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); padding: var(--s2) var(--s4); border-bottom: 1px solid var(--border); }
+.needs-row:last-child { border-bottom: 0; }
+.needs-row-text { flex: 1 1 16rem; min-width: 0; display: flex; flex-direction: column; gap: 1px; overflow-wrap: anywhere; }
+.needs-row-text b { font-size: var(--t-sm); font-weight: 600; color: var(--text); line-height: 1.4; }
+.needs-row-text span { font-size: var(--t-sm); color: var(--text-2); line-height: 1.4; }
+.needs-row-acts { flex: none; display: flex; flex-wrap: wrap; gap: var(--s2); }
+.needs-seeded { flex-basis: 100%; list-style: none; margin: 0; padding: 0; }
+.needs-seeded li { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); padding: var(--s2) 0; border-top: 1px solid var(--border); }
+.needs-seeded-text { flex: 1 1 16rem; min-width: 0; font-size: var(--t-sm); color: var(--text); overflow-wrap: anywhere; }
+.card .row.route-priority { flex-wrap: wrap; }
+.route-priority-decide { flex: 1 0 100%; width: 100%; margin-top: var(--s2); }
 .needs-none { margin: 0; font-size: var(--t-sm); color: var(--muted); }
 .route-settings .err-inline { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
 .route-none .toolbar { margin-top: var(--s2); }
@@ -175,8 +202,6 @@
 [data-route-item][tabindex="-1"]:focus:not(:focus-visible) { outline: none; }
 
 @media (max-width: 1100px) {
-  .needs ul { grid-template-columns: 1fr; }
-  .needs li { flex-wrap: wrap; }
   .route-settings .mrow.delivery-change { grid-template-columns: 5.5rem minmax(0, 1fr) auto; }
 }
 

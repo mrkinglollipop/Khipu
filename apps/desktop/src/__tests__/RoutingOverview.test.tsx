@@ -262,7 +262,7 @@ describe("Accounts and routing: Nothing here needs you only after every check ra
     expect(screen.queryByText("Nothing here needs you.")).toBeNull();
     await act(async () => release(config()));
     const needs = await screen.findByRole("region", { name: "Needs you" });
-    expect(needs).toHaveTextContent("Lane review-2 in Project A has no account");
+    expect(needs).toHaveTextContent("Job slot review-2 in Project A has no account");
     expect(screen.queryByText("Reading what needs you…")).toBeNull();
     expect(screen.queryByText("Nothing here needs you.")).toBeNull();
   });
@@ -317,24 +317,25 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(tags("Proposals and holds")).toEqual([]);
 
     const needs = screen.getByRole("region", { name: "Needs you" });
-    const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("span")!.textContent);
+    const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("b")!.textContent);
     expect(lines).toEqual([
-      "Claude second: two sources disagree",
-      "Grok Build: Khipu can't read its plan",
-      "Codex: not signed in",
-      "A conversation changed your priority: confirm or undo it",
-      "1 standing rule to confirm",
-      "Standing rule 7 may be broken: Project A's settings name gpt-5-fast",
+      "Claude second: two reports disagree",
+      "Khipu can't read Grok Build's plan",
+      "Codex isn't signed in",
+      "Your rule 7 may have been broken",
       "Your Project B job runner stopped reporting at 10:02 AM",
       "Khipu can't read Project C's files",
-      "Lane opus-batch in Project B has no account",
+      "Job slot opus-batch in Project B has no account",
+      "1 rule copied from your old routing file was never reviewed",
     ]);
+    expect(needs).toHaveTextContent("Project A's settings name gpt-5-fast.");
+    expect(within(needs).getByRole("article", { name: /order of accounts|ahead of/ })).toBeInTheDocument();
     // The limited and down accounts are tags only: their state is the action.
     expect(needs).not.toHaveTextContent("Claude main");
     expect(needs).not.toHaveTextContent("Muse");
-    for (const name of ["Show the Claude second disagreement", "Show Grok Build", "Show Codex", "Show the priority to confirm",
-      "Show the standing rule to confirm", "Show standing rule 7", "Show the Project B job runner", "Show the Project C job runner",
-      "Show lane opus-batch"]) {
+    for (const name of ["Compare: the Claude second disagreement", "See the account: Grok Build", "Go to sign in: Codex",
+      "Read them", "See the rule: rule 7", "Look into it: the Project B job runner", "Look into it: the Project C job runner",
+      "Choose an account: job slot opus-batch"]) {
       expect(within(needs).getByRole("button", { name })).toBeInTheDocument();
     }
     // The account lines carry their own problems' tags, from the same list.
@@ -453,12 +454,14 @@ describe("Accounts and routing: links open their group", () => {
     render(<RoutingSettings active />);
     await settled();
     const needs = screen.getByRole("region", { name: "Needs you" });
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the standing rule to confirm" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Read them" }));
+    expect(within(needs).getByRole("button", { name: "Keep as written" })).toBeInTheDocument();
+    fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="rule:3"]')));
     expect(document.querySelector('[data-route-item="rule:rule-uuid-3"]')).toBeNull();
     expect(groupButton("Your note and standing rules")).toHaveAttribute("aria-expanded", "true");
 
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the Claude second disagreement" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Compare: the Claude second disagreement" }));
     const line = document.querySelector<HTMLButtonElement>('[data-route-item="account:claude|/logins/claude-second"]')!;
     await waitFor(() => expect(document.activeElement).toBe(line));
     expect(groupButton("Accounts")).toHaveAttribute("aria-expanded", "true");
@@ -468,9 +471,9 @@ describe("Accounts and routing: links open their group", () => {
     expect(within(screen.getByRole("dialog")).getByRole("group", { name: "Claude second: two reports disagree" })).toBeVisible();
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close details" }));
 
-    fireEvent.click(within(needs).getByRole("button", { name: "Show lane opus-batch" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Choose an account: job slot opus-batch" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="lane:Project B/opus-batch"]')));
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the Project B job runner" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Project B job runner" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="runner:Project B"]')));
   });
 
@@ -484,12 +487,12 @@ describe("Accounts and routing: links open their group", () => {
     render(<RoutingSettings active />);
     await settled();
     const needs = screen.getByRole("region", { name: "Needs you" });
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the Project C job runner" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Project C job runner" }));
     const row = document.querySelector<HTMLElement>('[data-route-item="runner:Project C"]')!;
     await waitFor(() => expect(document.activeElement).toBe(row));
     expect(row).toHaveTextContent("Stopped reporting at 9:00 AM");
     expect(row).toHaveTextContent("Not in your job runner folders · /runners/c");
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the Private folder" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Private folder" }));
     const refused = document.querySelector<HTMLElement>('[data-route-item="runner:Private"]')!;
     await waitFor(() => expect(document.activeElement).toBe(refused));
     expect(refused).toHaveTextContent("Refused: it is inside a private folder");
@@ -717,7 +720,7 @@ describe("Accounts and routing: a passing gap keeps its figures, as on Home", ()
       .filter((p) => p.key === `plan:${SECOND}`);
     expect(plan(gapRow())).toEqual([]);
     expect(routingProblems(v, { accounts: [gapRow()] }, null, settingsOf(6 * 3600), MORNING).map((p) => p.needs))
-      .toContain("Claude second: Khipu can't read its plan");
+      .toContain("Khipu can't read Claude second's plan");
     // 0 is "Never": kept figures never go out of date.
     expect(routingProblems(v, { accounts: [gapRow({ last_good_at: "2026-10-01T00:00:00Z" })] }, null, settingsOf(0), MORNING)
       .filter((p) => p.key === `plan:${SECOND}`)).toEqual([]);
@@ -731,10 +734,10 @@ describe("Accounts and routing: a passing gap keeps its figures, as on Home", ()
     answers.khipu_route_view = gapView();
     render(<RoutingSettings active plansState={plansOf([gapRow({ error: "not_signed_in" })])} />);
     const needs = await screen.findByRole("region", { name: "Needs you" });
-    await waitFor(() => expect(needs).toHaveTextContent("Claude second: not signed in"));
+    await waitFor(() => expect(needs).toHaveTextContent("Claude second isn't signed in"));
     const v = gapView();
     expect(routingProblems(v, { accounts: [gapRow({ error: "no_plan_limits" })] }, null, settingsOf(43200), MORNING).map((p) => p.needs))
-      .toContain("Claude second: its sign-in reports no plan limits");
+      .toContain("Claude second's sign-in reports no plan limits");
   });
 });
 
@@ -785,7 +788,10 @@ describe.skipIf(!CHROME)("Accounts and routing laid out at 1280 wide", () => {
     // The approved mock adds the Pace group, one closed card taller: 46 px
     // of card and gap on top of the 15c budget (1,510 + 46 → 1,610 open;
     // 760 + 46 → 830 shut).
-    expect(open).toBeLessThan(1610);
-    expect(shut).toBeLessThan(830);
+    // Settings reorg slice A: Needs you's five lines each say why they matter,
+    // under band headings, in place of a two-column list: about 200 px more. The owner's
+    // call ("easy for a freaking human to read"); slice B takes the folds out.
+    expect(open).toBeLessThan(1850);
+    expect(shut).toBeLessThan(1070);
   }, 180000);
 });
