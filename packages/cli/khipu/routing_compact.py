@@ -19,8 +19,8 @@ over the compacted file is the fold over the full log:
     ``compute_pace`` reads (a rolling day), is not the newest reading of its
     witness and reset cycle before that span, is not the only one of its
     reset time still ahead, does not bridge reset estimates into one cycle,
-    and is not the twin of a reading that stays. Cycles older than the
-    current and the previous period keep no anchor. A line the fold ignores
+    and is not the twin of a reading that stays. Every cycle keeps its
+    newest reading per witness, however old. A line the fold ignores
     (no reset time) is no reading at all, and counts for nothing;
   * a ``source_seen`` goes unless it is among the last of its Mac and runner
     (only the last is read);
@@ -282,24 +282,17 @@ def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: da
         keep.update(i for _at, i in newest.values())
         if filtered:
             # The newest reading of each witness and cycle before the span,
-            # for the newest two cycles (the current and the previous period)
-            # and every cycle a window and a half-day-margin back. A cycle
-            # older than that sits wholly before the rest in time and
-            # whole in its own group: nothing the fold looks at (it looks
-            # forward from a reading, and back only within a cycle) reaches it.
+            # for every cycle. Old cycles are not provably unread: on noisy
+            # logs (several Macs, skewed clocks, jittered reset estimates)
+            # dropping their anchors changed pace's verdict, so each keeps
+            # one line per Mac and source.
             anchors: dict[tuple, dict] = {}
             for s in filtered:
                 if s["t"] < cut:
                     ident = (s["mac"], s["source"], s["_cycle_key"])
                     if ident not in anchors or s["t"] > anchors[ident]["t"]:
                         anchors[ident] = s
-            newest_of: dict[tuple, datetime] = {}
-            for (_mac, _source, cycle), s in anchors.items():
-                newest_of[cycle] = max(newest_of.get(cycle, s["t"]), s["t"])
-            old_cut = cut - timedelta(seconds=2 * params["window_s"])
-            recent_cycles = {cycle for rank, (cycle, at) in enumerate(
-                sorted(newest_of.items(), key=lambda item: item[1], reverse=True)) if rank < 2 or at >= old_cut}
-            keep.update(s["_i"] for (_mac, _source, cycle), s in anchors.items() if cycle in recent_cycles)
+            keep.update(s["_i"] for s in anchors.values())
             # One reading per reset time still ahead.
             ahead: dict[datetime, dict] = {}
             for s in filtered:
