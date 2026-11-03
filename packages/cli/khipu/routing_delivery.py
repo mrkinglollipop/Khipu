@@ -480,6 +480,25 @@ def plan(out, view, now, cfg, *, session=None, project=None):
             if project:
                 item["withheld"] = (line, label) != tuple(agent_view.redact_owner_tokens(v, words) for v in pair)
             items.append(item)
+    # The receipt of each routing change the owner directed (``owner_receipt``):
+    # one whole sentence ahead of everything else routing says, owed to every
+    # conversation until it has been delivered whole. Read from the folded
+    # view, so a prompt pays for no extra file.
+    receipts = r.recent_receipts(view, now)
+    if receipts:
+        pairs = [(rc["text"], "Routing change") for rc in receipts if isinstance(rc.get("text"), str)]
+        receipts = [rc for rc in receipts if isinstance(rc.get("text"), str)]
+        projected = project(pairs) if project else r._for_agents(pairs, view)
+        from khipu import agent_view
+
+        words = agent_view.keep_owner_words(view) if project else None
+        for rc, pair, (line, label) in zip(receipts, pairs, projected):
+            revision = hashlib.sha256(json.dumps([rc["id"], rc["text"]], ensure_ascii=False).encode()).hexdigest()[:16]
+            item = dict(entity="receipt:" + rc["id"], text=line, label=label, revision=revision,
+                        whole=True, visible=line in text, removed=False)
+            if project:
+                item["withheld"] = (line, label) != tuple(agent_view.redact_owner_tokens(v, words) for v in pair)
+            items.append(item)
     notices = r._replacement_notices(view, now, session)
     for _kind, raw, ident in notices:
         line = r._for_agents(raw, view)
@@ -509,6 +528,7 @@ def plan(out, view, now, cfg, *, session=None, project=None):
                                     "current_entities": list(view.get("effective", {})),
                                     "harness": health_harness(_current_harness()),
                                     "removed": removed, "notices": ["notice:" + n[2] for n in notices], "at": r._iso(now),
+                                    "receipts_known": True,
                                    "limit": cfg["routing_summary_chars"] if full else cfg["routing_prompt_chars"],
                                    "full": full, "page_limit": cfg["routing_prompt_chars"], "text": out.get("text"),
                                    "lease": cfg["routing_delivery_lease"],
@@ -529,6 +549,8 @@ def _due_rank(entry):
         return (0, 0)
     if not entry.get("whole"):
         return (1, 0)
+    if entity.startswith("receipt:"):
+        return (2, -1)
     if entity.startswith("priority-exception:"):
         return (2, 0)
     if entity == "priority":
@@ -544,18 +566,21 @@ def _front_order(due):
     def priority_entry(e):
         return e["entity"] == "priority" or e["entity"].startswith("priority-exception:")
 
+    # A receipt for a change the owner directed goes ahead of everything.
+    receipts = [e for e in due if e["entity"].startswith("receipt:")]
+    due = [e for e in due if not e["entity"].startswith("receipt:")]
     holds = [e for e in due if e["entity"].startswith("hold:")]
     rest = [e for e in due if not e["entity"].startswith("hold:")]
     moving = sorted((e for e in rest if priority_entry(e)), key=lambda e: e["entity"] == "priority")
     if not moving:
-        return holds + rest
+        return receipts + holds + rest
     others = [e for e in rest if not priority_entry(e)]
     at = len(others)
     for pos, e in enumerate(rest):
         if priority_entry(e) or e["entity"].startswith("rule:") or e["entity"] == "note":
             at = sum(not priority_entry(x) for x in rest[:pos])
             break
-    return holds + others[:at] + moving + others[at:]
+    return receipts + holds + others[:at] + moving + others[at:]
 
 
 # A line's owner travels from its producer to ``plan`` as a keyed digest of
@@ -656,7 +681,15 @@ def _merge(state, out):
     # alternate identity. It has no removal message to deliver. An ended
     # priority exception stops being shown the same way.
     planned_exceptions = {i["entity"] for i in items if i["entity"].startswith("priority-exception:")}
+    planned_receipts = {i["entity"] for i in items if i["entity"].startswith("receipt:")}
     for entity in list(entries):
+        if entity.startswith("receipt:") and entity not in planned_receipts \
+                and (not entries[entity].get("acked") or plan.get("receipts_known")):
+            # Its window ended (a plan built from the routing view knows every
+            # receipt there is): nothing is owed for it any more.
+            del entries[entity]
+            replaced.add(entity)
+            continue
         if entity.startswith("notice:") and not entries[entity].get("acked") and entity not in plan.get("notices", []):
             del entries[entity]
             replaced.add(entity)
