@@ -129,7 +129,16 @@ function routeNeeds() {
         runners: [{ name: "Project B", silent: true, heartbeat_at: ago(95), lanes: ["opus-batch"] }],
       },
       unmatched: [{ runner: "Project B", lane: "opus-batch" }],
-      changes: [],
+      changes: [
+        { version: 11, at: ago(20), entities: ["account:claude|"], items: [
+          { entity: "account:claude|", now: { label: "Claude", state: "limited", until: new Date(Date.now() + 3600000).toISOString(), basis: "cli" },
+            was: { label: "Claude", state: "open" }, source: "probe", by: "Khipu usage probe" },
+        ] },
+        { version: 10, at: ago(50), entities: ["rule:6"], items: [
+          { entity: "rule:6", n: 6, now: null, source: null, via: "app", was: { seeded: false,
+            text: "Keep documentation reviews on the account assigned to this project, including long-project-name-with-no-spaces-012345678901234567890123456789." }, by: "you" },
+        ] },
+      ],
     },
     config: {
       routing: {

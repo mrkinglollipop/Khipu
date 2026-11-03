@@ -5,6 +5,39 @@
 
 .route-settings { gap: var(--s3); }
 
+/* Eight permanent pages replace the old stack of route-group folds. The page
+ * list stays in view while the page itself scrolls in the app's main pane. */
+.route-pages { display: grid; grid-template-columns: 12rem minmax(0, 1fr); gap: var(--s5); align-items: start; }
+.route-page-nav { position: sticky; top: calc(var(--s2) + 64px); display: flex; flex-direction: column; gap: 2px; padding: var(--s2); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); box-shadow: var(--shadow-sm); }
+.route-page-nav button { justify-content: flex-start; width: 100%; min-height: 30px; height: auto; padding: 6px var(--s2); border: 0; background: transparent; color: var(--text-2); text-align: left; white-space: normal; line-height: 1.3; }
+.route-page-nav button:hover { background: var(--surface-2); color: var(--text); }
+.route-page-nav button[aria-current="page"] { background: var(--accent-soft); color: var(--accent-text); font-weight: 650; }
+.route-page-nav button[data-routing-page-select="rare"] { margin-top: var(--s2); padding-top: var(--s3); border-top: 1px solid var(--border); }
+.route-page-content { min-width: 0; }
+.route-page { display: flex; flex-direction: column; gap: var(--s3); min-width: 0; }
+.route-page[data-active="false"] { display: none; }
+.route-page > h2 { margin: 0; font-size: var(--t-lg); font-weight: 650; color: var(--text); }
+.route-page > h2:focus { outline: none; }
+.route-page > .set-intro { margin: calc(-1 * var(--s2)) 0 0; }
+.route-page-group { min-width: 0; padding-top: var(--s3); border-top: 1px solid var(--border); }
+.route-page-group-head { display: flex; align-items: baseline; gap: var(--s2) var(--s3); flex-wrap: wrap; }
+.route-page-group-head h3 { margin: 0; font-size: var(--t-md); font-weight: 650; color: var(--text); }
+.route-page-group-head .gline { flex: 1 1 14rem; min-width: 0; color: var(--text-2); font-size: var(--t-sm); }
+.route-page-group-head .gtags { display: inline-flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.route-page-group-body { display: flex; flex-direction: column; gap: var(--s2); padding-top: var(--s2); }
+.route-page-group-body > .section-body { padding: 0; }
+.route-page-group-body > .section-body + .section-body { border-top: 1px solid var(--border); padding-top: var(--s3); }
+.route-macs-controls { gap: var(--s3); }
+.route-rule .route-rule-body,
+.route-rule .route-rule-meta { overflow-wrap: anywhere; }
+.route-sub-fold { margin-top: var(--s3); min-width: 0; }
+.route-sub-fold > .sub-title { margin: 0 0 var(--s2); }
+
+@media (max-width: 760px) {
+  .route-pages { grid-template-columns: 1fr; gap: var(--s3); }
+  .route-page-nav { position: static; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
 /* The fold button, from folds.css. */
 .route-settings .fold.disclose { border-top: 1px solid var(--border); padding-top: var(--s1); }
 .route-settings button.fold-btn {
@@ -17,7 +50,7 @@
 .route-settings button.fold-btn[aria-expanded="true"] > .disclosure-chevron { transform: rotate(90deg); }
 .route-settings .fold-body[hidden] { display: none; }
 
-/* The intro, with Open all groups and Close all groups at its top right. */
+/* Legacy route-top spacing retained for existing inner controls. */
 .route-top { display: flex; align-items: flex-start; gap: var(--s2) var(--s4); flex-wrap: wrap; }
 .route-top .set-intro { flex: 1 1 22rem; min-width: 0; }
 .route-top .grp-btns { flex: none; display: inline-flex; gap: var(--s2); margin-left: auto; }
@@ -157,6 +190,8 @@
 .route-settings .mrow.lane { grid-template-columns: minmax(0, 9rem) 1.1em minmax(0, 7.5rem) minmax(0, 1fr) auto; align-items: center; }
 .route-settings .mrow.lane > .arrow { color: var(--muted); }
 .route-settings .mrow.lane .mono { font-family: var(--mono); font-size: var(--t-sm); }
+.route-settings .mrow.lane > span { min-width: 0; overflow-wrap: anywhere; }
+.route-settings .mrow.lane .tag { max-width: 100%; height: auto; white-space: normal; overflow-wrap: anywhere; }
 /* The candidates row under a lane, and the map form that takes the row's width. */
 .route-settings .cands { grid-column: 1 / -1; display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; margin-top: var(--s1);
   font-size: var(--t-sm); color: var(--text-2); }

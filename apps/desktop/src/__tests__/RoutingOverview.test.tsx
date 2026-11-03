@@ -228,7 +228,7 @@ afterEach(() => {
 });
 
 const groupButton = (name: string) =>
-  document.querySelector<HTMLButtonElement>(`[data-settings-group="${GROUPS.find((g) => g.name === name)!.key}"]`)!;
+  document.querySelector<HTMLElement>(`[data-settings-group="${GROUPS.find((g) => g.name === name)!.key}"]`)!;
 
 async function settled() {
   await screen.findByRole("region", { name: "Needs you" });
@@ -304,7 +304,6 @@ describe("Accounts and routing: every problem shows, once", () => {
     answers.khipu_config_show = config({ routing_table: setting("/notes/routing/ROUTING-NOW.md", null) });
     render(<RoutingSettings active plansState={TROUBLED_PLANS()} />);
     await settled();
-    for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "false");
 
     const tags = (name: string) => [...groupButton(name).querySelectorAll(".tag")].map((t) => t.textContent);
     // Two accounts are limited in the fixture: the tag counts both.
@@ -339,7 +338,6 @@ describe("Accounts and routing: every problem shows, once", () => {
       expect(within(needs).getByRole("button", { name })).toBeInTheDocument();
     }
     // The account lines carry their own problems' tags, from the same list.
-    fireEvent.click(groupButton("Accounts"));
     const line = (label: string) =>
       within(screen.getByRole("list", { name: "Accounts" })).getAllByRole("listitem").find((li) => li.textContent?.startsWith(label))!;
     expect(line("Claude second").querySelector(".at")).toHaveTextContent("Sources disagree");
@@ -437,15 +435,12 @@ describe("Accounts and routing: every problem shows, once", () => {
   });
 });
 
-describe("Accounts and routing: links open their group", () => {
-  it("opens a group a deep link names, and its body shows", async () => {
+describe("Accounts and routing: links select their page", () => {
+  it("selects the page a legacy group link names, then focuses its target", async () => {
     render(<RoutingSettings active />);
     await settled();
-    expect(groupButton("Your note and standing rules")).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByRole("region", { name: "Your note and standing rules" })).toBeNull();
     revealSettingsGroup("rules");
-    await waitFor(() => expect(groupButton("Your note and standing rules")).toHaveAttribute("aria-expanded", "true"));
-    expect(screen.getByRole("region", { name: "Your note and standing rules" })).toBeVisible();
+    await waitFor(() => expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true"));
     expect(document.activeElement).toBe(groupButton("Your note and standing rules"));
   });
 
@@ -459,12 +454,12 @@ describe("Accounts and routing: links open their group", () => {
     fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="rule:3"]')));
     expect(document.querySelector('[data-route-item="rule:rule-uuid-3"]')).toBeNull();
-    expect(groupButton("Your note and standing rules")).toHaveAttribute("aria-expanded", "true");
+    expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true");
 
     fireEvent.click(within(needs).getByRole("button", { name: "Compare: the Claude second disagreement" }));
     const line = document.querySelector<HTMLButtonElement>('[data-route-item="account:claude|/logins/claude-second"]')!;
     await waitFor(() => expect(document.activeElement).toBe(line));
-    expect(groupButton("Accounts")).toHaveAttribute("aria-expanded", "true");
+    expect(document.querySelector('[data-routing-page="accounts"]')).toHaveAttribute("data-active", "true");
     // The line opens the Routing detail (no fold of its own); the disagreement is there.
     expect(line).toHaveAttribute("aria-haspopup", "dialog");
     fireEvent.click(line);
@@ -475,6 +470,7 @@ describe("Accounts and routing: links open their group", () => {
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="lane:Project B/opus-batch"]')));
     fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Project B job runner" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="runner:Project B"]')));
+    expect(document.querySelector('[data-routing-page="wrong"]')).toHaveAttribute("data-active", "true");
   });
 
   it("gives a runner that isn't in your folders list a row of its own, and Show focuses it", async () => {
@@ -497,10 +493,31 @@ describe("Accounts and routing: links open their group", () => {
     await waitFor(() => expect(document.activeElement).toBe(refused));
     expect(refused).toHaveTextContent("Refused: it is inside a private folder");
   });
+
+  it("Show expands a seeded rule beyond the initial rules page before focusing it", async () => {
+    const record = view();
+    record.rules = [
+      { n: 1, text: "First reviewed rule", seeded: true, confirmed: true },
+      { n: 2, text: "Second reviewed rule", seeded: true, confirmed: true },
+      { n: 3, text: "Third reviewed rule", seeded: true, confirmed: true },
+      { n: 4, text: "Fourth reviewed rule", seeded: true, confirmed: true },
+      { n: 17, text: "Review this after the initial page", seeded: true, confirmed: false },
+    ];
+    answers.khipu_route_view = record;
+    render(<RoutingSettings active />);
+    await settled();
+    const needs = screen.getByRole("region", { name: "Needs you" });
+    fireEvent.click(within(needs).getByRole("button", { name: "Read them" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
+    const target = document.querySelector<HTMLElement>('[data-route-item="rule:17"]')!;
+    await waitFor(() => expect(target).toBeInTheDocument());
+    await waitFor(() => expect(document.activeElement).toBe(target));
+    expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true");
+  });
 });
 
-describe("Accounts and routing: open and closed, remembered on this Mac", () => {
-  it("uses the detail classification for the open count", async () => {
+describe("Accounts and routing: permanent pages", () => {
+  it("keeps the account summary and uses page navigation instead of remembered group folds", async () => {
     const record = calm();
     record.accounts = [
       acct("Codex", "codex", { state: "open" }),
@@ -510,56 +527,22 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
     render(<RoutingSettings active />);
     await settled();
     expect(groupButton("Accounts")).toHaveTextContent("2 accounts: 1 open, 1 probably open");
+    fireEvent.click(screen.getByRole("button", { name: "Your accounts" }));
+    expect(document.querySelector('[data-routing-page="accounts"]')).toHaveAttribute("data-active", "true");
     const accounts = within(screen.getByRole("list", { name: "Accounts" }));
     expect(accounts.getByRole("button", { name: /^Codex/ })).toHaveTextContent("Open");
     expect(accounts.getByRole("button", { name: /^Muse/ })).toHaveTextContent("this account can't be checked without using a turn");
   });
 
-  it("opens Accounts only at first, opens and closes every group, and remembers it", async () => {
+  it("keeps a partially written hold when the owner changes pages", async () => {
     render(<RoutingSettings active />);
     await settled();
-    expect(GROUPS.filter((g) => groupButton(g.name).getAttribute("aria-expanded") === "true").map((g) => g.key)).toEqual(["accounts"]);
-    fireEvent.click(screen.getByRole("button", { name: "Open all groups" }));
-    for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "true");
-    expect(JSON.parse(store.get(OPEN_KEY)!)).toEqual(expect.arrayContaining(GROUPS.map((g) => g.key)));
-    cleanup();
-    render(<RoutingSettings active />);
-    await settled();
-    for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "true");
-    fireEvent.click(screen.getByRole("button", { name: "Close all groups" }));
-    for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(groupButton("Proposals and holds"));
-    cleanup();
-    render(<RoutingSettings active />);
-    await settled();
-    expect(GROUPS.filter((g) => groupButton(g.name).getAttribute("aria-expanded") === "true").map((g) => g.key)).toEqual(["holds"]);
-  });
-
-  it("keeps a closed group's form as it was", async () => {
-    store.set(OPEN_KEY, JSON.stringify(["holds"]));
-    render(<RoutingSettings active />);
-    await settled();
+    fireEvent.click(screen.getByRole("button", { name: "Who gets what work" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
     fireEvent.change(screen.getByLabelText("Words"), { target: { value: "Half written" } });
-    fireEvent.click(groupButton("Proposals and holds"));
-    expect(screen.queryByRole("form", { name: "Add a hold" })).toBeNull();
-    fireEvent.click(groupButton("Proposals and holds"));
+    fireEvent.click(screen.getByRole("button", { name: "Your accounts" }));
+    fireEvent.click(screen.getByRole("button", { name: "Who gets what work" }));
     expect(screen.getByLabelText("Words")).toHaveValue("Half written");
-  });
-
-  it("works when this Mac can't store anything", async () => {
-    vi.stubGlobal("localStorage", {
-      getItem: () => {
-        throw new Error("blocked");
-      },
-      setItem: () => {
-        throw new Error("blocked");
-      },
-    });
-    render(<RoutingSettings active />);
-    await settled();
-    expect(groupButton("Accounts")).toHaveAttribute("aria-expanded", "true");
-    fireEvent.click(screen.getByRole("button", { name: "Open all groups" }));
-    expect(groupButton("Proposals and holds")).toHaveAttribute("aria-expanded", "true");
   });
 });
 
@@ -598,7 +581,9 @@ describe("Accounts and routing: nothing that was on the page is missing", () => 
     fireEvent.click(screen.getByRole("button", { name: "Change the account for Project B's opus-batch lane" }));
     fireEvent.click(screen.getByRole("button", { name: "Change which accounts Khipu reads" }));
     await screen.findByRole("form", { name: "Add an account" });
-    const named = (name: string) => ROLES.flatMap((role) => screen.queryAllByRole(role, { name }));
+    // The source inventory counts preserved controls in collapsed Rarely
+    // needed sections too; page navigation itself has separate assertions.
+    const named = (name: string) => ROLES.flatMap((role) => screen.queryAllByRole(role, { name, hidden: true }));
     const want = new Map<string, number>();
     for (const n of [...BEFORE, "Check all now", "Name", "CLI", "Login folder", "Add"]) want.set(n, (want.get(n) ?? 0) + 1);
     const missing = [...want].filter(([name, n]) => named(name).length < n).map(([name]) => name);
@@ -632,14 +617,14 @@ describe("Accounts and routing: nothing that was on the page is missing", () => 
   });
 });
 
-describe("Accounts and routing: folds and words", () => {
-  it("gives every fold aria-expanded and aria-controls naming its body, and words to every tag and dot", async () => {
+describe("Accounts and routing: rare folds and words", () => {
+  it("keeps only the technical sub-folds accessible, and words every tag and dot", async () => {
     answers.khipu_route_view = troubled();
     render(<RoutingSettings active plansState={TROUBLED_PLANS()} />);
     await settled();
-    // An account's line opens its Routing detail instead of folding.
+    // An account's line opens its Routing detail; permanent page groups do not fold.
     const folds = [...document.querySelectorAll<HTMLButtonElement>("button.fold-btn:not([aria-haspopup])")];
-    expect(folds.length).toBeGreaterThanOrEqual(GROUPS.length + 2);
+    expect(folds.length).toBeGreaterThanOrEqual(2);
     for (const b of folds) {
       expect(b.getAttribute("aria-expanded")).toMatch(/^(true|false)$/);
       const body = document.getElementById(b.getAttribute("aria-controls") ?? "");

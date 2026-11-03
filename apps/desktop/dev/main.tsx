@@ -272,17 +272,40 @@ function RoutingProposals() {
   );
 }
 
-/** Needs you with every kind of item, at the Settings pane's width (`?pane=`). */
+/** Needs you with every kind of item in the same Settings split as the app.
+ * `?pane=` remains for narrow checks; the default is the full desktop pane so
+ * the routing page list is judged at its real available width. */
 function RoutingNeeds() {
-  const pane = Number(new URLSearchParams(window.location.search).get("pane")) || 760;
+  const requestedPane = Number(new URLSearchParams(window.location.search).get("pane"));
+  const pane = requestedPane > 0 ? requestedPane : null;
   const [plans, setPlans] = useState<UsageReport | null>(null);
   useEffect(() => {
     void invoke<string>("khipu_usage_status").then((text) => setPlans(JSON.parse(text) as UsageReport));
   }, []);
   return (
-    <div className="settings-pane" style={{ width: pane, maxWidth: "100%" }}>
-      <RoutingSettings active plansState={{ data: plans, error: null, reread: async () => {} } as never}
-        deliveryHealth={{ status: "red", identities: [{ identity: "codex:abc", component: "main", status: "red", owed: 3 }] } as never} />
+    <div className="shell">
+      <aside className="rail" aria-label="App navigation">
+        <div className="rail-drag" />
+        <b className="brand"><span className="brand-name">Khipu</span></b>
+        <div className="rail-nav">
+          <div className="nav-group">
+            <button type="button" className="nav">Home</button>
+            <button type="button" className="nav">Work</button>
+            <button type="button" className="nav active">Accounts and routing</button>
+          </div>
+        </div>
+      </aside>
+      <main className="main">
+        <div className="main-content" data-routing-scroll-container>
+          <div className="panel-head"><h1>Accounts and routing</h1><p className="lede">Accounts, routing rules, and what needs your attention.</p></div>
+          <div className="panel-body wide settings-body" style={{ maxWidth: "none", minWidth: 0 }}>
+            <div className="settings-pane" style={{ width: pane ? `${pane}px` : "100%", maxWidth: "100%", minWidth: 0 }}>
+              <RoutingSettings active plansState={{ data: plans, error: null, reread: async () => {} } as never}
+                deliveryHealth={{ status: "red", identities: [{ identity: "codex:abc", component: "main", status: "red", owed: 3 }] } as never} />
+            </div>
+          </div>
+        </div>
+      </main>
     </div>
   );
 }
@@ -413,12 +436,7 @@ function Page() {
   }
   if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst") {
     // The Settings pane at its app width, uncapped by the 960 state frame.
-    return (
-      <main style={{ padding: 24 }} data-state={hash}>
-        <h1 style={{ fontSize: 14, color: "var(--muted)" }}>{st.title}</h1>
-        {st.render()}
-      </main>
-    );
+    return <div style={{ height: "100%" }} data-state={hash}>{st.render()}</div>;
   }
   return (
     // The pace group is screenshotted at the Settings pane's own 720px width,

@@ -165,6 +165,25 @@ function Band({ title, sub, children }: { title: string; sub: string; children: 
   );
 }
 
+const NEEDS_PAGE_SIZE = 3;
+
+/** Keep a busy route record readable without dropping any owner action. */
+function PagedRows({ rows, render, label }: { rows: Problem[]; render: (p: Problem) => ReactNode; label: string }) {
+  const [shown, setShown] = useState(NEEDS_PAGE_SIZE);
+  const visible = rows.slice(0, shown);
+  const left = rows.length - visible.length;
+  return (
+    <>
+      <ul className="needs-rows" aria-label={label}>{visible.map(render)}</ul>
+      {left > 0 ? (
+        <button type="button" className="sm" onClick={() => setShown((n) => n + NEEDS_PAGE_SIZE)}>
+          Show {Math.min(left, NEEDS_PAGE_SIZE)} more {left === 1 ? "item" : "items"}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
 export function NeedsYou({ cards, accounts, problems, seeded, data, w, reread, onShow, back }: {
   cards: DecideCard[];
   /** The accounts decision, which reads and answers its own request. */
@@ -180,6 +199,7 @@ export function NeedsYou({ cards, accounts, problems, seeded, data, w, reread, o
 }) {
   const eok = useEndOrKeep(w);
   const [readSeeded, setReadSeeded] = useState(false);
+  const [shownCards, setShownCards] = useState(NEEDS_PAGE_SIZE);
   const fix = problems.filter((p) => p.band !== "later");
   const later = problems.filter((p) => p.band === "later");
   const row = (p: Problem) => {
@@ -212,9 +232,14 @@ export function NeedsYou({ cards, accounts, problems, seeded, data, w, reread, o
       <h2 className="needs-head">Needs you</h2>
       {cards.length || accounts ? (
         <Band title="Decide" sub="A conversation changed something, and it waits for your answer.">
-          {cards.map((card) => (
+          {cards.slice(0, shownCards).map((card) => (
             <DecideItem key={card.key} card={card} data={data} w={w} eok={eok} reread={reread} back={back} />
           ))}
+          {cards.length > shownCards ? (
+            <button type="button" className="sm" onClick={() => setShownCards((n) => n + NEEDS_PAGE_SIZE)}>
+              Show {Math.min(cards.length - shownCards, NEEDS_PAGE_SIZE)} more {cards.length - shownCards === 1 ? "decision" : "decisions"}
+            </button>
+          ) : null}
           {accounts}
           {eok.ask && data ? (
             <EndOrKeepChoices view={data} ask={eok.ask} now={new Date()} busy={w.anyBusy} saveLabel="Save and confirm"
@@ -224,12 +249,12 @@ export function NeedsYou({ cards, accounts, problems, seeded, data, w, reread, o
       ) : null}
       {fix.length ? (
         <Band title="Fix" sub="Something isn't working or is about to run out. Nothing was stopped.">
-          <ul className="needs-rows" aria-label="Fix">{fix.map(row)}</ul>
+          <PagedRows rows={fix} render={row} label="Fix" />
         </Band>
       ) : null}
       {later.length ? (
         <Band title="When you have time" sub="Nothing is wrong. These can wait.">
-          <ul className="needs-rows" aria-label="When you have time">{later.map(row)}</ul>
+          <PagedRows rows={later} render={row} label="When you have time" />
         </Band>
       ) : null}
     </section>

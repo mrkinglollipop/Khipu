@@ -384,6 +384,10 @@ describe("Standing rules: search", () => {
     fireEvent.change(box, { target: { value: "zebra" } });
     expect(screen.getByText(/No rules match “zebra”\./)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    // The default page is deliberately short; paging does not omit matches.
+    while (screen.queryByRole("button", { name: /Show \d+ more rules/ })) {
+      fireEvent.click(screen.getByRole("button", { name: /Show \d+ more rules/ }));
+    }
     expect(within(screen.getByRole("list", { name: "Standing rules" })).getAllByRole("listitem")).toHaveLength(11);
   });
 });
