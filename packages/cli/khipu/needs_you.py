@@ -468,6 +468,12 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
             continue
         action, args, request = row.get("action"), row.get("args"), str(row.get("id"))
         decline = _act("direction.decline", request=request)
+        if not owner_direction.reviewed_hold(row):
+            out.append(_item("held", f"held:{request}", "This held change predates complete review or its reviewed "
+                             "content has changed. Request it again to see the full content before answering.",
+                             by=row.get("by"), at=row.get("created_at"), undo=decline,
+                             undo_does="Drops the old held request. Nothing changes."))
+            continue
         placed, same_target = False, False
         for item in items:
             for side in ("confirm", "undo"):

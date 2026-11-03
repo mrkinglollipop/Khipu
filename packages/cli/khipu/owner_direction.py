@@ -387,9 +387,10 @@ _REQUESTS_KEPT_S = 30 * 24 * 3600  # settled requests; a pending or applying one
 _BOUNDARY_MOST = 200
 _CONFIRMED: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_owner_confirmed", default=None)
 # Set while a conversation's own request is being applied at once on the
-# owner's turn (``owner_act.apply_request``): the log line says so, and its
-# Undo takes the whole request back rather than returning it pending.
-REQUEST_APPLIED: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_request_applied", default=False)
+# owner's turn (``owner_act.apply_request``): its token names the exact
+# request and its creation turn. True only bootstraps a read-only proof, never a claim.
+# The log names the instant application; Undo takes the whole request back.
+REQUEST_APPLIED: contextvars.ContextVar[str | bool] = contextvars.ContextVar("khipu_request_applied", default=False)
 
 
 def requests_path() -> Path:
@@ -527,7 +528,7 @@ def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | 
                 if row.get("state") == "pending":
                     audience = "t3:" + thread if in_t3 else "session:" + session
                     disclosed = set(row.get("disclosed") or [])
-                    if signature("direction.confirm", {"request": row["id"]}) in shown:
+                    if reviewed_hold(row) and signature("direction.confirm", {"request": row["id"]}) in shown:
                         disclosed.add(audience)
                         grown(row)
                     else:
@@ -563,6 +564,17 @@ def _seed(thread: str | None, session: str, answer: str) -> dict | None:
             return ({"asks": {session: json.loads(json.dumps(row["asks"][session]))}}
                     if answer in (row.get("shown") or []) else None)
     return None
+
+
+def _review_pin(request: dict) -> str:
+    return signature(str(request.get("action")), {k: request.get(k) for k in ("args", "ask", "files")})
+
+
+def reviewed_hold(request: dict) -> bool:
+    """Legacy holds cannot gain a reviewed contract merely by being listed."""
+    review = request.get("review")
+    return (isinstance(review, dict) and type(review.get("v")) is int and review["v"] == 1
+            and isinstance(request.get("files"), dict) and review.get("pin") == _review_pin(request))
 
 
 def _review_files(action: str, args: dict) -> dict:
@@ -643,6 +655,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                        "created_ts": now, "created_at": _iso(now), "session": session, "by": _asker(environ),
                        "ask": ask or ask_line(action, args), "files": files,
                        "disclosed": ["t3:" + thread] if "t3_snapshots" in extra else ["session:" + session], **extra}
+            request["review"] = {"v": 1, "pin": _review_pin(request)}
             state = _load(path)
             if state["erased"] != erased:
                 raise DirectionRefused("forgotten", "Khipu forgot this conversation's words while the request was "
@@ -1009,7 +1022,9 @@ def _instant_t3(environ, session: str, now: float, action: str | None = None) ->
     latest typed hook turn stands behind. Stricter than a confirm in one
     way, as a change is: that message must be inside the window
     (``latest_window_h``). A thread nobody has been asked about yet has no
-    boundary, so its first change is held and a later one applies. An answer
+    boundary, so its first change is held and a later one applies. An own
+    request instead proves its current typed message, even without an earlier
+    question; its creation-turn fingerprint must still match at mutation. An answer
     to something waiting (``ANSWER_ACTIONS``) also needs an ask in this thread
     that showed it (``_shown_read``): any other message is no reply to it."""
     from khipu import t3
@@ -1018,10 +1033,14 @@ def _instant_t3(environ, session: str, now: float, action: str | None = None) ->
         thread = _t3_thread_of(session)
         if action in ANSWER_ACTIONS and not REQUEST_APPLIED.get() and _shown_read(thread, ANSWERING.get()) is None:
             return None
-        base = _t3_baseline(thread)
+        base = None if REQUEST_APPLIED.get() else _t3_baseline(thread)
         if base is None:
-            return None
-        request_id, snapshot = base
+            if not REQUEST_APPLIED.get():
+                return None
+            # An own request needs the current typed message, not an earlier question.
+            request_id, snapshot = None, {"ids": [], "latest_ts": 0}
+        else:
+            request_id, snapshot = base
         stamp = _t3_proof(environ, session, {"t3_snapshots": {thread: json.loads(json.dumps(snapshot))}}, now)
     except DirectionRefused:
         return None
@@ -1032,7 +1051,8 @@ def _instant_t3(environ, session: str, now: float, action: str | None = None) ->
     if at is None or now - at > owner_turns.settings()["latest_window_h"] * 3600:
         return None
     stamp["instant"] = {"source": "t3", "message": proved["message"], "message_at": proved["message_at"],
-                        "message_sha256": proved["message_sha256"], "after_ask": request_id}
+                        "message_sha256": proved["message_sha256"],
+                        **({"after_ask": request_id} if request_id is not None else {})}
     return stamp
 
 
@@ -1077,18 +1097,63 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     return why
 
 
-def _claim_message(state: dict, stamp: dict, action: str) -> None:
-    """Spend a typed message once, under the requests lock, before any write."""
+def _message_key(stamp: dict) -> str:
     evidence = stamp.get("confirmed") or stamp.get("instant") or {}
     identity = ({"source": "t3", "message": evidence.get("message") or stamp.get("turn")}
                 if stamp.get("binding") == "t3" else
                 {"session": stamp.get("session"), "message": evidence.get("message") or stamp.get("turn"),
                  "occurrence": stamp.get("occurrence")})
-    key = signature("owner.message", identity)
+    return signature("owner.message", identity)
+
+
+def request_turn(action: str) -> str | None:
+    """Capture an own request's typed turn before writing its proposal."""
+    token = REQUEST_APPLIED.set(True)
+    try:
+        return _message_key(check(action, instant=True))
+    except (DirectionRefused, OSError, ValueError):
+        return None
+    finally:
+        REQUEST_APPLIED.reset(token)
+
+
+def request_token(turn: str, request: str, action: str) -> str:
+    return signature("owner.request", {"turn": turn, "request": request, "action": action})
+
+
+def reserve_request_turn(turn: str, request: str, action: str) -> bool:
+    """Reserve a creation turn for its exact request before returning its receipt."""
+    if request_turn(action) != turn:
+        return False
+    try:
+        with _requests_locked() as path:
+            state = _load(path)
+            used = state.setdefault("used", {})
+            if turn in used:
+                return False
+            used[turn] = {"request": request, "action": action}
+            _save(path, state, _clock())
+        return True
+    except OSError:
+        return False  # only a pending proposal exists; no owner's change is authorized
+
+
+def _claim_message(state: dict, stamp: dict, action: str) -> None:
+    """Spend a typed message once, under the requests lock, before any write."""
+    key = _message_key(stamp)
+    own_turn = REQUEST_APPLIED.get()
     used = state.setdefault("used", {})
-    if key in used:
-        raise DirectionRefused("message_used", "This owner message already authorized a change. Nothing else was changed; ask in a new turn.")
-    if not stamp.get("confirmed"):
+    reserved = used.get(key)
+    mine = (isinstance(reserved, dict) and reserved.get("action") == action
+            and isinstance(reserved.get("request"), str)
+            and own_turn == request_token(key, reserved["request"], action))
+    if key in used and not mine:
+        why = ("This owner message is reserved for its own request." if isinstance(reserved, dict)
+               else "This owner message already authorized a change.")
+        raise DirectionRefused("message_used", why + " Nothing else was changed; ask in a new turn.")
+    if isinstance(own_turn, str) and not mine:
+        raise DirectionRefused("request_turn_moved", "This request no longer belongs to the current typed turn. It stays pending; show its full content before asking for an answer.")
+    if not stamp.get("confirmed") and not mine:
         if any(r.get("state") == "pending" and r.get("session") == stamp.get("session")
                for r in state["requests"]):
             raise DirectionRefused("confirm_needed", "A question is already waiting in this conversation. This turn can answer that question; it cannot authorize an unrelated instant change.")
@@ -1119,6 +1184,8 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
             if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
+            if not reviewed_hold(request):
+                raise DirectionRefused("legacy_hold", "This held change has no intact reviewed contract. Nothing was changed. Request it again so the full content can be shown before a new answer.")
             with t3.owner_read_budget():
                 member = owner_turns._t3_membership(session)
                 if member == "unverified":
@@ -1211,7 +1278,7 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
 # Everything on a request that holds the owner's words or marks their
 # conversation's messages: the action's args, the ask line, an error, and
 # the ask boundaries (T3 message ids and times, turn ids and hashes).
-_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks", "shown", "files", "disclosed")
+_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks", "shown", "files", "disclosed", "review")
 
 
 def forget_requests(sessions, *, protected_sessions=(), now: float | None = None) -> dict:

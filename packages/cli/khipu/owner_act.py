@@ -604,7 +604,9 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
 
 def apply_request(kind: str, out, *, only: str | None = None) -> dict:
     """A conversation's request (``khipu_route_priority``, ``khipu_route_rule``)
-    taken on the owner's own typed turn applies at once: the same confirm the
+    created and applied on the same proved typed turn applies at once. Its
+    receipt pins that creation turn and the current pending event; only this
+    request can spend the message. This uses the same confirm the
     owner would give (``route.priority.confirm`` / ``route.rule.confirm`` by
     direction), so it is logged with the evidence it relied on, receipted to
     every conversation and undone in one step. A call that does not pass the
@@ -620,7 +622,7 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
     left pending, as before."""
     from khipu import owner_direction, routing
 
-    if not isinstance(out, dict) or out.get("ok") is False:
+    if not isinstance(out, dict) or out.get("ok") is False or not isinstance(out.get("owner_turn"), str):
         return out
     try:
         if kind == "priority":
@@ -629,7 +631,8 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
             mine = routing.conversation_author().get("session")
             # Only this conversation's own request: a newer one from another
             # conversation that landed in between is never confirmed unseen.
-            if not stored.get("pending") or not mine or (stored.get("written_by") or {}).get("session") != mine:
+            if (not stored.get("pending") or not mine or (stored.get("written_by") or {}).get("session") != mine
+                    or (view.get("priority") or {}).get("event_id") != out.get("id")):
                 return out
             if only is not None:
                 owned = (stored.get("replaced") or {}).get("entries")
@@ -649,18 +652,20 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
             rule = next((r for r in routing.read_view().get("rules") or [] if r["n"] == number), None)
             mine = routing.conversation_author().get("session")
             if (type(number) is not int or rule is None or not rule.get("pending") or not mine
-                    or (rule.get("pending_author") or {}).get("session") != mine):
+                    or (rule.get("pending_author") or {}).get("session") != mine or rule.get("revision") != out.get("id")):
                 return out
             action, args = "route.rule.confirm", {"rule": number, "expect": rule["revision"]}
         # Never a hold: a turn that cannot be proved owner's is left alone.
         checking = owner_direction.REQUEST_APPLIED.set(True)
         try:
-            owner_direction.check(action, instant=True)
+            stamp = owner_direction.check(action, instant=True)
+            if owner_direction._message_key(stamp) != out["owner_turn"]:
+                return out
         finally:
             owner_direction.REQUEST_APPLIED.reset(checking)
     except (owner_direction.DirectionRefused, routing.RouteError, StopIteration, KeyError):
         return out
-    token = owner_direction.REQUEST_APPLIED.set(True)
+    token = owner_direction.REQUEST_APPLIED.set(owner_direction.request_token(out["owner_turn"], out["id"], action))
     try:
         ok, result = act(action, args)
     finally:

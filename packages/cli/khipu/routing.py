@@ -6687,6 +6687,15 @@ def _done(written: dict, view: dict, **extra) -> dict:
     return out
 
 
+def _request_result(written: dict, view: dict, turn: str | None, action: str, **extra) -> dict:
+    from khipu import owner_direction
+
+    out = _done(written, view, **extra)
+    if out.get("ok") and turn and owner_direction.reserve_request_turn(turn, written["id"], action):
+        out["owner_turn"] = turn
+    return out
+
+
 # ---- writes --------------------------------------------------------------------------
 
 
@@ -7244,6 +7253,9 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     # An addition has nothing to be stale against: never require or record base.
     if n is not None and (not isinstance(base, str) or not base.strip()):
         raise RouteError("base must be the owner revision the request was prepared against")
+    from khipu import owner_direction
+
+    requested_on = owner_direction.request_turn("route.rule.confirm")
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
@@ -7269,7 +7281,7 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
                                     "written_by": by, "via": via, "op": op,
                                     **({"holds": holds} if holds is not None else {})})
         rule = next((r for r in view.get("rules", []) if r["entity"] == written["entity"]), None)
-        return dict(_done(written, view), n=rule["n"] if rule else _rule_number(written))
+        return dict(_request_result(written, view, requested_on, "route.rule.confirm"), n=rule["n"] if rule else _rule_number(written))
     # The predecessor and the append are one locked operation: an owner edit
     # between them must become the wording Undo restores.
     with _lock():
@@ -7281,7 +7293,7 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
                                 "prior_text": prior, "prior_confirmed": prior_confirmed,
                                 "owner_request": request_words, "written_by": by, "via": via, "op": op,
                                 **({"holds": holds} if holds is not None else {})})
-    return dict(_done(written, view), n=rule["n"])
+    return dict(_request_result(written, view, requested_on, "route.rule.confirm"), n=rule["n"])
 
 
 def retire_rule(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
@@ -7861,6 +7873,9 @@ def request_priority(entries, *, until=None, owner_request: str | None = None, a
 
 def _request_priority(entries, *, until, owner_request, author, via: str, now: datetime | None, expect,
                       base: str | None = None) -> dict:
+    from khipu import owner_direction
+
+    requested_on = owner_direction.request_turn("route.priority.confirm")
     if not isinstance(base, str) or not base.strip():
         raise RouteError("base must be the owner revision the request was prepared against")
     now = now or _now()
@@ -7901,7 +7916,7 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
         written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
                                 "base": observed,
                                 "owner_request": _clean(request_words, 0), "written_by": by, "via": via})
-    return dict(_done(written, view), entries=[e["label"] for e in rows])
+    return dict(_request_result(written, view, requested_on, "route.priority.confirm"), entries=[e["label"] for e in rows])
 
 
 def _held_priority(now: datetime | None, *, pending: bool | None = None) -> dict:
@@ -8468,6 +8483,9 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
     by = dict(author or conversation_author())
     if by.get("kind") != "conversation":
         by = conversation_author()
+    from khipu import owner_direction
+
+    requested_on = owner_direction.request_turn("route.priority.confirm")
     with _lock():
         _check_priority(expect, now)
         try:
@@ -8483,7 +8501,7 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
         written, view = _write({"type": "priority_set", "entries": rows, "until": whole, "pending": True,
                                 "base": observed,
                                 "owner_request": _clean(request_words, 0), "written_by": by, "via": via})
-    return dict(_done(written, view), entries=[e["label"] for e in rows], **done)
+    return dict(_request_result(written, view, requested_on, "route.priority.confirm"), entries=[e["label"] for e in rows], **done)
 
 
 # ---- the rule 12 tier table (slice 10) ---------------------------------------------------
