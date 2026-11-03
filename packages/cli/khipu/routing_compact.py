@@ -547,9 +547,8 @@ def _observation_drops(rows: list[tuple[bytes, dict | None]], now: datetime, hou
             continue
         if row.get("runner") and (not row.get("account") or row.get("unmatched")):
             lanes.setdefault((row["runner"], row.get("lane") or ""), []).append((at, write, row))
-        # As ``fold`` reads a line for a level: its reset, or else its limit's end.
-        reset = routing._parse(row.get("reset_at")) or (
-            routing._parse(row.get("until")) if row.get("state") == routing.LIMITED else None)
+        # The fold can read only confirmed resets to end a level.
+        reset = routing._confirmed_level_reset(row)
         for as_of in level_times if reset is not None else ():
             if reset > as_of:
                 ident = (as_of, row.get("account"), row.get("runner"), row.get("lane"), line_era.get(line))
