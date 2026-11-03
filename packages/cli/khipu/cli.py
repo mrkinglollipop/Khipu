@@ -492,6 +492,24 @@ def _disk_space_warnings(local: dict) -> list[str]:
     return [block["message"]] if block.get("level") == "amber" and block.get("message") else []
 
 
+def _doctor_rerank() -> tuple[dict, list[str]]:
+    """The rerank switch and whether a model stands behind it. On with no
+    model, searches skip the stage (and say so in ``degraded_legs``); that is
+    a warning here, never a gate."""
+    try:
+        from khipu import rerank
+
+        block = rerank.status()
+    except Exception as e:  # noqa: BLE001 — visibility only
+        return {"error": f"{type(e).__name__}: {e}"}, []
+    if block["enabled"] and not block["usable"]:
+        return block, [
+            f"rerank is switched on but there is no rerank model available ({block['reason']}); "
+            "searches skip it and list rerank in degraded_legs. Point the synth model at an API "
+            "provider with a key, or run `khipu features --set rerank off`."]
+    return block, []
+
+
 def _recall_outcomes_warnings(local: dict) -> list[str]:
     """A thin or timeouts-only recall sample is amber: visible, never gating."""
     block = local.get("prompt_recall_outcomes") or {}
@@ -874,6 +892,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         features_block = features.states()
     except Exception as e:  # noqa: BLE001
         features_block = {"error": f"{type(e).__name__}: {e}"}
+    rerank_block, rerank_warnings = _doctor_rerank()
     # Phase 2, session C: candidate supersession links awaiting review —
     # visibility only, same posture as features_block above; never gates `ok`.
     try:
@@ -1047,6 +1066,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         **({"t3": t3_health} if t3_health is not None else {}),
         **({"project_renames": project_renames_block} if project_renames_block is not None else {}),
         "features": features_block,
+        "rerank": rerank_block,
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
@@ -1065,7 +1085,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + list(owner_actions_log_block.get("warnings") or [])
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or [])
-                     + list(fact_provenance.get("warnings") or []) + _disk_space_warnings(local)
+                     + list(fact_provenance.get("warnings") or []) + rerank_warnings + _disk_space_warnings(local)
                      + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)),
         "not_configured": not_configured,
         "ok": (
@@ -3454,10 +3474,14 @@ def cmd_capture_now(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(json.dumps({"ok": False, "error": str(e)}))
         return 1
-    path = request_capture_now(harness, sid, note=getattr(args, "note", None))
+    kept: dict = {}
+    path = request_capture_now(harness, sid, note=getattr(args, "note", None), outcome=kept)
     print(json.dumps({
         "queued": True, "captured_by": "next stop",
         "harness": harness, "session_id": sid, "flag": str(path), "resolved_by": resolved_by,
+        # The flag keeps the newest MAX_CAPTURE_NOTE characters: say so when it cut.
+        **({k: kept[k] for k in ("truncated", "stored_chars", "sent_chars", "dropped_chars")}
+           if kept.get("truncated") else {}),
     }))
     return 0
 

@@ -90,6 +90,46 @@ class _Unavailable(Exception):
     """No usable synth provider is configured."""
 
 
+def _provider_problem(settings: Mapping[str, Any]) -> str | None:
+    """Why the configured synth role cannot rerank, or None when it can. Local
+    checks only (settings and key presence): no call and no network."""
+    provider = settings.get("provider")
+    if provider in {"claude-cli", "codex-cli"}:
+        return "rerank needs an API provider"
+    if (provider or "cloud").strip().lower() == "local":
+        if not (settings.get("endpoint") or "").strip() or not (settings.get("model_id") or "").strip():
+            return "local synth has no endpoint or model_id"
+        return None
+    from khipu import extract
+    from khipu.models import cloud_model_id
+
+    try:
+        cloud_model_id(settings)
+        extract._provider_key(provider or "gemini")
+    except RuntimeError as exc:
+        return str(exc)
+    return None
+
+
+def status() -> dict[str, Any]:
+    """Whether a rerank model is available, for ``khipu doctor``: ``enabled``
+    (the switch), ``usable`` (a synth model could answer), the synth
+    ``provider`` and, when not usable, the ``reason``. Never calls a model."""
+    from khipu import features
+
+    provider = None
+    try:
+        from khipu.models import synth_settings
+
+        settings = synth_settings()
+        provider = settings.get("provider")
+        problem = _provider_problem(settings)
+    except Exception as exc:  # noqa: BLE001 — a check that cannot run is not usable
+        problem = f"{type(exc).__name__}: {str(exc)[:160]}"
+    return {"enabled": features.enabled("rerank"), "usable": problem is None,
+            "provider": provider, "reason": problem}
+
+
 def _call_model(prompt: str, *, timeout: float) -> tuple[str, str]:
     """(answer text, model id) from the configured synth provider. No retries:
     the stage's own deadline is the only budget. Raises ``_Unavailable`` when
@@ -98,21 +138,16 @@ def _call_model(prompt: str, *, timeout: float) -> tuple[str, str]:
     from khipu.models import cloud_model_id, synth_settings
 
     settings = synth_settings()
-    if settings.get("provider") in {"claude-cli", "codex-cli"}:
-        raise _Unavailable("rerank needs an API provider")
+    problem = _provider_problem(settings)
+    if problem:
+        raise _Unavailable(problem)
     if (settings.get("provider") or "cloud").strip().lower() == "local":
         endpoint = (settings.get("endpoint") or "").strip()
         model_id = (settings.get("model_id") or "").strip()
-        if not endpoint or not model_id:
-            raise _Unavailable("local synth has no endpoint or model_id")
         return extract._generate_local(
             prompt, endpoint=endpoint, model_id=model_id, timeout=timeout, retries=0
         ), model_id
     model_id = cloud_model_id(settings)
-    try:
-        extract._provider_key(settings.get("provider") or "gemini")
-    except RuntimeError as exc:
-        raise _Unavailable(str(exc)) from exc
     return extract._generate(
         prompt, timeout=timeout, retries=0, caller="rerank"
     ), model_id
@@ -201,7 +236,8 @@ def rerank(
     )
     try:
         text, out["model"] = _call_within(prompt, deadline)
-    except _Unavailable:
+    except _Unavailable as exc:
+        out["detail"] = str(exc)[:200]
         return _finish("no-provider")
     except TimeoutError:
         return _finish("timeout")
@@ -262,6 +298,10 @@ def stage(
     result = rerank(query, fused, deadline=time.monotonic() + deadline_s, topic_sources=topic_sources)
     payload = {"applied": False, "model": result["model"], "ms": result["ms"],
                "candidates": result["candidates"], "reason": result["reason"]}
+    if result["reason"] == "no-provider":
+        # Not run: no model could answer. Said outright, so a block with a
+        # candidate count and a duration is never read as a rerank that ran.
+        payload.update(skipped=True, detail=result.get("detail"))
     if result["order"] is None:
         return fused, payload, result["reason"] != "too-few-candidates"
     payload["applied"] = True

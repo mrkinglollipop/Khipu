@@ -162,6 +162,11 @@ def _record_fact_gap(cur, episode_id: int | None, step: str, exc: BaseException,
     gap in the same transaction, so doctor reports it and the nightly
     re-runs it (invariant I4). Only on a hub with migration 0047; a gap that
     cannot be recorded defers the whole capture instead of losing the items."""
+    # The capture's caller is told which step lost its items, whether or not
+    # this hub can record the gap (a hub without 0047 has no table for it).
+    from khipu import commitments as _commitments
+
+    _commitments.report_step_failed(exc, step)
     if episode_id is None:
         return
     from khipu import provenance
@@ -1399,6 +1404,21 @@ def _verbatim_stored(cur, episode_id: int | None, verbatim: Any) -> bool:
 
 
 def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
+    """:func:`_write_pg` plus ``commitments``: what the capture's commitment
+    steps did with the open/closed loops it carried (``opened``, ``restated``,
+    ``closed``, ``rejected`` and ``not_closed`` with a reason each, or
+    ``step_failed``). Absent when no loop was involved."""
+    from khipu import commitments
+
+    report: dict[str, Any] = {}
+    with commitments.collecting(report):
+        stats = _write_pg(payload, legacy_projection=legacy_projection)
+    if report and isinstance(stats, dict):
+        stats["commitments"] = report
+    return stats
+
+
+def _write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
     # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
