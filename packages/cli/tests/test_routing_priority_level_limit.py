@@ -1,6 +1,4 @@
-"""A priority level ends at the first reset or limit end after its ``as_of``:
-the fold read a limit's end through ``_parse``, which takes text and got a
-datetime, so a limit never shortened a level. Hermetic."""
+"""Only confirmed resets can shorten an owner priority level. Hermetic."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -35,12 +33,12 @@ def _level_at(lines, when, as_of_h=5):
     return body["priority"]["entries"][0].get("level")
 
 
-def test_a_limit_ending_after_as_of_shortens_the_level(world):
-    assert _level_at([_limit(1, 2, 3)], NOW)["until"] == ISO(NOW + timedelta(hours=3))
+def test_an_unconfirmed_limit_does_not_shorten_the_level(world):
+    assert _level_at([_limit(1, 2, 3)], NOW)["until"] == ISO(NOW + timedelta(days=30))
 
 
-def test_the_level_is_gone_once_that_limit_has_ended(world):
-    assert _level_at([_limit(1, 2, 3)], NOW + timedelta(hours=4)) is None
+def test_the_level_survives_an_unconfirmed_limit_end(world):
+    assert _level_at([_limit(1, 2, 3)], NOW + timedelta(hours=4))["until"] == ISO(NOW + timedelta(days=30))
 
 
 def test_a_limit_that_ended_before_as_of_leaves_it(world):
@@ -48,9 +46,31 @@ def test_a_limit_that_ended_before_as_of_leaves_it(world):
 
 
 def test_a_lines_reset_time_still_comes_before_its_limit_end(world):
-    line = _limit(1, 2, 3, reset_at=ISO(NOW + timedelta(hours=8)))
+    line = _limit(1, 2, 3, source="probe", reset_at=ISO(NOW + timedelta(hours=8)))
     assert _level_at([line], NOW)["until"] == ISO(NOW + timedelta(hours=8))
 
 
 def test_another_accounts_limit_leaves_it(world):
     assert _level_at([_limit(1, 2, 3, account="codex|")], NOW)["until"] == ISO(NOW + timedelta(days=30))
+
+
+def test_default_limit_does_not_end_level(world):
+    assert _level_at([_limit(1, 0, .5, until_default=True)], NOW + timedelta(hours=1))["until"] == ISO(NOW + timedelta(days=30))
+
+
+def test_provider_stated_reset_ends_level(world):
+    line = _limit(1, 2, 3, source="report", message_time=True)
+    assert _level_at([line], NOW)["until"] == ISO(NOW + timedelta(hours=3))
+    assert _level_at([line], NOW + timedelta(hours=4)) is None
+
+
+def test_estimated_reset_field_is_not_confirmation(world):
+    line = _limit(1, 2, 3, basis="estimated", reset_at=ISO(NOW + timedelta(hours=1)))
+    assert _level_at([line], NOW)["until"] == ISO(NOW + timedelta(days=30))
+
+
+def test_cleared_confirmed_limit_does_not_end_level(world):
+    clear = {"id": "clear", "seq": 2, "type": "clear", "account": KEY,
+             "written_at": ISO(NOW - timedelta(hours=1)), "written_by": {"kind": "owner"},
+             "via": "app", "auth": "app"}
+    assert _level_at([_limit(1, 2, 3, source="report", message_time=True), clear], NOW)["until"] == ISO(NOW + timedelta(days=30))

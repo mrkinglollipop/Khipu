@@ -3537,6 +3537,18 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
                if k in event}, "turn": bool(event.get("observed_turn"))}
 
 
+def _confirmed_level_reset(item: dict) -> datetime | None:
+    """Only a measured reset or a dated provider message can end an owner level."""
+    if item.get("until_default") or item.get("basis") not in ("cli", "checked"):
+        return None
+    if item.get("source") in ("probe", "check"):
+        return _parse(item.get("reset_at"))
+    if item.get("message_time") and item.get("state") == LIMITED:
+        until = item.get("until")
+        return _parse(item.get("reset_at")) or (until if isinstance(until, datetime) else _parse(until))
+    return None
+
+
 def _owner_event(event: dict) -> dict:
     return {"id": event.get("id"), "at": _parse(event.get("written_at")), "seq": event["_seq"],
             "until": _parse(event.get("until")), "written_by": event.get("written_by") or OWNER,
@@ -4795,9 +4807,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         for item in priority_out["entries"]:
             level = item.get("level")
             if level:
-                # An evidence item's ``until`` is already a time, its ``reset_at`` text.
-                resets = [_parse(e.get("reset_at")) or e.get("until") for e in evidence
-                          if e.get("account") == item["account"]]
+                clear = owner["clears"].get(item["account"])
+                resets = [_confirmed_level_reset(e) for e in evidence
+                          if e.get("account") == item["account"]
+                          and e["id"] not in owner["dismissed"]
+                          and e.get("source_id") not in owner["dismissed"]
+                          and (clear is None or _k(e) > _k(clear))]
                 resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
                 if resets:
                     level["until"] = _iso(min(_parse(level["until"]), *resets))
