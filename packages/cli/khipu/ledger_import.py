@@ -121,7 +121,11 @@ def read_tracker(path: str | os.PathLike) -> dict[str, Any]:
     # The path goes to safe_read exactly as given: only it parses a path.
     try:
         _folder, file_name = safe_read.parse(path)
-        data, _st = safe_read.read_file(path)
+        from khipu import owner_direction
+
+        data = owner_direction.reviewed_file(path)
+        if data is None:
+            data, _st = safe_read.read_file(path)
     except safe_read.Refused:
         raise LedgerError("Not read: the file is inside a private folder or a login folder, or is reached through a link.",
                           "refused") from None

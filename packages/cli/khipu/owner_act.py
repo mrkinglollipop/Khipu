@@ -28,7 +28,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.note.end": ((), ()),
     "route.rule.add": (("text",), ("holds",)),
     "route.rule.edit": (("rule", "text"), ()),
-    "route.rule.retire": (("rule",), ()),
+    "route.rule.retire": (("rule",), ("expect",)),
     "route.rule.restore": (("rule",), ()),
     "route.rule.confirm": (("rule",), ("expect",)),
     "route.rule.undo": (("rule",), ("expect",)),
@@ -504,6 +504,10 @@ def act(action, args) -> tuple[bool, dict]:
     try:
         values = _values(action, args)
         pending = _priority_pending(action, values)
+        if pending is None and not owner_direction.REQUEST_APPLIED.get():
+            from khipu import needs_you
+
+            pending = needs_you.prepare_answer(action, values)
         if pending is not None:
             values = pending[0]
         head, positionals = argv(action, values)
@@ -528,7 +532,7 @@ def act(action, args) -> tuple[bool, dict]:
                 held = pending is not None
         if held:
             if pending is not None:
-                return _hold(action, values, ask=pending[1])
+                return _held_on_a_read(_hold(action, values, ask=pending[1]))
             from khipu import needs_you
 
             return _held_on_a_read(_hold(action, values, ask=needs_you.ask_for(action, values)))
@@ -639,7 +643,7 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
                 now_ = {e.get("account"): e for e in stored.get("entries") or []}
                 if any(was.get(a) != now_.get(a) for a in set(was) | set(now_) if a != key):
                     return out
-            action, args = "route.priority.confirm", {"expect": view.get("priority_version") or "p0"}
+            action, args = "route.priority.confirm", {"expect": routing.pending_priority_pin(view)}
         else:
             number = out.get("n")
             rule = next((r for r in routing.read_view().get("rules") or [] if r["n"] == number), None)
@@ -689,7 +693,7 @@ def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, d
                   "line": (f"Nothing is changed yet. Ask the owner: \"{request['ask']}\" Once they answer in this "
                            f"conversation, call khipu_owner_act with {CONFIRM} and "
                            f"{{\"request\": \"{request['id']}\"}}; if they say no, {DECLINE} with the same "
-                           "request. It can be confirmed later, from any conversation the owner types in.")}
+                           "request. In another conversation, read the full held item first, then the owner can answer once.")}
 
 
 def _confirm(args) -> tuple[bool, dict]:
@@ -705,7 +709,7 @@ def _confirm(args) -> tuple[bool, dict]:
     try:
         head, positionals = argv(action, _values(action, request.get("args") or {}))
         full = full_argv(head, positionals, ["--owner-direction"])
-        with owner_direction.confirmed_replay(action, stamp):
+        with owner_direction.confirmed_replay(action, stamp, files=request.get("files")):
             ok, result = _run(action, full)
     except Refused as err:
         result = err.refusal()

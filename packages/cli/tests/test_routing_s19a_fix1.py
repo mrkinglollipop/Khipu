@@ -182,20 +182,15 @@ def test_a_lost_counter_after_pruning_never_reuses_an_occurrence(world):
 # ---- P3: exact entity matching ----------------------------------------------
 
 
-def test_claude_does_not_close_on_a_claude_second_action(world):
+@pytest.mark.parametrize("account, remaining", [("Claude second", 1), ("Claude", 0)])
+def test_claude_does_not_close_on_a_claude_second_action(world, account, remaining):
     text = "Use Claude only one job at a time."
     say(text)
     (row,) = scan([text])
     assert row["target"]["entity"] == "Claude"
-    cap(1, account="Claude second")
+    cap(1, account=account)
     routing_directions.refresh()
-    assert len(routing_directions.owed_items()) == 1
-    cap(1, account="Claude")
-    routing_directions.refresh()
-    assert routing_directions.owed_items() == []
-
-
-# ---- P3: unjoined is not sticky ----------------------------------------------
+    assert len(routing_directions.owed_items()) == remaining
 
 
 def test_unjoined_clears_when_the_turn_record_arrives_later(world):

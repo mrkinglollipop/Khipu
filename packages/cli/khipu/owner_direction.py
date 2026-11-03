@@ -421,9 +421,9 @@ def _load(path: Path) -> dict:
         return {"requests": [], "erased": 0}
     rows = data.get("requests") if isinstance(data, dict) else None
     erased = data.get("erased", 0) if isinstance(data, dict) else None
-    if not isinstance(rows, list) or type(erased) is not int:
+    if not isinstance(rows, list) or type(erased) is not int or not isinstance(data.get("used", {}), dict):
         raise OSError("the held owner requests can't be read")
-    return {"requests": [r for r in rows if isinstance(r, dict)], "erased": erased}
+    return {"requests": [r for r in rows if isinstance(r, dict)], "erased": erased, "used": data.get("used", {})}
 
 
 def _read_requests(path: Path) -> list[dict]:
@@ -433,7 +433,7 @@ def _read_requests(path: Path) -> list[dict]:
 def _save(path: Path, state: dict, now: float) -> None:
     kept = [r for r in state["requests"]
             if r.get("settled_ts") is None or now - _float(r.get("settled_ts")) < _REQUESTS_KEPT_S]
-    _write_private(path, json.dumps({"requests": kept, "erased": state["erased"]}, ensure_ascii=False,
+    _write_private(path, json.dumps({"requests": kept, "erased": state["erased"], "used": state.get("used", {})}, ensure_ascii=False,
                                     sort_keys=True) + "\n")
 
 
@@ -467,7 +467,8 @@ def signature(action: str, args: dict) -> str:
 
 def _read_rows() -> list[dict]:
     try:
-        return [r for r in _read_requests(requests_path()) if r.get("action") == READ_ACTION]
+        return sorted((r for r in _read_requests(requests_path()) if r.get("action") == READ_ACTION),
+                      key=lambda r: _float(r.get("settled_ts")), reverse=True)
     except (OSError, ValueError):
         return []
 
@@ -475,9 +476,8 @@ def _read_rows() -> list[dict]:
 def _shown_read(thread: str, answer: str | None) -> dict | None:
     """The read in this T3 thread that showed ``answer``, when one did."""
     for row in _read_rows():
-        if (answer and answer in (row.get("shown") or [])
-                and _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None):
-            return row
+        if _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
+            return row if answer and answer in (row.get("shown") or []) else None
     return None
 
 
@@ -525,7 +525,14 @@ def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | 
             state = _load(path)
             for row in state["requests"]:
                 if row.get("state") == "pending":
-                    grown(row)
+                    audience = "t3:" + thread if in_t3 else "session:" + session
+                    disclosed = set(row.get("disclosed") or [])
+                    if signature("direction.confirm", {"request": row["id"]}) in shown:
+                        disclosed.add(audience)
+                        grown(row)
+                    else:
+                        disclosed.discard(audience)
+                    row["disclosed"] = sorted(disclosed)
             mine = next((r for r in state["requests"]
                          if r.get("action") == READ_ACTION and r.get("session") == session), None)
             if mine is None:
@@ -533,7 +540,7 @@ def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | 
                         "session": session, "created_ts": now, "created_at": _iso(now)}
                 state["requests"].append(mine)
             grown(mine)
-            mine["shown"] = [*(s for s in mine.get("shown") or [] if s not in shown), *shown][-_SHOWN_MOST:]
+            mine["shown"] = shown[-_SHOWN_MOST:]
             mine.update(settled_ts=now, settled_at=_iso(now))
             _save(path, state, now)
     except DirectionRefused as refused:
@@ -549,13 +556,42 @@ def _seed(thread: str | None, session: str, answer: str) -> dict | None:
     """The boundary of the read that showed ``answer``: a hold made after the
     owner replied to that read starts from it, so his one yes counts."""
     for row in _read_rows():
-        if answer not in (row.get("shown") or []):
-            continue
         if thread is not None and _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
-            return {"t3_snapshots": {thread: json.loads(json.dumps(row["t3_snapshots"][thread]))}}
+            return ({"t3_snapshots": {thread: json.loads(json.dumps(row["t3_snapshots"][thread]))}}
+                    if answer in (row.get("shown") or []) else None)
         if thread is None and row.get("session") == session and _ask_parts((row.get("asks") or {}).get(session)):
-            return {"asks": {session: json.loads(json.dumps(row["asks"][session]))}}
+            return ({"asks": {session: json.loads(json.dumps(row["asks"][session]))}}
+                    if answer in (row.get("shown") or []) else None)
     return None
+
+
+def _review_files(action: str, args: dict) -> dict:
+    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(action)
+    if not key or not args.get(key):
+        return {}
+    from khipu import safe_read
+    from khipu.redact import redact_secrets
+    try:
+        raw, _ = safe_read.read_file(args[key])
+        text = raw.decode("utf-8")
+        json.loads(text)
+        if len(text) > 12000 or redact_secrets(text, force=True)[1]:
+            raise ValueError("The complete file cannot be disclosed safely in one ask.")
+    except (OSError, ValueError, safe_read.Refused) as err:
+        raise DirectionRefused("file_unreviewable", f"The file cannot be reviewed completely: {err}") from None
+    return {str(args[key]): {"text": text, "sha256": _sha(text)}}
+
+
+def reviewed_file(path) -> bytes | None:
+    """The immutable bytes disclosed by this held action, never a later path read."""
+    replay = _CONFIRMED.get() or {}
+    files = replay.get("files") or {}
+    item = files.get(str(path))
+    if item is None:
+        return None
+    if _sha(item["text"]) != item["sha256"]:
+        raise DirectionRefused("file_changed", "The reviewed file snapshot is damaged; ask again.")
+    return item["text"].encode("utf-8")
 
 
 def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: str | None = None) -> dict:
@@ -576,6 +612,10 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
     session = _caller_session(environ)
+    files = _review_files(action, args)
+    if files:
+        ask = (ask or ask_line(action, args)) + " Reviewed file contents: " + " ".join(
+            f"{name} (sha256 {item['sha256']}): {item['text']}" for name, item in files.items())
     try:
         erased = _load(requests_path())["erased"]
         with _requests_locked() as path:
@@ -601,7 +641,8 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                     "asks": {session: _ask_boundary(None, turns_, now, session)}}
             request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
                        "created_ts": now, "created_at": _iso(now), "session": session, "by": _asker(environ),
-                       "ask": ask or ask_line(action, args), **extra}
+                       "ask": ask or ask_line(action, args), "files": files,
+                       "disclosed": ["t3:" + thread] if "t3_snapshots" in extra else ["session:" + session], **extra}
             state = _load(path)
             if state["erased"] != erased:
                 raise DirectionRefused("forgotten", "Khipu forgot this conversation's words while the request was "
@@ -924,7 +965,8 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
     message = read["message"] if parts is not None else None
     # The current turn is the latest hook row: a machine one (a notification,
     # a wake) never borrows an owner message from before it.
-    if message is not None and latest.get("typed") and not latest.get("machine"):
+    if (message is not None and latest.get("typed") and not latest.get("machine")
+            and latest.get("prompt_sha256") == owner_turns.prompt_sha256(message["text"])):
         sha = owner_turns.prompt_sha256(message["text"])
         return {"auth": "direction", "harness": "t3", "session": session, "turn": message["id"],
                 "prompt_sha256": sha, "binding": "t3",
@@ -1035,6 +1077,25 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     return why
 
 
+def _claim_message(state: dict, stamp: dict, action: str) -> None:
+    """Spend a typed message once, under the requests lock, before any write."""
+    evidence = stamp.get("confirmed") or stamp.get("instant") or {}
+    identity = ({"source": "t3", "message": evidence.get("message") or stamp.get("turn")}
+                if stamp.get("binding") == "t3" else
+                {"session": stamp.get("session"), "message": evidence.get("message") or stamp.get("turn"),
+                 "occurrence": stamp.get("occurrence")})
+    key = signature("owner.message", identity)
+    used = state.setdefault("used", {})
+    if key in used:
+        raise DirectionRefused("message_used", "This owner message already authorized a change. Nothing else was changed; ask in a new turn.")
+    if not stamp.get("confirmed"):
+        if any(r.get("state") == "pending" and r.get("session") == stamp.get("session")
+               for r in state["requests"]):
+            raise DirectionRefused("confirm_needed", "A question is already waiting in this conversation. This turn can answer that question; it cannot authorize an unrelated instant change.")
+    # Only opaque fingerprints persist: a long-lived held request has no reply-age limit.
+    used[key] = action
+
+
 def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dict, dict]:
     """(the held request, its confirm stamp), claimed for applying, or
     ``DirectionRefused``. Every refusal a change has runs first; then the
@@ -1059,10 +1120,17 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
             with t3.owner_read_budget():
+                member = owner_turns._t3_membership(session)
+                if member == "unverified":
+                    raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
+                audience = "t3:" + _t3_refusals(environ, session) if member == "t3" else "session:" + session
+                if audience not in (request.get("disclosed") or []):
+                    raise DirectionRefused("not_confirmed", "This complete request was not shown in this conversation. Read its full held item before answering.")
                 stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
                 raise DirectionRefused("not_confirmed", stamp)
+            _claim_message(state, stamp, request["action"])
             stamp["confirmed"]["request"] = request_id
             request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session))
             _save(path, state, now)
@@ -1100,6 +1168,7 @@ def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
             if isinstance(stamp, str):
                 _save(path, state, now)
                 raise DirectionRefused("not_confirmed", stamp.replace("direction.confirm", "direction.decline"))
+            _claim_message(state, stamp, DECLINE_ACTION)
             line = {"kind": "action", "id": _new_id(), "at": _iso(now), "action": DECLINE_ACTION,
                     "target": request_id, "before": None, "auth": stamp.get("auth"), "undo": None,
                     "no_undo": "Nothing was changed, so there is nothing to undo.", "state": "applied",
@@ -1142,7 +1211,7 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
 # Everything on a request that holds the owner's words or marks their
 # conversation's messages: the action's args, the ask line, an error, and
 # the ask boundaries (T3 message ids and times, turn ids and hashes).
-_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks", "shown")
+_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks", "shown", "files", "disclosed")
 
 
 def forget_requests(sessions, *, protected_sessions=(), now: float | None = None) -> dict:
@@ -1181,6 +1250,8 @@ def forget_requests(sessions, *, protected_sessions=(), now: float | None = None
                     makers = set(_makers(boundaries[name])) | ({name} if key == "asks" else set())
                     if not _makers(boundaries[name]) or makers & names:
                         del boundaries[name]
+                        audience = ("session:" if key == "asks" else "t3:") + name
+                        row["disclosed"] = [d for d in row.get("disclosed") or [] if d != audience]
                         removed += 1
                 if not boundaries:
                     row.pop(key)
@@ -1190,10 +1261,10 @@ def forget_requests(sessions, *, protected_sessions=(), now: float | None = None
 
 
 @contextlib.contextmanager
-def confirmed_replay(action: str, stamp: dict):
+def confirmed_replay(action: str, stamp: dict, *, files: dict | None = None):
     """While the held request's own command runs, the check returns the
     confirm stamp for that action in that conversation, and nothing else."""
-    token = _CONFIRMED.set({"action": action, "stamp": dict(stamp)})
+    token = _CONFIRMED.set({"action": action, "stamp": dict(stamp), "files": files or {}})
     try:
         yield
     finally:
@@ -1980,6 +2051,11 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
         raise DirectionRefused("before_unreadable",
                                "Khipu can't read what this would change right now, so it could not be undone; "
                                "nothing was changed. Try again when the database is back.")
+    if not replaying(want["action"]):
+        with _requests_locked() as path:
+            state = _load(path)
+            _claim_message(state, stamp, want["action"])
+            _save(path, state, _clock() if now is None else now)
     _abandon()
     pend = {"intent": want, "stamp": stamp, "before": before, "stamped": _routing_stamps()}
     try:

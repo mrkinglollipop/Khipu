@@ -424,6 +424,8 @@ def test_a_t3_request_confirms_from_claude_code_or_codex(world, front):
     request = _hold_in_t3(world, ago=DAY)
     _front_end_turn(world, front, "s-elsewhere")
     _be_front(world, front, "s-elsewhere")
+    from khipu import needs_you
+    needs_you.waiting(key="held:" + request)
     ok, out = _confirm_id(request)
     assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"]
     assert not _paused()
@@ -442,10 +444,12 @@ def test_a_claude_code_or_codex_request_confirms_from_t3_after_its_snapshot(worl
     world["t3"].message(THREAD, time.time() - 1)
     _t3_hook_turn()
     _be(world, T3_SESSION)
+    from khipu import needs_you
+    needs_you.waiting(key="held:" + request)
     ok, out = _confirm_id(request)
     assert not ok and out["code"] == "not_confirmed" and "Ask the owner to confirm now" in out["error"], out
     assert not _paused()
-    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    (row,) = [r for r in owner_direction._read_requests(owner_direction.requests_path()) if r.get("action") != owner_direction.READ_ACTION]
     assert row["state"] == "pending" and list(row["t3_snapshots"]) == [THREAD]
     ok, out = _confirm_id(request)
     assert not ok and out["code"] == "not_confirmed" and not _paused()
@@ -463,7 +467,7 @@ def test_direct_actions_from_claude_code_and_codex_still_apply_at_once(world, fr
     ok, out = owner_act.act("route.pause", {"account": "Codex"})
     assert ok and not out.get("pending"), out
     assert _paused()
-    assert not owner_direction.requests_path().exists()
+    assert owner_direction._read_requests(owner_direction.requests_path()) == []
 
 
 def test_a_direct_action_outside_the_window_is_still_refused_as_today(world):
@@ -481,7 +485,7 @@ def test_the_audit_line_names_the_confirming_message_by_id_time_and_hash_only(wo
     words = "Yes, go ahead and pause Codex — confirmed"
     when = time.time() - 2
     mid = world["t3"].message(THREAD, when, text=words)
-    _t3_hook_turn()
+    _t3_hook_turn(prompt=words)
     ok, out = _confirm_id(request)
     assert ok, out
     (line,) = owner_direction.actions()
@@ -718,6 +722,8 @@ def test_an_owner_turn_after_the_hold_but_before_the_latest_ask_is_refused(world
     request = _hold_by_request(world, "claude_code:cli", "s-front", ago=3600)
     _front_end_turn(world, "claude_code:cli", "s-other", ago=60)   # after the hold
     _be(world, "s-other")
+    from khipu import needs_you
+    needs_you.waiting(key="held:" + request)
     ok, out = _confirm_id(request)                                 # the latest ask here
     assert not ok and "Ask the owner to confirm now" in out["error"]
     ok, out = _confirm_id(request)
@@ -842,18 +848,21 @@ def test_review2_p2_forget_scrubs_a_conversations_boundaries_on_another_conversa
     request = _hold_by_request(world, "claude_code:cli", "s-front", ago=60)
     _front_end_turn(world, "claude_code:cli", "s-other", ago=30)
     _be(world, "s-other")
+    from khipu import needs_you
+    needs_you.waiting(key="held:" + request)
     ok, out = _confirm_id(request)                      # records s-other's ask on s-front's request
     assert not ok
     world["t3"].message(THREAD, time.time() - 20)
     _t3_hook_turn()
     _be(world, T3_SESSION)
+    needs_you.waiting(key="held:" + request)
     ok, out = _confirm_id(request)                      # records the T3 thread's snapshot on it
     assert not ok
-    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    (row,) = [r for r in owner_direction._read_requests(owner_direction.requests_path()) if r.get("action") != owner_direction.READ_ACTION]
     assert set(row["asks"]) == {"s-front", "s-other"} and list(row["t3_snapshots"]) == [THREAD]
     assert forget._owner_words_scan("claude_code:s-other", gateway=False)["ok"]
     assert forget._owner_words_scan(T3_SESSION, gateway=False)["ok"]
-    (row,) = owner_direction._read_requests(owner_direction.requests_path())
+    (row,) = [r for r in owner_direction._read_requests(owner_direction.requests_path()) if r.get("action") != owner_direction.READ_ACTION]
     assert row["state"] == "pending" and list(row["asks"]) == ["s-front"], row
     assert THREAD not in row.get("t3_snapshots", {}) and "msg-1" not in owner_direction.requests_path().read_text()
 

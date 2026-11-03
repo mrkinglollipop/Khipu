@@ -222,7 +222,7 @@ def _priority(view: dict, now: datetime) -> list[dict]:
     if not held.get("pending"):
         return []
     version = view.get("priority_version") or "p0"
-    undo = _act("route.priority.undo", expect=version)
+    undo = _act("route.priority.undo", expect=routing.pending_priority_pin(view))
     undo_does = ("Puts back the priority it replaced." if held.get("replaced")
                  else "Removes it: you had no priority set before.")
     by, at = held.get("pending_author") or held.get("written_by"), held.get("at")
@@ -238,7 +238,7 @@ def _priority(view: dict, now: datetime) -> list[dict]:
              + (f" It said you asked: {_quote(asked)}." if asked else ""))
     return [_item("priority", "priority", words, by=by, at=at,
                   confirm_does="Makes these changes your own priority, so it stops showing as unconfirmed.",
-                  undo_does=undo_does, confirm=_act("route.priority.confirm", expect=version), undo=undo)]
+                  undo_does=undo_does, confirm=_act("route.priority.confirm", expect=routing.pending_priority_pin(view)), undo=undo)]
 
 
 def _rules(view: dict) -> list[dict]:
@@ -266,7 +266,7 @@ def _rules(view: dict) -> list[dict]:
             undo, undo_does = _act("route.rule.dismiss", rule=n, expect=revision), "Drops the proposed rule."
         else:
             words = f"Khipu's starting rules include this one and you have not confirmed it: {_quote(r.get('text'))}."
-            undo, undo_does = _act("route.rule.retire", rule=n), "Retires the rule, so it no longer applies."
+            undo, undo_does = _act("route.rule.retire", rule=n, expect=revision), "Retires the rule, so it no longer applies."
         out.append(_item("rule", key, words, by=by, at=r.get("at"),
                          confirm_does="Makes these words your own standing rule.", undo_does=undo_does,
                          confirm=_act("route.rule.confirm", rule=n, expect=revision), undo=undo))
@@ -373,7 +373,7 @@ def _tier_table(view: dict) -> list[dict]:
                   confirm=_act("route.tier_table.confirm", expect=waiting["pin"]), undo=undo)]
 
 
-def _cap_words(event: dict) -> str:
+def _cap_amount(event: dict) -> str:
     kind = event.get("cap_kind") or event.get("kind")
     window = str(event.get("window") or "").replace("_", " ")
     limit = f"{window} limit" if window else "limit"
@@ -387,6 +387,14 @@ def _cap_words(event: dict) -> str:
     if kind == "spend":
         return f"at most ${event.get('usd')} over {event.get('days')} days"
     return f"at most {event.get('n')} jobs at once"
+
+
+def _cap_words(event: dict) -> str:
+    parts = [_cap_amount(event), f"purpose {event.get('purpose', 'job')}"]
+    for key in ("slack", "tier", "sensitive_only", "until", "revision"):
+        if event.get(key) is not None:
+            parts.append(f"{key.replace('_', ' ')} {routing.their_words(event[key])}")
+    return "; ".join(parts)
 
 
 def _cap_proposals(now: datetime) -> list[dict]:
@@ -911,6 +919,46 @@ def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None,
     # As khipu_route: the owner's own words stand, conversation-written words
     # leave through the strict scan.
     return routing._for_agents(answer, view)
+
+
+def prepare_answer(action: str, values: dict) -> tuple[dict, str] | None:
+    """Bind a held answer to the same complete item and pins the list offers."""
+    guarded = {"route.priority.confirm", "route.priority.undo", "route.rule.confirm", "route.rule.undo",
+               "route.rule.dismiss", "config.answer_request.confirm", "config.answer_request.undo",
+               "accounts.request.confirm", "accounts.request.undo", "route.tier_table.confirm"}
+    if action not in guarded:
+        return None
+    from khipu.owner_act import Refused
+
+    whole, clipped = _WHOLE.set(True), _CLIPPED.set(False)
+    try:
+        view = routing.read_view()
+        if action.startswith("route.priority."):
+            if (routing.pending_priority_unnamed(view) or not routing.pending_priority_changes(view)
+                    or (view.get("priority") or {}).get("proposal_withheld")):
+                raise Refused("priority_pending", "This priority cannot be shown completely here; answer on its source Mac.")
+        items = _local_confirmations(view, routing._now())
+        for item in items:
+            for side in ("confirm", "undo"):
+                offered = item["settle"].get(side)
+                if not offered or offered["action"] != action or _target(offered["args"]) != _target(values):
+                    continue
+                pinned = offered["args"]
+                expected = values.get("expect")
+                # Older clients know the priority version; the held answer upgrades it to a content pin.
+                valid = (None, pinned.get("expect"))
+                if action.startswith("route.priority."):
+                    valid += (view.get("priority_version"),)
+                if expected not in valid:
+                    raise Refused("version_moved", "The request changed after it was shown; read it again.")
+                ask = f"{item['words']} {'Confirm' if side == 'confirm' else 'Undo'}? {item[side + '_does']}"
+                if item.get("cut") or len(ask) > routing.PENDING_ASK_MOST:
+                    raise Refused("disclosure_unavailable", "The complete change is too long for one ask; use Settings.")
+                return dict(values, **pinned), ask
+        raise Refused("disclosure_unavailable", "There is no complete pending change here to confirm; read it again.")
+    finally:
+        _WHOLE.reset(whole)
+        _CLIPPED.reset(clipped)
 
 
 def ask_for(action: str, values: dict) -> str | None:

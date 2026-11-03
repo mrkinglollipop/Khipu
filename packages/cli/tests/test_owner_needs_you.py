@@ -115,7 +115,10 @@ def _ask_then_yes(world, action: dict, words: str = "Yes, go ahead") -> tuple[bo
     _t3_hook_turn()
     _be(world, T3_SESSION)
     ok, out = owner_act.act(action["action"], action["args"])
-    assert ok and out["pending"] is True and out["applied"] is False, out
+    if not ok:
+        assert out["code"] == "version_moved", out
+        return ok, out
+    assert out["pending"] is True and out["applied"] is False, out
     world["t3"].message(THREAD, time.time() + 1, text=words)
     _t3_hook_turn(prompt=words)
     return owner_act.act("direction.confirm", {"request": out["request"]})
@@ -253,7 +256,7 @@ def test_every_confirmation_kind_appears_with_words_and_its_settle(world, monkey
         if undo and undo["action"] not in ("direction.confirm", "direction.decline"):
             owner_act.argv(undo["action"], owner_act._values(undo["action"], undo["args"]))
     assert found["priority"]["settle"]["confirm"] == {"action": "route.priority.confirm",
-                                                      "args": {"expect": routing.priority_version()}}
+                                                      "args": {"expect": routing.pending_priority_pin(routing.read_view())}}
     assert "Codex takes the release work this week" in found["priority"]["words"]
     assert "Copy routing between your Macs" in found["setting"]["words"] and "from off to on" in found["setting"]["words"]
     assert "Muse" in found["accounts"]["words"]
@@ -492,7 +495,7 @@ def test_a_rule_answer_pinned_to_what_was_shown_is_refused_after_a_newer_proposa
     routing.request_rule("Docs go to Opus", n=n, owner_request="again", author=routing.conversation_author(), via="mcp",
                          base=rule["owner_revision"])
     ok, out = _ask_then_yes(world, pinned, "No")
-    assert not ok and "changed after it was read" in out["error"], out
+    assert not ok and out["code"] == "version_moved", out
     assert next(r for r in routing.read_view()["rules"] if r["n"] == n)["pending"] is True
 
 
@@ -599,7 +602,7 @@ def test_a_tier_table_pinned_to_what_was_shown_refuses_a_newer_proposal(world):
     pinned = _one("tier_table")["settle"]["confirm"]
     routing.request_tier_table(dict(TIERS, docs="opus"), owner_request="again", author=routing.conversation_author())
     ok, out = _ask_then_yes(world, pinned)
-    assert not ok and "moved" in out["error"], out
+    assert not ok and out["code"] == "version_moved", out
     assert not routing.read_view().get("tier_table")
 
 
@@ -1335,15 +1338,14 @@ def test_outside_t3_the_next_turn_after_the_read_settles(world):
     assert ok and _setting()["value"] is True, out
 
 
-def test_outside_t3_an_agent_that_skips_the_read_still_gets_through(world):
-    """The limit that stays: the gate has no read to compare with, and a turn
-    the owner typed recently is all it asks for there."""
+def test_outside_t3_an_unshown_answer_is_held(world):
+    """A different conversation has to show the complete ask first."""
     _setting_request(world)
     settle = _settle("setting")
     _front_end_turn(world, "claude_code:cli", "s-terminal")
     _be_front(world, "claude_code:cli", "s-terminal")
     ok, out = _act_on(settle)
-    assert ok and _setting()["value"] is True, out
+    assert ok and out["pending"] and _setting()["value"] is False, out
 
 
 def test_a_second_read_in_the_same_turn_still_shows_a_forgotten_summary(world, monkeypatch):
@@ -1388,6 +1390,7 @@ def test_a_held_request_refused_as_not_from_the_hook_confirms_from_another_conve
     _be_front(world, "claude_code:cli", "s-terminal")
     ok, out = owner_act.act("direction.confirm", {"request": request})
     assert not ok and out["code"] == "not_confirmed", out
+    needs_you.waiting(key="held:" + request)
     time.sleep(0.01)
     _front_end_turn(world, "claude_code:cli", "s-terminal")
     _be_front(world, "claude_code:cli", "s-terminal")

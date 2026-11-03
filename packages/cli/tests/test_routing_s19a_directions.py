@@ -97,14 +97,12 @@ def test_a_direction_opens_one_owed_item_naming_the_words(world):
     assert len(scan([GLM])) == 1  # the next capture does not open a second
 
 
-def test_the_matching_cap_closes_it_and_cap_4_leaves_it_open(world):
+@pytest.mark.parametrize("value, remaining", [(4, 1), (1, 0)])
+def test_the_matching_cap_closes_it_and_cap_4_leaves_it_open(world, value, remaining):
     say(GLM)
-    cap(4)
+    cap(value)
     scan([GLM])
-    assert len(routing_directions.owed_items()) == 1
-    cap(1)
-    scan([GLM])
-    assert routing_directions.owed_items() == []
+    assert len(routing_directions.owed_items()) == remaining
 
 
 def test_an_unrelated_routing_write_leaves_it_open(world):
@@ -145,16 +143,17 @@ def test_two_directions_with_one_written_leave_one_open(world):
     assert [i["words"] for i in routing_directions.owed_items()] == ["Use Grok for the builds."]
 
 
-def test_a_direction_without_a_value_closes_only_when_cited(world):
+@pytest.mark.parametrize("cited", [False, True])
+def test_a_direction_without_a_value_closes_only_when_cited(world, cited):
     say("Use Grok for the builds.")
     (row,) = scan(["Use Grok for the builds."])
     assert row["target"]["kind"] is None
-    cap(1)
+    if cited:
+        act(facts={"direction": row["id"]})
+    else:
+        cap(1)
     routing_directions.refresh()
-    assert len(routing_directions.owed_items()) == 1
-    act(facts={"direction": row["id"]})
-    routing_directions.refresh()
-    assert routing_directions.owed_items() == []
+    assert len(routing_directions.owed_items()) == (0 if cited else 1)
 
 
 def test_a_dismissal_survives_the_next_capture(world):

@@ -255,12 +255,16 @@ def test_widening_the_check_and_turning_it_on_are_ordinary_changes(world):
     world.say()
     rc, out = world.run(["owner-direction", "set", "latest_window_h", "12"], True)
     assert rc == 0 and owner_turns.settings()["latest_window_h"] == 12.0
+    world.say()
     rc, out = world.run(["owner-direction", "set", "trust", "claude_code:vscode"], True)
     assert rc == 0 and "claude_code:vscode" in owner_turns.settings()["trusted"]
+    world.say()
     rc, out = world.run(["owner-direction", "off"], True)
     assert rc == 0 and owner_turns.settings()["enabled"] is False
+    world.say()
     rc, out = world.run(["route", "pause", "Codex"], True)
     assert rc == 2 and out["code"] == "direction_off"
+    world.say()
     rc, out = world.run(["owner-direction", "on"], True)
     assert rc == 0 and owner_turns.settings()["enabled"] is True
     assert [line["action"] for line in _log()] == ["direction.set", "direction.set", "direction.off", "direction.on"]
@@ -797,6 +801,7 @@ def test_an_owner_change_outside_the_routing_record_is_named_in_the_next_push(wo
     named too. A routing change is named once, from its own line."""
     world.say()
     baseline = routing.read_view()
+    world.say()
     rc, out = world.run(["owner-direction", "set", "latest_window_h", "12"], True)
     assert rc == 0, out
     diff = routing.since(baseline["version"], routing.read_view())
@@ -804,12 +809,14 @@ def test_an_owner_change_outside_the_routing_record_is_named_in_the_next_push(wo
         "Changed the owner-direction settings by your direction in "), diff
     assert not [e for e in diff["entities"] if e.startswith("owner:")], diff
     mark = routing.read_view()["version"]
+    world.say()
     rc, out = world.run(["route", "pause", "Codex"], True)
     assert rc == 0, out
     diff = routing.since(mark, routing.read_view())
     assert len(diff["directions"]) == 1 and diff["directions"][0].startswith("Paused Codex"), diff
     mark = routing.read_view()["version"]
     line = next(a for a in _log() if a["action"] == "direction.set")
+    world.say()
     rc, out = world.run(["owner-direction", "undo", line["id"]], True)
     assert rc == 0 and owner_turns.settings()["latest_window_h"] == 6.0, out
     diff = routing.since(mark, routing.read_view())

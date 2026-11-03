@@ -591,7 +591,9 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
                 # converted against the accounts known now.
                 data[key] = convert_lane_map(data[key], accounts())[0]
         if request is not None:
-            requests[key] = dict(request, prior=prior, prior_set=prior_set)
+            import secrets
+
+            requests[key] = dict(request, id=secrets.token_hex(16), prior=prior, prior_set=prior_set)
         else:
             requests.pop(key, None)
         if requests:
@@ -607,7 +609,8 @@ def setting_request_pin(key: str, waiting: dict, value) -> str:
     owner. An answer carrying it (``expect``) never lands on a newer request
     or a value changed since."""
     body = {"key": key, "value": value, "request": waiting.get("request"), "by": waiting.get("by"),
-            "at": waiting.get("at"), "prior": waiting.get("prior"), "prior_set": waiting.get("prior_set")}
+            "at": waiting.get("at"), "prior": waiting.get("prior"), "prior_set": waiting.get("prior_set"),
+            "id": waiting.get("id")}
     return "sr-" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
 
@@ -7281,9 +7284,11 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     return dict(_done(written, view), n=rule["n"])
 
 
-def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
-    rule = _rule(n, now)
-    return dict(_owner_write({"type": "rule_retire", **_rule_target(rule)}, via), n=rule["n"])
+def retire_rule(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
+    with _lock():
+        rule = _rule(n, now)
+        _rule_as_shown(rule, expect)
+        return dict(_owner_write({"type": "rule_retire", **_rule_target(rule)}, via), n=rule["n"])
 
 
 def restore_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None,
@@ -7377,11 +7382,12 @@ def _rule_as_shown(rule: dict, expect) -> None:
 
 
 def undo_rule_request(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
-    rule = _rule(n, now)
-    if not rule.get("pending") or rule.get("pending_kind") != "changed" or not isinstance(rule.get("prior_text"), str):
-        raise RouteError(f"standing rule {rule['n']} has no pending edit to undo")
-    _rule_as_shown(rule, expect)
-    return dict(_owner_write({"type": "rule_undo", **_rule_target(rule)}, via), n=rule["n"])
+    with _lock():
+        rule = _rule(n, now)
+        if not rule.get("pending") or rule.get("pending_kind") != "changed" or not isinstance(rule.get("prior_text"), str):
+            raise RouteError(f"standing rule {rule['n']} has no pending edit to undo")
+        _rule_as_shown(rule, expect)
+        return dict(_owner_write({"type": "rule_undo", **_rule_target(rule)}, via), n=rule["n"])
 
 
 def pending_rule_line(entity: str) -> dict | None:
@@ -7455,11 +7461,12 @@ def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = N
 
 
 def dismiss_rule_request(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
-    rule = _rule(n, now)
-    if not rule.get("pending"):
-        raise RouteError(f"standing rule {rule['n']} has no pending proposal to dismiss")
-    _rule_as_shown(rule, expect)
-    return dict(_owner_write({"type": "rule_dismiss", **_rule_target(rule)}, via), n=rule["n"])
+    with _lock():
+        rule = _rule(n, now)
+        if not rule.get("pending"):
+            raise RouteError(f"standing rule {rule['n']} has no pending proposal to dismiss")
+        _rule_as_shown(rule, expect)
+        return dict(_owner_write({"type": "rule_dismiss", **_rule_target(rule)}, via), n=rule["n"])
 
 
 # ---- the owner's priority (phase 4b) -----------------------------------------------------
@@ -7810,7 +7817,9 @@ def _needs_version(expect) -> None:
 def _check_priority(expect, now: datetime | None) -> None:
     """Refuse when ``expect`` is given and the priority moved; the caller
     holds the routing lock until its write is down."""
-    if expect is not None and str(expect).strip() != (read_view(now).get("priority_version") or "p0"):
+    view = read_view(now)
+    actual = pending_priority_pin(view) if str(expect).startswith("pp-") else (view.get("priority_version") or "p0")
+    if expect is not None and str(expect).strip() != actual:
         raise PriorityMoved("the priority changed after it was read; read it again")
 
 
@@ -8551,16 +8560,19 @@ def pending_tier_table() -> dict | None:
     answers it. ``tiers``, ``at``, ``by``, ``request``, and ``pin``."""
     from khipu.routing_advisory import valid_tiers
 
-    latest = None
+    latest, owner_revision = None, None
     for event in _in_write_order(read_events()[0]):
         if event.get("type") in ("tier_table_set", "tier_table_clear"):
             latest = event
+            if event.get("confirmed") is True or event.get("type") == "tier_table_clear":
+                owner_revision = event
     if (latest is None or latest.get("type") != "tier_table_set" or latest.get("confirmed") is True
             or not valid_tiers(latest.get("tiers"))):
         return None
     tiers = dict(latest["tiers"])
     return {"tiers": tiers, "at": latest.get("written_at"), "by": latest.get("written_by"),
-            "request": latest.get("owner_request"), "pin": tier_table_pin(tiers)}
+            "request": latest.get("owner_request"),
+            "pin": tier_table_pin({"tiers": tiers, "proposal": latest, "owner_revision": owner_revision})}
 
 
 def confirm_tier_table(*, via: str, now: datetime | None = None, expect: str | None = None) -> dict:
@@ -12547,13 +12559,42 @@ def _owner_via(args, intent: dict | None = None) -> str | None:
     return "cli"
 
 
+def _terminal_from_harness() -> bool:
+    from khipu import owner_direction, owner_turns
+
+    if owner_turns.job_marker(os.environ):
+        return True
+    names = ("claude", "codex", "cursor", "aegis", "antigravity", "t3 code", "t3-code")
+    info = _proc_info(os.getpid())
+    pid, born = (info[0], info[2] if len(info) > 2 else None) if info else (0, None)
+    for _ in range(_CHAIN_MOST):
+        info = _proc_info(pid)
+        if info is None:
+            bare = owner_turns._proc_bare(pid)
+            if bare is None:
+                break
+            info = (bare[0], bare[2], bare[1])
+        started = info[2] if len(info) > 2 else None
+        if started is not None and born is not None and started > born:
+            break
+        name = os.path.basename(info[1]).lower()
+        if name.startswith(names):
+            return True
+        pid, born = info[0], started
+        if pid <= 1:
+            break
+    return False
+
+
 def typed_yes(prompt: str) -> bool:
     """The owner's typed confirmation: a yes typed on an interactive
     terminal. A piped or redirected answer (stdin not a terminal) is never
-    asked for and never counts. Routing's and the ledger's owner commands
-    both use this one rule."""
+    asked for and never counts. Known harnesses and dispatched jobs in the
+    ancestor chain also refuse, even through a nested pty. Routing's and the
+    ledger's owner commands both use this rule. Same-user automation that
+    hides or reparents its ancestry remains outside this process check."""
     try:
-        if not sys.stdin.isatty():
+        if not sys.stdin.isatty() or _terminal_from_harness():
             return False
         answer = input(prompt)
     except (EOFError, OSError):
@@ -13201,7 +13242,7 @@ def run_cli(args) -> int:
             elif len(params) != 1:
                 raise RouteError(f"rule {args.action} takes one rule number")
             elif args.action == "retire":
-                out = retire_rule(params[0], via=via, now=now)
+                out = retire_rule(params[0], via=via, now=now, expect=getattr(args, "expect", None))
             elif args.action == "restore":
                 out = restore_rule(params[0], via=via, now=now, holds=_holds_arg(args))
             elif args.action == "undo":

@@ -1060,6 +1060,10 @@ def _direction(tmp_path, monkeypatch, session="s-import"):
 
 
 def _owner_undo(line_id: str) -> tuple[int, dict]:
+    from khipu import owner_direction, owner_turns
+
+    owner_turns.record({"session_id": owner_direction.session_of(), "prompt": "undo that change", "cwd": "/work"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
     import io
     from contextlib import redirect_stderr, redirect_stdout
 

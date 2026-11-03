@@ -2626,7 +2626,8 @@ def _owed_tidy_by_direction(args: argparse.Namespace, project: str) -> int:
     try:
         if args.apply:
             try:
-                doc = json.loads(Path(args.apply).read_text(encoding="utf-8"))
+                frozen = owner_direction.reviewed_file(args.apply)
+                doc = json.loads(frozen.decode("utf-8") if frozen is not None else Path(args.apply).read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 res = {"ok": False, "error": f"could not read the plan: {type(exc).__name__}"}
             else:
