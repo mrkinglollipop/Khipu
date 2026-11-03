@@ -92,6 +92,8 @@ MIN_GAIN = 0.10
 MIN_INTERVAL_S = 6 * 3600
 ARCHIVE_KEEP_COUNT = 4
 ARCHIVE_KEEP_DAYS = 30
+# Absolute on-disk observation archive budget, including recent archives.
+ARCHIVE_MAX_BYTES = 64 << 20
 
 # (sample days, samples kept per window, evidence days, evidence kept per
 # state, reset-check days, observation hours, observations kept per kind). The
@@ -897,7 +899,7 @@ def _compact(now: datetime) -> dict:
             return {"result": "skipped", "why": "the record changed while it was checked"}
         body = head + current[len(data):]
         _replace(path, body, name, archive)
-        _write_state({"at": routing._iso(now), "attempted_at": routing._iso(now), "result": "compacted",
+        _write_state({**_read_state(), "at": routing._iso(now), "attempted_at": routing._iso(now), "result": "compacted",
                       "lines_before": chosen["before"], "lines_after": chosen["after"],
                       "bytes_before": len(data), "bytes_after": len(head),
                       "through_seq": chosen["through_seq"], "archive": name, "profile": chosen["profile"],
@@ -1008,6 +1010,8 @@ def full_log() -> list[bytes]:
     checks the original digest before any lines are accepted.
     """
     lines = [line for line in routing.events_file().read_bytes().split(b"\n") if line.strip()]
+    if _read_state().get("archive_retention_expired"):
+        warnings.warn("Archive retention: older observations are unavailable; owner history remains in the log", RuntimeWarning)
     pending = []
     for _at, path in _archives():
         if not path.name.endswith(".gz"):
@@ -1054,15 +1058,33 @@ def full_log() -> list[bytes]:
 
 
 def prune_archives(now: datetime) -> int:
-    """Remove archives past both ``ARCHIVE_KEEP_COUNT`` (the newest are kept)
-    and ``ARCHIVE_KEEP_DAYS``. An archive inside either bound stays."""
+    """Expire by age/count, then enforce the absolute byte budget oldest first.
+
+    Persist the retention boundary before deletion so a crash still reports
+    the unavailable history. Owner lines are never stored in these archives.
+    """
     _clean_archive_temps(now)
+    archives = _archives()
+    sizes = {}
+    for _at, path in archives:
+        with contextlib.suppress(OSError):
+            sizes[path] = path.stat().st_size
+    expired = {path for rank, (at, path) in enumerate(archives)
+               if rank >= ARCHIVE_KEEP_COUNT and now - at > timedelta(days=ARCHIVE_KEEP_DAYS)}
+    total = sum(size for path, size in sizes.items() if path not in expired)
+    for _at, path in reversed(archives):
+        if total <= ARCHIVE_MAX_BYTES:
+            break
+        if path not in expired:
+            expired.add(path)
+            total -= sizes.get(path, 0)
+    if expired:
+        _write_state(dict(_read_state(), archive_retention_expired=True))
     removed = 0
-    for rank, (at, path) in enumerate(_archives()):
-        if rank >= ARCHIVE_KEEP_COUNT and now - at > timedelta(days=ARCHIVE_KEEP_DAYS):
-            with contextlib.suppress(OSError):
-                path.unlink()
-                removed += 1
+    for path in expired:
+        with contextlib.suppress(OSError):
+            path.unlink()
+            removed += 1
     return removed
 
 

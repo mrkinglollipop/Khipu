@@ -66,3 +66,37 @@ def test_abandoned_archive_temp_is_cleaned(world):
     rc.prune_archives(END)
     assert not temp.exists()
 
+
+def test_byte_bound_removes_oldest_and_reports_unavailable_history(world, monkeypatch):
+    folder = rc.archive_dir()
+    folder.mkdir(parents=True)
+    routing.events_file().write_bytes(b'A\n')
+    paths = []
+    for day in (1, 2, 3):
+        path = folder / f'events-2026110{day}T120000Z-aaaaaa.jsonl.gz'
+        path.write_bytes(b'x' * 30)
+        paths.append(path)
+    monkeypatch.setattr(rc, 'ARCHIVE_MAX_BYTES', 65)
+    assert rc.prune_archives(END) == 1
+    assert not paths[0].exists() and all(p.exists() for p in paths[1:])
+    assert sum(p.stat().st_size for _, p in rc._archives()) <= 65
+    with pytest.warns(RuntimeWarning, match='retention.*unavailable'):
+        assert rc.full_log() == [b'A']
+
+
+def test_owner_lines_never_enter_archive_even_when_byte_bound_prunes(world, monkeypatch):
+    rows = _log(days=60)
+    synth.write(routing.events_file(), rows)
+    original = routing.events_file().read_bytes().splitlines()
+    owners = [line for line in original if json.loads(line).get('written_by', {}).get('kind') == 'owner']
+    assert owners
+    out = rc.compact(END)
+    assert out['result'] == 'compacted'
+    archive = rc.archive_dir() / out['archive']
+    dropped = gzip.decompress(archive.read_bytes()).splitlines()[1:]
+    assert all(json.loads(line).get('written_by', {}).get('kind') != 'owner' for line in dropped)
+    monkeypatch.setattr(rc, 'ARCHIVE_MAX_BYTES', 0)
+    assert rc.prune_archives(END) == 1
+    with pytest.warns(RuntimeWarning, match='unavailable'):
+        restored = rc.full_log()
+    assert [line for line in restored if line in owners] == owners
