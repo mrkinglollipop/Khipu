@@ -489,3 +489,20 @@ def test_confirm_pending_on_an_owner_turn_without_an_ask_is_refused(world):
     with pytest.raises(routing.RouteError, match="confirm_pending only comes from"):
         routing.amend_priority("Claude", append="x", via="app", expect=version, confirm_pending=pin)
     assert routing.read_view()["priority"]["pending"] is True and _roles()["Claude"] == "main work"
+
+
+def test_the_ask_names_an_entry_by_its_name_now_not_a_label_since_passed_on():
+    # Codex was "Work" when the owner set the priority; he has since renamed
+    # Codex "Ops" and Grok "Work". A request dropping Codex must not read as
+    # removing Grok.
+    view = {"accounts": [{"key": "codex|/h/a", "label": "Ops"}, {"key": "grok|/h/b", "label": "Work"},
+                         {"key": "claude|/h/c", "label": "Claude"}],
+            "priority_stored": {"pending": True,
+                                "entries": [{"account": "claude|/h/c", "label": "Claude", "role": "main"}],
+                                "replaced": {"entries": [{"account": "claude|/h/c", "label": "Claude", "role": "main"},
+                                                         {"account": "codex|/h/a", "label": "Work",
+                                                          "role": "reviews"}]}}}
+    said, unnamed = routing._pending_priority_diff(view, datetime.now(timezone.utc))
+    assert unnamed == []
+    assert "remove Ops (was named Work)" in said
+    assert not any(line == "remove Work" for line in said)

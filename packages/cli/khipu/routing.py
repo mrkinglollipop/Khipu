@@ -8110,8 +8110,15 @@ def _pending_priority_diff(view: dict, now: datetime) -> tuple[list[str], list[s
     now_rows, was_rows = lines["request"], lines["replaced"]
     was = {e["account"]: e for e in was_rows}
 
+    current = {e.get("key"): e.get("label") for e in view.get("accounts") or [] if isinstance(e, dict)}
+
     def label(entry: dict) -> str:
-        return str(entry.get("label") or _label_for_key(str(entry.get("account"))))
+        # The account's name now, as Settings shows it: a stored label can
+        # since have passed to another account.
+        stored_label = entry.get("label")
+        name = current.get(entry.get("account")) or stored_label or _label_for_key(str(entry.get("account")))
+        name = str(name)
+        return f"{name} (was named {stored_label})" if stored_label and str(stored_label) != name else name
 
     for entry in now_rows:
         said, missing = _entry_changes(label(entry), was.get(entry["account"]), entry, now)
