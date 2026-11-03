@@ -26,19 +26,23 @@ over the compacted file is the fold over the full log:
     (only the last is read);
   * a conversation's or a check's ``evidence`` goes only when it is old, its
     end has passed, it is not renewed and it is not among the newest of its
-    account, scope and state; an ``observation`` is never left out (the
-    sources' own sightings are matched to them by ``source_id``, and one
-    missing would let the sighting count again);
+    account, scope and state;
+  * an ``observation`` (a source's own sighting) and its renewals go only when
+    nothing below can read them (see ``_observation_drops``): it is over, a
+    source no longer offers its ``source_id``, and it is not among the newest
+    of its kind;
   * a ``reset_check`` goes when old and not among the newest of its account.
 
 Before anything is replaced the compacted log and the full log are folded
 at the present and at every moment the fold says its answer changes next
-(``valid_until``), and at fixed distances out to a year: they must agree, or
-nothing is written. The replacement writes the new file beside the log,
-fsyncs it, links the old log into ``archive/`` and renames the new file over
-the log (atomic), so a crash at any point leaves a log that reads, and at
-worst an extra archive. Archives are pruned only when past both their count
-and their age.
+(``valid_until``), and at fixed distances out to a year, with the sources'
+present sightings as well as without, and asked what those sightings would
+append: they must agree, or nothing is written. The replacement writes the new
+file beside the log, fsyncs it, links the old log into ``archive/`` and renames
+the new file over the log (atomic), so a crash at any point leaves a log that
+reads, and at worst an extra archive: every line left out is in that archive,
+byte for byte. Archives are pruned only when past both their count and their
+age.
 
 The planning and the check run outside the routing lock on a copy of the
 bytes read; under the lock the log must still begin with those bytes (a
@@ -53,6 +57,7 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from khipu import routing
 
@@ -78,12 +83,21 @@ ARCHIVE_KEEP_COUNT = 4
 ARCHIVE_KEEP_DAYS = 30
 
 # (sample days, samples kept per window, evidence days, evidence kept per
-# state, reset-check days). The first profile that reaches the target wins.
+# state, reset-check days, observation hours, observations kept per kind). The
+# first profile that reaches the target wins. No observation hours are under
+# ``routing_stale_after``'s default and its margin (13 h): an open reading is
+# still counted that long, whatever the profile.
 PROFILES = (
-    (3, 4, 45, 4, 30),
-    (2, 3, 21, 3, 14),
-    (2, 3, 7, 2, 7),
+    (3, 4, 45, 4, 30, 36, 3),
+    (2, 3, 21, 3, 14, 24, 2),
+    (2, 3, 7, 2, 7, 13, 1),
 )
+# An observation's end is this far past before it can go.
+OBSERVATION_OVER_S = 3600
+# The lines that say which account or lane a sighting belongs to: lines either
+# side of one are not compared with each other (``_observation_drops``).
+_ACCOUNT_CHANGES = frozenset({"account_note", "account_move", "account_rename", "account_migration",
+                              "account_binding"})
 RESET_CHECKS_KEPT = 3
 # The longest span ``routing_pace.compute_pace`` reads back from the fold's
 # moment: its horizon is the trailing window (a day at most) or the rolling
@@ -153,7 +167,8 @@ def health() -> dict:
         out["level"] = "yellow"
         out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes), over its bound of "
                           f"{LINES_YELLOW:,}, and compaction can't shrink it further: {total - gone:,} of "
-                          "its lines are the owner's, observations or others the fold needs, and are kept.")
+                          "its lines are the owner's, readings and observations still counted, or the newest "
+                          "of their kind, which the fold needs, and are kept.")
         out["kept_lines"] = total - gone
     elif level != "green":
         out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes); it is compacted at "
@@ -169,7 +184,12 @@ def _droppable() -> tuple[int, int]:
         rows = _rows(routing.events_file().read_bytes())
     except OSError:
         return 0, 0
-    return len(plan(rows, routing._now(), PROFILES[-1])), len(rows)
+    now = routing._now()
+    try:
+        emitted = _emitted(_sightings(routing._inputs(), now))
+    except Exception:  # noqa: BLE001 - doctor's row never fails on this
+        emitted = None
+    return len(plan(rows, now, PROFILES[-1], emitted=emitted)), len(rows)
 
 
 def _read_state() -> dict:
@@ -344,10 +364,249 @@ def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: da
     return drop
 
 
-def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple) -> set[int]:
+def _sent_or_last(rows: list[tuple[bytes, dict | None]]) -> set[int]:
+    """Lines no compaction may take, whatever their kind: the highest number
+    of each Mac (the next line numbers from it, and the upload cursor compares
+    with it), and with replication live any line not yet uploaded (the upload
+    reads this file, ``routing_replication._sync``: a line gone is never sent)."""
+    highest: dict[str, tuple[int, int]] = {}
+    for i, (_line, event) in enumerate(rows):
+        if event is not None and isinstance(event.get("seq"), int):
+            origin = event.get("mac") or "legacy"
+            if origin not in highest or event["seq"] >= highest[origin][0]:
+                highest[origin] = (event["seq"], i)
+    out = {i for _seq, i in highest.values()}
+    if not routing._replication_live():
+        return out
+    from khipu import routing_replication
+
+    state = routing_replication._state()
+    if state.get("mac") != routing._local_mac():
+        state = {}  # a new sender uploads everything again
+    uploaded, deferred = state.get("uploaded") or {}, state.get("deferred") or {}
+    for i, (_line, event) in enumerate(rows):
+        if event is None:
+            continue
+        seq = event.get("seq")
+        if not isinstance(seq, int) or seq > uploaded.get(event.get("mac") or "legacy", 0) \
+                or event.get("id") in deferred:
+            out.add(i)
+    return out
+
+
+def _over_at(row: dict, at: datetime, stale_after: int) -> datetime | None:
+    """When ``row`` (as ``entry_model.observations`` gives it) stops counting
+    for good: a limit at its time, anything else as ``_fold_account``'s
+    ``stale`` has it. None when it never does, or when that is not sure."""
+    state = row.get("state")
+    if state == routing.LIMITED:
+        end = routing._parse(row.get("until"))
+        last = routing._parse(row.get("expires_at"))
+        return max(end, last) if end is not None and last is not None else end
+    if state not in (routing.OPEN, routing.DOWN):
+        return None
+    if "expires_at" in row:
+        return routing._parse(row["expires_at"])
+    return routing._after(at, stale_after) if stale_after > 0 else None
+
+
+def _change_names(event: dict) -> list:
+    """The accounts and lanes an account change (``_ACCOUNT_CHANGES``) names."""
+    names = [event.get(k) for k in ("account", "target", "to")]
+    for field in ("bindings", "aliases"):
+        value = event.get(field)
+        if isinstance(value, dict):
+            names += list(value) + [v[0] if isinstance(v, (list, tuple)) and v else v for v in value.values()]
+    names += [tuple(pair) for pair in event.get("lanes_cut") or [] if isinstance(pair, (list, tuple))]
+    return [n for n in names if isinstance(n, (str, tuple))]
+
+
+def _unmatched_run(history: list[tuple[datetime, int, dict]]) -> list[tuple[datetime, int, dict]]:
+    """The tail of one lane's sightings ``fold``'s ``limited_since`` still
+    walks: from the sighting its current run began with, on."""
+    start, until_before = None, None
+    for pos, (at, _write, row) in enumerate(history):
+        until = routing._parse(row.get("until"))
+        if row.get("state") != routing.LIMITED or until is None:
+            start, until_before = None, None
+        elif start is None or (until_before is not None and at > until_before):
+            start, until_before = pos, until
+        else:
+            until_before = until
+    return history[start:] if start is not None else []
+
+
+def _observation_drops(rows: list[tuple[bytes, dict | None]], now: datetime, hours: float, kept: int,
+                       emitted: set[str], guarded: set[int]) -> set[int]:
+    """The ``observation`` lines and renewals nothing can read. Everything
+    that reads an observation, and what keeps its answer:
+
+      * ``routing_entries.observations``: a renewal counts only as the newest
+        of its target, author and Mac (the rest of a kept line's renewals go,
+        and all of a line that goes);
+      * ``routing._fold_account``: of evidence past its end it asks only for
+        the newest of a state, a scope, a window, a basis or a source, among
+        lines newer than a clear (so a newer line of the same kind answers for
+        an older one, whichever clear stands). Each kind (a slot of
+        ``routing_entries.slot`` with its state, basis and declaration) keeps
+        its newest ``kept`` and the last it wrote; a limit past its time meets
+        one of those first in ``disagreement_after``'s walk back. Evidence
+        that still counts it reads whole: a limit not yet at its time, or a
+        reading not yet stale, stays;
+      * ``routing.fold``: the keys and order of its rows, the first of a
+        slot; ``limited_since`` of an unmatched lane, its current run
+        (``_unmatched_run``); a priority level's end, the earliest reset after
+        its ``as_of`` per account (a level the owner backdates later, past
+        lines already gone, ends at the resets left); dismissals, their
+        targets; ``valid_until``, only ends still ahead;
+      * ``routing._unseen_sightings``: a sighting a source still offers is
+        matched by ``source_id``, so a line (or renewal) holding one stays. A
+        source's window only moves forward (a tail, the newest figures), so an
+        id it has stopped offering does not come back;
+      * ``routing_entries.source_events``: the last of each slot and Mac, and
+        the first (its order breaks a tie), and for ``crossed`` a newer line of
+        the same account and state;
+      * an account change splits the kinds of the accounts it names: a line's
+        account can differ either side, so neither side answers for the other.
+
+    A line in a transaction or batch stays (a part missing voids the whole),
+    as does any unreadable field. ``agree`` is the proof; this is only the
+    proposal, so a mistake here costs a compaction, not the record."""
+    entry_model = routing.entry_model
+    raw = [dict(event, _line=i) for i, (_line, event) in enumerate(rows) if event is not None]
+    ordered, _bad = routing._order_events(raw, 0)
+    events, _open = routing._split_txns(ordered, routing._held_list())
+    events = routing._complete_batches(routing._in_write_order(events))  # as ``fold`` reads them
+    stale_after = routing.settings()["routing_stale_after"] or 0
+    written = [at for at in (routing._parse(e.get("written_at")) for e in events) if at is not None]
+    if not written:
+        return set()
+    span = timedelta(hours=hours)
+    cut, tail, over = now - span, max(written) - span, now - timedelta(seconds=OBSERVATION_OVER_S)
+    eras: dict[Any, int] = {}
+    line_era: dict[int, tuple] = {}
+    targets: set[str] = set()
+    level_times: set[datetime] = set()
+    renewals: dict[str, list[dict]] = {}
+    for event in events:
+        kind = event.get("type")
+        if kind in _ACCOUNT_CHANGES:
+            for name in _change_names(event):
+                eras[name] = eras.get(name, 0) + 1
+        elif kind == "observation_renew":
+            if isinstance(event.get("target"), str):
+                renewals.setdefault(event["target"], []).append(event)
+            continue
+        elif isinstance(event.get("target"), str):
+            targets.add(event["target"])
+        for entry in event.get("entries") if isinstance(event.get("entries"), list) else ():
+            as_of = routing._parse(entry["level"].get("as_of")) if isinstance(entry, dict) \
+                and isinstance(entry.get("level"), dict) else None
+            if as_of is not None:
+                level_times.add(as_of)
+        if "_line" in event:
+            line_era[event["_line"]] = (eras.get(event.get("account"), 0),
+                                        eras.get((event.get("runner"), event.get("lane")), 0))
+    if targets:
+        targets |= {entry_model.source_id(t) for t in targets}
+
+    keep: set[int] = set()
+    candidates: set[int] = set()
+    target_line: dict[str, int] = {}
+    kinds: dict[str, list[tuple[datetime, int, int]]] = {}
+    slots: dict[str, list[tuple[int, int]]] = {}
+    lanes: dict[tuple, list[tuple[datetime, int, dict]]] = {}
+    earliest: dict[tuple, tuple[datetime, int]] = {}
+    for write, row in enumerate(entry_model.observations(events, {})):
+        at = routing._parse(row.get("written_at"))
+        line = row.get("_line")
+        if at is None:
+            if line is not None:
+                keep.add(line)
+            continue
+        if row.get("runner") and (not row.get("account") or row.get("unmatched")):
+            lanes.setdefault((row["runner"], row.get("lane") or ""), []).append((at, write, row))
+        # ``fold`` reads ``reset_at``; a limit's own end is kept by the same rule.
+        for field in ("reset_at", "until"):
+            reset = routing._parse(row.get(field))
+            for as_of in level_times if reset is not None else ():
+                if reset > as_of:
+                    ident = (field, as_of, row.get("account"), row.get("runner"), row.get("lane"), line_era.get(line))
+                    if ident not in earliest or reset < earliest[ident][0]:
+                        earliest[ident] = (reset, line if line is not None else -1)
+        if line is None or not (row.get("type") == "observation" or row.get("source_id")):
+            continue
+        candidates.add(line)
+        if isinstance(row.get("id"), str):
+            target_line[row["id"]] = line
+        written_at = routing._parse(rows[line][1].get("written_at"))
+        ends = _over_at(row, at, stale_after)
+        if (ends is None or ends > over or at > cut or written_at is None or written_at > tail or line in guarded
+                or row.get("txn") or row.get("batch") or row.get("id") in emitted or row.get("source_id") in emitted):
+            keep.add(line)
+        slot = entry_model.slot(row)
+        slots.setdefault(json.dumps([slot, row.get("mac")], default=str), []).append((write, line))
+        if row.get("id") in targets or row.get("source_id") in targets:
+            keep.add(line)
+            continue  # dismissed: read by its target's name alone, and answers for no other line
+        kind = json.dumps([slot, row.get("mac"), row.get("type"), row.get("state"), row.get("basis"),
+                           row.get("declaration"), line_era.get(line)], default=str, sort_keys=True)
+        kinds.setdefault(kind, []).append((at, write, line))
+    for items in kinds.values():
+        items.sort(reverse=True)
+        floor = items[min(kept, len(items)) - 1][0]
+        keep.update(line for at, _write, line in items if at >= floor)
+        keep.add(max(items, key=lambda item: item[1])[2])
+    for items in slots.values():
+        keep.add(min(items)[1])
+        keep.add(max(items)[1])
+    for history in lanes.values():
+        history.sort(key=lambda item: (item[0], item[1]))
+        keep.update(row["_line"] for _at, _write, row in _unmatched_run(history) if "_line" in row)
+    keep.update(line for _reset, line in earliest.values() if line >= 0)
+
+    # Renewals: the source's id on one keeps it, and the line it renews.
+    def young(event: dict) -> bool:
+        at = routing._parse(rows[event["_line"]][1].get("written_at")) if "_line" in event else None
+        return at is None or at > tail or event["_line"] in guarded or bool(event.get("txn") or event.get("batch"))
+
+    held: set[int] = set()
+    for target, group in renewals.items():
+        for event in group:
+            if "_line" in event and event.get("source_id") in emitted:
+                held.add(event["_line"])
+                if target in target_line:
+                    keep.add(target_line[target])
+    drop = candidates - keep
+    for target, group in renewals.items():
+        line = target_line.get(target)
+        if line is None:
+            continue  # its target is not an observation this log can see
+        if line in drop:
+            drop.update(e["_line"] for e in group if "_line" in e and e["_line"] not in held and not young(e))
+            continue
+        newest: dict[str, datetime] = {}
+        for event in group:
+            witness = routing._parse(event.get("witness_at"))
+            if witness is not None:
+                author = json.dumps([event.get("written_by"), event.get("mac")], default=str, sort_keys=True)
+                newest[author] = max(newest.get(author, witness), witness)
+        for event in group:
+            witness = routing._parse(event.get("witness_at"))
+            author = json.dumps([event.get("written_by"), event.get("mac")], default=str, sort_keys=True)
+            if witness is not None and witness < newest[author] and "_line" in event \
+                    and event["_line"] not in held and not young(event):
+                drop.add(event["_line"])
+    return drop
+
+
+def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple,
+         emitted: set[str] | None = None) -> set[int]:
     """The indexes of ``rows`` (line, its event or None) the fold can do
-    without, under ``profile``. Anything not sure is kept."""
-    sample_days, sample_kept, evidence_days, evidence_kept, reset_days = profile
+    without, under ``profile``. Anything not sure is kept: ``emitted`` is the
+    ids the sources offer now, and None, that they could not be read, keeps
+    every observation."""
+    sample_days, sample_kept, evidence_days, evidence_kept, reset_days, seen_hours, seen_kept = profile
     evidence_cut = now - timedelta(days=evidence_days)
     reset_cut = now - timedelta(days=reset_days)
     drop: set[int] = set()
@@ -410,6 +669,14 @@ def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple) -
             at = _when(rows[i][1], "written_at")
             if at is not None and at > newest - timedelta(days=1):
                 drop.discard(i)
+    guarded = _sent_or_last(rows)
+    drop -= guarded
+    if emitted is not None:
+        # Their own tail guard, by the hours of the profile, is inside.
+        try:
+            drop |= _observation_drops(rows, now, seen_hours, seen_kept, emitted, guarded)
+        except Exception:  # noqa: BLE001 - not sure: every observation stays
+            pass
     return drop
 
 
@@ -423,20 +690,49 @@ def _rows(data: bytes) -> list[tuple[bytes, dict | None]]:
 
 class _Log:
     """One log's lines parsed once, folded at any moment (the fold copies
-    what it is given, so one parse serves every moment)."""
+    what it is given, so one parse serves every moment). ``sightings`` is the
+    sources' (evidence, status) now, for the answers that read them."""
 
-    def __init__(self, lines: list[bytes], inputs: tuple):
+    def __init__(self, lines: list[bytes], inputs: tuple, sightings: tuple | None = None):
         self.raw = [e for e in (routing._line_event(line) for line in lines) if e is not None]
         self.inputs = inputs
+        self.sightings = sightings if sightings and (sightings[0] or sightings[1] is not None) else None
         self.cache: dict[datetime, dict] = {}
+        self.seen_cache: dict[datetime, dict] = {}
+
+    def _events(self) -> list[dict]:
+        ordered, _bad = routing._order_events(self.raw, 0)
+        return routing._split_txns(ordered, routing._held_list())[0]
 
     def at(self, when: datetime) -> dict:
         if when not in self.cache:
             _fingerprint, cfg, known = self.inputs
-            ordered, _bad = routing._order_events(self.raw, 0)
-            events, _open = routing._split_txns(ordered, routing._held_list())
-            self.cache[when] = routing.fold(events, now=when, cfg=cfg, known=known, extra=(), sources=None)
+            self.cache[when] = routing.fold(self._events(), now=when, cfg=cfg, known=known, extra=(), sources=None)
         return self.cache[when]
+
+    def seen_at(self, when: datetime) -> dict | None:
+        """``at``, as ``routing._fold_body`` folds it: with the sightings no
+        line of this log holds. None when no source says anything."""
+        if self.sightings is None:
+            return None
+        if when not in self.seen_cache:
+            _fingerprint, cfg, known = self.inputs
+            events = self._events()
+            self.seen_cache[when] = routing.fold(events, now=when, cfg=cfg, known=known,
+                                                 extra=routing._unseen_sightings(self.sightings[0], events),
+                                                 sources=self.sightings[1])
+        return self.seen_cache[when]
+
+    def would_write(self) -> list[dict]:
+        """What the sightings would append to this log, ``routing._refold_locked``'s
+        batch: a new line's random id left out, the line a renewal names not."""
+        if self.sightings is None or not self.sightings[0]:
+            return []
+        _fingerprint, cfg, known = self.inputs
+        events = self._events()
+        ordered = routing._in_write_order(events)
+        batch, _ids = routing._source_batch(self.sightings[0], events, ordered, cfg, known, cfg.get("_mac"))
+        return [{k: v for k, v in row.items() if k != "id"} for row in batch]
 
 
 def _normal(body: dict) -> str:
@@ -444,9 +740,11 @@ def _normal(body: dict) -> str:
 
 
 def agree(full: "_Log", kept: "_Log", now: datetime) -> tuple[bool, int, str | None]:
-    """(whether the two logs fold alike, how many moments were compared, the
+    """(whether the two logs answer alike, how many moments were compared, the
     first moment they differ at). The moments are now, each ``valid_until``
-    the full fold names after it, and fixed distances out."""
+    the full fold names after it (with the sources' sightings and without), and
+    fixed distances out; each is compared without the sightings, and with them
+    (``_Log.seen_at``), and last what the sightings would append."""
     moments, at = [now], now
     for _ in range(CHAIN_MOST - 1):
         nxt = routing._parse(full.at(at).get("valid_until"))
@@ -454,42 +752,83 @@ def agree(full: "_Log", kept: "_Log", now: datetime) -> tuple[bool, int, str | N
             break
         moments.append(nxt)
         at = nxt
+    if full.sightings is not None:
+        at = now
+        for _ in range(CHAIN_MOST - 1):
+            nxt = routing._parse(full.seen_at(at).get("valid_until"))
+            if nxt is None or nxt <= at:
+                break
+            moments.append(nxt)
+            at = nxt
     moments += [now + timedelta(seconds=s) for s in CHECK_OFFSETS_S]
+    moments = sorted(set(moments), key=moments.index)
     for count, when in enumerate(moments, 1):
         if _normal(full.at(when)) != _normal(kept.at(when)):
             return False, count, routing._iso(when)
+        if full.sightings is not None and _normal(full.seen_at(when)) != _normal(kept.seen_at(when)):
+            return False, count, routing._iso(when)
+    if full.would_write() != kept.would_write():
+        return False, len(moments), "the sources' next lines"
     return True, len(moments), None
 
 
 # ---- the compaction -------------------------------------------------------------
 
 
+def _sightings(inputs: tuple, now: datetime) -> tuple[list[dict], dict | None] | None:
+    """The sources' (evidence, status) now, read as a fold reads them; None
+    when they could not be read."""
+    try:
+        extra, status, _cache = routing._sources(inputs[1], now, routing._load_view())
+        return list(extra), status
+    except Exception:  # noqa: BLE001 - not sure: ``plan`` keeps every observation
+        return None
+
+
+def _emitted(sightings: tuple | None) -> set[str] | None:
+    """Every id a source offers now, as a line of the log could hold it."""
+    if sightings is None:
+        return None
+    try:
+        ids = {item["id"] for item in sightings[0] if item.get("id")}
+        return ids | {routing.entry_model.source_id(i) for i in ids}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _choose(data: bytes, now: datetime) -> dict:
     """The best verified compaction of ``data``: {"kept": lines, "profile",
     "moments", "dropped", "by_type"}, or {"why": ...} when there is none
-    worth making."""
+    worth making. A profile whose observations can't be left out alike is
+    tried again keeping them all, so they never hold up the rest."""
     rows = _rows(data)
     full = [line for line, _e in rows]
     inputs = routing._inputs()
-    whole = _Log(full, inputs)
+    sightings = _sightings(inputs, now)
+    emitted = _emitted(sightings)
+    whole = _Log(full, inputs, sightings)
     best: dict | None = None
     why = "nothing the fold can do without"
     for number, profile in enumerate(PROFILES, 1):
-        drop = plan(rows, now, profile)
-        if len(drop) < MIN_GAIN * len(rows):
-            why = "less than a tenth of the lines can go"
-            continue
-        kept = [line for i, line in enumerate(full) if i not in drop]
-        same, moments, differs = agree(whole, _Log(kept, inputs), now)
-        if not same:
-            why = f"the compacted log would fold differently at {differs}"
-            continue
-        seqs = [e.get("seq") for i, (_l, e) in enumerate(rows)
-                if i not in drop and e and isinstance(e.get("seq"), int)]
-        best = {"kept": kept, "profile": number, "moments": moments, "dropped": len(drop),
-                "by_type": _by_type(rows, drop), "before": len(rows), "after": len(kept),
-                "through_seq": max(seqs) if seqs else None}
-        if len(kept) <= LINES_TARGET and sum(len(k) + 1 for k in kept) <= BYTES_TARGET:
+        for offered in ((emitted, None) if emitted is not None else (None,)):
+            drop = plan(rows, now, profile, emitted=offered)
+            if len(drop) < MIN_GAIN * len(rows):
+                why = "less than a tenth of the lines can go"
+                continue
+            kept = [line for i, line in enumerate(full) if i not in drop]
+            same, moments, differs = agree(whole, _Log(kept, inputs, sightings), now)
+            if not same:
+                why = f"the compacted log would fold differently at {differs}"
+                continue
+            if best is None or len(kept) < best["after"]:
+                seqs = [e.get("seq") for i, (_l, e) in enumerate(rows)
+                        if i not in drop and e and isinstance(e.get("seq"), int)]
+                best = {"kept": kept, "profile": number, "moments": moments, "dropped": len(drop),
+                        "by_type": _by_type(rows, drop), "before": len(rows), "after": len(kept),
+                        "through_seq": max(seqs) if seqs else None}
+            break
+        if best is not None and best["after"] <= LINES_TARGET \
+                and sum(len(k) + 1 for k in best["kept"]) <= BYTES_TARGET:
             break
     return best or {"why": why}
 

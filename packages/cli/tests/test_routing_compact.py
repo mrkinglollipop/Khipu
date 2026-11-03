@@ -56,8 +56,8 @@ def test_compaction_keeps_the_fold(world, seed):
     # No line was rewritten: what is kept is the full log's lines, in order.
     it = iter(before_lines)
     assert all(any(line == other for other in it) for line in after_lines)
-    # Every owner line, every observation (and its renewals) is still there.
-    for kind in ("note_set", "priority_set", "lift", "clear", "observation", "observation_renew"):
+    # Every owner line is still there (for observations, test_routing_compact_observations).
+    for kind in ("note_set", "priority_set", "lift", "clear"):
         assert _types(after_lines).count(kind) == _types(before_lines).count(kind)
     assert _bodies(WHENS) == before
 
@@ -151,7 +151,7 @@ def test_the_owners_history_is_the_same_lines_after_compaction(world):
 def test_a_plan_that_changes_the_fold_writes_nothing(world, monkeypatch):
     _install(_log())
     original = routing.events_file().read_bytes()
-    monkeypatch.setattr(rc, "plan", lambda rows, now, profile: {
+    monkeypatch.setattr(rc, "plan", lambda rows, now, profile, **_kw: {
         i for i, (_l, e) in enumerate(rows) if e and e["type"] in ("usage_sample", "clear", "lift")})
     out = rc.compact(END)
     assert out["result"] == "skipped" and "fold differently" in out["why"]

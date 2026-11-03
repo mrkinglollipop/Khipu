@@ -5982,6 +5982,39 @@ def record_pace_samples(now: datetime | None = None) -> int:
     return len(batch)
 
 
+def _source_batch(extra: list[dict], events: list[dict], ordered: list[dict], cfg: dict, known: list[dict],
+                  mac: str) -> tuple[list[dict], dict]:
+    """(the lines the sources' evidence ``extra`` would append to this record,
+    the record's account ids). Writes nothing; compaction asks it of a log it
+    is checking."""
+    ids, _forwards, _aliases = account_identity.state(ordered, known)
+    forward = forwarding(events, {a["key"] for a in known})
+    cuts = {}
+    for event in events:
+        if event.get("type") == "account_note" and _list_change(event):
+            for pair in event.get("lanes_cut") or []:
+                cuts[tuple(pair)] = (event["_seq"], _parse(event["written_at"]))
+    matched = []
+    for item in extra:
+        cut = cuts.get((item.get("runner"), item.get("lane")))
+        key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
+            item, cfg.get("routing_lane_map") or {}, known, forward, cfg.get("_providers"))
+        matched.append(dict(item, account=key))
+    return entry_model.source_events(matched, ordered, cfg, mac, ids), ids
+
+
+def _unseen_sightings(extra: list[dict], events: list[dict]) -> list[dict]:
+    """The sources' evidence no line of the record already holds (matched by
+    ``source_id``, salted or as a legacy line wrote it)."""
+    source_ids = {e.get("source_id") for e in events if e.get("source_id")}
+    remaining = []
+    for item in extra:
+        source_id = entry_model.source_id(item["id"]) if source_ids and item.get("id") else None
+        if item.get("id") not in source_ids and source_id not in source_ids:
+            remaining.append(item)
+    return remaining
+
+
 def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     """Refold and save the view; the caller holds the lock."""
     fingerprint, cfg, known = inputs or _inputs()
@@ -5997,20 +6030,7 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     prev = _load_view()
     extra, _status, _cache = _sources(cfg, now, prev)
     if extra or (_status or {}).get("runners"):
-        ids, _forwards, _aliases = account_identity.state(ordered, known)
-        forward = forwarding(events, {a["key"] for a in known})
-        cuts = {}
-        for event in events:
-            if event.get("type") == "account_note" and _list_change(event):
-                for pair in event.get("lanes_cut") or []:
-                    cuts[tuple(pair)] = (event["_seq"], _parse(event["written_at"]))
-        matched = []
-        for item in extra:
-            cut = cuts.get((item.get("runner"), item.get("lane")))
-            key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
-                item, cfg.get("routing_lane_map") or {}, known, forward, cfg.get("_providers"))
-            matched.append(dict(item, account=key))
-        batch = entry_model.source_events(matched, ordered, cfg, _mac_locked(), ids)
+        batch, ids = _source_batch(extra, events, ordered, cfg, known, _mac_locked())
         # An allocated id must have a durable login binding before an
         # observation refers to it; a later fold otherwise allocates anew.
         observed_accounts = {row.get("account") for row in batch if row["type"] == "observation"}
@@ -6057,13 +6077,7 @@ def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
     itself, which reads and never writes."""
     now = _not_before_last_fold(now, prev)
     extra, status, cache = _sources(cfg, now, prev)
-    source_ids = {e.get("source_id") for e in events if e.get("source_id")}
-    remaining = []
-    for item in extra:
-        source_id = entry_model.source_id(item["id"]) if source_ids and item.get("id") else None
-        if item.get("id") not in source_ids and source_id not in source_ids:
-            remaining.append(item)
-    extra = remaining
+    extra = _unseen_sightings(extra, events)
     from khipu import routing_replication
 
     body = fold(events_ordered if events_ordered is not None else events,
