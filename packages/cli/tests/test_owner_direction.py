@@ -692,7 +692,8 @@ def test_direction_attribution_and_uuid_undo_survive_event_envelopes(world, monk
     assert line["state"] == "applied" and not line.get("no_undo")
     assert (line["action"], line["auth"], line["session"], line["turn"]) == (
         route if route.startswith("accounts.") else "route." + route, "direction", OWNER, turn)
-    event = routing.read_events()[0][-1]
+    # (A routing change by direction also writes its receipt, an owner_change line, after it.)
+    event = [e for e in routing.read_events()[0] if not e.get("receipt")][-1]
     assert event["type"] == event_kind
     assert event["op"] == line["id"]
     assert event["written_by"] == {"kind": "owner"}
@@ -723,7 +724,7 @@ def test_direction_attribution_and_uuid_undo_survive_event_envelopes(world, monk
     (undo_line,) = [row for row in owner_direction.read_log() if row.get("kind") == "undo"]
     assert undo_line["undoes"] == line["id"] and undo_line["state"] == "pending"
     assert owner_direction.line_state(undo_line["id"]) == "applied"
-    inverse = routing.read_events()[0][-1]
+    inverse = [e for e in routing.read_events()[0] if not e.get("receipt")][-1]
     assert inverse["written_by"] == {"kind": "owner"} and inverse["via"] == "direction"
     view = routing.read_view()
     if route.startswith("rule."):

@@ -104,6 +104,31 @@ ACTIONS: frozenset[str] = frozenset({
     "project.separate", "forget.send", "forget.here", "forget.not_same", "outbox.merge_preferences",
 })
 
+# Routing changes that apply as soon as the owner types them (2026-11-03, owner
+# decision): account priority and its exceptions, standing rules, the note,
+# pauses, holds and lifts. They still need the check below (a provably owner
+# turn); a turn that fails it keeps today's refusal or hold. Forget, purge,
+# permissions and trust settings, secrets and every other action are not here,
+# so they keep the explicit confirm they need.
+ROUTING_INSTANT: frozenset[str] = frozenset({
+    "route.pause", "route.lift", "route.note.set", "route.note.end", "route.rule.add", "route.rule.edit",
+    "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
+    "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.amend", "route.priority.confirm",
+    "route.priority.undo", "route.priority.clear",
+})
+
+
+def instant_allowed(action: str, target: str | None = None) -> bool:
+    """Whether ``action`` is a routing change that applies as soon as the
+    owner types it. An Undo (``direction.undo``) counts only when it undoes
+    one of those: undoing a trust, permission or forget action never does."""
+    if action in ROUTING_INSTANT:
+        return True
+    if action == "direction.undo" and target:
+        line = _find(str(target))
+        return bool(line and line.get("action") in ROUTING_INSTANT)
+    return False
+
 
 # ---- the session --------------------------------------------------------------------------
 
@@ -130,14 +155,21 @@ def _title(name: str) -> str:
 # ---- the check ---------------------------------------------------------------------------
 
 
-def check(action: str, *, env=None, now: float | None = None) -> dict:
+def check(action: str, *, env=None, now: float | None = None, instant: bool = False) -> dict:
     """The owner-direction check (scope section 2): the auth stamp for the
     record, or ``DirectionRefused``. The one test is where the request comes
     from: a conversation the owner typed in recently, where Khipu's own
     prompt hook recorded an eligible owner turn within the window
     (``latest_window_h``, 6 hours by default), and whose hook ran above this call. A background job, a
     dispatched job or a conversation nobody has typed in lately is refused.
-    Nothing here reads what the owner said, and nothing calls a model."""
+    Nothing here reads what the owner said, and nothing calls a model.
+
+    ``instant`` (a routing change, ``instant_allowed``): the stamp carries the
+    evidence the change relied on (``instant``), and a T3 conversation, whose
+    turns never count directly, applies it at once when T3's own record proves
+    a message the owner typed since this conversation was last asked about
+    (``_instant_t3``: the proof a confirm uses, against that earlier ask).
+    Without that proof it is held as before."""
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
@@ -175,6 +207,9 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
             # T3's own record decides whether it is a job (``_t3_bound``).
             with t3.owner_read_budget():
                 _t3_bound(environ, session, now)
+                stamp = _instant_t3(environ, session, now) if instant else None
+            if stamp is not None:
+                return stamp
             raise DirectionRefused("confirm_needed", _HOLD_WHY) from None
         if lineage_job:
             raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY) from None
@@ -191,9 +226,13 @@ def check(action: str, *, env=None, now: float | None = None) -> dict:
     elif lineage_job:
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     _from_the_hook(turn)
-    return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
-            "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
-            "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
+    stamp = {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
+             "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
+             "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
+    if instant:
+        stamp["instant"] = {"source": "hook", "turn": turn["turn"], "turn_at": turn.get("at"),
+                            "window_h": conf["latest_window_h"]}
+    return stamp
 
 
 def _recent_turn(session: str, conf: dict, now: float, recorded: list[dict] | None = None) -> dict:
@@ -323,6 +362,10 @@ _REQUESTS_KEPT_S = 30 * 24 * 3600  # settled requests; a pending or applying one
 # The most turn ids, occurrences or T3 message ids one ask boundary keeps.
 _BOUNDARY_MOST = 200
 _CONFIRMED: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_owner_confirmed", default=None)
+# Set while a conversation's own request is being applied at once on the
+# owner's turn (``owner_act.apply_request``): the log line says so, and its
+# Undo takes the whole request back rather than returning it pending.
+REQUEST_APPLIED: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_request_applied", default=False)
 
 
 def requests_path() -> Path:
@@ -735,6 +778,62 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
                               "message_sha256": sha}}
     snapshots[thread] = _t3_boundary(old, read, session)
     return _ASK_NOW
+
+
+def _t3_baseline(thread: str) -> tuple[str, dict] | None:
+    """(request id, snapshot) of the latest known ask boundary any held
+    request recorded for this T3 thread, or None when there is none. Only a
+    snapshot that bounds something counts (``_t3_parts``); a request Forget
+    scrubbed holds none."""
+    try:
+        rows = _read_requests(requests_path())
+    except OSError:
+        return None
+    best = None
+    for row in rows:
+        snapshots = row.get("t3_snapshots")
+        snapshot = snapshots.get(thread) if isinstance(snapshots, dict) else None
+        parts = _t3_parts(snapshot)
+        if parts is None:
+            continue
+        rank = parts[1] if parts[1] is not None else float("-inf")
+        if best is None or rank > best[0]:
+            best = (rank, str(row.get("id")), snapshot)
+    return None if best is None else (best[1], best[2])
+
+
+def _instant_t3(environ, session: str, now: float) -> dict | None:
+    """The stamp for a routing change in a T3 conversation, or None (the
+    change is then held). It is the confirm's own proof (``_t3_proof``, with
+    every refusal a change has: a job or child thread, an issuer that does
+    not trace to the T3 Code app, an untrusted front end, a latest hook turn
+    that is not typed) taken against the latest ask boundary this thread
+    already has (``_t3_baseline``), so no new rule of what is the owner's: an
+    owner message in T3's record that the boundary does not hold, which the
+    latest typed hook turn stands behind. Stricter than a confirm in one
+    way, as a change is: that message must be inside the window
+    (``latest_window_h``). A thread nobody has been asked about yet has no
+    boundary, so its first change is held and a later one applies."""
+    from khipu import t3
+
+    try:
+        thread = _t3_thread_of(session)
+        base = _t3_baseline(thread)
+        if base is None:
+            return None
+        request_id, snapshot = base
+        stamp = _t3_proof(environ, session, {"t3_snapshots": {thread: json.loads(json.dumps(snapshot))}}, now)
+    except DirectionRefused:
+        return None
+    if not isinstance(stamp, dict):
+        return None
+    proved = stamp.pop("confirmed")
+    at = t3._epoch(proved.get("message_at"))
+    if at is None or now - at > owner_turns.settings()["latest_window_h"] * 3600:
+        return None
+    stamp["instant"] = {"source": "t3", "message": proved["message"], "message_at": proved["message_at"],
+                        "message_sha256": proved["message_sha256"], "after_ask": request_id}
+    return stamp
 
 
 def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
@@ -1619,7 +1718,7 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
         raise DirectionRefused("not_by_direction",
                                "That change can't be made by direction: it needs the Khipu app or a yes typed on a "
                                "terminal.")
-    stamp = check(want["action"], env=env, now=now)
+    stamp = check(want["action"], env=env, now=now, instant=instant_allowed(want["action"], want["target"]))
     if want.pop("over_newer", False):
         _bind_over_newer(want.pop("owner_words", None), stamp)
     before = _before(want)
@@ -1872,9 +1971,11 @@ def _ahead_line(want: dict, stamp: dict, before) -> dict:
         if want.get("facts"):
             line["facts"] = want["facts"]
     for key in ("words", "harness", "session", "via_session", "turn", "prompt_sha256", "occurrence",
-                "binding", "auth_chain", "confirmed"):
+                "binding", "auth_chain", "confirmed", "instant"):
         if stamp.get(key) is not None:
             line[key] = stamp[key]
+    if REQUEST_APPLIED.get() and stamp.get("instant") is not None:
+        line["request_applied"] = True
     line["state"] = "pending"
     return line
 
@@ -1984,6 +2085,9 @@ def finish(result: dict | None, **extra) -> dict | None:
     if isinstance(result, dict):
         done["result"] = {k: v for k, v in result.items() if k != "owner_action"}
     line = pend.get("line")
+    receipt = None if refused or line is None else _receipt_text(want, stamp, line, result)
+    if receipt is not None:
+        done["receipt"] = {"what": receipt[0]}
     incomplete = False
     try:
         if line is None:
@@ -2001,6 +2105,8 @@ def finish(result: dict | None, **extra) -> dict | None:
         incomplete = True
     if not refused:
         _name_in_push(want, stamp, line, pend.get("stamped"))
+        if receipt is not None:
+            _write_receipt(receipt[1], line, stamp)
     # The app needs the id too: its Undo runs on exactly this line, never on one
     # picked out of the log afterwards.
     if stamp.get("auth") in ("direction", "app") and isinstance(result, dict) and not refused:
@@ -2046,6 +2152,114 @@ _PUSH_WORDS = {
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
     "outbox.merge_preferences": "Merged preferences held only in memory-file lines into the hub",
 }
+
+
+# ---- the receipt every conversation gets for a routing change by direction ---------------------
+#
+# One short whole sentence, written into the routing record as a receipt line
+# (``routing.owner_receipt``) so every conversation gets it ahead of its other
+# routing text on its next prompt, until it has been delivered
+# (``routing_delivery``, as an exception's change sentence is). It says what
+# changed in the owner's recorded words (a rule's, the note's, a priority's),
+# where it came from, and how to undo it. Never fails the change.
+
+RECEIPT_WORDS = 110  # characters of the owner's words in a receipt
+
+
+def _where(harness) -> str:
+    from khipu import routing
+
+    if harness == "t3":
+        return "a T3 conversation"
+    return routing.author_words({"kind": "conversation", "harness": harness or routing.UNKNOWN_HARNESS})
+
+
+def _quoted(text) -> str:
+    from khipu import routing
+
+    words = routing._word_clip(text, RECEIPT_WORDS) if isinstance(text, str) else ""
+    return f' "{words}"' if words else ""
+
+
+def _receipt_what(want: dict, result) -> str:
+    """What a routing change did, in a few words and the owner's own."""
+    from khipu import routing
+
+    action, target = want["action"], want["target"]
+    facts = want.get("facts") or {}
+    result = result if isinstance(result, dict) else {}
+    view = routing.read_view()
+    if action in ("route.pause", "route.lift"):
+        entry = next((a for a in view["accounts"] if a["key"] == target), {}) or {}
+        label = entry.get("label") or routing._label_for_key(target)
+        if action == "route.lift":
+            return f"Lifted the pause on {label}"
+        until = entry.get("until") if entry.get("state") == routing.PAUSED else None
+        return f"Paused {label}" + (f" until {until}" if until else "")
+    if action == "route.note.set":
+        return "Set the note:" + _quoted((view.get("note") or {}).get("text"))
+    if action == "route.note.end":
+        return "Ended the note"
+    if action.startswith("route.rule."):
+        verb = {"add": "Added", "edit": "Changed", "retire": "Retired", "restore": "Restored", "confirm": "Confirmed",
+                "undo": "Undid the change to", "dismiss": "Dismissed"}[action.rsplit(".", 1)[-1]]
+        n = result.get("n")
+        rule = next((r for r in view.get("rules") or [] if r["n"] == n or r.get("entity") == str(target)), None)
+        number = n if n is not None else (rule or {}).get("n")
+        words = (rule or {}).get("text") or routing._rule_words(str(target))
+        return f"{verb} standing rule {number if number is not None else '(number pending)'}:" + _quoted(words)
+    if action == "route.hold.add":
+        hold = next((h for h in view.get("holds") or [] if h["id"] == result.get("id")), {}) or {}
+        return "Added a hold:" + _quoted(hold.get("text"))
+    if action == "route.hold.end":
+        return "Ended a hold"
+    held = view.get("priority") or {}
+    labels = ", ".join(e["label"] for e in held.get("entries") or [])
+    if action == "route.priority.amend":
+        entry = next((e for e in held.get("entries") or [] if e["account"] == target), {}) or {}
+        words = facts.get("exception") or facts.get("role") or facts.get("append") or entry.get("role")
+        until = f" until {facts['until']}" if facts.get("exception") and facts.get("until") else ""
+        return f"Changed {entry.get('label') or routing._label_for_key(target)} in the priority{until}:" + _quoted(words)
+    if action == "route.priority.undo":
+        return "Undid the priority change"
+    if action == "route.priority.clear":
+        return "Cleared the priority"
+    verb = "Confirmed" if action == "route.priority.confirm" else "Set"
+    return f"{verb} the priority" + (f": {routing._word_clip(labels, RECEIPT_WORDS)}" if labels else "")
+
+
+def _receipt_text(want: dict, stamp: dict, line: dict, result) -> tuple[str, str] | None:
+    """(what, the whole sentence) for a routing change made by direction, or
+    None when this change gets no receipt."""
+    action = want["action"]
+    try:
+        if action == "direction.undo":
+            # An Undo of a change that had a receipt has its own, whoever makes it.
+            undone = _find(want["target"])
+            if not undone or not (undone.get("receipt") or {}).get("what"):
+                return None
+            what = "Undid: " + str(undone["receipt"]["what"])
+        elif stamp.get("auth") != "direction":
+            return None
+        elif action in ROUTING_INSTANT:
+            what = _receipt_what(want, result)
+        else:
+            return None
+    except Exception:  # noqa: BLE001 - a receipt never stops the change; the plain verb says enough
+        what = "Changed routing" if action != "direction.undo" else "Undid a routing change"
+    how = {"app": "in the app", "terminal": "on a terminal"}.get(stamp.get("auth"),
+                                                                 f"by your direction in {_where(stamp.get('harness'))}")
+    sentence = f"{what}, {how}; undo it with `khipu owner-direction undo {line['id']}` or Undo in Settings."
+    return what, sentence
+
+
+def _write_receipt(sentence: str, line: dict, stamp: dict) -> None:
+    try:
+        from khipu import routing
+
+        routing.owner_receipt(sentence, line["id"], stamp.get("harness"))
+    except Exception:  # noqa: BLE001 - the change is made and logged; the receipt is extra
+        pass
 
 
 def _name_in_push(want: dict, stamp: dict, line: dict | None, stamped) -> None:
@@ -2655,6 +2869,17 @@ def _undo_priority(line, via, holds=None):
     from khipu import routing
 
     before = _b(line)
+    if line.get("action") == "route.priority.confirm" and line.get("request_applied") and before.get("pending"):
+        # A conversation's request the owner's own turn applied at once: its
+        # Undo takes the whole change back (the priority it replaced, or
+        # none), not just its confirmation, which would leave it live.
+        replaced = before.get("replaced") or {}
+        if replaced.get("entries"):
+            return routing.restore_priority({"entries": replaced["entries"], "until": replaced.get("until")},
+                                            via=via, holds=_undo_holds(line, holds))
+        if routing.read_view().get("priority"):
+            return routing.clear_priority(via=via, expect=routing.priority_version())
+        return {"ok": True}
     if before.get("stored") and before.get("entries"):
         return routing.restore_priority(before, via=via, holds=_undo_holds(line, holds))
     return _set_priority_back(before, via, _undo_holds(line, holds),

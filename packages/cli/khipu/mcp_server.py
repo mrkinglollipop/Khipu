@@ -958,7 +958,9 @@ TOOLS: list[dict] = [
             "existing rule is live unless `base` is stale: then it is "
             "recorded as crossed and never applied, and the write answers "
             "that it did not take effect. Marked with this conversation as "
-            "the requester, and remains pending until the owner confirms it in "
+            "the requester. From a turn that is provably the owner's it is also "
+            "confirmed at once (`applied: true`, `instant.undo`); any other "
+            "call remains pending until the owner confirms it in "
             "Settings -> Routing or with a terminal confirmation. This tool "
             "cannot confirm, retire, dismiss or undo a rule."
         ),
@@ -995,7 +997,8 @@ TOOLS: list[dict] = [
             "answers that it did not take effect), marked "
             "with this conversation and unconfirmed, with the priority it "
             "replaced shown beside it, until the owner confirms or undoes it "
-            "in Settings -> Routing. Khipu keeps his order as given and never "
+            "in Settings -> Routing (from a turn that is provably the owner's it "
+            "is confirmed at once: `applied: true`, `instant.undo`). Khipu keeps his order as given and never "
             "reorders it. This tool cannot confirm, undo or clear a priority. "
             "To change one account's entry only, give account (with append, role, exception or end_exception, "
             "and revision, the entry's revision as read) in place of entries: that entry is patched under the "
@@ -3031,10 +3034,12 @@ def _tool_route_rule(args: dict) -> dict:
     if holds is not None and (not isinstance(holds, dict) or not all(isinstance(hold, str) and choice in ("end", "keep")
                                                                       for hold, choice in holds.items())):
         raise ValueError('holds must map each hold id to "end" or "keep"')
+    from khipu import owner_act
+
     try:
-        return routing.request_rule(text, n=number, owner_request=owner_request,
-                                    author=routing.conversation_author(), via="mcp", holds=holds,
-                                    base=base if number is not None else None)
+        return owner_act.apply_request("rule", routing.request_rule(
+            text, n=number, owner_request=owner_request, author=routing.conversation_author(), via="mcp", holds=holds,
+            base=base if number is not None else None))
     except routing.RuleCapError as exc:
         return {"ok": False, "error": str(exc), "code": exc.code}
 
@@ -3077,19 +3082,21 @@ def _tool_route_priority(args: dict) -> dict:
         share_pct = args.get("share_pct")
         if share_pct is not None and not isinstance(share_pct, (int, float)):
             raise ValueError("share_pct must be a percentage from 1 to 100")
-        return routing.conversation_priority_amend(args["account"], append=args.get("append"), role=args.get("role"),
-                                                   exception=args.get("exception"),
-                                                   end_exception=args.get("end_exception"),
-                                                   until=until, owner_request=owner_request,
-                                                   author=routing.conversation_author(), expect=args.get("expect"),
-                                                   entry_revision=args.get("revision"),
-                                                   base=base, share_pct=share_pct)
+        from khipu import owner_act
+
+        return owner_act.apply_request("priority", routing.conversation_priority_amend(
+            args["account"], append=args.get("append"), role=args.get("role"), exception=args.get("exception"),
+            end_exception=args.get("end_exception"), until=until, owner_request=owner_request,
+            author=routing.conversation_author(), expect=args.get("expect"), entry_revision=args.get("revision"),
+            base=base, share_pct=share_pct))
     entries = args.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("entries must be the owner's accounts, in his order")
-    return routing.conversation_priority(entries, until=until, owner_request=owner_request,
-                                         author=routing.conversation_author(), base=base,
-                                         **({"expect": args["expect"]} if args.get("expect") is not None else {}))
+    from khipu import owner_act
+
+    return owner_act.apply_request("priority", routing.conversation_priority(
+        entries, until=until, owner_request=owner_request, author=routing.conversation_author(), base=base,
+        **({"expect": args["expect"]} if args.get("expect") is not None else {})))
 
 
 def _tool_owner_act(args: dict) -> dict:

@@ -2271,7 +2271,7 @@ _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub
                  "batch_n", "window_mins")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
-                  "observed", "observed_turn", "session_logs", "silent", "unmatched")
+                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "provider_session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -4225,6 +4225,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             if event.get("auth") in _OWNER_AUTHS:
                 # Named in the next push in fixed words (``direction_line``).
                 causes[touched].update(auth=event["auth"], harness=event.get("harness"))
+            if kind == "owner_change" and event.get("receipt") is True:
+                causes[touched]["receipt"] = True
             if kind == "owner_change":
                 causes[touched]["text"] = event.get("text")
                 owner_changes.append(event)
@@ -4729,7 +4731,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         effective["note"] = {"text": note_out["text"]}
     # An owner change made outside this record, kept so the next push names
     # it (``direction_line``); never a line of its own.
-    effective.update({f"owner:{e['target']}": {"text": e.get("text")}
+    effective.update({f"owner:{e['target']}": {"text": e.get("text"),
+                                               **({"receipt": True, "at": e.get("written_at")}
+                                                  if e.get("receipt") is True else {})}
                       for e in owner_changes[-OWNER_CHANGES_KEPT:]})
     if priority_out is not None:
         effective["priority"] = _effective_priority(priority_out)
@@ -5553,8 +5557,11 @@ def _assemble(prev: dict | None, body: dict, now: datetime, bad: int, fingerprin
                   "lines": [change_line(k, view_for_lines, now, prev_effective) for k in shown],
                   "items": [_change_item(k, body, prev_effective, causes, since_at)
                             for k in shown]}
+        # A receipt (``owner_receipt``) is delivered as its own whole sentence
+        # (``routing_delivery.plan``), never as a fixed-words line as well.
         directions = [direction_line(k, causes[k], body, prev_effective, now) for k in changed
                       if (causes.get(k) or {}).get("auth") in _OWNER_AUTHS
+                      and not causes[k].get("receipt")
                       and (since_at is None or (_parse(causes[k].get("at")) or since_at) >= since_at)]
         if directions:
             change["directions"] = directions
@@ -11872,12 +11879,44 @@ _owner_stamped = [0]
 OWNER_CHANGES_KEPT = 20
 
 
+RECEIPT_KEPT_S = 3 * 24 * 3600  # how long a receipt is offered to a conversation that has not had it
+
+
+def recent_receipts(view: dict, now: datetime) -> list[dict]:
+    """The receipts (``owner_receipt``) in ``view`` still inside their window,
+    oldest first, each ``{id, text, at}``. Read from the folded view, so a
+    prompt pays nothing to find them."""
+    out = []
+    for key, value in (view.get("effective") or {}).items():
+        if not key.startswith("owner:") or not isinstance(value, dict) or value.get("receipt") is not True:
+            continue
+        at = _parse(value.get("at"))
+        if at is not None and (now - at).total_seconds() > RECEIPT_KEPT_S:
+            continue
+        out.append({"id": key.removeprefix("owner:"), "text": value.get("text"), "at": value.get("at")})
+    return sorted(out, key=lambda r: (r["at"] or "", r["id"]))
+
+
 def owner_change(text: str, line_id: str, auth: str, harness: str | None = None) -> dict:
     """Record an owner change made outside this record (a ledger, Work view,
     promotion or owner-direction change), so the next push names it once,
     in ``text``'s fixed words, with how it was made."""
     event = {"type": "owner_change", "target": line_id, "text": text, "auth": auth, "written_by": OWNER,
              "via": {"direction": "direction", "app": "app", "terminal": "cli"}.get(auth, auth), "op": line_id}
+    if harness:
+        event["harness"] = harness
+    written, view = _write(event)
+    return _done(written, view)
+
+
+def owner_receipt(text: str, line_id: str, harness: str | None = None) -> dict:
+    """The receipt for a routing change the owner directed: one whole
+    sentence (what changed, in his recorded words, where it came from, how to
+    undo it) that every conversation gets ahead of its other routing text
+    until it has been delivered (``routing_delivery.plan``). Its own
+    operation id, so it is never taken for a retry of the change it names."""
+    event = {"type": "owner_change", "target": line_id, "text": text, "auth": "direction", "written_by": OWNER,
+             "via": "direction", "op": "receipt:" + line_id, "receipt": True}
     if harness:
         event["harness"] = harness
     written, view = _write(event)
@@ -11909,6 +11948,11 @@ def _print_view(view: dict, now: datetime, account: str | None) -> None:
     facts = plan_facts(view, now)
     if view.get("priority"):
         print(priority_line(view["priority"], now, view=view, facts=facts))
+    receipts = [r["text"] for r in recent_receipts(view, now) if isinstance(r.get("text"), str)]
+    if receipts and account is None:
+        print("Applied by your direction (each can be undone):")
+        for text in receipts:
+            print(f"  {text}")
     entries = [e for e in view["accounts"] if account is None or e["key"] == account]
     if entries:
         print("Accounts:")

@@ -40,7 +40,7 @@ def test_direction_undo_keeps_a_held_account_the_action_never_named(direction_wo
     view = routing.read_view()
     assert view["priority"]["entries"][0]["account"] == "grok|"
     assert view["holds"][0]["id"] == hold["id"]
-    inverse = routing.read_events()[0][-1]
+    inverse = [e for e in routing.read_events()[0] if not e.get("receipt")][-1]  # (a receipt follows the Undo)
     assert inverse["holds"][hold["id"]] == "keep"  # an unnamed current hold defaults to keep
 
 
