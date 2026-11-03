@@ -631,7 +631,9 @@ def _dedup_cosine_best(
         take_session_budget(payload.get("session_id"))
         profile = _active_profile(cur)
         vec = embed_one(provider_text.live_input(_dedup_text(payload), "payload"), profile=profile)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if type(exc).__name__ == "BudgetExhausted":
+            _log(f"dedup similarity check skipped: {exc}")
         return None
     ids = [str(c["id"]) for c in candidates]
     try:
@@ -1929,7 +1931,7 @@ _GATE = (
 # (khipu/capture_stores.py), so it may only ever hold one of these strings.
 REASON_CODES = frozenset({
     "file_leg_empty_summary", "invalid_json", "file_leg_rejected",
-    "file_leg_not_configured", "file_leg_timeout", "file_leg_unrunnable",
+    "file_leg_not_configured", "file_leg_missing", "file_leg_timeout", "file_leg_unrunnable",
     "tombstone_registry_unavailable", "invalid_timestamp", "identity_conflict",
     "memory_lock_unavailable", "hub_pending", "legacy_verbatim_only_unstorable",
     "verbatim_only_unconfirmed", "unknown",
@@ -1971,8 +1973,10 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool,
         _set_reason(outcome, "file_leg_not_configured")
         return EX_SOFTWARE
     if not capture_v2.is_file():
+        # A path that was set but is gone (an unmounted volume, a typo) is a
+        # real fault, unlike an unset path: only the unset case is forgiven.
         _log(f"capture_v2 not found at {capture_v2} (khipu config --set capture_v2 PATH)")
-        _set_reason(outcome, "file_leg_not_configured")
+        _set_reason(outcome, "file_leg_missing")
         return EX_SOFTWARE
     env = dict(os.environ)
     if suppress_mirror:
@@ -2054,6 +2058,9 @@ def capture(payload: dict[str, Any], *, mode: str | None = None,
 def _capture(payload: dict[str, Any], *, mode: str | None,
              result: dict[str, Any] | None) -> int:
     mode = (mode or capture_mode()).lower()
+    if result is None:
+        # The CLI and the probe pass none; the file-leg verdict reads it.
+        result = {}
     try:
         _validate_timestamp(payload)
     except ValueError as exc:
@@ -2161,6 +2168,10 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
             _set_reason(result, "verbatim_only_unconfirmed")
             return EX_DATAERR
         _log("verbatim_only capture confirmed on the hub row; file wiki leg skipped")
+        return 0
+    if (stats.get("dedup") or {}).get("matched_via") == "same_content":
+        # Text this session already holds: no second paraphrase in the file wiki.
+        _log("same window text already captured; file wiki leg skipped")
         return 0
     if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
         return 0

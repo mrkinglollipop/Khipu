@@ -610,8 +610,11 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
 # single session that re-captures in a loop (2026-11-02: one Cursor session spent
 # the day's 10,000) would otherwise starve every other one. Past the bound the
 # capture still lands; its dedup falls back to word overlap and the episode's
-# vectors wait for `khipu embed backfill`. 0 turns the bound off.
-SESSION_DAILY_CALL_BUDGET = 100
+# vectors wait for `khipu embed backfill`. 0 turns the bound off. A window costs
+# about 2 calls (its dedup check and its episode), so 400 allows ~200 windows a
+# day for one session, far past any real one, while still holding a looping
+# session to a small share of a 10,000 day.
+SESSION_DAILY_CALL_BUDGET = 400
 
 
 def _session_cap() -> int:
@@ -626,6 +629,20 @@ def _session_budget_path() -> Path:
     from khipu.paths import ensure_data_dir
 
     return ensure_data_dir() / "state" / "embed-budget-session.json"
+
+
+def session_budget_status() -> dict[str, Any]:
+    """Today's per-session embedding calls: the cap and the sessions at it."""
+    cap, day = _session_cap(), _budget_today()
+    try:
+        raw = json.loads(_session_budget_path().read_text(encoding="utf-8"))
+        sessions = raw.get("sessions") if isinstance(raw, dict) and raw.get("day") == day else {}
+        sessions = sessions if isinstance(sessions, dict) else {}
+    except (OSError, ValueError):
+        sessions = {}
+    over = sorted(k for k, v in sessions.items() if isinstance(v, int) and cap > 0 and v >= cap)
+    return {"day": day, "cap": cap, "sessions": len(sessions), "at_cap": len(over),
+            "at_cap_sessions": over[:20]}
 
 
 def take_session_budget(session_id: str | None) -> None:

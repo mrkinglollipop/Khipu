@@ -208,6 +208,34 @@ class MissingFileLegTest(unittest.TestCase):
                 mock.patch("khipu.outbox.enqueue", return_value=Path("/tmp/queued.json")):
             self.assertEqual(cap._capture(dict(self.PAYLOAD), mode="hub", result={}), 0)
 
+    def test_a_configured_path_that_is_gone_is_a_real_failure(self):
+        outcome: dict = {}
+        with mock.patch.object(cap, "write_pg", return_value=dict(self.STATS)), \
+                mock.patch.object(cap, "_capture_v2", return_value=Path("/Volumes/gone/capture_v2.py")), \
+                mock.patch("khipu.t3.thread_for_session", return_value=None), \
+                mock.patch("khipu.embed.embed_on_capture"):
+            rc = cap._capture(dict(self.PAYLOAD), mode="hub", result=outcome)
+        self.assertEqual(rc, cap.EX_SOFTWARE)
+        self.assertEqual(outcome["reason"], "file_leg_missing")
+        self.assertIn("file_leg_missing", cap.REASON_CODES)
+
+    def test_a_caller_with_no_result_dict_gets_the_same_verdict(self):
+        # `khipu capture` and the probe call capture(payload) bare.
+        with mock.patch.object(cap, "write_pg", return_value=dict(self.STATS)), \
+                mock.patch.object(cap, "_capture_v2", return_value=None), \
+                mock.patch("khipu.t3.thread_for_session", return_value=None), \
+                mock.patch("khipu.embed.embed_on_capture"):
+            self.assertEqual(cap.capture(dict(self.PAYLOAD), mode="hub"), 0)
+
+    def test_a_same_content_skip_never_runs_the_file_leg(self):
+        stats = {**self.STATS, "dedup": {"action": "skip", "matched_via": "same_content"}}
+        with mock.patch.object(cap, "write_pg", return_value=stats), \
+                mock.patch.object(cap, "run_capture_v2") as leg, \
+                mock.patch("khipu.t3.thread_for_session", return_value=None), \
+                mock.patch("khipu.embed.embed_on_capture"):
+            self.assertEqual(cap._capture(dict(self.PAYLOAD), mode="dual", result={}), 0)
+        leg.assert_not_called()
+
     def test_a_file_leg_that_ran_and_failed_still_fails(self):
         with mock.patch.object(cap, "write_pg", return_value=dict(self.STATS)), \
                 mock.patch.object(cap, "run_capture_v2", return_value=cap.EX_SOFTWARE), \
@@ -295,6 +323,25 @@ class SessionEmbedBoundTest(unittest.TestCase):
             best = cap._dedup_cosine_best(
                 mock.Mock(), {"session_id": "cursor:agent-1", "summary": "s"}, [{"id": 1}], 0.9)
         self.assertIsNone(best)
+
+    def test_the_default_ceiling_leaves_room_for_a_heavy_real_session(self):
+        self.assertEqual(em.SESSION_DAILY_CALL_BUDGET, 400)
+
+    def test_the_refused_dedup_embedding_is_logged(self):
+        for _ in range(3):
+            em.take_session_budget("cursor:agent-1")
+        with mock.patch.object(cap, "_log") as log:
+            cap._dedup_cosine_best(
+                mock.Mock(), {"session_id": "cursor:agent-1", "summary": "s"}, [{"id": 1}], 0.9)
+        self.assertTrue(any("session embed budget exhausted" in str(c) for c in log.call_args_list))
+
+    def test_status_lists_the_sessions_at_the_ceiling(self):
+        for _ in range(3):
+            em.take_session_budget("cursor:agent-1")
+        em.take_session_budget("cursor:agent-2")
+        status = em.session_budget_status()
+        self.assertEqual((status["cap"], status["sessions"], status["at_cap"]), (3, 2, 1))
+        self.assertEqual(status["at_cap_sessions"], ["cursor:agent-1"])
 
     def test_a_corrupt_budget_file_does_not_block_a_capture(self):
         path = em._session_budget_path()

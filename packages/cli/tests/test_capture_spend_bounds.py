@@ -487,8 +487,9 @@ class BudgetCommandTest(_SynthBudget):
             em._budget_take(scope="synth")
             rc, out = _run(["budget", "status"])
         self.assertEqual(rc, 0)
-        self.assertEqual(set(out), {"synth", "memory", "library"})
-        for scope in out.values():
+        self.assertEqual(set(out), {"synth", "memory", "library", "session_budget"})
+        self.assertEqual(out["session_budget"]["cap"], em.SESSION_DAILY_CALL_BUDGET)
+        for scope in (out["synth"], out["memory"], out["library"]):
             for key in ("day", "calls", "cap", "remaining", "exhausted", "cap_source"):
                 self.assertIn(key, scope)
         self.assertEqual((out["synth"]["calls"], out["synth"]["cap"], out["synth"]["remaining"],
