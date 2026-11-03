@@ -4795,7 +4795,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         for item in priority_out["entries"]:
             level = item.get("level")
             if level:
-                resets = [_parse(e.get("reset_at") or e.get("until")) for e in evidence
+                # An evidence item's ``until`` is already a time, its ``reset_at`` text.
+                resets = [_parse(e.get("reset_at")) or e.get("until") for e in evidence
                           if e.get("account") == item["account"]]
                 resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
                 if resets:
