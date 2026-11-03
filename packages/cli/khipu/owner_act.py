@@ -31,8 +31,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.rule.retire": (("rule",), ()),
     "route.rule.restore": (("rule",), ()),
     "route.rule.confirm": (("rule",), ("expect",)),
-    "route.rule.undo": (("rule",), ()),
-    "route.rule.dismiss": (("rule",), ()),
+    "route.rule.undo": (("rule",), ("expect",)),
+    "route.rule.dismiss": (("rule",), ("expect",)),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
     "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only", "until")),
@@ -49,7 +49,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
     "route.tier_table.set": (("tiers",), ()),
-    "route.tier_table.confirm": ((), ()),
+    "route.tier_table.confirm": ((), ("expect",)),
     "route.tier_table.clear": ((), ()),
     "accounts.track": (("entries",), ("expect",)),
     "accounts.rename": (("account", "name"), ("expect",)),
@@ -62,8 +62,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "accounts.request.undo": ((), ("expect",)),
     "config.usage_accounts": (("list",), ("expect",)),
     "config.routing_setting": (("key",), ("value",)),
-    "config.answer_request.confirm": (("key",), ()),
-    "config.answer_request.undo": (("key",), ()),
+    "config.answer_request.confirm": (("key",), ("expect",)),
+    "config.answer_request.undo": (("key",), ("expect",)),
     "promote.gate_ignore": (("checks",), ()),
     "promote.gate_ignore.cancel": ((), ()),
     "ledger.import": (("file",), ("project", "catch_up")),
@@ -211,6 +211,9 @@ def _values(action: str, args) -> dict:
         elif key in _FLAGS:
             if not isinstance(value, bool):
                 raise _bad(f"{key} must be true or false")
+        elif key == "value" and isinstance(value, bool) and action == "config.routing_setting":
+            # A switch said as JSON: the command takes it as a word.
+            value = "true" if value else "false"
         elif key == "value" and isinstance(value, (int, float)) and not isinstance(value, bool):
             value = str(value)
         elif not isinstance(value, str) or not value.strip():
@@ -322,7 +325,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "route.tier_table.set":
         return ["route", "tier-table", "set", "--tiers=" + json.dumps(v["tiers"])], []
     if action.startswith("route.tier_table."):
-        return ["route", "tier-table", verb], []
+        return ["route", "tier-table", verb, *_opts(v, "expect")], []
     if action == "accounts.track":
         return ["accounts", "track", *_opts(v, "entries", "expect")], []
     if action in ("accounts.rename", "accounts.stop", "accounts.move"):
@@ -343,7 +346,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         if v["key"] not in routing.SETTINGS:
             raise _bad(f"{v['key']} is not a routing setting")
         if action != "config.routing_setting":
-            return ["config", "--answer-request", v["key"], verb], []
+            return ["config", "--answer-request", v["key"], verb, *_opts(v, "expect")], []
         if v.get("value") is None:
             return ["config", f"--unset={v['key']}"], []
         return ["config", "--set", v["key"], _bare(v["value"], "value")], []
@@ -488,6 +491,8 @@ def act(action, args) -> tuple[bool, dict]:
         return True, _READS[action]()
     if action == CONFIRM:
         return _confirm(args)
+    if action == DECLINE:
+        return _decline(args)
     held = action == REQUEST
     if held:
         if not isinstance(args, dict) or set(args) - {"action", "args"} or not isinstance(args.get("action"), str):
@@ -518,7 +523,11 @@ def act(action, args) -> tuple[bool, dict]:
             # request it would confirm: his yes to the ask naming both is.
             held = pending is not None
     if held:
-        return _hold(action, values, ask=pending[1] if pending is not None else None)
+        if pending is not None:
+            return _hold(action, values, ask=pending[1])
+        from khipu import needs_you
+
+        return _hold(action, values, ask=needs_you.ask_for(action, values))
     return _run(action, full)
 
 
@@ -639,8 +648,9 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
 # A change held for the owner to confirm, and its confirmation
 # (``owner_direction.hold`` / ``confirm``). Not owner actions themselves:
 # a hold changes nothing, and a confirm applies the held action, which is
-# logged as that action with the confirming message named.
-REQUEST, CONFIRM = "direction.request", "direction.confirm"
+# logged as that action with the confirming message named. A decline drops a
+# held request on the owner's no; nothing was changed, so nothing is undone.
+REQUEST, CONFIRM, DECLINE = "direction.request", "direction.confirm", "direction.decline"
 
 
 def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, dict]:
@@ -653,8 +663,8 @@ def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, d
     return True, {"ok": True, "applied": False, "pending": True, "request": request["id"], "ask": request["ask"],
                   "line": (f"Nothing is changed yet. Ask the owner: \"{request['ask']}\" Once they answer in this "
                            f"conversation, call khipu_owner_act with {CONFIRM} and "
-                           f"{{\"request\": \"{request['id']}\"}}. It can be confirmed later, from any "
-                           "conversation the owner types in.")}
+                           f"{{\"request\": \"{request['id']}\"}}; if they say no, {DECLINE} with the same "
+                           "request. It can be confirmed later, from any conversation the owner types in.")}
 
 
 def _confirm(args) -> tuple[bool, dict]:
@@ -680,6 +690,19 @@ def _confirm(args) -> tuple[bool, dict]:
         except OSError:
             pass
     return ok, dict(result or {}, request=request["id"], confirmed=stamp["confirmed"])
+
+
+def _decline(args) -> tuple[bool, dict]:
+    from khipu import owner_direction
+
+    if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
+        return False, _bad(f"{DECLINE} takes request, the held request's id").refusal()
+    try:
+        request = owner_direction.decline(args["request"])
+    except owner_direction.DirectionRefused as refused:
+        return False, refused.refusal()
+    return True, {"ok": True, "declined": True, "applied": False, "request": request["id"],
+                  "line": "The held request is dropped. Nothing was changed."}
 
 
 def _run(action: str, full: list[str]) -> tuple[bool, dict]:

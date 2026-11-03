@@ -3898,7 +3898,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         if isinstance(via, int):
             return via if via == 0 else 2
         try:
-            path = _routing.answer_setting_request(key, action)
+            path = _routing.answer_setting_request(key, action, expect=getattr(args, "expect", None))
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err), "code": getattr(err, "code", None)}))
             return 2
@@ -6276,6 +6276,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help='set: {"scope": "opus", "mock": "opus", ...} naming every task class')
     rtier.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (set only; stays a proposal)")
+    rtier.add_argument("--expect", default=None, metavar="PIN",
+                       help="confirm: the proposed table as it was shown; refused if it changed since")
     rtier.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rtier)
 

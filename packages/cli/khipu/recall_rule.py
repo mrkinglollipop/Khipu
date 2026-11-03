@@ -43,6 +43,9 @@ RULE_MD = """# Khipu memory (MCP server `khipu`)
 You have a persistent, cross-session memory: past conversation episodes, topic
 pages, and a knowledge graph, searchable through the `khipu` MCP tools.
 
+- Owner asks what needs confirming or approving, or what waits on them: call
+  `khipu_needs_you`, show its `words`, settle each on their own yes through
+  `khipu_owner_act`.
 - Before answering anything that might have prior context (a project, a
   decision, a preference, "what did we do about X"), call `khipu_search` with a
   short natural-language query. Default `mode` is `hybrid`: cosine similarity,

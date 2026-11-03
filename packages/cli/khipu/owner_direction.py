@@ -457,7 +457,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                 _from_the_hook(usable[-1])
                 extra["asks"] = {session: _ask_boundary(None, turns_, now, session)}
             request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
-                       "created_ts": now, "created_at": _iso(now), "session": session,
+                       "created_ts": now, "created_at": _iso(now), "session": session, "by": _asker(environ),
                        "ask": ask or ask_line(action, args), **extra}
             state = _load(path)
             if state["erased"] != erased:
@@ -470,6 +470,15 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
         raise DirectionRefused("log_unwritable", f"Khipu can't keep the request ({err}), so nothing was held or "
                                                  "changed. Try again once the disk can be written.") from None
     return request
+
+
+def _asker(environ) -> dict:
+    """Who is holding a request, for the owner's list: the harness and
+    project routing's author stamp names. Forget removes it with the words."""
+    from khipu import routing
+
+    by = routing.conversation_author(environ)
+    return {k: by[k] for k in ("kind", "harness", "project", "session") if by.get(k)}
 
 
 def _caller_session(environ) -> str:
@@ -916,6 +925,37 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
     return request, stamp
 
 
+def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
+    """The owner's no to a held request: it is dropped and nothing changes.
+    The proof a confirm needs, so a conversation can't answer for the owner
+    either way; with no reply since the ask it asks again, as a confirm does."""
+    from khipu import t3
+
+    now = _clock() if now is None else now
+    environ = os.environ if env is None else env
+    session = _caller_session(environ)
+    try:
+        with _requests_locked() as path:
+            state = _load(path)
+            request = next((r for r in state["requests"] if r.get("id") == request_id), None)
+            if request is None:
+                raise DirectionRefused("not_found", "There is no held request with that id.")
+            if request.get("state") != "pending":
+                raise DirectionRefused("not_pending", f"That request is already {request.get('state')}.")
+            with t3.owner_read_budget():
+                stamp = _proof(environ, session, request, now)
+            if isinstance(stamp, str):
+                _save(path, state, now)
+                raise DirectionRefused("not_confirmed", stamp.replace("direction.confirm", "direction.decline"))
+            request.update(state="declined", settled_ts=now, settled_at=_iso(now),
+                           declined=dict(stamp["confirmed"], session=session))
+            _save(path, state, now)
+    except OSError as err:
+        raise DirectionRefused("log_unwritable", f"Khipu can't read or write the held requests ({err}), so nothing "
+                                                 "was changed.") from None
+    return request
+
+
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
 _SETTLE_ERROR = "The held change was not applied."
 
@@ -942,7 +982,7 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
 # Everything on a request that holds the owner's words or marks their
 # conversation's messages: the action's args, the ask line, an error, and
 # the ask boundaries (T3 message ids and times, turn ids and hashes).
-_REQUEST_WORDS = ("args", "ask", "error", "t3_snapshots", "asks")
+_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks")
 
 
 def forget_requests(sessions, *, protected_sessions=(), now: float | None = None) -> dict:

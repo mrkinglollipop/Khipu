@@ -602,9 +602,19 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
     return config_file()
 
 
-def answer_setting_request(key: str, action: str) -> Path:
+def setting_request_pin(key: str, waiting: dict, value) -> str:
+    """A setting's waiting request and the value it holds, as shown to the
+    owner. An answer carrying it (``expect``) never lands on a newer request
+    or a value changed since."""
+    body = {"key": key, "value": value, "request": waiting.get("request"), "by": waiting.get("by"),
+            "at": waiting.get("at"), "prior": waiting.get("prior"), "prior_set": waiting.get("prior_set")}
+    return "sr-" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def answer_setting_request(key: str, action: str, *, expect: str | None = None) -> Path:
     """The owner's answer to a conversation's change to ``key``: confirm
-    keeps it; undo puts back the value it replaced."""
+    keeps it; undo puts back the value it replaced. ``expect``: the request
+    as it was shown (``setting_request_pin``)."""
     from khipu.config import config_file, mutate_config
 
     if action not in ("confirm", "undo"):
@@ -617,6 +627,9 @@ def answer_setting_request(key: str, action: str) -> Path:
         waiting = requests.pop(key, None)
         if waiting is None:
             raise SettingError(f"no conversation's change to {key} is waiting", "no_request")
+        if expect is not None and expect != setting_request_pin(key, waiting, data.get(key)):
+            raise SettingError(f"the change to {key} moved after it was shown; read what is waiting again",
+                               "version_moved")
         if action == "undo":
             if waiting.get("prior_set"):
                 data[key] = waiting.get("prior")
@@ -7358,10 +7371,16 @@ def unconfirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
     return dict(_owner_write({"type": "rule_unconfirm", **_rule_target(rule)}, via), n=rule["n"])
 
 
-def undo_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
+def _rule_as_shown(rule: dict, expect) -> None:
+    if expect is not None and expect != rule["revision"]:
+        raise RouteError("the rule changed after it was read; read its revision again")
+
+
+def undo_rule_request(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
     rule = _rule(n, now)
     if not rule.get("pending") or rule.get("pending_kind") != "changed" or not isinstance(rule.get("prior_text"), str):
         raise RouteError(f"standing rule {rule['n']} has no pending edit to undo")
+    _rule_as_shown(rule, expect)
     return dict(_owner_write({"type": "rule_undo", **_rule_target(rule)}, via), n=rule["n"])
 
 
@@ -7435,10 +7454,11 @@ def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = N
     return dict(_done(written[-1], view), n=number)
 
 
-def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
+def dismiss_rule_request(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
     rule = _rule(n, now)
     if not rule.get("pending"):
         raise RouteError(f"standing rule {rule['n']} has no pending proposal to dismiss")
+    _rule_as_shown(rule, expect)
     return dict(_owner_write({"type": "rule_dismiss", **_rule_target(rule)}, via), n=rule["n"])
 
 
@@ -8509,8 +8529,37 @@ def _proposed_tiers() -> dict | None:
     return proposed
 
 
-def confirm_tier_table(*, via: str, now: datetime | None = None) -> dict:
-    """Confirm the latest proposed tier table, as the owner wrote it."""
+def tier_table_pin(tiers: dict) -> str:
+    """A proposed tier table as it was shown to the owner."""
+    return "tt-" + hashlib.sha256(json.dumps(tiers, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def pending_tier_table() -> dict | None:
+    """The tier table a conversation proposed, while the record's latest word
+    on the table is that proposal: an owner's set, confirm or clear after it
+    answers it. ``tiers``, ``at``, ``by``, ``request``, and ``pin``."""
+    from khipu.routing_advisory import valid_tiers
+
+    latest = None
+    for event in _in_write_order(read_events()[0]):
+        if event.get("type") in ("tier_table_set", "tier_table_clear"):
+            latest = event
+    if (latest is None or latest.get("type") != "tier_table_set" or latest.get("confirmed") is True
+            or not valid_tiers(latest.get("tiers"))):
+        return None
+    tiers = dict(latest["tiers"])
+    return {"tiers": tiers, "at": latest.get("written_at"), "by": latest.get("written_by"),
+            "request": latest.get("owner_request"), "pin": tier_table_pin(tiers)}
+
+
+def confirm_tier_table(*, via: str, now: datetime | None = None, expect: str | None = None) -> dict:
+    """Confirm the latest proposed tier table, as the owner wrote it.
+    ``expect``: the proposal as it was shown (``tier_table_pin``); a newer one
+    or none is refused, never confirmed unseen."""
+    if expect is not None:
+        waiting = pending_tier_table()
+        if waiting is None or waiting["pin"] != expect:
+            raise RouteError("the proposed tier table moved after it was shown; read what is waiting again")
     proposed = _proposed_tiers()
     if proposed is None:
         raise RouteError("there is no proposed tier table to confirm")
@@ -12507,7 +12556,13 @@ def _owner_stamp(event: dict) -> dict:
     from khipu import owner_direction
 
     op = _OP.get() or owner_direction.operation_id(event)
-    return dict(event, **auth, **({"op": op} if op else {}))
+    stamped = dict(event, **auth, **({"op": op} if op else {}))
+    if "confirmed" in event:
+        # A held confirm's evidence (``confirmed``, on the owner-actions line
+        # too) must not overwrite a line's own field of that name: a tier table
+        # with a dict there is an unreadable line, and the change is lost.
+        stamped["confirmed"] = event["confirmed"]
+    return stamped
 
 
 # How many owner's lines this process stamped: an owner change that wrote
@@ -12805,7 +12860,7 @@ def _tier_table_cli(args, now: datetime) -> int:
     if action == "set":
         out = set_tier_table(_tier_table_arg(args), via=via, now=now)
     elif action == "confirm":
-        out = confirm_tier_table(via=via, now=now)
+        out = confirm_tier_table(via=via, now=now, expect=getattr(args, "expect", None))
     else:
         out = clear_tier_table(via=via, now=now)
     _print_json(_finish_owner(out))
@@ -13137,9 +13192,9 @@ def run_cli(args) -> int:
             elif args.action == "restore":
                 out = restore_rule(params[0], via=via, now=now, holds=_holds_arg(args))
             elif args.action == "undo":
-                out = undo_rule_request(params[0], via=via, now=now)
+                out = undo_rule_request(params[0], via=via, now=now, expect=getattr(args, "expect", None))
             elif args.action == "dismiss":
-                out = dismiss_rule_request(params[0], via=via, now=now)
+                out = dismiss_rule_request(params[0], via=via, now=now, expect=getattr(args, "expect", None))
             else:
                 out = confirm_rule(params[0], via=via, now=now, holds=_holds_arg(args), expect=getattr(args, "expect", None))
         else:
