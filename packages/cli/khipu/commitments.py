@@ -916,10 +916,51 @@ def _report_count(key: str, n: int = 1) -> None:
         report[key] = int(report.get(key) or 0) + n
 
 
-def _report_item(key: str, kind: str, text: str, reason: str) -> None:
+def _report_item(key: str, kind: str, text: str, reason: str, row: int | None = None) -> None:
     report = getattr(_REPORT, "current", None)
     if report is not None:
-        report.setdefault(key, []).append({"kind": kind, "text": text[:300], "reason": reason})
+        # ``_row`` is the commitment the item was matched to; it is dropped
+        # from the answer by :func:`finish_report` once the later steps ran.
+        report.setdefault(key, []).append(
+            {"kind": kind, "text": text[:300], "reason": reason, **({"_row": row} if row else {})})
+
+
+def _report_closed_row(row_id: int) -> None:
+    report = getattr(_REPORT, "current", None)
+    if report is not None:
+        report.setdefault("_closed_rows", []).append(row_id)
+
+
+def _loop_label(payload: dict[str, Any], text: str) -> str:
+    """``closed_loop``, or ``decision`` for a ``done:`` decision that closed (or
+    tried to close) a commitment through the same matcher."""
+    loops = {_DONE_PREFIX_RE.sub("", str(i.get("text") if isinstance(i, dict) else i or "").strip())
+             for i in payload.get("closed_loops") or []}
+    return "closed_loop" if text in loops else "decision"
+
+
+def _short_error(exc: BaseException) -> str:
+    """The exception class and a short plain message: a database error shows
+    its class and SQLSTATE only (its text names tables, columns and SQL)."""
+    name = type(exc).__name__
+    if type(exc).__module__.split(".")[0] == "psycopg":
+        state = getattr(exc, "sqlstate", None)
+        return f"{name} (sqlstate {state})" if state else name
+    first = (str(exc).strip().splitlines() or [""])[0][:100]
+    return f"{name}: {first}" if first else name
+
+
+def finish_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Settle a capture's report once every commitment step ran: a loop the
+    close step could not close but a later step (the session plan) did is not
+    reported as unclosed, and the internal row ids are removed."""
+    closed_rows = set(report.pop("_closed_rows", ()))
+    if report.get("not_closed"):
+        report["not_closed"] = [{k: v for k, v in item.items() if k != "_row"}
+                                for item in report["not_closed"] if item.get("_row") not in closed_rows]
+        if not report["not_closed"]:
+            del report["not_closed"]
+    return report
 
 
 def report_step_failed(exc: BaseException, step: str = "commitments") -> None:
@@ -929,7 +970,7 @@ def report_step_failed(exc: BaseException, step: str = "commitments") -> None:
     report = getattr(_REPORT, "current", None)
     if report is None:
         return
-    error = f"{type(exc).__name__}: {str(exc)[:200]}"
+    error = _short_error(exc)
     if step.endswith("commitments"):
         gaps = report.get("fact_gaps")
         report.clear()
@@ -2046,7 +2087,8 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
     open_rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id, with_owner=True)
     if not open_rows:
         for text, _kind, _reference in candidates:
-            _report_item("not_closed", "closed_loop", text, "no open commitment in this scope to close")
+            _report_item("not_closed", _loop_label(payload, text), text,
+                         "no open commitment in this scope to close")
         return 0
     from khipu.config import float_setting
 
@@ -2099,7 +2141,7 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
             if len(own) == 1:
                 best_id, tied = own[0], False
         if best_id is None or tied or (best_via == "cosine" and semantic_matches > 1):
-            _report_item("not_closed", "closed_loop", text,
+            _report_item("not_closed", _loop_label(payload, text), text,
                          "it matched more than one open commitment equally, so none was closed"
                          if (tied or best_id is not None)
                          else "it matched no open commitment in this scope")
@@ -2110,7 +2152,8 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         why_not = evidence_problem(text, best["text"], payload.get("project"), item=best)
         if why_not:
             _log(f"kept commitment {best_id} open: {why_not}")
-            _report_item("not_closed", "closed_loop", text, f"commitment {best_id} kept open: {why_not}")
+            _report_item("not_closed", _loop_label(payload, text), text,
+                         f"commitment {best_id} kept open: {why_not}", row=best_id)
             continue
         if close_by_rule(cur, best_id, rule="loop",
                          reason=f"{best_via} match ({best_score:.2f}): {text[:200]!r}",
@@ -2120,11 +2163,12 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
             already_closed.add(best_id)
             closed += 1
             _report_count("closed")
+            _report_closed_row(best_id)
             _log(f"closed commitment {best_id} via {best_via} ({best_score:.2f}) at episode {episode_id}")
         else:
-            _report_item("not_closed", "closed_loop", text,
+            _report_item("not_closed", _loop_label(payload, text), text,
                          f"commitment {best_id} matched but was not closed: its rules keep it open "
-                         "(the owner's own item, or its evidence is incomplete)")
+                         "(the owner's own item, or its evidence is incomplete)", row=best_id)
     return closed
 
 
@@ -2369,6 +2413,8 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         if close_by_rule(cur, row["id"], rule=rule, reason=reason, key=key, evidence=evidence,
                          episode=episode_id, proof=hit if rule == "session-plan" else None):
             closed += 1
+            _report_count("closed")
+            _report_closed_row(row["id"])
     if closed:
         _log(f"closed {closed} session-end commitment(s) for {session_id}")
     return closed

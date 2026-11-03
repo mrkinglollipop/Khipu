@@ -104,6 +104,75 @@ def test_capture_whose_commitment_step_failed_says_so(pg, monkeypatch):
     assert out["commitments"]["step_failed"]
 
 
+def _with_dedup(monkeypatch, dedup):
+    from khipu import capture as cap
+
+    monkeypatch.setattr(cap, "dedup_before_insert", lambda *a, **k: dict(dedup))
+
+
+def test_an_exact_replay_says_its_loops_were_handled_then(pg, monkeypatch):
+    first = _capture()
+    _with_dedup(monkeypatch, {"action": "skip", "matched_episode": first["episode_id"],
+                              "matched_via": "exact_window", "match": "identity"})
+    out = _capture(open_loops=["Review the widget parser migration plan before the release"])
+    assert out["dropped"] == [] and "partial" not in out
+    assert "handled then" in out["commitments"]["not_processed"]
+
+
+@pytest.mark.parametrize("dedup", [
+    {"action": "skip", "matched_via": "receipt", "match": "similarity"},
+    {"action": "merge", "matched_via": "cosine", "score": 0.97, "match": "similarity"},
+])
+def test_loops_on_a_capture_matched_by_resemblance_are_listed_as_dropped(pg, monkeypatch, dedup):
+    first = _capture()
+    _with_dedup(monkeypatch, {**dedup, "matched_episode": first["episode_id"]})
+    out = _capture(open_loops=["Review the widget parser migration plan before the release"],
+                   closed_loops=["Finished the parser rewrite"])
+    assert out["ok"] is True and out["partial"] is True
+    assert {d["kind"] for d in out["dropped"]} == {"open_loop", "closed_loop"}
+    assert all(d["reason"] == f"capture matched episode {first['episode_id']}; loops not stored"
+               for d in out["dropped"])
+    assert _open_texts(pg) == []
+
+
+def test_a_done_decision_that_closes_nothing_is_not_called_a_closed_loop(pg):
+    out = _capture(decisions=["done: sign the llama ranch agreement before the audit"])
+    assert [d["kind"] for d in out["dropped"]] == ["decision"]
+
+
+def test_an_unclosed_loop_that_the_session_plan_step_closed_is_not_reported(pg):
+    report = {"closed": 1, "_closed_rows": [7],
+              "not_closed": [{"kind": "closed_loop", "text": "a", "reason": "r", "_row": 7},
+                             {"kind": "closed_loop", "text": "b", "reason": "r", "_row": 8},
+                             {"kind": "closed_loop", "text": "c", "reason": "r"}]}
+    done = co.finish_report(report)
+    assert [i["text"] for i in done["not_closed"]] == ["b", "c"]
+    assert all("_row" not in i for i in done["not_closed"]) and "_closed_rows" not in done
+
+
+def test_step_errors_carry_the_class_and_a_short_message_never_sql(pg, monkeypatch):
+    import psycopg
+
+    def sql_boom(*a, **k):
+        raise psycopg.errors.UndefinedTable('relation "commitments" does not exist\nLINE 1: SELECT secret_col')
+
+    monkeypatch.setattr(co, "open_from_episode", sql_boom)
+    out = _capture(open_loops=["Review the widget parser migration plan before the release"])
+    text = json.dumps(out)
+    assert "UndefinedTable" in out["commitments"]["step_failed"]
+    assert "relation" not in text and "secret_col" not in text
+    assert "(sqlstate 42P01)" in out["commitments"]["step_failed"]
+
+    def multi(*a, **k):
+        raise RuntimeError("short reason\n  File secrets/trace " + "x" * 400)
+
+    monkeypatch.setattr(co, "open_from_episode", multi)
+    step = _capture(summary="Another widget parser capture entirely.",
+                    open_loops=["Review the widget parser migration plan before the release"]
+                    )["commitments"]["step_failed"]
+    assert step == "RuntimeError: short reason"
+
+
 def test_capture_names_a_fact_step_that_failed_and_was_rolled_back(pg, monkeypatch):
     from khipu import decisions
 
@@ -126,6 +195,15 @@ def test_a_capture_the_stop_hook_queues_names_the_fields_it_cannot_carry(monkeyp
     assert out["queued"] is True
     kinds = {d["field"]: d["count"] for d in out["dropped"]}
     assert kinds == {"open_loops": 2, "closed_loops": 1, "decisions": 1}
+
+
+def test_a_queued_capture_names_deliverables_and_verbatim_it_cannot_carry(monkeypatch):
+    monkeypatch.setattr(srv, "_stdio_hook_owns_capture", lambda: True)
+    with mock.patch("khipu.session_capture.resolve_session_ref", return_value=("claude", "s1", "state")), \
+            mock.patch("khipu.session_capture.request_capture_now"):
+        out = srv._tool_capture({"summary": "Did the thing.", "deliverables": [{"path": "a"}],
+                                 "verbatim": {"note": "n"}})
+    assert {d["field"] for d in out["dropped"]} == {"deliverables", "verbatim"} and out["partial"] is True
     assert all(d["reason"] for d in out["dropped"])
 
 

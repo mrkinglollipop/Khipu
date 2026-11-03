@@ -1789,7 +1789,7 @@ def _attach_prior_work(payload: dict, args: dict) -> None:
 
 
 _QUEUED_CAPTURE_DROPPED = ("open_loops", "closed_loops", "decisions", "decision_details",
-                           "preferences", "topics", "people")
+                           "preferences", "topics", "people", "deliverables", "verbatim")
 _QUEUED_CAPTURE_REASON = ("not stored: a capture queued for the stop hook carries only the summary "
                           "(as its note); the hook derives these from the transcript")
 
@@ -1835,7 +1835,8 @@ def _tool_capture(args: dict) -> dict:
         # The queued capture carries the note only: the structured fields this
         # call also gave are not part of it, and are named instead of vanishing.
         dropped = [{"field": key, "count": len(args[key]), "reason": _QUEUED_CAPTURE_REASON}
-                   for key in _QUEUED_CAPTURE_DROPPED if isinstance(args.get(key), list) and args[key]]
+                   for key in _QUEUED_CAPTURE_DROPPED
+                   if isinstance(args.get(key), (list, dict)) and args[key]]
         if dropped:
             out["dropped"] = dropped
             out["partial"] = True
@@ -1918,7 +1919,20 @@ def _capture_commitment_answer(args: dict, written: dict) -> dict:
         if facts:
             answer["commitments"] = {k: int(facts.get(k) or 0) for k in ("opened", "restated", "closed")}
         elif sent:
-            answer["commitments"] = {"not_processed": "this capture was already recorded; its loops were handled then"}
+            dedup = written.get("dedup") if isinstance(written.get("dedup"), dict) else {}
+            if dedup.get("action") == "skip" and dedup.get("match") == "identity":
+                # An exact replay: its loops were handled by the first write.
+                answer["commitments"] = {
+                    "not_processed": "this capture was already recorded; its loops were handled then"}
+            elif dedup.get("action") in ("skip", "merge"):
+                # Matched on resemblance (or a receipt of one): no fact step ran
+                # for this payload, so its loops were not stored.
+                why = f"capture matched episode {written.get('episode_id')}; loops not stored"
+                for kind, items in given.items():
+                    for item in items if isinstance(items, list) else []:
+                        text = item.get("text") if isinstance(item, dict) else item
+                        dropped.append({"kind": kind, "text": str(text)[:300], "reason": why})
+                answer["commitments"] = {"not_processed": why}
     answer["dropped"] = dropped
     gaps = facts.get("fact_gaps")
     if gaps:

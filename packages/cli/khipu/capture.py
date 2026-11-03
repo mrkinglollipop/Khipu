@@ -1414,7 +1414,7 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
     with commitments.collecting(report):
         stats = _write_pg(payload, legacy_projection=legacy_projection)
     if report and isinstance(stats, dict):
-        stats["commitments"] = report
+        stats["commitments"] = commitments.finish_report(report)
     return stats
 
 
