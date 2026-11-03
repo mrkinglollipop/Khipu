@@ -250,6 +250,7 @@ def _hub_episode_slug_map(cur) -> dict[str, list[tuple[Any, Any, Any]]]:
     """Process-local hub slug map, shared by every seed in a leg. A stamp or
     build that fails or runs out of budget raises ``DeadlineMissed`` so the
     leg reports ``missed`` instead of silently returning an empty expansion."""
+    # forget-fence source: per-prompt push candidates (cached map); prior_work_for_prompt fences them
     now = time.monotonic()
     with _HUB_SLUG_LOCK:
         cached = dict(_HUB_SLUG_CACHE)

@@ -3152,6 +3152,7 @@ def hybrid_search(
         literal_kind = kind if kind in _LITERAL_KINDS else None
 
         def _literal_worker() -> None:
+            # forget-fence source: the hybrid literal leg on its own thread; hybrid_search hands these rows on and every search output fences them
             _t = time.monotonic()
             try:
                 with try_hub_connect() as lit_conn:
