@@ -2373,6 +2373,8 @@ def test_recent_changes_name_the_owner_in_settings_for_every_change_made_in_the_
 # setting that is not an option at all. Each leaves this list in the PR that
 # builds it, so the test below then asks for its control.
 NOT_IN_THE_APP_YET = {
+    # How old a saved view may be before a prompt answered from it says routing is updating.
+    "routing_stale_view_cap",
     # Slice 15a owns delivery and health controls after the slice 14 mocks.
     "routing_delivery_lease", "routing_delivery_live_after", "routing_delivery_slack",
     # Phase 7: the copy for cloud agents.

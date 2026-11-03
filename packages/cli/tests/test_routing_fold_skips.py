@@ -65,7 +65,7 @@ def test_the_routing_lock_keeps_its_short_wait(monkeypatch):
     keeps the budget's half."""
     seen = {}
 
-    def fake_view(now, on_fold=None, clock=None):
+    def fake_view(now, on_fold=None, clock=None, kick=None):
         seen["deadline"] = routing._held.deadline - time.monotonic()
         seen["fold"] = routing._held.fold_deadline - time.monotonic()
         raise routing.FoldBusy("stop here")

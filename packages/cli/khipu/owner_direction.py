@@ -2583,6 +2583,7 @@ def _restore_setting(key: str, value, was_set: bool, request=None) -> None:
             data[routing.SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(routing.SETTINGS_REQUEST_KEY, None)
+    routing.refresh_view()  # config.json is an input of the view: the next prompt finds it current
 
 
 def _set_priority_back(before: dict, via: str, holds: dict | None = None, *, _undo_default_holds: bool = False) -> dict:

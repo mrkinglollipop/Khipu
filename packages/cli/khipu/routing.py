@@ -199,6 +199,9 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_resend_after": ("duration", 6 * 3600, "Send everything again after (0: never)"),
     "routing_not_refreshed_after": ("duration", 5 * 60, "The record counts as not refreshed after (0: never)"),
     "routing_poll_interval": ("duration", 10, "How often the daemon looks at the source files"),
+    "routing_stale_view_cap": ("duration", 120,
+                               "A prompt answered from a saved record older than this, with a newer change of "
+                               "yours behind it, says routing is updating (0: never)"),
     "routing_slow_read_pct": ("number", 1.0, "Warn when reading before a prompt is too slow on more than this % of prompts"),
     # Checking for resets (phase 5)
     "routing_reset_check": ("switch", True, "Check an account at its reset time"),
@@ -595,7 +598,8 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
-        return config_file()
+    refresh_view()  # config.json is an input of the view: the next prompt finds it current
+    return config_file()
 
 
 def answer_setting_request(key: str, action: str) -> Path:
@@ -622,7 +626,8 @@ def answer_setting_request(key: str, action: str) -> Path:
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
-        return config_file()
+    refresh_view()
+    return config_file()
 
 
 # ---- time and text -------------------------------------------------------------
@@ -2955,14 +2960,35 @@ def _inputs() -> tuple[dict, dict, list[dict]]:
     from khipu.config import accounts_version
 
     cfg["_accounts_version"] = accounts_version(config)
-    seed = cfg.get("routing_rules_seed")
     cfg["_mac"] = mac
-    from khipu import routing_replication
+    return _fingerprint(cfg, events_stat, config_stat), cfg, known
 
-    fingerprint = {"replication": routing_replication.fingerprint(), "entry_model": 1, "account_identity": 3, "payer_identity": 3, "events": events_stat, "config": config_stat,
-                   "seed": _stat(Path(seed)) if seed else None,
-                   "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
-    return fingerprint, cfg, known
+
+def _fingerprint(cfg: dict, events_stat: list | None, config_stat: list | None) -> dict:
+    """The stat of every file a fold reads. Stat only: its cost does not grow
+    with what the files hold."""
+    from khipu import routing_replication, routing_sources
+
+    seed = cfg.get("routing_rules_seed")
+    return {"replication": routing_replication.fingerprint(), "entry_model": 1, "account_identity": 3,
+            "payer_identity": 3, "events": events_stat, "config": config_stat,
+            "seed": _stat(Path(seed)) if seed else None,
+            "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
+
+
+def _light_inputs() -> tuple[dict, dict]:
+    """(fingerprint, settings) without the account definitions that
+    ``_inputs`` builds from the whole log. What a prompt needs to tell
+    whether the saved view is current: stats and the small config file, never
+    a parse of the log, so it costs the same however long the log is."""
+    from khipu.config import config_file, load_config
+
+    events_stat, config_stat = _stat(events_file()), _stat(config_file())
+    config = load_config()
+    cfg = settings(config)
+    cfg["_raw_sources"] = {"routing_sources": config.get("routing_sources"),
+                           "usage_accounts": config.get("usage_accounts")}
+    return _fingerprint(cfg, events_stat, config_stat), cfg
 
 
 def _sources(cfg: dict, now: datetime, prev: dict | None) -> tuple[list[dict], dict | None, dict]:
@@ -5426,24 +5452,33 @@ def _captures_unchanged(view: dict, fingerprint: dict, now: datetime) -> bool:
     return True
 
 
-def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
-    if not view or (view.get("fingerprint") != fingerprint and not _captures_unchanged(view, fingerprint, now)):
-        return False
+def _stale_reason(view: dict | None, fingerprint: dict, now: datetime) -> str | None:
+    """Why ``view`` is not current, or None when it is. "missing" and "shape"
+    (a view an older Khipu saved) and "clock" (folded at a time further ahead
+    of this clock than it trusts) mean it cannot be answered at all; the rest
+    (``SERVEABLE_STALE``) are a view whose own content is sound but that a
+    later input or the clock has overtaken: "inputs" (a file it was folded
+    from changed), "scan" (a runner's whole-log read has more to do),
+    "expiry" (a kept job attachment ended) and "due" (``valid_until``)."""
+    if not view:
+        return "missing"
     if ("priority_version" not in view
             or "priority_owner_revision" not in view or "priority_stored" not in view
             or view.get("event_identity") != 2
             or view.get("proposal_schema") != 1 or view.get("fold_audit_schema") != 1
             or "advice_cap_decisions" not in view):
-        return False
+        return "shape"
+    folded = _parse(view.get("folded_at"))
+    if folded is not None and (folded - now).total_seconds() > CLOCK_TOLERANCE:
+        return "clock"
+    if view.get("fingerprint") != fingerprint and not _captures_unchanged(view, fingerprint, now):
+        return "inputs"
     # A whole-log read of a runner's events still under way goes on at the
     # next read, one bounded chunk at a time, though no file changed.
     runners = ((view.get("source_cache") or {}).get("runners") or {}).values()
     if any(isinstance((r.get("events") or {}).get("scan"), dict) and not r["events"]["scan"].get("done")
            and not r["events"]["scan"].get("unfinished") for r in runners if isinstance(r, dict)):
-        return False
-    folded = _parse(view.get("folded_at"))
-    if folded is not None and (folded - now).total_seconds() > CLOCK_TOLERANCE:
-        return False  # folded at a time further ahead of this clock than it trusts: fold again at now
+        return "scan"
     # A kept job attachment ends at its own expiry even when every input file
     # is unchanged, so the equal-fingerprint path cannot skip this check.
     kept = (view.get("source_cache") or {}).get("captures")
@@ -5451,9 +5486,16 @@ def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
         if isinstance(entry, dict) and entry.get("until"):
             until = _parse(entry["until"])
             if until is None or now >= until:
-                return False
+                return "expiry"
     due = _parse(view.get("valid_until"))
-    return due is None or now < due
+    return None if due is None or now < due else "due"
+
+
+SERVEABLE_STALE = ("inputs", "scan", "expiry", "due")
+
+
+def _fresh(view: dict | None, fingerprint: dict, now: datetime) -> bool:
+    return _stale_reason(view, fingerprint, now) is None
 
 
 _SEED_SHAPE = 'each entry is {"text", "source", "date"}'
@@ -11054,10 +11096,102 @@ def _fold_turn():
         os.close(fd)
 
 
-def _prompt_view(now: datetime, on_fold=None, clock: dict | None = None) -> dict:
-    """The view for a prompt. A fresh view.json is answered as it is. When
-    an input changed or ``valid_until`` has passed (the clock caused a
-    change and nothing refolded yet), the record is refolded inline, as the
+def _view_age(view: dict, now: datetime) -> float:
+    """Seconds since the saved view was last folded or checked."""
+    at = _parse(view.get("checked_at") or view.get("folded_at"))
+    return max(0.0, (now - at).total_seconds()) if at else 0.0
+
+
+def _stale_answer(view: dict, why: str, fingerprint: dict, now: datetime) -> dict:
+    """A saved view answered though an input or the clock has overtaken it.
+    Its ``fingerprint`` becomes the log, config and replication stats as this
+    prompt read them, so the answer's record generation (``_generation``) is
+    the one it was read at: a change after that withdraws it, as for a
+    current view, and the change that made it stale arrives with the next
+    prompt. The ``sources`` (runner heartbeats) stay the view's own: the fold
+    read them then, so a heartbeat changed since is never blessed on advice
+    or pace built from the older one. ``checked_at`` is left as the fold set
+    it (the inputs were not all checked against this view), so
+    ``_not_refreshed`` speaks for an old one."""
+    own = (view.get("fingerprint") or {}).get("sources")
+    return dict(view, fingerprint=dict(fingerprint, sources=own),
+                stale_view={"reason": why, "age": round(_view_age(view, now), 3),
+                            "since": view.get("checked_at") or view.get("folded_at"),
+                            "events": (view.get("fingerprint") or {}).get("events")})
+
+
+_OWNER_TAIL_MOST = 256 * 1024
+
+
+def _owner_change_since(folded: list | None) -> bool:
+    """Whether the log holds an owner's line the view was not folded from:
+    only the bytes appended since its fold are read (``folded``, the log's
+    stat then), never the log. A log that was rewritten or replaced since
+    (another file, a shorter one), a tail too long to read, or one that
+    cannot be read, counts as a change: it could be one."""
+    old = folded
+    now = _stat(events_file())
+    if now is None:
+        return False
+    if old is None:
+        old = [0, 0, now[2]]
+    if now[2] != old[2] or now[1] < old[1]:
+        return True
+    if now[1] == old[1]:
+        return False
+    if now[1] - old[1] > _OWNER_TAIL_MOST:
+        return True
+    try:
+        with events_file().open("rb") as fh:
+            fh.seek(old[1])
+            tail = fh.read(now[1] - old[1])
+    except OSError:
+        return True
+    for line in tail.split(b"\n"):
+        if b'"owner"' not in line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return True
+        if isinstance(row, dict) and isinstance(row.get("written_by"), dict) \
+                and row["written_by"].get("kind") == "owner":
+            return True
+    return False
+
+
+def _stale_notice(out: dict, view: dict | None, now: datetime | None = None) -> dict:
+    """One line when a prompt was answered from a saved view older than
+    ``routing_stale_view_cap`` with an owner's change newer than it: the
+    change arrives with the next prompt, once the refold has saved it."""
+    held = (view or {}).get("stale_view")
+    if not held:
+        return out
+    cap = settings()["routing_stale_view_cap"]
+    if not cap or held["age"] <= cap or not _owner_change_since(held.get("events")):
+        return out
+    since = _parse(held.get("since"))
+    line = ("Routing is updating: this is Khipu's record as of "
+            f"{_clock(since, now or _now()) if since else 'a while ago'}; your newer change arrives with the next prompt.")
+    out = dict(out, text="\n".join(filter(None, [out.get("text"), line])))
+    if out.get("kind") == "none":
+        out["kind"] = "changes"
+    return out
+
+
+def _prompt_view(now: datetime, on_fold=None, clock: dict | None = None, kick=None) -> dict:
+    """The view for a prompt. With ``kick`` (the per-prompt child's), the
+    prompt never does work that grows with what is stored: it stats the
+    inputs, reads view.json and answers it, current or not. A view that a
+    later input or the clock has overtaken (``SERVEABLE_STALE``) is answered
+    as it is, stamped ``stale_view`` (its reason and age), and ``kick(reason)``
+    is called once so the caller refolds it off the prompt path
+    (``refold_in_background``). Only when no usable view.json exists (first
+    run, a lost, damaged or edited view, one an older Khipu saved) does it
+    fold inline, as below. Without ``kick`` (the daemon's poll) a fresh
+    view.json is answered as it is, and when an input changed or
+    ``valid_until`` has passed (the clock caused a change and nothing
+    refolded yet), the record is refolded inline, as the
     session-start child does it (``_start_view``: outside the routing lock,
     which is taken only to save). Only one fold runs at a time: while
     another prompt's child or the recall daemon's poll holds
@@ -11073,10 +11207,20 @@ def _prompt_view(now: datetime, on_fold=None, clock: dict | None = None) -> dict
         os.stat(events_file())
     except FileNotFoundError:
         pass  # any other error (a folder it cannot read) is raised: never "no record"
-    fingerprint, cfg, _known = _inputs()
-    prev = _load_view()
-    if _fresh(prev, fingerprint, now):
-        return dict(prev, checked_at=_iso(now))
+    if kick is not None:
+        fingerprint, cfg = _light_inputs()
+        prev = _load_view()
+        why = _stale_reason(prev, fingerprint, now)
+        if why is None:
+            return dict(prev, checked_at=_iso(now))
+        if why in SERVEABLE_STALE:
+            kick(why)
+            return _stale_answer(prev, why, fingerprint, now)
+    else:
+        fingerprint, cfg, _known = _inputs()
+        prev = _load_view()
+        if _fresh(prev, fingerprint, now):
+            return dict(prev, checked_at=_iso(now))
     from khipu import routing_sources
 
     if fingerprint["events"] is None and not fingerprint["replication"][0] and not cfg.get("routing_rules_seed") \
@@ -11406,7 +11550,8 @@ def changes_text(changed: dict, view: dict, now: datetime, cfg: dict | None = No
 
 
 def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-                on_fold=None, session_id: str | None = None, fold_wait: float | None = None) -> dict:
+                on_fold=None, session_id: str | None = None, fold_wait: float | None = None,
+                kick=None) -> dict:
     """What the per-prompt hook adds for a conversation whose last-seen
     marker is ``marker`` (``recall_prompt.routing_marker``):
     ``{"kind": "none" | "changes" | "full", "text", "version", "epoch",
@@ -11423,12 +11568,14 @@ def _prompt_push(marker: dict | None, *, budget: float, now: datetime | None = N
     the per-prompt child waits for it up to its hook's own deadline rather
     than skip (2026-10-27: a 25 ms wait beside 170-330 ms folds skipped
     about a fifth of prompts as fold-busy). An answer finished after the
-    hook stopped taking it is still the hook's ``skipped:budget``."""
+    hook stopped taking it is still the hook's ``skipped:budget``. ``kick``:
+    as for ``_prompt_view``: a view that is out of date is answered at once
+    and ``kick(reason)`` asks for its refold off the prompt path."""
     with lock_budget(budget / 2, fold=budget / 2 if fold_wait is None else max(budget / 2, fold_wait)):
         clock = None if now is not None else {}
         now = now or _now()
         _view_seen.stat = None
-        view = _prompt_view(now, on_fold=on_fold, clock=clock)
+        view = _prompt_view(now, on_fold=on_fold, clock=clock, kick=kick)
         now = (clock or {}).get("now", now)
     cfg = settings()
     session = getattr(marker, "session", None)
@@ -11575,9 +11722,10 @@ def _prompt_text(marker, view, now, cfg, *, session_id=None):
 
 
 def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = None,
-                on_fold=None, session_id: str | None = None, fold_wait: float | None = None) -> dict:
+                on_fold=None, session_id: str | None = None, fold_wait: float | None = None,
+                kick=None) -> dict:
     """Offer a leased batch when the marker carries a hook delivery identity.
-    ``fold_wait``: as for ``_prompt_push``."""
+    ``fold_wait``, ``kick``: as for ``_prompt_push``."""
     if session_id is not None:
         from khipu.routing_delivery import Marker
 
@@ -11585,19 +11733,19 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
     else:
         session_id = getattr(marker, "session", None)
     out = _prompt_push(marker, budget=budget, now=now, on_fold=on_fold, session_id=session_id,
-                       fold_wait=fold_wait)
+                       fold_wait=fold_wait, kick=kick)
     view = out.pop("_delivery_view")
     session = getattr(marker, "session", None)
     if not session:
         out.pop("line_entities", None)
     if not session or out.pop("_reserved", False):
-        return _replication_push_age(out, now)
+        return _replication_push_age(_stale_notice(out, view, now), now)
     from khipu import routing_delivery
 
     now = now or _now()
     out = routing_delivery.plan(out, view, now, settings(), session=session)
-    return _replication_push_age(routing_delivery.offer(out, session=session, component=marker.component,
-                                                        deferred=True), now)
+    return _replication_push_age(_stale_notice(routing_delivery.offer(
+        out, session=session, component=marker.component, deferred=True), view, now), now)
 
 
 def _replication_push_age(out: dict, now=None) -> dict:
@@ -11674,6 +11822,62 @@ def _poll_refold(now: datetime | None = None, *, on_fold=None) -> dict:
     # No record on this Mac: nothing was folded or written.
     return dict(out, folded=bool(view.get("record")), saved=view.get("saved", True) is not False,
                 version=view.get("version"), valid_until=view.get("valid_until"))
+
+
+# Waiting for the routing lock when a refold saves its view: off the prompt
+# path, so it can be longer than a prompt's; a write holds the lock for as
+# long as its own refold takes.
+BACKGROUND_LOCK_BUDGET = 5.0
+
+
+def refold_in_background(now: datetime | None = None, *, on_fold=None) -> str:
+    """The refold a prompt asked for (``_prompt_view``'s ``kick``), run by the
+    per-prompt child after its answer was sent: one fold at a time, and it
+    never waits for one. Answers "folded", "fresh" (another fold saved the
+    view while this one started), "busy" (``prompt-fold.lock`` is held, so a
+    fold is running that will save the view: this one has nothing to add) or
+    "failed" (not saved: the next prompt or the daemon's poll tries again).
+    ``on_fold`` is called once the fold lock is ours."""
+    try:
+        with lock_budget(BACKGROUND_LOCK_BUDGET, fold=0):
+            now = now or _now()
+            fingerprint, _cfg = _light_inputs()
+            if _fresh(_load_view(), fingerprint, now):
+                return "fresh"
+            with _fold_turn():
+                if on_fold is not None:
+                    on_fold()
+                view = _start_fold(now, save=True)
+        return "folded" if view.get("saved", True) is not False else "failed"
+    except FoldBusy:
+        return "busy"
+    except Exception:  # noqa: BLE001 - a refold that failed costs nothing: the poll refolds it
+        return "failed"
+
+
+def refresh_view(now: datetime | None = None) -> bool:
+    """Refold and save the view right after a write that did not do it
+    itself (``_write_many`` folds under the routing lock; a replication pull,
+    a setting, an account migration did not), so the prompt that follows
+    finds view.json current. Off the prompt path, under the same locks as
+    ``read_view``, within ``BACKGROUND_LOCK_BUDGET``. Never raises: the
+    write is down whatever this does, and the next read or poll refolds."""
+    try:
+        with lock_budget(BACKGROUND_LOCK_BUDGET), _fold_turn(), _lock():
+            _recover_accounts()
+            inputs = _inputs()
+            from khipu import routing_sources
+
+            if inputs[0]["events"] is None and not inputs[0]["replication"][0] \
+                    and not inputs[1].get("routing_rules_seed") \
+                    and not routing_sources.any_configured(inputs[1]["_raw_sources"], inputs[1]):
+                return True  # no record: nothing to fold, and nothing written
+            if _fresh(_load_view(), inputs[0], now or _now()):
+                return True
+            _refold_locked(now or _now(), inputs)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---- khipu route wait --------------------------------------------------------------------

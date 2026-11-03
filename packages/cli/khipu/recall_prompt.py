@@ -466,7 +466,11 @@ def _update_routing_marker(session_id: str, change, wait: float, *, component: s
 # per prompt while view.json stalled), unless it is refolding the record: then it
 # runs on until it has saved the view (the next prompt then reads it fast),
 # at most ``_ROUTING_FOLD_MOST`` seconds; only one prompt folds at a time
-# (``routing.FoldBusy``). Late, failed or switched
+# (``routing.FoldBusy``). A prompt never folds a record that has a saved view
+# (2026-11-03: a fold of 270-480 ms against a 50 ms budget skipped 13.4% of
+# prompts): it answers the saved view as it is, current or not, and the child
+# refolds it after the answer has gone (``routing.refold_in_background``); only
+# a record with no usable view.json is folded on the prompt, as before. Late, failed or switched
 # off, it adds nothing and recall's output is byte for byte what it was.
 
 _ROUTING_CHILD_MOST = 2.0
@@ -593,6 +597,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                                                          _ROUTING_FOLD_MOST))
                 signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 
+            refolds: list[str] = []  # why the saved view was out of date, when this prompt answered it as it was
             try:
                 marker = routing_marker(session_id, canonical=True)
                 # Another fold holding the lock saves the view this prompt
@@ -605,7 +610,7 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
                 fold_wait = (max(0.0, deadline - time.monotonic() - _ROUTING_FOLD_WAIT_SLACK)
                              if wait_fold else None)
                 out = routing.prompt_push(marker, budget=budget, on_fold=fold_started, session_id=session_id,
-                                          fold_wait=fold_wait)
+                                          fold_wait=fold_wait, kick=refolds.append)
                 answer = {k: out.get(k) for k in ("kind", "text", "version", "epoch", "count", "unrefreshed",
                                                    "owed_entities", "shown_entities", "generation", "notices", "routing_changes")}
                 if isinstance(answer["text"], str) and len(answer["text"]) > _ROUTING_TEXT_MOST:
@@ -627,6 +632,12 @@ def _prompt_routing_child(write_fd: int, session_id, environ, deadline: float, d
             _write_all(write_fd, wire.encode(answer, ensure_ascii=True) + b"\n")
             os.close(write_fd)  # the hook has its answer; nothing below delays it
             routing.kick_plan_refresh()
+            if refolds:
+                # The answer was the saved view, out of date: refold it here, off the
+                # prompt, where the next prompt will find it. One fold runs at a time
+                # (a try on ``prompt-fold.lock`` that never waits); a child that does
+                # not get the lock leaves, since the fold that holds it saves the view.
+                routing.refold_in_background(on_fold=fold_started)
         code = 0
     except BaseException:  # noqa: BLE001 - nothing for routing, never a failed hook
         code = 1

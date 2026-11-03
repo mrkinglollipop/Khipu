@@ -68,6 +68,26 @@ def test_changed_cap_verdict_invalidates_revision_and_buffered_go(mac, kind, val
 
 
 @pytest.mark.parametrize("kind", ["concurrency", "spend"])
+def test_a_stale_answer_does_not_bless_a_heartbeat_changed_since_its_fold(mac, kind):
+    """A prompt answers a stale view as it stands; the heartbeat that made it
+    stale is not one its advice was built from, so the answer's generation
+    keeps the view's own heartbeat stats and is withdrawn. The log, config and
+    replication stats are the current ones, as the one-prompt-late delivery needs."""
+    folder, before = _seed_cap(mac, kind)
+    _update_runner(folder, kind, 35)
+    kicks: list[str] = []
+    stale = routing._prompt_view(NOW, kick=kicks.append)
+    assert kicks == ["inputs"] and stale["stale_view"]["reason"] == "inputs"
+    assert stale["fingerprint"]["sources"] == before["fingerprint"]["sources"]
+    current, _cfg = routing._light_inputs()
+    assert stale["fingerprint"]["events"] == current["events"] and stale["fingerprint"]["config"] == current["config"]
+    assert not recall_prompt._routing_generation_current(routing._generation(stale, routing.settings()))
+    # The refold that follows reads the new heartbeat, and its answer is current.
+    assert routing.refold_in_background() == "folded"
+    assert recall_prompt._routing_generation_current(routing._generation(routing._load_view(), routing.settings()))
+
+
+@pytest.mark.parametrize("kind", ["concurrency", "spend"])
 def test_runner_change_invalidates_generation_before_refold(mac, kind):
     folder, before = _seed_cap(mac, kind)
     generation = routing._generation(before, routing.settings())
