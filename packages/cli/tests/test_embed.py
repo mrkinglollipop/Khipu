@@ -1509,6 +1509,51 @@ class SearchTimingTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in out["results"]], ["1"])
         self.assertIn("literal_ms", out["timing"])
 
+    def test_hybrid_literal_leg_exception_degrades_instead_of_failing(self):
+        import contextlib
+        from unittest import mock
+
+        class FakeCur:
+            def execute(self, sql, params=None):
+                pass
+
+            def fetchall(self):
+                return []
+
+            def fetchone(self):
+                return (False,)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class FakeConn:
+            def cursor(self_inner):
+                return FakeCur()
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+        @contextlib.contextmanager
+        def _hub():
+            yield FakeConn()
+
+        with mock.patch("khipu.hub_snapshot.try_hub_connect", _hub), \
+                mock.patch.object(em, "_cosine_candidates", return_value=[]), \
+                mock.patch("khipu.cli._literal_candidates", side_effect=RuntimeError("literal boom")), \
+                mock.patch.object(em, "_apply_search_filters", side_effect=lambda c, rows, **k: list(rows)), \
+                mock.patch("khipu.topic_graph.enrich_search_results",
+                           side_effect=lambda c, rows: list(rows)), \
+                mock.patch("khipu.relevance.is_evidence", return_value=True):
+            out = em.hybrid_search("khipu", limit=5, mode="hybrid", include_libraries=False)
+        self.assertIn("literal:error", out["degraded_legs"])
+        self.assertIn("literal boom", out["timing"]["literal_error"])
+
 
 class QueryEmbedBudgetTest(unittest.TestCase):
     """The interactive query path must not inherit the backfill client's

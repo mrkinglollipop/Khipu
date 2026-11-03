@@ -1046,9 +1046,15 @@ def test_real_blocker_and_fake_replica_cosine_lookup_uses_cosine(tmp_path, monke
     monkeypatch.setattr(hub_snapshot, "meta_path", lambda: tmp_path / "meta.json")
     hub_snapshot._MATRIX_CACHE.clear()
     # Force a fresh vector_scan import under the guard (the bug: ctypes banned).
+    # monkeypatch restores both the sys.modules entry and the package
+    # attribute at teardown, so later tests keep the original module object.
+    import khipu as _khipu_pkg
+
     for name in list(sys.modules):
         if name == "khipu.vector_scan" or name.startswith("khipu.vector_scan."):
-            del sys.modules[name]
+            monkeypatch.delitem(sys.modules, name)
+    if hasattr(_khipu_pkg, "vector_scan"):
+        monkeypatch.delattr(_khipu_pkg, "vector_scan")
     query = "golden otter"
     vectors = {recall_prompt._query_embed_cache_key(profile, query): [1.0, 0.0]}
     with ren._offline(vectors) as guard:
@@ -1062,6 +1068,12 @@ def test_real_blocker_and_fake_replica_cosine_lookup_uses_cosine(tmp_path, monke
         snap_out = guard.snapshot()
     assert rows and rows[0]["id"] == "1"
     assert snap_out["cosine_used"].get("prompt", 0) >= 1
+    if sys.platform == "darwin":
+        # The pure-Python fallback also bumps cosine_used; on darwin the real
+        # BLAS entry point must have loaded under the guard.
+        from khipu import vector_scan
+
+        assert vector_scan._cblas_sgemv() is not None
     assert snap_out["cosine_timeouts"] == {}
     assert snap_out["cosine_load_failures"] == {}
     assert ren._cosine_skipped(snap_out, {"prompt": [{}], "status": []}) is False
