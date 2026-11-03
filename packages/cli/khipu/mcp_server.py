@@ -3004,7 +3004,7 @@ def _tool_route_priority(args: dict) -> dict:
         raise ValueError("entries must be the owner's accounts, in his order")
     return routing.conversation_priority(entries, until=until, owner_request=owner_request,
                                          author=routing.conversation_author(), base=base,
-                                         expect=args.get("expect"))
+                                         **({"expect": args["expect"]} if args.get("expect") is not None else {}))
 
 
 def _tool_owner_act(args: dict) -> dict:
