@@ -924,7 +924,7 @@ def test_rules_and_the_note_arrive_whole_whatever_their_length(home):
     out = routing.summary()
     assert long_rule.strip() in out["text"] and note.strip() in out["text"]
     assert out["text"].index("Standing rules:") < out["text"].index("Note from the owner")
-    assert "Your rules and note are longer than the summary size." in routing.doctor_block()["warnings"]
+    assert routing.doctor_block()["rules_budget"]["note_chars"] == len(note)
     routing.end_note(via="app")
     assert routing.read_view()["note"] is None
 

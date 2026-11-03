@@ -3031,9 +3031,12 @@ def _tool_route_rule(args: dict) -> dict:
     if holds is not None and (not isinstance(holds, dict) or not all(isinstance(hold, str) and choice in ("end", "keep")
                                                                       for hold, choice in holds.items())):
         raise ValueError('holds must map each hold id to "end" or "keep"')
-    return routing.request_rule(text, n=number, owner_request=owner_request,
-                                author=routing.conversation_author(), via="mcp", holds=holds,
-                                base=base if number is not None else None)
+    try:
+        return routing.request_rule(text, n=number, owner_request=owner_request,
+                                    author=routing.conversation_author(), via="mcp", holds=holds,
+                                    base=base if number is not None else None)
+    except routing.RuleCapError as exc:
+        return {"ok": False, "error": str(exc), "code": exc.code}
 
 
 @_with_route_receipts

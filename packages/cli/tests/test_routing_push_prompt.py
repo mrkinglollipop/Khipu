@@ -381,11 +381,11 @@ def test_the_order_and_the_budget_of_a_change_block(home, monkeypatch):
     assert sum(len(x) + 1 for x in lines[1:]) <= 150
 
 
-def test_a_changed_rule_longer_than_the_budget_is_sent_whole(home, monkeypatch):
+def test_a_changed_rule_longer_than_the_budget_is_named_not_sent_whole(home, monkeypatch):
     _record()
     _push_on(monkeypatch)
     _seen_now()
-    _set(home, routing_prompt_chars=60, routing_line_chars=40)
+    _set(home, routing_prompt_chars=400, routing_line_chars=40)
     rule = ("Every Grok result that is acted on gets a re-check from a different model family, "
             "and the re-check looks wider than the list Grok gave. ") * 4
     routing.add_rule(rule, via="app")
@@ -394,10 +394,10 @@ def test_a_changed_rule_longer_than_the_budget_is_sent_whole(home, monkeypatch):
     home["clock"].advance(minutes=1)
     routing.report(account="Claude", state="limited", until="2h", author=ME)
     lines = _routing_part(_cold(monkeypatch)).splitlines()
-    assert f"Standing rule 1. {rule}" in lines  # owner whitespace survives as well as the words
-    assert any(line.startswith("Note from the owner") and line.endswith(note) for line in lines)
-    claude = next(line for line in lines if line.startswith("Claude"))
-    assert len(claude) <= 40
+    # Longer than the prompt's room: never one whole line; the words stay owed and arrive as pages.
+    assert not any(rule.strip() in line for line in lines)
+    assert any(entity.startswith("rule:") for entity in _marker().get("owed", []))
+    assert any(line.startswith("Claude: limit reached") for line in lines)
 
 
 @pytest.mark.parametrize("why", ["behind", "old", "epoch"])
@@ -855,7 +855,11 @@ def test_a_paged_block_does_not_ack_its_undelivered_remainder(home, monkeypatch,
 
     _record()
     seen = _seen_now() if kind == "changes" else {}
-    _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, seen)
+    if kind == "changes":
+        # A changed note this long is named in the update and its words paged across prompts.
+        routing.set_note("n" * (recall_rule._HOOK_CONTEXT_BUDGET - 60), via="app")
+    else:
+        _block_of(recall_rule._HOOK_CONTEXT_BUDGET - 60, seen)
     _push_on(monkeypatch)
     first = _cold(monkeypatch)
     assert _ctx(first).startswith("## Prior work")

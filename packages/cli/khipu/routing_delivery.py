@@ -379,6 +379,9 @@ def plan(out, view, now, cfg, *, session=None, project=None):
     facts = r.plan_facts(view, now)
     text = out.get("text") or ""
     shown = set(out.get("shown_entities") or [])
+    # Left out of a full block to keep it short, with a line saying so and
+    # where to read it: pointed to, so not owed until it changes.
+    covered = set(out.get("covered_entities") or [])
     for entity in entities:
         rule = rules.get(entity)
         whole = (entity in ("note", "priority") or entity.startswith("rule:")
@@ -439,7 +442,7 @@ def plan(out, view, now, cfg, *, session=None, project=None):
         item.update(text=line, label=label, revision=revision)
         # Rules and notes require their complete words. Accounts and holds
         # may use the existing renderer's identifying line projection.
-        visible = line in text if item["whole"] else item["entity"] in shown
+        visible = (line in text or (full and item["entity"] in covered)) if item["whole"] else item["entity"] in shown
         if full and not item["whole"]:
             width = cfg["routing_line_chars"]
             clipped = line[:max(0, width - 3)].rstrip() + "." * min(width, 3) if width and len(line) > width else line

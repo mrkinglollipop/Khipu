@@ -2462,7 +2462,7 @@ def _undo_rule_confirm(line, via, holds=None):
         return routing.unconfirm_rule(line["target"], via=via)
     if before.get("pending_kind") == "changed" and isinstance(before.get("prior_text"), str):
         return routing.edit_rule(line["target"], before["prior_text"], via=via, holds=holds,
-                                 _undo_default_holds=True)
+                                 _undo_default_holds=True, enforce_caps=False)
     return routing.retire_rule(line["target"], via=via)
 
 
@@ -2547,13 +2547,13 @@ def _undo_note_set(line, via):
     from khipu import routing
 
     text = _b(line).get("text")
-    return routing.set_note(text, via=via) if text else routing.end_note(via=via)
+    return routing.set_note(text, via=via, enforce_caps=False) if text else routing.end_note(via=via)
 
 
 def _undo_note_end(line, via):
     from khipu import routing
 
-    return routing.set_note(_b(line).get("text") or "", via=via)
+    return routing.set_note(_b(line).get("text") or "", via=via, enforce_caps=False)
 
 
 def _undo_rule_words(line, via, holds=None):
@@ -2564,7 +2564,7 @@ def _undo_rule_words(line, via, holds=None):
         return back
     words = _b(line).get("text") or ""
     return routing.edit_rule(line["target"], words, via=via, holds=_undo_holds(line, holds),
-                             _undo_default_holds=True)
+                             _undo_default_holds=True, enforce_caps=False)
 
 
 def _retire_rule(n_of):

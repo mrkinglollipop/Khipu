@@ -3082,7 +3082,7 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
 const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }[] = [
   {
     name: "Longest summary at the start of a conversation",
-    help: "Your rules and your note are never cut; this limits what follows them.",
+    help: "Account states and holds; your rules, note and priority have their own limit below.",
     fields: [{ key: "routing_summary_chars", label: "Longest summary", unit: "chars", options: [1000, 1500, 3000, 6000, 0], zero: "No limit" }],
   },
   {
@@ -3099,6 +3099,26 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
     name: "Longest line",
     help: "Each line about an account, a hold or a lane. Rules and your note are never cut.",
     fields: [{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }],
+  },
+  {
+    name: "Longest standing rule",
+    help: "Checked when you add or change a rule; rules already longer keep working.",
+    fields: [{ key: "routing_rule_chars", label: "Longest rule", unit: "chars", options: [300, 600, 1200, 2400, 0], zero: "No limit" }],
+  },
+  {
+    name: "Most standing rules",
+    help: "Checked when you add a rule; more already stored keep working.",
+    fields: [{ key: "routing_rules_max", label: "Most rules", unit: "rules", options: [20, 40, 80, 160, 0], zero: "No limit" }],
+  },
+  {
+    name: "Longest note",
+    help: "Checked when you set the note; a longer one already set keeps working.",
+    fields: [{ key: "routing_note_chars", label: "Longest note", unit: "chars", options: [750, 1500, 3000, 6000, 0], zero: "No limit" }],
+  },
+  {
+    name: "Most of your rules, note and priority shown at the start of a conversation",
+    help: "Past this, rules are cut at a whole rule and a line says how many were left out and how to read them; account state is never pushed out.",
+    fields: [{ key: "routing_rules_chars", label: "Rules shown", unit: "chars", options: [1000, 2000, 3000, 4000, 0], zero: "No limit" }],
   },
   {
     name: "Time allowed before a prompt",

@@ -638,20 +638,20 @@ def _utf16_len(text: str) -> int:
     return hook_shape.utf16_len(text)
 
 
-def fit_start_context(memory: str, routing_text: str | None,
-                      budget: int = _HOOK_CONTEXT_BUDGET) -> tuple[str, bool]:
-    """(the session-start context, whether the routing summary is in it).
-    The summary goes whole or not at all, since its rules and note are never
-    cut. To make room, whole lines are dropped from the bottom of the memory
-    slice, never from the recall rule, and a line says how many. When it
-    still does not fit, the memory part is returned exactly as it was and
-    the summary is left out (and not recorded as delivered), so a later push
-    carries it."""
-    if not routing_text:
-        return memory, False
+class _Text(str):
+    """The routing summary's text, carrying the account-state-only variant
+    (``lean``) that stands in for it when the rules, note and priority leave
+    no room (``fit_start_context``)."""
+    lean: str | None = None
+
+
+def _trimmed_fit(memory: str, routing_text: str, budget: int) -> str | None:
+    """``memory`` and ``routing_text`` together within ``budget``, dropping
+    whole lines from the bottom of the memory slice (never the recall rule)
+    with a line saying how many; None when that is not enough."""
     fixed = _utf16_len(_START_SEP) + _utf16_len(routing_text)
     if _utf16_len(memory) + fixed <= budget:
-        return f"{memory}{_START_SEP}{routing_text}", True
+        return f"{memory}{_START_SEP}{routing_text}"
     body = RULE_MD.strip()
     keep = len(body) if memory.startswith(body) else 0
     head, rest = memory[:keep], memory[keep:].split("\n")
@@ -663,9 +663,26 @@ def fit_start_context(memory: str, routing_text: str | None,
                     "the session-start limit; `khipu_search` for more.)")
             trimmed = f"{trimmed}\n{note}" if trimmed else note
         if _utf16_len(trimmed) + fixed <= budget:
-            return f"{trimmed}{_START_SEP}{routing_text}", True
-    # Too long to arrive whole, and it is never cut: say so and where to read
-    # it, so the rules and note are never dropped in silence (doctor warns too).
+            return f"{trimmed}{_START_SEP}{routing_text}"
+    return None
+
+
+def fit_start_context(memory: str, routing_text: str | None,
+                      budget: int = _HOOK_CONTEXT_BUDGET, lean: str | None = None) -> tuple[str, bool]:
+    """(the session-start context, whether the routing summary is in it).
+    To make room, whole lines are dropped from the bottom of the memory
+    slice, never from the recall rule, and a line says how many. When the
+    summary still does not fit, the account and state lines alone (``lean``,
+    or the text's own ``lean``) go in their place, with a line saying the
+    rules, note and priority are left to read: the owner's rules never push
+    account state out. Only when even that does not fit is the summary
+    replaced by a pointer, and then the memory part is returned as it was."""
+    if not routing_text:
+        return memory, False
+    lean = lean or getattr(routing_text, "lean", None)
+    for candidate in (routing_text, lean):
+        if candidate and (fitted := _trimmed_fit(memory, candidate, budget)) is not None:
+            return fitted, True
     if _utf16_len(memory) + _utf16_len(_START_SEP + ROUTING_TOO_LONG) <= budget:
         return f"{memory}{_START_SEP}{ROUTING_TOO_LONG}", False
     return memory, False
@@ -734,7 +751,7 @@ def _routing_child(write_fd: int, read_fd: int, budget: float, deadline: float, 
         if isinstance(out, dict):
             data = memoryview(json.dumps({k: out.get(k) for k in (
                 "kind", "text", "version", "epoch", "generation", "owed_entities", "shown_entities",
-                "notices", "routing_changes", "delivery_reservation", "delivery_plan")}).encode("utf-8"))
+                "covered_entities", "lean_text", "notices", "routing_changes", "delivery_reservation", "delivery_plan")}).encode("utf-8"))
             while data:
                 data = data[os.write(write_fd, data):]
             os.close(write_fd)  # the hook has its answer; nothing below delays it
@@ -836,6 +853,10 @@ class _RoutingAtStart:
                 out = offer(out, session=self.session)
                 text = out.get("text")
             self.out = out
+            lean = out.get("lean_text") if isinstance(out, dict) else None
+            if isinstance(text, str) and isinstance(lean, str) and lean.strip():
+                text = _Text(text)
+                text.lean = lean
             return text
         except Exception:
             return None
@@ -860,9 +881,11 @@ class _RoutingAtStart:
             # A late child may run on; reaping it never holds the hook.
             threading.Thread(target=reap, name="khipu-routing-reap", daemon=True).start()
 
-    def delivered(self, session_id) -> None:
+    def delivered(self, session_id, *, lean: bool = False) -> None:
         """Reset the session's last-seen version to the one just printed and
-        record the time of this full summary."""
+        record the time of this full summary. ``lean``: only the account
+        state went out (``fit_start_context``), so the rules, note and
+        priority stay owed to later prompts."""
         out = self.out
         if not isinstance(session_id, str) or not session_id or not isinstance(out, dict):
             return
@@ -879,7 +902,7 @@ class _RoutingAtStart:
 
             if out.get("notices") and not out.get("routing_changes"):
                 return
-            if out.get("routing_changes"):
+            if out.get("routing_changes") and not lean:
                 from khipu.routing_delivery import acknowledge
 
                 if not acknowledge(session_id, out["routing_changes"], reservation=out.get("delivery_reservation")):
@@ -908,7 +931,7 @@ def session_start_main(*, shape: str | None = None) -> None:
     """
     started = time.monotonic()
     payload = {}
-    injected, pushed = 0, False
+    injected, pushed, shown_as = 0, False, None
     reason, want = "ok", "claude"
     try:
         payload = _session_start_payload()
@@ -937,8 +960,11 @@ def session_start_main(*, shape: str | None = None) -> None:
         finally:
             _START_IS_JOB.reset(token)
         room = hook_shape.budget(want)
-        ctx, pushed = (fit_start_context(memory, routing.text()) if room == _HOOK_CONTEXT_BUDGET
-                       else fit_start_context(memory, routing.text(), room))
+        routing_text = routing.text()
+        ctx, pushed = (fit_start_context(memory, routing_text) if room == _HOOK_CONTEXT_BUDGET
+                       else fit_start_context(memory, routing_text, room))
+        lean_only = bool(pushed and getattr(routing_text, "lean", None) and routing_text not in ctx)
+        shown_as = "lean" if lean_only else "pointer" if (routing_text and not pushed and ROUTING_TOO_LONG in ctx) else None
         out = hook_shape.render(want, "SessionStart", ctx)
         from khipu import wire
 
@@ -950,7 +976,7 @@ def session_start_main(*, shape: str | None = None) -> None:
             except Exception as exc:
                 reason = f"error: {type(exc).__name__}: {exc}"
                 return
-            routing.delivered(sid or None)
+            routing.delivered(sid or None, lean=lean_only)
     except Exception as exc:
         reason = f"error: {type(exc).__name__}: {exc}"
         raise
@@ -965,7 +991,7 @@ def session_start_main(*, shape: str | None = None) -> None:
                 harness = "claude_code"
             session = hook_shape.session_id(payload) or "unknown"
             msg = (f"session={session} harness={harness} source={payload.get('source') or 'startup'} "
-                   f"reason={reason} bytes={injected} routing={'yes' if pushed and injected else 'no'} "
+                   f"reason={reason} bytes={injected} routing={shown_as or ('yes' if pushed and injected else 'no')} "
                    f"ms={(time.monotonic() - started) * 1000:.1f}")
             recall_prompt._log(" ".join(msg.split()), tag="khipu-session-start")
         except Exception:
