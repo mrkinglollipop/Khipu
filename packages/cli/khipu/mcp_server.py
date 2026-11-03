@@ -3088,7 +3088,7 @@ def _tool_route_priority(args: dict) -> dict:
             args["account"], append=args.get("append"), role=args.get("role"), exception=args.get("exception"),
             end_exception=args.get("end_exception"), until=until, owner_request=owner_request,
             author=routing.conversation_author(), expect=args.get("expect"), entry_revision=args.get("revision"),
-            base=base, share_pct=share_pct))
+            base=base, share_pct=share_pct), only=args["account"])
     entries = args.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("entries must be the owner's accounts, in his order")

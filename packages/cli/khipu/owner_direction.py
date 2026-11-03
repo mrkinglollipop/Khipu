@@ -114,7 +114,7 @@ ROUTING_INSTANT: frozenset[str] = frozenset({
     "route.pause", "route.lift", "route.note.set", "route.note.end", "route.rule.add", "route.rule.edit",
     "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
     "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.amend", "route.priority.confirm",
-    "route.priority.undo", "route.priority.clear",
+    "route.priority.undo",
 })
 
 
@@ -2085,7 +2085,7 @@ def finish(result: dict | None, **extra) -> dict | None:
     if isinstance(result, dict):
         done["result"] = {k: v for k, v in result.items() if k != "owner_action"}
     line = pend.get("line")
-    receipt = None if refused or line is None else _receipt_text(want, stamp, line, result)
+    receipt = None if refused or line is None else _receipt_text(want, stamp, line, result, pend.get("before"))
     if receipt is not None:
         done["receipt"] = {"what": receipt[0]}
     incomplete = False
@@ -2181,7 +2181,7 @@ def _quoted(text) -> str:
     return f' "{words}"' if words else ""
 
 
-def _receipt_what(want: dict, result) -> str:
+def _receipt_what(want: dict, result, before=None) -> str:
     """What a routing change did, in a few words and the owner's own."""
     from khipu import routing
 
@@ -2222,13 +2222,45 @@ def _receipt_what(want: dict, result) -> str:
         return f"Changed {entry.get('label') or routing._label_for_key(target)} in the priority{until}:" + _quoted(words)
     if action == "route.priority.undo":
         return "Undid the priority change"
-    if action == "route.priority.clear":
-        return "Cleared the priority"
     verb = "Confirmed" if action == "route.priority.confirm" else "Set"
-    return f"{verb} the priority" + (f": {routing._word_clip(labels, RECEIPT_WORDS)}" if labels else "")
+    # Every account whose role or exception words go live, with the new words,
+    # so the owner sees what the change put in force (not only the labels).
+    # A confirm compares with the priority it replaces, a set with the one before.
+    prior = None
+    if isinstance(before, dict):
+        prior = (before.get("replaced") or {}).get("entries") if action == "route.priority.confirm" \
+            else before.get("entries")
+    changes = _priority_changes(held.get("entries") or [], prior or [])
+    return f"{verb} the priority" + (f": {changes}" if changes else f": {labels}" if labels else "")
 
 
-def _receipt_text(want: dict, stamp: dict, line: dict, result) -> tuple[str, str] | None:
+PRIORITY_WORDS = 70  # characters of one account's new words in a receipt
+PRIORITY_RECEIPT_MOST = 400
+
+
+def _priority_changes(entries: list, prior: list) -> str:
+    """Each account in ``entries`` whose role or exceptions differ from
+    ``prior`` (or that is new), with its new words clipped, joined; empty when
+    nothing differs."""
+    from khipu import routing
+
+    was = {e.get("account"): e for e in prior if isinstance(e, dict)}
+    parts = []
+    for entry in entries:
+        old = was.get(entry.get("account"))
+        label = entry.get("label") or routing._label_for_key(str(entry.get("account")))
+        if old is None or old.get("role") != entry.get("role"):
+            words = routing._word_clip(entry.get("role") or "", PRIORITY_WORDS)
+            parts.append(f'{label} "{words}"' if words else f"{label} (no words)")
+        old_ex = {x.get("id"): x for x in (old or {}).get("exceptions") or [] if isinstance(x, dict)}
+        for exc in entry.get("exceptions") or []:
+            if isinstance(exc, dict) and old_ex.get(exc.get("id")) != exc:
+                parts.append(f'{label} exception "{routing._word_clip(exc.get("text") or "", PRIORITY_WORDS)}"')
+    text = "; ".join(parts)
+    return text if len(text) <= PRIORITY_RECEIPT_MOST else text[:PRIORITY_RECEIPT_MOST].rsplit(" ", 1)[0] + "..."
+
+
+def _receipt_text(want: dict, stamp: dict, line: dict, result, before=None) -> tuple[str, str] | None:
     """(what, the whole sentence) for a routing change made by direction, or
     None when this change gets no receipt."""
     action = want["action"]
@@ -2242,7 +2274,7 @@ def _receipt_text(want: dict, stamp: dict, line: dict, result) -> tuple[str, str
         elif stamp.get("auth") != "direction":
             return None
         elif action in ROUTING_INSTANT:
-            what = _receipt_what(want, result)
+            what = _receipt_what(want, result, before)
         else:
             return None
     except Exception:  # noqa: BLE001 - a receipt never stops the change; the plain verb says enough

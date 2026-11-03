@@ -509,7 +509,7 @@ def act(action, args) -> tuple[bool, dict]:
     return _run(action, full)
 
 
-def apply_request(kind: str, out) -> dict:
+def apply_request(kind: str, out, *, only: str | None = None) -> dict:
     """A conversation's request (``khipu_route_priority``, ``khipu_route_rule``)
     taken on the owner's own typed turn applies at once: the same confirm the
     owner would give (``route.priority.confirm`` / ``route.rule.confirm`` by
@@ -517,7 +517,14 @@ def apply_request(kind: str, out) -> dict:
     every conversation and undone in one step. A call that does not pass the
     owner check (a dispatched job, a headless turn, a handoff, a T3 turn
     without proof) leaves the request pending exactly as before; so does a
-    crossed or refused request. ``out`` is the request's answer."""
+    crossed or refused request. ``out`` is the request's answer.
+
+    ``only`` (an amend of one account's entry): the amend rebuilds the whole
+    stored priority, so it also carries whatever another conversation left
+    pending in the other entries. It applies at once only when the request
+    would make live nothing but that account's own entry: every other entry
+    must equal the owner's confirmed priority it replaced. Otherwise it is
+    left pending, as before."""
     from khipu import owner_direction, routing
 
     if not isinstance(out, dict) or out.get("ok") is False:
@@ -531,6 +538,18 @@ def apply_request(kind: str, out) -> dict:
             # conversation that landed in between is never confirmed unseen.
             if not stored.get("pending") or not mine or (stored.get("written_by") or {}).get("session") != mine:
                 return out
+            if only is not None:
+                owned = (stored.get("replaced") or {}).get("entries")
+                try:
+                    key = routing._resolve_account_key(only)
+                except routing.RouteError:
+                    return out
+                if not isinstance(owned, list):
+                    return out
+                was = {e.get("account"): e for e in owned}
+                now_ = {e.get("account"): e for e in stored.get("entries") or []}
+                if any(was.get(a) != now_.get(a) for a in set(was) | set(now_) if a != key):
+                    return out
             action, args = "route.priority.confirm", {"expect": view.get("priority_version") or "p0"}
         else:
             number = out.get("n")

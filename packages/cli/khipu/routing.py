@@ -4734,7 +4734,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     effective.update({f"owner:{e['target']}": {"text": e.get("text"),
                                                **({"receipt": True, "at": e.get("written_at")}
                                                   if e.get("receipt") is True else {})}
-                      for e in owner_changes[-OWNER_CHANGES_KEPT:]})
+                      for e in [*[c for c in owner_changes if c.get("receipt") is not True][-OWNER_CHANGES_KEPT:],
+                                *[c for c in owner_changes if c.get("receipt") is True][-RECEIPTS_KEPT:]]})
     if priority_out is not None:
         effective["priority"] = _effective_priority(priority_out)
     effective.update({f"lane:{u['runner']}/{u['lane']}": {"state": u["state"], "until": u["until"],
@@ -11877,6 +11878,7 @@ def _owner_stamp(event: dict) -> dict:
 # none is named in the push by ``owner_change``.
 _owner_stamped = [0]
 OWNER_CHANGES_KEPT = 20
+RECEIPTS_KEPT = 20  # their own cap: a burst of receipts never pushes another owner change out
 
 
 RECEIPT_KEPT_S = 3 * 24 * 3600  # how long a receipt is offered to a conversation that has not had it
