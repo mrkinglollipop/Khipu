@@ -93,3 +93,7 @@ Out: routing behaviour; the other 12 Settings sections' layout; answering Needs 
 1. **Should Accounts and routing get its own place in the left rail, out of Settings?** Recommended: yes; you check it daily. The mock shows this.
 2. **Should "Keep settings the same" cover all of Settings, not just this screen?** Recommended: yes, this screen first, always excluding secrets, paths and machine limits.
 3. **Rules copied from your old file are in use either way; confirming only removes a label. Should they keep asking?** Recommended: no; list them once under "When you have time".
+
+## Owner's decisions (2026-11-03)
+
+All three as recommended: its own place in the left rail; "Keep settings the same" covers all of Settings, this screen first, excluding secrets, paths and machine limits; rules copied from the old file are listed once under "When you have time". Acceptance, in his words: "organized and easy for a freaking human to read, and the text isn't screwed up."
