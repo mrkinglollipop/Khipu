@@ -1805,6 +1805,12 @@ def _attach_prior_work(payload: dict, args: dict) -> None:
         pass
 
 
+_QUEUED_CAPTURE_DROPPED = ("open_loops", "closed_loops", "decisions", "decision_details",
+                           "preferences", "topics", "people", "deliverables", "verbatim")
+_QUEUED_CAPTURE_REASON = ("not stored: a capture queued for the stop hook carries only the summary "
+                          "(as its note); the hook derives these from the transcript")
+
+
 def _tool_capture(args: dict) -> dict:
     # Locked semantics (agent-integration note, "MCP + CLI write / read
     # semantics"), amended for K1: a local capture hook (khipu-stop-hook /
@@ -1834,9 +1840,24 @@ def _tool_capture(args: dict) -> dict:
         # about themselves, never from which state file is newest: two sessions
         # can be live at once. An unresolvable caller is refused, not guessed.
         harness, sid, resolved_by = resolve_session_ref(harness or None, sid or None)
-        request_capture_now(harness, sid, note=summary.strip())
-        return {"queued": True, "captured_by": "next stop", "harness": harness, "session_id": sid,
-                "resolved_by": resolved_by}
+        kept: dict = {}
+        request_capture_now(harness, sid, note=summary.strip(), outcome=kept)
+        out = {"queued": True, "captured_by": "next stop", "harness": harness, "session_id": sid,
+               "resolved_by": resolved_by}
+        if kept.get("truncated"):
+            # The flag file holds at most MAX_CAPTURE_NOTE characters, newest
+            # kept: say what was cut instead of acknowledging the whole note.
+            out.update(truncated=True, stored_chars=kept["stored_chars"],
+                       sent_chars=kept["sent_chars"], dropped_chars=kept["dropped_chars"])
+        # The queued capture carries the note only: the structured fields this
+        # call also gave are not part of it, and are named instead of vanishing.
+        dropped = [{"field": key, "count": len(args[key]), "reason": _QUEUED_CAPTURE_REASON}
+                   for key in _QUEUED_CAPTURE_DROPPED
+                   if isinstance(args.get(key), (list, dict)) and args[key]]
+        if dropped:
+            out["dropped"] = dropped
+            out["partial"] = True
+        return out
 
     mode = _capture_mode()
     if mode != "hub":
@@ -1887,7 +1908,57 @@ def _tool_capture(args: dict) -> dict:
     episode_id = _captured_episode_id(written)
     if episode_id is not None:
         out["episode_id"] = episode_id
+    out.update(_capture_commitment_answer(args, written))
     return out
+
+
+def _capture_commitment_answer(args: dict, written: dict) -> dict:
+    """What became of the open/closed loops the caller sent, from write_pg's
+    ``commitments`` report. The episode is stored either way, so ``ok`` stays
+    true (as a mixed batch of owed changes does); ``dropped`` names each loop
+    that did not take effect with the reason, and ``partial`` says there are
+    some. ``commitments`` carries the counts."""
+    facts = written.get("commitments") if isinstance(written.get("commitments"), dict) else {}
+    given = {"open_loop": args.get("open_loops"), "closed_loop": args.get("closed_loops")}
+    sent = any(isinstance(v, list) and v for v in given.values())
+    dropped: list[dict] = []
+    answer: dict = {}
+    if facts.get("step_failed"):
+        # The commitment steps rolled back whole: every loop sent is unkept.
+        for kind, items in given.items():
+            for item in items if isinstance(items, list) else []:
+                text = item.get("text") if isinstance(item, dict) else item
+                dropped.append({"kind": kind, "text": str(text)[:300],
+                                "reason": f"the commitment step failed and was rolled back: {facts['step_failed']}"})
+        answer["commitments"] = {"step_failed": facts["step_failed"]}
+    else:
+        dropped = list(facts.get("rejected") or []) + list(facts.get("not_closed") or [])
+        if facts:
+            answer["commitments"] = {k: int(facts.get(k) or 0) for k in ("opened", "restated", "closed")}
+        elif sent:
+            dedup = written.get("dedup") if isinstance(written.get("dedup"), dict) else {}
+            if dedup.get("action") == "skip" and dedup.get("match") == "identity":
+                # An exact replay: its loops were handled by the first write.
+                answer["commitments"] = {
+                    "not_processed": "this capture was already recorded; its loops were handled then"}
+            elif dedup.get("action") in ("skip", "merge"):
+                # Matched on resemblance (or a receipt of one): no fact step ran
+                # for this payload, so its loops were not stored.
+                why = f"capture matched episode {written.get('episode_id')}; loops not stored"
+                for kind, items in given.items():
+                    for item in items if isinstance(items, list) else []:
+                        text = item.get("text") if isinstance(item, dict) else item
+                        dropped.append({"kind": kind, "text": str(text)[:300], "reason": why})
+                answer["commitments"] = {"not_processed": why}
+    answer["dropped"] = dropped
+    gaps = facts.get("fact_gaps")
+    if gaps:
+        # Other fact steps (decisions, close rules, deliverables) that failed
+        # and were rolled back; the episode itself is stored.
+        answer["fact_gaps"] = gaps
+    if dropped or gaps:
+        answer["partial"] = True
+    return answer
 
 
 def _captured_episode_id(written: dict) -> int | None:
@@ -2357,7 +2428,18 @@ def _owed_change_on_hub(args: dict) -> dict:
                         "id": cid, "ok": False,
                         "error": ("an open item already says the same" if action == "reopen"
                                   else f"no such commitment: {cid}")})
-                return {"ok": True, "changed": sum(1 for r in results if r["ok"]), "results": results,
+                changed = sum(1 for r in results if r["ok"])
+                failed = [r["id"] for r in results if not r["ok"]]
+                if changed == 0:
+                    # Nothing moved: not an ok (and nothing to keep, so the
+                    # refusal's rollback costs nothing). The per-id reasons stay.
+                    return {"ok": False, "changed": 0, "results": results, "failed": failed,
+                            "error": "no commitment was changed: " + str(results[0]["error"]) if results
+                            else "no commitment was changed", **echo}
+                return {"ok": True, "changed": changed, "results": results,
+                        # Some ids landed and some did not: the landed ones
+                        # are kept (a refusal would undo them), the rest named.
+                        **({"partial": True, "failed": failed} if failed else {}),
                         **({"batches": batches} if batches else {}), **echo}
 
             return owner_writes.apply_on_hub(conn, cur, "owed_update", args, write, echo)

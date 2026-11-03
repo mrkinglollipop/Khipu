@@ -1868,7 +1868,19 @@ def _capture_now_lock(harness: str, sid: str):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def request_capture_now(harness: str, sid: str, note: str | None = None) -> Path:
+def _note_outcome(sent: int, stored: int, dropped: int) -> dict:
+    """What a capture-now request kept: ``sent_chars`` came in with this call,
+    ``stored_chars`` are in the flag file now, and ``dropped_chars`` were cut
+    from the front (the oldest text) to stay within MAX_CAPTURE_NOTE."""
+    return {"truncated": dropped > 0, "sent_chars": sent, "stored_chars": stored,
+            "dropped_chars": dropped}
+
+
+def request_capture_now(harness: str, sid: str, note: str | None = None, *,
+                        outcome: dict | None = None) -> Path:
+    """Flag a session for capture at its next Stop/PreCompact/SessionEnd. The
+    note is capped at MAX_CAPTURE_NOTE characters (newest kept); ``outcome``,
+    when given, receives :func:`_note_outcome` so the caller can say so."""
     p = _capture_now_flag_path(harness, sid)
     with _capture_now_lock(harness, sid) as acquired:
         if not acquired:
@@ -1889,6 +1901,8 @@ def request_capture_now(harness: str, sid: str, note: str | None = None) -> Path
             text += ("\n\n" if text else "") + note
             parts.append({"end": len(text), "hash": hashlib.sha256(note.encode()).hexdigest()})
         cut = max(0, len(text) - MAX_CAPTURE_NOTE)
+        if outcome is not None:
+            outcome.update(_note_outcome(len(note or ""), len(text) - cut, cut))
         parts = [dict(part, end=part["end"] - cut) for part in parts if part["end"] > cut]
         tmp.write_text(json.dumps({"note": text[cut:] or None, "note_parts": parts, "requested_at": _mint_ts(),
                                    "request_id": uuid.uuid4().hex}), encoding="utf-8")

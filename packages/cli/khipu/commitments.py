@@ -18,6 +18,8 @@ import json
 import os
 import re
 import subprocess
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from functools import lru_cache
 from typing import Any
@@ -884,6 +886,101 @@ def _parse_due_after(raw: Any) -> tuple[str, Any]:
     return "NULL", None
 
 
+_REPORT = threading.local()
+
+REJECTION_WORDS = {
+    "empty": "the text is empty",
+    "reporting": "it reads as a status report, not something owed",
+    "too-short": f"fewer than {MIN_COMMITMENT_WORDS} words, too vague to be a commitment",
+    "no-action": "it names no action to take",
+}
+
+
+@contextmanager
+def collecting(report: dict[str, Any]):
+    """Collect what this capture's commitment steps did with the loops it was
+    given into ``report`` (``opened``, ``restated``, ``closed``, and the
+    ``rejected`` / ``not_closed`` lists of ``{kind, text, reason}``), so the
+    caller can answer with it. Outside this context the steps record nothing."""
+    previous = getattr(_REPORT, "current", None)
+    _REPORT.current = report
+    try:
+        yield report
+    finally:
+        _REPORT.current = previous
+
+
+def _report_count(key: str, n: int = 1) -> None:
+    report = getattr(_REPORT, "current", None)
+    if report is not None:
+        report[key] = int(report.get(key) or 0) + n
+
+
+def _report_item(key: str, kind: str, text: str, reason: str, row: int | None = None) -> None:
+    report = getattr(_REPORT, "current", None)
+    if report is not None:
+        # ``_row`` is the commitment the item was matched to; it is dropped
+        # from the answer by :func:`finish_report` once the later steps ran.
+        report.setdefault(key, []).append(
+            {"kind": kind, "text": text[:300], "reason": reason, **({"_row": row} if row else {})})
+
+
+def _report_closed_row(row_id: int) -> None:
+    report = getattr(_REPORT, "current", None)
+    if report is not None:
+        report.setdefault("_closed_rows", []).append(row_id)
+
+
+def _loop_label(payload: dict[str, Any], text: str) -> str:
+    """``closed_loop``, or ``decision`` for a ``done:`` decision that closed (or
+    tried to close) a commitment through the same matcher."""
+    loops = {_DONE_PREFIX_RE.sub("", str(i.get("text") if isinstance(i, dict) else i or "").strip())
+             for i in payload.get("closed_loops") or []}
+    return "closed_loop" if text in loops else "decision"
+
+
+def _short_error(exc: BaseException) -> str:
+    """The exception class and a short plain message: a database error shows
+    its class and SQLSTATE only (its text names tables, columns and SQL)."""
+    name = type(exc).__name__
+    if type(exc).__module__.split(".")[0] == "psycopg":
+        state = getattr(exc, "sqlstate", None)
+        return f"{name} (sqlstate {state})" if state else name
+    first = (str(exc).strip().splitlines() or [""])[0][:100]
+    return f"{name}: {first}" if first else name
+
+
+def finish_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Settle a capture's report once every commitment step ran: a loop the
+    close step could not close but a later step (the session plan) did is not
+    reported as unclosed, and the internal row ids are removed."""
+    closed_rows = set(report.pop("_closed_rows", ()))
+    if report.get("not_closed"):
+        report["not_closed"] = [{k: v for k, v in item.items() if k != "_row"}
+                                for item in report["not_closed"] if item.get("_row") not in closed_rows]
+        if not report["not_closed"]:
+            del report["not_closed"]
+    return report
+
+
+def report_step_failed(exc: BaseException, step: str = "commitments") -> None:
+    """A fact step was rolled back whole. For the commitment steps nothing they
+    were given landed, whatever they had counted before the error; any other
+    step (decisions, close rules, deliverables) is listed under ``fact_gaps``."""
+    report = getattr(_REPORT, "current", None)
+    if report is None:
+        return
+    error = _short_error(exc)
+    if step.endswith("commitments"):
+        gaps = report.get("fact_gaps")
+        report.clear()
+        report["step_failed"] = error
+        if gaps:
+            report["fact_gaps"] = gaps
+    else:
+        report.setdefault("fact_gaps", []).append({"step": step, "error": error})
+
+
 def _normalize_open_loop(item: Any) -> dict[str, Any] | None:
     if isinstance(item, str):
         text = item.strip()
@@ -1230,6 +1327,8 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
     for raw in items:
         norm = _normalize_open_loop(raw)
         if norm is None:
+            rejected += 1
+            _report_item("rejected", "open_loop", str(raw), "not usable: it is not text, or is empty")
             continue
         # Owner and future_trigger are decided HERE, deterministically, before
         # anything else looks at the item: the reporting rule (rule 3) is
@@ -1243,6 +1342,8 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
         if reason is not None:
             rejected += 1
             _log(f"rejected open_loop ({reason}): {norm['text'][:120]!r}")
+            _report_item("rejected", "open_loop", norm["text"],
+                         f"{reason}: {REJECTION_WORDS.get(reason, 'not a commitment')}")
             continue
         # content_hash and dedup key off the UNDECORATED text — the due
         # phrase is presentational, not part of the commitment's identity.
@@ -1289,6 +1390,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             if seen_ready:
                 _touch_seen(cur, existing)
             _claim_restatement(cur, existing, episode_id, norm["text"], payload.get("project"))
+            _report_count("restated")
             continue
         if existing is not None:
             if seen_ready:
@@ -1315,6 +1417,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                     labels += pr_requirement_labels(row.get("latest_text") or "", payload.get("project"))
                 if labels:
                     _keep_pr_refs(cur, existing, labels)
+            _report_count("restated")
             continue
         linked = [r["id"] for r in others
                   if r["id"] == exact or _row_near_dup_score(norm["text"], r) >= NEAR_DUP_MIN_SCORE]
@@ -1381,6 +1484,9 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
             )
             landed = cur.rowcount > 0
             if landed or not prov:
+                if not landed:
+                    # The same words were already open: nothing new was stored.
+                    _report_count("restated")
                 break
             # The same words were opened by a concurrent capture after this
             # one read the table: this episode claims that item instead.
@@ -1389,6 +1495,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                 if seen_ready:
                     _touch_seen(cur, other)
                 _claim_restatement(cur, other, episode_id, norm["text"], payload.get("project"))
+                _report_count("restated")
                 break
             # The winner retired (closed, or forgotten) before it could be
             # locked: its open slot is free again, so this item takes the
@@ -1401,6 +1508,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
                     "commitments: the open item this capture restates kept retiring; retry")
         if landed:
             inserted += 1
+            _report_count("opened")
             if prov:
                 row = cur.fetchone()
                 _claim_opened(cur, int(row[0]), episode_id, stored_text, norm["text"])
@@ -1978,6 +2086,9 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         return 0
     open_rows = _open_commitments(cur, scope, payload=payload, episode_id=episode_id, with_owner=True)
     if not open_rows:
+        for text, _kind, _reference in candidates:
+            _report_item("not_closed", _loop_label(payload, text), text,
+                         "no open commitment in this scope to close")
         return 0
     from khipu.config import float_setting
 
@@ -2030,6 +2141,10 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
             if len(own) == 1:
                 best_id, tied = own[0], False
         if best_id is None or tied or (best_via == "cosine" and semantic_matches > 1):
+            _report_item("not_closed", _loop_label(payload, text), text,
+                         "it matched more than one open commitment equally, so none was closed"
+                         if (tied or best_id is not None)
+                         else "it matched no open commitment in this scope")
             continue
         best = next(r for r in open_rows if r["id"] == best_id)
         # Every pull request the item was ever said to need counts, not only
@@ -2037,6 +2152,8 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
         why_not = evidence_problem(text, best["text"], payload.get("project"), item=best)
         if why_not:
             _log(f"kept commitment {best_id} open: {why_not}")
+            _report_item("not_closed", _loop_label(payload, text), text,
+                         f"commitment {best_id} kept open: {why_not}", row=best_id)
             continue
         if close_by_rule(cur, best_id, rule="loop",
                          reason=f"{best_via} match ({best_score:.2f}): {text[:200]!r}",
@@ -2045,7 +2162,13 @@ def auto_close(cur, payload: dict[str, Any], episode_id: int) -> int:
                                    "score": round(best_score, 3)}):
             already_closed.add(best_id)
             closed += 1
+            _report_count("closed")
+            _report_closed_row(best_id)
             _log(f"closed commitment {best_id} via {best_via} ({best_score:.2f}) at episode {episode_id}")
+        else:
+            _report_item("not_closed", _loop_label(payload, text), text,
+                         f"commitment {best_id} matched but was not closed: its rules keep it open "
+                         "(the owner's own item, or its evidence is incomplete)", row=best_id)
     return closed
 
 
@@ -2290,6 +2413,8 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         if close_by_rule(cur, row["id"], rule=rule, reason=reason, key=key, evidence=evidence,
                          episode=episode_id, proof=hit if rule == "session-plan" else None):
             closed += 1
+            _report_count("closed")
+            _report_closed_row(row["id"])
     if closed:
         _log(f"closed {closed} session-end commitment(s) for {session_id}")
     return closed

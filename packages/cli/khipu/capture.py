@@ -162,6 +162,11 @@ def _record_fact_gap(cur, episode_id: int | None, step: str, exc: BaseException,
     gap in the same transaction, so doctor reports it and the nightly
     re-runs it (invariant I4). Only on a hub with migration 0047; a gap that
     cannot be recorded defers the whole capture instead of losing the items."""
+    # The capture's caller is told which step lost its items, whether or not
+    # this hub can record the gap (a hub without 0047 has no table for it).
+    from khipu import commitments as _commitments
+
+    _commitments.report_step_failed(exc, step)
     if episode_id is None:
         return
     from khipu import provenance
@@ -2048,7 +2053,17 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
     # write must still carry it into the outbox, so the retry gets a copy.
     checkout = payload.get("checkout")
     try:
-        stats = write_pg(payload)
+        # What the commitment steps did with the loops this capture carried
+        # rides back as ``commitments`` (opened, restated, closed, rejected and
+        # not_closed with a reason each, or step_failed / fact_gaps), so the
+        # caller can say which were not kept. Absent when no loop was involved.
+        from khipu import commitments as _commitments
+
+        report: dict[str, Any] = {}
+        with _commitments.collecting(report):
+            stats = write_pg(payload)
+        if report and isinstance(stats, dict):
+            stats["commitments"] = _commitments.finish_report(report)
         if result is not None:
             result.update(stats)
         if stats.get("forgotten_source"):

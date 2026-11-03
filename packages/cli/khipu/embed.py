@@ -3396,6 +3396,8 @@ def hybrid_search(
                     )
                     if rerank_failed:
                         degraded_legs.append("rerank")
+                    if rerank_info.get("skipped"):
+                        timing["rerank_skipped"] = rerank_info.get("reason")
                 except Exception as exc:  # noqa: BLE001 — a rerank failure must not sink the search
                     degraded_legs.append("rerank")
                     rerank_info = {"applied": False, "model": None, "ms": 0.0,
