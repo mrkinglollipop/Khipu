@@ -89,10 +89,47 @@ def test_the_audits_lost_update_whole_list_with_a_stale_copy_of_another_entry(wo
     assert c["ok"] and _roles() == {"Claude": "alpha-from-a", "Codex": "beta-from-c"}
 
 
-def test_an_amend_must_carry_a_revision_or_the_version(world):
+def test_an_amend_with_no_revision_and_no_version_is_written_as_before(world):
+    """The CLI's amend at the owner's request (no --expect, no --revision)
+    keeps working: it patches that one entry and no other."""
     _revs, base = _seed()
-    with pytest.raises(routing.RouteError, match="revision"):
-        routing.request_priority_amend("Claude", role="x", owner_request="the owner asked", author=A, base=base)
+    out = routing.request_priority_amend("Claude", role="x", owner_request="the owner asked", author=A, base=base)
+    assert out["ok"] and _roles() == {"Claude": "x", "Codex": "beta"}
+
+
+def test_a_replaced_priority_shows_its_own_entries_revisions(world):
+    revs, base = _seed()
+    routing.request_priority_amend("Claude", role="alpha-from-a", owner_request="the owner asked", author=A,
+                                   base=base, entry_revision=revs["Claude"])
+    shown = routing.conversation_view()["priority"]
+    now_revs = {e["label"]: e["revision"] for e in shown["entries"]}
+    old_revs = {e["label"]: e["revision"] for e in shown["replaced"]["entries"]}
+    assert old_revs == revs and now_revs["Claude"] != revs["Claude"] and now_revs["Codex"] == revs["Codex"]
+
+
+def test_a_whole_list_must_carry_a_revision_for_every_existing_entry(world):
+    revs, base = _seed()
+    before = routing.events_file().read_bytes()
+    # No revision on Codex, which is already in the priority.
+    out = routing.conversation_priority([{"account": "Claude", "role": "c", "revision": revs["Claude"]},
+                                         {"account": "Codex", "role": "d"}],
+                                        owner_request="the owner asked", author=B, base=base)
+    assert out["ok"] is False and out["status"] == "crossed" and "revision" in out["error"]
+    assert [x["label"] for x in out["lost"]] == ["Codex"]
+    # Codex left out is an overwrite too.
+    out = routing.conversation_priority([{"account": "Claude", "role": "c", "revision": revs["Claude"]}],
+                                        owner_request="the owner asked", author=B, base=base)
+    assert out["ok"] is False and [x["label"] for x in out["lost"]] == ["Codex"]
+    assert routing.events_file().read_bytes() == before
+    # A new account needs none; with the whole version (expect) none is needed at all.
+    ok = routing.conversation_priority([{"account": "Claude", "role": "c", "revision": revs["Claude"]},
+                                        {"account": "Codex", "role": "d", "revision": revs["Codex"]}],
+                                       owner_request="the owner asked", author=B, base=base)
+    assert ok["ok"] and _roles() == {"Claude": "c", "Codex": "d"}
+    _, base = _read()
+    ok = routing.request_priority([{"account": "Codex", "role": "only"}], owner_request="the owner asked",
+                                  author=A, base=base, expect=routing.priority_version())
+    assert ok["ok"] and _roles() == {"Codex": "only"}
 
 
 def test_the_priority_version_still_guards_when_given(world):
@@ -116,8 +153,8 @@ def test_owner_writes_keep_their_semantics(world):
     assert _roles() == {"Codex": "only and more"}
 
 
-def test_whole_lists_without_revisions_are_written_as_before(world):
-    _revs, base = _seed()
+def test_a_first_priority_needs_no_revisions(world):
+    base = routing.conversation_view()["priority_owner_revision"]
     out = routing.request_priority([{"account": "Codex", "role": "first"}, {"account": "Claude"}],
                                    owner_request="the owner asked", author=A, base=base)
     assert out["ok"] and [e["label"] for e in routing.read_view()["priority"]["entries"]] == ["Codex", "Claude"]
@@ -144,3 +181,15 @@ def test_the_tool_takes_revision_in_place_of_expect(world):
     tool = next(t for t in mcp_server.TOOLS if t["name"] == "khipu_route_priority")
     assert "revision" in tool["inputSchema"]["properties"]
     assert "revision" in tool["inputSchema"]["properties"]["entries"]["items"]["properties"]
+
+
+def test_the_cli_amend_takes_revision(world, capsys):
+    from khipu import cli
+
+    revs, base = _seed()
+    code = cli.main(["route", "priority", "amend", "Claude", "--role", "from the cli", "--at-owner-request",
+                     "the owner asked", "--base", base, "--revision", revs["Claude"]])
+    assert code == 0 and json.loads(capsys.readouterr().out)["ok"]
+    code = cli.main(["route", "priority", "amend", "Claude", "--role", "again", "--at-owner-request",
+                     "the owner asked", "--base", base, "--revision", revs["Claude"]])
+    assert json.loads(capsys.readouterr().out)["status"] == "crossed"

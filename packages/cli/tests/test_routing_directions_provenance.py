@@ -39,10 +39,32 @@ def test_a_t3_helper_session_opens_nothing(world):
     assert scan() == []
 
 
-def test_a_t3_conversation_opens_nothing(world, monkeypatch):
+def test_a_direction_typed_in_a_t3_conversation_still_opens_the_item(world, monkeypatch):
+    """T3 is the owner's main harness and opening an item authorizes nothing;
+    ``owner_turns.eligible`` still refuses T3 for every authorization path."""
     monkeypatch.setattr(owner_turns, "entrypoint_of", lambda *a, **k: "t3")
+    monkeypatch.setattr(owner_turns, "dispatched_job", lambda *a, **k: None)  # T3's record is readable: no job
     say(GLM)
     assert owner_turns.turns(SESSION)[-1]["eligible"] is False
+    (row,) = scan()
+    assert row["status"] == "open"
+
+
+def test_a_t3_machine_or_handoff_turn_opens_nothing(world, monkeypatch):
+    monkeypatch.setattr(owner_turns, "entrypoint_of", lambda *a, **k: "t3")
+    monkeypatch.setattr(owner_turns, "dispatched_job", lambda *a, **k: None)
+    machine = f"<task-notification>\n<task-id>x</task-id>\n<summary>{GLM}</summary>\n</task-notification>"
+    handoff = "Context handoff (summary):\nProvider context handoff. Thread: t-1.\n\nUser message:"
+    say(machine)
+    say(handoff)
+    turns = owner_turns.turns(SESSION)
+    assert turns[0]["machine"] and not turns[0]["eligible"] and not turns[1]["typed"]
+    assert routing_directions.capture_scan(SESSION, [machine, handoff]) == []
+
+
+def test_a_t3_helper_turn_opens_nothing(world, monkeypatch):
+    monkeypatch.setattr(owner_turns, "entrypoint_of", lambda *a, **k: "t3")
+    say(GLM, cwd=f"{tempfile.gettempdir()}/t3code-claude-title-abc123")
     assert scan() == []
 
 
@@ -51,6 +73,8 @@ def test_a_dispatched_jobs_turn_opens_nothing(world, monkeypatch):
     say(GLM)
     assert owner_turns.turns(SESSION)[-1]["eligible"] is False
     assert scan() == []
+    monkeypatch.setattr(owner_turns, "entrypoint_of", lambda *a, **k: "t3")
+    assert scan() == []  # nor in T3
 
 
 def test_one_text_typed_by_him_and_sent_by_a_machine_opens_one_item(world):

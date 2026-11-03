@@ -214,6 +214,45 @@ def test_lines_written_while_it_checked_are_carried_over(world, monkeypatch):
     assert routing.read_view(END)["note"]["text"] == "late"
 
 
+def test_a_line_half_written_at_the_read_survives_once_and_whole(world, monkeypatch):
+    _install(_log(days=60))
+    line = json.dumps({"type": "note_set", "text": "half", "id": "half1", "seq": 99998,
+                       "written_at": routing._iso(END), "written_by": {"kind": "owner"}, "via": "app",
+                       "auth": "app"}, sort_keys=True).encode()
+    with routing.events_file().open("ab") as f:
+        f.write(line[:40])  # a writer's line, half down when the log is read
+    bad_before = routing.read_events()[1]
+    real = rc._choose
+
+    def finish_the_line(data, now):
+        out = real(data, now)
+        with routing.events_file().open("ab") as f:
+            f.write(line[40:] + b"\n")  # the writer finishes before the swap
+        return out
+
+    monkeypatch.setattr(rc, "_choose", finish_the_line)
+    assert rc.compact(END)["result"] == "compacted"
+    data = routing.events_file().read_bytes()
+    assert data.count(line + b"\n") == 1 and data.endswith(line + b"\n")
+    assert routing.read_events()[1] == bad_before - 1 if bad_before else True
+    assert routing.read_view(END)["note"]["text"] == "half"
+
+
+def test_a_log_nothing_can_shrink_says_so_instead_of_a_plain_red(world, monkeypatch):
+    monkeypatch.setattr(rc, "LINES_YELLOW", 50)
+    monkeypatch.setattr(rc, "LINES_RED", 100)
+    monkeypatch.setattr(rc, "BYTES_YELLOW", 10 ** 9)
+    monkeypatch.setattr(rc, "BYTES_RED", 10 ** 9)
+    owner = [{"type": "note_set", "text": f"n{i}", "id": f"n{i}", "seq": i + 1,
+              "written_at": routing._iso(END - timedelta(minutes=300 - i)),
+              "written_by": {"kind": "owner"}, "via": "app", "auth": "app"} for i in range(150)]
+    _install(owner)
+    assert rc.health()["level"] == "red"  # not tried yet: the plain row
+    assert rc.compact(END)["result"] == "skipped"
+    row = rc.health()
+    assert row["level"] == "yellow" and "can't shrink" in row["warning"] and "150 of its lines" in row["warning"]
+
+
 def test_a_rewritten_log_is_not_replaced(world, monkeypatch):
     _install(_log(days=60))
     real = rc._choose

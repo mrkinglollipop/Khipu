@@ -255,7 +255,8 @@ steps, holds, caps, clears, account lines), `observation` lines (the sources' si
 are folded at the present, at each `valid_until` that follows and at distances out to a year, and must agree,
 or nothing is written. The new file is written beside the log and fsynced, the old log is linked into
 `archive/`, and the new file is renamed over the log, so a crash leaves a readable log. The owner's lines are
-human-rate and stay.
+human-rate and stay. The archives hold routing words for up to 30 days and are listed by forget as kept routing
+words, as `remote.jsonl` is. Doctor says in words when a log is over its bound and nothing more can go.
 
 **"Owner only" is a convention, not a lock.** Khipu holds no credential, so any process with a shell can
 write. Every write is stamped with its author and shown in the app. Rules, the note, owner pauses and clears

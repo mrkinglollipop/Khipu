@@ -134,12 +134,28 @@ def health() -> dict:
                      "red": {"lines": LINES_RED, "bytes": BYTES_RED}},
            "last_compaction": last.get("at"), "last_result": last.get("result"),
            "archives": len(_archives())}
-    if level != "green":
+    gone, total = _droppable() if level != "green" and last.get("attempted_at") else (1, 0)
+    if level != "green" and last.get("attempted_at") and gone < MIN_GAIN * total:
+        out["level"] = "yellow"
+        out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes), over its bound of "
+                          f"{LINES_YELLOW:,}, and compaction can't shrink it further: {total - gone:,} of "
+                          "its lines are the owner's, observations or others the fold needs, and are kept.")
+        out["kept_lines"] = total - gone
+    elif level != "green":
         out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes); it is compacted at "
                           f"{LINES_YELLOW:,} lines or {BYTES_YELLOW:,} bytes, nightly and after the plan figures "
                           f"refresh" + (f". It is past {LINES_RED:,} lines or {BYTES_RED:,} bytes, where reading it "
                                         "before a prompt can run out of the time allowed." if level == "red" else "."))
     return out
+
+
+def _droppable() -> tuple[int, int]:
+    """(lines the strongest profile could drop now, lines in the log)."""
+    try:
+        rows = _rows(routing.events_file().read_bytes())
+    except OSError:
+        return 0, 0
+    return len(plan(rows, routing._now(), PROFILES[-1])), len(rows)
 
 
 def _read_state() -> dict:
@@ -334,8 +350,11 @@ def _choose(data: bytes, now: datetime) -> dict:
         if not same:
             why = f"the compacted log would fold differently at {differs}"
             continue
+        seqs = [e.get("seq") for i, (_l, e) in enumerate(rows)
+                if i not in drop and e and isinstance(e.get("seq"), int)]
         best = {"kept": kept, "profile": number, "moments": moments, "dropped": len(drop),
-                "by_type": _by_type(rows, drop)}
+                "by_type": _by_type(rows, drop), "before": len(rows), "after": len(kept),
+                "through_seq": max(seqs) if seqs else None}
         if len(kept) <= LINES_TARGET and sum(len(k) + 1 for k in kept) <= BYTES_TARGET:
             break
     return best or {"why": why}
@@ -368,35 +387,31 @@ def _compact(now: datetime) -> dict:
         data = path.read_bytes()
     except FileNotFoundError:
         return {"result": "skipped", "why": "no routing record"}
+    # Whole lines only: a writer's line may be half down at this read. The
+    # piece rides in the tail below, verbatim, whole once it is finished.
+    data = data[:data.rfind(b"\n") + 1]
     chosen = _choose(data, now)
     if "kept" not in chosen:
         _note(now, chosen["why"])
         return {"result": "skipped", "why": chosen["why"]}
-    kept = chosen["kept"]
+    head = b"".join(line + b"\n" for line in chosen["kept"])  # built before the lock is taken
     name = f"events-{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(3)}.jsonl"
     with routing._lock():
         current = path.read_bytes()
         if not current.startswith(data):
             return {"result": "skipped", "why": "the record changed while it was checked"}
-        body = b"".join(line + b"\n" for line in kept)
-        tail = current[len(data):]
-        if tail:
-            if not data.endswith(b"\n"):
-                body += b"\n"  # a torn last line stays one unreadable line of its own
-            body += tail
+        body = head + current[len(data):]
         _replace(path, body, name)
-        before, after = len(_rows(data)), len(_rows(body))
-        seqs = [e.get("seq") for _l, e in _rows(body) if e and isinstance(e.get("seq"), int)]
         _write_state({"at": routing._iso(now), "attempted_at": routing._iso(now), "result": "compacted",
-                      "lines_before": before, "lines_after": after,
-                      "bytes_before": len(current), "bytes_after": len(body),
-                      "through_seq": max(seqs) if seqs else None, "archive": name, "profile": chosen["profile"],
+                      "lines_before": chosen["before"], "lines_after": chosen["after"],
+                      "bytes_before": len(data), "bytes_after": len(head),
+                      "through_seq": chosen["through_seq"], "archive": name, "profile": chosen["profile"],
                       "moments_checked": chosen["moments"], "dropped_by_type": chosen["by_type"]})
         pruned = prune_archives(now)
         with contextlib.suppress(Exception):
             routing._refold_locked(now)
-    return {"result": "compacted", "lines_before": before, "lines_after": after, "bytes_after": len(body),
-            "archive": name, "pruned": pruned, "dropped_by_type": chosen["by_type"]}
+    return {"result": "compacted", "lines_before": chosen["before"], "lines_after": chosen["after"],
+            "bytes_after": len(head), "archive": name, "pruned": pruned, "dropped_by_type": chosen["by_type"]}
 
 
 def _replace(path: Path, body: bytes, name: str) -> None:

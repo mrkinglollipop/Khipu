@@ -202,7 +202,8 @@ def test_p6_account_stop_ends_or_rebases_live_priority_overlay(home):
     from khipu import accounts
     routing.set_priority([{"account": "Claude"}, {"account": "Codex"}], via="app", expect=routing.priority_version())
     shown = mcp_server._tool_route({})
-    mcp_server._tool_route_priority({"entries": [{"account": "Grok"}, {"account": "Codex"}], "owner_request": "x", "base": shown["priority_owner_revision"]})
+    mcp_server._tool_route_priority({"entries": [{"account": "Grok"}, {"account": "Codex"}], "owner_request": "x", "base": shown["priority_owner_revision"],
+                                     "expect": shown["priority"]["version"]})
     before = routing.read_view()
     live, = [p for p in before["proposals"].values() if p["status"] == "live"]
     accounts.stop("codex|", expect=accounts.status()["version"])
@@ -276,7 +277,8 @@ def test_only_authors_delivery_acknowledges_its_named_notice(home, monkeypatch, 
                                             base=shown["rules"][0]["owner_revision"]))
         else:
             mcp_server._tool_route_priority(dict(entries=[{"account": "Codex", "role": session}], owner_request="x",
-                                                base=shown["priority_owner_revision"]))
+                                                base=shown["priority_owner_revision"],
+                                                **({"expect": shown["priority"]["version"]} if shown["priority"] else {})))
     bystander = offer_prompt(None, budget=2, session_id="bystander")
     assert not bystander["notices"] and "was replaced" not in bystander["text"]
     delivered("bystander", bystander, home["clock"])
@@ -366,7 +368,7 @@ def test_saved_pre_fix_proposal_view_is_refolded_without_a_log_change(home):
     routing.set_priority([{"account": "Claude"}, {"account": "Codex"}], via="app", expect=routing.priority_version())
     shown = mcp_server._tool_route({})
     routing.request_priority([{"account": "Grok"}, {"account": "Codex"}], owner_request="x",
-                             base=shown["priority_owner_revision"])
+                             base=shown["priority_owner_revision"], expect=shown["priority"]["version"])
     before = routing.read_view()
     accounts.stop("codex|", expect=accounts.status()["version"])
     after = routing.read_view()

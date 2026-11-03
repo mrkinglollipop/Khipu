@@ -17,10 +17,11 @@ def sessionless(home, monkeypatch):
     return home
 
 
-def propose(kind, base):
+def propose(kind, base, expect=None):
     if kind == 'rule':
         return mcp_server._tool_route_rule(dict(text='PROPOSED', rule=1, owner_request='change', base=base))
-    return mcp_server._tool_route_priority(dict(entries=[{'account': 'Grok'}], owner_request='change', base=base))
+    extra = {} if expect is None else {'expect': expect}
+    return mcp_server._tool_route_priority(dict(entries=[{'account': 'Grok'}], owner_request='change', base=base, **extra))
 
 
 def revision(kind, view):
@@ -44,7 +45,8 @@ def test_sessionless_mcp_proposal(sessionless, kind):
 
 def test_sessionless_existing_priority(sessionless):
     routing.set_priority([{'account': 'Claude'}], via='app', expect=routing.priority_version())
-    propose('priority', mcp_server._tool_route({})['priority_owner_revision'])
+    shown = mcp_server._tool_route({})
+    propose('priority', shown['priority_owner_revision'], shown['priority']['version'])
     assert [e['label'] for e in routing.read_view()['priority']['entries']] == ['Grok']
 
 

@@ -36,7 +36,8 @@ def world(tmp_path, monkeypatch, khipu_app):
 def _priority_proposal():
     routing.set_priority([{"account": "Claude"}], via="app", expect=routing.priority_version())
     base = routing.conversation_view()["priority_owner_revision"]
-    routing.request_priority([{"account": "Codex"}], owner_request="synthetic request", base=base)
+    routing.request_priority([{"account": "Codex"}], owner_request="synthetic request", base=base,
+                             expect=routing.priority_version())
     return routing.read_view()
 
 

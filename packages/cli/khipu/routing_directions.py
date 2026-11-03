@@ -655,6 +655,22 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
         return _capture_scan_locked(session, turns, now=now, actions=actions)
 
 
+def _his(turn: dict, conf: dict) -> bool:
+    """Whether a recorded turn is the owner's for opening an owed item.
+    ``owner_turns.eligible`` decides, except for the one refusal that is about
+    authorizing a change: a T3 conversation can't be told apart from T3's
+    scheduled or relayed messages, so no change asked for there is applied on
+    its word. Opening a direction only creates a reminder and authorizes
+    nothing, so a typed turn in T3 opens one; a turn T3's record marks as a
+    machine's, a handoff, a helper, a dispatched job's or untyped is still
+    refused by the same checks. (Nothing here changes ``eligible``.)"""
+    if turn.get("entrypoint") == "t3":
+        harness = turn.get("harness")
+        return owner_turns.eligible(dict(turn, entrypoint="cli"),
+                                    dict(conf, trusted=[f"{harness}:cli"]))[0]
+    return owner_turns.eligible(turn, conf)[0]
+
+
 def _capture_scan_locked(session, turns, *, now, actions):
     now = time.time() if now is None else now
     data, bad = _read_store()  # an unreadable store raises and stays as it is
@@ -667,12 +683,13 @@ def _capture_scan_locked(session, turns, *, now, actions):
     # dispatched job's turn can carry the owner's words and still not be his.
     # A text with recorded turns and none of them eligible opens nothing.
     conf = owner_turns.settings()
+    is_his = lambda turn: _his(turn, conf)  # noqa: E731
     counted: set[str] = set()
     for turn in owner_turns.turns(session, now):
         sha = turn.get("prompt_sha256")
         if not isinstance(sha, str):
             continue
-        ok = owner_turns.eligible(turn, conf)[0]
+        ok = is_his(turn)
         if ok and sha not in counted:
             recorded[sha] = turn  # the first copy that is his stands for the text
             counted.add(sha)

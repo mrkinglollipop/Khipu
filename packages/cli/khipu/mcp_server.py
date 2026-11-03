@@ -1051,7 +1051,10 @@ TOOLS: list[dict] = [
                                                               "entry alone, so another account's change does not "
                                                               "cross this one; a changed entry is refused as "
                                                               "crossed (ok: false, lost: the entry as it is now)"},
-                "expect": {"type": "string", "description": "With account, in place of revision: the priority's "
+                "expect": {"type": "string", "description": "With entries, to replace the whole list on purpose (an entry "
+                                                            "left out or sent without its revision is otherwise "
+                                                            "refused): the priority's version as read. With account, "
+                                                            "in place of revision: the priority's "
                                                             "whole version as read (version, as khipu_route lists "
                                                             "it); any write to the priority moves it"},
                 "base": {"type": "string", "minLength": 1, "maxLength": 256,
@@ -3000,7 +3003,8 @@ def _tool_route_priority(args: dict) -> dict:
     if not isinstance(entries, list) or not entries:
         raise ValueError("entries must be the owner's accounts, in his order")
     return routing.conversation_priority(entries, until=until, owner_request=owner_request,
-                                         author=routing.conversation_author(), base=base)
+                                         author=routing.conversation_author(), base=base,
+                                         expect=args.get("expect"))
 
 
 def _tool_owner_act(args: dict) -> dict:

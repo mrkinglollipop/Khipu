@@ -7489,14 +7489,19 @@ def _lost_entry(entry: dict) -> dict:
     return out
 
 
-def _crossed_entries(lost: list[dict], *, entries: list[str] | None = None) -> dict:
+def _crossed_entries(lost: list[dict], *, entries: list[str] | None = None, unread: bool = False) -> dict:
     """The answer to a priority write refused because an entry it carried had
     changed: not written, in the words a crossed rule write answers with."""
     names = ", ".join(str(e.get("label") or e["account"]) for e in lost) or "an entry"
-    out = {"ok": False, "status": "crossed", "lost": lost,
-           "error": f"This request was crossed: {names} changed after it was read, so it never took effect. "
-                    "What the write would have overwritten is in lost; read the priority again and prepare the "
-                    "change from it."}
+    if unread:
+        why = (f"This request named no revision for {names}, or left it out, so it could have overwritten it "
+               "and never took effect. Read the priority again and send every entry it holds with its "
+               "revision (or pass expect, the priority's version).")
+    else:
+        why = (f"This request was crossed: {names} changed after it was read, so it never took effect. "
+               "What the write would have overwritten is in lost; read the priority again and prepare the "
+               "change from it.")
+    out = {"ok": False, "status": "crossed", "lost": lost, "error": why}
     if entries is not None:
         out["entries"] = entries
     return out
@@ -7571,17 +7576,27 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
     end = _priority_until(until, now)
     with _lock():
         _check_priority(expect, now)
-        # A conversation that carries an entry's revision says which entry it
-        # read: one another write has changed since is not overwritten.
+        # A conversation's whole list says which entry it read by carrying
+        # that entry's revision. Without ``expect`` (the whole version, which
+        # any write moves) it must carry one for every account already in the
+        # priority, and leave none out: an entry another write changed since,
+        # one with no revision and one left out are not overwritten.
         held = {e["account"]: e for e in (read_view(now).get("priority_stored") or {}).get("entries") or []}
-        lost = [_lost_entry(held[r["account"]]) for r in rows
-                if r.get("_revision") and r["account"] in held
-                and r["_revision"] != priority_entry_revision(held[r["account"]])]
+        named = {r["account"] for r in rows}
+        stale = [held[r["account"]] for r in rows
+                 if r.get("_revision") and r["account"] in held
+                 and r["_revision"] != priority_entry_revision(held[r["account"]])]
         gone = [r for r in rows if r.get("_revision") and r["account"] not in held]
+        # (A request whose base is no longer the owner's revision is recorded
+        # as crossed below and never takes effect: nothing of his to lose.)
+        unversioned = [] if expect is not None or base != read_view(now).get("priority_owner_revision") else (
+            [held[r["account"]] for r in rows if not r.get("_revision") and r["account"] in held]
+            + [e for account, e in held.items() if account not in named])
         rows = [{k: v for k, v in r.items() if k != "_revision"} for r in rows]
-        if lost or gone:
-            return _crossed_entries(lost or [{"account": r["account"], "label": r["label"]} for r in gone],
-                                    entries=[e["label"] for e in rows])
+        if stale or gone or unversioned:
+            lost = [_lost_entry(e) for e in [*stale, *unversioned]] or [
+                {"account": r["account"], "label": r["label"]} for r in gone]
+            return _crossed_entries(lost, entries=[e["label"] for e in rows], unread=not stale and not gone)
         _check_role_budget(rows, now)
         observed = _observed_base("priority", base=base, expect=expect)
         written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
@@ -7913,9 +7928,6 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
     The priority's whole version (``expect``) may still be given."""
     if not isinstance(base, str) or not base.strip():
         raise RouteError("base must be the owner revision the request was prepared against")
-    if entry_revision is None and expect is None:
-        raise RouteError("say which revision of the entry this change was made on (revision, as khipu_route "
-                         "lists it with the entry); read it again first")
     now = now or _now()
     request_words = _one_line(owner_request)
     if not request_words:
@@ -9832,20 +9844,24 @@ def _public_priority(view: dict, now: datetime, facts: dict) -> dict | None:
     if not held:
         return None
 
-    stored = {e["account"]: e for e in (view.get("priority_stored") or {}).get("entries") or []}
+    kept = view.get("priority_stored") or {}
 
-    def entries(rows: list[dict]) -> list[dict]:
+    def entries(rows: list[dict], source: list[dict]) -> list[dict]:
+        # The revision is of the stored entry the row shows (the replaced
+        # priority's own entries for ``replaced``), never of another's.
+        stored = {e["account"]: e for e in source or []}
         return [dict(_pick(e, _PRIORITY_ENTRY_FIELDS), id=account_id(e["account"]),
                      revision=priority_entry_revision(stored.get(e["account"]) or e)) for e in rows]
 
     replaced = held.get("replaced")
-    return {"entries": entries(held["entries"]), "until": held.get("until"), "confirmed": not held.get("pending"),
+    return {"entries": entries(held["entries"], kept.get("entries")), "until": held.get("until"), "confirmed": not held.get("pending"),
             "version": held.get("version") or view.get("priority_version"),
             "owner_revision": held.get("owner_revision"),
             "pending": bool(held.get("pending")), "pending_by": held.get("pending_by"),
             "proposal_withheld": bool(held.get("proposal_withheld")),
             "owner_request": held.get("owner_request"), "at": held.get("at"), "via": held.get("via"),
-            "replaced": {"entries": entries(replaced["entries"]), "until": replaced.get("until")} if replaced else None,
+            "replaced": {"entries": entries(replaced["entries"], (kept.get("replaced") or {}).get("entries")),
+                         "until": replaced.get("until")} if replaced else None,
             "line": priority_line(held, now, view=view, facts=facts)}
 
 
@@ -11794,7 +11810,8 @@ def _priority_cli(args, now: datetime) -> int:
                 exception=getattr(args, "exception", None), end_exception=getattr(args, "end_exception", None),
                 share_pct=getattr(args, "share_pct", None),
                 owner_request=args.at_owner_request, author=conversation_author(), via="cli", now=now,
-                expect=getattr(args, "expect", None), base=getattr(args, "base", None)))
+                expect=getattr(args, "expect", None), base=getattr(args, "base", None),
+                entry_revision=getattr(args, "revision", None)))
             return 0
         if action != "set":
             raise RouteError("--at-owner-request is only for priority set or amend: confirming, undoing and "

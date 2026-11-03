@@ -6186,6 +6186,9 @@ def build_parser() -> argparse.ArgumentParser:
     rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rprio)
     rprio.add_argument("--base", default=None, help="Owner revision read when preparing a priority request")
+    rprio.add_argument("--revision", default=None, metavar="R",
+                       help="amend at the owner's request: the entry's revision as read (--json lists it); an "
+                            "entry written since is not overwritten")
     rprio.add_argument("--expect", default=None, metavar="V",
                        help="The priority's version as read; refused if it changed since")
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])
