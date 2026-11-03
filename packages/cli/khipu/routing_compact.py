@@ -178,11 +178,14 @@ def health() -> dict:
            "archives": len(_archives())}
     gone, total = _droppable() if level != "green" and last.get("attempted_at") else (1, 0)
     if level != "green" and last.get("attempted_at") and gone < MIN_GAIN * total:
-        out["level"] = "yellow"
         out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes), over its bound of "
                           f"{LINES_YELLOW:,}, and compaction can't shrink it further: {total - gone:,} of "
                           "its lines are the owner's, readings and observations still counted, or the newest "
                           "of their kind, which the fold needs, and are kept.")
+        owners = sum(1 for _line, event in _rows(routing.events_file().read_bytes())
+                     if event is not None and (event.get("written_by") or {}).get("kind") == "owner")
+        out["warning"] += (f" The owner's protected history accounts for {owners:,} lines; "
+                           "nothing is broken by keeping that history.")
         out["kept_lines"] = total - gone
     elif level != "green":
         out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes); it is compacted at "

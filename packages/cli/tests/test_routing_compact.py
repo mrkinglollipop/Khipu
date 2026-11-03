@@ -237,7 +237,7 @@ def test_a_line_half_written_at_the_read_survives_once_and_whole(world, monkeypa
     assert routing.read_view(END)["note"]["text"] == "half"
 
 
-def test_a_log_nothing_can_shrink_says_so_instead_of_a_plain_red(world, monkeypatch):
+def test_protected_history_keeps_absolute_red_severity(world, monkeypatch):
     monkeypatch.setattr(rc, "LINES_YELLOW", 50)
     monkeypatch.setattr(rc, "LINES_RED", 100)
     monkeypatch.setattr(rc, "BYTES_YELLOW", 10 ** 9)
@@ -249,7 +249,16 @@ def test_a_log_nothing_can_shrink_says_so_instead_of_a_plain_red(world, monkeypa
     assert rc.health()["level"] == "red"  # not tried yet: the plain row
     assert rc.compact(END)["result"] == "skipped"
     row = rc.health()
-    assert row["level"] == "yellow" and "can't shrink" in row["warning"] and "150 of its lines" in row["warning"]
+    assert row["level"] == "red" and "can't shrink" in row["warning"] and "150 of its lines" in row["warning"]
+    assert "protected history" in row["warning"] and "nothing is broken" in row["warning"]
+
+
+def test_protected_history_keeps_absolute_byte_severity(world, monkeypatch):
+    _install(_log(days=1))
+    monkeypatch.setattr(rc, "BYTES_RED", 1)
+    monkeypatch.setattr(rc, "_read_state", lambda: {"attempted_at": routing._iso(END)})
+    monkeypatch.setattr(rc, "_droppable", lambda: (0, 100))
+    assert rc.health()["level"] == "red"
 
 
 def test_a_rewritten_log_is_not_replaced(world, monkeypatch):
