@@ -139,9 +139,14 @@ def test_pytest_process_cleanup(tmp_path, death):
     ready = tmp_path / "ready.json"
     test = tmp_path / "test_child.py"
     test.write_text(f"""
-import json, time
+import json, signal, time
 from pathlib import Path
 from tests.hermetic_pg import Cluster, pg_cluster
+
+# Shells and harnesses may launch pytest with SIGINT ignored or blocked.
+# This child explicitly exercises pytest's KeyboardInterrupt cleanup path.
+signal.signal(signal.SIGINT, signal.default_int_handler)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {{signal.SIGINT}})
 
 # The probe needs a running server, not a migrated database.
 Cluster.build_template = lambda self: None
@@ -171,6 +176,8 @@ def test_child(pg_cluster):
             code = child.wait(timeout=30)
             if death in ("SIGTERM", "SIGKILL"):
                 assert code == -getattr(signal, death)
+            if death == "SIGINT":
+                assert code == 2
             if death == "failure":
                 assert code == 1
             if death == "exit":
