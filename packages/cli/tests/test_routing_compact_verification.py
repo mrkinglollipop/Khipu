@@ -135,4 +135,3 @@ def test_replica_sync_survives_source_compaction_and_later_owner_write(pair, old
     assert sync(a, hub)["ok"]
     assert sync(b, hub)["ok"]
     assert b.view()["note"]["text"] == "after compaction"
-
