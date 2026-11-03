@@ -14,10 +14,14 @@ over the compacted file is the fold over the full log:
     holds, caps, clears, account lines and every undo or restore step), nor
     a line that cannot be read (doctor counts those), nor any line of an
     account change;
-  * a ``usage_sample`` goes only when it is older than the longest span the
-    pace calculation reads (``compute_pace`` reads one rolling day, a
-    trailing window and the newest earlier reading per witness) with
-    margin, and is not one of the newest few of its account and window;
+  * a ``usage_sample`` goes only when nothing pace reads can use it (see
+    ``_sample_drops``): it is older than twice the longest span
+    ``compute_pace`` reads (a rolling day), is not the newest reading of its
+    witness and reset cycle before that span, is not the only one of its
+    reset time still ahead, does not bridge reset estimates into one cycle,
+    and is not the twin of a reading that stays. Cycles older than the
+    current and the previous period keep no anchor. A line the fold ignores
+    (no reset time) is no reading at all, and counts for nothing;
   * a ``source_seen`` goes unless it is among the last of its Mac and runner
     (only the last is read);
   * a conversation's or a check's ``evidence`` goes only when it is old, its
@@ -81,6 +85,16 @@ PROFILES = (
     (2, 3, 7, 2, 7),
 )
 RESET_CHECKS_KEPT = 3
+# The longest span ``routing_pace.compute_pace`` reads back from the fold's
+# moment: its horizon is the trailing window (a day at most) or the rolling
+# day of a per-day cap (``horizon = 86400`` there). A reading inside twice
+# that is never dropped.
+PACE_READ_S = 86400
+PACE_MARGIN = 2
+# ``routing_pace._cycles`` links reset estimates at most this far apart into
+# one cycle; a bridge between two kept estimates stays under this less a margin.
+CYCLE_LINK_S = 3600
+CYCLE_BRIDGE_S = 2700
 SOURCE_SEEN_KEPT = 3
 # Moments, after now, the full and the compacted fold are compared at in
 # addition to the fold's own ``valid_until`` chain.
@@ -207,15 +221,144 @@ def _owner(event: dict) -> bool:
     return (event.get("written_by") or {}).get("kind") == "owner" or event.get("via") in ("app", "direction")
 
 
+def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: datetime,
+                  sample_days: float, sample_kept: int) -> set[int]:
+    """The ``usage_sample`` lines nothing the fold does with samples can use.
+
+    Everything the fold does with a sample is in ``routing.fold`` (through
+    ``routing.pace_sample``): ``routing_pace.compute_pace``, ``next_change``
+    and the newest reading. For one (account, window) at any moment from now
+    on they read:
+
+      * the readings inside the trailing window (a rolling day for a per-day
+        cap) and the newest reading before it per witness (Mac and source)
+        and reset cycle: every reading younger than ``PACE_MARGIN`` times the
+        longest of those spans stays, and the newest reading before that
+        point per witness and cycle, which is the anchor every later moment
+        falls back on;
+      * every reset time still ahead (``next_change`` schedules the fold's
+        ``valid_until`` at the earliest one past each moment): one reading
+        per distinct reset time ahead stays;
+      * the cycles themselves: ``_cycles`` links reset estimates less than an
+        hour apart into one cycle, so a reading that bridges two kept
+        estimates of one cycle stays;
+      * ``_filter``'s own choices: a reading it discards (a duplicate, one
+        with too coarse a clock) stays when a kept reading is its twin, so
+        dropping the kept one cannot let it back in;
+      * the writer's cadence (``routing_pace.should_sample``): the newest
+        line of each witness, whatever it holds.
+
+    A line the fold ignores (no reset time) is read by none of this. Groups
+    whose readings carry cycle ids keep a whole extra window back."""
+    from khipu import routing_pace
+
+    drop: set[int] = set()
+    horizon = timedelta(seconds=PACE_MARGIN * PACE_READ_S)
+    cut_days = timedelta(days=sample_days)
+    for (account, window), items in groups.items():
+        keep: set[int] = set()
+        cut = now - max(horizon, cut_days)
+        parsed = {}
+        for _at, i, event in items:
+            got = routing.pace_sample(event)
+            if got is not None and got[0] == (account, window):
+                parsed[i] = dict(got[1], _i=i)
+        params = routing_pace._sample_params(window, list(parsed.values())) if parsed else None
+        filtered = routing_pace._filter(list(parsed.values()), params) if params else []
+        if filtered:
+            routing_pace._cycles(filtered, window)
+            if any(s["_cycle_id"] for s in filtered):
+                cut = min(cut, now - horizon - timedelta(seconds=2 * params["window_s"]))
+        # Anything inside the span, and the newest few of the window.
+        keep.update(i for at, i, _e in items if at >= cut)
+        for _at, i, _e in sorted(items, key=lambda item: (item[0], item[1]), reverse=True)[:sample_kept]:
+            keep.add(i)
+        # The newest line of each witness, read or not (the writer's cadence).
+        newest: dict[tuple, tuple] = {}
+        for at, i, event in items:
+            witness = (event.get("mac"), event.get("source"))
+            if witness not in newest or (at, i) > newest[witness]:
+                newest[witness] = (at, i)
+        keep.update(i for _at, i in newest.values())
+        if filtered:
+            # The newest reading of each witness and cycle before the span,
+            # for the newest two cycles (the current and the previous period)
+            # and every cycle a window and a half-day-margin back. A cycle
+            # older than that sits wholly before the rest in time and
+            # whole in its own group: nothing the fold looks at (it looks
+            # forward from a reading, and back only within a cycle) reaches it.
+            anchors: dict[tuple, dict] = {}
+            for s in filtered:
+                if s["t"] < cut:
+                    ident = (s["mac"], s["source"], s["_cycle_key"])
+                    if ident not in anchors or s["t"] > anchors[ident]["t"]:
+                        anchors[ident] = s
+            newest_of: dict[tuple, datetime] = {}
+            for (_mac, _source, cycle), s in anchors.items():
+                newest_of[cycle] = max(newest_of.get(cycle, s["t"]), s["t"])
+            old_cut = cut - timedelta(seconds=2 * params["window_s"])
+            recent_cycles = {cycle for rank, (cycle, at) in enumerate(
+                sorted(newest_of.items(), key=lambda item: item[1], reverse=True)) if rank < 2 or at >= old_cut}
+            keep.update(s["_i"] for (_mac, _source, cycle), s in anchors.items() if cycle in recent_cycles)
+            # One reading per reset time still ahead.
+            ahead: dict[datetime, dict] = {}
+            for s in filtered:
+                if s["reset"] > now and (s["reset"] not in ahead or s["t"] > ahead[s["reset"]]["t"]):
+                    ahead[s["reset"]] = s
+            keep.update(s["_i"] for s in ahead.values())
+            # Bridges: ``_cycles`` links reset estimates less than an hour
+            # apart into one cycle. Within a cycle, between the first and the
+            # last reading that stays, a reading goes only when the next one
+            # is still close enough to the last kept; separate cycles need
+            # no bridge (dropping can split a cycle, never join two).
+            ordered = sorted(filtered, key=lambda s: (s["reset"], s["t"]))
+            comp = [0] * len(ordered)
+            for pos in range(1, len(ordered)):
+                gap = (ordered[pos]["reset"] - ordered[pos - 1]["reset"]).total_seconds()
+                comp[pos] = comp[pos - 1] + (1 if gap > CYCLE_LINK_S else 0)
+            last_forced: dict[int, int] = {}
+            for pos, s in enumerate(ordered):
+                if s["_i"] in keep:
+                    last_forced[comp[pos]] = pos
+            last = None
+            for pos, s in enumerate(ordered):
+                if pos and comp[pos] != comp[pos - 1]:
+                    last = None
+                if s["_i"] in keep:
+                    last = s["reset"]
+                    continue
+                if last is None or pos > last_forced.get(comp[pos], -1):
+                    continue
+                if (ordered[pos + 1]["reset"] - last).total_seconds() > CYCLE_BRIDGE_S:
+                    keep.add(s["_i"])
+                    last = s["reset"]
+            # Twins of the kept readings.
+            kept_by_witness: dict[tuple, list[dict]] = {}
+            for s in filtered:
+                if s["_i"] in keep:
+                    kept_by_witness.setdefault((s["mac"], s["source"]), []).append(s)
+            filtered_ids = {s["_i"] for s in filtered}
+            for i, r in parsed.items():
+                if i in filtered_ids or i in keep:
+                    continue
+                for k in kept_by_witness.get((r["mac"], r["source"]), ()):
+                    gap = abs((k["t"] - r["t"]).total_seconds())
+                    if gap == 0 or (k["reset"] == r["reset"] and k["used"] == r["used"]
+                                    and gap <= (k["t_err"] or 0) + (r["t_err"] or 0)):
+                        keep.add(i)
+                        break
+        drop.update(i for _at, i, _e in items if i not in keep)
+    return drop
+
+
 def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple) -> set[int]:
     """The indexes of ``rows`` (line, its event or None) the fold can do
     without, under ``profile``. Anything not sure is kept."""
     sample_days, sample_kept, evidence_days, evidence_kept, reset_days = profile
-    sample_cut = now - timedelta(days=sample_days)
     evidence_cut = now - timedelta(days=evidence_days)
     reset_cut = now - timedelta(days=reset_days)
     drop: set[int] = set()
-    samples: dict[tuple, list[tuple[datetime, int]]] = {}
+    samples: dict[tuple, list[tuple[datetime, int, dict]]] = {}
     seen: dict[tuple, list[int]] = {}
     evidence: dict[tuple, list[tuple[datetime, int]]] = {}
     checks: dict[str, list[tuple[datetime, int]]] = {}
@@ -234,7 +377,7 @@ def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple) -
         if kind == "usage_sample":
             at = _when(event, "witness_at", "written_at")
             if at is not None and isinstance(event.get("account"), str):
-                samples.setdefault((event["account"], event.get("window")), []).append((at, i))
+                samples.setdefault((event["account"], event.get("window")), []).append((at, i, event))
         elif kind == "source_seen":
             seen.setdefault((event.get("mac"), event.get("runner")), []).append(i)
         elif kind == "reset_check" and isinstance(event.get("account"), str):
@@ -250,9 +393,7 @@ def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple) -
                 if end is not None and end > evidence_cut:
                     continue
                 evidence.setdefault((event["account"], event.get("scope") or "all", event.get("state")), []).append((at, i))
-    for group in samples.values():
-        group.sort(reverse=True)
-        drop.update(i for at, i in group[sample_kept:] if at < sample_cut)
+    drop.update(_sample_drops(samples, now, sample_days, sample_kept))
     for group in seen.values():
         drop.update(group[:-SOURCE_SEEN_KEPT])
     for group in checks.values():

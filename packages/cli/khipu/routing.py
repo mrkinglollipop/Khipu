@@ -3856,6 +3856,29 @@ def _effective_priority(priority: dict) -> dict:
             "by": priority["pending_by"], "replaced": rows(replaced["entries"]) if replaced else None}
 
 
+def pace_sample(event: dict) -> tuple[tuple[str, str], dict] | None:
+    """((account, window), sample) for a ``usage_sample`` line the pace
+    calculation reads, or None for one the fold ignores (no witness time, no
+    reset time, an unusable window or reading). The fold and the log
+    compaction (``routing_compact``) both ask here what a sample is."""
+    from khipu import routing_pace
+
+    witness, reset = _parse(event.get("witness_at")), _parse(event.get("resets_at"))
+    mins = event.get("window_mins") if isinstance(event.get("window_mins"), int) else None
+    window = event.get("window") if routing_pace.window_params(
+        event.get("window"), mins * 60 if mins else None, reset) else None
+    used = event.get("used_pct")
+    if not (window and witness and reset and isinstance(event.get("account"), str)
+            and isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)):
+        return None
+    sample = {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
+              "source": event.get("source") or "probe", "cycle": event.get("cycle"),
+              "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0}
+    if mins and window not in routing_pace.WINDOWS:
+        sample["window_s"] = mins * 60
+    return (event["account"], window), sample
+
+
 def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
          extra: Iterable[dict] = (), sources: dict | None = None, mac: str | None = None,
          events_ordered: bool = False) -> dict:
@@ -4042,21 +4065,9 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         if kind in entry_model.OBSERVATIONS:
             continue
         if kind == "usage_sample":
-            from khipu import routing_pace
-
-            witness, reset = _parse(event.get("witness_at")), _parse(event.get("resets_at"))
-            mins = event.get("window_mins") if isinstance(event.get("window_mins"), int) else None
-            window = event.get("window") if routing_pace.window_params(
-                event.get("window"), mins * 60 if mins else None, reset) else None
-            used = event.get("used_pct")
-            if (window and witness and reset and isinstance(event.get("account"), str)
-                    and isinstance(used, (int, float)) and not isinstance(used, bool) and math.isfinite(used)):
-                sample = {"t": witness, "used": float(used), "reset": reset, "mac": event.get("mac") or "legacy",
-                          "source": event.get("source") or "probe", "cycle": event.get("cycle"),
-                          "t_err": event.get("t_err") if isinstance(event.get("t_err"), int) else 0}
-                if mins and window not in routing_pace.WINDOWS:
-                    sample["window_s"] = mins * 60
-                pace_samples.setdefault((event["account"], window), []).append(sample)
+            parsed = pace_sample(event)
+            if parsed is not None:
+                pace_samples.setdefault(parsed[0], []).append(parsed[1])
             continue
         if kind in ("cap_set", "cap_remove"):
             from khipu import routing_pace
