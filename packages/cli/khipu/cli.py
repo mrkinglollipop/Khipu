@@ -516,6 +516,21 @@ def _doctor_rerank() -> tuple[dict, list[str]]:
     return block, []
 
 
+def _storage_warnings(local: dict) -> list[str]:
+    """Held work (outbox dead, held capture jobs) past a count: never gating."""
+    return list((local.get("storage") or {}).get("warnings") or [])
+
+
+def _owner_writes_warnings() -> list[str]:
+    """Owner writes that were refused or never sent (waited past the replay horizon)."""
+    try:
+        from khipu import owner_writes
+
+        return owner_writes.doctor_warnings()
+    except Exception:  # noqa: BLE001 - a warning that cannot be read is not a failure of doctor
+        return []
+
+
 def _recall_outcomes_warnings(local: dict) -> list[str]:
     """A thin or timeouts-only recall sample is amber: visible, never gating."""
     block = local.get("prompt_recall_outcomes") or {}
@@ -583,7 +598,8 @@ def _cmd_doctor_quick(args: argparse.Namespace) -> int:
     out["schema_migrations"] = schema
     out["schema_migrations_ok"] = not schema.get("pending")
     out["warnings"] = (list(schema.get("warnings") or []) + _disk_space_warnings(local)
-                       + _replica_schema_warnings(local) + _recall_outcomes_warnings(local))
+                       + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
+                       + _storage_warnings(local) + _owner_writes_warnings())
     out["ok"] = (not imports and bool(config.get("ok")) and out["dsn_present"]
                  and all(bool(local[k]) for k in LOCAL_GATES) and out["schema_migrations_ok"])
     print(_strict_json(out, indent=2, default=str))
@@ -1095,7 +1111,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + list(ledger_block.get("warnings") or []) + list(work_block.get("warnings") or [])
                      + list(schema.get("warnings") or [])
                      + list(fact_provenance.get("warnings") or []) + rerank_warnings + _disk_space_warnings(local)
-                     + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)),
+                     + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
+                     + _storage_warnings(local) + _owner_writes_warnings()),
         "not_configured": not_configured,
         "ok": (
             hub_ok

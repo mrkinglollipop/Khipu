@@ -77,7 +77,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from khipu import antigravity_db, hook_shape
+from khipu import antigravity_db, hook_shape, logcap
 from khipu import t3 as _t3
 from khipu import wire
 if not hasattr(_t3, 'cache_thread'):
@@ -125,8 +125,9 @@ DEAD_CLAIM_GRACE_S = 10 * 60
 # plausible single turn (an agentic turn can run over an hour) — this is a
 # stopped-hook detector, not a latency alarm.
 HOOK_SILENT_S = int(_env_int("KHIPU_CAPTURE_HOOK_SILENT_MIN", "KHIPU_AEGIS_HOOK_SILENT_MIN", "120")) * 60
-# Per-session state files are never pruned, so cap transcript reads on each
-# `khipu doctor` by the hook's own recency stamp.
+# Per-session state files are pruned only after session_state_keep_days idle
+# (khipu.storage_bounds), so cap transcript reads on each `khipu doctor` by the
+# hook's own recency stamp.
 ACTIVITY_SCAN_LIMIT = 20              # a job this old means the drain is not landing
 
 
@@ -168,6 +169,7 @@ def _log(msg: str) -> None:
     try:
         p = log_path()
         p.parent.mkdir(parents=True, exist_ok=True)
+        logcap.rotate_if_over(p)
         with p.open("a", encoding="utf-8") as f:
             # ISO-8601 UTC (audit 2026-09-04): the old stamp was LOCAL time
             # with no offset, so a line could not be lined up with the hub's
@@ -2752,7 +2754,8 @@ def _archive_claimed(claimed: Path) -> Path:
 def _quarantine_claim(claimed: Path, reason: str) -> None:
     """Keep malformed bytes in the existing archive, outside eligible work.
 
-    The archive is already covered by Forget and retention. A sidecar records
+    The archive is covered by Forget and by archive_keep_days retention
+    (khipu.storage_bounds.prune_archives). A sidecar records
     why parsing failed without rewriting or discarding the original evidence.
     """
     from khipu import memory_lock

@@ -40,6 +40,14 @@ from khipu import owner_turns
 PURGE_DELAY_S = 24 * 3600
 LOG_NAME = "owner-actions.jsonl"
 HEAD_NAME = "owner-actions.head.json"
+# The log is kept in sealed segments so an append never reads the whole of it.
+# When the current log (``LOG_NAME``) holds ``SEGMENT_MAX_LINES`` lines it is
+# renamed to ``owner-actions.<six digit number>.jsonl`` and a fresh one starts;
+# the fresh log's first line chains to the sealed segment's last hash, so the
+# chain runs unbroken through every segment. No segment is ever removed:
+# ``read_log`` and the all-segment check (``verify_log``) read them all.
+SEGMENT_MAX_LINES = 2000
+_SEGMENT = re.compile(r"^owner-actions\.(\d{6})\.jsonl$")
 # A break found in the log (a changed line, lines cut from its end) is kept
 # here, apart from the log and its head, until the owner acknowledges it: a
 # later append rewrites the head and could otherwise make a cut end look
@@ -1083,11 +1091,80 @@ def _chained(raw: str) -> int:
     return count
 
 
+def segment_name(seq: int) -> str:
+    return f"owner-actions.{seq:06d}.jsonl"
+
+
+def _sealed_paths() -> list[Path]:
+    """The sealed segments, oldest first (name order is sequence order)."""
+    folder = log_path().parent
+    try:
+        names = sorted(n for n in os.listdir(folder) if _SEGMENT.match(n))
+    except OSError:
+        return []
+    return [folder / n for n in names]
+
+
+def _segment_seq(path: Path) -> int:
+    return int(_SEGMENT.match(path.name).group(1))
+
+
+def _log_files() -> list[Path]:
+    """Every file that holds log lines, in order: sealed segments, then the log."""
+    return [*_sealed_paths(), log_path()]
+
+
+def _file_tail(path: Path) -> str:
+    """What the next line chains to after this segment: its last line's hash,
+    found by reading the end of the file (the whole of it for a segment of
+    lines from before the chain)."""
+    try:
+        size = path.stat().st_size
+        chunk = 65536
+        with open(path, "rb") as fh:
+            while True:
+                fh.seek(max(0, size - chunk))
+                lines = [t for t in fh.read(min(size, chunk)).split(b"\n") if t.strip()]
+                if len(lines) >= 2 or size <= chunk:
+                    break
+                chunk *= 4
+        row = json.loads(lines[-1]) if lines else None
+        if isinstance(row, dict) and isinstance(row.get("hash"), str):
+            return row["hash"]
+    except ValueError:
+        pass
+    return _prev_of(path.read_text(encoding="utf-8"))
+
+
+def _seal(path: Path, raw: str, sealed: list[Path]) -> str:
+    """With the log lock held: rename the current log to the next sealed
+    segment and restart the head beside it. Returns the hash the next line
+    chains to."""
+    tail = _prev_of(raw)
+    seq = (_segment_seq(sealed[-1]) if sealed else 0) + 1
+    dest = path.with_name(segment_name(seq))
+    if dest.exists():
+        raise OSError(f"{dest.name} already exists")
+    os.replace(path, dest)
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        _write_private(head_path(), json.dumps({"v": 2, "seq": seq, "lines": 0, "head": tail}) + "\n")
+    except OSError:
+        pass  # the check reads a head one segment behind as a seal that was cut short
+    return tail
+
+
 def _append(line: dict) -> dict:
     """Append one line to the chain, under a lock so two writers never
     chain to the same line, and on disk before it returns; then the chain's
     new length and head beside it. A head that could not be written leaves
-    the check red (the log is ahead of it), never the change undone."""
+    the check red (the log is ahead of it), never the change undone. Only the
+    current segment is read and checked; a full current segment is sealed
+    first (``SEGMENT_MAX_LINES``)."""
     with _log_locked() as path:
         try:
             raw = path.read_text(encoding="utf-8")
@@ -1101,13 +1178,18 @@ def _append(line: dict) -> dict:
         else:
             line.pop("words_sha", None)
         try:
-            before = _verify_chain()
+            before = _verify_chain(current_only=True, raw=raw)
         except Exception:  # noqa: BLE001 - the check never stops an owner's change from being logged
             before = None
         if before is not None and before["first_bad"]:
             _raise_alarm(before["first_bad"])
+        sealed = _sealed_paths()
+        incoming = _file_tail(sealed[-1]) if sealed else ""
+        if raw.count("\n") >= SEGMENT_MAX_LINES:
+            incoming = _seal(path, raw, sealed)
+            sealed, raw = _sealed_paths(), ""
         line["v"] = LOG_VERSION
-        line["prev"] = _prev_of(raw)
+        line["prev"] = _prev_of(raw) or incoming
         line["hash"] = _line_hash(line)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
@@ -1115,8 +1197,8 @@ def _append(line: dict) -> dict:
             fh.flush()
             os.fsync(fh.fileno())
         try:
-            _write_private(head_path(), json.dumps({"v": 1, "lines": _chained(raw) + 1, "head": line["hash"]})
-                           + "\n")
+            _write_private(head_path(), json.dumps({"v": 2, "seq": len(sealed), "lines": _chained(raw) + 1,
+                                                    "head": line["hash"]}) + "\n")
         except OSError:
             pass
     return line
@@ -1132,27 +1214,30 @@ def scrub_words(sessions, *, protected_sessions=()) -> int:
     is being forgotten."""
     names = set(sessions)
     protected = set(protected_sessions)
-    with _log_locked() as path:
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return 0
-        out, count = [], 0
-        for text in raw.splitlines():
+    total = 0
+    with _log_locked():
+        for path in _log_files():
             try:
-                row = json.loads(text)
-            except ValueError:
-                row = None
-            if (isinstance(row, dict) and isinstance(row.get("words"), str)
-                    and (row.get("session") in names or row.get("via_session") in names)
-                    and row.get("session") not in protected and row.get("via_session") not in protected):
-                row["words_sha"] = row.get("words_sha") or _sha(row["words"])
-                row["words"], row["scrubbed"] = None, True
-                text, count = json.dumps(row, ensure_ascii=False), count + 1
-            out.append(text)
-        if count:
-            _write_private(path, "".join(text + "\n" for text in out))
-    return count
+                raw = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            out, count = [], 0
+            for text in raw.splitlines():
+                try:
+                    row = json.loads(text)
+                except ValueError:
+                    row = None
+                if (isinstance(row, dict) and isinstance(row.get("words"), str)
+                        and (row.get("session") in names or row.get("via_session") in names)
+                        and row.get("session") not in protected and row.get("via_session") not in protected):
+                    row["words_sha"] = row.get("words_sha") or _sha(row["words"])
+                    row["words"], row["scrubbed"] = None, True
+                    text, count = json.dumps(row, ensure_ascii=False), count + 1
+                out.append(text)
+            if count:
+                _write_private(path, "".join(text + "\n" for text in out))
+                total += count
+    return total
 
 
 def _head() -> dict | None | type:
@@ -1212,7 +1297,14 @@ def verify_log() -> dict:
     no tamper alarm waiting for the owner. A break found now raises the
     alarm; while it waits, the log reads as broken at the entry it named,
     however the log looks since, and ``alarm`` carries it."""
-    out = _verify_chain()
+    # Under the log's lock, so an append's seal (the rename and the head rewrite)
+    # is never caught half done and read as a break. Nothing here is called with
+    # the lock held; an append calls ``_verify_chain`` itself.
+    if log_path().parent.exists():
+        with _log_locked():
+            out = _verify_chain()
+    else:
+        out = _verify_chain()
     if out["first_bad"]:
         _raise_alarm(out["first_bad"])
     alarm = read_alarm()
@@ -1227,19 +1319,7 @@ def verify_log() -> dict:
     return out
 
 
-def _verify_chain() -> dict:
-    """Whether the log's hash chain holds: ``first_bad`` names the first line
-    that has no hash or a wrong one, no version or an older one after the
-    chain began, does not follow the line before it, or whose words do not
-    match their hash; or, by the head kept beside the log, the line where
-    lines Khipu wrote are missing from the end (line numbers count from 1)."""
-    try:
-        raw = log_path().read_text(encoding="utf-8")
-    except FileNotFoundError:
-        raw = ""
-    except OSError as err:
-        return {"ok": False, "lines": 0, "first_bad": {"line": 0, "id": None, "kind": None,
-                                                        "why": f"the log can't be read ({err.strerror})"}}
+def _split_rows(raw: str) -> tuple[list[str], list]:
     texts = raw.splitlines()
     rows: list = []
     for text in texts:
@@ -1247,47 +1327,134 @@ def _verify_chain() -> dict:
             rows.append(json.loads(text) if text.strip() else None)
         except ValueError:
             rows.append(ValueError)
+    return texts, rows
+
+
+def _walk(texts: list[str], rows: list, incoming: str | None, base: int, segment: str) -> dict:
+    """The chain inside one segment. ``incoming`` is the hash the segment's
+    first line must chain to (None for the first segment of the log, which may
+    open with lines from before the chain); ``base`` is the number of lines in
+    the segments before it, so line numbers count from the first segment."""
     count = sum(1 for r in rows if r is not None)
 
     def bad(i: int, why: str) -> dict:
         row = rows[i] if 0 <= i < len(rows) and isinstance(rows[i], dict) else {}
-        return {"ok": False, "lines": count, "first_bad": {"line": i + 1, "id": row.get("id"),
-                                                           "kind": row.get("kind"), "why": why}}
+        found = {"line": base + i + 1, "id": row.get("id"), "kind": row.get("kind"), "why": why}
+        if segment != LOG_NAME:
+            found["segment"] = segment
+        return {"ok": False, "lines": base + count, "first_bad": found}
 
     first = next((i for i, r in enumerate(rows) if isinstance(r, dict) and ("hash" in r or "v" in r)), None)
+    res: dict = {"rows": rows, "count": count, "first": first, "chained": 0, "last": None, "bad": None, "bad_fn": bad}
+    if incoming is not None:
+        lead = next((i for i, r in enumerate(rows) if r is not None), None)
+        if lead is not None and first != lead:
+            res["bad"] = bad(lead, "it follows an earlier segment of the log, so it must be chained to it")
+            return res
     start = first if first is not None else len(rows)
     for i in range(start):
         if rows[i] is ValueError:
-            return bad(i, "it is not a readable line")
-    head = _head()
-    if head is ValueError:
-        return bad(0, "the record of the log's length kept beside it can't be read")
-    chained, last = 0, None
+            res["bad"] = bad(i, "it is not a readable line")
+            return res
     if first is not None:
-        prev = _legacy_prev(texts[:first]) if first else ""
+        prev = incoming if incoming is not None else (_legacy_prev(texts[:first]) if first else "")
+        chained, last = 0, None
         for i in range(first, len(rows)):
             row = rows[i]
             if row is None:
                 continue
+            why = None
             if not isinstance(row, dict):
-                return bad(i, "it is not a readable line")
-            if not isinstance(row.get("hash"), str):
-                return bad(i, "it has no hash, so Khipu did not write it")
-            if row.get("v") != LOG_VERSION:
-                return bad(i, "it has no version or an older one after the chain began, so Khipu did not write it")
-            if row.get("prev") != prev:
+                why = "it is not a readable line"
+            elif not isinstance(row.get("hash"), str):
+                why = "it has no hash, so Khipu did not write it"
+            elif row.get("v") != LOG_VERSION:
+                why = "it has no version or an older one after the chain began, so Khipu did not write it"
+            elif row.get("prev") != prev:
                 if first and i == first and str(row.get("prev") or "").startswith(LEGACY):
-                    return bad(i, "a line written before the log was chained was changed")
-                return bad(i, "it does not follow the line before it: a line is missing or was changed")
-            if _line_hash(row) != row["hash"]:
-                return bad(i, "it was changed after Khipu wrote it")
-            words = row.get("words")
-            if words is not None and (not isinstance(words, str) or row.get("words_sha") != _sha(words)):
-                return bad(i, "its words do not match their hash")
+                    why = "a line written before the log was chained was changed"
+                else:
+                    why = "it does not follow the line before it: a line is missing or was changed"
+            elif _line_hash(row) != row["hash"]:
+                why = "it was changed after Khipu wrote it"
+            elif row.get("words") is not None and (not isinstance(row.get("words"), str)
+                                                  or row.get("words_sha") != _sha(row["words"])):
+                why = "its words do not match their hash"
+            if why:
+                res["bad"] = bad(i, why)
+                return res
             prev, chained, last = row["hash"], chained + 1, i
+        res["chained"], res["last"] = chained, last
+    return res
+
+
+def _verify_chain(*, current_only: bool = False, raw: str | None = None) -> dict:
+    """Whether the log's hash chain holds: ``first_bad`` names the first line
+    that has no hash or a wrong one, no version or an older one after the
+    chain began, does not follow the line before it, or whose words do not
+    match their hash; or, by the head kept beside the log, the line where
+    lines Khipu wrote are missing from the end (line numbers count from 1,
+    through every sealed segment).
+
+    ``current_only`` (the append's check) reads the current segment alone,
+    chained to the last sealed segment's end; it reads them all when the head
+    does not agree with the segments on disk, and ``verify_log`` always does."""
+    sealed = _sealed_paths()
+    head = _head()
+    if current_only and sealed and (not isinstance(head, dict) or head.get("seq", 0) != len(sealed)):
+        current_only = False
+    base, incoming, last_sealed, note = 0, None, None, None
+    try:
+        if sealed and current_only:
+            incoming = _file_tail(sealed[-1])
+        elif sealed:
+            expected = 1
+            for seg in sealed:
+                if _segment_seq(seg) != expected:
+                    return {"ok": False, "lines": base, "first_bad": {
+                        "line": base + 1, "id": None, "kind": None, "segment": seg.name,
+                        "why": f"sealed segment {segment_name(expected)} is missing"}}
+                expected += 1
+                texts, rows = _split_rows(seg.read_text(encoding="utf-8"))
+                res = _walk(texts, rows, incoming, base, seg.name)
+                if res["bad"]:
+                    return res["bad"]
+                if note is None and incoming is None:
+                    first = res["first"]
+                    note = ("Every line was written before the log was chained." if first is None and res["count"]
+                            else f"The first {first} lines were written before the log was chained." if first else "")
+                tail = _prev_of("\n".join(texts)) or incoming
+                last_sealed = (res["chained"], tail)
+                incoming, base = tail, base + res["count"]
+    except OSError as err:
+        return {"ok": False, "lines": base, "first_bad": {"line": base + 1, "id": None, "kind": None,
+                                                           "why": f"the log can't be read ({err.strerror})"}}
+    if raw is None:
+        try:
+            raw = log_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raw = ""
+        except OSError as err:
+            return {"ok": False, "lines": base, "first_bad": {"line": base + 1, "id": None, "kind": None,
+                                                               "why": f"the log can't be read ({err.strerror})"}}
+    texts, rows = _split_rows(raw)
+    res = _walk(texts, rows, incoming, base, LOG_NAME)
+    if res["bad"]:
+        return res["bad"]
+    bad, first, chained, last = res["bad_fn"], res["first"], res["chained"], res["last"]
+    start = first if first is not None else len(rows)
+    if head is ValueError:
+        return bad(0, "the record of the log's length kept beside it can't be read")
+    if head is not None and head.get("seq", 0) != len(sealed):
+        if (head.get("seq", 0) == len(sealed) - 1 and last_sealed is not None
+                and head["lines"] == last_sealed[0] and head["head"] == last_sealed[1]):
+            head = {"lines": 0, "head": last_sealed[1], "seq": len(sealed)}  # a seal cut short before its head
+        else:
+            return bad(0, "the sealed segments of the log do not match the record kept beside it: "
+                          "one is missing or was added")
     if head is None:
-        if chained:
-            return bad(first, "the record of the log's length kept beside it is missing")
+        if chained or sealed:
+            return bad(first or 0, "the record of the log's length kept beside it is missing")
     else:
         end = (last + 1) if last is not None else start
         if chained < head["lines"]:
@@ -1301,11 +1468,14 @@ def _verify_chain() -> dict:
         ahead = chained == head["lines"] + 1 and rows[last]["prev"] == head["head"]
         if chained > head["lines"] and not ahead:
             return bad(last, "the log has lines past the record of its length kept beside it")
-    out = {"ok": True, "lines": count, "first_bad": None}
-    if first is None and count:
-        out["note"] = "Every line was written before the log was chained."
-    elif first:
-        out["note"] = f"The first {first} lines were written before the log was chained."
+    out = {"ok": True, "lines": base + res["count"], "first_bad": None, "segments": len(sealed)}
+    if note is None:
+        if first is None and res["count"]:
+            note = "Every line was written before the log was chained."
+        elif first:
+            note = f"The first {first} lines were written before the log was chained."
+    if note:
+        out["note"] = note
     return out
 
 
@@ -1319,25 +1489,28 @@ def doctor_block() -> dict:
         summary = (f"The owner-actions log was changed outside Khipu at {what}: {bad['why']}. "
                    "Check that entry in Owner actions.")
         return {"ok": False, "chain": chain, "warnings": [summary], "summary": summary}
-    summary = f"Owner-actions log: {chain['lines']} lines, chain intact."
+    segments = f" in {chain['segments'] + 1} files" if chain.get("segments") else ""
+    summary = f"Owner-actions log: {chain['lines']} lines{segments}, chain intact."
     if chain.get("note"):
         summary += " " + chain["note"]
     return {"ok": True, "chain": chain, "warnings": [], "summary": summary}
 
 
 def read_log() -> list[dict]:
-    try:
-        raw = log_path().read_text(encoding="utf-8")
-    except OSError:
-        return []
+    """Every line, oldest first, through every sealed segment."""
     out = []
-    for text in raw.splitlines():
+    for path in _log_files():
         try:
-            row = json.loads(text)
-        except ValueError:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
             continue
-        if isinstance(row, dict):
-            out.append(row)
+        for text in raw.splitlines():
+            try:
+                row = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                out.append(row)
     return out
 
 

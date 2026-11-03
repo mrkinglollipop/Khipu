@@ -417,10 +417,12 @@ def test_usage_measures_the_replica_logs_backups_and_temps(data_dir, logs, tmp_p
     out = storage.usage()
 
     by = {p["name"]: p["bytes"] for p in out["places"]}
-    assert [p["name"] for p in out["places"]] == ["replica", "logs", "backups", "temp"]
+    assert [p["name"] for p in out["places"]][:4] == ["replica", "logs", "backups", "temp"]
+    assert [p["name"] for p in out["places"]][4:] == ["outbox", "capture queue", "capture archive",
+                                                      "session state", "jsonl logs"]
     assert by["replica"] >= 4000 and by["logs"] == 300 and by["backups"] == 2_000_000 and by["temp"] == 500
     assert out["total_bytes"] == sum(by.values())
-    assert out["line"].startswith("Khipu holds 2 MB: replica ") and out["line"].endswith("temporary files 500 B.")
+    assert out["line"].startswith("Khipu holds 2 MB: replica ") and "temporary files 500 B, outbox " in out["line"]
 
 
 def test_the_storage_command_prints_disk_space_and_usage(data_dir, capsys):

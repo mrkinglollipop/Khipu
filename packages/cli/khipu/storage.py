@@ -30,6 +30,12 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
                                                   "(0: keep every backup)"),
     "synth_usage_keep_days": ("count", 90, "Keep this many days of the summariser's token counts "
                                            "(0: keep every line)"),
+    "session_state_keep_days": ("count", 30, "Remove a conversation's capture state and lock files after this "
+                                             "many idle days (0: keep them all)"),
+    "archive_keep_days": ("count", 90, "Remove archived capture jobs that produced nothing and quarantined "
+                                       "outbox files after this many days (0: keep them all)"),
+    "receipt_keep_days": ("count", 90, "Remove the hub's owner-write receipts and old backup heartbeats after "
+                                       "this many days (0: keep them all)"),
     "log_max_mb": ("number", 5, "Start a log afresh when it passes this many MB, keeping one older "
                                 "copy (0: no cap)"),
 }
@@ -300,6 +306,26 @@ def trim_synth_usage(days: int, *, now: datetime | None = None) -> dict[str, Any
     return out
 
 
+def _sweep_bounds(limits: Mapping[str, Any], out: dict[str, Any]) -> dict[str, Any]:
+    """Per-session debris and archive retention (``storage_bounds``). Each
+    part is isolated: a miss is an error line, never a stop."""
+    from khipu import storage_bounds
+
+    parts: dict[str, Any] = {}
+    for name, call in (
+            ("session_state", lambda: storage_bounds.prune_session_state(
+                keep_days=int(limits["session_state_keep_days"]))),
+            ("archives", lambda: storage_bounds.prune_archives(keep_days=int(limits["archive_keep_days"])))):
+        try:
+            parts[name] = call()
+            out["freed_bytes"] += int(parts[name].get("freed_bytes") or 0)
+            if not parts[name].get("ok", True):
+                out["errors"].append(f"{name}: {parts[name].get('error') or 'errors while removing'}")
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"{name}: {describe_os_error(exc)}")
+    return parts
+
+
 def sweep() -> dict[str, Any]:
     """One pass over everything Khipu keeps that nobody reads."""
     out: dict[str, Any] = {"ok": True, "removed": [], "rotated": [], "freed_bytes": 0, "errors": []}
@@ -324,6 +350,7 @@ def sweep() -> dict[str, Any]:
                 continue
         for log in logs:
             _rotate_log(log, cap_bytes, out, preserve_archive=log.with_name(log.name + ".1") in over_cap_rotated)
+    out["bounds"] = _sweep_bounds(limits, out)
     try:
         trimmed = trim_synth_usage(int(limits["synth_usage_keep_days"]))
         if trimmed["dropped"]:
@@ -460,7 +487,32 @@ def _tree_bytes(path: Path) -> int:
     return total
 
 
-_PLACE_WORDS = {"replica": "replica", "logs": "logs", "backups": "backups", "temp": "temporary files"}
+_PLACE_WORDS = {"replica": "replica", "logs": "logs", "backups": "backups", "temp": "temporary files",
+                "outbox": "outbox", "capture queue": "capture queue", "capture archive": "capture archive",
+                "session state": "session state", "jsonl logs": "jsonl logs"}
+
+
+def _folder_bytes(path: Path) -> int:
+    """Bytes under ``path`` (symlinks counted as links, not followed); 0 when absent."""
+    try:
+        return _tree_bytes(path) if path.is_dir() and not path.is_symlink() else 0
+    except OSError:
+        return 0
+
+
+def _jsonl_log_bytes() -> tuple[int, list[str]]:
+    """The append-only ``*.jsonl`` logs: owner actions (every sealed segment
+    too), routing records, the summariser's token counts, owner turns."""
+    from khipu import owner_turns, routing
+    from khipu.paths import data_dir
+
+    total, names = 0, []
+    for folder in (data_dir(), _state_dir(), routing.routing_dir(), owner_turns.folder()):
+        for path in _children(folder):
+            if path.name.endswith(".jsonl") and path.is_file():
+                total += _size(path)
+                names.append(path.name)
+    return total, names
 
 
 def usage() -> dict[str, Any]:
@@ -480,16 +532,38 @@ def usage() -> dict[str, Any]:
     backups = sum(_tree_bytes(p) for p in _children(backups_dir) if hygiene._BACKUP_NAME.fullmatch(p.name))
     temp = sum(_size(p) for p in _children(replica_path.parent) if hub_snapshot.is_replica_temp(p.name))
     temp += sum(_tree_bytes(p) for p in _children(synth_cli.root()) if p.name.startswith("work-"))
+    from khipu import outbox, session_capture
+
+    jsonl_bytes, _jsonl_names = _jsonl_log_bytes()
     places = [
         {"name": "replica", "bytes": replica, "path": str(replica_path)},
         {"name": "logs", "bytes": logs, "path": str(folders[0]) if folders else None},
         {"name": "backups", "bytes": backups, "path": str(backups_dir)},
         {"name": "temp", "bytes": temp, "path": str(replica_path.parent)},
+        {"name": "outbox", "bytes": _folder_bytes(outbox.outbox_dir()), "path": str(outbox.outbox_dir()),
+         "parts": {name: _folder_bytes(outbox.outbox_dir() / name) for name in ("dead", "resolved", "quarantine")}},
+        {"name": "capture queue", "bytes": _folder_bytes(session_capture.queue_dir()),
+         "path": str(session_capture.queue_dir())},
+        {"name": "capture archive", "bytes": _folder_bytes(session_capture.empty_dir()),
+         "path": str(session_capture.empty_dir())},
+        {"name": "session state", "bytes": _folder_bytes(session_capture.state_dir()),
+         "path": str(session_capture.state_dir())},
+        {"name": "jsonl logs", "bytes": jsonl_bytes, "path": None},
     ]
     total = sum(p["bytes"] for p in places)
     line = f"Khipu holds {_human(total)}: " + ", ".join(
         f"{_PLACE_WORDS[p['name']]} {_human(p['bytes'])}" for p in places) + "."
-    return {"total_bytes": total, "places": places, "line": line}
+    out = {"total_bytes": total, "places": places, "line": line}
+    # Work that waits for the owner is never removed; a pile of it is a warning.
+    try:
+        from khipu import storage_bounds
+
+        held = storage_bounds.held_counts()
+        out["held"] = held
+        out["warnings"] = storage_bounds.warnings(held)
+    except Exception as exc:  # noqa: BLE001 - a miss must not hide the sizes
+        out["warnings"], out["held_error"] = [], f"{type(exc).__name__}: {exc}"
+    return out
 
 
 def _children(directory: Path) -> list[Path]:
@@ -501,6 +575,15 @@ def _children(directory: Path) -> list[Path]:
 
 def _sweep_state_path() -> Path:
     return _state_dir() / SWEEP_STATE_NAME
+
+
+def last_sweep() -> dict[str, Any] | None:
+    """What the last sweep recorded (``at`` and ``result``), or None."""
+    try:
+        data = json.loads(_sweep_state_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def sweep_if_due(*, now: datetime | None = None) -> dict[str, Any] | None:

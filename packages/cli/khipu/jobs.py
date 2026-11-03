@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from khipu import logcap
 from khipu.paths import DEFAULT_DIR, ensure_data_dir
 
 DRIVER_TIMEOUT_SECONDS = 3600
@@ -490,11 +491,26 @@ def _run_nightly_locked() -> int:
     _record_nightly_step(steps, "routing_ledger_prune", **_step_result(prune_result),
                          deferred=prune_result.get("deferred")
                          if isinstance(prune_result, dict) else None)
+    # The sweep that trims logs and per-session debris also runs from the replica
+    # job; the nightly makes sure it has run at least once a day wherever that job
+    # does not. The owner-actions chain is checked end to end (every segment).
+    sweep_result = _storage_sweep()
+    _record_nightly_step(steps, "storage_sweep", **_step_result(sweep_result),
+                         deferred=sweep_result.get("deferred") if isinstance(sweep_result, dict) else None)
+    _record_nightly_step(steps, "owner_actions_chain", **_step_result(_owner_actions_chain()))
     completion_result = _step_result(_commitment_close_rules())
     _record_nightly_step(steps, "commitments_close_rules", **completion_result)
+    # Its own step: it used to ride at the end of close-rules and was skipped
+    # whenever anything before it there raised.
+    changes_result = _fact_changes_prune()
+    _record_nightly_step(steps, "fact_changes_prune", **_step_result(changes_result),
+                         deferred=changes_result.get("deferred") if isinstance(changes_result, dict) else None)
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
     _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
+    receipt_result = _receipt_prune()
+    _record_nightly_step(steps, "receipt_prune", **_step_result(receipt_result),
+                         deferred=receipt_result.get("deferred") if isinstance(receipt_result, dict) else None)
     # Before the replica refresh, so a rename found tonight reaches the replica tonight.
     _record_nightly_step(steps, "project_renames", **_step_result(_project_renames_sweep()))
     # Reads the replica the pull timer keeps current; the full dump below stays last.
@@ -828,6 +844,7 @@ def _nightly_log(line: str) -> None:
         seen.add(t)
         try:
             t.parent.mkdir(parents=True, exist_ok=True)
+            logcap.rotate_if_over(t)
             with open(t, "ab") as f:
                 f.write(payload)
         except OSError:
@@ -955,20 +972,12 @@ def _prune_query_cache() -> dict[str, Any]:
 def _prune_routing_ledgers() -> dict[str, Any]:
     """Remove routing delivery ledgers unused for ``routing_ledger_keep_days``.
     Fail-open like the query-cache prune; never run from doctor. A prune that
-    hits its time budget having removed nothing, or that skips oversized
-    ledgers, is recorded as deferred so doctor can see it."""
+    stops early (time, batch) or skips non-file ledgers records why under
+    ``deferred`` so doctor can see it; the next night carries on."""
     try:
         from khipu import routing_ledger_prune
 
         out = routing_ledger_prune.prune()
-        if out.get("time_budget_exhausted") or (
-                int(out.get("skipped") or 0) > 0 and int(out.get("removed") or 0) == 0):
-            reasons = []
-            if out.get("time_budget_exhausted"):
-                reasons.append("time budget exhausted")
-            if int(out.get("skipped") or 0) > 0:
-                reasons.append(f"{out['skipped']} oversized ledger(s) skipped")
-            out = {**out, "deferred": "routing ledger prune: " + "; ".join(reasons)}
         _nightly_log(f"[khipu-routing] ledger prune {out}")
     except Exception as exc:  # noqa: BLE001
         _nightly_log(f"[khipu-routing] ledger prune skipped: {type(exc).__name__}: {exc}")
@@ -981,6 +990,91 @@ def _prune_routing_ledgers() -> dict[str, Any]:
         out = {**out, "log": routing_compact.maybe_compact(nightly=True)}
     except Exception as exc:  # noqa: BLE001
         out = {**out, "log": {"result": "skipped", "why": type(exc).__name__}}
+    return out
+
+
+def _storage_sweep() -> dict[str, Any]:
+    """Run the storage sweep (log rotation, per-session debris, archives) if
+    the replica job has not run it in the last day. Counts only in the
+    receipt, never the names it removed."""
+    try:
+        from khipu import storage
+
+        res = storage.sweep_if_due()
+        reused = res is None
+        if reused:
+            res = (storage.last_sweep() or {}).get("result") or {}
+        bounds = res.get("bounds") or {}
+        deferred = next((str(part["deferred"]) for part in bounds.values()
+                         if isinstance(part, dict) and part.get("deferred")), None)
+        out: dict[str, Any] = {
+            "ok": bool(res.get("ok", True)), "reused_todays_sweep": reused,
+            "rotated": len(res.get("rotated") or []), "removed": len(res.get("removed") or []),
+            "freed_bytes": int(res.get("freed_bytes") or 0),
+            "session_state_removed": int((bounds.get("session_state") or {}).get("removed") or 0),
+            "archives_removed": int((bounds.get("archives") or {}).get("removed") or 0),
+            "errors": [str(e)[:200] for e in (res.get("errors") or [])][:5],
+        }
+        if deferred:
+            out["deferred"] = deferred
+    except Exception as exc:  # noqa: BLE001 - housekeeping must not fail the nightly
+        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    _nightly_log(f"[khipu-storage] sweep {json.dumps(out, default=str)[:400]}")
+    return out
+
+
+def _owner_actions_chain() -> dict[str, Any]:
+    """Verify the owner-actions log end to end (every sealed segment), where
+    an append only checks the current one."""
+    try:
+        from khipu import owner_direction
+
+        chain = owner_direction.verify_log()
+        bad = chain.get("first_bad")
+        out: dict[str, Any] = {"ok": not bad, "lines": chain.get("lines"), "segments": chain.get("segments", 0)}
+        if bad:
+            out["error"] = f"the owner-actions log is broken at line {bad.get('line')}: {bad.get('why')}"[:300]
+    except Exception as exc:  # noqa: BLE001
+        out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    _nightly_log(f"[khipu-owner-actions] chain {json.dumps(out, default=str)[:300]}")
+    return out
+
+
+def _fact_changes_prune() -> dict[str, Any]:
+    """The 30-day retention of the replica change stream (``fact_changes``),
+    after tonight's provenance backfill and as a step of its own. A busy or
+    unreachable hub puts it off a night; any other failure is red."""
+    try:
+        from khipu import provenance
+        from khipu.db import connect
+
+        with connect() as conn:
+            out = dict(provenance.prune_changes(conn))
+    except Exception as exc:  # noqa: BLE001
+        if _transient_provenance_error(exc):
+            out = {"ok": True, "deferred": f"fact changes prune put off: {type(exc).__name__}"}
+        else:
+            out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    _nightly_log(f"[khipu-provenance] fact_changes prune {json.dumps(out, default=str)[:300]}")
+    return out
+
+
+def _receipt_prune() -> dict[str, Any]:
+    """Prune the hub's receipt tables older than ``receipt_keep_days``
+    (``khipu.receipt_prune``). Transient hub trouble puts it off a night."""
+    try:
+        from khipu import receipt_prune, storage
+        from khipu.db import connect
+
+        days = int(storage.settings()["receipt_keep_days"])
+        with connect() as conn:
+            out = receipt_prune.prune(conn, keep_days=days)
+    except Exception as exc:  # noqa: BLE001
+        if _transient_provenance_error(exc):
+            out = {"ok": True, "deferred": f"receipt prune put off: {type(exc).__name__}"}
+        else:
+            out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
+    _nightly_log(f"[khipu-receipts] prune {json.dumps(out, default=str)[:300]}")
     return out
 
 
@@ -1040,8 +1134,7 @@ def _provenance_outcome(out: dict[str, Any]) -> dict[str, Any]:
 
 def _provenance_backfill(conn) -> dict[str, Any]:
     """``khipu provenance backfill`` inside the nightly's close-rules step,
-    until every project is covered, then the 30-day prune of the replica
-    change stream (``fact_changes``). Errors remain visible and the rules
+    until every project is covered. Errors remain visible and the rules
     still run; only transient database errors are nonfatal to the nightly."""
     out: dict[str, Any] = {}
     try:
@@ -1060,8 +1153,8 @@ def _provenance_backfill(conn) -> dict[str, Any]:
         if out["index"].get("connection_unusable", False):
             out["connection_unusable"] = True
             return _provenance_outcome(out)
-        # The replica stream's 30-day retention (section 6 of the design).
-        out["changes"] = provenance.prune_changes(conn)
+        # The replica stream's 30-day retention is its own nightly step
+        # (``_fact_changes_prune``): a failure above must not skip it.
     except Exception as exc:  # noqa: BLE001 — the rules still run after a backfill failure
         rollback_failed = False
         try:
@@ -1258,6 +1351,22 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     ),
     "routing_ledger_prune_ok": (
         "routing_ledger_prune",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "storage_sweep_ok": (
+        "storage_sweep",
+        "run `khipu snapshot heal` or wait for the next nightly, and check the errors it lists",
+    ),
+    "owner_actions_chain_ok": (
+        "owner_actions_chain",
+        "open Owner actions and check the entry the doctor row names",
+    ),
+    "fact_changes_prune_ok": (
+        "fact_changes_prune",
+        "run `khipu jobs install nightly` or wait for the next nightly",
+    ),
+    "receipt_prune_ok": (
+        "receipt_prune",
         "run `khipu jobs install nightly` or wait for the next nightly",
     ),
     "commitments_close_rules_ok": (

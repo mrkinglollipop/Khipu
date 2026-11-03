@@ -409,7 +409,10 @@ class NightlyLastJsonContractTest(unittest.TestCase):
                     mock.patch.object(jobs, "_project_renames_sweep", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_recall_eval_step", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_summary_kind_backfill", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}):
+                    mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}), \
+                    contextlib.ExitStack() as storage_steps:
+                for name in ("_storage_sweep", "_owner_actions_chain", "_fact_changes_prune", "_receipt_prune"):
+                    storage_steps.enter_context(mock.patch.object(jobs, name, return_value={"ok": True}))
                 jobs.run_nightly()
             payload = json.loads((Path(data_td) / "nightly-last.json").read_text())
         names = {s["name"] for s in payload["steps"]}
@@ -418,7 +421,8 @@ class NightlyLastJsonContractTest(unittest.TestCase):
             {"sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "commitments_close_rules", "commitments_mark_stale",
              "commitments_hygiene", "ledger",
-             "project_renames", "snapshot_refresh", "recall_eval"},
+             "project_renames", "snapshot_refresh", "recall_eval",
+             "storage_sweep", "owner_actions_chain", "fact_changes_prune", "receipt_prune"},
         )
         for step in payload["steps"]:
             self.assertIn("ok", step)

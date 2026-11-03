@@ -48,6 +48,23 @@ TOOLS = ("owed_update", "decisions_update")
 _ECHO = ("id", "ids", "link_id", "action", "until", "by")
 _HELD = threading.local()  # the entry this thread's run() is applying
 _NO_ID = "queued by an older build; check it and redo it"
+# The hub keeps the record of an applied write for longer than this (see
+# khipu.receipt_prune), so a write still waiting after it can no longer be
+# shown to have landed or not: it is refused for the owner to check, never sent.
+REPLAY_HORIZON_DAYS = 60
+_TOO_OLD = ("waiting for the hub more than %d days; the hub no longer keeps the record of whether it landed, "
+            "so check it and redo it")
+
+
+def _too_old_to_replay(job: dict[str, Any]) -> bool:
+    stamp = job.get("made_at") or job.get("queued_at")
+    try:
+        made = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False  # no usable time: the age is unknown, so it is not judged by it
+    if made.tzinfo is None:
+        made = made.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - made).total_seconds() > REPLAY_HORIZON_DAYS * 86400
 
 
 class HubRecordMissing(RuntimeError):
@@ -348,6 +365,8 @@ def _replay(path: Path) -> str | None:
         except OSError:
             return "local_error"
         return "replayed"
+    if _too_old_to_replay(job):
+        return "refused" if _refuse(path, job, _TOO_OLD % REPLAY_HORIZON_DAYS) else "local_error"
     try:
         _write(path, {**job, "state": "sending", "sent_at": datetime.now(timezone.utc).isoformat()})
     except OSError:
@@ -428,6 +447,33 @@ def status() -> dict[str, Any]:
         refused = 0
     queued = sorted(str(j.get("queued_at") or j.get("made_at") or "") for j in jobs)
     return {"pending": len(paths), "refused": refused, "oldest_queued_at": queued[0] if queued else None}
+
+
+def doctor_warnings() -> list[str]:
+    """Refused writes the owner has to look at, in plain words: those never
+    sent because they waited past the replay horizon, and those the hub refused."""
+    stale = other = 0
+    try:
+        paths = list(_refused_dir().glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            error = str(json.loads(path.read_text(encoding="utf-8")).get("error") or "")
+        except (OSError, ValueError, AttributeError):
+            error = ""
+        if error.startswith(_TOO_OLD.split("%d")[0]):
+            stale += 1
+        else:
+            other += 1
+    out = []
+    if stale:
+        out.append(f"{stale} owner write{'s' if stale != 1 else ''} waited over {REPLAY_HORIZON_DAYS} days "
+                   f"and {'were' if stale != 1 else 'was'} not sent; check {'them' if stale != 1 else 'it'}.")
+    if other:
+        out.append(f"{other} owner write{'s' if other != 1 else ''} the hub refused "
+                   f"{'are' if other != 1 else 'is'} kept for you to check.")
+    return out
 
 
 def pending_marks(tool: str) -> dict[int, str]:
