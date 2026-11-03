@@ -88,7 +88,11 @@ def test_compaction_keeps_the_fold(world, seed):
     full = rc._Log([line for line, _ in rows], inputs)
     comp = rc._Log(kept, inputs)
     ok, _n, differs = rc.agree(full, comp, NOW)
-    assert ok, (seed, len(rows), len(drop), differs)
+    assert ok, (seed, len(rows), len(drop), differs)  # keeping anchors is the fallback: it must always pass
+    # What compaction would actually write, old cycles' anchors gone if it can spare them.
+    chosen = rc._choose(routing.events_file().read_bytes(), NOW)
+    if "kept" in chosen:
+        comp = rc._Log(chosen["kept"], inputs)
     for h in range(1, 24 * 14, 5):
         when = NOW + timedelta(hours=h)
         assert rc._normal(full.at(when)) == rc._normal(comp.at(when)), (seed, h)

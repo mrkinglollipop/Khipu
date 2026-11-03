@@ -173,7 +173,7 @@ def test_unreadable_lines_and_a_torn_last_line_survive(world):
 # ---- a crash leaves a readable log -----------------------------------------------------
 
 
-@pytest.mark.parametrize("where", ["replace", "link", "write"])
+@pytest.mark.parametrize("where", ["replace", "archive", "write"])
 def test_a_crash_mid_compaction_leaves_a_readable_log(world, monkeypatch, where):
     _install(_log(days=60))
     original = routing.events_file().read_bytes()
@@ -185,9 +185,8 @@ def test_a_crash_mid_compaction_leaves_a_readable_log(world, monkeypatch, where)
     with monkeypatch.context() as broken:
         if where == "replace":
             broken.setattr(rc.os, "replace", boom)
-        elif where == "link":
-            broken.setattr(rc.os, "link", boom)
-            broken.setattr(rc, "_copy", boom)
+        elif where == "archive":
+            broken.setattr(rc, "_write_archive", boom)
         else:
             broken.setattr(rc.os, "fsync", boom)
         assert rc.compact(END)["result"] == "skipped"
@@ -292,12 +291,12 @@ def test_archives_go_only_when_past_both_count_and_age(world):
     assert len(list(rc.archive_dir().iterdir())) == 3
 
 
-def test_compaction_archives_the_previous_full_log(world):
+def test_compaction_archives_what_it_leaves_out(world):
     _install(_log(days=60))
-    full = routing.events_file().read_bytes()
+    full = _lines()
     out = rc.compact(END)
     archived = rc.archive_dir() / out["archive"]
-    assert archived.read_bytes() == full
+    assert rc.full_log() == full
     assert oct(archived.stat().st_mode & 0o777) == "0o600"
     assert rc.health()["archives"] == 1
 
@@ -333,10 +332,9 @@ def test_bytes_alone_turn_the_row_yellow(world, monkeypatch):
 # ---- when it runs --------------------------------------------------------------------
 
 
-def test_it_runs_by_itself_over_the_bound_and_not_under_it(world, monkeypatch):
-    monkeypatch.setattr(rc, "LINES_YELLOW", 500)
-    monkeypatch.setattr(rc, "BYTES_YELLOW", 10 ** 9)
-    monkeypatch.setattr(rc, "BYTES_RED", 10 ** 9)
+def test_it_runs_by_itself_over_the_line_and_not_under_it(world, monkeypatch):
+    monkeypatch.setattr(rc, "LINES_TRIGGER", 500)
+    monkeypatch.setattr(rc, "BYTES_TRIGGER", 10 ** 9)
     _install(_log(days=100)[:300])
     assert rc.maybe_compact(END) == {"result": "not due"}
     _install(_log(days=100))
@@ -350,8 +348,8 @@ def test_it_runs_by_itself_over_the_bound_and_not_under_it(world, monkeypatch):
 def test_the_plan_figures_refresh_and_the_nightly_both_compact(world, monkeypatch):
     from khipu import features, usage
 
-    monkeypatch.setattr(rc, "LINES_YELLOW", 500)
-    monkeypatch.setattr(rc, "BYTES_YELLOW", 10 ** 9)
+    monkeypatch.setattr(rc, "LINES_TRIGGER", 500)
+    monkeypatch.setattr(rc, "BYTES_TRIGGER", 10 ** 9)
     monkeypatch.setattr(features, "enabled", lambda *a, **k: True)
     monkeypatch.setattr(usage, "refresh_due", lambda: {"refreshed": 0})
     monkeypatch.setattr(routing, "record_pace_samples", lambda *a, **k: 0)

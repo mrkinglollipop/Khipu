@@ -20,7 +20,8 @@ over the compacted file is the fold over the full log:
     witness and reset cycle before that span, is not the only one of its
     reset time still ahead, does not bridge reset estimates into one cycle,
     and is not the twin of a reading that stays. Every cycle keeps its
-    newest reading per witness, however old. A line the fold ignores
+    newest reading per witness until it and its reset are ``ANCHOR_DAYS`` old
+    (kept for good if the fold can't do without them). A line the fold ignores
     (no reset time) is no reading at all, and counts for nothing;
   * a ``source_seen`` goes unless it is among the last of its Mac and runner
     (only the last is read);
@@ -38,11 +39,11 @@ at the present and at every moment the fold says its answer changes next
 (``valid_until``), and at fixed distances out to a year, with the sources'
 present sightings as well as without, and asked what those sightings would
 append: they must agree, or nothing is written. The replacement writes the new
-file beside the log, fsyncs it, links the old log into ``archive/`` and renames
-the new file over the log (atomic), so a crash at any point leaves a log that
-reads, and at worst an extra archive: every line left out is in that archive,
-byte for byte. Archives are pruned only when past both their count and their
-age.
+file beside the log, fsyncs it, writes the lines left out to ``archive/``
+(compressed, byte for byte, each with its place: ``full_log`` puts them back) and
+renames the new file over the log (atomic), so a crash at any point leaves a log
+that reads, and at worst an extra archive. Archives are pruned only when past
+both their count and their age.
 
 The planning and the check run outside the routing lock on a copy of the
 bytes read; under the lock the log must still begin with those bytes (a
@@ -52,6 +53,7 @@ verbatim.
 from __future__ import annotations
 
 import contextlib
+import gzip
 import json
 import os
 import secrets
@@ -64,12 +66,18 @@ from khipu import routing
 ARCHIVE_DIR = "archive"
 STATE_NAME = "compaction.json"
 
-# The bound. The fold costs about 14 ms per 1,000 lines on this Mac and the
-# prompt path has 50 ms, so a log that stays under ~2,000 lines folds well
-# inside it. Yellow is the line where compaction starts on its own; red is
-# where a fresh fold is near the whole budget (4,000 lines ~ 55 ms).
-LINES_YELLOW, BYTES_YELLOW = 2000, 1 << 20
-LINES_RED, BYTES_RED = 4000, 2 << 20
+# Compaction starts on its own here. At a line a minute a compacted log holds
+# about 1,700 lines plus the owner's, which never go: two days of samples, half a
+# day of readings still counted, a fortnight of anchors.
+LINES_TRIGGER, BYTES_TRIGGER = 2000, 1 << 20
+# The bound doctor holds it to. Attempts are ``MIN_INTERVAL_S`` apart, so a healthy
+# log peaks 360 lines over what compaction leaves: yellow is that, with room for
+# about 900 owner lines, so it means something is wrong, not that the log is
+# between compactions. Prompts don't read the log, so nothing here is a prompt's
+# budget: a fold of 3,000 lines is about 50 ms. Red is where a compaction has been
+# failing for days.
+LINES_YELLOW, BYTES_YELLOW = 3000, 2 << 20
+LINES_RED, BYTES_RED = 4000, 3 << 20
 # Under this a log is never over the bound (a line is ~250 bytes): not even counted.
 SMALL_BYTES = 32 * 1024
 # A compaction aims below this, so the next one is not at once due.
@@ -105,6 +113,9 @@ RESET_CHECKS_KEPT = 3
 # that is never dropped.
 PACE_READ_S = 86400
 PACE_MARGIN = 2
+# A cycle's anchor (``_sample_drops``) goes once it and its reset are this old:
+# one per cycle and witness for good would be the log's one unbounded line.
+ANCHOR_DAYS = 14
 # ``routing_pace._cycles`` links reset estimates at most this far apart into
 # one cycle; a bridge between two kept estimates stays under this less a margin.
 CYCLE_LINK_S = 3600
@@ -146,9 +157,9 @@ def _lines(data: bytes) -> int:
 
 
 def health() -> dict:
-    """Doctor's row: ``level`` green, yellow (over the bound compaction starts
-    at) or red (over the line where a fresh fold nears the prompt budget),
-    with the line count and bytes and the last compaction."""
+    """Doctor's row: ``level`` green, yellow (over the bound a healthy log stays
+    under) or red (far over it), with the line count and bytes and the last
+    compaction."""
     size = log_size()
     lines, nbytes = size["lines"], size["bytes"]
     level = "green"
@@ -172,9 +183,9 @@ def health() -> dict:
         out["kept_lines"] = total - gone
     elif level != "green":
         out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes); it is compacted at "
-                          f"{LINES_YELLOW:,} lines or {BYTES_YELLOW:,} bytes, nightly and after the plan figures "
-                          f"refresh" + (f". It is past {LINES_RED:,} lines or {BYTES_RED:,} bytes, where reading it "
-                                        "before a prompt can run out of the time allowed." if level == "red" else "."))
+                          f"{LINES_TRIGGER:,} lines or {BYTES_TRIGGER:,} bytes, nightly and after the plan figures "
+                          f"refresh" + (f". It is past {LINES_RED:,} lines or {BYTES_RED:,} bytes, far more than "
+                                        "compaction leaves, so it may be failing." if level == "red" else "."))
     return out
 
 
@@ -189,7 +200,7 @@ def _droppable() -> tuple[int, int]:
         emitted = _emitted(_sightings(routing._inputs(), now))
     except Exception:  # noqa: BLE001 - doctor's row never fails on this
         emitted = None
-    return len(plan(rows, now, PROFILES[-1], emitted=emitted)), len(rows)
+    return len(plan(rows, now, PROFILES[-1], emitted=emitted, aged_anchors=True)), len(rows)
 
 
 def _read_state() -> dict:
@@ -242,7 +253,7 @@ def _owner(event: dict) -> bool:
 
 
 def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: datetime,
-                  sample_days: float, sample_kept: int) -> set[int]:
+                  sample_days: float, sample_kept: int, aged_anchors: bool = False) -> set[int]:
     """The ``usage_sample`` lines nothing the fold does with samples can use.
 
     Everything the fold does with a sample is in ``routing.fold`` (through
@@ -275,6 +286,7 @@ def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: da
     drop: set[int] = set()
     horizon = timedelta(seconds=PACE_MARGIN * PACE_READ_S)
     cut_days = timedelta(days=sample_days)
+    anchor_cut = now - timedelta(days=ANCHOR_DAYS) if aged_anchors else None
     for (account, window), items in groups.items():
         keep: set[int] = set()
         cut = now - max(horizon, cut_days)
@@ -305,10 +317,11 @@ def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: da
             # for every cycle. Old cycles are not provably unread: on noisy
             # logs (several Macs, skewed clocks, jittered reset estimates)
             # dropping their anchors changed pace's verdict, so each keeps
-            # one line per Mac and source.
+            # one line per Mac and source. With ``aged_anchors`` one long past
+            # goes, and ``agree`` says whether this log could spare it.
             anchors: dict[tuple, dict] = {}
             for s in filtered:
-                if s["t"] < cut:
+                if s["t"] < cut and not (anchor_cut and s["t"] < anchor_cut and s["reset"] < anchor_cut):
                     ident = (s["mac"], s["source"], s["_cycle_key"])
                     if ident not in anchors or s["t"] > anchors[ident]["t"]:
                         anchors[ident] = s
@@ -526,14 +539,14 @@ def _observation_drops(rows: list[tuple[bytes, dict | None]], now: datetime, hou
             continue
         if row.get("runner") and (not row.get("account") or row.get("unmatched")):
             lanes.setdefault((row["runner"], row.get("lane") or ""), []).append((at, write, row))
-        # ``fold`` reads ``reset_at``; a limit's own end is kept by the same rule.
-        for field in ("reset_at", "until"):
-            reset = routing._parse(row.get(field))
-            for as_of in level_times if reset is not None else ():
-                if reset > as_of:
-                    ident = (field, as_of, row.get("account"), row.get("runner"), row.get("lane"), line_era.get(line))
-                    if ident not in earliest or reset < earliest[ident][0]:
-                        earliest[ident] = (reset, line if line is not None else -1)
+        # As ``fold`` reads a line for a level: its reset, or else its limit's end.
+        reset = routing._parse(row.get("reset_at")) or (
+            routing._parse(row.get("until")) if row.get("state") == routing.LIMITED else None)
+        for as_of in level_times if reset is not None else ():
+            if reset > as_of:
+                ident = (as_of, row.get("account"), row.get("runner"), row.get("lane"), line_era.get(line))
+                if ident not in earliest or reset < earliest[ident][0]:
+                    earliest[ident] = (reset, line if line is not None else -1)
         if line is None or not (row.get("type") == "observation" or row.get("source_id")):
             continue
         candidates.add(line)
@@ -601,11 +614,11 @@ def _observation_drops(rows: list[tuple[bytes, dict | None]], now: datetime, hou
 
 
 def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple,
-         emitted: set[str] | None = None) -> set[int]:
+         emitted: set[str] | None = None, aged_anchors: bool = False) -> set[int]:
     """The indexes of ``rows`` (line, its event or None) the fold can do
     without, under ``profile``. Anything not sure is kept: ``emitted`` is the
     ids the sources offer now, and None, that they could not be read, keeps
-    every observation."""
+    every observation; ``aged_anchors`` lets old cycles' anchors go."""
     sample_days, sample_kept, evidence_days, evidence_kept, reset_days, seen_hours, seen_kept = profile
     evidence_cut = now - timedelta(days=evidence_days)
     reset_cut = now - timedelta(days=reset_days)
@@ -645,7 +658,7 @@ def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple,
                 if end is not None and end > evidence_cut:
                     continue
                 evidence.setdefault((event["account"], event.get("scope") or "all", event.get("state")), []).append((at, i))
-    drop.update(_sample_drops(samples, now, sample_days, sample_kept))
+    drop.update(_sample_drops(samples, now, sample_days, sample_kept, aged_anchors))
     for group in seen.values():
         drop.update(group[:-SOURCE_SEEN_KEPT])
     for group in checks.values():
@@ -798,9 +811,9 @@ def _emitted(sightings: tuple | None) -> set[str] | None:
 
 def _choose(data: bytes, now: datetime) -> dict:
     """The best verified compaction of ``data``: {"kept": lines, "profile",
-    "moments", "dropped", "by_type"}, or {"why": ...} when there is none
-    worth making. A profile whose observations can't be left out alike is
-    tried again keeping them all, so they never hold up the rest."""
+    "moments", "dropped", "by_type", "positions"}, or {"why": ...} when there
+    is none worth making. A profile whose old anchors or observations can't be
+    left out alike is tried again keeping them, so they never hold up the rest."""
     rows = _rows(data)
     full = [line for line, _e in rows]
     inputs = routing._inputs()
@@ -810,8 +823,9 @@ def _choose(data: bytes, now: datetime) -> dict:
     best: dict | None = None
     why = "nothing the fold can do without"
     for number, profile in enumerate(PROFILES, 1):
-        for offered in ((emitted, None) if emitted is not None else (None,)):
-            drop = plan(rows, now, profile, emitted=offered)
+        tries = [(emitted, True), (emitted, False)] if emitted is not None else []
+        for offered, aged in [*tries, (None, True), (None, False)]:
+            drop = plan(rows, now, profile, emitted=offered, aged_anchors=aged)
             if len(drop) < MIN_GAIN * len(rows):
                 why = "less than a tenth of the lines can go"
                 continue
@@ -825,7 +839,8 @@ def _choose(data: bytes, now: datetime) -> dict:
                         if i not in drop and e and isinstance(e.get("seq"), int)]
                 best = {"kept": kept, "profile": number, "moments": moments, "dropped": len(drop),
                         "by_type": _by_type(rows, drop), "before": len(rows), "after": len(kept),
-                        "through_seq": max(seqs) if seqs else None}
+                        "through_seq": max(seqs) if seqs else None, "positions": sorted(drop),
+                        "left_out": [full[i] for i in sorted(drop)]}
             break
         if best is not None and best["after"] <= LINES_TARGET \
                 and sum(len(k) + 1 for k in best["kept"]) <= BYTES_TARGET:
@@ -868,13 +883,14 @@ def _compact(now: datetime) -> dict:
         _note(now, chosen["why"])
         return {"result": "skipped", "why": chosen["why"]}
     head = b"".join(line + b"\n" for line in chosen["kept"])  # built before the lock is taken
-    name = f"events-{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(3)}.jsonl"
+    name = f"events-{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(3)}.jsonl.gz"
+    archive = _archive_bytes(chosen, now)
     with routing._lock():
         current = path.read_bytes()
         if not current.startswith(data):
             return {"result": "skipped", "why": "the record changed while it was checked"}
         body = head + current[len(data):]
-        _replace(path, body, name)
+        _replace(path, body, name, archive)
         _write_state({"at": routing._iso(now), "attempted_at": routing._iso(now), "result": "compacted",
                       "lines_before": chosen["before"], "lines_after": chosen["after"],
                       "bytes_before": len(data), "bytes_after": len(head),
@@ -887,10 +903,19 @@ def _compact(now: datetime) -> dict:
             "bytes_after": len(head), "archive": name, "pruned": pruned, "dropped_by_type": chosen["by_type"]}
 
 
-def _replace(path: Path, body: bytes, name: str) -> None:
-    """Write ``body`` beside the log and fsync it, link the log into
-    ``archive/`` as ``name`` and rename ``body`` over the log. A crash before
-    the rename leaves the log whole; after it, the compacted log."""
+def _archive_bytes(chosen: dict, now: datetime) -> bytes:
+    """The lines left out, as written, after a header with each one's place
+    among the lines the compaction read."""
+    header = json.dumps({"compacted_at": routing._iso(now), "before": chosen["before"],
+                         "positions": chosen["positions"]}, sort_keys=True).encode("utf-8")
+    return gzip.compress(b"".join(line + b"\n" for line in [header, *chosen["left_out"]]), 9, mtime=0)
+
+
+def _replace(path: Path, body: bytes, name: str, archive_body: bytes) -> None:
+    """Write ``body`` beside the log and fsync it, write the lines it leaves
+    out to ``archive/`` as ``name`` and rename ``body`` over the log. A crash
+    before the rename leaves the log whole, and at worst an archive of lines
+    still in it; after it, the compacted log."""
     folder = path.parent
     temp = folder / f".events-compact-{os.getpid()}-{secrets.token_hex(3)}.tmp"
     archive = archive_dir()
@@ -902,24 +927,19 @@ def _replace(path: Path, body: bytes, name: str) -> None:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
-        try:
-            os.link(path, archive / name)
-        except OSError:
-            _copy(path, archive / name)
+        _write_archive(archive / name, archive_body)
         _fsync_dir(archive)
         os.replace(temp, path)
         _fsync_dir(folder)
-        with contextlib.suppress(OSError):
-            os.chmod(archive / name, 0o600)  # the old log is now only the archive
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temp)
 
 
-def _copy(source: Path, target: Path) -> None:
+def _write_archive(target: Path, data: bytes) -> None:
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as stream:
-        stream.write(source.read_bytes())
+        stream.write(data)
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -939,7 +959,8 @@ def _archives() -> list[tuple[datetime, Path]]:
     except OSError:
         return []
     for path in names:
-        if not (path.name.startswith("events-") and path.name.endswith(".jsonl")):
+        # A ``.jsonl`` is a whole log, as compaction used to keep them.
+        if not (path.name.startswith("events-") and path.name.endswith((".jsonl", ".jsonl.gz"))):
             continue
         try:
             at = datetime.strptime(path.name[7:23], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
@@ -947,6 +968,19 @@ def _archives() -> list[tuple[datetime, Path]]:
             continue
         out.append((at, path))
     return sorted(out, reverse=True)
+
+
+def full_log() -> list[bytes]:
+    """The log's lines as if nothing had been left out, as far back as the
+    archives reach: each one, newest first, puts its lines back in their places."""
+    lines = [line for line in routing.events_file().read_bytes().split(b"\n") if line.strip()]
+    for _at, path in _archives():
+        if not path.name.endswith(".gz"):
+            break
+        header, *left_out = gzip.decompress(path.read_bytes()).split(b"\n")[:-1]
+        for position, line in zip(json.loads(header)["positions"], left_out):
+            lines.insert(position, line)
+    return lines
 
 
 def prune_archives(now: datetime) -> int:
@@ -965,8 +999,8 @@ def prune_archives(now: datetime) -> int:
 
 
 def due(now: datetime | None = None, *, nightly: bool = False) -> bool:
-    """Whether the log is over the yellow bound (and, outside the nightly,
-    no attempt was made in the last ``MIN_INTERVAL_S``)."""
+    """Whether the log is over the line compaction starts at (and, outside the
+    nightly, no attempt was made in the last ``MIN_INTERVAL_S``)."""
     now = now or routing._now()
     try:
         small = routing.events_file().stat().st_size < SMALL_BYTES
@@ -975,7 +1009,7 @@ def due(now: datetime | None = None, *, nightly: bool = False) -> bool:
     if small:
         return False
     size = log_size()
-    if size["lines"] <= LINES_YELLOW and size["bytes"] <= BYTES_YELLOW:
+    if size["lines"] <= LINES_TRIGGER and size["bytes"] <= BYTES_TRIGGER:
         return False
     if nightly:
         return True

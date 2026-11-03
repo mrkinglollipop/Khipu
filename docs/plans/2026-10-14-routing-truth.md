@@ -239,9 +239,11 @@ not in a new file per session.
 **The log's bound (2026-11-02).** Nothing Khipu stores grows without a bound, and the log was folded whole on
 every stale read: a fold costs about 14 ms per 1,000 lines, and at 10,000 lines (about 3 MB) a refold before a
 prompt took 555 ms against the prompt path's 50 ms, so the conversation got no routing. `khipu.routing_compact`
-keeps the log under 2,000 lines or 1 MB (doctor's `routing_log` row: yellow above, red above 4,000 lines or
-2 MB, with the line count and bytes). Over the bound it compacts, on its own after the plan figures refresh
-(six hours apart at most) and in the nightly. A compaction keeps the previous full log whole in
+compacts the log past 2,000 lines or 1 MB, on its own after the plan figures refresh (six hours apart at most)
+and in the nightly (doctor's `routing_log` row, with the line count and bytes: yellow above 3,000 lines or 2 MB,
+which a log between compactions stays under; red above 4,000 lines or 3 MB. Revised 2026-11-03: prompts no longer
+read the log, and the log's only unbounded lines are the owner's own). A compaction keeps the lines it leaves out,
+compressed and each with its place, in
 `state/routing/archive/` (the newest four, and any younger than 30 days: one goes only when past both) and
 leaves in `events.jsonl` the lines the fold can still tell apart from those left out, byte for byte and in
 order, with every later line after them: the checkpoint is those kept lines and `compaction.json` (when, how
@@ -250,10 +252,12 @@ over the full log, and the version, the epoch and `since` do not notice. What ca
 the longest span the pace calculation reads (kept: three days and the newest few per account and window),
 all but the last runner `source_seen` lines, a conversation's or a check's old evidence whose end has passed,
 and old reset-check outcomes. What never goes: any line an owner wrote (rules, note, priority and its undo
-steps, holds, caps, clears, account lines), `observation` lines (the sources' sightings are matched to them by
-`source_id`), unreadable lines and unfinished account changes. Before the swap the compacted and the full log
+steps, holds, caps, clears, account lines), unreadable lines and unfinished account changes. An `observation`
+goes only when it is over, no source still offers its `source_id` and it is not the newest of its kind; a cycle's
+newest sample per witness goes once it and its reset are 14 days old. Either is kept if the check below refuses
+without it. Before the swap the compacted and the full log
 are folded at the present, at each `valid_until` that follows and at distances out to a year, and must agree,
-or nothing is written. The new file is written beside the log and fsynced, the old log is linked into
+or nothing is written. The new file is written beside the log and fsynced, the lines left out are written to
 `archive/`, and the new file is renamed over the log, so a crash leaves a readable log. The owner's lines are
 human-rate and stay. The archives hold routing words for up to 30 days and are listed by forget as kept routing
 words, as `remote.jsonl` is. Doctor says in words when a log is over its bound and nothing more can go.

@@ -3,6 +3,7 @@ can read goes, every reader answers alike after, and the archive holds what left
 Hermetic."""
 from __future__ import annotations
 
+import gzip
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -275,6 +276,60 @@ def test_a_line_not_yet_uploaded_and_each_macs_last_never_go(world, monkeypatch)
     assert "sent" in gone and "unsent" not in gone
 
 
+# ---- old cycles' anchors -----------------------------------------------------------------
+
+
+def _cycles(days):
+    """Hourly readings of a five-hour window for ``days``: each old cycle's
+    last reading is its anchor."""
+    log = _Log()
+    for age in range(days * 24, 0, -1):
+        at = NOW - timedelta(hours=age)
+        cycle = int(at.timestamp()) // 18000
+        reset = datetime.fromtimestamp((cycle + 1) * 18000, tz=timezone.utc)
+        log.add(f"u{age}", {"type": "usage_sample", "account": KEY, "window": "five_hour", "witness_at": ISO(at),
+                            "resets_at": ISO(reset), "used_pct": 10.0, "t_err": 60, "source": "probe",
+                            "written_by": {"kind": "probe"}, "via": "probe"}, age)
+    log.padding()
+    return log
+
+
+def test_an_anchor_stays_for_a_fortnight_and_goes_after(world):
+    log = _cycles(30)
+    synth.write(routing.events_file(), log.rows)
+    rows = rc._rows(routing.events_file().read_bytes())
+    aged = rc.plan(rows, NOW, STRONGEST, emitted=set(), aged_anchors=True)
+    kept_for_good = rc.plan(rows, NOW, STRONGEST, emitted=set())
+    young = {i for name, i in log.names.items() if name.startswith("u") and int(name[1:]) < (rc.ANCHOR_DAYS - 1) * 24}
+    old = {i for name, i in log.names.items() if name.startswith("u") and int(name[1:]) > (rc.ANCHOR_DAYS + 1) * 24}
+    assert len(old - kept_for_good) >= 15 * 24 // 5 - 1  # every cycle: an anchor
+    assert old <= aged  # past the fortnight: none
+    assert young - aged == young - kept_for_good  # inside it: the same as ever
+    assert _agree(rows, aged)[0]
+
+
+def test_old_anchors_the_fold_needs_are_kept_for_good(world, monkeypatch):
+    """A profile whose aged plan fails the guard retries keeping them."""
+    original = rc.plan
+    tried = []
+
+    def needs_them(rows, now, profile, emitted=None, aged_anchors=False):
+        tried.append(aged_anchors)
+        drop = original(rows, now, profile, emitted=emitted, aged_anchors=aged_anchors)
+        if aged_anchors:
+            drop |= {i for i, (_l, e) in enumerate(rows) if e and e.get("type") == "note_set"}
+        return drop
+
+    monkeypatch.setattr(rc, "plan", needs_them)
+    log = _cycles(30)
+    synth.write(routing.events_file(), log.rows)
+    out = rc.compact(NOW)
+    assert out["result"] == "compacted"
+    assert True in tried and False in tried
+    assert b"note_set" in routing.events_file().read_bytes()
+    assert routing.events_file().read_bytes().count(b"usage_sample") >= 15 * 24 // 5 - 1  # the anchors
+
+
 # ---- the guard -------------------------------------------------------------------------
 
 
@@ -327,8 +382,8 @@ def test_a_rule_that_breaks_the_fold_costs_only_the_observations(world, monkeypa
     """Their proposal failing the guard falls back to keeping them all."""
     original = rc.plan
 
-    def bad_observations(rows, now, profile, emitted=None):
-        drop = original(rows, now, profile, emitted=None)
+    def bad_observations(rows, now, profile, emitted=None, aged_anchors=False):
+        drop = original(rows, now, profile, emitted=None, aged_anchors=aged_anchors)
         if emitted is not None:
             drop |= {i for i, (_l, e) in enumerate(rows) if e and e.get("type") == "observation"}
         return drop
@@ -363,17 +418,46 @@ def test_a_compaction_with_sources_answers_alike_and_keeps_what_they_offer(world
 def test_every_line_left_out_is_in_the_archive_byte_for_byte(world):
     rows = synth.stream_log(["claude|", "codex|"], NOW, seed=5)
     synth.write(routing.events_file(), rows)
-    before = routing.events_file().read_bytes()
+    before = [line for line in routing.events_file().read_bytes().split(b"\n") if line]
     out = rc.compact(NOW)
     assert out["result"] == "compacted" and out["dropped_by_type"]["observation"] > 1000
     archive = rc.archive_dir() / out["archive"]
-    assert archive.read_bytes() == before
-    live = routing.events_file().read_bytes().split(b"\n")
-    assert set(live) <= set(before.split(b"\n"))
-    # The live log is the archive's lines in the archive's order.
-    lines = iter(before.split(b"\n"))
-    assert all(any(line == other for other in lines) for line in live if line)
+    live = [line for line in routing.events_file().read_bytes().split(b"\n") if line]
+    _header, *left_out = gzip.decompress(archive.read_bytes()).split(b"\n")[:-1]
+    assert len(live) + len(left_out) == len(before)
+    assert sorted(live + left_out) == sorted(before)
+    assert rc.full_log() == before
+    # Small: the point of keeping only these.
+    assert archive.stat().st_size < sum(len(line) for line in left_out) / 4
     assert rc.prune_archives(NOW + timedelta(days=1)) == 0 and archive.exists()
+
+
+def test_the_whole_history_comes_back_through_every_compaction(world):
+    stream = synth.Stream(["claude|", "codex|"], NOW - timedelta(days=8), seed=8, runners=1, lanes=4)
+    written, compactions = [], 0
+    at = NOW - timedelta(days=8)
+    for _day in range(4):
+        at += timedelta(days=2)
+        lines = stream.until(at)
+        (synth.append if written else synth.write)(routing.events_file(), lines)
+        written += [json.dumps(row, sort_keys=True).encode() for row in lines]
+        world[0] = at
+        compactions += rc.compact(at)["result"] == "compacted"
+    assert compactions >= 2
+    assert rc.full_log() == written
+
+
+def test_an_older_whole_log_archive_still_prunes_and_stops_the_walk_back(world):
+    folder = rc.archive_dir()
+    folder.mkdir(parents=True)
+    old = folder / "events-20260101T000000Z-aaaaaa.jsonl"
+    old.write_bytes(b'{"whole": "log"}\n')
+    rows = synth.stream_log(["claude|", "codex|"], NOW, seed=9)
+    synth.write(routing.events_file(), rows)
+    written = [line for line in routing.events_file().read_bytes().split(b"\n") if line]
+    assert rc.compact(NOW)["result"] == "compacted"
+    assert rc.full_log() == written
+    assert old in [path for _at, path in rc._archives()]
 
 
 # ---- where the lines go ----------------------------------------------------------------
@@ -385,14 +469,12 @@ def test_the_log_doctor_said_could_not_shrink_comes_under_its_bound(world):
     synth.write(routing.events_file(), rows)
     out = rc.compact(NOW)
     assert out["result"] == "compacted"
-    assert out["lines_after"] <= rc.LINES_YELLOW
+    assert out["lines_after"] <= rc.LINES_TRIGGER
     assert rc.health()["level"] == "green"
     assert "warning" not in rc.health()
 
 
 def test_the_log_stays_near_its_bound_over_a_week_of_growth(world):
-    """A week, not for good: each usage cycle keeps an anchor per witness however
-    old (``_sample_drops``), so samples still add a few lines a day."""
     stream = synth.Stream(["claude|", "codex|"], NOW, seed=7, runners=1, lanes=4, owner_per_day=2)
     highest, compactions, at = 0, 0, NOW
     for _hour in range(0, 8 * 24, 3):
@@ -404,8 +486,20 @@ def test_the_log_stays_near_its_bound_over_a_week_of_growth(world):
             compactions += 1
             highest = max(highest, rc.log_size()["lines"])
     assert compactions >= 2
-    assert highest <= rc.LINES_YELLOW
-    assert rc.log_size()["lines"] <= rc.LINES_YELLOW + 300
+    assert highest <= rc.LINES_TRIGGER
+    assert rc.log_size()["lines"] <= rc.LINES_YELLOW
+    assert rc.health()["level"] == "green"
+
+
+def test_compaction_starts_well_under_the_bound_doctor_holds_it_to(world):
+    """A log between compactions is healthy: doctor stays green while it waits."""
+    assert rc.LINES_TRIGGER + 6 * 60 + 300 <= rc.LINES_YELLOW
+    rows = synth.stream_log(["claude|", "codex|"], NOW, seed=10, observations=1400, others=800, owner=20)
+    synth.write(routing.events_file(), rows[:2400])
+    size = rc.log_size()
+    assert rc.LINES_TRIGGER < size["lines"] < rc.LINES_YELLOW and size["bytes"] < rc.BYTES_YELLOW
+    assert rc.health()["level"] == "green"
+    assert rc.due(NOW)
 
 
 def test_doctor_names_what_it_keeps_when_it_cannot_shrink(world, monkeypatch):
