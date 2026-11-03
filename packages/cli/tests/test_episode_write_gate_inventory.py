@@ -300,5 +300,5 @@ def test_locked_entries_exist_and_the_lock_is_taken_before_the_gate():
         mod, func = qualified.rsplit(".", 1)
         assert any(f.name == func for f in modules[mod].functions), f"LOCKED lists missing {qualified}"
     gate = modules["tombstones"].body("write_gate")
-    assert gate.index("memory_lock.shared()") < gate.index("_locked_registry()"), \
+    assert gate.index("memory_lock.shared(") < gate.index("_locked_registry()"), \
         "write_gate must take the memory lock before the registry lock"
