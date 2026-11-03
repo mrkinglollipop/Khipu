@@ -348,3 +348,293 @@ def test_t3_handoff_history_marker_never_puts_history_on_disk(hooked):
     assert (turn["entrypoint"], turn["typed"]) == ("t3", True)
     disk = owner_turns.session_file("review-session").read_text(encoding="utf-8")
     assert "untrusted history" not in disk and "pause Codex" not in disk and "what did I just ask" not in disk
+
+
+# ---- a harness whose program file was replaced while it runs --------------------------------
+#
+# An update deletes the file a running Claude Code was started from, and the
+# kernel then has no path for it (``proc_pidpath`` returns 0) while its parent,
+# start time and name stay readable. The issuer and chain comparison is (pid,
+# start time), and a path only ever gave the name the shell and interpreter
+# refusals read and the app-bundle place, so a process seen by a hook while its
+# path was readable stays that process. One never seen so stays refused.
+
+REAL_CHAIN = owner_direction._caller_chain  # conftest puts a fake harness in front of it
+REAL_REPLACED = owner_direction._program_replaced
+HOOKED = ["claude", "--resume=3f1c"]
+TYPED = {"session_id": "s-replaced", "prompt": "pause Codex for now", "cwd": "/w"}
+
+
+class Kernel:
+    """The process tree the issuer and the chain read: the recorder (100)
+    under the shim (90) under Claude (80), and the MCP server (200) under
+    Claude. ``replace`` deletes a process's file: no path, the rest readable."""
+
+    def __init__(self, monkeypatch):
+        self.mp = monkeypatch
+        self.procs = {100: (90, "/usr/bin/python3", 3.0), 90: (80, "/bin/bash", 2.5),
+                      80: (70, "/Users/x/.local/share/claude/versions/2.1.316", 1.0),
+                      70: (1, "/usr/sbin/launcher", 0.5), 200: (80, "/usr/bin/python3", 3.0)}
+        self.args = {90: SHIM_ARGS, 80: list(HOOKED), 70: ["launcher"]}
+        self.names: dict[int, str] = {}
+        self.gone: set[int] = set()
+        monkeypatch.setattr(owner_turns, "_proc_info", self.info)
+        monkeypatch.setattr(owner_turns, "_proc_bare", self.bare)
+        monkeypatch.setattr(owner_turns, "_proc_args", lambda pid: self.args.get(pid))
+        monkeypatch.setattr(owner_turns, "_on_terminal", lambda pid: None)
+        monkeypatch.setattr(owner_direction, "_caller_chain", REAL_CHAIN)
+        monkeypatch.setattr(owner_direction, "_program_replaced", REAL_REPLACED)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-replaced")
+        self.be(100)
+
+    def be(self, pid: int) -> None:
+        self.mp.setattr(owner_turns.os, "getpid", lambda: pid)
+
+    def info(self, pid):
+        return None if pid in self.gone else self.procs.get(pid)
+
+    def bare(self, pid):
+        if pid not in self.procs:
+            return None
+        parent, exe, start = self.procs[pid]
+        return parent, start, self.names.get(pid, os.path.basename(exe))[:16]
+
+    def replace(self, *pids: int) -> None:
+        self.gone.update(pids)
+
+    def hook_turn(self):
+        """What the prompt hook records for one typed turn, read off the tree."""
+        self.be(100)
+        issuer = owner_turns.hook_issuer() or {"refused": "unknown"}
+        owner_turns.record(TYPED, CLAUDE_ENV, issuer=issuer)
+        return issuer
+
+    def check(self, caller: int = 200):
+        self.be(caller)
+        return owner_direction.check("route.pause")
+
+
+@pytest.fixture
+def kernel(folders, monkeypatch):
+    for name in ("CODEX_THREAD_ID", "KHIPU_SESSION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    return Kernel(monkeypatch)
+
+
+def _refused(kernel, caller: int = 200) -> str:
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        kernel.check(caller)
+    assert err.value.code == "not_from_the_hook"
+    return str(err.value)
+
+
+def test_a_known_process_keeps_the_proof_after_its_binary_is_replaced(kernel):
+    before = kernel.hook_turn()
+    assert before["pid"] == 80 and kernel.check()["auth"] == "direction"
+    kernel.replace(80)
+    after = kernel.hook_turn()
+    # The same facts as before the update, the kernel's start time included.
+    assert after == before
+    assert owner_turns.turns("s-replaced")[-1]["issuer"] == before
+    assert kernel.check()["auth"] == "direction"
+
+
+def test_a_hook_turn_from_before_the_update_still_matches_the_chain(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    assert kernel.check()["auth"] == "direction"
+
+
+def test_a_process_never_seen_with_a_readable_path_is_refused_and_told_to_restart(kernel):
+    kernel.replace(80)
+    assert kernel.hook_turn() == {"refused": "unknown"}
+    why = _refused(kernel)
+    assert "updated while" in why and "Restart" in why
+    assert "Ask the owner to say it" not in why
+
+
+def test_a_forged_issuer_for_a_process_never_seen_is_refused(kernel):
+    # The turn file names the right process; the chain can't read it, so it
+    # never reaches it, whatever its name says.
+    kernel.replace(80)
+    owner_turns.record(TYPED, CLAUDE_ENV, issuer={"pid": 80, "start": 1.0, "exe": "claude"})
+    assert "updated while" in _refused(kernel)
+
+
+def test_a_process_above_the_harness_with_no_path_is_not_the_conversations_to_restart(kernel):
+    # The conversation's own program is fine: restarting it would change nothing.
+    kernel.replace(70)
+    owner_turns.record(TYPED, CLAUDE_ENV, issuer={"pid": 80, "start": 1.5, "exe": "2.1.316"})
+    assert "updated while" not in _refused(kernel)
+
+
+def test_a_reused_process_number_with_a_matching_name_is_refused(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    # Another program of the same name got the number: the same name, its own start time.
+    kernel.procs[80] = (70, kernel.procs[80][1], 2.0)
+    kernel.be(100)
+    assert owner_turns.hook_issuer() is None
+    for start in (1.0, 2.0):
+        owner_turns.record(TYPED, CLAUDE_ENV, issuer={"pid": 80, "start": start, "exe": "2.1.316"})
+        _refused(kernel)
+
+
+def test_a_forged_issuer_start_for_a_known_replaced_process_is_refused(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    owner_turns.record(TYPED, CLAUDE_ENV, issuer={"pid": 80, "start": 1.5, "exe": "2.1.316"})
+    _refused(kernel)
+
+
+def test_a_known_process_that_runs_something_else_now_is_not_known(kernel):
+    # exec keeps the pid and the start time; the kernel's name is what moves.
+    kernel.hook_turn()
+    kernel.replace(80)
+    kernel.names[80] = "zsh"
+    kernel.be(100)
+    assert owner_turns.hook_issuer() is None
+    _refused(kernel)
+
+
+def test_a_matching_name_with_the_wrong_ancestry_is_refused(kernel):
+    # Two known programs of the same name, both replaced. The turn names the
+    # first; the call runs under the second, which is the nearest harness.
+    kernel.hook_turn()
+    kernel.procs[81] = (70, kernel.procs[80][1], 1.2)
+    kernel.procs[90] = (81, "/bin/bash", 2.5)
+    kernel.be(100)
+    assert owner_turns.hook_issuer()["pid"] == 81
+    kernel.procs[90] = (80, "/bin/bash", 2.5)
+    kernel.replace(80, 81)
+    assert kernel.hook_turn()["pid"] == 80
+    kernel.procs[300] = (81, "/usr/bin/python3", 3.0)
+    _refused(kernel, caller=300)
+    # And one Khipu never saw, whatever its name, ends the chain.
+    kernel.procs[82] = (70, kernel.procs[80][1], 1.3)
+    kernel.procs[301] = (82, "/usr/bin/python3", 3.0)
+    kernel.replace(82)
+    _refused(kernel, caller=301)
+    assert kernel.check()["auth"] == "direction"
+
+
+def test_the_agents_shell_under_a_known_replaced_process_stays_refused(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    kernel.procs[90] = (222, "/bin/bash", 2.5)
+    kernel.procs[222] = (80, "/bin/zsh", 2.0)
+    kernel.args[222] = BASH_TOOL_ARGS
+    kernel.be(100)
+    assert owner_turns.hook_issuer() == {"refused": "zsh"}
+    owner_turns.record(TYPED, CLAUDE_ENV, issuer={"refused": "zsh"})
+    # The real reason, not the update: a restart would not help.
+    assert "updated while" not in _refused(kernel)
+
+
+def test_an_agents_shell_replaced_too_is_never_taken_for_a_harness(kernel):
+    kernel.hook_turn()
+    kernel.procs[90] = (222, "/bin/bash", 2.5)
+    kernel.procs[222] = (80, "/opt/homebrew/bin/zsh", 2.0)
+    kernel.args[222] = BASH_TOOL_ARGS
+    kernel.replace(80, 222)
+    kernel.be(100)
+    assert owner_turns.hook_issuer() is None
+
+
+def test_a_refused_issuer_leaves_no_record_to_lean_on_later(kernel):
+    kernel.procs[90] = (222, "/bin/bash", 2.5)
+    kernel.procs[222] = (80, "/opt/homebrew/bin/python3.11", 2.0)
+    kernel.args[222] = ["python3", "run.py"]
+    kernel.be(100)
+    assert "refused" in owner_turns.hook_issuer()
+    kernel.replace(222)
+    kernel.be(100)
+    assert owner_turns.hook_issuer() is None
+
+
+def test_headless_is_still_read_live_on_a_known_replaced_process(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    kernel.args[80] = ["claude", "-p", "do it"]
+    issuer = kernel.hook_turn()
+    assert issuer["print"] is True and issuer["headless"] is True
+    assert owner_turns.turns("s-replaced")[-1]["entrypoint"] == "sdk-cli"
+    kernel.args[80] = None
+    assert kernel.hook_turn()["headless"] == "unknown"
+
+
+def test_the_app_bundle_a_known_process_ran_from_stays_what_the_kernel_said(kernel, folders, monkeypatch):
+    app = folders["home"] / "Applications" / "Cursor.app" / "Contents" / "MacOS"
+    app.mkdir(parents=True)
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(folders["home"]))
+    kernel.procs[80] = (70, str(app / "Cursor"), 1.0)
+    assert kernel.hook_turn()["app"] == "Cursor.app"
+    kernel.replace(80)
+    assert kernel.hook_turn()["app"] == "Cursor.app"
+
+
+def test_the_sweep_drops_the_record_of_a_process_that_is_gone(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    owner_turns.sweep()
+    kernel.be(100)
+    assert owner_turns.hook_issuer()["pid"] == 80
+    saved = kernel.procs.pop(80)
+    owner_turns.sweep()
+    # Its record went with it: nothing vouches for that number and time again.
+    kernel.procs[80] = saved
+    kernel.be(100)
+    assert owner_turns.hook_issuer() is None
+
+
+def test_the_records_are_private_and_hold_no_words(kernel):
+    kernel.hook_turn()
+    files = [p for p in owner_turns.folder().rglob("*") if p.is_file() and "2.1.316" in p.read_text()
+             and p.suffix != ".jsonl"]
+    assert files
+    for path in files:
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+        assert "pause Codex" not in path.read_text()
+
+
+def test_a_deleted_program_on_the_real_kernel(folders, monkeypatch, tmp_path):
+    """The seams above against macOS itself: a compiled program whose file is
+    deleted while it runs has no path, its start time and name stay, and only
+    the one a hook saw first is known."""
+    if sys.platform != "darwin":
+        pytest.skip("macOS process table")
+    import shutil
+    import time
+
+    if not shutil.which("cc"):
+        pytest.skip("no C compiler")
+    source = tmp_path / "wait.c"
+    source.write_text("#include <unistd.h>\nint main(void){sleep(60);return 0;}\n")
+
+    def started(name: str):
+        exe = tmp_path / name
+        subprocess.run(["cc", str(source), "-o", str(exe)], check=True, timeout=60, capture_output=True)
+        child = subprocess.Popen([str(exe)])
+        for _ in range(100):
+            if owner_turns._proc_info(child.pid) is not None:
+                return exe, child
+            time.sleep(0.02)
+        raise AssertionError("the program did not start")
+
+    seen_exe, seen = started("claude")
+    fresh_exe, fresh = started("claude2")
+    try:
+        parent, path, start = owner_turns._proc_info(seen.pid)
+        assert os.path.basename(path) == "claude"
+        owner_turns._pin_issuer(seen.pid, path, start)
+        seen_exe.unlink()
+        fresh_exe.unlink()
+        assert owner_turns._proc_info(seen.pid) is None and owner_turns._proc_info(fresh.pid) is None
+        assert owner_turns._proc_bare(seen.pid) == (parent, start, "claude")
+        assert owner_turns._known_info(seen.pid) == (parent, path, start)
+        assert owner_turns._known_info(fresh.pid) is None
+    finally:
+        for child in (seen, fresh):
+            child.kill()
+            child.wait()

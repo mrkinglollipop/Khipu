@@ -750,7 +750,7 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
     # starts Codex, Cursor or Antigravity is not known here, so on those
     # only the Khipu app confirms.
     if latest.get("entrypoint") != "t3" or not owner_turns.t3_launched(latest.get("issuer")):
-        raise DirectionRefused("not_from_the_hook",
+        raise DirectionRefused("not_from_the_hook", (latest.get("entrypoint") == "t3" and _replaced_why(latest)) or
                                "This conversation's latest hook turn did not come from T3's own agent (a headless "
                                "or scripted process, or one Khipu could not trace to the T3 Code app), so it can't "
                                "confirm. Nothing was changed.")
@@ -1019,14 +1019,15 @@ _PASS_THROUGH = ("env", "timeout", "nohup", "uv", "uvx")
 def _caller_chain() -> list[tuple[int, float, str]]:
     """This process's ancestors, parent first, as (pid, start time, the
     name of the file it runs). Stops where a parent started after its child
-    (its number was reused)."""
+    (its number was reused), and at a process with no path that no hook saw
+    with one (``owner_turns._known_info``)."""
     me = owner_turns._proc_info(os.getpid())
     if me is None:
         return []
     pid, born = me[0], me[2]
     out: list[tuple[int, float, str]] = []
     for _ in range(_CHAIN_MOST):
-        info = owner_turns._proc_info(pid)
+        info = owner_turns._known_info(pid)
         if info is None or info[2] > born:
             break
         out.append((pid, info[2], os.path.basename(os.path.realpath(info[1]))))
@@ -1050,6 +1051,42 @@ def _nearest_harness(chain: list[tuple[int, float, str]]) -> tuple[int, float] |
     return None
 
 
+_PROGRAM_NAMES = {"claude_code": "Claude", "codex": "Codex", "cursor": "Cursor", "antigravity": "Antigravity",
+                  "aegis": "Grok"}
+
+
+def _program_replaced() -> bool:
+    """Whether the walk up to this call's harness ends at a process with no
+    path and no record of one: its file went before any hook saw it, so only
+    restarting it gets a proof back. Nothing above the harness counts: this
+    conversation's restart would not touch it. Says why a refusal happened;
+    never decides one."""
+    me = pid = os.getpid()
+    for _ in range(_CHAIN_MOST):
+        info = owner_turns._known_info(pid)
+        if info is None:
+            return owner_turns._proc_bare(pid) is not None
+        name = os.path.basename(os.path.realpath(info[1]))
+        if (pid != me and _nearest_harness([(pid, info[2], name)])) or info[0] <= 1:
+            return False
+        pid = info[0]
+    return False
+
+
+def _replaced_why(turn: dict) -> str | None:
+    """The refusal's real reason when the program running this conversation
+    was updated before any hook saw it (``_program_replaced``), which no later
+    message here can mend. Never for an issuer refused for what it is: a
+    restart would not change that."""
+    issuer = turn.get("issuer")
+    if not isinstance(issuer, dict) or issuer.get("refused") not in (None, "unknown") or not _program_replaced():
+        return None
+    name = _PROGRAM_NAMES.get(turn.get("harness"), "agent")
+    return (f"This conversation's {name} program, or a program it runs, was updated while running, before Khipu had "
+            f"seen it, so Khipu can't tie this call to this conversation's prompt hook. Nothing was changed, and "
+            f"repeating the message here won't help. Restart this conversation's {name} program and it works again.")
+
+
 def _from_the_hook(turn: dict) -> None:
     """The turn was recorded by a hook its harness ran (its issuer is not an
     agent's shell or a script), and that harness is the nearest one above
@@ -1062,7 +1099,7 @@ def _from_the_hook(turn: dict) -> None:
     if not refused:
         refused = (issuer["pid"], issuer.get("start")) != _nearest_harness(_caller_chain())
     if refused:
-        raise DirectionRefused("not_from_the_hook",
+        raise DirectionRefused("not_from_the_hook", _replaced_why(turn) or
                                "The owner's recent turn was not recorded by the prompt hook of the conversation "
                                "making this call, so this call can't make an owner's change. Ask the owner to say "
                                "it in the conversation they are typing in.")

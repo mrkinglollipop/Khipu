@@ -1547,3 +1547,95 @@ def test_review5_a_late_copy_of_an_earlier_antigravity_row_stays_refused(world):
     ok, out = _confirm_id(request)
     assert not ok and out["code"] == "not_confirmed", out
     assert not _paused()
+
+
+# ---- a T3 Claude whose program file was replaced while it runs -----------------------------------
+
+
+RECORDER, SHIM = 4_000_010, 4_000_011
+
+
+def _known_then_replaced(world) -> dict:
+    """T3's Claude runs a prompt hook with its path readable, as the recorder
+    reads it. ``_replace`` is the update that then deletes its file."""
+    tree = world["tree"]
+    tree.procs[RECORDER] = (SHIM, "/usr/bin/python3", 1.0)
+    tree.procs[SHIM] = (4_000_000, "/bin/bash", 1.0)
+    tree.args[SHIM] = ["/bin/sh", "/live/packages/cli/bin/khipu-prompt-recall"]
+    world["mp"].setattr(owner_turns, "_proc_bare", lambda pid: (tree.procs[pid][0], tree.procs[pid][2], "claude")
+                        if pid in (4_000_000, 4_000_001) else None)
+    with world["mp"].context() as mp:
+        mp.setattr(owner_turns.os, "getpid", lambda: RECORDER)
+        issuer = owner_turns.hook_issuer()
+    assert (issuer["pid"], issuer["start"]) == (4_000_000, 1.0)
+    return issuer
+
+
+def _replace(world, pid: int = 4_000_000) -> None:
+    real = owner_turns._proc_info
+    world["mp"].setattr(owner_turns, "_proc_info", lambda p: None if p == pid else real(p))
+
+
+def test_a_replaced_t3_claude_seen_before_the_update_still_takes_the_owners_yes(world):
+    issuer = _known_then_replaced(world)
+    request = _hold_in_t3(world)
+    _replace(world)
+    assert owner_turns.t3_launched(issuer)
+    assert not owner_turns.t3_launched({**issuer, "start": 2.0})
+    mid = world["t3"].message(THREAD, time.time() + 1)
+    _t3_hook_turn()
+    ok, out = _confirm_id(request)
+    assert ok, out
+    assert _paused() and out["confirmed"]["message"] == mid
+
+
+@pytest.mark.parametrize("by, source, extra", [
+    ("agent", "mcp", {"scheduledTaskId": "task-1"}),
+    ("agent", "mcp", {"senderThreadId": "t3-sender"}),
+    ("agent", "provider", {"notification": {"kind": "command"}}),
+    ("user", "server", {}),
+], ids=["wake", "relay", "notification", "resume"])
+def test_a_replaced_t3_claude_never_counts_an_agents_message(world, by, source, extra):
+    _known_then_replaced(world)
+    request = _hold_in_t3(world)
+    _replace(world)
+    world["t3"].message(THREAD, time.time() + 1, text="yes, confirm it", by=by, source=source, **extra)
+    _t3_hook_turn()
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_confirmed", out
+    assert not _paused()
+
+
+def test_a_replaced_t3_claude_never_seen_is_refused_and_told_to_restart(world):
+    # Its path was gone before any hook ran: nothing vouches for it, and T3's
+    # record of the owner's message alone does not confirm.
+    request = _hold_in_t3(world)
+    _replace(world)
+    world["mp"].setattr(owner_direction, "_program_replaced", lambda: True)
+    world["t3"].message(THREAD, time.time() + 1)
+    owner_turns.record({"session_id": T3_SESSION, "prompt": OWNER_WORDS, "cwd": "/repo"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts"}, issuer={"refused": "unknown"})
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "not_from_the_hook", out
+    assert "updated while" in out["error"] and "Restart" in out["error"]
+    assert not _paused()
+    # The change itself says the same, instead of asking the owner to repeat it.
+    world["mp"].setattr(owner_direction, "_caller_chain", lambda: [])
+    ok, out = owner_act.act("route.pause", {"account": "Codex"})
+    assert not ok and out["code"] == "not_from_the_hook", out
+    assert "updated while" in out["error"] and "say it" not in out["error"]
+
+
+def test_only_the_issuer_may_be_known_by_its_record_on_the_way_to_t3(world):
+    # An ancestor with no path stays unreadable, even one a hook once saw.
+    tree = world["tree"]
+    tree.chain(("/Users/x/.local/bin/claude", T3_CLAUDE_ARGS), ("/Users/x/.local/bin/claude", T3_CLAUDE_ARGS),
+               (tree.t3_exe, ["T3 Code (Beta)"]))
+    issuer = _known_then_replaced(world)
+    tree.procs[SHIM] = (4_000_001, "/bin/bash", 1.0)
+    with world["mp"].context() as mp:
+        mp.setattr(owner_turns.os, "getpid", lambda: RECORDER)
+        assert owner_turns.hook_issuer()["pid"] == 4_000_001
+    assert owner_turns.t3_launched(issuer)
+    _replace(world, 4_000_001)
+    assert not owner_turns.t3_launched(issuer)
