@@ -48,9 +48,9 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
-    "route.tier_table.set": (("tiers",), ()),
+    "route.tier_table.set": (("tiers",), ("expect",)),
     "route.tier_table.confirm": ((), ("expect",)),
-    "route.tier_table.clear": ((), ()),
+    "route.tier_table.clear": ((), ("expect",)),
     "accounts.track": (("entries",), ("expect",)),
     "accounts.rename": (("account", "name"), ("expect",)),
     "accounts.stop": (("account",), ("expect",)),
@@ -323,7 +323,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":
-        return ["route", "tier-table", "set", "--tiers=" + json.dumps(v["tiers"])], []
+        return ["route", "tier-table", "set", "--tiers=" + json.dumps(v["tiers"]), *_opts(v, "expect")], []
     if action.startswith("route.tier_table."):
         return ["route", "tier-table", verb, *_opts(v, "expect")], []
     if action == "accounts.track":
@@ -426,7 +426,7 @@ def owner_turn() -> bool:
     from khipu import owner_direction
 
     try:
-        owner_direction.check("forget.here")
+        owner_direction.check("forget.here", reading=True)
     except Exception:  # noqa: BLE001 - any doubt keeps the text back
         return False
     return True
@@ -510,25 +510,44 @@ def act(action, args) -> tuple[bool, dict]:
         full = full_argv(head, positionals, ["--owner-direction"])
     except Refused as err:
         return False, err.refusal()
-    if not held:
-        try:
-            owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
-        except owner_direction.DirectionRefused as refused:
-            # Anything but a T3 conversation's hold runs the command as before.
-            held = refused.code == "confirm_needed"
-            if pending is not None and not held:
-                return False, refused.refusal()
-        else:
-            # The owner's words asked for the amend, never for the waiting
-            # request it would confirm: his yes to the ask naming both is.
-            held = pending is not None
-    if held:
-        if pending is not None:
-            return _hold(action, values, ask=pending[1])
-        from khipu import needs_you
+    token = owner_direction.ANSWERING.set(owner_direction.signature(action, values))
+    try:
+        if not held:
+            try:
+                owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
+            except owner_direction.DirectionRefused as refused:
+                if refused.code == "not_confirmed":
+                    return False, refused.refusal()  # the turn that read the list: no hold, nothing to ask yet
+                # Anything but a T3 conversation's hold runs the command as before.
+                held = refused.code == "confirm_needed"
+                if pending is not None and not held:
+                    return False, refused.refusal()
+            else:
+                # The owner's words asked for the amend, never for the waiting
+                # request it would confirm: his yes to the ask naming both is.
+                held = pending is not None
+        if held:
+            if pending is not None:
+                return _hold(action, values, ask=pending[1])
+            from khipu import needs_you
 
-        return _hold(action, values, ask=needs_you.ask_for(action, values))
-    return _run(action, full)
+            return _held_on_a_read(_hold(action, values, ask=needs_you.ask_for(action, values)))
+        return _run(action, full)
+    finally:
+        owner_direction.ANSWERING.reset(token)
+
+
+def _held_on_a_read(hold: tuple[bool, dict]) -> tuple[bool, dict]:
+    """A hold that started from the read that showed it (``owner_direction._seed``):
+    when the owner already replied to that read, this is his one yes, on the
+    confirm's own proof. With no reply it stays held, and says what to ask."""
+    ok, out = hold
+    if not ok or not out.pop("seeded", False):
+        return hold
+    done_ok, done = _confirm({"request": out["request"]})
+    if done_ok or done.get("code") != "not_confirmed":
+        return done_ok, done
+    return True, out
 
 
 def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
@@ -563,7 +582,8 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
         raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False)
                       + f"; it changes {', '.join(unnamed)} in a way the ask can't put in words, so the amend "
                         "can't confirm it too")
-    words = "; ".join(changes)
+    # A conversation's words stay in their quotes (``their_words``).
+    words = "; ".join(routing.their_words(c) for c in changes)
     if len(words) > routing.PENDING_ASK_MOST:
         raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False)
                       + "; its changes are too long to name in one ask, so the amend can't confirm it too")
@@ -572,7 +592,7 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
     asked = held.get("owner_request")
     amend = owner_direction.ask_line(action, {k: v for k, v in values.items() if k not in ("confirm_pending", "expect")})
     ask = (f"A priority request from {held.get('pending_by') or 'a conversation'} is waiting for you (version "
-           f"{version}" + (f", asked as \"{asked}\"" if asked else "") + f"). Confirming it makes these yours: "
+           f"{version}" + (f", asked as \"{routing.their_words(asked)}\"" if asked else "") + f"). Confirming it makes these yours: "
            f"{words}. Confirm that request, then " + amend[len("Confirm "):])
     # Whatever the caller passed, the pin is the request as this ask shows it.
     return dict(values, confirm_pending=routing.pending_priority_pin(view)), ask
@@ -629,7 +649,11 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
                 return out
             action, args = "route.rule.confirm", {"rule": number, "expect": rule["revision"]}
         # Never a hold: a turn that cannot be proved owner's is left alone.
-        owner_direction.check(action, instant=True)
+        checking = owner_direction.REQUEST_APPLIED.set(True)
+        try:
+            owner_direction.check(action, instant=True)
+        finally:
+            owner_direction.REQUEST_APPLIED.reset(checking)
     except (owner_direction.DirectionRefused, routing.RouteError, StopIteration, KeyError):
         return out
     token = owner_direction.REQUEST_APPLIED.set(True)
@@ -661,6 +685,7 @@ def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, d
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
     return True, {"ok": True, "applied": False, "pending": True, "request": request["id"], "ask": request["ask"],
+                  **({"seeded": True} if request.get("seeded") else {}),
                   "line": (f"Nothing is changed yet. Ask the owner: \"{request['ask']}\" Once they answer in this "
                            f"conversation, call khipu_owner_act with {CONFIRM} and "
                            f"{{\"request\": \"{request['id']}\"}}; if they say no, {DECLINE} with the same "

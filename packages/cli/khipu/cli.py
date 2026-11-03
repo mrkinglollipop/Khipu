@@ -6277,7 +6277,7 @@ def build_parser() -> argparse.ArgumentParser:
     rtier.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (set only; stays a proposal)")
     rtier.add_argument("--expect", default=None, metavar="PIN",
-                       help="confirm: the proposed table as it was shown; refused if it changed since")
+                       help="The proposed table as it was shown; refused if it changed since")
     rtier.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rtier)
 

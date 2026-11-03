@@ -8494,11 +8494,22 @@ def _checked_tiers(tiers) -> dict:
     return dict(tiers)
 
 
-def set_tier_table(tiers, *, via: str, now: datetime | None = None) -> dict:
-    """The owner's tier table, confirmed as written."""
+def _tier_as_shown(expect) -> None:
+    if expect is not None:
+        waiting = pending_tier_table()
+        if waiting is None or waiting["pin"] != expect:
+            raise RouteError("the proposed tier table moved after it was shown; read what is waiting again")
+
+
+def set_tier_table(tiers, *, via: str, now: datetime | None = None, expect: str | None = None) -> dict:
+    """The owner's tier table, confirmed as written. ``expect``: an answer to
+    a proposal as it was shown (``tier_table_pin``), never landing on a table
+    or a proposal written since."""
     rows = _checked_tiers(tiers)
-    return dict(_owner_write({"type": "tier_table_set", "tiers": rows, "confirmed": True}, via),
-                tiers=rows)
+    with _lock():
+        _tier_as_shown(expect)
+        return dict(_owner_write({"type": "tier_table_set", "tiers": rows, "confirmed": True}, via),
+                    tiers=rows)
 
 
 def request_tier_table(tiers, *, owner_request: str, author: dict | None = None, via: str = "mcp",
@@ -8556,19 +8567,21 @@ def confirm_tier_table(*, via: str, now: datetime | None = None, expect: str | N
     """Confirm the latest proposed tier table, as the owner wrote it.
     ``expect``: the proposal as it was shown (``tier_table_pin``); a newer one
     or none is refused, never confirmed unseen."""
-    if expect is not None:
-        waiting = pending_tier_table()
-        if waiting is None or waiting["pin"] != expect:
-            raise RouteError("the proposed tier table moved after it was shown; read what is waiting again")
-    proposed = _proposed_tiers()
-    if proposed is None:
-        raise RouteError("there is no proposed tier table to confirm")
-    return set_tier_table(proposed, via=via, now=now)
+    with _lock():
+        _tier_as_shown(expect)
+        proposed = _proposed_tiers()
+        if proposed is None:
+            raise RouteError("there is no proposed tier table to confirm")
+        return set_tier_table(proposed, via=via, now=now)
 
 
-def clear_tier_table(*, via: str, now: datetime | None = None) -> dict:
-    """Remove the tier table, so no table governs the dispatch check."""
-    return _owner_write({"type": "tier_table_clear"}, via)
+def clear_tier_table(*, via: str, now: datetime | None = None, expect: str | None = None) -> dict:
+    """Remove the tier table, so no table governs the dispatch check.
+    ``expect``: as for a set, so refusing a proposal never wipes a table
+    adopted since it was shown."""
+    with _lock():
+        _tier_as_shown(expect)
+        return _owner_write({"type": "tier_table_clear"}, via)
 
 
 # ---- words ----------------------------------------------------------------------------
@@ -12858,11 +12871,11 @@ def _tier_table_cli(args, now: datetime) -> int:
         return 2
     now = _now()
     if action == "set":
-        out = set_tier_table(_tier_table_arg(args), via=via, now=now)
+        out = set_tier_table(_tier_table_arg(args), via=via, now=now, expect=getattr(args, "expect", None))
     elif action == "confirm":
         out = confirm_tier_table(via=via, now=now, expect=getattr(args, "expect", None))
     else:
-        out = clear_tier_table(via=via, now=now)
+        out = clear_tier_table(via=via, now=now, expect=getattr(args, "expect", None))
     _print_json(_finish_owner(out))
     return 0
 

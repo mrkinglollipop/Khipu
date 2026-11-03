@@ -118,6 +118,25 @@ ROUTING_INSTANT: frozenset[str] = frozenset({
 })
 
 
+# Every action ``khipu_needs_you`` offers to settle something on the list.
+SETTLE_ACTIONS: frozenset[str] = frozenset({
+    "route.priority.confirm", "route.priority.undo", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
+    "route.rule.retire", "config.answer_request.confirm", "config.answer_request.undo", "accounts.request.confirm",
+    "accounts.request.undo", "route.tier_table.confirm", "route.tier_table.set", "route.tier_table.clear",
+    "owed.correct_job_origin.confirm", "project.merge", "project.keep_separate", "forget.send", "forget.here",
+    "forget.not_same", "direction.acknowledge", "route.hold.end", "route.clear", "route.cap.set",
+})
+# The routing changes that answer a request waiting on the owner, not a change
+# of his own. His typed message can be the direction for a change of his own;
+# an answer needs him to have been shown what it answers, so in T3 it applies at
+# once only on a message newer than an ask in that thread showing it
+# (``_shown_read``). A conversation's own request applied on the owner's turn
+# (``REQUEST_APPLIED``) is the change he typed, and stays as it was.
+ANSWER_ACTIONS: frozenset[str] = frozenset({
+    "route.priority.confirm", "route.priority.undo", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
+})
+
+
 def instant_allowed(action: str, target: str | None = None) -> bool:
     """Whether ``action`` is a routing change that applies as soon as the
     owner types it. An Undo (``direction.undo``) counts only when it undoes
@@ -155,7 +174,7 @@ def _title(name: str) -> str:
 # ---- the check ---------------------------------------------------------------------------
 
 
-def check(action: str, *, env=None, now: float | None = None, instant: bool = False) -> dict:
+def check(action: str, *, env=None, now: float | None = None, instant: bool = False, reading: bool = False) -> dict:
     """The owner-direction check (scope section 2): the auth stamp for the
     record, or ``DirectionRefused``. The one test is where the request comes
     from: a conversation the owner typed in recently, where Khipu's own
@@ -169,7 +188,10 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
     turns never count directly, applies it at once when T3's own record proves
     a message the owner typed since this conversation was last asked about
     (``_instant_t3``: the proof a confirm uses, against that earlier ask).
-    Without that proof it is held as before."""
+    Without that proof it is held as before.
+
+    ``reading``: only asking what a change would do now, for the list
+    (``owner_turn``, ``needs_you``), so the turn it was read in still counts."""
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
@@ -207,7 +229,7 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
             # T3's own record decides whether it is a job (``_t3_bound``).
             with t3.owner_read_budget():
                 _t3_bound(environ, session, now)
-                stamp = _instant_t3(environ, session, now) if instant else None
+                stamp = _instant_t3(environ, session, now, action) if instant else None
             if stamp is not None:
                 return stamp
             raise DirectionRefused("confirm_needed", _HOLD_WHY) from None
@@ -226,6 +248,8 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
     elif lineage_job:
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     _from_the_hook(turn)
+    if not reading and action in SETTLE_ACTIONS and not REQUEST_APPLIED.get():
+        _not_the_reading_turn(session, turn)
     stamp = {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
              "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
              "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
@@ -419,6 +443,121 @@ def ask_line(action: str, args: dict) -> str:
     return f"Confirm {action}" + (f" ({what})" if what else "") + "?"
 
 
+# ---- the list as an ask ---------------------------------------------------------------------------
+#
+# Reading ``khipu_needs_you`` is what puts the question to the owner, so it is an
+# ask boundary like a hold's: what he typed before it, the question included,
+# is no reply to it, and every pending request is grown to it from the same
+# read. It is kept as a row of its own (state ``shown``, under the requests lock,
+# Forget's scan and the 30-day retention like any settled row) with the
+# signature of each answer the read showed whole.
+
+READ_ACTION = "needs_you.read"
+_SHOWN_MOST = 400
+# The action being answered, as ``owner_act.act`` was asked for it, through to
+# the owner gate the command reaches: never from an argument.
+ANSWERING: contextvars.ContextVar[str | None] = contextvars.ContextVar("khipu_answering", default=None)
+_SAME_TURN = ("Not done: this is the same turn that read what is waiting, so the owner has not answered yet, and "
+              "nothing was changed. Show them the words, and call this after they reply.")
+
+
+def signature(action: str, args: dict) -> str:
+    return _sha(json.dumps({"action": action, "args": args}, sort_keys=True, default=str))[:24]
+
+
+def _read_rows() -> list[dict]:
+    try:
+        return [r for r in _read_requests(requests_path()) if r.get("action") == READ_ACTION]
+    except (OSError, ValueError):
+        return []
+
+
+def _shown_read(thread: str, answer: str | None) -> dict | None:
+    """The read in this T3 thread that showed ``answer``, when one did."""
+    for row in _read_rows():
+        if (answer and answer in (row.get("shown") or [])
+                and _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None):
+            return row
+    return None
+
+
+def _not_the_reading_turn(session: str, turn: dict) -> None:
+    """Outside T3: an answer is refused in the turn that read the list. An
+    agent that never read it has nothing to be compared with, and passes."""
+    for row in _read_rows():
+        boundary = (row.get("asks") or {}).get(session) if row.get("session") == session else None
+        if boundary is not None and not _after_ask(turn, boundary):
+            raise DirectionRefused("not_confirmed", _SAME_TURN)
+
+
+def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | None:
+    """Record that this conversation was just given the list: the ask boundary
+    for the conversation and every pending request, and what it showed. None
+    when it is recorded, or when this call could never settle anything anyway
+    (a job, a child thread, no conversation to name); otherwise why not, and
+    the list then offers no settle."""
+    from khipu import t3
+
+    now = _clock() if now is None else now
+    environ = os.environ if env is None else env
+    try:
+        session = _caller_session(environ)
+        with _requests_locked() as path, t3.owner_read_budget():
+            turns_ = owner_turns.turns(session, now)
+            in_t3 = any(t.get("entrypoint") == "t3" for t in turns_)
+            if not in_t3 and owner_turns.dispatched_job(environ, session):
+                return None
+            thread = _t3_bound(environ, session, now)[0] if in_t3 else None
+            read = _t3_read(thread, (), None) if in_t3 else None
+
+            def grown(row: dict) -> None:
+                if in_t3:
+                    boundaries = row.get("t3_snapshots")
+                    if not isinstance(boundaries, dict):
+                        boundaries = row["t3_snapshots"] = {}
+                    boundaries[thread] = _t3_boundary(boundaries.get(thread), read, session)
+                else:
+                    boundaries = row.get("asks")
+                    if not isinstance(boundaries, dict):
+                        boundaries = row["asks"] = {}
+                    boundaries[session] = _ask_boundary(boundaries.get(session), turns_, now, session)
+
+            state = _load(path)
+            for row in state["requests"]:
+                if row.get("state") == "pending":
+                    grown(row)
+            mine = next((r for r in state["requests"]
+                         if r.get("action") == READ_ACTION and r.get("session") == session), None)
+            if mine is None:
+                mine = {"id": "read-" + secrets.token_hex(6), "action": READ_ACTION, "state": "shown",
+                        "session": session, "created_ts": now, "created_at": _iso(now)}
+                state["requests"].append(mine)
+            grown(mine)
+            mine["shown"] = [*(s for s in mine.get("shown") or [] if s not in shown), *shown][-_SHOWN_MOST:]
+            mine.update(settled_ts=now, settled_at=_iso(now))
+            _save(path, state, now)
+    except DirectionRefused as refused:
+        if refused.code in ("t3_unreadable", "ask_limit"):
+            return refused.message
+        return None
+    except (OSError, ValueError):
+        return "Khipu can't write down that this list was shown."
+    return None
+
+
+def _seed(thread: str | None, session: str, answer: str) -> dict | None:
+    """The boundary of the read that showed ``answer``: a hold made after the
+    owner replied to that read starts from it, so his one yes counts."""
+    for row in _read_rows():
+        if answer not in (row.get("shown") or []):
+            continue
+        if thread is not None and _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
+            return {"t3_snapshots": {thread: json.loads(json.dumps(row["t3_snapshots"][thread]))}}
+        if thread is None and row.get("session") == session and _ask_parts((row.get("asks") or {}).get(session)):
+            return {"asks": {session: json.loads(json.dumps(row["asks"][session]))}}
+    return None
+
+
 def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: str | None = None) -> dict:
     """Hold ``action`` with its checked ``args`` for the owner to confirm.
     ``ask`` is the question to put to the owner when the plain one
@@ -445,7 +584,9 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             if any(t.get("entrypoint") == "t3" for t in turns_):
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
-                    extra["t3_snapshots"] = {thread: _t3_boundary(None, _t3_read(thread, (), None), session)}
+                    seeded = _seed(thread, session, signature(action, args))
+                    extra = {**seeded, "seeded": True} if seeded else {
+                        "t3_snapshots": {thread: _t3_boundary(None, _t3_read(thread, (), None), session)}}
             else:
                 if owner_turns.dispatched_job(environ, session):
                     raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
@@ -455,7 +596,9 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                                            "The owner has not typed in this conversation, so it can't ask for an "
                                            "owner's change (a background or dispatched job never can).")
                 _from_the_hook(usable[-1])
-                extra["asks"] = {session: _ask_boundary(None, turns_, now, session)}
+                seeded = _seed(None, session, signature(action, args))
+                extra = {**seeded, "seeded": True} if seeded else {
+                    "asks": {session: _ask_boundary(None, turns_, now, session)}}
             request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
                        "created_ts": now, "created_at": _iso(now), "session": session, "by": _asker(environ),
                        "ask": ask or ask_line(action, args), **extra}
@@ -766,8 +909,8 @@ def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
     if latest.get("harness") != "claude_code":
         raise DirectionRefused("not_from_the_hook",
                                f"Khipu can't yet tell T3's own {latest.get('harness')} agent apart from a scripted "
-                               "process, so a held change in this conversation is confirmed in the Khipu app. "
-                               "Nothing was changed.")
+                               "process, so a held change can't be confirmed from this conversation: confirm it from "
+                               "a Claude Code or Codex conversation the owner types in. Nothing was changed.")
     front = f"{latest.get('harness')}:t3"
     if front not in owner_turns.settings()["trusted"]:
         raise DirectionRefused("not_confirmed", f"Not confirmed: {owner_turns.untrusted_why(front)}.")
@@ -813,7 +956,7 @@ def _t3_baseline(thread: str) -> tuple[str, dict] | None:
     return None if best is None else (best[1], best[2])
 
 
-def _instant_t3(environ, session: str, now: float) -> dict | None:
+def _instant_t3(environ, session: str, now: float, action: str | None = None) -> dict | None:
     """The stamp for a routing change in a T3 conversation, or None (the
     change is then held). It is the confirm's own proof (``_t3_proof``, with
     every refusal a change has: a job or child thread, an issuer that does
@@ -824,11 +967,15 @@ def _instant_t3(environ, session: str, now: float) -> dict | None:
     latest typed hook turn stands behind. Stricter than a confirm in one
     way, as a change is: that message must be inside the window
     (``latest_window_h``). A thread nobody has been asked about yet has no
-    boundary, so its first change is held and a later one applies."""
+    boundary, so its first change is held and a later one applies. An answer
+    to something waiting (``ANSWER_ACTIONS``) also needs an ask in this thread
+    that showed it (``_shown_read``): any other message is no reply to it."""
     from khipu import t3
 
     try:
         thread = _t3_thread_of(session)
+        if action in ANSWER_ACTIONS and not REQUEST_APPLIED.get() and _shown_read(thread, ANSWERING.get()) is None:
+            return None
         base = _t3_baseline(thread)
         if base is None:
             return None
@@ -925,6 +1072,9 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
     return request, stamp
 
 
+DECLINE_ACTION = "direction.decline"
+
+
 def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
     """The owner's no to a held request: it is dropped and nothing changes.
     The proof a confirm needs, so a conversation can't answer for the owner
@@ -942,11 +1092,21 @@ def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
                 raise DirectionRefused("not_found", "There is no held request with that id.")
             if request.get("state") != "pending":
                 raise DirectionRefused("not_pending", f"That request is already {request.get('state')}.")
+            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
+                raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
+                                                        "typed on a terminal can answer this request.")
             with t3.owner_read_budget():
                 stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
                 raise DirectionRefused("not_confirmed", stamp.replace("direction.confirm", "direction.decline"))
+            line = {"kind": "action", "id": _new_id(), "at": _iso(now), "action": DECLINE_ACTION,
+                    "target": request_id, "before": None, "auth": stamp.get("auth"), "undo": None,
+                    "no_undo": "Nothing was changed, so there is nothing to undo.", "state": "applied",
+                    "facts": {"declined": request.get("action")}}
+            line.update({k: stamp[k] for k in ("harness", "session", "turn", "prompt_sha256", "occurrence", "binding",
+                                               "confirmed") if stamp.get(k) is not None})
+            _append(line)
             request.update(state="declined", settled_ts=now, settled_at=_iso(now),
                            declined=dict(stamp["confirmed"], session=session))
             _save(path, state, now)
@@ -982,7 +1142,7 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
 # Everything on a request that holds the owner's words or marks their
 # conversation's messages: the action's args, the ask line, an error, and
 # the ask boundaries (T3 message ids and times, turn ids and hashes).
-_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks")
+_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks", "shown")
 
 
 def forget_requests(sessions, *, protected_sessions=(), now: float | None = None) -> dict:
@@ -2190,6 +2350,7 @@ _PUSH_WORDS = {
     "work.not_same": "Marked a ledger row and a commitment as different work",
     "promote.gate_ignore": "Set Update anyway for the next promotion",
     "promote.gate_ignore.cancel": "Cancelled Update anyway",
+    "direction.decline": "Declined a change a conversation asked for",
     "config.routing_setting": "Changed a routing setting",
     "config.answer_request.confirm": "Confirmed a conversation's change to a routing setting",
     "config.answer_request.undo": "Undid a conversation's change to a routing setting",

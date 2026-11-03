@@ -1035,7 +1035,7 @@ def _t3_agent_turn(harness: str) -> None:
 def test_a_t3_confirm_in_a_conversation_t3_runs_on_cursor_or_antigravity_fails_closed(world, harness):
     # Review 4: how T3 starts Cursor and Antigravity (their hook issuer's
     # process tree) is not known from the code, so even an issuer that traces
-    # to the T3 Code app does not confirm there; the Khipu app does.
+    # to the T3 Code app does not confirm there; another conversation does.
     request = _hold_in_t3(world)
     world["t3"].message(THREAD, time.time() + 1)
     _t3_agent_turn(harness)
@@ -1044,7 +1044,7 @@ def test_a_t3_confirm_in_a_conversation_t3_runs_on_cursor_or_antigravity_fails_c
     assert owner_turns.t3_launched(latest["issuer"])
     _be(world, T3_SESSION, "KHIPU_SESSION_ID")
     ok, out = _confirm_id(request)
-    assert not ok and out["code"] == "not_from_the_hook" and "Khipu app" in out["error"], out
+    assert not ok and out["code"] == "not_from_the_hook" and "Claude Code or Codex conversation" in out["error"], out
     assert not _paused()
 
 

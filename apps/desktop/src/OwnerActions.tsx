@@ -136,6 +136,7 @@ export const ACTION_LABELS: Record<string, string> = {
   "accounts.request.undo": "Undid a change a conversation asked for",
   "config.usage_accounts": "Changed the tracked accounts",
   "config.routing_setting": "Changed a routing setting",
+  "direction.decline": "Declined a change a conversation asked for",
   "config.answer_request.confirm": "Kept a change a conversation asked for",
   "config.answer_request.undo": "Undid a change a conversation asked for",
   "promote.gate_ignore": "Let the next update skip a check",
