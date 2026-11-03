@@ -214,7 +214,9 @@ def seed_direction(monkeypatch, text="Use Codex for builds."):
     sha = owner_turns.prompt_sha256(text)
     monkeypatch.setattr(directions, "known_entities", lambda: {
         "all": {"codex": "Codex"}, "accounts": {"codex": "Codex"}})
-    monkeypatch.setattr(owner_turns, "turns", lambda *a, **kw: [{"prompt_sha256": sha, "occurrence": 1}])
+    # A turn as the recorder keeps one a trusted terminal typed (owner provenance counts it as his).
+    typed = {"prompt_sha256": sha, "occurrence": 1, "harness": "claude_code", "entrypoint": "cli", "typed": True}
+    monkeypatch.setattr(owner_turns, "turns", lambda *a, **kw: [dict(typed)])
     monkeypatch.setattr(owner_turns, "occurrence_state", lambda *a, **kw: {"counts": {sha: 1}})
     row, = directions.capture_scan("fake-session", [text], actions=[])
     return row

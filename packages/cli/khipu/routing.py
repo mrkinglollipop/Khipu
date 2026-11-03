@@ -2797,6 +2797,12 @@ def _read_all_events(*, identity_only: bool = False, author_check: bool = True) 
     no ``seq`` (written by phase 1a, or appended by hand) keep their place in
     the file."""
     raw, bad = _read_event_lines(identity_only)
+    return _order_events(raw, bad, author_check=author_check)
+
+
+def _order_events(raw: list[dict], bad: int, *, author_check: bool = True) -> tuple[list[dict], int]:
+    """``_read_all_events``' ordering over lines already read (also used to
+    fold a log that is not the file, ``routing_compact``)."""
     from khipu import routing_replication
 
     events = routing_replication.merge(raw)
@@ -7349,8 +7355,13 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
     for i, item in enumerate(raw, 1):
         if isinstance(item, str):
             item = {"account": item}
-        if not isinstance(item, dict) or set(item) - {"account", "role", "until", "level", "exceptions"}:
-            raise RouteError(f"priority entry {i} takes account, role, until, level and exceptions")
+        allowed = {"account", "role", "until", "level", "exceptions"} | ({"revision"} if conversation else set())
+        if not isinstance(item, dict) or set(item) - allowed:
+            raise RouteError(f"priority entry {i} takes account, role, until, level and exceptions"
+                             + (" and the revision it was read at" if conversation else ""))
+        claimed = item.get("revision")
+        if claimed is not None and not (isinstance(claimed, str) and claimed.strip()):
+            raise RouteError(f"priority entry {i}: the revision is the text khipu_route lists with the entry")
         name = item.get("account")
         if not isinstance(name, str) or not name.strip():
             raise RouteError(f"priority entry {i} needs its account")
@@ -7369,6 +7380,8 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
             if end <= now:
                 raise RouteError(f"priority entry {i}: its end must be in the future")
         out.append({"account": key, "label": label, "role": role or None, "until": _iso(end)})
+        if claimed is not None:
+            out[-1]["_revision"] = claimed.strip()
         if item.get("level") is not None:
             level = entry_model.checked_level(item["level"])
             if level is None:
@@ -7447,6 +7460,48 @@ class PriorityVersionNeeded(RouteError):
     code = "version_needed"
 
 
+def priority_entry_revision(entry: dict) -> str:
+    """One account's entry as it is stored, named by what it says (account,
+    role, end, level and exceptions): it moves when that entry is written and
+    when no other entry is. What a conversation carries back to say which
+    entry it read."""
+    body = {k: entry.get(k) for k in ("account", "role", "until", "level", "exceptions")}
+    return "pe-" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:12]
+
+
+class PriorityEntryMoved(RouteError):
+    """A conversation's priority write that carried the revision of an entry
+    another write has changed since: nothing is written, and ``lost`` holds
+    the entries as they are now (what the write would have overwritten)."""
+
+    def __init__(self, lost: list[dict]):
+        super().__init__("an entry of the priority changed after it was read")
+        self.lost = lost
+
+
+def _lost_entry(entry: dict) -> dict:
+    out = {"account": entry["account"], "label": entry.get("label"), "role": entry.get("role"),
+           "until": entry.get("until"), "revision": priority_entry_revision(entry)}
+    if entry.get("level"):
+        out["level"] = entry["level"]
+    if entry.get("exceptions"):
+        out["exceptions"] = [{k: x.get(k) for k in ("id", "text", "until", "by")} for x in entry["exceptions"]]
+    return out
+
+
+def _crossed_entries(lost: list[dict], *, entries: list[str] | None = None) -> dict:
+    """The answer to a priority write refused because an entry it carried had
+    changed: not written, in the words a crossed rule write answers with."""
+    names = ", ".join(str(e.get("label") or e["account"]) for e in lost) or "an entry"
+    out = {"ok": False, "status": "crossed", "lost": lost,
+           "error": f"This request was crossed: {names} changed after it was read, so it never took effect. "
+                    "What the write would have overwritten is in lost; read the priority again and prepare the "
+                    "change from it."}
+    if entries is not None:
+        out["entries"] = entries
+    return out
+
+
 def priority_version(now: datetime | None = None) -> str:
     return read_view(now).get("priority_version") or "p0"
 
@@ -7516,6 +7571,17 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
     end = _priority_until(until, now)
     with _lock():
         _check_priority(expect, now)
+        # A conversation that carries an entry's revision says which entry it
+        # read: one another write has changed since is not overwritten.
+        held = {e["account"]: e for e in (read_view(now).get("priority_stored") or {}).get("entries") or []}
+        lost = [_lost_entry(held[r["account"]]) for r in rows
+                if r.get("_revision") and r["account"] in held
+                and r["_revision"] != priority_entry_revision(held[r["account"]])]
+        gone = [r for r in rows if r.get("_revision") and r["account"] not in held]
+        rows = [{k: v for k, v in r.items() if k != "_revision"} for r in rows]
+        if lost or gone:
+            return _crossed_entries(lost or [{"account": r["account"], "label": r["label"]} for r in gone],
+                                    entries=[e["label"] for e in rows])
         _check_role_budget(rows, now)
         observed = _observed_base("priority", base=base, expect=expect)
         written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
@@ -7691,7 +7757,7 @@ def _caps_with_exception_share(caps: list[dict], priority: dict | None, account_
 
 def _amended_priority(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
                       now: datetime, conversation: bool, by: str = "owner",
-                      source: str = "", share_pct=None) -> tuple[list[dict], str | None, dict]:
+                      source: str = "", share_pct=None, entry_revision=None) -> tuple[list[dict], str | None, dict]:
     """(the priority's entries with the one account's changed, the priority's
     own end, what the change recorded), read from the held priority's stored
     line, not its folded view: every other entry (an ended one, a level not
@@ -7724,6 +7790,8 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
             row["exceptions"] = [dict(x) for x in item["exceptions"]]
         if item["account"] == key and not found:
             found = True
+            if entry_revision is not None and priority_entry_revision(item) != str(entry_revision).strip():
+                raise PriorityEntryMoved([_lost_entry(item)])
             live = [x for x in row.pop("exceptions", []) if (_parse(x.get("until")) or now) > now]
             if live:
                 row["exceptions"] = live
@@ -7835,11 +7903,19 @@ def restore_priority(stored: dict, *, via: str, holds: dict | None = None, now: 
 def request_priority_amend(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
                            owner_request: str | None = None, author: dict | None = None, via: str = "mcp",
                            now: datetime | None = None, expect=None, base: str | None = None,
-                           share_pct=None) -> dict:
+                           share_pct=None, entry_revision=None) -> dict:
     """A conversation's change to one account's entry, at the owner's
-    request: live at once and unconfirmed, as ``request_priority``."""
+    request: live at once and unconfirmed, as ``request_priority``. It
+    patches that entry under the lock and leaves every other as stored.
+    ``entry_revision`` (the entry's ``revision`` as read) is what it is
+    checked against: an entry another write changed since is not touched,
+    and the answer is ``ok: false`` with that entry as it is now (``lost``).
+    The priority's whole version (``expect``) may still be given."""
     if not isinstance(base, str) or not base.strip():
         raise RouteError("base must be the owner revision the request was prepared against")
+    if entry_revision is None and expect is None:
+        raise RouteError("say which revision of the entry this change was made on (revision, as khipu_route "
+                         "lists it with the entry); read it again first")
     now = now or _now()
     request_words = _one_line(owner_request)
     if not request_words:
@@ -7849,10 +7925,14 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
         by = conversation_author()
     with _lock():
         _check_priority(expect, now)
-        rows, whole, done = _amended_priority(account, append=append, role=role, until=until, exception=exception,
-                                              end_exception=end_exception, now=now, conversation=True,
-                                              by=author_words(by, push=True), source=_clean(request_words, 0),
-                                              share_pct=share_pct)
+        try:
+            rows, whole, done = _amended_priority(account, append=append, role=role, until=until,
+                                                  exception=exception, end_exception=end_exception, now=now,
+                                                  conversation=True, by=author_words(by, push=True),
+                                                  source=_clean(request_words, 0), share_pct=share_pct,
+                                                  entry_revision=entry_revision)
+        except PriorityEntryMoved as moved:
+            return _crossed_entries(moved.lost)
         _check_role_budget(rows, now)
         observed = _observed_base("priority", base=base, expect=expect)
         written, view = _write({"type": "priority_set", "entries": rows, "until": whole, "pending": True,
@@ -9137,6 +9217,11 @@ def doctor_block(now: datetime | None = None) -> dict:
     if bad:
         warnings.append(f"{bad} line{'s' if bad != 1 else ''} of the routing record can't be read; "
                         f"Khipu leaves {'them' if bad != 1 else 'it'} out.")
+    from khipu import routing_compact
+
+    log_health = routing_compact.health()
+    if log_health.get("warning"):
+        warnings.append(log_health["warning"])
     events, _bad = read_events()
     newest = max((at for at in (_parse(e.get("written_at")) for e in events) if at is not None), default=None)
     if newest is not None and (newest - now).total_seconds() > CLOCK_TOLERANCE:
@@ -9202,7 +9287,7 @@ def doctor_block(now: datetime | None = None) -> dict:
                          "entries": [e["label"] for e in (held or {}).get("entries") or []],
                          "line": priority_line(held, now, view=view) if held else None},
             "record": bool(view.get("record")), "version": view["version"], "folded_at": view.get("folded_at"),
-            "prompt_budget": budget,
+            "log": log_health, "prompt_budget": budget,
             "valid_until": view.get("valid_until"),
             "accounts": [{"account": e["label"], "state": e["state"], "until": e["until"], "basis": e["basis"],
                           "next_check": e.get("next_check"),
@@ -9747,8 +9832,11 @@ def _public_priority(view: dict, now: datetime, facts: dict) -> dict | None:
     if not held:
         return None
 
+    stored = {e["account"]: e for e in (view.get("priority_stored") or {}).get("entries") or []}
+
     def entries(rows: list[dict]) -> list[dict]:
-        return [dict(_pick(e, _PRIORITY_ENTRY_FIELDS), id=account_id(e["account"])) for e in rows]
+        return [dict(_pick(e, _PRIORITY_ENTRY_FIELDS), id=account_id(e["account"]),
+                     revision=priority_entry_revision(stored.get(e["account"]) or e)) for e in rows]
 
     replaced = held.get("replaced")
     return {"entries": entries(held["entries"]), "until": held.get("until"), "confirmed": not held.get("pending"),
@@ -10332,15 +10420,18 @@ def _conversation_priority_answer(written: dict, now: datetime | None) -> dict:
     view = read_view(now)
     held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
     out = {k: written[k] for k in (*_WRITE_FIELDS, "exception_id", "exception_until", "exception_until_default",
-                                   "exception_ended") if k in written}
+                                   "exception_ended", "lost") if k in written}
+    for entry in out.get("lost") or []:
+        entry["id"] = account_id(entry.pop("account"))
     out["priority"] = held
     out["about"] = ABOUT
     return _for_agents(out, view)
 
 
 def conversation_priority_amend(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
-                                owner_request: str, author: dict, expect, base: str, now: datetime | None = None,
-                                lock_wait: float | None = CONVERSATION_LOCK_BUDGET, share_pct=None) -> dict:
+                                owner_request: str, author: dict, expect=None, base: str, now: datetime | None = None,
+                                lock_wait: float | None = CONVERSATION_LOCK_BUDGET, share_pct=None,
+                                entry_revision=None) -> dict:
     """What MCP ``khipu_route_priority`` writes for one account's entry
     (``request_priority_amend``), answered as ``conversation_priority``."""
     by = dict(author or {})
@@ -10352,7 +10443,7 @@ def conversation_priority_amend(account, *, append=None, role=None, until=None, 
                 written = request_priority_amend(account, append=append, role=role, until=until,
                                                  exception=exception, end_exception=end_exception,
                                                  owner_request=owner_request, author=by, via="mcp", now=now,
-                                                 share_pct=share_pct,
+                                                 share_pct=share_pct, entry_revision=entry_revision,
                                                  expect=expect, base=base)
         except LockBusy:
             raise RouteError("Khipu's routing record is busy; try again in a moment") from None
@@ -10444,6 +10535,11 @@ def refresh_plan_figures() -> dict:
             return {"refreshed": 0, "skipped": "routing push off"}
         out = usage.refresh_due()
         record_pace_samples()
+        # Off the prompt path: the drain, after it wrote its samples, keeps
+        # the log inside its bound (a no-op under it).
+        from khipu import routing_compact
+
+        routing_compact.maybe_compact()
         return out
     except Exception:  # noqa: BLE001 - the drain never fails on this
         return {"refreshed": 0, "skipped": "error"}

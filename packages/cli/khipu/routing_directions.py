@@ -661,11 +661,25 @@ def _capture_scan_locked(session, turns, *, now, actions):
     rows = data["directions"]
     recorded: dict[str, dict] = {}
     recorded_occs: dict[str, list[int]] = {}
+    # A recorded turn counts as the owner's only where owner provenance says
+    # so (``owner_turns.eligible``, the check every owner change goes
+    # through): a machine entrypoint, a T3 conversation, a helper or a
+    # dispatched job's turn can carry the owner's words and still not be his.
+    # A text with recorded turns and none of them eligible opens nothing.
+    conf = owner_turns.settings()
+    counted: set[str] = set()
     for turn in owner_turns.turns(session, now):
-        if isinstance(turn.get("prompt_sha256"), str):
-            recorded.setdefault(turn["prompt_sha256"], turn)
-            if isinstance(turn.get("occurrence"), int):
-                recorded_occs.setdefault(turn["prompt_sha256"], []).append(turn["occurrence"])
+        sha = turn.get("prompt_sha256")
+        if not isinstance(sha, str):
+            continue
+        ok = owner_turns.eligible(turn, conf)[0]
+        if ok and sha not in counted:
+            recorded[sha] = turn  # the first copy that is his stands for the text
+            counted.add(sha)
+        else:
+            recorded.setdefault(sha, turn)
+        if ok and isinstance(turn.get("occurrence"), int):
+            recorded_occs.setdefault(sha, []).append(turn["occurrence"])
     known = known_entities()
     # First pass: the eligible typed turns in this scanned window, in
     # order. Occurrences come from the owner turn record (the durable
@@ -688,6 +702,8 @@ def _capture_scan_locked(session, turns, *, now, actions):
         if (seen is not None and (seen.get("delegated") or seen.get("machine"))) \
                 or owner_turns.brief_for(typed) is not None:
             continue  # a dispatched job's prompt is never the owner's direction
+        if seen is not None and sha not in counted:
+            continue  # recorded, and no recorded copy of it is the owner's turn
         typed_turns.append((typed, at, sha))
     totals: dict[str, int] = {}
     for _typed, _at, sha in typed_turns:

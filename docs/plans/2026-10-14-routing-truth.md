@@ -225,7 +225,8 @@ usable in the desktop app; Khipu holds no credential; plain language for a non-t
 any of them in front of conversations, he adds it as a rule in Settings.
 
 **Storage.** The record lives in Khipu's data directory beside the usage cache: `state/routing/events.jsonl`
-is append-only, written under a file lock, and is the full history; `state/routing/view.json` is the folded
+is append-only, written under a file lock, and is the history the fold reads; it is bounded (see "The log's
+bound" below). `state/routing/view.json` is the folded
 view, replaced atomically. The view carries `version`, which only goes up and moves only when the effective
 view changes, with the plain change lines for each version; `folded_at`; and `valid_until`, the time of the
 next change the clock alone will cause (a limit's end, a hold's or a pause's end, an entry going stale, a
@@ -234,6 +235,27 @@ the rules, the note and the holds. Who wrote an entry and when are shown but are
 report from many conversations does not move the version. Each conversation's last-seen version and the
 time of its last full summary are kept in that session's existing per-prompt state (`recall--<session>.json`),
 not in a new file per session.
+
+**The log's bound (2026-11-02).** Nothing Khipu stores grows without a bound, and the log was folded whole on
+every stale read: a fold costs about 14 ms per 1,000 lines, and at 10,000 lines (about 3 MB) a refold before a
+prompt took 555 ms against the prompt path's 50 ms, so the conversation got no routing. `khipu.routing_compact`
+keeps the log under 2,000 lines or 1 MB (doctor's `routing_log` row: yellow above, red above 4,000 lines or
+2 MB, with the line count and bytes). Over the bound it compacts, on its own after the plan figures refresh
+(six hours apart at most) and in the nightly. A compaction keeps the previous full log whole in
+`state/routing/archive/` (the newest four, and any younger than 30 days: one goes only when past both) and
+leaves in `events.jsonl` the lines the fold can still tell apart from those left out, byte for byte and in
+order, with every later line after them: the checkpoint is those kept lines and `compaction.json` (when, how
+many lines, the highest sequence number). No line is rewritten, so the fold over the compacted file is the fold
+over the full log, and the version, the epoch and `since` do not notice. What can go: pace samples older than
+the longest span the pace calculation reads (kept: three days and the newest few per account and window),
+all but the last runner `source_seen` lines, a conversation's or a check's old evidence whose end has passed,
+and old reset-check outcomes. What never goes: any line an owner wrote (rules, note, priority and its undo
+steps, holds, caps, clears, account lines), `observation` lines (the sources' sightings are matched to them by
+`source_id`), unreadable lines and unfinished account changes. Before the swap the compacted and the full log
+are folded at the present, at each `valid_until` that follows and at distances out to a year, and must agree,
+or nothing is written. The new file is written beside the log and fsynced, the old log is linked into
+`archive/`, and the new file is renamed over the log, so a crash leaves a readable log. The owner's lines are
+human-rate and stay.
 
 **"Owner only" is a convention, not a lock.** Khipu holds no credential, so any process with a shell can
 write. Every write is stamped with its author and shown in the app. Rules, the note, owner pauses and clears
