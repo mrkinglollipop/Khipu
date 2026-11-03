@@ -6,7 +6,7 @@
    that change the record live in Settings ->
    Routing. Khipu reports this; agents decide where work goes. */
 
-import { useId, useState } from "react";
+import { useId, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { useRoutingDetail } from "./AccountDetail";
 import { Disclosure, EmptyState, ListRow, Tag } from "./ui";
@@ -31,6 +31,7 @@ import { callCli } from "./settingsCli";
 import { holdChoiceIds, holdChoiceTargets } from "./routingProposals";
 import { priorityCard } from "./routingNeeds";
 import { DecideWords } from "./DecideWords";
+import { ConfirmGroup } from "./RoutingSettings";
 
 const NO_RECORD_HINT =
   "Khipu starts one when a plan check, a job runner folder or a conversation reports on an account. Until then no account is shown as open.";
@@ -119,6 +120,8 @@ function AccountRow({
 function PriorityRow({ p, view, now, reload, onOpen }: { p: RoutePriority; view: RouteView; now: Date; reload: () => Promise<void>; onOpen: (key: string) => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [asking, setAsking] = useState(false);
+  const backBtn = useRef<HTMLButtonElement>(null);
   const [holdIds, setHoldIds] = useState<string[] | null>(null);
   const [holds, setHolds] = useState<Record<string, "end" | "keep">>({});
   const targets = holdIds ? holdChoiceTargets(view, holdIds, now) : [];
@@ -172,11 +175,24 @@ function PriorityRow({ p, view, now, reload, onOpen }: { p: RoutePriority; view:
                 </button>
               ) : null}
               {card.back ? (
-                <button type="button" className="sm" disabled={busy !== null} onClick={() => void act("undo")}>
-                  {busy === "undo" ? "Going back…" : card.back}
+                <button ref={backBtn} type="button" className="sm" disabled={busy !== null} aria-expanded={asking}
+                  onClick={() => setAsking((v) => !v)}>
+                  {card.back}
                 </button>
               ) : null}
             </div>
+            {asking && card.back && card.backAsk ? (
+              <ConfirmGroup label={`${card.back}?`} onClose={() => setAsking(false)} back={() => backBtn.current}>
+                <span>{card.backAsk}</span>
+                <div className="toolbar">
+                  <button type="button" className="sm danger" disabled={busy !== null}
+                    onClick={async () => { await act("undo"); setAsking(false); }}>
+                    {busy === "undo" ? "Going back…" : `Yes, ${card.back.charAt(0).toLowerCase()}${card.back.slice(1)}`}
+                  </button>
+                  <button type="button" className="sm link" onClick={() => setAsking(false)}>Cancel</button>
+                </div>
+              </ConfirmGroup>
+            ) : null}
           </div>
           {error ? (
             <span className="set-error" role="alert">
@@ -300,7 +316,8 @@ export function RoutingCard({ state, plans, onOpenAccounts }: {
   }
   const holds = data.holds ?? [];
   const rules = data.rules ?? [];
-  const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
+  const waiting = rules.filter((r) => r.pending).length;
+  const fromOldFile = rules.filter((r) => r.seeded && !r.confirmed && !r.pending).length;
   // Counted per rule: one rule broken on two lanes is one rule that may be
   // broken. Its mark shows the latest sighting.
   const broken = brokenRules(data);
@@ -372,7 +389,8 @@ export function RoutingCard({ state, plans, onOpenAccounts }: {
             label={
               <>
                 {plural(rules.length, "standing rule", "standing rules")}
-                {toConfirm ? <Tag>{`${toConfirm} not confirmed yet`}</Tag> : null}
+                {waiting ? <Tag>{`${waiting} waiting for your answer`}</Tag> : null}
+                {fromOldFile ? <Tag>{`${fromOldFile} from your old file, not reviewed`}</Tag> : null}
                 {broken.length ? (
                   <Tag tone="warn" dot>
                     {`${broken.length} may be broken`}

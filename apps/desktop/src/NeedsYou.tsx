@@ -5,10 +5,10 @@
    When you have time: what can wait. The problems come from routingOverview.ts,
    the decisions from routingNeeds.ts. */
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { DecideWords } from "./DecideWords";
-import { Busy, EndOrKeepChoices, WriteError, escapeCloses, ruleTarget, useEndOrKeep } from "./RoutingSettings";
+import { Busy, ConfirmGroup, EndOrKeepChoices, WriteError, escapeCloses, ruleTarget, useEndOrKeep } from "./RoutingSettings";
 import type { Back, Writer } from "./RoutingSettings";
 import type { RouteRule, RouteView } from "./routing";
 import type { DecideCard } from "./routingNeeds";
@@ -61,6 +61,8 @@ function DecideItem({ card, data, w, eok, reread, back }: {
   back: Back;
 }) {
   const [editing, setEditing] = useState(false);
+  const [asking, setAsking] = useState(false);
+  const backBtn = useRef<HTMLButtonElement>(null);
   const keepId = `${card.key}:keep`;
   const backId = `${card.key}:back`;
   const t = card.target;
@@ -99,12 +101,26 @@ function DecideItem({ card, data, w, eok, reread, back }: {
             </button>
           ) : null}
           {card.back ? (
-            <button type="button" className="sm" disabled={w.isBusy(backId)} onClick={() => void undo()}>
-              <Busy on={w.isBusy(backId)} />
+            <button ref={backBtn} type="button" className="sm" disabled={w.isBusy(backId)} aria-expanded={card.backAsk ? asking : undefined}
+              onClick={() => { if (card.backAsk) setAsking((v) => !v); else void undo(); }}>
+              {card.backAsk ? null : <Busy on={w.isBusy(backId)} />}
               {card.back}
             </button>
           ) : null}
         </div>
+      ) : null}
+      {asking && card.back && card.backAsk ? (
+        <ConfirmGroup label={`${card.back}?`} onClose={() => setAsking(false)} back={() => backBtn.current}>
+          <span>{card.backAsk}</span>
+          <div className="toolbar">
+            <button type="button" className="sm danger" disabled={w.isBusy(backId)}
+              onClick={async () => { if (await undo()) setAsking(false); }}>
+              <Busy on={w.isBusy(backId)} />
+              Yes, {card.back.charAt(0).toLowerCase()}{card.back.slice(1)}
+            </button>
+            <button type="button" className="sm link" onClick={() => setAsking(false)}>Cancel</button>
+          </div>
+        </ConfirmGroup>
       ) : null}
       {editing && rule ? <RuleEdit card={card} rule={rule} w={w} eok={eok} onClose={() => setEditing(false)} /> : null}
       <WriteError w={w} id={keepId} />

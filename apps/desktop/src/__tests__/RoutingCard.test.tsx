@@ -146,7 +146,7 @@ describe("Home Routing card, the main mock", () => {
     const data = mainView();
     data.rules = [{ n: 1, text: "Keep deployment work local.", pending: true, pending_kind: "added", confirmed: false }];
     render(<RoutingCard state={stateOf(data)} plans={PLANS} />);
-    expect(screen.getByText(/1 standing rule/)).toHaveTextContent("1 not confirmed yet");
+    expect(screen.getByText(/1 standing rule/)).toHaveTextContent("1 waiting for your answer");
   });
 
   it("shows each account in the Plans order with its state, who said so and when", () => {
@@ -215,7 +215,7 @@ describe("Home Routing card, the main mock", () => {
       .toBeInTheDocument();
     const summary = screen.getByText(/7 standing rules/);
     expect(summary.closest("details")).not.toHaveAttribute("open");
-    expect(summary).toHaveTextContent("6 not confirmed yet");
+    expect(summary).toHaveTextContent("6 from your old file, not reviewed");
     expect(screen.queryByText("Khipu reports this; your agents decide where work goes.")).toBeNull();
   });
 
@@ -401,7 +401,7 @@ describe("Home Routing card, two sources disagree and a rule may be broken", () 
     expect(row).toHaveTextContent("Limit reached, back at 2:52 PM");
     expect(within(row).getByText("Sources disagree")).toBeInTheDocument();
     expect(row).toHaveTextContent(
-      "A Claude Code conversation in project-b reported it open 9 min ago. Claude's own message outranks a conversation's report, so the limit shows here; conversations are told both.");
+      "A Claude Code conversation in project-b reported it open 9 min ago. Claude's own message counts for more than a conversation's report, so the limit shows here; conversations are told both.");
     const summary = screen.getByText(/7 standing rules/);
     expect(summary).toHaveTextContent("1 may be broken");
     const broken = screen.getByText(/Never a -fast tier\./).closest("li");
@@ -505,7 +505,7 @@ describe("Home Routing card, fix round 1", () => {
     expect(row).toHaveTextContent("Opus limit reached, back Fri 9:00 AM; other models open");
     expect(within(row).getByText("Sources disagree")).toBeInTheDocument();
     expect(row).toHaveTextContent(
-      "A Claude Code conversation in project-c reported Opus open at 1:00 PM. Claude's own message outranks a conversation's report, so the Opus limit shows here; conversations are told both.");
+      "A Claude Code conversation in project-c reported Opus open at 1:00 PM. Claude's own message counts for more than a conversation's report, so the Opus limit shows here; conversations are told both.");
     // The attention item names the same model, and the card has its note.
     const items = routingAttention(v, AFTERNOON).filter((a) => a.key.startsWith("routing:disagree"));
     expect(items.map((a) => a.title)).toEqual(["Sources disagree about Claude main (Opus)"]);

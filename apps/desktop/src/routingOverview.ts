@@ -365,7 +365,10 @@ function deliveryProblems(s: OverviewSettings): Problem[] {
     if (row?.status !== "red") return;
     const label = labels[index];
     const owed = Number.isInteger(row.owed) ? (row.owed as number) : 0;
-    const who = `${label.conversation}${label.component === "main" ? "" : "'s helper"}${label.harness ? ` (${label.harness})` : ""}`;
+    // The read has no project or title to name it by, and "Conversation 1" is
+    // only a row number in Telling conversations.
+    const whose = label.harness ? `one of your ${label.harness} conversations` : "one of your conversations";
+    const who = label.component === "main" ? capitalise(whose) : `A helper in ${whose}`;
     add(`delivery:${index}`, "delivery-behind", owed > 0
       ? `${who} hasn't heard your last ${owed === 1 ? "change" : `${owed} changes`}`
       : `${who} may not be hearing your changes`, older);

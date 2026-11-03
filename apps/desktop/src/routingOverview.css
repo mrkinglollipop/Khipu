@@ -64,11 +64,15 @@
 }
 .needs-card:focus:not(:focus-visible) { outline: none; }
 .needs-title { margin: 0; font-size: var(--t-md, 13px); font-weight: 650; line-height: 1.35; color: var(--text); }
+.needs-changed { margin: 0; font-size: var(--t-sm); line-height: 1.45; color: var(--text); }
+.needs-changed b { font-weight: 600; }
 .needs-ba { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr)); gap: var(--s2); }
 .needs-ba > div {
   min-width: 0; padding: var(--s2) var(--s3); background: var(--surface-2); border-radius: var(--r-sm);
-  font-size: var(--t-sm); line-height: 1.45; color: var(--text); white-space: pre-line;
+  font-size: var(--t-sm); line-height: 1.45; color: var(--text);
 }
+.needs-line { display: block; }
+.needs-line.hang { padding-left: 1.4em; text-indent: -1.4em; }
 .needs-ba .cap { display: block; font-size: var(--t-xs); font-weight: 600; color: var(--text-2); white-space: normal; }
 .needs-facts { display: grid; grid-template-columns: 7.5rem minmax(0, 1fr); gap: 2px var(--s3); margin: 0; font-size: var(--t-sm); line-height: 1.45; }
 .needs-facts dt { color: var(--muted); }

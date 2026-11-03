@@ -295,6 +295,7 @@ function HomeNeeds() {
 
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
   "routing-needs": { title: "Needs you: every kind of item (settings reorg slice A)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
+  "routing-needs-worst": { title: "Needs you: the longest words (settings reorg slice A)", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
   "home-needs": { title: "Home: Confirm a priority a conversation set", fake: { routeNeeds: true, nineB: true }, render: () => <HomeNeeds /> },
   pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
   delivery: { title: "Telling conversations (fictional delivery evidence)", fake: { route15a: true }, render: () => <RoutingDelivery /> },
@@ -410,7 +411,7 @@ function Page() {
       </main>
     );
   }
-  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs") {
+  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst") {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return (
       <main style={{ padding: 24 }} data-state={hash}>

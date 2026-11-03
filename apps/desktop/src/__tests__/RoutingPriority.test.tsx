@@ -211,6 +211,8 @@ describe("the priority on Home", () => {
     await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "confirm", expect: "p7" }]));
     await waitFor(() => expect(load).toHaveBeenCalledWith(true));
     fireEvent.click(screen.getByRole("button", { name: "Remove this order" }));
+    expect(calls("khipu_route_priority")).toHaveLength(1);
+    fireEvent.click(within(screen.getByRole("group", { name: "Remove this order?" })).getByRole("button", { name: "Yes, remove this order" }));
     await waitFor(() => expect(calls("khipu_route_priority")[1]).toEqual({ action: "undo", expect: "p7" }));
   });
 
@@ -304,6 +306,8 @@ describe("the priority and the pace in Settings -> Routing", () => {
     fireEvent.click(within(group).getByRole("button", { name: "Keep the new order" }));
     await waitFor(() => expect(sent()).toEqual([{ action: "confirm", expect: "p7" }]));
     fireEvent.click(within(group).getByRole("button", { name: "Go back to my order" }));
+    expect(sent()).toHaveLength(1);
+    fireEvent.click(within(group).getByRole("button", { name: "Yes, go back to my order" }));
     await waitFor(() => expect(sent()[1]).toEqual({ action: "undo", expect: "p7" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear the priority" }));
     fireEvent.click(screen.getByRole("button", { name: "Clear it" }));

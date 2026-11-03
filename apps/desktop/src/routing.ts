@@ -922,12 +922,12 @@ function disagreementSentence(
   const by = d.by ? capitalise(d.by) : capitalise(witnessWords(d, harness, d.state ?? ""));
   return (
     `${by} reported ${subject} ${stateWord(d.state)} ${saidWhen(d.at, now)}. ` +
-    `${stronger} outranks ${weakerWords(d)}, so ${shown} shows here; conversations are told both.`
+    `${stronger} counts for more than ${weakerWords(d)}, so ${shown} shows here; conversations are told both.`
   );
 }
 
 /** "A Claude Code conversation in project-b reported it open at 11:31 AM.
- *  Claude's own message outranks a conversation's report, so the limit
+ *  Claude's own message counts for more than a conversation's report, so the limit
  *  shows here; conversations are told both." Null when nothing disagrees. */
 export function disagreementWords(a: RouteAccount, now: Date): string | null {
   const d = a.disagreement;
@@ -939,7 +939,7 @@ export function disagreementWords(a: RouteAccount, now: Date): string | null {
 
 /** The same for each model whose own limit a report disagrees with: "A
  *  Claude Code conversation in project-c reported Opus open at 1:00 PM.
- *  Claude's own message outranks a conversation's report, so the Opus limit
+ *  Claude's own message counts for more than a conversation's report, so the Opus limit
  *  shows here; conversations are told both." Only models whose limit is
  *  shown (its end is ahead), as the attention item names them. */
 export function modelDisagreementWords(a: RouteAccount, now: Date): string[] {

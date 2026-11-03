@@ -770,9 +770,11 @@ describe.skipIf(!CHROME)("Accounts and routing laid out at 1280 wide", () => {
   // 1,400 + 46 + 56 = 1,502, so 1,510 keeps the 15c overage visible instead
   // of excusing it, and every group can still be shut on one screen.
   // Routing slice 15e adds the Pace, caps and advice group: one more closed
-  // card (46 px with the page's gap), and its open height fits the same
-  // 1,610 budget. Every group still shuts on one screen (under 830).
-  it("is under 1,610 px with Accounts open, and fits one screen with every group closed", async () => {
+  // card (46 px with the page's gap), and its open height fit the same
+  // 1,610 budget, with every group shut under 830.
+  // Settings reorg slice A, BUDGETS: Needs you's lines now say why they matter,
+  // so the shut page no longer fits one screen; slice B takes the folds out.
+  it("is under 1,850 px with Accounts open, and under 1,070 px with every group closed", async () => {
     answers.khipu_route_view = five();
     const { container } = render(<RoutingSettings active plansState={plans()} />);
     await settled();
@@ -788,9 +790,6 @@ describe.skipIf(!CHROME)("Accounts and routing laid out at 1280 wide", () => {
     // The approved mock adds the Pace group, one closed card taller: 46 px
     // of card and gap on top of the 15c budget (1,510 + 46 → 1,610 open;
     // 760 + 46 → 830 shut).
-    // Settings reorg slice A: Needs you's five lines each say why they matter,
-    // under band headings, in place of a two-column list: about 200 px more. The owner's
-    // call ("easy for a freaking human to read"); slice B takes the folds out.
     expect(open).toBeLessThan(1850);
     expect(shut).toBeLessThan(1070);
   }, 180000);

@@ -5,7 +5,7 @@ import { CLIENT, TRACKED, discovery, liveRow, status9B } from "../src/__tests__/
 import type { DiscoverResult } from "../src/accountsApi";
 import { DELIVERY_VIEW } from "./deliveryFake";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; routeReplication?: boolean };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean };
 
 /** Fictional routing record for the Proposals and holds group (slice 15b),
  *  shaped as `khipu route --json` prints it. */
@@ -55,6 +55,36 @@ function route15b() {
 
 /** Every kind of Needs you item at once (settings reorg slice A), with long
  *  words where the owner's can be long. Fictional. */
+function routeNeedsWorst() {
+  const base = routeNeeds();
+  const long = "Reviews can use the second Claude account only after the first limit, and only for repositories whose owners have said in writing that a second reviewer is fine, and never for anything touching money, sign-in or privacy code, whichever account a job runner reports first";
+  const path = "/Users/someone/Library/Application Support/SomeTool/profiles/a-very-long-profile-name-with-no-spaces-at-all-0123456789abcdef0123456789abcdef/settings.json";
+  const entries = Array.from({ length: 20 }, (_, i) => ({ account: `a${i}|`, label: `Account number ${i + 1}`,
+    role: i % 3 === 0 ? "Paced: new launches only while its week is at most 15 points ahead of an even pace, and never for review work on the money code" : "builds" }));
+  const v = base.view as unknown as { accounts: unknown[]; rules: Record<string, unknown>[]; priority: Record<string, unknown>; holds: Record<string, unknown>[]; sources: { runners: Record<string, unknown>[] }; unmatched: Record<string, unknown>[] };
+  v.priority.entries = [entries[7], entries[0], entries[1], ...entries.slice(2, 7), ...entries.slice(8, 18), { account: "new|", label: "A brand new account", role: "second opinions" }];
+  v.priority.replaced = { entries, until: null };
+  v.priority.owner_request = `${long}. Also: ${path}`;
+  v.rules[0].text = `${long}. See ${path}.`;
+  v.rules[0].prior_text = long;
+  v.rules[2].text = `${long}, copied from the old file.`;
+  v.holds[0].text = `${long}.`;
+  const runner = "A-project-with-a-very-long-name-and-no-spaces-to-break-it-at-all-0123456789";
+  v.sources.runners[0].name = runner;
+  v.unmatched[0] = { runner, lane: "opus-batch-with-a-very-long-lane-name-0123456789" };
+  const routing = base.config.routing as Record<string, unknown>;
+  routing.routing_lane_map = { value: { [runner]: { "opus-batch": "claude|", "sonnet-batch": "codex|", "gone-lane": "old|~/.gone" } }, default: {}, kind: "lane_map", source: "file", pending: true,
+    request: { request: "send them over", by_words: "a Grok Build conversation", at: new Date().toISOString(), prior: { [runner]: { "sonnet-batch": "claude|" } } } };
+  routing.routing_rules_chars = { value: 0, default: 2000, kind: "count", source: "file", pending: true,
+    request: { request: long, by: { kind: "conversation", harness: "claude_code", project: "a-project-with-a-very-long-name-and-no-spaces-to-break-it-at-all" }, at: new Date().toISOString(), prior: 2000 } };
+  routing.routing_table = { value: path, default: null, kind: "path", source: "file", pending: true, request: { by_words: "a Codex conversation", at: new Date().toISOString(), prior: null } };
+  routing.routing_usage_login_cursor = { value: false, default: false, kind: "switch", source: "default", pending: true,
+    request: { request: "read cursor's usage", by_words: "a Cursor conversation", at: new Date().toISOString(), prior: null, asked: true, asked_set: true } };
+  routing.routing_usage_login_grok = { value: true, default: true, kind: "switch", source: "default", pending: true,
+    request: { by_words: "a Codex conversation", at: new Date().toISOString(), prior: null } };
+  return base;
+}
+
 function routeNeeds() {
   const ago = (min: number) => new Date(Date.now() - min * 60000).toISOString();
   const setting = (value: unknown, kind = "x") => ({ value, default: value, kind, source: "default" });
@@ -174,7 +204,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       case "khipu_accounts_try":
         return { ok: true, default: false, row: liveRow({ account: String(args?.harness ?? "claude") }) };
       case "khipu_config_show":
-        if (f.routeNeeds) return routeNeeds().config;
+        if (f.routeNeeds) return (f.worst ? routeNeedsWorst() : routeNeeds()).config;
         if (f.routeReplication) return routeReplication().config;
         if (f.route15a) return route15a().config;
         if (f.route15b) return route15b().config;
@@ -196,7 +226,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
       case "khipu_projects_list":
         return { ok: true, ...(f.projects as object) };
       case "khipu_route_view":
-        if (f.routeNeeds) return routeNeeds().view;
+        if (f.routeNeeds) return (f.worst ? routeNeedsWorst() : routeNeeds()).view;
         if (f.routeReplication) return routeReplication().view;
         if (f.route15a) return route15a().view;
         if (f.route15b) return route15b().view;

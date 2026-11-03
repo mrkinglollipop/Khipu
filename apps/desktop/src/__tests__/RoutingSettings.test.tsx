@@ -2378,14 +2378,15 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
         request: { request: "send lane r to Codex", by_words: "a Claude Code conversation in project-a", prior: {} } },
     });
     await page();
-    const box = screen.getByRole("article", { name: "A conversation changed “Which account each job slot uses”" });
+    const box = screen.getByRole("article", { name: "A conversation changed which account a job slot uses" });
     expect(box).toHaveTextContent("A Claude Code conversation in project-a");
     expect(box).toHaveTextContent("It says you asked“send lane r to Codex”");
-    expect(box).toHaveTextContent("BeforeNo job slots matched");
+    expect(box).toHaveTextContent("Beforer in jobs → no account");
+    expect(box).toHaveTextContent("In use nowr in jobs → ");
     expect(box).not.toHaveTextContent("{");
-    fireEvent.click(within(box).getByRole("button", { name: "Go back to the old value" }));
+    fireEvent.click(within(box).getByRole("button", { name: "Go back to the old match" }));
     await waitFor(() => expect(calls("khipu_config_request")).toEqual([{ key: "routing_lane_map", action: "undo" }]));
-    fireEvent.click(within(box).getByRole("button", { name: "Keep the new value" }));
+    fireEvent.click(within(box).getByRole("button", { name: "Keep the new match" }));
     await waitFor(() => expect(calls("khipu_config_request")).toHaveLength(2));
     expect(calls("khipu_config_request")[1]).toEqual({ key: "routing_lane_map", action: "confirm" });
   });

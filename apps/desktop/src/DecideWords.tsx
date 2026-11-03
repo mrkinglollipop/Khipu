@@ -4,22 +4,39 @@
 
 import type { DecideCard } from "./routingNeeds";
 
+/** One line to a line; in a list, wrapping under its own text rather than its number. */
+function Lines({ text }: { text: string }) {
+  const lines = text.split("\n");
+  return (
+    <>
+      {lines.map((line, i) => (
+        <span key={i} className={lines.length > 1 ? "needs-line hang" : "needs-line"}>{line}</span>
+      ))}
+    </>
+  );
+}
+
 export function DecideWords({ card }: { card: DecideCard }) {
   return (
     <>
       <h4 className="needs-title">{card.title}</h4>
+      {card.changed ? (
+        <p className="needs-changed">
+          <b>{card.changed.cap}:</b> {card.changed.text}
+        </p>
+      ) : null}
       {card.before || card.now ? (
         <div className="needs-ba">
           {card.before ? (
             <div>
               <span className="cap">{card.before.cap}</span>
-              {card.before.text}
+              <Lines text={card.before.text} />
             </div>
           ) : null}
           {card.now ? (
             <div>
               <span className="cap">{card.now.cap}</span>
-              {card.now.text}
+              <Lines text={card.now.text} />
             </div>
           ) : null}
         </div>
