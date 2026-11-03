@@ -3790,6 +3790,12 @@ def drain(*, limit: int | None = None, dry_run: bool = False, sweep: bool = Fals
             payload["window_id"] = job["window_id"]
         if job.get("part"):
             payload["part"] = job["part"]
+        # The window's text digest: the hub never lands the same text twice
+        # for one session, however a later read of it is ranged or phrased.
+        from khipu.capture import DIGEST_MIN_CHARS, transcript_digest
+
+        if len(job.get("transcript") or "") >= DIGEST_MIN_CHARS:
+            payload["transcript_sha256"] = transcript_digest(job["transcript"])
         if dry_run:
             print(wire.dumps(payload, indent=2, ensure_ascii=True))
             out["captured"] += 1
