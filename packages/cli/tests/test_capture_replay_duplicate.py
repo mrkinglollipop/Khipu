@@ -431,3 +431,21 @@ def test_a_cursor_with_no_database_still_skips_the_announcement(monkeypatch):
     monkeypatch.setattr(db, "has_table", mock.Mock(side_effect=RuntimeError("no real cursor")))
     tombstones.announce_hub_identities(cur, job(), source_identity(job()))
     cur.execute.assert_not_called()
+
+
+def test_a_false_or_zero_field_is_evidence_except_truncated_chars():
+    assert capture._replay_lacks({**JOB, "flag": True}, {**JOB, "flag": False}) == ["flag"]
+    assert capture._replay_lacks({**JOB, "ratio": 1.5}, {**JOB, "ratio": 0.0}) == ["ratio"]
+    assert capture._replay_lacks(dict(JOB), {**JOB, "truncated_chars": 0}) == []
+
+
+def test_a_job_project_on_a_row_without_one_is_not_a_replay():
+    row = {**JOB, "project": None, "repo_root": None}
+    assert capture._replay_lacks(row, {**JOB, "project": "acme/other", "repo_root": "/x"}) == ["project", "repo_root"]
+
+
+def test_a_merged_list_counts_only_where_the_merge_folds_it():
+    merged = {"merged_from": [{"payload": {"edges": ["a"], "decisions": ["d"]}}]}
+    row = {**JOB, **merged}
+    assert capture._replay_lacks(row, {**JOB, "edges": ["a"]}) == ["edges"]
+    assert capture._replay_lacks(row, {**JOB, "decisions": [*JOB.get("decisions", []), "d"]}) == []

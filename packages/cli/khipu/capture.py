@@ -1349,6 +1349,8 @@ REPLAY_KIND = "replayed_capture"
 _REPLAY_ENRICHED = frozenset({"topics", "tags", "topics_unresolved", "scope", "project", "repo_root",
                               "typed_project", "root_commit", "checkout", "origin", "merged_from"})
 _REPLAY_SAME = ("session_id", "transcript_range", "event")
+# What ``_merge_into_episode`` unions into the row's columns.
+_REPLAY_FOLDED = frozenset({"decisions", "preferences", "people"})
 # A writer of another version may not have set these (the Sep 14 app never sets
 # ``part``, and only a writer since 2026-11-02 sets ``transcript_sha256``), so
 # only two values that are both there can disagree.
@@ -1398,12 +1400,17 @@ def _replay_lacks(stored: Any, incoming: Any) -> list[str] | None:
     merged = [entry["payload"] for entry in stored.get("merged_from") or []
               if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)]
     settled = {"ts", "summary", *_REPLAY_SAME, *_REPLAY_IF_BOTH, *_REPLAY_ENRICHED}
-    lacks = []
+    # Inheritance never blanks a project, so a job's project on a row without
+    # one is not a faithful replay's: it would stay in the archive alone.
+    lacks = [key for key in ("project", "repo_root") if incoming.get(key) and not stored.get(key)]
     for key, value in incoming.items():
-        if key in settled or value in (None, "", [], {}, 0):
+        if key in settled or value is None or value == "" or value == [] or value == {} \
+                or (key == "truncated_chars" and value == 0):
             continue
         if isinstance(value, list):
-            lists = [stored.get(key), *(m.get(key) for m in merged)]
+            # A merged capture's list counts only where the merge folds it into
+            # a column a reader sees; anywhere else it is kept in raw alone.
+            lists = [stored.get(key), *(m.get(key) for m in merged if key in _REPLAY_FOLDED)]
             held = {canonical(item) for items in lists if isinstance(items, list) for item in items}
             found = all(canonical(item) in held for item in value)
         elif key == "verbatim" and isinstance(value, dict):
