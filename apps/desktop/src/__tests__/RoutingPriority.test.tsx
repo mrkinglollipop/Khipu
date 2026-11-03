@@ -334,6 +334,8 @@ describe("the priority and the pace in Settings -> Routing", () => {
     expect(sw).toBeChecked();
     fireEvent.click(sw);
     await waitFor(() => expect(calls("khipu_config_set")).toEqual([{ key: "routing_pace_order", value: "off" }]));
+    fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Priority and hold limits" }));
     expect(screen.getByRole("button", { name: "Change: Warn when a priority a conversation set is still unconfirmed after" })
       .closest(".route-limit")).toHaveTextContent("24 hours");
   });

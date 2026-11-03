@@ -209,6 +209,11 @@ async function page() {
   await screen.findByRole("list", { name: "Accounts" });
 }
 
+function expandNeeds() {
+  const needs = screen.getByRole("region", { name: "Needs you" });
+  for (let button; (button = within(needs).queryByRole("button", { name: /^Show \d+ more/ }));) fireEvent.click(button);
+}
+
 function openRare(name: string) {
   fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
   const fold = screen.getByRole("button", { name });
@@ -962,7 +967,8 @@ describe("Settings -> Routing: standing rules", () => {
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "add", text: "-fast is never used" }]));
     const first = invokeMock.mock.calls.find(([cmd]) => cmd === "khipu_route_rule")?.[1] as { op: string };
     expect(first.op).toMatch(/^[0-9a-f-]{36}$/);
-    fireEvent.change(box, { target: { value: "another synthetic rule" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
+    fireEvent.change(screen.getByLabelText("New rule"), { target: { value: "another synthetic rule" } });
     fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
     fireEvent.click(screen.getByRole("button", { name: "Add the rule" }));
     await waitFor(() => expect(calls("khipu_route_rule")).toHaveLength(2));
@@ -1078,6 +1084,7 @@ describe("Settings -> Routing: holds", () => {
     fireEvent.change(screen.getByLabelText("Longest words"), { target: { value: "0" } });
     fireEvent.click(within(screen.getByRole("form", { name: "Change: Longest words in a hold" })).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(calls("khipu_config_set")).toEqual([{ key: "routing_hold_chars", value: "0" }]));
+    openRare("Sizes, timing and hand-off scripts");
     expect(screen.getByRole("button", { name: "Change: Longest line" })).toBeEnabled();
   });
 
@@ -1439,9 +1446,9 @@ describe("Settings -> Routing: providers and lanes", () => {
     answers.khipu_config_show = lanesConfig();
     await page();
     openRare("Providers and account setup");
-    const group = screen.getByRole("region", { name: "Providers and lanes" });
+    expect(screen.getByRole("region", { name: "Providers and lanes" })).toBeInTheDocument();
     expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("5 providers · 2 folders, 8 lanes");
-    const rows = within(group).getAllByRole("list", { name: "Providers" })[0]!;
+    const rows = screen.getByRole("list", { name: "Providers" });
     expect(within(rows).getAllByRole("listitem").map((r) => r.querySelector(".name")?.textContent)).toEqual([
       "Claude", "Codex", "Grok", "GLM", "Muse",
     ]);
@@ -1497,7 +1504,7 @@ describe("Settings -> Routing: providers and lanes", () => {
     answers.khipu_config_show = lanesConfig();
     await page();
     fireEvent.click(screen.getByRole("button", { name: "Something's wrong" }));
-    expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("2 folders, both reporting");
+    expect(screen.getByRole("region", { name: "Providers and lanes" })).toHaveTextContent("2 folders, both reporting");
     expect(row("Job runner folders", "project-a")).toHaveTextContent("Read just now · 3 lanes");
     expect(within(row("Lanes", "claude")).queryByRole("button", { name: "Remove" })).toBeNull();
   });
@@ -1513,7 +1520,7 @@ describe("Settings -> Routing: providers and lanes", () => {
     expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("No job runner folders");
     expect(screen.getByText("No job runners yet")).toBeInTheDocument();
     expect(screen.getByText("Add a job runner folder and its lanes show here with the account each one uses.")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Add a folder…" }));
+    fireEvent.click(within(screen.getByRole("region", { name: "Providers and lanes" })).getByRole("button", { name: "Add a folder…" }));
     expect(await screen.findByRole("form", { name: "Add a job runner folder" })).toBeInTheDocument();
   });
 });
@@ -1729,6 +1736,7 @@ describe("Settings -> Routing: checks and copies", () => {
     // Neither the table nor any flag offers Confirm, Compare, Dismiss or Set a level.
     expect(within(group).queryByRole("button", { name: /Confirm|Compare|Dismiss|Set a level|Make it a cap/ })).toBeNull();
 
+    expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
     expect(within(needs).getByText("Priority 2 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
     expect(within(needs).getByText("Priority 3 names Antigravity, which Khipu doesn't track")).toBeInTheDocument();
@@ -1756,6 +1764,7 @@ describe("Settings -> Routing: checks and copies", () => {
     const titled = row("Contradictions and out-of-date words", "Rule 12 names Grok Build");
     expect(titled).toHaveTextContent("Rule 12 names Grok Build, which you paused until Fri 9:00 AM");
     expect(titled).toHaveTextContent("Your rule names an account you paused.");
+    expandNeeds();
     expect(within(screen.getByRole("region", { name: "Needs you" }))
       .getByText("Rule 12 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
   });
@@ -1765,7 +1774,7 @@ describe("Settings -> Routing: checks and copies", () => {
     await page();
     fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
     fireEvent.click(screen.getByRole("button", { name: "Model table" }));
-    const table = screen.getByRole("region", { name: "Your model table" });
+    const table = screen.getByRole("button", { name: "Model table" }).closest("section")!;
     expect([...table.querySelectorAll("dt")].map((d) => d.textContent)).toEqual([
       "Scopes and designs", "Mocks", "Rulings", "Hardest security code", "A fix that already failed",
       "Builds", "Fix rounds", "Tests", "Docs", "Reports and summaries", "Searches and lookups",
@@ -1991,7 +2000,8 @@ describe("Settings -> Routing: no fixed cap on the owner's words (R2-4)", () => 
     fireEvent.click(within(form).getByRole("button", { name: "Add hold" }));
     await waitFor(() => expect(calls("khipu_route_hold_add")).toHaveLength(1));
     expect(calls("khipu_route_hold_add")[0]!.text).toBe(words);
-    expect(screen.getByText(/Khipu sets no limit on its\s+length/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
+    expect(screen.getByText("No limit on length; the app hands over up to 128 KB at once")).toBeInTheDocument();
   });
 });
 
@@ -2006,13 +2016,16 @@ const CHROME = [
 ].find((p) => p && existsSync(p));
 
 const GAPS = `(function () {
-  var page = document.querySelector(".route-settings");
-  var kids = Array.prototype.filter.call(page.children, function (e) { return e.getBoundingClientRect().height > 0; });
-  var gaps = [];
-  for (var i = 1; i < kids.length; i++) {
-    gaps.push(Math.round(kids[i].getBoundingClientRect().top - kids[i - 1].getBoundingClientRect().bottom));
-  }
-  document.body.setAttribute("data-out", JSON.stringify({ gaps: gaps, n: kids.length }));
+  var pages = Array.from(document.querySelectorAll("[data-routing-page]"));
+  var out = pages.map(function(page) {
+    pages.forEach(function(p) { p.dataset.active = String(p === page); });
+    var groups = Array.from(page.children).filter(function(e) {
+      return e.matches(".route-page-group,.route-rare-fold,.needs,.section-body") && e.getBoundingClientRect().height > 0;
+    });
+    var gaps = groups.slice(1).map(function(e,i) { return Math.round(e.getBoundingClientRect().top - groups[i].getBoundingClientRect().bottom); });
+    return { page: page.dataset.routingPage, n: groups.length, gaps: gaps };
+  });
+  document.body.setAttribute("data-out", JSON.stringify(out));
 })();`;
 
 describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
@@ -2025,7 +2038,7 @@ describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
     await screen.findByRole("region", { name: "Needs you" });
     openRare("Checking accounts when they reset");
     await waitFor(() => expect(screen.getByLabelText("First retry in seconds")).toHaveValue("600"));
-    const css: string = readFileSync(`${CWD.cwd()}/src/App.css`, "utf8");
+    const css: string = readFileSync(`${CWD.cwd()}/src/App.css`, "utf8") + readFileSync(`${CWD.cwd()}/src/routingOverview.css`, "utf8");
     const dir = mkdtempSync(`${tmpdir()}/khipu-routing-settings-`);
     try {
       const file = `${dir}/page.html`;
@@ -2046,9 +2059,12 @@ describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
         throw new Error(`the page did not report its layout (status ${run.status}, signal ${run.signal}, ` +
           `${run.error?.message ?? "no error"}): ${(run.stderr ?? "").slice(-2000)}`);
       }
-      const out = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&")) as { gaps: number[]; n: number };
-      expect(out.n).toBeGreaterThanOrEqual(5);
-      for (const g of out.gaps) expect(g).toBeGreaterThanOrEqual(12);
+      const out = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&")) as { page: string; gaps: number[]; n: number }[];
+      expect(out.map((p) => p.page)).toEqual(["needs", "accounts", "work", "macs", "conversations", "changes", "wrong", "rare"]);
+      for (const page of out) {
+        expect(page.n, page.page).toBeGreaterThanOrEqual(1);
+        for (const g of page.gaps) expect(g, page.page).toBeGreaterThanOrEqual(page.page === "work" ? 8 : 12);
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2253,6 +2269,7 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
       routing_ledger_keep_days: setting(7),
     });
     await page();
+    openRare("Sizes, timing and hand-off scripts");
     await screen.findByText("512 KB");
     for (const [name, words] of [
       ["How long a limit reported without a time lasts", "30 minutes"],
@@ -2349,6 +2366,7 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
       expect(slot).toHaveAttribute("aria-busy", "true");
       expect(slot).toHaveTextContent("Reading…");
     }
+    openRare("Checking accounts when they reset");
     // Folders and lanes say Reading…, never "none yet", before the settings arrive.
     expect(screen.queryByText(/No job runner folders yet/)).toBeNull();
     expect(screen.queryByText(/Lanes show here once/)).toBeNull();
@@ -2545,6 +2563,7 @@ describe("Settings -> Accounts and routing: reading a tool's own login", () => {
 
   it("shows no login switch for a CLI that has none of these settings", async () => {
     await page();
+    openRare("Checking accounts when they reset");
     await screen.findByRole("switch", { name: "Check an account at its reset time" });
     expect(screen.queryByRole("switch", { name: /from its own login|Keychain login/ })).toBeNull();
   });

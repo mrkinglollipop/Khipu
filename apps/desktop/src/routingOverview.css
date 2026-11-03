@@ -317,3 +317,17 @@ button.chip[aria-pressed="true"] {
   .route-settings .pace-win .trend-none { grid-column: 2 / -1; }
   .route-settings .adv-row { grid-template-columns: 8rem 5rem minmax(0, 1fr); }
 }
+
+.route-work-jumps { position: sticky; top: 56px; z-index: 3; display: flex; flex-wrap: wrap; gap: var(--s2); background: var(--bg); padding: var(--s2) 0; border-bottom: 1px solid var(--border); }
+#route-work-note, #route-work-rules, #route-work-holds, #route-group-priority { scroll-margin-top: 112px; }
+.route-rule-meta[hidden], .rule-result[hidden] { display: none; }
+.route-rule .rule-preview { display: block; line-height: 1.45; }
+.route-rule .rule-more { padding: 0; min-height: 22px; height: auto; }
+.route-page[data-routing-page="work"] .route-rule { padding-top: var(--s2); padding-bottom: var(--s2); }
+
+.route-page[data-routing-page="work"] { gap: var(--s2); }
+.route-page[data-routing-page="work"] .section-body { gap: var(--s2); }
+
+.route-rule-body[data-expanded="false"] { position: relative; min-height: 22px; }
+.route-rule-body[data-expanded="false"] .rule-preview { width: calc(100% - 48px); }
+.route-rule-body[data-expanded="false"] .rule-more { position: absolute; right: 0; bottom: 0; }

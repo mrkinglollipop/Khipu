@@ -31,6 +31,13 @@ export function revealSettingsGroup(group: string, frames = 12): void {
         requestAnimationFrame(tick);
         return;
       }
+      const folds = [...document.querySelectorAll<HTMLElement>(".route-rare-fold")].filter((fold) => fold.contains(el));
+      const closed = folds.find((fold) => fold.querySelector<HTMLButtonElement>(":scope > button")?.getAttribute("aria-expanded") === "false");
+      if (closed) {
+        closed.querySelector<HTMLButtonElement>(":scope > button")?.click();
+        requestAnimationFrame(tick);
+        return;
+      }
       el.scrollIntoView?.({ block: "start" });
       el.focus?.();
       return;

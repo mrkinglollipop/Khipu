@@ -645,9 +645,16 @@ export function LoginUsageSwitches({ cfg, cfgError, w, reread }: { cfg: RouteCon
   );
 }
 
-function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
-  const enabled = cfg?.routing?.routing_reset_check?.value === true;
+function ResetCheckStatus({ data }: { data: RouteView | null }) {
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
+  return <div className="section-body" aria-label="Next reset checks">
+        <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
+        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
+  </div>;
+}
+
+function ResetChecksSection({ cfg, cfgError, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
+  const enabled = cfg?.routing?.routing_reset_check?.value === true;
   return (
     <div className="section-body">
         <SwitchRow id="route-reset-check" label="Check an account at its reset time"
@@ -662,8 +669,7 @@ function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteVie
           <RetryTimesRow cfg={cfg} w={w} reread={reread} />
           <LimitRow name="Wait while the Mac is busy" help="If load is over this number, Khipu waits before checking." fields={[{ key: "routing_busy_load", label: "Load", unit: "load", options: [50, 75, 90, 0], zero: "Never wait" }, { key: "routing_busy_wait", label: "Wait", unit: "time", options: [60, 300, 600, 0], zero: "Try again at the next look" }, { key: "routing_busy_tries", label: "Busy attempts", unit: "attempts", options: [1, 3, 5, 0], zero: "None: record it at once" }]} cfg={cfg} w={w} reread={reread} />
         </div>
-        <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
-        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
+
     </div>
   );
 }
@@ -1370,7 +1376,7 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
   }
   const written = note?.at ? `written ${whenLocal(note.at, now) || "today"}` : null;
   return (
-    <div className="section-body">
+    <div className="section-body" id="route-work-note" tabIndex={-1}>
         <h2 className="sub-title">
           Your note to every conversation
           {written ? <span className="meta">{` · ${written}`}</span> : null}
@@ -1486,6 +1492,45 @@ function ruleRemoveButton(id: string, n?: number): HTMLElement | null {
     ?? (n == null ? null : document.querySelector<HTMLElement>(`.route-rule-list button[aria-label="Remove rule ${n}"]`));
 }
 
+function RuleWords({ text, expanded }: { text: string; expanded: boolean }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const [preview, setPreview] = useState(text);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || expanded) return;
+    setPreview(text);
+    const measure = () => {
+      if (!el.clientWidth) return;
+      const style = getComputedStyle(el);
+      const probe = document.createElement("span");
+      Object.assign(probe.style, { position: "absolute", visibility: "hidden", display: "block", width: `${el.clientWidth}px`,
+        font: style.font, lineHeight: style.lineHeight, letterSpacing: style.letterSpacing, whiteSpace: "normal", overflowWrap: "anywhere" });
+      document.body.append(probe);
+      const max = 2 * (parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.45) + 1;
+      probe.textContent = text;
+      if (probe.getBoundingClientRect().height <= max) setPreview(text);
+      else {
+        const words = text.match(/\S+\s*/gu) ?? [];
+        let low = 0, high = words.length;
+        while (low < high) {
+          const mid = Math.ceil((low + high) / 2);
+          probe.textContent = `${words.slice(0, mid).join("").trimEnd()} …`;
+          if (probe.getBoundingClientRect().height <= max) low = mid;
+          else high = mid - 1;
+        }
+        setPreview(low ? `${words.slice(0, low).join("").trimEnd()} …` : "Long rule …");
+      }
+      probe.remove();
+    };
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(el);
+    window.addEventListener("resize", measure);
+    return () => { observer?.disconnect(); window.removeEventListener("resize", measure); };
+  }, [text, expanded]);
+  return <span ref={ref} className="row-main rule-preview">{expanded ? text : preview}</span>;
+}
+
 function RuleRow({
   r,
   watched,
@@ -1509,6 +1554,7 @@ function RuleRow({
   onRemoved: (r: RouteRule) => void;
   back: Back;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState(r.text);
   const [editConfirm, setEditConfirm] = useState(false);
   const identity = ruleIdentity(r);
@@ -1543,9 +1589,11 @@ function RuleRow({
       <span className="route-rule-n" aria-hidden>
         {r.n}.
       </span>
-      <span className="route-rule-body">
-        <span className="row-main">{r.text}</span>
-        <span className="route-rule-meta">
+      <span className="route-rule-body" data-expanded={expanded}>
+        <RuleWords text={r.text} expanded={expanded} />
+        <button type="button" className="sm link rule-more" aria-label={`${expanded ? "Less" : "More"} about rule ${name}`}
+          aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}>{expanded ? "Less" : "More"}</button>
+        <span className="route-rule-meta" hidden={!expanded}>
           {origin}
           {pending ? <Tag tone="warn">{r.pending_kind === "changed" ? "Changed, reconfirm" : "Added, confirm"}</Tag> : null}
           {!pending && toConfirm ? <Tag tone="warn">Seeded, confirm</Tag> : null}
@@ -1558,10 +1606,11 @@ function RuleRow({
           ) : null}
         </span>
         {checks.map((c) => (
-          <span key={c.text} className={`rule-result${c.tone ? ` ${c.tone}` : ""}`}>{c.text}</span>
+          <span key={c.text} hidden={!expanded} className={`rule-result${c.tone ? ` ${c.tone}` : ""}`}>{c.text}</span>
         ))}
       </span>
       <span className="route-acts">
+        {watched && result?.result === "broken" ? <Tag tone="warn">May be broken</Tag> : null}
         {toConfirm ? (
           <button ref={confirmBtn} type="button" className="sm" aria-label={`Confirm rule ${name}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ id: identity, kind: "confirm" })}>
             Confirm
@@ -1759,7 +1808,7 @@ function RulesSection({ data, lists, w, now, revealItem }: { data: RouteView; li
   }
   const restoreId = removed ? `rule-restore:${ruleIdentity(removed)}` : "";
   return (
-    <div className="section-body">
+    <div className="section-body" id="route-work-rules" tabIndex={-1}>
         <h2 className="sub-title">
           Standing rules{" "}
           <Tag>
@@ -2286,7 +2335,7 @@ function HoldsSection({
     }
   }
   return (
-    <div className="section-body">
+    <div className="section-body" id="route-work-holds" tabIndex={-1}>
         <h2 className="sub-title">Holds</h2>
         <p className="set-help">Short notes about one account, this Mac or all work. Every hold from a conversation ends on its own.</p>
         {holds.length ? (
@@ -2699,7 +2748,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
   );
 }
 
-function MacDeliverySection({ data, health, healthError }: { data: RouteView | null; health?: RouteDeliveryHealth | null; healthError?: string | null }) {
+export function MacDeliverySection({ data, health, healthError }: { data: RouteView | null; health?: RouteDeliveryHealth | null; healthError?: string | null }) {
   const readHealth = healthError ? null : health;
   const freshness = readHealth ? [
     readHealth.replication?.status === "not_applicable" ? null : freshnessWords("Other Macs", readHealth.replication) ?? { label: "Other Macs", text: "Can't be checked", tone: undefined },
@@ -3773,19 +3822,7 @@ function ProvidersLanesSection({
           <div className="empty">
             <b>No job runners yet</b>
             <span>Add a job runner folder and its lanes show here with the account each one uses.</span>
-            <div className="toolbar">
-              <button
-                type="button"
-                className="sm primary"
-                disabled={!cfg}
-                onClick={() => {
-                  folds.openKeys(["sub:folders"]);
-                  setAdding(true);
-                }}
-              >
-                Add a folder…
-              </button>
-            </div>
+
           </div>
         )}
       </div>
@@ -4704,9 +4741,9 @@ function PageGroup({
   children: ReactNode;
 }) {
   return (
-    <section className="route-page-group" data-settings-group={k} tabIndex={-1} aria-labelledby={`route-group-${k}`}>
-      <div className="route-page-group-head">
-        <h3 id={`route-group-${k}`}>{name}</h3>
+    <section className="route-page-group" aria-labelledby={`route-group-${k}`}>
+      <div className="route-page-group-head" data-settings-group={k} tabIndex={-1}>
+        <h3 id={`route-group-${k}`} tabIndex={-1}>{name}</h3>
         <span className="gline">{line === "Reading…" ? <span className="reading">Reading…</span> : line}</span>
         <span className="gtags">
           {tags.map((t) => (
@@ -4903,7 +4940,6 @@ export function RoutingSettings({
     ),
     holds: data ? (
       <>
-        <ProposalsSection data={data} now={now} />
         <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
       </>
     ) : unread,
@@ -5021,6 +5057,7 @@ export function RoutingSettings({
                   <AccountsRequestBand support={finder.support} reload={finder.reload} onChanged={() => void route.load(true)} />
                 ) : null} />
             ) : null}
+            {data ? <ProposalsSection data={data} now={now} /> : null}
             {needsNote ? (
               <p className="needs-none" role={needsNote === READING_NEEDS ? "status" : undefined}>
                 {needsNote}
@@ -5032,10 +5069,19 @@ export function RoutingSettings({
             <p className="set-help set-intro">Who has room, what Khipu can read, and how quickly an allowance is changing.</p>
             {group("accounts")}
             {group("pace")}
+            <ResetCheckStatus data={data} />
           </section>
           <section className="route-page" data-routing-page="work" data-active={page === "work"} aria-labelledby="route-page-work">
             <h2 id="route-page-work" tabIndex={-1}>Who gets what work</h2>
-            <p className="set-help set-intro">Your order, standing words, and temporary instructions.</p>
+            <nav className="route-work-jumps" aria-label="Who gets what work sections">
+              {[["Order", "route-group-priority"], ["Note", "route-work-note"], ["Rules", "route-work-rules"], ["Temporary instructions", "route-work-holds"]].map(([label, target]) => (
+                <button key={target} type="button" className="sm" onClick={() => {
+                  const el = document.getElementById(target);
+                  el?.scrollIntoView?.({ block: "start" });
+                  el?.focus({ preventScroll: true });
+                }}>{label}</button>
+              ))}
+            </nav>
             {group("priority")}
             {group("rules")}
             {group("holds")}

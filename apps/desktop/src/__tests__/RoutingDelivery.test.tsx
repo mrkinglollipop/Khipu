@@ -2,7 +2,7 @@
 // the evidence boundary so absent or failed CLI evidence never looks healthy.
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
-import { DeliverySection } from "../RoutingSettings";
+import { DeliverySection, MacDeliverySection } from "../RoutingSettings";
 import { routingOverview } from "../routingOverview";
 import { DELIVERY_HEALTH, DELIVERY_NOW, DELIVERY_VIEW } from "../../dev/deliveryFake";
 
@@ -20,7 +20,7 @@ const SESSION_ID_SHAPED = [
 
 describe("Telling conversations: delivery and health", () => {
   it("shows generic conversation labels, never raw identities or component ids", () => {
-    const { container } = render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const { container } = render(<><DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} /><MacDeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} /></>);
     const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
     expect(rows).toHaveLength(3);
     expect(rows[0]).toHaveTextContent("Conversation 1");
@@ -51,7 +51,7 @@ describe("Telling conversations: delivery and health", () => {
           : { have_count: 2, live_count: 2, have: [], waiting: [] },
       })),
     } as typeof DELIVERY_VIEW;
-    const { container } = render(<DeliverySection data={view} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const { container } = render(<><DeliverySection data={view} health={DELIVERY_HEALTH} now={DELIVERY_NOW} /><MacDeliverySection data={view} health={DELIVERY_HEALTH} /></>);
     const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
     expect(rows).toHaveLength(2);
     expect(rows[0]).toHaveTextContent("Fix the flaky build");
@@ -90,7 +90,7 @@ describe("Telling conversations: delivery and health", () => {
   });
 
   it("keeps has-it information unknown until the doctor exposes it", () => {
-    render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    render(<><DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} /><MacDeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} /></>);
     const changes = within(screen.getByRole("list", { name: "Recent changes and who has them" }));
     expect(changes.getAllByText("Who has it isn't available")).toHaveLength(2);
     expect(screen.getByRole("list", { name: "Other Macs and the cloud" })).toHaveTextContent("Other MacsBehind");
@@ -118,7 +118,8 @@ describe("Telling conversations: delivery and health", () => {
   });
 
   it("keeps a copy with no age unknown even if its status claims green", () => {
-    render(<DeliverySection data={DELIVERY_VIEW} health={{ ...DELIVERY_HEALTH, replication: { status: "green" } }} now={DELIVERY_NOW} />);
+    const health = { ...DELIVERY_HEALTH, replication: { status: "green" as const } };
+    render(<><DeliverySection data={DELIVERY_VIEW} health={health} now={DELIVERY_NOW} /><MacDeliverySection data={DELIVERY_VIEW} health={health} /></>);
     const copies = screen.getByRole("list", { name: "Other Macs and the cloud" });
     expect(copies).not.toHaveTextContent("Current");
     expect(copies).toHaveTextContent("Can't be checked");

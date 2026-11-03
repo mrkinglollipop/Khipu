@@ -1,0 +1,282 @@
+{
+  "oracle": "npx vitest run",
+  "tests": 1383,
+  "files": 75,
+  "totalCalls": 105,
+  "sites": [
+    {
+      "site": 1,
+      "line": 354,
+      "source": "w.run(id, command, args, after, back);\n    if (ok) return true;\n    const ids = holdChoiceIds(w.errorOf(id));\n    if (!ids.length) return false;\n    setAsk({\n      ids,\n      retry: async (holds) => {",
+      "executions": 33,
+      "commands": [
+        "khipu_route_priority",
+        "khipu_route_rule"
+      ]
+    },
+    {
+      "site": 2,
+      "line": 361,
+      "source": "w.run(id, command, { ...args, holds }, after, back);\n        if (done) {\n          setAsk(null);\n          onRetrySuccess?.();\n          return true;\n        }\n        const again = holdChoiceIds(w.er",
+      "executions": 7,
+      "commands": [
+        "khipu_route_priority",
+        "khipu_route_rule"
+      ]
+    },
+    {
+      "site": 3,
+      "line": 570,
+      "source": "w.run(id, \"khipu_route_clear\", { account: a.key, report: s.id }, null, back)}\n                    >\n                      <Busy on={w.isBusy(id)} />\n                      {s.label}\n                   ",
+      "executions": 4,
+      "commands": [
+        "khipu_route_clear"
+      ]
+    },
+    {
+      "site": 4,
+      "line": 640,
+      "source": "w.run(s.id, \"khipu_config_set\", { key: s.key, value: next ? \"on\" : \"off\" }, reread)}\n            error={<WriteError w={w} id={s.id} />} />\n        );\n      })}\n    </div>\n  );\n}\n\nfunction ResetCheckSt",
+      "executions": 2,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 5,
+      "line": 665,
+      "source": "w.run(\"reset-check\", \"khipu_config_set\", { key: \"routing_reset_check\", value: on ? \"on\" : \"off\" }, reread)}\n          error={<WriteError w={w} id=\"reset-check\" />} />\n        <div className=\"rows\">\n  ",
+      "executions": 1,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 6,
+      "line": 862,
+      "source": "w.run(id, \"khipu_route_priority\", { action: \"clear\", expect }, null, back);\n  const move = (i: number, by: number) => {\n    const next = priorityItems(entries);\n    const [item] = next.splice(i, 1);\n ",
+      "executions": 1,
+      "commands": [
+        "khipu_route_priority"
+      ]
+    },
+    {
+      "site": 7,
+      "line": 975,
+      "source": "w.run(\"priority:clear\", \"khipu_route_priority\", { action: \"clear\", expect }, null, () => addSelect.current)) setClearing(false);\n              }}>\n              <Busy on={w.isBusy(\"priority:clear\")} /",
+      "executions": 1,
+      "commands": [
+        "khipu_route_priority"
+      ]
+    },
+    {
+      "site": 8,
+      "line": 989,
+      "source": "w.run(\"pace-order\", \"khipu_config_set\", { key: \"routing_pace_order\", value: on ? \"on\" : \"off\" }, reread)}\n        error={<WriteError w={w} id=\"pace-order\" />} />\n    </div>\n  );\n}\n\nfunction PriorityRa",
+      "executions": 1,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 9,
+      "line": 1145,
+      "source": "w.run(`${id}:provider`, \"khipu_route_definition\", { definition: \"provider\", value })) return;\n          }\n          if (await w.run(`${id}:account`, \"khipu_route_definition\", { definition: \"account\",\n",
+      "executions": 1,
+      "commands": [
+        "khipu_route_definition"
+      ]
+    },
+    {
+      "site": 10,
+      "line": 1147,
+      "source": "w.run(`${id}:account`, \"khipu_route_definition\", { definition: \"account\",\n            value: { id: accountId, label: label.trim(), provider } }, null, () => trigger.current)) {\n            setOpen(fal",
+      "executions": 2,
+      "commands": [
+        "khipu_route_definition"
+      ]
+    },
+    {
+      "site": 11,
+      "line": 1375,
+      "source": "w.run(\"note\", \"khipu_route_note_set\", { text: draft })) close();\n  }\n  const written = note?.at ? `written ${whenLocal(note.at, now) || \"today\"}` : null;\n  return (\n    <div className=\"section-body\" i",
+      "executions": 1,
+      "commands": [
+        "khipu_route_note_set"
+      ]
+    },
+    {
+      "site": 12,
+      "line": 1444,
+      "source": "w.run(\"note-end\", \"khipu_route_note_end\")) close();\n                }}\n              >\n                <Busy on={w.isBusy(\"note-end\")} />\n                End the note\n              </button>\n         ",
+      "executions": 1,
+      "commands": [
+        "khipu_route_note_end"
+      ]
+    },
+    {
+      "site": 13,
+      "line": 1625,
+      "source": "w.run(`${id}:undo`, \"khipu_route_rule\", { action: r.pending_kind === \"added\" ? \"dismiss\" : \"undo\", ...ruleTarget(r) }, null, back)}\n          >\n            <Busy on={w.isBusy(`${id}:undo`)} />\n       ",
+      "executions": 2,
+      "commands": [
+        "khipu_route_rule"
+      ]
+    },
+    {
+      "site": 14,
+      "line": 1723,
+      "source": "w.run(id, \"khipu_route_rule\", { action: \"retire\", ...ruleTarget(r) })) {\n                  close();\n                  onRemoved(r);\n                }\n              }}\n            >\n              <Busy",
+      "executions": 4,
+      "commands": [
+        "khipu_route_rule"
+      ]
+    },
+    {
+      "site": 15,
+      "line": 2023,
+      "source": "w.run(id, \"khipu_config_set\", { key: f.key, value: next }, reread);\n      if (!ok) return;\n    }\n    close();\n  }\n  return (\n    <div className=\"row-item route-limit\">\n      <span className=\"route-lim",
+      "executions": 11,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 16,
+      "line": 2116,
+      "source": "w.run(id, \"khipu_config_set\", { key: \"routing_reset_check_retries\", value }, async () => { await reread(); setDirty(false); })}><Busy on={w.isBusy(id)} />Save</button></span>\n    {!valid ? <span class",
+      "executions": 3,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 17,
+      "line": 2325,
+      "source": "w.run(\"hold-add\", \"khipu_route_hold_add\", {\n      text,\n      reason,\n      scope,\n      account: scope === \"account\" ? about : null,\n      until: end.iso,\n    });\n    if (ok) {\n      setText(\"\");\n   ",
+      "executions": 2,
+      "commands": [
+        "khipu_route_hold_add"
+      ]
+    },
+    {
+      "site": 18,
+      "line": 2383,
+      "source": "w.run(id, \"khipu_route_hold_end\", { id: h.id }, null, () => {\n                              const usable = (j: number) => {\n                                const b = endBtns.current[from[j].id];\n     ",
+      "executions": 3,
+      "commands": [
+        "khipu_route_hold_end"
+      ]
+    },
+    {
+      "site": 19,
+      "line": 2916,
+      "source": "w.run(id, \"khipu_config_set\", { key: \"routing_dispatch_scripts\", value: JSON.stringify(next) }, reread)) close();\n  }\n  return (\n    <div className=\"row-item route-limit\">\n      <span className=\"route",
+      "executions": 1,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 20,
+      "line": 3186,
+      "source": "w.run(\"push\", \"khipu_feature_set\", { name: \"routing_push\", enabled: next }, rereadFeatures)}\n          error={\n            <>\n              {locked ? (\n                <p className=\"opt-cost\">\n       ",
+      "executions": 2,
+      "commands": [
+        "khipu_feature_set"
+      ]
+    },
+    {
+      "site": 21,
+      "line": 3209,
+      "source": "w.run(\"push-start\", \"khipu_config_set\", { key: \"routing_push_start\", value: next ? \"on\" : \"off\" }, reread)\n          }\n          error={<WriteError w={w} id=\"push-start\" />}\n        />\n        <Switch",
+      "executions": 1,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 22,
+      "line": 3223,
+      "source": "w.run(\"push-prompt\", \"khipu_config_set\", { key: \"routing_push_prompt\", value: next ? \"on\" : \"off\" }, reread)\n          }\n          error={<WriteError w={w} id=\"push-prompt\" />}\n        />\n        <Swi",
+      "executions": 2,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 23,
+      "line": 3237,
+      "source": "w.run(\"push-delegation\", \"khipu_config_set\", { key: \"routing_push_delegation\", value: next ? \"on\" : \"off\" }, reread)\n          }\n          error={<WriteError w={w} id=\"push-delegation\" />}\n        />\n",
+      "executions": 2,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 24,
+      "line": 3325,
+      "source": "w.run(\"replication-live\", \"khipu_config_set\", { key: \"routing_replication_live\", value: next ? \"on\" : \"off\" }, reread)\n          }\n          error={<WriteError w={w} id=\"replication-live\" />}\n        ",
+      "executions": 2,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 25,
+      "line": 3343,
+      "source": "w.run(\"proposal-text\", \"khipu_config_set\", { key: \"routing_proposal_text_between_macs\", value: next ? \"on\" : \"off\" }, reread)\n          }\n          error={<WriteError w={w} id=\"proposal-text\" />}\n    ",
+      "executions": 1,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 26,
+      "line": 3355,
+      "source": "w.run(\"gateway-cleanup\", \"khipu_gateway_copy_cleanup\", {}, async () => {\n                await reread();\n                await onRetryDelivery?.();\n              })}\n            >\n              {w.isB",
+      "executions": 3,
+      "commands": [
+        "khipu_gateway_copy_cleanup"
+      ]
+    },
+    {
+      "site": 27,
+      "line": 3668,
+      "source": "w.run(\n      id,\n      \"khipu_config_set\",\n      async () => {\n        const cur = await currentSetting(\"routing_sources\");\n        if (typeof cur === \"string\") return cur;\n        const next = edit(A",
+      "executions": 4,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 28,
+      "line": 4113,
+      "source": "w.run(\n      id,\n      \"khipu_config_set\",\n      async () => {\n        const cur = await currentSetting(\"routing_lane_map\");\n        if (typeof cur === \"string\") return cur;\n        const raw = cur.va",
+      "executions": 3,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 29,
+      "line": 4253,
+      "source": "w.run(id, \"khipu_config_set\", { key: \"routing_table\", value: p }, reread)) close();\n  }\n  async function stop() {\n    if (await w.run(id, \"khipu_config_unset\", { key: \"routing_table\" }, reread)) close",
+      "executions": 3,
+      "commands": [
+        "khipu_config_set"
+      ]
+    },
+    {
+      "site": 30,
+      "line": 4256,
+      "source": "w.run(id, \"khipu_config_unset\", { key: \"routing_table\" }, reread)) close();\n  }\n  return (\n    <div className=\"section-body\">\n        <div className=\"rows\">\n          <div className=\"row-item route-li",
+      "executions": 1,
+      "commands": [
+        "khipu_config_unset"
+      ]
+    }
+  ],
+  "log": "/tmp/khipu-slice-b-full2.log",
+  "runtimeLog": "/tmp/khipu-slice-b-full2-writers.jsonl"
+}
