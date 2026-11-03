@@ -93,6 +93,9 @@ def test_compaction_keeps_the_fold(world, seed):
     chosen = rc._choose(routing.events_file().read_bytes(), NOW)
     if "kept" in chosen:
         comp = rc._Log(chosen["kept"], inputs)
+        rc._replace(routing.events_file(), b"".join(line + b"\n" for line in chosen["kept"]),
+                    "events-20261103T120000Z-f00000.jsonl.gz", rc._archive_bytes(chosen, NOW))
+        assert rc.full_log() == [line for line, _ in rows]
     for h in range(1, 24 * 14, 5):
         when = NOW + timedelta(hours=h)
         assert rc._normal(full.at(when)) == rc._normal(comp.at(when)), (seed, h)

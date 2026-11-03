@@ -7,7 +7,10 @@ import pytest
 
 from khipu import routing, routing_compact as rc
 from tests import routing_compact_synth as synth
-from tests.test_routing_compact import END, _log, world  # noqa: F401
+from tests.test_routing_compact import END, _log
+from tests import test_routing_audit_fold as audit
+
+world = audit.world
 
 
 def _chosen():

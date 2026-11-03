@@ -7,8 +7,9 @@ conversation got no routing. This module compacts it.
 What a compaction is: dropped observations are archived and the live log
 is replaced by its *checkpoint*, the lines the fold can still
 tell apart from the lines left out, in their original order and bytes, with
-every later line (the tail) after them. No line is rewritten, so the fold
-over the compacted file is the fold over the full log:
+every later line (the tail) after them. No event line is rewritten. One inert,
+timestamped generation marker records the archive commit; readers already
+ignore its event type. The fold over the compacted file is the full fold:
 
   * nothing an owner wrote is ever left out (rules, the note, the priority,
     holds, caps, clears, account lines and every undo or restore step), nor
@@ -42,8 +43,9 @@ append: they must agree, or nothing is written. The replacement writes the new
 file beside the log, fsyncs it, writes the lines left out to ``archive/``
 (compressed, byte for byte, each with its place: ``full_log`` puts them back) and
 renames the new file over the log (atomic), so a crash at any point leaves a log
-that reads, and at worst an extra archive. Archives are pruned only when past
-both their count and their age.
+that reads, and at worst an uncommitted archive that reconstruction ignores.
+Archives are pruned past both count and age, or oldest first to fit the absolute
+byte budget. Reconstruction reports damaged or expired observation history.
 
 The planning and the check run outside the routing lock on a copy of the
 bytes read; under the lock the log must still begin with those bytes (a
