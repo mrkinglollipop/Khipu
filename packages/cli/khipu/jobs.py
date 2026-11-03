@@ -973,6 +973,14 @@ def _prune_routing_ledgers() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         _nightly_log(f"[khipu-routing] ledger prune skipped: {type(exc).__name__}: {exc}")
         out = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        # The routing log's bound (khipu.routing_compact): compacted here when
+        # over it, and its archives pruned. Never fails the step.
+        from khipu import routing_compact
+
+        out = {**out, "log": routing_compact.maybe_compact(nightly=True)}
+    except Exception as exc:  # noqa: BLE001
+        out = {**out, "log": {"result": "skipped", "why": type(exc).__name__}}
     return out
 
 

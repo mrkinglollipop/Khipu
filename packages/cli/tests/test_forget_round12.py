@@ -334,6 +334,19 @@ def test_unreadable_routing_folder_keeps_forget_open(tmp_path, monkeypatch):
                for loc in result["locations"])
 
 
+def test_routing_archives_are_listed_as_kept_routing_words(tmp_path, monkeypatch):
+    from khipu import routing
+
+    folder = routing.routing_dir() / "archive"
+    folder.mkdir(parents=True)
+    (folder / "events-20261102T120000Z-abcdef.jsonl").write_text("{}\n")
+    result = forget._routing_words_scan(gateway=False)
+    assert result["ok"]
+    assert any(loc["place"] == "routing words" and loc["state"] == "kept"
+               and loc["path"].endswith("archive/events-20261102T120000Z-abcdef.jsonl")
+               for loc in result["locations"])
+
+
 def test_routing_words_on_the_gateway_are_not_applicable():
     result = forget._routing_words_scan(gateway=True)
     assert result["ok"]

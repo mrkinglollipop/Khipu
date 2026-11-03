@@ -1050,6 +1050,9 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "decision_links": decision_links_block,
         "plan_usage": plan_usage_block,
         "routing": routing_block,
+        # The routing log's size against its bound: green, yellow (compaction
+        # starts) or red (a fresh fold nears the prompt's budget). Never gates `ok`.
+        "routing_log": routing_block.get("log"),
         "routing_delivery": routing_block.get("routing_delivery", {"status": "unknown", "missing": ["routing check"]}),
         "routing_delivery_ok": routing_block.get("routing_delivery", {}).get("status") == "green",
         "owner_direction": owner_direction_block,
@@ -6183,6 +6186,9 @@ def build_parser() -> argparse.ArgumentParser:
     rprio.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rprio)
     rprio.add_argument("--base", default=None, help="Owner revision read when preparing a priority request")
+    rprio.add_argument("--revision", default=None, metavar="R",
+                       help="amend at the owner's request: the entry's revision as read (--json lists it); an "
+                            "entry written since is not overwritten")
     rprio.add_argument("--expect", default=None, metavar="V",
                        help="The priority's version as read; refused if it changed since")
     rrule = rt_sub.add_parser("rule", help="Owner: add, edit, retire, restore or confirm a standing rule", parents=[rt_json])

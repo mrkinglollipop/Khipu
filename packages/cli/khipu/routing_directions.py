@@ -655,17 +655,48 @@ def capture_scan(session: str, turns, *, now: float | None = None, actions: list
         return _capture_scan_locked(session, turns, now=now, actions=actions)
 
 
+def _his(turn: dict, conf: dict) -> bool:
+    """Whether a recorded turn is the owner's for opening an owed item.
+    ``owner_turns.eligible`` decides, except for the one refusal that is about
+    authorizing a change: a T3 conversation can't be told apart from T3's
+    scheduled or relayed messages, so no change asked for there is applied on
+    its word. Opening a direction only creates a reminder and authorizes
+    nothing, so a typed turn in T3 opens one; a turn T3's record marks as a
+    machine's, a handoff, a helper, a dispatched job's or untyped is still
+    refused by the same checks. (Nothing here changes ``eligible``.)"""
+    if turn.get("entrypoint") == "t3":
+        harness = turn.get("harness")
+        return owner_turns.eligible(dict(turn, entrypoint="cli"),
+                                    dict(conf, trusted=[f"{harness}:cli"]))[0]
+    return owner_turns.eligible(turn, conf)[0]
+
+
 def _capture_scan_locked(session, turns, *, now, actions):
     now = time.time() if now is None else now
     data, bad = _read_store()  # an unreadable store raises and stays as it is
     rows = data["directions"]
     recorded: dict[str, dict] = {}
     recorded_occs: dict[str, list[int]] = {}
+    # A recorded turn counts as the owner's only where owner provenance says
+    # so (``owner_turns.eligible``, the check every owner change goes
+    # through): a machine entrypoint, a T3 conversation, a helper or a
+    # dispatched job's turn can carry the owner's words and still not be his.
+    # A text with recorded turns and none of them eligible opens nothing.
+    conf = owner_turns.settings()
+    is_his = lambda turn: _his(turn, conf)  # noqa: E731
+    counted: set[str] = set()
     for turn in owner_turns.turns(session, now):
-        if isinstance(turn.get("prompt_sha256"), str):
-            recorded.setdefault(turn["prompt_sha256"], turn)
-            if isinstance(turn.get("occurrence"), int):
-                recorded_occs.setdefault(turn["prompt_sha256"], []).append(turn["occurrence"])
+        sha = turn.get("prompt_sha256")
+        if not isinstance(sha, str):
+            continue
+        ok = is_his(turn)
+        if ok and sha not in counted:
+            recorded[sha] = turn  # the first copy that is his stands for the text
+            counted.add(sha)
+        else:
+            recorded.setdefault(sha, turn)
+        if ok and isinstance(turn.get("occurrence"), int):
+            recorded_occs.setdefault(sha, []).append(turn["occurrence"])
     known = known_entities()
     # First pass: the eligible typed turns in this scanned window, in
     # order. Occurrences come from the owner turn record (the durable
@@ -688,6 +719,8 @@ def _capture_scan_locked(session, turns, *, now, actions):
         if (seen is not None and (seen.get("delegated") or seen.get("machine"))) \
                 or owner_turns.brief_for(typed) is not None:
             continue  # a dispatched job's prompt is never the owner's direction
+        if seen is not None and sha not in counted:
+            continue  # recorded, and no recorded copy of it is the owner's turn
         typed_turns.append((typed, at, sha))
     totals: dict[str, int] = {}
     for _typed, _at, sha in typed_turns:

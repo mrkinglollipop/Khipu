@@ -998,8 +998,10 @@ TOOLS: list[dict] = [
             "in Settings -> Routing. Khipu keeps his order as given and never "
             "reorders it. This tool cannot confirm, undo or clear a priority. "
             "To change one account's entry only, give account (with append, role, exception or end_exception, "
-            "and expect, the priority's version as read) in place of entries: every other entry stays exactly "
-            "as it is. When the owner directed it himself, khipu_owner_act route.priority.amend applies it at once. "
+            "and revision, the entry's revision as read) in place of entries: that entry is patched under the "
+            "lock and every other entry stays exactly as it is; if the entry changed since, nothing is written "
+            "and the answer is ok: false with the entry as it is now. Entries given whole may each carry their "
+            "revision, checked the same way. When the owner directed it himself, khipu_owner_act route.priority.amend applies it at once. "
             "A direction with an end (\"until tomorrow 20:30Z\") is an exception, never role text: a role holds "
             "at most 2,000 characters, and a longer one is refused."
         ),
@@ -1017,6 +1019,11 @@ TOOLS: list[dict] = [
                             "account": {"type": "string", "description": "Its label or its id, as khipu_route lists them"},
                             "role": {"type": "string", "description": "The owner's words for its role"},
                             "until": {"type": "string", "description": "When this entry ends (a time, or 2d, 30h)"},
+                            "revision": {"type": "string",
+                                         "description": "The revision khipu_route listed with this entry when it was "
+                                                        "read. An entry whose revision has since moved is not "
+                                                        "overwritten: the write is crossed and answers what it would "
+                                                        "have lost"},
                         },
                         "required": ["account"],
                     },
@@ -1038,8 +1045,18 @@ TOOLS: list[dict] = [
                                              "of the share cap while the exception is live; never parsed from "
                                              "the exception's free text"},
                 "end_exception": {"type": "string", "description": "With account: the id of an exception to end early"},
-                "expect": {"type": "string", "description": "With account: the priority's version as read "
-                                                            "(version, as khipu_route lists it)"},
+                "revision": {"type": "string", "description": "With account: the entry's revision as read "
+                                                              "(revision, as khipu_route lists it with the "
+                                                              "entry). It is checked under the lock against that "
+                                                              "entry alone, so another account's change does not "
+                                                              "cross this one; a changed entry is refused as "
+                                                              "crossed (ok: false, lost: the entry as it is now)"},
+                "expect": {"type": "string", "description": "With entries, to replace the whole list on purpose (an entry "
+                                                            "left out or sent without its revision is otherwise "
+                                                            "refused): the priority's version as read. With account, "
+                                                            "in place of revision: the priority's "
+                                                            "whole version as read (version, as khipu_route lists "
+                                                            "it); any write to the priority moves it"},
                 "base": {"type": "string", "minLength": 1, "maxLength": 256,
                          "description": "The priority's owner revision (owner_revision, as khipu_route lists "
                                         "it) when this request was prepared; a request delivered after the "
@@ -2948,9 +2965,9 @@ def _tool_route_priority(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    amend_keys = {"account", "append", "role", "exception", "end_exception", "expect", "share_pct"}
+    amend_keys = {"account", "append", "role", "exception", "end_exception", "expect", "revision", "share_pct"}
     if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request", "base", *amend_keys}:
-        raise ValueError("khipu_route_priority takes entries (or account with append or role, and expect), "
+        raise ValueError("khipu_route_priority takes entries (or account with append or role, and revision), "
                          "owner_request, base and optional until")
     base = args.get("base")
     if not isinstance(base, str) or not base.strip():
@@ -2966,10 +2983,12 @@ def _tool_route_priority(args: dict) -> dict:
         # of route.priority.amend, unconfirmed like any request.
         if "entries" in args:
             raise ValueError("give entries (the whole priority) or account (one entry), not both")
-        if any(not isinstance(args.get(k), str) for k in ("account", "expect")) \
-                or any(k in args and not isinstance(args[k], str) for k in ("append", "role", "exception",
-                                                                            "end_exception")):
-            raise ValueError("account, expect, append, role, exception and end_exception must be text")
+        if not isinstance(args.get("account"), str) \
+                or any(k in args and not isinstance(args[k], str) for k in ("expect", "revision", "append", "role",
+                                                                            "exception", "end_exception")):
+            raise ValueError("account, revision, expect, append, role, exception and end_exception must be text")
+        if "expect" not in args and "revision" not in args:
+            raise ValueError("give the entry's revision as read (revision), or the priority's version (expect)")
         share_pct = args.get("share_pct")
         if share_pct is not None and not isinstance(share_pct, (int, float)):
             raise ValueError("share_pct must be a percentage from 1 to 100")
@@ -2977,13 +2996,15 @@ def _tool_route_priority(args: dict) -> dict:
                                                    exception=args.get("exception"),
                                                    end_exception=args.get("end_exception"),
                                                    until=until, owner_request=owner_request,
-                                                   author=routing.conversation_author(), expect=args["expect"],
+                                                   author=routing.conversation_author(), expect=args.get("expect"),
+                                                   entry_revision=args.get("revision"),
                                                    base=base, share_pct=share_pct)
     entries = args.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("entries must be the owner's accounts, in his order")
     return routing.conversation_priority(entries, until=until, owner_request=owner_request,
-                                         author=routing.conversation_author(), base=base)
+                                         author=routing.conversation_author(), base=base,
+                                         **({"expect": args["expect"]} if args.get("expect") is not None else {}))
 
 
 def _tool_owner_act(args: dict) -> dict:

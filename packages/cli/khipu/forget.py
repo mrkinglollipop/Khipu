@@ -1786,6 +1786,9 @@ def _routing_words_scan(*, gateway: bool) -> dict[str, Any]:
         (session_capture.state_dir(), lambda name: (name.startswith("recall--") and ".routing.json" in name)
          or name.startswith(("title-pending--", "title-cache--", ".title-pending--", ".title-cache--"))),
         (routing.routing_dir(), lambda name: name == "remote.jsonl" or name.startswith(".replication-")),
+        # The full logs compaction keeps (khipu.routing_compact), pruned by
+        # count and age: the same routing words as the log itself.
+        (routing.routing_dir() / "archive", lambda name: name.startswith("events-")),
     ):
         try:
             names = _listing(folder)
