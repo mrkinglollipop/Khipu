@@ -356,7 +356,7 @@ def _savepoint(cur, name: str) -> bool:
 
 _IDENTITY_KEYS = frozenset({
     "ts", "session_id", "harness", "repo_root", "project",
-    "parent_session_id", "transcript_range", "window_id",
+    "parent_session_id", "transcript_range", "window_id", "transcript_sha256",
 })
 
 

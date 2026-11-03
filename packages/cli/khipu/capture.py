@@ -288,6 +288,47 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
     return int(row[0]) if row else None
 
 
+# A window's rendered text is hashed by the drain (``transcript_sha256``) so the
+# same text never becomes a second episode of its session, whatever range or
+# window id re-read it (an offset reset, a transcript rewrite, a retry under a
+# new generation). A window under this size is a short turn that legitimately
+# repeats ("yes"), not a replay, so it carries no digest.
+from khipu.capture_identity import DIGEST_MIN_CHARS, transcript_digest  # noqa: E402,F401
+
+
+def _dedup_same_content(cur, payload: dict[str, Any], *, live_only: bool = False) -> int | None:
+    # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
+    """The live episode of this session already holding this window's exact
+    text, or None. An identity-free check, so it costs no embedding call and
+    holds for any later paraphrase of the same text. Never matches a sibling
+    part of this payload's own window, and never an owner's note (a note is
+    new evidence even over text already captured). Best-effort: a failed
+    lookup is no match."""
+    digest, harness, session_id = (payload.get("transcript_sha256"), payload.get("harness"),
+                                   payload.get("session_id"))
+    verbatim = payload.get("verbatim")
+    if not (digest and harness and session_id) or (isinstance(verbatim, dict) and verbatim.get("note")):
+        return None
+    live = " AND deleted_at IS NULL" if live_only else ""
+    params: list[Any] = [session_id, harness, digest]
+    own_window = ""
+    if payload.get("window_id"):
+        own_window = " AND raw->>'window_id' IS DISTINCT FROM %s"
+        params.append(payload["window_id"])
+    cur.execute("SAVEPOINT capture_same_content")
+    try:
+        cur.execute("SELECT id FROM episodes WHERE session_id = %s AND harness = %s "
+                    f"AND raw->>'transcript_sha256' = %s{own_window}{live} ORDER BY id LIMIT 1",
+                    params)
+        row = cur.fetchone()
+    except Exception:  # noqa: BLE001 — dedup is best-effort, never blocks a write
+        cur.execute("ROLLBACK TO SAVEPOINT capture_same_content")
+        cur.execute("RELEASE SAVEPOINT capture_same_content")
+        return None
+    cur.execute("RELEASE SAVEPOINT capture_same_content")
+    return int(row[0]) if row else None
+
+
 # A checkout observation that fails to reach the hub waits here, one small
 # JSON list per checkout key, oldest first, and is landed in order before the
 # next observation for that key (record_checkout_observation, _observe_checkout).
@@ -584,11 +625,16 @@ def _dedup_cosine_best(
         return None
     try:
         from khipu import provider_text
-        from khipu.embed import _active_profile, _vec_literal, embed_one
+        from khipu.embed import _active_profile, _vec_literal, embed_one, take_session_budget
 
+        # One session's embedding calls are bounded per day; past it the
+        # similarity leg falls back to the free word-overlap check.
+        take_session_budget(payload.get("session_id"))
         profile = _active_profile(cur)
         vec = embed_one(provider_text.live_input(_dedup_text(payload), "payload"), profile=profile)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if type(exc).__name__ == "BudgetExhausted":
+            _log(f"dedup similarity check skipped: {exc}")
         return None
     ids = [str(c["id"]) for c in candidates]
     try:
@@ -922,6 +968,12 @@ def dedup_before_insert(cur, payload: dict[str, Any], *,
         _log(f"dedup: exact window match episode {exact_id} — skipping insert")
         return {"action": "skip", "matched_episode": exact_id, "matched_via": "exact_window",
                 "match": MATCH_IDENTITY}
+
+    same_id = _dedup_same_content(cur, payload, live_only=live_only)
+    if same_id is not None:
+        _log(f"dedup: same window text already captured on episode {same_id} — skipping insert")
+        return {"action": "skip", "matched_episode": same_id, "matched_via": "same_content",
+                "match": MATCH_SIMILARITY}
 
     candidates = _dedup_candidates(cur, payload)
     if not candidates:
@@ -1880,7 +1932,7 @@ _GATE = (
 # (khipu/capture_stores.py), so it may only ever hold one of these strings.
 REASON_CODES = frozenset({
     "file_leg_empty_summary", "invalid_json", "file_leg_rejected",
-    "file_leg_not_configured", "file_leg_timeout", "file_leg_unrunnable",
+    "file_leg_not_configured", "file_leg_missing", "file_leg_timeout", "file_leg_unrunnable",
     "tombstone_registry_unavailable", "invalid_timestamp", "identity_conflict",
     "memory_lock_unavailable", "hub_pending", "legacy_verbatim_only_unstorable",
     "verbatim_only_unconfirmed", "unknown",
@@ -1922,8 +1974,10 @@ def run_capture_v2(payload: dict[str, Any], *, suppress_mirror: bool,
         _set_reason(outcome, "file_leg_not_configured")
         return EX_SOFTWARE
     if not capture_v2.is_file():
+        # A path that was set but is gone (an unmounted volume, a typo) is a
+        # real fault, unlike an unset path: only the unset case is forgiven.
         _log(f"capture_v2 not found at {capture_v2} (khipu config --set capture_v2 PATH)")
-        _set_reason(outcome, "file_leg_not_configured")
+        _set_reason(outcome, "file_leg_missing")
         return EX_SOFTWARE
     env = dict(os.environ)
     if suppress_mirror:
@@ -2005,6 +2059,9 @@ def capture(payload: dict[str, Any], *, mode: str | None = None,
 def _capture(payload: dict[str, Any], *, mode: str | None,
              result: dict[str, Any] | None) -> int:
     mode = (mode or capture_mode()).lower()
+    if result is None:
+        # The CLI and the probe pass none; the file-leg verdict reads it.
+        result = {}
     try:
         _validate_timestamp(payload)
     except ValueError as exc:
@@ -2090,7 +2147,7 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
             _log(f"hub delivery pending; durable_outbox={queued}")
             _set_reason(result, "hub_pending")
             return EX_SOFTWARE
-        rc = run_capture_v2(payload, suppress_mirror=False, outcome=result)
+        rc = _file_leg_rc(run_capture_v2(payload, suppress_mirror=False, outcome=result), result)
         if rc != 0:
             return rc
         if not queued:
@@ -2123,9 +2180,25 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
             return EX_DATAERR
         _log("verbatim_only capture confirmed on the hub row; file wiki leg skipped")
         return 0
+    if (stats.get("dedup") or {}).get("matched_via") == "same_content":
+        # Text this session already holds: no second paraphrase in the file wiki.
+        _log("same window text already captured; file wiki leg skipped")
+        return 0
     if mode == "hub" and os.environ.get("KHIPU_HUB_FILE_MIRROR", "1").strip().lower() in {"0", "false", "off"}:
         return 0
-    rc = run_capture_v2(payload, suppress_mirror=True, outcome=result)
+    return _file_leg_rc(run_capture_v2(payload, suppress_mirror=True, outcome=result), result)
+
+
+def _file_leg_rc(rc: int, result: dict[str, Any] | None) -> int:
+    """A hub-only install has no legacy file writer. Once the hub holds the
+    capture (or the outbox does), a missing writer is a setting, not a failed
+    delivery: reporting it as one kept the job queued and re-ran it on every
+    drain pass, one paraphrased episode per pass. A writer that ran and
+    failed still fails."""
+    if rc != 0 and isinstance(result, dict) and result.get("reason") == "file_leg_not_configured":
+        _log("file wiki leg not configured; the hub row is the record")
+        result.pop("reason", None)
+        return 0
     return rc
 
 

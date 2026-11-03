@@ -605,6 +605,86 @@ def _budget_take(*, deadline: float | None = None, scope: str = "memory") -> Non
         raise RuntimeError(f"{label} accounting unavailable: {type(exc).__name__}: {exc}") from exc
 
 
+# One session's capture-path embedding calls (its dedup check and each episode
+# it lands) per UTC day. The day's ceiling above is shared by every session, so a
+# single session that re-captures in a loop (2026-11-02: one Cursor session spent
+# the day's 10,000) would otherwise starve every other one. Past the bound the
+# capture still lands; its dedup falls back to word overlap and the episode's
+# vectors wait for `khipu embed backfill`. 0 turns the bound off. A window costs
+# about 2 calls (its dedup check and its episode), so 400 allows ~200 windows a
+# day for one session, far past any real one, while still holding a looping
+# session to a small share of a 10,000 day.
+SESSION_DAILY_CALL_BUDGET = 400
+
+
+def _session_cap() -> int:
+    raw = (os.environ.get("KHIPU_EMBED_SESSION_DAILY_CALLS") or "").strip()
+    try:
+        return int(raw) if raw else SESSION_DAILY_CALL_BUDGET
+    except ValueError:
+        return SESSION_DAILY_CALL_BUDGET
+
+
+def _session_budget_path() -> Path:
+    from khipu.paths import ensure_data_dir
+
+    return ensure_data_dir() / "state" / "embed-budget-session.json"
+
+
+def session_budget_status() -> dict[str, Any]:
+    """Today's per-session embedding calls: the cap and the sessions at it."""
+    cap, day = _session_cap(), _budget_today()
+    try:
+        raw = json.loads(_session_budget_path().read_text(encoding="utf-8"))
+        sessions = raw.get("sessions") if isinstance(raw, dict) and raw.get("day") == day else {}
+        sessions = sessions if isinstance(sessions, dict) else {}
+    except (OSError, ValueError):
+        sessions = {}
+    over = sorted(k for k, v in sessions.items() if isinstance(v, int) and cap > 0 and v >= cap)
+    return {"day": day, "cap": cap, "sessions": len(sessions), "at_cap": len(over),
+            "at_cap_sessions": over[:20]}
+
+
+def take_session_budget(session_id: str | None) -> None:
+    """Reserve one capture-path embedding call for ``session_id`` today, or
+    raise :class:`BudgetExhausted`. No session id is not counted, and an
+    unreadable record never blocks a capture (the global ceiling still holds)."""
+    sid = str(session_id or "").strip()
+    cap = _session_cap()
+    if not sid or cap <= 0:
+        return
+    day = _budget_today()
+    try:
+        path = _session_budget_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.with_suffix(path.suffix + ".lock").open("a+", encoding="utf-8") as lock:
+            with _lock_budget_file(lock, time.monotonic() + 1.0):
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                except (OSError, ValueError):
+                    raw = {}
+                sessions = raw.get("sessions") if isinstance(raw, dict) and raw.get("day") == day else {}
+                sessions = sessions if isinstance(sessions, dict) else {}
+                used = sessions.get(sid, 0)
+                used = used if isinstance(used, int) and not isinstance(used, bool) and used >= 0 else 0
+                if used >= cap:
+                    raise BudgetExhausted(
+                        f"session embed budget exhausted: {used} calls today for {sid} "
+                        f"(cap {cap}, KHIPU_EMBED_SESSION_DAILY_CALLS)")
+                sessions[sid] = used + 1
+                with tempfile.NamedTemporaryFile(
+                        "w", encoding="utf-8", dir=path.parent,
+                        prefix=path.name + ".", suffix=".tmp", delete=False) as tmp:
+                    json.dump({"day": day, "sessions": sessions}, tmp)
+                    tmp.flush()
+                    tmp_path = Path(tmp.name)
+                os.replace(tmp_path, path)
+    except BudgetExhausted:
+        raise
+    except (OSError, RuntimeError):
+        return
+
+
 QUERY_CACHE_SCHEME = "provider-input-v2"
 
 
@@ -2148,6 +2228,11 @@ def embed_on_capture(payload: dict[str, Any], *, episode_id: int | None = None) 
     has no id, such as the legacy file mirror) the row is found by the legacy
     (ts, md5(summary)) identity, which an edit or merge can move."""
     if os.environ.get("KHIPU_EMBED_ON_CAPTURE", "1").strip().lower() in {"0", "false", "off"}:
+        return False
+    try:
+        take_session_budget(payload.get("session_id"))
+    except BudgetExhausted as exc:
+        _log(f"embed-on-capture skipped: {exc}; backfill will catch it")
         return False
     try:
         from khipu.db import connect

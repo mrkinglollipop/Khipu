@@ -322,6 +322,12 @@ def _doctor_local_checks(mem: Path | None) -> dict:
         synth_budget = {"error": f"{type(e).__name__}: {e}"}
         synth_budget_ok = False
     try:
+        from khipu.embed import session_budget_status
+
+        synth_budget["session_budget"] = session_budget_status()
+    except Exception as e:  # noqa: BLE001 — informational, never gates
+        synth_budget["session_budget"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
         from khipu.extract import synth_usage_today
 
         _usage = synth_usage_today()
@@ -4118,6 +4124,12 @@ def _budget_status_all() -> dict:
         out[scope] = {k: st.get(k) for k in keys}
         if st.get("error"):
             out[scope]["error"] = st["error"]
+    try:
+        from khipu.embed import session_budget_status
+
+        out["session_budget"] = session_budget_status()
+    except Exception as e:  # noqa: BLE001 — accounting is informational
+        out["session_budget"] = {"error": f"{type(e).__name__}: {e}"}
     try:
         usage = synth_usage_today()
         out["synth"]["tokens_today"] = {k: usage[k] for k in
