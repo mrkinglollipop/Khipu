@@ -1083,8 +1083,10 @@ def _replaced_why(turn: dict) -> str | None:
         return None
     name = _PROGRAM_NAMES.get(turn.get("harness"), "agent")
     return (f"This conversation's {name} program, or a program it runs, was updated while running, before Khipu had "
-            f"seen it, so Khipu can't tie this call to this conversation's prompt hook. Nothing was changed, and "
-            f"repeating the message here won't help. Restart this conversation's {name} program and it works again.")
+            "seen it, so Khipu can't tie this call to this conversation's prompt hook. Nothing was changed, and "
+            f"repeating the message here won't help. Restart this conversation's {name} program if the owner is "
+            "typing in it, then have them type the request again; a background or dispatched job can't make an "
+            "owner's change, restarted or not.")
 
 
 def _from_the_hook(turn: dict) -> None:

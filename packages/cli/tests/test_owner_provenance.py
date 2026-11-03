@@ -355,9 +355,11 @@ def test_t3_handoff_history_marker_never_puts_history_on_disk(hooked):
 # An update deletes the file a running Claude Code was started from, and the
 # kernel then has no path for it (``proc_pidpath`` returns 0) while its parent,
 # start time and name stay readable. The issuer and chain comparison is (pid,
-# start time), and a path only ever gave the name the shell and interpreter
-# refusals read and the app-bundle place, so a process seen by a hook while its
-# path was readable stays that process. One never seen so stays refused.
+# start time), but the name a path gives decides which process that comparison
+# lands on (the walk skips shells and interpreters) and the app-bundle place
+# comes from it too. So a process seen by a hook while its path was readable
+# stays that process only while its record's name is the kernel's own. One
+# never seen so stays refused.
 
 REAL_CHAIN = owner_direction._caller_chain  # conftest puts a fake harness in front of it
 REAL_REPLACED = owner_direction._program_replaced
@@ -397,7 +399,7 @@ class Kernel:
         if pid not in self.procs:
             return None
         parent, exe, start = self.procs[pid]
-        return parent, start, self.names.get(pid, os.path.basename(exe))[:16]
+        return parent, start, self.names.get(pid, os.path.basename(exe))[:15]
 
     def replace(self, *pids: int) -> None:
         self.gone.update(pids)
@@ -518,6 +520,60 @@ def test_a_matching_name_with_the_wrong_ancestry_is_refused(kernel):
     assert kernel.check()["auth"] == "direction"
 
 
+def _forge_record(pid: int, start: float, name: str, path: str) -> None:
+    owner_turns.known_folder().mkdir(parents=True, exist_ok=True)
+    owner_turns._known_file(pid).write_text(json.dumps({"start": start, "name": name, "path": path}))
+
+
+def _job_under_the_conversation(kernel) -> int:
+    """A ``claude -p`` job (85) the conversation (80) started, its file gone,
+    with the owner's typed turn recorded for the parent; a call under it (400)."""
+    assert kernel.hook_turn()["pid"] == 80
+    kernel.procs[85] = (80, "/x/versions/claude", 2.0)
+    kernel.args[85] = ["claude", "-p", "do it"]
+    kernel.procs[400] = (85, "/usr/bin/python3", 3.0)
+    kernel.replace(85)
+    return 400
+
+
+def test_a_forged_record_cannot_make_a_job_read_as_a_shell(kernel):
+    # Security review of df3cdfc9: read as bash, the job would be skipped and
+    # its parent would be the nearest harness, whose turn then passes.
+    caller = _job_under_the_conversation(kernel)
+    _forge_record(85, 2.0, "claude", "/bin/bash")
+    assert owner_turns._known_info(85) is None
+    _refused(kernel, caller=caller)
+    kernel.be(caller)
+    assert owner_direction._caller_chain() == []
+
+
+def test_a_forged_record_through_a_symlink_cannot_make_a_job_read_as_a_shell(kernel, tmp_path):
+    # The walk names a process by the resolved path, so the resolved name must match too.
+    link = tmp_path / "claude"
+    link.symlink_to("/bin/bash")
+    caller = _job_under_the_conversation(kernel)
+    _forge_record(85, 2.0, "claude", str(link))
+    assert owner_turns._known_info(85) is None
+    _refused(kernel, caller=caller)
+
+
+def test_a_replaced_job_with_its_own_record_is_its_own_harness(kernel):
+    # The honest case: the job is the nearest harness, so the parent's turn is not its.
+    caller = _job_under_the_conversation(kernel)
+    _forge_record(85, 2.0, "claude", "/x/versions/claude")
+    kernel.be(caller)
+    assert owner_direction._nearest_harness(owner_direction._caller_chain()) == (85, 2.0)
+    assert "updated while" not in _refused(kernel, caller=caller)
+
+
+def test_the_refusal_is_true_for_a_conversation_and_for_a_job(kernel):
+    caller = _job_under_the_conversation(kernel)
+    why = _refused(kernel, caller=caller)
+    assert "updated while" in why
+    assert "type the request again" in why and "job can't make an owner's change, restarted or not" in why
+    assert "works again" not in why
+
+
 def test_the_agents_shell_under_a_known_replaced_process_stays_refused(kernel):
     kernel.hook_turn()
     kernel.replace(80)
@@ -624,6 +680,8 @@ def test_a_deleted_program_on_the_real_kernel(folders, monkeypatch, tmp_path):
 
     seen_exe, seen = started("claude")
     fresh_exe, fresh = started("claude2")
+    # The kernel keeps 15 bytes of a name, and the record is compared on those.
+    long_exe, long_named = started("a-program-with-a-long-name")
     try:
         parent, path, start = owner_turns._proc_info(seen.pid)
         assert os.path.basename(path) == "claude"
@@ -634,7 +692,17 @@ def test_a_deleted_program_on_the_real_kernel(folders, monkeypatch, tmp_path):
         assert owner_turns._proc_bare(seen.pid) == (parent, start, "claude")
         assert owner_turns._known_info(seen.pid) == (parent, path, start)
         assert owner_turns._known_info(fresh.pid) is None
+        # A record that names another program is no record, on the kernel's own name.
+        forged = {"start": owner_turns._proc_bare(fresh.pid)[1], "name": "claude2", "path": "/bin/bash"}
+        owner_turns._known_file(fresh.pid).write_text(json.dumps(forged))
+        assert owner_turns._known_info(fresh.pid) is None
+
+        parent, path, start = owner_turns._proc_info(long_named.pid)
+        owner_turns._pin_issuer(long_named.pid, path, start)
+        long_exe.unlink()
+        assert owner_turns._proc_bare(long_named.pid) == (parent, start, "a-program-with-")
+        assert owner_turns._known_info(long_named.pid) == (parent, path, start)
     finally:
-        for child in (seen, fresh):
+        for child in (seen, fresh, long_named):
             child.kill()
             child.wait()

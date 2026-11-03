@@ -645,8 +645,9 @@ def _proc_bare(pid: int) -> tuple[int, float, str] | None:
     """A process's parent, when it started and its kernel name (``pbi_comm``),
     all readable after the file it runs is gone, when ``_proc_info`` has no
     path to give; None when they can't be read. The name is the file's at
-    exec, cut to 16 bytes, and is never a proof that a program is any given
-    one: it is only compared with what the same pid and start time had."""
+    exec, cut to ``_KERNEL_NAME_BYTES``. It never makes a process known by
+    itself: it is only compared with what a record says this pid and start
+    time ran (``_known_info``)."""
     if sys.platform != "darwin" or pid <= 0:
         return None
     try:
@@ -666,13 +667,20 @@ def _proc_bare(pid: int) -> tuple[int, float, str] | None:
 
 # A running program outlives its file: an update deletes it, and the kernel
 # then gives no path for the process (2026-11-03, every running Claude Code
-# after an npm update). A path only ever gave the issuer and the chain a name
-# for the shell and interpreter refusals and an app-bundle place; what they
-# compare is the pid and start time. So the first thing a hook reads about its
-# issuer is kept, one file per process number, and stands in for the path when
-# the same pid and start time and kernel name are still there (exec keeps the
-# first two). A process no hook saw with a path has no such record and stays
+# after an npm update). The issuer and the chain compare the pid and start
+# time, but the path still counts: the name it gives decides which processes
+# the walk skips as shells and interpreters, and so which process that
+# comparison lands on, and the app-bundle place comes from it. So the first
+# thing a hook reads about its issuer is kept, one file per process number, and
+# stands in for the path only while the same pid and start time are there (exec
+# keeps both) and the record's name is the kernel's own: the record can't name
+# a process as anything but what the kernel says it runs (security review of
+# df3cdfc9: a job recorded as /bin/bash read as a shell, and its parent's turn
+# passed). A process no hook saw with a path has no such record and stays
 # unreadable: the kernel's name alone never makes a process known.
+_KERNEL_NAME_BYTES = 15  # pbi_comm: 16 bytes, the last always NUL
+
+
 def known_folder() -> Path:
     return folder() / "known-processes"
 
@@ -712,10 +720,16 @@ def _pin_issuer(pid: int, path: str, start: float) -> None:
         pass
 
 
+def _kernel_name(path: str) -> bytes:
+    """A path's file name as the kernel's process name would hold it."""
+    return os.fsencode(os.path.basename(path))[:_KERNEL_NAME_BYTES]
+
+
 def _known_info(pid: int) -> tuple[int, str, float] | None:
     """``_proc_info``, or for a process whose file is gone, the path a hook
-    read for this same process before that (``_pin_issuer``). None for any
-    other process with no path."""
+    read for this same process before that (``_pin_issuer``), when its file
+    name is the one the kernel still has. None for any other process with no
+    path."""
     info = _proc_info(pid)
     if info is not None:
         return info
@@ -723,7 +737,11 @@ def _known_info(pid: int) -> tuple[int, str, float] | None:
     known = _read_known(pid) if bare is not None else None
     if known is None or known["start"] != bare[1] or known["name"] != bare[2]:
         return None
-    return bare[0], known["path"], bare[1]
+    # Callers name a process by the resolved path, so both forms must agree.
+    path = known["path"]
+    if not (_kernel_name(path) == _kernel_name(os.path.realpath(path)) == os.fsencode(bare[2])[:_KERNEL_NAME_BYTES]):
+        return None
+    return bare[0], path, bare[1]
 
 
 def _sweep_known() -> None:
