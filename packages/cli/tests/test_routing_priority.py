@@ -715,6 +715,7 @@ def _before_the_role_budget(monkeypatch):
     monkeypatch.setattr(routing, "ROLE_BUDGET", 10 ** 6)
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_a_conversations_long_priority_fits_the_summary_budget_as_a_pointer(home, monkeypatch):
     _before_the_role_budget(monkeypatch)
     _set(home, routing_summary_chars=1500)

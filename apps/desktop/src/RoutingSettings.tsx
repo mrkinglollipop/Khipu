@@ -1496,9 +1496,10 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
           </ConfirmGroup>
         ) : null}
         <p className="set-help">
-          Conversations see this word for word, right after your standing rules, and it is never shortened. Khipu
-          never turns it into a choice of account. Earlier notes stay in Recent changes. Khipu sets no limit on its
-          length; the app hands over up to {WORDS_MOST_KB} KB of text in one change.
+          Conversations see this word for word, right after your standing rules, and Khipu never rewrites it. A note
+          is limited to 1,500 characters by default (Longest note, below); at the start of a conversation a longer
+          one shows its first sentence and a pointer to read the rest. Khipu never turns it into a choice of account.
+          Earlier notes stay in Recent changes. The app hands over up to {WORDS_MOST_KB} KB of text in one change.
         </p>
     </div>
   );
@@ -1815,8 +1816,11 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
         <p className="set-help">
           Rules marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or
           remove it. A conversation can add or change a rule at your request; those rows show what changed and stay
-          pending until you confirm or undo them. Rules are never shortened or cut, and Khipu sets no limit on their
-          length (the app hands over up to {WORDS_MOST_KB} KB of text at once).
+          pending until you confirm or undo them. Khipu never rewrites a rule. A rule is limited to 600
+          characters and you may have 40 by default (Longest standing rule and Most standing rules, below); rules
+          already stored over a limit keep working. At the start of a conversation the rules that fit the budget are
+          shown in your order and a line says how many were left to read (the app hands over up to {WORDS_MOST_KB} KB
+          of text at once).
         </p>
         {rules.length ? (
           <div className="route-filter">
@@ -3082,12 +3086,12 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
 const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }[] = [
   {
     name: "Longest summary at the start of a conversation",
-    help: "Your rules and your note are never cut; this limits what follows them.",
+    help: "Account states and holds; your rules, note and priority have their own limit below.",
     fields: [{ key: "routing_summary_chars", label: "Longest summary", unit: "chars", options: [1000, 1500, 3000, 6000, 0], zero: "No limit" }],
   },
   {
     name: "Longest update before a prompt",
-    help: "Rules and your note are never cut.",
+    help: "A changed rule or note longer than this arrives as a pointer and its first sentence, then in full over the next prompts.",
     fields: [{ key: "routing_prompt_chars", label: "Longest update", unit: "chars", options: [200, 400, 800, 1600, 0], zero: "No limit" }],
   },
   {
@@ -3097,8 +3101,28 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
   },
   {
     name: "Longest line",
-    help: "Each line about an account, a hold or a lane. Rules and your note are never cut.",
+    help: "Each line about an account, a hold or a lane. Rules and your note have their own limits.",
     fields: [{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }],
+  },
+  {
+    name: "Longest standing rule",
+    help: "Checked when you add or change a rule; rules already longer keep working.",
+    fields: [{ key: "routing_rule_chars", label: "Longest rule", unit: "chars", options: [300, 600, 1200, 2400, 0], zero: "No limit" }],
+  },
+  {
+    name: "Most standing rules",
+    help: "Checked when you add a rule; more already stored keep working.",
+    fields: [{ key: "routing_rules_max", label: "Most rules", unit: "rules", options: [20, 40, 80, 160, 0], zero: "No limit" }],
+  },
+  {
+    name: "Longest note",
+    help: "Checked when you set the note; a longer one already set keeps working.",
+    fields: [{ key: "routing_note_chars", label: "Longest note", unit: "chars", options: [750, 1500, 3000, 6000, 0], zero: "No limit" }],
+  },
+  {
+    name: "Most of your rules, note and priority shown at the start of a conversation",
+    help: "Past this, rules are cut at a whole rule and a line says how many were left out and how to read them; account state is never pushed out.",
+    fields: [{ key: "routing_rules_chars", label: "Rules shown", unit: "chars", options: [1000, 2000, 3000, 4000, 0], zero: "No limit" }],
   },
   {
     name: "Time allowed before a prompt",

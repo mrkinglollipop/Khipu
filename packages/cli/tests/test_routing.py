@@ -915,6 +915,7 @@ def test_the_seed_imports_once(home):
     assert routing.doctor_block()["rules_to_confirm"] == 1
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_rules_and_the_note_arrive_whole_whatever_their_length(home):
     long_rule = "Never send what is in the private folders to another model family; " * 6
     routing.add_rule(long_rule, via="app")
@@ -924,7 +925,7 @@ def test_rules_and_the_note_arrive_whole_whatever_their_length(home):
     out = routing.summary()
     assert long_rule.strip() in out["text"] and note.strip() in out["text"]
     assert out["text"].index("Standing rules:") < out["text"].index("Note from the owner")
-    assert "Your rules and note are longer than the summary size." in routing.doctor_block()["warnings"]
+    assert routing.doctor_block()["rules_budget"]["note_chars"] == len(note)
     routing.end_note(via="app")
     assert routing.read_view()["note"] is None
 

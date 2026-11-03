@@ -124,6 +124,32 @@ def _isolate_routing_inventory(monkeypatch):
     monkeypatch.setattr(agent_view, "_TABLE", {"sig": None, "at": 0.0, "table": None})
 
 
+RULE_SIZE_SETTINGS = ("routing_rule_chars", "routing_rules_max", "routing_note_chars")
+
+
+@pytest.fixture(autouse=True)
+def _rule_sizes_unlimited_by_default(monkeypatch):
+    """Many routing tests write rules and notes of thousands of characters to
+    exercise paging; the write-time limits are off for them (the render budget,
+    ``routing_rules_chars``, is not). ``test_routing_rules_budget`` puts the
+    real defaults back."""
+    from khipu import routing
+
+    for key in RULE_SIZE_SETTINGS:
+        kind, _default, words = routing.SETTINGS[key]
+        monkeypatch.setitem(routing.SETTINGS, key, (kind, 0, words))
+
+
+@pytest.fixture
+def unbounded_render(monkeypatch):
+    """For a test that needs the rules, note and priority whole at session
+    start whatever their length (``routing_rules_chars`` off)."""
+    from khipu import routing
+
+    kind, _default, words = routing.SETTINGS["routing_rules_chars"]
+    monkeypatch.setitem(routing.SETTINGS, "routing_rules_chars", (kind, 0, words))
+
+
 @pytest.fixture(autouse=True)
 def _reset_table_columns_cache():
     from khipu import db, provenance

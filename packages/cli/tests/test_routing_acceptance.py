@@ -486,6 +486,7 @@ def test_2_pending_rule_is_whole_across_pages(replay):
     expect("".join(delivered).count("~"), 2995, "2: pending rule was acknowledged as a preview, with text lost")
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_2_oversized_session_start_has_a_first_page(replay):
     routing.add_rule("x" * 10500, via="app")
     at = recall_rule._RoutingAtStart().begin()

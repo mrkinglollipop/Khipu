@@ -197,6 +197,7 @@ def _legacy_over_budget():
     return len(_codex()["role"])
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_an_over_budget_legacy_role_still_reads_warns_and_takes_exceptions(direction_world):
     size = _legacy_over_budget()
     assert size > routing.ROLE_BUDGET
