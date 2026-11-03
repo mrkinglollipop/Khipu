@@ -1880,9 +1880,14 @@ def test_4pa_cost_20000_events_with_18000_samples_stays_under_budget(replay):
     replay.advance(1)
     # The helper's table preparation is outside the measured push, as in
     # the slice cost workload; the push itself has the one-second budget.
+    # That preparation used to parse the log as a side effect of the alias
+    # inventory; the inventory now comes from the saved view, so the parse
+    # this inline fold reuses is warmed here, outside the measurement, as
+    # before. (A prompt child never folds inline: it answers the view.)
     out, elapsed = None, None
     for _attempt in range(20):
         agent_view.prepare_routing_table(refresh=True)
+        routing._entry_cache()
         started = _time.perf_counter()
         try:
             out = routing.prompt_push(recall_prompt.routing_marker("s1"), budget=1.0, now=replay.now)

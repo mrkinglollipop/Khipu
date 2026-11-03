@@ -151,6 +151,11 @@ def _homes(extra_keys: Iterable[str] | None, view: dict, *, local_only=False, re
         for entry in load_config().get("usage_accounts") or []:
             if isinstance(entry, dict) and isinstance(entry.get("home"), str) and entry["home"].strip():
                 out.append((str(entry.get("harness") or "").strip().lower(), entry["home"].strip()))
+        # Owner-defined accounts' login folders, bound in config: named even
+        # when no saved view lists the account yet.
+        for bound in (load_config().get("routing_account_bindings") or {}).values():
+            if isinstance(bound, dict) and isinstance(bound.get("home"), str) and bound["home"].strip():
+                out.append((str(bound.get("harness") or "").strip().lower(), bound["home"].strip()))
     with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         from khipu import claude_homes
 
@@ -357,7 +362,7 @@ class _Table:
         self.name_secrets = _name_regex(name_to, token_names, whole_value=True)
 
 
-def _other_paths(*, local_only=False) -> list[str]:
+def _other_paths(*, local_only=False, view=None) -> list[str]:
     others: list[str] = []
     with contextlib.suppress(Exception):
         from khipu import routing
@@ -370,7 +375,7 @@ def _other_paths(*, local_only=False) -> list[str]:
             others += [item["path"] for item in cfg.get("routing_sources") or []
                        if isinstance(item, dict) and isinstance(item.get("path"), str)]
         else:
-            others += routing._configured_paths()
+            others += routing._configured_paths(from_view=True, view=view)
     with contextlib.suppress(Exception):
         if not local_only:
             others += [os.path.join("/Volumes", n) for n in os.listdir("/Volumes")]
@@ -423,7 +428,7 @@ def _rules(extra_keys: Iterable[str] | None = None, *, local_only=False, require
                     # Aliases retain the original name's classification:
                     # stripping a dot or casefolding must not make it prose.
                     add_name(form, ident, plain=re.fullmatch(r"[a-z]+", folder) is not None)
-    for path in _other_paths(local_only=local_only):
+    for path in _other_paths(local_only=local_only, view=view):
         if len(path.rstrip("/")) > 1:
             root_to.setdefault(_fold(path.rstrip("/")), FOLDER_WORD)
             paths.append(path)
@@ -469,7 +474,7 @@ def _signature(extra_keys) -> tuple:
     view = _saved_view()
     home = _home_dir()
     homes = sorted(set(_homes(extra_keys, view)), key=repr)
-    paths = _other_paths()
+    paths = _other_paths(view=view)
     watched = set()
     for harness, raw in homes:
         if raw is None:
@@ -617,11 +622,13 @@ def _bounded_inventory(call, budget):
             signal.setitimer(signal.ITIMER_REAL, max(0.000001, timer[0] - (time.monotonic() - began)), timer[1])
 
 
-# A cold one-shot prompt child must fold the whole routing events log before it
-# can build (about 220-260 ms at 7.6 MB, 2026-11-01); the warm helper pays that
-# fold once. Only that fold gets this extra time: it reads the events log and
-# resolves no login, so the alias and inventory work below keeps 250 ms, and a
-# stalled volume or a huge view still withholds as fast as before.
+# The account inventory comes from the saved view (``routing.inventory_accounts``)
+# whenever it holds every account; only when it may not does a cold one-shot
+# prompt child parse the whole routing events log (about 220-260 ms at 7.6 MB,
+# 2026-11-01). Only that parse gets this extra time: it reads the events log
+# and resolves no login, so the alias and inventory work below (the view read
+# included) keeps 250 ms, and a stalled volume or a huge view still withholds
+# as fast as before.
 COLD_FOLD_BUDGET_S = 0.5
 _BUILD_BUDGET_S = 0.25
 
@@ -629,8 +636,10 @@ _BUILD_BUDGET_S = 0.25
 def prepare_routing_table(*, refresh=False, cold=False) -> None:
     """Rebuild the helper's full inventory within 250 ms, retrying failed starts.
 
-    ``cold``: first warm the routing events-log fold within
-    ``COLD_FOLD_BUDGET_S``, so the bounded build finds it cached.
+    ``cold``: build with the log parse deferred (``routing.parse_deferred``);
+    a build that needs it (no saved view holding every account) stops at
+    once, the parse alone runs within ``COLD_FOLD_BUDGET_S``, and the build
+    runs again, finding it cached.
 
     Prompt children inherit ``prepared`` even after a timeout. Only successful
     full builds renew the two-second freshness window.
@@ -638,11 +647,6 @@ def prepare_routing_table(*, refresh=False, cold=False) -> None:
     if not refresh and _TABLE.get("prepared"):
         return
     _TABLE["prepared"] = True
-    if cold:
-        with contextlib.suppress(Exception):
-            from khipu import routing
-
-            _bounded_inventory(routing._entry_cache, COLD_FOLD_BUDGET_S)
 
     def rebuild():
         previous = getattr(_FORM_CACHE, "current", None)
@@ -659,6 +663,16 @@ def prepare_routing_table(*, refresh=False, cold=False) -> None:
         finally:
             _FORM_CACHE.current = previous
 
+    if cold:
+        from khipu import routing
+
+        try:
+            with routing.parse_deferred(), contextlib.suppress(InventoryUnavailable):
+                _bounded_inventory(rebuild, _BUILD_BUDGET_S)
+            return
+        except routing.ParseWanted:
+            with contextlib.suppress(Exception):
+                _bounded_inventory(routing._entry_cache, COLD_FOLD_BUDGET_S)
     with contextlib.suppress(InventoryUnavailable):
         _bounded_inventory(rebuild, _BUILD_BUDGET_S)
 

@@ -811,13 +811,16 @@ def _clean(text, limit: int) -> str:
     return _clip(words, limit)
 
 
-def _configured_path_names() -> dict[str, str | tuple[str, str]]:
+def _configured_path_names(*, from_view: bool = False, view: dict | None = None) -> dict[str, str | tuple[str, str]]:
     """Every folder and file path Khipu is configured with (login folders,
     job runner folders, the routing table, the rules seed), each as written,
     expanded and resolved, with what stands for it in a conversation's
     words: a login folder as (harness, home), for its account's id as
     khipu_route gives it (worked out only when used: the id's salt is made
-    on first use), any other path as "a folder"."""
+    on first use), any other path as "a folder". ``from_view``: the
+    accounts come from ``inventory_accounts`` (the saved view's, when it
+    holds every account ``accounts()`` would give), not ``accounts()``;
+    ``view``, the saved view the caller already loaded (``_load_view``)."""
     from khipu.config import load_config
 
     config: dict = {}
@@ -830,7 +833,8 @@ def _configured_path_names() -> dict[str, str | tuple[str, str]]:
         if isinstance(item, dict) and isinstance(item.get("home"), str):
             logins.append((str(item.get("harness") or "").strip().lower(), item["home"]))
     with contextlib.suppress(Exception):
-        logins += [(a["harness"], str(a["home"])) for a in accounts() if a.get("home")]
+        logins += [(a["harness"], str(a["home"])) for a in (inventory_accounts(view) if from_view else accounts())
+                   if a.get("home")]
     for harness, home in logins:
         paths.setdefault(home, (harness, home.strip()))
     for name in ("routing_table", "routing_rules_seed"):
@@ -852,9 +856,9 @@ def _configured_path_names() -> dict[str, str | tuple[str, str]]:
     return {v: n for v, n in variants.items() if v and v != "/"}
 
 
-def _configured_paths() -> list[str]:
+def _configured_paths(*, from_view: bool = False, view: dict | None = None) -> list[str]:
     """Every configured path (``_configured_path_names``), longest first."""
-    return sorted(_configured_path_names(), key=len, reverse=True)
+    return sorted(_configured_path_names(from_view=from_view, view=view), key=len, reverse=True)
 
 
 def _cut_paths(words: str) -> str:
@@ -1052,6 +1056,133 @@ def accounts() -> list[dict]:
                     "home": account.get("home"),
                     **({"label_source": account["label_source"]} if "label_source" in account else {})})
     return _definition_accounts(out, config=config, definitions=definitions, entry_cache=entry_cache)
+
+
+def inventory_accounts(view: dict | None = None) -> list[dict]:
+    """The accounts agents' alias inventory names (``_configured_path_names``):
+    the saved view's when it holds every account ``accounts()`` would give
+    now (``_view_inventory``), so a prompt never parses the log for them;
+    otherwise ``accounts()``, which does. Never an empty list for a view it
+    cannot trust. ``view``: the saved view as the caller already loaded it
+    (``_load_view``; empty when there was none it could trust), not read
+    again. While ``parse_deferred`` is in effect, a parse it would need
+    raises ``ParseWanted`` instead."""
+    try:
+        known = _view_inventory(view)
+    except Exception:
+        known = None  # an unreadable view means the parse, never a partial inventory
+    if known is not None:
+        return known
+    if getattr(_PARSE_DEFERRED, "on", False):
+        raise ParseWanted()
+    return accounts()
+
+
+class ParseWanted(BaseException):
+    """``inventory_accounts`` needs the whole-log parse while
+    ``parse_deferred`` is in effect. A BaseException, so the discovery code
+    that suppresses ordinary errors never takes it for a missing account."""
+
+
+_PARSE_DEFERRED = threading.local()
+
+
+@contextlib.contextmanager
+def parse_deferred():
+    """``inventory_accounts`` raises ``ParseWanted`` rather than parse: a
+    cold prompt child builds its table under one short budget and gives the
+    parse, alone, a longer one only when the build needs it."""
+    previous = getattr(_PARSE_DEFERRED, "on", False)
+    _PARSE_DEFERRED.on = True
+    try:
+        yield
+    finally:
+        _PARSE_DEFERRED.on = previous
+
+
+# What a view's accounts were folded under; a view from another account model
+# is not taken for ``accounts()``.
+_MODEL_STAMPS = {"entry_model": 1, "account_identity": 3, "payer_identity": 3}
+
+
+def _view_inventory(view: dict | None = None) -> list[dict] | None:
+    """The saved view's accounts (key, label, harness, home), or None when
+    they may miss one ``accounts()`` would give now. ``accounts()`` reads
+    the config, the log and the replica; the view's accounts are a superset
+    of what it gives from the same three. So they are used only when the
+    view is one Khipu saved and can answer (``_load_view``, not
+    ``_unservable_reason``), folded under this account model, the config
+    and the replica are as the fold read them, and the log is the same file
+    with no line since the fold that can change an account
+    (``_account_lines_since``). A view stale for any other reason (a runner
+    heartbeat, an expiry, ``valid_until``) still holds every account.
+    ``view``: as ``inventory_accounts``."""
+    from khipu import routing_replication
+    from khipu.config import config_file
+
+    view = _load_view() if view is None else view
+    if not view or _unservable_reason(view, _now()) is not None:
+        return None
+    fp = view.get("fingerprint")
+    if not isinstance(fp, dict) or any(fp.get(k) != v for k, v in _MODEL_STAMPS.items()):
+        return None
+    if fp.get("config") != _stat(config_file()) or fp.get("replication") != routing_replication.fingerprint():
+        return None
+    out = []
+    for a in view.get("accounts") or []:
+        if not isinstance(a, dict) or not isinstance(a.get("key"), str) or not isinstance(a.get("harness"), str) \
+                or not isinstance(a.get("home"), (str, type(None))):
+            return None
+        out.append({"key": a["key"], "label": a.get("label"), "harness": a["harness"], "home": a["home"]})
+    if _account_lines_since(fp.get("events")):
+        return None
+    return out
+
+
+def _account_lines_since(folded: list | None) -> bool:
+    """Whether the log may hold a line that changes an account (a definition,
+    a provider, a binding, move, rename, note or migration, an account
+    transaction, or any line of a transaction or batch) that the view at
+    ``folded`` (the log's stat at its fold) was not folded from. Only the
+    bytes appended since are read, as ``_owner_change_since`` does. A log
+    replaced (another inode: compaction), shorter, rewritten in place (same
+    size, another mtime), removed, with a tail too long to read, a line still
+    being written, or a line that is not a JSON object with a type, counts
+    as a change: it could be one."""
+    now = _stat(events_file())
+    if folded is None:
+        if now is None:
+            return False
+        folded = [None, 0, now[2]]
+    if now is None or not isinstance(folded, list) or len(folded) != 3:
+        return True
+    if now[2] != folded[2] or now[1] < folded[1]:
+        return True
+    if now[1] == folded[1]:
+        return now[0] != folded[0]
+    if now[1] - folded[1] > _OWNER_TAIL_MOST:
+        return True
+    try:
+        with events_file().open("rb") as fh:
+            fh.seek(folded[1])
+            tail = fh.read(now[1] - folded[1])
+    except OSError:
+        return True
+    if not tail.endswith(b"\n"):
+        return True
+    for line in tail.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            row = _loads(line)
+        except ValueError:
+            return True
+        if not isinstance(row, dict) or not isinstance(row.get("type"), str) or "txn" in row or "batch" in row:
+            return True
+        kind = row["type"].lower()
+        if any(word in kind for word in ("account", "definition", "provider")):
+            return True
+    return False
 
 
 _ENTRY_INPUTS: dict[tuple, dict] = {}
@@ -2970,8 +3101,8 @@ def _fingerprint(cfg: dict, events_stat: list | None, config_stat: list | None) 
     from khipu import routing_replication, routing_sources
 
     seed = cfg.get("routing_rules_seed")
-    return {"replication": routing_replication.fingerprint(), "entry_model": 1, "account_identity": 3,
-            "payer_identity": 3, "events": events_stat, "config": config_stat,
+    return {"replication": routing_replication.fingerprint(), **_MODEL_STAMPS, "events": events_stat,
+            "config": config_stat,
             "seed": _stat(Path(seed)) if seed else None,
             "sources": routing_sources.fingerprint(cfg["_raw_sources"], cfg)}
 
@@ -5463,14 +5594,9 @@ def _captures_unchanged(view: dict, fingerprint: dict, now: datetime) -> bool:
     return True
 
 
-def _stale_reason(view: dict | None, fingerprint: dict, now: datetime) -> str | None:
-    """Why ``view`` is not current, or None when it is. "missing" and "shape"
-    (a view an older Khipu saved) and "clock" (folded at a time further ahead
-    of this clock than it trusts) mean it cannot be answered at all; the rest
-    (``SERVEABLE_STALE``) are a view whose own content is sound but that a
-    later input or the clock has overtaken: "inputs" (a file it was folded
-    from changed), "scan" (a runner's whole-log read has more to do),
-    "expiry" (a kept job attachment ended) and "due" (``valid_until``)."""
+def _unservable_reason(view: dict | None, now: datetime) -> str | None:
+    """Why ``view`` cannot be answered at all ("missing", "shape", "clock":
+    ``_stale_reason``), or None when it can, current or not."""
     if not view:
         return "missing"
     if ("priority_version" not in view
@@ -5482,6 +5608,20 @@ def _stale_reason(view: dict | None, fingerprint: dict, now: datetime) -> str | 
     folded = _parse(view.get("folded_at"))
     if folded is not None and (folded - now).total_seconds() > CLOCK_TOLERANCE:
         return "clock"
+    return None
+
+
+def _stale_reason(view: dict | None, fingerprint: dict, now: datetime) -> str | None:
+    """Why ``view`` is not current, or None when it is. "missing" and "shape"
+    (a view an older Khipu saved) and "clock" (folded at a time further ahead
+    of this clock than it trusts) mean it cannot be answered at all; the rest
+    (``SERVEABLE_STALE``) are a view whose own content is sound but that a
+    later input or the clock has overtaken: "inputs" (a file it was folded
+    from changed), "scan" (a runner's whole-log read has more to do),
+    "expiry" (a kept job attachment ended) and "due" (``valid_until``)."""
+    unservable = _unservable_reason(view, now)
+    if unservable is not None:
+        return unservable
     if view.get("fingerprint") != fingerprint and not _captures_unchanged(view, fingerprint, now):
         return "inputs"
     # A whole-log read of a runner's events still under way goes on at the
@@ -11158,6 +11298,11 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
     from khipu import agent_view
 
     agent_view.prepare_routing_table()
+    # The child's start-up reads the record's entries (``_start_view``):
+    # parse them here, bounded, so the forked child inherits them and its
+    # budget times the read, not the parse.
+    with contextlib.suppress(Exception):
+        agent_view._bounded_inventory(_entry_cache, agent_view.COLD_FOLD_BUDGET_S)
     deadline = time.monotonic() + budget
     read_fd = write_fd = None
     pid = None
