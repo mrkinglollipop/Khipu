@@ -74,3 +74,18 @@ def test_cleared_confirmed_limit_does_not_end_level(world):
              "written_at": ISO(NOW - timedelta(hours=1)), "written_by": {"kind": "owner"},
              "via": "app", "auth": "app"}
     assert _level_at([_limit(1, 2, 3, source="report", message_time=True), clear], NOW)["until"] == ISO(NOW + timedelta(days=30))
+
+
+def test_priority_write_preserves_stated_end_before_any_fold(world, monkeypatch):
+    from khipu import usage
+    monkeypatch.setattr(usage, "_load_cache", lambda: {KEY: {"windows": [{"resets_at": ISO(NOW + timedelta(hours=1))}]}})
+    level = {"claim": "low", "as_of": ISO(NOW), "until": ISO(NOW + timedelta(days=30))}
+    entries = routing._priority_entries([{"account": "Claude", "level": level}], now=NOW, conversation=False)
+    assert entries[0]["level"] == level
+
+
+def test_level_without_stated_end_is_rejected_without_inventing_one(world):
+    import pytest
+    with pytest.raises(routing.RouteError, match="level"):
+        routing._priority_entries([{"account": "Claude", "level": {"claim": "low", "as_of": ISO(NOW), "until": None}}],
+                                  now=NOW, conversation=False)

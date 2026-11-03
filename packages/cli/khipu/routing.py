@@ -7481,15 +7481,6 @@ def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
 # confirming, undoing and clearing are the owner's.
 
 
-def _level_at_reset(level: dict, key: str) -> dict:
-    from khipu import usage
-
-    row = usage._load_cache().get(key) or {}
-    resets = [_parse(w.get("resets_at")) for w in row.get("windows") or [] if isinstance(w, dict)]
-    resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
-    return dict(level, until=_iso(min(_parse(level["until"]), *resets))) if resets else level
-
-
 def set_definition(definition: str, value: dict, *, via: str) -> dict:
     """Owner-authored shared definitions; lane bindings belong to this Mac."""
     checked = entry_model.checked_definition(definition, value)
@@ -7688,7 +7679,7 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
                 raise RouteError("level takes claim, as_of and until, with until after as_of")
             if conversation:
                 level["claim"] = _clean(level["claim"], 0)
-            out[-1]["level"] = _level_at_reset(level, key)
+            out[-1]["level"] = level
         if item.get("exceptions") is not None:
             exceptions = _checked_exceptions(item["exceptions"])
             if exceptions is None:
