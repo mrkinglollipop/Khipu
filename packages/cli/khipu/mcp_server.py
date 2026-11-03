@@ -1032,6 +1032,11 @@ TOOLS: list[dict] = [
                                                                "owner's words; until is its end (none: the "
                                                                "account's next weekly reset, else 7 days). It "
                                                                "lapses on its own"},
+                "share_pct": {"type": "number", "minimum": 1, "maximum": 100,
+                              "description": "With account and exception: optional structured allowed share of "
+                                             "the account's window. Pace and khipu_route_advise use it in place "
+                                             "of the share cap while the exception is live; never parsed from "
+                                             "the exception's free text"},
                 "end_exception": {"type": "string", "description": "With account: the id of an exception to end early"},
                 "expect": {"type": "string", "description": "With account: the priority's version as read "
                                                             "(version, as khipu_route lists it)"},
@@ -2943,7 +2948,7 @@ def _tool_route_priority(args: dict) -> dict:
     _ensure_path()
     from khipu import routing
 
-    amend_keys = {"account", "append", "role", "exception", "end_exception", "expect"}
+    amend_keys = {"account", "append", "role", "exception", "end_exception", "expect", "share_pct"}
     if not isinstance(args, dict) or set(args) - {"entries", "until", "owner_request", "base", *amend_keys}:
         raise ValueError("khipu_route_priority takes entries (or account with append or role, and expect), "
                          "owner_request, base and optional until")
@@ -2965,12 +2970,15 @@ def _tool_route_priority(args: dict) -> dict:
                 or any(k in args and not isinstance(args[k], str) for k in ("append", "role", "exception",
                                                                             "end_exception")):
             raise ValueError("account, expect, append, role, exception and end_exception must be text")
+        share_pct = args.get("share_pct")
+        if share_pct is not None and not isinstance(share_pct, (int, float)):
+            raise ValueError("share_pct must be a percentage from 1 to 100")
         return routing.conversation_priority_amend(args["account"], append=args.get("append"), role=args.get("role"),
                                                    exception=args.get("exception"),
                                                    end_exception=args.get("end_exception"),
                                                    until=until, owner_request=owner_request,
                                                    author=routing.conversation_author(), expect=args["expect"],
-                                                   base=base)
+                                                   base=base, share_pct=share_pct)
     entries = args.get("entries")
     if not isinstance(entries, list) or not entries:
         raise ValueError("entries must be the owner's accounts, in his order")

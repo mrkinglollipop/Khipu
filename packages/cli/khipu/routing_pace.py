@@ -572,6 +572,8 @@ def compute_pace(samples, caps, now, window):
         pace["share_cap"] = {"revision": sc["revision"], "pct": sc["pct"], "verdict": sc["verdict"],
                              "needed_pct_per_h": sc.get("needed_pct_per_h"), "runs_out_at": sc.get("runs_out_at"),
                              "before_reset_s": sc.get("before_reset_s"), "unused_at_reset_pct": sc.get("unused_at_reset_pct")}
+        if share.get("exception_share"):
+            pace["share_cap"]["exception_share"] = True
     day = min((c for c in caps if c["kind"] == "per_day"), key=lambda c: c["pct"], default=None)
     if day:
         day_start = now - timedelta(hours=24)
@@ -732,6 +734,10 @@ def pace_line(label, pace, now):
     needed_text = f"{_rate_words(needed)}%/h" if needed is not None else "no rate"
     lands = f"{needed_text} lands on {obj.get('pct') or 100:g}%" if isinstance(obj.get('pct') or 100, (int, float)) \
         else f"{needed_text} lands on 100%"
+    if obj is pace.get("share_cap") and obj.get("exception_share"):
+        lands += " (priority exception)"
+    elif headline == "share_cap" and (pace.get("share_cap") or {}).get("exception_share"):
+        lands += " (priority exception)"
     gappy = " (gappy readings)" if pace.get("gappy") else ""
     lines = []
     if obj.get("runs_out_at"):
