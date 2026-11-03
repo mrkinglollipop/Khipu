@@ -234,6 +234,15 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
     from khipu import routing
 
     statuses = routing.cap_statuses(view, entry, now)
+    if not any(s.get("kind") == "share" for s in statuses):
+        # A live priority exception's structured share applies even where
+        # the account stores no share cap (pace already counts it).
+        for window_pace in entry.get("pace") or []:
+            held = window_pace.get("share_cap") or {}
+            if held.get("exception_share"):
+                statuses.append({"kind": "share", "revision": held.get("revision"),
+                                 "window": window_pace.get("window"), "purpose": "job", "pct": held.get("pct"),
+                                 "verdict": held.get("verdict", "unknown"), "exception_share": True})
     check_tier = tier if declared_tier is _DECLARED_TIER else declared_tier
     figures_purpose = "job" if purpose == "orchestration" else purpose
     applicable = [s for s in statuses if _applies(s, figures_purpose, statuses, tier=check_tier, sensitive=sensitive)]

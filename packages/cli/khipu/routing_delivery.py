@@ -447,26 +447,36 @@ def plan(out, view, now, cfg, *, session=None, project=None):
         item["visible"] = visible
     # Each new or changed live exception gets one short whole sentence ahead
     # of the paged priority body. A partial page never counts as delivered;
-    # an ended exception is simply absent from the plan.
+    # an ended exception is simply absent from the plan. A priority line
+    # that is itself visible, or a full block that carries the exception's
+    # own words, makes the sentence count as shown.
     held = view.get("priority")
-    if held:
-        for entry in held.get("entries") or []:
-            for exc in entry.get("exceptions") or []:
-                ends = r._parse(exc.get("until"))
-                if ends is not None and ends <= now:
-                    continue
-                if not isinstance(exc.get("id"), str) or not exc.get("text"):
-                    continue
-                sentence = r.exception_change_sentence(entry.get("label") or entry.get("account") or "account", exc)
-                line = (project([sentence])[0] if project else r._for_agents(sentence, view))
-                fingerprint = {"id": exc["id"], "text": exc["text"], "until": exc.get("until"),
-                               "share_pct": exc.get("share_pct"), "account": entry.get("account")}
-                revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False)
-                                          .encode()).hexdigest()[:16]
-                items.append(dict(entity="priority-exception:" + exc["id"], text=line,
-                                  label=f"Exception on {entry.get('label') or 'account'}",
-                                  revision=revision, whole=True,
-                                  visible=line in text, removed=False))
+    sentences = []
+    for entry in (held or {}).get("entries") or []:
+        for exc in entry.get("exceptions") or []:
+            ends = r._parse(exc.get("until"))
+            if (ends is not None and ends <= now) or not isinstance(exc.get("id"), str) or not exc.get("text"):
+                continue
+            label = entry.get("label") or entry.get("account") or "account"
+            sentences.append((entry, exc, (r.exception_change_sentence(label, exc), f"Exception on {r._word_clip(label, r.EXCEPTION_SENTENCE_LABEL)}")))
+    if sentences:
+        pairs = [pair for _e, _x, pair in sentences]
+        projected = project(pairs) if project else r._for_agents(pairs, view)
+        priority_visible = any(i["entity"] == "priority" and i["visible"] for i in items)
+        from khipu import agent_view
+
+        words = agent_view.keep_owner_words(view) if project else None
+        for (entry, exc, pair), (line, label) in zip(sentences, projected):
+            fingerprint = {"id": exc["id"], "text": exc["text"], "until": exc.get("until"),
+                           "share_pct": exc.get("share_pct"), "account": entry.get("account")}
+            revision = hashlib.sha256(json.dumps(fingerprint, sort_keys=True, ensure_ascii=False)
+                                      .encode()).hexdigest()[:16]
+            shown_in_full = full and r._one_line(exc["text"]) in text
+            item = dict(entity="priority-exception:" + exc["id"], text=line, label=label, revision=revision,
+                        whole=True, visible=line in text or priority_visible or shown_in_full, removed=False)
+            if project:
+                item["withheld"] = (line, label) != tuple(agent_view.redact_owner_tokens(v, words) for v in pair)
+            items.append(item)
     notices = r._replacement_notices(view, now, session)
     for _kind, raw, ident in notices:
         line = r._for_agents(raw, view)
@@ -509,17 +519,40 @@ PAGE_FLOOR = 300  # UTF-16 units; narrower pages are never sent
 def _due_rank(entry):
     """Delivery order: holds, then ordinary account/pace lines (same-version
     debt), then an unacknowledged priority change or its exception sentence
-    ahead of older owed rules and notes."""
+    ahead of older owed rules and notes. No entity name in the key: a stable
+    sort keeps each group in insertion order."""
     entity = entry.get("entity") or ""
     if entity.startswith("hold:"):
-        return (0, 0, entity)
+        return (0, 0)
     if not entry.get("whole"):
-        return (1, 0, entity)
+        return (1, 0)
     if entity.startswith("priority-exception:"):
-        return (2, 0, entity)
+        return (2, 0)
     if entity == "priority":
-        return (2, 1, entity)
-    return (3, 0, entity)
+        return (2, 1)
+    return (3, 0)
+
+
+def _front_order(due):
+    """Due order: holds first, then every other entry in insertion order,
+    except that an unacknowledged priority change (its exception sentences,
+    then its body) moves ahead of the older owed rules and notes. Account
+    and pace lines keep their place."""
+    def priority_entry(e):
+        return e["entity"] == "priority" or e["entity"].startswith("priority-exception:")
+
+    holds = [e for e in due if e["entity"].startswith("hold:")]
+    rest = [e for e in due if not e["entity"].startswith("hold:")]
+    moving = sorted((e for e in rest if priority_entry(e)), key=lambda e: e["entity"] == "priority")
+    if not moving:
+        return holds + rest
+    others = [e for e in rest if not priority_entry(e)]
+    at = len(others)
+    for pos, e in enumerate(rest):
+        if priority_entry(e) or e["entity"].startswith("rule:") or e["entity"] == "note":
+            at = sum(not priority_entry(x) for x in rest[:pos])
+            break
+    return holds + others[:at] + moving + others[at:]
 
 
 # A line's owner travels from its producer to ``plan`` as a keyed digest of
@@ -654,6 +687,13 @@ def _merge(state, out):
         if entity in done:
             del done[entity]  # a new revision is owed again
         old = entries.get(entity)
+        if (old is not None and entity == "priority" and old["revision"] != item["revision"]
+                and old.get("acked") and (old.get("text") or "") == (item.get("text") or "")
+                and bool(old.get("removed")) == bool(item.get("removed"))):
+            # Same words, new revision hash (the stable-hash migration): what
+            # was acknowledged stays acknowledged; nothing is owed again.
+            old["revision"] = item["revision"]
+            continue
         if old is None or old["revision"] != item["revision"]:
             replaced.add(entity)
             offset = 0
@@ -661,17 +701,19 @@ def _merge(state, out):
                              (old.get("offset") or any(i["entity"] == entity for i in
                               (state.get("flight") or {}).get("out", {}).get("routing_changes", {}).get("items", []))))
             # Do not reset a conversation's offset unless the text it has yet
-            # to read actually changed (a stable-hash miss or a real edit of
-            # the unread suffix). An append past the cursor keeps the offset.
-            if old is not None and old.get("revision") != item["revision"]:
+            # to read actually changed. Only an unacknowledged priority that
+            # is mid-text keeps its place, and only when the unread suffix is
+            # still the end of the new text (words inserted before the cursor
+            # move it); anything else restarts at page one.
+            if old is not None and entity == "priority" and not old.get("acked"):
                 old_off = old.get("offset", 0) or 0
                 old_text, new_text = old.get("text") or "", item.get("text") or ""
-                if old_off and old_off <= len(old_text) and old_off <= len(new_text):
-                    if new_text[old_off:] == old_text[old_off:] or new_text.startswith(old_text[:old_off]):
-                        offset = old_off
-                        if new_text[old_off:] == old_text[old_off:]:
-                            restarted = False
-            entries[entity] = dict(item, offset=offset, acked=False, restarted=restarted)
+                if 0 < old_off < len(old_text) and new_text.endswith(old_text[old_off:]):
+                    offset = len(new_text) - len(old_text) + old_off
+                    if offset > 0:
+                        restarted = False
+            entries[entity] = dict(item, offset=offset, acked=False, restarted=restarted,
+                                   **({"pages": old.get("pages", 0)} if offset else {}))
         elif not old.get("offset"):
             old.update(item)
     flight = state.get("flight")
@@ -710,7 +752,7 @@ def _budget_debt(state, plan, point, child=None):
         # sliver must not survive as a permanent seven-character budget.
         widths = [e["width"] for e in entries if type(e.get("width")) is int and e["width"] > 0]
     narrowest = max(floor, min(widths)) if widths else None
-    entries.sort(key=lambda e: (not e["entity"].startswith("hold:"), e["whole"]))
+    entries.sort(key=_due_rank)
     ahead = new_ahead = 0
     for entry in entries:
         if entry.get("acked"):
@@ -849,7 +891,7 @@ def _render(state, out, now, component, *, delivery_point=True, deferred=False):
     due = [e for e in entries.values() if not e.get("acked")]
     # Holds first; then an unacknowledged priority change or its exception
     # sentence ahead of older owed rules and notes; then other lines.
-    due.sort(key=_due_rank)
+    due[:] = _front_order(due)
     if not due:
         # Informational full/stale blocks have no change debt to reserve.
         answer = {k: v for k, v in out.items() if k not in

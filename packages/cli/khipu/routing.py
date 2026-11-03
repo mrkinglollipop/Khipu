@@ -6144,7 +6144,11 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
             obj = pace.get("share_cap" if kind == "share" else "day_cap") or {}
             verdict = next((s["verdict"] for s in pace.get("ceiling_verdicts") or []
                             if s["kind"] == kind and s["purpose"] == purpose), obj.get("verdict", "unknown"))
-            out.append({**base, "pct": cap.get("pct"), "verdict": verdict})
+            # A live priority exception's share replaces the stored share cap
+            # in the verdict; report the percentage the verdict used.
+            excepted = kind == "share" and obj.get("exception_share") and obj.get("pct") is not None
+            out.append({**base, "pct": obj["pct"] if excepted else cap.get("pct"), "verdict": verdict,
+                        **({"exception_share": True} if excepted else {})})
     return out
 
 
@@ -7608,13 +7612,30 @@ def _new_exception(key: str, text, until, *, now: datetime, conversation: bool, 
     return row, note
 
 
+EXCEPTION_SENTENCE_WORDS = 100  # characters of the exception's own words in its change sentence
+EXCEPTION_SENTENCE_LABEL = 40
+
+
+def _word_clip(text, limit: int) -> str:
+    """``text`` on one line, cut at a word boundary within ``limit`` characters."""
+    words = _one_line(text)
+    if len(words) <= limit:
+        return words
+    cut = words[:limit]
+    if not words[limit].isspace() and " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:.-") + "..."
+
+
 def exception_change_sentence(label: str, exception: dict) -> str:
     """One short whole sentence naming a new or changed exception: account,
-    the exception's own words, and until when. Uses the stored until (not
-    clock wording) so delivery does not restart when the day rolls."""
+    the exception's own words (cut at a word boundary), and until when. Uses
+    the stored until (not clock wording) so delivery does not restart when
+    the day rolls."""
     until = exception.get("until") or ""
-    words = _one_line(exception.get("text") or "")
-    return f"Exception on {label} until {until}: {words}."
+    words = _word_clip(exception.get("text") or "", EXCEPTION_SENTENCE_WORDS)
+    sentence = f"Exception on {_word_clip(label, EXCEPTION_SENTENCE_LABEL)} until {until}: {words}"
+    return sentence if sentence.endswith(".") else sentence + "."
 
 
 def _exception_share_pct(priority: dict | None, account_key: str, now: datetime) -> float | int | None:
