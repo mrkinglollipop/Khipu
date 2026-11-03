@@ -1404,21 +1404,6 @@ def _verbatim_stored(cur, episode_id: int | None, verbatim: Any) -> bool:
 
 
 def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
-    """:func:`_write_pg` plus ``commitments``: what the capture's commitment
-    steps did with the open/closed loops it carried (``opened``, ``restated``,
-    ``closed``, ``rejected`` and ``not_closed`` with a reason each, or
-    ``step_failed``). Absent when no loop was involved."""
-    from khipu import commitments
-
-    report: dict[str, Any] = {}
-    with commitments.collecting(report):
-        stats = _write_pg(payload, legacy_projection=legacy_projection)
-    if report and isinstance(stats, dict):
-        stats["commitments"] = commitments.finish_report(report)
-    return stats
-
-
-def _write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dict[str, Any]:
     # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """Durable PG write: episode row + any topic pages already on disk. Raises on failure.
 
@@ -2068,7 +2053,17 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
     # write must still carry it into the outbox, so the retry gets a copy.
     checkout = payload.get("checkout")
     try:
-        stats = write_pg(payload)
+        # What the commitment steps did with the loops this capture carried
+        # rides back as ``commitments`` (opened, restated, closed, rejected and
+        # not_closed with a reason each, or step_failed / fact_gaps), so the
+        # caller can say which were not kept. Absent when no loop was involved.
+        from khipu import commitments as _commitments
+
+        report: dict[str, Any] = {}
+        with _commitments.collecting(report):
+            stats = write_pg(payload)
+        if report and isinstance(stats, dict):
+            stats["commitments"] = _commitments.finish_report(report)
         if result is not None:
             result.update(stats)
         if stats.get("forgotten_source"):
