@@ -1868,6 +1868,24 @@ def test_a_cold_reader_ends_soon_after_its_prompt(home, monkeypatch):
         routing.view_file().unlink()
 
 
+def _await_children(pids: list[int], *, most: float = 20.0) -> None:
+    """Wait for the per-prompt children ``_count_forks`` saw to end. A child
+    refolds a stale view after its answer (``refold_in_background``), holding
+    ``prompt-fold.lock`` while it does, so a test that folds itself right after
+    ``_cold`` would otherwise race it for that lock and get "busy"."""
+    end = time.monotonic() + most
+    for pid in pids:
+        while True:
+            try:
+                done, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                break  # reaped already (the hook's reaper)
+            if done:
+                break
+            assert time.monotonic() < end, "the per-prompt child did not end"
+            time.sleep(0.01)
+
+
 def _lock_contended(monkeypatch) -> None:
     def busy():
         raise BlockingIOError("the routing lock is held")
@@ -1887,11 +1905,13 @@ def test_an_unsaved_change_is_never_taken_for_no_change(home, monkeypatch):
     home["clock"].advance(minutes=10)
     routing.report(account="Claude", state="limited", until="2h", author=ME)
     routing.view_file().write_bytes(saved)  # as if the fold after the report had not been saved
+    pids = _count_forks(monkeypatch)
     with monkeypatch.context() as m:
         _lock_contended(m)
         first = _routing_part(_cold(monkeypatch))
         assert "Claude: limit reached" not in first and "has not been refreshed since" in first
         assert {k: _marker().get(k) for k in ("version", "epoch")} == {k: before.get(k) for k in ("version", "epoch")}
+        _await_children(pids)  # the child's own refold (it cannot save either) holds the fold lock until it ends
         assert routing.refold_in_background() == "failed"  # it cannot save: the view stays as it was
     _wait_current()
     home["search"]["hits"] = [dict(HITS[0], id="42")]
