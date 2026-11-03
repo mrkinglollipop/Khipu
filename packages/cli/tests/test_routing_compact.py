@@ -34,7 +34,7 @@ def _bodies(whens):
 
 
 def _lines():
-    return [l for l in routing.events_file().read_bytes().split(b"\n") if l.strip()]
+    return rc._content_lines(routing.events_file().read_bytes())
 
 
 def _types(lines):

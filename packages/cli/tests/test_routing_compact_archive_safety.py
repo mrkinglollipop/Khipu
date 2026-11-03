@@ -100,3 +100,21 @@ def test_owner_lines_never_enter_archive_even_when_byte_bound_prunes(world, monk
     with pytest.warns(RuntimeWarning, match='unavailable'):
         restored = rc.full_log()
     assert [line for line in restored if line in owners] == owners
+
+
+def test_identical_retained_prefix_is_not_a_commit(world):
+    path = routing.events_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'A\nB\nB\n')
+    chosen = {"before": 3, "positions": [1], "left_out": [b'B'], "kept": [b'A', b'B']}
+    rc.archive_dir().mkdir()
+    (rc.archive_dir() / 'events-20261102T120000Z-aaaaaa.jsonl.gz').write_bytes(rc._archive_bytes(chosen, END))
+    assert rc.full_log() == [b'A', b'B', b'B']
+
+
+def test_archive_restores_crlf_bytes_exactly(world):
+    path = routing.events_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chosen = {"before": 3, "positions": [1], "left_out": [b'B\r'], "kept": [b'A\r', b'C\r']}
+    rc._replace(path, b'A\r\nC\r\n', 'events-20261102T120000Z-aaaaaa.jsonl.gz', rc._archive_bytes(chosen, END))
+    assert rc.full_log() == [b'A\r', b'B\r', b'C\r']

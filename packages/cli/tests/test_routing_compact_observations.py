@@ -418,11 +418,11 @@ def test_a_compaction_with_sources_answers_alike_and_keeps_what_they_offer(world
 def test_every_line_left_out_is_in_the_archive_byte_for_byte(world):
     rows = synth.stream_log(["claude|", "codex|"], NOW, seed=5)
     synth.write(routing.events_file(), rows)
-    before = [line for line in routing.events_file().read_bytes().split(b"\n") if line]
+    before = rc._content_lines(routing.events_file().read_bytes())
     out = rc.compact(NOW)
     assert out["result"] == "compacted" and out["dropped_by_type"]["observation"] > 1000
     archive = rc.archive_dir() / out["archive"]
-    live = [line for line in routing.events_file().read_bytes().split(b"\n") if line]
+    live = rc._content_lines(routing.events_file().read_bytes())
     _header, *left_out = gzip.decompress(archive.read_bytes()).split(b"\n")[:-1]
     assert len(live) + len(left_out) == len(before)
     assert sorted(live + left_out) == sorted(before)
@@ -454,7 +454,7 @@ def test_an_older_whole_log_archive_still_prunes_and_stops_the_walk_back(world):
     old.write_bytes(b'{"whole": "log"}\n')
     rows = synth.stream_log(["claude|", "codex|"], NOW, seed=9)
     synth.write(routing.events_file(), rows)
-    written = [line for line in routing.events_file().read_bytes().split(b"\n") if line]
+    written = rc._content_lines(routing.events_file().read_bytes())
     assert rc.compact(NOW)["result"] == "compacted"
     assert rc.full_log() == written
     assert old in [path for _at, path in rc._archives()]

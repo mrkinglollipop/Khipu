@@ -4,8 +4,8 @@ The log is append-only and was folded whole on every stale read: at 10,000
 lines a fresh fold overran the prompt path's 50 ms budget and the
 conversation got no routing. This module compacts it.
 
-What a compaction is: the previous log is kept whole as an archive and the
-live log is replaced by its *checkpoint*, the lines the fold can still
+What a compaction is: dropped observations are archived and the live log
+is replaced by its *checkpoint*, the lines the fold can still
 tell apart from the lines left out, in their original order and bytes, with
 every later line (the tail) after them. No line is rewritten, so the fold
 over the compacted file is the fold over the full log:
@@ -68,6 +68,7 @@ from khipu import routing
 
 ARCHIVE_DIR = "archive"
 STATE_NAME = "compaction.json"
+GENERATION_TYPE = "_routing_compaction_generation"
 
 # Compaction starts on its own here. At a line a minute a compacted log holds
 # about 1,700 lines plus the owner's, which never go: two days of samples, half a
@@ -700,9 +701,26 @@ def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple,
     return drop
 
 
+def _generation(data: bytes) -> str | None:
+    try:
+        row = json.loads(data.partition(b"\n")[0])
+    except ValueError:
+        return None
+    if not isinstance(row, dict) or set(row) != {"type", "generation", "written_at"} or row["type"] != GENERATION_TYPE:
+        return None
+    value = row["generation"]
+    return value if isinstance(value, str) and len(value) == 32 and all(c in "0123456789abcdef" for c in value) else None
+
+
+def _content_lines(data: bytes) -> list[bytes]:
+    # The first line is commit metadata, never an owner line or observation.
+    if _generation(data) is not None:
+        data = data.partition(b"\n")[2]
+    return [line for line in data.split(b"\n") if line.strip()]
+
+
 def _rows(data: bytes) -> list[tuple[bytes, dict | None]]:
-    # A blank line holds no event and is not carried.
-    return [(line, routing._line_event(line)) for line in data.split(b"\n") if line.strip()]
+    return [(line, routing._line_event(line)) for line in _content_lines(data)]
 
 
 # ---- the check ------------------------------------------------------------------
@@ -926,17 +944,24 @@ def _archive_bytes(chosen: dict, now: datetime) -> bytes:
 def _replace(path: Path, body: bytes, name: str, archive_body: bytes) -> None:
     """Write ``body`` beside the log and fsync it, write the lines it leaves
     out to ``archive/`` as ``name`` and rename ``body`` over the log. A crash
-    before the rename leaves the log whole, and at worst an archive of lines
-    still in it; after it, the compacted log."""
+    before the rename leaves the log whole and an uncommitted archive;
+    after it, the generation marker authorizes that archive's inverse."""
     folder = path.parent
     temp = folder / f".events-compact-{os.getpid()}-{secrets.token_hex(3)}.tmp"
     archive = archive_dir()
     archive.mkdir(parents=True, exist_ok=True)
     os.chmod(archive, 0o700)
+    generation = secrets.token_hex(16)
+    previous = _generation(path.read_bytes()) if path.exists() else None
+    header, *left_out = gzip.decompress(archive_body).split(b"\n")[:-1]
+    meta = dict(json.loads(header), generation_id=generation, previous_generation_id=previous)
+    archive_body = gzip.compress(b"\n".join([json.dumps(meta, sort_keys=True).encode(), *left_out, b""]), 9, mtime=0)
+    marker = json.dumps({"type": GENERATION_TYPE, "generation": generation,
+                         "written_at": meta["compacted_at"]}, sort_keys=True).encode() + b"\n"
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(fd, "wb") as stream:
-            stream.write(body)
+            stream.write(marker + body)
             stream.flush()
             os.fsync(stream.fileno())
         _write_archive(archive / name, archive_body)
@@ -1004,11 +1029,13 @@ def _line_hash(lines: list[bytes]) -> str:
 def full_log() -> list[bytes]:
     """Reconstruct only generations committed in the log, retaining appended tails.
 
-    The retained prefix's digest is the commit witness: an archive published
-    before the log swap cannot match the original prefix. Each inverse also
-    checks the original digest before any lines are accepted.
+    The generation marker is committed atomically with the compacted log.
+    Digests validate each inverse, and the header links to the previous
+    generation. A pre-swap archive cannot authorize reconstruction.
     """
-    lines = [line for line in routing.events_file().read_bytes().split(b"\n") if line.strip()]
+    data = routing.events_file().read_bytes()
+    generation = _generation(data)
+    lines = _content_lines(data)
     if _read_state().get("archive_retention_expired"):
         warnings.warn("Archive retention: older observations are unavailable; owner history remains in the log", RuntimeWarning)
     pending = []
@@ -1016,8 +1043,15 @@ def full_log() -> list[bytes]:
         if not path.name.endswith(".gz"):
             continue
         try:
-            header, *left_out = gzip.decompress(path.read_bytes()).splitlines()
+            decoded = gzip.decompress(path.read_bytes())
+            if not decoded.endswith(b"\n"):
+                raise ValueError("unterminated archive")
+            header, *left_out = decoded.split(b"\n")[:-1]
             meta = json.loads(header)
+            if "generation_id" not in meta:
+                continue  # published before log replacement, or an uncommitted old format
+            if not isinstance(meta["generation_id"], str) or not isinstance(meta.get("previous_generation_id"), (str, type(None))):
+                raise ValueError("invalid generation link")
             count, positions = meta["kept_count"], meta["positions"]
             if (not isinstance(count, int) or count < 0 or not isinstance(positions, list)
                     or len(positions) != len(left_out)
@@ -1031,13 +1065,18 @@ def full_log() -> list[bytes]:
             warnings.warn(f"Archive {path.name} is damaged or unverified; its history is unavailable", RuntimeWarning)
             continue
         pending.append((meta, left_out))
-    # Match by generation, not filename order (two compactions may share a second).
+    # Match the committed chain, not filename order (compactions may share a second).
     while pending:
         matched = False
         for i, (meta, left_out) in enumerate(pending):
             count = meta["kept_count"]
-            if _line_hash(lines[:count]) != meta["generation"]:
+            if meta["generation_id"] != generation:
                 continue
+            if _line_hash(lines[:count]) != meta["generation"]:
+                warnings.warn("Committed archive prefix is damaged; its history is unavailable", RuntimeWarning)
+                pending.pop(i)
+                matched = True
+                break
             restored = list(lines[:count])
             positions = meta["positions"]
             for position, line in zip(positions, left_out):
@@ -1048,11 +1087,14 @@ def full_log() -> list[bytes]:
                 matched = True
                 break
             lines = restored + lines[count:]
+            generation = meta["previous_generation_id"]
             pending.pop(i)
             matched = True
             break
         if not matched:
             break
+    if generation is not None:
+        warnings.warn("A committed archive generation is unavailable; returning the remaining history", RuntimeWarning)
     return lines
 
 
