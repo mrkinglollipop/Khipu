@@ -79,6 +79,8 @@ NOT_CAPTURE = {
     "storage.sweep_if_due": "when the storage sweep last ran and what it removed: names and sizes",
     "storage._rotate_log": "an over-size log copied to <name>.1 and emptied: the same log lines, "
                            "never capture text",
+    "logcap.rotate_if_over": "an over-size log copied to <name>.1 and emptied in place: the same log lines, "
+                             "never capture text",
     "storage.trim_synth_usage": "the summariser's token counts, rewritten without old lines",
     "hub_reach.note_unreachable": "the hub-unreachable memo: two times and a short error word, no capture text",
     "t3._recent_conversation_use": "opens T3's thread database read-only to inspect its newest message time; writes nothing",

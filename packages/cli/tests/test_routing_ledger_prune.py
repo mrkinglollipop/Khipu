@@ -117,23 +117,32 @@ def test_two_writers_cannot_overlap_after_a_prune(folder):
                 fcntl.flock(late, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
-def test_oversized_ledger_with_recent_evidence_is_kept(folder):
+def _oversized(folder, name, days_old):
     from khipu import routing_delivery
 
-    p = folder / "recall--big.routing.json"
-    p.write_text(json.dumps({"main": {"touched": _iso(-25000), "pad": "x" * (routing_delivery._SESSION_FILE_BUDGET + 10)}}))
-    when = (NOW - timedelta(days=30)).timestamp()
+    p = folder / f"recall--{name}.routing.json"
+    p.write_text(json.dumps({"main": {"touched": _iso(-25000),
+                                      "pad": "x" * (routing_delivery._SESSION_FILE_BUDGET + 10)}}))
+    when = (NOW - timedelta(days=days_old)).timestamp()
     os.utime(p, (when, when))
-    out = run(folder)
-    assert p.exists() and out["removed"] == 0 and out["skipped"] == 1
+    return p
 
 
-def test_unparseable_ledger_is_kept(folder):
-    p = folder / "recall--bad.routing.json"
-    p.write_text("{not json")
-    os.utime(p, (0, 0))
+def test_oversized_ledger_past_the_window_is_removed_and_a_recent_one_is_kept(folder):
+    old, recent = _oversized(folder, "big", 30), _oversized(folder, "fresh", 1)
     out = run(folder)
-    assert p.exists() and out["removed"] == 0 and out["skipped"] == 1
+    assert not old.exists() and recent.exists()
+    assert out["removed"] == 1 and out["kept"] == 1 and out["unreadable_removed"] == 1 and out["skipped"] == 0
+
+
+def test_unparseable_ledger_is_removed_past_the_window_and_kept_inside_it(folder):
+    old, recent = folder / "recall--bad.routing.json", folder / "recall--bad2.routing.json"
+    old.write_text("{not json")
+    os.utime(old, (0, 0))
+    recent.write_text("{not json")
+    out = run(folder)
+    assert not old.exists() and recent.exists()
+    assert out["removed"] == 1 and out["kept"] == 1 and out["unreadable_removed"] == 1
 
 
 def test_fifo_and_symlinks_are_never_opened_or_removed(folder):
@@ -188,3 +197,26 @@ def test_deadline_is_checked_while_listing_the_folder(folder, monkeypatch):
     out = run(folder, budget_s=10)
     assert out["time_budget_exhausted"] is True
     assert len(pulled) < 50
+
+
+def test_a_batch_limit_removes_the_oldest_first_and_carries_over(folder, monkeypatch):
+    monkeypatch.setattr(rlp, "BATCH_MAX", 2)
+    paths = {n: _ledger(folder, n, 30 + n, 30 + n, lock=False) for n in range(5)}  # 4 is the oldest
+    first = run(folder)
+    assert first["removed"] == 2 and first["remaining"] == 3
+    assert "3 old ledger(s) left" in first["deferred"]
+    assert not paths[4].exists() and not paths[3].exists() and paths[2].exists()
+    second = run(folder)
+    assert second["removed"] == 2 and second["remaining"] == 1
+    third = run(folder)
+    assert third["removed"] == 1 and third["remaining"] == 0 and "deferred" not in third
+    assert not any(p.exists() for p in paths.values())
+
+
+def test_a_folder_listing_that_runs_out_of_time_still_prunes_what_it_listed(folder, monkeypatch):
+    old = [_ledger(folder, f"o{n}", 30, 30, lock=False) for n in range(3)]
+    ticks = iter([0, 0, 0, 0, 0])  # the stop time, three listed names, the first ledger; then time is up
+    monkeypatch.setattr(rlp, "time", types.SimpleNamespace(monotonic=lambda: next(ticks, 10**6)))
+    out = run(folder, budget_s=5)
+    assert out["time_budget_exhausted"] is True
+    assert out["removed"] == 1 and sum(p.exists() for p in old) == 2

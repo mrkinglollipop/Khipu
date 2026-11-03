@@ -175,6 +175,9 @@ def _log(msg: str, *, tag: str = "khipu-prompt-recall") -> None:
     try:
         p = _log_path()
         p.parent.mkdir(parents=True, exist_ok=True)
+        from khipu import logcap
+
+        logcap.rotate_if_over(p)
         with p.open("a", encoding="utf-8") as f:
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             f.write(f"{stamp} [{tag}] {msg}\n")  # text-safe: every _log caller passes this module's checked message text

@@ -256,20 +256,20 @@ def test_doctor_reads_summary_kind_routing_prune_and_project_renames(tmp_path, m
         assert health[key]["ok"] is False
 
 
-def test_routing_ledger_prune_budget_exhaustion_is_visible(tmp_path):
-    # One huge ledger the prune skips forever, and a budget that expires
-    # before any removal: must not read as a silent green success.
+def test_routing_ledger_prune_budget_exhaustion_is_visible_and_the_next_run_finishes(tmp_path):
+    # An old oversized ledger and a budget that expires before any removal:
+    # visible as deferred, not a silent green success; the next run removes it.
     big = tmp_path / "recall--big.routing.json"
     from khipu import routing_delivery
     big.write_text(json.dumps({"main": {"touched": "2000-01-01T00:00:00Z",
                                         "pad": "x" * (routing_delivery._SESSION_FILE_BUDGET + 10)}}))
     os.utime(big, (0, 0))
     out = rlp.prune(keep_days=7, now=time.time(), folder=tmp_path, budget_s=0)
-    assert out.get("time_budget_exhausted") or out.get("skipped")
-    # Visible to the nightly step / doctor: not a bare ok with removed=0.
-    assert out.get("deferred") or out.get("time_budget_exhausted") or not (
-        out.get("ok") and out.get("removed") == 0 and not out.get("skipped")
-    )
+    assert out.get("time_budget_exhausted")
+    assert out.get("deferred") and "time budget" in out["deferred"]
+    assert big.exists()
+    out = rlp.prune(keep_days=7, now=time.time(), folder=tmp_path)
+    assert not big.exists() and out["removed"] == 1 and not out.get("deferred")
 
 
 def test_briefs_lock_held_is_deferred_not_built_zero_green(tmp_path, monkeypatch):

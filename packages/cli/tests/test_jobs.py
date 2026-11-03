@@ -107,7 +107,7 @@ class JobsRunTest(unittest.TestCase):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 14)
+            self.assertEqual(record.call_count, 18)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -126,9 +126,10 @@ class JobsRunTest(unittest.TestCase):
         self.assertEqual(
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
-             "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "commitments_close_rules",
+             "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "storage_sweep",
+             "owner_actions_chain", "commitments_close_rules", "fact_changes_prune",
              "commitments_mark_stale",
-             "commitments_hygiene", "ledger", "project_renames",
+             "commitments_hygiene", "ledger", "receipt_prune", "project_renames",
              "recall_eval", "snapshot_refresh"],
         )
         for step in payload["steps"]:
@@ -290,6 +291,8 @@ class JobsRunTest(unittest.TestCase):
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
                 mock.patch.object(jobs, "_commitment_close_rules"), \
+                mock.patch.object(jobs, "_fact_changes_prune"), \
+                mock.patch.object(jobs, "_receipt_prune"), \
                 mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch("khipu.hygiene.backup_commitments", return_value=Path("/tmp/backup")) as m_backup, \
                 mock.patch(

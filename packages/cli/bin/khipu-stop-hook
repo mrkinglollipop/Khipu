@@ -72,6 +72,10 @@ export PYTHONPATH
 LOG_DIR="${HOME}/Library/Logs/khipu"
 [ -n "${KHIPU_ISOLATED_DIR:-}" ] && LOG_DIR="${KHIPU_ISOLATED_DIR}/logs"
 mkdir -p "$LOG_DIR" 2>/dev/null
+# The Python below caps this log on start with one stat (khipu.logcap), so a
+# hook that never meets the storage sweep still cannot grow it without bound.
+KHIPU_HOOK_LOG="$LOG_DIR/stop-hook.log"
+export KHIPU_HOOK_LOG
 # Bytecode cache goes OUTSIDE any signed .app bundle — see khipu.paths.pycache_dir.
 # Running the bundled Python's __pycache__ writes inside Contents/Resources/khipu
 # broke the code signature and made Gatekeeper report "Khipu is damaged" (0.3.15,
@@ -111,6 +115,11 @@ HOOK_EVENT = (os.environ.get("KHIPU_HOOK_EVENT") or "").strip() or None
 QUEUE_ONLY = os.environ.get("KHIPU_CAPTURE_QUEUE_ONLY") == "1" or \
     (HOOK_EVENT or "").lower() == "postinvocation"
 _T0 = time.monotonic()
+try:
+    from khipu import logcap
+    logcap.rotate_if_over(os.environ.get("KHIPU_HOOK_LOG"))
+except Exception:  # noqa: BLE001 — fail-open, always
+    pass
 tag = f" harness={sys.argv[2]}" if len(sys.argv) > 2 and sys.argv[2] else ""
 _default_budget = 3.0 if len(sys.argv) > 2 and sys.argv[2] == "codex" else 20.0
 try:

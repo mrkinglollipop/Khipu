@@ -43,6 +43,8 @@ PATTERNS: tuple[tuple[str, str, str], ...] = (
     ("temp", "data", ".owner-*.tmp"),
     ("lock", "data", ".owner-*.lock"),
     ("log", "data", "owner-actions.jsonl"),
+    # Sealed segments of the log (owner_direction.SEGMENT_MAX_LINES): never removed.
+    ("log", "data", "owner-actions.[0-9][0-9][0-9][0-9][0-9][0-9].jsonl"),
     ("head", "data", "owner-actions.head.json"),
     ("pending", "data", "owner-direction-pending.json"),
     ("requests", "data", "owner-requests.json"),

@@ -128,13 +128,12 @@ def test_last_seen_at_is_selected_for_candidate_comparison(harness):
     ('gaps', {'ok': True, 'failed': 1, 'transient': True, 'reason': 'synthetic contention'}, False),
     ('index', {'ok': False, 'transient': True, 'error': 'synthetic contention'}, False),
     ('index', {'ok': False, 'transient': False, 'error': 'synthetic schema failure'}, True),
-    ('changes', {'ok': False, 'error': 'synthetic cleanup failure'}, True),
 ])
 def test_nested_cleanup_receipts_are_aggregated(harness, monkeypatch, step, receipt, fatal):
     monkeypatch.setattr(jobs, '_provenance_backfill', _REAL_PROVENANCE_BACKFILL)
     for name in ('backfill', 'replay_gaps', 'index_identities', 'prune_changes'):
         monkeypatch.setattr(provenance, name, lambda conn: {'ok': True})
-    helper = {'gaps': 'replay_gaps', 'index': 'index_identities', 'changes': 'prune_changes'}[step]
+    helper = {'gaps': 'replay_gaps', 'index': 'index_identities'}[step]
     monkeypatch.setattr(provenance, helper, lambda conn: dict(receipt))
     monkeypatch.setattr(close_rules.GitHub, 'state', lambda *a: ('merged', None))
     out = jobs._commitment_close_rules()
@@ -321,7 +320,8 @@ def test_replay_fatal_then_dropped_connection_keeps_failure(harness, monkeypatch
     assert receipts[0]['gaps']['failed'] == 2
     assert receipts[0]['connection_unusable'] is True
     index.assert_not_called()
-    prune.assert_not_called()
+    # The change-stream prune is its own nightly step now: it runs whatever close-rules did.
+    prune.assert_called_once()
 
 
 def test_index_schema_failure_survives_rollback_disconnect(harness, monkeypatch, tmp_path):
@@ -349,7 +349,8 @@ def test_index_schema_failure_survives_rollback_disconnect(harness, monkeypatch,
     assert 'UndefinedColumn: fatal schema error in index' in receipts[0]['reason']
     assert receipts[0]['index']['transient'] is False
     assert receipts[0]['connection_unusable'] is True
-    prune.assert_not_called()
+    # The change-stream prune is its own nightly step now: it runs whatever close-rules did.
+    prune.assert_called_once()
     assert prepared and all(conn not in failed_connections for conn in prepared)
 
 
@@ -419,7 +420,8 @@ def test_replay_receipt_write_rollback_failure_keeps_original_failure(harness, m
     assert receipts[0]['gaps']['failed'] == 1
     assert receipts[0]['connection_unusable'] is True
     index.assert_not_called()
-    prune.assert_not_called()
+    # The change-stream prune is its own nightly step now: it runs whatever close-rules did.
+    prune.assert_called_once()
 
 
 @pytest.mark.parametrize('phase', ['network', 'second_apply'])
