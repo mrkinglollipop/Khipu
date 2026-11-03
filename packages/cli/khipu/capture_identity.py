@@ -44,6 +44,18 @@ def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+# A window's rendered text is hashed by the drain (``transcript_sha256``) so the
+# same text never becomes a second episode of its session, whatever range or
+# window id re-read it. A window under this size is a short turn that
+# legitimately repeats ("yes"), not a replay, so it carries no digest. Kept
+# here, not in capture.py, so the drain imports it without the writer.
+DIGEST_MIN_CHARS = 400
+
+
+def transcript_digest(text: str) -> str:
+    return _sha256_hex(text or "")
+
+
 def _field(value: Any) -> str:
     return "" if value is None else str(value)
 

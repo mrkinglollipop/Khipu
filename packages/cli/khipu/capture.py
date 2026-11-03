@@ -288,11 +288,7 @@ def _dedup_exact_window(cur, payload: dict[str, Any], *,
 # window id re-read it (an offset reset, a transcript rewrite, a retry under a
 # new generation). A window under this size is a short turn that legitimately
 # repeats ("yes"), not a replay, so it carries no digest.
-DIGEST_MIN_CHARS = 400
-
-
-def transcript_digest(text: str) -> str:
-    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+from khipu.capture_identity import DIGEST_MIN_CHARS, transcript_digest  # noqa: E402,F401
 
 
 def _dedup_same_content(cur, payload: dict[str, Any], *, live_only: bool = False) -> int | None:
