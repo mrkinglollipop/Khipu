@@ -1067,7 +1067,10 @@ def inventory_accounts(view: dict | None = None) -> list[dict]:
     (``_load_view``; empty when there was none it could trust), not read
     again. While ``parse_deferred`` is in effect, a parse it would need
     raises ``ParseWanted`` instead."""
-    known = _view_inventory(view)
+    try:
+        known = _view_inventory(view)
+    except Exception:
+        known = None  # an unreadable view means the parse, never a partial inventory
     if known is not None:
         return known
     if getattr(_PARSE_DEFERRED, "on", False):
@@ -11019,6 +11022,11 @@ def child_page_push(session_id: str | None, agent_id: str | None, *,
     from khipu import agent_view
 
     agent_view.prepare_routing_table()
+    # The child's start-up reads the record's entries (``_start_view``):
+    # parse them here, bounded, so the forked child inherits them and its
+    # budget times the read, not the parse.
+    with contextlib.suppress(Exception):
+        agent_view._bounded_inventory(_entry_cache, agent_view.COLD_FOLD_BUDGET_S)
     deadline = time.monotonic() + budget
     read_fd = write_fd = None
     pid = None

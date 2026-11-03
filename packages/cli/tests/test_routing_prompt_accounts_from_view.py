@@ -216,6 +216,46 @@ def test_a_missing_or_hand_edited_view_falls_back_to_the_parse(record, parses, h
     _redacted(record, "bound", "work", bare=("work",))
 
 
+def test_a_view_inventory_that_raises_falls_back_to_the_parse(record, monkeypatch):
+    """An exception inside the view read must not escape (upstream it is
+    swallowed, leaving a partial inventory): the parse answers instead."""
+    expected = _homes(routing.accounts())
+    _cold()
+
+    def boom(*_a, **_k):
+        raise RuntimeError("unreadable view")
+
+    monkeypatch.setattr(routing, "_view_inventory", boom)
+    assert _homes(routing.inventory_accounts()) == expected
+    assert ("grok", record["bound"]) in expected
+
+
+def test_child_page_push_parses_the_entries_before_the_fork(record, monkeypatch):
+    """The forked child inherits the parent's parsed entries, so its budget
+    times the read, not the parse (``_start_view`` -> ``_inputs()``)."""
+    _cold()
+    seen: dict = {}
+
+    def fake_fork():
+        seen["entries"] = dict(routing._ENTRY_INPUTS)
+        raise OSError("no fork in the test")
+
+    monkeypatch.setattr(routing, "push_off", lambda *_a, **_k: False)
+    monkeypatch.setattr(routing, "prompt_budget", lambda: 5.0)
+    monkeypatch.setattr(os, "fork", fake_fork)
+    assert routing.child_page_push("s1", "a1") is None
+    assert seen["entries"], "the entry cache was empty at the fork"
+
+
+def test_a_bound_login_folder_name_is_redacted_without_a_saved_view(record):
+    """An owner-defined account's bare login-folder name comes from the
+    config's bindings, not only from a saved view.json."""
+    routing.view_file().unlink()
+    _cold()
+    out = agent_view.scrub("see a folder and grok-side-login here")
+    assert "grok-side-login" not in out
+
+
 def test_an_inventory_that_cannot_be_built_still_withholds(record, monkeypatch):
     """The fallback parse runs inside the same bounded inventory build, so a
     parse that cannot finish leaves no table and the prompt withholds."""

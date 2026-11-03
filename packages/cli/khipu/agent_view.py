@@ -151,6 +151,11 @@ def _homes(extra_keys: Iterable[str] | None, view: dict, *, local_only=False, re
         for entry in load_config().get("usage_accounts") or []:
             if isinstance(entry, dict) and isinstance(entry.get("home"), str) and entry["home"].strip():
                 out.append((str(entry.get("harness") or "").strip().lower(), entry["home"].strip()))
+        # Owner-defined accounts' login folders, bound in config: named even
+        # when no saved view lists the account yet.
+        for bound in (load_config().get("routing_account_bindings") or {}).values():
+            if isinstance(bound, dict) and isinstance(bound.get("home"), str) and bound["home"].strip():
+                out.append((str(bound.get("harness") or "").strip().lower(), bound["home"].strip()))
     with (contextlib.nullcontext() if require_complete else contextlib.suppress(Exception)):
         from khipu import claude_homes
 
