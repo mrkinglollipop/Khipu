@@ -535,6 +535,18 @@ def test_a_routing_setting_by_direction_and_its_undo(world):
     assert rc == 0 and routing.settings()["routing_stale_after"] == 12 * 3600
 
 
+def test_undoing_a_routing_setting_leaves_the_view_current(world):
+    """config.json is an input of the view: the undo refolds it, as set_setting does,
+    so the next prompt finds view.json current instead of stale."""
+    routing.set_note("builds go to Codex", via="app")  # a record, so there is a saved view
+    routing.read_view()
+    owner_direction._restore_setting("routing_stale_after", 6 * 3600, True)
+    assert routing.settings()["routing_stale_after"] == 6 * 3600
+    assert routing._stale_reason(routing._load_view(), routing._light_inputs()[0], routing._now()) is None
+    owner_direction._restore_setting("routing_stale_after", None, False)
+    assert routing._stale_reason(routing._load_view(), routing._light_inputs()[0], routing._now()) is None
+
+
 def test_work_hide_by_direction_goes_through_the_ledger_guard(world, monkeypatch):
     from khipu import work
 

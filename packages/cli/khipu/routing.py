@@ -11104,13 +11104,17 @@ def _view_age(view: dict, now: datetime) -> float:
 
 def _stale_answer(view: dict, why: str, fingerprint: dict, now: datetime) -> dict:
     """A saved view answered though an input or the clock has overtaken it.
-    Its ``fingerprint`` becomes the inputs' stats as this prompt read them,
-    so the answer's record generation (``_generation``) is the one it was read
-    at: a change after that withdraws it, as for a current view, and the
-    change that made it stale arrives with the next prompt. ``checked_at`` is
-    left as the fold set it (the inputs were not all checked against this
-    view), so ``_not_refreshed`` speaks for an old one."""
-    return dict(view, fingerprint=fingerprint,
+    Its ``fingerprint`` becomes the log, config and replication stats as this
+    prompt read them, so the answer's record generation (``_generation``) is
+    the one it was read at: a change after that withdraws it, as for a
+    current view, and the change that made it stale arrives with the next
+    prompt. The ``sources`` (runner heartbeats) stay the view's own: the fold
+    read them then, so a heartbeat changed since is never blessed on advice
+    or pace built from the older one. ``checked_at`` is left as the fold set
+    it (the inputs were not all checked against this view), so
+    ``_not_refreshed`` speaks for an old one."""
+    own = (view.get("fingerprint") or {}).get("sources")
+    return dict(view, fingerprint=dict(fingerprint, sources=own),
                 stale_view={"reason": why, "age": round(_view_age(view, now), 3),
                             "since": view.get("checked_at") or view.get("folded_at"),
                             "events": (view.get("fingerprint") or {}).get("events")})

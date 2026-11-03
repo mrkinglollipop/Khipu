@@ -1900,6 +1900,25 @@ def test_an_unsaved_change_is_never_taken_for_no_change(home, monkeypatch):
     assert _last_log().endswith(" routing=changes:1")
 
 
+def test_a_fold_that_cannot_save_a_change_is_pushunsaved_never_no_change(home, monkeypatch):
+    """The inline fold (no ``kick``: the daemon's poll) of a view that is out of
+    date, with the save failing: its version is the saved one's, so it must raise
+    ``PushUnsaved`` rather than answer "none". (With no view.json at all there is
+    no saved version to mistake it for, so ``unsaved_change`` is False there.)"""
+    _record()
+    _push_on(monkeypatch)
+    before = _seen_now()
+    saved = routing.view_file().read_bytes()
+    home["clock"].advance(minutes=10)
+    routing.report(account="Claude", state="limited", until="2h", author=ME)
+    routing.view_file().write_bytes(saved)  # the fold after the report was not saved
+    with monkeypatch.context() as m:
+        _lock_contended(m)
+        agent_view.prepare_routing_table(refresh=True)
+        with pytest.raises(routing.PushUnsaved):
+            routing.prompt_push(before, budget=1.0)
+
+
 def test_an_unsaved_view_that_changed_nothing_still_sends_nothing(home, monkeypatch):
     _record()
     _push_on(monkeypatch)
