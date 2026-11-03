@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
+
 from khipu import routing, routing_compact as rc
 from tests import routing_compact_synth as synth
 from tests.test_routing_compact import END, KEYS, _log
@@ -42,7 +44,8 @@ def test_two_compactors_and_a_locked_append_preserve_every_line(world, monkeypat
     assert rc.full_log() == original + [json.dumps(late, sort_keys=True).encode()]
 
 
-def test_1613a16d_reader_folds_compacted_log_identically(world, tmp_path):
+@pytest.fixture
+def old_reader(tmp_path):
     source = subprocess.check_output(['git', 'show', '1613a16d:packages/cli/khipu/routing.py'],
                                      cwd=Path(__file__).resolve().parents[3])
     old_path = tmp_path / 'old_routing.py'
@@ -52,17 +55,22 @@ def test_1613a16d_reader_folds_compacted_log_identically(world, tmp_path):
     sys.modules[spec.name] = old
     try:
         spec.loader.exec_module(old)
-        synth.write(routing.events_file(), _log(days=60))
-        def folded():
-            events, bad = old.read_events()
-            assert bad == 0
-            return [rc._normal(old.fold(events, now=END + timedelta(days=d), cfg=old.settings(), known=old.accounts()))
-                    for d in (0, 1, 9, 60)]
-        before = folded()
-        assert rc.compact(END)['result'] == 'compacted'
-        assert folded() == before
+        yield old
     finally:
         sys.modules.pop(spec.name, None)
+
+
+def test_1613a16d_reader_folds_compacted_log_identically(world, old_reader):
+    old = old_reader
+    synth.write(routing.events_file(), _log(days=60))
+    def folded():
+        events, bad = old.read_events()
+        assert bad == 0
+        return [rc._normal(old.fold(events, now=END + timedelta(days=d), cfg=old.settings(), known=old.accounts()))
+                for d in (0, 1, 9, 60)]
+    before = folded()
+    assert rc.compact(END)['result'] == 'compacted'
+    assert folded() == before
 
 
 def test_day_120_stream_figures_and_owner_rate(world, record_property):
@@ -91,7 +99,7 @@ def test_day_120_stream_figures_and_owner_rate(world, record_property):
     assert owners > 0 and after['lines'] < before['lines']
 
 
-def test_replica_sync_survives_source_compaction_and_later_owner_write(pair):
+def test_replica_sync_survives_source_compaction_and_later_owner_write(pair, old_reader):
     from tests.test_routing_s11b_replication import sync
     a, b, hub = pair
     a.activate()
@@ -107,12 +115,13 @@ def test_replica_sync_survives_source_compaction_and_later_owner_write(pair):
     assert sync(a, hub)["ok"]
     assert sync(b, hub)["ok"]
     b.now = END
-    def replica_fold():
+    def replica_fold(reader=routing):
         # Persisted view revisions advance with sync receipts. The pure fold
         # compares all routing semantics at one fixed clock, including remote events.
-        return rc._normal(routing.fold(routing.read_events()[0], now=END,
-                                       cfg=routing.settings(), known=routing.accounts()))
-    before = replica_fold()
+        events, bad = reader.read_events()
+        assert bad == 0
+        return rc._normal(reader.fold(events, now=END, cfg=reader.settings(), known=reader.accounts()))
+    before = (replica_fold(), replica_fold(old_reader))
     a.activate()
     outcome = rc.compact(END)
     assert outcome["result"] == "compacted", outcome
@@ -120,7 +129,7 @@ def test_replica_sync_survives_source_compaction_and_later_owner_write(pair):
     assert sync(a, hub)["ok"]
     assert len(hub.rows) == uploaded
     assert sync(b, hub)["ok"]
-    assert replica_fold() == before
+    assert (replica_fold(), replica_fold(old_reader)) == before
     a.activate()
     routing.set_note("after compaction", via="app")
     assert sync(a, hub)["ok"]

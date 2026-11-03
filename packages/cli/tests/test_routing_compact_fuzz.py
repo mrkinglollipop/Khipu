@@ -206,10 +206,20 @@ def test_compaction_keeps_every_reader_of_observations(world, seed):
     emitted = rc._emitted(sightings)
     full = rc._Log([line for line, _e in parsed], inputs, sightings)
     gone = 0
-    for profile in rc.PROFILES:
+    original = [line for line, _e in parsed]
+    for index, profile in enumerate(rc.PROFILES):
+        routing.events_file().write_bytes(b"".join(line + b"\n" for line in original))
         drop = rc.plan(parsed, NOW, profile, emitted=emitted)
         gone = max(gone, len(drop))
         comp = rc._Log([line for i, (line, _e) in enumerate(parsed) if i not in drop], inputs, sightings)
         ok, _n, differs = rc.agree(full, comp, NOW)
         assert ok, (seed, profile, len(rows), len(drop), differs)
+        if drop:
+            chosen = {"kept": [line for i, line in enumerate(original) if i not in drop],
+                      "left_out": [original[i] for i in sorted(drop)],
+                      "positions": sorted(drop), "before": len(original)}
+            rc._replace(routing.events_file(), b"".join(line + b"\n" for line in chosen["kept"]),
+                        f"events-{NOW.strftime('%Y%m%dT%H%M%SZ')}-f0000{index}.jsonl.gz",
+                        rc._archive_bytes(chosen, NOW))
+            assert rc.full_log() == original
     assert gone or len(rows) < 150, (seed, len(rows))  # the check is not idle
