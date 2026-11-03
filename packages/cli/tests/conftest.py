@@ -255,7 +255,8 @@ def _owner_turns_from_a_fake_harness(monkeypatch):
     """In-process ``owner_turns.record`` calls get ``FAKE_HOOK_ISSUER``, and
     the check's caller chain has it as the nearest harness above this
     process. A shim run in a
-    subprocess still computes its real issuer."""
+    subprocess still computes its real issuer. Why a refusal is worded as it
+    is never reads the process tree this suite happens to run under."""
     from khipu import owner_direction, owner_turns
 
     real_record, real_chain = owner_turns.record, owner_direction._caller_chain
@@ -264,6 +265,7 @@ def _owner_turns_from_a_fake_harness(monkeypatch):
         return real_record(payload, env, now, dict(FAKE_HOOK_ISSUER) if issuer is None else issuer, extra)
 
     monkeypatch.setattr(owner_turns, "record", record)
+    monkeypatch.setattr(owner_direction, "_program_replaced", lambda: False)
     monkeypatch.setattr(owner_direction, "_caller_chain",
                         lambda: [(FAKE_HOOK_ISSUER["pid"], FAKE_HOOK_ISSUER["start"], FAKE_HOOK_ISSUER["exe"])]
                         + real_chain())

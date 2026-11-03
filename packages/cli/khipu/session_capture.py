@@ -2195,7 +2195,7 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
         # yet. Skipping it could send a child's note to its recorded parent.
         chain = []
         for pid in pids:
-            info = owner_turns._proc_info(pid)
+            info = owner_turns._known_info(pid)
             if info is None:
                 raise _capture_ambiguity_error(cands)
             chain.append((pid, info[2], os.path.basename(os.path.realpath(info[1]))))
@@ -2215,7 +2215,7 @@ def resolve_session_ref(harness: str | None = None, sid: str | None = None, *,
         recorded = [(c, issuer) for c, issuer in issuers if issuer.get("pid") == pid]
         if not recorded:
             continue
-        info = owner_turns._proc_info(pid)
+        info = owner_turns._known_info(pid)
         holders = [c for c, issuer in recorded if info is not None
                    and issuer.get("start") is not None and issuer["start"] == info[2]]
         mismatched.update((c["harness"], c["sid"], pid) for c, issuer in recorded
