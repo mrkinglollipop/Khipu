@@ -691,7 +691,7 @@ export function outboxNotice(box: OutboxFields | undefined): { title: string; ca
     return {
       title: "Some captures are held on this Mac",
       cause:
-        "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to put them back.",
+        "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to count the ones other episodes already cover before putting any back.",
     };
   }
   // With no state fields at all (an older report), keep the long-standing wording.

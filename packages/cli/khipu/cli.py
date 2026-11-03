@@ -243,7 +243,9 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     # Dead letters sit outside drain(); only retry-dead moves them back. Held
     # file lines with preferences the hub lacks would only fail again there,
     # so status's fix (naming the merge first) stands for them.
-    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0 and not outbox.get("line_conflicts"):
+    # So would one refused for not announcing, and worse: status names the dry run.
+    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0 and not outbox.get("line_conflicts") \
+            and not outbox.get("announce_refused"):
         outbox["fix"] = "run `khipu outbox retry-dead`"
     elif not outbox_oldest_ok and not outbox.get("evidence_conflicts"):
         outbox["fix"] = "run `khipu sessions drain`"
@@ -4469,10 +4471,12 @@ def cmd_outbox(args: argparse.Namespace) -> int:
         print(json.dumps(outbox.status(), indent=2))
         return 0
     if args.outbox_cmd == "retry-dead":
-        print(json.dumps(outbox.retry_dead(), indent=2))
+        print(json.dumps(outbox.retry_dead(include_announce_refused=args.include_announce_refused), indent=2))
         return 0
     if args.outbox_cmd == "merge-line-preferences":
         return _outbox_merge_preferences(args)
+    if args.outbox_cmd == "span-covered":
+        return _outbox_span_covered(args)
     out = outbox.drain(limit=args.limit)
     out["remaining"] = outbox.status()["pending"]
     print(json.dumps(out, indent=2))
@@ -4566,6 +4570,46 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
     res = owner_direction.finish(res, **({"state": "partial"} if res.get("unproven") else {})) or res
     print(json.dumps(res, indent=2, default=str))
     return 0 if res.get("ok") else 1
+
+
+def _outbox_span_covered(args: argparse.Namespace) -> int:
+    """``khipu outbox span-covered``: a dry run by default, in plain words.
+    ``--apply`` is the owner's: a yes typed on a terminal, or ``--owner-direction``
+    only in the replay of a request his answer confirmed (``owner_direction.CONFIRM_ONLY``),
+    logged with its Undo either way. The drain never reaches this."""
+    from khipu import outbox_span_covered, owner_direction, routing
+
+    def show(out: dict) -> int:
+        print(json.dumps(out, indent=2, default=str) if args.json else outbox_span_covered.words(out))
+        return 0 if out.get("ok") else 1
+
+    if not args.apply:
+        return show(outbox_span_covered.dry_run())
+    want = owner_direction.intent(outbox_span_covered.ACTION, "outbox")
+    if getattr(args, "by_direction", False):
+        try:
+            if not owner_direction.replaying(outbox_span_covered.ACTION):
+                raise owner_direction.DirectionRefused(
+                    "confirm_needed", "This needs the owner's own yes: ask for it through khipu_owner_act, which "
+                                      "holds it until he answers.")
+            owner_direction.gate(want)
+        except owner_direction.DirectionRefused as err:
+            show({**err.refusal(), "error": err.message + " Nothing was changed."})
+            return 2
+    elif routing.typed_yes("This moves the dead jobs a dry run would retire to the outbox's resolved folder; nothing "
+                           "is written to the hub (Undo puts them back). Type yes to confirm: "):
+        owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
+    else:
+        show({"ok": False, "code": "owner_only",
+              "error": "Retiring dead jobs is the owner's change: type yes on a terminal, or ask for it through "
+                       "khipu_owner_act in a conversation the owner typed in. Nothing was changed."})
+        return 2
+    try:
+        res = outbox_span_covered.apply(record_resolutions=owner_direction.record_preference_resolutions)
+    except BaseException:
+        owner_direction._abandon()
+        raise
+    return show(owner_direction.finish(res) or res)
 
 
 def cmd_promote(args: argparse.Namespace) -> int:
@@ -7028,10 +7072,27 @@ def build_parser() -> argparse.ArgumentParser:
     obd = ob_sub.add_parser("drain", help="Replay queued captures into PG")
     obd.add_argument("--limit", type=int, default=None)
     ob_sub.add_parser("status", help="Pending count + oldest age + dead-letter count")
-    ob_sub.add_parser(
+    obr = ob_sub.add_parser(
         "retry-dead",
-        help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue",
+        help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue. Jobs refused for "
+             "not announcing their source identities stay held and are counted, since a retry may land them as "
+             "duplicates: run `span-covered` first",
     )
+    obr.add_argument("--include-announce-refused", action="store_true",
+                     help="Also retry the refused jobs span-covered can't retire and no forgotten episode overlaps "
+                          "(reads the hub; a failed read retries none)")
+    obs = ob_sub.add_parser(
+        "span-covered",
+        help="Dead jobs refused for not announcing their source identities, whose range and evidence another "
+             "episode in the session already holds: count them (default) or retire them with a record (--apply). "
+             "Writes nothing to the hub",
+    )
+    obs.add_argument("--apply", action="store_true",
+                     help="Retire them (the owner's: a typed yes, or his confirmed answer through khipu_owner_act)")
+    obs.add_argument("--json", action="store_true", help="Print the counts as JSON")
+    from khipu.owner_direction import add_owner_flags as _span_owner_flags
+
+    _span_owner_flags(obs)
     obm = ob_sub.add_parser(
         "merge-line-preferences",
         help="Held memory-file lines that differ from the hub only by preferences it lacks: "

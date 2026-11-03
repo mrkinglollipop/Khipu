@@ -363,7 +363,7 @@ def test_retry_dead_lands_a_refused_job_as_a_new_episode_beside_its_spanning_one
     assert "transcript_sha256" not in payload
     bury(payload, reason="CheckViolation", **REFUSED)
     before = counts(pg)
-    assert outbox.retry_dead()["moved"] == 1
+    assert outbox.retry_dead(include_announce_refused=True)["moved"] == 1
     report = outbox.drain()
     assert report["replayed"] == 1 and not report.get("resolved"), report
     after = counts(pg)
@@ -380,7 +380,7 @@ def test_duplicate_capture_handling_does_not_catch_it_even_with_a_digest(pg):
     land({**SPANNING, "transcript_sha256": "digest-of-the-whole-span"})
     bury(refused_job(transcript_sha256="digest-of-the-part"), reason="CheckViolation", **REFUSED)
     before = counts(pg)
-    outbox.retry_dead()
+    outbox.retry_dead(include_announce_refused=True)
     assert outbox.drain()["replayed"] == 1
     assert counts(pg)["episodes"] == before["episodes"] + 1
 
@@ -389,7 +389,7 @@ def test_only_near_text_within_five_minutes_folds_it_into_an_existing_episode(pg
     episode = land({**SPANNING, "ts": "2026-11-01T01:03:00Z", "summary": JOB["summary"] + " today"})
     bury(refused_job(decisions=SPANNING["decisions"]), reason="CheckViolation", **REFUSED)
     before = counts(pg)
-    outbox.retry_dead()
+    outbox.retry_dead(include_announce_refused=True)
     assert outbox.drain()["replayed"] == 1
     assert counts(pg)["episodes"] == before["episodes"]
     assert row(pg, episode)[0]["merged_from"][0]["match"] == capture.MATCH_SIMILARITY
@@ -410,7 +410,7 @@ def test_an_unannounced_insert_is_refused_and_buried_and_the_current_writer_land
         queued.write_text(json.dumps(envelope))
         # Unlike 08K01 ("predates fact provenance") it is not deferred: it buries.
         assert outbox.drain().get("buried") == 1
-    assert outbox.retry_dead()["moved"] == 1
+    assert outbox.retry_dead(include_announce_refused=True)["moved"] == 1
     assert outbox.drain()["replayed"] == 1
     assert counts(at_the_key)["episodes"] == 1
 

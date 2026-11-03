@@ -1387,9 +1387,6 @@ def _replay_lacks(stored: Any, incoming: Any) -> list[str] | None:
     def text(value: Any) -> str:
         return "" if value is None else str(value)
 
-    def canonical(value: Any) -> str:
-        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
-
     at = _instant(incoming.get("ts"))
     if at is None or at != _instant(stored.get("ts")) or incoming.get("summary") != stored.get("summary"):
         return None
@@ -1397,6 +1394,17 @@ def _replay_lacks(stored: Any, incoming: Any) -> list[str] | None:
         return None
     if any(stored.get(k) and incoming.get(k) and text(stored[k]) != text(incoming[k]) for k in _REPLAY_IF_BOTH):
         return None
+    return _evidence_lacks(stored, incoming)
+
+
+def _evidence_lacks(stored: dict[str, Any], incoming: dict[str, Any]) -> list[str]:
+    """The evidence fields a capture carries with a value and a row's raw does
+    not hold. Identity, labels and scope are not evidence here; a caller decides
+    whether the two are comparable at all."""
+
+    def canonical(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+
     merged = [entry["payload"] for entry in stored.get("merged_from") or []
               if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)]
     settled = {"ts", "summary", *_REPLAY_SAME, *_REPLAY_IF_BOTH, *_REPLAY_ENRICHED}
@@ -1420,6 +1428,37 @@ def _replay_lacks(stored: Any, incoming: Any) -> list[str] | None:
         if not found:
             lacks.append(key)
     return lacks
+
+
+SPAN_KIND = "span_covered"
+_SPAN_RANGE = re.compile(r"[0-9]+:[0-9]+")
+
+
+def _transcript_span(value: Any) -> tuple[int, int] | None:
+    """A transcript range as (start, end); None for anything but digits:digits
+    running forward."""
+    if not isinstance(value, str) or not _SPAN_RANGE.fullmatch(value):
+        return None
+    start, end = (int(part) for part in value.split(":"))
+    return (start, end) if start <= end else None
+
+
+def _span_lacks(stored: Any, incoming: Any) -> list[str] | None:
+    """Whether a row's raw spans a capture, as a pure function of the two, so a
+    resolution record proves itself later (``khipu outbox span-covered``).
+
+    None: the row is not in the capture's session and harness, or its range does
+    not contain the capture's. Otherwise ``_evidence_lacks``, which is ``[]``
+    when the capture would add nothing. The summary and instant are a span's own
+    and are never compared; the record keeps the capture's with the whole job."""
+    if not (isinstance(stored, dict) and isinstance(incoming, dict)):
+        return None
+    inner, outer = _transcript_span(incoming.get("transcript_range")), _transcript_span(stored.get("transcript_range"))
+    if inner is None or outer is None or outer[0] > inner[0] or inner[1] > outer[1]:
+        return None
+    if any(not incoming.get(k) or stored.get(k) != incoming.get(k) for k in ("session_id", "harness")):
+        return None
+    return _evidence_lacks(stored, incoming)
 
 
 def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:

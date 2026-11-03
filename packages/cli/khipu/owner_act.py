@@ -99,6 +99,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "forget.not_same": (("id",), ()),
     # Undone through direction.undo with the id this returns.
     "outbox.merge_preferences": ((), ("include_content", "include_decisions")),
+    # Always held (owner_direction.CONFIRM_ONLY). Undone through direction.undo.
+    "outbox.span_covered": ((), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
@@ -413,6 +415,8 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["episode", "forget-pending", f"--not-same={v['id']}"], []
     if action == "outbox.merge_preferences":
         return ["outbox", "merge-line-preferences", "--apply", *_opts(v, "include_content", "include_decisions")], []
+    if action == "outbox.span_covered":
+        return ["outbox", "span-covered", "--apply", "--json"], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 
@@ -505,6 +509,8 @@ def act(action, args) -> tuple[bool, dict]:
         full = full_argv(head, positionals, ["--owner-direction"])
     except Refused as err:
         return False, err.refusal()
+    if action in owner_direction.CONFIRM_ONLY:
+        return _hold(action, values, ask=owner_direction.CONFIRM_ONLY[action])
     if not held:
         try:
             owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))

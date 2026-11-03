@@ -278,8 +278,12 @@ def held_counts() -> dict[str, int]:
 def warnings(counts: dict[str, int] | None = None, threshold: int = HELD_WARN_COUNT) -> list[str]:
     counts = held_counts() if counts is None else counts
     out = []
-    for key, where in (("outbox_dead", "the outbox's dead folder"), ("capture_held", "the capture queue")):
+    for key, where, next_step in (
+            ("outbox_dead", "the outbox's dead folder",
+             "Start with `khipu outbox span-covered`, a dry run that changes nothing and counts the ones other "
+             "episodes already cover. `khipu outbox retry-dead` may land those as duplicates."),
+            ("capture_held", "the capture queue", "Run `khipu outbox retry-dead` or look at them.")):
         if counts.get(key, 0) > threshold:
             out.append(f"{counts[key]} jobs are held in {where} and wait for the owner (more than {threshold}); "
-                       "they are never removed on their own. Run `khipu outbox retry-dead` or look at them.")
+                       f"they are never removed on their own. {next_step}")
     return out
