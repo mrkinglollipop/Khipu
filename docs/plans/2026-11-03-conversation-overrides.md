@@ -83,3 +83,9 @@ Rules are free text, so W1 says "look at these together", never "conflict".
 1. **Do delegated children share an override by default?** Recommended: yes, while the parent's is live, since an orchestrator's work mostly runs in children.
 2. **With no ceiling given, where does an override stop?** Recommended: the stored share cap if there is one, otherwise the plan limit; the ask states which.
 3. **Second-Mac conversations read a separate record with no priority or rules (`routing_replication_live` is unset). Should overrides wait for shared records?** Recommended: no. Ship on the main Mac, refuse plainly on the second, and decide replication separately.
+
+## Owner's decisions (2026-11-03)
+
+1. Helpers a conversation starts share its override while the override lasts.
+2. With no limit given, the override stops at whatever the settings already say: the stored share cap if there is one, otherwise the plan limit. The ask states which.
+3. Both Macs behave the same. Overrides rely on routing copy being on, and routing copy gets turned on and proven first. While a Mac has no copy of the routing record, it refuses plainly instead of guessing.
