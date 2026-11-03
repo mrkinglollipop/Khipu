@@ -344,12 +344,27 @@ def test_a_replaced_line_is_never_sent(home, monkeypatch):
     assert "limit reached" not in part
 
 
+def _wait_current() -> None:
+    """The per-prompt child refolds a stale view after its answer, off the prompt;
+    wait for that (asking for it ourselves if no child managed it)."""
+    for _ in range(100):
+        if routing._fresh(routing._load_view(), routing._light_inputs()[0], routing._now()):
+            return
+        routing.refold_in_background()
+        time.sleep(0.1)
+    raise AssertionError("the view was not refolded")
+
+
 def test_a_limits_end_with_no_file_changing_is_sent(home, monkeypatch):
-    # The inline refold: valid_until passed, no input changed, nothing else refolded.
+    # valid_until passed, no input changed: the prompt answers the saved view (it never folds
+    # one that has a saved view), the child refolds it after its answer, the next prompt sends it.
     _record()
     _push_on(monkeypatch)
     _seen_now()
     home["clock"].advance(hours=1, minutes=1)
+    first = _routing_part(_cold(monkeypatch))
+    assert "probably open" not in first and "has not been refreshed since 15:00Z" in first  # the saved view, said to be old
+    _wait_current()
     part = _routing_part(_cold(monkeypatch))
     assert part.startswith(CHANGES)
     assert "Codex: probably open: its limit was due to end at 16:00Z" in part
@@ -1861,11 +1876,10 @@ def _lock_contended(monkeypatch) -> None:
 
 
 def test_an_unsaved_change_is_never_taken_for_no_change(home, monkeypatch):
-    """Finding R5-2: a fold that could not be saved kept the saved view's
-    version, so the version check answered "none" and the change was never
-    pushed while saves kept failing. Now the prompt skips
-    (routing=skipped:unsaved), the seen marker stays, and the next prompt
-    that can save delivers it."""
+    """Finding R5-2: a change that could not be saved was never pushed while saves
+    kept failing. A prompt now answers the saved view and folds nothing, so the
+    change is not lost to it: the seen marker stays at the saved version, and the
+    next prompt after a refold that can save delivers it."""
     _record()
     _push_on(monkeypatch)
     before = _seen_now()
@@ -1875,12 +1889,11 @@ def test_an_unsaved_change_is_never_taken_for_no_change(home, monkeypatch):
     routing.view_file().write_bytes(saved)  # as if the fold after the report had not been saved
     with monkeypatch.context() as m:
         _lock_contended(m)
-        with pytest.raises(routing.PushUnsaved):
-            agent_view.prepare_routing_table(refresh=True)
-            routing.prompt_push(before, budget=1.0)
-        assert "## Routing" not in _cold(monkeypatch)
-        assert _last_log().endswith(" routing=skipped:unsaved")
-        assert _marker() == before
+        first = _routing_part(_cold(monkeypatch))
+        assert "Claude: limit reached" not in first and "has not been refreshed since" in first
+        assert {k: _marker().get(k) for k in ("version", "epoch")} == {k: before.get(k) for k in ("version", "epoch")}
+        assert routing.refold_in_background() == "failed"  # it cannot save: the view stays as it was
+    _wait_current()
     home["search"]["hits"] = [dict(HITS[0], id="42")]
     out = _cold(monkeypatch)
     assert _routing_part(out).startswith(CHANGES) and "Claude: limit reached" in _routing_part(out)

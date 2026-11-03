@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import threading
 import os
 import secrets
 import tempfile
@@ -27,7 +28,24 @@ def _path(name):
     return routing.routing_dir() / name
 
 
+_wrote = threading.local()
+
+
+def _refreshing(call):
+    """``call`` (a pull, a restore), then the routing view refolded and saved
+    when it wrote a replication file (a fingerprint input of the view): the
+    prompt that follows finds view.json current, with no fold of its own."""
+    _wrote.flag = False
+    try:
+        return call()
+    finally:
+        if getattr(_wrote, "flag", False):
+            _wrote.flag = False
+            routing.refresh_view()
+
+
 def _atomic(path, data):
+    _wrote.flag = True
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".replication-", dir=path.parent)
     try:
@@ -221,6 +239,11 @@ class PostgresHub:
 
 
 def sync(*, hub=None, limit=500, max_pages=20):
+    """One bounded exchange (``_sync``), then the view refolded if it wrote."""
+    return _refreshing(lambda: _sync(hub=hub, limit=limit, max_pages=max_pages))
+
+
+def _sync(*, hub=None, limit=500, max_pages=20):
     """One bounded exchange; a partial scan resumes without a caught-up claim.
 
     Upload acknowledgements are saved only after their receipts are durable.
@@ -309,6 +332,11 @@ def sync(*, hub=None, limit=500, max_pages=20):
 
 
 def restore():
+    """Explicit local recovery (``_restore``), then the view refolded."""
+    return _refreshing(_restore)
+
+
+def _restore():
     """Explicit local recovery: a fresh sender, with the old log left intact."""
     try:
         with _sync_lock(), routing._lock():
