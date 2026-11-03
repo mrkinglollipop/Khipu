@@ -669,6 +669,7 @@ export type OutboxFields = {
   offline?: number;
   offline_only?: boolean;
   evidence_conflicts?: number;
+  announce_refused?: number;
   oldest_age_s?: number | null;
 };
 
@@ -691,7 +692,9 @@ export function outboxNotice(box: OutboxFields | undefined): { title: string; ca
     return {
       title: "Some captures are held on this Mac",
       cause:
-        "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to count the ones other episodes already cover before putting any back.",
+        (box?.announce_refused ?? 0) > 0
+          ? "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Putting some of these back may add duplicates: ask your agent to count the ones another episode already covers first."
+          : "Buried jobs are held on this Mac outside the normal queue, so the automatic retry does not touch them. Nothing is lost. Once the cause is fixed, ask your agent to put them back.",
     };
   }
   // With no state fields at all (an older report), keep the long-standing wording.

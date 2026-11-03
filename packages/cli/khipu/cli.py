@@ -4596,8 +4596,9 @@ def _outbox_span_covered(args: argparse.Namespace) -> int:
         except owner_direction.DirectionRefused as err:
             show({**err.refusal(), "error": err.message + " Nothing was changed."})
             return 2
-    elif routing.typed_yes("This moves the dead jobs a dry run would retire to the outbox's resolved folder; nothing "
-                           "is written to the hub (Undo puts them back). Type yes to confirm: "):
+    elif routing.typed_yes("This moves the dead jobs a dry run would retire to the outbox's resolved folder. Each "
+                           "job's own summary then stays only in that local record; nothing is written to the hub "
+                           "(Undo puts them back). Type yes to confirm: "):
         owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
     else:
         show({"ok": False, "code": "owner_only",
@@ -7080,12 +7081,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     obr.add_argument("--include-announce-refused", action="store_true",
                      help="Also retry the refused jobs span-covered can't retire and no forgotten episode overlaps "
-                          "(reads the hub; a failed read retries none)")
+                          "(reads the hub; a failed read retries none). The next drain lands each as a new episode, "
+                          "with its commitments, decisions and embeddings, beside any episode already spanning it")
     obs = ob_sub.add_parser(
         "span-covered",
-        help="Dead jobs refused for not announcing their source identities, whose range and evidence another "
-             "episode in the session already holds: count them (default) or retire them with a record (--apply). "
-             "Writes nothing to the hub",
+        help="Dead jobs refused for not announcing their source identities, whose range sits inside another episode "
+             "of the session that holds their evidence fields: count them (default) or retire them with a record "
+             "(--apply), where a job's own summary then stays. Summaries are not compared. Writes nothing to the hub",
     )
     obs.add_argument("--apply", action="store_true",
                      help="Retire them (the owner's: a typed yes, or his confirmed answer through khipu_owner_act)")

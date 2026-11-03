@@ -15,15 +15,23 @@ A job retires only when, on a fresh read of its session's rows:
   list, a queued erasure or a forgotten source, in any harness. A forgotten row
   whose range can't be read counts as overlapping, as does every one in the
   session when the job's own range can't be read;
-- one live row of the same session and harness contains its range and holds
-  all its evidence (``capture._span_lacks``, the proof the record repeats).
+- nothing in the session shows its offsets restarted (``_offsets_restarted``);
+- one live row of the same session and harness contains its range, can't be told
+  apart from it by window, part, digest or project, and holds all its evidence
+  fields (``capture._span_lacks``, the proof the record repeats).
 
 Anything else holds it, and any check that can't run holds it too. The write is
 ``outbox.archive_resolved`` alone: the whole job and the covering row's raw in a
 record written before the job goes. The hub gets no write and no fact steps.
+
+What this does not prove: summaries are never compared, and a range does not show
+the same text, since an old writer's rewrite in place left no mark to read. A
+retired job's own summary stays only in its local record.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -33,23 +41,32 @@ BATCH = 50
 NO_COVERING_ROW = "no_covering_row"
 RANGE_NOT_CONTAINED = "range_not_contained"
 RANGE_NOT_NUMERIC = "range_not_numeric"
+NOT_SAME_WINDOW = "not_same_window"
+OFFSETS_RESTARTED = "offsets_restarted"
 EVIDENCE_MISSING = "evidence_missing"
 FORGOTTEN = "forgotten"
 DIFFERENT_ERROR = "different_error"
 CHECK_FAILED = "check_failed"
 CHANGED = "changed"
+RECORD_CONFLICT = "record_conflict"
 HOLD_WORDS = {
     NO_COVERING_ROW: "no live episode in the same session and harness",
     RANGE_NOT_CONTAINED: "no live episode's range contains the job's",
-    RANGE_NOT_NUMERIC: "the job's transcript range is not two numbers in order",
+    RANGE_NOT_NUMERIC: "the job's transcript range is not two increasing numbers",
+    NOT_SAME_WINDOW: "the covering episode is another window or part, or differs in transcript digest or project",
+    OFFSETS_RESTARTED: "the session's transcript offsets restarted, so a range can't place the job's text",
     EVIDENCE_MISSING: "the job carries evidence no covering episode holds",
     FORGOTTEN: "a forgotten episode overlaps the job, or its source is forgotten",
     DIFFERENT_ERROR: "the job failed with a different error",
     CHECK_FAILED: "a check could not run, so the job stays held",
     CHANGED: "the job changed after it was read",
+    RECORD_CONFLICT: ("an interrupted run left a record for the job that it can't finish from, and both are kept "
+                      "whole: look at that record in the outbox's resolved folder, remove it if it is wrong, then "
+                      "run this again"),
 }
 # What a retry may land: not provably a duplicate, and nothing forgotten near it.
-RETRYABLE = frozenset({NO_COVERING_ROW, RANGE_NOT_CONTAINED, RANGE_NOT_NUMERIC, EVIDENCE_MISSING})
+RETRYABLE = frozenset({NO_COVERING_ROW, RANGE_NOT_CONTAINED, RANGE_NOT_NUMERIC, NOT_SAME_WINDOW, OFFSETS_RESTARTED,
+                       EVIDENCE_MISSING})
 
 _ROWS_SQL = ("SELECT id, session_id, transcript_range, deleted_at, raw FROM episodes "
              "WHERE session_id = ANY(%s) OR raw->>'session_id' = ANY(%s) ORDER BY id")
@@ -99,15 +116,48 @@ def _may_overlap(inner: tuple[int, int] | None, ranges: list[Any]) -> bool:
         return True
     for value in known:
         span = _transcript_span(value)
-        if span is None or (span[0] < inner[1] and inner[0] < span[1]) \
-                or span[0] <= inner[0] <= inner[1] <= span[1] or inner[0] <= span[0] <= span[1] <= inner[1]:
+        if span is None or (span[0] < inner[1] and inner[0] < span[1]):
             return True
+    return False
+
+
+def _generation_window(raw: dict[str, Any], span: tuple[int, int]) -> bool:
+    """A window id its offsets don't derive: written under a transcript generation,
+    which a file rewritten or replaced starts (``session_capture``'s window id)."""
+    window, harness, session = raw.get("window_id"), str(raw.get("harness") or ""), str(raw.get("session_id") or "")
+    if not window:
+        return False
+    native = session[len(harness) + 1:] if session.startswith(f"{harness}:") else session
+    return window != hashlib.sha256(f"{harness}:{native}:{span[0]}:{span[1]}".encode("utf-8")).hexdigest()
+
+
+def _offsets_restarted(view: dict[str, Any], rows: list[tuple]) -> bool:
+    """What a session shows of an offset reset, across its rows and the job: a
+    transcript generation's window, or an end offset moving back in time. A
+    rewrite an older writer read straight through shows neither."""
+    from khipu.capture import _instant, _transcript_span
+
+    points = []
+    for raw in (view, *(r[4] for r in rows if isinstance(r[4], dict) and r[4].get("harness") == view.get("harness"))):
+        span = _transcript_span(raw.get("transcript_range"))
+        if span is None:
+            continue
+        if _generation_window(raw, span):
+            return True
+        at = _instant(raw.get("ts"))
+        if at is not None:
+            points.append((at, span[1]))
+    furthest = 0
+    for _at, end in sorted(points):
+        if end < furthest:
+            return True
+        furthest = end
     return False
 
 
 def _verdict(cur, view: dict[str, Any], rows: list[tuple], withheld: frozenset[int]) -> tuple[str | None, tuple | None]:
     """(why the job holds, None), or (None, the row that retires it)."""
-    from khipu.capture import _span_lacks, _transcript_span
+    from khipu.capture import _span_contains, _span_lacks, _span_rewound, _span_same_window, _transcript_span
     from khipu.tombstones import hub_source_forgotten
 
     if hub_source_forgotten(cur, view):
@@ -125,11 +175,18 @@ def _verdict(cur, view: dict[str, Any], rows: list[tuple], withheld: frozenset[i
             and r[4].get("session_id") == view.get("session_id")]
     if not live:
         return NO_COVERING_ROW, None
-    covering = [(r, missing) for r in live if (missing := _span_lacks(r[4], view)) is not None]
-    if not covering:
+    containing = [r for r in live if _span_contains(r[4], view)]
+    if not containing:
         return RANGE_NOT_CONTAINED, None
-    for row, missing in covering:
-        if missing == []:
+    if _offsets_restarted(view, rows):
+        return OFFSETS_RESTARTED, None
+    same = [r for r in containing if _span_same_window(r[4], view)]
+    if not same:
+        return NOT_SAME_WINDOW, None
+    if all(_span_rewound(r[4], view) for r in same):
+        return OFFSETS_RESTARTED, None
+    for row in same:
+        if _span_lacks(row[4], view) == []:
             return None, row
     return EVIDENCE_MISSING, None
 
@@ -200,12 +257,24 @@ def retryable() -> dict[Path, bytes]:
 
 
 def _record(entry: dict[str, Any]) -> dict[str, Any]:
-    import json
+    """The job's record: an interrupted run's own when one is there, since it
+    proves itself and the job was judged eligible again just now (its covering
+    row may have changed since, and it stays the proof that was logged). Raises
+    ValueError when what is there can't be that."""
     from datetime import datetime, timezone
 
     from khipu.capture import SPAN_KIND
     from khipu.capture_identity import payload_sha256
 
+    from khipu import outbox
+
+    saved_path = outbox.resolved_dir() / (hashlib.sha256(entry["snapshot"]).hexdigest() + ".json")
+    if saved_path.exists():
+        saved = json.loads(saved_path.read_bytes())
+        outbox._validate_resolution(saved)
+        if saved["resolution"]["kind"] != SPAN_KIND or saved["queued_evidence"] != json.loads(entry["snapshot"]):
+            raise ValueError("a different record holds this job's id")
+        return saved
     eid, raw = int(entry["row"][0]), entry["row"][4]
     return {"payload": raw, "queued_evidence": json.loads(entry["snapshot"]),
             "resolution": {"kind": SPAN_KIND, "episode_id": eid, "original_payload_sha256": payload_sha256(raw),
@@ -216,8 +285,6 @@ def _record(entry: dict[str, Any]) -> dict[str, Any]:
 def _retire_batch(cur, part: list[dict[str, Any]], record_resolutions) -> str | None:
     """One batch, judged afresh with its sessions' rows share-locked, logged, then
     moved job by job. Why the run must stop, or None."""
-    import hashlib
-
     from khipu import outbox
     from khipu.tombstones import RegistryError
 
@@ -231,7 +298,7 @@ def _retire_batch(cur, part: list[dict[str, Any]], record_resolutions) -> str | 
             record = _record(entry)
             outbox._validate_resolution(record)
         except (ValueError, TypeError, KeyError, RecursionError):
-            entry["reason"] = CHECK_FAILED
+            entry["reason"] = RECORD_CONFLICT
             continue
         built.append((entry, record))
     if built:
@@ -247,12 +314,15 @@ def _retire_batch(cur, part: list[dict[str, Any]], record_resolutions) -> str | 
     for entry, record in built:
         try:
             status = outbox.archive_resolved(entry["path"], entry["snapshot"], record)
-        except (OSError, ValueError, TypeError, KeyError, RecursionError, RegistryError):
+        except ValueError:
+            status = "conflict"
+        except (OSError, TypeError, KeyError, RecursionError, RegistryError):
             status = None
         if status == "resolved":
             entry["retired"] = True
         else:
-            entry["reason"] = {"changed": CHANGED, "forgotten": FORGOTTEN}.get(status, CHECK_FAILED)
+            entry["reason"] = {"changed": CHANGED, "forgotten": FORGOTTEN,
+                               "conflict": RECORD_CONFLICT}.get(status, CHECK_FAILED)
     return None
 
 
@@ -314,13 +384,15 @@ def words(out: dict[str, Any]) -> str:
     if out["dry_run"]:
         held = out["would_hold"]
         lines = ["Dry run: nothing was changed.",
-                 f"{jobs} Would retire {out['would_retire']}: another episode in the session "
-                 "already holds their range and evidence.",
+                 f"{jobs} Would retire {out['would_retire']}: for each, a live episode in the session has a range "
+                 "containing the job's and holds every evidence field it carries. Summaries are not compared and a "
+                 "range does not prove the same text, so each retired job's own summary stays only in its local "
+                 "record.",
                  f"Would hold {sum(held.values())}."]
     else:
         held = out["held"]
-        lines = [f"{jobs} Retired {out['retired']}, each kept whole in the outbox's resolved "
-                 "folder with its record. Nothing was written to the hub.",
+        lines = [f"{jobs} Retired {out['retired']}, each kept whole in the outbox's resolved folder with its record, "
+                 "the only place its own summary now stays. Nothing was written to the hub.",
                  f"Held {sum(held.values())}."]
     lines += [f"  {count}: {HOLD_WORDS.get(reason, reason)}" for reason, count in held.items()]
     if out.get("error"):

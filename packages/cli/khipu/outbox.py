@@ -112,7 +112,8 @@ def _canonical(value: Any) -> str:
 # What the hub's trigger says to a writer from before announce_hub_identities,
 # as the drain records it (``type: message``, with the message's tail clipped).
 ANNOUNCE_REFUSAL = "CheckViolation: khipu: an episode write must announce its source identities"
-SPAN_FIRST = ("Run `khipu outbox span-covered` first: a dry run that counts the jobs other episodes already cover. "
+SPAN_FIRST = ("Run `khipu outbox span-covered` first: a dry run that counts the jobs whose range and evidence fields "
+              "another episode holds. "
               "`khipu outbox retry-dead` may land those as duplicates, so it leaves this kind held unless told "
               "otherwise.")
 
@@ -612,6 +613,17 @@ def _quarantine(jp: Path, error: Exception) -> Path:
     return dst
 
 
+def announce_refused_count() -> int:
+    """How many dead jobs ``announce_refused`` names; an unreadable one is not one."""
+    count = 0
+    for path in dead_jobs():
+        try:
+            count += announce_refused(_read_job(path))
+        except (OSError, ValueError, TypeError, RecursionError):
+            continue
+    return count
+
+
 def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
     """Move every dead job back to the queue with attempts reset, except jobs
     refused for not announcing their source identities: a retry can land one as
@@ -622,6 +634,7 @@ def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
     moved = 0
     quarantined = 0
     refused_held = 0
+    refused_moved = 0
     from khipu import memory_lock
     from khipu.tombstones import RegistryError, write_guard
 
@@ -682,6 +695,7 @@ def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
                             _atomic_write(destination, job)
                         jp.unlink(missing_ok=True)
                         moved += 1
+                        refused_moved += announce_refused(job)
             except RegistryError as exc:
                 _log(f"retry-dead refused for {jp.name}: {exc}")
                 continue
@@ -690,15 +704,23 @@ def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
     native_moved = retry_held()
     out = {"moved": moved + native_moved, "native_moved": native_moved,
            "quarantined": quarantined, "pending": len(jobs())}
+    warnings = []
+    if refused_moved:
+        out["announce_refused_moved"] = refused_moved
+        warnings.append(f"{refused_moved} dead job{'' if refused_moved == 1 else 's'} refused for not announcing source "
+                        "identities went back to the queue: the next drain lands each as a new episode, with its "
+                        "commitments, decisions and embeddings, beside any episode already spanning it.")
     if refused_held:
         out["announce_refused_held"] = refused_held
-        out["warning"] = (f"{refused_held} dead job{'' if refused_held == 1 else 's'} refused for not announcing "
+        warnings.append(f"{refused_held} dead job{'' if refused_held == 1 else 's'} refused for not announcing "
                           "source identities stayed held: "
                           + ("span-covered can retire them, a forgotten episode overlaps them, or a check could not "
                              "run." if include_announce_refused else
                              "a retry may land them as duplicates, or with text a forgotten episode held. Run `khipu "
                              "outbox span-covered` first (a dry run); `--include-announce-refused` then retries only "
                              "the ones it can't retire and no forgotten episode overlaps."))
+    if warnings:
+        out["warning"] = " ".join(warnings)
     return out
 
 

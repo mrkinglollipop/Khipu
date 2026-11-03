@@ -151,7 +151,7 @@ def test_a_range_not_contained_holds(pg):
     assert_held(pg, span.RANGE_NOT_CONTAINED)
 
 
-@pytest.mark.parametrize("value", ["abc", "100-200", "100:200\n", "200:100", "100:", ":200", "١٠:٢٠"])
+@pytest.mark.parametrize("value", ["abc", "100-200", "100:200\n", "200:100", "100:", ":200", "١٠:٢٠", "0:0", "150:150"])
 def test_a_range_that_is_not_two_numbers_holds(pg, value):
     land(COVER)
     dead(refused(transcript_range=value))
@@ -190,7 +190,7 @@ def test_an_overlapping_tombstone_holds_even_beside_a_covering_row(pg):
 
 def test_an_adjacent_tombstone_does_not_hold(pg):
     land(COVER)
-    other = land({**COVER, "ts": "2026-11-01T05:00:00Z", "summary": "The next window",
+    other = land({**COVER, "ts": "2026-11-01T03:00:00Z", "summary": "The next window",
                   "transcript_range": "200:300", "decisions": [], "open_loops": []})
     forget_row(pg, other)
     dead()
@@ -314,7 +314,7 @@ def test_the_dry_run_changes_nothing_and_says_counts_in_plain_words(pg):
     assert records() == [] and counts(pg) == before
     assert "Dry run: nothing was changed." in text
     assert "3 dead jobs. Would retire 1" in text and "Would hold 2." in text
-    assert "  1: the job's transcript range is not two numbers in order" in text
+    assert "  1: the job's transcript range is not two increasing numbers" in text
     assert "  1: the job failed with a different error" in text
     for secret in (TEXT, JOB["summary"], "Ada", "A second one", SESSION):
         assert secret not in text
@@ -395,6 +395,191 @@ def test_the_record_is_written_before_the_job_goes(pg, monkeypatch):
     assert order == ["record", "job"]
 
 
+def test_a_changed_row_after_a_crash_finishes_from_the_first_record(pg, monkeypatch):
+    episode = land(COVER)
+    (path,) = dead()
+    real = Path.unlink
+
+    def crash(self, *a, **kw):
+        if self == path:
+            raise KeyboardInterrupt()
+        return real(self, *a, **kw)
+
+    with monkeypatch.context() as crashing:
+        crashing.setattr(Path, "unlink", crash)
+        with pytest.raises(KeyboardInterrupt):
+            retire()
+    (first,) = records()
+    with pg.connect() as conn:
+        conn.execute("UPDATE episodes SET raw = raw || %s::jsonb WHERE id = %s",
+                     (json.dumps({"preferences": ["Added since the crash"]}), episode))
+        conn.commit()
+    report = retire()
+    assert report["retired"] == 1 and report["held"] == {}, report
+    assert outbox.dead_jobs() == [] and records() == [first]
+
+
+def test_a_record_that_cannot_finish_the_job_says_what_to_do(pg, monkeypatch):
+    land(COVER)
+    (path,) = dead()
+    snapshot = path.read_bytes()
+    real = Path.unlink
+
+    def crash(self, *a, **kw):
+        if self == path:
+            raise KeyboardInterrupt()
+        return real(self, *a, **kw)
+
+    with monkeypatch.context() as crashing:
+        crashing.setattr(Path, "unlink", crash)
+        with pytest.raises(KeyboardInterrupt):
+            retire()
+    (record_path,) = outbox.resolved_dir().glob("*.json")
+    other = json.loads(record_path.read_text())
+    other["queued_evidence"]["attempts"] = 1
+    record_path.write_text(json.dumps(other))
+    report = retire()
+    assert report["retired"] == 0 and report["held"] == {span.RECORD_CONFLICT: 1}, report
+    assert path.read_bytes() == snapshot and records() == [other]
+    text = span.words(report)
+    assert "kept whole" in text and "resolved folder" in text and "remove it if it is wrong" in text
+    record_path.unlink()
+    assert retire()["retired"] == 1
+
+
+# ---- what a range can't prove ------------------------------------------------------------------
+
+def window_of(span_text, session=SESSION, harness="codex"):
+    start, end = span_text.split(":")
+    native = session.split(":", 1)[1]
+    return hashlib.sha256(f"{harness}:{native}:{start}:{end}".encode()).hexdigest()
+
+
+# A capture with nothing but its summary: only identity can hold it back.
+def summary_only(**changes):
+    return {"ts": JOB["ts"], "summary": "A summary found nowhere else in the hub", "session_id": SESSION,
+            "harness": "codex", "event": "stop", "transcript_range": "100:200", **changes}
+
+
+def row_at(**changes):
+    return {"ts": COVER["ts"], "summary": COVER["summary"], "session_id": SESSION, "harness": "codex",
+            "event": "stop", "transcript_range": "100:200", "topics": [], **changes}
+
+
+W = window_of("100:200")
+WIDE = window_of("0:500")
+
+
+@pytest.mark.parametrize("row,job", [
+    (row_at(window_id=W, part="1/2"), summary_only(window_id=W, part="2/2")),
+    (row_at(window_id=W), summary_only(window_id="another-window")),
+    (row_at(transcript_sha256="digest-a"), summary_only(transcript_sha256="digest-b")),
+    # One set beside one unset proves no sameness.
+    (row_at(window_id=W, part="1/2"), summary_only()),
+    (row_at(), summary_only(window_id=W, part="1/2")),
+    (row_at(window_id=W, part="1/2"), summary_only(window_id=W)),
+    # A range that merely falls inside.
+    (row_at(transcript_range="0:500", window_id=WIDE, part="1/2"), summary_only()),
+    (row_at(transcript_range="0:500"), summary_only(window_id=W, part="1/2")),
+    (row_at(transcript_range="0:500", window_id=WIDE, part="1/2"), summary_only(window_id=W, part="1/2")),
+    # Two projects.
+    (row_at(project="acme/other"), summary_only(project="acme/span")),
+])
+def test_a_row_that_may_be_another_capture_proves_nothing(row, job):
+    assert capture._span_lacks(row, job) is None
+
+
+@pytest.mark.parametrize("row,job", [
+    (row_at(), summary_only()),
+    (row_at(window_id=W, part="1/2"), summary_only(window_id=W, part="1/2")),
+    (row_at(transcript_sha256="same"), summary_only(transcript_sha256="same")),
+    (row_at(project="acme/span"), summary_only()),
+    # A digest over another range can't disagree: a span's text differs from a part's.
+    (row_at(transcript_range="0:500", transcript_sha256="whole"), summary_only(transcript_sha256="part")),
+])
+def test_a_row_nothing_tells_apart_proves_the_fields(row, job):
+    assert capture._span_lacks(row, job) == []
+
+
+@pytest.mark.parametrize("row_changes,job_changes", [
+    ({"window_id": W, "part": "1/2"}, {"window_id": W, "part": "2/2"}),
+    ({"transcript_sha256": "digest-a"}, {"transcript_sha256": "digest-b"}),
+    ({"project": "acme/other"}, {"project": "acme/span"}),
+    ({"transcript_range": "0:500", "window_id": WIDE, "part": "1/2"}, {}),
+])
+def test_a_sibling_or_another_project_keeps_its_summary_out_of_the_archive(pg, row_changes, job_changes):
+    land(row_at(**row_changes))
+    dead(summary_only(**job_changes))
+    assert_held(pg, span.NOT_SAME_WINDOW)
+
+
+def test_another_window_at_the_same_range_holds(pg):
+    # A window id these offsets don't derive: a transcript generation's.
+    land(row_at(window_id=W, part="1/2"))
+    dead(summary_only(window_id="another-window", part="1/2"))
+    assert_held(pg, span.OFFSETS_RESTARTED)
+
+
+def test_a_zero_width_row_covers_nothing(pg):
+    land(row_at(transcript_range="150:150"))
+    dead()
+    assert_held(pg, span.RANGE_NOT_CONTAINED)
+
+
+def test_a_row_older_than_the_job_means_the_offset_went_back(pg):
+    land(row_at(ts="2026-10-31T01:00:00Z", transcript_range="0:500"))
+    dead(summary_only())
+    assert_held(pg, span.OFFSETS_RESTARTED)
+
+
+def test_equal_digests_prove_the_text_even_from_an_older_row(pg):
+    land(row_at(ts="2026-10-31T01:00:00Z", transcript_sha256="same"))
+    dead(summary_only(transcript_sha256="same"))
+    assert retire()["retired"] == 1
+
+
+def test_a_generation_window_anywhere_in_the_session_holds(pg):
+    land(row_at(transcript_range="0:500"))
+    land(row_at(ts="2026-11-01T05:00:00Z", summary="After the file was rewritten", transcript_range="500:600",
+                window_id="transcript-generation-hash", part="1/1"))
+    dead(summary_only())
+    assert_held(pg, span.OFFSETS_RESTARTED)
+
+
+def test_an_end_offset_moving_back_in_time_holds(pg):
+    land(row_at(transcript_range="0:500"))
+    land(row_at(ts="2026-11-01T05:00:00Z", summary="A shorter file now", transcript_range="0:40"))
+    dead(summary_only())
+    assert_held(pg, span.OFFSETS_RESTARTED)
+
+
+def test_a_split_window_elsewhere_in_the_session_is_no_restart(pg):
+    land(row_at(transcript_range="0:500"))
+    land(row_at(ts="2026-11-01T05:00:00Z", summary="A later split window", transcript_range="500:900",
+                window_id=window_of("500:900"), part="1/2"))
+    dead(summary_only())
+    assert retire()["retired"] == 1
+
+
+def test_a_summary_only_job_can_retire_and_every_word_says_what_that_costs(pg):
+    land(row_at(transcript_range="0:500"))
+    dead(summary_only())
+    dry = span.words(span.dry_run())
+    assert "Summaries are not compared" in dry and "does not prove the same text" in dry
+    assert "own summary stays only in its local record" in dry
+    assert "already" not in dry
+    report = retire()
+    assert report["retired"] == 1
+    done = span.words(report)
+    assert "the only place its own summary now stays" in done
+    assert hub_text(pg, "A summary found nowhere else") == 0
+    (record,) = records()
+    assert record["queued_evidence"]["payload"]["summary"] == "A summary found nowhere else in the hub"
+    ask = owner_direction.CONFIRM_ONLY[span.ACTION]
+    assert "Summaries are not compared" in ask and "does not prove the same text" in ask
+    assert "stays only in the local record" in ask and "proves" not in ask
+
+
 # ---- the drain never runs it ----------------------------------------------------------------
 
 def test_the_drain_never_runs_it(pg, monkeypatch):
@@ -455,6 +640,20 @@ def test_the_explicit_flag_moves_only_what_cannot_be_retired_and_touches_nothing
     assert retire()["retired"] == 1
 
 
+def test_a_refused_job_that_moves_says_what_the_drain_will_do(pg):
+    dead()
+    out = outbox.retry_dead(include_announce_refused=True)
+    assert out["moved"] == 1 and out["announce_refused_moved"] == 1 and "announce_refused_held" not in out, out
+    assert out["warning"].startswith("1 dead job refused") and "went back to the queue" in out["warning"]
+    assert "new episode" in out["warning"] and "commitments, decisions and embeddings" in out["warning"]
+
+
+def test_a_plain_job_that_moves_gets_no_warning(pg):
+    bury(refused(), reason="x", last_error="OperationalError: gone")
+    out = outbox.retry_dead(include_announce_refused=True)
+    assert out["moved"] == 1 and "warning" not in out and "announce_refused_moved" not in out, out
+
+
 def test_a_failed_read_retries_no_refused_job(pg, monkeypatch):
     dead()
     monkeypatch.setattr(db, "connect", mock.Mock(side_effect=OSError("no route")))
@@ -498,9 +697,22 @@ def test_doctor_names_the_dry_run_first_and_that_retry_may_land_duplicates(pg):
     status = outbox.status()
     assert status["announce_refused"] == 1
     assert status["fix"].startswith("Run `khipu outbox span-covered` first") and "duplicates" in status["fix"]
-    text = storage_bounds.warnings({"outbox_dead": 1053, "capture_held": 0})[0]
+    assert storage_bounds.held_counts()["outbox_announce_refused"] == 1
+    text = storage_bounds.warnings({"outbox_dead": 1053, "outbox_announce_refused": 906, "capture_held": 0})[0]
     assert text.index("khipu outbox span-covered") < text.index("khipu outbox retry-dead")
-    assert "dry run" in text and "duplicates" in text
+    assert "906 of them" in text and "dry run" in text and "duplicates" in text
+
+
+def test_the_storage_warning_gives_the_span_advice_only_for_its_kind(pg):
+    for path in [outbox.dead_dir() / f"d{n}.json" for n in range(3)]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"payload": {"summary": "x"}, "attempts": 25, "last_error": "OperationalError: x"}))
+    counts_now = storage_bounds.held_counts()
+    assert counts_now["outbox_dead"] == 3 and counts_now["outbox_announce_refused"] == 0
+    text = storage_bounds.warnings(counts_now, threshold=2)[0]
+    assert "khipu outbox retry-dead" in text and "span-covered" not in text and "duplicates" not in text
+    text = storage_bounds.warnings({"capture_held": 9, "outbox_announce_refused": 5}, threshold=2)[0]
+    assert "capture queue" in text and "span-covered" not in text
 
 
 def test_doctor_keeps_the_dry_run_first_for_this_kind_and_retry_for_any_other(pg):
@@ -526,6 +738,11 @@ def test_the_retry_dead_help_names_the_held_kind():
         cli.main(["outbox", "--help"])
     text = " ".join(out.getvalue().split())
     assert "stay held" in text and "duplicates" in text and "span-covered" in text
+    out = io.StringIO()
+    with redirect_stdout(out), pytest.raises(SystemExit):
+        cli.main(["outbox", "retry-dead", "--help"])
+    text = " ".join(out.getvalue().split())
+    assert "lands each as a new episode" in text and "commitments, decisions and embeddings" in text
 
 
 # ---- the owner's own yes ------------------------------------------------------------------------

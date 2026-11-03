@@ -1436,27 +1436,65 @@ _SPAN_RANGE = re.compile(r"[0-9]+:[0-9]+")
 
 def _transcript_span(value: Any) -> tuple[int, int] | None:
     """A transcript range as (start, end); None for anything but digits:digits
-    running forward."""
+    with some width running forward."""
     if not isinstance(value, str) or not _SPAN_RANGE.fullmatch(value):
         return None
     start, end = (int(part) for part in value.split(":"))
-    return (start, end) if start <= end else None
+    return (start, end) if start < end else None
+
+
+def _span_contains(stored: Any, incoming: Any) -> bool:
+    """A row of the capture's session and harness whose range contains its."""
+    if not (isinstance(stored, dict) and isinstance(incoming, dict)):
+        return False
+    inner, outer = _transcript_span(incoming.get("transcript_range")), _transcript_span(stored.get("transcript_range"))
+    if inner is None or outer is None or outer[0] > inner[0] or inner[1] > outer[1]:
+        return False
+    return not any(not incoming.get(k) or stored.get(k) != incoming.get(k) for k in ("session_id", "harness"))
+
+
+def _span_digest_says(stored: dict[str, Any], incoming: dict[str, Any]) -> bool | None:
+    """At one range, whether two window digests name the same text; None when a
+    digest is missing or the ranges differ, where it can't say."""
+    digests = stored.get("transcript_sha256"), incoming.get("transcript_sha256")
+    if not all(digests) or stored.get("transcript_range") != incoming.get("transcript_range"):
+        return None
+    return digests[0] == digests[1]
+
+
+def _span_same_window(stored: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    """Nothing tells the two apart as captures: the same window and part, which
+    a split window's siblings never share (``_dedup_exact_window``), set or
+    unset on both, since one set beside one unset proves nothing; digests that
+    don't disagree; and no two different projects."""
+    if any(str(stored.get(k) or "") != str(incoming.get(k) or "") for k in ("window_id", "part")):
+        return False
+    if stored.get("project") and incoming.get("project") and stored["project"] != incoming["project"]:
+        return False
+    return _span_digest_says(stored, incoming) is not False
+
+
+def _span_rewound(stored: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    """A row older than the capture it contains: the capture read bytes after the
+    row had, so the offset went back and the text may not be the row's. Equal
+    digests prove it is; an instant that can't be read proves nothing."""
+    if _span_digest_says(stored, incoming) is True:
+        return False
+    at, row_at = _instant(incoming.get("ts")), _instant(stored.get("ts"))
+    return at is None or row_at is None or row_at < at
 
 
 def _span_lacks(stored: Any, incoming: Any) -> list[str] | None:
     """Whether a row's raw spans a capture, as a pure function of the two, so a
     resolution record proves itself later (``khipu outbox span-covered``).
 
-    None: the row is not in the capture's session and harness, or its range does
-    not contain the capture's. Otherwise ``_evidence_lacks``, which is ``[]``
-    when the capture would add nothing. The summary and instant are a span's own
-    and are never compared; the record keeps the capture's with the whole job."""
-    if not (isinstance(stored, dict) and isinstance(incoming, dict)):
-        return None
-    inner, outer = _transcript_span(incoming.get("transcript_range")), _transcript_span(stored.get("transcript_range"))
-    if inner is None or outer is None or outer[0] > inner[0] or inner[1] > outer[1]:
-        return None
-    if any(not incoming.get(k) or stored.get(k) != incoming.get(k) for k in ("session_id", "harness")):
+    None unless ``_span_contains``, ``_span_same_window`` and not
+    ``_span_rewound``. Otherwise ``_evidence_lacks``, which is ``[]`` when the
+    capture carries no evidence field the row lacks. That is all it proves: the
+    summary is a span's own and is never compared, and a range does not show the
+    same text. The record keeps the capture's summary with the whole job."""
+    if not _span_contains(stored, incoming) or not _span_same_window(stored, incoming) \
+            or _span_rewound(stored, incoming):
         return None
     return _evidence_lacks(stored, incoming)
 

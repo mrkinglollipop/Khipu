@@ -272,17 +272,25 @@ def held_counts() -> dict[str, int]:
         capture_held = len(session_capture.held_jobs())
     except Exception:  # noqa: BLE001 - a miss shows as zero; doctor's outbox row names the real problem
         capture_held = 0
-    return {"outbox_dead": _count(outbox.dead_dir(), "*.json"), "capture_held": capture_held}
+    try:
+        refused = outbox.announce_refused_count()
+    except Exception:  # noqa: BLE001 - a miss shows as zero; doctor's outbox row names the real problem
+        refused = 0
+    return {"outbox_dead": _count(outbox.dead_dir(), "*.json"), "outbox_announce_refused": refused,
+            "capture_held": capture_held}
 
 
 def warnings(counts: dict[str, int] | None = None, threshold: int = HELD_WARN_COUNT) -> list[str]:
     counts = held_counts() if counts is None else counts
     out = []
-    for key, where, next_step in (
-            ("outbox_dead", "the outbox's dead folder",
-             "Start with `khipu outbox span-covered`, a dry run that changes nothing and counts the ones other "
-             "episodes already cover. `khipu outbox retry-dead` may land those as duplicates."),
-            ("capture_held", "the capture queue", "Run `khipu outbox retry-dead` or look at them.")):
+    retry = "Run `khipu outbox retry-dead` or look at them."
+    refused = counts.get("outbox_announce_refused", 0)
+    dead_step = retry if not refused else (
+        f"{refused} of them were refused for not announcing source identities: start with `khipu outbox span-covered`, "
+        "a dry run that changes nothing and counts those whose range and evidence fields another episode holds. "
+        "`khipu outbox retry-dead` may land those as duplicates.")
+    for key, where, next_step in (("outbox_dead", "the outbox's dead folder", dead_step),
+                                  ("capture_held", "the capture queue", retry)):
         if counts.get(key, 0) > threshold:
             out.append(f"{counts[key]} jobs are held in {where} and wait for the owner (more than {threshold}); "
                        f"they are never removed on their own. {next_step}")

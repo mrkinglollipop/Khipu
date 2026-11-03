@@ -109,9 +109,10 @@ ACTIONS: frozenset[str] = frozenset({
 # them with this question, and the command's ``--owner-direction`` passes only
 # in the replay of a request ``confirm`` proved he answered (``replaying``).
 CONFIRM_ONLY: dict[str, str] = {
-    "outbox.span_covered": ("Retire the dead outbox jobs that `khipu outbox span-covered` proves other episodes "
-                            "already cover? Each moves to the outbox's resolved folder with its record; nothing is "
-                            "written to the hub."),
+    "outbox.span_covered": ("Retire the dead outbox jobs `khipu outbox span-covered` counts? Each has a live episode "
+                            "whose range contains its own and which holds every evidence field it carries. Summaries "
+                            "are not compared and a range does not prove the same text, so each job's own summary "
+                            "then stays only in the local record; nothing is written to the hub."),
 }
 
 # Routing changes that apply as soon as the owner types them (2026-11-03, owner
@@ -2175,7 +2176,7 @@ _PUSH_WORDS = {
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
     "outbox.merge_preferences": "Merged preferences held only in memory-file lines into the hub",
-    "outbox.span_covered": "Retired dead outbox jobs other episodes already cover",
+    "outbox.span_covered": "Retired dead outbox jobs whose range and evidence fields another episode holds",
 }
 
 
