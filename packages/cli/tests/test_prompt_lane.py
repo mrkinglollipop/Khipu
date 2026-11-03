@@ -369,12 +369,11 @@ class DoctorOutcomesTest(unittest.TestCase):
         ]
         self._write(lines)
         out = rp.prompt_recall_outcomes()
-        # No searched calls at all: still insufficient; yellow when the file
-        # exists but holds nothing countable, hard red only when missing.
+        # No searched calls at all: nothing to measure, so not ok.
         self.assertTrue(out["insufficient"])
         self.assertEqual(out["count"], 0)
-        self.assertTrue(out["ok"])
-        self.assertEqual(out.get("level"), "amber")
+        self.assertFalse(out["ok"])
+        self.assertTrue(out.get("unmeasured"))
 
     def test_calls_outside_the_7_day_window_are_excluded(self) -> None:
         now = datetime(2026, 9, 28, tzinfo=timezone.utc)

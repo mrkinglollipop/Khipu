@@ -4662,6 +4662,11 @@ def refresh() -> dict[str, Any]:
     try:
         out = _refresh_locked()
     except memory_lock.MemoryLockError as exc:
+        if "busy until the deadline" in str(exc):
+            # A forget holding the memory lock past the wait is the same
+            # deferral as an overlapping dump, not a failure of this one.
+            return {"ok": False, "busy": True,
+                    "error": f"hub snapshot refresh already in progress ({exc})"}
         return {"ok": False, "error": str(exc)}
     if out.get("ok"):
         out["facts"] = copy_facts()
@@ -4880,33 +4885,36 @@ def _graph_temp_dirs() -> list[Path]:
     return [Path("/tmp"), Path("/var/tmp")]
 
 
-def _is_open_by_live_refresher(path: Path) -> bool:
-    """True when ``path`` looks like a temp a live dump still holds open:
-    another process holds the refresh lock and this file's mtime is young
-    enough that a dump could still be writing it. Age alone already keeps
-    young files; this refuses to unlink a borderline one while the lock is
-    held."""
+_LSOF_TIMEOUT_S = 5.0
+
+
+def _held_open(path: Path) -> bool:
+    """True when any process may have ``path`` open. Asks ``lsof -t -- path``;
+    an lsof that is missing, errors, or times out answers "maybe open" (True),
+    so a temp is never unlinked on a guess. Exit 1 with no output is lsof's
+    "nothing has it open"."""
+    import subprocess
+
     try:
-        age = time.time() - path.stat().st_mtime
-    except OSError:
-        return False
-    if age >= STALE_TEMP_AGE_S:
-        return False
-    lock = _acquire_refresh_lock()
-    if lock is None:
+        proc = subprocess.run(["lsof", "-t", "--", str(path)], capture_output=True, text=True,
+                              timeout=_LSOF_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
         return True
-    _release_refresh_lock(lock)
-    return False
+    if proc.stdout.strip():
+        return True
+    return proc.returncode not in (0, 1)
 
 
 def _sweep_graph_build_temps(directories: list[Path] | None = None,
-                             *, now: float | None = None) -> tuple[list[str], int]:
-    """Remove ``graph_build_*.sqlite`` past the age limit. Returns
-    (removed names, how many matching files were left). Never touches any
-    other pattern."""
+                             *, now: float | None = None) -> tuple[list[str], int, int]:
+    """Remove ``graph_build_*.sqlite`` past the age limit that no process has
+    open. Returns (removed names, how many matching files were left, how many
+    of those were left because something may hold them open). Never touches
+    any other pattern."""
     now = time.time() if now is None else now
     removed: list[str] = []
     left = 0
+    held = 0
     for directory in directories if directories is not None else _graph_temp_dirs():
         try:
             entries = list(os.scandir(directory))
@@ -4924,26 +4932,34 @@ def _sweep_graph_build_temps(directories: list[Path] | None = None,
                 if age < STALE_TEMP_AGE_S:
                     left += 1
                     continue
+                if _held_open(Path(entry.path)):
+                    left += 1
+                    held += 1
+                    continue
                 Path(entry.path).unlink(missing_ok=True)
                 removed.append(name)
             except OSError:
                 left += 1
                 continue
-    return removed, left
+    return removed, left, held
 
 
 def sweep_stale_temps() -> dict[str, Any]:
     """Remove leftover temporary replica files and killed graph-build temps
-    by age. Does not need the refresh lock. Never deletes a temp a live
-    refresher still holds open, and never anything but the exact patterns
-    (``.hub_snapshot.*.sqlite`` sidecars; ``graph_build_*.sqlite``). Reports
-    how many matching files were left behind."""
+    by age. Does not need the refresh lock. A candidate is checked with
+    ``lsof`` just before it is unlinked and skipped when any process may have
+    it open (``skipped_open``), so a temp a live refresher holds is never
+    deleted. Only the exact patterns (``.hub_snapshot.*.sqlite`` sidecars;
+    ``graph_build_*.sqlite``) are touched. Reports how many matching files
+    were left behind (``left``)."""
     removed: list[str] = []
     left = 0
+    held = 0
     directory = snapshot_path().parent
     for path in stale_replica_temps(directory):
-        if _is_open_by_live_refresher(path):
+        if _held_open(path):
             left += 1
+            held += 1
             continue
         try:
             path.unlink(missing_ok=True)
@@ -4962,10 +4978,11 @@ def sweep_stale_temps() -> dict[str, Any]:
                     continue
     except OSError:
         pass
-    graph_removed, graph_left = _sweep_graph_build_temps()
+    graph_removed, graph_left, graph_held = _sweep_graph_build_temps()
     removed.extend(graph_removed)
     left += graph_left
-    return {"ok": True, "removed": removed, "left": left}
+    held += graph_held
+    return {"ok": True, "removed": removed, "left": left, "skipped_open": held}
 
 
 def _acquire_refresh_lock():

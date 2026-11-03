@@ -1012,17 +1012,18 @@ def _shared_slowness_note(run: dict[str, Any], refs: tuple[Any, ...]) -> str | N
     return f"{ms:.0f} ms, reference {max(given):.0f} ms: shared slowness, not the candidate"
 
 
-def _search_problem(run: dict[str, Any], refs: tuple[Any, ...] = ()) -> str | None:
+def _search_problem(run: dict[str, Any], refs: tuple[Any, ...] = (),
+                    live: dict[str, Any] | None = None) -> str | None:
     """Why one replayed run's own search fails the step, or None: the hook
     exited non-zero or wrote no JSON, wrote no summary line, timed out or
     failed, or took longer than ``RECALL_BUDGET_MS`` and longer than every
     reference time in ``refs`` plus ``SLOWNESS_SLACK_MS`` (``_slower_than``).
     The same test for the run with routing off and the run with routing on.
 
-    A ``timeout>…`` reason is judged against the same live slack as a slow
-    ``ok`` run: under load live times out too, and that alone must not
-    refuse the candidate. A timeout where every reference succeeded under
-    the budget (or no reference was given) still refuses."""
+    A candidate ``timeout>…`` is forgiven only when ``live`` (the live
+    hook's own run on the same prompt) timed out too: shared load, not the
+    candidate. A live that answered, however slowly, makes the candidate's
+    timeout a refusal; so does no live run to compare with."""
     if run["exit"] != 0 or not run["valid_json"]:
         return f"hook exit {run['exit']}, valid_json={run['valid_json']}"
     reason = run.get("reason")
@@ -1031,10 +1032,8 @@ def _search_problem(run: dict[str, Any], refs: tuple[Any, ...] = ()) -> str | No
     if reason.startswith(("error", "gate error")):
         return reason
     if isinstance(reason, str) and reason.startswith("timeout"):
-        # Live also at or past the budget: shared load, not a refuse. A
-        # timeout where live succeeded under the budget still refuses.
-        given = [r for r in refs if r is not None]
-        if given and all(r >= RECALL_BUDGET_MS for r in given):
+        live_reason = (live or {}).get("reason")
+        if isinstance(live_reason, str) and live_reason.startswith("timeout"):
             return None
         return reason
     if _slower_than(run, refs):
@@ -1081,7 +1080,7 @@ def _off_problem(label: str, live: dict[str, Any] | None, cand: dict[str, Any]) 
     (``_empty_by_timing``) or the candidate's relevance gate abstained
     (``_abstained``). The same test for the first run and the replayed
     one."""
-    what = _search_problem(cand, ((live or {}).get("ms"),))
+    what = _search_problem(cand, ((live or {}).get("ms"),), live)
     if what:
         return f"{label}: {what}"
     live_hits = (live or {}).get("hits") or []
@@ -1113,7 +1112,7 @@ def _routing_problem(label: str, off: dict[str, Any], on: dict[str, Any],
         return f"{label}: with routing on, {what} (routing={status})"
     if on.get("push") is True and not status and on.get("reason") is not None:
         return f"{label}: with routing on, the candidate's push is on but its hook logged no routing status"
-    what = _search_problem(on, (off.get("ms"), (live or {}).get("ms")))
+    what = _search_problem(on, (off.get("ms"), (live or {}).get("ms")), live)
     if what:
         return f"{label}: with routing on, {what}"
     if _comparable(off, on) and on["hits"] != off["hits"]:

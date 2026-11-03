@@ -3965,9 +3965,18 @@ def prompt_recall_outcomes(*, now: datetime | None = None,
     if total < _OUTCOMES_MIN_CALLS:
         if lookback >= _OUTCOMES_MIN_CALLS:
             return {**base, "ok": True, "insufficient": True, "quiet": True}
-        # A thin sample (< 20 searched calls in seven days) is yellow, not a
-        # hard red that alone blocks a promote: the lane has not been exercised.
-        return {**base, "ok": True, "insufficient": True, "level": "amber"}
+        if total == 0:
+            # Nothing was searched in the window and the week was not busy
+            # enough to call the lane merely quiet: there is nothing to
+            # measure, and a check that could not measure must not read ok.
+            return {**base, "ok": False, "insufficient": True, "unmeasured": True,
+                    "error": "no recall calls to measure in the last 7 days",
+                    "fix": "check the prompt-recall hook is installed and firing"}
+        # A thin but nonzero sample (< 20 searched calls in seven days) is
+        # yellow, not a hard red that alone blocks a promote.
+        return {**base, "ok": True, "insufficient": True, "level": "amber",
+                "message": f"only {total} recall call(s) to judge so far (fewer than "
+                           f"{_OUTCOMES_MIN_CALLS}); the lane has barely been exercised"}
 
     timeouts = sum(1 for category, _ms in calls if category == "timeout")
     errors = sum(1 for category, _ms in calls if category == "error")
@@ -3997,6 +4006,8 @@ def prompt_recall_outcomes(*, now: datetime | None = None,
     if timeout_only:
         out["level"] = "amber"
         out["timeout_only"] = True
+        out["message"] = (f"{timeouts} of the last {total} recall calls missed the deadline "
+                          f"(timeouts only, under load)")
         out["reason"] = (
             f"{timeouts} of the last {total} recall attempts in the last "
             f"{window_minutes} minutes missed the deadline under load (timeouts only; not a hard red)"

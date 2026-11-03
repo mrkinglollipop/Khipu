@@ -880,10 +880,12 @@ def test_replay_fails_a_candidate_slower_than_live_at_the_median(home, monkeypat
 
 def test_a_timeout_reason_uses_the_live_slack():
     run = {"exit": 0, "valid_json": True, "reason": "timeout>1.2s", "ms": 1250.0, "hits": []}
-    # Live was also past the budget: shared load, not a refuse.
-    assert pm._search_problem(run, (1300.0,)) is None
-    # Live succeeded well under the budget: the candidate's timeout refuses.
-    assert pm._search_problem(run, (300.0,)) == "timeout>1.2s"
+    # Live also timed out: shared load, not a refuse.
+    live_timeout = {"exit": 0, "valid_json": True, "reason": "timeout>1.2s", "ms": 1300.0, "hits": []}
+    assert pm._search_problem(run, (1300.0,), live_timeout) is None
+    # Live succeeded under the budget: the candidate's timeout refuses.
+    live_ok = {"exit": 0, "valid_json": True, "reason": "ok", "ms": 300.0, "hits": []}
+    assert pm._search_problem(run, (300.0,), live_ok) == "timeout>1.2s"
 
 
 def test_replay_fails_routing_on_only_when_slower_than_both_references(home, monkeypatch):

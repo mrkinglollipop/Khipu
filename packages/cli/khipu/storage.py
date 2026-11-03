@@ -368,8 +368,8 @@ def _gb(n: int) -> str:
 
 def _disk_write_targets() -> list[tuple[str, Path]]:
     """Every distinct place Khipu writes that can sit on its own volume:
-    the data dir, the process temp dir, graph-build staging dirs, the
-    inactive live slot, and a configured worktree root when one is set."""
+    the data dir, the process temp dir, graph-build staging dirs, and the
+    inactive live slot."""
     import tempfile
 
     from khipu.paths import data_dir
@@ -386,17 +386,6 @@ def _disk_write_targets() -> list[tuple[str, Path]]:
         targets.append(("inactive live slot", promote.inactive_slot()))
     except Exception:  # noqa: BLE001 — a missing slot must not break the check
         pass
-    try:
-        from khipu.config import load_config
-
-        raw = load_config().get("worktree_root")
-        if isinstance(raw, str) and raw.strip():
-            targets.append(("worktree root", Path(raw.strip())))
-    except Exception:  # noqa: BLE001
-        pass
-    env_root = (os.environ.get("KHIPU_WORKTREE_ROOT") or "").strip()
-    if env_root:
-        targets.append(("worktree root", Path(env_root)))
     return targets
 
 

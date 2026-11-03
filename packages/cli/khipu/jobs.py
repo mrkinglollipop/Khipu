@@ -466,15 +466,7 @@ def _run_nightly_locked() -> int:
     steps: list[dict[str, Any]] = []
     # Capture last night's briefs outcome before this run overwrites the
     # receipt: a second night of lock-held deferral goes red.
-    prev_briefs: dict[str, Any] | None = None
-    try:
-        prev = nightly_last()
-        if isinstance(prev, dict) and isinstance(prev.get("steps"), list):
-            for entry in prev["steps"]:
-                if isinstance(entry, dict) and entry.get("name") == "briefs_build":
-                    prev_briefs = entry
-    except Exception:  # noqa: BLE001
-        prev_briefs = None
+    _capture_previous_briefs_step()
     drain_result = _step_result(_drain_sessions())
     _record_nightly_step(steps, "sessions_drain", **drain_result)
     driver_error = None
@@ -511,7 +503,7 @@ def _run_nightly_locked() -> int:
                          deferred=recall_eval_result.get("deferred")
                          if isinstance(recall_eval_result, dict) else None)
     _record_nightly_step(steps, "snapshot_refresh", **_step_result(_refresh_snapshot()))
-    briefs_result = _briefs_build_if_on(previous=prev_briefs)
+    briefs_result = _briefs_build_if_on()
     if briefs_result is not None:
         briefs_step = _step_result(briefs_result)
         _record_nightly_step(steps, "briefs_build", **briefs_step,
@@ -598,8 +590,10 @@ _REFRESH_HELD_FRESH_S = 15 * 60
 
 
 def _refresh_busy(out: Mapping[str, Any] | None) -> bool:
+    if (out or {}).get("busy"):
+        return True
     err = str((out or {}).get("error") or "").lower()
-    return "in progress" in err or "already in progress" in err
+    return "in progress" in err or "memory lock busy" in err
 
 
 def _wait_refresh_idle(deadline_s: float = _REFRESH_IDLE_WAIT_S) -> bool:
@@ -615,6 +609,22 @@ def _wait_refresh_idle(deadline_s: float = _REFRESH_IDLE_WAIT_S) -> bool:
         if time.monotonic() >= end:
             return False
         time.sleep(min(0.2, max(0.0, end - time.monotonic())))
+
+
+def _still_busy_result() -> dict[str, Any]:
+    """The refresh stayed busy to the end of the wait. A deferral is only
+    honest while the replica is fresh; a replica days old is a failure."""
+    from khipu import hub_snapshot
+
+    msg = "hub snapshot refresh already in progress"
+    try:
+        age = (hub_snapshot.snapshot_health() or {}).get("age_seconds")
+    except Exception:  # noqa: BLE001 — an unreadable replica is not known fresh
+        age = None
+    if isinstance(age, (int, float)) and 0 <= age <= _REFRESH_HELD_FRESH_S:
+        return {"ok": True, "deferred": msg}
+    return {"ok": False, "error": f"{msg}, and the replica is stale"
+            + (f" ({int(age)}s old)" if isinstance(age, (int, float)) else " (no usable age)")}
 
 
 def _refresh_snapshot() -> dict[str, Any]:
@@ -650,7 +660,7 @@ def _refresh_snapshot() -> dict[str, Any]:
             if idle:
                 out = hub_snapshot.refresh()
                 if _refresh_busy(out):
-                    return {"ok": True, "deferred": "hub snapshot refresh already in progress"}
+                    return _still_busy_result()
                 if not out.get("ok"):
                     # Holder finished but the replica is still stale and our
                     # own dump could not run: that is tonight's failure.
@@ -661,7 +671,7 @@ def _refresh_snapshot() -> dict[str, Any]:
                                 + str(out.get("error") or "refresh failed")}
                 # Fall through to the normal ok / facts handling below.
             else:
-                return {"ok": True, "deferred": "hub snapshot refresh already in progress"}
+                return _still_busy_result()
         res = {"ok": bool(out.get("ok")), **{k: v for k, v in out.items() if k != "path"}}
         # The dump is only half of this step: the fact copy that follows it
         # must not fail unseen behind an ok dump. A copy that gave up because
@@ -700,15 +710,40 @@ def _drain_sessions() -> dict[str, Any]:
 BRIEFS_NIGHTLY_LIMIT = 40
 
 
-def _briefs_build_if_on(*, previous: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+_UNCAPTURED: Any = object()
+# Last night's ``briefs_build`` step, captured by the nightly before its own
+# receipt overwrites it (``_UNCAPTURED`` outside a nightly run).
+_PREVIOUS_BRIEFS_STEP: Any = _UNCAPTURED
+
+
+def _read_briefs_step() -> dict[str, Any] | None:
+    try:
+        data = nightly_last() or {}
+        found = None
+        if isinstance(data.get("steps"), list):
+            for entry in data["steps"]:
+                if isinstance(entry, dict) and entry.get("name") == "briefs_build":
+                    found = entry
+        return found
+    except Exception:  # noqa: BLE001 — a broken receipt must not fail the night
+        return None
+
+
+def _capture_previous_briefs_step() -> None:
+    global _PREVIOUS_BRIEFS_STEP
+    _PREVIOUS_BRIEFS_STEP = _read_briefs_step()
+
+
+def _briefs_build_if_on() -> dict[str, Any] | None:
     """Rebuild the stale or missing source-backed briefs, at most
     BRIEFS_NIGHTLY_LIMIT a night. ``None`` (no step recorded) while the
     `briefs` switch is off, so an unswitched nightly is unchanged. The
     advisory lock is the same one `khipu briefs build` takes: a manual build
     in flight means this one builds nothing rather than racing it. A lock
     held is a deferral (not "built 0" green); two nights running still
-    deferred goes red. ``previous`` is last night's briefs step (captured
-    before this run overwrites the receipt). Fail-open like every step here:
+    deferred goes red; last night's briefs step is the one the nightly
+    captured before this run overwrote the receipt (else read from the
+    receipt). Fail-open like every step here:
     it never raises."""
     try:
         from khipu import briefs, features
@@ -721,16 +756,8 @@ def _briefs_build_if_on(*, previous: Mapping[str, Any] | None = None) -> dict[st
             with conn.cursor() as cur:
                 if not briefs.acquire_build_lock(cur):
                     _nightly_log("[khipu-briefs] another build holds the lock; deferred")
-                    prev = previous
-                    if prev is None:
-                        try:
-                            data = nightly_last() or {}
-                            if isinstance(data.get("steps"), list):
-                                for entry in data["steps"]:
-                                    if isinstance(entry, dict) and entry.get("name") == "briefs_build":
-                                        prev = entry
-                        except Exception:  # noqa: BLE001 — a broken receipt must not fail the night
-                            prev = None
+                    prev = (_PREVIOUS_BRIEFS_STEP if _PREVIOUS_BRIEFS_STEP is not _UNCAPTURED
+                            else _read_briefs_step())
                     again = bool(prev and (prev.get("deferred") or (
                         isinstance(prev.get("counts"), dict) and prev["counts"].get("reason") == "lock held")
                         or prev.get("reason") == "lock held"))
@@ -1495,6 +1522,16 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
                     "error": "scheduled nightly has no usable recent step receipt or first-run evidence",
                     "fix": "run `khipu jobs status` and inspect the nightly logs",
                     "source": source,
+                }
+                continue
+            if last_run is not None:
+                # The nightly has run (recently) yet left no receipt for this
+                # step: nothing was measured, and an unmeasured check must not
+                # read ok. Only a fresh install that has never run is skipped.
+                out[doctor_key] = {
+                    "ok": False, "applicable": True, "unmeasured": True,
+                    "error": "the nightly ran recently but left no receipt for this step",
+                    "fix": fix, "ts": last_run, "source": source,
                 }
                 continue
             out[doctor_key] = {

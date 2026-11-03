@@ -129,26 +129,66 @@ def test_sweep_reclaims_graph_build_temps_without_the_refresh_lock(tmp_path, mon
         hs._release_refresh_lock(lock)
 
 
-def test_sweep_never_claims_success_for_doing_nothing_when_busy_with_stale(tmp_path, monkeypatch):
+def test_sweep_never_deletes_an_old_temp_a_live_process_holds_open(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("KHIPU_TEST", "1")
+    private = tmp_path / "tmp"
+    private.mkdir()
+    old = tmp_path / ".hub_snapshot.old.sqlite"
+    old.write_bytes(b"pages")
+    old_graph = private / "graph_build_held.sqlite"
+    old_graph.write_bytes(b"graph")
+    free_graph = private / "graph_build_free.sqlite"
+    free_graph.write_bytes(b"graph")
+    then = time.time() - hs.STALE_TEMP_AGE_S - 1
+    for f in (old, old_graph, free_graph):
+        os.utime(f, (then, then))
+    lock = hs._acquire_refresh_lock()
+    assert lock is not None
+    holders = [open(old, "rb"), open(old_graph, "rb")]
+    try:
+        with mock.patch.object(hs, "snapshot_path", return_value=tmp_path / "hub_snapshot.sqlite"), \
+                mock.patch.object(hs, "_graph_temp_dirs", return_value=[private]):
+            out = hs.sweep_stale_temps()
+            assert out["ok"] is True
+            # Held open: left alone and counted. The unheld old graph temp goes.
+            assert old.exists() and old_graph.exists()
+            assert not free_graph.exists()
+            assert out["removed"] == [free_graph.name]
+            assert out["skipped_open"] == 2
+            assert out["left"] >= 2
+            for h in holders:
+                h.close()
+            holders = []
+            again = hs.sweep_stale_temps()
+        assert not old.exists() and not old_graph.exists()
+        assert sorted(again["removed"]) == sorted([old.name, old_graph.name])
+        assert again["skipped_open"] == 0
+    finally:
+        for h in holders:
+            h.close()
+        hs._release_refresh_lock(lock)
+
+
+@pytest.mark.parametrize("failure", [FileNotFoundError("no lsof"),
+                                     __import__("subprocess").TimeoutExpired("lsof", 5)])
+def test_sweep_skips_a_temp_when_lsof_cannot_answer(tmp_path, monkeypatch, failure):
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("KHIPU_TEST", "1")
     old = tmp_path / ".hub_snapshot.old.sqlite"
     old.write_bytes(b"pages")
     then = time.time() - hs.STALE_TEMP_AGE_S - 1
     os.utime(old, (then, then))
-    lock = hs._acquire_refresh_lock()
-    assert lock is not None
-    try:
-        with mock.patch.object(hs, "snapshot_path", return_value=tmp_path / "hub_snapshot.sqlite"), \
-                mock.patch.object(hs, "_graph_temp_dirs", return_value=[]):
-            out = hs.sweep_stale_temps()
-        # Age-based reclaim must still remove the leftover even while a dump
-        # holds the refresh lock (the leftover is not that dump's open file).
-        assert out["ok"] is True
-        assert old.name in out.get("removed", [])
-        assert not old.exists()
-    finally:
-        hs._release_refresh_lock(lock)
+
+    def broken(*a, **k):
+        raise failure
+
+    with mock.patch("subprocess.run", side_effect=broken), \
+            mock.patch.object(hs, "snapshot_path", return_value=tmp_path / "hub_snapshot.sqlite"), \
+            mock.patch.object(hs, "_graph_temp_dirs", return_value=[]):
+        out = hs.sweep_stale_temps()
+    assert old.exists()
+    assert out["removed"] == [] and out["skipped_open"] == 1
 
 
 # ---- 3. disk_space covers every volume Khipu writes ----
@@ -194,37 +234,6 @@ def test_disk_space_stats_the_inactive_live_slot(tmp_path, monkeypatch):
     assert any("inactive" in lab.lower() or "live" in lab.lower() for lab in labels), labels
     assert out["level"] == "red"
     assert out["ok"] is False
-
-
-def test_disk_space_stats_a_configured_worktree_root(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("KHIPU_TEST", "1")
-    (tmp_path / "data").mkdir()
-    wt = tmp_path / "worktrees"
-    wt.mkdir()
-    monkeypatch.setattr("khipu.config.load_config", lambda: {"worktree_root": str(wt)})
-
-    real_stat = Path.stat
-
-    def fake_stat(self, *a, **k):
-        st = real_stat(self, *a, **k)
-        if "worktrees" in str(self):
-            return os.stat_result((st.st_mode, st.st_ino, 88888, st.st_nlink, st.st_uid, st.st_gid,
-                                   st.st_size, st.st_atime, st.st_mtime, st.st_ctime))
-        return st
-
-    def fake_usage(path):
-        import shutil as _sh
-        if "worktrees" in str(path):
-            return _sh._ntuple_diskusage(int(100e9), int(98e9), int(2e9))
-        return _sh._ntuple_diskusage(int(400e9), int(100e9), int(300e9))
-
-    monkeypatch.setattr(Path, "stat", fake_stat)
-    monkeypatch.setattr(storage.shutil, "disk_usage", fake_usage)
-    out = storage.disk_space()
-    assert any("worktree" in v["label"].lower() for v in out["volumes"]), out["volumes"]
-    assert out["level"] == "red"
 
 
 # ---- 4. Doctor rows for every nightly step; prune/briefs tell the truth ----
@@ -314,7 +323,8 @@ def test_briefs_deferred_two_nights_running_goes_red(tmp_path, monkeypatch):
             mock.patch("khipu.db.connect", return_value=_Conn()), \
             mock.patch("khipu.briefs.acquire_build_lock", return_value=False), \
             mock.patch.object(jobs, "_nightly_log"):
-        out = jobs._briefs_build_if_on(previous=previous)
+        monkeypatch.setattr(jobs, "_PREVIOUS_BRIEFS_STEP", previous)
+        out = jobs._briefs_build_if_on()
     assert out["ok"] is False
     assert "deferred" in str(out.get("deferred") or out.get("error") or "").lower() or "lock" in str(
         out.get("error") or "").lower()
@@ -326,9 +336,16 @@ def test_briefs_deferred_two_nights_running_goes_red(tmp_path, monkeypatch):
 def test_search_problem_timeout_uses_live_slack():
     # Live was also past the budget: shared load, not the candidate.
     run = {"exit": 0, "valid_json": True, "reason": "timeout>1.2s", "ms": 1250.0, "hits": []}
-    assert pm._search_problem(run, (1300.0,)) is None
+    live_timeout = {"exit": 0, "valid_json": True, "reason": "timeout>1.2s", "ms": 1300.0, "hits": []}
+    assert pm._search_problem(run, (1300.0,), live_timeout) is None
     # Live succeeded well under budget: the candidate's timeout is a refusal.
-    assert pm._search_problem(run, (300.0,)) == "timeout>1.2s"
+    live_ok = {"exit": 0, "valid_json": True, "reason": "ok", "ms": 300.0, "hits": []}
+    assert pm._search_problem(run, (300.0,), live_ok) == "timeout>1.2s"
+    # Live succeeded slowly (1250 ms, no timeout): still a refusal.
+    live_slow = {"exit": 0, "valid_json": True, "reason": "ok", "ms": 1250.0, "hits": []}
+    assert pm._search_problem(run, (1250.0,), live_slow) == "timeout>1.2s"
+    # No live run to compare with: refuse.
+    assert pm._search_problem(run, (1300.0,)) == "timeout>1.2s"
 
 
 def test_promote_refuses_candidate_timeout_where_live_succeeded(home, monkeypatch):
@@ -504,3 +521,106 @@ def _one_query(home):
 def _many_queries(home, n):
     from tests.test_promote import _many_queries as real
     return real(home, n)
+
+
+def test_replay_refuses_candidate_timeout_where_live_succeeded_slowly(home, monkeypatch):
+    """Live ok at 1250 ms (slow, but an answer); the candidate times out."""
+    candidate = _one_query(home)
+
+    def fake_run(argv, *, env=None, input=None, cwd=None, timeout=120):
+        import subprocess
+        if argv[1:2] == ["-c"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"push": True}) + "\n", "")
+        cand = "/candidate/packages/" in argv[0]
+        reason = "timeout>1.2s" if cand else "ok"
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (f"{stamp} [khipu-prompt-recall] session=s1 reason={reason} ms=1250.0 "
+                f"hits=['episode:3'] legs=['lexical'] degraded=None")
+        if env.get("KHIPU_FEATURE_ROUTING_PUSH") == "1":
+            line += " routing=full"
+        log = Path(env["KHIPU_CAPTURE_HOME"]) / "logs" / "prompt-recall.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(line + "\n")
+        return subprocess.CompletedProcess(argv, 0, '{"hookSpecificOutput": {}}\n', "")
+
+    monkeypatch.setattr(pm, "_run", fake_run)
+    out = pm.gate_recall_replay(candidate)
+    assert not out["ok"], out
+    assert "timeout" in out["detail"]
+
+
+def test_outcomes_with_nothing_to_measure_is_not_ok(tmp_path, monkeypatch):
+    log = tmp_path / "prompt-recall.log"
+    log.write_text("not a call\n")
+    monkeypatch.setattr(rp, "_log_path", lambda: log)
+    out = rp.prompt_recall_outcomes(now=datetime(2026, 9, 28, tzinfo=timezone.utc))
+    assert out["ok"] is False and out["unmeasured"] is True and out["count"] == 0
+    # A thin but nonzero sample stays yellow and carries a visible message.
+    ts = "2026-09-28T00:00:00Z"
+    log.write_text(f"{ts} [khipu-prompt-recall] session=s reason=ok ms=500.0 hits=[] legs=[] "
+                   "degraded=None\n")
+    thin = rp.prompt_recall_outcomes(now=datetime(2026, 9, 28, tzinfo=timezone.utc))
+    assert thin["ok"] is True and thin["level"] == "amber" and thin["message"]
+    assert not thin.get("unmeasured")
+
+
+def test_doctor_gate_and_warning_for_the_recall_outcomes_states():
+    from khipu import cli
+
+    unmeasured = {"prompt_recall_outcomes": {"ok": False, "unmeasured": True}}
+    assert bool(unmeasured["prompt_recall_outcomes"].get("ok")) is False
+    thin = {"prompt_recall_outcomes": {"ok": True, "level": "amber", "message": "only 3 recall call(s)"}}
+    assert cli._recall_outcomes_warnings(thin) == ["only 3 recall call(s)"]
+    assert cli._recall_outcomes_warnings(unmeasured) == []
+
+
+def test_doctor_step_without_a_receipt_after_a_recent_nightly_is_not_ok(tmp_path, monkeypatch):
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    recent = datetime.now(timezone.utc).isoformat()
+    (tmp_path / "nightly-last.json").write_text(json.dumps({"steps": [
+        {"name": "notes_reconcile", "ok": True, "error": None, "ts": recent},
+    ]}))
+    job = {"plist_loaded": True, "plist_mtime": time.time() - 86400, "last_exit": 0,
+           "last_exit_ts": recent, "last_run_iso": recent}
+    with mock.patch.object(jobs, "_is_index_sync_host", return_value=True), \
+            mock.patch.object(jobs, "ensure_data_dir", return_value=tmp_path), \
+            mock.patch.object(jobs, "_job_entry", return_value=job), \
+            mock.patch("khipu.features.enabled", return_value=False):
+        health = jobs.nightly_step_health()
+    row = health["summary_kind_backfill_ok"]
+    assert row["ok"] is False and row["unmeasured"] is True and not row.get("skipped")
+
+
+def test_memory_lock_busy_refresh_is_busy_not_a_failure(monkeypatch):
+    from khipu import memory_lock
+
+    def boom():
+        raise memory_lock.MemoryLockError("memory lock busy until the deadline")
+
+    monkeypatch.setattr(hs, "_refresh_locked", boom)
+    out = hs.refresh()
+    assert out["ok"] is False and jobs._refresh_busy(out)
+
+    def other():
+        raise memory_lock.MemoryLockError("memory lock unavailable: OSError")
+
+    monkeypatch.setattr(hs, "_refresh_locked", other)
+    assert not jobs._refresh_busy(hs.refresh())
+
+
+@pytest.mark.parametrize("path", ["idle_timeout", "still_busy"])
+def test_deferral_with_a_days_old_replica_is_a_failure(monkeypatch, path):
+    busy = {"ok": False, "error": "hub snapshot refresh already in progress"}
+    monkeypatch.setattr(jobs.time, "sleep", lambda s: None)
+    with mock.patch("khipu.hub_snapshot.refresh", return_value=busy), \
+            mock.patch("khipu.hub_snapshot.snapshot_health", return_value={
+                "exists": True, "age_seconds": 3 * 86400}), \
+            mock.patch.object(jobs, "_wait_refresh_idle", return_value=(path == "still_busy")):
+        res = jobs._refresh_snapshot()
+    assert res["ok"] is False and "stale" in res["error"]
+    with mock.patch("khipu.hub_snapshot.refresh", return_value=busy), \
+            mock.patch("khipu.hub_snapshot.snapshot_health", return_value={
+                "exists": True, "age_seconds": 60}), \
+            mock.patch.object(jobs, "_wait_refresh_idle", return_value=(path == "still_busy")):
+        ok = jobs._refresh_snapshot()
+    assert ok["ok"] is True and ok["deferred"]
