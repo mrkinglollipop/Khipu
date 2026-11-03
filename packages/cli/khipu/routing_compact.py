@@ -56,6 +56,7 @@ import contextlib
 import gzip
 import hashlib
 import warnings
+import zlib
 import json
 import os
 import secrets
@@ -944,11 +945,26 @@ def _replace(path: Path, body: bytes, name: str, archive_body: bytes) -> None:
 
 
 def _write_archive(target: Path, data: bytes) -> None:
-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
+    temp = target.parent / f".archive-{os.getpid()}-{secrets.token_hex(6)}.tmp"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, target)
+        _fsync_dir(target.parent)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _clean_archive_temps(now: datetime) -> None:
+    # A writer may be publishing outside this caller's lock. Only abandoned
+    # files older than a day are eligible; a failed live write cleans itself.
+    for path in archive_dir().glob(".archive-*.tmp"):
+        with contextlib.suppress(OSError):
+            if now.timestamp() - path.stat().st_mtime > 86400:
+                path.unlink()
 
 
 def _note(now: datetime, why: str) -> None:
@@ -993,10 +1009,20 @@ def full_log() -> list[bytes]:
     for _at, path in _archives():
         if not path.name.endswith(".gz"):
             continue
-        header, *left_out = gzip.decompress(path.read_bytes()).splitlines()
-        meta = json.loads(header)
-        if "generation" not in meta:
-            warnings.warn(f"Archive {path.name}: unverified generation; history unavailable", RuntimeWarning)
+        try:
+            header, *left_out = gzip.decompress(path.read_bytes()).splitlines()
+            meta = json.loads(header)
+            count, positions = meta["kept_count"], meta["positions"]
+            if (not isinstance(count, int) or count < 0 or not isinstance(positions, list)
+                    or len(positions) != len(left_out)
+                    or any(not isinstance(p, int) or p < 0 or p > count + i
+                           for i, p in enumerate(positions))
+                    or positions != sorted(set(positions))
+                    or meta["before"] != count + len(left_out)
+                    or not isinstance(meta["generation"], str) or not isinstance(meta["original"], str)):
+                raise ValueError("invalid archive header")
+        except (OSError, EOFError, ValueError, KeyError, TypeError, zlib.error):
+            warnings.warn(f"Archive {path.name} is damaged or unverified; its history is unavailable", RuntimeWarning)
             continue
         pending.append((meta, left_out))
     # Match by generation, not filename order (two compactions may share a second).
@@ -1008,12 +1034,13 @@ def full_log() -> list[bytes]:
                 continue
             restored = list(lines[:count])
             positions = meta["positions"]
-            if len(positions) != len(left_out):
-                raise ValueError("archive positions differ from its lines")
             for position, line in zip(positions, left_out):
                 restored.insert(position, line)
             if len(restored) != meta["before"] or _line_hash(restored) != meta["original"]:
-                raise ValueError("archive generation does not reconstruct its original")
+                warnings.warn("Archive generation is damaged; its history is unavailable", RuntimeWarning)
+                pending.pop(i)
+                matched = True
+                break
             lines = restored + lines[count:]
             pending.pop(i)
             matched = True
@@ -1026,6 +1053,7 @@ def full_log() -> list[bytes]:
 def prune_archives(now: datetime) -> int:
     """Remove archives past both ``ARCHIVE_KEEP_COUNT`` (the newest are kept)
     and ``ARCHIVE_KEEP_DAYS``. An archive inside either bound stays."""
+    _clean_archive_temps(now)
     removed = 0
     for rank, (at, path) in enumerate(_archives()):
         if rank >= ARCHIVE_KEEP_COUNT and now - at > timedelta(days=ARCHIVE_KEEP_DAYS):
