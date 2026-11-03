@@ -3,6 +3,7 @@ process writes every few hundred milliseconds. No timing assertions; run from
 ``packages/cli`` with the checkout under test first on the path:
 
     python -m tests.routing_prompt_bench [prompts] [write_every_ms]
+    python -m tests.routing_prompt_bench pre-ready [lines ...]
 
 Each prompt is a forked child of this process (as the per-prompt child is of the
 routing helper, which keeps its caches and its alias table fresh between requests) that calls ``routing.prompt_push``; the time is the
@@ -118,6 +119,82 @@ def run(prompts: int = 100, every_ms: int = 300) -> dict:
             "write_p95_ms": round(_percentile(writes, 95), 1) if writes else None}
 
 
+_PRE_READY = r"""
+import json, os, statistics, sys, time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+root, lines, runs = Path(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+os.environ.update(HOME=str(root), KHIPU_DATA_DIR=str(root / "data"), KHIPU_CAPTURE_HOME=str(root / "capture"),
+                  KHIPU_KEYCHAIN="0")
+(root / "data").mkdir(parents=True)
+(root / "data" / "config.json").write_text(json.dumps({"usage_accounts": [
+    {"label": "Claude", "harness": "claude"}, {"label": "Work", "harness": "claude", "home": str(root / ".claude-work")},
+    {"label": "Codex", "harness": "codex"}], "routing_reset_check": False}))
+from khipu import routing
+from tests import routing_compact_synth as synth
+keys = ["claude|", "claude|" + str(root / ".claude-work"), "codex|"]
+synth.write(routing.events_file(), synth.real_shape(keys, datetime.now(timezone.utc) - timedelta(minutes=5), total=lines))
+routing.read_view()
+routing.prompt_imports()
+from khipu import agent_view
+times, parses = [], 0
+for _ in range(runs):
+    read, write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read)
+        routing._ENTRY_INPUTS.clear()
+        routing._PARSED_LINE_CACHE.clear()
+        agent_view._TABLE.clear()
+        agent_view._TABLE.update(sig=None, at=0.0, table=None)
+        calls = []
+        real = routing._read_all_events
+        routing._read_all_events = lambda *a, **k: (calls.append(1), real(*a, **k))[1]
+        began = time.perf_counter()
+        # What ``recall_prompt._routing_child`` does before it writes "ready".
+        agent_view.prepare_routing_table(cold=True)
+        if not routing.push_off("prompt", environ=dict(os.environ)):
+            routing.prompt_budget()
+        took = (time.perf_counter() - began) * 1000
+        os.write(write, json.dumps([took, len(calls)]).encode())
+        os._exit(0)
+    os.close(write)
+    took, n = json.loads(os.read(read, 256))
+    os.close(read)
+    os.waitpid(pid, 0)
+    times.append(took)
+    parses = max(parses, n)
+began = time.perf_counter()
+routing._ENTRY_INPUTS.clear()
+routing._PARSED_LINE_CACHE.clear()
+routing._entry_cache()
+parse_ms = (time.perf_counter() - began) * 1000
+print(json.dumps({"lines": sum(1 for _ in routing.events_file().open()), "runs": runs,
+                  "pre_ready_ms": round(statistics.median(times), 2), "pre_ready_max_ms": round(max(times), 2),
+                  "parses": parses, "full_parse_ms": round(parse_ms, 1)}))
+"""
+
+
+def pre_ready(lines: int = 10_000, runs: int = 5, root: Path | None = None) -> dict:
+    """The per-prompt child's routing work before it says it is ready (the
+    alias inventory build and the push budget), median of ``runs`` cold
+    children forked from a process that has imported what the helper
+    imports, against a ``lines``-line log with a saved view. ``parses``: the
+    most whole-log parses any child made; ``full_parse_ms``: what one costs
+    here, which the child paid before its inventory came from the view. A
+    fresh interpreter, so the environment it sets stays its own."""
+    root = Path(tempfile.mkdtemp(prefix="khipu-pre-ready-")) if root is None else root
+    cwd = Path(__file__).resolve().parent.parent
+    out = subprocess.run([sys.executable, "-c", _PRE_READY, str(root), str(lines), str(runs)], cwd=cwd,
+                         env=dict(os.environ, PYTHONPATH=str(cwd)), capture_output=True, text=True, timeout=300,
+                         check=True)
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["pre-ready"]:
+        for n in [int(a) for a in sys.argv[2:]] or [1_000, 10_000]:
+            print(json.dumps(pre_ready(n), sort_keys=True))
+        sys.exit(0)
     args = [int(a) for a in sys.argv[1:]]
     print(json.dumps(run(*args), sort_keys=True))

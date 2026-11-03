@@ -587,7 +587,7 @@ def test_each_table_source_invalidates_warm_cache(owner, monkeypatch, tmp_path, 
     elif source == "environment":
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", fresh)
     elif source == "configured_paths":
-        monkeypatch.setattr(routing, "_configured_paths", lambda: [fresh])
+        monkeypatch.setattr(routing, "_configured_paths", lambda **kw: [fresh])
     elif source == "memory_root":
         monkeypatch.setenv("KHIPU_MEMORY_ROOT", fresh)
     elif source == "volumes":
