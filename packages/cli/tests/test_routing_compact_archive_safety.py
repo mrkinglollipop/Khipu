@@ -2,13 +2,12 @@
 import gzip
 import json
 import os
-from datetime import timedelta
 
 import pytest
 
 from khipu import routing, routing_compact as rc
 from tests import routing_compact_synth as synth
-from tests.test_routing_compact import END, _log, world
+from tests.test_routing_compact import END, _log, world  # noqa: F401
 
 
 def _chosen():
@@ -62,7 +61,6 @@ def test_abandoned_archive_temp_is_cleaned(world):
     folder.mkdir(parents=True)
     temp = folder / '.archive-abandoned.tmp'
     temp.write_bytes(b'partial')
-    os.utime(temp, (0, 0))
     rc.prune_archives(END)
     assert not temp.exists()
 

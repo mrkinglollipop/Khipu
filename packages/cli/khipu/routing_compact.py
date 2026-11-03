@@ -987,18 +987,19 @@ def _write_archive(target: Path, data: bytes) -> None:
         temp.unlink(missing_ok=True)
 
 
-def _clean_archive_temps(now: datetime) -> None:
-    # A writer may be publishing outside this caller's lock. Only abandoned
-    # files older than a day are eligible; a failed live write cleans itself.
-    for path in archive_dir().glob(".archive-*.tmp"):
-        with contextlib.suppress(OSError):
-            if now.timestamp() - path.stat().st_mtime > 86400:
+def _clean_archive_temps() -> None:
+    # The caller holds the routing lock, as every archive publisher does.
+    # Any remaining temporary file belongs to an interrupted publication.
+    for folder, pattern in ((archive_dir(), ".archive-*.tmp"), (_dir(), ".events-compact-*.tmp")):
+        for path in folder.glob(pattern):
+            with contextlib.suppress(OSError):
                 path.unlink()
 
 
 def _note(now: datetime, why: str) -> None:
     with contextlib.suppress(OSError):
-        _write_state(dict(_read_state(), attempted_at=routing._iso(now), result=f"skipped: {why}"))
+        with routing._lock():
+            _write_state(dict(_read_state(), attempted_at=routing._iso(now), result=f"skipped: {why}"))
 
 
 # ---- archives -------------------------------------------------------------------
@@ -1099,12 +1100,17 @@ def full_log() -> list[bytes]:
 
 
 def prune_archives(now: datetime) -> int:
+    with routing._lock():
+        return _prune_archives(now)
+
+
+def _prune_archives(now: datetime) -> int:
     """Expire by age/count, then enforce the absolute byte budget oldest first.
 
     Persist the retention boundary before deletion so a crash still reports
     the unavailable history. Owner lines are never stored in these archives.
     """
-    _clean_archive_temps(now)
+    _clean_archive_temps()
     archives = _archives()
     sizes = {}
     for _at, path in archives:
