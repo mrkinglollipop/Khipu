@@ -7976,33 +7976,125 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
     return rows, stored.get("until"), done
 
 
+def pending_amend_refusal(version: str, *, combine: bool = True) -> str:
+    """Why an owner amend is refused while a conversation's request waits,
+    naming the two owner actions that settle it (and, with ``combine``, the
+    amend that confirms it in the same yes)."""
+    out = (f"the priority is a conversation's request still waiting for you (version {version}): confirm or undo "
+           f"it before amending it (khipu_owner_act route.priority.confirm or route.priority.undo, each with expect "
+           f"{version})")
+    if combine:
+        out += (", or ask for the amend again through khipu_owner_act, whose ask names that request so one yes "
+                "confirms it and applies the amendment")
+    return out
+
+
+# The longest a pending request's changes may be to be confirmed in an
+# amend's own ask: past this the owner confirms or undoes it on its own.
+PENDING_ASK_MOST = 1600
+
+
+def _live_exceptions(entry: dict, now: datetime) -> dict:
+    return {x.get("id"): x for x in entry.get("exceptions") or []
+            if isinstance(x, dict) and (_parse(x.get("until")) or now) > now}
+
+
+def pending_priority_changes(view: dict, now: datetime | None = None) -> list[str] | None:
+    """What confirming a conversation's waiting priority request makes the
+    owner's, against the priority it replaced, each change in its full words
+    (never clipped): an account added or removed, a role, an end, a level, an
+    exception added, changed or ended, the order and the whole priority's
+    end. None when nothing is waiting."""
+    now = now or _now()
+    stored = view.get("priority_stored") or {}
+    if not stored.get("pending"):
+        return None
+    replaced = stored.get("replaced") or {}
+    now_rows = [e for e in stored.get("entries") or [] if isinstance(e, dict)]
+    was_rows = [e for e in replaced.get("entries") or [] if isinstance(e, dict)]
+    was = {e.get("account"): e for e in was_rows}
+    out: list[str] = []
+
+    def label(entry: dict) -> str:
+        return str(entry.get("label") or _label_for_key(str(entry.get("account"))))
+
+    for entry in now_rows:
+        name, old = label(entry), was.get(entry.get("account"))
+        if old is None:
+            out.append(f"add {name}" + (f": \"{entry['role']}\"" if entry.get("role") else "")
+                       + (f", until {entry['until']}" if entry.get("until") else ""))
+        else:
+            if (old.get("role") or "") != (entry.get("role") or ""):
+                out.append(f"{name}'s role: \"{entry.get('role') or ''}\"")
+            if old.get("until") != entry.get("until"):
+                out.append(f"{name} until {entry.get('until') or 'no end'}")
+        if (old or {}).get("level") != entry.get("level") and entry.get("level"):
+            out.append(f"{name} level: {entry['level'].get('claim')}")
+        before, after = _live_exceptions(old or {}, now), _live_exceptions(entry, now)
+        for key, exc in after.items():
+            if before.get(key) != exc:
+                share = exc.get("share_pct")
+                out.append(f"{name} exception until {exc.get('until')}"
+                           + (f", share {share:g}%" if isinstance(share, (int, float)) else "")
+                           + f": \"{exc.get('text')}\"")
+        out += [f"{name} exception ended: \"{exc.get('text')}\"" for key, exc in before.items() if key not in after]
+    named = {e.get("account") for e in now_rows}
+    out += [f"remove {label(e)}" for e in was_rows if e.get("account") not in named]
+    common = [e.get("account") for e in now_rows if e.get("account") in was]
+    if common != [e.get("account") for e in was_rows if e.get("account") in named]:
+        out.append("order: " + ", ".join(label(e) for e in now_rows))
+    if was_rows and stored.get("until") != replaced.get("until"):
+        out.append(f"whole priority until {stored.get('until') or 'no end'}")
+    return out or ["no change to the priority it replaced"]
+
+
 def amend_priority(account, *, append=None, role=None, until=None, exception=None, end_exception=None,
                    via: str, now: datetime | None = None, expect=None, holds: dict | None = None,
-                   share_pct=None) -> dict:
+                   share_pct=None, confirm_pending: bool = False) -> dict:
     """The owner's change to one account's entry in the priority (words added
     to its role, or its role replaced, and optionally its end; or an
     exception that lapses on its own, or the end of one), confirmed at once
     like ``set_priority``. Every other entry is left as it is.
     ``share_pct`` is an optional structured allowed share on a new exception.
-    ``expect`` is required, as for a set."""
+    ``expect`` is required, as for a set.
+
+    While a conversation's request waits, an owner write would confirm every
+    entry of it, which the owner may never have seen: refused, unless
+    ``confirm_pending`` says the owner's yes covered that request too (the
+    held ask named its changes). Then ``expect`` pins the request as shown, so
+    a newer one is refused, never confirmed unseen, and the confirm and the
+    amendment are written as one batch under the lock."""
     _needs_version(expect)
     now = now or _now()
     with _lock():
         _check_priority(expect, now)
-        if (read_view(now).get("priority") or {}).get("pending"):
-            # An owner write would confirm every entry of the conversation's
-            # request, which the owner never saw: he confirms or undoes it first.
-            raise RouteError("the priority is a conversation's request still waiting for you: confirm or undo it "
-                             "before amending it")
+        held = read_view(now).get("priority") or {}
+        if held.get("pending") and not confirm_pending:
+            raise RouteError(pending_amend_refusal(str(expect).strip()))
+        if confirm_pending and not held.get("pending"):
+            raise RouteError("nothing is waiting for your confirmation: amend without confirm_pending")
+        if confirm_pending and held.get("proposal_withheld"):
+            raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
         rows, whole, done = _amended_priority(account, append=append, role=role, until=until, exception=exception,
                                               end_exception=end_exception, now=now, conversation=False,
                                               by="owner", source=str(via), share_pct=share_pct)
         _check_role_budget(rows, now)
         # ``holds``: end or keep for each hold on an account it names, as a
         # set takes them (``_require_hold_choices``).
-        out = _owner_write({"type": "priority_set", "entries": rows, "until": whole,
-                            **({"holds": holds} if holds is not None else {})}, via)
-    return dict(out, entries=[e["label"] for e in rows], **done)
+        choices = {"holds": holds} if holds is not None else {}
+        if not confirm_pending:
+            out = _owner_write({"type": "priority_set", "entries": rows, "until": whole, **choices}, via)
+            return dict(out, entries=[e["label"] for e in rows], **done)
+        view = read_view(now)
+        proposal = next(p["id"] for p in view["proposals"].values()
+                        if p.get("kind") == "priority" and p.get("status") == "live")
+        stored = view.get("priority_stored") or {}
+        confirm = {"type": "priority_confirm", "entries": [dict(e) for e in stored.get("entries") or []],
+                   "confirm_proposal": proposal, **choices}
+        amend = {"type": "priority_set", "entries": rows, "until": whole, **choices}
+        written, view = _write_batch(owner_lines([confirm, amend], via), target=f"priority:{str(expect).strip()}")
+        out = _done(written[-1], view)
+    return dict(out, entries=[e["label"] for e in rows], confirmed_request=True, **done)
 
 
 def restore_priority(stored: dict, *, via: str, holds: dict | None = None, now: datetime | None = None) -> dict:
@@ -9591,7 +9683,8 @@ def _priority_warnings(view: dict, now: datetime, cfg: dict) -> list[str]:
     at = _parse(held.get("at"))
     if held.get("pending") and after and at is not None and (now - at).total_seconds() > after:
         out.append(f"Your priority was set by {held.get('pending_by') or 'a conversation'} at your request "
-                   f"{_ago(at, now)} and is not confirmed yet; confirm or undo it in Settings \u2192 Routing.")
+                   f"{_ago(at, now)} and is not confirmed yet; confirm or undo it in Settings \u2192 Routing, or "
+                   "tell any conversation to (khipu_owner_act route.priority.confirm or route.priority.undo).")
     first = held["entries"][0]
     entry = next((a for a in view["accounts"] if a["key"] == first["account"]), None)
     if entry is not None and entry["state"] in (LIMITED, PAUSED, DOWN):
@@ -10374,9 +10467,23 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
             mine = {f"account:{key}"} | {f"hold:{i}" for i in _holds_on(key, view)}
             pairs = [(e, line) for e, line in pairs
                      if e in mine or e.startswith("rule:") or e in ("note", "priority")]
-        return _for_agents({"since": out["since"], "epoch": out["epoch"], "version": out["version"],
-                            "complete": out["complete"], "entities": [_public_entity(e) for e, _line in pairs],
-                            "lines": [line for _e, line in pairs], "about": ABOUT}, view)
+        answer = {"since": out["since"], "epoch": out["epoch"], "version": out["version"],
+                  "complete": out["complete"], "entities": [_public_entity(e) for e, _line in pairs],
+                  "lines": [line for _e, line in pairs], "about": ABOUT}
+        # The priority's line here is the whole priority as it stands (and
+        # what a waiting request replaced): a conversation shown it has read
+        # that revision, as from a full read, so it can write against it
+        # without paying for the full record again. A stored line of a
+        # priority that has since gone is not the current revision.
+        shown = dict(pairs).get("priority")
+        current = view.get("priority") is not None and shown == change_line("priority", view, now)
+        if current:
+            answer["priority"] = {k: v for k, v in (_priority_receipt(view, now) or {}).items()
+                                  if k not in ("read", "changes")}
+        result = _for_agents(answer, view)
+        if current:
+            _record_read(view, priority=True)
+        return result
     out = {k: view[k] for k in _VIEW_FIELDS if k in view}
     out["generated_at"] = _iso(now)
     out["seed"] = _pick(view.get("seed"), ("at", "count"))
@@ -10693,14 +10800,41 @@ def conversation_priority(entries, *, until=None, owner_request: str, author: di
         return _conversation_priority_answer(written, now)
 
 
+# Characters of each change a priority write's receipt names.
+RECEIPT_CHANGE_WORDS = 120
+PRIORITY_READ_POINTER = ("This is a receipt, not the whole priority: read it with khipu_route since=<the version "
+                         "you last read> (which counts as shown) or view=priority.")
+
+
+def _priority_receipt(view: dict, now: datetime) -> dict | None:
+    """A priority write's answer about the priority: its version and owner
+    revision, whether it waits for the owner, each entry by label, id and
+    revision (what a later amend carries) and what the waiting request
+    changes, each change cut short. Never the whole priority and what it
+    replaced, which ``khipu_route`` gives (and records as shown)."""
+    held = view.get("priority")
+    if not held:
+        return None
+    kept = {e["account"]: e for e in (view.get("priority_stored") or {}).get("entries") or []}
+    out = {"version": view.get("priority_version"), "owner_revision": view.get("priority_owner_revision"),
+           "pending": bool(held.get("pending")), "confirmed": not held.get("pending"),
+           "pending_by": held.get("pending_by"),
+           "entries": [{"label": e["label"], "id": account_id(e["account"]),
+                        "revision": priority_entry_revision(kept.get(e["account"]) or e)} for e in held["entries"]],
+           "read": PRIORITY_READ_POINTER}
+    changes = pending_priority_changes(view, now)
+    if changes:
+        out["changes"] = [_word_clip(c, RECEIPT_CHANGE_WORDS) for c in changes]
+    return out
+
+
 def _conversation_priority_answer(written: dict, now: datetime | None) -> dict:
     view = read_view(now)
-    held = _public_priority(view, now or _now(), plan_facts(view, now or _now()))
     out = {k: written[k] for k in (*_WRITE_FIELDS, "exception_id", "exception_until", "exception_until_default",
                                    "exception_ended", "lost") if k in written}
     for entry in out.get("lost") or []:
         entry["id"] = account_id(entry.pop("account"))
-    out["priority"] = held
+    out["priority"] = _priority_receipt(view, now or _now())
     out["about"] = ABOUT
     return _for_agents(out, view)
 
@@ -12335,7 +12469,8 @@ def _priority_cli(args, now: datetime) -> int:
                              exception=getattr(args, "exception", None),
                              end_exception=getattr(args, "end_exception", None),
                              share_pct=getattr(args, "share_pct", None),
-                             via=via, now=now, expect=expect, holds=_holds_arg(args))
+                             via=via, now=now, expect=expect, holds=_holds_arg(args),
+                             confirm_pending=bool(getattr(args, "confirm_pending", False)))
     elif action == "confirm":
         out = confirm_priority(via=via, now=now, expect=expect, holds=_holds_arg(args))
     elif action == "undo":
@@ -12425,7 +12560,10 @@ def _priority_intent(args, action: str) -> dict | None:
                                                                ("exception", getattr(args, "exception", None)),
                                                                ("end_exception", getattr(args, "end_exception", None)),
                                                                ("share_pct", getattr(args, "share_pct", None)),
-                                                               ("holds", _holds_arg(args)))
+                                                               ("holds", _holds_arg(args)),
+                                                               ("confirm_pending",
+                                                                True if getattr(args, "confirm_pending", False)
+                                                                else None))
                                              if v is not None})
     if action != "set":
         return owner_direction.intent(f"route.priority.{action}", "priority")

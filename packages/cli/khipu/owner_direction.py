@@ -419,8 +419,10 @@ def ask_line(action: str, args: dict) -> str:
     return f"Confirm {action}" + (f" ({what})" if what else "") + "?"
 
 
-def hold(action: str, args: dict, *, env=None, now: float | None = None) -> dict:
+def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: str | None = None) -> dict:
     """Hold ``action`` with its checked ``args`` for the owner to confirm.
+    ``ask`` is the question to put to the owner when the plain one
+    (``ask_line``) would leave out what the yes also covers.
     Only a conversation that passes every refusal but the owner's
     confirmation can hold one: a job, a child thread or a call its
     conversation's hook did not record is refused as for a change. The
@@ -456,7 +458,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None) -> dict
                 extra["asks"] = {session: _ask_boundary(None, turns_, now, session)}
             request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
                        "created_ts": now, "created_at": _iso(now), "session": session,
-                       "ask": ask_line(action, args), **extra}
+                       "ask": ask or ask_line(action, args), **extra}
             state = _load(path)
             if state["erased"] != erased:
                 raise DirectionRefused("forgotten", "Khipu forgot this conversation's words while the request was "
@@ -2219,7 +2221,14 @@ def _receipt_what(want: dict, result, before=None) -> str:
         entry = next((e for e in held.get("entries") or [] if e["account"] == target), {}) or {}
         words = facts.get("exception") or facts.get("role") or facts.get("append") or entry.get("role")
         until = f" until {facts['until']}" if facts.get("exception") and facts.get("until") else ""
-        return f"Changed {entry.get('label') or routing._label_for_key(target)} in the priority{until}:" + _quoted(words)
+        changed = f"Changed {entry.get('label') or routing._label_for_key(target)} in the priority{until}:" + _quoted(words)
+        if facts.get("confirm_pending"):
+            # One yes covered both: name the conversation's request it confirmed.
+            prior = (before.get("replaced") or {}).get("entries") if isinstance(before, dict) else None
+            confirmed = _priority_changes((before or {}).get("entries") or [], prior or []) \
+                if isinstance(before, dict) else ""
+            return "Confirmed the priority request" + (f" ({confirmed})" if confirmed else "") + "; " + changed
+        return changed
     if action == "route.priority.undo":
         return "Undid the priority change"
     verb = "Confirmed" if action == "route.priority.confirm" else "Set"

@@ -40,8 +40,10 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.set": (("entries",), ("until", "expect", "holds")),
     # One account's entry only: ``append`` words to its role or ``role`` in its place (one of the two).
     # ``exception`` (with ``until`` as its end) adds a direction that lapses on its own; ``end_exception`` ends one.
+    # ``confirm_pending``: the owner's one yes also confirms the conversation's request waiting in the priority,
+    # pinned by ``expect``; added by the hold itself when a request waits, so its ask names that request.
     "route.priority.amend": (("account", "expect"), ("append", "role", "until", "exception", "end_exception",
-                                                     "share_pct", "holds")),
+                                                     "share_pct", "holds", "confirm_pending")),
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
@@ -100,7 +102,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions"}
+_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions",
+          "confirm_pending"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -313,7 +316,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
                        "exception (a direction with an end, with until) or end_exception (an exception's id), one of the four")
         return ["route", "priority", "amend",
                 *_opts(v, "append", "role", "until", "exception", "end_exception", "share_pct", "holds",
-                       "expect")], [v["account"]]
+                       "expect", "confirm_pending")], [v["account"]]
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":
@@ -492,8 +495,12 @@ def act(action, args) -> tuple[bool, dict]:
         action, args = args["action"], args.get("args") or {}
     if not isinstance(action, str) or action not in owner_direction.ACTIONS or action not in SPECS:
         return False, {"ok": False, "code": "not_by_direction", "error": "That change can't be made by direction."}
+    pending = None
     try:
         values = _values(action, args)
+        pending = _priority_pending(action, values)
+        if pending is not None:
+            values = pending[0]
         head, positionals = argv(action, values)
         full = full_argv(head, positionals, ["--owner-direction"])
     except Refused as err:
@@ -504,9 +511,54 @@ def act(action, args) -> tuple[bool, dict]:
         except owner_direction.DirectionRefused as refused:
             # Anything but a T3 conversation's hold runs the command as before.
             held = refused.code == "confirm_needed"
+            if pending is not None and not held:
+                return False, refused.refusal()
+        else:
+            # The owner's words asked for the amend, never for the waiting
+            # request it would confirm: his yes to the ask naming both is.
+            held = pending is not None
     if held:
-        return _hold(action, values)
+        return _hold(action, values, ask=pending[1] if pending is not None else None)
     return _run(action, full)
+
+
+def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
+    """For a priority amend while a conversation's request waits in the
+    priority: (its values with ``confirm_pending``, the ask naming every
+    change that request makes the owner's and the amendment), so one yes
+    settles both. The amend's ``expect`` must be the version the ask shows:
+    a newer request is refused at the confirm, never confirmed unseen.
+    ``Refused`` naming route.priority.confirm and route.priority.undo when
+    the request can't be shown whole in the ask. None otherwise."""
+    if action != "route.priority.amend":
+        return None
+    from khipu import routing
+
+    view = routing.read_view()
+    held = view.get("priority") or {}
+    version = view.get("priority_version") or "p0"
+    if not held.get("pending"):
+        if values.get("confirm_pending"):
+            raise _bad("confirm_pending is for a priority with a conversation's request waiting, and none is")
+        return None
+    if str(values.get("expect") or "").strip() != version:
+        raise Refused("version_moved", f"the priority changed after it was read (it is now version {version}); "
+                                       "read it again")
+    changes = routing.pending_priority_changes(view)
+    if held.get("proposal_withheld") or not changes:
+        raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False))
+    words = "; ".join(changes)
+    if len(words) > routing.PENDING_ASK_MOST:
+        raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False)
+                      + "; its changes are too long to name in one ask, so the amend can't confirm it too")
+    from khipu import owner_direction
+
+    asked = held.get("owner_request")
+    amend = owner_direction.ask_line(action, {k: v for k, v in values.items() if k not in ("confirm_pending", "expect")})
+    ask = (f"A priority request from {held.get('pending_by') or 'a conversation'} is waiting for you (version "
+           f"{version}" + (f", asked as \"{asked}\"" if asked else "") + f"). Confirming it makes these yours: "
+           f"{words}. Confirm that request, then " + amend[len("Confirm "):])
+    return dict(values, confirm_pending=True), ask
 
 
 def apply_request(kind: str, out, *, only: str | None = None) -> dict:
@@ -583,11 +635,11 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
 REQUEST, CONFIRM = "direction.request", "direction.confirm"
 
 
-def _hold(action: str, values: dict) -> tuple[bool, dict]:
+def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, dict]:
     from khipu import owner_direction
 
     try:
-        request = owner_direction.hold(action, values)
+        request = owner_direction.hold(action, values, ask=ask)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
     return True, {"ok": True, "applied": False, "pending": True, "request": request["id"], "ask": request["ask"],
