@@ -117,7 +117,9 @@ def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str
 def _validate_resolution(record: Any) -> None:
     """Validate archived content itself, never trust its saved hash claims."""
     from khipu.capture_identity import payload_sha256
-    from khipu.capture import _legacy_preferences_contained, _legacy_projection_kind, _redact_capture_values
+    from khipu.capture import (
+        REPLAY_KIND, _legacy_preferences_contained, _legacy_projection_kind, _redact_capture_values, _replay_lacks,
+    )
 
     outbox_payloads(record)
     resolution = record.get("resolution")
@@ -130,7 +132,7 @@ def _validate_resolution(record: Any) -> None:
     hub_view.pop("origin", None)
     hub_view = _redact_capture_values(hub_view)
     if (not isinstance(resolution, dict)
-            or resolution.get("kind") not in ("legacy_comma_projection", "legacy_landed_line",
+            or resolution.get("kind") not in (REPLAY_KIND, "legacy_comma_projection", "legacy_landed_line",
                                               "preferences_contained", "preferences_contained_normalized",
                                               "content_contained_normalized", "scope_differs_kept",
                                               "decisions_contained_normalized")
@@ -143,13 +145,18 @@ def _validate_resolution(record: Any) -> None:
 
     attempts = queued.get("attempts", 0)
     if (type(attempts) is not int or attempts < 0
-            or ("origin" in queued and not valid_origin(queued["origin"]))
-            or queued.get("reason") != "recovery: the legacy key holds different facts"
+            or ("origin" in queued and not valid_origin(queued["origin"]))):
+        raise ValueError("resolution queued envelope is invalid")
+    # A replay can be any queued capture; every other kind is a file line's proof.
+    if resolution["kind"] != REPLAY_KIND and (
+            queued.get("reason") != "recovery: the legacy key holds different facts"
             or "origin" not in queued or queued["origin"] is not None):
         raise ValueError("resolution queued envelope is invalid")
     # preferences_contained is the owner's merge command's proof
     # (outbox_preferences), never one the drain makes.
-    if resolution["kind"] == "preferences_contained":
+    if resolution["kind"] == REPLAY_KIND:
+        proved = _replay_lacks(record["payload"], hub_view) == []
+    elif resolution["kind"] == "preferences_contained":
         proved = (_legacy_projection_kind(record["payload"], hub_view) is None
                   and _legacy_preferences_contained(record["payload"], hub_view))
     elif resolution["kind"] == "preferences_contained_normalized":
@@ -211,7 +218,7 @@ class _RecoveryIndex:
                 record = json.loads(path.read_bytes())
                 _validate_resolution(record)
                 job = record["queued_evidence"]
-                key = _canonical({"payload": job["payload"], "origin": job["origin"]})
+                key = _canonical({"payload": job["payload"], **{k: job[k] for k in ("origin",) if k in job}})
                 self.queued.setdefault(key, []).append(path)
                 for digest in {payload_sha256(record["payload"]), payload_sha256(job["payload"])}:
                     self.payloads.setdefault(digest, []).append(path)

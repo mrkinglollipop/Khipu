@@ -989,7 +989,13 @@ def announce_hub_identities(cur, payload: dict[str, Any],
     try:
         if not has_table(cur, "forgotten_sources"):
             return
-    except Exception:  # noqa: BLE001 - a probe that cannot run (no real cursor) skips the announcement
+    except Exception as exc:  # noqa: BLE001 - a probe that cannot run (no real cursor) skips the announcement
+        import psycopg
+
+        # A database's own error has aborted this transaction: skipping on would
+        # only rename it InFailedSqlTransaction at the insert, unclassifiable.
+        if isinstance(exc, psycopg.Error):
+            raise
         return
     found = set(_hub_identities(payload, sources[0] if sources else None)) | hub_identity_set(payload)
     for source in sources:
