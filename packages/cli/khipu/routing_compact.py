@@ -54,6 +54,8 @@ from __future__ import annotations
 
 import contextlib
 import gzip
+import hashlib
+import warnings
 import json
 import os
 import secrets
@@ -906,8 +908,13 @@ def _compact(now: datetime) -> dict:
 def _archive_bytes(chosen: dict, now: datetime) -> bytes:
     """The lines left out, as written, after a header with each one's place
     among the lines the compaction read."""
+    original = list(chosen["kept"])
+    for position, line in zip(chosen["positions"], chosen["left_out"]):
+        original.insert(position, line)
     header = json.dumps({"compacted_at": routing._iso(now), "before": chosen["before"],
-                         "positions": chosen["positions"]}, sort_keys=True).encode("utf-8")
+                         "positions": chosen["positions"], "kept_count": len(chosen["kept"]),
+                         "generation": _line_hash(chosen["kept"]),
+                         "original": _line_hash(original)}, sort_keys=True).encode("utf-8")
     return gzip.compress(b"".join(line + b"\n" for line in [header, *chosen["left_out"]]), 9, mtime=0)
 
 
@@ -970,16 +977,49 @@ def _archives() -> list[tuple[datetime, Path]]:
     return sorted(out, reverse=True)
 
 
+def _line_hash(lines: list[bytes]) -> str:
+    return hashlib.sha256(b"".join(line + b"\n" for line in lines)).hexdigest()
+
+
 def full_log() -> list[bytes]:
-    """The log's lines as if nothing had been left out, as far back as the
-    archives reach: each one, newest first, puts its lines back in their places."""
+    """Reconstruct only generations committed in the log, retaining appended tails.
+
+    The retained prefix's digest is the commit witness: an archive published
+    before the log swap cannot match the original prefix. Each inverse also
+    checks the original digest before any lines are accepted.
+    """
     lines = [line for line in routing.events_file().read_bytes().split(b"\n") if line.strip()]
+    pending = []
     for _at, path in _archives():
         if not path.name.endswith(".gz"):
+            continue
+        header, *left_out = gzip.decompress(path.read_bytes()).splitlines()
+        meta = json.loads(header)
+        if "generation" not in meta:
+            warnings.warn(f"Archive {path.name}: unverified generation; history unavailable", RuntimeWarning)
+            continue
+        pending.append((meta, left_out))
+    # Match by generation, not filename order (two compactions may share a second).
+    while pending:
+        matched = False
+        for i, (meta, left_out) in enumerate(pending):
+            count = meta["kept_count"]
+            if _line_hash(lines[:count]) != meta["generation"]:
+                continue
+            restored = list(lines[:count])
+            positions = meta["positions"]
+            if len(positions) != len(left_out):
+                raise ValueError("archive positions differ from its lines")
+            for position, line in zip(positions, left_out):
+                restored.insert(position, line)
+            if len(restored) != meta["before"] or _line_hash(restored) != meta["original"]:
+                raise ValueError("archive generation does not reconstruct its original")
+            lines = restored + lines[count:]
+            pending.pop(i)
+            matched = True
             break
-        header, *left_out = gzip.decompress(path.read_bytes()).split(b"\n")[:-1]
-        for position, line in zip(json.loads(header)["positions"], left_out):
-            lines.insert(position, line)
+        if not matched:
+            break
     return lines
 
 
