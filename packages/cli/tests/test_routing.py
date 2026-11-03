@@ -915,6 +915,7 @@ def test_the_seed_imports_once(home):
     assert routing.doctor_block()["rules_to_confirm"] == 1
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_rules_and_the_note_arrive_whole_whatever_their_length(home):
     long_rule = "Never send what is in the private folders to another model family; " * 6
     routing.add_rule(long_rule, via="app")

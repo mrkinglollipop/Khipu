@@ -161,6 +161,7 @@ def test_the_pushed_text_is_the_light_status_projection(home, monkeypatch):
     assert "/logins/" not in part and "claude|" not in part and "s-one" not in part
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_rules_and_the_note_arrive_whole_whatever_their_length(home, monkeypatch):
     long_rule = ("Every Grok result that is acted on gets a re-check from a different model family, "
                  "and the re-check looks wider than the list Grok gave; ") * 3
@@ -587,6 +588,7 @@ def _maximal_memory() -> str:
     return recall_rule.RULE_MD.strip() + "\n\n" + "\n".join(lines)
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_the_session_start_output_stays_within_claude_codes_limit(home, monkeypatch):
     # R2-1: past 10,000 characters Claude Code keeps only a 2,000-character preview,
     # so neither the routing summary nor the memory slice reached the model.
@@ -617,6 +619,7 @@ def test_the_session_start_output_stays_within_claude_codes_limit(home, monkeypa
     assert _context(_hook(monkeypatch)) == memory
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_a_large_start_pages_the_note_and_keeps_mandatory_memory(home, monkeypatch):
     from khipu import routing_delivery
 

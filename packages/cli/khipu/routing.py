@@ -6900,29 +6900,35 @@ def _shown_report_ids(entry: dict) -> set[str]:
 # Checked only when words are written, never on what is stored: a rule or note
 # already past its limit keeps working, and nothing is truncated.
 
-def _check_words_size(text: str, setting: str, what: str) -> None:
+def _check_words_size(text: str, setting: str, what: str, via: str | None) -> None:
     limit = settings()[setting]
     size = len(text.strip())
     if limit and size > limit:
-        raise RuleCapError(f"{what} is {size:,} characters; the limit is {limit:,} (setting {setting}). "
-                           "Shorten it and try again.", "too_long")
+        ask = ("Shorten it and try again." if via == "app" else
+               "Tell the owner; do not shorten or paraphrase his words yourself.")
+        raise RuleCapError(f"{what} is {size:,} characters; the limit is {limit:,} (setting {setting}). {ask}",
+                           "too_long")
 
 
-def check_rule_words(text: str) -> None:
-    _check_words_size(text, "routing_rule_chars", "That rule")
+def check_rule_words(text: str, via: str | None = None) -> None:
+    _check_words_size(text, "routing_rule_chars", "That rule", via)
 
 
-def check_note_words(text: str) -> None:
-    _check_words_size(text, "routing_note_chars", "That note")
+def check_note_words(text: str, via: str | None = None) -> None:
+    _check_words_size(text, "routing_note_chars", "That note", via)
 
 
-def check_rule_count(now: datetime | None = None) -> None:
-    """Refuse a new rule when the owner already has the most (call inside the lock)."""
+def check_rule_count(now: datetime | None = None, via: str | None = None) -> None:
+    """Refuse a new rule when the owner already has the most (call inside the
+    lock). Only standing rules count: a conversation's unconfirmed request
+    never takes room from the owner's own."""
     limit = settings()["routing_rules_max"]
-    count = len(read_view(now)["rules"])
+    count = sum(1 for r in read_view(now)["rules"] if not r.get("pending"))
     if limit and count >= limit:
+        ask = ("Retire a rule you no longer need, or raise the limit." if via == "app" else
+               "Tell the owner; do not drop or merge his rules yourself.")
         raise RuleCapError(f"There are already {count:,} standing rules; the limit is {limit:,} "
-                           "(setting routing_rules_max). Retire or merge one first.", "too_many")
+                           f"(setting routing_rules_max). {ask}", "too_many")
 
 
 def first_sentence(text: str, most: int) -> str | None:
@@ -6939,7 +6945,7 @@ def set_note(text: str, *, via: str, now: datetime | None = None, enforce_caps: 
     if not isinstance(text, str) or not text.strip():
         raise RouteError("the note needs its words")
     if enforce_caps:
-        check_note_words(text)
+        check_note_words(text, via)
     return _owner_write({"type": "note_set", "text": text}, via)
 
 
@@ -6982,9 +6988,9 @@ def add_rule(text: str, *, source: str | None = None, via: str, now: datetime | 
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
-    check_rule_words(text)
+    check_rule_words(text, via)
     with _lock():
-        check_rule_count(now)
+        check_rule_count(now, via)
         events, _bad = read_events()
         n = _next_rules(events, 1)
         out = _owner_write({"type": "rule_add", "n": n, "text": text, **({"holds": holds} if holds is not None else {}),
@@ -6999,7 +7005,7 @@ def edit_rule(n, text: str, *, via: str, now: datetime | None = None, holds: dic
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
     if enforce_caps:
-        check_rule_words(text)
+        check_rule_words(text, via)
     with _lock():
         rule = _rule(n, now)
         choices = _undo_hold_choices(holds, words=text, now=now) if _undo_default_holds else holds
@@ -7024,7 +7030,7 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
-    check_rule_words(text)
+    check_rule_words(text, via)
     if owner_request is None:
         request_words = "the owner requested this change"
     else:
@@ -7037,7 +7043,7 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     op = op or _OP.get() or event_identity.uuid7()
     if n is None:
         with _lock():
-            check_rule_count(now)
+            check_rule_count(now, via)
             events, _bad = read_events()
             number = _next_rules(events, 1)
             written, view = _write({"type": "rule_add", "n": number, "text": text.strip(),
@@ -9018,6 +9024,19 @@ def _replacement_notices(view: dict, now: datetime, session: str | None) -> list
     return items
 
 
+def _live_exception_sentences(priority: dict | None, now: datetime) -> list[str]:
+    """The short sentence for each live exception, as the delivery plan
+    counts it (``routing_delivery.plan``)."""
+    out = []
+    for entry in (priority or {}).get("entries") or []:
+        for exc in entry.get("exceptions") or []:
+            ends = _parse(exc.get("until"))
+            if (ends is not None and ends <= now) or not isinstance(exc.get("id"), str) or not exc.get("text"):
+                continue
+            out.append(exception_change_sentence(entry.get("label") or entry.get("account") or "account", exc))
+    return out
+
+
 LEAN_POINTER = ("Your standing rules, note and priority are left out of this summary to keep the account "
                 "state: read them with `khipu_route`.")
 
@@ -9038,8 +9057,11 @@ def _fit_owner_words(whole: list[str], owners: list, slots: dict, budget: int, v
     covered: list = []
     half = budget // 2
     if prio is not None and len(whole[prio]) + 1 > half:
-        whole[prio] = OWNER_PRIORITY_POINTER
-        covered.append("priority")
+        # Not covered: the priority stays owed and the delivery ledger pages
+        # it whole. Each live exception's short sentence goes ahead of the
+        # pointer so a new exception still arrives at once.
+        sentences = _live_exception_sentences(view.get("priority"), now)
+        whole[prio] = "\n".join([*sentences, OWNER_PRIORITY_POINTER])
     if note is not None and len(whole[note]) + 1 > half:
         head = note_line({**view["note"], "text": ""}, now)
         pointer = "(the rest is too long to show here: read it with `khipu_route`)"
@@ -9340,7 +9362,7 @@ def _rules_block(view: dict, text: dict | None, cfg: dict) -> dict:
     covered = (text or {}).get("covered_entities") or []
     if left_out or covered:
         what = [f"{left_out} of {len(rules)} standing rules"] if left_out else []
-        what += [name for name, key in (("your note", "note"), ("your priority", "priority")) if key in covered]
+        what += ["your note"] if "note" in covered else []
         warnings.append(f"The summary at the start of a conversation shows only part of your words ({' and '.join(what)} "
                         f"left to read with khipu_route) to keep within {cfg['routing_rules_chars']:,} characters "
                         "(routing_rules_chars).")

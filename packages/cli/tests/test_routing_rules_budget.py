@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from khipu import mcp_server, recall_prompt, recall_rule, routing
+from khipu import agent_view, mcp_server, recall_prompt, recall_rule, routing
 from tests.test_routing_acceptance import replay  # noqa: F401
 
 T0 = datetime(2026, 10, 14, 15, 0, tzinfo=timezone.utc)
@@ -321,3 +321,71 @@ def test_doctor_shows_the_session_start_swap(home, monkeypatch):
     block = routing.doctor_block()
     assert block["rules_budget"]["start"] == "pointer"
     assert any("even without your rules, note and priority" in w for w in block["warnings"])
+
+
+# ---- a long priority and a live exception still reach a new conversation ------------------------
+
+
+def test_the_summary_keeps_a_long_priority_owed_and_leads_with_the_exception(replay):
+    names = ["Grok", "Codex", "Claude"]
+    entries = [{"account": n, "role": f"{n} role " + " ".join(f"Point {j} " + "p" * 90 + "." for j in range(18))}
+               for n in names]
+    routing.set_priority(entries, via="app", expect=routing.priority_version())
+    routing.amend_priority("Codex", exception="Codex checks may run 15 points over pace", until="2h",
+                           via="app", expect=routing.priority_version())
+    agent_view.prepare_routing_table(refresh=True)
+    out = routing.summary()
+    assert "priority" not in out["covered_entities"]
+    assert "Exception on Codex until" in out["text"] and "Your priority is too long" in out["text"]
+    assert out["text"].index("Exception on Codex") < out["text"].index("Your priority is too long")
+
+
+def test_a_new_conversation_gets_a_long_priorities_exception_and_body(replay):
+    names = ["Grok", "Codex", "Claude"]
+    entries = [{"account": n, "role": f"{n} role " + " ".join(f"Point {j} " + "p" * 90 + "." for j in range(18))}
+               for n in names]
+    routing.set_priority(entries, via="app", expect=routing.priority_version())
+    routing.amend_priority("Codex", exception="Codex checks may run 15 points over pace", until="2h",
+                           via="app", expect=routing.priority_version())
+    held = routing.read_view()["priority"]
+    assert len(routing.priority_line(held, replay.now)) > 5000
+    exc = next(x for e in held["entries"] for x in e.get("exceptions") or [])
+    sentence = routing.exception_change_sentence("Codex", exc)
+    agent_view.prepare_routing_table(refresh=True)
+    start = recall_rule._RoutingAtStart(session_id="s-new").begin()
+    text = start.text()
+    assert sentence in text and "priority; revision" in text  # the exception arrives at once, then the body pages
+    ctx, pushed = recall_rule.fit_start_context(recall_rule.RULE_MD.strip(), text)
+    assert pushed and sentence in ctx
+    start.delivered("s-new")
+    assert "priority" in recall_prompt.routing_marker("s-new").get("owed", [])  # the body is still owed
+    seen = []
+    for _ in range(80):
+        out, context, info = replay.offer("s-new")
+        if not context:
+            break
+        seen.append(context)
+        replay.ack(info)
+    body = "\n".join([text, *seen])
+    assert "Grok role" in body and "Claude role" in body and "Point 17" in body
+    assert not recall_prompt.routing_marker("s-new").get("owed")
+
+
+def test_the_refusal_tells_an_agent_not_to_paraphrase_and_the_owner_to_shorten(home):
+    with pytest.raises(routing.RuleCapError, match="do not shorten or paraphrase his words yourself"):
+        routing.add_rule("x" * 601, via="direction")
+    with pytest.raises(routing.RuleCapError, match="do not shorten or paraphrase"):
+        routing.request_rule("x" * 601, via="mcp", author=ME)
+    with pytest.raises(routing.RuleCapError, match="Shorten it and try again"):
+        routing.add_rule("x" * 601, via="app")
+
+
+def test_a_conversations_pending_requests_never_take_the_owners_room(home):
+    _set(home, routing_rules_max=2)
+    routing.add_rule("Owner rule.", via="app")
+    routing.request_rule("A request.", via="mcp", author=ME, owner_request="add it")
+    routing.add_rule("Second owner rule.", via="app")  # the pending request does not count
+    with pytest.raises(routing.RuleCapError, match="routing_rules_max"):
+        routing.add_rule("Third.", via="app")
+    with pytest.raises(routing.RuleCapError, match="Tell the owner"):
+        routing.request_rule("Another request.", via="mcp", author=ME, owner_request="add it")

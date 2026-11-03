@@ -83,6 +83,7 @@ def test_revision_change_cancels_unacknowledged_batch(replay):
     assert routing_delivery.snapshot("s1")["entries"][entity]["offset"] > 0
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_owner_words_reassemble_byte_identically_with_unicode_and_paths(replay):
     words = ("Owner /Users/example/kept-path.\nEmoji 😀 and accent e\u0301. " * 220)
     routing.add_rule(words, via="app")
@@ -115,6 +116,7 @@ def test_owner_words_reassemble_byte_identically_with_unicode_and_paths(replay):
     assert not recall_prompt.routing_marker("s1").get("owed")
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_session_start_and_prompts_share_the_same_reservation(replay):
     routing.add_rule("x" * 10500, via="app")
     start = recall_rule._RoutingAtStart(session_id="s1").begin()
@@ -177,6 +179,7 @@ def test_projection_checks_paths_once_per_read_and_refreshes_between_reads(repla
     assert len(calls) == 1
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_crowded_recall_repacks_an_unshown_batch_without_losing_words(replay):
     words = "owner words " * 580
     routing.add_rule(words, via="app")
@@ -231,6 +234,7 @@ def test_ack_write_failure_is_fail_open_and_keeps_the_reservation(replay, monkey
     assert not recall_prompt.routing_marker("s1").get("owed")
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_start_pages_leave_room_for_the_mandatory_memory_rules(replay):
     routing.add_rule("x" * 7000, via="app")
     start = recall_rule._RoutingAtStart(session_id="s1").begin()
@@ -356,6 +360,7 @@ def test_stalled_volume_refresh_keeps_prompt_routing_and_restores_alarm(replay, 
     assert signal.getitimer(signal.ITIMER_REAL)[0] == 0
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_ack_history_is_bounded_and_recent_ack_is_idempotent(replay):
     routing.add_rule("x" * 100000, via="app")
     # This direct renderer call starts with the complete inventory a helper prepares.

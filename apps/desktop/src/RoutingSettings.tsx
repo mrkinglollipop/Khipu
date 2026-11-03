@@ -1496,9 +1496,10 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
           </ConfirmGroup>
         ) : null}
         <p className="set-help">
-          Conversations see this word for word, right after your standing rules, and it is never shortened. Khipu
-          never turns it into a choice of account. Earlier notes stay in Recent changes. Khipu sets no limit on its
-          length; the app hands over up to {WORDS_MOST_KB} KB of text in one change.
+          Conversations see this word for word, right after your standing rules, and Khipu never rewrites it. A note
+          is limited to 1,500 characters by default (Longest note, below); at the start of a conversation a longer
+          one shows its first sentence and a pointer to read the rest. Khipu never turns it into a choice of account.
+          Earlier notes stay in Recent changes. The app hands over up to {WORDS_MOST_KB} KB of text in one change.
         </p>
     </div>
   );
@@ -1815,8 +1816,11 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
         <p className="set-help">
           Rules marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or
           remove it. A conversation can add or change a rule at your request; those rows show what changed and stay
-          pending until you confirm or undo them. Rules are never shortened or cut, and Khipu sets no limit on their
-          length (the app hands over up to {WORDS_MOST_KB} KB of text at once).
+          pending until you confirm or undo them. Khipu never rewrites a rule. A rule is limited to 600
+          characters and you may have 40 by default (Longest standing rule and Most standing rules, below); rules
+          already stored over a limit keep working. At the start of a conversation the rules that fit the budget are
+          shown in your order and a line says how many were left to read (the app hands over up to {WORDS_MOST_KB} KB
+          of text at once).
         </p>
         {rules.length ? (
           <div className="route-filter">
@@ -3087,7 +3091,7 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
   },
   {
     name: "Longest update before a prompt",
-    help: "Rules and your note are never cut.",
+    help: "A changed rule or note longer than this arrives as a pointer and its first sentence, then in full over the next prompts.",
     fields: [{ key: "routing_prompt_chars", label: "Longest update", unit: "chars", options: [200, 400, 800, 1600, 0], zero: "No limit" }],
   },
   {
@@ -3097,7 +3101,7 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
   },
   {
     name: "Longest line",
-    help: "Each line about an account, a hold or a lane. Rules and your note are never cut.",
+    help: "Each line about an account, a hold or a lane. Rules and your note have their own limits.",
     fields: [{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }],
   },
   {

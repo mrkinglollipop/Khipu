@@ -801,6 +801,7 @@ def _assert_note_arrives_whole_in_context(first, pull):
     assert _marker()["version"] == routing.read_view()["version"]
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_a_block_too_long_for_the_harness_limit_arrives_as_pages(home, monkeypatch):
     _record()
     routing.set_note("Codex first for builds today; Grok for surveys. " * 250, via="app")
@@ -815,6 +816,7 @@ def test_a_block_too_long_for_the_harness_limit_arrives_as_pages(home, monkeypat
     assert _last_log().endswith(" routing=none")
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_a_block_and_the_recall_part_together_stay_within_the_harness_limit(home, monkeypatch):
     _record()
     routing.set_note("Codex first for builds today; Grok for surveys. " * 180, via="app")
@@ -850,6 +852,7 @@ def _block_of(text_len_target: int, marker: dict) -> str:
 
 
 @pytest.mark.parametrize("kind", ["full", "changes"])
+@pytest.mark.usefixtures("unbounded_render")
 def test_a_paged_block_does_not_ack_its_undelivered_remainder(home, monkeypatch, kind):
     from khipu import recall_rule
 
@@ -869,6 +872,7 @@ def test_a_paged_block_does_not_ack_its_undelivered_remainder(home, monkeypatch,
     assert "pointer" not in _marker()
 
 
+@pytest.mark.usefixtures("unbounded_render")
 def test_paged_delivery_continues_on_the_daemon_path(home, monkeypatch, daemon):
     from khipu import recall_rule
 
