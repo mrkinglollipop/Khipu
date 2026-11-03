@@ -426,6 +426,12 @@ def _step_result(result: Any) -> dict[str, Any]:
     return {"ok": True, "counts": None, "error": None}
 
 
+def _known_nightly_steps() -> list[str]:
+    """Every step this code's nightly records, so doctor can tell a step that
+    a run skipped from one that run's code did not have yet."""
+    return sorted({step for step, _fix in _NIGHTLY_STEP_CHECKS.values()})
+
+
 def _record_nightly_step(
     steps: list[dict[str, Any]], name: str, *, ok: bool, counts: Any = None, error: str | None = None,
     deferred: str | None = None,
@@ -449,7 +455,8 @@ def _record_nightly_step(
     steps.append(entry)
     try:
         _nightly_last_path().write_text(
-            json.dumps({"steps": steps}, default=str, indent=2), encoding="utf-8"
+            json.dumps({"steps": steps, "known_steps": _known_nightly_steps()}, default=str, indent=2),
+            encoding="utf-8",
         )
     except OSError:
         pass
@@ -1541,6 +1548,13 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
         )
     )
     job = _job_entry("nightly") if applicable else {}
+    known_doc = data.get("known_steps") if isinstance(data, dict) else None
+    # A receipt written before steps were listed (or by older code) can only
+    # vouch for the steps it actually recorded.
+    known_steps = (
+        {str(x) for x in known_doc} if isinstance(known_doc, list)
+        else {str(e.get("name")) for e in (steps_doc if isinstance(steps_doc, list) else []) if isinstance(e, dict)}
+    )
     by_name: dict[str, dict[str, Any]] = {}
     if data and isinstance(data.get("steps"), list):
         for entry in data["steps"]:
@@ -1639,6 +1653,16 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
                     "error": "scheduled nightly has no usable recent step receipt or first-run evidence",
                     "fix": "run `khipu jobs status` and inspect the nightly logs",
                     "source": source,
+                }
+                continue
+            if last_run is not None and step_name not in known_steps:
+                # The last nightly ran code that did not have this step yet
+                # (an upgrade since): nothing could have been recorded, so it
+                # waits for the next run instead of blocking a promote.
+                out[doctor_key] = {
+                    "ok": True, "applicable": True, "skipped": True, "pending": True,
+                    "reason": "added since the last nightly — first checked after the next run",
+                    "ts": last_run, "source": source,
                 }
                 continue
             if last_run is not None:
