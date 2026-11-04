@@ -396,7 +396,7 @@ def sync(*, hub=None, limit=500, max_pages=20):
 
 REQUEST_KEPT_S = 14 * 86400
 _ASK_MOST = 1200
-_FINAL = {"applied": "applied", "applying": "applied", "failed": "failed", "declined": "declined"}
+_FINAL = {"applied": "applied", "applying": "applied", "failed": "failed", "interrupted": "failed", "declined": "declined"}
 
 
 def _sig(text):

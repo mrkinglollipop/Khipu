@@ -4805,6 +4805,12 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["owner_direction"] = timer_error(exc)
         try:
+            from khipu import owner_background
+
+            out["owner_jobs"] = {"interrupted": owner_background.heal()}
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out["owner_jobs"] = timer_error(exc)
+        try:
             jobs._write_job_state("replica_refresh", rc)
             out["job_state"] = {"ok": True}
         except Exception as exc:  # noqa: BLE001 — no timer stage starves the next

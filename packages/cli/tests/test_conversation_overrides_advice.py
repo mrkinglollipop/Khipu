@@ -182,3 +182,15 @@ def test_an_override_for_a_whole_folder_reaches_each_conversation_in_it(replay, 
     assert routing.advise("Claude", now=replay.now, environ=MINE)["verdict"] == "go"
     monkeypatch.setattr(routing, "_project_name", lambda cwd: "elsewhere")
     assert routing.advise("Claude", now=replay.now, environ=OTHER)["verdict"] == "hold_back"
+
+
+def test_a_folder_override_reaches_a_t3_conversation_in_that_folder_only(replay, tmp_path, monkeypatch):
+    _t3(tmp_path, monkeypatch, [("th-in", "sess-mine", None), ("th-out", "sess-other", None)])
+    _pace_target(replay, used=18)
+    overrides.grant({"account": "Claude", "effect": "ahead_of_pace", "request": "x",
+                     "subject": {"kind": "project", "id": "synthetic-folder", "mac": routing._local_mac()},
+                     "until": routing._iso(replay.now + timedelta(hours=3))}, now=replay.now)
+    monkeypatch.setattr(routing, "_project_name", lambda cwd: "synthetic-folder")
+    assert routing.advise("Claude", now=replay.now, environ=MINE)["verdict"] == "go"
+    monkeypatch.setattr(routing, "_project_name", lambda cwd: "elsewhere")
+    assert routing.advise("Claude", now=replay.now, environ=OTHER)["verdict"] == "hold_back"

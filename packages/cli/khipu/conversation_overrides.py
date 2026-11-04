@@ -92,7 +92,7 @@ def subject(author: dict | None = None, *, environ: dict | None = None, cwd: str
         if ids:
             if len(ids) != 1 or not isinstance(ids[0], str) or not ids[0]:
                 return None, "Khipu can't identify this T3 thread, so it uses normal pace."
-            return {"kind": "thread", "id": ids[0], "mac": mac}, None
+            return {"kind": "thread", "id": ids[0], "project": project, "mac": mac}, None
         # T3 answered and has no thread for this session: a native session.
     else:
         t3_store = Path(os.environ.get("KHIPU_T3_DB") or Path.home() / ".t3/userdata/statev2.sqlite")

@@ -31,7 +31,9 @@ CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_p
                  "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
 LOOK_KINDS = ("remind", "disagree", "broken", "contradiction", "signin", "plan", "crossing", "lane", "silent",
               "unreadable", "refused", "delivery-behind", "delivery-copy", "delivery-read")
-KINDS = CONFIRM_KINDS + LOOK_KINDS
+# Looks the app has no tag for: a change that was interrupted shows in a conversation's list only.
+CLI_ONLY_KINDS = ("interrupted",)
+KINDS = CONFIRM_KINDS + LOOK_KINDS + CLI_ONLY_KINDS
 
 # Each kind the app's routingOverview.ts knows (``TAG_WORDS``): the kind it is
 # here, or why its Needs you never shows it.
@@ -605,6 +607,34 @@ def _forgets() -> list[dict]:
     return out
 
 
+INTERRUPTED_SHOWN_S = 7 * 24 * 3600  # an interrupted job stays listed this long
+
+
+def _interrupted() -> list[dict]:
+    """Long changes the owner confirmed whose worker died before they finished.
+    Never run again by Khipu, since part of one may have applied."""
+    from khipu import owner_background
+
+    owner_background.heal()
+    rows = owner_direction._read_requests(owner_direction.requests_path())
+    now = owner_direction._clock()
+    out = []
+    for row in rows:
+        if row.get("state") != "interrupted" or now - float(row.get("settled_ts") or 0) > INTERRUPTED_SHOWN_S:
+            continue
+        again = [r for r in rows if r.get("action") == row.get("action") and r.get("args") == row.get("args")
+                 and r.get("state") == "applied" and float(r.get("settled_ts") or 0) > float(row.get("settled_ts") or 0)]
+        if again:
+            continue
+        out.append(_item("interrupted", f"interrupted:{row.get('id')}",
+                         f"A change you confirmed, to {ACTION_WORDS.get(row.get('action'), 'make a change')}, was "
+                         "interrupted before it finished, most likely because the Mac restarted. Part of it may "
+                         "already be done. Khipu has not run it again.", at=row.get("settled_at"),
+                         do="Ask in a conversation to run it again, then say yes once. Check the result first where "
+                            "running it twice would matter."))
+    return out
+
+
 def _alarm() -> list[dict]:
     alarm = owner_direction.read_alarm()
     if alarm is None:
@@ -943,7 +973,8 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
     held, missed = _held(items)
     items += held
     unread += missed
-    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm)):
+    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm),
+                        ("changes that were interrupted", _interrupted)):
         try:
             items += build()
         except Exception:  # noqa: BLE001 - named in unread

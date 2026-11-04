@@ -99,10 +99,93 @@ def test_queued_work_keeps_no_second_copy_of_the_owners_words(world, monkeypatch
     world["t3"].message(THREAD, time.time() + 1, text="yes")
     _t3_hook_turn(prompt="yes")
     assert owner_act.act("direction.confirm", {"request": request})[1]["started"]
-    assert json.loads(owner_background.path(request).read_text()) == {"state": "started"}
+    job = json.loads(owner_background.path(request).read_text())
+    assert job["state"] == "started" and set(job) <= {"state", "started_ts", "pid", "worker"}  # ids and times, no words
     owner_direction.forget_requests({T3_SESSION})
     def never_run(*args):
         raise AssertionError("forgotten work ran")
     monkeypatch.setattr(owner_act, "_run", never_run)
     ok, result = owner_background.run(request)
     assert not ok and result["code"] == "request_gone"
+
+
+def _started(world, monkeypatch):
+    """A confirmed long request whose worker has been launched (the launch itself is stubbed)."""
+    request = _hold_in_t3(world)
+    monkeypatch.setattr(owner_background, "LONG_ACTIONS", {"route.pause"})
+    launched = []
+    monkeypatch.setattr(owner_background, "_spawn", lambda ident: launched.append(ident) or 0)
+    world["t3"].message(THREAD, time.time() + 1, text="yes")
+    _t3_hook_turn(prompt="yes")
+    assert owner_act.act("direction.confirm", {"request": request})[1]["started"]
+    return request
+
+
+def _row(request):
+    return next(r for r in owner_direction._read_requests(owner_direction.requests_path()) if r["id"] == request)
+
+
+def _worker(seconds):
+    import subprocess, sys
+    return subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
+
+
+def test_a_worker_killed_mid_run_becomes_interrupted_and_is_shown_in_needs_you(world, monkeypatch):
+    from khipu import needs_you
+    request = _started(world, monkeypatch)
+    # The worker wrote its line ahead, then died before finishing.
+    owner_direction.gate(owner_direction.intent("route.pause", "Codex"))
+    owner_direction._PENDING.set(None)
+    worker = _worker(60)
+    owner_background._save(request, {"state": "started", "started_ts": time.time(), "pid": worker.pid,
+                                     "worker": owner_background._identity(worker.pid)})
+    assert owner_background.heal() == []  # alive: left alone
+    worker.kill()
+    worker.wait()
+    assert owner_background.heal() == [request]
+    row = _row(request)
+    assert row["state"] == "interrupted" and row["error_code"] == "interrupted"
+    assert owner_background.heal() == []  # settled once
+    assert json.loads(owner_background.path(request).read_text())["state"] == "finished"
+    # Not replayed: the held action never ran again, and the owner-actions log shows it unfinished.
+    assert next(r for r in owner_direction.actions() if r["action"] == "route.pause")["state"] == "unconfirmed"
+    items = [i for i in needs_you.waiting(record_read=False)["items"] if i["kind"] == "interrupted"]
+    assert len(items) == 1 and "interrupted before it finished" in items[0]["words"] and "Khipu has not run it again" in items[0]["words"]
+
+
+def test_a_live_slow_worker_is_never_called_interrupted(world, monkeypatch):
+    request = _started(world, monkeypatch)
+    worker = _worker(60)
+    try:
+        owner_background._save(request, {"state": "started", "started_ts": time.time() - 30 * 24 * 3600, "pid": worker.pid,
+                                         "worker": owner_background._identity(worker.pid)})
+        assert owner_background.heal() == []
+        assert _row(request)["state"] == "applying"
+    finally:
+        worker.kill()
+        worker.wait()
+
+
+def test_a_reused_pid_is_not_taken_for_the_worker(world, monkeypatch):
+    request = _started(world, monkeypatch)
+    worker = _worker(60)
+    try:
+        owner_background._save(request, {"state": "started", "started_ts": time.time(), "pid": worker.pid,
+                                         "worker": "Mon Jan  1 00:00:00 2001"})
+        assert owner_background.heal() == [request]
+    finally:
+        worker.kill()
+        worker.wait()
+
+
+def test_a_job_whose_worker_has_not_yet_recorded_itself_gets_time_to_start(world, monkeypatch):
+    request = _started(world, monkeypatch)
+    assert owner_background.heal() == []  # just started, no pid yet
+    assert owner_background.heal(time.time() + owner_background.NO_WORKER_GRACE_S + 5) == [request]
+
+
+def test_a_finished_job_is_untouched_by_the_timer(world, monkeypatch):
+    request = _started(world, monkeypatch)
+    ok, _ = owner_background.run(request)
+    assert ok and owner_background.heal(time.time() + 10**7) == []
+    assert _row(request)["state"] == "applied"
