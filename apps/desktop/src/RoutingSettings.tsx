@@ -649,7 +649,7 @@ function ResetCheckStatus({ data }: { data: RouteView | null }) {
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
   return <div className="section-body" aria-label="Next reset checks">
         <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
-        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
+        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "Nothing is waiting on a reset check."}</p>
   </div>;
 }
 
@@ -1000,6 +1000,48 @@ type Folds = { isOpen: (key: string) => boolean; toggle: (key: string) => void; 
 
 type RoutingPageKey = "needs" | "accounts" | "work" | "macs" | "conversations" | "changes" | "wrong" | "rare";
 
+type FindSetting = {
+  name: string;
+  where: string;
+  page: RoutingPageKey;
+  aliases: string[];
+  selector: string;
+  group?: GroupKey;
+  rare?: boolean;
+};
+
+/** Old homes are search aliases, so a remembered name still reaches its
+ * setting. Search changes neither routing nor settings. */
+const FIND_SETTINGS: readonly FindSetting[] = [
+  { name: "Your accounts", where: "Your accounts", page: "accounts", aliases: ["accounts", "pause", "cap", "allowance", "check all"], selector: "[data-find-setting='group-accounts']", group: "accounts" },
+  { name: "Add an account", where: "Your accounts", page: "accounts", aliases: ["find accounts", "account login"], selector: "[data-find-setting='group-accounts']", group: "accounts" },
+  { name: "Your order and rules", where: "Who gets what work", page: "work", aliases: ["priority", "note", "rules", "holds", "temporary instructions"], selector: "[data-find-setting='group-priority']", group: "priority" },
+  { name: "Temporary instructions", where: "Who gets what work", page: "work", aliases: ["hold", "holds", "temporary instruction"], selector: "[data-find-setting='group-holds']", group: "holds" },
+  { name: "Copy routing between your Macs", where: "Your Macs", page: "macs", aliases: ["routing copy", "replication", "copy routing between macs", "hub copy", "keep settings the same"], selector: "[data-find-setting='routing-copy']" },
+  { name: "Share proposal words between your Macs", where: "Your Macs", page: "macs", aliases: ["proposal words", "mac tags", "this mac only"], selector: "[data-find-setting='mac-tags']" },
+  { name: "Tell conversations about routing", where: "Conversations", page: "conversations", aliases: ["telling", "telling conversations", "when conversations hear", "before each prompt"], selector: "[data-find-setting='group-telling']", group: "telling" },
+  { name: "Recent changes", where: "What changed", page: "changes", aliases: ["history", "bring back", "undo"], selector: "[data-find-setting='group-changes']", group: "changes" },
+  { name: "Checks and job runners", where: "Something's wrong", page: "wrong", aliases: ["checks", "lane", "lanes", "job slots", "providers", "runner folders", "conflicts"], selector: "[data-find-setting='group-checks']", group: "checks" },
+  { name: "Technical limits and timing", where: "Rarely needed", page: "rare", aliases: ["sizes", "times", "warnings", "dispatch scripts"], selector: "[data-find-setting='rare-sizes']", rare: true },
+  { name: "Reading usage from logins", where: "Rarely needed", page: "rare", aliases: ["grok login", "cursor login", "opencode login"], selector: "[data-find-setting='rare-logins']", rare: true },
+  { name: "Old routing table file", where: "Rarely needed", page: "rare", aliases: ["routing-now", "legacy routing file", "old file"], selector: "[data-find-setting='rare-table']", rare: true },
+];
+
+function FindASetting({ onChoose }: { onChoose: (target: FindSetting) => void }) {
+  const [query, setQuery] = useState("");
+  const words = query.trim().toLocaleLowerCase();
+  const matches = words ? FIND_SETTINGS.filter((target) => [target.name, target.where, ...target.aliases].join(" ").toLocaleLowerCase().includes(words)).slice(0, 7) : [];
+  return <div className="route-find" role="search">
+    <label className="sr-only" htmlFor="route-find-setting">Find a setting</label>
+    <input id="route-find-setting" type="search" value={query} placeholder="Find a setting" autoComplete="off" onChange={(event) => setQuery(event.target.value)} />
+    {words ? <div className="route-find-results" role="listbox" aria-label="Find a setting results">
+      {matches.length ? matches.map((target) => <button key={target.name} type="button" role="option" onClick={() => { setQuery(""); onChoose(target); }}>
+        <span>{target.name}</span><small>{target.where}</small>
+      </button>) : <span className="route-find-none" role="status">No setting has those words.</span>}
+    </div> : null}
+  </div>;
+}
+
 const ROUTING_PAGES: ReadonlyArray<{ key: RoutingPageKey; name: string; groups: GroupKey[] }> = [
   { key: "needs", name: "Needs you", groups: [] },
   { key: "accounts", name: "Your accounts", groups: ["accounts", "pace"] },
@@ -1314,13 +1356,8 @@ function AccountsSection({
         </>
       ) : null}
       <p className="set-help">
-        Khipu reads the accounts selected below. Their status can come from a plan check, your job runners,
-        conversations, or you; the old routing table is not a source.
-      </p>
-      <p className="set-help">
-        Mark paused tells conversations you want an account left alone; Lift ends it. Clear ends a limit or a
-        "down" report at once, and Khipu treats the account as open until something newer reports on it; if Claude
-        or a job runner reports the limit again, it comes back.
+        Use Details on an account to pause it, set a cap, or clear a limit that has passed. Khipu checks each
+        account again when its limit resets.
       </p>
       <div className="acct-foot">
         <span>
@@ -1551,7 +1588,7 @@ function RuleRow({
   const identity = ruleIdentity(r);
   const mine = ask?.id === identity ? ask.kind : null;
   const pending = !!r.pending;
-  const toConfirm = pending || (r.seeded && !r.confirmed);
+  const toConfirm = pending;
   const name = ruleName(r);
   const id = `rule:${identity}`;
   // Overview links use the durable display number for standing rules; only a
@@ -1587,8 +1624,7 @@ function RuleRow({
         <span className="route-rule-meta" hidden={!expanded}>
           {origin}
           {pending ? <Tag tone="warn">{r.pending_kind === "changed" ? "Changed, reconfirm" : "Added, confirm"}</Tag> : null}
-          {!pending && toConfirm ? <Tag tone="warn">Copied rule, confirm</Tag> : null}
-          {r.seeded && r.confirmed ? <Tag tone="ok">Confirmed</Tag> : null}
+          {!pending && r.seeded ? <Tag>Copied from old file</Tag> : null}
           {pending ? (
             <span className="set-help">
               {`${r.pending_kind === "changed" ? "Changed" : "Added"} by ${r.pending_by ?? "a conversation"} at the owner's request; the owner has not confirmed it yet.`}
@@ -1766,10 +1802,10 @@ function RulesSection({ data, lists, w, now, revealItem }: { data: RouteView; li
     setAdding(false);
     setAddOpen(false);
   };
-  const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
+  const toConfirm = rules.filter((r) => r.pending).length;
   const inFilter: Record<RuleFilter, (r: RouteRule) => boolean> = {
     all: () => true,
-    confirm: (r) => !!r.pending || (!!r.seeded && !r.confirmed),
+    confirm: (r) => !!r.pending,
     checked: (r) => watchedRules.includes(r.n),
     broken: (r) => watchedRules.includes(r.n) && resultOf(r.n)?.result === "broken",
   };
@@ -1962,6 +1998,16 @@ function settingDefault(cfg: RouteConfig | null, key: string): number | null {
   return typeof v === "number" ? v : null;
 }
 
+/** Which rarely needed settings stay on this Mac. Everything else is the same
+ * on every Mac once the routing copy is on (the approved inventory's Macs column). */
+const THIS_MAC_ONLY = new Set([
+  "routing_prompt_budget_ms", "routing_start_budget_ms", "routing_ledger_keep_days",
+  "routing_busy_load", "routing_busy_wait", "routing_busy_tries", "routing_table",
+]);
+function MacTag({ keys }: { keys: string[] }) {
+  return <Tag>{keys.some((k) => THIS_MAC_ONLY.has(k)) ? "This Mac only" : "Same on my Macs"}</Tag>;
+}
+
 function LimitRow({
   name,
   help,
@@ -2007,6 +2053,7 @@ function LimitRow({
       <span className="route-limit-text">
         <span className="route-limit-name">{name}</span>
         <span className="set-help">{help}</span>
+        <MacTag keys={fields.map((f) => f.key)} />
       </span>
       <span className="route-val">{shown}</span>
       <button
@@ -2088,7 +2135,7 @@ function RetryTimesRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer;
   const value = `[${[a, b].filter((t) => t !== "").join(",")}]`;
   const shown = values == null ? "…" : values.length === 0 ? "No retries" : values.map((v) => limitWords(v, "time")).join(" and ");
   return <div className="row-item route-limit route-retries">
-    <span className="route-limit-text"><span className="route-limit-name">Try again after</span><span className="set-help">Up to two retry times when the same limit remains. Leave both empty for no retries.</span></span>
+    <span className="route-limit-text"><span className="route-limit-name">Try again after</span><span className="set-help">Up to two retry times when the same limit remains. Leave both empty for no retries.</span><MacTag keys={["routing_reset_check_retries"]} /></span>
     <span className="route-val">{shown}</span>
     <span className="toolbar"><label>First retry (seconds)<input aria-label="First retry in seconds" value={first} onChange={(e) => { setDirty(true); setFirst(e.target.value); }} /></label><label>Second retry (seconds)<input aria-label="Second retry in seconds" value={second} onChange={(e) => { setDirty(true); setSecond(e.target.value); }} /></label><button type="button" className="sm" disabled={!valid || w.isBusy(id)} onClick={() => void w.run(id, "khipu_config_set", { key: "routing_reset_check_retries", value }, async () => { await reread(); setDirty(false); })}><Busy on={w.isBusy(id)} />Save</button></span>
     {!valid ? <span className="set-error" role="alert">Use positive whole seconds, the second later than the first, or leave both empty for no retries.</span> : null}<WriteError w={w} id={id} />
@@ -2140,7 +2187,7 @@ function ProposalRowView({ row, data, now }: { row: ProposalRow; data: RouteView
         <span>That rule isn't in this read, so this proposal can't be confirmed or dismissed here. Read the routing record again, then try again.</span>
       ) : null}
       <span className="end">
-        {live ? <Tag tone="accent" dot>In use</Tag> : p.status === "crossed" ? <Tag tone="warn" dot>Crossed</Tag> : <Tag dot>{endedWords(p.status)}</Tag>}
+        {live ? <Tag tone="accent" dot>In use</Tag> : p.status === "crossed" ? <Tag tone="warn" dot>Two Macs disagreed</Tag> : <Tag dot>{endedWords(p.status)}</Tag>}
       </span>
       {live && !row.withheld ? (
         <div className="prop-side">
@@ -2901,18 +2948,19 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
   return (
     <div className="row-item route-limit">
       <span className="route-limit-text">
-        <span className="route-limit-name">Your dispatch scripts</span>
+        <span className="route-limit-name">Your hand-off scripts</span>
         <span className="set-help">
           Scripts of your own that hand work to another agent. A shell command that runs one counts as handing work on,
           like claude -p or codex exec.
         </span>
+        <MacTag keys={["routing_dispatch_scripts"]} />
       </span>
       <span className="route-val">{names == null ? "…" : names.length ? names.join(", ") : "None"}</span>
       <button
         ref={btn}
         type="button"
         className="sm"
-        aria-label="Change your dispatch scripts"
+        aria-label="Change your hand-off scripts"
         aria-expanded={open}
         aria-controls={open ? formId : undefined}
         disabled={names == null}
@@ -2929,7 +2977,7 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
         Change…
       </button>
       {open ? (
-        <form className="route-pause" id={formId} aria-label="Change your dispatch scripts" onSubmit={save} onKeyDown={escapeCloses(close)}>
+        <form className="route-pause" id={formId} aria-label="Change your hand-off scripts" onSubmit={save} onKeyDown={escapeCloses(close)}>
           <div className="toolbar">
             <label htmlFor={`${formId}-names`}>File names</label>
             <input
@@ -2944,7 +2992,7 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
             />
           </div>
           <p className="set-help">File names only, separated by commas. Leave it empty for none.</p>
-          <WriteError w={w} id={id} say={(m) => settingWords(m, "routing_dispatch_scripts", "Your dispatch scripts")} />
+          <WriteError w={w} id={id} say={(m) => settingWords(m, "routing_dispatch_scripts", "Your hand-off scripts")} />
           <div className="toolbar">
             <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
               <Busy on={w.isBusy(id)} />
@@ -2979,7 +3027,7 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
   },
   {
     name: "Longest line",
-    help: "Each line about an account, a hold or a lane. Rules and your note have their own limits.",
+    help: "Each line about an account, a hold or a job slot. Rules and your note have their own limits.",
     fields: [{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }],
   },
   {
@@ -3154,13 +3202,13 @@ function TellingSection({
       <SubFold k="sub:hears" name="What each kind of conversation hears" line={`${HEARS.length} kinds`} folds={folds}>
       <p className="opt-group-note">
         A running conversation hears a change as soon as its app allows. Any conversation can also ask Khipu.
-        Switching these off stops only the telling.
+        Switching these off stops only the updates.
       </p>
       <div className="opt-list">
         <SwitchRow
           id="route-push-all"
           label="Tell conversations about routing"
-          what="Turns all of the telling on or off. The same switch is in Optional features."
+          what="Turns all of these updates on or off. The same switch is in Optional features."
           tag={locked ? <Tag>Locked</Tag> : <Tag>Also in Optional features</Tag>}
           checked={master?.enabled === true}
           disabled={!master || locked || w.anyBusy}
@@ -3241,7 +3289,7 @@ function TellingSection({
             ) : null}
             {old.file ? (
               <>
-                The file <span className="mono">/tmp/.routing_now_disable</span> exists; delete it to turn the telling
+                The file <span className="mono">/tmp/.routing_now_disable</span> exists; delete it to turn these updates
                 back on.
               </>
             ) : null}
@@ -3252,7 +3300,7 @@ function TellingSection({
           <p className="set-help">
             Your old "routing off" file, <span className="mono">/tmp/.routing_now_disable</span>, isn't there. Khipu
             can't see your shell's settings: if <span className="mono">ROUTING_NOW_OFF=1</span> is set there,
-            conversations started from that shell are told nothing. Setting either one turns the telling off.
+            conversations started from that shell are told nothing. Setting either one turns these updates off.
           </p>
         )}
         </SubFold>
@@ -3290,7 +3338,7 @@ function MacRoutingControls({
 }) {
   const cfgRead = switchRead(cfg, cfgError, reread);
   return (
-    <div className="section-body route-macs-controls">
+    <div className="section-body route-macs-controls" data-find-setting="routing-copy">
       <p className="set-help">
         These controls apply to this Mac. They do not change what conversations hear or send proposal words to cloud agents.
       </p>
@@ -3300,7 +3348,7 @@ function MacRoutingControls({
           id="route-replication-live"
           label="Copy routing between your Macs through the hub"
           what="Sends your routing record to the hub so your other Macs can pick it up, and brings their routing changes here. This is the Mac-to-Mac copy, separate from the copy for cloud agents."
-          tag={<Tag>Between your Macs</Tag>}
+          tag={<Tag>Same on my Macs</Tag>}
           checked={cfg?.routing?.routing_replication_live?.value === true}
           disabled={!cfg || w.anyBusy}
           read={cfgRead}
@@ -3315,7 +3363,7 @@ function MacRoutingControls({
           {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
         </p>
         </div>
-        <SwitchRow
+        <div data-find-setting="mac-tags"><SwitchRow
           id="route-proposal-text"
           label="Share proposal words between your Macs"
           what="A conversation's proposed words travel between your Macs, so you can confirm them anywhere. Off, they stay on the Mac they came from until you confirm them there. They never go to cloud agents."
@@ -3328,7 +3376,7 @@ function MacRoutingControls({
             void w.run("proposal-text", "khipu_config_set", { key: "routing_proposal_text_between_macs", value: next ? "on" : "off" }, reread)
           }
           error={<WriteError w={w} id="proposal-text" />}
-        />
+        /></div>
         {deliveryHealth?.gateway?.cleanup_gave_up || deliveryHealth?.gateway?.cleanup_interrupted
           || deliveryHealth?.gateway?.cleanup_full ? (
           <div className="set-help" role="alert">
@@ -3382,7 +3430,7 @@ function runnerState(r: RouteRunner | undefined, now: Date): { text: string; ton
   }
   const lanes = r.lanes?.length ?? 0;
   const read = r.heartbeat_at ? `Read ${saidWhen(r.heartbeat_at, now)}` : "Read";
-  return { text: `${read} · ${lanes} lane${lanes === 1 ? "" : "s"}`, tone: "ok" };
+  return { text: `${read} · ${lanes} job slot${lanes === 1 ? "" : "s"}`, tone: "ok" };
 }
 
 function runnerDetail(entry: SourceEntry, r: RouteRunner | undefined, now: Date): string {
@@ -3752,35 +3800,35 @@ function ProvidersLanesSection({
       </div> : null}
       {mode !== "providers" ? <><div className="section-body">
         <h2 className="sub-title">
-          Lanes{" "}
+          Job slots{" "}
           {totalLanes ? (
             <span className="meta">
-              {plural(totalLanes, "lane", "lanes")}
+              {plural(totalLanes, "job slot", "job slots")}
               {entries.length ? ` in ${plural(entries.length, "job runner folder", "job runner folders")}` : ""}
             </span>
           ) : null}
         </h2>
         {recordRead !== "ready" ? (
           // Before the lane map is read every lane would look unmatched.
-          <RecordReadLine read={recordRead} what="job runner lanes" />
+          <RecordReadLine read={recordRead} what="job slots" />
         ) : totalLanes ? (
           <>
             {searchLanes ? (
               <>
                 <div className="search-row">
                   <label className="sr-only" htmlFor={laneSearchId}>
-                    Search job runner lanes
+                    Search job runner job slots
                   </label>
-                  <input id={laneSearchId} ref={laneSearch} className="filter-input" type="search" placeholder={`Search the ${totalLanes} lanes`}
+                  <input id={laneSearchId} ref={laneSearch} className="filter-input" type="search" placeholder={`Search the ${totalLanes} job slots`}
                     autoComplete="off" value={lists.laneQuery} onChange={(e) => lists.setLaneQuery(e.target.value)} />
                 </div>
                 {query ? (
                   <p className="set-help" role="status">
                     {shownLanes.length
-                      ? `${shownLanes.length} of ${totalLanes} lanes match.`
-                      : `No lanes match “${query}”.`}
+                      ? `${shownLanes.length} of ${totalLanes} job slots match.`
+                      : `No job slots match “${query}”.`}
                     {hiddenNoAccount
-                      ? ` ${plural(hiddenNoAccount, "lane without an account is", "lanes without an account are")} hidden by this search.`
+                      ? ` ${plural(hiddenNoAccount, "job slot without an account is", "job slots without an account are")} hidden by this search.`
                       : ""}{" "}
                     <button type="button" className="sm link" onClick={() => {
                       lists.setLaneQuery("");
@@ -3793,7 +3841,7 @@ function ProvidersLanesSection({
               </>
             ) : null}
             {shownLanes.length ? (
-              <div className="mrows" role="list" aria-label="Lanes">
+              <div className="mrows" role="list" aria-label="Job slots">
                 {shownLanes.map(({ runner, lane }) => (
                   <LaneRow key={`${runner}/${lane}`} runner={runner} lane={lane} target={map[runner]?.[lane]}
                     match={runners.find((r) => r.name === runner)?.lane_matches?.[lane]}
@@ -3801,12 +3849,12 @@ function ProvidersLanesSection({
                 ))}
               </div>
             ) : null}
-            <p className="set-help">A lane without an account still runs; its limits just count toward no account.</p>
+            <p className="set-help">A job slot without an account still runs; its limits just count toward no account.</p>
           </>
         ) : (
           <div className="empty">
             <b>No job runners yet</b>
-            <span>Add a job runner folder and its lanes show here with the account each one uses.</span>
+            <span>Add a job runner folder and its job slots show here with the account each one uses.</span>
 
           </div>
         )}
@@ -3909,7 +3957,7 @@ function ProvidersLanesSection({
           })}
           {unmatchedLimits.length ? (
             <p className="set-help" role="status">
-              {unmatchedLimits.length === 1 ? "A limit came" : `${unmatchedLimits.length} limits came`} from a lane that
+              {unmatchedLimits.length === 1 ? "A limit came" : `${unmatchedLimits.length} limits came`} from a job slot that
               isn't matched to an account. Match it above and the limit counts for that account.
             </p>
           ) : null}
@@ -3951,7 +3999,7 @@ function ProvidersLanesSection({
           <div className="rows">
             <LimitRow
               name="Say a job runner stopped reporting after"
-              help="Counted in the runner's own heartbeat intervals."
+              help="Counted in the runner's own check-in intervals."
               fields={[{ key: "routing_runner_silent_intervals", label: "Stopped after", unit: "intervals", options: [2, 3, 5, 10, 20, 0], zero: "Never" }]}
               cfg={cfg}
               w={w}
@@ -3975,7 +4023,7 @@ function ProvidersLanesSection({
             />
             <LimitRow
               name="Newest limit lines kept from each runner"
-              help="The runner's lines that say a lane reached a limit."
+              help="The runner's lines that say a job slot reached a limit."
               fields={[{ key: "routing_runner_limited_lines", label: "Keep", unit: "lines", options: [50, 100, 200, 500, 1000, 0], zero: "No limit" }]}
               cfg={cfg}
               w={w}
@@ -3991,13 +4039,13 @@ function ProvidersLanesSection({
             />
           </div>
           <p className="set-help">
-            Khipu only reads these folders. It never writes to them, never changes a runner's settings, and reads only
-            its limits, its job starts, its heartbeat and the few lane settings it needs to watch your rules. Every line
-            it keeps is checked for secrets first. A folder inside API Keys, My Portfolio or any sign-in file is refused.
+            Khipu only reads these folders; it never writes to them or changes a runner's settings. It keeps only
+            limits, job starts and check-ins, after checking each line for secrets. A folder inside API Keys, My
+            Portfolio or any sign-in file is refused.
           </p>
           <p className="set-help">
-            A limit on one lane closes every lane on the same account. A lane that isn't matched is never guessed;
-            conversations are told a limit came from an unmatched lane.
+            A limit on one job slot closes every job slot on the same account. A job slot that isn't matched is never guessed;
+            conversations are told a limit came from an unmatched job slot.
           </p>
         </SubFold>
       </div></> : null}
@@ -4027,7 +4075,7 @@ const LANE_REASON_WORDS: Record<string, string> = {
   "override has no unique current binding": "the account you mapped it to has no unique binding",
 };
 
-const LANE_MAP_HELP = "Add an account line for this lane in the runner's settings, or map it here.";
+const LANE_MAP_HELP = "Add an account line for this job slot in the runner's settings, or map it here.";
 
 /** The how-matched line, the tag beside it and the candidates row under a
  *  lane, in the mock's words. `undefined` tag: none. */
@@ -4123,7 +4171,7 @@ function LaneRow({
       </span>
       <span className="arrow" aria-hidden>→</span>
       {open ? (
-        <form className="lane-form" aria-label={`Account for ${runner}'s ${lane} lane`} onSubmit={save}>
+        <form className="lane-form" aria-label={`Account for ${runner}'s ${lane} job slot`} onSubmit={save}>
           {!resolved ? <Tag tone="warn">No account</Tag> : null}
           {!resolved && !!match?.candidates.length ? <span>Could be: {match.candidates.join(", ")}</span> : null}
           <label className="sr-only" htmlFor={selId}>
@@ -4168,7 +4216,7 @@ function LaneRow({
             <button
               type="button"
               className="sm"
-              aria-label={`Change the account for ${runner}'s ${lane} lane`}
+              aria-label={`Change the account for ${runner}'s ${lane} job slot`}
               onClick={() => {
                 setChoice(known?.label ?? "");
                 setOpen(true);
@@ -4250,6 +4298,7 @@ function TableSection({
                 An old file you kept by hand before Khipu had its own record. Khipu reads it but never writes to it and
                 never takes an account's state from it; it only notes when the file's current-state section changes.
               </span>
+              <MacTag keys={["routing_table"]} />
             </span>
             <span className="route-val">{path ? val : ""}</span>
             <button
@@ -4664,10 +4713,10 @@ export function PaceSection({ data, plans, now, folds }: {
         <span><i className="cap" />your cap</span>
       </div>
       <SubFold k="sub:pace-push" name="When pace changes are sent to conversations"
-        line="At a verdict change, and 24 h, 6 h, 1 h and 15 min before a limit" folds={folds}>
+        line="When the advice changes, and 24 h, 6 h, 1 h and 15 min before a limit" folds={folds}>
         <p className="set-help">
-          A conversation hears when a window&apos;s verdict changes, and when its forecast crosses 24 hours, 6 hours,
-          1 hour or 15 minutes. It hears each forecast once, and the advice never stops a job.
+          A conversation hears when the advice for a limit changes, and again 24 hours, 6 hours, 1 hour and 15 minutes
+          before it. It hears each one once, and the advice never stops a job.
         </p>
       </SubFold>
     </div>
@@ -4697,10 +4746,10 @@ type ShownTag = { text: string; tone: GroupTag["tone"] | "accent" };
 
 /** Technical sections stay available but do not turn the rare page into a
  * second routing dashboard. This is the only page allowed to fold. */
-function RareFold({ name, children }: { name: string; children: ReactNode }) {
+function RareFold({ name, children, findKey }: { name: string; children: ReactNode; findKey?: string }) {
   const [open, setOpen] = useState(false);
   const id = `route-rare-${useId().replace(/:/g, "")}`;
-  return <section className="fold disclose route-sub-fold route-rare-fold" data-open={open}>
+  return <section className="fold disclose route-sub-fold route-rare-fold" data-open={open} data-find-setting={findKey}>
     <button type="button" className="disclosure fold-btn" aria-expanded={open} aria-controls={id} onClick={() => setOpen((v) => !v)}>
       <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
       <span>{name}</span>
@@ -4725,7 +4774,7 @@ function PageGroup({
   children: ReactNode;
 }) {
   return (
-    <section className="route-page-group" aria-labelledby={`route-group-${k}`}>
+    <section className="route-page-group" aria-labelledby={`route-group-${k}`} data-find-setting={`group-${k}`}>
       <div className="route-page-group-head" data-settings-group={k} tabIndex={-1}>
         <h3 id={`route-group-${k}`} tabIndex={-1}>{name}</h3>
         <span className="gline">{line === "Reading…" ? <span className="reading">Reading…</span> : line}</span>
@@ -4810,11 +4859,27 @@ export function RoutingSettings({
   const w = useWriter(rereadRoute);
   const folds = useFolds();
   const [page, setPage] = useState<RoutingPageKey>("needs");
+  const [findTarget, setFindTarget] = useState<FindSetting | null>(null);
   const selectPage = (next: RoutingPageKey) => setPage(next);
   const selectGroup = (group: GroupKey) => setPage(pageForGroup(group));
   useEffect(() => {
     document.querySelector<HTMLElement>(".main-content")?.scrollTo?.({ top: 0 });
   }, [page]);
+  useEffect(() => {
+    if (!findTarget || page !== findTarget.page) return;
+    const frame = requestAnimationFrame(() => {
+      const target = pagesRef.current?.querySelector<HTMLElement>(findTarget.selector);
+      if (!target) return;
+      if (findTarget.rare) {
+        const fold = target.querySelector<HTMLButtonElement>("button[aria-expanded]");
+        if (fold?.getAttribute("aria-expanded") === "false") fold.click();
+      }
+      target.scrollIntoView?.({ block: "center" });
+      (target.querySelector<HTMLElement>("button, input, select, textarea, [tabindex]") ?? target).focus?.();
+      setFindTarget(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [findTarget, page]);
   const laneRaw = config.data?.routing?.routing_lane_map?.value;
   const finder = useAccountsFinder(active, {
     view: route.data,
@@ -4914,6 +4979,12 @@ export function RoutingSettings({
     setFocusItem({ item: p.item ?? null, group: p.group });
   };
 
+  const openFoundSetting = (target: FindSetting) => {
+    if (target.group) folds.openKeys([target.group]);
+    setFindTarget(target);
+    selectPage(target.page);
+  };
+
   const unread = route.error ? (
     <p className="set-error">Khipu couldn't read the routing record, so this stays blank until the read works.</p>
   ) : (
@@ -4999,6 +5070,7 @@ export function RoutingSettings({
     <div className="route-settings">
       <div ref={pagesRef} className="route-pages">
         <nav className="route-page-nav" aria-label="Accounts and routing pages">
+          <FindASetting onChoose={openFoundSetting} />
           {ROUTING_PAGES.map((p) => (
             <button key={p.key} type="button" data-routing-page-select={p.key} aria-current={page === p.key ? "page" : undefined}
               onClick={() => selectPage(p.key)}>
@@ -5071,13 +5143,14 @@ export function RoutingSettings({
           </div>
           <section className="route-page" data-routing-page="accounts" data-active={page === "accounts"} aria-labelledby="route-page-accounts">
             <h2 id="route-page-accounts" tabIndex={-1}>Your accounts</h2>
-            <p className="set-help set-intro">Who has room, what Khipu can read, and how quickly an allowance is changing.</p>
+            <p className="set-help set-intro">Who has room now, when that changes, and the details you can adjust.</p>
             {group("accounts")}
             {group("pace")}
             <ResetCheckStatus data={data} />
           </section>
           <section className="route-page" data-routing-page="work" data-active={page === "work"} aria-labelledby="route-page-work">
             <h2 id="route-page-work" tabIndex={-1}>Who gets what work</h2>
+            <p className="set-help set-intro">Your order, rules, note and temporary instructions. Khipu passes them on.</p>
             <nav className="route-work-jumps" aria-label="Who gets what work sections">
               {[["Order", "route-group-priority"], ["Note", "route-work-note"], ["Rules", "route-work-rules"], ["Holds", "route-work-holds"]].map(([label, target]) => (
                 <button key={target} type="button" className="sm" onClick={() => {
@@ -5100,12 +5173,12 @@ export function RoutingSettings({
           </section>
           <section className="route-page" data-routing-page="conversations" data-active={page === "conversations"} aria-labelledby="route-page-conversations">
             <h2 id="route-page-conversations" tabIndex={-1}>Conversations</h2>
-            <p className="set-help set-intro">What each conversation has heard and when Khipu tells it about routing.</p>
+            <p className="set-help set-intro">What running conversations have heard and when Khipu tells them about routing.</p>
             {group("telling")}
           </section>
           <section className="route-page" data-routing-page="changes" data-active={page === "changes"} aria-labelledby="route-page-changes">
             <h2 id="route-page-changes" tabIndex={-1}>What changed</h2>
-            <p className="set-help set-intro">Recent routing changes, newest first.</p>
+            <p className="set-help set-intro">Every routing change, newest first, and who made it.</p>
             {group("changes")}
             {data ? <ProposalsSection data={data} now={now} /> : null}
           </section>
@@ -5118,13 +5191,13 @@ export function RoutingSettings({
           <section className="route-page route-page-rare" data-routing-page="rare" data-active={page === "rare"} aria-labelledby="route-page-rare">
             <h2 id="route-page-rare" tabIndex={-1}>Rarely needed</h2>
             <p className="set-help set-intro">Technical settings and local setup details. The defaults are usually fine.</p>
-            <RareFold name="Checking accounts when they reset">{group("resets")}</RareFold>
-            <RareFold name="Old routing table file">{group("table")}</RareFold>
-            <RareFold name="Priority and hold limits"><PriorityRarelySetting cfg={config.data} w={w} reread={rereadConfig} /><HoldRarelySettings cfg={config.data} w={w} reread={rereadConfig} /></RareFold>
-            <RareFold name="Sizes, timing and hand-off scripts"><TellingRarelySettings cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></RareFold>
-            <RareFold name="Model table">{data ? <ModelTableSection data={data} now={now} /> : null}</RareFold>
-            <RareFold name="Providers and account setup"><ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} mode="providers" /></RareFold>
-            <RareFold name="Reading usage from logins"><section className="route-page-group" aria-labelledby="route-login-reads">
+            <RareFold name="Checking accounts when they reset" findKey="rare-resets">{group("resets")}</RareFold>
+            <RareFold name="Old routing table file" findKey="rare-table">{group("table")}</RareFold>
+            <RareFold name="Priority and hold limits" findKey="rare-priority"><PriorityRarelySetting cfg={config.data} w={w} reread={rereadConfig} /><HoldRarelySettings cfg={config.data} w={w} reread={rereadConfig} /></RareFold>
+            <RareFold name="Sizes, timing and hand-off scripts" findKey="rare-sizes"><TellingRarelySettings cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></RareFold>
+            <RareFold name="Model table" findKey="rare-models">{data ? <ModelTableSection data={data} now={now} /> : null}</RareFold>
+            <RareFold name="Providers and account setup" findKey="rare-providers"><ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} mode="providers" /></RareFold>
+            <RareFold name="Reading usage from logins" findKey="rare-logins"><section className="route-page-group" aria-labelledby="route-login-reads">
               <div className="route-page-group-head"><h3 id="route-login-reads">Reading usage from logins</h3></div>
               <div className="route-page-group-body"><LoginUsageSwitches cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></div>
             </section></RareFold>

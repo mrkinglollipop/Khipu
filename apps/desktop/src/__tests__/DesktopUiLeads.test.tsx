@@ -54,7 +54,7 @@ describe("Optional features: a write that succeeds and a re-read that fails", ()
   });
 });
 
-describe("Telling conversations", () => {
+describe("When conversations hear", () => {
   it("does not say nobody is live when the CLI's delivery_rows is null (damaged) but doctor lists a red identity", () => {
     const view = { ...DELIVERY_VIEW, delivery_rows: null } as typeof DELIVERY_VIEW;
     render(<DeliverySection data={view} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);

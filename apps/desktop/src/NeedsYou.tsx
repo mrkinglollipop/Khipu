@@ -130,28 +130,14 @@ function DecideItem({ card, data, w, eok, reread, back }: {
   );
 }
 
-/** Rules copied from the old routing file, read and kept where they are listed. */
-function SeededRules({ rules, w, eok, onEdit, back }: { rules: RouteRule[]; w: Writer; eok: EndOrKeep; onEdit: () => void; back: Back }) {
+/** Rules copied from the old routing file are already in force. They are a
+ * single later reference, not a second confirmation queue. */
+function SeededRules({ rules, onEdit }: { rules: RouteRule[]; onEdit: () => void }) {
   return (
-    <ul className="needs-seeded">
-      {rules.map((r) => {
-        const id = `needs:seeded:${r.entity ?? r.n}`;
-        return (
-          <li key={id}>
-            <span className="needs-seeded-text">{r.text}</span>
-            <span className="needs-row-acts">
-              <button type="button" className="sm" disabled={w.isBusy(id)}
-                onClick={() => void eok.attempt(id, "khipu_route_rule", { action: "confirm", ...ruleTarget(r), expect: r.revision }, null, back)}>
-                <Busy on={w.isBusy(id)} />
-                Keep as written
-              </button>
-              <button type="button" className="sm" onClick={onEdit}>Edit or remove</button>
-            </span>
-            <WriteError w={w} id={id} />
-          </li>
-        );
-      })}
-    </ul>
+    <>
+      <ul className="needs-seeded">{rules.map((r) => <li key={`needs:seeded:${r.entity ?? r.n}`}><span className="needs-seeded-text">{r.text}</span></li>)}</ul>
+      <button type="button" className="sm" onClick={onEdit}>Edit rules</button>
+    </>
   );
 }
 
@@ -205,7 +191,7 @@ export function NeedsYou({ cards, accounts, problems, seeded, data, w, reread, o
   const later = problems.filter((p) => p.band === "later");
   const row = (p: Problem) => {
     const verb = p.act ?? "Show";
-    const isSeeded = p.kind === "confirm" && seeded.length > 0;
+    const isSeeded = p.kind === "old-file-rules" && seeded.length > 0;
     return (
       <li key={p.key} className="needs-row">
         {p.band === "later" ? null : <span className={`hdot ${p.tone}`} aria-hidden />}
@@ -224,7 +210,7 @@ export function NeedsYou({ cards, accounts, problems, seeded, data, w, reread, o
             </button>
           )}
         </span>
-        {isSeeded && readSeeded ? <SeededRules rules={seeded} w={w} eok={eok} onEdit={() => onShow(p)} back={back} /> : null}
+        {isSeeded && readSeeded ? <SeededRules rules={seeded} onEdit={() => onShow(p)} /> : null}
       </li>
     );
   };

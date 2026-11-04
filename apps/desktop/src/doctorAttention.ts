@@ -638,7 +638,7 @@ export function routingAttention(view: RouteView | null | undefined, now: Date =
       key: `routing:lane:${u.runner}/${u.lane}`,
       tone: "warn",
       title: "A limit came from a lane not matched to an account",
-      cause: `A limit came from ${u.runner}'s ${u.lane} lane, which isn't matched to an account${u.until ? `; it ends ${aheadWords(u.until, now)}` : ""}. Conversations are told the lane's name only, never a guessed account.`,
+      cause: `A limit came from ${u.runner}'s ${u.lane} job slot, which isn't matched to an account${u.until ? `; it ends ${aheadWords(u.until, now)}` : ""}. Conversations are told the job slot's name only, never a guessed account.`,
     });
   }
   return items;

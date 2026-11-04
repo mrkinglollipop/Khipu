@@ -27,9 +27,9 @@ export const GROUPS: ReadonlyArray<{ key: GroupKey; name: string; record: boolea
   { key: "rules", name: "Your note and standing rules", record: true },
   { key: "holds", name: "Holds", record: true },
   { key: "checks", name: "Checks and copies", record: true },
-  { key: "telling", name: "Telling conversations", record: false },
+  { key: "telling", name: "When conversations hear", record: false },
   { key: "resets", name: "Checking for resets", record: false },
-  { key: "runners", name: "Providers and lanes", record: true },
+  { key: "runners", name: "Job runners and job slots", record: true },
   { key: "table", name: "Old routing table file", record: false },
   { key: "changes", name: "Recent changes", record: true },
 ];
@@ -244,19 +244,27 @@ export function routingProblems(
   if (view.priority?.pending) {
     out.push({ key: "priority", group: "priority", kind: "priority", tone: "warn", item: "priority:pending" });
   }
-  const toConfirm = (view.rules ?? []).filter((r) => r.pending || (r.seeded && !r.confirmed));
+  // A pending change still needs an answer. Rules copied from the old file do
+  // not: the owner decided they remain in force either way, so show them once
+  // as a later reference rather than making the same request in two places.
+  const toConfirm = (view.rules ?? []).filter((r) => r.pending);
   for (const r of toConfirm) out.push({ key: `confirm:${r.n}`, group: "rules", kind: "confirm", tone: "warn" });
   const oldRules = oldFileRules(view);
   if (oldRules.length) {
-    // Owner's decision 3: in use either way, so listed once, for when he has time.
-    const first = out.find((p) => p.key === `confirm:${oldRules[0].n}`)!;
-    first.needs = oldRules.length === 1
+    out.push({
+      key: "old-file-rules",
+      group: "rules",
+      kind: "old-file-rules",
+      tone: "warn",
+      needs: oldRules.length === 1
       ? "1 rule copied from your old routing file was never reviewed"
-      : `${oldRules.length} rules copied from your old routing file were never reviewed`;
-    first.detail = `${oldRules.length === 1 ? "It is" : "They are"} in use either way. Reviewing only marks ${oldRules.length === 1 ? "it" : "them"} as yours.`;
-    first.band = "later";
-    first.show = oldRules.length === 1 ? "the rule from your old file" : "the rules from your old file";
-    first.item = `rule:${oldRules[0].n}`;
+      : `${oldRules.length} rules copied from your old routing file were never reviewed`,
+      detail: `${oldRules.length === 1 ? "It is" : "They are"} in use either way. You can edit or remove ${oldRules.length === 1 ? "it" : "them"} whenever you want.`,
+      band: "later",
+      act: "Read them",
+      show: oldRules.length === 1 ? "the rule from your old file" : "the rules from your old file",
+      item: `rule:${oldRules[0].n}`,
+    });
   }
   for (const { rule, checks } of brokenRules(view)) {
     const said = (checks[0]?.text ?? "").replace(/^A standing rule may be broken: /, "").replace(/\.$/, "");
@@ -334,13 +342,14 @@ const TAG_WORDS: Record<string, (n: number) => string> = {
   priority: () => "To confirm",
   confirm: (n) => `${n} to confirm`,
   broken: (n) => `${n} may be broken`,
+  "old-file-rules": (n) => `${n} from your old file`,
   proposal: (n) => (n === 1 ? "1 to confirm" : `${n} to confirm`),
   remind: (n) => plural(n, "hold to look at", "holds to look at"),
   silent: (n) => `${n} stopped reporting`,
   unreadable: (n) => `${n} can't be read`,
   refused: (n) => `${n} refused`,
-  lane: (n) => plural(n, "lane without an account", "lanes without an account"),
-  conflict: (n) => plural(n, "lane conflicts", "lanes conflict"),
+  lane: (n) => plural(n, "job slot without an account", "job slots without an account"),
+  conflict: (n) => plural(n, "job slot conflicts", "job slots conflict"),
   table: () => "Can't read the file",
   contradiction: (n) => plural(n, "contradiction", "contradictions"),
   crossing: (n) => plural(n, "cap crossing", "cap crossings"),
@@ -494,7 +503,7 @@ function runnersLine(view: RouteView, s: OverviewSettings): string {
     lanes += new Set([...(r?.lanes ?? []), ...Object.keys(map[name] ?? {})]).size;
   }
   if (!folders && !lanes) return "No job runner folders";
-  return `${plural(providerRows(view).length, "provider", "providers")} · ${plural(folders, "folder", "folders")}, ${plural(lanes, "lane", "lanes")}`;
+  return `${plural(providerRows(view).length, "provider", "providers")} · ${plural(folders, "folder", "folders")}, ${plural(lanes, "job slot", "job slots")}`;
 }
 
 function tableLine(s: OverviewSettings): string {
