@@ -185,37 +185,62 @@ def health(now: datetime | None = None) -> dict:
                      "red": {"lines": LINES_RED, "bytes": BYTES_RED}},
            "last_compaction": last.get("at"), "last_result": last.get("result"),
            "archives": len(_archives())}
-    gone, total = _droppable() if level != "green" and last.get("attempted_at") else (1, 0)
-    if level != "green" and last.get("attempted_at") and gone < MIN_GAIN * total:
-        out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes), over its bound of "
-                          f"{LINES_YELLOW:,}, and compaction can't shrink it further: {total - gone:,} of "
-                          "its lines are the owner's, readings and observations still counted, or the newest "
-                          "of their kind, which the fold needs, and are kept.")
-        owners = sum(1 for _line, event in _rows(routing.events_file().read_bytes())
-                     if event is not None and (event.get("written_by") or {}).get("kind") == "owner")
-        out["warning"] += (f" The owner's protected history accounts for {owners:,} lines; "
-                           "nothing is broken by keeping that history.")
-        out["kept_lines"] = total - gone
-    elif level != "green":
-        out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes); it is compacted at "
-                          f"{LINES_TRIGGER:,} lines or {BYTES_TRIGGER:,} bytes, nightly and after the plan figures "
-                          f"refresh" + (f". It is past {LINES_RED:,} lines or {BYTES_RED:,} bytes, far more than "
-                                        "compaction leaves, so it may be failing." if level == "red" else "."))
+    gone, total = (_droppable() if now is None else _droppable(now)) if level != "green" else (0, 0)
+    if level != "green":
+        local, remote = _stored_rows()
+        rows = local + remote
+        owned = [line for line, event in rows if event is not None and _owner(event)]
+        owners = len(owned)
+        owner_bound = owners > LINES_RED or sum(len(line) + 1 for line in owned) > BYTES_RED
+        if gone < MIN_GAIN * total or gone == 0 or owner_bound:
+            out["level"] = "yellow"
+            out["kept_lines"] = total - gone
+            if owners == total or owner_bound:
+                out["warning"] = (f"Your own history accounts for {owners:,} of the routing record's {lines:,} lines ({nbytes:,} bytes); "
+                                  "nothing is broken and there is nothing to do.")
+            else:
+                out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes) and can't shrink "
+                                  f"further: {total - gone:,} of its lines are protected history, readings and "
+                                  "observations still counted, or the newest of their kind.")
+        else:
+            out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes); it is compacted at "
+                              f"{LINES_TRIGGER:,} lines or {BYTES_TRIGGER:,} bytes, nightly and after the plan figures "
+                              f"refresh" + (f". It is past {LINES_RED:,} lines or {BYTES_RED:,} bytes and still has "
+                                            "observations compaction can remove, so compaction may be failing."
+                                            if level == "red" else "."))
     return out
 
 
-def _droppable() -> tuple[int, int]:
-    """(lines the strongest profile could drop now, lines in the log)."""
+def _stored_rows():
+    from khipu import routing_replication as replication
+
     try:
-        rows = _rows(routing.events_file().read_bytes())
-    except OSError:
-        return 0, 0
-    now = routing._now()
+        local = _rows(routing.events_file().read_bytes())
+    except FileNotFoundError:
+        local = []
+    remote = replication.remote_events()
+    return local, [(json.dumps(row, sort_keys=True).encode(), row) for row in remote]
+
+
+def _droppable(now: datetime | None = None) -> tuple[int, int]:
+    """(removable physical lines, physical event lines across both stores)."""
+    from khipu import routing_replication as replication
+
+    local, remote = _stored_rows()
+    now = now or routing._now()
     try:
         emitted = _emitted(_sightings(routing._inputs(), now))
     except Exception:  # noqa: BLE001 - doctor's row never fails on this
         emitted = None
-    return len(plan(rows, now, PROFILES[-1], emitted=emitted, aged_anchors=True)), len(rows)
+    gone = len(plan(local, now, PROFILES[-1], emitted=emitted, aged_anchors=True))
+    if remote:
+        combined = replication.merge([e for _line, e in local if e is not None], remote=[e for _line, e in remote])
+        rows = [(json.dumps(e, sort_keys=True).encode(), e) for e in combined]
+        drop = plan(rows, now, PROFILES[-1], emitted=emitted, aged_anchors=True, replica=True)
+        ids = {rows[i][1].get("id") for i in drop}
+        completed = replication._state().get("completed_order", 0)
+        gone += sum(e["id"] in ids and e.get("hub_order", completed + 1) <= completed for _line, e in remote)
+    return gone, len(local) + len(remote)
 
 
 def _read_state() -> dict:

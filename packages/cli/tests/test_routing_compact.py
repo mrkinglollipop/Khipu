@@ -237,7 +237,7 @@ def test_a_line_half_written_at_the_read_survives_once_and_whole(world, monkeypa
     assert routing.read_view(END)["note"]["text"] == "half"
 
 
-def test_protected_history_keeps_absolute_red_severity(world, monkeypatch):
+def test_protected_history_is_yellow_without_action(world, monkeypatch):
     monkeypatch.setattr(rc, "LINES_YELLOW", 50)
     monkeypatch.setattr(rc, "LINES_RED", 100)
     monkeypatch.setattr(rc, "BYTES_YELLOW", 10 ** 9)
@@ -246,19 +246,19 @@ def test_protected_history_keeps_absolute_red_severity(world, monkeypatch):
               "written_at": routing._iso(END - timedelta(minutes=300 - i)),
               "written_by": {"kind": "owner"}, "via": "app", "auth": "app"} for i in range(150)]
     _install(owner)
-    assert rc.health()["level"] == "red"  # not tried yet: the plain row
+    assert rc.health()["level"] == "yellow"  # protected history needs no attempt
     assert rc.compact(END)["result"] == "skipped"
     row = rc.health()
-    assert row["level"] == "red" and "can't shrink" in row["warning"] and "150 of its lines" in row["warning"]
-    assert "protected history" in row["warning"] and "nothing is broken" in row["warning"]
+    assert row["level"] == "yellow" and "own history" in row["warning"]
+    assert "nothing is broken" in row["warning"] and "nothing to do" in row["warning"]
 
 
-def test_protected_history_keeps_absolute_byte_severity(world, monkeypatch):
+def test_protected_byte_growth_is_yellow_without_action(world, monkeypatch):
     _install(_log(days=1))
     monkeypatch.setattr(rc, "BYTES_RED", 1)
     monkeypatch.setattr(rc, "_read_state", lambda: {"attempted_at": routing._iso(END)})
     monkeypatch.setattr(rc, "_droppable", lambda: (0, 100))
-    assert rc.health()["level"] == "red"
+    assert rc.health()["level"] == "yellow"
 
 
 def test_a_rewritten_log_is_not_replaced(world, monkeypatch):
@@ -325,9 +325,9 @@ def test_doctor_row_is_green_then_yellow_then_red(world, monkeypatch):
     block = routing.doctor_block(END)
     assert block["log"]["level"] == "yellow" and block["log"]["lines"] == 80 and block["log"]["bytes"] > 0
     assert any("80 lines" in w for w in block["warnings"])
-    _install(rows[:200])
+    _install(rows)
     block = routing.doctor_block(END)
-    assert block["log"]["level"] == "red" and block["log"]["lines"] == 200
+    assert block["log"]["level"] == "red" and block["log"]["lines"] == len(rows)
     assert any("past 120 lines" in w for w in block["warnings"])
 
 

@@ -9891,7 +9891,7 @@ def doctor_block(now: datetime | None = None) -> dict:
                         f"Khipu leaves {'them' if bad != 1 else 'it'} out.")
     from khipu import routing_compact
 
-    log_health = routing_compact.health()
+    log_health = routing_compact.health(now)
     if log_health.get("warning"):
         warnings.append(log_health["warning"])
     events, _bad = read_events()
