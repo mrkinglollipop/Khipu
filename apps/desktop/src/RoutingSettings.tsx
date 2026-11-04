@@ -106,7 +106,8 @@ import {
 } from "./routingWords";
 import type { ChangeRow, LimitUnit } from "./routingWords";
 
-type RouteConfig = { routing?: Record<string, RouteSetting> };
+type SyncDifference = { key: string; name: string; local: unknown; remote: unknown; remote_snapshot?: boolean };
+type RouteConfig = { routing?: Record<string, RouteSetting>; settings_sync?: { differences?: SyncDifference[] } };
 
 /** Where focus goes when the control that made a change is gone. */
 export type Back = () => HTMLElement | null | undefined;
@@ -3292,14 +3293,15 @@ function MacRoutingControls({
   return (
     <div className="section-body route-macs-controls">
       <p className="set-help">
-        These controls apply to this Mac. They do not change what conversations hear or send proposal words to cloud agents.
+        Keep settings the same on my Macs copies shared routing settings and caps through the hub. Paths, logins, addresses,
+        machine limits and switches that send data elsewhere stay on this Mac. Search: Copy routing between your Macs.
       </p>
       <div className="opt-list">
         <div className="route-copy-option" role="group" aria-label="Routing copy">
         <SwitchRow
           id="route-replication-live"
-          label="Copy routing between your Macs through the hub"
-          what="Sends your routing record to the hub so your other Macs can pick it up, and brings their routing changes here. This is the Mac-to-Mac copy, separate from the copy for cloud agents."
+          label="Keep settings the same on my Macs"
+          what="Turns routing copy on all your Macs. Shared settings, rules and caps use the hub; local folders, logins and egress controls stay here."
           tag={<Tag>Between your Macs</Tag>}
           checked={cfg?.routing?.routing_replication_live?.value === true}
           disabled={!cfg || w.anyBusy}
@@ -3315,6 +3317,25 @@ function MacRoutingControls({
           {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
         </p>
         </div>
+        {(cfg?.settings_sync?.differences ?? []).length ? (
+          <section className="rows" aria-label="Settings differences">
+            <h3>Differences to choose</h3>
+            <p className="set-help">Nothing was overwritten when settings sync first turned on. Choose one value for each setting.</p>
+            {(cfg?.settings_sync?.differences ?? []).map((d) => (
+              <div className="row-item" key={d.key} role="group" aria-label={d.name}>
+                <span className="route-name">{d.name}</span>
+                <span className="set-help">This Mac: <b>{String(d.local)}</b> · Other Mac: <b>{String(d.remote)}</b></span>
+                <span className="route-actions">
+                  <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-local-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.local) }, reread)}>Use {String(d.local)}</button>
+                  <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-remote-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.remote) }, reread)}>Use {String(d.remote)}</button>
+                </span>
+              </div>
+            ))}
+            <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void (async () => {
+              for (const d of cfg?.settings_sync?.differences ?? []) await w.run(`sync-all-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.remote) }, reread);
+            })()}>Use the other Mac&apos;s for all</button>
+          </section>
+        ) : null}
         <SwitchRow
           id="route-proposal-text"
           label="Share proposal words between your Macs"

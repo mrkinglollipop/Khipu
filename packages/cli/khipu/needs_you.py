@@ -319,6 +319,21 @@ def _settings() -> list[dict]:
                          confirm_does=does, undo_does="Puts back the value it replaced.",
                          confirm=_act("config.answer_request.confirm", key=key, expect=pin),
                          undo=_act("config.answer_request.undo", key=key, expect=pin)))
+    # One persistent, explicit pointer for first-enable conflicts.  The
+    # choices live on Your Macs where both values are visible; no inferred
+    # answer is ever applied merely because a remote snapshot arrived.
+    try:
+        from khipu import routing_replication
+
+        differences = routing_replication.settings_status().get("differences") or []
+        if differences:
+            out.append(_item("setting", "settings-sync", f"On {len(differences)} setting difference"
+                             f"{'s' if len(differences) != 1 else ''} between your Macs to choose.",
+                             confirm_does="Open Your Macs and choose which value to use.",
+                             undo_does="Nothing is changed until you choose.",
+                             do="Open Accounts and routing, then Your Macs."))
+    except Exception:  # noqa: BLE001 - a read failure never hides real requests
+        pass
     return out
 
 

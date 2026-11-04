@@ -398,6 +398,47 @@ def test_unprojected_kinds_are_reported_and_retried_after_projection_upgrade(pai
     assert len(hub.rows) == 2
 
 
+def test_settings_events_and_caps_use_the_existing_closed_projection(pair, monkeypatch):
+    a, _, _ = pair
+    a.activate()
+    event = a.event("setting_set", 1, key="routing_summary_chars", value_json="900", value_set=True)
+    cap = a.event("cap_set", 2, account="codex|", kind="share", window="weekly", pct=30,
+                  revision="cap-test", purpose="job")
+    projected = routing.replication_payload([event, cap], bindings={"codex|": "codex:main"})
+    assert [row["type"] for row in projected] == ["setting_set", "cap_set"]
+    assert projected[0]["key"] == "routing_summary_chars"
+    assert projected[1]["account"] == "codex:main" and projected[1]["pct"] == 30
+
+    # Compatibility proof: this is the untouched old closed-map behaviour.
+    # An older reader has no new entries, so it drops them rather than failing
+    # or copying their values.
+    old = dict(routing._REPLICATION_FIELDS)
+    monkeypatch.delitem(routing._REPLICATION_FIELDS, "setting_set")
+    monkeypatch.delitem(routing._REPLICATION_FIELDS, "cap_set")
+    assert routing.replication_payload([event, cap], bindings={"codex|": "codex:main"}) == []
+    routing._REPLICATION_FIELDS.clear()
+    routing._REPLICATION_FIELDS.update(old)
+
+
+def test_off_mac_polls_and_applies_owner_copy_switch(pair):
+    a, b, hub = pair
+    a.activate()
+    routing.set_setting("routing_replication_live", "on")
+    assert sync(a, hub)["ok"]
+    b.activate()
+    b.configure(routing_replication_live=False)
+    assert sync(b, hub)["ok"]
+    assert routing.settings()["routing_replication_live"] is True
+    a.activate()
+    routing.set_setting("routing_replication_live", "off")
+    assert [e["enabled"] for e in routing.read_events()[0] if e["type"] == "settings_sync_switch"] == [True, False]
+    assert sync(a, hub)["ok"]
+    assert [r["payload"]["enabled"] for r in hub.rows.values() if r["payload"]["type"] == "settings_sync_switch"] == [True, False]
+    b.activate()
+    assert sync(b, hub)["ok"]
+    assert routing.settings()["routing_replication_live"] is False
+
+
 def test_completed_old_scan_reports_its_actual_age(pair):
     from khipu import routing_replication as replication
     a, b, hub = pair

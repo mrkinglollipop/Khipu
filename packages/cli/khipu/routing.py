@@ -237,6 +237,30 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_mac_names": ("mac_names", {}, "Names you gave your Macs, by Mac id"),
 }
 
+# Settings that are meaningful on every owner Mac. This is an allow-list:
+# paths, login folders, egress switches and per-machine limits stay local.
+_SYNC_EXCLUDED = frozenset({
+    "routing_rules_seed", "routing_lane_map", "routing_sources", "routing_table",
+    "routing_replication_live", "routing_proposal_text_between_macs",
+    "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
+    "routing_usage_login_grok", "routing_usage_login_cursor", "routing_usage_login_opencode",
+    "routing_busy_load", "routing_busy_wait", "routing_busy_tries", "routing_mac_names",
+})
+
+
+def settings_syncable(key: str) -> bool:
+    """Whether a routing setting may leave this Mac in a setting_set event."""
+    return key in SETTINGS and key not in _SYNC_EXCLUDED and SETTINGS[key][0] in {
+        "duration", "count", "number", "switch", "durations", "names",
+    }
+
+
+def _setting_event(key: str, value, value_set: bool, *, snapshot: bool = False) -> dict:
+    """A closed, typed setting event; JSON preserves booleans and lists."""
+    return {"type": "setting_set", "key": key,
+            "value_json": json.dumps(value, sort_keys=True, separators=(",", ":")),
+            "value_set": value_set, "snapshot": snapshot}
+
 _UNITS = {"w": 604800, "wk": 604800, "week": 604800, "weeks": 604800, "d": 86400, "day": 86400, "days": 86400,
           "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600, "m": 60, "min": 60, "mins": 60,
           "minute": 60, "minutes": 60, "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1}
@@ -568,6 +592,7 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
     if key not in SETTINGS:
         raise KeyError(f"unknown routing setting {key!r}")
     kind = SETTINGS[key][0]
+    emitted: list[dict] = []
     with _lock(), mutate_config() as data:
         requests = _setting_requests(data)
         if request is not None and key in requests:
@@ -604,6 +629,23 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
+        # The legacy routing-copy key is now the one owner setting which must
+        # cross even while normal replication is off.  Its dedicated event is
+        # small, typed and harmless to older readers (they ignore its kind).
+        if request is None and key == "routing_replication_live":
+            emitted.append({"type": "settings_sync_switch", "enabled": data.get(key) is True})
+            if data.get(key) is True:
+                # First enable is a snapshot, never an implicit overwrite on
+                # the other Mac.  The receiver exposes differences first.
+                for other in SETTINGS:
+                    if settings_syncable(other):
+                        emitted.append(_setting_event(other, data.get(other, SETTINGS[other][1]), other in data,
+                                                      snapshot=True))
+        elif request is None and data.get("routing_replication_live") is True \
+                and "routing_replication_live" not in requests and settings_syncable(key):
+            emitted.append(_setting_event(key, data.get(key, SETTINGS[key][1]), key in data))
+    if emitted:
+        _write_many(owner_lines(emitted, "app"))
     refresh_view()  # config.json is an input of the view: the next prompt finds it current
     return config_file()
 
@@ -2001,6 +2043,15 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
                     "state_id": "id", "schedule_id": "id"},
     "owner_change": {"target": "id", "auth": "owner_auth",
                      "harness": "name"},
+    # Settings use JSON only after the local reader has re-coerced the value.
+    # New kinds are intentionally absent from old maps, so old Macs drop them.
+    "setting_set": {"key": "name", "value_json": "setting_json", "value_set": "bool", "snapshot": "bool"},
+    "settings_sync_switch": {"enabled": "bool"},
+    "cap_set": {"account": "account", "kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
+                "purpose": frozenset({"job", "check"}), "pct": "float", "slack": "float", "usd": "float",
+                "days": "float", "n": "int", "revision": "id", "tier": "name", "sensitive_only": "bool", "until": "time"},
+    "cap_remove": {"account": "account", "cap_kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
+                   "purpose": frozenset({"job", "check"})},
 }
 # Kinds whose "text" is owner words; a hold's text is owner words only when
 # the hold is the owner's, and priority "role" words follow the same switch
@@ -2088,6 +2139,14 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
             return value if safe_name(value) == value else None
         if shape == "scope_text":
             return value if value in ("all", "quota") or _MODEL_NAME.fullmatch(value) else None
+        if shape == "setting_json":
+            if len(value) > 4096 or _dangerous(value):
+                return None
+            try:
+                parsed = _loads(value)
+            except ValueError:
+                return None
+            return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
         if shape == "reset_status":
             return value if value in _RESET_STATUSES else None
         if shape == "reset_reason":
@@ -2121,6 +2180,8 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
         return None
 
     def scalar(shape, value):
+        if shape == "bool":
+            return value if isinstance(value, bool) else None
         if shape == "int":
             return value if isinstance(value, int) and not isinstance(value, bool) \
                 and abs(value) <= _WHOLE_MOST else None
@@ -2421,14 +2482,14 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
                 "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
                 "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal", "batch",
-                "batch_target")
+                "batch_target", "key", "value_json")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",
                  "batch_n", "window_mins")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
-                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt")
+                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt", "value_set", "enabled", "snapshot")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "provider_session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -2822,6 +2883,20 @@ def _checked(data: dict) -> dict | None:
             out[field] = _no_surrogates(raw)
         if not out.get("account") or not out.get("id"):
             return None
+    if out["type"] == "setting_set":
+        key = out.get("key")
+        if not settings_syncable(key) or not isinstance(out.get("value_set"), bool) \
+                or not isinstance(out.get("value_json"), str):
+            return None
+        try:
+            value = _loads(out["value_json"])
+            # Both an explicit value and an omitted/default value are
+            # canonicalised by the receiving version before any config write.
+            _coerce(SETTINGS[key][0], value, key)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+    if out["type"] == "settings_sync_switch" and not isinstance(out.get("enabled"), bool):
+        return None
     return out
 
 
@@ -12316,9 +12391,11 @@ def poll_interval(cfg: dict | None = None) -> float | None:
     (``routing_poll_interval``), or None when the owner turned the look off
     (0): the clock-driven refold at ``valid_until`` still runs."""
     seconds = float((cfg or settings())["routing_poll_interval"])
-    if _replication_live():
-        from khipu.routing_replication import POLL_SECONDS
+    # The tiny owner-controlled copy switch is polled even while normal
+    # routing replication is off, so another Mac can turn it on (or off).
+    from khipu.routing_replication import POLL_SECONDS
 
+    if _replication_live() or _hub_configured():
         return min(seconds, POLL_SECONDS) if seconds > 0 else POLL_SECONDS
     return seconds if seconds > 0 else None
 

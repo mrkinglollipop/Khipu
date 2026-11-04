@@ -12,6 +12,7 @@ import threading
 import os
 import secrets
 import tempfile
+from datetime import datetime, timezone
 from datetime import timedelta
 
 from khipu import routing
@@ -97,7 +98,69 @@ def cache_key():
     return tuple(tuple(value or ()) for value in fingerprint())
 
 
-RETENTION_KINDS = frozenset({"usage_sample", "source_seen", "evidence", "observation", "observation_renew", "reset_check"})
+RETENTION_KINDS = frozenset({"usage_sample", "source_seen", "evidence", "observation", "observation_renew", "reset_check", "setting_set"})
+
+
+def _event_order(row):
+    """Owner timestamp first, hub order only as its deterministic tie-break."""
+    at = routing._parse(row.get("written_at")) or datetime.min.replace(tzinfo=timezone.utc)
+    return at, row.get("hub_order", 0) if isinstance(row.get("hub_order"), int) else 0
+
+
+def settings_status():
+    """Local/remote values retained for Your Macs; no value is silently picked
+    while a first-enable snapshot disagrees."""
+    from khipu.config import load_config
+
+    remote = [e for e in remote_events() if e.get("type") == "setting_set"]
+    newest = {}
+    for row in remote:
+        key = row.get("key")
+        if routing.settings_syncable(key) and (key not in newest or _event_order(row) > _event_order(newest[key])):
+            newest[key] = row
+    config = load_config()
+    differences = []
+    for key, row in newest.items():
+        try:
+            remote_value = json.loads(row["value_json"])
+            remote_value = routing._coerce(routing.SETTINGS[key][0], remote_value, key)
+        except (ValueError, TypeError, KeyError):
+            continue
+        local_value = routing.settings(config)[key]
+        if local_value != remote_value:
+            differences.append({"key": key, "name": routing.SETTINGS[key][2], "local": local_value,
+                                "remote": remote_value, "remote_snapshot": row.get("snapshot") is True,
+                                "remote_at": row.get("written_at")})
+    return {"enabled": routing._replication_live(), "differences": differences}
+
+
+def _apply_remote_settings():
+    """Apply later owner changes only.  Snapshot conflicts remain visible for
+    the owner to choose; selected values write a newer local event normally."""
+    if not routing._replication_live():
+        return
+    from khipu.config import mutate_config
+
+    remote = [e for e in remote_events() if e.get("type") == "setting_set" and not e.get("snapshot")]
+    newest = {}
+    for row in remote:
+        key = row.get("key")
+        if routing.settings_syncable(key) and (key not in newest or _event_order(row) > _event_order(newest[key])):
+            newest[key] = row
+    if not newest:
+        return
+    with routing._lock(), mutate_config() as data:
+        for key, row in newest.items():
+            try:
+                value = routing._coerce(routing.SETTINGS[key][0], json.loads(row["value_json"]), key)
+            except (ValueError, TypeError, KeyError):
+                continue
+            current = routing.settings(data)[key]
+            if current != value:
+                if row.get("value_set"):
+                    data[key] = value
+                else:
+                    data.pop(key, None)
 
 
 def _remote_snapshot(data=None):
@@ -262,10 +325,74 @@ class PostgresHub:
         return dict(rows=[self._receipt(r) for r in rows[:limit]], complete=len(rows) <= limit,
                     hub_now=now, until=upper, sources=sources)
 
+    def pull_controls(self, after, limit):
+        """The off-state poll reads only the singleton copy-control stream."""
+        from khipu import db
+
+        with db.connect(statement_timeout_s=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT event_id, hub_order, payload, received_at, rule_number FROM routing_events "
+                            "WHERE payload ->> 'type' = 'settings_sync_switch' "
+                            "AND (received_at, event_id) > (%s::timestamptz, %s) "
+                            "ORDER BY received_at, event_id LIMIT %s", (*after, limit))
+                rows = cur.fetchall()
+        return {"rows": [self._receipt(r) for r in rows]}
+
 
 def sync(*, hub=None, limit=500, max_pages=20):
     """One bounded exchange (``_sync``), then the view refolded if it wrote."""
     return _refreshing(lambda: _sync(hub=hub, limit=limit, max_pages=max_pages))
+
+
+def _apply_remote_switch(rows):
+    """The narrow off-state exception: one owner switch controls copy on all
+    Macs. Older clients safely ignore this new payload kind."""
+    rows = [r for r in rows if (r.get("payload") or {}).get("type") == "settings_sync_switch"]
+    if not rows:
+        return
+    newest = max(rows, key=lambda r: _event_order(dict(r.get("payload") or {}, hub_order=r.get("hub_order"))))
+    enabled = newest["payload"].get("enabled")
+    if not isinstance(enabled, bool):
+        return
+    from khipu.config import mutate_config
+    with routing._lock(), mutate_config() as data:
+        data["routing_replication_live"] = enabled
+
+
+def _control_sync(*, hub=None):
+    """The periodic off-state control poll. It only uploads/pulls the tiny
+    switch record; ordinary routing stays gated until that record says on."""
+    try:
+        with _sync_lock(), routing._lock():
+            mac = routing._mac_locked()
+            local, _bad = routing._read_event_lines()
+        state = _state()
+        hub = hub if hub is not None else PostgresHub()
+        sent = set(state.get("control_uploaded", []))
+        for event in local:
+            if event.get("type") != "settings_sync_switch" or not event.get("id") or event["id"] in sent:
+                continue
+            payload = routing.replication_payload([event], bindings={})
+            if payload:
+                hub.upload(mac, payload[0])
+                sent.add(event["id"])
+        state["control_uploaded"] = sorted(sent)[-32:]
+        cursor = state.get("control_cursor", [EPOCH, ""])
+        # Test/downgrade hubs have only the old broad pull API. Re-read its
+        # small synthetic window from zero so a same-timestamp late insert
+        # cannot hide behind an event-id cursor; real hubs use the indexed
+        # control-only query above.
+        result = hub.pull_controls(cursor, 64) if hasattr(hub, "pull_controls") else hub.pull([EPOCH, ""], None, 64)
+        rows = result.get("rows") or []
+        _apply_remote_switch(rows)
+        if rows:
+            state["control_cursor"] = [rows[-1]["received_at"], rows[-1]["event_id"]]
+        _save(state)
+        return {"ok": True, "disabled": True, "caught_up": False}
+    except BlockingIOError:
+        return {"ok": False, "caught_up": False, "error": "busy"}
+    except Exception:
+        return {"ok": False, "caught_up": False, "error": "replication_unavailable"}
 
 
 def _sync(*, hub=None, limit=500, max_pages=20):
@@ -276,7 +403,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
     Errors are closed codes: a connection exception may contain credentials.
     """
     if not routing._replication_live():
-        return dict(ok=True, disabled=True, caught_up=False)
+        return _control_sync(hub=hub)
     if limit <= 0 or max_pages <= 0:
         raise ValueError("replication limits must be positive")
     from khipu.hub_snapshot import FRESHNESS_OVERLAP_S
@@ -331,6 +458,8 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                     raise ValueError("invalid hub clock")
                 rows = result["rows"]
                 _store(rows)
+                _apply_remote_switch(rows)
+                _apply_remote_settings()
                 state["scan_order"] = max([state.get("scan_order", 0)] + [r["hub_order"] for r in rows])
                 state["sources"] = result["sources"]
                 state["hub_offset_seconds"] = (hub_now - routing._now()).total_seconds()
