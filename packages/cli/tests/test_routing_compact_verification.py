@@ -89,14 +89,15 @@ def test_day_120_stream_figures_and_owner_rate(world, record_property, replicati
         config_file().write_text(json.dumps(config))
         (routing.routing_dir() / "mac-id").write_text(stream.mac + "\n")
         bindings, _forwards, _aliases = routing.account_identity.state(routing.read_events()[0], routing.accounts())
-        projected = routing.replication_payload(rows, bindings=bindings)
+        projected = [row for row in routing.replication_payload(rows, bindings=bindings) if row.get("id")]
+        deferred = {row["id"]: row["type"] for row in rows if row["type"] not in routing._REPLICATION_FIELDS}
         # A bulk post-sync fixture avoids benchmarking per-receipt disk writes.
         # Pair tests exercise actual paginated sync and the completed watermark.
         rr._store([dict(payload=row, event_id=row["id"], hub_order=n,
                         received_at=routing._iso(END), rule_number=None)
                    for n, row in enumerate(projected, 1)])
         rr._save(dict(mac=stream.mac, uploaded={stream.mac: max(row["seq"] for row in rows)},
-                      completed_order=len(projected), caught_up_at=routing._iso(END)))
+                      completed_order=len(projected), caught_up_at=routing._iso(END), deferred=deferred))
     before = rc.log_size()
     world[0] = END
     out = rc.compact(END)
@@ -113,6 +114,7 @@ def test_day_120_stream_figures_and_owner_rate(world, record_property, replicati
                    local_lines=rc._lines(routing.events_file().read_bytes()),
                    remote_lines=rc._lines(remote_path.read_bytes()) if remote_path.exists() else 0,
                    merged_lines=len(routing.read_events()[0]),
+                   deferred_lines=len(rr._state().get("deferred", {})) if replication else 0,
                    archive_bytes=archive_bytes, owner_lines=owners, owner_lines_per_day=owners / 120,
                    configured_owner_lines_per_day=stream.owner_per_day)
     print('DAY120 ' + json.dumps(figures, sort_keys=True))

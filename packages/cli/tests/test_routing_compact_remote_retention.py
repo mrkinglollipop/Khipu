@@ -1,5 +1,8 @@
 """Receipt retention uses the same fold rules, preserves owners and advances pulls."""
 
+import json
+from datetime import timedelta
+
 from khipu import routing, routing_compact as rc, routing_replication as rr
 from tests import routing_compact_synth as synth
 from tests import test_routing_s11b_replication as replicas
@@ -68,3 +71,30 @@ def test_remote_copies_do_not_reinflate_a_compacted_local_fold(pair):
     # The complete merged fold must still fit the existing compaction target.
     assert len(routing.read_events()[0]) <= rc.LINES_TARGET
     assert _fold() == before
+
+
+def test_expired_unsupported_samples_archive_without_losing_supported_unsent_rows(pair):
+    from tests.test_routing_compact import _log
+
+    a, _b, hub = pair
+    a.activate()
+    a.now = hub.now = END
+    rows = _log(days=60)
+    synth.write(routing.events_file(), rows)
+    assert replicas.sync(a, hub)['ok']
+    sample_ids = {row['id'] for row in rows if row['type'] == 'usage_sample'}
+    owner_ids = {row['id'] for row in rows if rc._owner(row)}
+    assert sample_ids <= set(rr._state()['deferred'])
+    unsent = [dict(type='source_seen', id=f'unsent-{n}', seq=max(row['seq'] for row in rows) + n + 1, runner='unsent', status='{}',
+                   written_at=routing._iso(END - timedelta(days=20)),
+                   written_by={'kind': 'runner'}, via='runner') for n in range(6)]
+    synth.append(routing.events_file(), unsent)
+    outcome = rc.compact(END)
+    assert outcome['result'] == 'compacted', outcome
+    live = [event for _line, event in rc._rows(routing.events_file().read_bytes()) if event is not None]
+    live_ids = {row.get('id') for row in live}
+    archived = sample_ids - live_ids
+    assert len(archived) > len(sample_ids) / 2
+    assert not archived & set(rr._state()['deferred'])
+    assert owner_ids | {row['id'] for row in unsent} <= live_ids
+    assert rc.full_log() == [json.dumps(row, sort_keys=True).encode() for row in rows + unsent]

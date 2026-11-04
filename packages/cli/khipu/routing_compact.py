@@ -420,8 +420,9 @@ def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: da
 def _sent_or_last(rows: list[tuple[bytes, dict | None]], *, replica: bool = False) -> set[int]:
     """Lines no compaction may take, whatever their kind: the highest number
     of each Mac (the next line numbers from it, and the upload cursor compares
-    with it), and with replication live any line not yet uploaded (the upload
-    reads this file, ``routing_replication._sync``: a line gone is never sent)."""
+    with it), and with replication live every supported line not yet uploaded. Expired
+    unsupported observation kinds may enter the archive under the same fold
+    guard; they are not pending deliveries under the current projection."""
     highest: dict[str, tuple[int, int]] = {}
     for i, (_line, event) in enumerate(rows):
         if event is not None and isinstance(event.get("seq"), int):
@@ -439,6 +440,9 @@ def _sent_or_last(rows: list[tuple[bytes, dict | None]], *, replica: bool = Fals
     uploaded, deferred = state.get("uploaded") or {}, state.get("deferred") or {}
     for i, (_line, event) in enumerate(rows):
         if event is None:
+            continue
+        kind = event.get("type")
+        if kind in routing_replication.RETENTION_KINDS and kind not in routing._REPLICATION_FIELDS:
             continue
         seq = event.get("seq")
         if not isinstance(seq, int) or seq > uploaded.get(event.get("mac") or "legacy", 0) \
@@ -957,12 +961,21 @@ def _compact(now: datetime) -> dict:
     head = b"".join(line + b"\n" for line in chosen["kept"])  # built before the lock is taken
     name = f"events-{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(3)}.jsonl.gz"
     archive = _archive_bytes(chosen, now)
+    archived_ids = {event.get("id") for line in chosen["left_out"]
+                    if (event := routing._line_event(line)) is not None}
     with routing._lock():
         current = path.read_bytes()
         if not current.startswith(data) or replication.cache_key() != replica:
             return {"result": "skipped", "why": "the record changed while it was checked"}
         body = head + current[len(data):]
         _replace(path, body, name, archive)
+        state = replication._state()
+        deferred = state.get("deferred", {})
+        remaining = {ident: kind for ident, kind in deferred.items()
+                     if ident not in archived_ids or kind not in replication.RETENTION_KINDS
+                     or kind in routing._REPLICATION_FIELDS}
+        if remaining != deferred:
+            replication._save(dict(state, deferred=remaining))
         _write_state({**_read_state(), "at": routing._iso(now), "attempted_at": routing._iso(now), "result": "compacted",
                       "lines_before": chosen["before"], "lines_after": chosen["after"],
                       "bytes_before": len(data), "bytes_after": len(head),
