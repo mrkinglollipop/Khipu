@@ -6687,15 +6687,6 @@ def _done(written: dict, view: dict, **extra) -> dict:
     return out
 
 
-def _request_result(written: dict, view: dict, turn: str | None, action: str, **extra) -> dict:
-    from khipu import owner_direction
-
-    out = _done(written, view, **extra)
-    if out.get("ok") and turn and owner_direction.reserve_request_turn(turn, written["id"], action):
-        out["owner_turn"] = turn
-    return out
-
-
 # ---- writes --------------------------------------------------------------------------
 
 
@@ -7253,9 +7244,6 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     # An addition has nothing to be stale against: never require or record base.
     if n is not None and (not isinstance(base, str) or not base.strip()):
         raise RouteError("base must be the owner revision the request was prepared against")
-    from khipu import owner_direction
-
-    requested_on = owner_direction.request_turn("route.rule.confirm")
     now = now or _now()
     if not isinstance(text, str) or not text.strip():
         raise RouteError("a rule needs its words")
@@ -7281,7 +7269,7 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
                                     "written_by": by, "via": via, "op": op,
                                     **({"holds": holds} if holds is not None else {})})
         rule = next((r for r in view.get("rules", []) if r["entity"] == written["entity"]), None)
-        return dict(_request_result(written, view, requested_on, "route.rule.confirm"), n=rule["n"] if rule else _rule_number(written))
+        return dict(_done(written, view), n=rule["n"] if rule else _rule_number(written))
     # The predecessor and the append are one locked operation: an owner edit
     # between them must become the wording Undo restores.
     with _lock():
@@ -7293,7 +7281,7 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
                                 "prior_text": prior, "prior_confirmed": prior_confirmed,
                                 "owner_request": request_words, "written_by": by, "via": via, "op": op,
                                 **({"holds": holds} if holds is not None else {})})
-    return dict(_request_result(written, view, requested_on, "route.rule.confirm"), n=rule["n"])
+    return dict(_done(written, view), n=rule["n"])
 
 
 def retire_rule(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
@@ -7873,9 +7861,6 @@ def request_priority(entries, *, until=None, owner_request: str | None = None, a
 
 def _request_priority(entries, *, until, owner_request, author, via: str, now: datetime | None, expect,
                       base: str | None = None) -> dict:
-    from khipu import owner_direction
-
-    requested_on = owner_direction.request_turn("route.priority.confirm")
     if not isinstance(base, str) or not base.strip():
         raise RouteError("base must be the owner revision the request was prepared against")
     now = now or _now()
@@ -7916,7 +7901,7 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
         written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
                                 "base": observed,
                                 "owner_request": _clean(request_words, 0), "written_by": by, "via": via})
-    return dict(_request_result(written, view, requested_on, "route.priority.confirm"), entries=[e["label"] for e in rows])
+    return dict(_done(written, view), entries=[e["label"] for e in rows])
 
 
 def _held_priority(now: datetime | None, *, pending: bool | None = None) -> dict:
@@ -8483,9 +8468,6 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
     by = dict(author or conversation_author())
     if by.get("kind") != "conversation":
         by = conversation_author()
-    from khipu import owner_direction
-
-    requested_on = owner_direction.request_turn("route.priority.confirm")
     with _lock():
         _check_priority(expect, now)
         try:
@@ -8501,7 +8483,7 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
         written, view = _write({"type": "priority_set", "entries": rows, "until": whole, "pending": True,
                                 "base": observed,
                                 "owner_request": _clean(request_words, 0), "written_by": by, "via": via})
-    return dict(_request_result(written, view, requested_on, "route.priority.confirm"), entries=[e["label"] for e in rows], **done)
+    return dict(_done(written, view), entries=[e["label"] for e in rows], **done)
 
 
 # ---- the rule 12 tier table (slice 10) ---------------------------------------------------
@@ -12560,6 +12542,8 @@ def _owner_via(args, intent: dict | None = None) -> str | None:
     it opens."""
     from khipu import owner_direction
 
+    _TERMINAL_REASON.set(None)
+
     if getattr(args, "from_app", False):
         caller = _caller()
         if not caller["app"]:
@@ -12577,11 +12561,11 @@ def _owner_via(args, intent: dict | None = None) -> str | None:
     return "cli"
 
 
-def _terminal_from_harness() -> bool:
+def _terminal_harness() -> str | None:
     from khipu import owner_direction, owner_turns
 
     if owner_turns.job_marker(os.environ):
-        return True
+        return "a dispatched job"
     names = ("claude", "codex", "cursor", "aegis", "antigravity", "t3 code", "t3-code")
     info = _proc_info(os.getpid())
     pid, born = (info[0], info[2] if len(info) > 2 else None) if info else (0, None)
@@ -12597,23 +12581,49 @@ def _terminal_from_harness() -> bool:
             break
         name = os.path.basename(info[1]).lower()
         if name.startswith(names):
-            return True
+            return name
         pid, born = info[0], started
         if pid <= 1:
             break
-    return False
+    return None
 
 
-def typed_yes(prompt: str) -> bool:
+def _terminal_from_harness() -> bool:
+    return _terminal_harness() is not None
+
+
+class TerminalRefusal:
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def __bool__(self):
+        return False
+
+
+_TERMINAL_REASON = contextvars.ContextVar("khipu_terminal_reason", default=None)
+
+
+def terminal_refusal(default=None) -> str:
+    return _TERMINAL_REASON.get() or default or _REFUSED
+
+
+def typed_yes(prompt: str) -> bool | TerminalRefusal:
     """The owner's typed confirmation: a yes typed on an interactive
     terminal. A piped or redirected answer (stdin not a terminal) is never
     asked for and never counts. Known harnesses and dispatched jobs in the
     ancestor chain also refuse, even through a nested pty. Routing's and the
     ledger's owner commands both use this rule. Same-user automation that
     hides or reparents its ancestry remains outside this process check."""
+    _TERMINAL_REASON.set(None)
     try:
-        if not sys.stdin.isatty() or _terminal_from_harness():
+        if not sys.stdin.isatty():
             return False
+        harness = _terminal_harness()
+        if harness:
+            reason = f"This terminal runs inside {harness}; say yes in the conversation or the app."
+            _TERMINAL_REASON.set(reason)
+            print(reason, file=sys.stderr)
+            return TerminalRefusal(reason)
         answer = input(prompt)
     except (EOFError, OSError):
         return False
@@ -12870,7 +12880,7 @@ def _priority_cli(args, now: datetime) -> int:
         return 0
     via = _owner_via(args, _intent_or_none(_priority_intent, args, action))
     if via is None:
-        _print_json({"ok": False, "error": _REFUSED})
+        _print_json({"ok": False, "error": terminal_refusal()})
         return 2
     now = _now()
     expect = getattr(args, "expect", None)
@@ -12926,7 +12936,7 @@ def _tier_table_cli(args, now: datetime) -> int:
         return 0
     via = _owner_via(args, _intent_or_none(_tier_table_intent, args, action))
     if via is None:
-        _print_json({"ok": False, "error": _REFUSED})
+        _print_json({"ok": False, "error": terminal_refusal()})
         return 2
     now = _now()
     if action == "set":
@@ -13183,7 +13193,7 @@ def run_cli(args) -> int:
             if owner_flag:
                 via = _owner_via(args, _intent_or_none(_hold_intent, args, words))
                 if via is None:
-                    _print_json({"ok": False, "error": _REFUSED})
+                    _print_json({"ok": False, "error": terminal_refusal()})
                     return 2
                 now = _now()
             if len(words) == 2 and words[0] == "end":
@@ -13221,7 +13231,7 @@ def run_cli(args) -> int:
         want = _route_intent(cmd, args) if cmd == "definition" else _intent_or_none(_route_intent, cmd, args)
         via = _owner_via(args, want)
         if via is None:
-            _print_json({"ok": False, "error": _REFUSED})
+            _print_json({"ok": False, "error": terminal_refusal()})
             return 2
         now = _now()
         if cmd == "cap":

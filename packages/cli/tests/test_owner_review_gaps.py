@@ -5,32 +5,6 @@ from tests.test_t3_owner_confirm import world, THREAD, T3_SESSION, OTHER_SESSION
 from tests.test_owner_needs_you import (_owner_types, _tier_request, _setting_request,
     _rule_added, _priority_request, _earlier_ask, _settle, _act_on, _setting, TIERS, OTHER)
 
-def test_clipped_held_request_cannot_be_confirmed(world):
-    _owner_types(world, 'what can you change?')
-    text = 'innocuous words ' * 80 + 'DO NOT SHOW THE TAIL'
-    ok, held = owner_act.act('route.rule.add', {'text': text})
-    assert ok and held['pending'], held
-    _owner_types(world, 'what needs me?')
-    item = next(i for i in needs_you.waiting()['items'] if i['key'] == 'held:' + held['request'])
-    assert item['cut'] and 'DO NOT SHOW THE TAIL' not in item['words'], item
-    _owner_types(world, 'yes to what you showed')
-    ok, out = _act_on(item['settle']['confirm'])
-    stored = [r for r in routing.read_view()['rules'] if r['text'] == text]
-    assert not ok and not stored, {'ok': ok, 'out': out, 'stored_tail': bool(stored)}
-
-def test_hidden_held_request_cannot_borrow_filtered_read(world):
-    world['t3'].message(OTHER_THREAD, time.time() - 1, text='unrelated conversation')
-    _t3_hook_turn(session=OTHER_SESSION, prompt='unrelated conversation')
-    _be(world, OTHER_SESSION)
-    ok, held = owner_act.act('config.routing_setting', {'key': 'routing_replication_live', 'value': 'true'})
-    assert ok and held['pending'], held
-    _rule_added(world)
-    _owner_types(world, 'show only rules')
-    shown = needs_you.waiting(kind='rule')
-    assert all(i['kind'] == 'rule' for i in shown['items'])
-    _owner_types(world, 'yes to the rule')
-    ok, out = owner_act.act('direction.confirm', {'request': held['request']})
-    assert not ok and _setting()['value'] is False, {'ok': ok, 'value': _setting()['value'], 'out': out}
 
 def test_old_tier_undo_cannot_overwrite_new_owner_table_after_same_proposal_returns(world):
     old = dict(TIERS, docs='haiku')

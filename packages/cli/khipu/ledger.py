@@ -3067,8 +3067,8 @@ def require(command: str, *, from_app: bool = False, dry_run: bool = False, by_d
     if routing.typed_yes(f"This is the owner's change ({command}). Type yes to confirm: "):
         _noted(intent, "terminal")
         return None
-    raise LedgerError("only the Khipu app, the owner's yes typed on a terminal, or a conversation the owner is "
-                      "typing in (owner direction) can make this change; nothing was changed", "not_app")
+    raise LedgerError(routing.terminal_refusal("only the Khipu app, the owner's yes typed on a terminal, or a conversation the owner is "
+                      "typing in (owner direction) can make this change; nothing was changed"), "not_app")
 
 
 def _direction(command: str, intent: dict | None) -> dict:

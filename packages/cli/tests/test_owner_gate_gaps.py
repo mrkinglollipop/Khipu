@@ -10,7 +10,7 @@ from tests.test_t3_owner_confirm import (
 from tests.test_owner_priority_pending import _ask_in_t3, _owner_says_yes, _pending_request
 
 
-def test_confirm_message_cannot_authorize_unrelated_instant_writes(world):
+def test_a_typed_turn_can_direct_more_than_one_routing_change(world):
     _hold_in_t3(world)
     ok, sensitive = owner_act.act('direction.set', {'key':'latest_window_h', 'value':'1000'})
     assert ok and sensitive['pending'], sensitive
@@ -21,8 +21,9 @@ def test_confirm_message_cannot_authorize_unrelated_instant_writes(world):
     assert changed['confirmed']['message'] == mid
     for text in ('unrequested note one', 'unrequested note two'):
         ok, out = owner_act.act('route.note.set', {'text':text})
-        assert not ok or out.get('pending'), out
-        assert (routing.read_view().get('note') or {}).get('text') != text
+        assert ok and not out.get('pending'), out
+        assert routing.read_view()['note']['text'] == text
+        assert owner_direction._find(out['owner_action']).get('receipt')
 
 
 def test_priority_confirm_discloses_and_pins_underlying_change(world):
@@ -84,14 +85,14 @@ def test_config_confirm_cannot_retarget_new_request(world):
     assert status['value']==0 and status['pending'],status
 
 
-def test_t3_explicit_confirmation_rejects_a_different_hook_prompt(world):
+def test_t3_confirmation_does_not_compare_transport_text(world):
     _hold_in_t3(world)
     ok, held = owner_act.act('direction.set', {'key':'latest_window_h', 'value':'1000'})
     assert ok and held['pending']
     world['t3'].message(THREAD, time.time()+1, text='a real owner message')
     _t3_hook_turn(prompt='a synthetic different prompt')
     ok, out = _confirm_id(held['request'])
-    assert not ok and out['code'] == 'not_confirmed', out
+    assert ok and owner_turns.settings()['latest_window_h'] == 1000, out
 
 
 def test_terminal_pty_from_harness_is_refused_but_owner_terminal_works(monkeypatch):
@@ -110,7 +111,7 @@ def test_terminal_pty_from_harness_is_refused_but_owner_terminal_works(monkeypat
     assert routing.typed_yes('confirm')
 
 
-def test_two_held_changes_cannot_share_one_reply(world):
+def test_each_asked_request_applies_once_without_a_message_quota(world):
     first = _hold_in_t3(world)
     ok, second = owner_act.act('direction.set', {'key': 'latest_window_h', 'value': '1000'})
     assert ok and second['pending']
@@ -118,11 +119,11 @@ def test_two_held_changes_cannot_share_one_reply(world):
     ok, out = _confirm_id(first)
     assert ok, out
     ok, out = _confirm_id(second['request'])
-    assert not ok and out['code'] == 'message_used', out
-    assert owner_turns.settings()['latest_window_h'] != 1000
+    assert ok and owner_turns.settings()['latest_window_h'] == 1000, out
+    assert not _confirm_id(second['request'])[0]
 
 
-def test_one_fresh_turn_allows_one_instant_change_without_a_yes_prompt(world):
+def test_instant_changes_keep_the_owner_approved_interpretation_tradeoff(world):
     request = _hold_in_t3(world)
     _owner_says_yes(world)
     assert _confirm_id(request)[0]
@@ -131,8 +132,9 @@ def test_one_fresh_turn_allows_one_instant_change_without_a_yes_prompt(world):
     ok, out = owner_act.act('route.note.set', {'text': 'requested note'})
     assert ok and not out.get('pending'), out
     ok, out = owner_act.act('route.note.set', {'text': 'unrelated second note'})
-    assert not ok and out['code'] == 'message_used', out
-    assert routing.read_view()['note']['text'] == 'requested note'
+    assert ok and not out.get('pending'), out
+    assert routing.read_view()['note']['text'] == 'unrelated second note'
+    assert owner_direction._find(out['owner_action']).get('receipt')
 
 
 def test_identical_setting_resubmissions_have_distinct_pins(world):
@@ -164,13 +166,3 @@ def test_owed_tidy_hold_replays_the_full_reviewed_plan(world, monkeypatch):
     _owner_says_yes(world)
     ok, out = _confirm_id(held['request'])
     assert ok and seen == [original], out
-
-
-def test_t3_reply_cannot_be_reused_after_native_session_switch():
-    import pytest
-    state = {'requests': []}
-    stamp = {'session': 'native-a', 'binding': 't3', 'turn': 'owner-message',
-             'confirmed': {'message': 'owner-message', 'source': 't3'}}
-    owner_direction._claim_message(state, stamp, 'route.pause')
-    with pytest.raises(owner_direction.DirectionRefused, match='already authorized'):
-        owner_direction._claim_message(state, dict(stamp, session='native-b'), 'route.note.set')

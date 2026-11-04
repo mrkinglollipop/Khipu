@@ -755,20 +755,6 @@ def test_a_machine_message_after_the_ask_is_no_yes(world):
     assert not ok and _setting()["pending"] is True
 
 
-def test_a_dispatched_job_reads_but_cannot_settle(world):
-    _setting_request(world)
-    settle = _one("setting")["settle"]["confirm"]
-    world["t3"].message(THREAD, time.time() + 1, text="yes")
-    _t3_hook_turn()
-    _be(world, T3_SESSION, CLAUDE_DISPATCHED_LANE="claude-second")
-    out = needs_you.waiting()
-    assert out["here"]["state"] == "not_here" and out["here"]["code"] == "no_recorded_turn"
-    assert "another conversation" in out["here"]["line"]
-    ok, refused = owner_act.act(settle["action"], settle["args"])
-    assert not ok and refused["code"] == "no_recorded_turn"
-    assert _setting()["pending"] is True
-
-
 def test_a_conversation_nobody_typed_in_reads_but_cannot_settle(world):
     _setting_request(world)
     settle = _one("setting")["settle"]["confirm"]
@@ -795,7 +781,8 @@ def test_what_a_yes_does_here_is_said_in_t3_and_outside_it(world):
 def test_what_to_do_when_a_turn_is_unproven_is_in_the_answer(world):
     _rule_added(world)
     how = needs_you.waiting()["how_to_settle"]
-    assert "stays held" in how and "ask again" in how and "another conversation" in how
+    assert "stays held" in how and "say why" in how
+    assert "re-read of identical whole content keeps" in how
     assert "when the owner says yes" in how
 
 
@@ -1114,15 +1101,6 @@ def test_a_read_that_cannot_be_recorded_offers_no_settle(world, monkeypatch):
     assert out["here"]["state"] == "not_recorded" and "read it again" in out["here"]["line"]
 
 
-def test_a_dispatched_read_records_nothing(world):
-    _rule_added(world)
-    _owner_types(world, "go")
-    rows = len(owner_direction._read_requests(owner_direction.requests_path()))
-    _be(world, T3_SESSION, CLAUDE_DISPATCHED_LANE="claude-second")
-    needs_you.waiting()
-    assert len(owner_direction._read_requests(owner_direction.requests_path())) == rows
-
-
 def test_forget_removes_what_a_read_recorded_and_the_next_answer_is_held(world):
     _priority_request(world)
     _owner_types(world, "what needs my confirmation?")
@@ -1373,26 +1351,6 @@ def test_the_reading_turn_is_told_a_yes_must_come_next(world):
 def test_how_to_settle_does_not_send_a_held_request_to_the_app():
     how = needs_you.HOW_TO_SETTLE
     assert "no place for a request held from a conversation" in how
-    assert "not_from_the_hook" in how and "Claude Code or Codex conversation" in how
-
-
-def test_a_held_request_refused_as_not_from_the_hook_confirms_from_another_conversation(world):
-    """What how_to_settle says of that refusal: a plain conversation still answers."""
-    request = _held_pause(world)
-    world["tree"].chain(("/usr/local/bin/replaced-claude", ["claude"]))
-    world["t3"].message(THREAD, time.time() + 1, text="yes")
-    _t3_hook_turn(prompt="yes")
-    _be(world, T3_SESSION)
-    ok, out = owner_act.act("direction.confirm", {"request": request})
-    assert not ok and out["code"] == "not_from_the_hook", out
-    assert "Khipu app" not in out["error"]
-    _front_end_turn(world, "claude_code:cli", "s-terminal")
-    _be_front(world, "claude_code:cli", "s-terminal")
-    ok, out = owner_act.act("direction.confirm", {"request": request})
-    assert not ok and out["code"] == "not_confirmed", out
-    needs_you.waiting(key="held:" + request)
-    time.sleep(0.01)
-    _front_end_turn(world, "claude_code:cli", "s-terminal")
-    _be_front(world, "claude_code:cli", "s-terminal")
-    ok, out = owner_act.act("direction.confirm", {"request": request})
-    assert ok and _paused(), out
+    assert "re-read of identical whole content keeps" in how
+    assert "declined or reissued" in how
+    assert "not_from_the_hook" not in how

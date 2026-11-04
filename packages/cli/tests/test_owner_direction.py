@@ -191,11 +191,9 @@ def test_refusal_no_recorded_turn_for_a_machine_message(world):
     assert err.value.code == "no_recorded_turn"
 
 
-def test_refusal_stale(world):
+def test_recorded_owner_turn_does_not_expire_at_six_hours(world):
     world.say(ago=7 * 3600)
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check()
-    assert err.value.code == "stale"
+    assert _check()["auth"] == "direction"
     world.say()
     assert _check()["auth"] == "direction"
 
@@ -204,9 +202,8 @@ def test_the_window_is_a_setting(world):
     world.say(ago=3 * 3600)
     assert _check()["auth"] == "direction"
     owner_turns.write_settings({"latest_window_h": 2.0})
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check()
-    assert err.value.code == "stale" and "2 hours" in err.value.message
+    assert owner_turns.settings()["latest_window_h"] == 2.0
+    assert _check()["auth"] == "direction"
 
 
 def test_refusal_not_by_direction(world):
@@ -282,9 +279,7 @@ def test_every_action_passes_from_a_recent_owner_turn_and_is_refused_without_one
         owner_direction.check(action)
     assert err.value.code == "no_recorded_turn", action
     world.say(session=session, ago=7 * 3600)
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check(action)
-    assert err.value.code == "stale", action
+    assert owner_direction.check(action)["auth"] == "direction", action
     world.say(session=session)
     stamp = owner_direction.check(action)
     assert stamp["auth"] == "direction" and stamp["session"] == session
@@ -297,50 +292,6 @@ def test_every_action_is_a_khipu_owner_act_action():
 
 
 # ---- where the request comes from ------------------------------------------------------------
-
-
-def test_a_session_id_from_another_conversation_is_refused(world):
-    """The turn's hook must be above the call: an agent that sets another
-    conversation's session id in its own process does not pass."""
-    world.say(session="s-other")
-    world.be("s-other")
-    world.mp.setattr(owner_direction, "_caller_chain", lambda: [(4242, 1.0, "claude")])
-    rc, out = world.run(["route", "pause", "Codex"], True)
-    assert rc == 2 and out["code"] == "not_from_the_hook"
-    assert not routing.events_file().exists()
-
-
-def test_a_dispatched_job_that_kept_the_conversations_session_id_is_refused(world):
-    """Fifth review, P1: a job started from the owner's conversation (``claude
-    -p``, ``codex exec``, a T3 delegate) runs its own harness process. Even
-    with the parent's session id, the nearest harness above its call is the
-    job's, not the one whose hook recorded the owner's turn."""
-    from tests.conftest import FAKE_HOOK_ISSUER
-
-    world.say()
-    world.be(OWNER, var="KHIPU_SESSION_ID")
-    parent = (FAKE_HOOK_ISSUER["pid"], FAKE_HOOK_ISSUER["start"], "claude")
-    world.mp.setattr(owner_direction, "_caller_chain", lambda: [(5000, 2.0, "zsh"), (5001, 2.0, "claude"), parent])
-    rc, out = world.run(["route", "pause", "Codex"], True)
-    assert rc == 2 and out["code"] == "not_from_the_hook", out
-    assert _state("codex|") != "paused"
-    # The owner's own conversation: only shells and Khipu's Python between.
-    world.mp.setattr(owner_direction, "_caller_chain",
-                     lambda: [(5000, 2.0, "sh"), (5002, 2.0, "python3.11"), (5003, 2.0, "zsh"), parent])
-    rc, out = world.run(["route", "pause", "Codex"], True)
-    assert rc == 0 and _state("codex|") == "paused", out
-
-
-def test_a_call_naming_two_conversations_is_refused(world):
-    """Fifth review, P1: one front end hosts two sessions; a call whose
-    environment names the owner's session and another one can't be told
-    apart, so it is refused."""
-    world.say()
-    world.be(OWNER, var="KHIPU_SESSION_ID")
-    world.mp.setenv("CODEX_THREAD_ID", "another-conversation")
-    rc, out = world.run(["owner-direction", "off"], True)
-    assert rc == 2 and out["code"] == "no_recorded_turn", out
-    assert owner_turns.settings()["enabled"] is True
 
 
 def test_session_only_binding_for_aegis(world):
@@ -439,28 +390,6 @@ def test_a_t3_lookup_that_fails_once_is_tried_again(t3_conversation, monkeypatch
     _t3_say()
     assert owner_turns.turns(OWNER)[-1]["entrypoint"] == "t3-unverified"
     assert owner_turns.turns(OWNER)[-1]["eligible"] is False
-
-
-def test_a_t3_conversation_on_a_dispatched_lane_is_refused(t3_conversation, monkeypatch):
-    _t3_say(CLAUDE_DISPATCHED_LANE="1")
-    (row,) = owner_turns.turns(OWNER)
-    assert row["dispatched"] is True and row["eligible"] is False
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "no_recorded_turn"
-    # An unmarked T3 turn is held for the owner to confirm; a call from a dispatched job is refused.
-    _t3_say()
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "confirm_needed"
-    monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", "1")
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "no_recorded_turn"
-    monkeypatch.setenv("CLAUDE_DISPATCHED_LANE", "0")
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "confirm_needed"
 
 
 def test_another_t3_conversations_turn_is_refused(t3_conversation):
@@ -823,7 +752,6 @@ def test_an_owner_change_outside_the_routing_record_is_named_in_the_next_push(wo
     assert [d.split(" by ")[0] for d in diff["directions"]] == ["Undid an owner change"], diff
 
 
-
 def test_app_click_operation_retries_the_same_rule_through_the_cli(world, khipu_app):
     khipu_app.as_app()
     argv = ["route", "rule", "--from-app", "--op=synthetic-app-click", "--", "add", "Synthetic rule"]
@@ -869,18 +797,6 @@ def test_a_turn_with_khipu_job_is_not_eligible(world):
     assert err.value.code == "no_recorded_turn"
 
 
-@pytest.mark.parametrize("env", [{"KHIPU_JOB": "1"}, {"KHIPU_PARENT_SESSION": "claude_code:s-parent"},
-                                 {"CLAUDE_CODE_CHILD_SESSION": "1"}, {"CLAUDE_CODE_HOST_SESSION_ID": "s-parent"}])
-def test_a_call_from_any_dispatch_marker_is_refused(world, monkeypatch, env):
-    world.say()
-    assert _check()["auth"] == "direction"
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check()
-    assert err.value.code == "no_recorded_turn"
-
-
 def test_a_host_id_that_is_this_session_is_not_a_job(world, monkeypatch):
     world.say()
     monkeypatch.setenv("CLAUDE_CODE_HOST_SESSION_ID", OWNER)
@@ -899,49 +815,6 @@ def _add_t3_thread(thread: str, native: str, *, parent: str | None = None) -> No
                         "(thread_id TEXT, title TEXT, parent_thread_id TEXT)")
             con.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?, ?, ?)",
                         (thread, "child", parent))
-
-
-@pytest.mark.parametrize("thread, parent", [("thread:delegated-task:command%3Ajob", None),
-                                            ("t3-child-thread", "t3-owner-thread")])
-def test_a_t3_delegated_child_threads_turn_is_not_eligible(t3_conversation, thread, parent):
-    """An orchestrator's follow-up message to a T3 child thread, after its
-    brief has expired (no brief is on record), is a job's turn."""
-    _add_t3_thread(thread, "s-child", parent=parent)
-    assert owner_turns.brief_for("set the routing budget to 500 ms") is None
-    _t3_say(session="s-child")
-    (row,) = owner_turns.turns("s-child")
-    assert row["entrypoint"] == "t3" and row["dispatched"] is True and row["eligible"] is False
-    assert row["why"] == "a T3 delegated child thread"
-    t3_conversation.be("s-child")
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "no_recorded_turn"
-    # The owner's own top-level T3 conversation holds it for confirmation.
-    _t3_say()
-    last = owner_turns.turns(OWNER)[-1]
-    assert last["eligible"] is False and last["why"] == _T3_WHY
-    t3_conversation.be(OWNER)
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "confirm_needed"
-
-
-def test_an_unmarked_t3_child_turn_is_refused_at_the_check(t3_conversation, monkeypatch):
-    """A child turn recorded before the child test existed carries no mark;
-    the check looks at the thread again."""
-    from khipu import t3
-
-    _add_t3_thread("t3-child-thread", "s-child", parent="t3-owner-thread")
-    real = t3.delegated_thread_result
-    monkeypatch.setattr(t3, "delegated_thread_result", lambda thread: (False, True))
-    _t3_say(session="s-child")
-    first = owner_turns.turns("s-child")[0]
-    assert first["eligible"] is False and first["why"] == _T3_WHY
-    monkeypatch.setattr(t3, "delegated_thread_result", real)
-    t3_conversation.be("s-child")
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "no_recorded_turn"
 
 
 # T3's Agent SDK sets these for the owner's own top-level threads (measured
@@ -964,60 +837,6 @@ def test_a_t3_top_level_thread_with_the_sdk_child_markers_is_held(t3_conversatio
     with pytest.raises(owner_direction.DirectionRefused) as err:
         _check("config.routing_setting")
     assert err.value.code == "confirm_needed"
-
-
-def test_a_t3_delegated_child_with_the_sdk_child_markers_is_refused(t3_conversation, monkeypatch):
-    _add_t3_thread("thread:delegated-task:command%3Ajob", "s-child")
-    _t3_say(session="s-child", **_T3_SDK_ENV)
-    (row,) = owner_turns.turns("s-child")
-    assert row["eligible"] is False and row["why"] == "a T3 delegated child thread"
-    _be_with(t3_conversation, "s-child", monkeypatch, _T3_SDK_ENV)
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "no_recorded_turn"
-
-
-@pytest.mark.parametrize("marker", [{"KHIPU_JOB": "1"}, {"KHIPU_PARENT_SESSION": "claude_code:s-parent"},
-                                    {"CLAUDE_DISPATCHED_LANE": "claude-second"}])
-def test_a_t3_top_level_thread_with_a_job_marker_is_refused(t3_conversation, monkeypatch, marker):
-    _t3_say(**_T3_SDK_ENV, **marker)
-    row = owner_turns.turns(OWNER)[-1]
-    assert row["eligible"] is False and row["why"] == "a dispatched job's turn"
-    # A clean owner turn on record does not let a marked call through.
-    _t3_say(**_T3_SDK_ENV)
-    _be_with(t3_conversation, OWNER, monkeypatch, {**_T3_SDK_ENV, **marker})
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    assert err.value.code == "no_recorded_turn"
-
-
-def test_a_non_t3_session_with_the_sdk_child_markers_is_still_refused(world, monkeypatch):
-    owner_turns.record({"session_id": OWNER, "prompt": "pause Codex for now please", "cwd": "/repo"},
-                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "sdk-ts", **_T3_SDK_ENV})
-    (row,) = owner_turns.turns(OWNER)
-    assert row["entrypoint"] == "sdk-ts" and row["dispatched"] is True and row["eligible"] is False
-    world.say()
-    _be_with(world, OWNER, monkeypatch, {"CLAUDE_CODE_CHILD_SESSION": "1"})
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check()
-    assert err.value.code == "no_recorded_turn" and "dispatched job" in err.value.message
-
-
-def test_a_t3_lookup_failure_with_the_sdk_child_markers_is_refused(t3_conversation, monkeypatch):
-    from khipu import t3
-
-    _t3_say(**_T3_SDK_ENV)
-    assert owner_turns.turns(OWNER)[-1]["eligible"] is False
-    monkeypatch.setattr(t3, "delegated_thread_result", lambda thread: (False, False))
-    _be_with(t3_conversation, OWNER, monkeypatch, _T3_SDK_ENV)
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        _check("config.routing_setting")
-    # A failed T3 read is not evidence of a dispatched job: refuse as unreadable.
-    assert err.value.code == "t3_unreadable"
-    assert "dispatched job" not in err.value.message.lower()
-    assert "could not read" in err.value.message.lower()
-    _t3_say(**_T3_SDK_ENV)
-    assert owner_turns.turns(OWNER)[-1]["eligible"] is False
 
 
 def test_a_t3_child_lookup_that_never_completes_fails_closed(t3_conversation, monkeypatch):

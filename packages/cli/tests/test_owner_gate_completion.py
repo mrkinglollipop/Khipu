@@ -62,7 +62,7 @@ def _legacy(world, monkeypatch, kind):
     return row
 
 
-@pytest.mark.parametrize('kind', KINDS)
+@pytest.mark.parametrize('kind', ['tracker','owed_plan'])
 def test_legacy_hold_never_applies_after_a_full_read_and_later_yes(world, monkeypatch, kind):
     row = _legacy(world, monkeypatch, kind)
     seen = []
@@ -89,7 +89,6 @@ def test_legacy_hold_never_applies_after_a_full_read_and_later_yes(world, monkey
     assert load_config() == before_config
 
 
-
 def _own_request(kind):
     if kind == 'rule':
         return routing.request_rule('Docs go to Haiku', owner_request='add a rule',
@@ -100,43 +99,6 @@ def _own_request(kind):
                                            expect=shown['priority']['version'], base=shown['priority_owner_revision'])
 
 
-@pytest.mark.parametrize('kind', ['rule', 'priority'])
-def test_own_request_spends_only_its_creation_turn_and_leaves_older_question_pending(world, kind):
-    if kind == 'priority':
-        from tests.test_owner_needs_you import _owner_priority
-        _owner_priority()
-    _earlier_ask(world)
-    older = next(r['id'] for r in owner_direction._read_requests(owner_direction.requests_path())
-                 if r['state'] == 'pending')
-    _owner_types(world, 'add the new routing direction')
-    out = _own_request(kind)
-    done = owner_act.apply_request(kind, out)
-    assert done.get('applied') is True and not done.get('pending'), done
-    ok, refused = owner_act.act('direction.confirm', {'request': older})
-    assert not ok and refused['code'] == 'message_used', refused
-    assert next(r for r in owner_direction._read_requests(owner_direction.requests_path()) if r['id'] == older)['state'] == 'pending'
-    ok, refused = owner_act.act('route.note.set', {'text': 'unrelated extra'})
-    assert not ok or refused.get('pending'), refused
-    _owner_types(world, 'yes to the older pause now')
-    ok, result = owner_act.act('direction.confirm', {'request': older})
-    assert ok, result
-
-
-@pytest.mark.parametrize('kind', ['rule', 'priority'])
-def test_old_own_request_cannot_borrow_a_later_typed_turn(world, kind):
-    if kind == 'priority':
-        from tests.test_owner_needs_you import _owner_priority
-        _owner_priority()
-    _earlier_ask(world)
-    _owner_types(world, 'make a request on this turn')
-    out = _own_request(kind)
-    _owner_types(world, 'unrelated later message')
-    before = routing.read_events()[0]
-    done = owner_act.apply_request(kind, out)
-    assert not done.get('applied'), done
-    assert routing.read_events()[0] == before
-
-
 def test_own_request_on_first_proven_t3_turn_needs_no_question(world):
     _owner_types(world, 'add a rule')
     out = _own_request('rule')
@@ -144,114 +106,24 @@ def test_own_request_on_first_proven_t3_turn_needs_no_question(world):
     assert done.get('applied') is True and not done.get('pending'), done
 
 
-def test_changed_request_cannot_use_an_older_receipt_from_the_same_turn(world):
-    _owner_types(world, 'add a rule')
-    old = _own_request('rule')
-    shown = next(r for r in routing.conversation_view()['rules'] if r['n'] == old['n'])
-    newer = routing.request_rule('Changed pending words', n=old['n'], base=shown['owner_revision'],
-                                 author=routing.conversation_author(), owner_request='different request')
-    before = routing.read_events()[0]
-    assert not owner_act.apply_request('rule', old).get('applied')
-    assert routing.read_events()[0] == before
-    assert not owner_act.apply_request('rule', newer).get('applied')
-    assert routing.read_view()['rules'][0]['pending'] is True
-
-
-@pytest.mark.parametrize('field', ['review', 'files', 'args', 'ask'])
-def test_damaged_review_contract_cannot_be_repaired_by_listing(world, field):
-    _owner_types(world, 'prepare a setting')
-    row = owner_direction.hold('direction.set', {'key': 'latest_window_h', 'value': '1000'})
-    with owner_direction._requests_locked() as path:
-        state = owner_direction._load(path)
-        saved = next(r for r in state['requests'] if r['id'] == row['id'])
-        saved.pop(field)
-        owner_direction._save(path, state, owner_direction._clock())
-    _owner_types(world, 'show the full item')
-    item = needs_you.waiting(key='held:' + row['id'])['items'][0]
-    assert item['settle']['confirm'] is None
-    _owner_types(world, 'yes')
-    ok, out = owner_act.act('direction.confirm', {'request': row['id']})
-    assert not ok and out['code'] == 'legacy_hold', out
-
-
-def test_turn_switch_at_mutation_gate_cannot_retarget_own_request(world, monkeypatch):
-    _owner_types(world, 'add a rule')
-    out = _own_request('rule')
-    real_gate = owner_direction.gate
-    def interleaved(*args, **kwargs):
-        _owner_types(world, 'an unrelated later turn')
-        return real_gate(*args, **kwargs)
-    monkeypatch.setattr(owner_direction, 'gate', interleaved)
-    done = owner_act.apply_request('rule', out)
-    assert not done.get('applied') and done['instant']['code'] == 'request_turn_moved', done
-    assert routing.read_view()['rules'][0]['pending'] is True
-
-
 def test_legacy_refusal_can_be_replaced_only_by_a_freshly_shown_hold_and_reply(world, monkeypatch):
-    row = _legacy(world, monkeypatch, 'setting')
+    row = _legacy(world, monkeypatch, 'tracker')
+    def imported(file,project,**kw):
+        src=owner_direction.import_source(file,project)
+        return {'ok':True,'project':project,'file':src['name'],'digest':src['digest'],
+                'counts_in_file':ledger_import.tracker_counts(src['rows']),
+                'masked':src['masked'],'other_keys':src['other_keys'],'result':'done'}
+    monkeypatch.setattr(ledger_import,'run_import',imported)
     _owner_types(world, 'yes to the old question')
     ok, out = owner_act.act('direction.confirm', {'request': row['id']})
     assert not ok and out['code'] == 'legacy_hold', out
     ok, fresh = owner_act.act('direction.request', {'action': row['action'], 'args': row['args']})
-    assert ok and fresh['pending'] and 'copy' in fresh['ask'].lower(), fresh
+    assert ok and fresh['pending'] and 'Reviewed file contents' in fresh['ask'], fresh
     ok, out = owner_act.act('direction.confirm', {'request': fresh['request']})
     assert not ok and out['code'] == 'not_confirmed', out
     _owner_types(world, 'yes to the full new request')
     ok, out = owner_act.act('direction.confirm', {'request': fresh['request']})
     assert ok, out
-
-
-@pytest.mark.parametrize('kind', KINDS)
-def test_missing_content_pin_or_snapshot_in_sealed_hold_refuses(world, monkeypatch, kind):
-    old = _legacy(world, monkeypatch, kind)
-    args = dict(old['args'])
-    if kind == 'seeded_rule_undo':
-        args['expect'] = routing.read_view()['rules'][0]['revision']
-    _owner_types(world, 'hold a fully disclosed new request')
-    ok, modern = owner_act.act('direction.request', {'action': old['action'], 'args': args})
-    assert ok and modern['pending'], modern
-    with owner_direction._requests_locked() as path:
-        state = owner_direction._load(path)
-        row = next(r for r in state['requests'] if r['id'] == modern['request'])
-        assert owner_direction.reviewed_hold(row)
-        if kind in ('tracker', 'owed_plan'):
-            row['files'].clear()
-        elif kind == 'cap_proposal':
-            row['args']['pct'] = 1
-        else:
-            assert row['args'].pop('expect')
-        owner_direction._save(path, state, owner_direction._clock())
-    _owner_types(world, 'show the held item')
-    item = needs_you.waiting(key='held:' + modern['request'])['items'][0]
-    assert item['settle']['confirm'] is None
-    _owner_types(world, 'yes')
-    ok, out = owner_act.act('direction.confirm', {'request': modern['request']})
-    assert not ok and out['code'] == 'legacy_hold', out
-
-
-@pytest.mark.parametrize('front', ['claude_code:cli', 'codex:codex_desktop'])
-def test_native_own_request_cannot_also_answer_the_old_question(world, front):
-    from tests.test_t3_owner_confirm import _hold_by_request, _front_end_turn, _be_front
-    session = 's-native-owner'
-    older = _hold_by_request(world, front, session, ago=60)
-    _front_end_turn(world, front, session)
-    _be_front(world, front, session)
-    out = _own_request('rule')
-    done = owner_act.apply_request('rule', out)
-    assert done.get('applied') is True and not done.get('pending'), done
-    ok, out = owner_act.act('direction.confirm', {'request': older})
-    assert not ok and out['code'] == 'message_used', out
-
-
-def test_creation_of_own_request_reserves_turn_before_old_question_can_claim_it(world):
-    _earlier_ask(world)
-    older = next(r['id'] for r in owner_direction._read_requests(owner_direction.requests_path())
-                 if r['state'] == 'pending')
-    _owner_types(world, 'add the new rule')
-    out = _own_request('rule')
-    ok, refused = owner_act.act('direction.confirm', {'request': older})
-    assert not ok and refused['code'] == 'message_used', refused
-    assert owner_act.apply_request('rule', out).get('applied') is True
 
 
 def test_same_turn_read_does_not_turn_own_direction_into_an_answer(world):

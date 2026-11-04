@@ -588,9 +588,6 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
                         "can't confirm it too")
     # A conversation's words stay in their quotes (``their_words``).
     words = "; ".join(routing.their_words(c) for c in changes)
-    if len(words) > routing.PENDING_ASK_MOST:
-        raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False)
-                      + "; its changes are too long to name in one ask, so the amend can't confirm it too")
     from khipu import owner_direction
 
     asked = held.get("owner_request")
@@ -604,9 +601,7 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
 
 def apply_request(kind: str, out, *, only: str | None = None) -> dict:
     """A conversation's request (``khipu_route_priority``, ``khipu_route_rule``)
-    created and applied on the same proved typed turn applies at once. Its
-    receipt pins that creation turn and the current pending event; only this
-    request can spend the message. This uses the same confirm the
+    taken on the owner's own typed turn applies at once: the same confirm the
     owner would give (``route.priority.confirm`` / ``route.rule.confirm`` by
     direction), so it is logged with the evidence it relied on, receipted to
     every conversation and undone in one step. A call that does not pass the
@@ -622,7 +617,7 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
     left pending, as before."""
     from khipu import owner_direction, routing
 
-    if not isinstance(out, dict) or out.get("ok") is False or not isinstance(out.get("owner_turn"), str):
+    if not isinstance(out, dict) or out.get("ok") is False:
         return out
     try:
         if kind == "priority":
@@ -631,8 +626,7 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
             mine = routing.conversation_author().get("session")
             # Only this conversation's own request: a newer one from another
             # conversation that landed in between is never confirmed unseen.
-            if (not stored.get("pending") or not mine or (stored.get("written_by") or {}).get("session") != mine
-                    or (view.get("priority") or {}).get("event_id") != out.get("id")):
+            if not stored.get("pending") or not mine or (stored.get("written_by") or {}).get("session") != mine:
                 return out
             if only is not None:
                 owned = (stored.get("replaced") or {}).get("entries")
@@ -652,20 +646,18 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
             rule = next((r for r in routing.read_view().get("rules") or [] if r["n"] == number), None)
             mine = routing.conversation_author().get("session")
             if (type(number) is not int or rule is None or not rule.get("pending") or not mine
-                    or (rule.get("pending_author") or {}).get("session") != mine or rule.get("revision") != out.get("id")):
+                    or (rule.get("pending_author") or {}).get("session") != mine):
                 return out
             action, args = "route.rule.confirm", {"rule": number, "expect": rule["revision"]}
         # Never a hold: a turn that cannot be proved owner's is left alone.
         checking = owner_direction.REQUEST_APPLIED.set(True)
         try:
-            stamp = owner_direction.check(action, instant=True)
-            if owner_direction._message_key(stamp) != out["owner_turn"]:
-                return out
+            owner_direction.check(action, instant=True)
         finally:
             owner_direction.REQUEST_APPLIED.reset(checking)
     except (owner_direction.DirectionRefused, routing.RouteError, StopIteration, KeyError):
         return out
-    token = owner_direction.REQUEST_APPLIED.set(owner_direction.request_token(out["owner_turn"], out["id"], action))
+    token = owner_direction.REQUEST_APPLIED.set(True)
     try:
         ok, result = act(action, args)
     finally:
@@ -736,7 +728,8 @@ def _decline(args) -> tuple[bool, dict]:
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
     return True, {"ok": True, "declined": True, "applied": False, "request": request["id"],
-                  "line": "The held request is dropped. Nothing was changed."}
+                  "line": "The held request is dropped. Nothing was changed.",
+                  "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}
 
 
 def _run(action: str, full: list[str]) -> tuple[bool, dict]:

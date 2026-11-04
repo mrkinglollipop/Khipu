@@ -117,10 +117,10 @@ HOW_TO_SETTLE = (
     "own judgment. Khipu proves a new typed message but does not read it, so taking \"thanks\" for a yes is yours "
     "not to do. If the answer says pending: true, nothing changed yet: Khipu held it. Put its ask to the owner and, "
     "once they reply, call direction.confirm with its request (direction.decline if they say no). If either says "
-    "not confirmed, Khipu could not prove a new typed message from the owner: nothing changed and it stays held, so "
-    "ask again here. If an action is refused, say why: it stays waiting, and the owner can answer in another "
-    "conversation Khipu can prove they type in. When T3's own agent can't be traced (not_from_the_hook), a Claude "
-    "Code or Codex conversation still works. The app's Settings can also answer the priority, a rule, a setting and "
+    "not confirmed, say why: nothing changed and it stays held. A re-read of identical whole content keeps the "
+    "owner's answer valid; changed content needs to be shown before a new answer. Old file requests without saved "
+    "content can be declined or reissued with their full content. A decline only removes the waiting question: "
+    "the same message may also give a new direction. The app's Settings can also answer the priority, a rule, a setting and "
     "the account list, but has no place for a request held from a conversation. A settle of null means no such "
     "action exists; do says what to do instead. An item with cut: true is shortened: read read_full and show it "
     "whole before asking; until then it asks again before it applies.")
@@ -340,6 +340,14 @@ def _accounts() -> list[dict]:
     now_labels, was = _labels(st.get("value")), _labels(request.get("prior"))
     changes = [f"adds {routing.their_words(a)}" for a in now_labels if a not in was]
     changes += [f"stops reading {routing.their_words(a)}" for a in was if a not in now_labels]
+    before = {e.get("label") or e.get("harness"): e for e in request.get("prior") or [] if isinstance(e, dict)}
+    for entry in st.get("value") or []:
+        if not isinstance(entry, dict):
+            continue
+        label = entry.get("label") or entry.get("harness")
+        home = entry.get("home") or "the default login folder"
+        prior = (before.get(label) or {}).get("home") or "the default login folder"
+        changes.append(f"{routing.their_words(label)} home: {_quote(prior)} to {_quote(home)}")
     what = "; ".join(changes) or "changes the details of the accounts it reads"
     asked = request.get("request")
     words = (f"A conversation changed which accounts Khipu reads: it {what}."
@@ -469,8 +477,8 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
         action, args, request = row.get("action"), row.get("args"), str(row.get("id"))
         decline = _act("direction.decline", request=request)
         if not owner_direction.reviewed_hold(row):
-            out.append(_item("held", f"held:{request}", "This held change predates complete review or its reviewed "
-                             "content has changed. Request it again to see the full content before answering.",
+            out.append(_item("held", f"held:{request}", "This old held change has no saved input. Decline it or ask for it to be reissued; its "
+                             "full content must be shown before it applies.",
                              by=row.get("by"), at=row.get("created_at"), undo=decline,
                              undo_does="Drops the old held request. Nothing changes."))
             continue
@@ -831,7 +839,7 @@ def _can_settle_here() -> dict:
 
 
 def _shown(page: list[dict]) -> list[str]:
-    """Each answer an item showed whole: what a yes after this read may apply."""
+    """Each pinned answer an item showed whole."""
     return [owner_direction.signature(offered["action"], offered["args"]) for item in page if not item.get("cut")
             for offered in item["settle"].values() if offered]
 
@@ -924,7 +932,15 @@ def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None,
             answer["here"] = {"state": "not_recorded", "line": f"{why} Nothing can be settled from this answer: read it again."}
     # As khipu_route: the owner's own words stand, conversation-written words
     # leave through the strict scan.
-    return routing._for_agents(answer, view)
+    projected = routing._for_agents(answer, view)
+    if isinstance(projected, dict):
+        from khipu import agent_view
+
+        for original, shown in zip(answer.get("items", []), projected.get("items", [])):
+            if original.get("kind") == "accounts" and isinstance(shown, dict):
+                # Login paths are the account choice being reviewed; credentials still get scrubbed.
+                shown["words"] = agent_view.scrub_strict(original["words"], keep=[original["words"]])
+    return projected
 
 
 def prepare_answer(action: str, values: dict) -> tuple[dict, str] | None:
@@ -958,8 +974,8 @@ def prepare_answer(action: str, values: dict) -> tuple[dict, str] | None:
                 if expected not in valid:
                     raise Refused("version_moved", "The request changed after it was shown; read it again.")
                 ask = f"{item['words']} {'Confirm' if side == 'confirm' else 'Undo'}? {item[side + '_does']}"
-                if item.get("cut") or len(ask) > routing.PENDING_ASK_MOST:
-                    raise Refused("disclosure_unavailable", "The complete change is too long for one ask; use Settings.")
+                if item.get("cut"):
+                    raise Refused("disclosure_unavailable", "Read the complete item by its key, then answer in this conversation.")
                 return dict(values, **pinned), ask
         raise Refused("disclosure_unavailable", "There is no complete pending change here to confirm; read it again.")
     finally:

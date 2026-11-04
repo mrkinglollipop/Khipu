@@ -2889,6 +2889,12 @@ def _default_agent_label(cur, commitment_id: int) -> str:
     return label if owner == OWNER_AGENT and label and label != "other" else ORCHESTRATOR
 
 
+def bulk_owner_refusal() -> str:
+    from khipu import routing
+
+    return routing.terminal_refusal(BULK_OWNER_REFUSAL)
+
+
 def bulk_owner_gate(count: int) -> str | None:
     """The owner gate for a change to more than one of the owner's own items
     (decision 6): ``"app"`` when the Khipu app itself started this process,

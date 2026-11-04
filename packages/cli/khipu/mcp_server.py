@@ -1130,8 +1130,7 @@ TOOLS: list[dict] = [
             "next routing block, and can be undone from Settings, Owner "
             "actions, or by asking for direction.undo with its id. "
             "An undo is refused when a newer change touched the same thing since; "
-            "direction.undo with over_newer true restores over it, only when the owner asked for that: pass "
-            "the owner's latest message word for word as owner_words, and it must ask to undo anyway. "
+            "direction.undo with over_newer true restores over it when the owner agrees to lose the newer change. "
             "For one account's priority entry use route.priority.amend (account, expect, append or role, "
             "optional until, and holds when an account it names is on hold), not route.priority.set, which "
             "rewrites every account. While a conversation's priority request is waiting for the owner, "
@@ -2314,7 +2313,7 @@ def owed_change(ids: list[int], action: str, *, by: str, reason=None, until=None
             if gate is None:
                 why = ("" if mine else "The hub is away, so whose items these are cannot be checked. ")
                 return {"ok": False, "changed": 0, "action": action, "ids": ids,
-                        "needs_owner": mine if mine else ids, "error": why + commitments.BULK_OWNER_REFUSAL}
+                        "needs_owner": mine if mine else ids, "error": why + commitments.bulk_owner_refusal()}
     write = {"ids": ids, "action": action, "by": by,
              **({"reason": reason} if reason else {}),
              **({"until": str(until)} if action == "snooze" else {}),

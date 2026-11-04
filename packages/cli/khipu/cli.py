@@ -3652,7 +3652,7 @@ def _owner_only(args: argparse.Namespace, intent: "dict | None" = None) -> "str 
     finally:
         routing._OWNER_AUTH.reset(auth)
     if via is None:
-        print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+        print(json.dumps({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"}))
         return 2
     return via
 
@@ -3761,7 +3761,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             else:
                 via = routing._owner_via(args, _accounts_list_intent(args))
                 if via is None:
-                    print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+                    print(json.dumps({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"}))
                     return 2
             # One write path for the list: the save becomes the account
             # operations it implies (track, rename, stop, move), each with
@@ -4551,6 +4551,7 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
         owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
         via = "cli"
     if via is None:
+        refused["error"] = routing.terminal_refusal(refused.get("error"))
         print(json.dumps(refused))
         return 2
     try:

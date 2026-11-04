@@ -622,8 +622,8 @@ def _gate(args, want: dict) -> int | None:
         owner_direction.noted(want, {"auth": "terminal"})
         return None
     return _emit({"ok": False, "code": "owner_only",
-                  "error": "only the Khipu app, the owner's yes typed on a terminal, or a conversation the owner is "
-                           "typing in (owner direction) can make this change; nothing was changed"}, 2)
+                  "error": routing.terminal_refusal("only the Khipu app, the owner's yes typed on a terminal, or a conversation the owner is "
+                           "typing in (owner direction) can make this change; nothing was changed")}, 2)
 
 
 def check_names(names: list[Any]) -> str | None:

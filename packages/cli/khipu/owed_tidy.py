@@ -599,10 +599,10 @@ def apply(doc: dict[str, Any], *, owner_gate: str | None = None) -> dict[str, An
             rows, skipped, live = current(lock=False)
             passed, gate, mine = _gate(cur, rows, live, passed=owner_gate)
             if not passed:
-                return {"ok": False, "changed": 0, "needs_owner": mine, "error": co.BULK_OWNER_REFUSAL}
+                return {"ok": False, "changed": 0, "needs_owner": mine, "error": co.bulk_owner_refusal()}
             rows, skipped, live = current(lock=True)
             if not gate and any(_is_users(rows[cid]) for cid in live):
-                return {"ok": False, "changed": 0, "error": co.BULK_OWNER_REFUSAL}
+                return {"ok": False, "changed": 0, "error": co.bulk_owner_refusal()}
             batch = _batch_id("tidy")
             from khipu import owner_direction
 
@@ -826,7 +826,7 @@ def undo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
             if not passed:
                 conn.rollback()
                 return {"ok": False, "restored": 0, "batch": batch, "needs_owner": mine,
-                        "error": co.BULK_OWNER_REFUSAL}
+                        "error": co.bulk_owner_refusal()}
             from khipu import owner_direction
 
             owner_direction.record_owed_undo_scope(batch, [])
@@ -966,7 +966,7 @@ def redo(batch: str, *, project: str | None = None, owner_gate: str | None = Non
             if not passed:
                 conn.rollback()
                 return {"ok": False, "reapplied": 0, "batch": batch, "needs_owner": mine,
-                        "error": co.BULK_OWNER_REFUSAL}
+                        "error": co.bulk_owner_refusal()}
             reapplied = 0
             lineage_ready = co._lineage_columns_ready(cur)
             for cid in todo:

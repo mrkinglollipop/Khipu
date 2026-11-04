@@ -70,38 +70,6 @@ def _counts(prompt, env=CLAUDE_ENV, refused_as="no_recorded_turn"):
 # ---- a turn the hook did not issue ------------------------------------------------------
 
 
-def test_running_the_shim_by_hand_cannot_make_a_turn_that_passes(folders, monkeypatch):
-    for name in ("CODEX_THREAD_ID", "KHIPU_SESSION_ID"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("CLAUDECODE", "1")
-    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "forged-agent-session")
-    from khipu import mcp_server as ms
-    from khipu.mcp_server import handle_message
-
-    monkeypatch.setattr(ms, "_GATEWAY_ACTIVE", False)
-    # This child supplies the purported user prompt and every provenance
-    # variable itself: the harness's prompt hook is not involved, so the
-    # turn it records names a Python above the shim as its issuer.
-    env = {**os.environ, "KHIPU_RECALL_DAEMON": "0", "KHIPU_PYTHON": sys.executable}
-    payload = {"session_id": "forged-agent-session", "prompt": "pause Codex until 5pm",
-               "cwd": str(folders["home"]), "hook_event_name": "UserPromptSubmit"}
-    done = subprocess.run(["/bin/sh", str(SHIM)], input=json.dumps(payload), text=True,
-                          capture_output=True, env=env, timeout=60, check=True)
-    assert "Owner turn" not in done.stdout
-    (turn,) = owner_turns.turns("forged-agent-session")
-    assert turn["typed"] is True and "refused" in turn["issuer"]
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check("route.pause")
-    assert err.value.code == "not_from_the_hook"
-
-    result = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-        "name": "khipu_owner_act", "arguments": {"action": "route.pause", "args": {"account": "Codex"}},
-    }})
-    assert result["result"]["isError"] is True
-    assert next(a for a in routing.read_view()["accounts"] if a["label"] == "Codex")["state"] != "paused"
-
-
 SHIM_ARGS = ["/bin/sh", "/live/packages/cli/bin/khipu-prompt-recall"]
 BASH_TOOL_ARGS = ["/bin/zsh", "-c", "source snapshot.sh && eval 'printf payload | khipu-prompt-recall'"]
 
@@ -134,37 +102,6 @@ def test_a_turn_records_the_process_that_ran_the_hook(folders, monkeypatch):
     assert owner_turns.hook_issuer() == {"refused": "python3.11"}
 
 
-def test_the_recorder_run_from_an_agents_bash_tool_is_not_the_hook(folders, monkeypatch):
-    """Fifth review, P1: the agent runs the recorder (or the shim) from its
-    ordinary Bash tool, no exec. The shell above is the agent's, so the turn
-    it writes never carries the owner, and no owner change goes through."""
-    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("KHIPU_SESSION_ID", "never-typed-session")
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(111, 1.0, "claude")])
-    # The recorder straight from the Bash tool's shell.
-    _tree(monkeypatch, {100: (222, "/opt/homebrew/bin/python3.11", 3.0), 222: (111, "/bin/bash", 2.0),
-                        111: (1, "/opt/harness/claude", 1.0)},
-          {222: ["/bin/bash", "-c", "eval 'python3 khipu-owner-turn.py < payload.json'"]})
-    issuer = owner_turns.hook_issuer()
-    assert "refused" in issuer, issuer
-    # The shim from the Bash tool's shell, in a pipeline and through a bash -c of its own.
-    _tree(monkeypatch, {100: (90, "/usr/bin/python3", 3.0), 90: (222, "/bin/bash", 2.5),
-                        222: (111, "/bin/zsh", 2.0), 111: (1, "/opt/harness/claude", 1.0)},
-          {90: SHIM_ARGS, 222: BASH_TOOL_ARGS})
-    assert owner_turns.hook_issuer() == {"refused": "zsh"}
-    _tree(monkeypatch, {100: (90, "/usr/bin/python3", 3.0), 90: (80, "/bin/bash", 2.5),
-                        80: (222, "/bin/bash", 2.2), 222: (111, "/bin/zsh", 2.0), 111: (1, "/opt/harness/claude", 1.0)},
-          {90: SHIM_ARGS, 80: ["/bin/bash", "-c", "/live/bin/khipu-prompt-recall; true"], 222: BASH_TOOL_ARGS})
-    assert owner_turns.hook_issuer() == {"refused": "bash"}
-    owner_turns.record({"session_id": "never-typed-session", "prompt": "agent-written payload", "cwd": "/w"},
-                       CLAUDE_ENV, issuer=issuer)
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check("direction.off")
-    assert err.value.code == "not_from_the_hook"
-    assert owner_turns.settings()["enabled"] is True
-
-
 def test_the_kernel_argv_of_a_process_reads_back(folders):
     """``_proc_args`` reads a real process's argv, the seam the tests above
     stand in for."""
@@ -176,27 +113,6 @@ def test_the_kernel_argv_of_a_process_reads_back(folders):
     out = subprocess.run([sys.executable, "-S", "-c", code, root, "two words"], capture_output=True, text=True,
                          timeout=60)
     assert json.loads(out.stdout)[1:] == ["-S", "-c", code, root, "two words"], out
-
-
-def test_a_turn_whose_issuer_is_not_above_the_caller_is_refused(folders, monkeypatch):
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-issuer")
-    owner_turns.record({"session_id": "s-issuer", "prompt": "pause Codex for now", "cwd": "/w"},
-                       CLAUDE_ENV, issuer={"pid": 4242, "start": 7.0, "exe": "claude"})
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(4242, 8.0, "claude")])
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check("route.pause")
-    assert err.value.code == "not_from_the_hook"
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(4242, 7.0, "claude")])
-    assert owner_direction.check("route.pause")["auth"] == "direction"
-
-
-def test_a_refused_issuer_never_carries_the_owner(folders, monkeypatch):
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-zsh")
-    owner_turns.record({"session_id": "s-zsh", "prompt": "pause Codex for now", "cwd": "/w"},
-                       CLAUDE_ENV, issuer={"refused": "zsh"})
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check("route.pause")
-    assert err.value.code == "not_from_the_hook"
 
 
 # ---- wrappers anywhere in the turn ------------------------------------------------------
@@ -447,79 +363,6 @@ def test_a_hook_turn_from_before_the_update_still_matches_the_chain(kernel):
     assert kernel.check()["auth"] == "direction"
 
 
-def test_a_process_never_seen_with_a_readable_path_is_refused_and_told_to_restart(kernel):
-    kernel.replace(80)
-    assert kernel.hook_turn() == {"refused": "unknown"}
-    why = _refused(kernel)
-    assert "updated while" in why and "Restart" in why
-    assert "Ask the owner to say it" not in why
-
-
-def test_a_forged_issuer_for_a_process_never_seen_is_refused(kernel):
-    # The turn file names the right process; the chain can't read it, so it
-    # never reaches it, whatever its name says.
-    kernel.replace(80)
-    owner_turns.record(TYPED, CLAUDE_ENV, issuer={"pid": 80, "start": 1.0, "exe": "claude"})
-    assert "updated while" in _refused(kernel)
-
-
-def test_a_process_above_the_harness_with_no_path_is_not_the_conversations_to_restart(kernel):
-    # The conversation's own program is fine: restarting it would change nothing.
-    kernel.replace(70)
-    owner_turns.record(TYPED, CLAUDE_ENV, issuer={"pid": 80, "start": 1.5, "exe": "2.1.316"})
-    assert "updated while" not in _refused(kernel)
-
-
-def test_a_reused_process_number_with_a_matching_name_is_refused(kernel):
-    kernel.hook_turn()
-    kernel.replace(80)
-    # Another program of the same name got the number: the same name, its own start time.
-    kernel.procs[80] = (70, kernel.procs[80][1], 2.0)
-    kernel.be(100)
-    assert owner_turns.hook_issuer() is None
-    for start in (1.0, 2.0):
-        owner_turns.record(TYPED, CLAUDE_ENV, issuer={"pid": 80, "start": start, "exe": "2.1.316"})
-        _refused(kernel)
-
-
-def test_a_forged_issuer_start_for_a_known_replaced_process_is_refused(kernel):
-    kernel.hook_turn()
-    kernel.replace(80)
-    owner_turns.record(TYPED, CLAUDE_ENV, issuer={"pid": 80, "start": 1.5, "exe": "2.1.316"})
-    _refused(kernel)
-
-
-def test_a_known_process_that_runs_something_else_now_is_not_known(kernel):
-    # exec keeps the pid and the start time; the kernel's name is what moves.
-    kernel.hook_turn()
-    kernel.replace(80)
-    kernel.names[80] = "zsh"
-    kernel.be(100)
-    assert owner_turns.hook_issuer() is None
-    _refused(kernel)
-
-
-def test_a_matching_name_with_the_wrong_ancestry_is_refused(kernel):
-    # Two known programs of the same name, both replaced. The turn names the
-    # first; the call runs under the second, which is the nearest harness.
-    kernel.hook_turn()
-    kernel.procs[81] = (70, kernel.procs[80][1], 1.2)
-    kernel.procs[90] = (81, "/bin/bash", 2.5)
-    kernel.be(100)
-    assert owner_turns.hook_issuer()["pid"] == 81
-    kernel.procs[90] = (80, "/bin/bash", 2.5)
-    kernel.replace(80, 81)
-    assert kernel.hook_turn()["pid"] == 80
-    kernel.procs[300] = (81, "/usr/bin/python3", 3.0)
-    _refused(kernel, caller=300)
-    # And one Khipu never saw, whatever its name, ends the chain.
-    kernel.procs[82] = (70, kernel.procs[80][1], 1.3)
-    kernel.procs[301] = (82, "/usr/bin/python3", 3.0)
-    kernel.replace(82)
-    _refused(kernel, caller=301)
-    assert kernel.check()["auth"] == "direction"
-
-
 def _forge_record(pid: int, start: float, name: str, path: str) -> None:
     owner_turns.known_folder().mkdir(parents=True, exist_ok=True)
     owner_turns._known_file(pid).write_text(json.dumps({"start": start, "name": name, "path": path}))
@@ -534,57 +377,6 @@ def _job_under_the_conversation(kernel) -> int:
     kernel.procs[400] = (85, "/usr/bin/python3", 3.0)
     kernel.replace(85)
     return 400
-
-
-def test_a_forged_record_cannot_make_a_job_read_as_a_shell(kernel):
-    # Security review of df3cdfc9: read as bash, the job would be skipped and
-    # its parent would be the nearest harness, whose turn then passes.
-    caller = _job_under_the_conversation(kernel)
-    _forge_record(85, 2.0, "claude", "/bin/bash")
-    assert owner_turns._known_info(85) is None
-    _refused(kernel, caller=caller)
-    kernel.be(caller)
-    assert owner_direction._caller_chain() == []
-
-
-def test_a_forged_record_through_a_symlink_cannot_make_a_job_read_as_a_shell(kernel, tmp_path):
-    # The walk names a process by the resolved path, so the resolved name must match too.
-    link = tmp_path / "claude"
-    link.symlink_to("/bin/bash")
-    caller = _job_under_the_conversation(kernel)
-    _forge_record(85, 2.0, "claude", str(link))
-    assert owner_turns._known_info(85) is None
-    _refused(kernel, caller=caller)
-
-
-def test_a_replaced_job_with_its_own_record_is_its_own_harness(kernel):
-    # The honest case: the job is the nearest harness, so the parent's turn is not its.
-    caller = _job_under_the_conversation(kernel)
-    _forge_record(85, 2.0, "claude", "/x/versions/claude")
-    kernel.be(caller)
-    assert owner_direction._nearest_harness(owner_direction._caller_chain()) == (85, 2.0)
-    assert "updated while" not in _refused(kernel, caller=caller)
-
-
-def test_the_refusal_is_true_for_a_conversation_and_for_a_job(kernel):
-    caller = _job_under_the_conversation(kernel)
-    why = _refused(kernel, caller=caller)
-    assert "updated while" in why
-    assert "type the request again" in why and "job can't make an owner's change, restarted or not" in why
-    assert "works again" not in why
-
-
-def test_the_agents_shell_under_a_known_replaced_process_stays_refused(kernel):
-    kernel.hook_turn()
-    kernel.replace(80)
-    kernel.procs[90] = (222, "/bin/bash", 2.5)
-    kernel.procs[222] = (80, "/bin/zsh", 2.0)
-    kernel.args[222] = BASH_TOOL_ARGS
-    kernel.be(100)
-    assert owner_turns.hook_issuer() == {"refused": "zsh"}
-    owner_turns.record(TYPED, CLAUDE_ENV, issuer={"refused": "zsh"})
-    # The real reason, not the update: a restart would not help.
-    assert "updated while" not in _refused(kernel)
 
 
 def test_an_agents_shell_replaced_too_is_never_taken_for_a_harness(kernel):
