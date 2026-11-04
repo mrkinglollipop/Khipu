@@ -3033,11 +3033,12 @@ def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None 
     events = [e for e in events if e.get("mac") in (None, mac)]
     times = [t for t in (_parse(e.get("written_at")) for e in events) if t is not None]
     last = _parse(events[-1].get("written_at")) if events else None
-    settled = [t for t in _record_times(events)[0] if t is not None]
     clock_at = None
     stamp = _not_behind(clock, last)
-    if len(times) >= 2 and settled and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
-        stamp, clock_at = settled[-1], clock
+    if len(times) >= 2 and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
+        settled = [t for t in _record_times(events)[0] if t is not None]
+        if settled:
+            stamp, clock_at = settled[-1], clock
     out = []
     for i in range(count):
         line = {"written_at": _iso(stamp), "seq": first + i, "mac": mac}
