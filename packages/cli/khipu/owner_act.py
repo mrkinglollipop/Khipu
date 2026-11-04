@@ -48,10 +48,13 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
-    "route.override.grant": (("account", "subject", "effect", "request"), ("until", "indefinite", "review_at", "children", "ceiling_pct", "reason", "ref")),
+    # One conversation's pace override. ``subject`` is never the caller's to name: Khipu reads it from this
+    # server's own environment and T3's record and freezes it into the ask (``whole_folder``: every conversation in this folder).
+    # ``helpers`` false keeps the conversations it starts out of it.
+    "route.override.grant": (("account", "request"), ("whole_folder", "subject", "until", "indefinite", "helpers",
+                                                       "ceiling_pct", "window", "reason", "ref")),
     "route.override.end": (("override",), ()),
-    "route.override.grant": (("account", "subject", "effect", "request"), ("until", "indefinite", "review_at", "children", "ceiling_pct", "reason", "ref")),
-    "route.override.end": (("override",), ()),
+    "route.override.keep": (("override",), ()),
     "route.tier_table.set": (("tiers",), ("expect",)),
     "route.tier_table.confirm": ((), ("expect",)),
     "route.tier_table.clear": ((), ("expect",)),
@@ -109,7 +112,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "children"}
+_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "helpers", "whole_folder"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -256,6 +259,22 @@ def _values(action: str, args) -> dict:
     return out
 
 
+def _with_frozen_subject(args) -> dict:
+    """The conversation an override is for, read here from this server's own
+    environment and T3's record (never from the call), and frozen into the
+    ask the owner answers. ``Refused`` when Khipu can't tell who is asking."""
+    from khipu import conversation_overrides
+
+    if not isinstance(args, dict):
+        raise _bad("route.override.grant takes arguments")
+    if "subject" in args:
+        raise _bad("the conversation an override is for is Khipu's to name, not the call's")
+    subject, why = conversation_overrides.subject(scope="project" if args.get("whole_folder") is True else "conversation")
+    if subject is None:
+        raise Refused("unknown_conversation", why or "Khipu can't tell which conversation this is.")
+    return dict(args, subject=subject)
+
+
 def _opts(values: dict, *keys: str) -> list[str]:
     """``--name=value`` options: a value joined to its flag is never read as
     a flag of its own."""
@@ -325,6 +344,14 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "hold", *_opts(v, "reason", "until"), *where], [v["text"]]
     if action == "route.hold.end":
         return ["route", "hold"], ["end", v["hold"]]
+    if action == "route.override.grant":
+        if not isinstance(v.get("subject"), dict):
+            raise _bad("an override needs the conversation Khipu froze into its ask")
+        return ["route", "override", "grant", "--subject=" + json.dumps(v["subject"], sort_keys=True),
+                *(["--no-children"] if v.get("helpers") is False else []),
+                *_opts(v, "until", "indefinite", "ceiling_pct", "window", "reason", "ref", "request")], [v["account"]]
+    if action in ("route.override.end", "route.override.keep"):
+        return ["route", "override", verb], [v["override"]]
     if action.startswith("route.cap."):
         return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "slack", "usd", "days", "n",
                                              "revision", "purpose", "tier", "sensitive_only", "until")], [v["account"]]
@@ -468,7 +495,33 @@ def _forget_list() -> dict:
 # only when the owner-direction check passes, so the owner can choose
 # forget.here or forget.not_same. The app reads its list through
 # ``khipu episode forget-pending`` instead.
-_READS = {"forget.list": _forget_list}
+def _overrides_mine() -> dict:
+    """The override that applies to this conversation, if any: what it hears
+    about itself and nothing about anyone else's."""
+    from khipu import conversation_overrides as overrides, routing
+
+    who = overrides.resolve()
+    if who["subject"] is None:
+        return {"ok": True, "available": False, "reason": who["reason"], "overrides": []}
+    now = routing._now()
+    return {"ok": True, "available": True, "overrides": [overrides.describe(r, now) | {"account": r["account"]}
+                                                          for r in overrides.matches(who, now).values()]}
+
+
+def _walkthrough(leave=None, keep=None, restart=False) -> dict:
+    """One clean-up item at a time (``priority_cleanup``). Only a
+    conversation the owner is typing in is shown the items themselves."""
+    from khipu import conversation_overrides as overrides
+
+    if not owner_turn():
+        return {"ok": True, "available": False,
+                "line": "Only a conversation the owner is typing in can walk through the clean-up."}
+    return overrides.walkthrough(leave=leave, keep_pair=keep, restart=restart is True)
+
+
+_READS = {"forget.list": _forget_list, "route.overrides.mine": _overrides_mine}
+# Reads that take a few arguments (the walk-through's bookmark: leave an item, keep a pair, start over).
+_ARG_READS = {"route.walkthrough": (_walkthrough, ("leave", "keep", "restart"))}
 
 
 def _parsed(text: str) -> dict:
@@ -506,6 +559,11 @@ def act(action, args) -> tuple[bool, dict]:
         if not isinstance(args, dict) or args:
             return False, _bad(f"{action} takes no arguments").refusal()
         return True, _READS[action]()
+    if isinstance(action, str) and action in _ARG_READS:
+        reader, allowed = _ARG_READS[action]
+        if not isinstance(args, dict) or set(args) - set(allowed):
+            return False, _bad(f"{action} takes only {', '.join(allowed)}").refusal()
+        return True, reader(**args)
     if action == CONFIRM:
         return _confirm(args)
     if action == DECLINE:
@@ -519,16 +577,9 @@ def act(action, args) -> tuple[bool, dict]:
         return False, {"ok": False, "code": "not_by_direction", "error": "That change can't be made by direction."}
     pending = None
     try:
+        if action == "route.override.grant":
+            args = _with_frozen_subject(args)
         values = _values(action, args)
-        if action in ("route.override.grant", "route.override.end"):
-            try:
-                owner_direction.check(action, instant=True)
-            except owner_direction.DirectionRefused as refused:
-                return False, refused.refusal()
-            from khipu import conversation_overrides
-            result = (conversation_overrides.grant(values) if action == "route.override.grant"
-                      else conversation_overrides.end(values["override"]))
-            return True, {"ok": True, "override": result}
         pending = _priority_pending(action, values)
         if pending is None and not owner_direction.REQUEST_APPLIED.get():
             from khipu import needs_you

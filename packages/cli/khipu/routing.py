@@ -6507,8 +6507,15 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
         target = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
     elif lane:
         target = _lane_account_key(lane, view)
+    # A conversation's own pace override: found once for the caller, applied
+    # only to the answer for its conversation; the shared view never holds it.
+    from khipu import conversation_overrides
+    overrides, refused = {}, None
+    if any(r.get("account") for r in conversation_overrides.list_overrides(now=now)):
+        who = conversation_overrides.resolve(environ=environ)
+        overrides, refused = conversation_overrides.matches(who, now), who.get("reason")
     ranked = routing_advice.rank(view, now, purpose=effective, tier=tier, kind=kind,
-                                 privacy=privacy, sensitive=sensitive, target_key=target)
+                                 privacy=privacy, sensitive=sensitive, target_key=target, overrides=overrides)
     out: dict = {"purpose": effective, "requested_purpose": purpose, "dispatched": dispatched,
                  "tier": tier, "kind": kind, "privacy": bool(privacy), "sensitive": sensitive, "ranked": ranked,
                  "about": ABOUT, "advisory": True}
@@ -6516,16 +6523,8 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
         out.update({k: ranked[0][k] for k in
                     ("account", "label", "verdict", "reason", "evidence", "numbers", "caps",
                      "eligible", "why_eligible")})
-        # Overrides are intentionally narrower than the shared routing view:
-        # only this conversation's pace answer changes. Holds, states, limits,
-        # spend, concurrency and eligibility keep their normal verdict.
-        from khipu import conversation_overrides
-        override, refused = conversation_overrides.advice(target, now=now, environ=environ)
-        if override is not None:
-            # The structured advice engine owns the verdict.  Keeping this
-            # annotation separate prevents a free-text reason from turning a
-            # spend/concurrency/eligibility hold into a go.
-            out["override"] = override
+        if ranked[0].get("override"):
+            out["override"] = ranked[0]["override"]
         elif refused:
             out["override_refused"] = refused
     return out
@@ -7746,7 +7745,15 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
             if any(len(x["text"]) > EXCEPTION_WORDS_MOST for x in [*exceptions, *live]):
                 raise RouteError(f"priority entry {i}: an exception holds at most {EXCEPTION_WORDS_MOST} characters")
             if live:
-                out[-1]["exceptions"] = live
+                from khipu import priority_cleanup
+
+                kept: list[dict] = []
+                for x in live:
+                    # A repeat of an instruction already in this entry is dropped, never stacked.
+                    twin = priority_cleanup.find_duplicate(x["text"], kept)
+                    if not (twin and twin[0] == "same"):
+                        kept.append(x)
+                out[-1]["exceptions"] = kept
     return out
 
 
@@ -7940,6 +7947,8 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
                 {"account": r["account"], "label": r["label"]} for r in gone]
             return _crossed_entries(lost, entries=[e["label"] for e in rows], unread=not stale and not gone)
         _check_role_budget(rows, now)
+        if done.get("duplicate"):
+            return {"ok": True, "duplicate": True, "pending": False, "entries": [e["label"] for e in rows], **done}
         observed = _observed_base("priority", base=base, expect=expect)
         written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
                                 "base": observed,
@@ -8153,6 +8162,20 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
             if live:
                 row["exceptions"] = live
             if exception is not None:
+                # The same instruction again writes nothing (a retry's second
+                # copy); a near copy is named, not stacked.
+                from khipu import priority_cleanup
+
+                twin = priority_cleanup.find_duplicate(exception, row.get("exceptions"))
+                if twin and twin[0] == "same":
+                    done = {"duplicate": True, "exception_id": twin[1]["id"], "exception_until": twin[1]["until"]}
+                    rows.append(row)
+                    continue
+                if twin:
+                    raise RouteError(
+                        f"{row['label']} already has an instruction that reads almost the same "
+                        f"({twin[1]['id']}: \"{_word_clip(twin[1]['text'], 80)}\", ends {twin[1]['until']}); "
+                        f"end that one first (end_exception {twin[1]['id']}) or say what is different")
                 if len(row.get("exceptions") or []) >= EXCEPTION_MOST:
                     raise RouteError(f"{row['label']} already has {EXCEPTION_MOST} exceptions; end one first")
                 made, note = _new_exception(key, exception, until, now=now, conversation=conversation, by=by,
@@ -8433,6 +8456,8 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
                                               end_exception=end_exception, now=now, conversation=False,
                                               by="owner", source=str(via), share_pct=share_pct)
         _check_role_budget(rows, now)
+        if done.get("duplicate") and confirm_pending is None:
+            return {"ok": True, "duplicate": True, "entries": [e["label"] for e in rows], **done}
         # ``holds``: end or keep for each hold on an account it names, as a
         # set takes them (``_require_hold_choices``).
         choices = {"holds": holds} if holds is not None else {}
@@ -13013,6 +13038,50 @@ def _tier_table_intent(args, action: str) -> dict | None:
     return owner_direction.intent(f"route.tier_table.{action}", "tier_table", facts=facts)
 
 
+def _override_cli(args) -> int:
+    """``khipu route override grant|end|keep``: the owner's change to one
+    conversation's pace, by the same owner check as every routing change."""
+    from khipu import conversation_overrides as overrides, owner_direction
+
+    verb, params = args.action, list(args.params)
+
+    def intent():
+        if len(params) != 1:
+            raise RouteError("grant takes the account; end and keep take the override's id")
+        if verb != "grant":
+            return owner_direction.intent(f"route.override.{verb}", params[0])
+        try:
+            subject = json.loads(args.subject or "")
+        except ValueError:
+            raise RouteError("--subject is the conversation the ask showed, as JSON") from None
+        facts = {"subject": subject, "until": args.until, "indefinite": bool(args.indefinite),
+                 "children": not args.no_children, "ceiling_pct": args.ceiling_pct, "window": args.window}
+        return owner_direction.intent("route.override.grant", _resolve_account_key(params[0]),
+                                      facts={k: v for k, v in facts.items() if v not in (None, False) or k == "children"})
+
+    want = _intent_or_none(intent)
+    if _owner_via(args, want) is None:
+        _print_json({"ok": False, "error": terminal_refusal()})
+        return 2
+    now = _now()
+    if verb == "grant":
+        row = overrides.grant({"account": params[0], "subject": want["facts"]["subject"], "effect": args.effect,
+                               "until": args.until, "indefinite": args.indefinite, "ceiling_pct": args.ceiling_pct,
+                               "window": args.window, "children": not args.no_children, "reason": args.reason,
+                               "ref": args.ref, "request": args.request or "owner grant"}, now=now)
+        out = {"ok": True, "id": row["id"], "account": row["account"], "until": row.get("until"),
+               "review_at": row.get("review_at"), "indefinite": bool(row.get("indefinite")),
+               "replaced": row["replaced"]}
+    elif verb == "end":
+        row = overrides.end(params[0], now=now)
+        out = {"ok": True, "override": params[0], "end": row["id"]}
+    else:
+        row = overrides.keep(params[0], now=now)
+        out = {"ok": True, "override": params[0], "review_at": row["review_at"]}
+    _print_json(_finish_owner(out))
+    return 0
+
+
 def _finish_owner(out: dict) -> dict:
     from khipu import owner_direction
 
@@ -13265,6 +13334,8 @@ def run_cli(args) -> int:
                            hold_id=_planned_id("route.hold.add") if owner_flag else None)
             _print_json(_finish_owner(out) if owner_flag else out)
             return 0
+        if cmd == "override":
+            return _override_cli(args)
         if cmd == "priority":
             return _priority_cli(args, now)
         if cmd == "tier-table":

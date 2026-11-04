@@ -229,8 +229,14 @@ def _applies(status: dict, purpose: str, statuses: list[dict], *, tier=None, sen
 
 def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
                    tier=None, kind=None, privacy: bool = False, sensitive: bool = False,
-                   explicit: bool = False, declared_tier=_DECLARED_TIER) -> dict:
-    """One account's advice at ``now``. Never a permission decision."""
+                   explicit: bool = False, declared_tier=_DECLARED_TIER, override: dict | None = None) -> dict:
+    """One account's advice at ``now``. Never a permission decision.
+
+    ``override`` (a live conversation override that applies to the caller, see
+    ``conversation_overrides``) changes only the pace answer: it drops the
+    pace-target holds and the cap-crossing look-ahead, then keeps the override's
+    own ceiling. Holds, pause, limits, down, spend, concurrency, share caps and
+    eligibility are decided before this point and stay as they were."""
     from khipu import routing
 
     statuses = routing.cap_statuses(view, entry, now)
@@ -305,7 +311,14 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
                    if _applies(s, purpose, statuses, tier=check_tier, sensitive=sensitive)
                    and s.get("verdict") in _HOLD_VERDICTS.get(s.get("kind"), set())]
         crossing = _crosses_within_hour(entry, now) if purpose in ("job", "check") else []
-        if holding:
+        over_ceiling = None
+        if override is not None and purpose in ("job", "check"):
+            holding = [s for s in holding if s.get("kind") != "pace_target"]
+            crossing = []
+            over_ceiling = _override_ceiling(entry, override)
+        if over_ceiling:
+            verdict, reason = "hold_back", over_ceiling
+        elif holding:
             verdict = "hold_back"
             reason = "; ".join(f"{s['kind']} {s['verdict']}" + (f" (cap ends {s['until']})" if s.get("until") else "")
                                for s in holding)
@@ -317,12 +330,38 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         elif crossing:
             verdict = "hold_back"
             reason = "a cap crosses within the hour at the trailing average"
-    return {"account": routing.account_id(entry["key"]), "label": entry.get("label"),
+    applied = None
+    if override is not None and purpose in ("job", "check"):
+        from khipu import conversation_overrides
+        applied = conversation_overrides.describe(override, now)
+        if verdict == "go":
+            reason = applied["line"][len("go ("):-1]
+    out = {"account": routing.account_id(entry["key"]), "label": entry.get("label"),
             "purpose": purpose, "verdict": verdict, "reason": reason,
             "evidence": evidence, "numbers": numbers,
             "caps": [{**s, "applies": _applies(s, purpose, statuses, tier=check_tier, sensitive=sensitive)}
                      for s in statuses],
             "eligible": eligible, "why_eligible": why_eligible, "advisory": True}
+    if applied is not None:
+        out["override"] = applied
+    return out
+
+
+def _override_ceiling(entry: dict, override: dict) -> str | None:
+    """Why the override's own ceiling holds the work back, or None. Usage is
+    not split by conversation, so the ceiling measures the whole account; a
+    reading Khipu can't place holds back rather than guessing."""
+    ceiling = override.get("ceiling_pct")
+    if ceiling is None:
+        return None
+    window = override.get("window") or "weekly"
+    pace = next((p for p in entry.get("pace") or [] if p.get("window") == window), None)
+    if pace is None or _pace_reading_unknown(pace):
+        return f"override ceiling {ceiling:g}% can't be checked: no usage reading for the {window} window"
+    used = pace.get("used_pct")
+    if used >= ceiling:
+        return f"override ceiling {ceiling:g}% of the {window} window reached ({used:g}% used)"
+    return None
 
 
 def advice_line(advice: dict) -> str:
@@ -338,7 +377,8 @@ def advice_line(advice: dict) -> str:
 
 
 def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
-         privacy: bool = False, sensitive: bool = False, target_key: str | None = None) -> list[dict]:
+         privacy: bool = False, sensitive: bool = False, target_key: str | None = None,
+         overrides: dict | None = None) -> list[dict]:
     """Every account's advice, ranked for work of this kind.
 
     Eligible ``go`` accounts come first in the owner's priority order
@@ -361,7 +401,7 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
     for entry in entries:
         advice = account_advice(view, entry, now, purpose=purpose, tier=tier, kind=kind,
                                 privacy=privacy, sensitive=sensitive, explicit=target_key is not None,
-                                declared_tier=declared_tier)
+                                declared_tier=declared_tier, override=(overrides or {}).get(entry["key"]))
         if not advice["eligible"]:
             group = 3
             why = advice["why_eligible"]

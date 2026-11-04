@@ -91,7 +91,7 @@ ACTIONS: frozenset[str] = frozenset({
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
     "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
     "route.priority.set", "route.priority.amend", "route.priority.confirm",
-    "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm", "route.override.grant", "route.override.end",
+    "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm", "route.override.grant", "route.override.end", "route.override.keep",
     "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
@@ -123,7 +123,7 @@ ROUTING_INSTANT: frozenset[str] = frozenset({
     "route.pause", "route.lift", "route.note.set", "route.note.end", "route.rule.add", "route.rule.edit",
     "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
     "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.amend", "route.priority.confirm",
-    "route.priority.undo", "route.override.grant", "route.override.end",
+    "route.priority.undo", "route.override.grant", "route.override.end", "route.override.keep",
 })
 
 
@@ -134,7 +134,11 @@ SETTLE_ACTIONS: frozenset[str] = frozenset({
     "accounts.request.undo", "route.tier_table.confirm", "route.tier_table.set", "route.tier_table.clear",
     "owed.correct_job_origin.confirm", "project.merge", "project.keep_separate", "forget.send", "forget.here",
     "forget.not_same", "direction.acknowledge", "route.hold.end", "route.clear", "route.cap.set",
+    "route.override.end", "route.override.keep",
 })
+# A conversation's override changes only that conversation's advice, so
+# nothing about it is pushed to the others (no receipt line, no push words).
+LOCAL_ONLY_ROUTING: frozenset[str] = frozenset({"route.override.grant", "route.override.end", "route.override.keep"})
 # The routing changes that answer a request waiting on the owner, not a change
 # of his own. His typed message can be the direction for a change of his own;
 # an answer needs him to have been shown what it answers, so in T3 it applies at
@@ -527,6 +531,10 @@ def reviewed_file(path) -> bytes | None:
     return item["text"].encode("utf-8")
 
 
+_ONE_WAITING = frozenset({"route.override.grant", "route.override.end", "route.override.keep",
+                          "route.priority.amend"})
+
+
 def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: str | None = None) -> dict:
     """Hold ``action`` with its checked ``args`` for the owner to confirm.
     ``ask`` is the question to put to the owner when the plain one
@@ -577,6 +585,14 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                 raise DirectionRefused("forgotten", "Khipu forgot this conversation's words while the request was "
                                                     "being held, so nothing was held or changed. Ask again if the "
                                                     "owner still wants it.")
+            if action in _ONE_WAITING:
+                # A retry of a request that is still waiting is that request,
+                # not a second copy for the owner to answer.
+                same = next((r for r in state["requests"] if r.get("state") == "pending" and r.get("action") == action
+                             and r.get("session") == session
+                             and signature(action, r.get("args") or {}) == signature(action, args)), None)
+                if same is not None:
+                    return same
             state["requests"].append(request)
             _save(path, state, now)
     except OSError as err:
@@ -2170,7 +2186,7 @@ def finish(result: dict | None, **extra) -> dict | None:
         if pend.get("line") is None:
             return result
         incomplete = True
-    if not refused:
+    if not refused and want["action"] not in LOCAL_ONLY_ROUTING:
         _name_in_push(want, stamp, line, pend.get("stamped"))
         if receipt is not None:
             _write_receipt(receipt[1], line, stamp)
@@ -2178,6 +2194,8 @@ def finish(result: dict | None, **extra) -> dict | None:
     # picked out of the log afterwards.
     if stamp.get("auth") in ("direction", "app") and isinstance(result, dict) and not refused:
         out = dict(result, owner_action=line["id"])
+        if receipt is not None and want["action"] in LOCAL_ONLY_ROUTING:
+            out["receipt"] = receipt[1]
         if incomplete:
             out["record_incomplete"] = _INCOMPLETE
         return out
@@ -2282,6 +2300,15 @@ def _receipt_what(want: dict, result, before=None) -> str:
         return "Added a hold:" + _quoted(hold.get("text"))
     if action == "route.hold.end":
         return "Ended a hold"
+    if action.startswith("route.override."):
+        from khipu import conversation_overrides as overrides
+
+        if action == "route.override.grant":
+            row = {"until": result.get("until"), "review_at": result.get("review_at")}
+            label = routing._label_for_key(target)
+            return (f"Let {overrides.subject_words(facts.get('subject') or {})} run ahead of pace on {label} "
+                    f"{overrides.when_words(row)}")
+        return "Ended an override" if action == "route.override.end" else "Kept an override for another week"
     held = view.get("priority") or {}
     labels = ", ".join(e["label"] for e in held.get("entries") or [])
     if action == "route.priority.amend":
@@ -2632,6 +2659,13 @@ def _before(want: dict):
         # Read, changed and diffed under the group lock in the change's own
         # transaction: its result's ``delta`` (on the finish line) is the Undo.
         return {}
+    if action == "route.override.keep":
+        from khipu import conversation_overrides
+
+        row = next((r for r in conversation_overrides.list_overrides() if r.get("id") == target), None)
+        return {"review": {"override": target, "review_at": row.get("review_at")}} if row else {}
+    if action.startswith("route.override."):
+        return {}
     if action in _UNDO or action in ("ledger.purge", "direction.undo"):
         return None
     return _NO_UNDO
@@ -2640,7 +2674,8 @@ def _before(want: dict):
 def _after(want: dict, result) -> Any:
     if not isinstance(result, dict):
         return None
-    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts", "tiers")
+    keep = ("id", "entity", "n", "account", "until", "entries", "version", "state", "runs_at", "ended", "label", "accounts", "tiers",
+            "replaced", "override", "review_at", "end")
     return {k: result[k] for k in keep if k in result} or None
 
 
@@ -3158,7 +3193,42 @@ def _undo_definition(line: dict, via: str) -> dict:
                                  "value": facts["value"]}, via)
 
 
+def _undo_override_grant(line, via):
+    from khipu import conversation_overrides as overrides
+
+    after = line.get("after") or {}
+    if not after.get("id"):
+        raise ValueError("Khipu can't tell which override this was, so it can't undo it")
+    overrides.end(after["id"])
+    for old in after.get("replaced") or []:
+        overrides.restore(ended=old["end"])
+    return {"ok": True}
+
+
+def _undo_override_end(line, via):
+    from khipu import conversation_overrides as overrides
+
+    ended = (line.get("after") or {}).get("end") or (line.get("result") or {}).get("end")
+    if not ended:
+        raise ValueError("Khipu can't tell which ending this was, so it can't undo it")
+    overrides.restore(ended=ended)
+    return {"ok": True}
+
+
+def _undo_override_keep(line, via):
+    from khipu import conversation_overrides as overrides
+
+    review = (line.get("before") or {}).get("review")
+    if not review:
+        raise ValueError("Khipu can't tell the earlier review date, so it can't undo this")
+    overrides.restore(review=review)
+    return {"ok": True}
+
+
 _UNDO = {
+    "route.override.grant": _undo_override_grant,
+    "route.override.end": _undo_override_end,
+    "route.override.keep": _undo_override_keep,
     "route.cap.set": _undo_cap,
     "route.cap.remove": _undo_cap,
     "route.definition.set": _undo_definition,
@@ -3428,6 +3498,8 @@ _ACTION_WORDS = {
     "route.rule.restore": "a rule restored", "route.rule.confirm": "a rule confirm",
     "route.rule.undo": "a rule proposal undone", "route.rule.dismiss": "a rule proposal dismissed",
     "route.hold.add": "a hold added", "route.hold.end": "a hold ended", "route.pause": "a pause",
+    "route.override.grant": "an override granted", "route.override.end": "an override ended",
+    "route.override.keep": "an override kept",
     "route.lift": "a lift", "route.note.set": "a routing note set",
     "route.note.end": "the routing note ended", "route.tier_table.set": "a tier table set",
     "route.tier_table.confirm": "a tier table confirm", "route.tier_table.clear": "the tier table cleared",

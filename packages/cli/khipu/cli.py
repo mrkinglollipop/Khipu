@@ -6225,6 +6225,23 @@ def build_parser() -> argparse.ArgumentParser:
     hold.add_argument("--owner", action="store_true", help="The owner's hold (asks for a typed confirmation)")
     hold.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(hold)
+    rover = rt_sub.add_parser("override", help="Owner: let one conversation run ahead of pace on an account "
+                              "(grant ACCOUNT --subject JSON --until T | --indefinite), end one early (end ID) "
+                              "or keep one with no end (keep ID)", parents=[rt_json])
+    rover.add_argument("action", choices=("grant", "end", "keep"))
+    rover.add_argument("params", nargs="*")
+    rover.add_argument("--subject", default=None, metavar="JSON", help="Who it is for, as the ask showed it")
+    rover.add_argument("--effect", default="ahead_of_pace")
+    rover.add_argument("--until", default=None, metavar="T")
+    rover.add_argument("--indefinite", action="store_true")
+    rover.add_argument("--no-children", dest="no_children", action="store_true")
+    rover.add_argument("--ceiling-pct", dest="ceiling_pct", type=float, default=None)
+    rover.add_argument("--window", default=None, choices=("weekly", "five-hour"))
+    rover.add_argument("--reason", default=None)
+    rover.add_argument("--ref", default=None)
+    rover.add_argument("--request", default=None, help="The owner's words, one line")
+    rover.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rover)
     rpause = rt_sub.add_parser("pause", help="Owner: mark an account paused (asks for a typed confirmation)",
                                parents=[rt_json])
     rpause.add_argument("account")
