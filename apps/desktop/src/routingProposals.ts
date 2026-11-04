@@ -111,7 +111,7 @@ const ENDED_WORDS: Record<string, string> = {
   confirmed: "confirmed",
   undone: "undone",
   overtaken: "replaced by you",
-  crossed: "crossed",
+  crossed: "two Macs disagreed",
 };
 
 export function endedWords(status: string): string {

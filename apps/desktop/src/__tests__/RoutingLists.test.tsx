@@ -398,7 +398,7 @@ describe("Job runner lanes: search", () => {
   it("appears only over eight lanes, and filters by lane, runner and account", async () => {
     store.set(OPEN_KEY, ALL_OPEN);
     const few = await page();
-    expect(screen.queryByRole("searchbox", { name: "Search job runner lanes" })).toBeNull();
+    expect(screen.queryByRole("searchbox", { name: "Search job runner job slots" })).toBeNull();
     few.unmount();
 
     const v = view();
@@ -406,20 +406,20 @@ describe("Job runner lanes: search", () => {
     answers.khipu_route_view = v;
     answers.khipu_config_show = config({ "lane-01": "Codex", "lane-02": "Codex", "lane-03": "Claude main" });
     await page();
-    const box = await screen.findByRole("searchbox", { name: "Search job runner lanes" });
-    expect(box).toHaveAttribute("placeholder", "Search the 10 lanes");
+    const box = await screen.findByRole("searchbox", { name: "Search job runner job slots" });
+    expect(box).toHaveAttribute("placeholder", "Search the 10 job slots");
     fireEvent.change(box, { target: { value: "codex" } });
-    expect(screen.getByText(/2 of 10 lanes match\./)).toBeInTheDocument();
-    // The 7 lanes with no account are hidden and named.
-    expect(screen.getByText(/lanes without an account are hidden by this search/)).toBeInTheDocument();
-    expect(screen.getByRole("list", { name: "Lanes" }).textContent).toContain("lane-01");
+    expect(screen.getByText(/2 of 10 job slots match\./)).toBeInTheDocument();
+    // The 7 job slots with no account are hidden and named.
+    expect(screen.getByText(/job slots without an account are hidden by this search/)).toBeInTheDocument();
+    expect(screen.getByRole("list", { name: "Job slots" }).textContent).toContain("lane-01");
     fireEvent.change(box, { target: { value: "zebra" } });
-    expect(screen.getByText(/No lanes match “zebra”\./)).toBeInTheDocument();
-    expect(screen.queryByRole("list", { name: "Lanes" })).toBeNull();
+    expect(screen.getByText(/No job slots match “zebra”\./)).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Job slots" })).toBeNull();
     // The folder rows live in the Job runner folders fold, whatever the search.
     expect(document.querySelector('[data-route-item="runner:Project A"]')).not.toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
-    expect(within(screen.getByRole("list", { name: "Lanes" })).getAllByRole("listitem")).toHaveLength(10);
+    expect(within(screen.getByRole("list", { name: "Job slots" })).getAllByRole("listitem")).toHaveLength(10);
   });
 });
 

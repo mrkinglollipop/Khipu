@@ -353,3 +353,25 @@ button.chip[aria-pressed="true"] {
   .route-settings .mrow.delivery:has(.delivery-heard) { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .route-settings .mrow.delivery .mac-col { text-align: right; }
 }
+
+/* Phone width (the pane has no room for side-by-side columns): stack what
+   would otherwise squeeze a label or a note to one letter per line. */
+@media (max-width: 760px) {
+  .route-page-nav { flex-wrap: wrap; overflow: visible; position: static; }
+  .route-find { flex: 1 0 100%; padding-right: 0; padding-bottom: var(--s2); margin-bottom: var(--s1); border-right: 0; border-bottom: 1px solid var(--border); }
+  .route-page-nav button { white-space: normal; }
+}
+@media (max-width: 560px) {
+  .route-settings .mrow.lane { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s3); }
+  .route-settings .mrow.lane > .arrow { display: none; }
+  .route-settings .mrow.lane .lane-form, .route-settings .mrow.lane .route-pause { flex: 1 0 100%; }
+  .route-settings .mrow.delivery-change { grid-template-columns: 4.5rem minmax(0, 1fr); }
+  .route-settings .mrow.delivery-change > .end { grid-column: 2; justify-self: start; }
+  .row-item.route-limit { grid-template-columns: minmax(0, 1fr); row-gap: var(--s1); align-items: start; }
+  .route-limit .route-val { white-space: normal; }
+  .route-limit > button { justify-self: start; }
+  .row-item.route-event { grid-template-columns: 4rem minmax(0, 1fr); }
+  .route-event .route-who { grid-column: 2; text-align: left; }
+  .row-item.route-hear { grid-template-columns: minmax(0, 1fr); row-gap: 2px; }
+}
+.route-limit-text > .tag { align-self: flex-start; margin-top: 2px; }

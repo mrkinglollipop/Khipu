@@ -649,7 +649,7 @@ function ResetCheckStatus({ data }: { data: RouteView | null }) {
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
   return <div className="section-body" aria-label="Next reset checks">
         <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
-        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
+        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "Nothing is waiting on a reset check."}</p>
   </div>;
 }
 
@@ -1021,7 +1021,7 @@ const FIND_SETTINGS: readonly FindSetting[] = [
   { name: "Share proposal words between your Macs", where: "Your Macs", page: "macs", aliases: ["proposal words", "mac tags", "this mac only"], selector: "[data-find-setting='mac-tags']" },
   { name: "Tell conversations about routing", where: "Conversations", page: "conversations", aliases: ["telling", "telling conversations", "when conversations hear", "before each prompt"], selector: "[data-find-setting='group-telling']", group: "telling" },
   { name: "Recent changes", where: "What changed", page: "changes", aliases: ["history", "bring back", "undo"], selector: "[data-find-setting='group-changes']", group: "changes" },
-  { name: "Checks and job runners", where: "Something's wrong", page: "wrong", aliases: ["checks", "lanes", "providers", "runner folders", "conflicts"], selector: "[data-find-setting='group-checks']", group: "checks" },
+  { name: "Checks and job runners", where: "Something's wrong", page: "wrong", aliases: ["checks", "lane", "lanes", "job slots", "providers", "runner folders", "conflicts"], selector: "[data-find-setting='group-checks']", group: "checks" },
   { name: "Technical limits and timing", where: "Rarely needed", page: "rare", aliases: ["sizes", "times", "warnings", "dispatch scripts"], selector: "[data-find-setting='rare-sizes']", rare: true },
   { name: "Reading usage from logins", where: "Rarely needed", page: "rare", aliases: ["grok login", "cursor login", "opencode login"], selector: "[data-find-setting='rare-logins']", rare: true },
   { name: "Old routing table file", where: "Rarely needed", page: "rare", aliases: ["routing-now", "legacy routing file", "old file"], selector: "[data-find-setting='rare-table']", rare: true },
@@ -1356,13 +1356,8 @@ function AccountsSection({
         </>
       ) : null}
       <p className="set-help">
-        Khipu reads the accounts selected below. Their status can come from a plan check, your job runners,
-        conversations, or you; the old routing table is not a source.
-      </p>
-      <p className="set-help">
-        Mark paused tells conversations you want an account left alone; Lift ends it. Clear ends a limit or a
-        "down" report at once, and Khipu treats the account as open until something newer reports on it; if Claude
-        or a job runner reports the limit again, it comes back.
+        Use Details on an account to pause it, set a cap, or clear a limit that has passed. Khipu checks each
+        account again when its limit resets.
       </p>
       <div className="acct-foot">
         <span>
@@ -2003,6 +1998,16 @@ function settingDefault(cfg: RouteConfig | null, key: string): number | null {
   return typeof v === "number" ? v : null;
 }
 
+/** Which rarely needed settings stay on this Mac. Everything else is the same
+ * on every Mac once the routing copy is on (the approved inventory's Macs column). */
+const THIS_MAC_ONLY = new Set([
+  "routing_prompt_budget_ms", "routing_start_budget_ms", "routing_ledger_keep_days",
+  "routing_busy_load", "routing_busy_wait", "routing_busy_tries", "routing_table",
+]);
+function MacTag({ keys }: { keys: string[] }) {
+  return <Tag>{keys.some((k) => THIS_MAC_ONLY.has(k)) ? "This Mac only" : "Same on my Macs"}</Tag>;
+}
+
 function LimitRow({
   name,
   help,
@@ -2048,6 +2053,7 @@ function LimitRow({
       <span className="route-limit-text">
         <span className="route-limit-name">{name}</span>
         <span className="set-help">{help}</span>
+        <MacTag keys={fields.map((f) => f.key)} />
       </span>
       <span className="route-val">{shown}</span>
       <button
@@ -2129,7 +2135,7 @@ function RetryTimesRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer;
   const value = `[${[a, b].filter((t) => t !== "").join(",")}]`;
   const shown = values == null ? "…" : values.length === 0 ? "No retries" : values.map((v) => limitWords(v, "time")).join(" and ");
   return <div className="row-item route-limit route-retries">
-    <span className="route-limit-text"><span className="route-limit-name">Try again after</span><span className="set-help">Up to two retry times when the same limit remains. Leave both empty for no retries.</span></span>
+    <span className="route-limit-text"><span className="route-limit-name">Try again after</span><span className="set-help">Up to two retry times when the same limit remains. Leave both empty for no retries.</span><MacTag keys={["routing_reset_check_retries"]} /></span>
     <span className="route-val">{shown}</span>
     <span className="toolbar"><label>First retry (seconds)<input aria-label="First retry in seconds" value={first} onChange={(e) => { setDirty(true); setFirst(e.target.value); }} /></label><label>Second retry (seconds)<input aria-label="Second retry in seconds" value={second} onChange={(e) => { setDirty(true); setSecond(e.target.value); }} /></label><button type="button" className="sm" disabled={!valid || w.isBusy(id)} onClick={() => void w.run(id, "khipu_config_set", { key: "routing_reset_check_retries", value }, async () => { await reread(); setDirty(false); })}><Busy on={w.isBusy(id)} />Save</button></span>
     {!valid ? <span className="set-error" role="alert">Use positive whole seconds, the second later than the first, or leave both empty for no retries.</span> : null}<WriteError w={w} id={id} />
@@ -2181,7 +2187,7 @@ function ProposalRowView({ row, data, now }: { row: ProposalRow; data: RouteView
         <span>That rule isn't in this read, so this proposal can't be confirmed or dismissed here. Read the routing record again, then try again.</span>
       ) : null}
       <span className="end">
-        {live ? <Tag tone="accent" dot>In use</Tag> : p.status === "crossed" ? <Tag tone="warn" dot>Crossed</Tag> : <Tag dot>{endedWords(p.status)}</Tag>}
+        {live ? <Tag tone="accent" dot>In use</Tag> : p.status === "crossed" ? <Tag tone="warn" dot>Two Macs disagreed</Tag> : <Tag dot>{endedWords(p.status)}</Tag>}
       </span>
       {live && !row.withheld ? (
         <div className="prop-side">
@@ -2942,18 +2948,19 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
   return (
     <div className="row-item route-limit">
       <span className="route-limit-text">
-        <span className="route-limit-name">Your dispatch scripts</span>
+        <span className="route-limit-name">Your hand-off scripts</span>
         <span className="set-help">
           Scripts of your own that hand work to another agent. A shell command that runs one counts as handing work on,
           like claude -p or codex exec.
         </span>
+        <MacTag keys={["routing_dispatch_scripts"]} />
       </span>
       <span className="route-val">{names == null ? "…" : names.length ? names.join(", ") : "None"}</span>
       <button
         ref={btn}
         type="button"
         className="sm"
-        aria-label="Change your dispatch scripts"
+        aria-label="Change your hand-off scripts"
         aria-expanded={open}
         aria-controls={open ? formId : undefined}
         disabled={names == null}
@@ -2970,7 +2977,7 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
         Change…
       </button>
       {open ? (
-        <form className="route-pause" id={formId} aria-label="Change your dispatch scripts" onSubmit={save} onKeyDown={escapeCloses(close)}>
+        <form className="route-pause" id={formId} aria-label="Change your hand-off scripts" onSubmit={save} onKeyDown={escapeCloses(close)}>
           <div className="toolbar">
             <label htmlFor={`${formId}-names`}>File names</label>
             <input
@@ -2985,7 +2992,7 @@ function DispatchScriptsRow({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
             />
           </div>
           <p className="set-help">File names only, separated by commas. Leave it empty for none.</p>
-          <WriteError w={w} id={id} say={(m) => settingWords(m, "routing_dispatch_scripts", "Your dispatch scripts")} />
+          <WriteError w={w} id={id} say={(m) => settingWords(m, "routing_dispatch_scripts", "Your hand-off scripts")} />
           <div className="toolbar">
             <button type="submit" className="primary sm" disabled={w.isBusy(id)}>
               <Busy on={w.isBusy(id)} />
@@ -3020,7 +3027,7 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
   },
   {
     name: "Longest line",
-    help: "Each line about an account, a hold or a lane. Rules and your note have their own limits.",
+    help: "Each line about an account, a hold or a job slot. Rules and your note have their own limits.",
     fields: [{ key: "routing_line_chars", label: "Longest line", unit: "chars", options: [100, 200, 400, 800, 0], zero: "No limit" }],
   },
   {
@@ -3195,13 +3202,13 @@ function TellingSection({
       <SubFold k="sub:hears" name="What each kind of conversation hears" line={`${HEARS.length} kinds`} folds={folds}>
       <p className="opt-group-note">
         A running conversation hears a change as soon as its app allows. Any conversation can also ask Khipu.
-        Switching these off stops only the telling.
+        Switching these off stops only the updates.
       </p>
       <div className="opt-list">
         <SwitchRow
           id="route-push-all"
           label="Tell conversations about routing"
-          what="Turns all of the telling on or off. The same switch is in Optional features."
+          what="Turns all of these updates on or off. The same switch is in Optional features."
           tag={locked ? <Tag>Locked</Tag> : <Tag>Also in Optional features</Tag>}
           checked={master?.enabled === true}
           disabled={!master || locked || w.anyBusy}
@@ -3282,7 +3289,7 @@ function TellingSection({
             ) : null}
             {old.file ? (
               <>
-                The file <span className="mono">/tmp/.routing_now_disable</span> exists; delete it to turn the telling
+                The file <span className="mono">/tmp/.routing_now_disable</span> exists; delete it to turn these updates
                 back on.
               </>
             ) : null}
@@ -3293,7 +3300,7 @@ function TellingSection({
           <p className="set-help">
             Your old "routing off" file, <span className="mono">/tmp/.routing_now_disable</span>, isn't there. Khipu
             can't see your shell's settings: if <span className="mono">ROUTING_NOW_OFF=1</span> is set there,
-            conversations started from that shell are told nothing. Setting either one turns the telling off.
+            conversations started from that shell are told nothing. Setting either one turns these updates off.
           </p>
         )}
         </SubFold>
@@ -3423,7 +3430,7 @@ function runnerState(r: RouteRunner | undefined, now: Date): { text: string; ton
   }
   const lanes = r.lanes?.length ?? 0;
   const read = r.heartbeat_at ? `Read ${saidWhen(r.heartbeat_at, now)}` : "Read";
-  return { text: `${read} · ${lanes} lane${lanes === 1 ? "" : "s"}`, tone: "ok" };
+  return { text: `${read} · ${lanes} job slot${lanes === 1 ? "" : "s"}`, tone: "ok" };
 }
 
 function runnerDetail(entry: SourceEntry, r: RouteRunner | undefined, now: Date): string {
@@ -3793,35 +3800,35 @@ function ProvidersLanesSection({
       </div> : null}
       {mode !== "providers" ? <><div className="section-body">
         <h2 className="sub-title">
-          Lanes{" "}
+          Job slots{" "}
           {totalLanes ? (
             <span className="meta">
-              {plural(totalLanes, "lane", "lanes")}
+              {plural(totalLanes, "job slot", "job slots")}
               {entries.length ? ` in ${plural(entries.length, "job runner folder", "job runner folders")}` : ""}
             </span>
           ) : null}
         </h2>
         {recordRead !== "ready" ? (
           // Before the lane map is read every lane would look unmatched.
-          <RecordReadLine read={recordRead} what="job runner lanes" />
+          <RecordReadLine read={recordRead} what="job slots" />
         ) : totalLanes ? (
           <>
             {searchLanes ? (
               <>
                 <div className="search-row">
                   <label className="sr-only" htmlFor={laneSearchId}>
-                    Search job runner lanes
+                    Search job runner job slots
                   </label>
-                  <input id={laneSearchId} ref={laneSearch} className="filter-input" type="search" placeholder={`Search the ${totalLanes} lanes`}
+                  <input id={laneSearchId} ref={laneSearch} className="filter-input" type="search" placeholder={`Search the ${totalLanes} job slots`}
                     autoComplete="off" value={lists.laneQuery} onChange={(e) => lists.setLaneQuery(e.target.value)} />
                 </div>
                 {query ? (
                   <p className="set-help" role="status">
                     {shownLanes.length
-                      ? `${shownLanes.length} of ${totalLanes} lanes match.`
-                      : `No lanes match “${query}”.`}
+                      ? `${shownLanes.length} of ${totalLanes} job slots match.`
+                      : `No job slots match “${query}”.`}
                     {hiddenNoAccount
-                      ? ` ${plural(hiddenNoAccount, "lane without an account is", "lanes without an account are")} hidden by this search.`
+                      ? ` ${plural(hiddenNoAccount, "job slot without an account is", "job slots without an account are")} hidden by this search.`
                       : ""}{" "}
                     <button type="button" className="sm link" onClick={() => {
                       lists.setLaneQuery("");
@@ -3834,7 +3841,7 @@ function ProvidersLanesSection({
               </>
             ) : null}
             {shownLanes.length ? (
-              <div className="mrows" role="list" aria-label="Lanes">
+              <div className="mrows" role="list" aria-label="Job slots">
                 {shownLanes.map(({ runner, lane }) => (
                   <LaneRow key={`${runner}/${lane}`} runner={runner} lane={lane} target={map[runner]?.[lane]}
                     match={runners.find((r) => r.name === runner)?.lane_matches?.[lane]}
@@ -3842,12 +3849,12 @@ function ProvidersLanesSection({
                 ))}
               </div>
             ) : null}
-            <p className="set-help">A lane without an account still runs; its limits just count toward no account.</p>
+            <p className="set-help">A job slot without an account still runs; its limits just count toward no account.</p>
           </>
         ) : (
           <div className="empty">
             <b>No job runners yet</b>
-            <span>Add a job runner folder and its lanes show here with the account each one uses.</span>
+            <span>Add a job runner folder and its job slots show here with the account each one uses.</span>
 
           </div>
         )}
@@ -3950,7 +3957,7 @@ function ProvidersLanesSection({
           })}
           {unmatchedLimits.length ? (
             <p className="set-help" role="status">
-              {unmatchedLimits.length === 1 ? "A limit came" : `${unmatchedLimits.length} limits came`} from a lane that
+              {unmatchedLimits.length === 1 ? "A limit came" : `${unmatchedLimits.length} limits came`} from a job slot that
               isn't matched to an account. Match it above and the limit counts for that account.
             </p>
           ) : null}
@@ -3992,7 +3999,7 @@ function ProvidersLanesSection({
           <div className="rows">
             <LimitRow
               name="Say a job runner stopped reporting after"
-              help="Counted in the runner's own heartbeat intervals."
+              help="Counted in the runner's own check-in intervals."
               fields={[{ key: "routing_runner_silent_intervals", label: "Stopped after", unit: "intervals", options: [2, 3, 5, 10, 20, 0], zero: "Never" }]}
               cfg={cfg}
               w={w}
@@ -4016,7 +4023,7 @@ function ProvidersLanesSection({
             />
             <LimitRow
               name="Newest limit lines kept from each runner"
-              help="The runner's lines that say a lane reached a limit."
+              help="The runner's lines that say a job slot reached a limit."
               fields={[{ key: "routing_runner_limited_lines", label: "Keep", unit: "lines", options: [50, 100, 200, 500, 1000, 0], zero: "No limit" }]}
               cfg={cfg}
               w={w}
@@ -4032,13 +4039,13 @@ function ProvidersLanesSection({
             />
           </div>
           <p className="set-help">
-            Khipu only reads these folders. It never writes to them, never changes a runner's settings, and reads only
-            its limits, its job starts, its heartbeat and the few lane settings it needs to watch your rules. Every line
-            it keeps is checked for secrets first. A folder inside API Keys, My Portfolio or any sign-in file is refused.
+            Khipu only reads these folders; it never writes to them or changes a runner's settings. It keeps only
+            limits, job starts and check-ins, after checking each line for secrets. A folder inside API Keys, My
+            Portfolio or any sign-in file is refused.
           </p>
           <p className="set-help">
-            A limit on one lane closes every lane on the same account. A lane that isn't matched is never guessed;
-            conversations are told a limit came from an unmatched lane.
+            A limit on one job slot closes every job slot on the same account. A job slot that isn't matched is never guessed;
+            conversations are told a limit came from an unmatched job slot.
           </p>
         </SubFold>
       </div></> : null}
@@ -4068,7 +4075,7 @@ const LANE_REASON_WORDS: Record<string, string> = {
   "override has no unique current binding": "the account you mapped it to has no unique binding",
 };
 
-const LANE_MAP_HELP = "Add an account line for this lane in the runner's settings, or map it here.";
+const LANE_MAP_HELP = "Add an account line for this job slot in the runner's settings, or map it here.";
 
 /** The how-matched line, the tag beside it and the candidates row under a
  *  lane, in the mock's words. `undefined` tag: none. */
@@ -4164,7 +4171,7 @@ function LaneRow({
       </span>
       <span className="arrow" aria-hidden>→</span>
       {open ? (
-        <form className="lane-form" aria-label={`Account for ${runner}'s ${lane} lane`} onSubmit={save}>
+        <form className="lane-form" aria-label={`Account for ${runner}'s ${lane} job slot`} onSubmit={save}>
           {!resolved ? <Tag tone="warn">No account</Tag> : null}
           {!resolved && !!match?.candidates.length ? <span>Could be: {match.candidates.join(", ")}</span> : null}
           <label className="sr-only" htmlFor={selId}>
@@ -4209,7 +4216,7 @@ function LaneRow({
             <button
               type="button"
               className="sm"
-              aria-label={`Change the account for ${runner}'s ${lane} lane`}
+              aria-label={`Change the account for ${runner}'s ${lane} job slot`}
               onClick={() => {
                 setChoice(known?.label ?? "");
                 setOpen(true);
@@ -4291,6 +4298,7 @@ function TableSection({
                 An old file you kept by hand before Khipu had its own record. Khipu reads it but never writes to it and
                 never takes an account's state from it; it only notes when the file's current-state section changes.
               </span>
+              <MacTag keys={["routing_table"]} />
             </span>
             <span className="route-val">{path ? val : ""}</span>
             <button
@@ -4705,10 +4713,10 @@ export function PaceSection({ data, plans, now, folds }: {
         <span><i className="cap" />your cap</span>
       </div>
       <SubFold k="sub:pace-push" name="When pace changes are sent to conversations"
-        line="At a verdict change, and 24 h, 6 h, 1 h and 15 min before a limit" folds={folds}>
+        line="When the advice changes, and 24 h, 6 h, 1 h and 15 min before a limit" folds={folds}>
         <p className="set-help">
-          A conversation hears when a window&apos;s verdict changes, and when its forecast crosses 24 hours, 6 hours,
-          1 hour or 15 minutes. It hears each forecast once, and the advice never stops a job.
+          A conversation hears when the advice for a limit changes, and again 24 hours, 6 hours, 1 hour and 15 minutes
+          before it. It hears each one once, and the advice never stops a job.
         </p>
       </SubFold>
     </div>

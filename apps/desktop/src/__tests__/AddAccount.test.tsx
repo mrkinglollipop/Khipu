@@ -1088,11 +1088,11 @@ describe("setup's Accounts step with what discovery found", () => {
 });
 
 describe("What's new", () => {
-  it("adds one sentence to the Accounts and routing item, no new item", () => {
+  it("describes the Accounts and routing pages in the one existing item, no new item", () => {
     const release = NOTICES.find((n) => n.version === "0.4.16")!;
     const items = release.items.filter((i) => i.title === "Accounts and routing");
     expect(items).toHaveLength(1);
-    expect(items[0].text).toBe("Khipu tells your conversations which accounts have room. It also finds your other logins and lets you add one.");
+    expect(items[0].text).toBe("Accounts and routing now has one page for each job: your accounts, preferences, Macs, conversations, changes, checks and technical settings. Find a setting also accepts the old names.");
     expect(release.items.filter((i) => /logins/.test(i.title))).toHaveLength(0);
   });
 });

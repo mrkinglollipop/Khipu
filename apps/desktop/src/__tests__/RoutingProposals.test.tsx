@@ -186,7 +186,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     const list = await proposalHistory();
     expect(within(list).queryByText("Rule 1")).toBeNull();
     const crossed = within(list).getByText("Rule 6").closest(".mrow")!;
-    expect(crossed).toHaveTextContent("Crossed");
+    expect(crossed).toHaveTextContent("Two Macs disagreed");
     expect(crossed).toHaveTextContent("never took effect");
     expect(within(list).queryByRole("button", { name: "Confirm the proposed rule 6" })).toBeNull();
     expect(screen.queryByRole("list", { name: "Ended proposals" })).toBeNull();
