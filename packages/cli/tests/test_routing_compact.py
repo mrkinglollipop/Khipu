@@ -34,7 +34,7 @@ def _bodies(whens):
 
 
 def _lines():
-    return [l for l in routing.events_file().read_bytes().split(b"\n") if l.strip()]
+    return rc._content_lines(routing.events_file().read_bytes())
 
 
 def _types(lines):
@@ -56,8 +56,8 @@ def test_compaction_keeps_the_fold(world, seed):
     # No line was rewritten: what is kept is the full log's lines, in order.
     it = iter(before_lines)
     assert all(any(line == other for other in it) for line in after_lines)
-    # Every owner line, every observation (and its renewals) is still there.
-    for kind in ("note_set", "priority_set", "lift", "clear", "observation", "observation_renew"):
+    # Every owner line is still there (for observations, test_routing_compact_observations).
+    for kind in ("note_set", "priority_set", "lift", "clear"):
         assert _types(after_lines).count(kind) == _types(before_lines).count(kind)
     assert _bodies(WHENS) == before
 
@@ -151,7 +151,7 @@ def test_the_owners_history_is_the_same_lines_after_compaction(world):
 def test_a_plan_that_changes_the_fold_writes_nothing(world, monkeypatch):
     _install(_log())
     original = routing.events_file().read_bytes()
-    monkeypatch.setattr(rc, "plan", lambda rows, now, profile: {
+    monkeypatch.setattr(rc, "plan", lambda rows, now, profile, **_kw: {
         i for i, (_l, e) in enumerate(rows) if e and e["type"] in ("usage_sample", "clear", "lift")})
     out = rc.compact(END)
     assert out["result"] == "skipped" and "fold differently" in out["why"]
@@ -173,7 +173,7 @@ def test_unreadable_lines_and_a_torn_last_line_survive(world):
 # ---- a crash leaves a readable log -----------------------------------------------------
 
 
-@pytest.mark.parametrize("where", ["replace", "link", "write"])
+@pytest.mark.parametrize("where", ["replace", "archive", "write"])
 def test_a_crash_mid_compaction_leaves_a_readable_log(world, monkeypatch, where):
     _install(_log(days=60))
     original = routing.events_file().read_bytes()
@@ -185,9 +185,8 @@ def test_a_crash_mid_compaction_leaves_a_readable_log(world, monkeypatch, where)
     with monkeypatch.context() as broken:
         if where == "replace":
             broken.setattr(rc.os, "replace", boom)
-        elif where == "link":
-            broken.setattr(rc.os, "link", boom)
-            broken.setattr(rc, "_copy", boom)
+        elif where == "archive":
+            broken.setattr(rc, "_write_archive", boom)
         else:
             broken.setattr(rc.os, "fsync", boom)
         assert rc.compact(END)["result"] == "skipped"
@@ -238,7 +237,7 @@ def test_a_line_half_written_at_the_read_survives_once_and_whole(world, monkeypa
     assert routing.read_view(END)["note"]["text"] == "half"
 
 
-def test_a_log_nothing_can_shrink_says_so_instead_of_a_plain_red(world, monkeypatch):
+def test_protected_history_is_yellow_without_action(world, monkeypatch):
     monkeypatch.setattr(rc, "LINES_YELLOW", 50)
     monkeypatch.setattr(rc, "LINES_RED", 100)
     monkeypatch.setattr(rc, "BYTES_YELLOW", 10 ** 9)
@@ -247,10 +246,19 @@ def test_a_log_nothing_can_shrink_says_so_instead_of_a_plain_red(world, monkeypa
               "written_at": routing._iso(END - timedelta(minutes=300 - i)),
               "written_by": {"kind": "owner"}, "via": "app", "auth": "app"} for i in range(150)]
     _install(owner)
-    assert rc.health()["level"] == "red"  # not tried yet: the plain row
+    assert rc.health()["level"] == "yellow"  # protected history needs no attempt
     assert rc.compact(END)["result"] == "skipped"
     row = rc.health()
-    assert row["level"] == "yellow" and "can't shrink" in row["warning"] and "150 of its lines" in row["warning"]
+    assert row["level"] == "yellow" and "own history" in row["warning"]
+    assert "nothing is broken" in row["warning"] and "nothing to do" in row["warning"]
+
+
+def test_protected_byte_growth_is_yellow_without_action(world, monkeypatch):
+    _install(_log(days=1))
+    monkeypatch.setattr(rc, "BYTES_RED", 1)
+    monkeypatch.setattr(rc, "_read_state", lambda: {"attempted_at": routing._iso(END)})
+    monkeypatch.setattr(rc, "_droppable", lambda: (0, 100))
+    assert rc.health()["level"] == "yellow"
 
 
 def test_a_rewritten_log_is_not_replaced(world, monkeypatch):
@@ -292,12 +300,12 @@ def test_archives_go_only_when_past_both_count_and_age(world):
     assert len(list(rc.archive_dir().iterdir())) == 3
 
 
-def test_compaction_archives_the_previous_full_log(world):
+def test_compaction_archives_what_it_leaves_out(world):
     _install(_log(days=60))
-    full = routing.events_file().read_bytes()
+    full = _lines()
     out = rc.compact(END)
     archived = rc.archive_dir() / out["archive"]
-    assert archived.read_bytes() == full
+    assert rc.full_log() == full
     assert oct(archived.stat().st_mode & 0o777) == "0o600"
     assert rc.health()["archives"] == 1
 
@@ -317,9 +325,9 @@ def test_doctor_row_is_green_then_yellow_then_red(world, monkeypatch):
     block = routing.doctor_block(END)
     assert block["log"]["level"] == "yellow" and block["log"]["lines"] == 80 and block["log"]["bytes"] > 0
     assert any("80 lines" in w for w in block["warnings"])
-    _install(rows[:200])
+    _install(rows)
     block = routing.doctor_block(END)
-    assert block["log"]["level"] == "red" and block["log"]["lines"] == 200
+    assert block["log"]["level"] == "red" and block["log"]["lines"] == len(rows)
     assert any("past 120 lines" in w for w in block["warnings"])
 
 
@@ -333,10 +341,9 @@ def test_bytes_alone_turn_the_row_yellow(world, monkeypatch):
 # ---- when it runs --------------------------------------------------------------------
 
 
-def test_it_runs_by_itself_over_the_bound_and_not_under_it(world, monkeypatch):
-    monkeypatch.setattr(rc, "LINES_YELLOW", 500)
-    monkeypatch.setattr(rc, "BYTES_YELLOW", 10 ** 9)
-    monkeypatch.setattr(rc, "BYTES_RED", 10 ** 9)
+def test_it_runs_by_itself_over_the_line_and_not_under_it(world, monkeypatch):
+    monkeypatch.setattr(rc, "LINES_TRIGGER", 500)
+    monkeypatch.setattr(rc, "BYTES_TRIGGER", 10 ** 9)
     _install(_log(days=100)[:300])
     assert rc.maybe_compact(END) == {"result": "not due"}
     _install(_log(days=100))
@@ -350,8 +357,8 @@ def test_it_runs_by_itself_over_the_bound_and_not_under_it(world, monkeypatch):
 def test_the_plan_figures_refresh_and_the_nightly_both_compact(world, monkeypatch):
     from khipu import features, usage
 
-    monkeypatch.setattr(rc, "LINES_YELLOW", 500)
-    monkeypatch.setattr(rc, "BYTES_YELLOW", 10 ** 9)
+    monkeypatch.setattr(rc, "LINES_TRIGGER", 500)
+    monkeypatch.setattr(rc, "BYTES_TRIGGER", 10 ** 9)
     monkeypatch.setattr(features, "enabled", lambda *a, **k: True)
     monkeypatch.setattr(usage, "refresh_due", lambda: {"refreshed": 0})
     monkeypatch.setattr(routing, "record_pace_samples", lambda *a, **k: 0)

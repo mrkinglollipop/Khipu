@@ -75,6 +75,7 @@ from khipu.routing_generation import SCHEMA
 
 STATE_DIR = ("state", "routing")
 EVENTS_NAME = "events.jsonl"
+COMPACTION_GENERATION_TYPE = "_routing_compaction_generation"
 VIEW_NAME = "view.json"
 LOCK_NAME = "routing.lock"
 CHANGES_KEPT = 100
@@ -2309,7 +2310,8 @@ def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = No
     """Enrich new lines only. All append paths, including seeds and account
     transactions, pass here while holding the routing lock."""
     observed = _read_all_events()[0] if observed is None else observed
-    history = _in_write_order(observed) if ordered is None else ordered
+    observed = [e for e in observed if e.get("type") != COMPACTION_GENERATION_TYPE]
+    history = _in_write_order(observed) if ordered is None else [e for e in ordered if e.get("type") != COMPACTION_GENERATION_TYPE]
     mac = _mac_locked()
     clocks = [e["hlc"] for e in [*observed, *history] if e.get("hlc")]
     clocks += [{"wall": max(0, int(at.timestamp() * 1000)), "counter": 0, "mac": "legacy"}
@@ -2831,7 +2833,7 @@ def _line_event(raw: bytes, *, identity_only: bool = False) -> dict | None:
         return None
     if not isinstance(data, dict) or not isinstance(data.get("type"), str):
         return None
-    if identity_only and data["type"] not in _IDENTITY_KINDS:
+    if identity_only and data["type"] not in _IDENTITY_KINDS and data["type"] != COMPACTION_GENERATION_TYPE:
         # Keep ordering slots around old unsequenced identity events. The
         # identity fold needs no evidence body or timestamp normalization.
         seq = data.get("seq")
@@ -2945,7 +2947,8 @@ def _read_event_lines(identity_only: bool = False) -> tuple[list[dict], int]:
         if event is None:
             bad += 1
             continue
-        events.append(event)
+        if event.get("type") != COMPACTION_GENERATION_TYPE:
+            events.append(event)
     _PARSED_LINE_CACHE[identity_only] = (path, data, tuple(events), bad)
     cache[key] = (events, bad)
     return events, bad
@@ -2968,12 +2971,12 @@ def _read_all_events(*, identity_only: bool = False, author_check: bool = True) 
     return _order_events(raw, bad, author_check=author_check)
 
 
-def _order_events(raw: list[dict], bad: int, *, author_check: bool = True) -> tuple[list[dict], int]:
+def _order_events(raw: list[dict], bad: int, *, author_check: bool = True, replica=None) -> tuple[list[dict], int]:
     """``_read_all_events``' ordering over lines already read (also used to
     fold a log that is not the file, ``routing_compact``)."""
     from khipu import routing_replication
 
-    events = routing_replication.merge(raw)
+    events = routing_replication.merge(raw) if replica is None else routing_replication.merge(raw, remote=replica)
     if author_check:
         _mark_unchecked(events)  # a sequence cannot move a line before the first author check
     slots = [i for i, e in enumerate(events) if isinstance(e.get("seq"), int) and not e.get("mac")]
@@ -3036,6 +3039,7 @@ def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None 
     line written ahead, then a right clock) keeps its own time, and the fold
     orders the lines as in phase 1a."""
     events = _read_all_events()[0] if events is None else events
+    events = [e for e in events if e.get("type") != COMPACTION_GENERATION_TYPE]
     mac = _mac_locked()
     legacy_mac = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
     if legacy_mac is None:
@@ -3045,11 +3049,12 @@ def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None 
     events = [e for e in events if e.get("mac") in (None, mac)]
     times = [t for t in (_parse(e.get("written_at")) for e in events) if t is not None]
     last = _parse(events[-1].get("written_at")) if events else None
-    settled = [t for t in _record_times(events)[0] if t is not None]
     clock_at = None
     stamp = _not_behind(clock, last)
-    if len(times) >= 2 and settled and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
-        stamp, clock_at = settled[-1], clock
+    if len(times) >= 2 and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
+        settled = [t for t in _record_times(events)[0] if t is not None]
+        if settled:
+            stamp, clock_at = settled[-1], clock
     out = []
     for i in range(count):
         line = {"written_at": _iso(stamp), "seq": first + i, "mac": mac}
@@ -3553,6 +3558,18 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
                if k in event}, "turn": bool(event.get("observed_turn"))}
 
 
+def _confirmed_level_reset(item: dict) -> datetime | None:
+    """Only a measured reset or a dated provider message can end an owner level."""
+    if item.get("until_default") or item.get("basis") not in ("cli", "checked"):
+        return None
+    if item.get("source") in ("probe", "check"):
+        return _parse(item.get("reset_at"))
+    if item.get("message_time") and item.get("state") == LIMITED:
+        until = item.get("until")
+        return _parse(item.get("reset_at")) or (until if isinstance(until, datetime) else _parse(until))
+    return None
+
+
 def _owner_event(event: dict) -> dict:
     return {"id": event.get("id"), "at": _parse(event.get("written_at")), "seq": event["_seq"],
             "until": _parse(event.get("until")), "written_by": event.get("written_by") or OWNER,
@@ -3874,7 +3891,7 @@ def _record_times(events: list[dict]) -> tuple[list[datetime | None], list[datet
     make two lines agree on that time, and the fold would keep it and lift
     every correct line after it. Doctor names copied lines by their clock's
     reading (``clock_at``), not here."""
-    raw = [_parse(e.get("written_at")) for e in events]
+    raw = [None if e.get("type") == COMPACTION_GENERATION_TYPE else _parse(e.get("written_at")) for e in events]
     copied = [_copied(e) for e in events]
     fixed, behind, ahead = _write_order_times([None if c else t for t, c in zip(raw, copied)])
     before: datetime | None = None
@@ -3890,6 +3907,7 @@ def _in_write_order(events: list[dict]) -> list[dict]:
     """Settle each Mac's timestamps, then order the event set by HLC.
     Unstamped history retains its local order and gets derived revisions;
     legacy origin markers keep later replication from changing that origin."""
+    events = [e for e in events if e.get("type") != COMPACTION_GENERATION_TYPE]
     operations_salt = _id_salt(operations=True) if any(not e.get("mac") and not e.get("_revision") for e in events) else None
     origin = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
     origin = origin or next((event_identity.legacy_mac(e, operations_salt=operations_salt)
@@ -4811,8 +4829,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         for item in priority_out["entries"]:
             level = item.get("level")
             if level:
-                resets = [_parse(e.get("reset_at") or e.get("until")) for e in evidence
-                          if e.get("account") == item["account"]]
+                clear = owner["clears"].get(item["account"])
+                resets = [_confirmed_level_reset(e) for e in evidence
+                          if e.get("account") == item["account"]
+                          and e["id"] not in owner["dismissed"]
+                          and e.get("source_id") not in owner["dismissed"]
+                          and (clear is None or _k(e) > _k(clear))]
                 resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
                 if resets:
                     level["until"] = _iso(min(_parse(level["until"]), *resets))
@@ -5998,6 +6020,39 @@ def record_pace_samples(now: datetime | None = None) -> int:
     return len(batch)
 
 
+def _source_batch(extra: list[dict], events: list[dict], ordered: list[dict], cfg: dict, known: list[dict],
+                  mac: str) -> tuple[list[dict], dict]:
+    """(the lines the sources' evidence ``extra`` would append to this record,
+    the record's account ids). Writes nothing; compaction asks it of a log it
+    is checking."""
+    ids, _forwards, _aliases = account_identity.state(ordered, known)
+    forward = forwarding(events, {a["key"] for a in known})
+    cuts = {}
+    for event in events:
+        if event.get("type") == "account_note" and _list_change(event):
+            for pair in event.get("lanes_cut") or []:
+                cuts[tuple(pair)] = (event["_seq"], _parse(event["written_at"]))
+    matched = []
+    for item in extra:
+        cut = cuts.get((item.get("runner"), item.get("lane")))
+        key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
+            item, cfg.get("routing_lane_map") or {}, known, forward, cfg.get("_providers"))
+        matched.append(dict(item, account=key))
+    return entry_model.source_events(matched, ordered, cfg, mac, ids), ids
+
+
+def _unseen_sightings(extra: list[dict], events: list[dict]) -> list[dict]:
+    """The sources' evidence no line of the record already holds (matched by
+    ``source_id``, salted or as a legacy line wrote it)."""
+    source_ids = {e.get("source_id") for e in events if e.get("source_id")}
+    remaining = []
+    for item in extra:
+        source_id = entry_model.source_id(item["id"]) if source_ids and item.get("id") else None
+        if item.get("id") not in source_ids and source_id not in source_ids:
+            remaining.append(item)
+    return remaining
+
+
 def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     """Refold and save the view; the caller holds the lock."""
     fingerprint, cfg, known = inputs or _inputs()
@@ -6013,20 +6068,7 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     prev = _load_view()
     extra, _status, _cache = _sources(cfg, now, prev)
     if extra or (_status or {}).get("runners"):
-        ids, _forwards, _aliases = account_identity.state(ordered, known)
-        forward = forwarding(events, {a["key"] for a in known})
-        cuts = {}
-        for event in events:
-            if event.get("type") == "account_note" and _list_change(event):
-                for pair in event.get("lanes_cut") or []:
-                    cuts[tuple(pair)] = (event["_seq"], _parse(event["written_at"]))
-        matched = []
-        for item in extra:
-            cut = cuts.get((item.get("runner"), item.get("lane")))
-            key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
-                item, cfg.get("routing_lane_map") or {}, known, forward, cfg.get("_providers"))
-            matched.append(dict(item, account=key))
-        batch = entry_model.source_events(matched, ordered, cfg, _mac_locked(), ids)
+        batch, ids = _source_batch(extra, events, ordered, cfg, known, _mac_locked())
         # An allocated id must have a durable login binding before an
         # observation refers to it; a later fold otherwise allocates anew.
         observed_accounts = {row.get("account") for row in batch if row["type"] == "observation"}
@@ -6073,13 +6115,7 @@ def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
     itself, which reads and never writes."""
     now = _not_before_last_fold(now, prev)
     extra, status, cache = _sources(cfg, now, prev)
-    source_ids = {e.get("source_id") for e in events if e.get("source_id")}
-    remaining = []
-    for item in extra:
-        source_id = entry_model.source_id(item["id"]) if source_ids and item.get("id") else None
-        if item.get("id") not in source_ids and source_id not in source_ids:
-            remaining.append(item)
-    extra = remaining
+    extra = _unseen_sightings(extra, events)
     from khipu import routing_replication
 
     body = fold(events_ordered if events_ordered is not None else events,
@@ -7478,15 +7514,6 @@ def dismiss_rule_request(n, *, via: str, now: datetime | None = None, expect=Non
 # confirming, undoing and clearing are the owner's.
 
 
-def _level_at_reset(level: dict, key: str) -> dict:
-    from khipu import usage
-
-    row = usage._load_cache().get(key) or {}
-    resets = [_parse(w.get("resets_at")) for w in row.get("windows") or [] if isinstance(w, dict)]
-    resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
-    return dict(level, until=_iso(min(_parse(level["until"]), *resets))) if resets else level
-
-
 def set_definition(definition: str, value: dict, *, via: str) -> dict:
     """Owner-authored shared definitions; lane bindings belong to this Mac."""
     checked = entry_model.checked_definition(definition, value)
@@ -7685,7 +7712,7 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
                 raise RouteError("level takes claim, as_of and until, with until after as_of")
             if conversation:
                 level["claim"] = _clean(level["claim"], 0)
-            out[-1]["level"] = _level_at_reset(level, key)
+            out[-1]["level"] = level
         if item.get("exceptions") is not None:
             exceptions = _checked_exceptions(item["exceptions"])
             if exceptions is None:
@@ -9939,7 +9966,7 @@ def doctor_block(now: datetime | None = None) -> dict:
                         f"Khipu leaves {'them' if bad != 1 else 'it'} out.")
     from khipu import routing_compact
 
-    log_health = routing_compact.health()
+    log_health = routing_compact.health(now)
     if log_health.get("warning"):
         warnings.append(log_health["warning"])
     events, _bad = read_events()
