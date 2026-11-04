@@ -6,7 +6,7 @@ import type { DiscoverResult } from "../src/accountsApi";
 import { DELIVERY_VIEW } from "./deliveryFake";
 import { config as fixtureRoutingConfig } from "../src/__tests__/routingSettingsFixtures";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off" };
 
 /** Values used by every routing-settings preview. They match the CLI's named
  * settings so every Change control is enabled with a real-looking value. */
@@ -224,6 +224,35 @@ function route15a() {
   };
 }
 
+/** Your Macs, three states, with fictional Macs (Studio and Laptop): first
+ * switch-on with differences to choose, everything settled, and the copy off. */
+function routeMacs(kind: "first" | "settled" | "off") {
+  const base = routeReplication();
+  const on = kind !== "off";
+  return {
+    view: base.view,
+    config: {
+      routing: { ...base.config.routing, routing_replication_live: { value: on, default: false, kind: "switch", source: "file" } },
+      settings_sync: {
+        enabled: on,
+        differences: kind === "first" ? [
+          { key: "routing_summary_chars", name: "Longest summary", local: 700, remote: 900, remote_snapshot: true },
+          { key: "routing_stale_after", name: "Out-of-date after", local: 21600, remote: 43200, remote_snapshot: true },
+          { key: "routing_resend_after", name: "Resend a changed fact after", local: 7200, remote: 3600, remote_snapshot: true },
+        ] : [],
+        waiting: kind === "first" ? [
+          { id: "rm-req-0a1b2c3d4e5f", request: "req-0a1b2c3d4e5f", mac: "Studio", state: "pending", answerable: true,
+            ask: "A conversation on Studio asked to pause Codex for 6 hours, and it is held until you answer." },
+        ] : [],
+        requests: kind === "settled" ? [
+          { request: "req-1", mac: "Studio", state: "applied", words: "Applied on Studio." },
+          { request: "req-2", mac: "Studio", state: "stale", stale: true, words: "That was already settled on Studio before your answer arrived, so your answer changed nothing." },
+        ] : [],
+      },
+    },
+  };
+}
+
 function fake(): Fake {
   return ((window as unknown as { __khipuFake?: Fake }).__khipuFake ?? {}) as Fake;
 }
@@ -247,6 +276,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         return { ok: true, default: false, row: liveRow({ account: String(args?.harness ?? "claude") }) };
       case "khipu_config_show":
         if (f.routeNeeds) return (f.worst ? routeNeedsWorst() : routeNeeds()).config;
+        if (f.routeMacs) return routeMacs(f.routeMacs).config;
         if (f.routeReplication) return routeReplication().config;
         if (f.route15a) return route15a().config;
         if (f.route15b) return route15b().config;
@@ -269,6 +299,7 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
         return { ok: true, ...(f.projects as object) };
       case "khipu_route_view":
         if (f.routeNeeds) return (f.worst ? routeNeedsWorst() : routeNeeds()).view;
+        if (f.routeMacs) return routeMacs(f.routeMacs).view;
         if (f.routeReplication) return routeReplication().view;
         if (f.route15a) return route15a().view;
         if (f.route15b) return route15b().view;

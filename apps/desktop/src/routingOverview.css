@@ -28,6 +28,12 @@
 .route-page-group-body > .section-body { padding: 0; }
 .route-page-group-body > .section-body + .section-body { border-top: 1px solid var(--border); padding-top: var(--s3); }
 .route-macs-controls { gap: var(--s3); }
+.route-sync-line { margin: 0; }
+.route-sync-row { flex-wrap: wrap; gap: var(--s2) var(--s3); }
+.route-sync-row .route-name { flex: 1 1 11rem; min-width: 0; }
+.route-sync-row .route-sync-values { flex: 2 1 14rem; min-width: 0; }
+.route-sync-row .route-actions { display: inline-flex; flex-wrap: wrap; gap: var(--s2); margin-left: auto; }
+.route-sync-row[data-stale="true"] .route-sync-values { color: var(--text); }
 .route-rule .route-rule-body,
 .route-rule .route-rule-meta { overflow-wrap: anywhere; }
 .route-sub-fold { margin-top: var(--s3); min-width: 0; }

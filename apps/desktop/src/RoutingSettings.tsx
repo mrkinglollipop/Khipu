@@ -96,6 +96,7 @@ import {
   agoSpan,
   changeDays,
   chosenEnd,
+  durationWords,
   endChoices,
   holdKind,
   limitWords,
@@ -107,7 +108,22 @@ import {
 import type { ChangeRow, LimitUnit } from "./routingWords";
 
 type SyncDifference = { key: string; name: string; local: unknown; remote: unknown; remote_snapshot?: boolean };
-type RouteConfig = { routing?: Record<string, RouteSetting>; settings_sync?: { differences?: SyncDifference[] } };
+/** A request another Mac held for the owner and how it ended there (never its words). */
+type SyncRequest = { id?: string; request: string; mac: string; state: string; words?: string | null; stale?: boolean;
+  ask?: string | null; answerable?: boolean };
+type RouteConfig = {
+  routing?: Record<string, RouteSetting>;
+  settings_sync?: { enabled?: boolean; differences?: SyncDifference[]; requests?: SyncRequest[]; waiting?: SyncRequest[] };
+};
+
+/** A setting's value in words a person reads: never "[object Object]". */
+function syncValue(value: unknown, kind?: string): string {
+  if (kind === "duration" && typeof value === "number") return durationWords(value);
+  if (value === true) return "on";
+  if (value === false) return "off";
+  if (value === null || value === undefined) return "not set";
+  return typeof value === "object" ? JSON.stringify(value) : String(value);
+}
 
 /** Where focus goes when the control that made a change is gone. */
 export type Back = () => HTMLElement | null | undefined;
@@ -3293,15 +3309,16 @@ function MacRoutingControls({
   return (
     <div className="section-body route-macs-controls">
       <p className="set-help">
-        Keep settings the same on my Macs copies shared routing settings and caps through the hub. Paths, logins, addresses,
-        machine limits and switches that send data elsewhere stay on this Mac. Search: Copy routing between your Macs.
+        These controls apply to this Mac. Keeping settings the same on my Macs is the first one: it copies shared routing
+        settings and caps through the hub. Paths, logins, addresses, machine limits and switches that send data elsewhere
+        stay on this Mac. They do not change what conversations hear or send proposal words to cloud agents.
       </p>
       <div className="opt-list">
         <div className="route-copy-option" role="group" aria-label="Routing copy">
         <SwitchRow
           id="route-replication-live"
-          label="Keep settings the same on my Macs — Copy routing between your Macs through the hub"
-          what="Turns routing copy on all your Macs. Shared settings, rules and caps use the hub; local folders, logins and egress controls stay here."
+          label="Copy routing between your Macs through the hub"
+          what="Sends your routing record and shared settings to the hub so your other Macs can pick them up, and brings their changes here. Turning it on or off here does the same on your other Macs. This is the Mac-to-Mac copy, separate from the copy for cloud agents."
           tag={<Tag>Between your Macs</Tag>}
           checked={cfg?.routing?.routing_replication_live?.value === true}
           disabled={!cfg || w.anyBusy}
@@ -3317,23 +3334,85 @@ function MacRoutingControls({
           {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
         </p>
         </div>
+        {cfg?.settings_sync ? (
+          <p className="set-help route-sync-line" role="status" data-sync-state={
+            cfg.settings_sync.enabled !== true ? "off" : (cfg.settings_sync.differences ?? []).length ? "choose" : "settled"}>
+            {cfg.settings_sync.enabled !== true
+              ? "Not shared: each Mac keeps its own settings. Turn this on here, or from a conversation on your other Mac."
+              : (cfg.settings_sync.differences ?? []).length
+                ? `${(cfg.settings_sync.differences ?? []).length} setting${(cfg.settings_sync.differences ?? []).length === 1 ? " differs" : "s differ"} between your Macs. Nothing changes until you choose.`
+                : "Settled: shared settings are the same on this Mac and your other Macs."}
+          </p>
+        ) : null}
         {(cfg?.settings_sync?.differences ?? []).length ? (
-          <section className="rows" aria-label="Settings differences">
-            <h3>Differences to choose</h3>
-            <p className="set-help">Nothing was overwritten when settings sync first turned on. Choose one value for each setting.</p>
-            {(cfg?.settings_sync?.differences ?? []).map((d) => (
-              <div className="row-item" key={d.key} role="group" aria-label={d.name}>
-                <span className="route-name">{d.name}</span>
-                <span className="set-help">This Mac: <b>{String(d.local)}</b> · Other Mac: <b>{String(d.remote)}</b></span>
-                <span className="route-actions">
-                  <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-local-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.local) }, reread)}>Use {String(d.local)}</button>
-                  <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-remote-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.remote) }, reread)}>Use {String(d.remote)}</button>
-                </span>
+          <section className="route-page-group" aria-labelledby="route-sync-differences">
+            <div className="route-page-group-head">
+              <h3 id="route-sync-differences">Differences to choose</h3>
+              <span className="gline">Nothing was overwritten. Choose one value for each.</span>
+            </div>
+            <div className="route-page-group-body">
+              <div className="rows">
+                {(cfg?.settings_sync?.differences ?? []).map((d) => {
+                  const kind = cfg?.routing?.[d.key]?.kind;
+                  return (
+                    <div className="row-item route-sync-row" key={d.key} role="group" aria-label={d.name}>
+                      <span className="route-name">{d.name}</span>
+                      <span className="set-help route-sync-values">This Mac: <b>{syncValue(d.local, kind)}</b> · Other Mac: <b>{syncValue(d.remote, kind)}</b></span>
+                      <span className="route-actions">
+                        <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-local-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.local) }, reread)}>Keep {syncValue(d.local, kind)}</button>
+                        <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-remote-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.remote) }, reread)}>Use {syncValue(d.remote, kind)}</button>
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
-            ))}
-            <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void (async () => {
-              for (const d of cfg?.settings_sync?.differences ?? []) await w.run(`sync-all-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.remote) }, reread);
-            })()}>Use the other Mac&apos;s for all</button>
+              <div>
+                <button type="button" className="btn" disabled={w.anyBusy} onClick={() => void (async () => {
+                  for (const d of cfg?.settings_sync?.differences ?? []) await w.run(`sync-all-${d.key}`, "khipu_config_set", { key: d.key, value: JSON.stringify(d.remote) }, reread);
+                })()}>Use the other Mac&apos;s for all</button>
+              </div>
+            </div>
+          </section>
+        ) : null}
+        {(cfg?.settings_sync?.waiting ?? []).length ? (
+          <section className="route-page-group" aria-labelledby="route-sync-waiting">
+            <div className="route-page-group-head">
+              <h3 id="route-sync-waiting">Waiting for your answer on another Mac</h3>
+              <span className="gline">Your answer goes to that Mac, which makes the change within a few minutes.</span>
+            </div>
+            <div className="route-page-group-body">
+              <div className="rows">
+                {(cfg?.settings_sync?.waiting ?? []).map((r) => (
+                  <div className="row-item route-sync-row" key={r.id ?? r.request} role="group" aria-label={r.mac}>
+                    <span className="route-name">{r.mac}</span>
+                    <span className="set-help route-sync-values">{r.ask ?? "Its words stay on that Mac: answer it there."}</span>
+                    {r.answerable && r.id ? (
+                      <span className="route-actions">
+                        <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-no-${r.id}`, "khipu_owner_answer", { request: r.id, answer: "no" }, reread)}>No</button>
+                        <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-yes-${r.id}`, "khipu_owner_answer", { request: r.id, answer: "yes" }, reread)}>Yes</button>
+                      </span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+        ) : null}
+        {(cfg?.settings_sync?.requests ?? []).length ? (
+          <section className="route-page-group" aria-labelledby="route-sync-requests">
+            <div className="route-page-group-head">
+              <h3 id="route-sync-requests">Answers you gave for your other Macs</h3>
+            </div>
+            <div className="route-page-group-body">
+              <div className="rows">
+                {(cfg?.settings_sync?.requests ?? []).map((r) => (
+                  <div className="row-item route-sync-row" key={r.request} role="group" aria-label={r.mac} data-stale={r.stale ? "true" : undefined}>
+                    <span className="route-name">{r.mac}</span>
+                    <span className="set-help route-sync-values">{r.words}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
           </section>
         ) : null}
         <SwitchRow

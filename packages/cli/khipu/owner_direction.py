@@ -198,9 +198,11 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
                                                 "terminal can make this change.")
     environ = os.environ if env is None else env
     confirmed = _CONFIRMED.get()
-    if confirmed is not None and confirmed["action"] == action and confirmed["stamp"].get("binding") == "other_mac":
+    if confirmed is not None and confirmed["action"] == action \
+            and confirmed["stamp"].get("binding") in ("other_mac", "owner_cli"):
         # The answer was typed on another of the owner's Macs and proved there
-        # (``remote_stamp``); this Mac has no conversation to ask.
+        # (``remote_stamp``), or given by him in the app or on a terminal
+        # (``cli_stamp``); this process has no conversation to ask.
         return dict(confirmed["stamp"])
     session = _caller_session(environ)
     if confirmed is not None and confirmed["action"] == action and confirmed["stamp"]["session"] == session:
@@ -872,7 +874,16 @@ def remote_stamp(answer: dict) -> dict:
                           "message_sha256": sha}}
 
 
-def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict | None = None) -> tuple[dict, dict]:
+def cli_stamp(via: str, request_id: str) -> dict:
+    """The auth stamp for the owner's own answer to a held request, given in
+    the app or on a terminal: ``routing._owner_via`` proved it was him."""
+    return {"auth": "direction", "harness": None, "session": f"owner-{via}", "turn": f"{via}:{request_id}",
+            "prompt_sha256": None, "binding": "owner_cli",
+            "confirmed": {"source": "app" if via == "app" else "terminal", "message": f"{via}:{request_id}"}}
+
+
+def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict | None = None,
+            stamp: dict | None = None) -> tuple[dict, dict]:
     """(the held request, its confirm stamp), claimed for applying, or
     ``DirectionRefused``. Every refusal a change has runs first; then the
     proof (``_proof``). A confirm that finds no reply to the latest ask
@@ -883,7 +894,7 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
 
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
-    session = f"other-mac:{remote.get('mac')}" if remote else _caller_session(environ)
+    session = f"other-mac:{remote.get('mac')}" if remote else stamp["session"] if stamp else _caller_session(environ)
     try:
         with _requests_locked() as path:
             state = _load(path)
@@ -892,11 +903,11 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
                 raise DirectionRefused("not_found", "There is no held request with that id.")
             if request.get("state") != "pending":
                 raise DirectionRefused("not_pending", f"That request is already {request.get('state')}.")
-            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
+            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on" and not stamp:
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
-            if remote:
-                stamp = remote_stamp(remote)
+            if remote or stamp:
+                stamp = remote_stamp(remote) if remote else dict(stamp, confirmed=dict(stamp["confirmed"]))
                 stamp["confirmed"]["request"] = request_id
                 request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session))
                 _save(path, state, now)
@@ -923,7 +934,8 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
 DECLINE_ACTION = "direction.decline"
 
 
-def decline(request_id: str, *, env=None, now: float | None = None, remote: dict | None = None) -> dict:
+def decline(request_id: str, *, env=None, now: float | None = None, remote: dict | None = None,
+            stamp: dict | None = None) -> dict:
     """The owner's no to a held request: it is dropped and nothing changes.
     The proof a confirm needs, so a conversation can't answer for the owner
     either way; with no reply since the ask it asks again, as a confirm does."""
@@ -931,7 +943,7 @@ def decline(request_id: str, *, env=None, now: float | None = None, remote: dict
 
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
-    session = f"other-mac:{remote.get('mac')}" if remote else _caller_session(environ)
+    session = f"other-mac:{remote.get('mac')}" if remote else stamp["session"] if stamp else _caller_session(environ)
     try:
         with _requests_locked() as path:
             state = _load(path)
@@ -940,11 +952,11 @@ def decline(request_id: str, *, env=None, now: float | None = None, remote: dict
                 raise DirectionRefused("not_found", "There is no held request with that id.")
             if request.get("state") != "pending":
                 raise DirectionRefused("not_pending", f"That request is already {request.get('state')}.")
-            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
+            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on" and not stamp:
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can answer this request.")
-            if remote:
-                stamp = remote_stamp(remote)
+            if remote or stamp:
+                stamp = remote_stamp(remote) if remote else dict(stamp, confirmed=dict(stamp["confirmed"]))
                 stamp["confirmed"]["request"] = request_id
             else:
                 with t3.owner_read_budget():
@@ -3952,6 +3964,35 @@ def run_cli(args) -> int:
             out = undo(args.id, via, holds=choices, over_newer=over)
             _print(finish(out) or out)
             return 0
+        if cmd == "answer":
+            via = routing._owner_via(args, None)
+            if via is None:
+                _print({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"})
+                return 2
+            from khipu import owner_act
+
+            stamp = cli_stamp(via, args.request)
+            try:
+                if args.answer_yes:
+                    request, stamp = confirm(args.request, stamp=stamp)
+                    if request.get("remote"):
+                        ok, out = owner_act._answered_for_another_mac(request, stamp, "confirm")
+                    else:
+                        ok, out = owner_act.apply_confirmed(request, stamp)
+                        out = dict(out or {}, request=request["id"])
+                else:
+                    request = decline(args.request, stamp=stamp)
+                    ok, out = True, {"ok": True, "declined": True, "request": request["id"]}
+                    if request.get("remote"):
+                        from khipu import routing_replication
+
+                        routing_replication.answer_remote(request, stamp, "decline")
+                        out["sent"] = True
+            except DirectionRefused as refused:
+                _print(refused.refusal())
+                return 2
+            _print(out)
+            return 0 if ok else 2
         if cmd == "on":
             # Turning it on is an owner action like any other: logged, with an Undo.
             want = intent("direction.on", "direction")
@@ -4036,6 +4077,13 @@ def add_parser(sub) -> None:
         sp = verbs.add_parser(name, help=words)
         sp.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
         add_owner_flags(sp)
+    ans = verbs.add_parser("answer", help="Answer a request held for you (yes or no), here or one your other "
+                                          "Mac is holding")
+    ans.add_argument("request")
+    pick = ans.add_mutually_exclusive_group(required=True)
+    pick.add_argument("--yes", dest="answer_yes", action="store_true")
+    pick.add_argument("--no", dest="answer_no", action="store_true")
+    ans.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     ack = verbs.add_parser("acknowledge", help="Acknowledge the tamper alarm on the owner-actions log")
     ack.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     add_owner_flags(ack)

@@ -4933,6 +4933,15 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     labels = {e["key"]: e["label"] for e in entries}
     in_settings = {e["key"]: e["configured"] for e in entries}
     in_settings.update({key: False for key, note in notes.items() if note.get("state") == "untracked"})
+    # An account definition the owner removed is no longer tracked, with or
+    # without an account list on this Mac.
+    removed: dict[str, bool] = {}
+    for event in events:
+        if event.get("type") in ("definition_set", "definition_remove") and event.get("definition") == "account" \
+                and (event.get("written_by") or {}).get("kind") == "owner" and isinstance(event.get("value"), dict) \
+                and isinstance(event["value"].get("id"), str):
+            removed[event["value"]["id"]] = event["type"] == "definition_remove"
+    in_settings.update({key: False for key, gone in removed.items() if gone})
     if cfg.get("_accounts_version"):
         priority_version = f"{priority_version}.{cfg['_accounts_version']}"
     priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys, none=none)

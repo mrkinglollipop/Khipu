@@ -135,7 +135,9 @@ def test_12_partial_pull_does_not_claim_caught_up_and_resumes(pair):
     assert replication.status()["sources"]
 
 
-def test_upload_backlog_yields_to_pull_after_a_bounded_slice(pair):
+def test_upload_backlog_yields_to_pull_after_a_bounded_slice(pair, monkeypatch):
+    from khipu import routing_replication
+    monkeypatch.setattr(routing_replication, "ROUND_BUDGET_S", 0)  # one slice per sync, as a busy timer tick
     a, b, hub = pair
     a.activate()
     for n in range(UPLOAD_PER_TURN + 3):
@@ -146,6 +148,10 @@ def test_upload_backlog_yields_to_pull_after_a_bounded_slice(pair):
     # the source Mac's whole historical upload queue.
     assert sync(b, hub)["ok"]
     assert len(b.view()["rules"]) == UPLOAD_PER_TURN
+    # With the budget back, one sync keeps sending slices until nothing is left.
+    monkeypatch.setattr(routing_replication, "ROUND_BUDGET_S", 240.0)
+    assert sync(a, hub)["caught_up"]
+    assert sync(b, hub)["ok"] and len(b.view()["rules"]) == UPLOAD_PER_TURN + 3
 
 
 def test_12_overlap_finds_late_commit_behind_previous_cursor(pair):

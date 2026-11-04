@@ -11,6 +11,7 @@ import json
 import hashlib
 import re
 import threading
+import time
 import os
 import secrets
 import tempfile
@@ -26,6 +27,7 @@ def _stamp(dt):
 EPOCH = "1970-01-01T00:00:00Z"
 POLL_SECONDS = 30
 UPLOAD_PER_TURN = 64
+ROUND_BUDGET_S = 240.0  # how long one sync keeps sending slices (each is saved durably) before the next tick takes over
 CONTROL_EVERY_S = 270  # just under the 5-minute timer, so every tick looks
 
 
@@ -135,7 +137,9 @@ def settings_status():
             differences.append({"key": key, "name": routing.SETTINGS[key][2], "local": local_value,
                                 "remote": remote_value, "remote_snapshot": row.get("snapshot") is True,
                                 "remote_at": row.get("written_at")})
-    return {"enabled": routing._replication_live(), "differences": differences}
+    return {"enabled": routing._replication_live(), "differences": differences,
+            "requests": [r for r in remote_requests() if r["state"] != "pending"][:10],
+            "waiting": [r for r in remote_requests() if r["state"] == "pending"][:10]}
 
 
 def mac_label(mac):
@@ -582,7 +586,9 @@ def remote_requests():
         if not remote:
             continue
         state = row.get("state")
-        out.append({"request": remote.get("request"), "mac": mac_label(remote.get("mac")), "state": state,
+        out.append({"id": row.get("id"), "ask": None if remote.get("withheld") else row.get("ask"),
+                    "answerable": not remote.get("withheld"),
+                    "request": remote.get("request"), "mac": mac_label(remote.get("mac")), "state": state,
                     "words": row.get("receipt") or (
                         "Your answer is on its way; it applies there within a few minutes." if state == "answered"
                         else "Waiting for your answer." if state == "pending" else None),
@@ -704,6 +710,12 @@ def _control_sync(*, hub=None):
     switch record; ordinary routing stays gated until that record says on."""
     if hub is None and not routing._hub_configured():
         return {"ok": True, "disabled": True, "caught_up": False}
+    from khipu.config import load_config
+
+    if "routing_replication_live" in routing._setting_requests(load_config()):
+        # A conversation asked to turn the copy on and the owner has not
+        # answered: this Mac makes no hub call at all until he does.
+        return {"ok": True, "disabled": True, "caught_up": False}
     try:
         with _sync_lock(), routing._lock():
             mac = routing._mac_locked()
@@ -784,71 +796,87 @@ def _sync(*, hub=None, limit=500, max_pages=20):
             uploaded = state.setdefault("uploaded", {})
             deferred = state.setdefault("deferred", {})
             skipped = 0
-            sent_this_turn = 0
-            local_pending = False
             ordered = sorted(enumerate(local, 1), key=lambda pair: (pair[1].get("mac", ""), pair[1].get("seq", pair[0]), pair[0]))
-            for position, event in ordered:
-                origin = event.get("mac") or "legacy"
-                seq = event.get("seq", position)
-                if seq <= uploaded.get(origin, 0) and event.get("id") not in deferred:
-                    continue
-                projected = routing.replication_payload([event], bindings=bindings)
-                # A rejected identifier is not a new id; it must never upload.
-                if projected and projected[0].get("id"):
-                    receipt = hub.upload(mac, projected[0])
-                    if receipt["event_id"] != projected[0]["id"]:
-                        raise ValueError("wrong upload receipt")
-                    _store([receipt])
-                    deferred.pop(event["id"], None)
-                elif not projected and event.get("id"):
-                    deferred[event["id"]] = event["type"]
-                else:
-                    skipped += 1
-                uploaded[origin] = max(seq, uploaded.get(origin, 0))
-                _save(state)
-                sent_this_turn += 1
-                # Uploading an old local backlog before ever pulling starves
-                # every other Mac.  One bounded slice, then a pull, makes
-                # progress fair and leaves the remaining local rows durable.
-                if sent_this_turn >= UPLOAD_PER_TURN:
-                    local_pending = any(
-                        later.get("id") and later.get("seq", n) > uploaded.get(later.get("mac") or "legacy", 0)
-                        for n, later in ordered[position:]
-                    )
-                    break
-            for _ in range(max_pages):
-                after = state.get("scan_after") or [state.get("pull_cursor", EPOCH), ""]
-                result = hub.pull(after, state.get("scan_until"), limit)
-                upper = routing._parse(result["until"])
-                hub_now = routing._parse(result["hub_now"])
-                if upper is None or hub_now is None:
-                    raise ValueError("invalid hub clock")
-                rows = result["rows"]
-                _store(rows)
-                _apply_remote_switch(rows)
-                _apply_remote_settings(state)
-                apply_remote_answers(state)
-                mirror_remote_requests(state)
-                state["scan_order"] = max([state.get("scan_order", 0)] + [r["hub_order"] for r in rows])
-                state["sources"] = result["sources"]
-                state["hub_offset_seconds"] = (hub_now - routing._now()).total_seconds()
-                if result["complete"]:
-                    state["completed_order"] = max(state.get("completed_order", 0), state.pop("scan_order", 0))
-                    state["pull_cursor"] = _stamp(upper - timedelta(seconds=FRESHNESS_OVERLAP_S))
-                    state["caught_up_at"] = routing._iso(upper)
-                    state["checked_local_at"] = routing._iso(routing._now())
-                    state.pop("scan_after", None)
-                    state.pop("scan_until", None)
-                    state.pop("error", None)
+            deadline = time.monotonic() + ROUND_BUDGET_S
+            first_round = True
+            while True:
+                # Each round sends one bounded slice and then pulls, so a large
+                # local backlog never starves the other Macs; rounds repeat while
+                # the budget lasts, and what is left goes on the next tick.
+                sent_this_turn = 0
+                local_pending = False
+                finished = None
+                for position, event in ordered:
+                    origin = event.get("mac") or "legacy"
+                    seq = event.get("seq", position)
+                    retry = seq <= uploaded.get(origin, 0)
+                    # A deferred row is tried again once per sync, not every round.
+                    if retry and (event.get("id") not in deferred or not first_round):
+                        continue
+                    projected = routing.replication_payload([event], bindings=bindings)
+                    # A rejected identifier is not a new id; it must never upload.
+                    if projected and projected[0].get("id"):
+                        receipt = hub.upload(mac, projected[0])
+                        if receipt["event_id"] != projected[0]["id"]:
+                            raise ValueError("wrong upload receipt")
+                        _store([receipt])
+                        deferred.pop(event["id"], None)
+                    elif not projected and event.get("id"):
+                        deferred[event["id"]] = event["type"]
+                    else:
+                        skipped += 1
+                    uploaded[origin] = max(seq, uploaded.get(origin, 0))
                     _save(state)
-                    return dict(ok=True, caught_up=not local_pending, local_pending=local_pending, skipped=skipped,
-                                deferred_kinds=sorted(set(deferred.values())))
-                if not rows:
-                    raise ValueError("pull made no progress")
-                state["scan_after"] = [rows[-1]["received_at"], rows[-1]["event_id"]]
-                state["scan_until"] = result["until"]
-                _save(state)
-            return dict(ok=True, caught_up=False, partial=True)
+                    # A deferred row tried again is not new work for the slice.
+                    sent_this_turn += 0 if retry else 1
+                    # Uploading an old local backlog before ever pulling starves
+                    # every other Mac.  One bounded slice, then a pull, makes
+                    # progress fair and leaves the remaining local rows durable.
+                    if sent_this_turn >= UPLOAD_PER_TURN:
+                        local_pending = any(
+                            later.get("id") and later.get("seq", n) > uploaded.get(later.get("mac") or "legacy", 0)
+                            for n, later in ordered[position:]
+                        )
+                        break
+                for _ in range(max_pages):
+                    after = state.get("scan_after") or [state.get("pull_cursor", EPOCH), ""]
+                    result = hub.pull(after, state.get("scan_until"), limit)
+                    upper = routing._parse(result["until"])
+                    hub_now = routing._parse(result["hub_now"])
+                    if upper is None or hub_now is None:
+                        raise ValueError("invalid hub clock")
+                    rows = result["rows"]
+                    _store(rows)
+                    _apply_remote_switch(rows)
+                    _apply_remote_settings(state)
+                    apply_remote_answers(state)
+                    mirror_remote_requests(state)
+                    state["scan_order"] = max([state.get("scan_order", 0)] + [r["hub_order"] for r in rows])
+                    state["sources"] = result["sources"]
+                    state["hub_offset_seconds"] = (hub_now - routing._now()).total_seconds()
+                    if result["complete"]:
+                        state["completed_order"] = max(state.get("completed_order", 0), state.pop("scan_order", 0))
+                        state["pull_cursor"] = _stamp(upper - timedelta(seconds=FRESHNESS_OVERLAP_S))
+                        state["caught_up_at"] = routing._iso(upper)
+                        state["checked_local_at"] = routing._iso(routing._now())
+                        state.pop("scan_after", None)
+                        state.pop("scan_until", None)
+                        state.pop("error", None)
+                        _save(state)
+                        finished = dict(ok=True, caught_up=not local_pending, local_pending=local_pending, skipped=skipped,
+                                        deferred_kinds=sorted(set(deferred.values())))
+                        break
+                    if not rows:
+                        raise ValueError("pull made no progress")
+                    state["scan_after"] = [rows[-1]["received_at"], rows[-1]["event_id"]]
+                    state["scan_until"] = result["until"]
+                    _save(state)
+                if finished is None:
+                    return dict(ok=True, caught_up=False, partial=True)
+                if local_pending and time.monotonic() < deadline:
+                    first_round = False
+                    continue
+                return finished
     except BlockingIOError:
         return dict(ok=True, caught_up=False, busy=True)
     except Exception:

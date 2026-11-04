@@ -420,3 +420,93 @@ def test_an_older_mac_on_main_reads_the_new_lines_without_harm(macs, pg, tmp_pat
     assert result["sync"]["ok"] is True and result["sync"]["caught_up"] is True, result
     assert "keep Codex for tests" in result["rules"], result
     assert result["live"] is True
+
+
+# ---- account warnings on a Mac that has no account list of its own ------------------------------
+
+
+def _priority_rows(mac):
+    mac.activate()
+    view = routing.read_view(now=mac.now)
+    from khipu import routing_advisory
+
+    by_key, _ = routing_advisory._accounts(view)
+    entries = [(e["label"], e["in_settings"]) for e in (view["priority"] or {}).get("entries", [])]
+    return entries, sorted(r["id"] for r in by_key.values())
+
+
+def test_account_warnings_on_a_mac_with_no_account_list_of_its_own(macs):
+    from khipu import accounts, config
+
+    a, b = macs
+    both_on(a, b)
+    b.config.pop("usage_accounts")
+    b.configure()
+    a.activate()
+    routing.set_priority([{"account": "Codex"}, {"account": "Grok"}], via="app", expect=routing.priority_version())
+    sync_all(a, b)
+    entries, ids = _priority_rows(b)
+    # No list here is not "stopped tracking": no untracked warning, and one id per account.
+    assert entries == [("Codex", True), ("Grok", True)]
+    assert ids == ["codex:main", "grok:main"]
+
+    # An account the owner stopped on A still warns on B, and only that one.
+    a.activate()
+    assert accounts.stop("grok|", keep_priority=True, expect=config.accounts_version())["ok"]
+    sync_all(a, b)
+    entries, ids = _priority_rows(b)
+    assert entries == [("Codex", True), ("Grok", False)]
+    assert ids == ["codex:main", "grok:main"]
+
+
+def test_the_same_priority_is_one_id_on_a_mac_that_has_its_own_list(macs):
+    a, b = macs
+    both_on(a, b)
+    a.activate()
+    routing.set_priority([{"account": "Codex"}, {"account": "Grok"}], via="app", expect=routing.priority_version())
+    sync_all(a, b)
+    entries, ids = _priority_rows(b)
+    assert entries == [("Codex", True), ("Grok", True)]
+    assert ids == ["claude:main", "codex:main", "grok:main"]  # never also codex| or grok| as a second id
+
+
+# ---- the app and a terminal answer the same way a conversation does -------------------------------
+
+
+def test_the_app_answers_a_request_held_on_the_other_mac(macs):
+    a, b = macs
+    both_on(a, b)
+    request = a.hold_pause()
+    sync_all(a, b)
+    b.activate()
+    b.app.as_app()
+    try:
+        assert cli.main(["owner-direction", "answer", "--from-app", f"rm-{request}", "--yes"]) == 0
+    finally:
+        b.app.as_shell("/opt/harness/claude")
+    sync_all(b, a)
+    assert a.paused()
+    (line,) = [x for x in a.log() if x.get("action") == "route.pause"]
+    assert line["confirmed"]["source"] == "other_mac"
+
+
+def test_a_yes_typed_on_a_terminal_answers_a_request_held_here(macs, monkeypatch):
+    a, b = macs
+    request = a.hold_pause()
+    a.activate()
+    monkeypatch.setattr(routing, "typed_yes", lambda *_a, **_k: True)
+    assert cli.main(["owner-direction", "answer", request, "--yes"]) == 0
+    assert a.paused()
+    (line,) = [x for x in a.log() if x.get("action") == "route.pause"]
+    assert line["confirmed"]["source"] == "terminal"
+    # Answered once: a second yes finds nothing waiting.
+    assert cli.main(["owner-direction", "answer", request, "--yes"]) == 2
+
+
+def test_a_no_typed_on_a_terminal_declines_a_request_held_here(macs, monkeypatch):
+    a, _ = macs
+    request = a.hold_pause()
+    a.activate()
+    monkeypatch.setattr(routing, "typed_yes", lambda *_a, **_k: True)
+    assert cli.main(["owner-direction", "answer", request, "--no"]) == 0
+    assert not a.paused()
