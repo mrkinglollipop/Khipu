@@ -333,6 +333,7 @@ describe("the priority and the pace in Settings -> Routing", () => {
     fireEvent.click(within(grok).getByRole("button", { name: "Close details" }));
     const sw = screen.getByRole("switch", { name: "With no priority set, list accounts by how soon their allowance runs out unused" });
     expect(sw).toBeChecked();
+    expect(sw.closest(".opt-row")).toHaveTextContent("Khipu lists the account closest to wasting its allowance first; a priority you set always comes first.");
     fireEvent.click(sw);
     await waitFor(() => expect(calls("khipu_config_set")).toEqual([{ key: "routing_pace_order", value: "off" }]));
     fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));

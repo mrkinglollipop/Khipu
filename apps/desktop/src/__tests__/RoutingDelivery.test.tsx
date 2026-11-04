@@ -22,13 +22,13 @@ describe("Telling conversations: delivery and health", () => {
   it("labels an unavailable last-heard time once on every fallback row", () => {
     render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
     const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
-    for (const row of rows) expect(within(row).getAllByText("Last heard unavailable")).toHaveLength(1);
+    for (const row of rows) expect(within(row).getAllByText("Last heard: not known yet")).toHaveLength(1);
   });
 
   it("does not invent a last-heard time for missing or invalid owner-row timestamps", () => {
     render(<DeliverySection data={{ ...DELIVERY_VIEW, delivery_rows: [{ label: "No timestamp" }, { label: "Invalid timestamp", last_prompt_at: "not a date" }] }} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
     const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
-    for (const row of rows) expect(within(row).getAllByText("Last heard unavailable")).toHaveLength(1);
+    for (const row of rows) expect(within(row).getAllByText("Last heard: not known yet")).toHaveLength(1);
   });
 
   it("shows generic conversation labels, never raw identities or component ids", () => {
@@ -69,7 +69,7 @@ describe("Telling conversations: delivery and health", () => {
     expect(rows[0]).toHaveTextContent("Fix the flaky build");
     expect(rows[0]).toHaveTextContent("This Mac");
     expect(rows[0]).toHaveTextContent("Last heard 2 min ago");
-    expect(rows[0]).not.toHaveTextContent("Last heard unavailable");
+    expect(rows[0]).not.toHaveTextContent("Last heard: not known yet");
     expect(rows[0]).toHaveTextContent("No changes owed");
     expect(rows[1]).toHaveTextContent("Conversation 2");
     expect(rows[1]).toHaveTextContent("Studio Mac");
@@ -81,7 +81,7 @@ describe("Telling conversations: delivery and health", () => {
     const macs = screen.getByRole("list", { name: "Other Macs and the cloud" });
     expect(macs).toHaveTextContent("MacBook Air");
     expect(macs).toHaveTextContent("Behind");
-    expect(screen.queryByText("Who has it isn't available")).toBeNull();
+    expect(screen.queryByText("Not known yet who has it")).toBeNull();
     expect(within(screen.getByRole("list", { name: "Live conversations" })).queryAllByRole("button")).toHaveLength(0);
     for (const pattern of SESSION_ID_SHAPED) expect(container.textContent).not.toMatch(pattern);
   });
@@ -105,7 +105,7 @@ describe("Telling conversations: delivery and health", () => {
   it("keeps has-it information unknown until the doctor exposes it", () => {
     render(<><DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} /><MacDeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} /></>);
     const changes = within(screen.getByRole("list", { name: "Recent changes and who has them" }));
-    expect(changes.getAllByText("Who has it isn't available")).toHaveLength(2);
+    expect(changes.getAllByText("Not known yet who has it")).toHaveLength(2);
     expect(screen.getByRole("list", { name: "Other Macs and the cloud" })).toHaveTextContent("Other MacsBehind");
     expect(screen.getByRole("list", { name: "Other Macs and the cloud" })).toHaveTextContent("Cloud copyCan't be checked");
   });

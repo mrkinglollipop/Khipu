@@ -290,7 +290,7 @@ def test_a_t3_turn_without_a_new_owner_message_holds(t3world):
     assert _state("Grok") != "paused" and _lines() == []
 
 
-def test_a_t3_message_outside_the_window_holds(t3world):
+def test_a_t3_message_does_not_expire_after_six_hours(t3world):
     t3world["t3"].message(t3t.THREAD, time.time() - 30, text="pause Codex")
     t3t._t3_hook_turn()
     ok, out = _t3_pause(t3world, "Codex")
@@ -303,19 +303,21 @@ def test_a_t3_message_outside_the_window_holds(t3world):
     t3world["mp"].setattr(owner_direction, "_clock", lambda: later)
     t3t._t3_hook_turn()
     ok, out = _t3_pause(t3world, "Grok")
-    assert ok and out["pending"] is True, out
-    assert _state("Grok") != "paused"
+    assert ok and not out.get("pending") and out["owner_action"], out
+    assert _state("Grok") == "paused"
+    assert owner_direction._find(out["owner_action"])["receipt"]
 
 
-def test_a_t3_priority_request_applies_with_proof_and_stays_pending_without(t3world):
+def test_a_t3_own_priority_request_needs_no_prior_question(t3world):
     _set_priority_by_the_owner()
-    # Without a boundary: pending as before.
+    # An own request on a typed owner turn needs no earlier question.
     t3world["t3"].message(t3t.THREAD, time.time() - 30, text="loosen Codex")
     t3t._t3_hook_turn()
     t3world["mp"].setenv("CLAUDE_CODE_SESSION_ID", t3t.T3_SESSION)
     out = _amend_request()
-    assert "applied" not in out and routing.read_view()["priority"]["pending"] is True
-    routing.undo_priority(via="app", expect=routing.priority_version())
+    assert out["applied"] and not routing.read_view()["priority"]["pending"], out
+    ok, undone = owner_act.act("direction.undo", {"id": out["instant"]["owner_action"]})
+    assert ok, undone
     # A prior ask in the thread, then a newer owner message: applied.
     ok, held = _t3_pause(t3world, "Codex")
     assert ok and held["pending"] is True

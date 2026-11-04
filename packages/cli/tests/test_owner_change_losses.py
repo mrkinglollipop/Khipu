@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from khipu import mcp_server, routing, t3
+from khipu import mcp_server, owner_direction, routing, t3
 from tests.test_routing_s5_fix1 import ACCOUNTS, Clock, ME, T0
 from tests.test_t3_owner_confirm import (T3_SESSION, THREAD, _be, _confirm_id, _hold_in_t3, _paused,
                                          _t3_hook_turn, world)
@@ -155,11 +155,16 @@ def test_a_failed_t3_lookup_on_confirm_says_unreadable_not_dispatched_job(world,
     assert not _paused()
 
 
-def test_a_t3_owner_reply_is_not_rejected_for_a_lane_marker(world):
+def test_a_job_lane_cannot_borrow_a_t3_reply_or_burn_the_owners_answer(world):
     request = _hold_in_t3(world)
     world["t3"].message(THREAD, time.time() + 1)
     _t3_hook_turn()
     _be(world, T3_SESSION, CLAUDE_DISPATCHED_LANE="claude-second")
+    ok, out = _confirm_id(request)
+    assert not ok and out["code"] == "no_recorded_turn" and not _paused(), out
+    row = next(r for r in owner_direction._read_requests(owner_direction.requests_path()) if r["id"] == request)
+    assert row["state"] == "pending"
+    world["mp"].delenv("CLAUDE_DISPATCHED_LANE")
     ok, out = _confirm_id(request)
     assert ok and _paused(), out
 

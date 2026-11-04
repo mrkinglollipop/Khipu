@@ -535,7 +535,7 @@ def act(action, args) -> tuple[bool, dict]:
             else:
                 # The owner's words asked for the amend, never for the waiting
                 # request it would confirm: his yes to the ask naming both is.
-                held = pending is not None
+                held = pending is not None and action == "route.priority.amend"
         if held:
             if pending is not None:
                 return _held_on_a_read(_hold(action, values, ask=pending[1]))

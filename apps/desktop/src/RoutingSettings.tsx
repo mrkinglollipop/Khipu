@@ -980,7 +980,7 @@ function PrioritySection({
         </ConfirmGroup>
       ) : null}
       <SwitchRow id="route-pace-order" label="With no priority set, list accounts by how soon their allowance runs out unused"
-        what="Khipu works out, for each account it can read, the pace that would use what is left of its longest window by the time it resets, and lists the fastest first under a heading that says it is arithmetic, not your priority. Each account's pace is told either way. A priority you set always comes first and is never reordered."
+        what="Khipu lists the account closest to wasting its allowance first; a priority you set always comes first."
         tag={<Tag>{paceOn ? "On" : "Off"}</Tag>} checked={paceOn} disabled={!cfg || w.anyBusy} busy={w.isBusy("pace-order")}
         onChange={(on) => void w.run("pace-order", "khipu_config_set", { key: "routing_pace_order", value: on ? "on" : "off" }, reread)}
         error={<WriteError w={w} id="pace-order" />} />
@@ -2646,7 +2646,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
                 <div key={`owner-delivery-${index}`} className="mrow delivery" role="listitem">
                   <span><span className="name">{row.label}</span><br /><span className="src">{[deliveryHarnessName(row.harness), deliveryComponentWord(row.component)].filter(Boolean).join(" · ")}</span></span>
                   <span className="mac-col">{row.mac ?? "This Mac"}</span>
-                  <span className="num delivery-heard">{row.last_prompt_at && !Number.isNaN(Date.parse(row.last_prompt_at)) ? `Last heard ${agoSpan(row.last_prompt_at, now)}` : "Last heard unavailable"}</span>
+                  <span className="num delivery-heard">{row.last_prompt_at && !Number.isNaN(Date.parse(row.last_prompt_at)) ? `Last heard ${agoSpan(row.last_prompt_at, now)}` : "Last heard: not known yet"}</span>
                   <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
                 </div>
               );
@@ -2665,7 +2665,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
               return (
                 <div key={`delivery-${index}`} className="mrow delivery" role="listitem">
                   <span><span className="name">{label.conversation}</span><br /><span className="src">{[label.harness, label.component].filter(Boolean).join(" · ")}</span></span>
-                  <span className="delivery-state"><span className="src">Last heard unavailable</span><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
+                  <span className="delivery-state"><span className="src">Last heard: not known yet</span><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
                 </div>
               );
             })}
@@ -2696,7 +2696,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
                     {change.recipients.waiting.length ? <span className="src">Waiting: {change.recipients.waiting.join(", ")}</span> : null}
                   </span>
                 ) : (
-                  <span className="end"><Tag>Who has it isn&apos;t available</Tag></span>
+                  <span className="end"><Tag>Not known yet who has it</Tag></span>
                 )}
               </div>
             ))}

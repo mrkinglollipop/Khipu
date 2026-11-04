@@ -60,6 +60,7 @@ _ANSWERS = frozenset({
 })
 # A held request's action in words, for every action one can hold.
 ACTION_WORDS = {
+    "outbox.span_covered": "mark a queued conversation span as already captured",
     "owed.correct_job_origin": "ask Khipu to work out which Owed items a background job opened",
     "owed.correct_job_origin.confirm": "mark Owed items as opened by a background job, as previewed",
     "route.definition.set": "change a provider, account or lane definition",
@@ -963,7 +964,9 @@ def prepare_answer(action: str, values: dict) -> tuple[dict, str] | None:
         for item in items:
             for side in ("confirm", "undo"):
                 offered = item["settle"].get(side)
-                if not offered or offered["action"] != action or _target(offered["args"]) != _target(values):
+                same_action = offered and (offered["action"] == action or (
+                    action == "route.rule.dismiss" and offered["action"] == "route.rule.undo"))
+                if not same_action or _target(offered["args"]) != _target(values):
                     continue
                 pinned = offered["args"]
                 expected = values.get("expect")

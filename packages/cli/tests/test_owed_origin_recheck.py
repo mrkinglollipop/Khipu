@@ -42,16 +42,18 @@ def test_job_cannot_enable_its_own_direction_through_pty(origin_db, owner_prompt
     assert not ok and state == ('user', 'conversation'), (ok, out, state)
 
 
-def test_stale_session_cannot_extend_window_through_pty(origin_db, owner_prompt, monkeypatch):
+def test_old_typed_turn_confirms_without_extending_a_window_through_pty(origin_db, owner_prompt, monkeypatch):
     cid = seed(origin_db)
     _, pending = command('--request')
     owner_prompt.say(ago=7*3600)
-    assert command('--confirm', pending['request'], '--owner-direction')[1]['code'] == 'stale'
+    rc, applied = command('--confirm', pending['request'], '--owner-direction')
+    assert rc == 0 and applied['changed'] == 1, applied
     rc, output = pty_cli(monkeypatch, ['owner-direction', 'set', 'latest_window_h', '24'])
     assert rc != 0, output
-    rc, result = command('--confirm', pending['request'], '--owner-direction')
-    print('STALE_WINDOW_RESULT', rc, result.get('changed'))
-    assert rc != 0, result
+    assert owner_turns.settings()['latest_window_h'] == 6
+    with origin_db.cursor() as cur:
+        cur.execute('SELECT owner, origin FROM commitments WHERE id=%s', (cid,))
+        assert cur.fetchone() == ('agent', 'job')
 
 
 def test_correction_undo_cannot_use_fake_terminal(origin_db, monkeypatch):

@@ -1316,14 +1316,15 @@ def test_outside_t3_the_next_turn_after_the_read_settles(world):
     assert ok and _setting()["value"] is True, out
 
 
-def test_outside_t3_an_unshown_answer_is_held(world):
-    """A different conversation has to show the complete ask first."""
+def test_outside_t3_a_typed_direction_applies_the_pinned_answer(world):
+    """Native turns keep their simple direction path without a shown-read challenge."""
     _setting_request(world)
     settle = _settle("setting")
     _front_end_turn(world, "claude_code:cli", "s-terminal")
     _be_front(world, "claude_code:cli", "s-terminal")
     ok, out = _act_on(settle)
-    assert ok and out["pending"] and _setting()["value"] is False, out
+    assert ok and not out.get("pending") and _setting()["value"] is True, out
+    assert owner_direction._find(out["owner_action"])["before"]["request"]
 
 
 def test_a_second_read_in_the_same_turn_still_shows_a_forgotten_summary(world, monkeypatch):

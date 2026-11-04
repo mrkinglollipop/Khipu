@@ -197,9 +197,7 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
     environ = os.environ if env is None else env
-    session = session_of(env)
-    if not session:
-        raise DirectionRefused("no_recorded_turn", "Khipu cannot identify this conversation.")
+    session = _caller_session(environ)
     confirmed = _CONFIRMED.get()
     if confirmed is not None and confirmed["action"] == action and confirmed["stamp"]["session"] == session:
         # The replay of a held request ``confirm`` proved the owner confirmed.
@@ -599,6 +597,8 @@ def _asker(environ) -> dict:
 def _caller_session(environ) -> str:
     """The calling conversation, after the refusals that need no record."""
     session = session_of(environ)
+    if owner_turns.job_marker(environ):
+        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     if not session:
         raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't tell "
                                                    "whether the owner is in it.")

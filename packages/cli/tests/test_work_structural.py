@@ -234,12 +234,23 @@ def test_export_json_uses_projection(monkeypatch, capsys):
 
 _NORMALISERS = re.compile(r"os\.path\.(?:normpath|abspath|realpath)\(|\.resolve\(|expanduser\(")
 # The modules that take a path someone gave and read it (through safe_read).
-_READERS = ("work.py", "ledger.py", "ledger_import.py")
+_READERS = ("work.py", "ledger.py", "ledger_import.py", "owner_direction.py")
 
 
 def test_only_safe_read_parses_a_path_given_to_a_reader():
+    import ast
     for name in _READERS:
-        for number, line in enumerate((PKG / name).read_text(encoding="utf-8").splitlines(), 1):
+        text = (PKG / name).read_text(encoding="utf-8")
+        if name == "owner_direction.py":
+            # Process diagnostics normalize executable paths, not supplied file paths.
+            tree = ast.parse(text)
+            text = "\n".join(ast.get_source_segment(text, node) for node in tree.body
+                             if isinstance(node, ast.FunctionDef) and any(
+                                 isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                                 and isinstance(call.func.value, ast.Name) and call.func.value.id == "safe_read"
+                                 for call in ast.walk(node)))
+            assert text
+        for number, line in enumerate(text.splitlines(), 1):
             assert not _NORMALISERS.search(line), f"{name}:{number} parses a path itself: {line.strip()}"
     # And every module that reads through safe_read leaves the parsing to it.
     for path in PKG.glob("*.py"):
@@ -408,6 +419,7 @@ def test_an_owner_verb_refuses_a_conversation_and_a_piped_yes(monkeypatch, tmp_p
 
 
 def test_a_typed_yes_on_a_terminal_counts_as_routing_does(monkeypatch):
+    monkeypatch.setattr(routing, "_terminal_harness", lambda: None)
     monkeypatch.setattr(routing, "_caller", lambda: {"app": False, "chain": ["zsh"]})
     monkeypatch.setattr(sys, "stdin", io.StringIO("yes\n"))
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)

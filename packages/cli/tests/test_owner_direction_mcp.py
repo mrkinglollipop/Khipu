@@ -241,10 +241,8 @@ def test_a_pending_rule_confirmed_by_direction(mcp_world):
     mcp_world.server("s-1")
     revision = next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == n)
     is_error, out = _act("route.rule.confirm", {"rule": n, "expect": revision})
-    assert not is_error and out["pending"] is True and out["ask"], out
-    mcp_world.say("yes to the disclosed request", session="s-1")
-    is_error, out = _act("direction.confirm", {"request": out["request"]})
-    assert not is_error and out["ok"] is True, out
+    assert not is_error and out["ok"] is True and not out.get("pending"), out
+    assert out["owner_action"]
     (rule,) = routing.read_view()["rules"]
     assert rule["pending"] is False
 
@@ -272,10 +270,8 @@ def test_a_pending_priority_confirmed_by_direction(mcp_world):
     mcp_world.say("yes confirm it", session="s-1")
     mcp_world.server("s-1")
     is_error, out = _act("route.priority.confirm", {"expect": version})
-    assert not is_error and out["pending"] is True and out["ask"], out
-    mcp_world.say("yes to the disclosed request", session="s-1")
-    is_error, out = _act("direction.confirm", {"request": out["request"]})
-    assert not is_error and out["ok"] is True, out
+    assert not is_error and out["ok"] is True and not out.get("pending"), out
+    assert out["owner_action"]
     assert routing.read_view()["priority"]["pending"] is False
 
 
@@ -308,10 +304,8 @@ def test_a_pending_routing_setting_confirmed_by_direction(mcp_world, capsys):
     mcp_world.say("yes, confirm that change", session="s-1")
     mcp_world.server("s-1")
     is_error, out = _act("config.answer_request.confirm", {"key": "routing_stale_after"})
-    assert not is_error and out["pending"] is True and out["ask"], out
-    mcp_world.say("yes to the disclosed request", session="s-1")
-    is_error, out = _act("direction.confirm", {"request": out["request"]})
-    assert not is_error and out["ok"] is True, out
+    assert not is_error and out["ok"] is True and not out.get("pending"), out
+    assert out["owner_action"]
     assert routing._setting_requests(json.loads((mcp_world.tmp / "data" / "config.json").read_text())) == {}
 
 
@@ -332,8 +326,6 @@ def test_a_pending_account_list_change_confirmed_by_direction(mcp_world, capsys)
     mcp_world.say("yes, confirm that account list change", session="s-1")
     mcp_world.server("s-1")
     is_error, out = _act("accounts.request.confirm", {"expect": config.accounts_version()})
-    assert not is_error and out["pending"] is True and out["ask"], out
-    mcp_world.say("yes to the disclosed request", session="s-1")
-    is_error, out = _act("direction.confirm", {"request": out["request"]})
-    assert not is_error and out["ok"] is True, out
+    assert not is_error and out["ok"] is True and not out.get("pending"), out
+    assert out["owner_action"]
     assert not config.load_config().get("usage_accounts_request")
