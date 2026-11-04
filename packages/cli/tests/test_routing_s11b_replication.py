@@ -191,11 +191,36 @@ def test_12_default_off_never_constructs_transport(pair, monkeypatch):
     a, _, _ = pair
     a.activate()
     a.configure(routing_replication_live=False)
+    monkeypatch.setattr(routing, "_hub_configured", lambda: False)
     def forbidden():
         pytest.fail("disabled replication attempted a hub connection")
     monkeypatch.setattr(replication, "PostgresHub", forbidden)
     assert replication.sync()["disabled"]
     routing.poll_refold()
+
+
+def test_off_mac_touches_only_the_copy_switch_once_per_tick(pair, monkeypatch):
+    """With the copy off and a hub configured, a Mac reads one small record
+    (the copy switch) at most once a timer tick, and sends nothing else."""
+    from khipu import routing_replication as replication
+    a, _, hub = pair
+    a.activate()
+    a.configure(routing_replication_live=False)
+    routing.add_rule("local only", via="app")
+    calls = []
+
+    class Narrow(Hub):
+        def pull(self, after, until, limit):
+            calls.append("pull")
+            return super().pull(after, until, limit)
+    narrow = Narrow()
+    assert replication.sync(hub=narrow)["disabled"]
+    assert calls == ["pull"] and not narrow.calls and not narrow.rows
+    assert replication.sync(hub=narrow)["disabled"]
+    assert calls == ["pull"]
+    a.advance(300)
+    assert replication.sync(hub=narrow)["disabled"]
+    assert calls == ["pull", "pull"] and not narrow.rows
 
 
 def test_12_missing_and_path_ids_are_skipped_before_upload(pair):

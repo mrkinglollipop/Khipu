@@ -629,25 +629,31 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
-        # The legacy routing-copy key is now the one owner setting which must
-        # cross even while normal replication is off.  Its dedicated event is
-        # small, typed and harmless to older readers (they ignore its kind).
-        if request is None and key == "routing_replication_live":
-            emitted.append({"type": "settings_sync_switch", "enabled": data.get(key) is True})
-            if data.get(key) is True:
-                # First enable is a snapshot, never an implicit overwrite on
-                # the other Mac.  The receiver exposes differences first.
-                for other in SETTINGS:
-                    if settings_syncable(other):
-                        emitted.append(_setting_event(other, data.get(other, SETTINGS[other][1]), other in data,
-                                                      snapshot=True))
-        elif request is None and data.get("routing_replication_live") is True \
-                and "routing_replication_live" not in requests and settings_syncable(key):
-            emitted.append(_setting_event(key, data.get(key, SETTINGS[key][1]), key in data))
+        if request is None:
+            emitted = _sync_events(key, data, requests)
     if emitted:
         _write_many(owner_lines(emitted, "app"))
     refresh_view()  # config.json is an input of the view: the next prompt finds it current
     return config_file()
+
+
+def _sync_events(key: str, data: dict, requests: dict) -> list[dict]:
+    """What the owner's change to ``key`` sends the other Macs. The routing-copy
+    key is the one setting which must cross even while the copy is off: its
+    small typed line is ignored by older readers. Turning it on also sends a
+    snapshot of every shared setting, which the receiver lists as differences
+    rather than applying."""
+    out: list[dict] = []
+    if key == "routing_replication_live":
+        out.append({"type": "settings_sync_switch", "enabled": data.get(key) is True})
+        if data.get(key) is True:
+            for other in SETTINGS:
+                if settings_syncable(other):
+                    out.append(_setting_event(other, data.get(other, SETTINGS[other][1]), other in data, snapshot=True))
+    elif data.get("routing_replication_live") is True and "routing_replication_live" not in requests \
+            and settings_syncable(key):
+        out.append(_setting_event(key, data.get(key, SETTINGS[key][1]), key in data))
+    return out
 
 
 def setting_request_pin(key: str, waiting: dict, value) -> str:
@@ -668,6 +674,7 @@ def answer_setting_request(key: str, action: str, *, expect: str | None = None) 
 
     if action not in ("confirm", "undo"):
         raise SettingError("answer confirm or undo", "bad_answer")
+    emitted: list[dict] = []
     with _lock(), mutate_config() as data:
         from khipu import owner_direction
 
@@ -688,6 +695,11 @@ def answer_setting_request(key: str, action: str, *, expect: str | None = None) 
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
+        if action == "confirm":
+            # His yes makes the conversation's value his own: the other Macs follow it.
+            emitted = _sync_events(key, data, requests)
+    if emitted:
+        _write_many(owner_lines(emitted, "app"))
     refresh_view()
     return config_file()
 
@@ -2047,6 +2059,13 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
     # New kinds are intentionally absent from old maps, so old Macs drop them.
     "setting_set": {"key": "name", "value_json": "setting_json", "value_set": "bool", "snapshot": "bool"},
     "settings_sync_switch": {"enabled": "bool"},
+    # What waits on the owner on one Mac, and his answer given on another. The
+    # words travel only as a pending proposal's do (``proposal_text``).
+    "request_state": {"request": "id", "req_kind": frozenset({"held", "setting"}),
+                      "req_state": frozenset({"pending", "applied", "declined", "failed", "stale", "gone"}),
+                      "req_action": "id", "sig": "revision_id", "asked_at": "time", "withheld": "bool"},
+    "request_answer": {"request": "id", "req_answer": frozenset({"confirm", "decline"}), "sig": "revision_id",
+                       "answer_harness": "name", "message_sha": "revision_id"},
     "cap_set": {"account": "account", "kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
                 "purpose": frozenset({"job", "check"}), "pct": "float", "slack": "float", "usd": "float",
                 "days": "float", "n": "int", "revision": "id", "tier": "name", "sensitive_only": "bool", "until": "time"},
@@ -2360,6 +2379,9 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
                     row["text"] = text
             elif kind in _TEXT_KINDS and (not pending or proposal_text):
                 row["text"] = text
+        if kind == "request_state" and isinstance(event.get("ask"), str) and proposal_text \
+                and event.get("withheld") is not True:
+            row["ask"] = event["ask"]
         if proposal_text and isinstance(event.get("owner_request"), str):
             row["owner_request"] = event["owner_request"]
         if kind in ("rule_add", "rule_edit") and isinstance(event.get("prior_text"), str) \
@@ -2482,14 +2504,15 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
                 "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
                 "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal", "batch",
-                "batch_target", "key", "value_json")
+                "batch_target", "key", "value_json", "request", "req_kind", "req_state", "req_action",
+                "sig", "ask", "req_answer", "answer_harness", "message_sha")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
-                "witness_at", "expires_at", "reset_at", "resets_at")
+                "witness_at", "expires_at", "reset_at", "resets_at", "asked_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",
                  "batch_n", "window_mins")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
-                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt", "value_set", "enabled", "snapshot")
+                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt", "value_set", "enabled", "snapshot", "withheld")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "provider_session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -2897,6 +2920,13 @@ def _checked(data: dict) -> dict | None:
             return None
     if out["type"] == "settings_sync_switch" and not isinstance(out.get("enabled"), bool):
         return None
+    if out["type"] in ("request_state", "request_answer"):
+        shapes = _REPLICATION_FIELDS[out["type"]]
+        for field in ("request", "sig") + (("req_kind", "req_state") if out["type"] == "request_state"
+                                           else ("req_answer",)):
+            if not isinstance(out.get(field), str) or (isinstance(shapes.get(field), frozenset)
+                                                       and out[field] not in shapes[field]):
+                return None
     return out
 
 
@@ -12394,11 +12424,9 @@ def poll_interval(cfg: dict | None = None) -> float | None:
     (``routing_poll_interval``), or None when the owner turned the look off
     (0): the clock-driven refold at ``valid_until`` still runs."""
     seconds = float((cfg or settings())["routing_poll_interval"])
-    # The tiny owner-controlled copy switch is polled even while normal
-    # routing replication is off, so another Mac can turn it on (or off).
-    from khipu.routing_replication import POLL_SECONDS
+    if _replication_live():
+        from khipu.routing_replication import POLL_SECONDS
 
-    if _replication_live() or _hub_configured():
         return min(seconds, POLL_SECONDS) if seconds > 0 else POLL_SECONDS
     return seconds if seconds > 0 else None
 

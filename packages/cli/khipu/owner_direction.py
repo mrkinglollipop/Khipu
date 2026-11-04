@@ -197,8 +197,12 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
     environ = os.environ if env is None else env
-    session = _caller_session(environ)
     confirmed = _CONFIRMED.get()
+    if confirmed is not None and confirmed["action"] == action and confirmed["stamp"].get("binding") == "other_mac":
+        # The answer was typed on another of the owner's Macs and proved there
+        # (``remote_stamp``); this Mac has no conversation to ask.
+        return dict(confirmed["stamp"])
+    session = _caller_session(environ)
     if confirmed is not None and confirmed["action"] == action and confirmed["stamp"]["session"] == session:
         # The replay of a held request ``confirm`` proved the owner confirmed.
         return dict(confirmed["stamp"])
@@ -856,7 +860,19 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     return why
 
 
-def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dict, dict]:
+def remote_stamp(answer: dict) -> dict:
+    """The auth stamp for an answer the owner typed on another Mac. That Mac
+    proved his typed turn (``_proof``) before it sent the answer; this one
+    records whose turn it was and from where, and has nothing to re-prove."""
+    mac, message = answer.get("mac"), answer.get("id")
+    sha = answer.get("message_sha")
+    return {"auth": "direction", "harness": answer.get("answer_harness"), "session": f"other-mac:{mac}",
+            "turn": message, "prompt_sha256": sha, "binding": "other_mac",
+            "confirmed": {"source": "other_mac", "mac": mac, "message": message, "message_at": answer.get("written_at"),
+                          "message_sha256": sha}}
+
+
+def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict | None = None) -> tuple[dict, dict]:
     """(the held request, its confirm stamp), claimed for applying, or
     ``DirectionRefused``. Every refusal a change has runs first; then the
     proof (``_proof``). A confirm that finds no reply to the latest ask
@@ -867,7 +883,7 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
 
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
-    session = _caller_session(environ)
+    session = f"other-mac:{remote.get('mac')}" if remote else _caller_session(environ)
     try:
         with _requests_locked() as path:
             state = _load(path)
@@ -879,6 +895,12 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
             if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
+            if remote:
+                stamp = remote_stamp(remote)
+                stamp["confirmed"]["request"] = request_id
+                request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session))
+                _save(path, state, now)
+                return request, stamp
             if not reviewed_hold(request):
                 raise DirectionRefused("legacy_hold", "This old held change has no saved content to apply. Decline it or ask for it to be reissued with its full content.")
             with t3.owner_read_budget():
@@ -901,7 +923,7 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
 DECLINE_ACTION = "direction.decline"
 
 
-def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
+def decline(request_id: str, *, env=None, now: float | None = None, remote: dict | None = None) -> dict:
     """The owner's no to a held request: it is dropped and nothing changes.
     The proof a confirm needs, so a conversation can't answer for the owner
     either way; with no reply since the ask it asks again, as a confirm does."""
@@ -909,7 +931,7 @@ def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
 
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
-    session = _caller_session(environ)
+    session = f"other-mac:{remote.get('mac')}" if remote else _caller_session(environ)
     try:
         with _requests_locked() as path:
             state = _load(path)
@@ -921,8 +943,12 @@ def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
             if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can answer this request.")
-            with t3.owner_read_budget():
-                stamp = _proof(environ, session, request, now)
+            if remote:
+                stamp = remote_stamp(remote)
+                stamp["confirmed"]["request"] = request_id
+            else:
+                with t3.owner_read_budget():
+                    stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
                 raise DirectionRefused("not_confirmed", stamp.replace("direction.confirm", "direction.decline"))
@@ -952,7 +978,8 @@ _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
 _SETTLE_ERROR = "The held change was not applied."
 
 
-def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float | None = None) -> None:
+def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float | None = None,
+           state_name: str | None = None) -> None:
     """Record how an ``applying`` request ended. Only its state, the time and,
     on a failure, a fixed code and a generic message are written: never the
     action's arguments or the command's text, and no field Forget removed
@@ -963,7 +990,7 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
         for row in state["requests"]:
             if row.get("id") != request_id or row.get("state") != "applying":
                 continue
-            row.update(state="applied" if ok else "failed", settled_ts=now, settled_at=_iso(now))
+            row.update(state=state_name or ("applied" if ok else "failed"), settled_ts=now, settled_at=_iso(now))
             if not ok:
                 code = result.get("code") if isinstance(result, dict) else None
                 row.update(error_code=code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else "failed",
@@ -2648,7 +2675,9 @@ def _restore_setting(key: str, value, was_set: bool, request=None) -> None:
     from khipu import routing
     from khipu.config import mutate_config
 
+    emitted: list[dict] = []
     with routing._lock(), mutate_config() as data:
+        before = routing.settings(data).get(key)
         if was_set:
             data[key] = value
         else:
@@ -2662,6 +2691,12 @@ def _restore_setting(key: str, value, was_set: bool, request=None) -> None:
             data[routing.SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(routing.SETTINGS_REQUEST_KEY, None)
+        # An Undo is the owner's change too: the other Macs follow it.
+        if routing.settings_syncable(key) and data.get("routing_replication_live") is True \
+                and "routing_replication_live" not in requests and routing.settings(data).get(key) != before:
+            emitted.append(routing._setting_event(key, data.get(key, routing.SETTINGS[key][1]), key in data))
+    if emitted:
+        routing._write_many(routing.owner_lines(emitted, "app"))
     routing.refresh_view()  # config.json is an input of the view: the next prompt finds it current
 
 

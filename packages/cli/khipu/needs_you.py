@@ -478,6 +478,12 @@ def _quote_ask(ask) -> str:
     return f'"{_said(ask, _WORDS_MOST)}"'
 
 
+def routing_replication_label(mac) -> str:
+    from khipu import routing_replication
+
+    return routing_replication.mac_label(mac)
+
+
 def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
     """(held items, what couldn't be read). A held answer to a listed item
     settles that item, so it is not listed twice: the item's settle becomes
@@ -497,6 +503,21 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
                              "full content must be shown before it applies.",
                              by=row.get("by"), at=row.get("created_at"), undo=decline,
                              undo_does="Drops the old held request. Nothing changes."))
+            continue
+        remote = row.get("remote")
+        if remote:
+            where = routing_replication_label(remote.get("mac"))
+            said = f" It asks: {_quote_ask(row.get('ask'))}." if row.get("ask") and not remote.get("withheld") else ""
+            if remote.get("withheld"):
+                out.append(_item("held", f"held:{request}", row.get("ask") or "", by={"kind": "other_mac"}, at=row.get("created_at"),
+                                 confirm_does="Can't be answered here: answer it on " + where + ".",
+                                 undo_does="Nothing to undo here."))
+                continue
+            out.append(_item("held", f"held:{request}", f"On {where}, a conversation asked for a change, and it is "
+                             f"held until you answer.{said}", by={"kind": "other_mac", "mac": where}, at=row.get("created_at"),
+                             confirm_does=f"Tells {where} yes: it makes the change there within a few minutes.",
+                             undo_does=f"Tells {where} no: it drops the request and nothing changes.",
+                             confirm=_act("direction.confirm", request=request), undo=decline))
             continue
         placed, same_target = False, False
         for item in items:
