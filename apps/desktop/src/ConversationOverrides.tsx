@@ -55,6 +55,7 @@ function ownerLine(row: OverrideRow, now: Date): string {
 export function OverridesSection({ now, nonce = 0 }: { now: Date; nonce?: number }) {
   const [rows, setRows] = useState<OverrideRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [readFailed, setReadFailed] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [ended, setEnded] = useState<{ row: OverrideRow; action: string } | null>(null);
 
@@ -62,9 +63,9 @@ export function OverridesSection({ now, nonce = 0 }: { now: Date; nonce?: number
     const res = await callCli<OverridesAnswer>("khipu_route_override_view");
     if (res.ok && Array.isArray(res.data.overrides)) {
       setRows(res.data.overrides);
-      setError(null);
+      setReadFailed(false);
     } else {
-      setError("Khipu couldn't read the conversations that may run ahead.");
+      setReadFailed(true);
     }
   }, []);
   useEffect(() => { void load(); }, [load, nonce]);
@@ -131,7 +132,9 @@ export function OverridesSection({ now, nonce = 0 }: { now: Date; nonce?: number
           </ul>
         ) : rows ? (
           <p className="set-help">No conversation is allowed to run ahead right now.</p>
-        ) : error ? null : (
+        ) : readFailed ? (
+          <p className="set-help">Khipu couldn't read the conversations that may run ahead.</p>
+        ) : (
           <p className="set-help">Reading…</p>
         )}
         {ended ? (
@@ -165,6 +168,7 @@ export function settleCall(item: WalkItem): { command: string; args: Record<stri
 export function CleanUpWalk({ onChanged }: { onChanged?: () => void }) {
   const [walk, setWalk] = useState<Walk | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [readFailed, setReadFailed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [started, setStarted] = useState(false);
   const headRef = useRef<HTMLHeadingElement>(null);
@@ -173,9 +177,9 @@ export function CleanUpWalk({ onChanged }: { onChanged?: () => void }) {
     const res = await callCli<Walk>("khipu_route_cleanup_walk", args);
     if (res.ok && typeof res.data.total === "number") {
       setWalk(res.data);
-      setError(null);
+      setReadFailed(false);
     } else {
-      setError(res.ok ? "Khipu couldn't read the clean-up." : res.error);
+      setReadFailed(true);
     }
   }, []);
   useEffect(() => { void read(); }, [read]);
@@ -207,7 +211,7 @@ export function CleanUpWalk({ onChanged }: { onChanged?: () => void }) {
           and you can stop and come back.
         </p>
         {!walk ? (
-          error ? null : <p className="set-help">Reading…</p>
+          <p className="set-help">{readFailed ? "Khipu couldn't read the clean-up." : "Reading…"}</p>
         ) : !item ? (
           <p className="set-help cleanup-done">Nothing to tidy up.</p>
         ) : !started ? (

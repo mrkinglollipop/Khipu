@@ -3052,6 +3052,11 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
     help: "The nightly run removes it; a conversation that comes back starts a fresh one.",
     fields: [{ key: "routing_ledger_keep_days", label: "Remove after", unit: "days", options: [3, 7, 14, 30, 90, 0], zero: "Never" }],
   },
+  {
+    name: "Keep the record of an ended conversation override for",
+    help: "An override still in force is never removed.",
+    fields: [{ key: "routing_override_log_keep_days", label: "Keep for", unit: "days", options: [7, 14, 30, 90, 0], zero: "Forever" }],
+  },
 ];
 
 /** "11 settings, 2 changed from the default", from the values Khipu read. */
