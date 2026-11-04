@@ -70,7 +70,7 @@ from khipu import routing
 
 ARCHIVE_DIR = "archive"
 STATE_NAME = "compaction.json"
-GENERATION_TYPE = "_routing_compaction_generation"
+GENERATION_TYPE = routing.COMPACTION_GENERATION_TYPE
 
 # Compaction starts on its own here. At a line a minute a compacted log holds
 # about 1,700 lines plus the owner's, which never go: two days of samples, half a

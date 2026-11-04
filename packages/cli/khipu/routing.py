@@ -75,6 +75,7 @@ from khipu.routing_generation import SCHEMA
 
 STATE_DIR = ("state", "routing")
 EVENTS_NAME = "events.jsonl"
+COMPACTION_GENERATION_TYPE = "_routing_compaction_generation"
 VIEW_NAME = "view.json"
 LOCK_NAME = "routing.lock"
 CHANGES_KEPT = 100
@@ -2293,7 +2294,8 @@ def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = No
     """Enrich new lines only. All append paths, including seeds and account
     transactions, pass here while holding the routing lock."""
     observed = _read_all_events()[0] if observed is None else observed
-    history = _in_write_order(observed) if ordered is None else ordered
+    observed = [e for e in observed if e.get("type") != COMPACTION_GENERATION_TYPE]
+    history = _in_write_order(observed) if ordered is None else [e for e in ordered if e.get("type") != COMPACTION_GENERATION_TYPE]
     mac = _mac_locked()
     clocks = [e["hlc"] for e in [*observed, *history] if e.get("hlc")]
     clocks += [{"wall": max(0, int(at.timestamp() * 1000)), "counter": 0, "mac": "legacy"}
@@ -2815,7 +2817,7 @@ def _line_event(raw: bytes, *, identity_only: bool = False) -> dict | None:
         return None
     if not isinstance(data, dict) or not isinstance(data.get("type"), str):
         return None
-    if identity_only and data["type"] not in _IDENTITY_KINDS:
+    if identity_only and data["type"] not in _IDENTITY_KINDS and data["type"] != COMPACTION_GENERATION_TYPE:
         # Keep ordering slots around old unsequenced identity events. The
         # identity fold needs no evidence body or timestamp normalization.
         seq = data.get("seq")
@@ -2929,7 +2931,8 @@ def _read_event_lines(identity_only: bool = False) -> tuple[list[dict], int]:
         if event is None:
             bad += 1
             continue
-        events.append(event)
+        if event.get("type") != COMPACTION_GENERATION_TYPE:
+            events.append(event)
     _PARSED_LINE_CACHE[identity_only] = (path, data, tuple(events), bad)
     cache[key] = (events, bad)
     return events, bad
@@ -3020,6 +3023,7 @@ def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None 
     line written ahead, then a right clock) keeps its own time, and the fold
     orders the lines as in phase 1a."""
     events = _read_all_events()[0] if events is None else events
+    events = [e for e in events if e.get("type") != COMPACTION_GENERATION_TYPE]
     mac = _mac_locked()
     legacy_mac = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
     if legacy_mac is None:
@@ -3870,7 +3874,7 @@ def _record_times(events: list[dict]) -> tuple[list[datetime | None], list[datet
     make two lines agree on that time, and the fold would keep it and lift
     every correct line after it. Doctor names copied lines by their clock's
     reading (``clock_at``), not here."""
-    raw = [_parse(e.get("written_at")) for e in events]
+    raw = [None if e.get("type") == COMPACTION_GENERATION_TYPE else _parse(e.get("written_at")) for e in events]
     copied = [_copied(e) for e in events]
     fixed, behind, ahead = _write_order_times([None if c else t for t, c in zip(raw, copied)])
     before: datetime | None = None
@@ -3886,6 +3890,7 @@ def _in_write_order(events: list[dict]) -> list[dict]:
     """Settle each Mac's timestamps, then order the event set by HLC.
     Unstamped history retains its local order and gets derived revisions;
     legacy origin markers keep later replication from changing that origin."""
+    events = [e for e in events if e.get("type") != COMPACTION_GENERATION_TYPE]
     operations_salt = _id_salt(operations=True) if any(not e.get("mac") and not e.get("_revision") for e in events) else None
     origin = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
     origin = origin or next((event_identity.legacy_mac(e, operations_salt=operations_salt)
