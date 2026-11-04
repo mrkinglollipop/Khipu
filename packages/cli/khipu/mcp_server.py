@@ -1145,7 +1145,7 @@ TOOLS: list[dict] = [
             "route.override.grant (account, request, until or indefinite, optional ceiling_pct, window, helpers false, "
             "whole_folder true) lets this conversation, which Khipu names itself, run ahead of pace on an account; "
             "route.override.end and route.override.keep take the override's id. Reads, no change: route.overrides.mine "
-            "(what this conversation hears) and route.walkthrough (the next priority clean-up item in plain words, "
+            "(what this conversation hears) and route.walkthrough (the next priority clean-up item, "
             "one yes settles it; leave, keep or restart are its bookmark)."
         ),
         "inputSchema": {

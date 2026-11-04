@@ -1051,6 +1051,7 @@ const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_runner_limited_lines",
     "routing_busy_tries",
     "routing_ledger_keep_days",
+    "routing_override_log_keep_days",
 ];
 /// Numbers of 0 or more, a fraction allowed (a percentage).
 const ROUTING_NUMBER_KEYS: &[&str] = &["routing_slow_read_pct", "routing_busy_load"];

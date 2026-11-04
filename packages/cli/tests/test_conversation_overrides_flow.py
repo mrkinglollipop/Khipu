@@ -248,3 +248,22 @@ def test_only_the_app_lists_every_override_and_in_plain_words(world, khipu_app, 
     assert cli.main(["route", "override", "end", row["id"], "--from-app"]) == 0
     ended = json.loads(capsys.readouterr().out)
     assert ended["ok"] is True and ended["owner_action"] and _mine() == []
+
+
+def test_the_apps_walk_read_has_the_shape_the_screen_uses(messy, khipu_app, capsys):
+    capsys.readouterr()
+    assert cli.main(["route", "override", "walk", "--from-app"]) == 2
+    capsys.readouterr()
+    khipu_app.as_app()
+    assert cli.main(["route", "override", "walk", "--from-app"]) == 0
+    walk = json.loads(capsys.readouterr().out)
+    item = walk["item"]
+    assert {"code", "key", "words", "yes", "number", "of", "came_back", "settle"} <= set(item)
+    assert item["settle"]["confirm"]["action"] == "route.priority.amend"
+    assert set(item["settle"]["confirm"]["args"]) == {"account", "end_exception", "expect"}
+    # The app's leave and the app's one-click end of that exception.
+    assert cli.main(["route", "override", "walk", "--from-app", f"--leave={item['key']}"]) == 0
+    assert json.loads(capsys.readouterr().out)["left_for_later"] == 1
+    args = item["settle"]["confirm"]["args"]
+    assert cli.main(["route", "priority", "--from-app", "amend", args["account"], f"--end-exception={args['end_exception']}",
+                     f"--expect={args['expect']}"]) == 0
