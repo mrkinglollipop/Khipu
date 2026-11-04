@@ -4,16 +4,14 @@ The third way past an owner gate, beside the app and a yes typed on a
 terminal (scope: docs/plans/2026-10-16-owner-direction.md, section 2). A
 conversation submits the structured action (``khipu_owner_act``, or
 ``--owner-direction`` on the owner command) and it applies. The one check
-(``check``) is where the request comes from: a conversation where Khipu's own
-prompt hook recorded an owner turn within the window (``owner_turns``), whose
-hook ran above this call. That keeps background jobs, dispatched jobs and
-unattended conversations from making owner changes on their own. Nothing
-here reads the owner's words or calls a model: this is a permission decision.
+(``check``) is where the request comes from: a conversation with a recorded
+typed owner message (``owner_turns``, or T3's message rows). Held changes use
+a message after their ask, with no reply-age limit. Nothing here reads the
+owner's words or calls a model.
 
 The session is never an argument: it is read from the calling process's
-environment, as ``routing.conversation_author`` reads it, and the turn's
-hook must be an ancestor of the call, so a session id set by hand in another
-process does not pass.
+environment, as ``routing.conversation_author`` reads it. Interpretation of
+the owner's direction and same-user code remain outside this gate.
 
 Every owner action through a gate (the app, a terminal, a direction) is a
 line in ``<data dir>/owner-actions.jsonl`` with what it changed; a direction
@@ -102,7 +100,18 @@ ACTIONS: frozenset[str] = frozenset({
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
     "project.separate", "forget.send", "forget.here", "forget.not_same", "outbox.merge_preferences",
+    "outbox.span_covered",
 })
+
+# Actions a recent owner turn does not make: ``khipu_owner_act`` always holds
+# them with this question, and the command's ``--owner-direction`` passes only
+# in the replay of a request ``confirm`` proved he answered (``replaying``).
+CONFIRM_ONLY: dict[str, str] = {
+    "outbox.span_covered": ("Retire the dead outbox jobs `khipu outbox span-covered` counts? Each has a live episode "
+                            "whose range contains its own and which holds every evidence field it carries. Summaries "
+                            "are not compared and a range does not prove the same text, so each job's own summary "
+                            "then stays only in the local record; nothing is written to the hub."),
+}
 
 # Routing changes that apply as soon as the owner types them (2026-11-03, owner
 # decision): account priority and its exceptions, standing rules, the note,
@@ -115,6 +124,25 @@ ROUTING_INSTANT: frozenset[str] = frozenset({
     "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
     "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.amend", "route.priority.confirm",
     "route.priority.undo",
+})
+
+
+# Every action ``khipu_needs_you`` offers to settle something on the list.
+SETTLE_ACTIONS: frozenset[str] = frozenset({
+    "route.priority.confirm", "route.priority.undo", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
+    "route.rule.retire", "config.answer_request.confirm", "config.answer_request.undo", "accounts.request.confirm",
+    "accounts.request.undo", "route.tier_table.confirm", "route.tier_table.set", "route.tier_table.clear",
+    "owed.correct_job_origin.confirm", "project.merge", "project.keep_separate", "forget.send", "forget.here",
+    "forget.not_same", "direction.acknowledge", "route.hold.end", "route.clear", "route.cap.set",
+})
+# The routing changes that answer a request waiting on the owner, not a change
+# of his own. His typed message can be the direction for a change of his own;
+# an answer needs him to have been shown what it answers, so in T3 it applies at
+# once only on a message newer than an ask in that thread showing it
+# (``_shown_read``). A conversation's own request applied on the owner's turn
+# (``REQUEST_APPLIED``) is the change he typed, and stays as it was.
+ANSWER_ACTIONS: frozenset[str] = frozenset({
+    "route.priority.confirm", "route.priority.undo", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
 })
 
 
@@ -155,21 +183,12 @@ def _title(name: str) -> str:
 # ---- the check ---------------------------------------------------------------------------
 
 
-def check(action: str, *, env=None, now: float | None = None, instant: bool = False) -> dict:
-    """The owner-direction check (scope section 2): the auth stamp for the
-    record, or ``DirectionRefused``. The one test is where the request comes
-    from: a conversation the owner typed in recently, where Khipu's own
-    prompt hook recorded an eligible owner turn within the window
-    (``latest_window_h``, 6 hours by default), and whose hook ran above this call. A background job, a
-    dispatched job or a conversation nobody has typed in lately is refused.
-    Nothing here reads what the owner said, and nothing calls a model.
+def check(action: str, *, env=None, now: float | None = None, instant: bool = False, reading: bool = False) -> dict:
+    """A recorded owner turn in this conversation, or the replay of its answer.
 
-    ``instant`` (a routing change, ``instant_allowed``): the stamp carries the
-    evidence the change relied on (``instant``), and a T3 conversation, whose
-    turns never count directly, applies it at once when T3's own record proves
-    a message the owner typed since this conversation was last asked about
-    (``_instant_t3``: the proof a confirm uses, against that earlier ask).
-    Without that proof it is held as before."""
+    T3 uses its owner-message rows. Native fronts use their recorded typed
+    turns. Reading only reports capability; it never applies a change.
+    """
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
     now = _clock() if now is None else now
@@ -178,20 +197,7 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
     environ = os.environ if env is None else env
-    session = session_of(env)
-    if owner_turns.job_marker(environ):
-        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
-    # Lineage markers outside T3; a T3 turn is decided by T3's record below.
-    lineage_job = owner_turns.dispatched_job(environ, session)
-    if not session:
-        raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't tell "
-                                                   "whether the owner is in it.")
-    if len(_sessions_named(env)) > 1:
-        # A job started from a conversation keeps the conversation's id
-        # beside its own: which one is asking can't be told.
-        raise DirectionRefused("no_recorded_turn", "This call names more than one conversation, so Khipu can't tell "
-                                                   "whether the owner is in the one asking. Ask the owner to say it "
-                                                   "in the conversation they are typing in.")
+    session = _caller_session(environ)
     confirmed = _CONFIRMED.get()
     if confirmed is not None and confirmed["action"] == action and confirmed["stamp"]["session"] == session:
         # The replay of a held request ``confirm`` proved the owner confirmed.
@@ -207,25 +213,13 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
             # T3's own record decides whether it is a job (``_t3_bound``).
             with t3.owner_read_budget():
                 _t3_bound(environ, session, now)
-                stamp = _instant_t3(environ, session, now) if instant else None
+                stamp = _instant_t3(environ, session, now, action) if instant else None
             if stamp is not None:
                 return stamp
             raise DirectionRefused("confirm_needed", _HOLD_WHY) from None
-        if lineage_job:
-            raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY) from None
         raise
-    # A turn recorded before the T3 child test existed carries no mark, so a
-    # T3 turn is looked at again here; outside T3 the lineage markers stand.
-    if turn.get("entrypoint") == "t3":
-        with t3.owner_read_budget():
-            why = owner_turns.dispatched_job(environ, session, t3_thread=True)
-        if why:
-            if _t3_lookup_failed(why):
-                raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
-            raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
-    elif lineage_job:
-        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
-    _from_the_hook(turn)
+    if not reading and action in SETTLE_ACTIONS and not REQUEST_APPLIED.get():
+        _not_the_reading_turn(session, turn)
     stamp = {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
              "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
              "binding": "session" if turn.get("harness") in owner_turns.SESSION_ONLY_HARNESSES else "hook"}
@@ -236,8 +230,7 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
 
 
 def _recent_turn(session: str, conf: dict, now: float, recorded: list[dict] | None = None) -> dict:
-    """The session's latest eligible owner turn, when it is inside the window
-    (``recorded``: the session's turns already read)."""
+    """The latest recorded eligible typed turn; an answer has no age cutoff."""
     recorded = owner_turns.turns(session, now) if recorded is None else recorded
     usable = [t for t in recorded if owner_turns.eligible(t, conf)[0]]
     if not usable:
@@ -253,11 +246,6 @@ def _recent_turn(session: str, conf: dict, now: float, recorded: list[dict] | No
                                "(a background or dispatched job never can). Ask the owner to say it in a "
                                "conversation they are typing in.")
     turn = usable[-1]
-    if now - _float(turn.get("ts")) > conf["latest_window_h"] * 3600:
-        raise DirectionRefused("stale",
-                               f"The owner has not typed in this conversation for over {conf['latest_window_h']:g} hours, "
-                               "so it can't make an owner's change now. It works again once the owner sends a "
-                               "message here.")
     return turn
 
 
@@ -302,31 +290,13 @@ def _t3_lookup_failed(why: str | None) -> bool:
 
 
 def _t3_refusals(environ, session: str) -> str:
-    """This conversation's T3 thread, after the refusals T3's own record
-    decides: an unreadable or ambiguous record, and a job or a delegated
-    child thread, are refused. A failed lookup says Khipu could not read
-    T3's record (try again); "dispatched job" only when the evidence shows one."""
-    thread = _t3_thread_of(session)
-    why = owner_turns.dispatched_job(environ, session, t3_thread=True)
-    if why:
-        if _t3_lookup_failed(why):
-            raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
-        raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
-    return thread
+    return _t3_thread_of(session)
 
 
 def _t3_bound(environ, session: str, now: float) -> tuple[str, dict]:
-    """(T3 thread, the hook turn binding this call to it): ``_t3_refusals``,
-    and a turn T3's prompt hook recorded above this call, which a change or
-    a hold needs (a confirm is proved by T3's record, ``_proof``)."""
-    thread = _t3_refusals(environ, session)
-    usable = [t for t in owner_turns.turns(session, now) if _usable_t3_turn(t)]
-    if not usable:
-        raise DirectionRefused("no_recorded_turn",
-                               "The owner has not typed in this conversation, so it can't make an owner's change "
-                               "(a background or dispatched job never can).")
-    _from_the_hook(usable[-1])
-    return thread, usable[-1]
+    thread = _t3_thread_of(session)
+    recorded = owner_turns.turns(session, now)
+    return thread, recorded[-1] if recorded else {}
 
 
 # ---- held requests and the owner's confirmation ---------------------------------------------
@@ -336,35 +306,16 @@ def _t3_bound(environ, session: str, now: float) -> tuple[str, dict]:
 # it. The confirm is made during the agent turn the owner's reply started,
 # so that turn is what is proved, never a search of stored turns:
 #
-# - outside T3, the session's latest recorded row of any kind must be an
-#   eligible turn (on a trusted front end, inside the window, recorded by
-#   the hook above this call; a copy stands in for its original only as
-#   ``_current_turn`` says), later than the latest ask Khipu recorded for
-#   this conversation, never a late record (``_late_copy``), and none of the
-#   turns that ask excludes; in Antigravity its words must not be any the
-#   conversation had said when asked (``ag_words``);
-# - in T3, the call must come from the conversation's harness (its latest
-#   hook turn, of any kind, was recorded by the hook above this call, and
-#   its issuer traces to the T3 Code app), that turn must be typed, T3 must
-#   still be a trusted front end, and T3's record must hold an owner message
-#   the thread's ask snapshot does not.
-#
-# Every time Khipu tells the agent to ask (the hold, and a confirm that finds
-# no reply) it records an ask boundary for that conversation on the request:
-# in T3 what the thread held (``t3_snapshots``, by thread), elsewhere Khipu's
-# time and the ids and occurrences of the turns already recorded (``asks``,
-# by session). Each boundary names the conversations that made it (``by``),
-# and is only ever grown from the same read that found no reply, never
-# replaced (``_bounded``). No codes, and the owner's words are never read.
+# A reply is a typed turn after the ask: a T3 owner-message row, or a native
+# prompt-hook row. There is no hash equality, process ancestry, word-matching,
+# global message quota or reply-age challenge. Re-reading the same pinned
+# answers leaves the existing ask boundary alone.
 
 REQUESTS_NAME = "owner-requests.json"
 _REQUESTS_KEPT_S = 30 * 24 * 3600  # settled requests; a pending or applying one is never dropped
-# The most turn ids, occurrences or T3 message ids one ask boundary keeps.
-_BOUNDARY_MOST = 200
 _CONFIRMED: contextvars.ContextVar[dict | None] = contextvars.ContextVar("khipu_owner_confirmed", default=None)
-# Set while a conversation's own request is being applied at once on the
-# owner's turn (``owner_act.apply_request``): the log line says so, and its
-# Undo takes the whole request back rather than returning it pending.
+# Marks a conversation's own request so it applies on the owner's turn.
+# The log names the instant application; Undo takes the whole request back.
 REQUEST_APPLIED: contextvars.ContextVar[bool] = contextvars.ContextVar("khipu_request_applied", default=False)
 
 
@@ -408,7 +359,8 @@ def _read_requests(path: Path) -> list[dict]:
 
 def _save(path: Path, state: dict, now: float) -> None:
     kept = [r for r in state["requests"]
-            if r.get("settled_ts") is None or now - _float(r.get("settled_ts")) < _REQUESTS_KEPT_S]
+            if r.get("settled_ts") is None or r.get("action") == READ_ACTION
+            or now - _float(r.get("settled_ts")) < _REQUESTS_KEPT_S]
     _write_private(path, json.dumps({"requests": kept, "erased": state["erased"]}, ensure_ascii=False,
                                     sort_keys=True) + "\n")
 
@@ -419,14 +371,168 @@ def ask_line(action: str, args: dict) -> str:
     return f"Confirm {action}" + (f" ({what})" if what else "") + "?"
 
 
+# ---- the list as an ask ---------------------------------------------------------------------------
+#
+# Reading ``khipu_needs_you`` is what puts the question to the owner, so it is an
+# ask boundary like a hold's: what he typed before it, the question included,
+# is no reply to it. It is kept as a row of its own (state ``shown``, under the requests lock,
+# Forget's scan and the 30-day retention like any settled row) with the
+# signature of each answer the read showed whole.
+
+READ_ACTION = "needs_you.read"
+# The action being answered, as ``owner_act.act`` was asked for it, through to
+# the owner gate the command reaches: never from an argument.
+ANSWERING: contextvars.ContextVar[str | None] = contextvars.ContextVar("khipu_answering", default=None)
+_SAME_TURN = ("Not done: this is the same turn that read what is waiting, so the owner has not answered yet, and "
+              "nothing was changed. Show them the words, and call this after they reply.")
+
+
+def signature(action: str, args: dict) -> str:
+    return _sha(json.dumps({"action": action, "args": args}, sort_keys=True, default=str))[:24]
+
+
+def _read_rows() -> list[dict]:
+    try:
+        return sorted((r for r in _read_requests(requests_path()) if r.get("action") == READ_ACTION),
+                      key=lambda r: _float(r.get("settled_ts")), reverse=True)
+    except (OSError, ValueError):
+        return []
+
+
+def _shown_read(thread: str, answer: str | None) -> dict | None:
+    """The read in this T3 thread that showed ``answer``, when one did."""
+    for row in _read_rows():
+        if _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
+            return row if answer and answer in (row.get("shown") or []) else None
+    return None
+
+
+def _not_the_reading_turn(session: str, turn: dict) -> None:
+    """Outside T3: an answer is refused in the turn that read the list. An
+    agent that never read it has nothing to be compared with, and passes."""
+    for row in _read_rows():
+        boundary = (row.get("asks") or {}).get(session) if row.get("session") == session else None
+        if boundary is not None and not _after_ask(turn, boundary):
+            raise DirectionRefused("not_confirmed", _SAME_TURN)
+
+
+def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | None:
+    """Record that this conversation was just given the list: the ask boundary
+    for the conversation and the requests it showed. None
+    when it is recorded, or when this call could never settle anything anyway
+    (a job, a child thread, no conversation to name); otherwise why not, and
+    the list then offers no settle."""
+    from khipu import t3
+
+    now = _clock() if now is None else now
+    environ = os.environ if env is None else env
+    try:
+        session = _caller_session(environ)
+        with _requests_locked() as path, t3.owner_read_budget():
+            turns_ = owner_turns.turns(session, now)
+            in_t3 = any(t.get("entrypoint") == "t3" for t in turns_)
+            if not in_t3 and owner_turns.dispatched_job(environ, session):
+                return None
+            thread = _t3_bound(environ, session, now)[0] if in_t3 else None
+            read = _t3_read(thread, (), None) if in_t3 else None
+
+            def grown(row: dict) -> None:
+                if in_t3:
+                    boundaries = row.get("t3_snapshots")
+                    if not isinstance(boundaries, dict):
+                        boundaries = row["t3_snapshots"] = {}
+                    boundaries[thread] = _t3_boundary(boundaries.get(thread), read, session)
+                else:
+                    boundaries = row.get("asks")
+                    if not isinstance(boundaries, dict):
+                        boundaries = row["asks"] = {}
+                    boundaries[session] = _ask_boundary(boundaries.get(session), turns_, now, session)
+
+            state = _load(path)
+            mine = next((r for r in state["requests"]
+                         if r.get("action") == READ_ACTION and r.get("session") == session), None)
+            previous = set((mine or {}).get("shown") or [])
+            def same(answer: str) -> bool:
+                return answer in previous
+            for row in state["requests"]:
+                answer = signature("direction.confirm", {"request": row.get("id")})
+                if row.get("state") == "pending" and answer in shown and not same(answer):
+                    grown(row)
+            if mine is None:
+                mine = {"id": "read-" + secrets.token_hex(6), "action": READ_ACTION, "state": "shown",
+                        "session": session, "created_ts": now, "created_at": _iso(now)}
+                state["requests"].append(mine)
+            if not all(same(v) for v in shown):
+                grown(mine)
+            mine["shown"] = sorted(previous | set(shown))
+            mine.update(settled_ts=now, settled_at=_iso(now))
+            _save(path, state, now)
+    except DirectionRefused as refused:
+        if refused.code == "t3_unreadable":
+            return refused.message
+        return None
+    except (OSError, ValueError):
+        return "Khipu can't write down that this list was shown."
+    return None
+
+
+def _seed(thread: str | None, session: str, answer: str) -> dict | None:
+    """The boundary of the read that showed ``answer``: a hold made after the
+    owner replied to that read starts from it, so his one yes counts."""
+    for row in _read_rows():
+        if thread is not None and _t3_parts((row.get("t3_snapshots") or {}).get(thread)) is not None:
+            return ({"t3_snapshots": {thread: json.loads(json.dumps(row["t3_snapshots"][thread]))}}
+                    if answer in (row.get("shown") or []) else None)
+        if thread is None and row.get("session") == session and _ask_parts((row.get("asks") or {}).get(session)):
+            return ({"asks": {session: json.loads(json.dumps(row["asks"][session]))}}
+                    if answer in (row.get("shown") or []) else None)
+    return None
+
+
+def reviewed_hold(request: dict) -> bool:
+    """Whether the held input includes the content required for replay."""
+    args, files = request.get("args"), request.get("files")
+    if not isinstance(args, dict):
+        return False
+    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(request.get("action"))
+    return not key or not args.get(key) or (isinstance(files, dict) and str(args[key]) in files)
+
+
+def _review_files(action: str, args: dict) -> dict:
+    key = {"ledger.import": "file", "owed.tidy": "plan"}.get(action)
+    if not key or not args.get(key):
+        return {}
+    from khipu import safe_read
+    from khipu.redact import redact_secrets
+    try:
+        raw, _ = safe_read.read_file(args[key])
+        text = raw.decode("utf-8")
+        json.loads(text)
+        if redact_secrets(text, force=True)[1]:
+            raise ValueError("The complete file cannot be disclosed safely in one ask.")
+    except (OSError, ValueError, safe_read.Refused) as err:
+        raise DirectionRefused("file_unreviewable", f"The file cannot be reviewed completely: {err}") from None
+    return {str(args[key]): {"text": text, "sha256": _sha(text)}}
+
+
+def reviewed_file(path) -> bytes | None:
+    """The immutable bytes disclosed by this held action, never a later path read."""
+    replay = _CONFIRMED.get() or {}
+    files = replay.get("files") or {}
+    item = files.get(str(path))
+    if item is None:
+        return None
+    if _sha(item["text"]) != item["sha256"]:
+        raise DirectionRefused("file_changed", "The reviewed file snapshot is damaged; ask again.")
+    return item["text"].encode("utf-8")
+
+
 def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: str | None = None) -> dict:
     """Hold ``action`` with its checked ``args`` for the owner to confirm.
     ``ask`` is the question to put to the owner when the plain one
     (``ask_line``) would leave out what the yes also covers.
-    Only a conversation that passes every refusal but the owner's
-    confirmation can hold one: a job, a child thread or a call its
-    conversation's hook did not record is refused as for a change. The
-    admission and the save run under the requests lock Forget takes, and a
+    The caller must identify a conversation with a recorded typed turn.
+    Admission and the save run under the requests lock Forget takes, and a
     Forget since the hold began (``erased``) refuses it."""
     from khipu import t3
 
@@ -437,6 +543,10 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
     session = _caller_session(environ)
+    files = _review_files(action, args)
+    if files:
+        ask = (ask or ask_line(action, args)) + " Reviewed file contents: " + " ".join(
+            f"{name} (sha256 {item['sha256']}): {item['text']}" for name, item in files.items())
     try:
         erased = _load(requests_path())["erased"]
         with _requests_locked() as path:
@@ -445,7 +555,9 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             if any(t.get("entrypoint") == "t3" for t in turns_):
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
-                    extra["t3_snapshots"] = {thread: _t3_boundary(None, _t3_read(thread, (), None), session)}
+                    seeded = _seed(thread, session, signature(action, args))
+                    extra = {**seeded, "seeded": True} if seeded else {
+                        "t3_snapshots": {thread: _t3_boundary(None, _t3_read(thread, (), None), session)}}
             else:
                 if owner_turns.dispatched_job(environ, session):
                     raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
@@ -454,11 +566,12 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
                     raise DirectionRefused("no_recorded_turn",
                                            "The owner has not typed in this conversation, so it can't ask for an "
                                            "owner's change (a background or dispatched job never can).")
-                _from_the_hook(usable[-1])
-                extra["asks"] = {session: _ask_boundary(None, turns_, now, session)}
+                seeded = _seed(None, session, signature(action, args))
+                extra = {**seeded, "seeded": True} if seeded else {
+                    "asks": {session: _ask_boundary(None, turns_, now, session)}}
             request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
-                       "created_ts": now, "created_at": _iso(now), "session": session,
-                       "ask": ask or ask_line(action, args), **extra}
+                       "created_ts": now, "created_at": _iso(now), "session": session, "by": _asker(environ),
+                       "ask": ask or ask_line(action, args), "files": files, **extra}
             state = _load(path)
             if state["erased"] != erased:
                 raise DirectionRefused("forgotten", "Khipu forgot this conversation's words while the request was "
@@ -472,22 +585,24 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
     return request
 
 
+def _asker(environ) -> dict:
+    """Who is holding a request, for the owner's list: the harness and
+    project routing's author stamp names. Forget removes it with the words."""
+    from khipu import routing
+
+    by = routing.conversation_author(environ)
+    return {k: by[k] for k in ("kind", "harness", "project", "session") if by.get(k)}
+
+
 def _caller_session(environ) -> str:
     """The calling conversation, after the refusals that need no record."""
+    session = session_of(environ)
     if owner_turns.job_marker(environ):
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
-    session = session_of(environ)
     if not session:
         raise DirectionRefused("no_recorded_turn", "Khipu can't tell which conversation this is, so it can't tell "
                                                    "whether the owner is in it.")
-    if len(_sessions_named(environ)) > 1:
-        raise DirectionRefused("no_recorded_turn", "This call names more than one conversation, so Khipu can't tell "
-                                                   "whether the owner is in the one asking.")
     return session
-
-
-_ASK_LIMIT = ("This request has been asked about in this conversation more often than Khipu can keep track of, "
-              "so nothing was changed. Ask for the change again with khipu_owner_act, which holds a fresh request.")
 
 
 def _entries(raw, width: int) -> list[list]:
@@ -513,11 +628,7 @@ def _entries(raw, width: int) -> list[list]:
 
 
 def _bounded(entries: list[list], since: float | None, *, keep_ties: bool = False) -> list[list]:
-    """``entries`` (``[*key, ts]``, old ones first) as one set, newest first,
-    at most ``_BOUNDARY_MOST``. Only an entry the boundary's time already
-    excludes (dated at or before ``since``; before it with ``keep_ties``) is
-    ever left out; when the bound would drop any other, ``DirectionRefused``
-    instead of forgetting it."""
+    """Keep the recorded ask entries without an artificial message-count limit."""
     best: dict[tuple, list] = {}
     for entry in entries:
         key, ts = tuple(entry[:-1]), entry[-1]
@@ -525,10 +636,7 @@ def _bounded(entries: list[list], since: float | None, *, keep_ties: bool = Fals
         if have is None or (have[-1] is not None and (ts is None or ts > have[-1])):
             best[key] = list(entry)
     ordered = sorted(best.values(), key=lambda e: (e[-1] is not None, -(e[-1] or 0.0)))
-    dropped = ordered[_BOUNDARY_MOST:]
-    if any(e[-1] is None or since is None or e[-1] > since or (keep_ties and e[-1] == since) for e in dropped):
-        raise DirectionRefused("ask_limit", _ASK_LIMIT)
-    return ordered[:_BOUNDARY_MOST]
+    return ordered
 
 
 def _makers(boundary) -> list[str]:
@@ -564,103 +672,13 @@ def _ask_boundary(old, turns_: list[dict], now: float, session: str) -> dict:
     copies_in += [[t["prompt_sha256"], t["occurrence"], _float(t.get("ts"))] for t in turns_
                   if isinstance(t.get("prompt_sha256"), str) and type(t.get("occurrence")) is int]
     out = {"by": session, "ts": since, "turns": _bounded(turns_in, since), "copies": _bounded(copies_in, since)}
-    has_words = isinstance(old, dict) and _AG_WORDS in old
-    if has_words or any(t.get("harness") == "antigravity" for t in turns_):
-        words = _ag_words(old) if has_words else set()
-        if words is None:
-            raise DirectionRefused("ask_limit", _ASK_LIMIT)
-        words |= {t["prompt_sha256"] for t in turns_ if isinstance(t.get("prompt_sha256"), str)}
-        if len(words) > _BOUNDARY_MOST:
-            raise DirectionRefused("ask_limit", _ASK_LIMIT)
-        out[_AG_WORDS] = sorted(words)
     return out
 
 
-# Antigravity's turn identity is its words. Its step numbers are not stable
-# (a submit-time row and its flushed step can disagree, a transcript can be
-# renumbered, a turn's model calls repeat its PreInvocation), and a turn read
-# again is a new row with a new id and occurrence. So an Antigravity ask
-# boundary keeps the prompt hash of every turn the conversation had recorded
-# when it was asked (``ag_words``), with no time: the 24 h prune never drops
-# them, refreshes only add to them, and the cap refuses. A reply whose words
-# were said before the question never confirms; a boundary saved before it
-# kept them (no ``ag_words``) is unknown, never empty.
-_AG_WORDS = "ag_words"
-_AG_SAID_BEFORE = ("Not confirmed yet: the reply's words were already said in this conversation, so Khipu can't "
-                   "tell it is a new reply, and nothing was changed. The reply must differ from anything said in "
-                   "this conversation before the question. Ask the owner to confirm now, in this conversation, "
-                   "in other words (for example \"yes, pause it\"), then call direction.confirm again.")
-_AG_LEGACY = ("Not confirmed yet: this request was held before Khipu kept what this conversation had said when it "
-              "was asked, so nothing was changed. Ask the owner to confirm now, in this conversation, in words "
-              "that differ from anything said here before, then call direction.confirm again.")
-
-
-def _ag_words(boundary) -> set[str] | None:
-    """The prompt hashes an Antigravity ask boundary excludes; None when it
-    has none (saved before they were kept) or they are malformed."""
-    words = boundary.get(_AG_WORDS) if isinstance(boundary, dict) else None
-    if not isinstance(words, list) or not all(isinstance(h, str) for h in words):
-        return None
-    return set(words)
-
-
-def _current_turn(recorded: list[dict], conf: dict) -> dict | None:
-    """The turn a confirm may take as the owner's reply: the session's latest
-    recorded row of any kind, when it is eligible. In Antigravity a copy of a
-    turn (``duplicate_of``: its flushed step) stands in for its original when
-    every row after that original is a copy of it: the original is then the
-    turn judged, by its own id and time. None otherwise."""
-    if not recorded or not owner_turns.eligible(recorded[-1], conf)[0]:
-        return None
-    latest = recorded[-1]
-    if latest.get("duplicate_of") is None or latest.get("harness") != "antigravity":
-        return latest
-    for i in range(len(recorded) - 2, -1, -1):
-        row = recorded[i]
-        if row.get("turn") == latest["duplicate_of"]:
-            later = recorded[i + 1:]
-            if all(r.get("duplicate_of") == row["turn"] for r in later) \
-                    and owner_turns.eligible(row, conf)[0] and row.get("harness") == latest.get("harness"):
-                return row
-            return None
-    return None
-
-
-def _late_copy(turn: dict) -> bool:
-    """A row recorded after its turn or as a copy of one (``owner_turns.record``:
-    ``late``, ``duplicate_of``): never the owner's reply. A ``fallback`` row
-    alone is Antigravity's submit-time read of ``lastUserInput`` by the
-    PreInvocation hook (``antigravity_prompt``), so it is the current turn; the
-    PostInvocation and Stop recorders always add ``late``, and a flushed copy of
-    a fallback turn gets ``late: "flush"``. A turn no PreInvocation could read,
-    first recorded at PostInvocation or Stop and dated by that PreInvocation
-    (``ag_invoked``, set only when it is no copy of a recorded row), is its
-    own turn, not a late copy: ``_after_ask`` and ``ag_words`` still judge it."""
-    if turn.get("duplicate_of") is not None:
-        return True
-    if turn.get("harness") == "antigravity" and turn.get("ag_invoked") is True \
-            and turn.get("late") in ("PostInvocation", "Stop"):
-        return False
-    return bool(turn.get("late"))
-
-
 def _after_ask(turn: dict, boundary) -> bool:
-    """Whether ``turn`` came after the ask ``boundary`` and is none of the
-    turns it excludes: not one of them, not a copy of one (its occurrence,
-    or ``duplicate_of`` naming one)."""
     parts = _ask_parts(boundary)
-    if parts is None:
-        return False
-    since, turns_in, copies_in = parts
-    ids = {e[0] for e in turns_in}
-    copies = {(e[0], e[1]) for e in copies_in}
-    if _float(turn.get("ts")) <= since:
-        return False
-    if str(turn.get("turn")) in ids or (turn.get("duplicate_of") is not None and str(turn["duplicate_of"]) in ids):
-        return False
-    occurrence = turn.get("occurrence")
-    return not (isinstance(turn.get("prompt_sha256"), str) and type(occurrence) is int
-                and (turn["prompt_sha256"], occurrence) in copies)
+    return bool(parts and _float(turn.get("ts")) > parts[0]
+                and turn.get("turn") not in {e[0] for e in parts[1]})
 
 
 def _t3_read(thread: str, seen, since) -> dict:
@@ -737,42 +755,16 @@ def _proof(environ, session: str, request: dict, now: float) -> dict | str:
 
 def _t3_proof(environ, session: str, request: dict, now: float) -> dict | None:
     thread = _t3_refusals(environ, session)
-    recorded = owner_turns.turns(session, now)
-    if not recorded:
-        raise DirectionRefused("no_recorded_turn", "Khipu has no recent turn from this conversation's prompt hook, "
-                                                   "so it can't tell this call comes from it. Nothing was changed; "
-                                                   "it works once the owner replies here.")
-    latest = recorded[-1]
-    # The hook turn's own entrypoint (``claude -p`` is sdk-cli, a machine),
-    # and its issuer's place in the process tree: T3's own agent is a child
-    # of the T3 Code app with no shell, interpreter or headless launcher in
-    # between. A process that only inherits the session is neither. How T3
-    # starts Codex, Cursor or Antigravity is not known here, so on those
-    # only the Khipu app confirms.
-    if latest.get("entrypoint") != "t3" or not owner_turns.t3_launched(latest.get("issuer")):
-        raise DirectionRefused("not_from_the_hook",
-                               "This conversation's latest hook turn did not come from T3's own agent (a headless "
-                               "or scripted process, or one Khipu could not trace to the T3 Code app), so it can't "
-                               "confirm. Nothing was changed.")
-    if latest.get("harness") != "claude_code":
-        raise DirectionRefused("not_from_the_hook",
-                               f"Khipu can't yet tell T3's own {latest.get('harness')} agent apart from a scripted "
-                               "process, so a held change in this conversation is confirmed in the Khipu app. "
-                               "Nothing was changed.")
-    front = f"{latest.get('harness')}:t3"
-    if front not in owner_turns.settings()["trusted"]:
-        raise DirectionRefused("not_confirmed", f"Not confirmed: {owner_turns.untrusted_why(front)}.")
-    _from_the_hook(latest)
     snapshots = request.get("t3_snapshots")
     if not isinstance(snapshots, dict):
         snapshots = request["t3_snapshots"] = {}
     old = snapshots.get(thread)
     parts = _t3_parts(old)
+    if parts is None and isinstance(request.get("created_ts"), (int, float)):
+        parts = ([], request["created_ts"], None)
     read = _t3_read(thread, [e[0] for e in parts[0]] if parts else (), parts[1] if parts else None)
     message = read["message"] if parts is not None else None
-    # The current turn is the latest hook row: a machine one (a notification,
-    # a wake) never borrows an owner message from before it.
-    if message is not None and latest.get("typed") and not latest.get("machine"):
+    if message is not None:
         sha = owner_turns.prompt_sha256(message["text"])
         return {"auth": "direction", "harness": "t3", "session": session, "turn": message["id"],
                 "prompt_sha256": sha, "binding": "t3",
@@ -804,37 +796,37 @@ def _t3_baseline(thread: str) -> tuple[str, dict] | None:
     return None if best is None else (best[1], best[2])
 
 
-def _instant_t3(environ, session: str, now: float) -> dict | None:
-    """The stamp for a routing change in a T3 conversation, or None (the
-    change is then held). It is the confirm's own proof (``_t3_proof``, with
-    every refusal a change has: a job or child thread, an issuer that does
-    not trace to the T3 Code app, an untrusted front end, a latest hook turn
-    that is not typed) taken against the latest ask boundary this thread
-    already has (``_t3_baseline``), so no new rule of what is the owner's: an
-    owner message in T3's record that the boundary does not hold, which the
-    latest typed hook turn stands behind. Stricter than a confirm in one
-    way, as a change is: that message must be inside the window
-    (``latest_window_h``). A thread nobody has been asked about yet has no
-    boundary, so its first change is held and a later one applies."""
+def _instant_t3(environ, session: str, now: float, action: str | None = None) -> dict | None:
+    """A T3 owner's message for an instant change, independent of hook text.
+
+    Existing answering actions use their shown ask. An own request keeps the
+    owner's interpretation tradeoff and needs no earlier question.
+    """
     from khipu import t3
 
     try:
         thread = _t3_thread_of(session)
-        base = _t3_baseline(thread)
-        if base is None:
+        answered = _shown_read(thread, ANSWERING.get()) if action in ANSWER_ACTIONS else None
+        if action in ANSWER_ACTIONS and not REQUEST_APPLIED.get() and answered is None:
             return None
-        request_id, snapshot = base
+        base = ((answered["id"], answered["t3_snapshots"][thread]) if answered is not None
+                else None if REQUEST_APPLIED.get() else _t3_baseline(thread))
+        if base is None:
+            if not REQUEST_APPLIED.get():
+                return None
+            # An own request needs the current typed message, not an earlier question.
+            request_id, snapshot = None, {"ids": [], "latest_ts": 0}
+        else:
+            request_id, snapshot = base
         stamp = _t3_proof(environ, session, {"t3_snapshots": {thread: json.loads(json.dumps(snapshot))}}, now)
     except DirectionRefused:
         return None
     if not isinstance(stamp, dict):
         return None
     proved = stamp.pop("confirmed")
-    at = t3._epoch(proved.get("message_at"))
-    if at is None or now - at > owner_turns.settings()["latest_window_h"] * 3600:
-        return None
     stamp["instant"] = {"source": "t3", "message": proved["message"], "message_at": proved["message_at"],
-                        "message_sha256": proved["message_sha256"], "after_ask": request_id}
+                        "message_sha256": proved["message_sha256"],
+                        **({"after_ask": request_id} if request_id is not None else {})}
     return stamp
 
 
@@ -846,29 +838,14 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     if owner_turns.dispatched_job(environ, session):
         raise DirectionRefused("no_recorded_turn", _DISPATCHED_WHY)
     conf = owner_turns.settings()
-    # The refusals a change has (no owner turn, an untrusted front end, a
-    # stale conversation), then the current turn: only the latest row.
-    usable = _recent_turn(session, conf, now, recorded)
-    turn = _current_turn(recorded, conf)
-    if turn is not None and now - _float(turn.get("ts")) > conf["latest_window_h"] * 3600:
-        turn = None
-    _from_the_hook(turn or usable)
+    turn = next((t for t in reversed(recorded) if owner_turns.eligible(t, conf)[0]), None)
+    if turn is None:
+        raise DirectionRefused("no_recorded_turn", "No typed owner reply was recorded in this conversation.")
     asks = request.get("asks")
     if not isinstance(asks, dict):
         asks = request["asks"] = {}
-    old = asks.get(session)
-    why = _ASK_NOW
-    if turn is not None and not _late_copy(turn) and _after_ask(turn, old):
-        if turn.get("harness") == "antigravity":
-            words = _ag_words(old)
-            if words is None:
-                why = _AG_LEGACY
-            elif not isinstance(turn.get("prompt_sha256"), str) or turn["prompt_sha256"] in words:
-                why = _AG_SAID_BEFORE
-            else:
-                why = None
-        else:
-            why = None
+    old = asks.get(session) or {"ts": request.get("created_ts", now), "turns": [], "copies": []}
+    why = None if _after_ask(turn, old) else _ASK_NOW
     if why is None:
         return {"auth": "direction", "harness": turn.get("harness"), "session": session, "turn": turn["turn"],
                 "prompt_sha256": turn.get("prompt_sha256"), "occurrence": turn.get("occurrence"),
@@ -902,7 +879,12 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
             if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
+            if not reviewed_hold(request):
+                raise DirectionRefused("legacy_hold", "This old held change has no saved content to apply. Decline it or ask for it to be reissued with its full content.")
             with t3.owner_read_budget():
+                member = owner_turns._t3_membership(session)
+                if member == "unverified":
+                    raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
                 stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
@@ -914,6 +896,56 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
         raise DirectionRefused("log_unwritable", f"Khipu can't read or write the held requests ({err}), so nothing "
                                                  "was changed.") from None
     return request, stamp
+
+
+DECLINE_ACTION = "direction.decline"
+
+
+def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
+    """The owner's no to a held request: it is dropped and nothing changes.
+    The proof a confirm needs, so a conversation can't answer for the owner
+    either way; with no reply since the ask it asks again, as a confirm does."""
+    from khipu import t3
+
+    now = _clock() if now is None else now
+    environ = os.environ if env is None else env
+    session = _caller_session(environ)
+    try:
+        with _requests_locked() as path:
+            state = _load(path)
+            request = next((r for r in state["requests"] if r.get("id") == request_id), None)
+            if request is None:
+                raise DirectionRefused("not_found", "There is no held request with that id.")
+            if request.get("state") != "pending":
+                raise DirectionRefused("not_pending", f"That request is already {request.get('state')}.")
+            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
+                raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
+                                                        "typed on a terminal can answer this request.")
+            with t3.owner_read_budget():
+                stamp = _proof(environ, session, request, now)
+            if isinstance(stamp, str):
+                _save(path, state, now)
+                raise DirectionRefused("not_confirmed", stamp.replace("direction.confirm", "direction.decline"))
+            line = {"kind": "action", "id": _new_id(), "at": _iso(now), "action": DECLINE_ACTION,
+                    "target": request_id, "before": None, "auth": stamp.get("auth"), "undo": None,
+                    "no_undo": "Nothing was changed, so there is nothing to undo.", "state": "applied",
+                    "facts": {"declined": request.get("action"), "request_session": request.get("session")}}
+            line.update({k: stamp[k] for k in ("harness", "session", "turn", "prompt_sha256", "occurrence", "binding",
+                                               "confirmed") if stamp.get(k) is not None})
+            from khipu import needs_you
+
+            origin = "this conversation" if request.get("session") == session else "another conversation"
+            sentence = f"Declined the request from {origin} to {needs_you.ACTION_WORDS.get(request.get('action'), 'make a change')}. Nothing was changed."
+            line["receipt"] = {"what": "Declined a held request", "text": sentence}
+            _append(line)
+            request.update(owner_action=line["id"], receipt=sentence, state="declined", settled_ts=now, settled_at=_iso(now),
+                           declined=dict(stamp["confirmed"], session=session))
+            _save(path, state, now)
+    except OSError as err:
+        raise DirectionRefused("log_unwritable", f"Khipu can't read or write the held requests ({err}), so nothing "
+                                                 "was changed.") from None
+    _write_receipt(sentence, line, stamp)
+    return request
 
 
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
@@ -942,7 +974,7 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
 # Everything on a request that holds the owner's words or marks their
 # conversation's messages: the action's args, the ask line, an error, and
 # the ask boundaries (T3 message ids and times, turn ids and hashes).
-_REQUEST_WORDS = ("args", "ask", "error", "t3_snapshots", "asks")
+_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks", "shown", "files", "disclosed", "review")
 
 
 def forget_requests(sessions, *, protected_sessions=(), now: float | None = None) -> dict:
@@ -981,6 +1013,8 @@ def forget_requests(sessions, *, protected_sessions=(), now: float | None = None
                     makers = set(_makers(boundaries[name])) | ({name} if key == "asks" else set())
                     if not _makers(boundaries[name]) or makers & names:
                         del boundaries[name]
+                        audience = ("session:" if key == "asks" else "t3:") + name
+                        row["disclosed"] = [d for d in row.get("disclosed") or [] if d != audience]
                         removed += 1
                 if not boundaries:
                     row.pop(key)
@@ -990,10 +1024,10 @@ def forget_requests(sessions, *, protected_sessions=(), now: float | None = None
 
 
 @contextlib.contextmanager
-def confirmed_replay(action: str, stamp: dict):
+def confirmed_replay(action: str, stamp: dict, *, files: dict | None = None):
     """While the held request's own command runs, the check returns the
     confirm stamp for that action in that conversation, and nothing else."""
-    token = _CONFIRMED.set({"action": action, "stamp": dict(stamp)})
+    token = _CONFIRMED.set({"action": action, "stamp": dict(stamp), "files": files or {}})
     try:
         yield
     finally:
@@ -1019,14 +1053,15 @@ _PASS_THROUGH = ("env", "timeout", "nohup", "uv", "uvx")
 def _caller_chain() -> list[tuple[int, float, str]]:
     """This process's ancestors, parent first, as (pid, start time, the
     name of the file it runs). Stops where a parent started after its child
-    (its number was reused)."""
+    (its number was reused), and at a process with no path that no hook saw
+    with one (``owner_turns._known_info``)."""
     me = owner_turns._proc_info(os.getpid())
     if me is None:
         return []
     pid, born = me[0], me[2]
     out: list[tuple[int, float, str]] = []
     for _ in range(_CHAIN_MOST):
-        info = owner_turns._proc_info(pid)
+        info = owner_turns._known_info(pid)
         if info is None or info[2] > born:
             break
         out.append((pid, info[2], os.path.basename(os.path.realpath(info[1]))))
@@ -1050,22 +1085,44 @@ def _nearest_harness(chain: list[tuple[int, float, str]]) -> tuple[int, float] |
     return None
 
 
-def _from_the_hook(turn: dict) -> None:
-    """The turn was recorded by a hook its harness ran (its issuer is not an
-    agent's shell or a script), and that harness is the nearest one above
-    this call. A session id set by hand in another process, or inherited by
-    a job started from the conversation, points at a harness that is not
-    the one running this call."""
+_PROGRAM_NAMES = {"claude_code": "Claude", "codex": "Codex", "cursor": "Cursor", "antigravity": "Antigravity",
+                  "aegis": "Grok"}
+
+
+def _program_replaced() -> bool:
+    """Whether the walk up to this call's harness ends at a process with no
+    path and no record of one: its file went before any hook saw it, so only
+    restarting it gets a proof back. Nothing above the harness counts: this
+    conversation's restart would not touch it. Says why a refusal happened;
+    never decides one."""
+    me = pid = os.getpid()
+    for _ in range(_CHAIN_MOST):
+        info = owner_turns._known_info(pid)
+        if info is None:
+            return owner_turns._proc_bare(pid) is not None
+        name = os.path.basename(os.path.realpath(info[1]))
+        if (pid != me and _nearest_harness([(pid, info[2], name)])) or info[0] <= 1:
+            return False
+        pid = info[0]
+    return False
+
+
+def _replaced_why(turn: dict) -> str | None:
+    """The refusal's real reason when the program running this conversation
+    was updated before any hook saw it (``_program_replaced``), which no later
+    message here can mend. Never for an issuer refused for what it is: a
+    restart would not change that."""
     issuer = turn.get("issuer")
-    refused = not isinstance(issuer, dict) or issuer.get("refused") is not None \
-        or not isinstance(issuer.get("pid"), int)
-    if not refused:
-        refused = (issuer["pid"], issuer.get("start")) != _nearest_harness(_caller_chain())
-    if refused:
-        raise DirectionRefused("not_from_the_hook",
-                               "The owner's recent turn was not recorded by the prompt hook of the conversation "
-                               "making this call, so this call can't make an owner's change. Ask the owner to say "
-                               "it in the conversation they are typing in.")
+    if not isinstance(issuer, dict) or issuer.get("refused") not in (None, "unknown") or not _program_replaced():
+        return None
+    name = _PROGRAM_NAMES.get(turn.get("harness"), "agent")
+    return (f"This conversation's {name} program, or a program it runs, was updated while running, before Khipu had "
+            "seen it, so Khipu can't tie this call to this conversation's prompt hook. Nothing was changed, and "
+            f"repeating the message here won't help. Restart this conversation's {name} program if the owner is "
+            "typing in it, then have them type the request again; a background or dispatched job can't make an "
+            "owner's change, restarted or not.")
+
+
 
 
 def _float(value) -> float:
@@ -1730,13 +1787,9 @@ def gate(want: dict | None, *, env=None, now: float | None = None) -> dict:
                                "That change can't be made by direction: it needs the Khipu app or a yes typed on a "
                                "terminal.")
     stamp = check(want["action"], env=env, now=now, instant=instant_allowed(want["action"], want["target"]))
-    if want.pop("over_newer", False):
-        _bind_over_newer(want.pop("owner_words", None), stamp)
+    want.pop("over_newer", None)
+    want.pop("owner_words", None)
     before = _before(want)
-    if before is _NO_UNDO and want["action"] == "ledger.import":
-        raise DirectionRefused("not_by_direction",
-                               "A catch-up import can't be undone, so it can't be made by direction; it needs the "
-                               "Khipu app or a yes typed on a terminal.")
     if before is _UNREADABLE:
         raise DirectionRefused("before_unreadable",
                                "Khipu can't read what this would change right now, so it could not be undone; "
@@ -1829,13 +1882,16 @@ def record_preference_merges(entries: list[dict]) -> None:
              "state": "pending", "preference_merges": entries})
 
 
+_RESOLVING_ACTIONS = ("outbox.merge_preferences", "outbox.span_covered")
+
+
 def record_preference_resolutions(jobs: list[dict]) -> None:
     """Persist the held jobs a merge is about to archive as resolved (record
     id, job name, where it was held) before any moves: the Undo puts them
     back."""
     pend = _PENDING.get()
     line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
+    if not pend or pend["intent"]["action"] not in _RESOLVING_ACTIONS or line is None:
         raise OSError("the owner action must be recorded before held lines can be resolved")
     _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
              "state": "pending", "preference_resolutions": jobs})
@@ -2060,7 +2116,7 @@ def _abandon() -> None:
             state = _hub_write_state(write)
         elif pend["line"].get("inverse_writes"):
             state = _inverse_state(pend["line"]["inverse_writes"])
-        elif pend["intent"]["action"] == "outbox.merge_preferences" and _merge_recorded(pend["line"]["id"]):
+        elif pend["intent"]["action"] in _RESOLVING_ACTIONS and _merge_recorded(pend["line"]["id"]):
             # Batches before the failure committed and their Undo is logged:
             # unconfirmed, so Undo still runs.
             state = "pending"
@@ -2150,6 +2206,7 @@ _PUSH_WORDS = {
     "work.not_same": "Marked a ledger row and a commitment as different work",
     "promote.gate_ignore": "Set Update anyway for the next promotion",
     "promote.gate_ignore.cancel": "Cancelled Update anyway",
+    "direction.decline": "Declined a change a conversation asked for",
     "config.routing_setting": "Changed a routing setting",
     "config.answer_request.confirm": "Confirmed a conversation's change to a routing setting",
     "config.answer_request.undo": "Undid a conversation's change to a routing setting",
@@ -2162,6 +2219,7 @@ _PUSH_WORDS = {
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
     "outbox.merge_preferences": "Merged preferences held only in memory-file lines into the hub",
+    "outbox.span_covered": "Retired dead outbox jobs whose range and evidence fields another episode holds",
 }
 
 
@@ -2556,6 +2614,9 @@ def _before(want: dict):
     if action == "outbox.merge_preferences":
         # Each transaction's additions are written ahead as their own state
         # line (``record_preference_merges``) before it commits.
+        return {"change": "apply"}
+    if action == "outbox.span_covered":
+        # Each batch's jobs are written ahead (``record_preference_resolutions``).
         return {"change": "apply"}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
@@ -3057,6 +3118,15 @@ def _undo_outbox_preferences(line, via):
                                                   "(outbox merge-line-preferences --include-decisions)")
 
 
+def _undo_span_covered(line, via):
+    from khipu import outbox_span_covered
+
+    entries = preference_merges(line["id"], "preference_resolutions")
+    if not entries and not (line["state"] == "applied" and not int((line.get("result") or {}).get("retired") or 0)):
+        raise ValueError("Khipu has no record of which jobs this retired, so it can't undo it")
+    return outbox_span_covered.undo(entries)
+
+
 def _ledger_undo(verb: str):
     def run(line, via):
         return _ledger_write(verb, line["target"])
@@ -3148,6 +3218,7 @@ _UNDO = {
     "owed.tidy": _undo_owed_tidy,
     "owed.correct_job_origin.confirm": _undo_owed_change,
     "outbox.merge_preferences": _undo_outbox_preferences,
+    "outbox.span_covered": _undo_span_covered,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,
@@ -3684,45 +3755,6 @@ def _refuse_over_newer(line: dict, over_newer: bool) -> None:
         ahead["facts"] = facts
 
 
-# Through owner direction an Undo over a newer change needs the owner's own
-# latest message (its hash is the recorded turn's) to say what the app's
-# button says. Strict on purpose: the phrase, or "lose the newer change" with
-# an imperative undo/revert opening a sentence; never a question, never
-# "keep the newer", never a negated loss.
-OVER_NEWER_PHRASE = "undo anyway and lose the newer change"
-_LOSE_NEWER = "lose the newer change"
-_IMPERATIVE_UNDO = re.compile(r"(?:^|[.!;\n])\s*(?:please\s+)?(?:undo|revert|roll ?back)\b")
-_KEEP_NEWER = re.compile(r"\bkeep(?:ing)?\s+the\s+newer\b")
-_NEGATED_LOSS = re.compile(r"\b(?:don'?t|do not|never|not|no|without)\b\W+(?:\w+\W+){0,4}?(?:lose|losing|undo|revert)\b")
-
-
-def _bind_over_newer_asked(text: str) -> bool:
-    text = " ".join(text.lower().replace("\u2019", "'").split())
-    if "?" in text or _KEEP_NEWER.search(text) or _NEGATED_LOSS.search(text):
-        return False
-    if OVER_NEWER_PHRASE in text:
-        return True
-    return _LOSE_NEWER in text and bool(_IMPERATIVE_UNDO.search(text))
-
-
-def _bind_over_newer(words, stamp: dict) -> None:
-    from khipu import owner_turns as turns
-
-    if not isinstance(words, str) or not words.strip():
-        raise DirectionRefused("over_newer_not_asked",
-                               "Undoing over a newer change by direction needs the owner's own words asking for it: "
-                               "pass the owner's latest message here, word for word, as owner_words. Nothing was "
-                               "changed.")
-    if not stamp.get("prompt_sha256") or turns.prompt_sha256(words) != stamp["prompt_sha256"]:
-        raise DirectionRefused("over_newer_not_asked",
-                               "Those words are not the owner's latest message in this conversation, so they can't "
-                               "authorise undoing over a newer change. Nothing was changed.")
-    if not _bind_over_newer_asked(turns.canonical_prompt(words)):
-        raise DirectionRefused("over_newer_not_asked",
-                               "The owner's message doesn't ask to lose the newer change, so this Undo can't go over "
-                               f"it. Nothing was changed. The owner must say: \"{OVER_NEWER_PHRASE.capitalize()}\".")
-
-
 def undo(line_id: str, via: str, *, holds: dict | None = None, over_newer: bool = False,
          include_unproven: bool = False) -> dict:
     """Apply the inverse of a logged action. Its ``undo`` line is written
@@ -3880,7 +3912,7 @@ def run_cli(args) -> int:
             via = (_settings_owner_via(args, want) if line["action"] in
                    ("direction.set", "direction.on", "direction.off") else routing._owner_via(args, want))
             if via is None:
-                _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
+                _print({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"})
                 return 2
             out = undo(args.id, via, holds=choices, over_newer=over)
             _print(finish(out) or out)
@@ -3890,7 +3922,7 @@ def run_cli(args) -> int:
             want = intent("direction.on", "direction")
             via = _settings_owner_via(args, want)
             if via is None:
-                _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
+                _print({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"})
                 return 2
             out = {"ok": True, "settings": owner_turns.write_settings({"enabled": True})}
             _print(finish(out) or out)
@@ -3903,7 +3935,7 @@ def run_cli(args) -> int:
             want = intent("direction.acknowledge", "alarm")
             via = routing._owner_via(args, want)
             if via is None:
-                _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
+                _print({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"})
                 return 2
             alarm = acknowledge_alarm()
             out = {"ok": True, "acknowledged": alarm, "chain": verify_log(),
@@ -3914,7 +3946,7 @@ def run_cli(args) -> int:
             want = intent("direction.off", "direction")
             via = _settings_owner_via(args, want)
             if via is None:
-                _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
+                _print({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"})
                 return 2
             out = {"ok": True, "settings": owner_turns.write_settings({"enabled": False})}
             _print(finish(out) or out)
@@ -3929,7 +3961,7 @@ def run_cli(args) -> int:
             want = intent("direction.set", target)
             via = _settings_owner_via(args, want)
             if via is None:
-                _print({"ok": False, "error": routing._REFUSED, "code": "owner_only"})
+                _print({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"})
                 return 2
             out = {"ok": True, "settings": owner_turns.write_settings(values)}
             _print(finish(out) or out)
@@ -3985,6 +4017,6 @@ def add_parser(sub) -> None:
     un.add_argument("--over-newer", dest="over_newer", action="store_true",
                     help="Undo even though a newer change touched the same target since; that change is lost")
     un.add_argument("--owner-words", dest="owner_words", default=None, metavar="TEXT",
-                    help="By direction with --over-newer: the owner's latest message, word for word, asking for it")
+                    help="==SUPPRESS==")
     un.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     add_owner_flags(un)

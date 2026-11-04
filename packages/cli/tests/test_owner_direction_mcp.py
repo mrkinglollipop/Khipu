@@ -157,12 +157,11 @@ def test_an_unknown_action_is_refused(mcp_world):
     assert _state("Codex") != "paused"
 
 
-def test_a_stale_turn_is_refused(mcp_world):
+def test_a_recorded_owner_turn_is_not_rejected_for_age(mcp_world):
     mcp_world.say(session="s-1", ago=7 * 3600)
     mcp_world.server("s-1")
     is_error, out = _act("route.pause", {"account": "Codex", "until": "6h"})
-    assert is_error and out["code"] == "stale"
-    assert _state("Codex") != "paused"
+    assert not is_error and _state("Codex") == "paused", out
 
 
 def test_a_routing_setting_outside_the_routing_settings_is_refused(mcp_world):
@@ -175,12 +174,6 @@ def test_a_routing_setting_outside_the_routing_settings_is_refused(mcp_world):
 def test_the_tool_takes_only_an_action_and_its_arguments(mcp_world):
     tool = next(t for t in ms.TOOLS if t["name"] == "khipu_owner_act")
     text = tool["description"].lower()
-    # The one place owner words are asked for: an Undo over a newer change by
-    # direction carries the owner's latest message, checked against its hash.
-    over_newer = ("pass the owner's latest message word for word as owner_words, "
-                  "and it must ask to undo anyway. ")
-    assert over_newer in text
-    text = text.replace(over_newer, "")
     for phrase in ("page", "another conversation", "dispatched"):
         assert phrase in text, phrase
     for gone in ("quote", "paraphrase", "owner turn", "words"):
@@ -248,7 +241,8 @@ def test_a_pending_rule_confirmed_by_direction(mcp_world):
     mcp_world.server("s-1")
     revision = next(r["revision"] for r in routing.read_view()["rules"] if r["n"] == n)
     is_error, out = _act("route.rule.confirm", {"rule": n, "expect": revision})
-    assert not is_error and out["ok"] is True, out
+    assert not is_error and out["ok"] is True and not out.get("pending"), out
+    assert out["owner_action"]
     (rule,) = routing.read_view()["rules"]
     assert rule["pending"] is False
 
@@ -276,7 +270,8 @@ def test_a_pending_priority_confirmed_by_direction(mcp_world):
     mcp_world.say("yes confirm it", session="s-1")
     mcp_world.server("s-1")
     is_error, out = _act("route.priority.confirm", {"expect": version})
-    assert not is_error and out["ok"] is True, out
+    assert not is_error and out["ok"] is True and not out.get("pending"), out
+    assert out["owner_action"]
     assert routing.read_view()["priority"]["pending"] is False
 
 
@@ -309,7 +304,8 @@ def test_a_pending_routing_setting_confirmed_by_direction(mcp_world, capsys):
     mcp_world.say("yes, confirm that change", session="s-1")
     mcp_world.server("s-1")
     is_error, out = _act("config.answer_request.confirm", {"key": "routing_stale_after"})
-    assert not is_error and out["ok"] is True, out
+    assert not is_error and out["ok"] is True and not out.get("pending"), out
+    assert out["owner_action"]
     assert routing._setting_requests(json.loads((mcp_world.tmp / "data" / "config.json").read_text())) == {}
 
 
@@ -330,5 +326,6 @@ def test_a_pending_account_list_change_confirmed_by_direction(mcp_world, capsys)
     mcp_world.say("yes, confirm that account list change", session="s-1")
     mcp_world.server("s-1")
     is_error, out = _act("accounts.request.confirm", {"expect": config.accounts_version()})
-    assert not is_error and out["ok"] is True, out
+    assert not is_error and out["ok"] is True and not out.get("pending"), out
+    assert out["owner_action"]
     assert not config.load_config().get("usage_accounts_request")

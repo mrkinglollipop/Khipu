@@ -12,7 +12,9 @@ One file per session, ``<capture home>/owner-turns/<session>.jsonl``, mode
 0600 in a 0700 folder: never synced, captured, searched or backed up. Each
 line is a time and facts about the turn, never its text. Lines older than
 ``RETENTION_S`` go on the next write or read of the file, and on the timer's
-``sweep`` (the replica-refresh job) when neither comes. Standard library plus
+``sweep`` (the replica-refresh job) when neither comes. Beside them,
+``known-processes/<pid>.json`` keeps what a hook read about its issuer for as
+long as that process lives (``_pin_issuer``). Standard library plus
 ``khipu.t3`` and ``khipu.turn_text``, so the hook's recorder starts in a few
 milliseconds without the rest of the package.
 
@@ -639,6 +641,124 @@ def _proc_info(pid: int) -> tuple[int, str, float] | None:
         return None
 
 
+def _proc_bare(pid: int) -> tuple[int, float, str] | None:
+    """A process's parent, when it started and its kernel name (``pbi_comm``),
+    all readable after the file it runs is gone, when ``_proc_info`` has no
+    path to give; None when they can't be read. The name is the file's at
+    exec, cut to ``_KERNEL_NAME_BYTES``. It never makes a process known by
+    itself: it is only compared with what a record says this pid and start
+    time ran (``_known_info``)."""
+    if sys.platform != "darwin" or pid <= 0:
+        return None
+    try:
+        import ctypes
+        import struct
+
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+        info = ctypes.create_string_buffer(136)  # struct proc_bsdinfo
+        if lib.proc_pidinfo(pid, 3, ctypes.c_uint64(0), info, 136) != 136:  # PROC_PIDTBSDINFO
+            return None
+        sec, usec = struct.unpack_from("QQ", info, 120)
+        name = os.fsdecode(info.raw[48:64].split(b"\0", 1)[0])  # pbi_comm
+        return struct.unpack_from("I", info, 16)[0], sec + usec / 1e6, name
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
+# A running program outlives its file: an update deletes it, and the kernel
+# then gives no path for the process (2026-11-03, every running Claude Code
+# after an npm update). The issuer and the chain compare the pid and start
+# time, but the path still counts: the name it gives decides which processes
+# the walk skips as shells and interpreters, and so which process that
+# comparison lands on, and the app-bundle place comes from it. So the first
+# thing a hook reads about its issuer is kept, one file per process number, and
+# stands in for the path only while the same pid and start time are there (exec
+# keeps both) and the record's name is the kernel's own: the record can't name
+# a process as anything but what the kernel says it runs (security review of
+# df3cdfc9: a job recorded as /bin/bash read as a shell, and its parent's turn
+# passed). A process no hook saw with a path has no such record and stays
+# unreadable: the kernel's name alone never makes a process known.
+_KERNEL_NAME_BYTES = 15  # pbi_comm: 16 bytes, the last always NUL
+
+
+def known_folder() -> Path:
+    return folder() / "known-processes"
+
+
+def _known_file(pid: int) -> Path:
+    return known_folder() / f"{pid}.json"
+
+
+def _read_known(pid: int) -> dict | None:
+    try:
+        data = json.loads(_known_file(pid).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    start, name, path = data.get("start"), data.get("name"), data.get("path")
+    if isinstance(start, bool) or not isinstance(start, (int, float)):
+        return None
+    return data if isinstance(name, str) and name and isinstance(path, str) and path.startswith("/") else None
+
+
+def _pin_issuer(pid: int, path: str, start: float) -> None:
+    """Keep what a hook read about its issuer (``hook_issuer``). Never raises."""
+    bare = _proc_bare(pid)
+    if bare is None or bare[1] != start:
+        return
+    known = {"start": start, "name": bare[2], "path": path}
+    if _read_known(pid) == known:
+        return
+    try:
+        d = known_folder()
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(folder(), 0o700)
+        os.chmod(d, 0o700)
+        _write_private(_known_file(pid), json.dumps(known) + "\n")
+    except OSError:
+        pass
+
+
+def _kernel_name(path: str) -> bytes:
+    """A path's file name as the kernel's process name would hold it."""
+    return os.fsencode(os.path.basename(path))[:_KERNEL_NAME_BYTES]
+
+
+def _known_info(pid: int) -> tuple[int, str, float] | None:
+    """``_proc_info``, or for a process whose file is gone, the path a hook
+    read for this same process before that (``_pin_issuer``), when its file
+    name is the one the kernel still has. None for any other process with no
+    path."""
+    info = _proc_info(pid)
+    if info is not None:
+        return info
+    bare = _proc_bare(pid)
+    known = _read_known(pid) if bare is not None else None
+    if known is None or known["start"] != bare[1] or known["name"] != bare[2]:
+        return None
+    # Callers name a process by the resolved path, so both forms must agree.
+    path = known["path"]
+    if not (_kernel_name(path) == _kernel_name(os.path.realpath(path)) == os.fsencode(bare[2])[:_KERNEL_NAME_BYTES]):
+        return None
+    return bare[0], path, bare[1]
+
+
+def _sweep_known() -> None:
+    """Drop the records of processes that have ended (a process number and
+    start time never come back)."""
+    try:
+        paths = list(known_folder().iterdir())
+    except OSError:
+        return
+    for path in paths:
+        pid = int(path.stem) if path.stem.isdecimal() and path.suffix == ".json" else 0
+        known = _read_known(pid) if pid else None
+        bare = _proc_bare(pid) if known else None
+        if bare is None or bare[1] != known["start"]:
+            path.unlink(missing_ok=True)
+
+
 def _refused_issuer(name: str) -> bool:
     low = name.lower()
     return low in REFUSED_ISSUERS or low.startswith(REFUSED_ISSUER_PREFIXES) or low in HOOK_SHELLS
@@ -856,14 +976,14 @@ def t3_launched(issuer) -> bool:
     chain reaches a process running from T3 Code's app bundle with no
     scripted launcher (``_scripted_launcher``) on the way, the issuer
     itself included. Anything unreadable, or a reused process number, is
-    False."""
+    False; only the issuer may be known by its record (``_known_info``)."""
     if not isinstance(issuer, dict) or type(issuer.get("pid")) is not int:
         return False
     start = issuer.get("start")
     if isinstance(start, bool) or not isinstance(start, (int, float)):
         return False
     pid = issuer["pid"]
-    info = _proc_info(pid)
+    info = _known_info(pid)
     if info is None or info[2] != start:
         return False
     born = start
@@ -896,13 +1016,15 @@ def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
     interpreter or anything that is not a harness's hook (an agent's Bash
     tool running it); None when the tree can't be read. Same-user processes
     can't be told apart for certain (scope 2.6): this closes running the
-    recorder or the shim from an agent's shell, not ``exec`` tricks."""
+    recorder or the shim from an agent's shell, not ``exec`` tricks. An issuer
+    found is kept, so it stays readable after an update deletes its file
+    (``_pin_issuer``, ``_known_info``)."""
     me = _proc_info(os.getpid())
     if me is None:
         return None
     pid, born = me[0], me[2]
     for step in range(_ISSUER_MOST):
-        info = _proc_info(pid)
+        info = _known_info(pid)
         if info is None:
             return None
         parent, exe, started = info
@@ -929,6 +1051,7 @@ def hook_issuer(shim: str = PROMPT_SHIM) -> dict | None:
         out["tty"] = UNKNOWN if tty is None else tty
         app = _app_bundle(exe)
         out["app"] = UNKNOWN if app is None else (app or None)
+        _pin_issuer(pid, exe, started)
         return out
     return None
 
@@ -1076,6 +1199,11 @@ def _sweep(now: float) -> dict:
         except OSError as err:
             out["ok"] = False
             out["errors"].append(f"{path.name}: {err.strerror or err}")
+    try:
+        _sweep_known()
+    except OSError as err:
+        out["ok"] = False
+        out["errors"].append(f"known processes: {err.strerror or err}")
     return out
 
 

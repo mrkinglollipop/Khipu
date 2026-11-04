@@ -75,6 +75,7 @@ from khipu.routing_generation import SCHEMA
 
 STATE_DIR = ("state", "routing")
 EVENTS_NAME = "events.jsonl"
+COMPACTION_GENERATION_TYPE = "_routing_compaction_generation"
 VIEW_NAME = "view.json"
 LOCK_NAME = "routing.lock"
 CHANGES_KEPT = 100
@@ -546,7 +547,10 @@ def settings_status() -> dict[str, dict]:
                     "request": {"request": waiting.get("request"), "by": waiting.get("by"), "at": waiting.get("at"),
                                 "by_words": author_words(waiting.get("by") if isinstance(waiting.get("by"), dict)
                                                          else None, push=True),
-                                "prior": waiting.get("prior")} if waiting else None}
+                                "prior": waiting.get("prior"),
+                                # What was asked for, as stored: ``value`` can't
+                                # say, a login switch's being the one still in use.
+                                "asked": config.get(key), "asked_set": key in config} if waiting else None}
     return out
 
 
@@ -591,7 +595,9 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
                 # converted against the accounts known now.
                 data[key] = convert_lane_map(data[key], accounts())[0]
         if request is not None:
-            requests[key] = dict(request, prior=prior, prior_set=prior_set)
+            import secrets
+
+            requests[key] = dict(request, id=secrets.token_hex(16), prior=prior, prior_set=prior_set)
         else:
             requests.pop(key, None)
         if requests:
@@ -602,9 +608,20 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
     return config_file()
 
 
-def answer_setting_request(key: str, action: str) -> Path:
+def setting_request_pin(key: str, waiting: dict, value) -> str:
+    """A setting's waiting request and the value it holds, as shown to the
+    owner. An answer carrying it (``expect``) never lands on a newer request
+    or a value changed since."""
+    body = {"key": key, "value": value, "request": waiting.get("request"), "by": waiting.get("by"),
+            "at": waiting.get("at"), "prior": waiting.get("prior"), "prior_set": waiting.get("prior_set"),
+            "id": waiting.get("id")}
+    return "sr-" + hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def answer_setting_request(key: str, action: str, *, expect: str | None = None) -> Path:
     """The owner's answer to a conversation's change to ``key``: confirm
-    keeps it; undo puts back the value it replaced."""
+    keeps it; undo puts back the value it replaced. ``expect``: the request
+    as it was shown (``setting_request_pin``)."""
     from khipu.config import config_file, mutate_config
 
     if action not in ("confirm", "undo"):
@@ -617,6 +634,9 @@ def answer_setting_request(key: str, action: str) -> Path:
         waiting = requests.pop(key, None)
         if waiting is None:
             raise SettingError(f"no conversation's change to {key} is waiting", "no_request")
+        if expect is not None and expect != setting_request_pin(key, waiting, data.get(key)):
+            raise SettingError(f"the change to {key} moved after it was shown; read what is waiting again",
+                               "version_moved")
         if action == "undo":
             if waiting.get("prior_set"):
                 data[key] = waiting.get("prior")
@@ -2293,7 +2313,8 @@ def _identify_locked(events: Iterable[dict], *, observed: list[dict] | None = No
     """Enrich new lines only. All append paths, including seeds and account
     transactions, pass here while holding the routing lock."""
     observed = _read_all_events()[0] if observed is None else observed
-    history = _in_write_order(observed) if ordered is None else ordered
+    observed = [e for e in observed if e.get("type") != COMPACTION_GENERATION_TYPE]
+    history = _in_write_order(observed) if ordered is None else [e for e in ordered if e.get("type") != COMPACTION_GENERATION_TYPE]
     mac = _mac_locked()
     clocks = [e["hlc"] for e in [*observed, *history] if e.get("hlc")]
     clocks += [{"wall": max(0, int(at.timestamp() * 1000)), "counter": 0, "mac": "legacy"}
@@ -2815,7 +2836,7 @@ def _line_event(raw: bytes, *, identity_only: bool = False) -> dict | None:
         return None
     if not isinstance(data, dict) or not isinstance(data.get("type"), str):
         return None
-    if identity_only and data["type"] not in _IDENTITY_KINDS:
+    if identity_only and data["type"] not in _IDENTITY_KINDS and data["type"] != COMPACTION_GENERATION_TYPE:
         # Keep ordering slots around old unsequenced identity events. The
         # identity fold needs no evidence body or timestamp normalization.
         seq = data.get("seq")
@@ -2929,7 +2950,8 @@ def _read_event_lines(identity_only: bool = False) -> tuple[list[dict], int]:
         if event is None:
             bad += 1
             continue
-        events.append(event)
+        if event.get("type") != COMPACTION_GENERATION_TYPE:
+            events.append(event)
     _PARSED_LINE_CACHE[identity_only] = (path, data, tuple(events), bad)
     cache[key] = (events, bad)
     return events, bad
@@ -2952,12 +2974,12 @@ def _read_all_events(*, identity_only: bool = False, author_check: bool = True) 
     return _order_events(raw, bad, author_check=author_check)
 
 
-def _order_events(raw: list[dict], bad: int, *, author_check: bool = True) -> tuple[list[dict], int]:
+def _order_events(raw: list[dict], bad: int, *, author_check: bool = True, replica=None) -> tuple[list[dict], int]:
     """``_read_all_events``' ordering over lines already read (also used to
     fold a log that is not the file, ``routing_compact``)."""
     from khipu import routing_replication
 
-    events = routing_replication.merge(raw)
+    events = routing_replication.merge(raw) if replica is None else routing_replication.merge(raw, remote=replica)
     if author_check:
         _mark_unchecked(events)  # a sequence cannot move a line before the first author check
     slots = [i for i, e in enumerate(events) if isinstance(e.get("seq"), int) and not e.get("mac")]
@@ -3020,6 +3042,7 @@ def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None 
     line written ahead, then a right clock) keeps its own time, and the fold
     orders the lines as in phase 1a."""
     events = _read_all_events()[0] if events is None else events
+    events = [e for e in events if e.get("type") != COMPACTION_GENERATION_TYPE]
     mac = _mac_locked()
     legacy_mac = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
     if legacy_mac is None:
@@ -3029,11 +3052,12 @@ def _stamp_locked(clock: datetime, count: int = 1, *, events: list[dict] | None 
     events = [e for e in events if e.get("mac") in (None, mac)]
     times = [t for t in (_parse(e.get("written_at")) for e in events) if t is not None]
     last = _parse(events[-1].get("written_at")) if events else None
-    settled = [t for t in _record_times(events)[0] if t is not None]
     clock_at = None
     stamp = _not_behind(clock, last)
-    if len(times) >= 2 and settled and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
-        stamp, clock_at = settled[-1], clock
+    if len(times) >= 2 and (min(times) - clock).total_seconds() > CLOCK_TOLERANCE:
+        settled = [t for t in _record_times(events)[0] if t is not None]
+        if settled:
+            stamp, clock_at = settled[-1], clock
     out = []
     for i in range(count):
         line = {"written_at": _iso(stamp), "seq": first + i, "mac": mac}
@@ -3537,6 +3561,18 @@ def _evidence(event: dict, cfg: dict) -> dict | None:
                if k in event}, "turn": bool(event.get("observed_turn"))}
 
 
+def _confirmed_level_reset(item: dict) -> datetime | None:
+    """Only a measured reset or a dated provider message can end an owner level."""
+    if item.get("until_default") or item.get("basis") not in ("cli", "checked"):
+        return None
+    if item.get("source") in ("probe", "check"):
+        return _parse(item.get("reset_at"))
+    if item.get("message_time") and item.get("state") == LIMITED:
+        until = item.get("until")
+        return _parse(item.get("reset_at")) or (until if isinstance(until, datetime) else _parse(until))
+    return None
+
+
 def _owner_event(event: dict) -> dict:
     return {"id": event.get("id"), "at": _parse(event.get("written_at")), "seq": event["_seq"],
             "until": _parse(event.get("until")), "written_by": event.get("written_by") or OWNER,
@@ -3858,7 +3894,7 @@ def _record_times(events: list[dict]) -> tuple[list[datetime | None], list[datet
     make two lines agree on that time, and the fold would keep it and lift
     every correct line after it. Doctor names copied lines by their clock's
     reading (``clock_at``), not here."""
-    raw = [_parse(e.get("written_at")) for e in events]
+    raw = [None if e.get("type") == COMPACTION_GENERATION_TYPE else _parse(e.get("written_at")) for e in events]
     copied = [_copied(e) for e in events]
     fixed, behind, ahead = _write_order_times([None if c else t for t, c in zip(raw, copied)])
     before: datetime | None = None
@@ -3874,6 +3910,7 @@ def _in_write_order(events: list[dict]) -> list[dict]:
     """Settle each Mac's timestamps, then order the event set by HLC.
     Unstamped history retains its local order and gets derived revisions;
     legacy origin markers keep later replication from changing that origin."""
+    events = [e for e in events if e.get("type") != COMPACTION_GENERATION_TYPE]
     operations_salt = _id_salt(operations=True) if any(not e.get("mac") and not e.get("_revision") for e in events) else None
     origin = next((e["legacy_mac"] for e in events if e.get("legacy_mac")), None)
     origin = origin or next((event_identity.legacy_mac(e, operations_salt=operations_salt)
@@ -4795,8 +4832,12 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
         for item in priority_out["entries"]:
             level = item.get("level")
             if level:
-                resets = [_parse(e.get("reset_at") or e.get("until")) for e in evidence
-                          if e.get("account") == item["account"]]
+                clear = owner["clears"].get(item["account"])
+                resets = [_confirmed_level_reset(e) for e in evidence
+                          if e.get("account") == item["account"]
+                          and e["id"] not in owner["dismissed"]
+                          and e.get("source_id") not in owner["dismissed"]
+                          and (clear is None or _k(e) > _k(clear))]
                 resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
                 if resets:
                     level["until"] = _iso(min(_parse(level["until"]), *resets))
@@ -5982,6 +6023,39 @@ def record_pace_samples(now: datetime | None = None) -> int:
     return len(batch)
 
 
+def _source_batch(extra: list[dict], events: list[dict], ordered: list[dict], cfg: dict, known: list[dict],
+                  mac: str) -> tuple[list[dict], dict]:
+    """(the lines the sources' evidence ``extra`` would append to this record,
+    the record's account ids). Writes nothing; compaction asks it of a log it
+    is checking."""
+    ids, _forwards, _aliases = account_identity.state(ordered, known)
+    forward = forwarding(events, {a["key"] for a in known})
+    cuts = {}
+    for event in events:
+        if event.get("type") == "account_note" and _list_change(event):
+            for pair in event.get("lanes_cut") or []:
+                cuts[tuple(pair)] = (event["_seq"], _parse(event["written_at"]))
+    matched = []
+    for item in extra:
+        cut = cuts.get((item.get("runner"), item.get("lane")))
+        key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
+            item, cfg.get("routing_lane_map") or {}, known, forward, cfg.get("_providers"))
+        matched.append(dict(item, account=key))
+    return entry_model.source_events(matched, ordered, cfg, mac, ids), ids
+
+
+def _unseen_sightings(extra: list[dict], events: list[dict]) -> list[dict]:
+    """The sources' evidence no line of the record already holds (matched by
+    ``source_id``, salted or as a legacy line wrote it)."""
+    source_ids = {e.get("source_id") for e in events if e.get("source_id")}
+    remaining = []
+    for item in extra:
+        source_id = entry_model.source_id(item["id"]) if source_ids and item.get("id") else None
+        if item.get("id") not in source_ids and source_id not in source_ids:
+            remaining.append(item)
+    return remaining
+
+
 def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     """Refold and save the view; the caller holds the lock."""
     fingerprint, cfg, known = inputs or _inputs()
@@ -5997,20 +6071,7 @@ def _refold_locked(now: datetime, inputs: tuple | None = None) -> dict:
     prev = _load_view()
     extra, _status, _cache = _sources(cfg, now, prev)
     if extra or (_status or {}).get("runners"):
-        ids, _forwards, _aliases = account_identity.state(ordered, known)
-        forward = forwarding(events, {a["key"] for a in known})
-        cuts = {}
-        for event in events:
-            if event.get("type") == "account_note" and _list_change(event):
-                for pair in event.get("lanes_cut") or []:
-                    cuts[tuple(pair)] = (event["_seq"], _parse(event["written_at"]))
-        matched = []
-        for item in extra:
-            cut = cuts.get((item.get("runner"), item.get("lane")))
-            key = None if not item.get("account") and cut and _before_cut(item, cut) else _evidence_account(
-                item, cfg.get("routing_lane_map") or {}, known, forward, cfg.get("_providers"))
-            matched.append(dict(item, account=key))
-        batch = entry_model.source_events(matched, ordered, cfg, _mac_locked(), ids)
+        batch, ids = _source_batch(extra, events, ordered, cfg, known, _mac_locked())
         # An allocated id must have a durable login binding before an
         # observation refers to it; a later fold otherwise allocates anew.
         observed_accounts = {row.get("account") for row in batch if row["type"] == "observation"}
@@ -6057,13 +6118,7 @@ def _fold_body(now: datetime, cfg: dict, known: list[dict], events: list[dict],
     itself, which reads and never writes."""
     now = _not_before_last_fold(now, prev)
     extra, status, cache = _sources(cfg, now, prev)
-    source_ids = {e.get("source_id") for e in events if e.get("source_id")}
-    remaining = []
-    for item in extra:
-        source_id = entry_model.source_id(item["id"]) if source_ids and item.get("id") else None
-        if item.get("id") not in source_ids and source_id not in source_ids:
-            remaining.append(item)
-    extra = remaining
+    extra = _unseen_sightings(extra, events)
     from khipu import routing_replication
 
     body = fold(events_ordered if events_ordered is not None else events,
@@ -7268,9 +7323,11 @@ def request_rule(text: str, *, n: int | None = None, owner_request: str | None =
     return dict(_done(written, view), n=rule["n"])
 
 
-def retire_rule(n, *, via: str, now: datetime | None = None) -> dict:
-    rule = _rule(n, now)
-    return dict(_owner_write({"type": "rule_retire", **_rule_target(rule)}, via), n=rule["n"])
+def retire_rule(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
+    with _lock():
+        rule = _rule(n, now)
+        _rule_as_shown(rule, expect)
+        return dict(_owner_write({"type": "rule_retire", **_rule_target(rule)}, via), n=rule["n"])
 
 
 def restore_rule(n, *, via: str, now: datetime | None = None, holds: dict | None = None,
@@ -7358,11 +7415,18 @@ def unconfirm_rule(n, *, via: str, now: datetime | None = None) -> dict:
     return dict(_owner_write({"type": "rule_unconfirm", **_rule_target(rule)}, via), n=rule["n"])
 
 
-def undo_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
-    rule = _rule(n, now)
-    if not rule.get("pending") or rule.get("pending_kind") != "changed" or not isinstance(rule.get("prior_text"), str):
-        raise RouteError(f"standing rule {rule['n']} has no pending edit to undo")
-    return dict(_owner_write({"type": "rule_undo", **_rule_target(rule)}, via), n=rule["n"])
+def _rule_as_shown(rule: dict, expect) -> None:
+    if expect is not None and expect != rule["revision"]:
+        raise RouteError("the rule changed after it was read; read its revision again")
+
+
+def undo_rule_request(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
+    with _lock():
+        rule = _rule(n, now)
+        if not rule.get("pending") or rule.get("pending_kind") != "changed" or not isinstance(rule.get("prior_text"), str):
+            raise RouteError(f"standing rule {rule['n']} has no pending edit to undo")
+        _rule_as_shown(rule, expect)
+        return dict(_owner_write({"type": "rule_undo", **_rule_target(rule)}, via), n=rule["n"])
 
 
 def pending_rule_line(entity: str) -> dict | None:
@@ -7435,11 +7499,13 @@ def restore_rule_request(n, request: dict, *, via: str, now: datetime | None = N
     return dict(_done(written[-1], view), n=number)
 
 
-def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
-    rule = _rule(n, now)
-    if not rule.get("pending"):
-        raise RouteError(f"standing rule {rule['n']} has no pending proposal to dismiss")
-    return dict(_owner_write({"type": "rule_dismiss", **_rule_target(rule)}, via), n=rule["n"])
+def dismiss_rule_request(n, *, via: str, now: datetime | None = None, expect=None) -> dict:
+    with _lock():
+        rule = _rule(n, now)
+        if not rule.get("pending"):
+            raise RouteError(f"standing rule {rule['n']} has no pending proposal to dismiss")
+        _rule_as_shown(rule, expect)
+        return dict(_owner_write({"type": "rule_dismiss", **_rule_target(rule)}, via), n=rule["n"])
 
 
 # ---- the owner's priority (phase 4b) -----------------------------------------------------
@@ -7449,15 +7515,6 @@ def dismiss_rule_request(n, *, via: str, now: datetime | None = None) -> dict:
 # the rules and the note; it never computes, reorders, fills in or enforces
 # it. A conversation sets it only at the owner's request, marked unconfirmed;
 # confirming, undoing and clearing are the owner's.
-
-
-def _level_at_reset(level: dict, key: str) -> dict:
-    from khipu import usage
-
-    row = usage._load_cache().get(key) or {}
-    resets = [_parse(w.get("resets_at")) for w in row.get("windows") or [] if isinstance(w, dict)]
-    resets = [t for t in resets if t is not None and t > _parse(level["as_of"])]
-    return dict(level, until=_iso(min(_parse(level["until"]), *resets))) if resets else level
 
 
 def set_definition(definition: str, value: dict, *, via: str) -> dict:
@@ -7658,7 +7715,7 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
                 raise RouteError("level takes claim, as_of and until, with until after as_of")
             if conversation:
                 level["claim"] = _clean(level["claim"], 0)
-            out[-1]["level"] = _level_at_reset(level, key)
+            out[-1]["level"] = level
         if item.get("exceptions") is not None:
             exceptions = _checked_exceptions(item["exceptions"])
             if exceptions is None:
@@ -7790,7 +7847,9 @@ def _needs_version(expect) -> None:
 def _check_priority(expect, now: datetime | None) -> None:
     """Refuse when ``expect`` is given and the priority moved; the caller
     holds the routing lock until its write is down."""
-    if expect is not None and str(expect).strip() != (read_view(now).get("priority_version") or "p0"):
+    view = read_view(now)
+    actual = pending_priority_pin(view) if str(expect).startswith("pp-") else (view.get("priority_version") or "p0")
+    if expect is not None and str(expect).strip() != actual:
         raise PriorityMoved("the priority changed after it was read; read it again")
 
 
@@ -8474,11 +8533,22 @@ def _checked_tiers(tiers) -> dict:
     return dict(tiers)
 
 
-def set_tier_table(tiers, *, via: str, now: datetime | None = None) -> dict:
-    """The owner's tier table, confirmed as written."""
+def _tier_as_shown(expect) -> None:
+    if expect is not None:
+        waiting = pending_tier_table()
+        if waiting is None or waiting["pin"] != expect:
+            raise RouteError("the proposed tier table moved after it was shown; read what is waiting again")
+
+
+def set_tier_table(tiers, *, via: str, now: datetime | None = None, expect: str | None = None) -> dict:
+    """The owner's tier table, confirmed as written. ``expect``: an answer to
+    a proposal as it was shown (``tier_table_pin``), never landing on a table
+    or a proposal written since."""
     rows = _checked_tiers(tiers)
-    return dict(_owner_write({"type": "tier_table_set", "tiers": rows, "confirmed": True}, via),
-                tiers=rows)
+    with _lock():
+        _tier_as_shown(expect)
+        return dict(_owner_write({"type": "tier_table_set", "tiers": rows, "confirmed": True}, via),
+                    tiers=rows)
 
 
 def request_tier_table(tiers, *, owner_request: str, author: dict | None = None, via: str = "mcp",
@@ -8509,17 +8579,51 @@ def _proposed_tiers() -> dict | None:
     return proposed
 
 
-def confirm_tier_table(*, via: str, now: datetime | None = None) -> dict:
-    """Confirm the latest proposed tier table, as the owner wrote it."""
-    proposed = _proposed_tiers()
-    if proposed is None:
-        raise RouteError("there is no proposed tier table to confirm")
-    return set_tier_table(proposed, via=via, now=now)
+def tier_table_pin(tiers: dict) -> str:
+    """A proposed tier table as it was shown to the owner."""
+    return "tt-" + hashlib.sha256(json.dumps(tiers, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
-def clear_tier_table(*, via: str, now: datetime | None = None) -> dict:
-    """Remove the tier table, so no table governs the dispatch check."""
-    return _owner_write({"type": "tier_table_clear"}, via)
+def pending_tier_table() -> dict | None:
+    """The tier table a conversation proposed, while the record's latest word
+    on the table is that proposal: an owner's set, confirm or clear after it
+    answers it. ``tiers``, ``at``, ``by``, ``request``, and ``pin``."""
+    from khipu.routing_advisory import valid_tiers
+
+    latest, owner_revision = None, None
+    for event in _in_write_order(read_events()[0]):
+        if event.get("type") in ("tier_table_set", "tier_table_clear"):
+            latest = event
+            if event.get("confirmed") is True or event.get("type") == "tier_table_clear":
+                owner_revision = event
+    if (latest is None or latest.get("type") != "tier_table_set" or latest.get("confirmed") is True
+            or not valid_tiers(latest.get("tiers"))):
+        return None
+    tiers = dict(latest["tiers"])
+    return {"tiers": tiers, "at": latest.get("written_at"), "by": latest.get("written_by"),
+            "request": latest.get("owner_request"),
+            "pin": tier_table_pin({"tiers": tiers, "proposal": latest, "owner_revision": owner_revision})}
+
+
+def confirm_tier_table(*, via: str, now: datetime | None = None, expect: str | None = None) -> dict:
+    """Confirm the latest proposed tier table, as the owner wrote it.
+    ``expect``: the proposal as it was shown (``tier_table_pin``); a newer one
+    or none is refused, never confirmed unseen."""
+    with _lock():
+        _tier_as_shown(expect)
+        proposed = _proposed_tiers()
+        if proposed is None:
+            raise RouteError("there is no proposed tier table to confirm")
+        return set_tier_table(proposed, via=via, now=now)
+
+
+def clear_tier_table(*, via: str, now: datetime | None = None, expect: str | None = None) -> dict:
+    """Remove the tier table, so no table governs the dispatch check.
+    ``expect``: as for a set, so refusing a proposal never wipes a table
+    adopted since it was shown."""
+    with _lock():
+        _tier_as_shown(expect)
+        return _owner_write({"type": "tier_table_clear"}, via)
 
 
 # ---- words ----------------------------------------------------------------------------
@@ -9865,7 +9969,7 @@ def doctor_block(now: datetime | None = None) -> dict:
                         f"Khipu leaves {'them' if bad != 1 else 'it'} out.")
     from khipu import routing_compact
 
-    log_health = routing_compact.health()
+    log_health = routing_compact.health(now)
     if log_health.get("warning"):
         warnings.append(log_health["warning"])
     events, _bad = read_events()
@@ -12468,6 +12572,8 @@ def _owner_via(args, intent: dict | None = None) -> str | None:
     it opens."""
     from khipu import owner_direction
 
+    _TERMINAL_REASON.set(None)
+
     if getattr(args, "from_app", False):
         caller = _caller()
         if not caller["app"]:
@@ -12485,14 +12591,69 @@ def _owner_via(args, intent: dict | None = None) -> str | None:
     return "cli"
 
 
-def typed_yes(prompt: str) -> bool:
+def _terminal_harness() -> str | None:
+    from khipu import owner_direction, owner_turns
+
+    if owner_turns.job_marker(os.environ):
+        return "a dispatched job"
+    names = ("claude", "codex", "cursor", "aegis", "antigravity", "t3 code", "t3-code")
+    info = _proc_info(os.getpid())
+    pid, born = (info[0], info[2] if len(info) > 2 else None) if info else (0, None)
+    for _ in range(_CHAIN_MOST):
+        info = _proc_info(pid)
+        if info is None:
+            bare = owner_turns._proc_bare(pid)
+            if bare is None:
+                break
+            info = (bare[0], bare[2], bare[1])
+        started = info[2] if len(info) > 2 else None
+        if started is not None and born is not None and started > born:
+            break
+        name = os.path.basename(info[1]).lower()
+        if name.startswith(names):
+            return name
+        pid, born = info[0], started
+        if pid <= 1:
+            break
+    return None
+
+
+def _terminal_from_harness() -> bool:
+    return _terminal_harness() is not None
+
+
+class TerminalRefusal:
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def __bool__(self):
+        return False
+
+
+_TERMINAL_REASON = contextvars.ContextVar("khipu_terminal_reason", default=None)
+
+
+def terminal_refusal(default=None) -> str:
+    return _TERMINAL_REASON.get() or default or _REFUSED
+
+
+def typed_yes(prompt: str) -> bool | TerminalRefusal:
     """The owner's typed confirmation: a yes typed on an interactive
     terminal. A piped or redirected answer (stdin not a terminal) is never
-    asked for and never counts. Routing's and the ledger's owner commands
-    both use this one rule."""
+    asked for and never counts. Known harnesses and dispatched jobs in the
+    ancestor chain also refuse, even through a nested pty. Routing's and the
+    ledger's owner commands both use this rule. Same-user automation that
+    hides or reparents its ancestry remains outside this process check."""
+    _TERMINAL_REASON.set(None)
     try:
         if not sys.stdin.isatty():
             return False
+        harness = _terminal_harness()
+        if harness:
+            reason = f"This terminal runs inside {harness}; say yes in the conversation or the app."
+            _TERMINAL_REASON.set(reason)
+            print(reason, file=sys.stderr)
+            return TerminalRefusal(reason)
         answer = input(prompt)
     except (EOFError, OSError):
         return False
@@ -12507,7 +12668,13 @@ def _owner_stamp(event: dict) -> dict:
     from khipu import owner_direction
 
     op = _OP.get() or owner_direction.operation_id(event)
-    return dict(event, **auth, **({"op": op} if op else {}))
+    stamped = dict(event, **auth, **({"op": op} if op else {}))
+    if "confirmed" in event:
+        # A held confirm's evidence (``confirmed``, on the owner-actions line
+        # too) must not overwrite a line's own field of that name: a tier table
+        # with a dict there is an unreadable line, and the change is lost.
+        stamped["confirmed"] = event["confirmed"]
+    return stamped
 
 
 # How many owner's lines this process stamped: an owner change that wrote
@@ -12743,7 +12910,7 @@ def _priority_cli(args, now: datetime) -> int:
         return 0
     via = _owner_via(args, _intent_or_none(_priority_intent, args, action))
     if via is None:
-        _print_json({"ok": False, "error": _REFUSED})
+        _print_json({"ok": False, "error": terminal_refusal()})
         return 2
     now = _now()
     expect = getattr(args, "expect", None)
@@ -12799,15 +12966,15 @@ def _tier_table_cli(args, now: datetime) -> int:
         return 0
     via = _owner_via(args, _intent_or_none(_tier_table_intent, args, action))
     if via is None:
-        _print_json({"ok": False, "error": _REFUSED})
+        _print_json({"ok": False, "error": terminal_refusal()})
         return 2
     now = _now()
     if action == "set":
-        out = set_tier_table(_tier_table_arg(args), via=via, now=now)
+        out = set_tier_table(_tier_table_arg(args), via=via, now=now, expect=getattr(args, "expect", None))
     elif action == "confirm":
-        out = confirm_tier_table(via=via, now=now)
+        out = confirm_tier_table(via=via, now=now, expect=getattr(args, "expect", None))
     else:
-        out = clear_tier_table(via=via, now=now)
+        out = clear_tier_table(via=via, now=now, expect=getattr(args, "expect", None))
     _print_json(_finish_owner(out))
     return 0
 
@@ -13056,7 +13223,7 @@ def run_cli(args) -> int:
             if owner_flag:
                 via = _owner_via(args, _intent_or_none(_hold_intent, args, words))
                 if via is None:
-                    _print_json({"ok": False, "error": _REFUSED})
+                    _print_json({"ok": False, "error": terminal_refusal()})
                     return 2
                 now = _now()
             if len(words) == 2 and words[0] == "end":
@@ -13094,7 +13261,7 @@ def run_cli(args) -> int:
         want = _route_intent(cmd, args) if cmd == "definition" else _intent_or_none(_route_intent, cmd, args)
         via = _owner_via(args, want)
         if via is None:
-            _print_json({"ok": False, "error": _REFUSED})
+            _print_json({"ok": False, "error": terminal_refusal()})
             return 2
         now = _now()
         if cmd == "cap":
@@ -13133,13 +13300,13 @@ def run_cli(args) -> int:
             elif len(params) != 1:
                 raise RouteError(f"rule {args.action} takes one rule number")
             elif args.action == "retire":
-                out = retire_rule(params[0], via=via, now=now)
+                out = retire_rule(params[0], via=via, now=now, expect=getattr(args, "expect", None))
             elif args.action == "restore":
                 out = restore_rule(params[0], via=via, now=now, holds=_holds_arg(args))
             elif args.action == "undo":
-                out = undo_rule_request(params[0], via=via, now=now)
+                out = undo_rule_request(params[0], via=via, now=now, expect=getattr(args, "expect", None))
             elif args.action == "dismiss":
-                out = dismiss_rule_request(params[0], via=via, now=now)
+                out = dismiss_rule_request(params[0], via=via, now=now, expect=getattr(args, "expect", None))
             else:
                 out = confirm_rule(params[0], via=via, now=now, holds=_holds_arg(args), expect=getattr(args, "expect", None))
         else:

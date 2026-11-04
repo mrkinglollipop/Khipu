@@ -20,7 +20,7 @@
    cloud agents (phase 7) join with their phases. The Mac-to-Mac replication
    switch sits beside the proposal-text switch in Sizes and times. */
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, ReactNode, RefObject } from "react";
 import { ChevronRight, Loader2 } from "lucide-react";
 import { EmptyState, Tag } from "./ui";
@@ -31,9 +31,12 @@ import type { PlanUsageState, UsageAccount, UsageReport } from "./PlansCard";
 import { inPlansOrder } from "./RoutingCard";
 import { PlanDetailSheet, RoutingDetailSheet, useDetailHost } from "./AccountDetail";
 import { AccountsRequestBand } from "./AccountControls";
+import { NeedsYou } from "./NeedsYou";
+import { accountsCard, decideCards } from "./routingNeeds";
+import type { RouteSetting } from "./routingNeeds";
 import { priorityItems } from "./accountControlsModel";
 import type { PriorityItem } from "./accountControlsModel";
-import { GROUPS, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
+import { GROUPS, oldFileRules, accountTags, accountWeek, lanesWithoutAccount, providerRows, routingOverview, staleAfterSeconds } from "./routingOverview";
 import type { GroupKey, GroupTag, OverviewSettings, Problem, ProviderRow } from "./routingOverview";
 import { paceModel } from "./routingPace";
 import type { PaceTrend, PaceWindow } from "./routingPace";
@@ -69,7 +72,6 @@ import {
   modelDisagreementWords,
   pastWords,
   ROUTE_READ_FAILED,
-  priorityPendingWords,
   ruleResultLines,
   saidWhen,
   useRouting,
@@ -104,19 +106,6 @@ import {
 } from "./routingWords";
 import type { ChangeRow, LimitUnit } from "./routingWords";
 
-/** A conversation's change to a routing setting at your request, made and
- *  marked until you confirm it or undo it (the CLI's ``request``). */
-type SettingRequest = { request?: string | null; by_words?: string | null; at?: string | null; prior?: unknown };
-type RouteSetting = {
-  value: unknown;
-  default: unknown;
-  kind: string;
-  source: string;
-  words?: string;
-  request?: SettingRequest | null;
-  /** A conversation's change is waiting for the owner; `value` is still the live state. */
-  pending?: boolean;
-};
 type RouteConfig = { routing?: Record<string, RouteSetting> };
 
 /** Where focus goes when the control that made a change is gone. */
@@ -597,43 +586,6 @@ export function DisagreePanel({ a, w, now, back }: { a: RouteAccount; w: Writer;
   );
 }
 
-/** Each routing setting a conversation changed at your request: what it
- *  said you asked, and Confirm or Undo (the value it replaced comes back). */
-function SettingRequests({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
-  const waiting = Object.entries(cfg?.routing ?? {}).filter(([, s]) => s.request);
-  if (!waiting.length) return null;
-  return (
-    <>
-      {waiting.map(([key, s]) => (
-        <div key={key} className="route-disagree" role="group" aria-label={`A conversation changed: ${s.words ?? key}`}
-          data-route-item={`setting:${key}`} tabIndex={-1}>
-          <span>
-            <b>
-              {s.words ?? key}: changed by {s.request?.by_words || "a conversation"} at your request; you haven't
-              confirmed it yet.
-            </b>
-          </span>
-          {s.request?.request ? <span>What it said you asked: “{s.request.request}”</span> : null}
-          <div className="toolbar">
-            <button type="button" className="sm primary" disabled={w.isBusy(`setting:${key}:confirm`)}
-              onClick={() => void w.run(`setting:${key}:confirm`, "khipu_config_request", { key, action: "confirm" }, reread)}>
-              <Busy on={w.isBusy(`setting:${key}:confirm`)} />
-              Confirm
-            </button>
-            <button type="button" className="sm" disabled={w.isBusy(`setting:${key}:undo`)}
-              onClick={() => void w.run(`setting:${key}:undo`, "khipu_config_request", { key, action: "undo" }, reread)}>
-              <Busy on={w.isBusy(`setting:${key}:undo`)} />
-              Undo
-            </button>
-          </div>
-          <WriteError w={w} id={`setting:${key}:confirm`} />
-          <WriteError w={w} id={`setting:${key}:undo`} />
-        </div>
-      ))}
-    </>
-  );
-}
-
 /** Reading a tool's own login for its real usage limits (owner decision
  *  2026-10-29): one switch per tool. The token goes only to that tool's own
  *  usage page; Khipu never changes the login. */
@@ -693,9 +645,16 @@ export function LoginUsageSwitches({ cfg, cfgError, w, reread }: { cfg: RouteCon
   );
 }
 
-function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
-  const enabled = cfg?.routing?.routing_reset_check?.value === true;
+function ResetCheckStatus({ data }: { data: RouteView | null }) {
   const next = (data?.accounts ?? []).filter((a) => a.next_check).map((a) => `${a.label}: ${whenLocal(a.next_check!, new Date())}`);
+  return <div className="section-body" aria-label="Next reset checks">
+        <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
+        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
+  </div>;
+}
+
+function ResetChecksSection({ cfg, cfgError, w, reread }: { data: RouteView | null; cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
+  const enabled = cfg?.routing?.routing_reset_check?.value === true;
   return (
     <div className="section-body">
         <SwitchRow id="route-reset-check" label="Check an account at its reset time"
@@ -710,8 +669,7 @@ function ResetChecksSection({ data, cfg, cfgError, w, reread }: { data: RouteVie
           <RetryTimesRow cfg={cfg} w={w} reread={reread} />
           <LimitRow name="Wait while the Mac is busy" help="If load is over this number, Khipu waits before checking." fields={[{ key: "routing_busy_load", label: "Load", unit: "load", options: [50, 75, 90, 0], zero: "Never wait" }, { key: "routing_busy_wait", label: "Wait", unit: "time", options: [60, 300, 600, 0], zero: "Try again at the next look" }, { key: "routing_busy_tries", label: "Busy attempts", unit: "attempts", options: [1, 3, 5, 0], zero: "None: record it at once" }]} cfg={cfg} w={w} reread={reread} />
         </div>
-        <p className="set-help">{next.length ? `Khipu checks again at ${next.join("; ")}.` : "No reset checks are scheduled."}</p>
-        <p className="set-help">{(data?.accounts ?? []).filter((a) => a.reset_check?.reason).map((a) => `${a.label}: ${a.reset_check?.reason}`).join("; ") || "No account has a reset-check reason."}</p>
+
     </div>
   );
 }
@@ -888,6 +846,9 @@ function PrioritySection({
   const [endOpen, setEndOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [adding, setAdding] = useState("");
+  // Priority rows carry their inline Change form, so three keeps the normal
+  // work page readable while the existing pager still exposes every account.
+  const [shownEntries, setShownEntries] = useState(3);
   const addId = useId();
   const addSelect = useRef<HTMLSelectElement>(null);
   const candidates = (data.accounts ?? []).filter((a) => a.configured !== false && !entries.some((e) => e.account === a.key));
@@ -909,48 +870,20 @@ function PrioritySection({
   const ids = entries.map((e) => `priority:move:${e.account}`).concat(entries.map((e) => `priority:remove:${e.account}`));
   return (
     <div className="section-body route-priority-set" role="group" aria-label="Your priority">
-      <p className="set-help">
-        Your order of accounts, each with your words for its role and an end if you want one. Conversations hear it
-        first, before the account lines, word for word. Khipu keeps your order as you set it and never picks or reorders
-        for you; if the first account is limited, paused or down, conversations hear that beside it.
-      </p>
+      <p className="set-help">Your order tells conversations which accounts you prefer; Khipu keeps it exactly as you set it.</p>
       {p?.pending ? (
-        <div className="route-disagree" role="group" aria-label="A conversation set your priority"
-          data-route-item="priority:pending" tabIndex={-1}>
-          <span>
-            <b>{priorityPendingWords(p)}</b>
-          </span>
-          {p.owner_request && !p.proposal_withheld ? <span>What it said you asked: “{p.owner_request}”</span> : null}
-          <span>
-            It replaced:{" "}
-            {p.replaced?.entries.length
-              ? p.replaced.entries.map((e, i) => `${i + 1}. ${e.label}${e.role ? `: ${e.role}` : ""}`).join("; ")
-              : "no priority"}
-            .
-          </span>
-          <div className="toolbar">
-            <button type="button" className="sm primary" disabled={w.isBusy("priority:confirm")}
-              onClick={() => void eok.attempt("priority:confirm", "khipu_route_priority", { action: "confirm", expect })}>
-              <Busy on={w.isBusy("priority:confirm")} />
-              Confirm
-            </button>
-            <button type="button" className="sm" disabled={w.isBusy("priority:undo")}
-              onClick={() => void w.run("priority:undo", "khipu_route_priority", { action: "undo", expect }, null, () => addSelect.current)}>
-              <Busy on={w.isBusy("priority:undo")} />
-              Undo
-            </button>
-          </div>
-          <WriteError w={w} id="priority:confirm" />
-          <WriteError w={w} id="priority:undo" />
-        </div>
+        <p className="set-help" data-route-item="priority:pending" tabIndex={-1}>
+          A conversation changed this order and waits for your answer on Needs you.
+        </p>
       ) : null}
       {eok.ask ? (
         <EndOrKeepChoices view={data} ask={eok.ask} now={now} busy={w.anyBusy} saveLabel="Save priority"
           onCancel={() => eok.setAsk(null)} />
       ) : null}
       {entries.length ? (
-        <ol className="rows route-priority-list" aria-label="Your priority, first to last">
-          {entries.map((e, i) => (
+        <>
+          <ol className="rows route-priority-list" aria-label="Your priority, first to last">
+          {entries.slice(0, shownEntries).map((e, i) => (
             <li key={e.account} className="row-item route-acct">
               <span className="route-name">
                 {i + 1}. {e.label}
@@ -983,7 +916,13 @@ function PrioritySection({
               {editing === i && p ? <PriorityEntryForm p={p} i={i} w={w} attempt={eok.attempt} onClose={() => setEditing(null)} /> : null}
             </li>
           ))}
-        </ol>
+          </ol>
+          {entries.length > shownEntries ? (
+            <button type="button" className="sm" onClick={() => setShownEntries((n) => n + 3)}>
+              Show {Math.min(entries.length - shownEntries, 3)} more {entries.length - shownEntries === 1 ? "account" : "accounts"}
+            </button>
+          ) : null}
+        </>
       ) : (
         <p className="set-help">No priority set. Conversations hear the accounts in their usual order.</p>
       )}
@@ -1041,22 +980,40 @@ function PrioritySection({
         </ConfirmGroup>
       ) : null}
       <SwitchRow id="route-pace-order" label="With no priority set, list accounts by how soon their allowance runs out unused"
-        what="Khipu works out, for each account it can read, the pace that would use what is left of its longest window by the time it resets, and lists the fastest first under a heading that says it is arithmetic, not your priority. Each account's pace is told either way. A priority you set always comes first and is never reordered."
+        what="Khipu lists the account closest to wasting its allowance first; a priority you set always comes first."
         tag={<Tag>{paceOn ? "On" : "Off"}</Tag>} checked={paceOn} disabled={!cfg || w.anyBusy} busy={w.isBusy("pace-order")}
         onChange={(on) => void w.run("pace-order", "khipu_config_set", { key: "routing_pace_order", value: on ? "on" : "off" }, reread)}
         error={<WriteError w={w} id="pace-order" />} />
-      <div className="rows">
-        <LimitRow name="Warn when a priority a conversation set is still unconfirmed after"
-          help="Khipu's health report reminds you to confirm or undo it."
-          fields={[{ key: "routing_priority_unconfirmed_warn_after", label: "Warn after", unit: "time", options: [12 * H, D, 3 * D, 0], zero: "Never" }]}
-          cfg={cfg} w={w} reread={reread} />
-      </div>
     </div>
   );
 }
 
+function PriorityRarelySetting({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
+  return <div className="section-body"><div className="rows"><LimitRow name="Warn when a priority a conversation set is still unconfirmed after"
+    help="Khipu's health report reminds you to confirm or undo it."
+    fields={[{ key: "routing_priority_unconfirmed_warn_after", label: "Warn after", unit: "time", options: [12 * H, D, 3 * D, 0], zero: "Never" }]}
+    cfg={cfg} w={w} reread={reread} /></div></div>;
+}
+
 /** Which groups, account lines and inner folds are open, by key. */
 type Folds = { isOpen: (key: string) => boolean; toggle: (key: string) => void; openKeys: (keys: string[]) => void };
+
+type RoutingPageKey = "needs" | "accounts" | "work" | "macs" | "conversations" | "changes" | "wrong" | "rare";
+
+const ROUTING_PAGES: ReadonlyArray<{ key: RoutingPageKey; name: string; groups: GroupKey[] }> = [
+  { key: "needs", name: "Needs you", groups: [] },
+  { key: "accounts", name: "Your accounts", groups: ["accounts", "pace"] },
+  { key: "work", name: "Who gets what work", groups: ["priority", "rules", "holds"] },
+  { key: "macs", name: "Your Macs", groups: [] },
+  { key: "conversations", name: "Conversations", groups: ["telling"] },
+  { key: "changes", name: "What changed", groups: ["changes"] },
+  { key: "wrong", name: "Something's wrong", groups: ["checks", "runners"] },
+  { key: "rare", name: "Rarely needed", groups: ["resets", "table"] },
+];
+
+function pageForGroup(group: GroupKey): RoutingPageKey {
+  return ROUTING_PAGES.find((p) => p.groups.includes(group))?.key ?? "rare";
+}
 
 /** One account as a line: name, state in words with its dot, the week and
  *  pace, and its problem tags. It opens the Routing detail, where every
@@ -1098,7 +1055,7 @@ function AccountLine({
         <button type="button" className="fold-btn" aria-haspopup="dialog" data-route-item={key}
           onClick={() => detail.open(true)}>
           <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
-          <span className="an">{a.label}</span>
+          <span className="an">{a.label}<span className="account-details-cue">Details…</span></span>
           <span className="as">
             <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
             <span>{st.text}</span>
@@ -1219,7 +1176,6 @@ function AccountsSection({
   lists,
   active,
   staleAfterS,
-  w,
   now,
   reread,
   finder,
@@ -1262,9 +1218,7 @@ function AccountsSection({
   const names = (plans ? rows.map((r) => r.account || r.harness || "an account") : accounts.map((a) => a.label)).join(", ");
   return (
     <div className="section-body">
-      {finder ? <AccountsRequestBand support={finder.support} reload={finder.reload} onChanged={() => void reread()} /> : null}
       {finder ? <FinderTop finder={finder} rows={rows} /> : null}
-      <AddProviderAccount data={data} w={w} />
       {accounts.length ? (
         <>
           <div className="route-filter">
@@ -1360,8 +1314,8 @@ function AccountsSection({
         </>
       ) : null}
       <p className="set-help">
-        The same accounts as Plans, from the list at the end of this group. Reports come from four places: each
-        account's plan check, your job runners, conversations, and you. Your routing table is not one of them.
+        Khipu reads the accounts selected below. Their status can come from a plan check, your job runners,
+        conversations, or you; the old routing table is not a source.
       </p>
       <p className="set-help">
         Mark paused tells conversations you want an account left alone; Lift ends it. Clear ends a limit or a
@@ -1418,7 +1372,7 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
   }
   const written = note?.at ? `written ${whenLocal(note.at, now) || "today"}` : null;
   return (
-    <div className="section-body">
+    <div className="section-body" id="route-work-note" tabIndex={-1}>
         <h2 className="sub-title">
           Your note to every conversation
           {written ? <span className="meta">{` · ${written}`}</span> : null}
@@ -1495,12 +1449,7 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
             </div>
           </ConfirmGroup>
         ) : null}
-        <p className="set-help">
-          Conversations see this word for word, right after your standing rules, and Khipu never rewrites it. A note
-          is limited to 1,500 characters by default (Longest note, below); at the start of a conversation a longer
-          one shows its first sentence and a pointer to read the rest. Khipu never turns it into a choice of account.
-          Earlier notes stay in Recent changes. The app hands over up to {WORDS_MOST_KB} KB of text in one change.
-        </p>
+        <p className="set-help">Conversations see this word for word after your rules; Khipu never rewrites it.</p>
     </div>
   );
 }
@@ -1513,7 +1462,7 @@ type RuleAsk = { id: string; kind: "confirm" | "edit" | "remove" } | null;
 
 /** A replicated rule can be live before it has a display number. Its entity
  * is the stable CLI target for every action during that interval. */
-function ruleTarget(r: RouteRule): Record<string, unknown> {
+export function ruleTarget(r: RouteRule): Record<string, unknown> {
   return r.number_pending && r.entity ? { entity: r.entity } : { n: r.n };
 }
 
@@ -1532,6 +1481,45 @@ function ruleIdentity(r: RouteRule): string {
 function ruleRemoveButton(id: string, n?: number): HTMLElement | null {
   return document.querySelector<HTMLElement>(`[data-route-item="rule:${selectorValue(id)}"] button[aria-label^="Remove rule "]`)
     ?? (n == null ? null : document.querySelector<HTMLElement>(`.route-rule-list button[aria-label="Remove rule ${n}"]`));
+}
+
+function RuleWords({ text, expanded }: { text: string; expanded: boolean }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  const [preview, setPreview] = useState(text);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || expanded) return;
+    setPreview(text);
+    const measure = () => {
+      if (!el.clientWidth) return;
+      const style = getComputedStyle(el);
+      const probe = document.createElement("span");
+      Object.assign(probe.style, { position: "absolute", visibility: "hidden", display: "block", width: `${el.clientWidth}px`,
+        font: style.font, lineHeight: style.lineHeight, letterSpacing: style.letterSpacing, whiteSpace: "normal", overflowWrap: "anywhere" });
+      document.body.append(probe);
+      const max = 2 * (parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.45) + 1;
+      probe.textContent = text;
+      if (probe.getBoundingClientRect().height <= max) setPreview(text);
+      else {
+        const words = text.match(/\S+\s*/gu) ?? [];
+        let low = 0, high = words.length;
+        while (low < high) {
+          const mid = Math.ceil((low + high) / 2);
+          probe.textContent = `${words.slice(0, mid).join("").trimEnd()} …`;
+          if (probe.getBoundingClientRect().height <= max) low = mid;
+          else high = mid - 1;
+        }
+        setPreview(low ? `${words.slice(0, low).join("").trimEnd()} …` : "Long rule …");
+      }
+      probe.remove();
+    };
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(el);
+    window.addEventListener("resize", measure);
+    return () => { observer?.disconnect(); window.removeEventListener("resize", measure); };
+  }, [text, expanded]);
+  return <span ref={ref} className="row-main rule-preview">{expanded ? text : preview}</span>;
 }
 
 function RuleRow({
@@ -1557,6 +1545,7 @@ function RuleRow({
   onRemoved: (r: RouteRule) => void;
   back: Back;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState(r.text);
   const [editConfirm, setEditConfirm] = useState(false);
   const identity = ruleIdentity(r);
@@ -1591,12 +1580,14 @@ function RuleRow({
       <span className="route-rule-n" aria-hidden>
         {r.n}.
       </span>
-      <span className="route-rule-body">
-        <span className="row-main">{r.text}</span>
-        <span className="route-rule-meta">
+      <span className="route-rule-body" data-expanded={expanded}>
+        <RuleWords text={r.text} expanded={expanded} />
+        <button type="button" className="sm link rule-more" aria-label={`${expanded ? "Less" : "More"} about rule ${name}`}
+          aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}>{expanded ? "Less" : "More"}</button>
+        <span className="route-rule-meta" hidden={!expanded}>
           {origin}
           {pending ? <Tag tone="warn">{r.pending_kind === "changed" ? "Changed, reconfirm" : "Added, confirm"}</Tag> : null}
-          {!pending && toConfirm ? <Tag tone="warn">Seeded, confirm</Tag> : null}
+          {!pending && toConfirm ? <Tag tone="warn">Copied rule, confirm</Tag> : null}
           {r.seeded && r.confirmed ? <Tag tone="ok">Confirmed</Tag> : null}
           {pending ? (
             <span className="set-help">
@@ -1606,10 +1597,11 @@ function RuleRow({
           ) : null}
         </span>
         {checks.map((c) => (
-          <span key={c.text} className={`rule-result${c.tone ? ` ${c.tone}` : ""}`}>{c.text}</span>
+          <span key={c.text} hidden={!expanded} className={`rule-result${c.tone ? ` ${c.tone}` : ""}`}>{c.text}</span>
         ))}
       </span>
       <span className="route-acts">
+        {watched && result?.result === "broken" ? <Tag tone="warn">May be broken</Tag> : null}
         {toConfirm ? (
           <button ref={confirmBtn} type="button" className="sm" aria-label={`Confirm rule ${name}`} aria-expanded={mine === "confirm"} onClick={() => setAsk({ id: identity, kind: "confirm" })}>
             Confirm
@@ -1624,7 +1616,7 @@ function RuleRow({
             onClick={() => void w.run(`${id}:undo`, "khipu_route_rule", { action: r.pending_kind === "added" ? "dismiss" : "undo", ...ruleTarget(r) }, null, back)}
           >
             <Busy on={w.isBusy(`${id}:undo`)} />
-            Undo
+            Undo change
           </button>
         ) : null}
         <button
@@ -1642,13 +1634,13 @@ function RuleRow({
           Edit
         </button>
         <button ref={removeBtn} type="button" className="sm" aria-label={`Remove rule ${name}`} aria-expanded={mine === "remove"} onClick={() => setAsk({ id: identity, kind: "remove" })}>
-          Remove
+          Remove rule
         </button>
       </span>
       {pending ? <WriteError w={w} id={`${id}:undo`} /> : null}
       {mine === "confirm" ? (
         <ConfirmGroup label={`Confirm rule ${name}?`} onClose={close} back={() => confirmBtn.current ?? editBtn.current}>
-          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${name} as written? It loses its Seeded mark.`} It stays first in every conversation.</span>
+          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${name} as written? It loses its copied mark.`} It stays first in every conversation.</span>
           <WriteError w={w} id={id} />
           <div className="toolbar">
             <button
@@ -1747,7 +1739,7 @@ const RULE_FILTERS: { key: RuleFilter; label: string }[] = [
 
 const rulesWord = (n: number) => `${n} rule${n === 1 ? "" : "s"}`;
 
-function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListControls; w: Writer; now: Date }) {
+function RulesSection({ data, lists, w, now, revealItem }: { data: RouteView; lists: ListControls; w: Writer; now: Date; revealItem: string | null }) {
   const rules = data.rules ?? [];
   const results = data.rule_results ?? [];
   // Which rules Khipu checks: those with a result (the same matrix the lines
@@ -1763,13 +1755,16 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
   const [ask, setAsk] = useState<RuleAsk>(null);
   const [removed, setRemoved] = useState<RouteRule | null>(null);
   const [draft, setDraft] = useState("");
+  const [addOpen, setAddOpen] = useState(false);
   const [adding, setAdding] = useState(false);
+  const [shownRules, setShownRules] = useState(3);
   const fieldId = useId();
   const addBtn = useRef<HTMLButtonElement>(null);
   const eok = useEndOrKeep(w);
   const resetAdd = () => {
     setDraft("");
     setAdding(false);
+    setAddOpen(false);
   };
   const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
   const inFilter: Record<RuleFilter, (r: RouteRule) => boolean> = {
@@ -1783,6 +1778,12 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
   const searching = rules.length > SEARCH_OVER;
   const shown = searching && query.trim() ? inFilterRules.filter((r) => matchesQuery(query, r.text)) : inFilterRules;
   const checkable = rules.filter((r) => watchedRules.includes(r.n)).length;
+  useEffect(() => {
+    if (!revealItem?.startsWith("rule:")) return;
+    const target = revealItem.slice("rule:".length);
+    const index = shown.findIndex((r) => String(r.n) === target || r.entity === target);
+    if (index >= 0) setShownRules((count) => Math.max(count, index + 1));
+  }, [revealItem, shown]);
   async function add(e: FormEvent) {
     e.preventDefault();
     if (!draft.trim()) {
@@ -1798,7 +1799,7 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
   }
   const restoreId = removed ? `rule-restore:${ruleIdentity(removed)}` : "";
   return (
-    <div className="section-body">
+    <div className="section-body" id="route-work-rules" tabIndex={-1}>
         <h2 className="sub-title">
           Standing rules{" "}
           <Tag>
@@ -1806,22 +1807,8 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
             {toConfirm ? ` · ${toConfirm} to confirm` : ""}
           </Tag>
         </h2>
-        <p className="set-help">
-          {"Every conversation sees these rules first, in full. "}
-          {checkable
-            ? `Khipu can check ${checkable} of them by reading your job runners' settings; if one looks broken you get a warning.`
-            : "Khipu can check rules about -fast models, the paid xAI API and Grok work by reading your job runners' settings; none of these is one."}
-          {" Khipu never stops any work."}
-        </p>
-        <p className="set-help">
-          Rules marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or
-          remove it. A conversation can add or change a rule at your request; those rows show what changed and stay
-          pending until you confirm or undo them. Khipu never rewrites a rule. A rule is limited to 600
-          characters and you may have 40 by default (Longest standing rule and Most standing rules, below); rules
-          already stored over a limit keep working. At the start of a conversation the rules that fit the budget are
-          shown in your order and a line says how many were left to read (the app hands over up to {WORDS_MOST_KB} KB
-          of text at once).
-        </p>
+        <p className="set-help">Every conversation sees your rules first; {checkable ? `Khipu can check ${checkable} by reading your job runners' settings` : "Khipu warns if a rule it can check looks broken"}, but never stops work.</p>
+        <p className="set-help">Copied rules already apply; review them here when you have time, and answer conversation changes on Needs you.</p>
         {rules.length ? (
           <div className="route-filter">
             <span className="lbl" id={filterLabel}>
@@ -1853,11 +1840,18 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
           </div>
         ) : null}
         {shown.length ? (
-          <ol className="rows route-rule-list" role="list" aria-label="Standing rules">
-            {shown.map((r) => (
+          <>
+            <ol className="rows route-rule-list" role="list" aria-label="Standing rules">
+            {shown.slice(0, shownRules).map((r) => (
               <RuleRow key={r.entity ?? r.n} r={r} watched={watchedRules.includes(r.n)} result={resultOf(r.n)} ask={ask} setAsk={setAsk} w={w} attempt={eok.attempt} now={now} onRemoved={setRemoved} back={() => addBtn.current} />
             ))}
-          </ol>
+            </ol>
+            {shown.length > shownRules ? (
+              <button type="button" className="sm" onClick={() => setShownRules((n) => n + 3)}>
+                Show {Math.min(shown.length - shownRules, 3)} more {shown.length - shownRules === 1 ? "rule" : "rules"}
+              </button>
+            ) : null}
+          </>
         ) : searching && query.trim() && inFilterRules.length ? (
           <p className="set-help" role="status">
             {`No rules match “${query.trim()}”. `}
@@ -1902,7 +1896,7 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
         {eok.ask ? (
           <EndOrKeepChoices view={data} ask={eok.ask} now={now} busy={w.anyBusy} saveLabel="Save rule" onCancel={() => eok.setAsk(null)} />
         ) : null}
-        <form className="route-form" aria-label="Add a standing rule" onSubmit={add}>
+        {addOpen ? <form className="route-form" aria-label="Add a standing rule" onSubmit={add}>
           <div className="toolbar">
             <label htmlFor={fieldId}>New rule</label>
             <input
@@ -1934,7 +1928,16 @@ function RulesSection({ data, lists, w, now }: { data: RouteView; lists: ListCon
             </ConfirmGroup>
           ) : null}
           <WriteError w={w} id="rule-add" />
-        </form>
+          {!adding ? (
+            <button type="button" className="sm link" onClick={() => setAddOpen(false)}>
+              Close
+            </button>
+          ) : null}
+        </form> : (
+          <button ref={addBtn} type="button" className="sm" onClick={() => setAddOpen(true)}>
+            Add rule…
+          </button>
+        )}
         <p className="set-help">
           Khipu doesn't enforce rules. A rule Checked by Khipu that looks broken shows a warning here, on Home and in
           the health report; nothing is stopped.
@@ -2108,54 +2111,11 @@ function proposalEndsAt(at: string | null | undefined): string | null {
   return new Date(d.getTime() + 7 * 24 * 3600 * 1000).toISOString();
 }
 
-function ProposalRowView({
-  row,
-  data,
-  w,
-  attempt,
-  ask,
-  setAsk,
-  now,
-}: {
-  row: ProposalRow;
-  data: RouteView;
-  w: Writer;
-  attempt: (id: string, command: string, args: Record<string, unknown>, after?: (() => Promise<unknown>) | null, back?: Back, onRetrySuccess?: () => void) => Promise<boolean>;
-  ask: string | null;
-  setAsk: (a: string | null) => void;
-  now: Date;
-}) {
+function ProposalRowView({ row, data, now }: { row: ProposalRow; data: RouteView; now: Date }) {
   const p = row.proposal;
   const live = p.status === "live";
-  const [draft, setDraft] = useState(row.proposed ?? "");
-  const [editConfirm, setEditConfirm] = useState(false);
-  const confirmId = `proposal:confirm:${p.id}`;
-  const dismissId = `proposal:dismiss:${p.id}`;
-  const editId = `proposal:edit:${p.id}`;
   const rule = p.kind === "rule" ? (data.rules ?? []).find((r) => r.entity === p.entity) ?? (data.rules ?? []).find((r) => r.n === p.n) : undefined;
-  const expect = data.priority?.version ?? data.priority_version ?? null;
   const ends = proposalEndsAt(p.at);
-  const close = () => {
-    setAsk(null);
-    setEditConfirm(false);
-  };
-  const ruleMissing = p.kind === "rule" && !rule;
-  const refuse = (id: string) => {
-    w.fail(id, "That rule isn't in this read, so nothing was sent. Read the routing record again, then try again.");
-    return Promise.resolve(false);
-  };
-  const confirm = () =>
-    ruleMissing
-      ? refuse(confirmId)
-      : p.kind === "rule" && rule
-        ? attempt(confirmId, "khipu_route_rule", { action: "confirm", ...ruleTarget(rule), expect: rule.revision })
-        : attempt(confirmId, "khipu_route_priority", { action: "confirm", expect });
-  const dismiss = () =>
-    ruleMissing
-      ? refuse(dismissId)
-      : p.kind === "rule" && rule
-        ? w.run(dismissId, "khipu_route_rule", { action: "dismiss", ...ruleTarget(rule) })
-        : w.run(dismissId, "khipu_route_priority", { action: "undo", expect });
   return (
     <div className="mrow prop" role="listitem" data-route-item={`proposal:${p.id}`} tabIndex={-1}>
       <span className="name">{row.name}</span>
@@ -2176,7 +2136,7 @@ function ProposalRowView({
           <>{row.by}. You replaced it with your own write, so it has ended.</>
         )}
       </span>
-      {live && ruleMissing ? (
+      {live && p.kind === "rule" && !rule ? (
         <span>That rule isn't in this read, so this proposal can't be confirmed or dismissed here. Read the routing record again, then try again.</span>
       ) : null}
       <span className="end">
@@ -2194,88 +2154,12 @@ function ProposalRowView({
           </div>
         </div>
       ) : null}
-      {live && !ruleMissing ? (
-        <div className="acts">
-          {!row.withheld ? (
-            <button type="button" className="sm primary" disabled={w.isBusy(confirmId)}
-              aria-label={`Confirm the proposed ${row.name.toLowerCase()}`} onClick={() => void confirm()}>
-              <Busy on={w.isBusy(confirmId)} />
-              Confirm
-            </button>
-          ) : null}
-          {p.kind === "rule" && !row.withheld ? (
-            <button type="button" className="sm" aria-expanded={ask === "edit"}
-              aria-label={`Edit the proposed ${row.name.toLowerCase()}`} onClick={() => { setDraft(row.proposed ?? ""); setEditConfirm(false); setAsk(ask === "edit" ? null : "edit"); }}>
-              Edit, then confirm
-            </button>
-          ) : null}
-          <button type="button" className="sm" aria-expanded={ask === "dismiss"}
-            aria-label={`Dismiss the proposed ${row.name.toLowerCase()}`} onClick={() => setAsk(ask === "dismiss" ? null : "dismiss")}>
-            Dismiss
-          </button>
-        </div>
-      ) : null}
-      {live && ask === "dismiss" ? (
-        <ConfirmGroup label={`Dismiss the proposed ${row.name.toLowerCase()}?`} onClose={close} back={() => null}>
-          <span>
-            Dismiss this proposal? {row.owner ? "Your words stay as they are." : "Nothing is added."} The conversation
-            that proposed it is told.
-          </span>
-          <WriteError w={w} id={dismissId} />
-          <div className="toolbar">
-            <button type="button" className="sm danger" disabled={w.isBusy(dismissId)}
-              onClick={async () => { if (await dismiss()) close(); }}>
-              <Busy on={w.isBusy(dismissId)} />
-              Dismiss it
-            </button>
-            <button type="button" className="sm link" onClick={close}>
-              Keep it
-            </button>
-          </div>
-        </ConfirmGroup>
-      ) : null}
-      {live && ask === "edit" && rule ? (
-        <form className={editConfirm ? "route-confirm" : "route-pause"} aria-label={`Edit the proposed ${row.name.toLowerCase()}`}
-          onKeyDown={escapeCloses(close)}
-          onSubmit={async (e) => {
-            e.preventDefault();
-            if (!draft.trim()) {
-              w.fail(editId, "Write the words first.");
-              return;
-            }
-            if (!editConfirm) {
-              w.fail(editId, null);
-              setEditConfirm(true);
-              return;
-            }
-            if (await attempt(editId, "khipu_route_rule", { action: "edit", ...ruleTarget(rule), text: draft }, null, undefined, close)) close();
-          }}>
-          <div className="toolbar">
-            <label htmlFor={editId}>Words</label>
-            <input id={editId} value={draft} autoFocus autoComplete="off" readOnly={editConfirm} onChange={(e) => setDraft(e.target.value)} />
-          </div>
-          {editConfirm ? <span>Make these your words for {row.name.toLowerCase()}? They replace the proposal.</span> : null}
-          <WriteError w={w} id={editId} />
-          <div className="toolbar">
-            <button type="submit" className="primary sm" disabled={w.isBusy(editId)}>
-              <Busy on={w.isBusy(editId)} />
-              {editConfirm ? "Make them mine" : "Save…"}
-            </button>
-            <button type="button" className="sm link" onClick={close}>
-              Cancel
-            </button>
-          </div>
-        </form>
-      ) : null}
-      <WriteError w={w} id={confirmId} />
     </div>
   );
 }
 
-function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }) {
+function ProposalsSection({ data, now }: { data: RouteView; now: Date }) {
   const model = proposalsModel(data, now);
-  const eok = useEndOrKeep(w);
-  const [ask, setAsk] = useState<{ id: string; kind: string } | null>(null);
   const [showEnded, setShowEnded] = useState(false);
   const ended = model.ended;
   const endedCounts = ended
@@ -2286,17 +2170,22 @@ function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: D
     .reduce<Record<string, number>>((acc, r) => ({ ...acc, [r.proposal.status]: (acc[r.proposal.status] ?? 0) + 1 }), {});
   const endedToday = model.endedToday;
   const anyDatedEnd = ended.some((r) => r.proposal.ended_at);
-  const rows = [...model.live, ...model.stale];
+  const live = model.live.filter(({ proposal: p }) => {
+    if (p.kind === "priority") return !data.priority?.pending;
+    if (p.kind === "rule") return !(data.rules ?? []).some((r) => r.pending &&
+      ((p.entity != null && r.entity === p.entity) || (p.n != null && r.n === p.n)));
+    return true;
+  });
+  const rows = [...live, ...model.stale];
+  if (!rows.length && !ended.length) return null;
   return (
     <div className="section-body">
-      <h2 className="sub-title">Proposals from conversations</h2>
-      <p className="set-help">A conversation's change is in use until you confirm or dismiss it.</p>
+      <h2 className="sub-title">Proposal history</h2>
+      <p className="set-help">Current proposals are decided on Needs you. Past and unavailable proposals are kept here.</p>
       {rows.length ? (
         <div className="mrows" role="list" aria-label="Proposals">
           {rows.map((row) => (
-            <ProposalRowView key={row.proposal.id} row={row} data={data} w={w} attempt={eok.attempt} now={now}
-              ask={ask?.id === row.proposal.id ? ask.kind : null}
-              setAsk={(kind) => setAsk(kind ? { id: row.proposal.id, kind } : null)} />
+            <ProposalRowView key={row.proposal.id} row={row} data={data} now={now} />
           ))}
         </div>
       ) : (
@@ -2305,10 +2194,6 @@ function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: D
           <span>When a conversation proposes a change to a rule, your note or your priority, it shows here beside your words.</span>
         </div>
       )}
-      {eok.ask ? (
-        <EndOrKeepChoices view={data} ask={eok.ask} now={now} busy={w.anyBusy} saveLabel="Save and confirm"
-          onCancel={() => eok.setAsk(null)} />
-      ) : null}
       {ended.length ? (
         <p className="set-help">
           {anyDatedEnd ? (
@@ -2341,7 +2226,7 @@ function ProposalsSection({ data, w, now }: { data: RouteView; w: Writer; now: D
       {model.live.some((r) => r.withheld) ? (
         <p className="set-help">
           Proposal words are kept on the Mac they came from because “Share proposal words between your Macs” is off in
-          Telling conversations.
+          Your Macs.
         </p>
       ) : null}
     </div>
@@ -2377,7 +2262,6 @@ function HoldsSection({
   cfg,
   w,
   now,
-  reread,
 }: {
   data: RouteView;
   cfg: RouteConfig | null;
@@ -2393,6 +2277,7 @@ function HoldsSection({
   const [reason, setReason] = useState("other");
   const [choice, setChoice] = useState("tomorrow");
   const [custom, setCustom] = useState("");
+  const [addOpen, setAddOpen] = useState(false);
   const base = useId().replace(/:/g, "");
   const endBtns = useRef<Record<string, HTMLButtonElement | null>>({});
   const addBtn = useRef<HTMLButtonElement>(null);
@@ -2409,7 +2294,7 @@ function HoldsSection({
       w.fail(
         "hold-add",
         `A hold's words are at most ${limitWords(most, "chars")} (these are ${limitWords(words, "chars")}). ` +
-          "Shorten them, or raise the limit under Longest words in a hold below.",
+          "Shorten them, or raise the limit under Longest words in a hold in Rarely needed.",
       );
       return;
     }
@@ -2427,12 +2312,15 @@ function HoldsSection({
       account: scope === "account" ? about : null,
       until: end.iso,
     });
-    if (ok) setText("");
+    if (ok) {
+      setText("");
+      setAddOpen(false);
+    }
   }
   return (
-    <div className="section-body">
+    <div className="section-body" id="route-work-holds" tabIndex={-1}>
         <h2 className="sub-title">Holds</h2>
-        <p className="set-help">Short notes about one account, this Mac or all work. Every hold from a conversation ends on its own.</p>
+        <p className="set-help">Temporary instructions for one account, this Mac, or all work. Conversation holds end on their own.</p>
         {holds.length ? (
           <div className="rows" role="list" aria-label="Holds">
             {holds.map((h, i) => {
@@ -2509,7 +2397,7 @@ function HoldsSection({
           Conversations are told who set each hold, what kind it is and when it ends. The words of a hold set by a
           conversation show here and when a conversation asks; only your own holds are sent word for word.
         </p>
-        <form className="route-form" aria-label="Add a hold" onSubmit={add}>
+        {addOpen ? <form className="route-form" aria-label="Add a hold" onSubmit={add}>
           <div className="toolbar">
             <label htmlFor={`${base}-text`}>Words</label>
             <input
@@ -2525,7 +2413,7 @@ function HoldsSection({
                 ? ""
                 : most
                   ? `At most ${limitWords(most, "chars")}`
-                  : `No limit on length; the app hands over up to ${WORDS_MOST_KB} KB at once`}
+                  : "No length limit from this setting"}
             </span>
           </div>
           <div className="toolbar">
@@ -2567,54 +2455,29 @@ function HoldsSection({
               <Busy on={w.isBusy("hold-add")} />
               Add hold
             </button>
+            <button type="button" className="sm link" onClick={() => setAddOpen(false)}>
+              Close
+            </button>
           </div>
-        </form>
-        <div className="rows">
-          <LimitRow
-            name="How long a conversation's hold lasts"
-            help="When a conversation doesn't say; it can ask for longer, up to the most."
-            fields={[
-              { key: "routing_conversation_hold", label: "Usually", unit: "time", options: [H, 4 * H, 12 * H, 24 * H, 48 * H] },
-              {
-                key: "routing_conversation_hold_max",
-                label: "At most",
-                unit: "time",
-                options: [24 * H, 3 * D, 7 * D, 14 * D, 30 * D, 0],
-                zero: "No maximum",
-              },
-            ]}
-            join=" · at most "
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Longest words in a hold"
-            help="Yours and conversations' alike."
-            fields={[{ key: "routing_hold_chars", label: "Longest words", unit: "chars", options: [150, 300, 600, 1200, 0], zero: "No limit" }]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-          <LimitRow
-            name="Remind me about my own holds after"
-            help="A reminder on Home; your hold stays until you end it."
-            fields={[
-              {
-                key: "routing_owner_hold_reminder",
-                label: "Remind me after",
-                unit: "time",
-                options: [30 * D, 60 * D, 90 * D, 180 * D, 365 * D, 0],
-                zero: "Never",
-              },
-            ]}
-            cfg={cfg}
-            w={w}
-            reread={reread}
-          />
-        </div>
+        </form> : (
+          <button ref={addBtn} type="button" className="sm" onClick={() => setAddOpen(true)}>
+            Add hold…
+          </button>
+        )}
     </div>
   );
+}
+
+function HoldRarelySettings({ cfg, w, reread }: { cfg: RouteConfig | null; w: Writer; reread: () => Promise<unknown> }) {
+  return <div className="section-body"><div className="rows">
+    <LimitRow name="How long a conversation's hold lasts" help="When a conversation doesn't say; it can ask for longer, up to the most."
+      fields={[{ key: "routing_conversation_hold", label: "Usually", unit: "time", options: [H, 4 * H, 12 * H, 24 * H, 48 * H] }, { key: "routing_conversation_hold_max", label: "At most", unit: "time", options: [24 * H, 3 * D, 7 * D, 14 * D, 30 * D, 0], zero: "No maximum" }]}
+      join=" · at most " cfg={cfg} w={w} reread={reread} />
+    <LimitRow name="Longest words in a hold" help={`Yours and conversations' alike. Each save can hand over up to ${WORDS_MOST_KB} KB of text.`}
+      fields={[{ key: "routing_hold_chars", label: "Longest words", unit: "chars", options: [150, 300, 600, 1200, 0], zero: "No limit" }]} cfg={cfg} w={w} reread={reread} />
+    <LimitRow name="Remind me about my own holds after" help="A reminder on Home; your hold stays until you end it."
+      fields={[{ key: "routing_owner_hold_reminder", label: "Remind me after", unit: "time", options: [30 * D, 60 * D, 90 * D, 180 * D, 365 * D, 0], zero: "Never" }]} cfg={cfg} w={w} reread={reread} />
+  </div></div>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2696,7 +2559,7 @@ function deliveryStatus(health: RouteDeliveryHealth): "green" | "red" | "unknown
 /** Delivery and health (routing slice 15a): presentation only. The route view
  * supplies recent changes; `khipu doctor` supplies receipt evidence. Nothing
  * here acknowledges delivery, changes settings, or decides where work goes. */
-export function DeliverySection({ data, health, healthError, healthReadAt, tellingOff, now, liveAfterSeconds, onRetry }: {
+export function DeliverySection({ data, health, healthError, healthReadAt, tellingOff, now, liveAfterSeconds, onRetry, includeMacs = false }: {
   data: RouteView | null;
   health?: RouteDeliveryHealth | null;
   healthError?: string | null;
@@ -2707,6 +2570,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
   now: Date;
   liveAfterSeconds?: number;
   onRetry?: () => Promise<unknown>;
+  includeMacs?: boolean;
 }) {
   // A failed doctor read must never leave last-good delivery evidence looking
   // current. The routing record can still show its own recent changes.
@@ -2782,7 +2646,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
                 <div key={`owner-delivery-${index}`} className="mrow delivery" role="listitem">
                   <span><span className="name">{row.label}</span><br /><span className="src">{[deliveryHarnessName(row.harness), deliveryComponentWord(row.component)].filter(Boolean).join(" · ")}</span></span>
                   <span className="mac-col">{row.mac ?? "This Mac"}</span>
-                  <span className="num">{row.last_prompt_at ? agoSpan(row.last_prompt_at, now) : "Can't be checked"}</span>
+                  <span className="num delivery-heard">{row.last_prompt_at && !Number.isNaN(Date.parse(row.last_prompt_at)) ? `Last heard ${agoSpan(row.last_prompt_at, now)}` : "Last heard: not known yet"}</span>
                   <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
                 </div>
               );
@@ -2801,7 +2665,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
               return (
                 <div key={`delivery-${index}`} className="mrow delivery" role="listitem">
                   <span><span className="name">{label.conversation}</span><br /><span className="src">{[label.harness, label.component].filter(Boolean).join(" · ")}</span></span>
-                  <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
+                  <span className="delivery-state"><span className="src">Last heard: not known yet</span><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
                 </div>
               );
             })}
@@ -2832,7 +2696,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
                     {change.recipients.waiting.length ? <span className="src">Waiting: {change.recipients.waiting.join(", ")}</span> : null}
                   </span>
                 ) : (
-                  <span className="end"><Tag>Who has it isn&apos;t available</Tag></span>
+                  <span className="end"><Tag>Not known yet who has it</Tag></span>
                 )}
               </div>
             ))}
@@ -2840,7 +2704,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
         )}
       </div>
 
-      {freshness.length || otherMacs.length ? (
+      {includeMacs && (freshness.length || otherMacs.length) ? (
         <div className="section-body">
           <h2 className="sub-title">Other Macs and the cloud</h2>
           <div className="mrows" role="list" aria-label="Other Macs and the cloud">
@@ -2865,6 +2729,20 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
       ) : null}
     </div>
   );
+}
+
+export function MacDeliverySection({ data, health, healthError }: { data: RouteView | null; health?: RouteDeliveryHealth | null; healthError?: string | null }) {
+  const readHealth = healthError ? null : health;
+  const freshness = readHealth ? [
+    readHealth.replication?.status === "not_applicable" ? null : freshnessWords("Other Macs", readHealth.replication) ?? { label: "Other Macs", text: "Can't be checked", tone: undefined },
+    readHealth.gateway?.status === "not_applicable" ? null : freshnessWords("Cloud copy", readHealth.gateway) ?? { label: "Cloud copy", text: "Can't be checked", tone: undefined },
+  ].filter((row): row is NonNullable<typeof row> => row != null) : [];
+  const otherMacs = (data?.delivery_macs ?? []).filter((mac) => mac && typeof mac.label === "string");
+  if (!freshness.length && !otherMacs.length) return null;
+  return <div className="section-body"><h2 className="sub-title">Other Macs and the cloud</h2><div className="mrows" role="list" aria-label="Other Macs and the cloud">
+    {otherMacs.map((mac, index) => { const age = deliveryAge(mac.age_seconds); return <div key={`mac-${mac.label}-${index}`} className="mrow delivery-freshness" role="listitem"><span className="name">{mac.label}</span><span>{age ? `Its copy is ${age}` : "Its copy can't be checked"}</span><span className="end"><Tag tone={mac.behind ? "err" : age ? "ok" : undefined} dot>{mac.behind ? "Behind" : age ? "Current" : "Can't be checked"}</Tag></span></div>; })}
+    {(otherMacs.length ? freshness.filter((row) => row.label === "Cloud copy") : freshness).map((row) => <div key={row.label} className="mrow delivery-freshness" role="listitem"><span className="name">{row.label}</span><span className="end"><Tag tone={row.tone} dot>{row.text}</Tag></span></div>)}
+  </div></div>;
 }
 
 const HEARS: [string, string][] = [
@@ -3116,7 +2994,7 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
   },
   {
     name: "Longest note",
-    help: "Checked when you set the note; a longer one already set keeps working.",
+    help: "Checked when you set the note; longer notes already set keep working and are sent in parts when needed.",
     fields: [{ key: "routing_note_chars", label: "Longest note", unit: "chars", options: [750, 1500, 3000, 6000, 0], zero: "No limit" }],
   },
   {
@@ -3189,21 +3067,14 @@ function sizesLine(cfg: RouteConfig | null, cfgError?: string | null): string {
   return `${n} ${n === 1 ? "setting" : "settings"}, ${changed ? `${changed} changed from the default` : "none changed from the default"}`;
 }
 
-/** A fold inside a group: closed by default, its closed line beside its name. */
-function SubFold({ k, name, line, folds, children }: { k: string; name: string; line: string; folds: Folds; children: ReactNode }) {
-  const open = folds.isOpen(k);
-  const bodyId = `route-sub-${useId().replace(/:/g, "")}`;
+/** Former inner folds are now always readable on their page. Account detail
+ * dialogs remain the one exception because their controls are not page text. */
+function SubFold({ k, name, line, children }: { k: string; name: string; line: string; folds: Folds; children: ReactNode }) {
   return (
-    <div className="fold disclose route-sub-fold" data-open={open}>
-      <button type="button" className="disclosure fold-btn" aria-expanded={open} aria-controls={bodyId} onClick={() => folds.toggle(k)}>
-        <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
-        <span>{name}</span>
-        <span className="sline">{line}</span>
-      </button>
-      <div className="fold-body" id={bodyId} role="region" aria-label={name} hidden={!open}>
-        {children}
-      </div>
-    </div>
+    <section className="route-sub-fold" data-route-subfold={k} aria-label={name}>
+      <h3 className="sub-title">{name} <span className="sline">{line}</span></h3>
+      {children}
+    </section>
   );
 }
 
@@ -3217,7 +3088,7 @@ export function replicationStatusWords(
   healthError?: string | null,
   pending?: boolean,
 ): string {
-  if (pending) return "waiting for your OK";
+  if (pending) return "waiting for your answer on Needs you";
   if (healthError) return "can't be checked";
   if (!freshness) return "checking…";
   if (freshness.status === "not_applicable") return "off";
@@ -3351,9 +3222,6 @@ function TellingSection({
           error={<WriteError w={w} id="push-delegation" />}
         />
       </div>
-      <div className="rows">
-        <DispatchScriptsRow cfg={cfg} w={w} reread={reread} />
-      </div>
           <div className="rows" role="list" aria-label="What each kind of conversation hears">
             {HEARS.map(([name, words]) => (
               <div key={name} className="row-item route-hear" role="listitem">
@@ -3388,66 +3256,98 @@ function TellingSection({
           </p>
         )}
         </SubFold>
-        <SubFold k="sub:sizes" name="Sizes and times" line={sizesLine(cfg, cfgError)} folds={folds}>
-          <div className="rows">
-            {SIZES.map((r) => (
-              <LimitRow key={r.name} name={r.name} help={r.help} fields={r.fields} join={r.join} cfg={cfg} w={w} reread={reread} />
-            ))}
-          </div>
-          <div className="opt-list">
-            <SwitchRow
-              id="route-proposal-text"
-              label="Share proposal words between your Macs"
-              what="A conversation's proposed words travel between your Macs, so you can confirm them anywhere. Off, they stay on the Mac they came from until you confirm them there. They never go to cloud agents."
-              tag={<Tag>Between your Macs</Tag>}
-              checked={cfg?.routing?.routing_proposal_text_between_macs?.value !== false}
-              disabled={!cfg || w.anyBusy}
-              read={cfgRead}
-              busy={w.isBusy("proposal-text")}
-              onChange={(next) =>
-                void w.run("proposal-text", "khipu_config_set", { key: "routing_proposal_text_between_macs", value: next ? "on" : "off" }, reread)
-              }
-              error={<WriteError w={w} id="proposal-text" />}
-            />
-            <SwitchRow
-              id="route-replication-live"
-              label="Copy routing between your Macs through the hub"
-              what="Sends your routing record to the hub so your other Macs can pick it up, and brings their routing changes here. This is the Mac-to-Mac copy, separate from the copy for cloud agents."
-              tag={<Tag>Between your Macs</Tag>}
-              checked={cfg?.routing?.routing_replication_live?.value === true}
-              disabled={!cfg || w.anyBusy}
-              read={cfgRead}
-              busy={w.isBusy("replication-live")}
-              onChange={(next) =>
-                void w.run("replication-live", "khipu_config_set", { key: "routing_replication_live", value: next ? "on" : "off" }, reread)
-              }
-              error={<WriteError w={w} id="replication-live" />}
-            />
-            <p className="set-help" role="status">
-              Replication: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError, cfg?.routing?.routing_replication_live?.pending === true)}
-              {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
-            </p>
-            {deliveryHealth?.gateway?.cleanup_gave_up || deliveryHealth?.gateway?.cleanup_interrupted
-              || deliveryHealth?.gateway?.cleanup_full ? (
-              <div className="set-help" role="alert">
-                <p>{deliveryHealth.gateway.reason_words ?? "Routing copy cleanup stopped; a copy may still be on the hub."}</p>
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={w.anyBusy}
-                  onClick={() => void w.run("gateway-cleanup", "khipu_gateway_copy_cleanup", {}, async () => {
-                    await reread();
-                    await onRetryDelivery?.();
-                  })}
-                >
-                  {w.isBusy("gateway-cleanup") ? "Retrying…" : "Retry cleanup"}
-                </button>
-                <WriteError w={w} id="gateway-cleanup" />
-              </div>
-            ) : null}
-          </div>
-        </SubFold>
+    </div>
+  );
+}
 
+function TellingRarelySettings({ cfg, cfgError, w, reread }: { cfg: RouteConfig | null; cfgError?: string | null; w: Writer; reread: () => Promise<unknown> }) {
+  return <div className="section-body">
+    <h2 className="sub-title">Sizes and times <span className="meta">{sizesLine(cfg, cfgError)}</span></h2>
+    <div className="rows">{SIZES.map((r) => <LimitRow key={r.name} name={r.name} help={r.help} fields={r.fields} join={r.join} cfg={cfg} w={w} reread={reread} />)}</div>
+    <div className="rows"><DispatchScriptsRow cfg={cfg} w={w} reread={reread} /></div>
+  </div>;
+}
+
+/** The two Mac-to-Mac controls used to live under Telling's technical sizes.
+ * They keep the same commands and read state, but live together on Your Macs
+ * so a copy problem is not hidden behind conversation delivery settings. */
+function MacRoutingControls({
+  cfg,
+  cfgError,
+  deliveryHealth,
+  deliveryHealthError,
+  w,
+  reread,
+  onRetryDelivery,
+}: {
+  cfg: RouteConfig | null;
+  cfgError?: string | null;
+  deliveryHealth?: RouteDeliveryHealth | null;
+  deliveryHealthError?: string | null;
+  w: Writer;
+  reread: () => Promise<unknown>;
+  onRetryDelivery?: () => Promise<unknown>;
+}) {
+  const cfgRead = switchRead(cfg, cfgError, reread);
+  return (
+    <div className="section-body route-macs-controls">
+      <p className="set-help">
+        These controls apply to this Mac. They do not change what conversations hear or send proposal words to cloud agents.
+      </p>
+      <div className="opt-list">
+        <div className="route-copy-option" role="group" aria-label="Routing copy">
+        <SwitchRow
+          id="route-replication-live"
+          label="Copy routing between your Macs through the hub"
+          what="Sends your routing record to the hub so your other Macs can pick it up, and brings their routing changes here. This is the Mac-to-Mac copy, separate from the copy for cloud agents."
+          tag={<Tag>Between your Macs</Tag>}
+          checked={cfg?.routing?.routing_replication_live?.value === true}
+          disabled={!cfg || w.anyBusy}
+          read={cfgRead}
+          busy={w.isBusy("replication-live")}
+          onChange={(next) =>
+            void w.run("replication-live", "khipu_config_set", { key: "routing_replication_live", value: next ? "on" : "off" }, reread)
+          }
+          error={<WriteError w={w} id="replication-live" />}
+        />
+        <p className="set-help" role="status">
+          Routing copy: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError, cfg?.routing?.routing_replication_live?.pending === true)}
+          {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
+        </p>
+        </div>
+        <SwitchRow
+          id="route-proposal-text"
+          label="Share proposal words between your Macs"
+          what="A conversation's proposed words travel between your Macs, so you can confirm them anywhere. Off, they stay on the Mac they came from until you confirm them there. They never go to cloud agents."
+          tag={<Tag>This Mac only</Tag>}
+          checked={cfg?.routing?.routing_proposal_text_between_macs?.value !== false}
+          disabled={!cfg || w.anyBusy}
+          read={cfgRead}
+          busy={w.isBusy("proposal-text")}
+          onChange={(next) =>
+            void w.run("proposal-text", "khipu_config_set", { key: "routing_proposal_text_between_macs", value: next ? "on" : "off" }, reread)
+          }
+          error={<WriteError w={w} id="proposal-text" />}
+        />
+        {deliveryHealth?.gateway?.cleanup_gave_up || deliveryHealth?.gateway?.cleanup_interrupted
+          || deliveryHealth?.gateway?.cleanup_full ? (
+          <div className="set-help" role="alert">
+            <p>{deliveryHealth.gateway.reason_words ?? "Routing copy cleanup stopped; a copy may still be on the hub."}</p>
+            <button
+              type="button"
+              className="btn"
+              disabled={w.anyBusy}
+              onClick={() => void w.run("gateway-cleanup", "khipu_gateway_copy_cleanup", {}, async () => {
+                await reread();
+                await onRetryDelivery?.();
+              })}
+            >
+              {w.isBusy("gateway-cleanup") ? "Retrying…" : "Retry cleanup"}
+            </button>
+            <WriteError w={w} id="gateway-cleanup" />
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -3589,7 +3489,7 @@ function ProvidersList({ view }: { view: RouteView }) {
  *  stale level words) are left out rather than guessed.
  *  Today's model mismatches, open owed directions and routing copies
  *  found in files stay local to the owner's Mac. */
-function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds: Folds }) {
+function ChecksSection({ data, now, folds, includeTable = true }: { data: RouteView; now: Date; folds: Folds; includeTable?: boolean }) {
   const model = checksModel(data, now);
   const row = (r: { key: string; title: string; sub: string }, tag?: ReactNode) => (
     <div key={r.key} className="mrow adv" role="listitem" data-route-item={`check:${r.key}`} tabIndex={-1}>
@@ -3609,7 +3509,7 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
           </div>
         </div>
       ) : null}
-      {model.table ? (
+      {includeTable && model.table ? (
         <div className="section-body">
           <SubFold k="sub:model-table" name="Your model table" line={model.table.line} folds={folds}>
             <dl className="tiers">
@@ -3696,7 +3596,7 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
           </div>
         </div>
       ) : null}
-      {!model.table && !model.mismatches.length && !model.contradictions.length && !model.upkeep.length && !model.unreached.length
+      {(!includeTable || !model.table) && !model.mismatches.length && !model.contradictions.length && !model.upkeep.length && !model.unreached.length
         && !model.fileCopies?.hits.length && !(model.fileCopies && model.fileCopies.status !== "checked") ? (
         <div className="section-body">
           <EmptyState title="Nothing to fix" hint="No priority, rule or direction disagrees with an account." />
@@ -3704,6 +3604,14 @@ function ChecksSection({ data, now, folds }: { data: RouteView; now: Date; folds
       ) : null}
     </>
   );
+}
+
+function ModelTableSection({ data, now }: { data: RouteView; now: Date }) {
+  const table = checksModel(data, now).table;
+  if (!table) return null;
+  return <div className="section-body"><h2 className="sub-title">Your model table <span className="meta">{table.line}</span></h2>
+    <dl className="tiers">{table.rows.map((t) => <div key={t.label}><dt>{t.label}</dt><dd>{t.tier}</dd></div>)}</dl>
+  </div>;
 }
 
 function ProvidersLanesSection({
@@ -3715,6 +3623,7 @@ function ProvidersLanesSection({
   now,
   reread,
   folds,
+  mode = "all",
 }: {
   data: RouteView | null;
   cfg: RouteConfig | null;
@@ -3724,6 +3633,7 @@ function ProvidersLanesSection({
   now: Date;
   reread: () => Promise<unknown>;
   folds: Folds;
+  mode?: "all" | "providers" | "runners";
 }) {
   const raw = cfg?.routing?.routing_sources?.value;
   const entries: SourceEntry[] = Array.isArray(raw) ? (raw as SourceEntry[]) : [];
@@ -3831,15 +3741,16 @@ function ProvidersLanesSection({
       }`;
   return (
     <>
-      <div className="section-body">
+      {mode !== "runners" ? <div className="section-body">
         <h2 className="sub-title">Providers</h2>
         {data ? (
           <ProvidersList view={data} />
         ) : (
           <RecordReadLine read={recordRead === "failed" ? "failed" : "reading"} what="the providers" />
         )}
-      </div>
-      <div className="section-body">
+        {data ? <AddProviderAccount data={data} w={w} /> : null}
+      </div> : null}
+      {mode !== "providers" ? <><div className="section-body">
         <h2 className="sub-title">
           Lanes{" "}
           {totalLanes ? (
@@ -3896,19 +3807,7 @@ function ProvidersLanesSection({
           <div className="empty">
             <b>No job runners yet</b>
             <span>Add a job runner folder and its lanes show here with the account each one uses.</span>
-            <div className="toolbar">
-              <button
-                type="button"
-                className="sm primary"
-                disabled={!cfg}
-                onClick={() => {
-                  folds.openKeys(["sub:folders"]);
-                  setAdding(true);
-                }}
-              >
-                Add a folder…
-              </button>
-            </div>
+
           </div>
         )}
       </div>
@@ -4101,7 +4000,7 @@ function ProvidersLanesSection({
             conversations are told a limit came from an unmatched lane.
           </p>
         </SubFold>
-      </div>
+      </div></> : null}
     </>
   );
 }
@@ -4666,15 +4565,6 @@ export function PaceSection({ data, plans, now, folds }: {
   const closed = model.rows.filter((r) => !openRows.includes(r.key));
   return (
     <div className="section-body pace-section">
-      <p className="set-help">
-        How fast each account is being used against its limit and your caps, at the last 24 hours&apos; rate (the last
-        hour&apos;s for five-hour windows). Khipu&apos;s advice for jobs is advisory; it starts and stops nothing.
-      </p>
-      <div className="legend" aria-hidden="true">
-        <span><i />used now</span>
-        <span><i className="need" />rate that lands on the limit</span>
-        <span><i className="cap" />your cap</span>
-      </div>
       {model.empty ? (
         <EmptyState
           title="No usage readings yet"
@@ -4765,6 +4655,14 @@ export function PaceSection({ data, plans, now, folds }: {
           ))}
         </div>
       ) : null}
+      <p className="set-help">
+        Pace compares recent use with each limit and your caps. Khipu&apos;s advice is advisory; it starts and stops nothing.
+      </p>
+      <div className="legend" aria-hidden="true">
+        <span><i />used now</span>
+        <span><i className="need" />rate that lands on the limit</span>
+        <span><i className="cap" />your cap</span>
+      </div>
       <SubFold k="sub:pace-push" name="When pace changes are sent to conversations"
         line="At a verdict change, and 24 h, 6 h, 1 h and 15 min before a limit" folds={folds}>
         <p className="set-help">
@@ -4797,31 +4695,39 @@ function useFolds() {
 /** A tag on a group's closed line: its problems, and phase 9's neutral "N found". */
 type ShownTag = { text: string; tone: GroupTag["tone"] | "accent" };
 
-/** One group: a fold button with its name, closed line and problem tags, and
- *  its body, kept mounted while closed so a half-filled form keeps its words. */
-function Group({
+/** Technical sections stay available but do not turn the rare page into a
+ * second routing dashboard. This is the only page allowed to fold. */
+function RareFold({ name, children }: { name: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const id = `route-rare-${useId().replace(/:/g, "")}`;
+  return <section className="fold disclose route-sub-fold route-rare-fold" data-open={open}>
+    <button type="button" className="disclosure fold-btn" aria-expanded={open} aria-controls={id} onClick={() => setOpen((v) => !v)}>
+      <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
+      <span>{name}</span>
+    </button>
+    <div id={id} className="fold-body" hidden={!open}>{children}</div>
+  </section>;
+}
+
+/** A named home for an existing settings group. Group keys stay stable so old
+ * notices and deep links still land on the right page. */
+function PageGroup({
   k,
   name,
   line,
   tags,
-  folds,
   children,
 }: {
   k: GroupKey;
   name: string;
   line: string;
   tags: ShownTag[];
-  folds: Folds;
   children: ReactNode;
 }) {
-  const open = folds.isOpen(k);
-  const bodyId = `route-group-${k}`;
   return (
-    <div className="fold disclose route-group" data-open={open}>
-      <button type="button" className="disclosure fold-btn" aria-expanded={open} aria-controls={bodyId} data-settings-group={k}
-        onClick={() => folds.toggle(k)}>
-        <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
-        <span className="gname">{name}</span>
+    <section className="route-page-group" aria-labelledby={`route-group-${k}`}>
+      <div className="route-page-group-head" data-settings-group={k} tabIndex={-1}>
+        <h3 id={`route-group-${k}`} tabIndex={-1}>{name}</h3>
         <span className="gline">{line === "Reading…" ? <span className="reading">Reading…</span> : line}</span>
         <span className="gtags">
           {tags.map((t) => (
@@ -4830,11 +4736,9 @@ function Group({
             </Tag>
           ))}
         </span>
-      </button>
-      <div className="fold-body" id={bodyId} role="region" aria-label={name} hidden={!open}>
-        <div className="disclose-body">{children}</div>
       </div>
-    </div>
+      <div className="route-page-group-body">{children}</div>
+    </section>
   );
 }
 
@@ -4873,6 +4777,28 @@ export function RoutingSettings({
   /** Re-reads the existing app-wide doctor report; it changes no routing state. */
   onRetryDelivery?: () => Promise<unknown>;
 }) {
+  const pagesRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const pages = pagesRef.current;
+    const header = document.querySelector<HTMLElement>(".panel-head");
+    const nav = pages?.querySelector<HTMLElement>(".route-page-nav");
+    if (!pages || !header || !nav) return;
+    const measure = () => {
+      pages.style.setProperty("--route-panel-head-h", `${header.getBoundingClientRect().height}px`);
+      pages.style.setProperty("--route-page-nav-h", window.innerWidth <= 760 ? `${nav.getBoundingClientRect().height}px` : "0px");
+    };
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(header);
+    observer?.observe(nav);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", measure);
+      pages.style.removeProperty("--route-panel-head-h");
+      pages.style.removeProperty("--route-page-nav-h");
+    };
+  }, []);
   const route = useRouting(active);
   const config = useCliState<RouteConfig>("khipu_config_show", active);
   const features = useCliState<FeaturesShape>("khipu_features_show", active);
@@ -4883,6 +4809,12 @@ export function RoutingSettings({
   };
   const w = useWriter(rereadRoute);
   const folds = useFolds();
+  const [page, setPage] = useState<RoutingPageKey>("needs");
+  const selectPage = (next: RoutingPageKey) => setPage(next);
+  const selectGroup = (group: GroupKey) => setPage(pageForGroup(group));
+  useEffect(() => {
+    document.querySelector<HTMLElement>(".main-content")?.scrollTo?.({ top: 0 });
+  }, [page]);
   const laneRaw = config.data?.routing?.routing_lane_map?.value;
   const finder = useAccountsFinder(active, {
     view: route.data,
@@ -4895,16 +4827,19 @@ export function RoutingSettings({
     },
     onShowAccount: (label) => {
       const a = (route.data?.accounts ?? []).find((x) => x.label === label);
+      selectGroup("accounts");
       folds.openKeys(["accounts", ...(a ? [`account:${a.key}`] : [])]);
       setFocusItem({ item: a ? `account:${a.key}` : null, group: "accounts" });
     },
     onEdit: () => {
+      selectGroup("rules");
       folds.openKeys(["rules"]);
       setFocusItem({ item: null, group: "rules" });
     },
   });
   const lists = useListControls();
   const [focusItem, setFocusItem] = useState<{ item: string | null; group: GroupKey } | null>(null);
+  const [revealItem, setRevealItem] = useState<string | null>(null);
   const [retrying, setRetrying] = useState(false);
   const now = new Date();
   const data = route.data;
@@ -4933,6 +4868,9 @@ export function RoutingSettings({
   const nFound = foundCount(finder.disc.data);
   const foundTag: ShownTag | null = nFound && !finder.disc.looking ? { text: `${nFound} found`, tone: "accent" } : null;
   const needs = overview.problems.filter((p) => p.needs);
+  const cards = decideCards(data, config.data?.routing, now);
+  const accountsWaiting = finder.support.state === "here" && !!accountsCard(finder.support.status, now);
+  const anyNeeds = needs.length > 0 || cards.length > 0 || accountsWaiting;
   // "Nothing here needs you" only once every read the problems come from is
   // in: the record, the settings (lanes, folders) and plan usage (plans,
   // sign-ins). A read still under way says so; a failed one says which
@@ -4949,23 +4887,28 @@ export function RoutingSettings({
       ? READING_NEEDS
       : notRun.length
         ? `Khipu couldn't read ${notRun.join(" or ")}, so some checks didn't run.`
-        : needs.length
+        : anyNeeds
           ? null
           : "Nothing here needs you.";
 
   useEffect(() => {
     if (!focusItem) return;
-    setFocusItem(null);
-    const el =
-      (focusItem.item ? document.querySelector<HTMLElement>(`[data-route-item="${selectorValue(focusItem.item)}"]`) : null) ??
-      document.querySelector<HTMLElement>(`[data-settings-group="${focusItem.group}"]`);
-    el?.scrollIntoView?.({ block: "center" });
-    el?.focus();
+    const frame = requestAnimationFrame(() => {
+      setFocusItem(null);
+      const el =
+        (focusItem.item ? document.querySelector<HTMLElement>(`[data-route-item="${selectorValue(focusItem.item)}"]`) : null) ??
+        document.querySelector<HTMLElement>(`[data-settings-group="${focusItem.group}"]`);
+      el?.scrollIntoView?.({ block: "center" });
+      el?.focus();
+    });
+    return () => cancelAnimationFrame(frame);
   }, [focusItem]);
 
   const show = (p: Problem) => {
     // Clear whatever filter or search could hide the item Show points at.
     lists.reveal(p.group);
+    selectGroup(p.group);
+    setRevealItem(p.item ?? null);
     // A job runner's line lives inside the Providers and lanes group's fold.
     folds.openKeys([p.group, ...(p.item?.startsWith("account:") ? [p.item] : []), ...(p.item?.startsWith("runner:") ? ["sub:folders"] : [])]);
     setFocusItem({ item: p.item ?? null, group: p.group });
@@ -4989,7 +4932,6 @@ export function RoutingSettings({
         ) : (
           unread
         )}
-        <LoginUsageSwitches cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />
       </>
     ),
     pace: data ? <PaceSection data={data} plans={plansState?.data ?? null} now={now} folds={folds} /> : unread,
@@ -4997,19 +4939,18 @@ export function RoutingSettings({
     rules: data ? (
       <>
         <NoteSection data={data} w={w} now={now} />
-        <RulesSection data={data} lists={lists} w={w} now={now} />
+        <RulesSection data={data} lists={lists} w={w} now={now} revealItem={revealItem} />
       </>
     ) : (
       unread
     ),
     holds: data ? (
       <>
-        <ProposalsSection data={data} w={w} now={now} />
         <HoldsSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />
       </>
     ) : unread,
     checks: data ? (
-      <ChecksSection data={data} now={now} folds={folds} />
+      <ChecksSection data={data} now={now} folds={folds} includeTable={false} />
     ) : route.error ? (
       <p className="set-error">
         Couldn't read the checks: {recordCause(route.error)}. That is not the same as nothing found.
@@ -5039,100 +4980,157 @@ export function RoutingSettings({
       />
     ),
     resets: <ResetChecksSection data={data} cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} />,
-    runners: <ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} />,
+    runners: <ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} mode="runners" />,
     table: <TableSection data={data} cfg={config.data} w={w} now={now} reread={rereadConfig} />,
     changes: data ? <ChangesSection data={data} lists={lists} w={w} now={now} /> : unread,
   };
 
+  const group = (key: GroupKey) => {
+    const meta = GROUPS.find((g) => g.key === key)!;
+    return (
+      <PageGroup key={key} k={key} name={meta.name} line={overview.lines[key]}
+        tags={key === "holds" ? overview.tags[key].filter((t) => !t.text.includes("to confirm")) : key === "accounts" && foundTag ? [foundTag, ...overview.tags[key]] : overview.tags[key]}>
+        {body[key]}
+      </PageGroup>
+    );
+  };
+
   return (
     <div className="route-settings">
-      <div className="route-top">
-        <p className="set-help set-intro">
-          Khipu tells your conversations which accounts have room, what you paused and what your rules are. Your agents
-          decide where work goes.
-        </p>
-        <div className="grp-btns">
-          <button type="button" className="sm" onClick={() => folds.setGroups(true)}>
-            Open all groups
-          </button>
-          <button type="button" className="sm" onClick={() => folds.setGroups(false)}>
-            Close all groups
-          </button>
-        </div>
-      </div>
-      <SettingRequests cfg={config.data} w={w} reread={rereadConfig} />
-      {route.error ? (
-        <div className="set-error err-inline" role="alert">
-          <span>
-            {data
-              ? `Couldn't read the routing record just now: ${recordCause(route.error)}. What shows below is from the last read.`
-              : `Couldn't read the routing record: ${recordCause(route.error)}. Nothing below is a guess; it stays blank until the read works.`}
-          </span>
-          <button
-            type="button"
-            className="sm"
-            disabled={retrying}
-            aria-busy={retrying || undefined}
-            onClick={async () => {
-              setRetrying(true);
-              try {
-                await route.load(true);
-              } finally {
-                setRetrying(false);
-              }
-            }}
-          >
-            <Busy on={retrying} />
-            Try again
-          </button>
-        </div>
-      ) : null}
-      {data && data.record === false ? (
-        <div className="callout route-none" role="region" aria-label="No routing record on this Mac">
-          <div className="txt">
-            <b>No routing record on this Mac</b>
-            <span>
-              Khipu starts one when a plan check, a job runner folder or a conversation reports on an account, or when
-              you add a rule, a note or a hold here. Until then no account is shown as open.
-            </span>
-            {onSetUpAccounts ? (
-              <div className="toolbar">
-                <button type="button" className="primary sm" onClick={onSetUpAccounts}>
-                  Set up accounts
+      <div ref={pagesRef} className="route-pages">
+        <nav className="route-page-nav" aria-label="Accounts and routing pages">
+          {ROUTING_PAGES.map((p) => (
+            <button key={p.key} type="button" data-routing-page-select={p.key} aria-current={page === p.key ? "page" : undefined}
+              onClick={() => selectPage(p.key)}>
+              {p.name}
+            </button>
+          ))}
+        </nav>
+        <div className="route-page-content">
+          <div className="route-page" data-routing-page="needs" data-active={page === "needs"} aria-labelledby="route-page-needs">
+            <span id="route-page-needs" className="sr-only">Needs you</span>
+            <p className="set-help set-intro">
+              Khipu tells your conversations which accounts have room, what you paused and what your rules are. Your agents decide where work goes.
+            </p>
+            {route.error ? (
+              <div className="set-error err-inline" role="alert">
+                <span>
+                  {data
+                    ? `Couldn't read the routing record just now: ${recordCause(route.error)}. What shows below is from the last read.`
+                    : `Couldn't read the routing record: ${recordCause(route.error)}. Nothing below is a guess; it stays blank until the read works.`}
+                </span>
+                <button
+                  type="button"
+                  className="sm"
+                  disabled={retrying}
+                  aria-busy={retrying || undefined}
+                  onClick={async () => {
+                    setRetrying(true);
+                    try {
+                      await route.load(true);
+                    } finally {
+                      setRetrying(false);
+                    }
+                  }}
+                >
+                  <Busy on={retrying} />
+                  Try again
                 </button>
               </div>
             ) : null}
+            {data && data.record === false ? (
+              <div className="callout route-none" role="region" aria-label="No routing record on this Mac">
+                <div className="txt">
+                  <b>No routing record on this Mac</b>
+                  <span>
+                    Khipu starts one when a plan check, a job runner folder or a conversation reports on an account, or when
+                    you add a rule, a note or a hold here. Until then no account is shown as open.
+                  </span>
+                  {onSetUpAccounts ? (
+                    <div className="toolbar">
+                      <button type="button" className="primary sm" onClick={onSetUpAccounts}>
+                        Set up accounts
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+            {anyNeeds ? (
+              <NeedsYou cards={cards} problems={needs} seeded={data ? oldFileRules(data) : []} data={data} w={w} reread={rereadConfig}
+                onShow={show} back={() => document.querySelector<HTMLElement>(".route-settings .needs button:not(:disabled), .route-settings .route-page-nav button")}
+                accounts={accountsWaiting ? (
+                  <AccountsRequestBand support={finder.support} reload={finder.reload} onChanged={() => void route.load(true)} />
+                ) : null} />
+            ) : null}
+            {needsNote ? (
+              <p className="needs-none" role={needsNote === READING_NEEDS ? "status" : undefined}>
+                {needsNote}
+              </p>
+            ) : null}
           </div>
-        </div>
-      ) : null}
-      {needs.length ? (
-        <div className="callout warn needs" role="region" aria-label="Needs you">
-          <div className="txt">
-            <b>Needs you</b>
-            <ul>
-              {needs.map((p) => (
-                <li key={p.key}>
-                  <span>{p.needs}</span>
-                  <button type="button" className="sm" aria-label={`Show ${p.show ?? "it"}`} onClick={() => show(p)}>
-                    Show
-                  </button>
-                </li>
+          <section className="route-page" data-routing-page="accounts" data-active={page === "accounts"} aria-labelledby="route-page-accounts">
+            <h2 id="route-page-accounts" tabIndex={-1}>Your accounts</h2>
+            <p className="set-help set-intro">Who has room, what Khipu can read, and how quickly an allowance is changing.</p>
+            {group("accounts")}
+            {group("pace")}
+            <ResetCheckStatus data={data} />
+          </section>
+          <section className="route-page" data-routing-page="work" data-active={page === "work"} aria-labelledby="route-page-work">
+            <h2 id="route-page-work" tabIndex={-1}>Who gets what work</h2>
+            <nav className="route-work-jumps" aria-label="Who gets what work sections">
+              {[["Order", "route-group-priority"], ["Note", "route-work-note"], ["Rules", "route-work-rules"], ["Holds", "route-work-holds"]].map(([label, target]) => (
+                <button key={target} type="button" className="sm" onClick={() => {
+                  const el = document.getElementById(target);
+                  el?.scrollIntoView?.({ block: "start" });
+                  el?.focus({ preventScroll: true });
+                }}>{label}</button>
               ))}
-            </ul>
-          </div>
+            </nav>
+            {group("priority")}
+            {group("rules")}
+            {group("holds")}
+          </section>
+          <section className="route-page" data-routing-page="macs" data-active={page === "macs"} aria-labelledby="route-page-macs">
+            <h2 id="route-page-macs" tabIndex={-1}>Your Macs</h2>
+            <p className="set-help set-intro">Choose what this Mac shares with your other Macs, then check whether their copies are current.</p>
+            <MacRoutingControls cfg={config.data} cfgError={config.error} deliveryHealth={deliveryHealth}
+              deliveryHealthError={deliveryHealthError} w={w} reread={rereadConfig} onRetryDelivery={onRetryDelivery} />
+            <MacDeliverySection data={data} health={deliveryHealth} healthError={deliveryHealthError} />
+          </section>
+          <section className="route-page" data-routing-page="conversations" data-active={page === "conversations"} aria-labelledby="route-page-conversations">
+            <h2 id="route-page-conversations" tabIndex={-1}>Conversations</h2>
+            <p className="set-help set-intro">What each conversation has heard and when Khipu tells it about routing.</p>
+            {group("telling")}
+          </section>
+          <section className="route-page" data-routing-page="changes" data-active={page === "changes"} aria-labelledby="route-page-changes">
+            <h2 id="route-page-changes" tabIndex={-1}>What changed</h2>
+            <p className="set-help set-intro">Recent routing changes, newest first.</p>
+            {group("changes")}
+            {data ? <ProposalsSection data={data} now={now} /> : null}
+          </section>
+          <section className="route-page" data-routing-page="wrong" data-active={page === "wrong"} aria-labelledby="route-page-wrong">
+            <h2 id="route-page-wrong" tabIndex={-1}>Something's wrong</h2>
+            <p className="set-help set-intro">Checks that need attention; they never stop work on their own.</p>
+            {group("checks")}
+            {group("runners")}
+          </section>
+          <section className="route-page route-page-rare" data-routing-page="rare" data-active={page === "rare"} aria-labelledby="route-page-rare">
+            <h2 id="route-page-rare" tabIndex={-1}>Rarely needed</h2>
+            <p className="set-help set-intro">Technical settings and local setup details. The defaults are usually fine.</p>
+            <RareFold name="Checking accounts when they reset">{group("resets")}</RareFold>
+            <RareFold name="Old routing table file">{group("table")}</RareFold>
+            <RareFold name="Priority and hold limits"><PriorityRarelySetting cfg={config.data} w={w} reread={rereadConfig} /><HoldRarelySettings cfg={config.data} w={w} reread={rereadConfig} /></RareFold>
+            <RareFold name="Sizes, timing and hand-off scripts"><TellingRarelySettings cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></RareFold>
+            <RareFold name="Model table">{data ? <ModelTableSection data={data} now={now} /> : null}</RareFold>
+            <RareFold name="Providers and account setup"><ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} mode="providers" /></RareFold>
+            <RareFold name="Reading usage from logins"><section className="route-page-group" aria-labelledby="route-login-reads">
+              <div className="route-page-group-head"><h3 id="route-login-reads">Reading usage from logins</h3></div>
+              <div className="route-page-group-body"><LoginUsageSwitches cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></div>
+            </section></RareFold>
+          </section>
         </div>
-      ) : null}
-      {needsNote ? (
-        <p className="needs-none" role={needsNote === READING_NEEDS ? "status" : undefined}>
-          {needsNote}
-        </p>
-      ) : null}
-      {GROUPS.map((g) => (
-        <Group key={g.key} k={g.key} name={g.name} line={overview.lines[g.key]}
-          tags={g.key === "accounts" && foundTag ? [foundTag, ...overview.tags[g.key]] : overview.tags[g.key]} folds={folds}>
-          {body[g.key]}
-        </Group>
-      ))}
+      </div>
       {config.error && !config.data ? (
         <p className="set-error" role="alert">
           Could not read the settings: {config.error}

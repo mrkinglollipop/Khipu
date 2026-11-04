@@ -109,6 +109,21 @@ def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
+# What the hub's trigger says to a writer from before announce_hub_identities,
+# as the drain records it (``type: message``, with the message's tail clipped).
+ANNOUNCE_REFUSAL = "CheckViolation: khipu: an episode write must announce its source identities"
+SPAN_FIRST = ("Run `khipu outbox span-covered` first: a dry run that counts the jobs whose range and evidence fields "
+              "another episode holds. "
+              "`khipu outbox retry-dead` may land those as duplicates, so it leaves this kind held unless told "
+              "otherwise.")
+
+
+def announce_refused(job: Any) -> bool:
+    """A job the hub refused for not announcing its source identities."""
+    error = job.get("last_error") if isinstance(job, dict) else None
+    return isinstance(error, str) and error.startswith(ANNOUNCE_REFUSAL)
+
+
 def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str, Any]) -> bool:
     return (_canonical(job["payload"]) == _canonical(payload)
             and _canonical({k: job[k] for k in ("origin",) if k in job}) == _canonical(stamp))
@@ -117,7 +132,10 @@ def _same_evidence(job: dict[str, Any], payload: dict[str, Any], stamp: dict[str
 def _validate_resolution(record: Any) -> None:
     """Validate archived content itself, never trust its saved hash claims."""
     from khipu.capture_identity import payload_sha256
-    from khipu.capture import _legacy_preferences_contained, _legacy_projection_kind, _redact_capture_values
+    from khipu.capture import (
+        REPLAY_KIND, SPAN_KIND, _legacy_preferences_contained, _legacy_projection_kind, _redact_capture_values,
+        _replay_lacks, _span_lacks,
+    )
 
     outbox_payloads(record)
     resolution = record.get("resolution")
@@ -130,7 +148,7 @@ def _validate_resolution(record: Any) -> None:
     hub_view.pop("origin", None)
     hub_view = _redact_capture_values(hub_view)
     if (not isinstance(resolution, dict)
-            or resolution.get("kind") not in ("legacy_comma_projection", "legacy_landed_line",
+            or resolution.get("kind") not in (REPLAY_KIND, SPAN_KIND, "legacy_comma_projection", "legacy_landed_line",
                                               "preferences_contained", "preferences_contained_normalized",
                                               "content_contained_normalized", "scope_differs_kept",
                                               "decisions_contained_normalized")
@@ -143,13 +161,21 @@ def _validate_resolution(record: Any) -> None:
 
     attempts = queued.get("attempts", 0)
     if (type(attempts) is not int or attempts < 0
-            or ("origin" in queued and not valid_origin(queued["origin"]))
-            or queued.get("reason") != "recovery: the legacy key holds different facts"
+            or ("origin" in queued and not valid_origin(queued["origin"]))):
+        raise ValueError("resolution queued envelope is invalid")
+    # A replay or a spanned capture can be any queued capture; every other kind
+    # is a file line's proof.
+    if resolution["kind"] not in (REPLAY_KIND, SPAN_KIND) and (
+            queued.get("reason") != "recovery: the legacy key holds different facts"
             or "origin" not in queued or queued["origin"] is not None):
         raise ValueError("resolution queued envelope is invalid")
     # preferences_contained is the owner's merge command's proof
     # (outbox_preferences), never one the drain makes.
-    if resolution["kind"] == "preferences_contained":
+    if resolution["kind"] == REPLAY_KIND:
+        proved = _replay_lacks(record["payload"], hub_view) == []
+    elif resolution["kind"] == SPAN_KIND:
+        proved = announce_refused(queued) and _span_lacks(record["payload"], hub_view) == []
+    elif resolution["kind"] == "preferences_contained":
         proved = (_legacy_projection_kind(record["payload"], hub_view) is None
                   and _legacy_preferences_contained(record["payload"], hub_view))
     elif resolution["kind"] == "preferences_contained_normalized":
@@ -211,7 +237,7 @@ class _RecoveryIndex:
                 record = json.loads(path.read_bytes())
                 _validate_resolution(record)
                 job = record["queued_evidence"]
-                key = _canonical({"payload": job["payload"], "origin": job["origin"]})
+                key = _canonical({"payload": job["payload"], **{k: job[k] for k in ("origin",) if k in job}})
                 self.queued.setdefault(key, []).append(path)
                 for digest in {payload_sha256(record["payload"]), payload_sha256(job["payload"])}:
                     self.payloads.setdefault(digest, []).append(path)
@@ -587,12 +613,36 @@ def _quarantine(jp: Path, error: Exception) -> Path:
     return dst
 
 
-def retry_dead() -> dict[str, Any]:
-    """Move every dead job back to the queue with attempts reset."""
+def announce_refused_count() -> int:
+    """How many dead jobs ``announce_refused`` names; an unreadable one is not one."""
+    count = 0
+    for path in dead_jobs():
+        try:
+            count += announce_refused(_read_job(path))
+        except (OSError, ValueError, TypeError, RecursionError):
+            continue
+    return count
+
+
+def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
+    """Move every dead job back to the queue with attempts reset, except jobs
+    refused for not announcing their source identities: a retry can land one as
+    a near-duplicate episode beside the episode spanning it, or live with text
+    a forgotten episode held. They stay and are counted.
+    ``include_announce_refused`` moves those a hub read shows are safe to land
+    (``outbox_span_covered.retryable``); a failed read moves none."""
     moved = 0
     quarantined = 0
+    refused_held = 0
+    refused_moved = 0
     from khipu import memory_lock
     from khipu.tombstones import RegistryError, write_guard
+
+    retryable: dict[Path, bytes] = {}
+    if include_announce_refused:
+        from khipu import outbox_span_covered
+
+        retryable = outbox_span_covered.retryable()
 
     # Do not hold the outbox lock while taking the registry lock: forget takes
     # the memory lock, the registry, then the outbox. A job is re-read under
@@ -634,6 +684,9 @@ def retry_dead() -> dict[str, Any]:
                         if not allowed:
                             jp.unlink(missing_ok=True)
                             continue
+                        if announce_refused(job) and retryable.get(jp) != snapshot:
+                            refused_held += 1
+                            continue
                         job["attempts"] = 0
                         job.pop("buried_at", None)
                         job.pop("hold_reason", None)
@@ -642,14 +695,33 @@ def retry_dead() -> dict[str, Any]:
                             _atomic_write(destination, job)
                         jp.unlink(missing_ok=True)
                         moved += 1
+                        refused_moved += announce_refused(job)
             except RegistryError as exc:
                 _log(f"retry-dead refused for {jp.name}: {exc}")
                 continue
     from khipu.session_capture import retry_held
 
     native_moved = retry_held()
-    return {"moved": moved + native_moved, "native_moved": native_moved,
-            "quarantined": quarantined, "pending": len(jobs())}
+    out = {"moved": moved + native_moved, "native_moved": native_moved,
+           "quarantined": quarantined, "pending": len(jobs())}
+    warnings = []
+    if refused_moved:
+        out["announce_refused_moved"] = refused_moved
+        warnings.append(f"{refused_moved} dead job{'' if refused_moved == 1 else 's'} refused for not announcing source "
+                        "identities went back to the queue: the next drain lands each as a new episode, with its "
+                        "commitments, decisions and embeddings, beside any episode already spanning it.")
+    if refused_held:
+        out["announce_refused_held"] = refused_held
+        warnings.append(f"{refused_held} dead job{'' if refused_held == 1 else 's'} refused for not announcing "
+                          "source identities stayed held: "
+                          + ("span-covered can retire them, a forgotten episode overlaps them, or a check could not "
+                             "run." if include_announce_refused else
+                             "a retry may land them as duplicates, or with text a forgotten episode held. Run `khipu "
+                             "outbox span-covered` first (a dry run); `--include-announce-refused` then retries only "
+                             "the ones it can't retire and no forgotten episode overlaps."))
+    if warnings:
+        out["warning"] = " ".join(warnings)
+    return out
 
 
 def jobs() -> list[Path]:
@@ -698,11 +770,13 @@ def status() -> dict[str, Any]:
             offline += 1
     quarantined = len(list(quarantine_dir().glob("*.json"))) if quarantine_dir().is_dir() else 0
     held_conflicts = []
+    refused = 0
     for jp in dead_jobs():
         try:
             held = _read_job(jp)
         except (OSError, ValueError, TypeError, RecursionError):
             continue  # dead still names unreadable held work
+        refused += announce_refused(held)
         if held.get("evidence_conflict"):
             held_conflicts.append(jp.name)
             line_conflicts += _is_line_conflict(held)
@@ -723,7 +797,7 @@ def status() -> dict[str, Any]:
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
             "evidence_conflicts": evidence_conflicts,
             "held_conflicts": len(held_conflicts), "held_conflict_jobs": held_conflicts,
-            "line_conflicts": line_conflicts, "resolved": resolved}
+            "line_conflicts": line_conflicts, "announce_refused": refused, "resolved": resolved}
     if line_conflicts:
         # Most of these lines differ from the hub only by preference text it
         # lacks (2026-10-27); retry-dead alone would just fail them again.
@@ -738,6 +812,8 @@ def status() -> dict[str, Any]:
         if held_conflicts:
             # A buried job never re-enters the queue on its own.
             result["fix"] += " Then run `khipu outbox retry-dead` to replay the buried ones."
+    if refused:
+        result["fix"] = f"{result['fix']} {SPAN_FIRST}" if result.get("fix") else SPAN_FIRST
     return result
 
 

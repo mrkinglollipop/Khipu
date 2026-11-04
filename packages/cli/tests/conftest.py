@@ -64,6 +64,11 @@ os.environ["TMPDIR"] = TEMP_ROOT
 tempfile.tempdir = TEMP_ROOT
 
 if os.environ.get("KHIPU_LIVE_TESTS") != "1":
+    # Children launched by filename or from a temporary cwd do not inherit
+    # pytest's sys.path. They must import this checkout, not an installed CLI.
+    _CLI_ROOT = str(Path(__file__).resolve().parents[1])
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        [_CLI_ROOT, *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep))])
     _HERMETIC_HOME = tempfile.mkdtemp(prefix="khipu-hermetic-home-")
     atexit.register(shutil.rmtree, _HERMETIC_HOME, ignore_errors=True)
     os.environ["HOME"] = _HERMETIC_HOME
@@ -255,7 +260,8 @@ def _owner_turns_from_a_fake_harness(monkeypatch):
     """In-process ``owner_turns.record`` calls get ``FAKE_HOOK_ISSUER``, and
     the check's caller chain has it as the nearest harness above this
     process. A shim run in a
-    subprocess still computes its real issuer."""
+    subprocess still computes its real issuer. Why a refusal is worded as it
+    is never reads the process tree this suite happens to run under."""
     from khipu import owner_direction, owner_turns
 
     real_record, real_chain = owner_turns.record, owner_direction._caller_chain
@@ -264,6 +270,7 @@ def _owner_turns_from_a_fake_harness(monkeypatch):
         return real_record(payload, env, now, dict(FAKE_HOOK_ISSUER) if issuer is None else issuer, extra)
 
     monkeypatch.setattr(owner_turns, "record", record)
+    monkeypatch.setattr(owner_direction, "_program_replaced", lambda: False)
     monkeypatch.setattr(owner_direction, "_caller_chain",
                         lambda: [(FAKE_HOOK_ISSUER["pid"], FAKE_HOOK_ISSUER["start"], FAKE_HOOK_ISSUER["exe"])]
                         + real_chain())

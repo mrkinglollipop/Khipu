@@ -1,4 +1,4 @@
-"""Append-only routing exchange. Network access exists only behind the live switch.
+"""Retained routing exchange. Network access exists only behind the live switch.
 
 The local log remains authoritative for its private fields. remote.jsonl stores
 projected events and hub receipts, never a rewritten copy of events.jsonl.
@@ -97,25 +97,44 @@ def cache_key():
     return tuple(tuple(value or ()) for value in fingerprint())
 
 
-def remote_events():
-    try:
-        data = _path("remote.jsonl").read_bytes()
-    except FileNotFoundError:
-        return []
-    rows = []
-    for line in data.split(b"\n"):
+RETENTION_KINDS = frozenset({"usage_sample", "source_seen", "evidence", "observation", "observation_renew", "reset_check"})
+
+
+def _remote_snapshot(data=None):
+    if data is None:
+        try:
+            data = _path("remote.jsonl").read_bytes()
+        except FileNotFoundError:
+            return [], 0
+    rows, retired = [], 0
+    for index, line in enumerate(data.split(b"\n")):
         if not line.strip():
+            continue
+        header = json.loads(line) if index == 0 else None
+        if isinstance(header, dict) and set(header) == {"retired_through_order"}:
+            retired = header["retired_through_order"]
+            if type(retired) is not int or retired < 0:
+                raise ValueError("invalid routing replica retention")
             continue
         row = routing._line_event(line)
         if row is None or not row.get("id"):
             raise ValueError("invalid routing replica")
         rows.append(row)
-    return rows
+    return rows, retired
 
 
-def merge(local):
+def remote_events():
+    return _remote_snapshot()[0]
+
+
+def _remote_contents(rows, retired=0):
+    header = json.dumps({"retired_through_order": retired}) + "\n" if retired else ""
+    return header + "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+
+
+def merge(local, *, remote=None):
     """Keep existing numbers; receipts number previously unnumbered rules."""
-    rows = {r["id"]: dict(r, remote=True) for r in remote_events()}
+    rows = {r["id"]: dict(r, remote=True) for r in (remote_events() if remote is None else remote)}
     for row in local:
         receipt = rows.get(row.get("id"), {})
         merged = dict(row)
@@ -133,7 +152,8 @@ def _store(receipts):
 
 
 def _store_locked(receipts):
-    rows = {r["id"]: r for r in remote_events()}
+    existing, retired = _remote_snapshot()
+    rows = {r["id"]: r for r in existing}
     changed = False
     for receipt in receipts:
         payload = receipt["payload"]
@@ -149,6 +169,11 @@ def _store_locked(receipts):
                                         **({"rule_number": number} if number is not None else {})))
         if checked is None:
             raise ValueError("invalid hub event")
+        from khipu import routing_compact
+
+        if (order <= retired and payload["id"] not in rows and checked["type"] in RETENTION_KINDS
+                and not routing_compact._owner(checked)):
+            continue
         if payload["id"] not in rows:
             rows[payload["id"]] = checked
             changed = True
@@ -156,7 +181,7 @@ def _store_locked(receipts):
             rows[payload["id"]].update(checked)
             changed = True
     if changed:
-        _atomic(_path("remote.jsonl"), "".join(json.dumps(r, sort_keys=True) + "\n" for r in rows.values()))
+        _atomic(_path("remote.jsonl"), _remote_contents(rows.values(), retired))
 
 
 class PostgresHub:
@@ -306,9 +331,11 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                     raise ValueError("invalid hub clock")
                 rows = result["rows"]
                 _store(rows)
+                state["scan_order"] = max([state.get("scan_order", 0)] + [r["hub_order"] for r in rows])
                 state["sources"] = result["sources"]
                 state["hub_offset_seconds"] = (hub_now - routing._now()).total_seconds()
                 if result["complete"]:
+                    state["completed_order"] = max(state.get("completed_order", 0), state.pop("scan_order", 0))
                     state["pull_cursor"] = _stamp(upper - timedelta(seconds=FRESHNESS_OVERLAP_S))
                     state["caught_up_at"] = routing._iso(upper)
                     state["checked_local_at"] = routing._iso(routing._now())

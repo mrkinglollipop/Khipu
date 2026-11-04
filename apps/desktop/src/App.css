@@ -2756,8 +2756,12 @@ button.t3-detail {
 
 .subnav button {
   justify-content: flex-start;
-  height: 30px;
-  padding: 0 10px;
+  /* A long name wraps inside its own highlight at the narrow width. */
+  height: auto;
+  min-height: 30px;
+  padding: 4px 10px;
+  line-height: 1.3;
+  text-align: left;
   border-color: transparent;
   background: transparent;
   color: var(--text-2);
@@ -3674,6 +3678,7 @@ input.switch:disabled {
 .row-item.health-hl, .rows.health-hl { background: var(--accent-soft); border-radius: var(--r-sm); transition: background 0.4s; }
 
 .route-state.route-prio { display: block; }
+.route-state.route-prio .route-prio-name { display: inline; height: auto; padding: 0; margin: 0; border: 0; background: none; }
 dialog.sheet-dialog { position: fixed; inset: 0 0 0 auto; z-index: 50; margin: 0 0 0 auto; padding: 0; border: 0; border-left: 1px solid var(--border-strong); background: var(--surface); color: var(--text); width: min(480px, 100vw); max-width: none; height: 100vh; max-height: none; box-shadow: var(--shadow-md); }
 .sheet { display: flex; flex-direction: column; height: 100%; }
 .sheet-head { display: flex; align-items: flex-start; gap: var(--s2); padding: var(--s4) var(--s5) var(--s3); border-bottom: 1px solid var(--border); }

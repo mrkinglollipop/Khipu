@@ -10,10 +10,11 @@ import type { RouteAuthor, RouteProposal, RouteView } from "./routing";
 const HARNESS_WORDS: Record<string, string> = {
   claude_code: "Claude Code",
   codex: "Codex",
+  grok: "Grok Build",
   grok_build: "Grok Build",
   aegis: "Aegis",
   cursor: "Cursor",
-  shell: "shell",
+  muse: "Muse",
 };
 
 /** A proposal's author in words, from Khipu's stamp alone (never any text
@@ -22,7 +23,9 @@ export function proposalAuthor(author: RouteAuthor | undefined): string {
   if (!author) return "a conversation";
   if (author.kind === "owner") return "you";
   const harness = author.harness ? (HARNESS_WORDS[author.harness] ?? null) : null;
-  const words = harness ? `a ${harness} conversation` : "a conversation";
+  const words = author.harness === "shell"
+    ? "a shell command"
+    : harness ? `${/^[AEIOU]/.test(harness) ? "an" : "a"} ${harness} conversation` : "a conversation";
   return author.project ? `${words} in ${author.project}` : words;
 }
 
@@ -40,7 +43,7 @@ export type ProposalRow = {
   withheld: boolean;
 };
 
-function priorityWords(entries: { label: string; role?: string | null; until?: string | null }[] | undefined, now: Date): string | null {
+export function priorityWords(entries: { label: string; role?: string | null; until?: string | null }[] | undefined, now: Date): string | null {
   if (!entries?.length) return null;
   return entries
     .map((e, i) => `${i + 1}. ${e.label}${e.role ? `: ${e.role}` : ""}${e.until ? ` (until ${whenLocal(e.until, now)})` : ""}`)

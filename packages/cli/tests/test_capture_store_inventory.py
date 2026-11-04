@@ -152,8 +152,8 @@ NOT_CAPTURE = {
     "agent_view.emit": "a ledger board or ledger rows, to a file the owner names with --out; not captures",
     "routing_compact._write_state": "when the routing log was last compacted: times, line and byte counts, "
                                     "the archive's name; no log text",
-    **dict.fromkeys(("routing_compact._replace", "routing_compact._copy"),
-                    "the routing log's compacted copy and its archive of the previous log: the routing "
+    **dict.fromkeys(("routing_compact._replace", "routing_compact._write_archive"),
+                    "the routing log's compacted copy and its archive of the lines left out: the routing "
                     "record's own lines, not captures"),
     **dict.fromkeys(("routing._append_locked", "routing._fold_turn", "routing._id_salt",
                      "routing._save_view", "routing_replay._routing_quiet", "routing_replay._seed",

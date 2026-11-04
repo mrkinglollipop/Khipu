@@ -336,6 +336,8 @@ These are yours:
 - **Pause.** Mark an account paused, optionally until a time. Lift it later.
 - **Clear.** Clear an account's state, or dismiss one report.
 
+To answer from a conversation, ask it what needs your confirmation: `khipu_needs_you` lists each thing waiting on you in plain words and settles it on your yes through `khipu_owner_act`, including a held routing setting such as the copy between Macs.
+
 Ordinary conversation proposal tools can record a rule or priority only when you asked them to. They cannot confirm, retire, dismiss or undo owner state. Eligible owner conversations can perform those owner actions through `--owner-direction` or `khipu_owner_act`; standalone terminal writes ask for typed confirmation, and app writes use the verified app path.
 
 Rule edits and priority requests must carry `base`, the owner revision returned by the conversation's earlier `khipu_route` read. A missing or unread base is refused; later reads never fill it in. The CLI takes the same revision as `--base` with `--at-owner-request`. Replacement notices name the rule number or priority and go only to their author's session, once delivered; undelivered notices expire after seven days.

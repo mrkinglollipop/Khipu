@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -94,6 +95,8 @@ def _fake_terminal(monkeypatch, answer: str) -> list[str]:
 
     monkeypatch.setattr("sys.stdin", Tty(answer + "\n"))
     monkeypatch.setattr("builtins.input", lambda prompt="": asked.append(prompt) or answer)
+    tree = {os.getpid(): (999991, "/usr/bin/python3"), 999991: (1, "/bin/zsh")}
+    monkeypatch.setattr(routing, "_proc_info", lambda pid: tree.get(pid))
     return asked
 
 

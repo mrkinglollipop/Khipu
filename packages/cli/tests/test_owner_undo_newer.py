@@ -372,52 +372,20 @@ def _two_priorities(world, khipu_app) -> tuple[dict, dict]:
     return first, _set_priority(world, khipu_app, "second role")
 
 
-def _not_asked(rc: int, out: dict) -> None:
-    assert rc == 2 and out["code"] == "over_newer_not_asked", out
-    assert _role() == "second role" and not _undo_lines()
-
-
-def test_direction_over_newer_without_the_owners_words_is_refused(world, khipu_app):
-    first, _second = _two_priorities(world, khipu_app)
-    world.say("undo that first priority change anyway and lose the newer change")
-    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"]))
-
-
-def test_direction_over_newer_with_words_that_are_not_the_latest_message_is_refused(world, khipu_app):
-    first, _second = _two_priorities(world, khipu_app)
-    world.say("undo that first priority change anyway and lose the newer change")
-    world.say("thanks")
-    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"],
-                                "--owner-words=undo that first priority change anyway and lose the newer change"))
-
-
-def test_direction_over_newer_when_the_owner_only_asked_for_an_undo_is_refused(world, khipu_app):
-    first, _second = _two_priorities(world, khipu_app)
-    world.say("undo the first priority change")
-    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"],
-                                "--owner-words=undo the first priority change"))
-    world.say("don't undo it anyway, keep the newer one")
-    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"],
-                                "--owner-words=don't undo it anyway, keep the newer one"))
-
-
-@pytest.mark.parametrize("words", [
-    "what happens if we undo anyway?",
-    "should I undo it anyway?",
-    "Undo it anyway, keep the newer change though",
-    "Revert the cap. Override nothing else.",
+@pytest.mark.parametrize("words, extra", [
+    ("yes", []),
+    ("thanks", []),
+    ("go ahead", ["--owner-words=an old message"]),
 ])
-def test_direction_over_newer_loose_wording_is_refused(world, khipu_app, words):
-    first, _second = _two_priorities(world, khipu_app)
+def test_direction_over_newer_accepts_an_ordinary_answer_without_matching_words(world, khipu_app, words, extra):
+    first, second = _two_priorities(world, khipu_app)
     world.say(words)
-    _not_asked(*_direction_undo(world, khipu_app, first["owner_action"], "--owner-words=" + words))
-
-
-def test_direction_over_newer_refusal_names_the_phrase_to_type(world, khipu_app):
-    first, _second = _two_priorities(world, khipu_app)
-    world.say("undo it anyway")
-    rc, out = _direction_undo(world, khipu_app, first["owner_action"], "--owner-words=undo it anyway")
-    assert rc == 2 and "Undo anyway and lose the newer change" in json.dumps(out)
+    rc, out = _direction_undo(world, khipu_app, first["owner_action"], *extra)
+    assert rc == 0, out
+    assert not routing.read_view().get("priority")
+    (line,) = _undo_lines()
+    assert line["auth"] == "direction" and line["facts"]["newer"] == second["owner_action"]
+    assert "words" not in line
 
 
 def test_direction_over_newer_imperative_with_lose_the_newer_change_restores(world, khipu_app):

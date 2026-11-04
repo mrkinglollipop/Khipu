@@ -6,8 +6,8 @@
    the closed lines' tags and Home's attention items read the same sources
    (`brokenRules`, `quietRunners` in routing.ts). */
 
-import { accountClassification, brokenRules, deliveryConversationLabels, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
-import type { PlanFact, RouteDeliveryHealth, RouteProvider, RouteView } from "./routing";
+import { accountClassification, brokenRules, capitalise, deliveryConversationLabels, disagreementWords, holdReminder, holdWords, modelDisagreementWords, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
+import type { PlanFact, RouteDeliveryHealth, RouteProvider, RouteRule, RouteView } from "./routing";
 import { almostPrefix } from "./humanWords";
 import { proposalsModel } from "./routingProposals";
 import { checksLine, checksModel } from "./routingChecks";
@@ -25,7 +25,7 @@ export const GROUPS: ReadonlyArray<{ key: GroupKey; name: string; record: boolea
   { key: "pace", name: "Pace, caps and advice", record: true },
   { key: "priority", name: "Priority", record: true },
   { key: "rules", name: "Your note and standing rules", record: true },
-  { key: "holds", name: "Proposals and holds", record: true },
+  { key: "holds", name: "Holds", record: true },
   { key: "checks", name: "Checks and copies", record: true },
   { key: "telling", name: "Telling conversations", record: false },
   { key: "resets", name: "Checking for resets", record: false },
@@ -45,7 +45,13 @@ export type Problem = {
   kind: string;
   tone: Tone;
   needs?: string;
-  /** What Show opens, for its accessible name ("Show the Claude second disagreement"). */
+  /** Under the line: why it matters, in a sentence. */
+  detail?: string;
+  /** Needs you's band: Fix unless it can wait. A decision is a card, not a problem (routingNeeds.ts). */
+  band?: "fix" | "later";
+  /** The button's words ("Compare"); it opens the problem's item. */
+  act?: string;
+  /** What the button opens, for its accessible name ("Compare: the Claude second disagreement"). */
   show?: string;
   item?: string;
 };
@@ -170,6 +176,12 @@ export function providerRows(view: RouteView): ProviderRow[] {
   return rows.sort((a, b) => rank(a) - rank(b) || a.label.localeCompare(b.label));
 }
 
+/** Rules copied from the old routing file and never reviewed; a conversation's
+ *  pending rule is a decision instead. */
+export function oldFileRules(view: RouteView): RouteRule[] {
+  return (view.rules ?? []).filter((r) => r.seeded && !r.confirmed && !r.pending);
+}
+
 /** Every problem on the page (scope rule 1), each from one source. */
 export function routingProblems(
   view: RouteView,
@@ -193,7 +205,8 @@ export function routingProblems(
     );
     if (a.disagreement || modelDisagrees) {
       out.push({ key: `disagree:${a.key}`, group: "accounts", kind: "disagree", tone: "warn",
-        needs: `${a.label}: two sources disagree`, show: `the ${a.label} disagreement`, item: `account:${a.key}` });
+        needs: `${a.label}: two reports disagree`, detail: disagreementWords(a, now) ?? modelDisagreementWords(a, now)[0],
+        act: "Compare", show: `the ${a.label} disagreement`, item: `account:${a.key}` });
     }
   }
   for (const row of plans?.accounts ?? []) {
@@ -211,66 +224,69 @@ export function routingProblems(
       kind: signIn ? "signin" : "plan",
       tone: "warn",
       needs: signIn
-        ? `${name}: not signed in`
+        ? `${name} isn't signed in`
         : st.code === "no_plan_limits"
-          ? `${name}: its sign-in reports no plan limits`
-          : `${name}: Khipu can't read its plan`,
+          ? `${name}'s sign-in reports no plan limits`
+          : `Khipu can't read ${name}'s plan`,
+      detail: signIn
+        ? "Khipu can't see how much it has left until you sign in again."
+        : "So Khipu can't say how much it has left.",
+      act: signIn ? "Go to sign in" : "See the account",
       show: name,
       item: routed ? `account:${row.key}` : `plan:${row.key ?? name}`,
     });
   }
   if (plansError && !plans) out.push({ key: "plans-read", group: "accounts", kind: "plans-read", tone: "warn" });
-  // Live proposals (slice 15b) already give every pending rule and the
-  // pending priority one Needs you line below; a pending thing a live
-  // proposal covers must not be counted again under its own group.
+  // Live proposals (slice 15b): a pending rule or priority is one decision card
+  // in Needs you (routingNeeds.ts), so none has a line here; each still counts
+  // on its own group's closed line.
   const proposals = proposalsModel(view, now);
-  const coveredPriority = proposals.live.some((r) => r.proposal.kind === "priority");
-  const coveredRule = (n: number, entity?: string) =>
-    proposals.live.some((r) => r.proposal.kind === "rule" && (r.proposal.entity === entity || r.proposal.n === n));
   if (view.priority?.pending) {
-    out.push({ key: "priority", group: "priority", kind: "priority", tone: "warn",
-      ...(coveredPriority
-        ? {}
-        : { needs: "A conversation changed your priority: confirm or undo it", show: "the priority to confirm" }),
-      item: "priority:pending" });
+    out.push({ key: "priority", group: "priority", kind: "priority", tone: "warn", item: "priority:pending" });
   }
   const toConfirm = (view.rules ?? []).filter((r) => r.pending || (r.seeded && !r.confirmed));
   for (const r of toConfirm) out.push({ key: `confirm:${r.n}`, group: "rules", kind: "confirm", tone: "warn" });
-  const uncovered = toConfirm.filter((r) => !coveredRule(r.n, r.entity));
-  if (uncovered.length) {
-    // One Needs you line for the uncovered ones only, pointing at the first.
-    const first = out.find((p) => p.key === `confirm:${uncovered[0].n}`)!;
-    first.needs = uncovered.length === 1 ? "1 standing rule to confirm" : `${uncovered.length} standing rules to confirm`;
-    first.show = uncovered.length === 1 ? "the standing rule to confirm" : "the standing rules to confirm";
-    first.item = `rule:${uncovered[0].n}`;
+  const oldRules = oldFileRules(view);
+  if (oldRules.length) {
+    // Owner's decision 3: in use either way, so listed once, for when he has time.
+    const first = out.find((p) => p.key === `confirm:${oldRules[0].n}`)!;
+    first.needs = oldRules.length === 1
+      ? "1 rule copied from your old routing file was never reviewed"
+      : `${oldRules.length} rules copied from your old routing file were never reviewed`;
+    first.detail = `${oldRules.length === 1 ? "It is" : "They are"} in use either way. Reviewing only marks ${oldRules.length === 1 ? "it" : "them"} as yours.`;
+    first.band = "later";
+    first.show = oldRules.length === 1 ? "the rule from your old file" : "the rules from your old file";
+    first.item = `rule:${oldRules[0].n}`;
   }
   for (const { rule, checks } of brokenRules(view)) {
     const said = (checks[0]?.text ?? "").replace(/^A standing rule may be broken: /, "").replace(/\.$/, "");
     const r = (view.rules ?? []).find((x) => x.n === rule);
     out.push({ key: `broken:${rule}`, group: "rules", kind: "broken", tone: "warn",
-      needs: `Standing rule ${rule} may be broken${said ? `: ${said}` : r ? `: it says ${ruleWords(r.text)}` : ""}`,
-      show: `standing rule ${rule}`, item: `rule:${rule}` });
+      needs: `Your rule ${rule} may have been broken`,
+      detail: said ? `${capitalise(said)}.` : r ? `It says ${ruleWords(r.text)}.` : undefined,
+      act: "See the rule", show: `rule ${rule}`, item: `rule:${rule}` });
   }
-  proposals.live.forEach((row, i) => {
-    out.push({ key: `proposal:${row.proposal.id}`, group: "holds", kind: "proposal", tone: "warn",
-      ...(i === 0
-        ? { needs: proposals.live.length === 1 ? "1 proposal from a conversation to confirm" : `${proposals.live.length} proposals from conversations to confirm`,
-            show: "the proposals from conversations", item: `proposal:${row.proposal.id}` }
-        : { item: `proposal:${row.proposal.id}` }) });
+  proposals.live.forEach((row) => {
+    out.push({ key: `proposal:${row.proposal.id}`, group: "holds", kind: "proposal", tone: "warn", item: `proposal:${row.proposal.id}` });
   });
   for (const h of view.holds ?? []) {
     if (h.remind) {
       out.push({ key: `hold:${h.id}`, group: "holds", kind: "remind", tone: "warn",
-        needs: `Your hold on ${h.scope_label} is still on: is it still needed?`, show: `the hold on ${h.scope_label}`, item: `hold:${h.id}` });
+        needs: `Your instruction about ${h.scope_label} is still on`,
+        detail: `“${holdWords(h)}” ${holdReminder(h, now) ?? ""}`.trim(), band: "later",
+        act: "See it", show: `the instruction about ${h.scope_label}`, item: `hold:${h.id}` });
     }
   }
   for (const r of quietRunners(view)) {
     out.push({ key: `runner:${r.name}`, group: "runners", kind: r.silent && !r.unreadable ? "silent" : "unreadable",
-      tone: "err", needs: runnerWords(r, now).replace(/\.$/, ""), show: `the ${r.name} job runner`, item: `runner:${r.name}` });
+      tone: "err", needs: runnerWords(r, now).replace(/\.$/, ""),
+      detail: r.silent ? "Limits it finds won't reach your conversations until it runs again." : "Limits it finds can't reach your conversations until Khipu can read them.",
+      act: "Look into it", show: `the ${r.name} job runner`, item: `runner:${r.name}` });
   }
   for (const name of view.sources?.refused ?? []) {
     out.push({ key: `refused:${name}`, group: "runners", kind: "refused", tone: "err",
-      needs: `Khipu refused the ${name} folder: it is inside a private folder`, show: `the ${name} folder`, item: `runner:${name}` });
+      needs: `Khipu won't read the ${name} job runner folder`, detail: "It is inside a private folder, so Khipu refused it.",
+      act: "Look into it", show: `the ${name} folder`, item: `runner:${name}` });
   }
   for (const { runner, lane } of lanesWithoutAccount(view, s)) {
     const match = (view.sources?.runners ?? []).find((r) => r.name === runner)?.lane_matches?.[lane];
@@ -284,25 +300,29 @@ export function routingProblems(
     const n = match?.candidates.length ?? 0;
     out.push({ key: `lane:${runner}/${lane}`, group: "runners", kind: "lane", tone: "warn",
       needs: n >= 2
-        ? `Lane ${lane} in ${runner} matches ${n === 2 ? "two accounts" : `${n} accounts`}`
-        : `Lane ${lane} in ${runner} has no account`,
-      show: `lane ${lane}`, item: `lane:${runner}/${lane}` });
+        ? `Job slot ${lane} in ${runner} matches ${n === 2 ? "two accounts" : `${n} accounts`}`
+        : `Job slot ${lane} in ${runner} has no account`,
+      detail: "Limits it reports can't count against an account until you choose one.",
+      act: "Choose an account", show: `job slot ${lane}`, item: `lane:${runner}/${lane}` });
   }
   if (view.sources?.table?.error) out.push({ key: "table", group: "table", kind: "table", tone: "warn" });
   // Advisory contradictions need the owner to choose which line holds, so
   // each gets its own Needs you line; rule upkeep is an advisory mark only.
   for (const row of checksModel(view, now).contradictions) {
     out.push({ key: `check:${row.key}`, group: "checks", kind: "contradiction", tone: "warn",
-      needs: row.title, show: row.title, item: `check:${row.key}` });
+      needs: row.title, detail: row.sub || undefined, act: "Look at it", show: row.title, item: `check:${row.key}` });
   }
   // Pace crossings under 6 h: the same rows the Pace group opens by itself.
   for (const crossing of paceModel(view, plans, now).crossings) {
     out.push({ key: crossing.key, group: "pace", kind: "crossing", tone: "warn",
-      needs: crossing.needs, show: crossing.show, item: crossing.item });
+      needs: crossing.needs, detail: "At the pace it is being used now.", act: "See its pace", show: crossing.show, item: crossing.item });
   }
   return out;
 }
 
+/* Every kind a problem can be. A new one must be placed in APP_KINDS or
+   APP_NOT_NEEDS in packages/cli/khipu/needs_you.py, the list a conversation
+   reads (tests/test_owner_needs_you.py fails until it is). */
 const TAG_WORDS: Record<string, (n: number) => string> = {
   limit: (n) => (n === 1 ? "1 at its limit" : `${n} at their limit`),
   down: (n) => `${n} down`,
@@ -332,9 +352,12 @@ const TAG_WORDS: Record<string, (n: number) => string> = {
 /** Delivery remains visible even when the separate routing-record read fails. */
 function deliveryProblems(s: OverviewSettings): Problem[] {
   const out: Problem[] = [];
-  const add = (key: string, kind: string, needs: string) => out.push({ key, kind, needs, group: "telling", tone: "err", show: "routing delivery" });
+  const act = "See who has what";
+  const add = (key: string, kind: string, needs: string, detail: string) => out.push({ key, kind, needs, detail, act, group: "telling", tone: "err", show: "what your conversations have heard" });
+  const older = "It may still be using an older picture of your accounts.";
   if (s.deliveryError) {
-    out.push({ key: "delivery-read", kind: "delivery-read", needs: "Routing delivery couldn't be read", group: "telling", tone: "warn", show: "routing delivery" });
+    out.push({ key: "delivery-read", kind: "delivery-read", needs: "Khipu couldn't check whether conversations are hearing your changes",
+      detail: "That is not the same as all of them being up to date.", act, group: "telling", tone: "warn", show: "what your conversations have heard" });
     return out;
   }
   const health = s.delivery;
@@ -344,13 +367,18 @@ function deliveryProblems(s: OverviewSettings): Problem[] {
   identities.forEach((row, index) => {
     if (row?.status !== "red") return;
     const label = labels[index];
-    const owed = Number.isInteger(row.owed) && (row.owed ?? -1) >= 0 ? `: ${row.owed} changes owed` : "";
-    const where = label.harness ? ` (${label.harness}, ${label.component})` : ` (${label.component})`;
-    add(`delivery:${index}`, "delivery-behind", `${label.conversation}${where} has a delivery problem${owed}`);
+    const owed = Number.isInteger(row.owed) ? (row.owed as number) : 0;
+    // The read has no project or title to name it by, and "Conversation 1" is
+    // only a row number in Telling conversations.
+    const whose = label.harness ? `one of your ${label.harness} conversations` : "one of your conversations";
+    const who = label.component === "main" ? capitalise(whose) : `A helper in ${whose}`;
+    add(`delivery:${index}`, "delivery-behind", owed > 0
+      ? `${who} hasn't heard your last ${owed === 1 ? "change" : `${owed} changes`}`
+      : `${who} may not be hearing your changes`, older);
   });
-  if (health.replication?.status === "red") add("delivery-macs", "delivery-copy", "Other Macs' routing copy is behind");
-  if (health.gateway?.status === "red") add("delivery-cloud", "delivery-copy", "The cloud routing copy is behind");
-  if (health.status === "red" && !out.length) add("delivery-health", "delivery-behind", "Routing delivery needs attention");
+  if (health.replication?.status === "red") add("delivery-macs", "delivery-copy", "Your other Macs are behind on routing changes", "They may still be telling conversations something older.");
+  if (health.gateway?.status === "red") add("delivery-cloud", "delivery-copy", "The cloud copy of your routing is behind", "Conversations that read it may hear something older.");
+  if (health.status === "red" && !out.length) add("delivery-health", "delivery-behind", "Some conversations may not be hearing your changes", older);
   return out;
 }
 
@@ -405,11 +433,7 @@ function rulesLine(view: RouteView): string {
 
 function holdsLine(view: RouteView, now: Date): string {
   const holds = view.holds ?? [];
-  const proposals = proposalsModel(view, now);
   const parts: string[] = [];
-  if (proposals.live.length) parts.push(`${plural(proposals.live.length, "proposal", "proposals")} in use`);
-  const crossed = proposals.stale.filter((r) => r.proposal.status === "crossed").length;
-  if (crossed) parts.push(`${crossed} crossed`);
   if (holds.length) {
     const next = holds
       .map((h) => h.until)
@@ -417,7 +441,7 @@ function holdsLine(view: RouteView, now: Date): string {
       .sort((a, b) => new Date(a).getTime() - new Date(b).getTime())[0];
     parts.push(next ? `${plural(holds.length, "hold", "holds")}, the next ends ${whenLocal(next, now)}` : `${plural(holds.length, "hold", "holds")}, each until you clear it`);
   }
-  return parts.length ? parts.join(" · ") : "No proposals · no holds";
+  return parts.length ? parts.join(" · ") : "No holds";
 }
 
 function tellingLine(s: OverviewSettings): string {
@@ -491,8 +515,9 @@ function changesLine(view: RouteView, now: Date): string {
     const at = new Date(c.at).getTime();
     if (!Number.isNaN(at) && at >= today) n += items;
   }
-  if (!any) return "No changes yet";
-  return n ? `${plural(n, "change", "changes")} today` : "No changes today";
+  const changes = !any ? "No changes yet" : n ? `${plural(n, "change", "changes")} today` : "No changes today";
+  const crossed = proposalsModel(view, now).stale.length;
+  return crossed ? `${changes} · ${crossed} crossed` : changes;
 }
 
 /** The closed lines and tags for every group. `view` null: the record is not

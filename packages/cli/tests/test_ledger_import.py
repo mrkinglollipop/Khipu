@@ -1060,6 +1060,10 @@ def _direction(tmp_path, monkeypatch, session="s-import"):
 
 
 def _owner_undo(line_id: str) -> tuple[int, dict]:
+    from khipu import owner_direction, owner_turns
+
+    owner_turns.record({"session_id": owner_direction.session_of(), "prompt": "undo that change", "cwd": "/work"},
+                       {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
     import io
     from contextlib import redirect_stderr, redirect_stdout
 
@@ -1092,11 +1096,11 @@ def test_an_import_by_direction_is_undone_by_removing_what_it_added(hub, tmp_pat
     assert rc == 2 and "already undone" in again["error"], again
 
 
-def test_a_catch_up_import_is_not_made_by_direction(hub, tmp_path, monkeypatch):
-    """A catch-up changes rows already there, so it has no Undo and needs the app."""
+def test_catch_up_reaches_the_importer_by_conversation(hub, tmp_path, monkeypatch):
+    """The conversation gate does not force a terminal/app detour; importer prerequisites still apply."""
     _direction(tmp_path, monkeypatch)
     rc, report = _import(_write(tmp_path, _tracker(10)), "--catch-up", "--owner-direction")
-    assert rc != 0 and report.get("reason") == "not_by_direction", report
+    assert rc != 0 and report.get("reason") == "no_import", report
 
 
 def test_a_set_queued_unseen_never_overwrites_a_value_another_mac_imported(hub, tmp_path, monkeypatch):

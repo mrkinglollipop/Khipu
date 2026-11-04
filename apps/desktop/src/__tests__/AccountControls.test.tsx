@@ -467,20 +467,33 @@ describe("a conversation's change to the accounts", () => {
     const reload = vi.fn(async () => {});
     const changed = vi.fn();
     render(<AccountsRequestBand support={support({ request: "track my Kimi account", by: { label: "a Codex conversation" } })} reload={reload} onChanged={changed} />);
-    const band = screen.getByRole("group", { name: "A conversation changed your accounts" });
-    expect(band).toHaveTextContent("a Codex conversation changed which accounts Khipu reads at your request");
+    const band = screen.getByRole("article", { name: "A conversation changed which accounts Khipu reads" });
+    expect(band).toHaveTextContent("WhoA Codex conversation");
     expect(band).toHaveTextContent("“track my Kimi account”");
-    fireEvent.click(within(band).getByRole("button", { name: "Keep" }));
+    fireEvent.click(within(band).getByRole("button", { name: "Keep the new list" }));
     await waitFor(() => expect(calls("khipu_accounts_request")).toEqual([{ action: "confirm", expect: "v7" }]));
     await waitFor(() => expect(reload).toHaveBeenCalled());
     expect(changed).toHaveBeenCalled();
+  });
+
+  it("never shows a conversation's raw harness name, and says what changed", () => {
+    render(<AccountsRequestBand reload={async () => {}} support={{ state: "here", status: {
+      ok: true, version: "v7", none: false, auto_track: true, value: null, user_home: null, declined: [],
+      accounts: [{ label: "Codex", harness: "codex" }, { label: "Muse", harness: "muse" }],
+      request: { by: { kind: "conversation", harness: "claude_code", project: "project-a" }, prior: [{ label: "Codex", harness: "codex" }] },
+    } }} />);
+    const band = screen.getByRole("article", { name: "A conversation added Muse to the accounts Khipu reads" });
+    expect(band).toHaveTextContent("A Claude Code conversation in project-a");
+    expect(band).not.toHaveTextContent("claude_code");
+    expect(band).toHaveTextContent("BeforeCodex");
+    expect(band).toHaveTextContent("In use nowCodex, Muse");
   });
 
   it("undoes the change and shows a refusal in words", async () => {
     answers.khipu_accounts_request = { ok: false, error: "the list changed after you read it" };
     render(<AccountsRequestBand support={support({ request: "stop tracking Muse" })} reload={async () => {}} />);
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+      fireEvent.click(screen.getByRole("button", { name: "Go back to the old list" }));
     });
     await waitFor(() => expect(calls("khipu_accounts_request")).toEqual([{ action: "undo", expect: "v7" }]));
     expect(await screen.findByRole("alert")).toHaveTextContent("Khipu didn't make that change");

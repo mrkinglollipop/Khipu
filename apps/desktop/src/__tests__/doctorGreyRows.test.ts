@@ -1,7 +1,7 @@
 // Doctor rows that did not run (skipped / not applicable) and attention wording
 // for buried outbox / non-hook capture failures.
 import { describe, expect, it } from "vitest";
-import { buildAttention } from "../doctorAttention";
+import { buildAttention, outboxNotice } from "../doctorAttention";
 import { healthRows } from "../healthRows";
 
 describe("doctor attention wording", () => {
@@ -34,6 +34,15 @@ describe("doctor attention wording", () => {
     expect(queued.title).toMatch(/queued on this Mac/);
     expect(queued.cause).not.toMatch(/unreachable/);
     for (const n of [held, offline, queued]) expect(n.cause + n.title).not.toMatch(/`khipu|run `|retry-dead/);
+  });
+
+  it("warns about duplicates only for held captures of that kind", () => {
+    const plain = outboxNotice({ pending: 0, dead: 3, announce_refused: 0 });
+    expect(plain.cause).toMatch(/put them back/);
+    expect(plain.cause).not.toMatch(/duplicates/);
+    const refused = outboxNotice({ pending: 0, dead: 3, announce_refused: 2 });
+    expect(refused.cause).toMatch(/may add duplicates/);
+    expect(refused.cause).not.toMatch(/`khipu|run `|retry-dead/);
   });
 
   it("no outbox or capture wording hands the owner a terminal command", () => {

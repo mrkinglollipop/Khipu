@@ -219,7 +219,7 @@ def test_level_is_public_expires_on_earlier_reset_and_is_retained_for_owner_undo
     assert replay.view()["valid_until"] == routing._iso(reset)
     replay.now = reset
     assert "level" not in replay.view()["priority"]["entries"][0]
-    assert rows()[-1]["entries"][0]["level"] == expected
+    assert rows()[-1]["entries"][0]["level"] == level
 
 
 @pytest.mark.parametrize("level", [{}, {"claim": "low"}, {"claim": "low", "as_of": "bad", "until": "bad"},

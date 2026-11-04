@@ -298,6 +298,7 @@ export type RoutePriority = {
   pending?: boolean;
   confirmed?: boolean;
   pending_by?: string | null;
+  pending_author?: RouteAuthor | null;
   proposal_withheld?: boolean;
   owner_request?: string | null;
   replaced?: { entries: RoutePriorityEntry[]; until?: string | null } | null;
@@ -921,12 +922,12 @@ function disagreementSentence(
   const by = d.by ? capitalise(d.by) : capitalise(witnessWords(d, harness, d.state ?? ""));
   return (
     `${by} reported ${subject} ${stateWord(d.state)} ${saidWhen(d.at, now)}. ` +
-    `${stronger} outranks ${weakerWords(d)}, so ${shown} shows here; conversations are told both.`
+    `${stronger} counts for more than ${weakerWords(d)}, so ${shown} shows here; conversations are told both.`
   );
 }
 
 /** "A Claude Code conversation in project-b reported it open at 11:31 AM.
- *  Claude's own message outranks a conversation's report, so the limit
+ *  Claude's own message counts for more than a conversation's report, so the limit
  *  shows here; conversations are told both." Null when nothing disagrees. */
 export function disagreementWords(a: RouteAccount, now: Date): string | null {
   const d = a.disagreement;
@@ -938,7 +939,7 @@ export function disagreementWords(a: RouteAccount, now: Date): string | null {
 
 /** The same for each model whose own limit a report disagrees with: "A
  *  Claude Code conversation in project-c reported Opus open at 1:00 PM.
- *  Claude's own message outranks a conversation's report, so the Opus limit
+ *  Claude's own message counts for more than a conversation's report, so the Opus limit
  *  shows here; conversations are told both." Only models whose limit is
  *  shown (its end is ahead), as the attention item names them. */
 export function modelDisagreementWords(a: RouteAccount, now: Date): string[] {
@@ -1330,11 +1331,6 @@ export function priorityOrder(p: RoutePriority, now: Date): string {
 export function priorityHeadline(p: RoutePriority, now: Date): string {
   const whole = p.until ? ` (all of it until ${whenLocal(p.until, now)})` : "";
   return `Priority: ${priorityOrder(p, now)}${whole}`;
-}
-
-/** Who set a priority that waits for the owner, in his words. */
-export function priorityPendingWords(p: RoutePriority): string {
-  return `Set by ${p.pending_by || "a conversation"} at your request; you haven't confirmed it yet.`;
 }
 
 /** "when read 1 h ago" for figures that may be out of date. */

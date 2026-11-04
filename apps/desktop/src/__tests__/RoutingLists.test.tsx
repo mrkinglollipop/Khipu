@@ -352,7 +352,7 @@ describe("Accounts: Sort by and Show accounts", () => {
     await page();
     expect(names()).toHaveLength(1);
     const needs = await screen.findByRole("region", { name: "Needs you" });
-    fireEvent.click(within(needs).getAllByRole("button", { name: /^Show / })[0]!);
+    fireEvent.click(within(needs).getAllByRole("button", { name: /^(Compare|Go to sign in|See the account): / })[0]!);
     await waitFor(() => expect(names()).toHaveLength(4));
     expect(JSON.parse(store.get(LISTS_KEY)!).accountFilter).toBe("all");
     await waitFor(() => expect(document.activeElement?.getAttribute("data-route-item") ?? "").toMatch(/^account:/));
@@ -384,6 +384,10 @@ describe("Standing rules: search", () => {
     fireEvent.change(box, { target: { value: "zebra" } });
     expect(screen.getByText(/No rules match “zebra”\./)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    // The default page is deliberately short; paging does not omit matches.
+    while (screen.queryByRole("button", { name: /Show \d+ more rules/ })) {
+      fireEvent.click(screen.getByRole("button", { name: /Show \d+ more rules/ }));
+    }
     expect(within(screen.getByRole("list", { name: "Standing rules" })).getAllByRole("listitem")).toHaveLength(11);
   });
 });

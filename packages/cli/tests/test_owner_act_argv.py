@@ -28,7 +28,8 @@ def test_built_argv_never_contains_double_dash(monkeypatch):
                          ("route.hold.end", {"hold": "h1"}),
                          ("work.same", {"row": "a", "commitment": "b"})):
         with pytest.raises(Stop):
-            owner_act.act(action, args)
+            head, pos = owner_act.argv(action, owner_act._values(action, args))
+            owner_act._run(action, owner_act.full_argv(head, pos, ["--owner-direction"]))
     assert len(seen) == 4
     assert all("--" not in full for full in seen)
     assert seen[0][:3] == ["route", "pause", "codex"]

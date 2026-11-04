@@ -28,11 +28,11 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.note.end": ((), ()),
     "route.rule.add": (("text",), ("holds",)),
     "route.rule.edit": (("rule", "text"), ()),
-    "route.rule.retire": (("rule",), ()),
+    "route.rule.retire": (("rule",), ("expect",)),
     "route.rule.restore": (("rule",), ()),
     "route.rule.confirm": (("rule",), ("expect",)),
-    "route.rule.undo": (("rule",), ()),
-    "route.rule.dismiss": (("rule",), ()),
+    "route.rule.undo": (("rule",), ("expect",)),
+    "route.rule.dismiss": (("rule",), ("expect",)),
     "route.hold.add": (("text", "reason", "scope"), ("account", "until")),
     "route.hold.end": (("hold",), ()),
     "route.cap.set": (("account", "kind"), ("window", "pct", "slack", "usd", "days", "n", "revision", "purpose", "tier", "sensitive_only", "until")),
@@ -48,9 +48,9 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
-    "route.tier_table.set": (("tiers",), ()),
-    "route.tier_table.confirm": ((), ()),
-    "route.tier_table.clear": ((), ()),
+    "route.tier_table.set": (("tiers",), ("expect",)),
+    "route.tier_table.confirm": ((), ("expect",)),
+    "route.tier_table.clear": ((), ("expect",)),
     "accounts.track": (("entries",), ("expect",)),
     "accounts.rename": (("account", "name"), ("expect",)),
     "accounts.stop": (("account",), ("expect",)),
@@ -62,8 +62,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "accounts.request.undo": ((), ("expect",)),
     "config.usage_accounts": (("list",), ("expect",)),
     "config.routing_setting": (("key",), ("value",)),
-    "config.answer_request.confirm": (("key",), ()),
-    "config.answer_request.undo": (("key",), ()),
+    "config.answer_request.confirm": (("key",), ("expect",)),
+    "config.answer_request.undo": (("key",), ("expect",)),
     "promote.gate_ignore": (("checks",), ()),
     "promote.gate_ignore.cancel": ((), ()),
     "ledger.import": (("file",), ("project", "catch_up")),
@@ -99,6 +99,8 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "forget.not_same": (("id",), ()),
     # Undone through direction.undo with the id this returns.
     "outbox.merge_preferences": ((), ("include_content", "include_decisions")),
+    # Always held (owner_direction.CONFIRM_ONLY). Undone through direction.undo.
+    "outbox.span_covered": ((), ()),
 }
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
@@ -211,6 +213,9 @@ def _values(action: str, args) -> dict:
         elif key in _FLAGS:
             if not isinstance(value, bool):
                 raise _bad(f"{key} must be true or false")
+        elif key == "value" and isinstance(value, bool) and action == "config.routing_setting":
+            # A switch said as JSON: the command takes it as a word.
+            value = "true" if value else "false"
         elif key == "value" and isinstance(value, (int, float)) and not isinstance(value, bool):
             value = str(value)
         elif not isinstance(value, str) or not value.strip():
@@ -320,9 +325,9 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action.startswith("route.priority."):
         return ["route", "priority", verb, *_opts(v, "entries", "until", "expect", "holds")], []
     if action == "route.tier_table.set":
-        return ["route", "tier-table", "set", "--tiers=" + json.dumps(v["tiers"])], []
+        return ["route", "tier-table", "set", "--tiers=" + json.dumps(v["tiers"]), *_opts(v, "expect")], []
     if action.startswith("route.tier_table."):
-        return ["route", "tier-table", verb], []
+        return ["route", "tier-table", verb, *_opts(v, "expect")], []
     if action == "accounts.track":
         return ["accounts", "track", *_opts(v, "entries", "expect")], []
     if action in ("accounts.rename", "accounts.stop", "accounts.move"):
@@ -343,7 +348,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         if v["key"] not in routing.SETTINGS:
             raise _bad(f"{v['key']} is not a routing setting")
         if action != "config.routing_setting":
-            return ["config", "--answer-request", v["key"], verb], []
+            return ["config", "--answer-request", v["key"], verb, *_opts(v, "expect")], []
         if v.get("value") is None:
             return ["config", f"--unset={v['key']}"], []
         return ["config", "--set", v["key"], _bare(v["value"], "value")], []
@@ -413,6 +418,8 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["episode", "forget-pending", f"--not-same={v['id']}"], []
     if action == "outbox.merge_preferences":
         return ["outbox", "merge-line-preferences", "--apply", *_opts(v, "include_content", "include_decisions")], []
+    if action == "outbox.span_covered":
+        return ["outbox", "span-covered", "--apply", "--json"], []
     raise Refused("not_by_direction", "That change can't be made by direction.")
 
 
@@ -423,7 +430,7 @@ def owner_turn() -> bool:
     from khipu import owner_direction
 
     try:
-        owner_direction.check("forget.here")
+        owner_direction.check("forget.here", reading=True)
     except Exception:  # noqa: BLE001 - any doubt keeps the text back
         return False
     return True
@@ -488,6 +495,8 @@ def act(action, args) -> tuple[bool, dict]:
         return True, _READS[action]()
     if action == CONFIRM:
         return _confirm(args)
+    if action == DECLINE:
+        return _decline(args)
     held = action == REQUEST
     if held:
         if not isinstance(args, dict) or set(args) - {"action", "args"} or not isinstance(args.get("action"), str):
@@ -499,27 +508,56 @@ def act(action, args) -> tuple[bool, dict]:
     try:
         values = _values(action, args)
         pending = _priority_pending(action, values)
+        if pending is None and not owner_direction.REQUEST_APPLIED.get():
+            from khipu import needs_you
+
+            pending = needs_you.prepare_answer(action, values)
         if pending is not None:
             values = pending[0]
         head, positionals = argv(action, values)
         full = full_argv(head, positionals, ["--owner-direction"])
     except Refused as err:
         return False, err.refusal()
-    if not held:
-        try:
-            owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
-        except owner_direction.DirectionRefused as refused:
-            # Anything but a T3 conversation's hold runs the command as before.
-            held = refused.code == "confirm_needed"
-            if pending is not None and not held:
-                return False, refused.refusal()
-        else:
-            # The owner's words asked for the amend, never for the waiting
-            # request it would confirm: his yes to the ask naming both is.
-            held = pending is not None
-    if held:
-        return _hold(action, values, ask=pending[1] if pending is not None else None)
-    return _run(action, full)
+    if action in owner_direction.CONFIRM_ONLY:
+        return _held_on_a_read(_hold(action, values, ask=owner_direction.CONFIRM_ONLY[action]))
+    token = owner_direction.ANSWERING.set(owner_direction.signature(action, values))
+    try:
+        if not held:
+            try:
+                owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
+            except owner_direction.DirectionRefused as refused:
+                if refused.code == "not_confirmed":
+                    return False, refused.refusal()  # the turn that read the list: no hold, nothing to ask yet
+                # Anything but a T3 conversation's hold runs the command as before.
+                held = refused.code == "confirm_needed"
+                if pending is not None and not held:
+                    return False, refused.refusal()
+            else:
+                # The owner's words asked for the amend, never for the waiting
+                # request it would confirm: his yes to the ask naming both is.
+                held = pending is not None and action == "route.priority.amend"
+        if held:
+            if pending is not None:
+                return _held_on_a_read(_hold(action, values, ask=pending[1]))
+            from khipu import needs_you
+
+            return _held_on_a_read(_hold(action, values, ask=needs_you.ask_for(action, values)))
+        return _run(action, full)
+    finally:
+        owner_direction.ANSWERING.reset(token)
+
+
+def _held_on_a_read(hold: tuple[bool, dict]) -> tuple[bool, dict]:
+    """A hold that started from the read that showed it (``owner_direction._seed``):
+    when the owner already replied to that read, this is his one yes, on the
+    confirm's own proof. With no reply it stays held, and says what to ask."""
+    ok, out = hold
+    if not ok or not out.pop("seeded", False):
+        return hold
+    done_ok, done = _confirm({"request": out["request"]})
+    if done_ok or done.get("code") != "not_confirmed":
+        return done_ok, done
+    return True, out
 
 
 def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
@@ -554,16 +592,14 @@ def _priority_pending(action: str, values: dict) -> tuple[dict, str] | None:
         raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False)
                       + f"; it changes {', '.join(unnamed)} in a way the ask can't put in words, so the amend "
                         "can't confirm it too")
-    words = "; ".join(changes)
-    if len(words) > routing.PENDING_ASK_MOST:
-        raise Refused("priority_pending", routing.pending_amend_refusal(version, combine=False)
-                      + "; its changes are too long to name in one ask, so the amend can't confirm it too")
+    # A conversation's words stay in their quotes (``their_words``).
+    words = "; ".join(routing.their_words(c) for c in changes)
     from khipu import owner_direction
 
     asked = held.get("owner_request")
     amend = owner_direction.ask_line(action, {k: v for k, v in values.items() if k not in ("confirm_pending", "expect")})
     ask = (f"A priority request from {held.get('pending_by') or 'a conversation'} is waiting for you (version "
-           f"{version}" + (f", asked as \"{asked}\"" if asked else "") + f"). Confirming it makes these yours: "
+           f"{version}" + (f", asked as \"{routing.their_words(asked)}\"" if asked else "") + f"). Confirming it makes these yours: "
            f"{words}. Confirm that request, then " + amend[len("Confirm "):])
     # Whatever the caller passed, the pin is the request as this ask shows it.
     return dict(values, confirm_pending=routing.pending_priority_pin(view)), ask
@@ -610,7 +646,7 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
                 now_ = {e.get("account"): e for e in stored.get("entries") or []}
                 if any(was.get(a) != now_.get(a) for a in set(was) | set(now_) if a != key):
                     return out
-            action, args = "route.priority.confirm", {"expect": view.get("priority_version") or "p0"}
+            action, args = "route.priority.confirm", {"expect": routing.pending_priority_pin(view)}
         else:
             number = out.get("n")
             rule = next((r for r in routing.read_view().get("rules") or [] if r["n"] == number), None)
@@ -620,7 +656,11 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
                 return out
             action, args = "route.rule.confirm", {"rule": number, "expect": rule["revision"]}
         # Never a hold: a turn that cannot be proved owner's is left alone.
-        owner_direction.check(action, instant=True)
+        checking = owner_direction.REQUEST_APPLIED.set(True)
+        try:
+            owner_direction.check(action, instant=True)
+        finally:
+            owner_direction.REQUEST_APPLIED.reset(checking)
     except (owner_direction.DirectionRefused, routing.RouteError, StopIteration, KeyError):
         return out
     token = owner_direction.REQUEST_APPLIED.set(True)
@@ -639,8 +679,9 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
 # A change held for the owner to confirm, and its confirmation
 # (``owner_direction.hold`` / ``confirm``). Not owner actions themselves:
 # a hold changes nothing, and a confirm applies the held action, which is
-# logged as that action with the confirming message named.
-REQUEST, CONFIRM = "direction.request", "direction.confirm"
+# logged as that action with the confirming message named. A decline drops a
+# held request on the owner's no; nothing was changed, so nothing is undone.
+REQUEST, CONFIRM, DECLINE = "direction.request", "direction.confirm", "direction.decline"
 
 
 def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, dict]:
@@ -651,10 +692,11 @@ def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, d
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
     return True, {"ok": True, "applied": False, "pending": True, "request": request["id"], "ask": request["ask"],
+                  **({"seeded": True} if request.get("seeded") else {}),
                   "line": (f"Nothing is changed yet. Ask the owner: \"{request['ask']}\" Once they answer in this "
                            f"conversation, call khipu_owner_act with {CONFIRM} and "
-                           f"{{\"request\": \"{request['id']}\"}}. It can be confirmed later, from any "
-                           "conversation the owner types in.")}
+                           f"{{\"request\": \"{request['id']}\"}}; if they say no, {DECLINE} with the same "
+                           "request. In another conversation, read the full held item first, then the owner can answer once.")}
 
 
 def _confirm(args) -> tuple[bool, dict]:
@@ -670,7 +712,7 @@ def _confirm(args) -> tuple[bool, dict]:
     try:
         head, positionals = argv(action, _values(action, request.get("args") or {}))
         full = full_argv(head, positionals, ["--owner-direction"])
-        with owner_direction.confirmed_replay(action, stamp):
+        with owner_direction.confirmed_replay(action, stamp, files=request.get("files")):
             ok, result = _run(action, full)
     except Refused as err:
         result = err.refusal()
@@ -680,6 +722,20 @@ def _confirm(args) -> tuple[bool, dict]:
         except OSError:
             pass
     return ok, dict(result or {}, request=request["id"], confirmed=stamp["confirmed"])
+
+
+def _decline(args) -> tuple[bool, dict]:
+    from khipu import owner_direction
+
+    if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
+        return False, _bad(f"{DECLINE} takes request, the held request's id").refusal()
+    try:
+        request = owner_direction.decline(args["request"])
+    except owner_direction.DirectionRefused as refused:
+        return False, refused.refusal()
+    return True, {"ok": True, "declined": True, "applied": False, "request": request["id"],
+                  "line": "The held request is dropped. Nothing was changed.",
+                  "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}
 
 
 def _run(action: str, full: list[str]) -> tuple[bool, dict]:

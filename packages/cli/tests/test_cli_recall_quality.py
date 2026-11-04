@@ -31,6 +31,7 @@ def _green_doctor_patches():
         mock.patch("khipu.graph_backup.offsite_health", return_value={"ok": True}),
         mock.patch("khipu.config.path_setting", return_value=None),  # graph_sqlite not configured
         mock.patch("khipu.outbox.status", return_value={"pending": 0}),
+        mock.patch("khipu.ledger.outbox_status", return_value={"pending": 0, "refused": 0}),
         mock.patch("khipu.outbox.drain", return_value={"failed": 0}),
         mock.patch("khipu.session_capture.queued_jobs", return_value=False),
         mock.patch("khipu.session_capture.drain", return_value=None),

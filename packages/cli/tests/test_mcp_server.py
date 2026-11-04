@@ -118,6 +118,7 @@ class ProtocolTest(unittest.TestCase):
                 "khipu_route_priority",
                 "khipu_ledger",
                 "khipu_owner_act",
+                "khipu_needs_you",
                 "khipu_project",
             },
         )

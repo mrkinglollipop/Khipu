@@ -2,7 +2,7 @@
 // the evidence boundary so absent or failed CLI evidence never looks healthy.
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
-import { DeliverySection } from "../RoutingSettings";
+import { DeliverySection, MacDeliverySection } from "../RoutingSettings";
 import { routingOverview } from "../routingOverview";
 import { DELIVERY_HEALTH, DELIVERY_NOW, DELIVERY_VIEW } from "../../dev/deliveryFake";
 
@@ -19,8 +19,20 @@ const SESSION_ID_SHAPED = [
 ];
 
 describe("Telling conversations: delivery and health", () => {
+  it("labels an unavailable last-heard time once on every fallback row", () => {
+    render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
+    for (const row of rows) expect(within(row).getAllByText("Last heard: not known yet")).toHaveLength(1);
+  });
+
+  it("does not invent a last-heard time for missing or invalid owner-row timestamps", () => {
+    render(<DeliverySection data={{ ...DELIVERY_VIEW, delivery_rows: [{ label: "No timestamp" }, { label: "Invalid timestamp", last_prompt_at: "not a date" }] }} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
+    for (const row of rows) expect(within(row).getAllByText("Last heard: not known yet")).toHaveLength(1);
+  });
+
   it("shows generic conversation labels, never raw identities or component ids", () => {
-    const { container } = render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const { container } = render(<><DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} /><MacDeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} /></>);
     const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
     expect(rows).toHaveLength(3);
     expect(rows[0]).toHaveTextContent("Conversation 1");
@@ -51,16 +63,17 @@ describe("Telling conversations: delivery and health", () => {
           : { have_count: 2, live_count: 2, have: [], waiting: [] },
       })),
     } as typeof DELIVERY_VIEW;
-    const { container } = render(<DeliverySection data={view} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const { container } = render(<><DeliverySection data={view} health={DELIVERY_HEALTH} now={DELIVERY_NOW} /><MacDeliverySection data={view} health={DELIVERY_HEALTH} /></>);
     const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
     expect(rows).toHaveLength(2);
     expect(rows[0]).toHaveTextContent("Fix the flaky build");
     expect(rows[0]).toHaveTextContent("This Mac");
-    expect(rows[0]).toHaveTextContent("2 min ago");
+    expect(rows[0]).toHaveTextContent("Last heard 2 min ago");
+    expect(rows[0]).not.toHaveTextContent("Last heard: not known yet");
     expect(rows[0]).toHaveTextContent("No changes owed");
     expect(rows[1]).toHaveTextContent("Conversation 2");
     expect(rows[1]).toHaveTextContent("Studio Mac");
-    expect(rows[1]).toHaveTextContent("1 h ago");
+    expect(rows[1]).toHaveTextContent("Last heard 1 h ago");
     const changes = within(screen.getByRole("list", { name: "Recent changes and who has them" }));
     expect(changes.getByText("1 of 2 have it")).toBeTruthy();
     expect(changes.getByText(/Waiting: Conversation 2/)).toBeTruthy();
@@ -68,7 +81,7 @@ describe("Telling conversations: delivery and health", () => {
     const macs = screen.getByRole("list", { name: "Other Macs and the cloud" });
     expect(macs).toHaveTextContent("MacBook Air");
     expect(macs).toHaveTextContent("Behind");
-    expect(screen.queryByText("Who has it isn't available")).toBeNull();
+    expect(screen.queryByText("Not known yet who has it")).toBeNull();
     expect(within(screen.getByRole("list", { name: "Live conversations" })).queryAllByRole("button")).toHaveLength(0);
     for (const pattern of SESSION_ID_SHAPED) expect(container.textContent).not.toMatch(pattern);
   });
@@ -90,9 +103,9 @@ describe("Telling conversations: delivery and health", () => {
   });
 
   it("keeps has-it information unknown until the doctor exposes it", () => {
-    render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    render(<><DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} /><MacDeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} /></>);
     const changes = within(screen.getByRole("list", { name: "Recent changes and who has them" }));
-    expect(changes.getAllByText("Who has it isn't available")).toHaveLength(2);
+    expect(changes.getAllByText("Not known yet who has it")).toHaveLength(2);
     expect(screen.getByRole("list", { name: "Other Macs and the cloud" })).toHaveTextContent("Other MacsBehind");
     expect(screen.getByRole("list", { name: "Other Macs and the cloud" })).toHaveTextContent("Cloud copyCan't be checked");
   });
@@ -118,7 +131,8 @@ describe("Telling conversations: delivery and health", () => {
   });
 
   it("keeps a copy with no age unknown even if its status claims green", () => {
-    render(<DeliverySection data={DELIVERY_VIEW} health={{ ...DELIVERY_HEALTH, replication: { status: "green" } }} now={DELIVERY_NOW} />);
+    const health = { ...DELIVERY_HEALTH, replication: { status: "green" as const } };
+    render(<><DeliverySection data={DELIVERY_VIEW} health={health} now={DELIVERY_NOW} /><MacDeliverySection data={DELIVERY_VIEW} health={health} /></>);
     const copies = screen.getByRole("list", { name: "Other Macs and the cloud" });
     expect(copies).not.toHaveTextContent("Current");
     expect(copies).toHaveTextContent("Can't be checked");
@@ -128,9 +142,9 @@ describe("Telling conversations: delivery and health", () => {
     const model = routingOverview(null, "route failed", null, null, { routing: null, push: null, delivery: DELIVERY_HEALTH }, DELIVERY_NOW);
     expect(model.problems.filter((item) => item.group === "telling")).toHaveLength(2);
     const needs = model.problems.map((item) => item.needs).join(" ");
-    expect(needs).toContain("Conversation 2");
+    expect(needs).not.toContain("Conversation 2");
     expect(needs).toContain("Codex");
-    expect(needs).toContain("2 changes owed");
+    expect(needs).toContain("last 2 changes");
     for (const pattern of SESSION_ID_SHAPED) expect(needs).not.toMatch(pattern);
     expect(model.tags.telling.every((tag) => tag.tone === "err")).toBe(true);
   });

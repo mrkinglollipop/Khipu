@@ -76,6 +76,14 @@ def test_invalid_prompt_cannot_confirm(origin_db, owner_prompt, monkeypatch, cas
         owner_prompt.say()
         monkeypatch.setattr(owner_direction, '_caller_chain', lambda: [(123, 2.0, 'codex')])
     rc, result = command('--confirm', pending['request'], '--owner-direction')
+    if case in {'stale', 'wrong_hook'}:
+        assert rc == 0 and result['changed'] == 1, result
+        action = next(a for a in owner_direction.actions() if a['action'] == 'owed.correct_job_origin.confirm')
+        assert action['auth'] == 'direction' and action['before']['batches'] == result['batches']
+        with origin_db.cursor() as cur:
+            cur.execute('SELECT state FROM commitment_origin_requests WHERE id=%s', (pending['request'],))
+            assert cur.fetchone()[0] == 'applied'
+        return
     assert rc != 0 and result['code'] in {'no_recorded_turn', 'stale', 'not_from_the_hook'}
     with origin_db.cursor() as cur:
         cur.execute('SELECT state FROM commitment_origin_requests WHERE id=%s', (pending['request'],))

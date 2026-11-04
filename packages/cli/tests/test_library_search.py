@@ -637,9 +637,8 @@ class ConcurrentLibraryLegsTest(unittest.TestCase):
 
             with mock.patch("khipu.hub_snapshot.try_hub_connect", _connect):
                 out = em.hybrid_search("divine council", limit=5)
-        self.assertEqual(len(calls), 2)                      # memory legs + library thread
-        self.assertIn("khipu-library-legs", calls)
-        self.assertEqual(sum(1 for c in calls if c != "khipu-library-legs"), 1)
+        self.assertCountEqual(calls, [threading.current_thread().name,
+                                     "khipu-library-legs", "khipu-hybrid-literal"])
         self.assertIn("library:biblical:7#3", _ids(out))
         self.assertIn("library_wall_ms", out["timing"])
         self.assertNotIn("degraded_legs", out)
@@ -675,12 +674,19 @@ class ConcurrentLibraryLegsTest(unittest.TestCase):
         self.assertEqual(_ids(out), ["11"])
         self.assertIn("boom", out["timing"]["library_error"])
 
-    def test_include_libraries_false_starts_no_thread(self):
+    def test_include_libraries_false_starts_no_library_thread(self):
         cur = FakeCur(cosine=[_cos_row()])
+        real_thread = threading.Thread
+
+        def memory_thread(*args, **kwargs):
+            self.assertEqual(kwargs["name"], "khipu-hybrid-literal")
+            return real_thread(*args, **kwargs)
+
         with _hub(cur), \
                 mock.patch.object(em, "_LibraryLegs", side_effect=AssertionError("thread started")), \
-                mock.patch("threading.Thread", side_effect=AssertionError("thread started")):
+                mock.patch("threading.Thread", side_effect=memory_thread) as started:
             out = em.hybrid_search("a topical prompt", include_libraries=False)
+        started.assert_called_once()
         self.assertNotIn("library_wall_ms", out["timing"])
 
     def test_the_explicit_library_search_stays_serial(self):

@@ -144,6 +144,29 @@ def test_existing_install_with_a_login_defaults_on_and_cursor_defaults_off(env):
     assert status["routing_usage_login_grok"]["login_found"] is True
 
 
+@pytest.mark.parametrize("word, asked", [("on", True), ("off", False)])
+def test_a_waiting_login_switch_says_what_was_asked(env, word, asked):
+    """The app says which way it goes. ``value`` is the one still in use, so it
+    can't: cursor reads off here whichever way the conversation asked."""
+    key = "routing_usage_login_cursor"
+    routing.set_setting(key, word, request={"request": "change it", "by": {"kind": "conversation"}, "at": None})
+    status = routing.settings_status()[key]
+    assert status["value"] is False
+    assert status["request"]["asked"] is asked
+    assert status["request"]["asked_set"] is True
+    assert status["request"]["prior"] is None
+
+
+def test_a_waiting_login_switch_says_when_the_default_was_asked_for(env):
+    key = "routing_usage_login_grok"
+    routing.set_setting(key, "on")
+    routing.set_setting(key, None, request={"request": "put it back", "by": {"kind": "conversation"}, "at": None})
+    status = routing.settings_status()[key]
+    assert status["request"]["asked"] is None
+    assert status["request"]["asked_set"] is False
+    assert status["request"]["prior"] is True
+
+
 def test_a_provider_with_no_login_here_defaults_off(env):
     env.opencode_file.unlink()
     assert usage_logins.login_switch("opencode") == (False, "default")

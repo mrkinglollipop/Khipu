@@ -136,6 +136,7 @@ export const ACTION_LABELS: Record<string, string> = {
   "accounts.request.undo": "Undid a change a conversation asked for",
   "config.usage_accounts": "Changed the tracked accounts",
   "config.routing_setting": "Changed a routing setting",
+  "direction.decline": "Declined a change a conversation asked for",
   "config.answer_request.confirm": "Kept a change a conversation asked for",
   "config.answer_request.undo": "Undid a change a conversation asked for",
   "promote.gate_ignore": "Let the next update skip a check",
@@ -165,6 +166,7 @@ export const ACTION_LABELS: Record<string, string> = {
   "forget.here": "Forgot a hub episode, already forgotten on this Mac",
   "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
   "outbox.merge_preferences": "Merged saved notes from held captures into the hub",
+  "outbox.span_covered": "Retired held captures another episode covers",
 };
 
 /** An id with no label above, as words: "foo.bar_baz" reads "Owner change: foo bar baz". */
@@ -312,6 +314,8 @@ export function actionWords(a: OwnerAction, rules?: RouteRule[] | null): string 
       return `Forgot hub episode ${t}, already forgotten on this Mac`;
     case "outbox.merge_preferences":
       return "Merged saved notes from held captures into the hub";
+    case "outbox.span_covered":
+      return "Retired held captures another episode covers";
     case "forget.not_same":
       return `Marked hub episode ${t} as not the one forgotten on this Mac`;
     case "direction.set": {
