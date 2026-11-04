@@ -73,12 +73,30 @@ def test_1613a16d_reader_folds_compacted_log_identically(world, old_reader):
     assert folded() == before
 
 
-def test_day_120_stream_figures_and_owner_rate(world, record_property):
+@pytest.mark.parametrize("replication", [False, True])
+def test_day_120_stream_figures_and_owner_rate(world, record_property, replication):
     start = END - timedelta(days=120)
     stream = synth.Stream(KEYS, start, seed=7, runners=1, lanes=4)
     rows = stream.until(END)
     owners = sum(r.get('written_by', {}).get('kind') == 'owner' for r in rows)
     synth.write(routing.events_file(), rows)
+    if replication:
+        from khipu import routing_replication as rr
+        from khipu.config import config_file
+
+        config = json.loads(config_file().read_text())
+        config["routing_replication_live"] = True
+        config_file().write_text(json.dumps(config))
+        (routing.routing_dir() / "mac-id").write_text(stream.mac + "\n")
+        bindings, _forwards, _aliases = routing.account_identity.state(routing.read_events()[0], routing.accounts())
+        projected = routing.replication_payload(rows, bindings=bindings)
+        # A bulk post-sync fixture avoids benchmarking per-receipt disk writes.
+        # Pair tests exercise actual paginated sync and the completed watermark.
+        rr._store([dict(payload=row, event_id=row["id"], hub_order=n,
+                        received_at=routing._iso(END), rule_number=None)
+                   for n, row in enumerate(projected, 1)])
+        rr._save(dict(mac=stream.mac, uploaded={stream.mac: max(row["seq"] for row in rows)},
+                      completed_order=len(projected), caught_up_at=routing._iso(END)))
     before = rc.log_size()
     world[0] = END
     out = rc.compact(END)
@@ -90,7 +108,11 @@ def test_day_120_stream_figures_and_owner_rate(world, record_property):
         rc._Log(routing.events_file().read_bytes().splitlines(), routing._inputs()).at(END)
         times.append((time.perf_counter() - began) * 1000)
     archive_bytes = sum(p.stat().st_size for _, p in rc._archives())
-    figures = dict(seed=7, days=120, before=before, after=after, fold_ms=times,
+    remote_path = routing.routing_dir() / "remote.jsonl"
+    figures = dict(seed=7, days=120, replication=replication, before=before, after=after, fold_ms=times,
+                   local_lines=rc._lines(routing.events_file().read_bytes()),
+                   remote_lines=rc._lines(remote_path.read_bytes()) if remote_path.exists() else 0,
+                   merged_lines=len(routing.read_events()[0]),
                    archive_bytes=archive_bytes, owner_lines=owners, owner_lines_per_day=owners / 120,
                    configured_owner_lines_per_day=stream.owner_per_day)
     print('DAY120 ' + json.dumps(figures, sort_keys=True))

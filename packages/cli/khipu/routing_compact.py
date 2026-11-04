@@ -153,18 +153,22 @@ def archive_dir() -> Path:
 
 def log_size() -> dict:
     """The log's line count and bytes (0 and 0 when there is none)."""
-    try:
-        data = routing.events_file().read_bytes()
-    except OSError:
-        return {"lines": 0, "bytes": 0}
-    return {"lines": _lines(data), "bytes": len(data)}
+    counts = {"lines": 0, "bytes": 0}
+    for path in (routing.events_file(), _dir() / "remote.jsonl"):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        counts["lines"] += _lines(data)
+        counts["bytes"] += len(data)
+    return counts
 
 
 def _lines(data: bytes) -> int:
     return data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
 
 
-def health() -> dict:
+def health(now: datetime | None = None) -> dict:
     """Doctor's row: ``level`` green, yellow (over the bound a healthy log stays
     under) or red (far over it), with the line count and bytes and the last
     compaction."""
@@ -388,7 +392,7 @@ def _sample_drops(groups: dict[tuple, list[tuple[datetime, int, dict]]], now: da
     return drop
 
 
-def _sent_or_last(rows: list[tuple[bytes, dict | None]]) -> set[int]:
+def _sent_or_last(rows: list[tuple[bytes, dict | None]], *, replica: bool = False) -> set[int]:
     """Lines no compaction may take, whatever their kind: the highest number
     of each Mac (the next line numbers from it, and the upload cursor compares
     with it), and with replication live any line not yet uploaded (the upload
@@ -400,7 +404,7 @@ def _sent_or_last(rows: list[tuple[bytes, dict | None]]) -> set[int]:
             if origin not in highest or event["seq"] >= highest[origin][0]:
                 highest[origin] = (event["seq"], i)
     out = {i for _seq, i in highest.values()}
-    if not routing._replication_live():
+    if replica or not routing._replication_live():
         return out
     from khipu import routing_replication
 
@@ -624,7 +628,7 @@ def _observation_drops(rows: list[tuple[bytes, dict | None]], now: datetime, hou
 
 
 def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple,
-         emitted: set[str] | None = None, aged_anchors: bool = False) -> set[int]:
+         emitted: set[str] | None = None, aged_anchors: bool = False, replica: bool = False) -> set[int]:
     """The indexes of ``rows`` (line, its event or None) the fold can do
     without, under ``profile``. Anything not sure is kept: ``emitted`` is the
     ids the sources offer now, and None, that they could not be read, keeps
@@ -692,7 +696,7 @@ def plan(rows: list[tuple[bytes, dict | None]], now: datetime, profile: tuple,
             at = _when(rows[i][1], "written_at")
             if at is not None and at > newest - timedelta(days=1):
                 drop.discard(i)
-    guarded = _sent_or_last(rows)
+    guarded = _sent_or_last(rows, replica=replica)
     drop -= guarded
     if emitted is not None:
         # Their own tail guard, by the hours of the profile, is inside.
@@ -735,15 +739,17 @@ class _Log:
     what it is given, so one parse serves every moment). ``sightings`` is the
     sources' (evidence, status) now, for the answers that read them."""
 
-    def __init__(self, lines: list[bytes], inputs: tuple, sightings: tuple | None = None):
+    def __init__(self, lines: list[bytes], inputs: tuple, sightings: tuple | None = None, *, replica=None):
         self.raw = [e for e in (routing._line_event(line) for line in lines) if e is not None]
         self.inputs = inputs
+        self.replica = replica
         self.sightings = sightings if sightings and (sightings[0] or sightings[1] is not None) else None
         self.cache: dict[datetime, dict] = {}
         self.seen_cache: dict[datetime, dict] = {}
 
     def _events(self) -> list[dict]:
-        ordered, _bad = routing._order_events(self.raw, 0)
+        ordered, _bad = (routing._order_events(self.raw, 0) if self.replica is None else
+                         routing._order_events(self.raw, 0, replica=self.replica))
         return routing._split_txns(ordered, routing._held_list())[0]
 
     def at(self, when: datetime) -> dict:
@@ -848,7 +854,10 @@ def _choose(data: bytes, now: datetime) -> dict:
     inputs = routing._inputs()
     sightings = _sightings(inputs, now)
     emitted = _emitted(sightings)
-    whole = _Log(full, inputs, sightings)
+    from khipu import routing_replication as replication
+
+    replica = replication.remote_events()
+    whole = _Log(full, inputs, sightings, replica=replica)
     best: dict | None = None
     why = "nothing the fold can do without"
     for number, profile in enumerate(PROFILES, 1):
@@ -859,7 +868,7 @@ def _choose(data: bytes, now: datetime) -> dict:
                 why = "less than a tenth of the lines can go"
                 continue
             kept = [line for i, line in enumerate(full) if i not in drop]
-            same, moments, differs = agree(whole, _Log(kept, inputs, sightings), now)
+            same, moments, differs = agree(whole, _Log(kept, inputs, sightings, replica=replica), now)
             if not same:
                 why = f"the compacted log would fold differently at {differs}"
                 continue
@@ -891,7 +900,13 @@ def compact(now: datetime | None = None) -> dict:
     "skipped", "why": ...}``."""
     now = now or routing._now()
     try:
-        return _compact(now)
+        remote = _compact_remote(now)
+        result = _compact(now)
+        if remote is not None:
+            if result["result"] == "skipped" and remote["result"] == "compacted":
+                return {"result": "compacted", "local": result, "remote": remote}
+            result["remote"] = remote
+        return result
     except routing.LockBusy:
         return {"result": "skipped", "why": "the routing record is busy"}
     except Exception as exc:  # noqa: BLE001 - a failed compaction leaves the log as it was
@@ -907,6 +922,9 @@ def _compact(now: datetime) -> dict:
     # Whole lines only: a writer's line may be half down at this read. The
     # piece rides in the tail below, verbatim, whole once it is finished.
     data = data[:data.rfind(b"\n") + 1]
+    from khipu import routing_replication as replication
+
+    replica = replication.cache_key()
     chosen = _choose(data, now)
     if "kept" not in chosen:
         _note(now, chosen["why"])
@@ -916,7 +934,7 @@ def _compact(now: datetime) -> dict:
     archive = _archive_bytes(chosen, now)
     with routing._lock():
         current = path.read_bytes()
-        if not current.startswith(data):
+        if not current.startswith(data) or replication.cache_key() != replica:
             return {"result": "skipped", "why": "the record changed while it was checked"}
         body = head + current[len(data):]
         _replace(path, body, name, archive)
@@ -930,6 +948,57 @@ def _compact(now: datetime) -> dict:
             routing._refold_locked(now)
     return {"result": "compacted", "lines_before": chosen["before"], "lines_after": chosen["after"],
             "bytes_after": len(head), "archive": name, "pruned": pruned, "dropped_by_type": chosen["by_type"]}
+
+
+def _compact_remote(now: datetime) -> dict | None:
+    from khipu import routing_replication as replication
+
+    path = replication._path("remote.jsonl")
+    if not path.exists():
+        return None
+    data = path.read_bytes()
+    remote, retired = replication._remote_snapshot(data)
+    completed = replication._state().get("completed_order", 0)
+    if not remote or not completed:
+        return {"result": "skipped", "why": "no completed pull watermark"}
+    local_path = routing.events_file()
+    local_data = local_path.read_bytes() if local_path.exists() else b""
+    local_lines = _content_lines(local_data)
+    local = [e for _line, e in _rows(local_data) if e is not None]
+    combined = replication.merge(local, remote=remote)
+    rows = [(json.dumps(e, sort_keys=True).encode(), e) for e in combined]
+    inputs = routing._inputs()
+    sightings = _sightings(inputs, now)
+    emitted = _emitted(sightings)
+    full = _Log(local_lines, inputs, sightings, replica=remote)
+    best = None
+    for profile in PROFILES:
+        for offered, aged in ((emitted, True), (emitted, False), (None, True), (None, False)):
+            drop = plan(rows, now, profile, emitted=offered, aged_anchors=aged, replica=True)
+            ids = {rows[i][1].get("id") for i in drop}
+            kept = [r for r in remote if r["id"] not in ids or r.get("hub_order", completed + 1) > completed]
+            if len(remote) - len(kept) < MIN_GAIN * len(remote):
+                continue
+            same, _moments, _differs = agree(full, _Log(local_lines, inputs, sightings, replica=kept), now)
+            if same and (best is None or len(kept) < len(best)):
+                best = kept
+                break
+        if best is not None and len(best) <= LINES_TARGET:
+            break
+    if best is None:
+        return {"result": "skipped", "why": "no replica observations can be removed alike"}
+    with routing._lock():
+        current_local = local_path.read_bytes() if local_path.exists() else b""
+        if path.read_bytes() != data or current_local != local_data:
+            return {"result": "skipped", "why": "the record changed while the replica was checked"}
+        # The fence and its retained exceptions commit in one file replacement.
+        # Only a fully scanned hub-order prefix may reject a repeated observation.
+        replication._atomic(path, replication._remote_contents(best, max(retired, completed)))
+        _write_state(dict(_read_state(), at=routing._iso(now), attempted_at=routing._iso(now), result="compacted",
+                          remote_lines_before=len(remote), remote_lines_after=len(best)))
+        with contextlib.suppress(Exception):
+            routing._refold_locked(now)
+    return {"result": "compacted", "lines_before": len(remote), "lines_after": len(best)}
 
 
 def _archive_bytes(chosen: dict, now: datetime) -> bytes:
@@ -1148,13 +1217,9 @@ def due(now: datetime | None = None, *, nightly: bool = False) -> bool:
     """Whether the log is over the line compaction starts at (and, outside the
     nightly, no attempt was made in the last ``MIN_INTERVAL_S``)."""
     now = now or routing._now()
-    try:
-        small = routing.events_file().stat().st_size < SMALL_BYTES
-    except OSError:
-        return False
-    if small:
-        return False
     size = log_size()
+    if size["bytes"] < SMALL_BYTES:
+        return False
     if size["lines"] <= LINES_TRIGGER and size["bytes"] <= BYTES_TRIGGER:
         return False
     if nightly:

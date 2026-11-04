@@ -2955,12 +2955,12 @@ def _read_all_events(*, identity_only: bool = False, author_check: bool = True) 
     return _order_events(raw, bad, author_check=author_check)
 
 
-def _order_events(raw: list[dict], bad: int, *, author_check: bool = True) -> tuple[list[dict], int]:
+def _order_events(raw: list[dict], bad: int, *, author_check: bool = True, replica=None) -> tuple[list[dict], int]:
     """``_read_all_events``' ordering over lines already read (also used to
     fold a log that is not the file, ``routing_compact``)."""
     from khipu import routing_replication
 
-    events = routing_replication.merge(raw)
+    events = routing_replication.merge(raw) if replica is None else routing_replication.merge(raw, remote=replica)
     if author_check:
         _mark_unchecked(events)  # a sequence cannot move a line before the first author check
     slots = [i for i, e in enumerate(events) if isinstance(e.get("seq"), int) and not e.get("mac")]
