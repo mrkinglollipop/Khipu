@@ -510,3 +510,18 @@ def test_a_no_typed_on_a_terminal_declines_a_request_held_here(macs, monkeypatch
     monkeypatch.setattr(routing, "typed_yes", lambda *_a, **_k: True)
     assert cli.main(["owner-direction", "answer", request, "--no"]) == 0
     assert not a.paused()
+
+
+def test_needs_you_yes_and_no_answer_a_request_held_on_the_other_mac_the_same_way(macs, monkeypatch):
+    """``khipu needs-you --yes/--no`` and ``khipu owner-direction answer`` share one confirm and one decline."""
+    a, b = macs
+    both_on(a, b)
+    yes_request, no_request = a.hold_pause(), a.hold_pause()
+    sync_all(a, b)
+    b.activate()
+    monkeypatch.setattr(routing, "typed_yes", lambda *_a, **_k: True)
+    assert cli.main(["needs-you", "--yes", f"held:rm-{yes_request}"]) == 0
+    assert cli.main(["needs-you", "--no", f"held:rm-{no_request}"]) == 0
+    sync_all(b, a)
+    assert a.paused()
+    assert [x for x in a.log() if x.get("action") == "route.pause"][0]["confirmed"]["source"] == "other_mac"
