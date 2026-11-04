@@ -398,10 +398,14 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
     rows = []
     entries = [e for e in view.get("accounts") or []
                if target_key is None or e["key"] == target_key]
+    if overrides:
+        from khipu import routing
     for entry in entries:
+        # An override is kept under the account's one id, whichever login-folder key it was asked by.
         advice = account_advice(view, entry, now, purpose=purpose, tier=tier, kind=kind,
                                 privacy=privacy, sensitive=sensitive, explicit=target_key is not None,
-                                declared_tier=declared_tier, override=(overrides or {}).get(routing.account_id(entry["key"])) if overrides else None)
+                                declared_tier=declared_tier,
+                                override=overrides.get(routing.account_id(entry["key"])) if overrides else None)
         if not advice["eligible"]:
             group = 3
             why = advice["why_eligible"]
