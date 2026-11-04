@@ -15,8 +15,8 @@ import shlex
 
 import pytest
 
-from khipu import routing, routing_delegation
-from tests.test_routing_acceptance import AUTHOR, expect
+from khipu import routing, routing_advisory, routing_delegation
+from tests.test_routing_acceptance import AUTHOR, T0, expect
 
 pytest_plugins = ("tests.test_routing_acceptance",)
 
@@ -440,3 +440,16 @@ def test_10_clean_rules_and_open_priority_have_no_false_flags(replay):
     for surface in ("view", "mcp", "doctor"):
         assert flags(replay, "contradictions", surface) == []
         assert flags(replay, "rule_hygiene", surface) == []
+
+
+def test_priority_without_local_bindings_is_not_implicitly_untracked():
+    held = {"entries": [{"account": "muse:main", "label": "Muse"}]}
+    active, _ = routing._priority_now(held, T0, {}, {}, set(), none=False)
+    assert active[0]["in_settings"] is True
+    explicit, _ = routing._priority_now(held, T0, {}, {"muse:main": False}, set(), none=False)
+    assert explicit[0]["in_settings"] is False
+
+
+def test_priority_stable_id_uses_its_local_login_record():
+    record = {"key": "muse|", "id": "muse:main", "label": "Muse", "state": "open", "configured": True}
+    assert routing_advisory._record_for_key("muse:main", "Muse", {"muse|": record}) is record

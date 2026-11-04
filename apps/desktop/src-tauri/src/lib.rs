@@ -1605,6 +1605,25 @@ fn config_request_argv(key: &str, action: &str) -> Result<Vec<String>, String> {
             action.to_string()])
 }
 
+/// The owner's yes or no to a request held for him, here or on another Mac
+/// (`khipu owner-direction answer`). The id can never read as a flag.
+fn owner_answer_argv(request: &str, answer: &str) -> Result<Vec<String>, String> {
+    let plain = !request.is_empty()
+        && request.len() <= 128
+        && request.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && request.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'));
+    if !plain {
+        return Err(format!("not a held request: {request:?}"));
+    }
+    let flag = match answer {
+        "yes" => "--yes",
+        "no" => "--no",
+        _ => return Err(format!("not an answer to a request: {answer:?}")),
+    };
+    Ok(vec!["owner-direction".to_string(), "answer".to_string(), "--from-app".to_string(), request.to_string(),
+            flag.to_string()])
+}
+
 /// Embedding profile ids look like `gemini-embedding-2@768`; the CLI also
 /// accepts `:` and `/` (an Ollama tag such as `nomic-embed-text:latest@768`).
 /// The first character is alphanumeric, so an id can never read as a flag.
@@ -1687,6 +1706,11 @@ async fn khipu_config_unset(key: String, expect: Option<String>) -> Result<Strin
 #[tauri::command]
 async fn khipu_config_request(key: String, action: String) -> Result<String, String> {
     run_khipu_cli_async(config_request_argv(&key, &action)?).await
+}
+
+#[tauri::command]
+async fn khipu_owner_answer(request: String, answer: String) -> Result<String, String> {
+    run_khipu_cli_async(owner_answer_argv(&request, &answer)?).await
 }
 
 #[tauri::command]
@@ -5478,6 +5502,7 @@ pub fn run() {
             khipu_config_set,
             khipu_snapshot_refresh,
             khipu_config_request,
+            khipu_owner_answer,
             khipu_config_unset,
             khipu_budget_status,
             khipu_budget_lift_synth_today,
@@ -6513,6 +6538,15 @@ mod settings_command_tests {
         assert!(config_request_argv("routing_lane_map", "--x").is_err());
         assert!(config_request_argv("usage_accounts", "confirm").is_err());
         assert!(config_request_argv("--from-app", "confirm").is_err());
+        assert_eq!(
+            owner_answer_argv("rm-req-0a1b2c3d4e5f", "yes").unwrap(),
+            ["owner-direction", "answer", "--from-app", "rm-req-0a1b2c3d4e5f", "--yes"]
+        );
+        assert_eq!(owner_answer_argv("rm-setting:routing_stale_after", "no").unwrap()[4], "--no");
+        assert!(owner_answer_argv("--yes", "yes").is_err());
+        assert!(owner_answer_argv("", "yes").is_err());
+        assert!(owner_answer_argv("rm-req-1", "--no").is_err());
+        assert!(owner_answer_argv("rm-req-1 --yes", "yes").is_err());
     }
 
     #[test]

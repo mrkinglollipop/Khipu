@@ -330,6 +330,21 @@ def _settings() -> list[dict]:
                          confirm_does=does, undo_does="Puts back the value it replaced.",
                          confirm=_act("config.answer_request.confirm", key=key, expect=pin),
                          undo=_act("config.answer_request.undo", key=key, expect=pin)))
+    # One persistent, explicit pointer for first-enable conflicts.  The
+    # choices live on Your Macs where both values are visible; no inferred
+    # answer is ever applied merely because a remote snapshot arrived.
+    try:
+        from khipu import routing_replication
+
+        differences = routing_replication.settings_status().get("differences") or []
+        if differences:
+            out.append(_item("setting", "settings-sync", f"On {len(differences)} setting difference"
+                             f"{'s' if len(differences) != 1 else ''} between your Macs to choose.",
+                             confirm_does="Open Your Macs and choose which value to use.",
+                             undo_does="Nothing is changed until you choose.",
+                             do="Open Accounts and routing, then Your Macs."))
+    except Exception:  # noqa: BLE001 - a read failure never hides real requests
+        pass
     return out
 
 
@@ -474,6 +489,12 @@ def _quote_ask(ask) -> str:
     return f'"{_said(ask, _WORDS_MOST)}"'
 
 
+def routing_replication_label(mac) -> str:
+    from khipu import routing_replication
+
+    return routing_replication.mac_label(mac)
+
+
 def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
     """(held items, what couldn't be read). A held answer to a listed item
     settles that item, so it is not listed twice: the item's settle becomes
@@ -493,6 +514,21 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
                              "full content must be shown before it applies.",
                              by=row.get("by"), at=row.get("created_at"), undo=decline,
                              undo_does="Drops the old held request. Nothing changes."))
+            continue
+        remote = row.get("remote")
+        if remote:
+            where = routing_replication_label(remote.get("mac"))
+            said = f" It asks: {_quote_ask(row.get('ask'))}." if row.get("ask") and not remote.get("withheld") else ""
+            if remote.get("withheld"):
+                out.append(_item("held", f"held:{request}", row.get("ask") or "", by={"kind": "other_mac"}, at=row.get("created_at"),
+                                 confirm_does="Can't be answered here: answer it on " + where + ".",
+                                 undo_does="Nothing to undo here."))
+                continue
+            out.append(_item("held", f"held:{request}", f"On {where}, a conversation asked for a change, and it is "
+                             f"held until you answer.{said}", by={"kind": "other_mac", "mac": where}, at=row.get("created_at"),
+                             confirm_does=f"Tells {where} yes: it makes the change there within a few minutes.",
+                             undo_does=f"Tells {where} no: it drops the request and nothing changes.",
+                             confirm=_act("direction.confirm", request=request), undo=decline))
             continue
         reason = owner_direction.unapplyable_reason(row)
         if reason:

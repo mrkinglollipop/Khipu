@@ -408,6 +408,13 @@ def _public_id(key, label, harness) -> str | None:
 def _record_for_key(key, label, by_key: dict) -> dict | None:
     if key in by_key:
         return by_key[key]
+    # A replicated priority uses the stable ``provider:account`` identity,
+    # while this Mac may still hold its local ``provider|home`` key.  Compare
+    # the public identity before inventing a second open record.
+    if isinstance(key, str):
+        same = [record for record in by_key.values() if record.get("id") == key]
+        if len(same) == 1:
+            return same[0]
     if not isinstance(label, str):
         return None
     record = _record(key, label, None, "open", True)

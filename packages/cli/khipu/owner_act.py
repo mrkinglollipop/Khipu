@@ -713,6 +713,8 @@ def _confirm(args, *, terminal: bool = False) -> tuple[bool, dict]:
         request, stamp = owner_direction.confirm(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
+    if request.get("remote"):
+        return _answered_for_another_mac(request, stamp, "confirm")
     from khipu import owner_background
 
     if owner_background.is_long(request["action"], request.get("args") or {}):
@@ -721,6 +723,14 @@ def _confirm(args, *, terminal: bool = False) -> tuple[bool, dict]:
 
 
 def _apply_confirmed(request: dict, stamp: dict) -> tuple[bool, dict]:
+    ok, result = apply_confirmed(request, stamp)
+    return ok, dict(result or {}, request=request["id"], confirmed=stamp["confirmed"])
+
+
+def apply_confirmed(request: dict, stamp: dict) -> tuple[bool, dict | None]:
+    """Run a request ``owner_direction.confirm`` claimed (state ``applying``)
+    and record how it ended. Used for the owner's yes typed here and for one
+    typed on another Mac (``routing_replication.apply_remote_answers``)."""
     from khipu import owner_direction
 
     action, ok, result = request["action"], False, None
@@ -736,7 +746,28 @@ def _apply_confirmed(request: dict, stamp: dict) -> tuple[bool, dict]:
             owner_direction.settle(request["id"], ok, result)
         except OSError:
             pass
-    return ok, dict(result or {}, request=request["id"], confirmed=stamp["confirmed"])
+    return ok, result
+
+
+def _answered_for_another_mac(request: dict, stamp: dict, answer: str) -> tuple[bool, dict]:
+    """The owner answered, here, a request another of his Macs is holding:
+    send his answer through the routing record, where that Mac applies it."""
+    from khipu import owner_direction, routing_replication
+
+    sent = False
+    try:
+        sent = routing_replication.answer_remote(request, stamp, answer)
+    except Exception:  # noqa: BLE001 - said plainly below; the row stays answerable
+        sent = False
+    try:
+        owner_direction.settle(request["id"], sent, {"code": "not_sent"}, state_name="answered" if sent else None)
+    except OSError:
+        pass
+    if not sent:
+        return False, {"ok": False, "code": "not_sent", "request": request["id"],
+                       "error": "Khipu could not record your answer to send to your other Mac. Nothing was changed."}
+    return True, {"ok": True, "applied": False, "sent": True, "request": request["id"],
+                  "line": "Your answer is on its way to the other Mac, which applies it within a few minutes."}
 
 
 def _decline(args, *, terminal: bool = False) -> tuple[bool, dict]:
@@ -748,6 +779,16 @@ def _decline(args, *, terminal: bool = False) -> tuple[bool, dict]:
         request = owner_direction.decline(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
+    if request.get("remote"):
+        from khipu import routing_replication
+
+        try:
+            routing_replication.answer_remote(request, None, "decline")
+        except Exception:  # noqa: BLE001 - the no is recorded here; the other Mac's request ends by itself
+            pass
+        return True, {"ok": True, "declined": True, "applied": False, "sent": True, "request": request["id"],
+                      "line": "Your no is on its way to the other Mac, which drops the request. Nothing was changed.",
+                      "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}
     return True, {"ok": True, "declined": True, "applied": False, "request": request["id"],
                   "line": "The held request is dropped. Nothing was changed.",
                   "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}
