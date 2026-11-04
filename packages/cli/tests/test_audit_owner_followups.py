@@ -140,8 +140,12 @@ def test_partial_hub_undo_skips_committed_batch_on_retry(pg_world, world, monkey
     with monkeypatch.context() as mp:
         mp.setattr(owed_tidy, 'undo', stop_second)
         lose_completion(mp)
-        with pytest.raises(psycopg.OperationalError, match='second batch'):
-            act('direction.undo', {'id': changed['owner_action']})
+        from khipu import owner_background
+        ok, started = owner_act.act('direction.undo', {'id': changed['owner_action']})
+        assert ok and started['started']
+        ok, failed = owner_background.run(started['request'])
+        assert not ok and failed['code'] == 'failed'
+        assert 'OperationalError' in failed['error']
     assert od.line_state(changed['owner_action']) == 'unconfirmed'
     assert owed_tidy.redo(first, owner_gate='app')['reapplied'] == 1
     act('direction.undo', {'id': changed['owner_action']})

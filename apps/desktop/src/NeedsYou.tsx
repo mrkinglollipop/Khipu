@@ -74,6 +74,7 @@ function DecideItem({ card, data, w, eok, reread, back }: {
     return Promise.resolve(false);
   };
   const undo = () => {
+    if (t.type === "held") return w.run(backId, "khipu_owner_request_decline", { id: t.id }, reread, back);
     if (t.type === "priority") return w.run(backId, "khipu_route_priority", { action: "undo", expect }, null, back);
     if (t.type === "rule" && t.rule) {
       // A live proposal is dismissed; a pending rule with no proposal record has its own undo.

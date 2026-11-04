@@ -10,6 +10,7 @@ import type { PlanUsageState, UsageAccount } from "../PlansCard";
 import { RoutingCard } from "../RoutingCard";
 import { RoutingSettings } from "../RoutingSettings";
 import { paceWords, priorityHeadline } from "../routing";
+import { decideCards, priorityCard } from "../routingNeeds";
 import { accountWeek } from "../routingOverview";
 import type { RoutePriority, RouteView, RoutingState } from "../routing";
 
@@ -364,4 +365,25 @@ describe("the words", () => {
     expect(paceWords(passed, NOW)).toBe("Its reset time passed; figures out of date");
     expect(accountWeek(passed, NOW).week).toBe("Its reset time passed; figures out of date");
   });
+});
+
+
+it("offers only decline for a priority whose saved end has passed", () => {
+  const data = view(null);
+  data.expired_priority = { ...PRIORITY, pending: true, until: "2026-10-15T13:59:00Z" };
+  const card = priorityCard(data, NOW)!;
+  expect(card.keep).toBeNull();
+  expect(card.back).toBeTruthy();
+  expect(card.title).toContain("expired");
+  expect(card.ifIgnored).toContain("will not apply");
+});
+
+
+it("shows a stale saved request with decline and no Keep", () => {
+  const data = view();
+  data.decline_only_requests = [{ id: "req-old", words: "This request is out of date because the priority changed since it was saved." }];
+  const card = decideCards(data, {}, NOW).find((c) => c.target.type === "held")!;
+  expect(card.keep).toBeNull();
+  expect(card.back).toBe("Decline this request");
+  expect(card.title).toContain("priority changed since");
 });

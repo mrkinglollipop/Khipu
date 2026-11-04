@@ -551,8 +551,8 @@ def _bury(jp: Path, job: dict[str, Any]) -> None:
     _log(f"buried {jp.name} after {job.get('attempts')} attempts: {job.get('last_error')}")
 
 
-def _read_job(jp: Path) -> dict[str, Any]:
-    raw = jp.read_bytes()
+def _read_job(jp: Path, *, snapshot: bytes | None = None) -> dict[str, Any]:
+    raw = jp.read_bytes() if snapshot is None else snapshot
     job = json.loads(raw)
     if not isinstance(job, dict):
         raise ValueError("job envelope is not an object")

@@ -22,7 +22,18 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from khipu import briefs, decisions, forget, migrate, recall_prompt
+
+
+@pytest.fixture(autouse=True)
+def _isolate_forget_fence(tmp_path, monkeypatch):
+    from khipu import tombstones
+
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    monkeypatch.setattr(tombstones, "_FENCE_LAST", None)
 
 _T0 = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
 _BRIEFS_COLUMNS = (

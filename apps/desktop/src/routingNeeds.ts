@@ -42,7 +42,8 @@ export type DecideTarget =
   | { type: "priority" }
   | { type: "rule"; rule: RouteRule | null; proposal: RouteProposal | null }
   | { type: "setting"; key: string }
-  | { type: "accounts" };
+  | { type: "accounts" }
+  | { type: "held"; id: string };
 
 export type DecideCard = {
   /** Its `data-route-item`. */
@@ -155,8 +156,13 @@ function priorityTitle(p: RoutePriority): string {
 
 /** The priority a conversation set, as Settings and Home's Confirm both say it. */
 export function priorityCard(view: RouteView, now: Date): DecideCard | null {
-  const p = view.priority;
+  const p = view.priority ?? view.expired_priority;
   if (!p?.pending) return null;
+  const end = p.until ? new Date(p.until).getTime() : Number.NaN;
+  // A pending priority with an end in the past is not merely stale UI. The
+  // CLI refuses to confirm it too, so do not offer a Keep button that cannot
+  // succeed; its only safe outcome is to put the prior order back.
+  const expired = Number.isFinite(end) && end <= now.getTime();
   const proposal = liveProposal(view, (x) => x.kind === "priority");
   const had = !!p.replaced?.entries.length;
   const author = p.pending_author?.project
@@ -179,9 +185,10 @@ export function priorityCard(view: RouteView, now: Date): DecideCard | null {
   return {
     key: "needs:priority",
     target: { type: "priority" },
-    title: priorityTitle(p),
+    title: expired ? "A conversation's pending order has expired" : priorityTitle(p),
     before: { cap: "Your order before", text: priorityWords(p.replaced?.entries, now) ?? "You had no order set." },
-    now: { cap: "The order in use now", text: p.proposal_withheld ? WITHHELD : (priorityWords(p.entries, now) ?? "") },
+    now: { cap: "The order in use now", text: expired ? "Its saved end has passed. It cannot be kept or applied; decline it to restore the earlier order."
+      : p.proposal_withheld ? WITHHELD : (priorityWords(p.entries, now) ?? "") },
     who: whoWords(author, proposal?.at ?? p.at, now),
     asked: p.proposal_withheld ? null : (p.owner_request ?? null),
     changed: (() => {
@@ -191,10 +198,12 @@ export function priorityCard(view: RouteView, now: Date): DecideCard | null {
     detailCount: Math.max(old.length, p.entries.length),
     changedBefore: { cap: "Changed lines before", text: changedWords(old) || (old.length ? "No earlier lines changed." : "You had no order set.") },
     changedNow: { cap: "Changed lines now", text: p.proposal_withheld ? WITHHELD : changedWords(p.entries) || "Those lines were removed." },
-    ifIgnored: day
+    ifIgnored: expired
+      ? "This is decline-only: Khipu will not apply the expired order."
+      : day
       ? `The new order stays in use until ${day}, then ${had ? "your order comes back" : "it ends: you had no order before"}.`
       : `The new order stays in use, and ${STAYS_WAITING}.`,
-    keep: p.proposal_withheld ? null : "Keep the new order",
+    keep: p.proposal_withheld || expired ? null : "Keep the new order",
     back: had ? "Go back to my order" : "Remove this order",
     backAsk: had
       ? "Go back to your order? The new order is dropped, and the conversation that set it is told."
@@ -521,6 +530,14 @@ function settingCard(key: string, s: RouteSetting, view: RouteView | null, now: 
 export function decideCards(view: RouteView | null, routing: Record<string, RouteSetting> | null | undefined, now: Date): DecideCard[] {
   const out: DecideCard[] = [];
   if (view) {
+    for (const request of view.decline_only_requests ?? []) out.push({
+      key: `needs:held:${request.id}`, target: { type: "held", id: request.id },
+      title: request.words, before: null, now: null,
+      who: whoWords(request.by ?? "A conversation", request.at, now), asked: request.ask ?? null,
+      changed: null, detailCount: 0, changedBefore: null, changedNow: null,
+      ifIgnored: "This stays waiting. Khipu will not apply it.", keep: null,
+      back: "Decline this request", backAsk: "Drop this held request? Nothing else changes.", edit: null,
+    });
     const priority = priorityCard(view, now);
     if (priority) out.push(priority);
     const rules = view.rules ?? [];

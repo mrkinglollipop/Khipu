@@ -2651,6 +2651,11 @@ async fn khipu_owner_direction_show() -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn khipu_owner_request_decline(id: String) -> Result<String, String> {
+    run_khipu_cli_async(vec!["owner-direction".into(), "decline".into(), "--from-app".into(), "--".into(), id]).await
+}
+
+#[tauri::command]
 async fn khipu_owner_direction_actions() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(OWNER_DIRECTION_ACTIONS_ARGV)).await
 }
@@ -5489,6 +5494,7 @@ pub fn run() {
             khipu_gateway_copy_cleanup,
             khipu_owner_direction_show,
             khipu_owner_direction_actions,
+            khipu_owner_request_decline,
             khipu_owner_direction_undo,
             khipu_owner_direction_acknowledge,
             khipu_owner_direction_switch,

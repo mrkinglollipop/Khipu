@@ -191,6 +191,10 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
     """
     if action not in ACTIONS:
         raise DirectionRefused("not_by_direction", "That change can't be made by direction.")
+    confirmed = _CONFIRMED.get()
+    if (confirmed is not None and confirmed["action"] == action
+            and confirmed["stamp"].get("auth") == "terminal"):
+        return dict(confirmed["stamp"])
     now = _clock() if now is None else now
     conf = owner_turns.settings()
     if not conf["enabled"] and action != "direction.on":
@@ -527,7 +531,7 @@ def reviewed_file(path) -> bytes | None:
     return item["text"].encode("utf-8")
 
 
-def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: str | None = None) -> dict:
+def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: str | None = None, terminal: bool = False, authorized: dict | None = None) -> dict:
     """Hold ``action`` with its checked ``args`` for the owner to confirm.
     ``ask`` is the question to put to the owner when the plain one
     (``ask_line``) would leave out what the yes also covers.
@@ -539,10 +543,10 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
     conf = owner_turns.settings()
-    if not conf["enabled"] and action != "direction.on":
+    if not terminal and not conf["enabled"] and action != "direction.on":
         raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes typed on a "
                                                 "terminal can make this change.")
-    session = _caller_session(environ)
+    session = "terminal" if terminal else _caller_session(environ)
     files = _review_files(action, args)
     if files:
         ask = (ask or ask_line(action, args)) + " Reviewed file contents: " + " ".join(
@@ -552,7 +556,9 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
         with _requests_locked() as path:
             turns_ = owner_turns.turns(session, now)
             extra = {}
-            if any(t.get("entrypoint") == "t3" for t in turns_):
+            if terminal or authorized is not None:
+                pass
+            elif any(t.get("entrypoint") == "t3" for t in turns_):
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
                     seeded = _seed(thread, session, signature(action, args))
@@ -572,6 +578,11 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             request = {"id": "req-" + secrets.token_hex(6), "action": action, "args": args, "state": "pending",
                        "created_ts": now, "created_at": _iso(now), "session": session, "by": _asker(environ),
                        "ask": ask or ask_line(action, args), "files": files, **extra}
+            if authorized is not None:
+                confirmed = dict(authorized.get("confirmed") or {}, request=request["id"],
+                                 source="owner_turn", message_at=_iso(now))
+                request.update(state="applying", confirmed=confirmed,
+                               execution_stamp=dict(authorized, confirmed=confirmed))
             state = _load(path)
             if state["erased"] != erased:
                 raise DirectionRefused("forgotten", "Khipu forgot this conversation's words while the request was "
@@ -856,7 +867,32 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     return why
 
 
-def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dict, dict]:
+def unapplyable_reason(request: dict, *, now: float | None = None) -> str | None:
+    """Why a saved priority request can now only be declined."""
+    action, values = request.get("action", ""), request.get("args") or {}
+    if not action.startswith("route.priority.") or action == "route.priority.undo":
+        return None
+    from khipu import routing
+
+    moment = datetime.fromtimestamp(_clock() if now is None else now, timezone.utc)
+    end = routing._parse(values.get("until"))
+    if end is not None and end <= moment:
+        return "This request has expired because its saved end has passed. Decline it; it cannot be applied."
+    view = routing.read_view(moment)
+    for key in ("expect", "confirm_pending"):
+        expected = values.get(key)
+        if expected is not None:
+            actual = routing.pending_priority_pin(view) if str(expected).startswith("pp-") else view.get("priority_version", "p0")
+            if expected != actual:
+                return "This request is out of date because the priority changed since it was saved. Decline it; it cannot be applied."
+    if action == "route.priority.confirm":
+        end = routing._parse((view.get("priority_stored") or {}).get("until"))
+        if end is not None and end <= moment:
+            return "This request has expired because its saved end has passed. Decline it; it cannot be applied."
+    return None
+
+
+def confirm(request_id: str, *, env=None, now: float | None = None, terminal: bool = False) -> tuple[dict, dict]:
     """(the held request, its confirm stamp), claimed for applying, or
     ``DirectionRefused``. Every refusal a change has runs first; then the
     proof (``_proof``). A confirm that finds no reply to the latest ask
@@ -867,7 +903,7 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
 
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
-    session = _caller_session(environ)
+    session = "terminal" if terminal else _caller_session(environ)
     try:
         with _requests_locked() as path:
             state = _load(path)
@@ -876,21 +912,29 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
                 raise DirectionRefused("not_found", "There is no held request with that id.")
             if request.get("state") != "pending":
                 raise DirectionRefused("not_pending", f"That request is already {request.get('state')}.")
-            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
+            if not terminal and not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can make this change.")
+            reason = unapplyable_reason(request, now=now)
+            if reason:
+                raise DirectionRefused("decline_only", reason)
             if not reviewed_hold(request):
                 raise DirectionRefused("legacy_hold", "This old held change has no saved content to apply. Decline it or ask for it to be reissued with its full content.")
-            with t3.owner_read_budget():
-                member = owner_turns._t3_membership(session)
-                if member == "unverified":
-                    raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
-                stamp = _proof(environ, session, request, now)
+            if terminal:
+                stamp = {"auth": "terminal", "harness": "shell", "session": session,
+                         "confirmed": {"source": "terminal", "message": "typed yes", "message_at": _iso(now)}}
+            else:
+                with t3.owner_read_budget():
+                    member = owner_turns._t3_membership(session)
+                    if member == "unverified":
+                        raise DirectionRefused("t3_unreadable", _T3_UNREADABLE_WHY)
+                    stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
                 raise DirectionRefused("not_confirmed", stamp)
             stamp["confirmed"]["request"] = request_id
-            request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session))
+            request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session),
+                           execution_stamp=dict(stamp))
             _save(path, state, now)
     except OSError as err:
         raise DirectionRefused("log_unwritable", f"Khipu can't read or write the held requests ({err}), so nothing "
@@ -901,7 +945,7 @@ def confirm(request_id: str, *, env=None, now: float | None = None) -> tuple[dic
 DECLINE_ACTION = "direction.decline"
 
 
-def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
+def decline(request_id: str, *, env=None, now: float | None = None, terminal: bool = False, app: bool = False) -> dict:
     """The owner's no to a held request: it is dropped and nothing changes.
     The proof a confirm needs, so a conversation can't answer for the owner
     either way; with no reply since the ask it asks again, as a confirm does."""
@@ -909,7 +953,7 @@ def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
 
     now = _clock() if now is None else now
     environ = os.environ if env is None else env
-    session = _caller_session(environ)
+    session = "app" if app else "terminal" if terminal else _caller_session(environ)
     try:
         with _requests_locked() as path:
             state = _load(path)
@@ -918,11 +962,16 @@ def decline(request_id: str, *, env=None, now: float | None = None) -> dict:
                 raise DirectionRefused("not_found", "There is no held request with that id.")
             if request.get("state") != "pending":
                 raise DirectionRefused("not_pending", f"That request is already {request.get('state')}.")
-            if not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
+            if not (terminal or app) and not owner_turns.settings()["enabled"] and request.get("action") != "direction.on":
                 raise DirectionRefused("direction_off", "Owner direction is off, so only the Khipu app or a yes "
                                                         "typed on a terminal can answer this request.")
-            with t3.owner_read_budget():
-                stamp = _proof(environ, session, request, now)
+            if terminal or app:
+                stamp = {"auth": "app" if app else "terminal", "harness": "app" if app else "shell", "session": session,
+                         "confirmed": {"source": "app" if app else "terminal",
+                                       "message": "declined in app" if app else "typed no", "message_at": _iso(now)}}
+            else:
+                with t3.owner_read_budget():
+                    stamp = _proof(environ, session, request, now)
             if isinstance(stamp, str):
                 _save(path, state, now)
                 raise DirectionRefused("not_confirmed", stamp.replace("direction.confirm", "direction.decline"))
@@ -952,9 +1001,19 @@ _ERROR_CODE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
 _SETTLE_ERROR = "The held change was not applied."
 
 
+def result_counts(result: dict | None) -> dict:
+    """Completion facts without restoring any words Forget removed."""
+    if not isinstance(result, dict):
+        return {}
+    return {key: value for key, value in result.items()
+            if isinstance(value, (bool, int, float))
+            or key in ("owner_action", "request", "code") and isinstance(value, str)
+            or isinstance(value, dict) and all(isinstance(v, (bool, int, float)) for v in value.values())}
+
+
 def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float | None = None) -> None:
     """Record how an ``applying`` request ended. Only its state, the time and,
-    on a failure, a fixed code and a generic message are written: never the
+    on a failure, a fixed code and a generic message, plus numeric result counts: never the
     action's arguments or the command's text, and no field Forget removed
     while it was applying comes back."""
     now = _clock() if now is None else now
@@ -963,7 +1022,8 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
         for row in state["requests"]:
             if row.get("id") != request_id or row.get("state") != "applying":
                 continue
-            row.update(state="applied" if ok else "failed", settled_ts=now, settled_at=_iso(now))
+            row.update(state="applied" if ok else "failed", settled_ts=now, settled_at=_iso(now),
+                       result=result_counts(result))
             if not ok:
                 code = result.get("code") if isinstance(result, dict) else None
                 row.update(error_code=code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else "failed",
@@ -974,7 +1034,7 @@ def settle(request_id: str, ok: bool, result: dict | None = None, *, now: float 
 # Everything on a request that holds the owner's words or marks their
 # conversation's messages: the action's args, the ask line, an error, and
 # the ask boundaries (T3 message ids and times, turn ids and hashes).
-_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks", "shown", "files", "disclosed", "review")
+_REQUEST_WORDS = ("args", "ask", "by", "error", "t3_snapshots", "asks", "shown", "files", "disclosed", "review", "execution_stamp")
 
 
 def forget_requests(sessions, *, protected_sessions=(), now: float | None = None) -> dict:
@@ -1105,24 +1165,6 @@ def _program_replaced() -> bool:
             return False
         pid = info[0]
     return False
-
-
-def _replaced_why(turn: dict) -> str | None:
-    """The refusal's real reason when the program running this conversation
-    was updated before any hook saw it (``_program_replaced``), which no later
-    message here can mend. Never for an issuer refused for what it is: a
-    restart would not change that."""
-    issuer = turn.get("issuer")
-    if not isinstance(issuer, dict) or issuer.get("refused") not in (None, "unknown") or not _program_replaced():
-        return None
-    name = _PROGRAM_NAMES.get(turn.get("harness"), "agent")
-    return (f"This conversation's {name} program, or a program it runs, was updated while running, before Khipu had "
-            "seen it, so Khipu can't tie this call to this conversation's prompt hook. Nothing was changed, and "
-            f"repeating the message here won't help. Restart this conversation's {name} program if the owner is "
-            "typing in it, then have them type the request again; a background or dispatched job can't make an "
-            "owner's change, restarted or not.")
-
-
 
 
 def _float(value) -> float:
@@ -3887,6 +3929,12 @@ def run_cli(args) -> int:
         return 0
     auth = routing._OWNER_AUTH.set(None)
     try:
+        if cmd == "decline":
+            if not args.from_app or routing._owner_via(args) != "app":
+                raise DirectionRefused("owner_only", "Answer in the conversation or the Khipu app.")
+            request = decline(args.id, app=True)
+            _print({"ok": True, "receipt": request.get("receipt")})
+            return 0
         if cmd == "undo":
             line = _find(args.id)
             why = _undo_refusal(line, args.id)
@@ -4010,6 +4058,9 @@ def add_parser(sub) -> None:
     st.add_argument("value")
     st.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     add_owner_flags(st)
+    dec = verbs.add_parser("decline", help="Decline a held request from the app")
+    dec.add_argument("id")
+    dec.add_argument("--from-app", action="store_true", help="==SUPPRESS==")
     un = verbs.add_parser("undo", help="Undo one owner action by its id")
     un.add_argument("id")
     un.add_argument("--holds", default=None, metavar="JSON",

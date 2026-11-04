@@ -95,6 +95,11 @@ def test_reads_setting_default_seven(folder, monkeypatch):
 
 
 def test_nightly_step_reports_counts(folder, monkeypatch):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+    monkeypatch.setattr(rlp, "datetime", Clock)
     _ledger(folder, "a", 30, 30)
     _ledger(folder, "b", 1, 1)
     monkeypatch.setattr(jobs, "_nightly_log", lambda *_a, **_k: None)

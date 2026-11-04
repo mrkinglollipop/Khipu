@@ -121,7 +121,11 @@ def _ask_then_yes(world, action: dict, words: str = "Yes, go ahead") -> tuple[bo
     assert out["pending"] is True and out["applied"] is False, out
     world["t3"].message(THREAD, time.time() + 1, text=words)
     _t3_hook_turn(prompt=words)
-    return owner_act.act("direction.confirm", {"request": out["request"]})
+    ok, done = owner_act.act("direction.confirm", {"request": out["request"]})
+    if ok and done.get("started"):
+        from khipu import owner_background
+        return owner_background.run(done["request"])
+    return ok, done
 
 
 def _setting(key: str = "routing_replication_live") -> dict:
@@ -674,7 +678,8 @@ def test_a_held_answer_whose_target_moved_can_only_be_refused(world):
     item = _one("held")
     assert item["settle"]["confirm"] is None
     assert item["settle"]["undo"] == {"action": "direction.decline", "args": {"request": out["request"]}}
-    assert "only be refused" in item["words"]
+    assert "out of date because the priority changed since" in item["words"]
+    assert item["decline_only"] is True
 
 
 @pytest.mark.parametrize("kind,side,action", [

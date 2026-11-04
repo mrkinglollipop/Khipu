@@ -11,11 +11,12 @@ from khipu import cli, config, owner_act, owner_direction as od, owner_turns as 
 from khipu import db, owner_writes as ow, mcp_server as srv, commitments as co
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests import fact_seed
+from tests.owner_jobs import finish_owner_job
 from tests.test_owner_direction import world  # noqa: F401
 
 
 def act(action, args):
-    ok, out = owner_act.act(action, args)
+    ok, out = finish_owner_job(owner_act.act(action, args))
     assert ok, out
     return out
 

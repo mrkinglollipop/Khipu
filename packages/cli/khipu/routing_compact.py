@@ -93,6 +93,9 @@ LINES_TARGET, BYTES_TARGET = 1500, 768 * 1024
 MIN_GAIN = 0.10
 # Automatic attempts are at least this far apart (the nightly ignores it).
 MIN_INTERVAL_S = 6 * 3600
+# A health warning may call compaction failed only after this implementation
+# attempted it.  Older state cannot describe today's planner.
+ATTEMPT_GENERATION = 1
 ARCHIVE_KEEP_COUNT = 4
 ARCHIVE_KEEP_DAYS = 30
 # Absolute on-disk observation archive budget, including recent archives.
@@ -203,10 +206,23 @@ def health(now: datetime | None = None) -> dict:
                                   f"further: {total - gone:,} of its lines are protected history, readings and "
                                   "observations still counted, or the newest of their kind.")
         else:
+            result = str(last.get("result") or "")
+            attempted_here = last.get("attempt_generation") == ATTEMPT_GENERATION
+            failed_here = attempted_here and result.startswith("failed:")
+            tried = routing._parse(last.get("attempted_at"))
+            eligible = tried + timedelta(seconds=MIN_INTERVAL_S) if tried else None
+            waiting = (f" The next automatic attempt is eligible at {routing._iso(eligible)}, after the plan figures refresh."
+                       if eligible and eligible > (now or routing._now()) else
+                       " It has not run under this code yet; the next run time is not known." if not attempted_here else
+                       " The next attempt will run after the plan figures refresh; its time is not known.")
+            outcome = (f". Compaction last tried under this code and failed: {result}."
+                       if failed_here else ". Compaction has not run under this code yet." if not attempted_here else
+                       f". Compaction last completed under this code." if result == "compacted" else
+                       f". The last compaction attempt did not compact the record: {result}.") + waiting
             out["warning"] = (f"The routing record holds {lines:,} lines ({nbytes:,} bytes); it is compacted at "
                               f"{LINES_TRIGGER:,} lines or {BYTES_TRIGGER:,} bytes, nightly and after the plan figures "
                               f"refresh" + (f". It is past {LINES_RED:,} lines or {BYTES_RED:,} bytes and still has "
-                                            "observations compaction can remove, so compaction may be failing."
+                                            f"observations compaction can remove{outcome}"
                                             if level == "red" else "."))
     return out
 
@@ -937,8 +953,10 @@ def compact(now: datetime | None = None) -> dict:
             result["remote"] = remote
         return result
     except routing.LockBusy:
+        _note(now, "the routing record is busy")
         return {"result": "skipped", "why": "the routing record is busy"}
     except Exception as exc:  # noqa: BLE001 - a failed compaction leaves the log as it was
+        _note(now, type(exc).__name__, failed=True)
         return {"result": "skipped", "why": type(exc).__name__}
 
 
@@ -977,6 +995,7 @@ def _compact(now: datetime) -> dict:
         if remaining != deferred:
             replication._save(dict(state, deferred=remaining))
         _write_state({**_read_state(), "at": routing._iso(now), "attempted_at": routing._iso(now), "result": "compacted",
+                      "attempt_generation": ATTEMPT_GENERATION,
                       "lines_before": chosen["before"], "lines_after": chosen["after"],
                       "bytes_before": len(data), "bytes_after": len(head),
                       "through_seq": chosen["through_seq"], "archive": name, "profile": chosen["profile"],
@@ -1033,6 +1052,7 @@ def _compact_remote(now: datetime) -> dict | None:
         # Only a fully scanned hub-order prefix may reject a repeated observation.
         replication._atomic(path, replication._remote_contents(best, max(retired, completed)))
         _write_state(dict(_read_state(), at=routing._iso(now), attempted_at=routing._iso(now), result="compacted",
+                          attempt_generation=ATTEMPT_GENERATION,
                           remote_lines_before=len(remote), remote_lines_after=len(best)))
         with contextlib.suppress(Exception):
             routing._refold_locked(now)
@@ -1109,10 +1129,11 @@ def _clean_archive_temps() -> None:
                 path.unlink()
 
 
-def _note(now: datetime, why: str) -> None:
+def _note(now: datetime, why: str, *, failed: bool = False) -> None:
     with contextlib.suppress(OSError):
         with routing._lock():
-            _write_state(dict(_read_state(), attempted_at=routing._iso(now), result=f"skipped: {why}"))
+            _write_state(dict(_read_state(), attempted_at=routing._iso(now), result=f"{'failed' if failed else 'skipped'}: {why}",
+                              attempt_generation=ATTEMPT_GENERATION))
 
 
 # ---- archives -------------------------------------------------------------------

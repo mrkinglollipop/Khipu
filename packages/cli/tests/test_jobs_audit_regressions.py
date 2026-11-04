@@ -114,6 +114,18 @@ def test_driver_deadline_kills_process_group_and_continues(tmp_path, monkeypatch
     monkeypatch.setattr(jobs, 'CONSOLIDATE_NIGHTLY', script)
     monkeypatch.setattr(jobs, 'DRIVER_TIMEOUT_SECONDS', .4, raising=False)
     monkeypatch.setattr(jobs, 'DRIVER_TERMINATE_GRACE_SECONDS', .1, raising=False)
+    real_spawn = subprocess.Popen
+    def ready_child(*args, **kwargs):
+        proc = real_spawn(*args, **kwargs)
+        # This test measures killing a running descendant, not interpreter
+        # startup. Keep the original outer bound and the .4-second deadline.
+        ready_by = time.monotonic() + 1
+        while time.monotonic() < ready_by and not (ids.exists() and heartbeat.exists()):
+            if proc.poll() is not None:
+                break
+            time.sleep(.01)
+        return proc
+    monkeypatch.setattr(jobs.subprocess, 'Popen', ready_child)
     start = time.monotonic()
     try:
         assert jobs.run_nightly() == 124

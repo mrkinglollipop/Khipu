@@ -28,6 +28,7 @@ from khipu import cli, commitments as co, config, db, owed_tidy, routing, work
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.fact_seed import announce
 from tests import fact_seed
+from tests.owner_jobs import finish_owner_job
 
 PROJECT = "acme/widget"
 BASE_AT = datetime(2026, 10, 8, tzinfo=timezone.utc)
@@ -786,7 +787,7 @@ def test_apply_by_direction_passes_the_gate_is_logged_and_its_undo_restores(owed
     before = _rows(owed)
     _no_gate_but_direction(monkeypatch)
     _direction(tmp_path, monkeypatch)
-    ok_, out = owner_act.act("owed.tidy", {"project": PROJECT, "plan": _plan_file(tmp_path, plan)})
+    ok_, out = finish_owner_job(owner_act.act("owed.tidy", {"project": PROJECT, "plan": _plan_file(tmp_path, plan)}))
     assert ok_ and out["owner_gate"] == "direction" and out["changed"] > 0 and out["owner_action"], out
     assert _rows(owed, [mine])[mine]["owner"] == "user"
     line = next(x for x in owner_direction.actions() if x["id"] == out["owner_action"])
@@ -805,7 +806,7 @@ def test_apply_by_direction_is_refused_without_a_recent_owner_turn(owed, monkeyp
     _no_gate_but_direction(monkeypatch)
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-nobody-typed")
-    ok_, out = owner_act.act("owed.tidy", {"project": PROJECT, "plan": _plan_file(tmp_path, plan)})
+    ok_, out = finish_owner_job(owner_act.act("owed.tidy", {"project": PROJECT, "plan": _plan_file(tmp_path, plan)}))
     assert not ok_ and out["code"] == "no_recorded_turn" and "Nothing was changed" in out["error"], out
     assert _snapshot(owed) == before
 
@@ -824,7 +825,7 @@ def test_undo_by_direction_restores_the_batch_and_its_undo_puts_the_changes_back
     monkeypatch.setattr(routing, "_caller", lambda: {"app": False, "chain": ["claude"]})
     _no_gate_but_direction(monkeypatch)
     _direction(tmp_path, monkeypatch)
-    ok_, out = owner_act.act("owed.tidy", {"project": PROJECT, "batch": applied["batch"]})
+    ok_, out = finish_owner_job(owner_act.act("owed.tidy", {"project": PROJECT, "batch": applied["batch"]}))
     assert ok_ and out["restored"] == applied["changed"] and out["owner_action"], out
     assert _rows(owed) == before
     line = next(x for x in owner_direction.actions() if x["id"] == out["owner_action"])
@@ -862,7 +863,7 @@ def test_tidy_by_direction_takes_a_plan_or_a_batch_and_nothing_else(owed, tmp_pa
 
     for args in ({"project": PROJECT}, {"project": PROJECT, "plan": "p.json", "batch": "tidy-1"},
                  {"plan": "p.json"}, {"project": PROJECT, "plan": "p.json", "ids": [1]}):
-        ok_, out = owner_act.act("owed.tidy", args)
+        ok_, out = finish_owner_job(owner_act.act("owed.tidy", args))
         assert not ok_ and out["code"] == "bad_args", (args, out)
     head, pos = owner_act.argv("owed.tidy", owner_act._values("owed.tidy", {"project": PROJECT, "plan": "-x.json"}))
     ns = cli.build_parser().parse_args(owner_act.full_argv(head, pos, ["--owner-direction"]))

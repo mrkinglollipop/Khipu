@@ -345,3 +345,13 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "routing_received" in item.keywords:
                 item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _owner_background_processes_are_explicit(monkeypatch):
+    # Most tests use fake hub connections that cannot cross a process boundary.
+    # They execute the queued worker explicitly; process acceptance restores
+    # the real spawn function against its own disposable local-only request.
+    from khipu import owner_background
+
+    monkeypatch.setattr(owner_background, "_spawn", lambda request: 0)
