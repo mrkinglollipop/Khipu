@@ -19,6 +19,18 @@ const SESSION_ID_SHAPED = [
 ];
 
 describe("Telling conversations: delivery and health", () => {
+  it("labels an unavailable last-heard time once on every fallback row", () => {
+    render(<DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
+    for (const row of rows) expect(within(row).getAllByText("Last heard unavailable")).toHaveLength(1);
+  });
+
+  it("does not invent a last-heard time for missing or invalid owner-row timestamps", () => {
+    render(<DeliverySection data={{ ...DELIVERY_VIEW, delivery_rows: [{ label: "No timestamp" }, { label: "Invalid timestamp", last_prompt_at: "not a date" }] }} health={DELIVERY_HEALTH} now={DELIVERY_NOW} />);
+    const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
+    for (const row of rows) expect(within(row).getAllByText("Last heard unavailable")).toHaveLength(1);
+  });
+
   it("shows generic conversation labels, never raw identities or component ids", () => {
     const { container } = render(<><DeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} now={DELIVERY_NOW} /><MacDeliverySection data={DELIVERY_VIEW} health={DELIVERY_HEALTH} /></>);
     const rows = within(screen.getByRole("list", { name: "Live conversations" })).getAllByRole("listitem");
@@ -56,11 +68,12 @@ describe("Telling conversations: delivery and health", () => {
     expect(rows).toHaveLength(2);
     expect(rows[0]).toHaveTextContent("Fix the flaky build");
     expect(rows[0]).toHaveTextContent("This Mac");
-    expect(rows[0]).toHaveTextContent("2 min ago");
+    expect(rows[0]).toHaveTextContent("Last heard 2 min ago");
+    expect(rows[0]).not.toHaveTextContent("Last heard unavailable");
     expect(rows[0]).toHaveTextContent("No changes owed");
     expect(rows[1]).toHaveTextContent("Conversation 2");
     expect(rows[1]).toHaveTextContent("Studio Mac");
-    expect(rows[1]).toHaveTextContent("1 h ago");
+    expect(rows[1]).toHaveTextContent("Last heard 1 h ago");
     const changes = within(screen.getByRole("list", { name: "Recent changes and who has them" }));
     expect(changes.getByText("1 of 2 have it")).toBeTruthy();
     expect(changes.getByText(/Waiting: Conversation 2/)).toBeTruthy();

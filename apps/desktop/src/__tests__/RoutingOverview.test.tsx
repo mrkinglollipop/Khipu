@@ -318,7 +318,7 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(tags("Your note and standing rules")).toEqual(["1 to confirm", "1 may be broken"]);
     expect(tags("Providers and lanes")).toEqual(["1 stopped reporting", "1 can't be read", "1 lane without an account"]);
     expect(tags("Old routing table file")).toEqual(["Can't read the file"]);
-    expect(tags("Proposals and holds")).toEqual([]);
+    expect(tags("Holds")).toEqual([]);
 
     expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
@@ -360,7 +360,7 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(line("Claude main").querySelector(".at")?.textContent).toBe("");
   });
 
-  it("counts only the crossed proposals still in the main list, never the ended ones", () => {
+  it("shows only the current crossed count on What changed, never the ended ones", async () => {
     const v = view();
     v.proposals = {
       "prop-crossed": { id: "prop-crossed", entity: "rule-b", kind: "rule", n: 6, status: "crossed", at: "2026-10-14T12:00:00Z",
@@ -371,8 +371,16 @@ describe("Accounts and routing: every problem shows, once", () => {
         ended_at: "2026-10-14T09:00:00Z", author: { kind: "conversation", harness: "codex", project: "project-b" } },
     };
     const overview = routingOverview(v, null, null, null, { routing: config().routing, push: { enabled: true } }, MORNING);
-    expect(overview.lines.holds).toContain("1 crossed");
-    expect(overview.lines.holds).not.toContain("2 crossed");
+    expect(overview.lines.changes).toContain("1 crossed");
+    expect(overview.lines.changes).not.toContain("2 crossed");
+    answers.khipu_route_view = v;
+    render(<RoutingSettings active />);
+    await settled();
+    fireEvent.click(screen.getByRole("button", { name: "What changed" }));
+    const changes = document.querySelector('[data-routing-page="changes"]')!;
+    expect(changes).toBeVisible();
+    expect(within(changes as HTMLElement).getByText(/1 crossed/)).toBeVisible();
+    expect(changes).not.toHaveTextContent("2 crossed");
   });
 
   it("stops counting a crossed proposal once it is older than 48 hours", () => {
@@ -383,7 +391,7 @@ describe("Accounts and routing: every problem shows, once", () => {
         author: { kind: "conversation", harness: "grok_build", project: "project-d" } },
     };
     const overview = routingOverview(v, null, null, null, { routing: config().routing, push: { enabled: true } }, MORNING);
-    expect(overview.lines.holds).not.toContain("crossed");
+    expect(overview.lines.changes).not.toContain("crossed");
   });
 
   it("counts a lane once when both the runner's lanes and a limit from it say it has no account", () => {
@@ -437,7 +445,8 @@ describe("Accounts and routing: every problem shows, once", () => {
     fireEvent.click(within(none).getByRole("button", { name: "Set up accounts" }));
     expect(onSetUp).toHaveBeenCalledTimes(1);
     expect(groupButton("Accounts")).toHaveTextContent("No accounts yet");
-    expect(groupButton("Proposals and holds")).toHaveTextContent("No proposals · no holds");
+    expect(groupButton("Holds")).toHaveTextContent("No holds");
+    expect(screen.queryAllByRole("article")).toHaveLength(0);
   });
 });
 

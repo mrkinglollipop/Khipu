@@ -4,8 +4,29 @@
 import { CLIENT, TRACKED, discovery, liveRow, status9B } from "../src/__tests__/accountsFixtures";
 import type { DiscoverResult } from "../src/accountsApi";
 import { DELIVERY_VIEW } from "./deliveryFake";
+import { config as fixtureRoutingConfig } from "../src/__tests__/routingSettingsFixtures";
 
 export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean };
+
+/** Values used by every routing-settings preview. They match the CLI's named
+ * settings so every Change control is enabled with a real-looking value. */
+function routingFixtureSettings() {
+  const setting = (value: unknown, kind = "count") => ({ value, default: value, kind, source: "default" });
+  return {
+    ...fixtureRoutingConfig().routing,
+    routing_dispatch_scripts: setting(["claude -p", "codex exec"], "commands"),
+    routing_summary_chars: setting(1500), routing_prompt_chars: setting(400), routing_child_chars: setting(4000),
+    routing_line_chars: setting(200), routing_rule_chars: setting(600), routing_rules_max: setting(40),
+    routing_note_chars: setting(1500), routing_rules_chars: setting(2000), routing_prompt_budget_ms: setting(50),
+    routing_slow_read_pct: setting(1, "number"), routing_start_budget_ms: setting(1000),
+    routing_resend_after_versions: setting(20), routing_resend_after: setting(6 * 3600, "duration"),
+    routing_stale_after: setting(12 * 3600, "duration"), routing_report_default_limit: setting(2 * 3600, "duration"),
+    routing_priority_unconfirmed_warn_after: setting(86400, "duration"),
+    routing_disagreement_warn_after: setting(3600, "duration"), routing_not_refreshed_after: setting(5 * 60, "duration"),
+    routing_ledger_keep_days: setting(7), routing_poll_interval: setting(30, "duration"), routing_runner_silent_intervals: setting(5),
+    routing_runner_tail_bytes: setting(512 * 1024), routing_runner_limited_lines: setting(200),
+  };
+}
 
 /** Fictional routing record for the Proposals and holds group (slice 15b),
  *  shaped as `khipu route --json` prints it. */
@@ -43,6 +64,7 @@ function route15b() {
     },
     config: {
       routing: {
+        ...routingFixtureSettings(),
         routing_conversation_hold: setting(86400), routing_conversation_hold_max: setting(604800),
         routing_owner_hold_reminder: setting(7776000), routing_hold_chars: setting(300),
         routing_proposal_text_between_macs: setting(true),
@@ -69,6 +91,9 @@ function routeNeedsWorst() {
   v.rules[0].prior_text = long;
   v.rules[2].text = `${long}, copied from the old file.`;
   v.holds[0].text = `${long}.`;
+  const delivery = base.view.delivery_rows;
+  delivery[0].label = "Review settings for a-project-with-a-very-long-name-and-no-spaces-0123456789";
+  delivery[1].mac = "MacBook Pro in the upstairs office";
   const runner = "A-project-with-a-very-long-name-and-no-spaces-to-break-it-at-all-0123456789";
   v.sources.runners[0].name = runner;
   v.unmatched[0] = { runner, lane: "opus-batch-with-a-very-long-lane-name-0123456789" };
@@ -91,6 +116,11 @@ function routeNeeds() {
   return {
     view: {
       record: true, version: 12, checked_at: ago(1),
+      delivery_rows: [
+        { label: "Review the settings pages", harness: "codex", component: "main", mac: "This Mac", last_prompt_at: ago(5), status: "green", owed: 0 },
+        { label: "Fix the nightly build", harness: "claude_code", component: "main", mac: "MacBook Pro", last_prompt_at: ago(18), status: "red", owed: 3 },
+        { label: "Documentation helper", harness: "claude_code", component: "agent", mac: "This Mac", last_prompt_at: null, status: "unknown", missing: ["delivery time"] },
+      ],
       accounts: [
         { key: "codex|", label: "Codex", harness: "codex", state: "open", models: [], witness: null, disagreement: null, last_seen: null },
         { key: "claude|", label: "Claude", harness: "claude", state: "open", models: [], witness: null, disagreement: null, last_seen: null },
@@ -142,6 +172,7 @@ function routeNeeds() {
     },
     config: {
       routing: {
+        ...routingFixtureSettings(),
         routing_push_start: setting(true, "switch"),
         routing_push_prompt: { value: false, default: true, kind: "switch", source: "file", words: "Tell conversations before each prompt", pending: true,
           request: { request: "stop the per-prompt updates", by: { kind: "conversation", harness: "codex", project: "project-a" }, by_words: "a Codex conversation", at: ago(30), prior: true } },
@@ -168,6 +199,7 @@ function routeReplication() {
     view: base.view,
     config: {
       routing: {
+        ...routingFixtureSettings(),
         ...base.config.routing,
         routing_replication_live: { value: true, default: false, kind: "switch", source: "file" },
       },
@@ -184,6 +216,7 @@ function route15a() {
     view: DELIVERY_VIEW,
     config: {
       routing: {
+        ...routingFixtureSettings(),
         routing_push_start: setting(true), routing_push_prompt: setting(true), routing_push_delegation: setting(true),
         routing_delivery_live_after: setting(43200),
       },

@@ -301,7 +301,11 @@ function RoutingNeeds() {
           <div className="panel-body wide settings-body" style={{ maxWidth: "none", minWidth: 0 }}>
             <div className="settings-pane" style={{ width: pane ? `${pane}px` : "100%", maxWidth: "100%", minWidth: 0 }}>
               <RoutingSettings active plansState={{ data: plans, error: null, reread: async () => {} } as never}
-                deliveryHealth={{ status: "red", identities: [{ identity: "codex:abc", component: "main", status: "red", owed: 3 }] } as never} />
+                deliveryHealth={{ status: "red", identities: [
+                  { identity: "codex:fixture", component: "main", status: "green", owed: 0 },
+                  { identity: "claude:fixture", component: "main", status: "red", owed: 3 },
+                  { identity: "claude-helper:fixture", component: "agent:helper", status: "unknown", missing: ["delivery time"] },
+                ] } as never} />
             </div>
           </div>
         </div>
