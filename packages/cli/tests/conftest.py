@@ -64,6 +64,11 @@ os.environ["TMPDIR"] = TEMP_ROOT
 tempfile.tempdir = TEMP_ROOT
 
 if os.environ.get("KHIPU_LIVE_TESTS") != "1":
+    # Children launched by filename or from a temporary cwd do not inherit
+    # pytest's sys.path. They must import this checkout, not an installed CLI.
+    _CLI_ROOT = str(Path(__file__).resolve().parents[1])
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        [_CLI_ROOT, *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep))])
     _HERMETIC_HOME = tempfile.mkdtemp(prefix="khipu-hermetic-home-")
     atexit.register(shutil.rmtree, _HERMETIC_HOME, ignore_errors=True)
     os.environ["HOME"] = _HERMETIC_HOME
