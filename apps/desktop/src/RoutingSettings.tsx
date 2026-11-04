@@ -1000,6 +1000,48 @@ type Folds = { isOpen: (key: string) => boolean; toggle: (key: string) => void; 
 
 type RoutingPageKey = "needs" | "accounts" | "work" | "macs" | "conversations" | "changes" | "wrong" | "rare";
 
+type FindSetting = {
+  name: string;
+  where: string;
+  page: RoutingPageKey;
+  aliases: string[];
+  selector: string;
+  group?: GroupKey;
+  rare?: boolean;
+};
+
+/** Old homes are search aliases, so a remembered name still reaches its
+ * setting. Search changes neither routing nor settings. */
+const FIND_SETTINGS: readonly FindSetting[] = [
+  { name: "Your accounts", where: "Your accounts", page: "accounts", aliases: ["accounts", "pause", "cap", "allowance", "check all"], selector: "[data-find-setting='group-accounts']", group: "accounts" },
+  { name: "Add an account", where: "Your accounts", page: "accounts", aliases: ["find accounts", "account login"], selector: "[data-find-setting='group-accounts']", group: "accounts" },
+  { name: "Your order and rules", where: "Who gets what work", page: "work", aliases: ["priority", "note", "rules", "holds", "temporary instructions"], selector: "[data-find-setting='group-priority']", group: "priority" },
+  { name: "Temporary instructions", where: "Who gets what work", page: "work", aliases: ["hold", "holds", "temporary instruction"], selector: "[data-find-setting='group-holds']", group: "holds" },
+  { name: "Copy routing between your Macs", where: "Your Macs", page: "macs", aliases: ["routing copy", "replication", "copy routing between macs", "hub copy", "keep settings the same"], selector: "[data-find-setting='routing-copy']" },
+  { name: "Share proposal words between your Macs", where: "Your Macs", page: "macs", aliases: ["proposal words", "mac tags", "this mac only"], selector: "[data-find-setting='mac-tags']" },
+  { name: "Tell conversations about routing", where: "Conversations", page: "conversations", aliases: ["telling", "telling conversations", "when conversations hear", "before each prompt"], selector: "[data-find-setting='group-telling']", group: "telling" },
+  { name: "Recent changes", where: "What changed", page: "changes", aliases: ["history", "bring back", "undo"], selector: "[data-find-setting='group-changes']", group: "changes" },
+  { name: "Checks and job runners", where: "Something's wrong", page: "wrong", aliases: ["checks", "lanes", "providers", "runner folders", "conflicts"], selector: "[data-find-setting='group-checks']", group: "checks" },
+  { name: "Technical limits and timing", where: "Rarely needed", page: "rare", aliases: ["sizes", "times", "warnings", "dispatch scripts"], selector: "[data-find-setting='rare-sizes']", rare: true },
+  { name: "Reading usage from logins", where: "Rarely needed", page: "rare", aliases: ["grok login", "cursor login", "opencode login"], selector: "[data-find-setting='rare-logins']", rare: true },
+  { name: "Old routing table file", where: "Rarely needed", page: "rare", aliases: ["routing-now", "legacy routing file", "old file"], selector: "[data-find-setting='rare-table']", rare: true },
+];
+
+function FindASetting({ onChoose }: { onChoose: (target: FindSetting) => void }) {
+  const [query, setQuery] = useState("");
+  const words = query.trim().toLocaleLowerCase();
+  const matches = words ? FIND_SETTINGS.filter((target) => [target.name, target.where, ...target.aliases].join(" ").toLocaleLowerCase().includes(words)).slice(0, 7) : [];
+  return <div className="route-find" role="search">
+    <label className="sr-only" htmlFor="route-find-setting">Find a setting</label>
+    <input id="route-find-setting" type="search" value={query} placeholder="Find a setting" autoComplete="off" onChange={(event) => setQuery(event.target.value)} />
+    {words ? <div className="route-find-results" role="listbox" aria-label="Find a setting results">
+      {matches.length ? matches.map((target) => <button key={target.name} type="button" role="option" onClick={() => { setQuery(""); onChoose(target); }}>
+        <span>{target.name}</span><small>{target.where}</small>
+      </button>) : <span className="route-find-none" role="status">No setting has those words.</span>}
+    </div> : null}
+  </div>;
+}
+
 const ROUTING_PAGES: ReadonlyArray<{ key: RoutingPageKey; name: string; groups: GroupKey[] }> = [
   { key: "needs", name: "Needs you", groups: [] },
   { key: "accounts", name: "Your accounts", groups: ["accounts", "pace"] },
@@ -1551,7 +1593,7 @@ function RuleRow({
   const identity = ruleIdentity(r);
   const mine = ask?.id === identity ? ask.kind : null;
   const pending = !!r.pending;
-  const toConfirm = pending || (r.seeded && !r.confirmed);
+  const toConfirm = pending;
   const name = ruleName(r);
   const id = `rule:${identity}`;
   // Overview links use the durable display number for standing rules; only a
@@ -1587,8 +1629,7 @@ function RuleRow({
         <span className="route-rule-meta" hidden={!expanded}>
           {origin}
           {pending ? <Tag tone="warn">{r.pending_kind === "changed" ? "Changed, reconfirm" : "Added, confirm"}</Tag> : null}
-          {!pending && toConfirm ? <Tag tone="warn">Copied rule, confirm</Tag> : null}
-          {r.seeded && r.confirmed ? <Tag tone="ok">Confirmed</Tag> : null}
+          {!pending && r.seeded ? <Tag>Copied from old file</Tag> : null}
           {pending ? (
             <span className="set-help">
               {`${r.pending_kind === "changed" ? "Changed" : "Added"} by ${r.pending_by ?? "a conversation"} at the owner's request; the owner has not confirmed it yet.`}
@@ -1766,10 +1807,10 @@ function RulesSection({ data, lists, w, now, revealItem }: { data: RouteView; li
     setAdding(false);
     setAddOpen(false);
   };
-  const toConfirm = rules.filter((r) => r.pending || (r.seeded && !r.confirmed)).length;
+  const toConfirm = rules.filter((r) => r.pending).length;
   const inFilter: Record<RuleFilter, (r: RouteRule) => boolean> = {
     all: () => true,
-    confirm: (r) => !!r.pending || (!!r.seeded && !r.confirmed),
+    confirm: (r) => !!r.pending,
     checked: (r) => watchedRules.includes(r.n),
     broken: (r) => watchedRules.includes(r.n) && resultOf(r.n)?.result === "broken",
   };
@@ -3290,7 +3331,7 @@ function MacRoutingControls({
 }) {
   const cfgRead = switchRead(cfg, cfgError, reread);
   return (
-    <div className="section-body route-macs-controls">
+    <div className="section-body route-macs-controls" data-find-setting="routing-copy">
       <p className="set-help">
         These controls apply to this Mac. They do not change what conversations hear or send proposal words to cloud agents.
       </p>
@@ -3300,7 +3341,7 @@ function MacRoutingControls({
           id="route-replication-live"
           label="Copy routing between your Macs through the hub"
           what="Sends your routing record to the hub so your other Macs can pick it up, and brings their routing changes here. This is the Mac-to-Mac copy, separate from the copy for cloud agents."
-          tag={<Tag>Between your Macs</Tag>}
+          tag={<Tag>Same on my Macs</Tag>}
           checked={cfg?.routing?.routing_replication_live?.value === true}
           disabled={!cfg || w.anyBusy}
           read={cfgRead}
@@ -3315,7 +3356,7 @@ function MacRoutingControls({
           {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
         </p>
         </div>
-        <SwitchRow
+        <div data-find-setting="mac-tags"><SwitchRow
           id="route-proposal-text"
           label="Share proposal words between your Macs"
           what="A conversation's proposed words travel between your Macs, so you can confirm them anywhere. Off, they stay on the Mac they came from until you confirm them there. They never go to cloud agents."
@@ -3328,7 +3369,7 @@ function MacRoutingControls({
             void w.run("proposal-text", "khipu_config_set", { key: "routing_proposal_text_between_macs", value: next ? "on" : "off" }, reread)
           }
           error={<WriteError w={w} id="proposal-text" />}
-        />
+        /></div>
         {deliveryHealth?.gateway?.cleanup_gave_up || deliveryHealth?.gateway?.cleanup_interrupted
           || deliveryHealth?.gateway?.cleanup_full ? (
           <div className="set-help" role="alert">
@@ -4697,10 +4738,10 @@ type ShownTag = { text: string; tone: GroupTag["tone"] | "accent" };
 
 /** Technical sections stay available but do not turn the rare page into a
  * second routing dashboard. This is the only page allowed to fold. */
-function RareFold({ name, children }: { name: string; children: ReactNode }) {
+function RareFold({ name, children, findKey }: { name: string; children: ReactNode; findKey?: string }) {
   const [open, setOpen] = useState(false);
   const id = `route-rare-${useId().replace(/:/g, "")}`;
-  return <section className="fold disclose route-sub-fold route-rare-fold" data-open={open}>
+  return <section className="fold disclose route-sub-fold route-rare-fold" data-open={open} data-find-setting={findKey}>
     <button type="button" className="disclosure fold-btn" aria-expanded={open} aria-controls={id} onClick={() => setOpen((v) => !v)}>
       <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
       <span>{name}</span>
@@ -4725,7 +4766,7 @@ function PageGroup({
   children: ReactNode;
 }) {
   return (
-    <section className="route-page-group" aria-labelledby={`route-group-${k}`}>
+    <section className="route-page-group" aria-labelledby={`route-group-${k}`} data-find-setting={`group-${k}`}>
       <div className="route-page-group-head" data-settings-group={k} tabIndex={-1}>
         <h3 id={`route-group-${k}`} tabIndex={-1}>{name}</h3>
         <span className="gline">{line === "Reading…" ? <span className="reading">Reading…</span> : line}</span>
@@ -4810,11 +4851,27 @@ export function RoutingSettings({
   const w = useWriter(rereadRoute);
   const folds = useFolds();
   const [page, setPage] = useState<RoutingPageKey>("needs");
+  const [findTarget, setFindTarget] = useState<FindSetting | null>(null);
   const selectPage = (next: RoutingPageKey) => setPage(next);
   const selectGroup = (group: GroupKey) => setPage(pageForGroup(group));
   useEffect(() => {
     document.querySelector<HTMLElement>(".main-content")?.scrollTo?.({ top: 0 });
   }, [page]);
+  useEffect(() => {
+    if (!findTarget || page !== findTarget.page) return;
+    const frame = requestAnimationFrame(() => {
+      const target = pagesRef.current?.querySelector<HTMLElement>(findTarget.selector);
+      if (!target) return;
+      if (findTarget.rare) {
+        const fold = target.querySelector<HTMLButtonElement>("button[aria-expanded]");
+        if (fold?.getAttribute("aria-expanded") === "false") fold.click();
+      }
+      target.scrollIntoView?.({ block: "center" });
+      (target.querySelector<HTMLElement>("button, input, select, textarea, [tabindex]") ?? target).focus?.();
+      setFindTarget(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [findTarget, page]);
   const laneRaw = config.data?.routing?.routing_lane_map?.value;
   const finder = useAccountsFinder(active, {
     view: route.data,
@@ -4914,6 +4971,12 @@ export function RoutingSettings({
     setFocusItem({ item: p.item ?? null, group: p.group });
   };
 
+  const openFoundSetting = (target: FindSetting) => {
+    if (target.group) folds.openKeys([target.group]);
+    setFindTarget(target);
+    selectPage(target.page);
+  };
+
   const unread = route.error ? (
     <p className="set-error">Khipu couldn't read the routing record, so this stays blank until the read works.</p>
   ) : (
@@ -4999,6 +5062,7 @@ export function RoutingSettings({
     <div className="route-settings">
       <div ref={pagesRef} className="route-pages">
         <nav className="route-page-nav" aria-label="Accounts and routing pages">
+          <FindASetting onChoose={openFoundSetting} />
           {ROUTING_PAGES.map((p) => (
             <button key={p.key} type="button" data-routing-page-select={p.key} aria-current={page === p.key ? "page" : undefined}
               onClick={() => selectPage(p.key)}>
@@ -5071,13 +5135,14 @@ export function RoutingSettings({
           </div>
           <section className="route-page" data-routing-page="accounts" data-active={page === "accounts"} aria-labelledby="route-page-accounts">
             <h2 id="route-page-accounts" tabIndex={-1}>Your accounts</h2>
-            <p className="set-help set-intro">Who has room, what Khipu can read, and how quickly an allowance is changing.</p>
+            <p className="set-help set-intro">Who has room now, when that changes, and the details you can adjust.</p>
             {group("accounts")}
             {group("pace")}
             <ResetCheckStatus data={data} />
           </section>
           <section className="route-page" data-routing-page="work" data-active={page === "work"} aria-labelledby="route-page-work">
             <h2 id="route-page-work" tabIndex={-1}>Who gets what work</h2>
+            <p className="set-help set-intro">Your order, rules, note and temporary instructions. Khipu passes them on.</p>
             <nav className="route-work-jumps" aria-label="Who gets what work sections">
               {[["Order", "route-group-priority"], ["Note", "route-work-note"], ["Rules", "route-work-rules"], ["Holds", "route-work-holds"]].map(([label, target]) => (
                 <button key={target} type="button" className="sm" onClick={() => {
@@ -5100,12 +5165,12 @@ export function RoutingSettings({
           </section>
           <section className="route-page" data-routing-page="conversations" data-active={page === "conversations"} aria-labelledby="route-page-conversations">
             <h2 id="route-page-conversations" tabIndex={-1}>Conversations</h2>
-            <p className="set-help set-intro">What each conversation has heard and when Khipu tells it about routing.</p>
+            <p className="set-help set-intro">What running conversations have heard and when Khipu tells them about routing.</p>
             {group("telling")}
           </section>
           <section className="route-page" data-routing-page="changes" data-active={page === "changes"} aria-labelledby="route-page-changes">
             <h2 id="route-page-changes" tabIndex={-1}>What changed</h2>
-            <p className="set-help set-intro">Recent routing changes, newest first.</p>
+            <p className="set-help set-intro">Every routing change, newest first, and who made it.</p>
             {group("changes")}
             {data ? <ProposalsSection data={data} now={now} /> : null}
           </section>
@@ -5118,13 +5183,13 @@ export function RoutingSettings({
           <section className="route-page route-page-rare" data-routing-page="rare" data-active={page === "rare"} aria-labelledby="route-page-rare">
             <h2 id="route-page-rare" tabIndex={-1}>Rarely needed</h2>
             <p className="set-help set-intro">Technical settings and local setup details. The defaults are usually fine.</p>
-            <RareFold name="Checking accounts when they reset">{group("resets")}</RareFold>
-            <RareFold name="Old routing table file">{group("table")}</RareFold>
-            <RareFold name="Priority and hold limits"><PriorityRarelySetting cfg={config.data} w={w} reread={rereadConfig} /><HoldRarelySettings cfg={config.data} w={w} reread={rereadConfig} /></RareFold>
-            <RareFold name="Sizes, timing and hand-off scripts"><TellingRarelySettings cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></RareFold>
-            <RareFold name="Model table">{data ? <ModelTableSection data={data} now={now} /> : null}</RareFold>
-            <RareFold name="Providers and account setup"><ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} mode="providers" /></RareFold>
-            <RareFold name="Reading usage from logins"><section className="route-page-group" aria-labelledby="route-login-reads">
+            <RareFold name="Checking accounts when they reset" findKey="rare-resets">{group("resets")}</RareFold>
+            <RareFold name="Old routing table file" findKey="rare-table">{group("table")}</RareFold>
+            <RareFold name="Priority and hold limits" findKey="rare-priority"><PriorityRarelySetting cfg={config.data} w={w} reread={rereadConfig} /><HoldRarelySettings cfg={config.data} w={w} reread={rereadConfig} /></RareFold>
+            <RareFold name="Sizes, timing and hand-off scripts" findKey="rare-sizes"><TellingRarelySettings cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></RareFold>
+            <RareFold name="Model table" findKey="rare-models">{data ? <ModelTableSection data={data} now={now} /> : null}</RareFold>
+            <RareFold name="Providers and account setup" findKey="rare-providers"><ProvidersLanesSection data={data} cfg={config.data} lists={lists} recordRead={recordRead} w={w} now={now} reread={rereadConfig} folds={folds} mode="providers" /></RareFold>
+            <RareFold name="Reading usage from logins" findKey="rare-logins"><section className="route-page-group" aria-labelledby="route-login-reads">
               <div className="route-page-group-head"><h3 id="route-login-reads">Reading usage from logins</h3></div>
               <div className="route-page-group-body"><LoginUsageSwitches cfg={config.data} cfgError={config.error} w={w} reread={rereadConfig} /></div>
             </section></RareFold>

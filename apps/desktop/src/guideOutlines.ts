@@ -94,11 +94,12 @@ export const OUTLINES: Partial<Record<GuideId, GuideOutline>> = {
     opens: [{ label: "Open Accounts and routing", target: { kind: "settings", section: "routing" } }],
   },
   routing: {
-    lede: "Khipu tells your agents which accounts have room and what you prefer. It never starts, stops or moves work.",
+    lede: "Accounts and routing keeps your accounts, preferences, conversations and checks in separate plain-language pages. Khipu never starts, stops or moves work.",
     steps: [
-      { title: "Set your priority", text: "The order you'd like accounts used in." },
+      { title: "See your accounts", text: "Your accounts shows who has room now and when that changes." },
+      { title: "Set your priority", text: "Who gets what work holds the order you'd like accounts used in." },
       { title: "Say what each account is for", text: "Your own words for each account." },
-      { title: "Add rules and a note", text: "Khipu shows them to agents. It doesn't enforce them." },
+      { title: "Add rules and a note", text: "Who gets what work shows them to agents. It doesn't enforce them." },
       { title: "Change any of it by asking a conversation", text: "That is owner direction, and it needs your confirmation." },
     ],
     opens: [{ label: "Open Accounts and routing", target: { kind: "settings", section: "routing" } }],

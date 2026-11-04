@@ -466,8 +466,8 @@ describe("Accounts and routing: links select their page", () => {
     expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
     fireEvent.click(within(needs).getByRole("button", { name: "Read them" }));
-    expect(within(needs).getByRole("button", { name: "Keep as written" })).toBeInTheDocument();
-    fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
+    expect(within(needs).queryByRole("button", { name: "Keep as written" })).toBeNull();
+    fireEvent.click(within(needs).getByRole("button", { name: "Edit rules" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="rule:3"]')));
     expect(document.querySelector('[data-route-item="rule:rule-uuid-3"]')).toBeNull();
     expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true");
@@ -526,7 +526,7 @@ describe("Accounts and routing: links select their page", () => {
     expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
     fireEvent.click(within(needs).getByRole("button", { name: "Read them" }));
-    fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Edit rules" }));
     const target = document.querySelector<HTMLElement>('[data-route-item="rule:17"]')!;
     await waitFor(() => expect(target).toBeInTheDocument());
     await waitFor(() => expect(document.activeElement).toBe(target));

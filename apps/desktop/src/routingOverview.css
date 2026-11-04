@@ -9,6 +9,12 @@
  * list stays in view while the page itself scrolls in the app's main pane. */
 .route-pages { display: grid; grid-template-columns: 12rem minmax(0, 1fr); gap: var(--s5); align-items: start; }
 .route-page-nav { position: sticky; top: var(--route-panel-head-h, 0px); z-index: 4; align-self: start; display: flex; flex-direction: column; gap: 2px; max-height: calc(100vh - var(--route-panel-head-h, 0px)); overflow-y: auto; padding: var(--s2); border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); box-shadow: var(--shadow-sm); }
+.route-find { display: flex; flex-direction: column; gap: var(--s1); padding-bottom: var(--s2); margin-bottom: var(--s1); border-bottom: 1px solid var(--border); }
+.route-find input { width: 100%; }
+.route-find-results { display: flex; flex-direction: column; gap: 1px; }
+.route-find-results button { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
+.route-find-results small { color: var(--muted); font-size: var(--t-xs); font-weight: 400; }
+.route-find-none { padding: var(--s2); color: var(--text-2); font-size: var(--t-sm); }
 .route-page-nav button { justify-content: flex-start; width: 100%; min-height: 30px; height: auto; padding: 6px var(--s2); border: 0; background: transparent; color: var(--text-2); text-align: left; white-space: normal; line-height: 1.3; }
 .route-page-nav button:hover { background: var(--surface-2); color: var(--text); }
 .route-page-nav button[aria-current="page"] { background: var(--accent-soft); color: var(--accent-text); font-weight: 650; }
@@ -37,6 +43,7 @@
 @media (max-width: 760px) {
   .route-pages { grid-template-columns: 1fr; gap: var(--s3); }
   .route-page-nav { position: sticky; top: var(--route-panel-head-h, 0px); z-index: 5; flex-direction: row; flex-wrap: nowrap; max-width: 100%; max-height: none; overflow-x: auto; overflow-y: hidden; border-radius: 0; }
+  .route-find { flex: 0 0 12rem; padding-right: var(--s2); padding-bottom: 0; margin-bottom: 0; border-right: 1px solid var(--border); border-bottom: 0; }
   .route-page-nav button { flex: 0 0 auto; width: auto; white-space: nowrap; }
 }
 

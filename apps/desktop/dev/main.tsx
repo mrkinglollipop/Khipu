@@ -321,6 +321,8 @@ function HomeNeeds() {
 }
 
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
+  "routing-settings-cde": { title: "Accounts and routing: CDE pages (fictional fixture)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
+  "routing-settings-cde-worst": { title: "Accounts and routing: CDE long-text fixture", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
   "routing-needs": { title: "Needs you: every kind of item (settings reorg slice A)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
   "routing-needs-worst": { title: "Needs you: the longest words (settings reorg slice A)", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
   "home-needs": { title: "Home: Confirm a priority a conversation set", fake: { routeNeeds: true, nineB: true }, render: () => <HomeNeeds /> },
@@ -438,7 +440,7 @@ function Page() {
       </main>
     );
   }
-  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst") {
+  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst") {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return <div style={{ height: "100%" }} data-state={hash}>{st.render()}</div>;
   }

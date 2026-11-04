@@ -564,10 +564,9 @@ describe("Settings -> Routing: standing rules", () => {
     await page();
     const three = row("Standing rules", "3.");
     expect(three).toHaveTextContent("From your routing table, Oct 13");
-    expect(three).toHaveTextContent("Copied rule, confirm");
+    expect(three).toHaveTextContent("Copied from old file");
     expect(three).toHaveTextContent("Checked by Khipu");
     const seven = row("Standing rules", "7.");
-    expect(seven).toHaveTextContent("Confirmed");
     expect(seven).toHaveTextContent("Passed to every conversation as written. Khipu has no way to check this one.");
     expect(within(seven).queryByRole("button", { name: "Confirm rule 7" })).toBeNull();
     expect(screen.queryByText(/Watched/)).toBeNull();
@@ -785,7 +784,7 @@ describe("Settings -> Routing: standing rules", () => {
     const chips = screen.getByRole("group", { name: "Show rules" });
     const all = within(chips).getByRole("button", { name: "All, 2 rules" });
     expect(all).toHaveAttribute("aria-pressed", "true");
-    within(chips).getByRole("button", { name: "To confirm, 1 rule" });
+    within(chips).getByRole("button", { name: "To confirm, 0 rules" });
     within(chips).getByRole("button", { name: "Checked by Khipu, 1 rule" });
     const broken = within(chips).getByRole("button", { name: "May be broken, 1 rule" });
     fireEvent.click(broken);

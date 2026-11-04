@@ -165,6 +165,39 @@ describe("Runtime parity for every approved scope inventory row", () => {
     fireEvent.click(p.getByRole("switch", { name: "At the start of a conversation, and after it is compacted" }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("khipu_config_set", expect.objectContaining({ key: "routing_push_start", value: "off" })));
   });
+  it("finds settings by their old homes and opens the matching page", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
+    const find = screen.getByRole("searchbox", { name: "Find a setting" });
+    fireEvent.change(find, { target: { value: "routing copy" } });
+    const option = screen.getByRole("option", { name: /Copy routing between your Macs/ });
+    expect(option).toHaveTextContent("Your Macs");
+    fireEvent.click(option);
+    const macs = document.querySelector<HTMLElement>('[data-routing-page="macs"]')!;
+    await waitFor(() => expect(macs).toHaveAttribute("data-active", "true"));
+    expect(within(macs).getByRole("switch", { name: "Copy routing between your Macs through the hub" })).toBeVisible();
+    fireEvent.change(find, { target: { value: "telling" } });
+    fireEvent.click(screen.getByRole("option", { name: /Tell conversations about routing/ }));
+    const conversations = document.querySelector<HTMLElement>('[data-routing-page="conversations"]')!;
+    await waitFor(() => expect(conversations).toHaveAttribute("data-active", "true"));
+    expect(within(conversations).getByRole("switch", { name: "Tell conversations about routing" })).toBeVisible();
+  });
+
+  it("lists copied old-file rules once under When you have time without asking for confirmation", async () => {
+    record.rules = [{ n: 77, text: "Never use a fast tier.", seeded: true, confirmed: false }];
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
+    const needs = await home("Needs you");
+    const later = needs.getByRole("list", { name: "When you have time" });
+    expect(within(later).getByText("1 rule copied from your old routing file was never reviewed")).toBeVisible();
+    fireEvent.click(within(later).getByRole("button", { name: "Read them" }));
+    expect(within(later).getByText("Never use a fast tier.")).toBeVisible();
+    expect(within(later).queryByRole("button", { name: "Keep as written" })).toBeNull();
+    const work = await home("Who gets what work");
+    expect(work.queryByRole("button", { name: "Confirm rule 77" })).toBeNull();
+  });
   it("the rule's More control reveals all words and origin in place without changing its writer buttons", async () => {
     record.rules![0].text = "Keep the complete original wording, including extraordinarilylongunbrokenwordsandpaths0123456789. ".repeat(40);
     render(<App />);
