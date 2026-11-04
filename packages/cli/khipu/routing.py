@@ -4114,7 +4114,7 @@ def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
         # A stable id from another Mac may have no local ``harness|home``
         # binding yet.  Absence is not an explicit owner choice to untrack;
         # only a configured list omission or an owner untracked note is.
-        configured = key in known_keys or in_settings.get(key, not known_keys and not none)
+        configured = key in known_keys or in_settings.get(key, not none)
         active.append({"account": key, "label": label, "role": item.get("role"), "until": item.get("until"),
                        "in_settings": bool(configured)})
         # An exception shows only before its end; one that has passed leaves
@@ -4932,7 +4932,11 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     note_out = None if note is None else {"text": note["text"], "at": _iso(note["at"]),
                                           "written_by": note["written_by"], "via": note["via"]}
     labels = {e["key"]: e["label"] for e in entries}
-    in_settings = {e["key"]: e["configured"] for e in entries}
+    # With no account list stored here (and not "read no accounts"), an account
+    # this Mac doesn't track is not "stopped tracking": the priority is the
+    # owner's, shared by every Mac, and a second Mac keeps no list of its own.
+    # Only his untracked note or a removed definition (below) marks one stopped.
+    in_settings = {e["key"]: bool(e["configured"] or not none) for e in entries}
     in_settings.update({key: False for key, note in notes.items() if note.get("state") == "untracked"})
     # An account definition the owner removed is no longer tracked, with or
     # without an account list on this Mac.
