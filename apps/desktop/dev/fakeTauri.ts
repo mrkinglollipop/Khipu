@@ -6,7 +6,7 @@ import type { DiscoverResult } from "../src/accountsApi";
 import { DELIVERY_VIEW } from "./deliveryFake";
 import { config as fixtureRoutingConfig } from "../src/__tests__/routingSettingsFixtures";
 
-export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off" };
+export type Fake = { projects?: unknown; nineB?: boolean; disc?: DiscoverResult; usage?: unknown; none?: boolean; route15a?: boolean; route15b?: boolean; routeNeeds?: boolean; worst?: boolean; routeReplication?: boolean; routeMacs?: "first" | "settled" | "off"; overrides?: boolean };
 
 /** Values used by every routing-settings preview. They match the CLI's named
  * settings so every Change control is enabled with a real-looking value. */
@@ -253,6 +253,58 @@ function routeMacs(kind: "first" | "settled" | "off") {
   };
 }
 
+// Conversation overrides and the tidy-up walk, fictional: enough state to click through
+// (end early, undo, say yes, leave, start over) in the dev preview.
+const overrideState = {
+  rows: [
+    { id: "ov-1", label: "Claude second", who: "The T3 conversation \"Healthy You retrospective\"", until: "2026-11-04T19:40:00Z",
+      indefinite: false, review_at: null, review_due: false, cap: "It stops when the account reaches 60% of its week" },
+    { id: "ov-2", label: "Grok", who: "Every conversation in the folder khipu-slices", until: null, indefinite: true,
+      review_at: "2026-11-04T09:00:00Z", review_due: true, cap: "It stops at the account's saved share cap if it has one, otherwise at its plan limit" },
+  ] as Array<Record<string, unknown>>,
+  items: [
+    { code: "duplicate", key: "dup:codex|:x1", words: "Codex has \"re-check of PRs #3 and #11\" twice (ends Nov 5 14:00Z and Nov 5 15:00Z).", yes: "End the second one and keep the first.", settle: { confirm: { action: "route.priority.amend", args: { account: "codex|", end_exception: "x1", expect: "p4" } } } },
+    { code: "near_duplicate", key: "dup:codex|:x2", words: "Codex has \"re-check of PRs #3 and #11\" twice, worded a little differently (ends Nov 5 14:00Z and Nov 5 16:00Z).", yes: "End the second one and keep the first.", settle: { confirm: { action: "route.priority.amend", args: { account: "codex|", end_exception: "x2", expect: "p4" } } } },
+    { code: "twin", key: "twin:x1:x5", words: "The same instruction \"re-check of PRs #3 and #11\" is on both Codex and Claude.", yes: "Keep both; stop asking about this pair.", settle: { confirm: null } },
+  ] as Array<Record<string, unknown>>,
+  left: [] as string[],
+  undone: null as null | Array<Record<string, unknown>>,
+};
+
+function walkAnswer() {
+  const pending = overrideState.items;
+  const fresh = pending.filter((i) => !overrideState.left.includes(i.key as string));
+  const later = pending.filter((i) => overrideState.left.includes(i.key as string));
+  const ordered = [...fresh, ...later];
+  const item = ordered[0] ? { ...ordered[0], number: 1, of: ordered.length, came_back: overrideState.left.includes(ordered[0].key as string) } : null;
+  return { ok: true, total: ordered.length, left_for_later: later.length, item, soon: [] };
+}
+
+function overridesCommand(cmd: string, args?: Record<string, unknown>): unknown | undefined {
+  switch (cmd) {
+    case "khipu_route_override_view":
+      return { ok: true, overrides: overrideState.rows };
+    case "khipu_route_override_act": {
+      overrideState.undone = overrideState.rows.slice();
+      overrideState.rows = overrideState.rows.filter((r) => r.id !== args?.id);
+      return { ok: true, owner_action: "act-1" };
+    }
+    case "khipu_owner_direction_undo":
+      if (overrideState.undone) overrideState.rows = overrideState.undone;
+      return { ok: true };
+    case "khipu_route_cleanup_walk":
+      if (args?.restart) overrideState.left = [];
+      if (args?.leave) overrideState.left.push(args.leave as string);
+      if (args?.keep) overrideState.items = overrideState.items.filter((i) => i.key !== args.keep);
+      return walkAnswer();
+    case "khipu_route_exception_end":
+      overrideState.items = overrideState.items.filter((i) => ((i.settle as { confirm: { args: { end_exception: string } } | null }).confirm?.args.end_exception) !== args?.id);
+      return { ok: true };
+    default:
+      return undefined;
+  }
+}
+
 function fake(): Fake {
   return ((window as unknown as { __khipuFake?: Fake }).__khipuFake ?? {}) as Fake;
 }
@@ -261,6 +313,10 @@ export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Pr
   const f = fake();
   await new Promise((r) => setTimeout(r, 200));
   const answer = (() => {
+    if (f.overrides) {
+      const mine = overridesCommand(cmd, args);
+      if (mine !== undefined) return mine;
+    }
     switch (cmd) {
       case "khipu_accounts_discover":
       case "khipu_accounts_check":

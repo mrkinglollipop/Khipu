@@ -32,6 +32,7 @@ import { inPlansOrder } from "./RoutingCard";
 import { PlanDetailSheet, RoutingDetailSheet, useDetailHost } from "./AccountDetail";
 import { AccountsRequestBand } from "./AccountControls";
 import { NeedsYou } from "./NeedsYou";
+import { CleanUpWalk, OverridesSection } from "./ConversationOverrides";
 import { accountsCard, decideCards } from "./routingNeeds";
 import type { RouteSetting } from "./routingNeeds";
 import { priorityItems } from "./accountControlsModel";
@@ -3116,6 +3117,11 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
     help: "The nightly run removes it; a conversation that comes back starts a fresh one.",
     fields: [{ key: "routing_ledger_keep_days", label: "Remove after", unit: "days", options: [3, 7, 14, 30, 90, 0], zero: "Never" }],
   },
+  {
+    name: "Keep the record of an ended conversation override for",
+    help: "An override still in force is never removed.",
+    fields: [{ key: "routing_override_log_keep_days", label: "Keep for", unit: "days", options: [7, 14, 30, 90, 0], zero: "Forever" }],
+  },
 ];
 
 /** "11 settings, 2 changed from the default", from the values Khipu read. */
@@ -5263,6 +5269,7 @@ export function RoutingSettings({
             {group("priority")}
             {group("rules")}
             {group("holds")}
+            <CleanUpWalk onChanged={() => void route.load(true)} />
           </section>
           <section className="route-page" data-routing-page="macs" data-active={page === "macs"} aria-labelledby="route-page-macs">
             <h2 id="route-page-macs" tabIndex={-1}>Your Macs</h2>
@@ -5274,6 +5281,7 @@ export function RoutingSettings({
           <section className="route-page" data-routing-page="conversations" data-active={page === "conversations"} aria-labelledby="route-page-conversations">
             <h2 id="route-page-conversations" tabIndex={-1}>Conversations</h2>
             <p className="set-help set-intro">What running conversations have heard and when Khipu tells them about routing.</p>
+            <OverridesSection now={now} />
             {group("telling")}
           </section>
           <section className="route-page" data-routing-page="changes" data-active={page === "changes"} aria-labelledby="route-page-changes">
@@ -5317,3 +5325,4 @@ export function RoutingSettings({
     </div>
   );
 }
+

@@ -329,6 +329,17 @@ function RoutingNeeds() {
   );
 }
 
+/** Just the settings pane, no app shell: how it reads when the window is narrow. */
+function RoutingBare() {
+  return (
+    <div className="main-content" style={{ padding: "12px" }}>
+      <div className="panel-body wide settings-body" style={{ maxWidth: "none", minWidth: 0 }}>
+        <RoutingSettings active plansState={{ data: null, error: null, reread: async () => {} } as never} />
+      </div>
+    </div>
+  );
+}
+
 /** Home's routing card with a priority a conversation set. */
 function HomeNeeds() {
   const route = useRouting(true);
@@ -339,6 +350,8 @@ const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNo
   "routing-settings-cde": { title: "Accounts and routing: CDE pages (fictional fixture)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
   "routing-settings-cde-worst": { title: "Accounts and routing: CDE long-text fixture", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
   "routing-needs": { title: "Needs you: every kind of item (settings reorg slice A)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
+  "routing-overrides": { title: "Conversation overrides and the tidy-up walk", fake: { routeNeeds: true, nineB: true, overrides: true }, render: () => <RoutingNeeds /> },
+  "routing-overrides-bare": { title: "Conversation overrides and the tidy-up walk, pane only", fake: { routeNeeds: true, nineB: true, overrides: true }, render: () => <RoutingBare /> },
   "routing-needs-worst": { title: "Needs you: the longest words (settings reorg slice A)", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
   "home-needs": { title: "Home: Confirm a priority a conversation set", fake: { routeNeeds: true, nineB: true }, render: () => <HomeNeeds /> },
   pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
@@ -458,7 +471,7 @@ function Page() {
       </main>
     );
   }
-  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst") {
+  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst" || hash.startsWith("routing-overrides")) {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return <div style={{ height: "100%" }} data-state={hash}>{st.render()}</div>;
   }

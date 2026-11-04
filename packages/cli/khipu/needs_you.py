@@ -71,7 +71,10 @@ ACTION_WORDS = {
     "route.rule.restore": "bring back a retired standing rule", "route.rule.confirm": "confirm a standing rule",
     "route.rule.undo": "undo a conversation's edit to a standing rule",
     "route.rule.dismiss": "drop a standing rule a conversation proposed", "route.hold.add": "put a hold on work",
-    "route.hold.end": "end a hold on work", "route.cap.set": "set a usage cap on an account",
+    "route.hold.end": "end a hold on work",
+    "route.override.grant": "let one conversation run ahead of pace on an account",
+    "route.override.end": "end a conversation's override early",
+    "route.override.keep": "keep a conversation's override for another week", "route.cap.set": "set a usage cap on an account",
     "route.cap.remove": "remove a usage cap from an account", "route.priority.set": "replace your account priority",
     "route.priority.amend": "change one account's entry in your priority",
     "route.priority.confirm": "confirm a conversation's change to your priority",
@@ -1048,6 +1051,10 @@ def ask_for(action: str, values: dict) -> str | None:
     the reason a hold fails."""
     whole, clipped = _WHOLE.set(True), _CLIPPED.set(False)
     try:
+        if action.startswith("route.override."):
+            from khipu import conversation_overrides
+
+            return conversation_overrides.ask_for(action, values)
         if action == "config.routing_setting":
             return f"Khipu holds this until you answer: {_action_words(action, values)}. Confirm?"
         if action not in SETTLE_ACTIONS:

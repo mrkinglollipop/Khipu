@@ -1141,7 +1141,12 @@ TOOLS: list[dict] = [
             "goes in route.priority.amend exception (the direction as the owner gave it) with until, which lapses "
             "on its own "
             "(no until: the account's next weekly reset, else 7 days); end_exception ends one early; "
-            "route.cap.set takes an optional until, after which the cap stops applying."
+            "route.cap.set takes an optional until, after which the cap stops applying. "
+            "route.override.grant (account, request, until or indefinite, optional ceiling_pct, window, helpers false, "
+            "whole_folder true) lets this conversation, which Khipu names itself, run ahead of pace on an account; "
+            "route.override.end and route.override.keep take the override's id. Reads, no change: route.overrides.mine "
+            "(what this conversation hears) and route.walkthrough (the next priority clean-up item, "
+            "one yes settles it; leave, keep or restart are its bookmark)."
         ),
         "inputSchema": {
             "type": "object",
