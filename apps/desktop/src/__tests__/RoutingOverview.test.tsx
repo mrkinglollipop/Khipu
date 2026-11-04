@@ -228,7 +228,12 @@ afterEach(() => {
 });
 
 const groupButton = (name: string) =>
-  document.querySelector<HTMLButtonElement>(`[data-settings-group="${GROUPS.find((g) => g.name === name)!.key}"]`)!;
+  document.querySelector<HTMLElement>(`[data-settings-group="${GROUPS.find((g) => g.name === name)!.key}"]`)!;
+
+function expandNeeds() {
+  const needs = screen.getByRole("region", { name: "Needs you" });
+  for (let button; (button = within(needs).queryByRole("button", { name: /^Show \d+ more/ }));) fireEvent.click(button);
+}
 
 async function settled() {
   await screen.findByRole("region", { name: "Needs you" });
@@ -262,7 +267,7 @@ describe("Accounts and routing: Nothing here needs you only after every check ra
     expect(screen.queryByText("Nothing here needs you.")).toBeNull();
     await act(async () => release(config()));
     const needs = await screen.findByRole("region", { name: "Needs you" });
-    expect(needs).toHaveTextContent("Lane review-2 in Project A has no account");
+    expect(needs).toHaveTextContent("Job slot review-2 in Project A has no account");
     expect(screen.queryByText("Reading what needs you…")).toBeNull();
     expect(screen.queryByText("Nothing here needs you.")).toBeNull();
   });
@@ -304,7 +309,6 @@ describe("Accounts and routing: every problem shows, once", () => {
     answers.khipu_config_show = config({ routing_table: setting("/notes/routing/ROUTING-NOW.md", null) });
     render(<RoutingSettings active plansState={TROUBLED_PLANS()} />);
     await settled();
-    for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "false");
 
     const tags = (name: string) => [...groupButton(name).querySelectorAll(".tag")].map((t) => t.textContent);
     // Two accounts are limited in the fixture: the tag counts both.
@@ -316,29 +320,30 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(tags("Old routing table file")).toEqual(["Can't read the file"]);
     expect(tags("Proposals and holds")).toEqual([]);
 
+    expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
-    const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("span")!.textContent);
+    const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("b")!.textContent);
     expect(lines).toEqual([
-      "Claude second: two sources disagree",
-      "Grok Build: Khipu can't read its plan",
-      "Codex: not signed in",
-      "A conversation changed your priority: confirm or undo it",
-      "1 standing rule to confirm",
-      "Standing rule 7 may be broken: Project A's settings name gpt-5-fast",
+      "Claude second: two reports disagree",
+      "Khipu can't read Grok Build's plan",
+      "Codex isn't signed in",
+      "Your rule 7 may have been broken",
       "Your Project B job runner stopped reporting at 10:02 AM",
       "Khipu can't read Project C's files",
-      "Lane opus-batch in Project B has no account",
+      "Job slot opus-batch in Project B has no account",
+      "1 rule copied from your old routing file was never reviewed",
     ]);
+    expect(needs).toHaveTextContent("Project A's settings name gpt-5-fast.");
+    expect(within(needs).getByRole("article", { name: /order of accounts|ahead of/ })).toBeInTheDocument();
     // The limited and down accounts are tags only: their state is the action.
     expect(needs).not.toHaveTextContent("Claude main");
     expect(needs).not.toHaveTextContent("Muse");
-    for (const name of ["Show the Claude second disagreement", "Show Grok Build", "Show Codex", "Show the priority to confirm",
-      "Show the standing rule to confirm", "Show standing rule 7", "Show the Project B job runner", "Show the Project C job runner",
-      "Show lane opus-batch"]) {
+    for (const name of ["Compare: the Claude second disagreement", "See the account: Grok Build", "Go to sign in: Codex",
+      "Read them", "See the rule: rule 7", "Look into it: the Project B job runner", "Look into it: the Project C job runner",
+      "Choose an account: job slot opus-batch"]) {
       expect(within(needs).getByRole("button", { name })).toBeInTheDocument();
     }
     // The account lines carry their own problems' tags, from the same list.
-    fireEvent.click(groupButton("Accounts"));
     const line = (label: string) =>
       within(screen.getByRole("list", { name: "Accounts" })).getAllByRole("listitem").find((li) => li.textContent?.startsWith(label))!;
     expect(line("Claude second").querySelector(".at")).toHaveTextContent("Sources disagree");
@@ -436,42 +441,43 @@ describe("Accounts and routing: every problem shows, once", () => {
   });
 });
 
-describe("Accounts and routing: links open their group", () => {
-  it("opens a group a deep link names, and its body shows", async () => {
+describe("Accounts and routing: links select their page", () => {
+  it("selects the page a legacy group link names, then focuses its target", async () => {
     render(<RoutingSettings active />);
     await settled();
-    expect(groupButton("Your note and standing rules")).toHaveAttribute("aria-expanded", "false");
-    expect(screen.queryByRole("region", { name: "Your note and standing rules" })).toBeNull();
     revealSettingsGroup("rules");
-    await waitFor(() => expect(groupButton("Your note and standing rules")).toHaveAttribute("aria-expanded", "true"));
-    expect(screen.getByRole("region", { name: "Your note and standing rules" })).toBeVisible();
-    expect(document.activeElement).toBe(groupButton("Your note and standing rules"));
+    await waitFor(() => expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true"));
+    await waitFor(() => expect(document.activeElement).toBe(groupButton("Your note and standing rules")));
   });
 
   it("Show opens the problem's group and line and moves focus to the item", async () => {
     store.set(OPEN_KEY, "[]");
     render(<RoutingSettings active />);
     await settled();
+    expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the standing rule to confirm" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Read them" }));
+    expect(within(needs).getByRole("button", { name: "Keep as written" })).toBeInTheDocument();
+    fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="rule:3"]')));
     expect(document.querySelector('[data-route-item="rule:rule-uuid-3"]')).toBeNull();
-    expect(groupButton("Your note and standing rules")).toHaveAttribute("aria-expanded", "true");
+    expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true");
 
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the Claude second disagreement" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Compare: the Claude second disagreement" }));
     const line = document.querySelector<HTMLButtonElement>('[data-route-item="account:claude|/logins/claude-second"]')!;
     await waitFor(() => expect(document.activeElement).toBe(line));
-    expect(groupButton("Accounts")).toHaveAttribute("aria-expanded", "true");
+    expect(document.querySelector('[data-routing-page="accounts"]')).toHaveAttribute("data-active", "true");
     // The line opens the Routing detail (no fold of its own); the disagreement is there.
     expect(line).toHaveAttribute("aria-haspopup", "dialog");
     fireEvent.click(line);
     expect(within(screen.getByRole("dialog")).getByRole("group", { name: "Claude second: two reports disagree" })).toBeVisible();
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close details" }));
 
-    fireEvent.click(within(needs).getByRole("button", { name: "Show lane opus-batch" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Choose an account: job slot opus-batch" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="lane:Project B/opus-batch"]')));
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the Project B job runner" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Project B job runner" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="runner:Project B"]')));
+    expect(document.querySelector('[data-routing-page="wrong"]')).toHaveAttribute("data-active", "true");
   });
 
   it("gives a runner that isn't in your folders list a row of its own, and Show focuses it", async () => {
@@ -483,21 +489,44 @@ describe("Accounts and routing: links open their group", () => {
     answers.khipu_route_view = v;
     render(<RoutingSettings active />);
     await settled();
+    expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the Project C job runner" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Project C job runner" }));
     const row = document.querySelector<HTMLElement>('[data-route-item="runner:Project C"]')!;
     await waitFor(() => expect(document.activeElement).toBe(row));
     expect(row).toHaveTextContent("Stopped reporting at 9:00 AM");
     expect(row).toHaveTextContent("Not in your job runner folders · /runners/c");
-    fireEvent.click(within(needs).getByRole("button", { name: "Show the Private folder" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Private folder" }));
     const refused = document.querySelector<HTMLElement>('[data-route-item="runner:Private"]')!;
     await waitFor(() => expect(document.activeElement).toBe(refused));
     expect(refused).toHaveTextContent("Refused: it is inside a private folder");
   });
+
+  it("Show expands a seeded rule beyond the initial rules page before focusing it", async () => {
+    const record = view();
+    record.rules = [
+      { n: 1, text: "First reviewed rule", seeded: true, confirmed: true },
+      { n: 2, text: "Second reviewed rule", seeded: true, confirmed: true },
+      { n: 3, text: "Third reviewed rule", seeded: true, confirmed: true },
+      { n: 4, text: "Fourth reviewed rule", seeded: true, confirmed: true },
+      { n: 17, text: "Review this after the initial page", seeded: true, confirmed: false },
+    ];
+    answers.khipu_route_view = record;
+    render(<RoutingSettings active />);
+    await settled();
+    expandNeeds();
+    const needs = screen.getByRole("region", { name: "Needs you" });
+    fireEvent.click(within(needs).getByRole("button", { name: "Read them" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
+    const target = document.querySelector<HTMLElement>('[data-route-item="rule:17"]')!;
+    await waitFor(() => expect(target).toBeInTheDocument());
+    await waitFor(() => expect(document.activeElement).toBe(target));
+    expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true");
+  });
 });
 
-describe("Accounts and routing: open and closed, remembered on this Mac", () => {
-  it("uses the detail classification for the open count", async () => {
+describe("Accounts and routing: permanent pages", () => {
+  it("keeps the account summary and uses page navigation instead of remembered group folds", async () => {
     const record = calm();
     record.accounts = [
       acct("Codex", "codex", { state: "open" }),
@@ -507,56 +536,22 @@ describe("Accounts and routing: open and closed, remembered on this Mac", () => 
     render(<RoutingSettings active />);
     await settled();
     expect(groupButton("Accounts")).toHaveTextContent("2 accounts: 1 open, 1 probably open");
+    fireEvent.click(screen.getByRole("button", { name: "Your accounts" }));
+    expect(document.querySelector('[data-routing-page="accounts"]')).toHaveAttribute("data-active", "true");
     const accounts = within(screen.getByRole("list", { name: "Accounts" }));
     expect(accounts.getByRole("button", { name: /^Codex/ })).toHaveTextContent("Open");
     expect(accounts.getByRole("button", { name: /^Muse/ })).toHaveTextContent("this account can't be checked without using a turn");
   });
 
-  it("opens Accounts only at first, opens and closes every group, and remembers it", async () => {
+  it("keeps a partially written hold when the owner changes pages", async () => {
     render(<RoutingSettings active />);
     await settled();
-    expect(GROUPS.filter((g) => groupButton(g.name).getAttribute("aria-expanded") === "true").map((g) => g.key)).toEqual(["accounts"]);
-    fireEvent.click(screen.getByRole("button", { name: "Open all groups" }));
-    for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "true");
-    expect(JSON.parse(store.get(OPEN_KEY)!)).toEqual(expect.arrayContaining(GROUPS.map((g) => g.key)));
-    cleanup();
-    render(<RoutingSettings active />);
-    await settled();
-    for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "true");
-    fireEvent.click(screen.getByRole("button", { name: "Close all groups" }));
-    for (const g of GROUPS) expect(groupButton(g.name)).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(groupButton("Proposals and holds"));
-    cleanup();
-    render(<RoutingSettings active />);
-    await settled();
-    expect(GROUPS.filter((g) => groupButton(g.name).getAttribute("aria-expanded") === "true").map((g) => g.key)).toEqual(["holds"]);
-  });
-
-  it("keeps a closed group's form as it was", async () => {
-    store.set(OPEN_KEY, JSON.stringify(["holds"]));
-    render(<RoutingSettings active />);
-    await settled();
+    fireEvent.click(screen.getByRole("button", { name: "Who gets what work" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
     fireEvent.change(screen.getByLabelText("Words"), { target: { value: "Half written" } });
-    fireEvent.click(groupButton("Proposals and holds"));
-    expect(screen.queryByRole("form", { name: "Add a hold" })).toBeNull();
-    fireEvent.click(groupButton("Proposals and holds"));
+    fireEvent.click(screen.getByRole("button", { name: "Your accounts" }));
+    fireEvent.click(screen.getByRole("button", { name: "Who gets what work" }));
     expect(screen.getByLabelText("Words")).toHaveValue("Half written");
-  });
-
-  it("works when this Mac can't store anything", async () => {
-    vi.stubGlobal("localStorage", {
-      getItem: () => {
-        throw new Error("blocked");
-      },
-      setItem: () => {
-        throw new Error("blocked");
-      },
-    });
-    render(<RoutingSettings active />);
-    await settled();
-    expect(groupButton("Accounts")).toHaveAttribute("aria-expanded", "true");
-    fireEvent.click(screen.getByRole("button", { name: "Open all groups" }));
-    expect(groupButton("Proposals and holds")).toHaveAttribute("aria-expanded", "true");
   });
 });
 
@@ -595,7 +590,12 @@ describe("Accounts and routing: nothing that was on the page is missing", () => 
     fireEvent.click(screen.getByRole("button", { name: "Change the account for Project B's opus-batch lane" }));
     fireEvent.click(screen.getByRole("button", { name: "Change which accounts Khipu reads" }));
     await screen.findByRole("form", { name: "Add an account" });
-    const named = (name: string) => ROLES.flatMap((role) => screen.queryAllByRole(role, { name }));
+    // The source inventory counts preserved controls in collapsed Rarely
+    // needed sections too; page navigation itself has separate assertions.
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
+    for (const fold of document.querySelectorAll<HTMLButtonElement>(".route-rare-fold > button")) if (fold.getAttribute("aria-expanded") === "false") fireEvent.click(fold);
+    const named = (name: string) => ROLES.flatMap((role) => screen.queryAllByRole(role, { name, hidden: true }));
     const want = new Map<string, number>();
     for (const n of [...BEFORE, "Check all now", "Name", "CLI", "Login folder", "Add"]) want.set(n, (want.get(n) ?? 0) + 1);
     const missing = [...want].filter(([name, n]) => named(name).length < n).map(([name]) => name);
@@ -629,14 +629,14 @@ describe("Accounts and routing: nothing that was on the page is missing", () => 
   });
 });
 
-describe("Accounts and routing: folds and words", () => {
-  it("gives every fold aria-expanded and aria-controls naming its body, and words to every tag and dot", async () => {
+describe("Accounts and routing: rare folds and words", () => {
+  it("keeps only the technical sub-folds accessible, and words every tag and dot", async () => {
     answers.khipu_route_view = troubled();
     render(<RoutingSettings active plansState={TROUBLED_PLANS()} />);
     await settled();
-    // An account's line opens its Routing detail instead of folding.
+    // An account's line opens its Routing detail; permanent page groups do not fold.
     const folds = [...document.querySelectorAll<HTMLButtonElement>("button.fold-btn:not([aria-haspopup])")];
-    expect(folds.length).toBeGreaterThanOrEqual(GROUPS.length + 2);
+    expect(folds.length).toBeGreaterThanOrEqual(2);
     for (const b of folds) {
       expect(b.getAttribute("aria-expanded")).toMatch(/^(true|false)$/);
       const body = document.getElementById(b.getAttribute("aria-controls") ?? "");
@@ -661,24 +661,29 @@ const CHROME = [
 ].find((p) => p && existsSync(p));
 
 const MEASURE = `(function () {
-  var page = document.querySelector(".route-settings");
-  document.body.setAttribute("data-out", JSON.stringify({ h: Math.round(page.getBoundingClientRect().height) }));
+  var pages = Array.from(document.querySelectorAll("[data-routing-page]"));
+  var heights = {};
+  pages.forEach(function(page) {
+    pages.forEach(function(p) { p.dataset.active = String(p === page); });
+    heights[page.dataset.routingPage] = Math.ceil(page.getBoundingClientRect().height);
+  });
+  document.body.setAttribute("data-out", JSON.stringify(heights));
 })();`;
 
-function heightInChrome(html: string): number {
+function heightsInChrome(html: string): Record<string, number> {
   const css = readFileSync(`${CWD.cwd()}/src/App.css`, "utf8") + readFileSync(`${CWD.cwd()}/src/routingOverview.css`, "utf8");
   const dir = mkdtempSync(`${tmpdir()}/khipu-routing-overview-`);
   try {
     const file = `${dir}/page.html`;
     writeFileSync(file, `<!doctype html><html lang="en"><head><meta charset="utf-8"><style>${css}</style></head>` +
-      `<body><div id="root"><div class="settings-pane">${html}</div></div><script>${MEASURE}</script></body></html>`);
+      `<body><div id="root"><div class="shell"><aside class="rail"></aside><main class="main"><div class="main-content"><div class="panel-head"><h1>Accounts and routing</h1></div><div class="panel-body wide">${html}</div></div></main></div></div><script>${MEASURE}</script></body></html>`);
     const dom: string = execFileSync(CHROME!, [
       "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check", `--user-data-dir=${dir}/profile`,
-      "--window-size=1280,2400", "--virtual-time-budget=2000", "--dump-dom", `file://${file}`,
+      "--window-size=1100,720", "--virtual-time-budget=2000", "--dump-dom", `file://${file}`,
     ], { encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "ignore"] });
     const m = dom.match(/data-out="([^"]*)"/);
     if (!m) throw new Error("the page did not report its layout");
-    return (JSON.parse(m[1].replace(/&quot;/g, '"')) as { h: number }).h;
+    return JSON.parse(m[1].replace(/&quot;/g, '"')) as Record<string, number>;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -717,7 +722,7 @@ describe("Accounts and routing: a passing gap keeps its figures, as on Home", ()
       .filter((p) => p.key === `plan:${SECOND}`);
     expect(plan(gapRow())).toEqual([]);
     expect(routingProblems(v, { accounts: [gapRow()] }, null, settingsOf(6 * 3600), MORNING).map((p) => p.needs))
-      .toContain("Claude second: Khipu can't read its plan");
+      .toContain("Khipu can't read Claude second's plan");
     // 0 is "Never": kept figures never go out of date.
     expect(routingProblems(v, { accounts: [gapRow({ last_good_at: "2026-10-01T00:00:00Z" })] }, null, settingsOf(0), MORNING)
       .filter((p) => p.key === `plan:${SECOND}`)).toEqual([]);
@@ -731,14 +736,14 @@ describe("Accounts and routing: a passing gap keeps its figures, as on Home", ()
     answers.khipu_route_view = gapView();
     render(<RoutingSettings active plansState={plansOf([gapRow({ error: "not_signed_in" })])} />);
     const needs = await screen.findByRole("region", { name: "Needs you" });
-    await waitFor(() => expect(needs).toHaveTextContent("Claude second: not signed in"));
+    await waitFor(() => expect(needs).toHaveTextContent("Claude second isn't signed in"));
     const v = gapView();
     expect(routingProblems(v, { accounts: [gapRow({ error: "no_plan_limits" })] }, null, settingsOf(43200), MORNING).map((p) => p.needs))
-      .toContain("Claude second: its sign-in reports no plan limits");
+      .toContain("Claude second's sign-in reports no plan limits");
   });
 });
 
-describe.skipIf(!CHROME)("Accounts and routing laid out at 1280 wide", () => {
+describe.skipIf(!CHROME)("Accounts and routing laid out at 1100 wide", () => {
   /** Five accounts, five problems: a disagreement, a plan that can't be read,
    *  a rule to confirm, a runner that stopped reporting and a lane with no account. */
   function five(): RouteView {
@@ -760,32 +765,22 @@ describe.skipIf(!CHROME)("Accounts and routing laid out at 1280 wide", () => {
       planRow({ key: "grok|", harness: "grok", account: "Grok Build", ok: false, error: "no_answer", windows: [] }),
     ]);
 
-  // Routing slice 15d adds the approved Checks and copies group (mock
-  // checks-light.html): 56 px (one more closed row, 44 px, and the page's
-  // gap, 12 px) on top of the 46 px the page already carried over its old
-  // 1,400 px budget from slice 15c (it measured 1,446 px at 9e894c8).
-  // 1,400 + 46 + 56 = 1,502, so 1,510 keeps the 15c overage visible instead
-  // of excusing it, and every group can still be shut on one screen.
-  // Routing slice 15e adds the Pace, caps and advice group: one more closed
-  // card (46 px with the page's gap), and its open height fits the same
-  // 1,610 budget. Every group still shuts on one screen (under 830).
-  it("is under 1,610 px with Accounts open, and fits one screen with every group closed", async () => {
+  // Each destination has its own budget. The Work target is the owner's
+  // requested 1,600px at the real default app width, with the 216px rail.
+  it("keeps all eight destinations within their own readable height budgets at 1100", async () => {
     answers.khipu_route_view = five();
     const { container } = render(<RoutingSettings active plansState={plans()} />);
     await settled();
-    const needs = within(screen.getByRole("region", { name: "Needs you" })).getAllByRole("listitem");
-    expect(needs).toHaveLength(5);
-    const open = heightInChrome(container.innerHTML);
-    cleanup();
-    store.set(OPEN_KEY, "[]");
-    const closed = render(<RoutingSettings active plansState={plans()} />);
-    await settled();
-    const shut = heightInChrome(closed.container.innerHTML);
-    console.log(`Accounts and routing at 1280 wide: ${open} px with Accounts open, ${shut} px with every group closed`);
-    // The approved mock adds the Pace group, one closed card taller: 46 px
-    // of card and gap on top of the 15c budget (1,510 + 46 → 1,610 open;
-    // 760 + 46 → 830 shut).
-    expect(open).toBeLessThan(1610);
-    expect(shut).toBeLessThan(830);
+    const defaultHtml = container.innerHTML;
+    expandNeeds();
+    expect(within(screen.getByRole("region", { name: "Needs you" })).getAllByRole("listitem")).toHaveLength(5);
+    const heights = heightsInChrome(defaultHtml);
+    const budgets: Record<string, number> = { needs: 1600, accounts: 1800, work: 1600, macs: 800, conversations: 1800, changes: 1000, wrong: 2200, rare: 650 };
+    expect(Object.keys(heights)).toEqual(Object.keys(budgets));
+    console.log("Eight routing page heights at 1100:", heights);
+    for (const [page, budget] of Object.entries(budgets)) {
+      expect(heights[page], page).toBeGreaterThan(0);
+      expect(heights[page], page).toBeLessThanOrEqual(budget);
+    }
   }, 180000);
 });

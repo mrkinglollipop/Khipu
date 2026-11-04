@@ -114,6 +114,7 @@ type Tab =
   | "recall"
   | "activity"
   | "harnesses"
+  | "routing"
   | "settings"
   | "guides"
   | "revisions";
@@ -148,7 +149,7 @@ class PaneBoundary extends Component<PaneBoundaryProps, { failed: boolean }> {
 
 const PANE_TITLES: Record<Tab, string> = {
   "first-run": "Setup", home: "Home", activity: "Activity", recall: "Recall",
-  revisions: "Revisions", work: "Work", harnesses: "Harnesses", settings: "Settings", guides: "Guides",
+  revisions: "Revisions", work: "Work", harnesses: "Harnesses", routing: "Accounts and routing", settings: "Settings", guides: "Guides",
 };
 
 type CacheTab = "status" | "activity" | "revisions" | "doctor" | "rightNow";
@@ -431,6 +432,17 @@ const NAV_ICONS: Record<Exclude<Tab, "first-run" | "revisions">, ReactNode> = {
       }
     />
   ),
+  routing: (
+    <RailIcon
+      d={
+        <>
+          <path d="M3 5h10M3 11h10" />
+          <circle cx="6" cy="5" r="1.5" />
+          <circle cx="10" cy="11" r="1.5" />
+        </>
+      }
+    />
+  ),
   settings: (
     <RailIcon
       d={
@@ -614,7 +626,6 @@ type SettingsSection =
 const SETTINGS_SECTIONS: ReadonlyArray<readonly [SettingsSection, string]> = [
   ["database", "Database"],
   ["capture", "Capture & models"],
-  ["routing", "Accounts and routing"],
   ["owner", "Owner actions"],
   ["work", "Work"],
   ["projects", "Projects"],
@@ -1253,7 +1264,7 @@ const OwedRow = memo(function OwedRow({
 export default function App() {
   const [tab, setTab] = useState<Tab>("home");
   const [paneRetryKeys, setPaneRetryKeys] = useState<Record<Tab, number>>({
-    "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, settings: 0, guides: 0,
+    "first-run": 0, home: 0, activity: 0, recall: 0, revisions: 0, work: 0, harnesses: 0, routing: 0, settings: 0, guides: 0,
   });
   // Every screen shares one scroll container (`.main-content`), so a screen
   // would open scrolled to wherever the last one was left. A layout effect runs
@@ -2699,6 +2710,7 @@ export default function App() {
         ["recall", "Recall", "What does the agent remember about this?"],
         ["activity", "Activity", "Every session Khipu recorded"],
         ["harnesses", "Harnesses", "Claude Code · Cursor · Aegis · Codex"],
+        ["routing", "Accounts and routing", "Accounts, routing rules and what needs you"],
         ["settings", "Settings", "Capture, models, data and this Mac"],
       ] as const,
     [],
@@ -2750,8 +2762,8 @@ export default function App() {
   // Routing delivery is part of doctor, not `khipu route --json`; read the
   // existing cached report whenever this Settings group becomes active.
   useEffect(() => {
-    if (dsnOk && tab === "settings" && settingsSection === "routing") void loadDoctor(false);
-  }, [dsnOk, tab, settingsSection, loadDoctor]);
+    if (dsnOk && tab === "routing") void loadDoctor(false);
+  }, [dsnOk, tab, loadDoctor]);
   // Read once at start, so the count beside Projects shows before it is opened.
   const projects = useCliState<ProjectsList>("khipu_projects_list", true);
   const projectsWaiting = askedCount(projects.data);
@@ -2770,7 +2782,7 @@ export default function App() {
         ? "work"
         : tab === "guides"
           ? "guides"
-          : tab === "settings" && settingsSection === "routing"
+          : tab === "routing"
           ? "settings"
           : null,
   );
@@ -2788,14 +2800,17 @@ export default function App() {
     if (t.kind === "guide") openGuide(t.id);
     else if (t.kind === "harnesses") setTab("harnesses");
     else {
-      setSettingsSection(t.section as SettingsSection);
-      setTab("settings");
+      if (t.section === "routing") setTab("routing");
+      else {
+        setSettingsSection(t.section as SettingsSection);
+        setTab("settings");
+      }
     }
   };
   // Routing truth phase 4: the routing record (`khipu route --json`), read on
   // Home and every minute while Home stays open. Its attention items warn and
   // block nothing (the record is guidance, not a gate).
-  // Settings -> Accounts and routing reads its own; Work shows the accounts too.
+  // Accounts and routing is its own rail destination; Work shows the accounts too.
   const routing = useRouting(tab === "home" || tab === "work");
   // Work (docs/plans/2026-10-15-work-view.md, phase 4): the live view, read
   // every few seconds while Work is open and once a minute for the rail
@@ -2859,8 +2874,11 @@ export default function App() {
     if (target.kind === "home") setTab("home");
     else if (target.kind === "harnesses") setTab("harnesses");
     else if (target.kind === "settings") {
-      setSettingsSection(target.section);
-      setTab("settings");
+      if (target.section === "routing") setTab("routing");
+      else {
+        setSettingsSection(target.section);
+        setTab("settings");
+      }
       if (target.group) revealSettingsGroup(target.group);
     } else {
       setWelcomeInitialStep(target.step);
@@ -3584,6 +3602,7 @@ export default function App() {
       case "revisions": await loadRevisions(true); break;
       case "work": await Promise.all([work.load(true), loadOwed("open", true)]); break;
       case "harnesses": await loadDoctor(true); break;
+      case "routing": await Promise.all([loadDoctor(true), plans.load()]); break;
       case "settings": await Promise.all([refreshDsn(true), loadPaths(), loadGraphSources(), loadModels(), loadSecretsPresence()]); break;
       case "first-run": await refreshDsn(true); break;
       case "guides": await guideSignals.reload(); break;
@@ -4223,8 +4242,7 @@ export default function App() {
                 void routing.load();
               }}
               onOpenAccounts={() => {
-                setSettingsSection("routing");
-                setTab("settings");
+                setTab("routing");
                 revealSettingsGroup("accounts");
               }}
             />
@@ -4327,8 +4345,7 @@ export default function App() {
               noneTracked={noneTracked}
               onAddAccount={() => setAddAccountSignal((n) => n + 1)}
               onOpenAccounts={() => {
-                setSettingsSection("routing");
-                setTab("settings");
+                setTab("routing");
                 revealSettingsGroup("accounts");
               }}
             />
@@ -4337,8 +4354,7 @@ export default function App() {
               state={routing}
               plans={plans.data}
               onOpenAccounts={() => {
-                setSettingsSection("routing");
-                setTab("settings");
+                setTab("routing");
                 revealSettingsGroup("accounts");
               }}
             />
@@ -5764,8 +5780,7 @@ export default function App() {
               setSnoozeTarget(owedOpenRows.find((c) => String(c.id) === id) ?? { id: Number(id), text: title })
             }
             onOpenRouting={() => {
-              setSettingsSection("routing");
-              setTab("settings");
+              setTab("routing");
             }}
             onImportTracker={() => {
               setSettingsSection("work");
@@ -6006,6 +6021,23 @@ export default function App() {
           </PaneBoundary>
         </section>
 
+        <section className={panelClass("routing")}>
+          <PaneBoundary key={paneRetryKeys.routing} title={PANE_TITLES.routing} onRetry={retryActivePane}>
+          <PanelHeader title="Accounts and routing" lede="Accounts, routing rules, and what needs your attention." />
+          <div className="panel-body wide">
+            {tab === "routing" ? <RoutingSettings
+              active
+              plansState={plans}
+              onSetUpAccounts={openAccountsStepInFirstRun}
+              deliveryHealth={(doctorParsed as { routing_delivery?: RouteDeliveryHealth } | null)?.routing_delivery ?? null}
+              deliveryHealthError={doctorReadError}
+              deliveryHealthReadAt={doctorLastOkAt}
+              onRetryDelivery={() => loadDoctor(true)}
+            /> : null}
+          </div>
+          </PaneBoundary>
+        </section>
+
         <section className={panelClass("settings")}>
           <PaneBoundary key={paneRetryKeys["settings"]} title={PANE_TITLES["settings"]} onRetry={retryActivePane}>
           <PanelHeader
@@ -6181,18 +6213,6 @@ export default function App() {
                       .
                     </p>
                   </>
-                ) : null}
-
-                {settingsSection === "routing" ? (
-                  <RoutingSettings
-                    active={tab === "settings" && settingsSection === "routing"}
-                    plansState={plans}
-                    onSetUpAccounts={openAccountsStepInFirstRun}
-                    deliveryHealth={(doctorParsed as { routing_delivery?: RouteDeliveryHealth } | null)?.routing_delivery ?? null}
-                    deliveryHealthError={doctorReadError}
-                    deliveryHealthReadAt={doctorLastOkAt}
-                    onRetryDelivery={() => loadDoctor(true)}
-                  />
                 ) : null}
 
                 {settingsSection === "owner" ? (

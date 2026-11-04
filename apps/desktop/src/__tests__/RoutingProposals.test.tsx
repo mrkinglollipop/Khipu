@@ -9,6 +9,12 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { RoutingSettings, replicationStatusWords } from "../RoutingSettings";
 import { endedWords, holdChoiceIds, holdChoiceTargets, proposalsModel } from "../routingProposals";
 import type { RouteView } from "../routing";
+// @ts-expect-error node:fs has no types here
+import { readFileSync } from "node:fs";
+import { SETTING_WORDS_KEYS, decideCards, priorityChanges, settingValueWords } from "../routingNeeds";
+import type { RoutePriority, RouteRule } from "../routing";
+import type { RouteSetting } from "../routingNeeds";
+import { proposalAuthor } from "../routingProposals";
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -147,25 +153,29 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     expect(screen.getByText(/Ended today: 1 \(1 dismissed\)/)).toBeInTheDocument();
   });
 
-  it("confirms a rule proposal only through the owner's Confirm, on the existing rule command", async () => {
+  it("confirms a rule proposal only through the owner's button, on the existing rule command", async () => {
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm the proposed rule 1" }));
+    const card = screen.getByRole("article", { name: "A conversation reworded your rule 1" });
+    expect(card).toHaveTextContent("Your wordsUse at most 80% of the xAI week.");
+    expect(card).toHaveTextContent("The words in use nowUse at most 76% of the xAI week.");
+    expect(card).toHaveTextContent(/then your words come back/);
+    fireEvent.click(within(card).getByRole("button", { name: "Keep the new words" }));
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "confirm", n: 1, expect: "shown-rule-1" }]));
   });
 
-  it("dismisses a priority proposal in two steps, through Undo on the existing priority command", async () => {
+  it("goes back to the owner's priority in two steps, through Undo on the existing priority command", async () => {
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss the proposed your priority" }));
+    fireEvent.click(screen.getByRole("button", { name: "Go back to my order" }));
     expect(calls("khipu_route_priority")).toEqual([]);
-    const group = await screen.findByRole("group", { name: "Dismiss the proposed your priority?" });
-    fireEvent.click(within(group).getByRole("button", { name: "Dismiss it" }));
+    const group = await screen.findByRole("group", { name: "Go back to my order?" });
+    fireEvent.click(within(group).getByRole("button", { name: "Yes, go back to my order" }));
     await waitFor(() => expect(calls("khipu_route_priority")).toEqual([{ action: "undo", expect: "p3" }]));
   });
 
   it("edits a rule proposal's words, then makes them the owner's in two steps", async () => {
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Edit the proposed rule 1" }));
-    const form = screen.getByRole("form", { name: "Edit the proposed rule 1" });
+    fireEvent.click(screen.getByRole("button", { name: "Edit them first" }));
+    const form = screen.getByRole("form", { name: "Edit: A conversation reworded your rule 1" });
     fireEvent.change(within(form).getByLabelText("Words"), { target: { value: "Use at most 70% of the xAI week." } });
     fireEvent.click(within(form).getByRole("button", { name: "Save…" }));
     expect(calls("khipu_route_rule")).toEqual([]);
@@ -173,18 +183,19 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "edit", n: 1, text: "Use at most 70% of the xAI week." }]));
   });
 
-  it("a proposal whose words stay on another Mac offers Dismiss, never Confirm", async () => {
+  it("a proposal whose words stay on another Mac can be taken back, never kept here", async () => {
     answers.khipu_route_view = view({
       rules: [{ n: 1, entity: "rule-a", text: "Use at most 80% of the xAI week.", pending: true, pending_kind: "changed",
         pending_by: "a Claude Code conversation in project-a", prior_text: "Use at most 80% of the xAI week.", proposal_withheld: true }],
     });
     await page();
-    expect(screen.queryByRole("button", { name: "Confirm the proposed rule 1" })).toBeNull();
-    expect(screen.getByText(/Its words stay on the Mac it came from/)).toBeInTheDocument();
+    const card = screen.getByRole("article", { name: "A conversation on another Mac changed a rule" });
+    expect(within(card).queryByRole("button", { name: "Keep the new words" })).toBeNull();
+    expect(card).toHaveTextContent(/Its words stay on the Mac it came from/);
     expect(screen.getByText(/Share proposal words between your Macs” is off/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Dismiss the proposed rule 1" }));
-    const group = await screen.findByRole("group", { name: "Dismiss the proposed rule 1?" });
-    fireEvent.click(within(group).getByRole("button", { name: "Dismiss it" }));
+    fireEvent.click(within(card).getByRole("button", { name: "Keep my words" }));
+    expect(calls("khipu_route_rule")).toEqual([]);
+    fireEvent.click(within(card).getByRole("button", { name: "Yes, keep my words" }));
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "dismiss", n: 1 }]));
   });
 
@@ -198,7 +209,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
       return { ok: true };
     };
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm the proposed your priority" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep the new order" }));
     const panel = await screen.findByRole("group", { name: "End or keep each hold" });
     expect(within(panel).getByText(/Grok: held by you/)).toBeInTheDocument();
     expect(within(panel).getByText(/Grok: paused by you/)).toBeInTheDocument();
@@ -229,6 +240,8 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     await page();
     expect(document.body.textContent).not.toContain("SECRET OWNER WORDS");
     expect(document.body.textContent).not.toContain("What it said you asked");
+    expect(document.body.textContent).not.toContain("It says you asked");
+    expect(screen.queryByRole("button", { name: "Keep the new order" })).toBeNull();
     const list = screen.getByRole("list", { name: "Proposals" });
     const prio = within(list).getByText("Your priority").closest(".mrow")!;
     expect(prio).toHaveTextContent("Its words stay on the Mac it came from");
@@ -264,17 +277,19 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     const list = screen.getByRole("list", { name: "Proposals" });
     const row = within(list).getByText("Rule 4").closest(".mrow")! as HTMLElement;
     expect(row).toHaveTextContent(/isn't in this read/);
-    expect(within(row).queryByRole("button", { name: "Confirm the proposed rule 4" })).toBeNull();
-    expect(within(row).queryByRole("button", { name: "Dismiss the proposed rule 4" })).toBeNull();
+    expect(within(row).queryByRole("button")).toBeNull();
+    const card = screen.getByRole("article", { name: "A conversation proposed a change to a rule" });
+    expect(card).toHaveTextContent(/isn't in this read/);
+    expect(within(card).queryByRole("button")).toBeNull();
     expect(calls("khipu_route_priority")).toEqual([]);
     expect(calls("khipu_route_rule")).toEqual([]);
   });
 
-  it("lists each thing to confirm once in Needs you, under the proposals line alone", async () => {
+  it("gives each thing to decide one card in Needs you", async () => {
     await page();
     const needs = screen.getByRole("region", { name: "Needs you" });
-    const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("span")!.textContent);
-    expect(lines).toEqual(["2 proposals from conversations to confirm"]);
+    const titles = within(needs).getAllByRole("article").map((a) => a.getAttribute("aria-label"));
+    expect(titles).toEqual(["A conversation changed your order of accounts", "A conversation reworded your rule 1"]);
   });
 
   it("does not call an ended proposal 'today' when it has no ended time, however recent its write time", async () => {
@@ -450,5 +465,117 @@ describe("Proposals and holds: the pure model", () => {
       },
     });
     expect(proposalsModel(dated, MORNING).endedToday).toBe(1);
+  });
+});
+
+describe("Needs you: what a card says", () => {
+  const now = new Date("2026-11-03T15:00:00Z");
+  const request = { by_words: "a Codex conversation", at: "2026-11-03T14:30:00Z" };
+  const card = (key: string, s: Record<string, unknown>, routeView: RouteView | null = null) =>
+    decideCards(routeView, { [key]: { default: null, source: "file", ...s } as RouteSetting }, now)[0];
+
+  it("has words for every setting the CLI knows, and a unit for every count", () => {
+    const source = readFileSync("../../packages/cli/khipu/routing.py", "utf8");
+    const table = source.slice(source.indexOf("SETTINGS: dict[str"), source.indexOf("_UNITS = {"));
+    const entries = [...table.matchAll(/"(routing_[a-z_]+)":\s*\("([a-z_]+)",/g)].map((m) => [m[1], m[2]]);
+    expect(entries.length).toBeGreaterThan(50);
+    expect(entries.map(([key]) => key).filter((key) => !SETTING_WORDS_KEYS.includes(key))).toEqual([]);
+    for (const [key, kind] of entries) {
+      if (kind !== "count" && kind !== "number") continue;
+      // A bare number is what the owner couldn't read: 200 of what?
+      expect(settingValueWords(key, kind, 7), key).not.toMatch(/^[\d,.]+$/);
+    }
+  });
+
+  it("gives a setting's old and new value in words a person can read, never its stored form", () => {
+    const zero = card("routing_line_chars", { kind: "count", value: 0, default: 200, words: "Longest line, rules and note aside (0: no limit)", request: { ...request, prior: null } });
+    expect(zero.title).toBe("A conversation changed how long one line of routing news can be, not counting your rules and note");
+    expect(zero.before?.text).toBe("200 characters");
+    expect(zero.now?.text).toBe("No limit");
+    expect(zero.back).toBe("Go back to 200 characters");
+    const time = card("routing_stale_after", { kind: "duration", value: 3600, words: "Treat a report as out of date after (0: never)", request: { ...request, prior: 43200 } });
+    expect(time.before?.text).toBe("12 hours");
+    expect(time.now?.text).toBe("1 hour");
+    expect(settingValueWords("routing_runner_tail_bytes", "count", 524288)).toMatch(/KB|MB/);
+    expect(settingValueWords("routing_busy_load", "number", 75)).toBe("A load of 75");
+    expect(settingValueWords("routing_slow_read_pct", "number", 1)).toBe("1% of prompts");
+    expect(settingValueWords("routing_mac_names", "mac_names", { "abc123": "MacBook Air" })).toBe("MacBook Air");
+    const unknown = card("routing_new_thing", { kind: "count", value: 4, request });
+    expect(unknown.title).toBe("A conversation changed a routing setting");
+  });
+
+  it("names the job slot and account a lane map change touches, by label, and only those", () => {
+    const routeView = { accounts: [{ key: "claude|", label: "Claude" }, { key: "codex|", label: "Codex" }] } as unknown as RouteView;
+    const lanes = card("routing_lane_map", { kind: "lane_map", default: {}, words: "Which account each job lane uses",
+      value: { "Project B": { "opus-batch": "claude|", same: "codex|" }, "Project C": { gone: "old|~/x" } },
+      request: { ...request, prior: { "Project B": { same: "codex|" } } } }, routeView);
+    expect(lanes.title).toBe("A conversation changed which account a job slot uses");
+    expect(lanes.before?.text).toBe("opus-batch in Project B → no account\ngone in Project C → no account");
+    expect(lanes.now?.text).toBe("opus-batch in Project B → Claude\ngone in Project C → an account Khipu no longer tracks");
+    expect([lanes.keep, lanes.back]).toEqual(["Keep the new match", "Go back to the old match"]);
+  });
+
+  it("names a switch's result on its buttons", () => {
+    const off = card("routing_push_prompt", { kind: "switch", value: false, default: true, words: "Before each prompt", request: { ...request, prior: true } });
+    expect(off.title).toBe("A conversation turned off routing news before each prompt");
+    expect([off.keep, off.back]).toEqual(["Keep it off", "Turn it back on"]);
+    expect(off.ifIgnored).toBe("It stays off, and this stays here until you answer.");
+  });
+
+  it("says replication isn't in use until he answers", () => {
+    const on = card("routing_replication_live", { kind: "switch", value: false, default: false, request: { ...request, prior: null } });
+    expect(on.title).toBe("A conversation asked to turn on copying routing between your Macs");
+    expect(on.now?.text).toBe("Off");
+    expect([on.keep, on.back]).toEqual(["Turn it on", "Leave it off"]);
+    const off = card("routing_replication_live", { kind: "switch", value: false, default: false, request: { ...request, prior: true } });
+    expect([off.keep, off.back]).toEqual(["Keep it off", "Turn it back on"]);
+  });
+
+  it("says which way a login switch goes from what was asked, never by guessing from the value", () => {
+    const login = (value: boolean, asked: Record<string, unknown>) =>
+      card("routing_usage_login_cursor", { kind: "switch", value, default: false, request: { ...request, ...asked } });
+    const on = login(false, { asked: true, asked_set: true, prior: null });
+    expect(on.title).toBe("A conversation asked to turn on reading Cursor's usage from its login in the Keychain");
+    expect([on.keep, on.back]).toEqual(["Turn it on", "Leave it off"]);
+    expect(on.ifIgnored).toBe("It stays off, and this stays here until you answer.");
+    const off = login(true, { asked: false, asked_set: true, prior: true });
+    expect([off.keep, off.back]).toEqual(["Turn it off", "Leave it on"]);
+    // The refusal of a request that changes nothing covers only replication.
+    const same = login(true, { asked: true, asked_set: true, prior: true });
+    expect(same.title).toMatch(/, which is already on$/);
+    expect([same.keep, same.back]).toEqual(["Keep it on", "Drop the request"]);
+    expect(login(true, { asked: null, asked_set: false, prior: true }).keep).toBe("Use the default");
+    const older = login(false, { prior: null });
+    expect(older.title).toBe("A conversation asked to change reading Cursor's usage from its login in the Keychain");
+    expect(older.changed?.text).toMatch(/can't tell whether it turns it on or off/);
+    expect([older.keep, older.back]).toEqual(["Accept the change", "Leave it as it is"]);
+  });
+
+  it("says what a new order changed in a line: moved, added, removed, reworded", () => {
+    const e = (account: string, role?: string) => ({ account, label: account, role });
+    const p = (entries: ReturnType<typeof e>[], old: ReturnType<typeof e>[]) =>
+      ({ entries, pending: true, replaced: { entries: old } }) as unknown as RoutePriority;
+    expect(priorityChanges(p([e("B"), e("A"), e("C")], [e("A"), e("B"), e("C")]))).toBe("A moved to 2nd");
+    expect(priorityChanges(p([e("C"), e("A"), e("B")], [e("A"), e("B"), e("C")]))).toBe("C moved to 1st");
+    expect(priorityChanges(p([e("A"), e("D")], [e("A"), e("B")]))).toBe("D added as 2nd; B removed");
+    expect(priorityChanges(p([e("A", "new")], [e("A", "old")]))).toBe("A's role reworded");
+    expect(priorityChanges(p([e("A")], [e("A")]))).toBeNull();
+    expect(priorityChanges({ entries: [e("A")], pending: true } as unknown as RoutePriority)).toBeNull();
+  });
+
+  it("asks a second time before dropping a conversation's words, not before a setting that can be set again", () => {
+    const rule = { n: 1, text: "New.", pending: true, pending_kind: "added" } as RouteRule;
+    const [added] = decideCards({ rules: [rule] } as unknown as RouteView, null, now);
+    expect(added.back).toBe("Remove it");
+    expect(added.backAsk).toMatch(/^Remove this rule\?/);
+    expect(card("routing_push_prompt", { kind: "switch", value: false, request: { ...request, prior: true } }).backAsk).toBeNull();
+  });
+
+  it("says who in words, with today's time and a project when there is one", () => {
+    const named = card("routing_push_prompt", { kind: "switch", value: false, words: "X", request: { ...request, by: { kind: "conversation", harness: "claude_code", project: "project-a" }, prior: true } });
+    expect(named.who).toMatch(/^A Claude Code conversation in project-a, 30 min ago$/);
+    expect(proposalAuthor({ kind: "conversation", harness: "aegis" })).toBe("an Aegis conversation");
+    expect(proposalAuthor({ kind: "conversation", harness: "shell" })).toBe("a shell command");
+    expect(proposalAuthor({ kind: "conversation", harness: "made_up" })).toBe("a conversation");
   });
 });

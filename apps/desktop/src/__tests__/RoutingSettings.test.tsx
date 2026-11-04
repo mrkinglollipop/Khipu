@@ -209,6 +209,17 @@ async function page() {
   await screen.findByRole("list", { name: "Accounts" });
 }
 
+function expandNeeds() {
+  const needs = screen.getByRole("region", { name: "Needs you" });
+  for (let button; (button = within(needs).queryByRole("button", { name: /^Show \d+ more/ }));) fireEvent.click(button);
+}
+
+function openRare(name: string) {
+  fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+  const fold = screen.getByRole("button", { name });
+  if (fold.getAttribute("aria-expanded") === "false") fireEvent.click(fold);
+}
+
 function row(listName: string, start: string): HTMLElement {
   const list = screen.getByRole("list", { name: listName });
   const found = within(list).getAllByRole("listitem").find((r) => r.textContent?.startsWith(start));
@@ -449,7 +460,7 @@ describe("Settings -> Routing: standing rules", () => {
     // The stable entity is the write target; the accessible name stays in
     // owner-readable rule words while its display number is pending.
     fireEvent.click(screen.getByRole("button", { name: "Confirm rule Keep reviews local." }));
-    const provisionalRow = screen.getByText("Keep reviews local.").closest<HTMLElement>(".route-rule")!;
+    const provisionalRow = screen.getAllByText("Keep reviews local.").map((el) => el.closest<HTMLElement>(".route-rule")).find(Boolean)!;
     expect(within(provisionalRow).queryAllByRole("button", { name: /null/i })).toHaveLength(0);
     const confirm = await screen.findByRole("group", { name: "Confirm rule Keep reviews local.?" });
     fireEvent.click(within(confirm).getByRole("button", { name: "Confirm rule Keep reviews local." }));
@@ -459,6 +470,7 @@ describe("Settings -> Routing: standing rules", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save rule" }));
     await waitFor(() => expect(calls("khipu_route_rule")[1]).toEqual({ action: "confirm", entity: "rule:pending-1", expect: "shown-pending-1", holds: { h1: "end" } }));
 
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
     fireEvent.change(screen.getByLabelText("New rule"), { target: { value: "Use the review lane." } });
     fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
     fireEvent.click(screen.getByRole("button", { name: "Add the rule" }));
@@ -483,7 +495,7 @@ describe("Settings -> Routing: standing rules", () => {
       ? { ok: true }
       : { ok: false, error: "say end or keep in holds for: h1" };
     await page();
-    fireEvent.click(screen.getByRole("button", { name: "Confirm the proposed a rule" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep this rule" }));
     await screen.findByRole("group", { name: "End or keep each hold" });
     expect(calls("khipu_route_rule")[0]).toEqual({ action: "confirm", entity: "rule:proposal-1", expect: "shown-proposal-1" });
     fireEvent.click(screen.getByRole("radio", { name: "Keep it" }));
@@ -944,6 +956,7 @@ describe("Settings -> Routing: standing rules", () => {
 
   it("adds a rule after asking, and never with empty words", async () => {
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
     const box = screen.getByLabelText("New rule");
     fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Write the rule's words first.");
@@ -954,7 +967,8 @@ describe("Settings -> Routing: standing rules", () => {
     await waitFor(() => expect(calls("khipu_route_rule")).toEqual([{ action: "add", text: "-fast is never used" }]));
     const first = invokeMock.mock.calls.find(([cmd]) => cmd === "khipu_route_rule")?.[1] as { op: string };
     expect(first.op).toMatch(/^[0-9a-f-]{36}$/);
-    fireEvent.change(box, { target: { value: "another synthetic rule" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
+    fireEvent.change(screen.getByLabelText("New rule"), { target: { value: "another synthetic rule" } });
     fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
     fireEvent.click(screen.getByRole("button", { name: "Add the rule" }));
     await waitFor(() => expect(calls("khipu_route_rule")).toHaveLength(2));
@@ -985,6 +999,7 @@ describe("Settings -> Routing: keyboard focus around inline questions (F5)", () 
 
   it("moves focus into Add this rule?, and Escape gives it back to Add rule…", async () => {
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Add rule…" }));
     fireEvent.change(screen.getByLabelText("New rule"), { target: { value: "Keep Codex for reviews." } });
     const add = screen.getByRole("button", { name: "Add rule…" });
     add.focus();
@@ -1037,6 +1052,7 @@ describe("Settings -> Routing: holds", () => {
 
   it("adds a hold with its words, scope, kind and end, until cleared too", async () => {
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
     fireEvent.click(screen.getByRole("button", { name: "Add hold" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Write what conversations should know.");
     fireEvent.change(screen.getByLabelText("Words"), { target: { value: "Keep it for reviews" } });
@@ -1053,23 +1069,29 @@ describe("Settings -> Routing: holds", () => {
 
   it("says a hold's longest words by the field, checks them first, and lets you raise the limit (F3)", async () => {
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
     await waitFor(() => expect(screen.getByText("At most 300 characters")).toBeInTheDocument());
     fireEvent.change(screen.getByLabelText("Words"), { target: { value: "x".repeat(301) } });
     fireEvent.click(screen.getByRole("button", { name: "Add hold" }));
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("A hold's words are at most 300 characters (these are 301 characters).");
-    expect(alert).toHaveTextContent("raise the limit under Longest words in a hold below");
+    expect(alert).toHaveTextContent("raise the limit under Longest words in a hold in Rarely needed");
     expect(alert.textContent).not.toMatch(/routing_/);
     expect(calls("khipu_route_hold_add")).toEqual([]);
+    fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Priority and hold limits" }));
     fireEvent.click(screen.getByRole("button", { name: "Change: Longest words in a hold" }));
     fireEvent.change(screen.getByLabelText("Longest words"), { target: { value: "0" } });
     fireEvent.click(within(screen.getByRole("form", { name: "Change: Longest words in a hold" })).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(calls("khipu_config_set")).toEqual([{ key: "routing_hold_chars", value: "0" }]));
+    openRare("Sizes, timing and hand-off scripts");
     expect(screen.getByRole("button", { name: "Change: Longest line" })).toBeEnabled();
   });
 
   it("changes how long a conversation's hold lasts, and its most", async () => {
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Priority and hold limits" }));
     expect(await screen.findByText("24 hours · at most 7 days")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Change: How long a conversation's hold lasts" }));
     fireEvent.change(screen.getByLabelText("At most"), { target: { value: "0" } });
@@ -1114,6 +1136,7 @@ describe("Settings -> Routing: telling conversations", () => {
     answers.khipu_config_show = () =>
       calls("khipu_config_set").length ? config({ routing_dispatch_scripts: setting(["dispatch.py", "run-job.sh"], []) }) : config();
     await page();
+    openRare("Sizes, timing and hand-off scripts");
     const row = screen.getByText("Your dispatch scripts").closest(".row-item") as HTMLElement;
     expect(within(row).getByText("None")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Change your dispatch scripts" }));
@@ -1145,6 +1168,7 @@ describe("Settings -> Routing: telling conversations", () => {
 
   it("shows every size and time, each removable on the spot", async () => {
     await page();
+    openRare("Sizes, timing and hand-off scripts");
     await screen.findByText("1,500 characters");
     for (const words of ["400 characters", "50 ms", "20 changes or 6 hours", "12 hours", "30 minutes", "5 minutes"]) {
       expect(screen.getByText(words)).toBeInTheDocument();
@@ -1161,6 +1185,7 @@ describe("Settings -> Routing: telling conversations", () => {
   it("shows the CLI's refusal of a size", async () => {
     answers.khipu_config_set = { ok: false, error: "routing_stale_after must be a whole number of 0 or more" };
     await page();
+    openRare("Sizes, timing and hand-off scripts");
     await screen.findByText("1,500 characters");
     fireEvent.click(screen.getByRole("button", { name: "Change: Treat a report as out of date after" }));
     fireEvent.change(screen.getByLabelText("Out of date after"), { target: { value: "0" } });
@@ -1188,6 +1213,7 @@ describe("Settings -> Routing: telling conversations", () => {
 describe("Settings -> Routing: checking for resets", () => {
   it("writes the master switch, wait, retries, and each busy setting through fixed controls", async () => {
     await page();
+    openRare("Checking accounts when they reset");
     fireEvent.click(await screen.findByRole("switch", { name: "Check an account at its reset time" }));
     await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_reset_check", value: "off" }));
 
@@ -1223,6 +1249,7 @@ describe("Settings -> Routing: checking for resets", () => {
     answers.khipu_config_show = config({ routing_reset_check_retries: setting([900, 2400]) });
     answers.khipu_route_check = { ok: true, reason: "not checked: the Mac was busy" };
     await page();
+    openRare("Checking accounts when they reset");
     expect(await screen.findByLabelText("First retry in seconds")).toHaveValue("900");
     expect(screen.getByText(/Claude main:.*this account can't be checked without using a turn/)).toBeInTheDocument();
     const dialog = openAccount("Claude main");
@@ -1238,6 +1265,7 @@ describe("Settings -> Routing: checking for resets", () => {
     answers.khipu_route_view = v;
     answers.khipu_route_check = { ok: true, reason: "not checked: the Mac was busy" };
     await page();
+    openRare("Checking accounts when they reset");
     await screen.findByLabelText("First retry in seconds");
     const dialog = openAccount("Claude main");
     const stateLine = () => dialog.querySelector(".sheet-state")!;
@@ -1261,6 +1289,7 @@ describe("Settings -> Routing: checking for resets", () => {
     expect(limitWords(1, "attempts")).toBe("1 attempt");
     answers.khipu_config_show = config({ routing_busy_load: setting(0), routing_reset_check_retries: setting([]) });
     await page();
+    openRare("Checking accounts when they reset");
     const busy = screen.getByRole("button", { name: "Change: Wait while the Mac is busy" }).closest(".route-limit")!;
     expect(busy).toHaveTextContent("Never wait · 5 minutes · 3 attempts");
     const retries = screen.getByLabelText("First retry in seconds").closest(".route-limit")!;
@@ -1349,6 +1378,7 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
 
   it("shows the routing table file read only, and recent changes by day", async () => {
     await page();
+    openRare("Old routing table file");
     expect(await screen.findByText("/notes/routing/ROUTING-NOW.md")).toBeInTheDocument();
     expect(screen.getByText("Current-state section changed 9:20 AM")).toBeInTheDocument();
     const today = screen.getByRole("list", { name: "Today" });
@@ -1415,9 +1445,10 @@ describe("Settings -> Routing: providers and lanes", () => {
     answers.khipu_route_view = lanesView();
     answers.khipu_config_show = lanesConfig();
     await page();
-    const group = screen.getByRole("region", { name: "Providers and lanes" });
+    openRare("Providers and account setup");
+    expect(screen.getByRole("region", { name: "Providers and lanes" })).toBeInTheDocument();
     expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("5 providers · 2 folders, 8 lanes");
-    const rows = within(group).getAllByRole("list", { name: "Providers" })[0]!;
+    const rows = screen.getByRole("list", { name: "Providers" });
     expect(within(rows).getAllByRole("listitem").map((r) => r.querySelector(".name")?.textContent)).toEqual([
       "Claude", "Codex", "Grok", "GLM", "Muse",
     ]);
@@ -1435,6 +1466,7 @@ describe("Settings -> Routing: providers and lanes", () => {
     answers.khipu_route_view = lanesView();
     answers.khipu_config_show = lanesConfig();
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Something's wrong" }));
     expect(row("Lanes", "claude")).toHaveTextContent("project-a runner");
     expect(row("Lanes", "claude")).toHaveTextContent("No account");
     expect(row("Lanes", "claude")).toHaveTextContent("two accounts match the name");
@@ -1460,41 +1492,35 @@ describe("Settings -> Routing: providers and lanes", () => {
     expect(within(row("Lanes", "main-opus")).getByText("Conflict")).toBeInTheDocument();
     expect(row("Lanes", "main-opus")).toHaveTextContent("Fix the runner's settings, or pick the account here.");
     const needs = screen.getByRole("region", { name: "Needs you" });
-    expect(within(needs).getByText("Lane claude in project-a matches two accounts")).toBeInTheDocument();
-    expect(within(needs).getByText("Lane review-2 in project-a has no account")).toBeInTheDocument();
+    expect(within(needs).getByText("Job slot claude in project-a matches two accounts")).toBeInTheDocument();
+    expect(within(needs).getByText("Job slot review-2 in project-a has no account")).toBeInTheDocument();
     expect(within(needs).queryByText(/main-opus/)).toBeNull();
     expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("2 lanes without an account");
     expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("1 lane conflicts");
   });
 
-  it("folds the job runner folders under the lanes, saying how each is doing", async () => {
+  it("keeps the job runner folders beside the lanes, saying how each is doing", async () => {
     answers.khipu_route_view = lanesView();
     answers.khipu_config_show = lanesConfig();
     await page();
-    const fold = screen.getByRole("button", { name: /Job runner folders/ });
-    expect(fold).toHaveTextContent("2 folders, both reporting");
-    expect(fold).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Something's wrong" }));
+    expect(screen.getByRole("region", { name: "Providers and lanes" })).toHaveTextContent("2 folders, both reporting");
     expect(row("Job runner folders", "project-a")).toHaveTextContent("Read just now · 3 lanes");
     expect(within(row("Lanes", "claude")).queryByRole("button", { name: "Remove" })).toBeNull();
   });
 
-  it("says No job runners yet, and its Add a folder opens the folders fold", async () => {
+  it("says No job runners yet and keeps its Add a folder control", async () => {
     answers.khipu_route_view = { ...lanesView(), sources: { runners: [], table: { stamped_at: null, changed_at: null } } };
     answers.khipu_config_show = config({
       routing_sources: setting([], []),
       routing_lane_map: setting({}, {}),
     });
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Something's wrong" }));
     expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("No job runner folders");
     expect(screen.getByText("No job runners yet")).toBeInTheDocument();
     expect(screen.getByText("Add a job runner folder and its lanes show here with the account each one uses.")).toBeInTheDocument();
-    const foldersFold = screen.getByRole("button", { name: /Job runner folders/ });
-    // The page opens every fold for these tests; close this one so the empty
-    // state's own Add a folder… is the one button.
-    fireEvent.click(foldersFold);
-    expect(foldersFold).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(screen.getByRole("button", { name: "Add a folder…" }));
-    expect(foldersFold).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(within(screen.getByRole("region", { name: "Providers and lanes" })).getByRole("button", { name: "Add a folder…" }));
     expect(await screen.findByRole("form", { name: "Add a job runner folder" })).toBeInTheDocument();
   });
 });
@@ -1710,11 +1736,12 @@ describe("Settings -> Routing: checks and copies", () => {
     // Neither the table nor any flag offers Confirm, Compare, Dismiss or Set a level.
     expect(within(group).queryByRole("button", { name: /Confirm|Compare|Dismiss|Set a level|Make it a cap/ })).toBeNull();
 
+    expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
     expect(within(needs).getByText("Priority 2 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
     expect(within(needs).getByText("Priority 3 names Antigravity, which Khipu doesn't track")).toBeInTheDocument();
     expect(within(needs).queryByText(/Rule 9|Rules 3 and 6|edit to rule 7/)).toBeNull();
-    fireEvent.click(within(needs).getByRole("button", { name: "Show Priority 2 names Grok Build, which you paused until Fri 9:00 AM" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Look at it: Priority 2 names Grok Build, which you paused until Fri 9:00 AM" }));
     const target = document.querySelector<HTMLElement>('[data-route-item="check:account_state:grok:main:priority-1:0"]')!;
     await waitFor(() => expect(document.activeElement).toBe(target));
   });
@@ -1737,6 +1764,7 @@ describe("Settings -> Routing: checks and copies", () => {
     const titled = row("Contradictions and out-of-date words", "Rule 12 names Grok Build");
     expect(titled).toHaveTextContent("Rule 12 names Grok Build, which you paused until Fri 9:00 AM");
     expect(titled).toHaveTextContent("Your rule names an account you paused.");
+    expandNeeds();
     expect(within(screen.getByRole("region", { name: "Needs you" }))
       .getByText("Rule 12 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
   });
@@ -1744,12 +1772,9 @@ describe("Settings -> Routing: checks and copies", () => {
   it("folds the confirmed model table with all eleven kinds of work", async () => {
     answers.khipu_route_view = checksView();
     await page();
-    const fold = screen.getByRole("button", { name: /Your model table/ });
-    expect(fold).toHaveTextContent("11 kinds of work · confirmed by you");
-    expect(fold).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(fold);
-    expect(fold).toHaveAttribute("aria-expanded", "true");
-    const table = screen.getByRole("region", { name: "Your model table" });
+    fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Model table" }));
+    const table = screen.getByRole("button", { name: "Model table" }).closest("section")!;
     expect([...table.querySelectorAll("dt")].map((d) => d.textContent)).toEqual([
       "Scopes and designs", "Mocks", "Rulings", "Hardest security code", "A fix that already failed",
       "Builds", "Fix rounds", "Tests", "Docs", "Reports and summaries", "Searches and lookups",
@@ -1799,6 +1824,7 @@ describe("Settings -> Routing: choosing the routing table file (R2-1)", () => {
   it("chooses a file when none is set, refusing a relative path", async () => {
     answers.khipu_config_show = config({ routing_table: setting(null, null) });
     await page();
+    openRare("Old routing table file");
     expect(await screen.findByText("No file set")).toBeInTheDocument();
     const choose = screen.getByRole("button", { name: "Choose the routing table file" });
     expect(choose).toHaveTextContent("Choose…");
@@ -1825,6 +1851,7 @@ describe("Settings -> Routing: choosing the routing table file (R2-1)", () => {
   it("changes the file, stops reading it, and shows the CLI's refusal", async () => {
     answers.khipu_config_set = { ok: false, error: "routing_table can't name a file inside a private folder" };
     await page();
+    openRare("Old routing table file");
     const change = await screen.findByRole("button", { name: "Change the routing table file" });
     expect(change).toHaveTextContent("Change…");
     fireEvent.click(change);
@@ -1931,7 +1958,7 @@ describe("Settings -> Routing: focus after a button removes itself (R2-2)", () =
     fireEvent.click(screen.getByRole("button", { name: "End the hold on all work" }));
     fireEvent.click(within(await screen.findByRole("group", { name: "End the hold on all work?" })).getByRole("button", { name: "End the hold" }));
     await waitFor(() => expect(screen.queryByRole("button", { name: "End the hold on all work" })).toBeNull());
-    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add hold" })));
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("button", { name: "Add hold…" })));
   });
 
   it("leaves focus on a button the write keeps", async () => {
@@ -1964,6 +1991,7 @@ describe("Settings -> Routing: no fixed cap on the owner's words (R2-4)", () => 
   it("sends a hold longer than 4,000 characters when Longest words is No limit, and says what the app can hand over", async () => {
     answers.khipu_config_show = config({ routing_hold_chars: setting(0, 300) });
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
     expect(await screen.findByText("No limit on length; the app hands over up to 128 KB at once")).toBeInTheDocument();
     const words = "Keep this account for the nightly review only. ".repeat(100).trim();
     expect(words.length).toBeGreaterThan(4000);
@@ -1972,7 +2000,8 @@ describe("Settings -> Routing: no fixed cap on the owner's words (R2-4)", () => 
     fireEvent.click(within(form).getByRole("button", { name: "Add hold" }));
     await waitFor(() => expect(calls("khipu_route_hold_add")).toHaveLength(1));
     expect(calls("khipu_route_hold_add")[0]!.text).toBe(words);
-    expect(screen.getByText(/Khipu sets no limit on its\s+length/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
+    expect(screen.getByText("No limit on length; the app hands over up to 128 KB at once")).toBeInTheDocument();
   });
 });
 
@@ -1987,13 +2016,16 @@ const CHROME = [
 ].find((p) => p && existsSync(p));
 
 const GAPS = `(function () {
-  var page = document.querySelector(".route-settings");
-  var kids = Array.prototype.filter.call(page.children, function (e) { return e.getBoundingClientRect().height > 0; });
-  var gaps = [];
-  for (var i = 1; i < kids.length; i++) {
-    gaps.push(Math.round(kids[i].getBoundingClientRect().top - kids[i - 1].getBoundingClientRect().bottom));
-  }
-  document.body.setAttribute("data-out", JSON.stringify({ gaps: gaps, n: kids.length }));
+  var pages = Array.from(document.querySelectorAll("[data-routing-page]"));
+  var out = pages.map(function(page) {
+    pages.forEach(function(p) { p.dataset.active = String(p === page); });
+    var groups = Array.from(page.children).filter(function(e) {
+      return e.matches(".route-page-group,.route-rare-fold,.needs,.section-body") && e.getBoundingClientRect().height > 0;
+    });
+    var gaps = groups.slice(1).map(function(e,i) { return Math.round(e.getBoundingClientRect().top - groups[i].getBoundingClientRect().bottom); });
+    return { page: page.dataset.routingPage, n: groups.length, gaps: gaps };
+  });
+  document.body.setAttribute("data-out", JSON.stringify(out));
 })();`;
 
 describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
@@ -2004,8 +2036,9 @@ describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
     // settings, so an early snapshot on a busy machine had fewer cards.
     await screen.findByRole("list", { name: "Accounts" });
     await screen.findByRole("region", { name: "Needs you" });
+    openRare("Checking accounts when they reset");
     await waitFor(() => expect(screen.getByLabelText("First retry in seconds")).toHaveValue("600"));
-    const css: string = readFileSync(`${CWD.cwd()}/src/App.css`, "utf8");
+    const css: string = readFileSync(`${CWD.cwd()}/src/App.css`, "utf8") + readFileSync(`${CWD.cwd()}/src/routingOverview.css`, "utf8");
     const dir = mkdtempSync(`${tmpdir()}/khipu-routing-settings-`);
     try {
       const file = `${dir}/page.html`;
@@ -2026,9 +2059,12 @@ describe.skipIf(!CHROME)("Settings -> Routing laid out (fix round 1)", () => {
         throw new Error(`the page did not report its layout (status ${run.status}, signal ${run.signal}, ` +
           `${run.error?.message ?? "no error"}): ${(run.stderr ?? "").slice(-2000)}`);
       }
-      const out = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&")) as { gaps: number[]; n: number };
-      expect(out.n).toBeGreaterThanOrEqual(5);
-      for (const g of out.gaps) expect(g).toBeGreaterThanOrEqual(12);
+      const out = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, "&")) as { page: string; gaps: number[]; n: number }[];
+      expect(out.map((p) => p.page)).toEqual(["needs", "accounts", "work", "macs", "conversations", "changes", "wrong", "rare"]);
+      for (const page of out) {
+        expect(page.n, page.page).toBeGreaterThanOrEqual(1);
+        for (const g of page.gaps) expect(g, page.page).toBeGreaterThanOrEqual(page.page === "work" ? 8 : 12);
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2041,6 +2077,7 @@ describe("Settings -> Routing: the routing table file in plain words", () => {
   it("names the setting as its row does, never by its key (S1)", async () => {
     answers.khipu_config_set = { ok: false, error: "routing_table needs the file's full path (starting with / or ~)" };
     await page();
+    openRare("Old routing table file");
     fireEvent.click(await screen.findByRole("button", { name: "Change the routing table file" }));
     const form = screen.getByRole("form", { name: "Change the routing table file" });
     fireEvent.change(within(form).getByLabelText("File"), { target: { value: "/notes/other.md" } });
@@ -2232,6 +2269,7 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
       routing_ledger_keep_days: setting(7),
     });
     await page();
+    openRare("Sizes, timing and hand-off scripts");
     await screen.findByText("512 KB");
     for (const [name, words] of [
       ["How long a limit reported without a time lasts", "30 minutes"],
@@ -2328,6 +2366,7 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
       expect(slot).toHaveAttribute("aria-busy", "true");
       expect(slot).toHaveTextContent("Reading…");
     }
+    openRare("Checking accounts when they reset");
     // Folders and lanes say Reading…, never "none yet", before the settings arrive.
     expect(screen.queryByText(/No job runner folders yet/)).toBeNull();
     expect(screen.queryByText(/Lanes show here once/)).toBeNull();
@@ -2374,23 +2413,26 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
   it("shows a conversation's change to a routing setting and answers it as the owner", async () => {
     const lanes = setting({ jobs: { r: "codex|" } }, {});
     answers.khipu_config_show = config({
-      routing_lane_map: { ...lanes, words: "Which account each job lane uses",
+      routing_lane_map: { ...lanes, kind: "lane_map", words: "Which account each job lane uses",
         request: { request: "send lane r to Codex", by_words: "a Claude Code conversation in project-a", prior: {} } },
     });
     await page();
-    const box = screen.getByRole("group", { name: "A conversation changed: Which account each job lane uses" });
-    expect(box).toHaveTextContent("changed by a Claude Code conversation in project-a at your request");
-    expect(box).toHaveTextContent("What it said you asked: “send lane r to Codex”");
-    fireEvent.click(within(box).getByRole("button", { name: "Undo" }));
+    const box = screen.getByRole("article", { name: "A conversation changed which account a job slot uses" });
+    expect(box).toHaveTextContent("A Claude Code conversation in project-a");
+    expect(box).toHaveTextContent("It says you asked“send lane r to Codex”");
+    expect(box).toHaveTextContent("Beforer in jobs → no account");
+    expect(box).toHaveTextContent("In use nowr in jobs → ");
+    expect(box).not.toHaveTextContent("{");
+    fireEvent.click(within(box).getByRole("button", { name: "Go back to the old match" }));
     await waitFor(() => expect(calls("khipu_config_request")).toEqual([{ key: "routing_lane_map", action: "undo" }]));
-    fireEvent.click(within(box).getByRole("button", { name: "Confirm" }));
+    fireEvent.click(within(box).getByRole("button", { name: "Keep the new match" }));
     await waitFor(() => expect(calls("khipu_config_request")).toHaveLength(2));
     expect(calls("khipu_config_request")[1]).toEqual({ key: "routing_lane_map", action: "confirm" });
   });
 
   it("shows no request box when nothing waits", async () => {
     await page();
-    expect(screen.queryByRole("group", { name: /^A conversation changed:/ })).toBeNull();
+    expect(screen.queryByRole("article", { name: /^A conversation / })).toBeNull();
   });
 });
 
@@ -2410,6 +2452,8 @@ it("shows a Cursor lane matched to Grok without writing a lane override", async 
 
 it("creates a tracked GLM account and its provider facts from Settings", async () => {
   await page();
+  fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+  fireEvent.click(screen.getByRole("button", { name: "Providers and account setup" }));
   fireEvent.click(screen.getByRole("button", { name: "Add provider account" }));
   const form = screen.getByRole("form", { name: "Add provider account" });
   fireEvent.change(within(form).getByLabelText("Account name"), { target: { value: "GLM work" } });
@@ -2428,6 +2472,8 @@ it("retains a failed account form and existing provider facts", async () => {
   } } } };
   answers.khipu_route_definition = { ok: false, error: "The definition could not be saved." };
   await page();
+  fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+  fireEvent.click(screen.getByRole("button", { name: "Providers and account setup" }));
   fireEvent.click(screen.getByRole("button", { name: "Add provider account" }));
   const form = screen.getByRole("form", { name: "Add provider account" });
   fireEvent.change(within(form).getByLabelText("Provider"), { target: { value: "deepseek" } });
@@ -2464,12 +2510,13 @@ describe("Settings -> Routing: an account's line opens its Routing detail (C5)",
     expect(within(dialog).queryByRole("button", { name: "More" })).toBeNull();
   });
 
-  it("shows Keep and Undo for a conversation's change to the accounts, above the list", async () => {
+  it("shows a conversation's change to the accounts under Needs you, and doesn't say nothing needs you", async () => {
     answers.khipu_accounts_status = status({ request: { request: "track my Kimi account", by: { label: "a Codex conversation" } } });
     await page();
-    const band = await screen.findByRole("group", { name: "A conversation changed your accounts" });
-    expect(within(band).getByRole("button", { name: "Keep" })).toBeInTheDocument();
-    expect(within(band).getByRole("button", { name: "Undo" })).toBeInTheDocument();
+    const band = await within(screen.getByRole("region", { name: "Needs you" })).findByRole("article", { name: "A conversation changed which accounts Khipu reads" });
+    expect(within(band).getByRole("button", { name: "Keep the new list" })).toBeInTheDocument();
+    expect(within(band).getByRole("button", { name: "Go back to the old list" })).toBeInTheDocument();
+    expect(screen.queryByText("Nothing here needs you.")).toBeNull();
   });
 });
 
@@ -2483,6 +2530,8 @@ describe("Settings -> Accounts and routing: reading a tool's own login", () => {
   it("shows one switch per tool, Cursor's saying macOS may ask, and writes each through the fixed command", async () => {
     answers.khipu_config_show = LOGIN();
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reading usage from logins" }));
     const grok = await screen.findByRole("switch", { name: "Read Grok's usage from its own login" });
     expect(grok).toBeChecked();
     const cursor = screen.getByRole("switch", { name: "Read Cursor's usage from its Keychain login" });
@@ -2499,18 +2548,50 @@ describe("Settings -> Accounts and routing: reading a tool's own login", () => {
   it("asks once in one line on a new install that has the login, and not after the owner answered", async () => {
     answers.khipu_config_show = LOGIN({ value: false, ask: true });
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reading usage from logins" }));
     expect(await screen.findByText(/Grok's login is on this Mac\. Turn on "Read Grok's usage from its own login"/)).toBeInTheDocument();
     expect(screen.getAllByRole("status").filter((n) => /login is on this Mac/.test(n.textContent ?? ""))).toHaveLength(1);
     cleanup();
     answers.khipu_config_show = LOGIN({ value: false, source: "file", ask: false });
     await page();
+    fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reading usage from logins" }));
     await screen.findByRole("switch", { name: "Read Grok's usage from its own login" });
     expect(screen.queryByText(/login is on this Mac/)).toBeNull();
   });
 
   it("shows no login switch for a CLI that has none of these settings", async () => {
     await page();
+    openRare("Checking accounts when they reset");
     await screen.findByRole("switch", { name: "Check an account at its reset time" });
     expect(screen.queryByRole("switch", { name: /from its own login|Keychain login/ })).toBeNull();
+  });
+});
+
+describe("Settings -> Accounts and routing: eight pages", () => {
+  it("keeps every page in the permanent navigation and moves existing Mac controls without changing their command", async () => {
+    await page();
+    const nav = screen.getByRole("navigation", { name: "Accounts and routing pages" });
+    expect(within(nav).getAllByRole("button").map((b) => b.textContent)).toEqual([
+      "Needs you", "Your accounts", "Who gets what work", "Your Macs", "Conversations", "What changed", "Something's wrong", "Rarely needed",
+    ]);
+    fireEvent.click(within(nav).getByRole("button", { name: "Your Macs" }));
+    const macs = document.querySelector<HTMLElement>('[data-routing-page="macs"]')!;
+    expect(macs).toHaveAttribute("data-active", "true");
+    expect(within(macs).getByRole("switch", { name: "Copy routing between your Macs through the hub" })).toBeInTheDocument();
+    expect(within(macs).getByRole("switch", { name: "Share proposal words between your Macs" })).toBeInTheDocument();
+    fireEvent.click(within(macs).getByRole("switch", { name: "Copy routing between your Macs through the hub" }));
+    await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_replication_live", value: "on" }));
+  });
+
+  it("puts runner and lane controls on Something's wrong, where Needs you links already point", async () => {
+    await page();
+    const nav = screen.getByRole("navigation", { name: "Accounts and routing pages" });
+    fireEvent.click(within(nav).getByRole("button", { name: "Something's wrong" }));
+    const wrong = document.querySelector<HTMLElement>('[data-routing-page="wrong"]')!;
+    expect(wrong).toHaveAttribute("data-active", "true");
+    expect(within(wrong).getByText("Providers and lanes")).toBeInTheDocument();
+    expect(within(wrong).getByRole("list", { name: "Lanes" })).toBeInTheDocument();
   });
 });

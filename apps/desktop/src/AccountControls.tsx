@@ -28,6 +28,8 @@ import { callCli } from "./settingsCli";
 import { plainError } from "./humanWords";
 import { chosenEnd, endChoices, holdKind } from "./routingWords";
 import { whenLocal } from "./routing";
+import { DecideWords } from "./DecideWords";
+import { accountsCard } from "./routingNeeds";
 import type { CapStatus, RouteAccount, RouteHold, RouteView } from "./routing";
 import type { CapRow } from "./accountDetailModel";
 import type { UsageAccount } from "./PlansCard";
@@ -961,16 +963,6 @@ function ReplaceKey({ row, onChanged }: { row: UsageAccount; onChanged?: () => P
 // Settings → Accounts: a conversation changed the list of accounts
 // ---------------------------------------------------------------------------
 
-type AccountsRequest = { request?: string | null; by?: unknown; at?: string | null };
-
-function requestBy(by: unknown): string {
-  if (by && typeof by === "object") {
-    const o = by as { label?: unknown; name?: unknown; harness?: unknown };
-    for (const v of [o.label, o.name, o.harness]) if (typeof v === "string" && v) return v;
-  }
-  return typeof by === "string" && by ? by : "a conversation";
-}
-
 /** Keep or Undo for the change a conversation made to the accounts Khipu
  *  reads (`accounts request confirm|undo`, answered against the version the
  *  owner saw). */
@@ -982,8 +974,8 @@ export function AccountsRequestBand({ support, reload, onChanged }: {
   const [busy, setBusy] = useState<"confirm" | "undo" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const status = support.state === "here" ? support.status : null;
-  const request = (status?.request ?? null) as AccountsRequest | null;
-  if (!status || !request || typeof request !== "object") return null;
+  const card = accountsCard(status, new Date());
+  if (!status || !card) return null;
   const answer = async (action: "confirm" | "undo") => {
     setBusy(action);
     setError(null);
@@ -997,22 +989,19 @@ export function AccountsRequestBand({ support, reload, onChanged }: {
     }
   };
   return (
-    <div className="route-disagree" role="group" aria-label="A conversation changed your accounts" tabIndex={-1}>
-      <span>
-        <b>A conversation changed your accounts.</b> {requestBy(request.by)} changed which accounts Khipu reads at your request, and you haven't answered yet.
-      </span>
-      {request.request ? <span>What it said you asked: “{request.request}”</span> : null}
-      <div className="toolbar">
+    <article className="needs-card" data-route-item={card.key} tabIndex={-1} aria-label={card.title}>
+      <DecideWords card={card} />
+      <div className="needs-acts">
         <button type="button" className="sm primary" disabled={busy != null} onClick={() => void answer("confirm")}>
           <Busy on={busy === "confirm"} />
-          Keep
+          {card.keep}
         </button>
         <button type="button" className="sm" disabled={busy != null} onClick={() => void answer("undo")}>
           <Busy on={busy === "undo"} />
-          Undo
+          {card.back}
         </button>
       </div>
       {error ? <p className="set-error" role="alert">Khipu didn't make that change: {error}</p> : null}
-    </div>
+    </article>
   );
 }

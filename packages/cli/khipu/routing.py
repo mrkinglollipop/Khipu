@@ -547,7 +547,10 @@ def settings_status() -> dict[str, dict]:
                     "request": {"request": waiting.get("request"), "by": waiting.get("by"), "at": waiting.get("at"),
                                 "by_words": author_words(waiting.get("by") if isinstance(waiting.get("by"), dict)
                                                          else None, push=True),
-                                "prior": waiting.get("prior")} if waiting else None}
+                                "prior": waiting.get("prior"),
+                                # What was asked for, as stored: ``value`` can't
+                                # say, a login switch's being the one still in use.
+                                "asked": config.get(key), "asked_set": key in config} if waiting else None}
     return out
 
 

@@ -101,7 +101,7 @@ export function agoSpan(iso: string, now: Date): string {
 export type LimitUnit = "time" | "chars" | "ms" | "changes" | "bytes" | "lines" | "intervals" | "pct" | "load" | "attempts" | "days" | "rules";
 
 /** "512 KB", "1 MB", "300 bytes": a size in bytes. */
-function bytesWords(value: number): string {
+export function bytesWords(value: number): string {
   const MB = 1024 * 1024;
   if (value >= MB && value % (MB / 4) === 0) return `${(value / MB).toLocaleString()} MB`;
   if (value >= 1024 && value % 1024 === 0) return `${(value / 1024).toLocaleString()} KB`;

@@ -37,6 +37,10 @@ import { PlanBlock } from "../src/PlansCard";
 import { ProjectsSettings } from "../src/ProjectsSettings";
 import type { ProjectsList } from "../src/ProjectsSettings";
 import { useCliState } from "../src/settingsCli";
+import { invoke } from "./fakeTauri";
+import { RoutingCard } from "../src/RoutingCard";
+import { useRouting } from "../src/routing";
+import type { UsageReport } from "../src/PlansCard";
 import type { UsageAccount } from "../src/PlansCard";
 import { PaceSection } from "../src/RoutingSettings";
 import { paceModel } from "../src/routingPace";
@@ -268,7 +272,54 @@ function RoutingProposals() {
   );
 }
 
+/** Needs you with every kind of item in the same Settings split as the app.
+ * `?pane=` remains for narrow checks; the default is the full desktop pane so
+ * the routing page list is judged at its real available width. */
+function RoutingNeeds() {
+  const requestedPane = Number(new URLSearchParams(window.location.search).get("pane"));
+  const pane = requestedPane > 0 ? requestedPane : null;
+  const [plans, setPlans] = useState<UsageReport | null>(null);
+  useEffect(() => {
+    void invoke<string>("khipu_usage_status").then((text) => setPlans(JSON.parse(text) as UsageReport));
+  }, []);
+  return (
+    <div className="shell">
+      <aside className="rail" aria-label="App navigation">
+        <div className="rail-drag" />
+        <b className="brand"><span className="brand-name">Khipu</span></b>
+        <div className="rail-nav">
+          <div className="nav-group">
+            <button type="button" className="nav">Home</button>
+            <button type="button" className="nav">Work</button>
+            <button type="button" className="nav active">Accounts and routing</button>
+          </div>
+        </div>
+      </aside>
+      <main className="main">
+        <div className="main-content" data-routing-scroll-container>
+          <div className="panel-head"><h1>Accounts and routing</h1><p className="lede">Accounts, routing rules, and what needs your attention.</p></div>
+          <div className="panel-body wide settings-body" style={{ maxWidth: "none", minWidth: 0 }}>
+            <div className="settings-pane" style={{ width: pane ? `${pane}px` : "100%", maxWidth: "100%", minWidth: 0 }}>
+              <RoutingSettings active plansState={{ data: plans, error: null, reread: async () => {} } as never}
+                deliveryHealth={{ status: "red", identities: [{ identity: "codex:abc", component: "main", status: "red", owed: 3 }] } as never} />
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+/** Home's routing card with a priority a conversation set. */
+function HomeNeeds() {
+  const route = useRouting(true);
+  return <RoutingCard state={route} />;
+}
+
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
+  "routing-needs": { title: "Needs you: every kind of item (settings reorg slice A)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
+  "routing-needs-worst": { title: "Needs you: the longest words (settings reorg slice A)", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
+  "home-needs": { title: "Home: Confirm a priority a conversation set", fake: { routeNeeds: true, nineB: true }, render: () => <HomeNeeds /> },
   pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
   delivery: { title: "Telling conversations (fictional delivery evidence)", fake: { route15a: true }, render: () => <RoutingDelivery /> },
   "delivery-unknown": { title: "Telling conversations (missing evidence)", fake: { route15a: true }, render: () => <RoutingDelivery health={{ status: "unknown", identities: [], missing: ["live delivery identities"], replication: { status: "unknown" }, gateway: { status: "unknown" } }} /> },
@@ -383,14 +434,9 @@ function Page() {
       </main>
     );
   }
-  if (hash === "routing-proposals" || hash === "routing-replication") {
+  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst") {
     // The Settings pane at its app width, uncapped by the 960 state frame.
-    return (
-      <main style={{ padding: 24 }} data-state={hash}>
-        <h1 style={{ fontSize: 14, color: "var(--muted)" }}>{st.title}</h1>
-        {st.render()}
-      </main>
-    );
+    return <div style={{ height: "100%" }} data-state={hash}>{st.render()}</div>;
   }
   return (
     // The pace group is screenshotted at the Settings pane's own 720px width,
