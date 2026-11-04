@@ -528,7 +528,11 @@ def status(now=None):
     caught = routing._parse(state.get("caught_up_at"))
     offset = state.get("hub_offset_seconds", 0)
     age = max(0, (now + timedelta(seconds=offset) - caught).total_seconds()) if caught else None
+    first_catch_up = caught is None and bool(state.get("uploaded") or state.get("scan_after"))
     return dict(caught_up_at=state.get("caught_up_at"), age_seconds=age,
+                first_catch_up=first_catch_up,
+                words=("Copying routing between your Macs for the first time. This can take a few minutes."
+                       if first_catch_up else None),
                 stale=age is None or age > 600, sources=state.get("sources", []),
                 hub_offset_seconds=state.get("hub_offset_seconds"),
                 deferred_kinds=sorted(set(state.get("deferred", {}).values())))
@@ -537,7 +541,10 @@ def status(now=None):
 def age_line(now=None):
     if not routing._replication_live():
         return None
-    age = status(now)["age_seconds"]
+    current = status(now)
+    if current["first_catch_up"]:
+        return current["words"]
+    age = current["age_seconds"]
     return ("routing from other Macs has not been received yet" if age is None else
             f"routing from other Macs is {int(age // 60)} min old")
 

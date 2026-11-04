@@ -590,3 +590,19 @@ def test_confirmed_words_and_proposal_identity_share_one_locked_read(pair, monke
     assert view["rules"][0]["text"] == "first proposal"
     second_event = next(e for e in routing.read_events()[0] if e["id"] == results[0]["id"])
     assert view["proposals"][second_event["proposal"]]["status"] == "crossed"
+
+
+def test_first_catch_up_status_words_and_overlap_is_not_failure(pair, monkeypatch):
+    from khipu import routing_replication as replication
+    from contextlib import contextmanager
+    a, b, hub = pair
+    a.activate()
+    monkeypatch.setattr(replication, "_state", lambda: {"uploaded": {"mac": 3}})
+    assert replication.status()["first_catch_up"] is True
+    assert "first time" in replication.age_line()
+    @contextmanager
+    def occupied():
+        raise BlockingIOError()
+        yield
+    monkeypatch.setattr(replication, "_sync_lock", occupied)
+    assert replication.sync(hub=hub) == {"ok": True, "caught_up": False, "busy": True}
