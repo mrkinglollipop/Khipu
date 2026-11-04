@@ -3300,7 +3300,7 @@ function MacRoutingControls({
         <div className="route-copy-option" role="group" aria-label="Routing copy">
         <SwitchRow
           id="route-replication-live"
-          label="Keep settings the same on my Macs"
+          label="Keep settings the same on my Macs — Copy routing between your Macs through the hub"
           what="Turns routing copy on all your Macs. Shared settings, rules and caps use the hub; local folders, logins and egress controls stay here."
           tag={<Tag>Between your Macs</Tag>}
           checked={cfg?.routing?.routing_replication_live?.value === true}

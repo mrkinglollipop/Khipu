@@ -23,6 +23,7 @@ def _stamp(dt):
 
 EPOCH = "1970-01-01T00:00:00Z"
 POLL_SECONDS = 30
+UPLOAD_PER_TURN = 64
 
 
 def _path(name):
@@ -390,7 +391,9 @@ def _control_sync(*, hub=None):
         _save(state)
         return {"ok": True, "disabled": True, "caught_up": False}
     except BlockingIOError:
-        return {"ok": False, "caught_up": False, "error": "busy"}
+        # The periodic timer overlapping another sync is ordinary contention,
+        # not a failed transport or a reason to alarm the owner.
+        return {"ok": True, "caught_up": False, "busy": True}
     except Exception:
         return {"ok": False, "caught_up": False, "error": "replication_unavailable"}
 
@@ -429,6 +432,8 @@ def _sync(*, hub=None, limit=500, max_pages=20):
             uploaded = state.setdefault("uploaded", {})
             deferred = state.setdefault("deferred", {})
             skipped = 0
+            sent_this_turn = 0
+            local_pending = False
             ordered = sorted(enumerate(local, 1), key=lambda pair: (pair[1].get("mac", ""), pair[1].get("seq", pair[0]), pair[0]))
             for position, event in ordered:
                 origin = event.get("mac") or "legacy"
@@ -449,6 +454,16 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                     skipped += 1
                 uploaded[origin] = max(seq, uploaded.get(origin, 0))
                 _save(state)
+                sent_this_turn += 1
+                # Uploading an old local backlog before ever pulling starves
+                # every other Mac.  One bounded slice, then a pull, makes
+                # progress fair and leaves the remaining local rows durable.
+                if sent_this_turn >= UPLOAD_PER_TURN:
+                    local_pending = any(
+                        later.get("id") and later.get("seq", n) > uploaded.get(later.get("mac") or "legacy", 0)
+                        for n, later in ordered[position:]
+                    )
+                    break
             for _ in range(max_pages):
                 after = state.get("scan_after") or [state.get("pull_cursor", EPOCH), ""]
                 result = hub.pull(after, state.get("scan_until"), limit)
@@ -472,7 +487,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                     state.pop("scan_until", None)
                     state.pop("error", None)
                     _save(state)
-                    return dict(ok=True, caught_up=True, skipped=skipped,
+                    return dict(ok=True, caught_up=not local_pending, local_pending=local_pending, skipped=skipped,
                                 deferred_kinds=sorted(set(deferred.values())))
                 if not rows:
                     raise ValueError("pull made no progress")
@@ -481,7 +496,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                 _save(state)
             return dict(ok=True, caught_up=False, partial=True)
     except BlockingIOError:
-        return dict(ok=False, caught_up=False, error="busy")
+        return dict(ok=True, caught_up=False, busy=True)
     except Exception:
         # Keep cursors as last persisted: the failed operation may have committed.
         return dict(ok=False, caught_up=False, error="replication_unavailable")

@@ -4080,8 +4080,10 @@ def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
         # Tracking includes owner-defined accounts without a usage reader.
         # Only legacy login keys get the default-login fallback; an absent
         # stable definition is no longer tracked even with no known accounts.
-        configured = key in known_keys or in_settings.get(
-            key, not known_keys and "|" in key and not key.partition("|")[2] and not none)
+        # A stable id from another Mac may have no local ``harness|home``
+        # binding yet.  Absence is not an explicit owner choice to untrack;
+        # only a configured list omission or an owner untracked note is.
+        configured = key in known_keys or in_settings.get(key, not known_keys and not none)
         active.append({"account": key, "label": label, "role": item.get("role"), "until": item.get("until"),
                        "in_settings": bool(configured)})
         # An exception shows only before its end; one that has passed leaves
@@ -4900,6 +4902,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                                           "written_by": note["written_by"], "via": note["via"]}
     labels = {e["key"]: e["label"] for e in entries}
     in_settings = {e["key"]: e["configured"] for e in entries}
+    in_settings.update({key: False for key, note in notes.items() if note.get("state") == "untracked"})
     if cfg.get("_accounts_version"):
         priority_version = f"{priority_version}.{cfg['_accounts_version']}"
     priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys, none=none)

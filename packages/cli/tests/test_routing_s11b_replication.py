@@ -6,6 +6,7 @@ from datetime import timedelta
 import pytest
 
 from khipu import routing
+from khipu.routing_replication import UPLOAD_PER_TURN
 from tests.test_routing_acceptance import Replay, T0, AUTHOR
 
 
@@ -132,6 +133,19 @@ def test_12_partial_pull_does_not_claim_caught_up_and_resumes(pair):
     assert sync(b, hub, limit=1, max_pages=1)["caught_up"] is True
     assert len(b.view()["rules"]) == 3
     assert replication.status()["sources"]
+
+
+def test_upload_backlog_yields_to_pull_after_a_bounded_slice(pair):
+    a, b, hub = pair
+    a.activate()
+    for n in range(UPLOAD_PER_TURN + 3):
+        routing.add_rule(f"backlog {n}", via="app")
+    first = sync(a, hub)
+    assert first["ok"] and first["local_pending"] and not first["caught_up"]
+    # A peer can already receive this bounded slice; it is not stuck behind
+    # the source Mac's whole historical upload queue.
+    assert sync(b, hub)["ok"]
+    assert len(b.view()["rules"]) == UPLOAD_PER_TURN
 
 
 def test_12_overlap_finds_late_commit_behind_previous_cursor(pair):
