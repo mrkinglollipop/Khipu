@@ -4707,6 +4707,14 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
             out["job_state"] = {"ok": True}
         except Exception as exc:  # noqa: BLE001 — no timer stage starves the next
             out["job_state"] = timer_error(exc)
+        # The routing copy between Macs must not depend on a prompt helper
+        # being alive. Last, so a slow hub cannot delay the stages above.
+        try:
+            from khipu import routing
+
+            out["routing_copy"] = routing.poll_refold()
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out["routing_copy"] = timer_error(exc)
         print(json.dumps(out, indent=2))
         return rc
     if args.snapshot_cmd == "status":

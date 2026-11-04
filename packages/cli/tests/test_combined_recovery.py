@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from khipu import cli, hub_snapshot as hs, jobs, owner_direction, owner_writes as ow
-from khipu import promote as pm, replica_heal as rh, storage
+from khipu import promote as pm, replica_heal as rh, routing, storage
 
 
 @pytest.fixture(autouse=True)
@@ -116,7 +116,7 @@ def test_owner_replay_preserves_write_after_transient_enospc(fake_world, monkeyp
 # Every timer stage is a best-effort local recovery action. A failure must be
 # visible, but no stage gets to starve the rest of the timer tick.
 @pytest.mark.parametrize("failure", [RuntimeError("timer fault"), OSError(errno.ENOSPC, "disk full")])
-@pytest.mark.parametrize("failed_stage", ["storage", "replica", "owner", "job_state"])
+@pytest.mark.parametrize("failed_stage", ["storage", "replica", "owner", "job_state", "routing"])
 def test_heal_timer_stages_are_isolated_and_storage_runs_first(fake_world, monkeypatch, capsys, failure, failed_stage):
     calls = []
 
@@ -132,13 +132,14 @@ def test_heal_timer_stages_are_isolated_and_storage_runs_first(fake_world, monke
     monkeypatch.setattr(rh, "run", stage("replica", {"ok": True, "action": "none"}))
     monkeypatch.setattr(owner_direction, "timer", stage("owner", {"ok": True}))
     monkeypatch.setattr(jobs, "_write_job_state", stage("job_state", None))
+    monkeypatch.setattr(routing, "poll_refold", stage("routing", {"folded": False}))
 
     rc = cli.cmd_snapshot(argparse.Namespace(snapshot_cmd="heal"))
     out = json.loads(capsys.readouterr().out)
 
-    assert calls == ["storage", "replica", "owner", "job_state"]
-    key = {"storage": "storage_sweep", "replica": "replica_heal",
-           "owner": "owner_direction", "job_state": "job_state"}[failed_stage]
+    assert calls == ["storage", "replica", "owner", "job_state", "routing"]
+    key = {"storage": "storage_sweep", "replica": "replica_heal", "owner": "owner_direction",
+           "job_state": "job_state", "routing": "routing_copy"}[failed_stage]
     if failed_stage == "replica":
         assert rc == 1
     else:
