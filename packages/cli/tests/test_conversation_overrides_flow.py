@@ -9,7 +9,7 @@ from datetime import timedelta
 
 import pytest
 
-from khipu import cli, conversation_overrides as overrides, priority_cleanup, routing
+from khipu import cli, conversation_overrides as overrides, owner_direction, priority_cleanup, routing
 from tests.test_owner_direction_e2e import SESSION, _act, _hook, world as _world  # noqa: F401
 
 world = _world
@@ -225,7 +225,7 @@ def test_a_near_copy_goes_through_with_a_receipt_naming_the_similar_one(world, k
     assert len(codex["exceptions"]) == 3
 
 
-def test_a_near_copy_held_for_one_yes_has_its_normal_receipt_naming_the_similar_one(world):
+def test_a_near_copy_held_for_one_yes_has_its_normal_receipt_naming_the_similar_one(world, khipu_app):
     routing._owner_write({"type": "priority_set", "entries": [{"account": "codex|", "label": "Codex", "role": "r"}],
                           "until": None}, "app")
     routing.amend_priority("Codex", exception="re-check of PRs #3 and #11 before the release goes out today",
@@ -235,10 +235,17 @@ def test_a_near_copy_held_for_one_yes_has_its_normal_receipt_naming_the_similar_
     bad, out = _act("route.priority.amend", {"account": "Codex", "expect": version, "until": _in(5),
                                               "exception": "re-check of PRs #3 and #11 before the release goes out today please"})
     assert not bad and out["ok"] is True, out
-    assert "reads almost the same as an instruction already there" in out["receipt"]
-    assert f"khipu owner-direction undo {out['owner_action']}" in out["receipt"]
+    # The normal receipt (kept in the owner-actions log, with its Undo) names the similar instruction.
+    line = owner_direction._find(out["owner_action"])
+    assert "reads almost the same as an instruction already there" in line["receipt"]["what"]
+    assert out["similar_exception"] in line["receipt"]["what"]
     codex = next(e for e in routing.read_view()["priority"]["entries"] if e["account"] == "codex|")
     assert len(codex["exceptions"]) == 2
+    # And its Undo takes only the new one back.
+    khipu_app.as_app()
+    assert cli.main(["owner-direction", "undo", "--from-app", "--", out["owner_action"]]) == 0
+    codex = next(e for e in routing.read_view()["priority"]["entries"] if e["account"] == "codex|")
+    assert [x["id"] for x in codex["exceptions"]] == [out["similar_exception"]]
 
 
 def test_overrides_that_no_longer_make_sense_are_offered_for_ending(world):

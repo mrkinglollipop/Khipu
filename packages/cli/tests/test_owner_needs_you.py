@@ -226,6 +226,15 @@ def test_a_hub_that_cannot_be_read_leaves_the_rest_of_the_list_and_says_so(world
     assert out["unread"][0]["why"] == "the hub can't be reached right now" and "hub.example" not in json.dumps(out)
 
 
+def _override_due(monkeypatch) -> None:
+    from khipu import conversation_overrides as overrides
+
+    monkeypatch.setattr(overrides, "REVIEW_DAYS", -1)
+    overrides.grant({"account": "Codex", "indefinite": True, "effect": "ahead_of_pace", "request": "run ahead",
+                     "subject": {"kind": "session", "id": "review-me", "harness": "codex", "project": "p", "mac": "m1"}})
+    monkeypatch.setattr(overrides, "REVIEW_DAYS", 7)
+
+
 def _all_confirmations(world, monkeypatch) -> dict[str, dict]:
     _priority_request(world)
     _rule_added(world)
@@ -234,6 +243,7 @@ def _all_confirmations(world, monkeypatch) -> dict[str, dict]:
     _tier_request(world)
     _cap_request(world)
     _held_pause(world)
+    _override_due(monkeypatch)
     monkeypatch.setattr(owner_act, "_forget_list", lambda: {
         "strings": ["forgotten-a"], "ids": [{"id": 41, "summary": "a talk about the roof"}], "at": "2026-11-01T00:00:00Z"})
     monkeypatch.setattr(owner_direction, "read_alarm", lambda: {"at": "2026-11-01T00:00:00Z", "first_bad": {}})

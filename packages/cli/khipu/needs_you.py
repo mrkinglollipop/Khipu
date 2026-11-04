@@ -36,7 +36,7 @@ KINDS = CONFIRM_KINDS + LOOK_KINDS
 # Each kind the app's routingOverview.ts knows (``TAG_WORDS``): the kind it is
 # here, or why its Needs you never shows it.
 APP_KINDS: dict[str, str] = {
-    "priority": "priority", "confirm": "rule", "proposal": "proposal", "remind": "remind", "disagree": "disagree",
+    "priority": "priority", "confirm": "rule", "old-file-rules": "rule", "proposal": "proposal", "remind": "remind", "disagree": "disagree",
     "broken": "broken", "contradiction": "contradiction", "signin": "signin", "plan": "plan",
     "crossing": "crossing", "lane": "lane", "silent": "silent", "unreadable": "unreadable", "refused": "refused",
     "delivery-behind": "delivery-behind", "delivery-copy": "delivery-copy", "delivery-read": "delivery-read",

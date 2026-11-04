@@ -4105,7 +4105,7 @@ function ProvidersLanesSection({
           <div className="rows">
             <LimitRow
               name="Say a job runner stopped reporting after"
-              help="Counted in the runner's own check-in intervals."
+              help="Counted in the job runner's own check-in intervals."
               fields={[{ key: "routing_runner_silent_intervals", label: "Stopped after", unit: "intervals", options: [2, 3, 5, 10, 20, 0], zero: "Never" }]}
               cfg={cfg}
               w={w}
