@@ -1,4 +1,4 @@
-"""Append-only routing exchange. Network access exists only behind the live switch.
+"""Retained routing exchange. Network access exists only behind the live switch.
 
 The local log remains authoritative for its private fields. remote.jsonl stores
 projected events and hub receipts, never a rewritten copy of events.jsonl.

@@ -78,6 +78,16 @@ def test_day_120_stream_figures_and_owner_rate(world, record_property, replicati
     start = END - timedelta(days=120)
     stream = synth.Stream(KEYS, start, seed=7, runners=1, lanes=4)
     rows = stream.until(END)
+    # Real event ids are UUIDv7. Preserve references while giving the fixture
+    # that typed shape, so the closed projection accepts every supported row.
+    ids = {}
+    for row in rows:
+        wall = f"{int(routing._parse(row['written_at']).timestamp() * 1000):012x}"
+        ids[row['id']] = f"{wall[:8]}-{wall[8:]}-7000-8000-{row['seq']:012x}"
+    for row in rows:
+        row['id'] = ids[row['id']]
+        if row.get('target') in ids:
+            row['target'] = ids[row['target']]
     owners = sum(r.get('written_by', {}).get('kind') == 'owner' for r in rows)
     synth.write(routing.events_file(), rows)
     if replication:
@@ -91,6 +101,7 @@ def test_day_120_stream_figures_and_owner_rate(world, record_property, replicati
         bindings, _forwards, _aliases = routing.account_identity.state(routing.read_events()[0], routing.accounts())
         projected = [row for row in routing.replication_payload(rows, bindings=bindings) if row.get("id")]
         deferred = {row["id"]: row["type"] for row in rows if row["type"] not in routing._REPLICATION_FIELDS}
+        assert len(projected) + len(deferred) == len(rows)
         # A bulk post-sync fixture avoids benchmarking per-receipt disk writes.
         # Pair tests exercise actual paginated sync and the completed watermark.
         rr._store([dict(payload=row, event_id=row["id"], hub_order=n,
@@ -115,12 +126,15 @@ def test_day_120_stream_figures_and_owner_rate(world, record_property, replicati
                    remote_lines=rc._lines(remote_path.read_bytes()) if remote_path.exists() else 0,
                    merged_lines=len(routing.read_events()[0]),
                    deferred_lines=len(rr._state().get("deferred", {})) if replication else 0,
+                   projected_rows=len(projected) if replication else 0,
+                   initial_deferred_lines=len(deferred) if replication else 0,
                    archive_bytes=archive_bytes, owner_lines=owners, owner_lines_per_day=owners / 120,
                    configured_owner_lines_per_day=stream.owner_per_day)
     print('DAY120 ' + json.dumps(figures, sort_keys=True))
     record_property('day120', json.dumps(figures))
     assert rc.full_log() == [json.dumps(row, sort_keys=True).encode() for row in rows]
     assert owners > 0 and after['lines'] < before['lines']
+    assert figures['merged_lines'] <= rc.LINES_YELLOW
 
 
 def test_replica_sync_survives_source_compaction_and_later_owner_write(pair, old_reader):
