@@ -1341,6 +1341,164 @@ def _legacy_projection_kind(original: Any, incoming: dict[str, Any]) -> str | No
     return None
 
 
+REPLAY_KIND = "replayed_capture"
+# What write_pg itself rewrites or adds on the way to a row's raw: the topic
+# classifier's labels and K6's scope, what project inheritance, alias resolution
+# and the checkout observation read from the hub, and the two keys never stored
+# from a caller. Everything else a capture carries is evidence.
+_REPLAY_ENRICHED = frozenset({"topics", "tags", "topics_unresolved", "scope", "project", "repo_root",
+                              "typed_project", "root_commit", "checkout", "origin", "merged_from"})
+_REPLAY_SAME = ("session_id", "transcript_range", "event")
+# What ``_merge_into_episode`` unions into the row's columns.
+_REPLAY_FOLDED = frozenset({"decisions", "preferences", "people"})
+# A writer of another version may not have set these (the Sep 14 app never sets
+# ``part``, and only a writer since 2026-11-02 sets ``transcript_sha256``), so
+# only two values that are both there can disagree.
+_REPLAY_IF_BOTH = ("harness", "window_id", "part", "transcript_sha256")
+
+
+def _instant(value: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _replay_lacks(stored: Any, incoming: Any) -> list[str] | None:
+    """Whether a capture is a replay of the one a row's raw holds, as a pure
+    function of the two, so a resolution record proves itself later.
+
+    None: not shown to be the same capture. It needs the same instant and
+    summary, the same session, range and event (a capture with no natural key
+    has no such identity), and no disagreement in ``_REPLAY_IF_BOTH``.
+
+    Otherwise the evidence fields the capture carries with a value and the
+    episode does not hold, which is ``[]`` for a replay. A list item may be on
+    the raw or on a capture merged into it, and the row may hold more. An
+    unknown field counts as evidence, so a field added later is never dropped.
+    Labels and scope are ``_REPLAY_ENRICHED``: alias folding reads a table that
+    moves, so a faithful replay cannot reproduce them, and they are retrieval
+    labels that the resolution record keeps with the whole job."""
+    from khipu.capture_identity import has_natural_key
+
+    if not (isinstance(stored, dict) and isinstance(incoming, dict) and has_natural_key(incoming)):
+        return None
+
+    def text(value: Any) -> str:
+        return "" if value is None else str(value)
+
+    at = _instant(incoming.get("ts"))
+    if at is None or at != _instant(stored.get("ts")) or incoming.get("summary") != stored.get("summary"):
+        return None
+    if any(text(stored.get(k)) != text(incoming.get(k)) for k in _REPLAY_SAME):
+        return None
+    if any(stored.get(k) and incoming.get(k) and text(stored[k]) != text(incoming[k]) for k in _REPLAY_IF_BOTH):
+        return None
+    return _evidence_lacks(stored, incoming)
+
+
+def _evidence_lacks(stored: dict[str, Any], incoming: dict[str, Any]) -> list[str]:
+    """The evidence fields a capture carries with a value and a row's raw does
+    not hold. Identity, labels and scope are not evidence here; a caller decides
+    whether the two are comparable at all."""
+
+    def canonical(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    merged = [entry["payload"] for entry in stored.get("merged_from") or []
+              if isinstance(entry, dict) and isinstance(entry.get("payload"), dict)]
+    settled = {"ts", "summary", *_REPLAY_SAME, *_REPLAY_IF_BOTH, *_REPLAY_ENRICHED}
+    # Inheritance never blanks a project, so a job's project on a row without
+    # one is not a faithful replay's: it would stay in the archive alone.
+    lacks = [key for key in ("project", "repo_root") if incoming.get(key) and not stored.get(key)]
+    for key, value in incoming.items():
+        if key in settled or value is None or value == "" or value == [] or value == {} \
+                or (key == "truncated_chars" and value == 0):
+            continue
+        if isinstance(value, list):
+            # A merged capture's list counts only where the merge folds it into
+            # a column a reader sees; anywhere else it is kept in raw alone.
+            lists = [stored.get(key), *(m.get(key) for m in merged if key in _REPLAY_FOLDED)]
+            held = {canonical(item) for items in lists if isinstance(items, list) for item in items}
+            found = all(canonical(item) in held for item in value)
+        elif key == "verbatim" and isinstance(value, dict):
+            found = _verbatim_contained(stored.get(key), value)
+        else:
+            found = canonical(stored.get(key)) == canonical(value)
+        if not found:
+            lacks.append(key)
+    return lacks
+
+
+SPAN_KIND = "span_covered"
+_SPAN_RANGE = re.compile(r"[0-9]+:[0-9]+")
+
+
+def _transcript_span(value: Any) -> tuple[int, int] | None:
+    """A transcript range as (start, end); None for anything but digits:digits
+    with some width running forward."""
+    if not isinstance(value, str) or not _SPAN_RANGE.fullmatch(value):
+        return None
+    start, end = (int(part) for part in value.split(":"))
+    return (start, end) if start < end else None
+
+
+def _span_contains(stored: Any, incoming: Any) -> bool:
+    """A row of the capture's session and harness whose range contains its."""
+    if not (isinstance(stored, dict) and isinstance(incoming, dict)):
+        return False
+    inner, outer = _transcript_span(incoming.get("transcript_range")), _transcript_span(stored.get("transcript_range"))
+    if inner is None or outer is None or outer[0] > inner[0] or inner[1] > outer[1]:
+        return False
+    return not any(not incoming.get(k) or stored.get(k) != incoming.get(k) for k in ("session_id", "harness"))
+
+
+def _span_digest_says(stored: dict[str, Any], incoming: dict[str, Any]) -> bool | None:
+    """At one range, whether two window digests name the same text; None when a
+    digest is missing or the ranges differ, where it can't say."""
+    digests = stored.get("transcript_sha256"), incoming.get("transcript_sha256")
+    if not all(digests) or stored.get("transcript_range") != incoming.get("transcript_range"):
+        return None
+    return digests[0] == digests[1]
+
+
+def _span_same_window(stored: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    """Nothing tells the two apart as captures: the same window and part, which
+    a split window's siblings never share (``_dedup_exact_window``), set or
+    unset on both, since one set beside one unset proves nothing; digests that
+    don't disagree; and no two different projects."""
+    if any(str(stored.get(k) or "") != str(incoming.get(k) or "") for k in ("window_id", "part")):
+        return False
+    if stored.get("project") and incoming.get("project") and stored["project"] != incoming["project"]:
+        return False
+    return _span_digest_says(stored, incoming) is not False
+
+
+def _span_rewound(stored: dict[str, Any], incoming: dict[str, Any]) -> bool:
+    """A row older than the capture it contains: the capture read bytes after the
+    row had, so the offset went back and the text may not be the row's. Equal
+    digests prove it is; an instant that can't be read proves nothing."""
+    if _span_digest_says(stored, incoming) is True:
+        return False
+    at, row_at = _instant(incoming.get("ts")), _instant(stored.get("ts"))
+    return at is None or row_at is None or row_at < at
+
+
+def _span_lacks(stored: Any, incoming: Any) -> list[str] | None:
+    """Whether a row's raw spans a capture, as a pure function of the two, so a
+    resolution record proves itself later (``khipu outbox span-covered``).
+
+    None unless ``_span_contains``, ``_span_same_window`` and not
+    ``_span_rewound``. Otherwise ``_evidence_lacks``, which is ``[]`` when the
+    capture carries no evidence field the row lacks. That is all it proves: the
+    summary is a span's own and is never compared, and a range does not show the
+    same text. The record keeps the capture's summary with the whole job."""
+    if not _span_contains(stored, incoming) or not _span_same_window(stored, incoming) \
+            or _span_rewound(stored, incoming):
+        return None
+    return _evidence_lacks(stored, incoming)
+
+
 def _sibling_part_summary(cur, payload: dict[str, Any]) -> str | None:
     # forget-fence: capture writer: dedup and merge lookups; returns ids or the write's outcome
     """The summary a multi-part capture lands under when a sibling part holds
@@ -1540,6 +1698,8 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                         original = target.get("raw") if target else None
                         if target and not target.get("deleted_at"):
                             kind = _legacy_projection_kind(original, payload)
+                            if not kind and _replay_lacks(original, payload) == []:
+                                kind = REPLAY_KIND
                             if kind:
                                 return {
                                     "episode_inserted": False, "topics_written": 0,
@@ -1764,14 +1924,36 @@ def write_pg(payload: dict[str, Any], *, legacy_projection: bool = False) -> dic
                         raise ClaimDeferred(f"{type(exc).__name__}: {exc}") from exc
                     stored_raw = target.get("raw") or {}
                     # Known immutable sources/receipts were already matched above.
-                    # At this legacy collision, only matching canonical raw content can
-                    # prove another replay. Enrichment can make that proof absent;
-                    # retaining an unproven capture is safer than discarding fields
-                    # omitted from an ever-incomplete evidence allowlist.
+                    # At this legacy collision the row's raw is enriched and the
+                    # source hash is not, so that hash can only prove a capture no
+                    # step rewrote. ``_replay_lacks`` proves the rest: the same
+                    # capture, every piece of its evidence on the episode. Anything
+                    # less is retained, including the same capture holding content
+                    # the episode lacks: the drain merges nothing (a merge into an
+                    # existing row is the owner's, outbox_preferences).
                     if not target or payload_sha256(stored_raw) != source["payload_sha256"]:
+                        lacks = None if sibling_summary else _replay_lacks(stored_raw, payload)
+                        if lacks == []:
+                            duplicate: dict[str, Any] = {
+                                "episode_inserted": False, "topics_written": 0,
+                                "episode_id": episode_id, "source_key": source["source_key"],
+                                "dedup": {"action": "skip", "matched_via": REPLAY_KIND},
+                                "legacy_projection_duplicate": {
+                                    "kind": REPLAY_KIND, "payload": stored_raw, "episode_id": episode_id,
+                                    "original_payload_sha256": payload_sha256(stored_raw),
+                                    "queued_payload_sha256": source["payload_sha256"],
+                                },
+                            }
+                            if verbatim_check is not None:
+                                duplicate["verbatim_stored"] = _verbatim_stored(cur, episode_id, verbatim_check)
+                            conn.commit()  # the owner claim above
+                            return duplicate
+                        # Field names only: this text reaches logs forget does not scan.
+                        names = [k if re.fullmatch(r"[a-z0-9_]{1,40}", k) else "other" for k in lacks or []]
                         raise CaptureEvidenceConflict(
                             f"legacy episode key conflicts with distinct evidence on episode {episode_id}; "
-                            "incoming capture retained for resolution")
+                            "incoming capture retained for resolution"
+                            + (f"; same capture, only the job holds: {', '.join(names)}" if names else ""))
                 from khipu.config import path_setting
                 from khipu.topic_graph import persist_capture_graph
 
@@ -2122,7 +2304,8 @@ def _capture(payload: dict[str, Any], *, mode: str | None,
         if report and isinstance(stats, dict):
             stats["commitments"] = _commitments.finish_report(report)
         if result is not None:
-            result.update(stats)
+            # The proof holds the row's raw, for the drain's archive only.
+            result.update({k: v for k, v in stats.items() if k != "legacy_projection_duplicate"})
         if stats.get("forgotten_source"):
             _log("capture source belongs to a forgotten episode; skipping persistence legs")
             return 0

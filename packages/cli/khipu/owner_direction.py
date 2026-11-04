@@ -100,7 +100,18 @@ ACTIONS: frozenset[str] = frozenset({
     "work.same", "work.not_same", "owed.change", "owed.tidy", "direction.off", "direction.on", "direction.acknowledge", "direction.set",
     "direction.undo", "project.alias_add", "project.alias_remove", "project.merge", "project.keep_separate",
     "project.separate", "forget.send", "forget.here", "forget.not_same", "outbox.merge_preferences",
+    "outbox.span_covered",
 })
+
+# Actions a recent owner turn does not make: ``khipu_owner_act`` always holds
+# them with this question, and the command's ``--owner-direction`` passes only
+# in the replay of a request ``confirm`` proved he answered (``replaying``).
+CONFIRM_ONLY: dict[str, str] = {
+    "outbox.span_covered": ("Retire the dead outbox jobs `khipu outbox span-covered` counts? Each has a live episode "
+                            "whose range contains its own and which holds every evidence field it carries. Summaries "
+                            "are not compared and a range does not prove the same text, so each job's own summary "
+                            "then stays only in the local record; nothing is written to the hub."),
+}
 
 # Routing changes that apply as soon as the owner types them (2026-11-03, owner
 # decision): account priority and its exceptions, standing rules, the note,
@@ -1871,13 +1882,16 @@ def record_preference_merges(entries: list[dict]) -> None:
              "state": "pending", "preference_merges": entries})
 
 
+_RESOLVING_ACTIONS = ("outbox.merge_preferences", "outbox.span_covered")
+
+
 def record_preference_resolutions(jobs: list[dict]) -> None:
     """Persist the held jobs a merge is about to archive as resolved (record
     id, job name, where it was held) before any moves: the Undo puts them
     back."""
     pend = _PENDING.get()
     line = (pend or {}).get("line")
-    if not pend or pend["intent"]["action"] != "outbox.merge_preferences" or line is None:
+    if not pend or pend["intent"]["action"] not in _RESOLVING_ACTIONS or line is None:
         raise OSError("the owner action must be recorded before held lines can be resolved")
     _append({"kind": "state", "id": _new_id(), "at": _iso(_clock()), "target": line["id"],
              "state": "pending", "preference_resolutions": jobs})
@@ -2102,7 +2116,7 @@ def _abandon() -> None:
             state = _hub_write_state(write)
         elif pend["line"].get("inverse_writes"):
             state = _inverse_state(pend["line"]["inverse_writes"])
-        elif pend["intent"]["action"] == "outbox.merge_preferences" and _merge_recorded(pend["line"]["id"]):
+        elif pend["intent"]["action"] in _RESOLVING_ACTIONS and _merge_recorded(pend["line"]["id"]):
             # Batches before the failure committed and their Undo is logged:
             # unconfirmed, so Undo still runs.
             state = "pending"
@@ -2205,6 +2219,7 @@ _PUSH_WORDS = {
     "forget.here": "Forgot a hub episode this Mac had forgotten by id",
     "forget.not_same": "Marked a hub episode as not the one forgotten on this Mac",
     "outbox.merge_preferences": "Merged preferences held only in memory-file lines into the hub",
+    "outbox.span_covered": "Retired dead outbox jobs whose range and evidence fields another episode holds",
 }
 
 
@@ -2599,6 +2614,9 @@ def _before(want: dict):
     if action == "outbox.merge_preferences":
         # Each transaction's additions are written ahead as their own state
         # line (``record_preference_merges``) before it commits.
+        return {"change": "apply"}
+    if action == "outbox.span_covered":
+        # Each batch's jobs are written ahead (``record_preference_resolutions``).
         return {"change": "apply"}
     if action in ("direction.off", "direction.on"):
         return {"enabled": owner_turns.settings()["enabled"]}
@@ -3100,6 +3118,15 @@ def _undo_outbox_preferences(line, via):
                                                   "(outbox merge-line-preferences --include-decisions)")
 
 
+def _undo_span_covered(line, via):
+    from khipu import outbox_span_covered
+
+    entries = preference_merges(line["id"], "preference_resolutions")
+    if not entries and not (line["state"] == "applied" and not int((line.get("result") or {}).get("retired") or 0)):
+        raise ValueError("Khipu has no record of which jobs this retired, so it can't undo it")
+    return outbox_span_covered.undo(entries)
+
+
 def _ledger_undo(verb: str):
     def run(line, via):
         return _ledger_write(verb, line["target"])
@@ -3191,6 +3218,7 @@ _UNDO = {
     "owed.tidy": _undo_owed_tidy,
     "owed.correct_job_origin.confirm": _undo_owed_change,
     "outbox.merge_preferences": _undo_outbox_preferences,
+    "outbox.span_covered": _undo_span_covered,
     "direction.off": _undo_direction,
     "direction.on": _undo_direction,
     "direction.set": _undo_direction,

@@ -359,6 +359,11 @@ describe("actionWords", () => {
     expect(text.length).toBeGreaterThan(10);
   });
 
+  it("has a plain label for retiring held captures", () => {
+    const text = actionWords({ id: "1", at: "2026-11-03T00:00:00Z", action: "outbox.span_covered", target: "outbox" });
+    expect(text).toBe("Retired held captures another episode covers");
+  });
+
   it("has a plain label for every action id the back end can log", () => {
     const cwd = (globalThis as unknown as { process: { cwd(): string } }).process.cwd();
     const src: string = readFileSync(`${cwd}/../../packages/cli/khipu/owner_direction.py`, "utf8");
