@@ -512,5 +512,6 @@ def test_doctor_names_what_it_keeps_when_it_cannot_shrink(world, monkeypatch):
     world[0] = NOW
     assert rc.compact(NOW)["result"] == "skipped"
     row = rc.health()
-    assert "can't shrink" in row["warning"] and "still counted" in row["warning"]
-    assert "observations or others" not in row["warning"]
+    assert row["level"] == "yellow"
+    assert "own history" in row["warning"] and "nothing is broken" in row["warning"]
+    assert "nothing to do" in row["warning"]

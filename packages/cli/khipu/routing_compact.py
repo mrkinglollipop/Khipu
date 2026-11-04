@@ -192,7 +192,7 @@ def health(now: datetime | None = None) -> dict:
         owned = [line for line, event in rows if event is not None and _owner(event)]
         owners = len(owned)
         owner_bound = owners > LINES_RED or sum(len(line) + 1 for line in owned) > BYTES_RED
-        if gone < MIN_GAIN * total or gone == 0 or owner_bound:
+        if gone < MIN_GAIN * total or gone == 0:
             out["level"] = "yellow"
             out["kept_lines"] = total - gone
             if owners == total or owner_bound:

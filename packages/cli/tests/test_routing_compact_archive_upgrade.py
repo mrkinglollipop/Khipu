@@ -44,3 +44,4 @@ def test_old_full_copy_pruning_does_not_poison_a_complete_upgrade_chain(world):
         assert rc.full_log() == expected
     assert not found, [str(w.message) for w in found]
     assert not _clock_warnings(later)
+    assert routing.doctor_block(later)['log']['level'] == 'green'

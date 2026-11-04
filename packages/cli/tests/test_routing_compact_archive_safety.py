@@ -69,20 +69,25 @@ def test_abandoned_archive_temp_is_cleaned(world):
 
 
 def test_byte_bound_removes_oldest_and_reports_unavailable_history(world, monkeypatch):
-    folder = rc.archive_dir()
-    folder.mkdir(parents=True)
-    routing.events_file().write_bytes(b'A\n')
+    path = routing.events_file()
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'A\nB\nC\nD\nE\n')
     paths = []
+    original = [b'A', b'B', b'C', b'D', b'E']
     for day in (1, 2, 3):
-        path = folder / f'events-2026110{day}T120000Z-aaaaaa.jsonl.gz'
-        path.write_bytes(b'x' * 30)
-        paths.append(path)
-    monkeypatch.setattr(rc, 'ARCHIVE_MAX_BYTES', 65)
+        chosen = {"before": len(original), "positions": [1], "left_out": [original[1]],
+                  "kept": original[:1] + original[2:]}
+        name = f'events-2026110{day}T120000Z-aaaaaa.jsonl.gz'
+        rc._replace(path, b''.join(line + b'\n' for line in chosen['kept']), name, rc._archive_bytes(chosen, END))
+        paths.append(rc.archive_dir() / name)
+        original = chosen['kept']
+    budget = sum(p.stat().st_size for p in paths[1:])
+    monkeypatch.setattr(rc, 'ARCHIVE_MAX_BYTES', budget)
     assert rc.prune_archives(END) == 1
     assert not paths[0].exists() and all(p.exists() for p in paths[1:])
-    assert sum(p.stat().st_size for _, p in rc._archives()) <= 65
+    assert sum(p.stat().st_size for _, p in rc._archives()) <= budget
     with pytest.warns(RuntimeWarning, match='retention.*unavailable'):
-        assert rc.full_log() == [b'A']
+        assert rc.full_log() == [b'A', b'C', b'D', b'E']
 
 
 def test_owner_lines_never_enter_archive_even_when_byte_bound_prunes(world, monkeypatch):
