@@ -1137,8 +1137,6 @@ def full_log() -> list[bytes]:
     data = routing.events_file().read_bytes()
     generation = _generation(data)
     lines = _content_lines(data)
-    if _read_state().get("archive_retention_expired"):
-        warnings.warn("Archive retention: older observations are unavailable; owner history remains in the log", RuntimeWarning)
     pending = []
     for _at, path in _archives():
         if not path.name.endswith(".gz"):
@@ -1195,7 +1193,16 @@ def full_log() -> list[bytes]:
         if not matched:
             break
     if generation is not None:
-        warnings.warn("A committed archive generation is unavailable; returning the remaining history", RuntimeWarning)
+        if _read_state().get("archive_retention_expired"):
+            warnings.warn("Archive retention: older observations are unavailable; owner history remains in the log", RuntimeWarning)
+        else:
+            warnings.warn("A committed archive generation is unavailable; returning the remaining history", RuntimeWarning)
+    elif _read_state().get("archive_retention_expired"):
+        with routing._lock():
+            if routing.events_file().read_bytes() == data:
+                state = _read_state()
+                state.pop("archive_retention_expired", None)
+                _write_state(state)
     return lines
 
 
