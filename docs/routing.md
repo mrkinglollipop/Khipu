@@ -197,6 +197,26 @@ Purpose defaults to `job` and may be `check` or `orchestration`; dispatched work
 requesting orchestration receives job advice. An on-request provider is
 ineligible unless the caller targets its account or a lane that resolves to it.
 
+A conversation the owner let run ahead (`khipu route override`, `khipu_owner_act`
+`route.override.grant`) hears its own answer change and nobody else's. Only the
+pace answer moves: the pace-target hold and the cap-crossing look-ahead are
+dropped for that conversation and the helpers it starts, and the override's own
+`ceiling_pct` (of the whole account's week or five-hour window; usage is not split
+by conversation) holds work back when reached or when the reading can't be
+placed. Holds, pauses, limits, down, spend, concurrency, share caps, the plan
+limit and eligibility are decided first and are never lifted. The answer carries
+an `override` object and its reason reads `override until ...`; a conversation
+Khipu can't identify, or a T3 thread it can't pin to one, hears normal pace and
+`override_refused` says why. An end that has passed needs no write; an override
+with no end asks again each week. The log lives beside the routing record on the
+Mac, is never copied to the hub or the cloud copy, and the second Mac reads its
+own.
+
+Writing an instruction the priority already holds (an exception with the same words
+after case, spacing and punctuation) writes nothing and answers with the existing id;
+one that reads almost the same (word overlap of 0.8 or more, same numbers) is refused
+naming the match. A retry of a request still waiting for the owner is that request.
+
 Runners use the same `purpose: "check"` on `khipu_route_advise` and their
 budget declarations. MCP advice also takes caller-declared `tier` and
 `sensitive`; runner budget declarations carry the cap's optional `tier` and

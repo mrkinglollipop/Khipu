@@ -346,3 +346,21 @@ button.chip[aria-pressed="true"] {
   .route-settings .mrow.delivery:has(.delivery-heard) { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .route-settings .mrow.delivery .mac-col { text-align: right; }
 }
+
+/* Conversations allowed to run ahead, and the tidy-up walk
+   (docs/plans/2026-11-03-conversation-overrides.md): the same bordered rows as the lists above. */
+.route-settings ul.mrows { margin: 0; padding: 0; list-style: none; }
+.route-settings .mrow.override-row { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.route-settings .mrow.override-row .name { overflow-wrap: anywhere; }
+.route-settings .mrow.override-row .override-on { font-weight: 400; color: var(--text-2); }
+.route-settings .mrow.override-row .override-detail { grid-column: 1 / -1; }
+.route-settings .cleanup-card { display: flex; flex-direction: column; gap: var(--s2); padding: var(--s3);
+  border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface); }
+.route-settings .cleanup-card .cleanup-step { margin: 0; }
+.route-settings .cleanup-card .cleanup-words { margin: 0; font-size: var(--t-base, 1rem); line-height: 1.5; overflow-wrap: anywhere; }
+.route-settings .cleanup-card .toolbar button { white-space: normal; text-align: left; height: auto; min-height: 30px; }
+.route-settings .cleanup-soon { margin: 0; padding-left: var(--s4); }
+@media (max-width: 760px) {
+  .route-settings .mrow.override-row { grid-template-columns: minmax(0, 1fr); }
+  .route-settings .mrow.override-row .end { justify-self: start; justify-content: flex-start; }
+}

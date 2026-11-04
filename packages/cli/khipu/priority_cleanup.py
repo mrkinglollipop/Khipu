@@ -103,7 +103,9 @@ def _exceptions(view: dict, now: datetime) -> list[tuple[dict, dict]]:
 
 
 def _ends(exc: dict) -> str:
-    return f"ends {exc.get('until')}" if exc.get("until") else "has no end"
+    from khipu import conversation_overrides as overrides
+
+    return f"ends {overrides.short_time(exc.get('until'))}" if exc.get("until") else "has no end"
 
 
 def items(view: dict, now: datetime) -> list[dict]:
@@ -231,7 +233,7 @@ def ending_soon(view: dict, now: datetime) -> list[str]:
     for row in overrides.list_overrides(now=now):
         end = routing._parse(row.get("until"))
         if end is not None and end - now <= SOON:
-            out.append(f"The override on {routing._label_for_key(row['account'])} ends {row['until']}.")
+            out.append(f"The override on {routing._label_for_key(row['account'])} ends {overrides.short_time(row['until'])}.")
     return out
 
 

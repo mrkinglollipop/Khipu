@@ -2803,6 +2803,68 @@ async fn khipu_route_hold_end(id: String, op: Option<String>) -> Result<String, 
     run_khipu_cli_async(route_operation_argv(route_hold_end_argv(&id)?, op.as_deref())?).await
 }
 
+// Conversation overrides and the priority tidy-up (docs/plans/2026-11-03-conversation-overrides.md).
+// Each is one fixed verb of `khipu route override` with `--from-app`; the webview names a verb and an id.
+
+/// The override verbs the app offers besides reading: end one early, keep one with no end.
+const ROUTE_OVERRIDE_VERBS: &[&str] = &["end", "keep"];
+
+fn route_override_argv(verb: &str, id: &str) -> Result<Vec<String>, String> {
+    if !ROUTE_OVERRIDE_VERBS.contains(&verb) {
+        return Err(format!("not a change to an override: {verb:?}"));
+    }
+    let mut argv = route_base("override");
+    argv.extend([verb.to_string(), checked_route_id(id)?]);
+    Ok(argv)
+}
+
+fn route_cleanup_walk_argv(leave: Option<&str>, keep: Option<&str>, restart: bool) -> Result<Vec<String>, String> {
+    let mut argv = route_base("override");
+    argv.push("walk".to_string());
+    if let Some(key) = leave {
+        argv.push(format!("--leave={}", checked_route_id(key)?));
+    }
+    if let Some(key) = keep {
+        argv.push(format!("--keep={}", checked_route_id(key)?));
+    }
+    if restart {
+        argv.push("--restart".to_string());
+    }
+    Ok(argv)
+}
+
+/// End one temporary instruction early: `route priority amend ACCOUNT --end-exception=ID --expect=V`.
+fn route_exception_end_argv(account: &str, id: &str, expect: &str) -> Result<Vec<String>, String> {
+    let mut argv = route_base("priority");
+    argv.push("amend".to_string());
+    argv.push(checked_route_account(account)?);
+    argv.push(format!("--end-exception={}", checked_route_id(id)?));
+    argv.push(format!("--expect={}", checked_route_id(expect)?));
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_route_override_view() -> Result<String, String> {
+    let mut argv = route_base("override");
+    argv.push("list".to_string());
+    run_khipu_cli_async(argv).await
+}
+
+#[tauri::command]
+async fn khipu_route_override_act(verb: String, id: String) -> Result<String, String> {
+    run_khipu_cli_async(route_override_argv(&verb, &id)?).await
+}
+
+#[tauri::command]
+async fn khipu_route_cleanup_walk(leave: Option<String>, keep: Option<String>, restart: Option<bool>) -> Result<String, String> {
+    run_khipu_cli_async(route_cleanup_walk_argv(leave.as_deref(), keep.as_deref(), restart.unwrap_or(false))?).await
+}
+
+#[tauri::command]
+async fn khipu_route_exception_end(account: String, id: String, expect: String) -> Result<String, String> {
+    run_khipu_cli_async(route_exception_end_argv(&account, &id, &expect)?).await
+}
+
 // ---- Work: the live view and the ledger (docs/plans/2026-10-15-work-view.md, phase 4)
 //
 // Fixed argv for the Work tab and a project's ledger page. `work` and
@@ -5505,6 +5567,10 @@ pub fn run() {
             khipu_route_rule,
             khipu_route_hold_add,
             khipu_route_hold_end,
+            khipu_route_override_view,
+            khipu_route_override_act,
+            khipu_route_cleanup_walk,
+            khipu_route_exception_end,
             khipu_route_cap,
             khipu_route_priority,
             khipu_route_definition,
@@ -6343,6 +6409,18 @@ mod settings_command_tests {
         assert!(route_pause_argv("Codex", Some("2026-10-16T09:00:00Z\n--x")).is_err());
         assert!(route_clear_argv("Codex", Some("-e1")).is_err());
         assert!(route_clear_argv("Codex", Some("e1 --from-app")).is_err());
+        assert_eq!(route_override_argv("end", "abc-123").unwrap(), v(&["route", "override", "--from-app", "end", "abc-123"]));
+        assert!(route_override_argv("grant", "abc-123").is_err());
+        assert!(route_override_argv("end", "--all").is_err());
+        assert_eq!(
+            route_cleanup_walk_argv(Some("dup:codex|:xaa111"), None, false).unwrap(),
+            v(&["route", "override", "--from-app", "walk", "--leave=dup:codex|:xaa111"])
+        );
+        assert!(route_cleanup_walk_argv(Some("--x"), None, false).is_err());
+        assert_eq!(
+            route_exception_end_argv("codex|", "xaa111", "p3").unwrap(),
+            v(&["route", "priority", "--from-app", "amend", "codex|", "--end-exception=xaa111", "--expect=p3"])
+        );
         assert!(route_hold_end_argv("--all").is_err());
         assert!(route_hold_end_argv("h1\nend").is_err());
         assert!(route_hold_add_argv("x", "--all", "all", None, None).is_err());

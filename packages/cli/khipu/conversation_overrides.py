@@ -349,11 +349,17 @@ def match(account: str, author: dict | None = None, *, now: datetime | None = No
     return matches(who, now).get(account), None
 
 
+def short_time(value) -> str:
+    """"Nov 4 19:40Z" for a stored time: plain, and the same wherever it is read."""
+    when = _parse(value)
+    return when.astimezone(timezone.utc).strftime("%b %-d %H:%MZ") if when else str(value)
+
+
 def line(row: dict) -> str:
     """The fixed words a conversation hears (no writer-chosen text)."""
     if row.get("until"):
-        return f"go (override until {row['until']})"
-    return f"go (override with no end; review {row.get('review_at')})"
+        return f"go (override until {short_time(row['until'])})"
+    return f"go (override with no end; review {short_time(row.get('review_at'))})"
 
 
 def advice(account: str, author: dict | None = None, *, now: datetime | None = None, environ: dict | None = None) -> tuple[dict | None, str | None]:
@@ -390,8 +396,8 @@ def subject_words(subj: dict) -> str:
 
 def when_words(row: dict) -> str:
     if row.get("until"):
-        return f"until {row['until']}"
-    return f"with no end; Khipu will ask you again on {row.get('review_at')}"
+        return f"until {short_time(row['until'])}"
+    return f"with no end; Khipu will ask you again on {short_time(row.get('review_at'))}"
 
 
 def cap_words(row: dict) -> str:
@@ -444,3 +450,12 @@ def walkthrough(*, now: datetime | None = None, leave: str | None = None, keep_p
     out["items"] = priority_cleanup.items(view, now)
     out["overrides"] = list_overrides(now=now)
     return out
+
+
+def owner_row(row: dict, now: datetime) -> dict:
+    """One override as the app lists it, in plain words."""
+    who = subject_words(row.get("subject") or {})
+    return {"id": row["id"], "label": routing._label_for_key(row["account"]), "who": who[:1].upper() + who[1:],
+            "until": row.get("until"), "indefinite": bool(row.get("indefinite")), "review_at": row.get("review_at"),
+            "review_due": bool(row.get("indefinite") and (_parse(row.get("review_at")) or now) <= now),
+            "cap": cap_words(row)[:1].upper() + cap_words(row)[1:]}

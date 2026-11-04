@@ -7947,8 +7947,6 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
                 {"account": r["account"], "label": r["label"]} for r in gone]
             return _crossed_entries(lost, entries=[e["label"] for e in rows], unread=not stale and not gone)
         _check_role_budget(rows, now)
-        if done.get("duplicate"):
-            return {"ok": True, "duplicate": True, "pending": False, "entries": [e["label"] for e in rows], **done}
         observed = _observed_base("priority", base=base, expect=expect)
         written, view = _write({"type": "priority_set", "entries": rows, "until": end, "pending": True,
                                 "base": observed,
@@ -8547,6 +8545,8 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
         except PriorityEntryMoved as moved:
             return _crossed_entries(moved.lost)
         _check_role_budget(rows, now)
+        if done.get("duplicate"):
+            return {"ok": True, "duplicate": True, "pending": False, "entries": [e["label"] for e in rows], **done}
         observed = _observed_base("priority", base=base, expect=expect)
         written, view = _write({"type": "priority_set", "entries": rows, "until": whole, "pending": True,
                                 "base": observed,
@@ -10296,13 +10296,6 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     from khipu import routing_mismatches
 
     out["model_mismatches"] = routing_mismatches.today(now)
-    # Owner-facing only.  The per-conversation log never travels in a
-    # routing push, a cloud copy, or another conversation's read.
-    from khipu import conversation_overrides
-    try:
-        out["conversation_overrides"] = conversation_overrides.list_overrides(now=now)
-    except Exception:  # noqa: BLE001 - a damaged optional log must not break routing
-        out["conversation_overrides"] = None
     # Owner-local only: file paths and quoted owner words from the scan
     # report never enter the fold or any routing delivery projection.
     from khipu import routing_scan_report
@@ -13044,6 +13037,18 @@ def _override_cli(args) -> int:
     from khipu import conversation_overrides as overrides, owner_direction
 
     verb, params = args.action, list(args.params)
+    if verb in ("list", "walk"):
+        # Reads for the app only: every conversation's override is the owner's to see.
+        if not getattr(args, "from_app", False) or not _caller()["app"]:
+            _print_json({"ok": False, "error": "Only the Khipu app lists conversation overrides."})
+            return 2
+        if verb == "list":
+            now = _now()
+            rows = overrides.list_overrides(now=now)
+            _print_json({"ok": True, "overrides": [overrides.owner_row(r, now) for r in rows]})
+        else:
+            _print_json(overrides.walkthrough(leave=args.leave, keep_pair=args.keep, restart=args.restart))
+        return 0
 
     def intent():
         if len(params) != 1:

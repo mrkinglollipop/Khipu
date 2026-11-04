@@ -231,3 +231,20 @@ def test_overrides_that_no_longer_make_sense_are_offered_for_ending(world):
     found = [i for i in priority_cleanup.items(routing.read_view(), routing._now()) if i.get("override") == granted["id"]]
     assert [i["code"] for i in found] == ["closed_account"]
     assert found[0]["settle"]["confirm"] == {"action": "route.override.end", "args": {"override": granted["id"]}}
+
+
+def test_only_the_app_lists_every_override_and_in_plain_words(world, khipu_app, capsys):
+    _hook("run ahead on Codex for 3 hours")
+    assert not _act("route.override.grant", {"account": "Codex", "until": _in(3), "request": "x"})[0]
+    capsys.readouterr()
+    assert cli.main(["route", "override", "list", "--from-app"]) == 2  # not started by the app
+    assert "Only the Khipu app" in capsys.readouterr().out
+    khipu_app.as_app()
+    assert cli.main(["route", "override", "list", "--from-app"]) == 0
+    (row,) = json.loads(capsys.readouterr().out)["overrides"]
+    assert row["label"] == "Codex" and row["who"] == "This conversation" and row["review_due"] is False
+    assert row["cap"].startswith("Stopping at the account's saved share cap")
+    # The app's own one-click end, with the line Undo works from.
+    assert cli.main(["route", "override", "end", row["id"], "--from-app"]) == 0
+    ended = json.loads(capsys.readouterr().out)
+    assert ended["ok"] is True and ended["owner_action"] and _mine() == []
