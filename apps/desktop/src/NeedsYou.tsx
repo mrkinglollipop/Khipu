@@ -235,15 +235,15 @@ export function NeedsYou({ cards, accounts, problems, seeded, data, w, reread, o
           {cards.slice(0, shownCards).map((card) => (
             <DecideItem key={card.key} card={card} data={data} w={w} eok={eok} reread={reread} back={back} />
           ))}
-          {cards.length > shownCards ? (
-            <button type="button" className="sm" onClick={() => setShownCards((n) => n + NEEDS_PAGE_SIZE)}>
-              Show {Math.min(cards.length - shownCards, NEEDS_PAGE_SIZE)} more {cards.length - shownCards === 1 ? "decision" : "decisions"}
-            </button>
-          ) : null}
           {accounts}
           {eok.ask && data ? (
             <EndOrKeepChoices view={data} ask={eok.ask} now={new Date()} busy={w.anyBusy} saveLabel="Save and confirm"
               onCancel={() => eok.setAsk(null)} />
+          ) : null}
+          {cards.length > shownCards ? (
+            <button type="button" className="sm" onClick={() => setShownCards((n) => n + NEEDS_PAGE_SIZE)}>
+              Show {Math.min(cards.length - shownCards, NEEDS_PAGE_SIZE)} more {cards.length - shownCards === 1 ? "decision" : "decisions"}
+            </button>
           ) : null}
         </Band>
       ) : null}

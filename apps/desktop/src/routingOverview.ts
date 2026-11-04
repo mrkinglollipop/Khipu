@@ -25,7 +25,7 @@ export const GROUPS: ReadonlyArray<{ key: GroupKey; name: string; record: boolea
   { key: "pace", name: "Pace, caps and advice", record: true },
   { key: "priority", name: "Priority", record: true },
   { key: "rules", name: "Your note and standing rules", record: true },
-  { key: "holds", name: "Proposals and holds", record: true },
+  { key: "holds", name: "Holds", record: true },
   { key: "checks", name: "Checks and copies", record: true },
   { key: "telling", name: "Telling conversations", record: false },
   { key: "resets", name: "Checking for resets", record: false },
@@ -433,11 +433,7 @@ function rulesLine(view: RouteView): string {
 
 function holdsLine(view: RouteView, now: Date): string {
   const holds = view.holds ?? [];
-  const proposals = proposalsModel(view, now);
   const parts: string[] = [];
-  if (proposals.live.length) parts.push(`${plural(proposals.live.length, "proposal", "proposals")} in use`);
-  const crossed = proposals.stale.filter((r) => r.proposal.status === "crossed").length;
-  if (crossed) parts.push(`${crossed} crossed`);
   if (holds.length) {
     const next = holds
       .map((h) => h.until)
@@ -445,7 +441,7 @@ function holdsLine(view: RouteView, now: Date): string {
       .sort((a, b) => new Date(a).getTime() - new Date(b).getTime())[0];
     parts.push(next ? `${plural(holds.length, "hold", "holds")}, the next ends ${whenLocal(next, now)}` : `${plural(holds.length, "hold", "holds")}, each until you clear it`);
   }
-  return parts.length ? parts.join(" · ") : "No proposals · no holds";
+  return parts.length ? parts.join(" · ") : "No holds";
 }
 
 function tellingLine(s: OverviewSettings): string {
@@ -519,8 +515,9 @@ function changesLine(view: RouteView, now: Date): string {
     const at = new Date(c.at).getTime();
     if (!Number.isNaN(at) && at >= today) n += items;
   }
-  if (!any) return "No changes yet";
-  return n ? `${plural(n, "change", "changes")} today` : "No changes today";
+  const changes = !any ? "No changes yet" : n ? `${plural(n, "change", "changes")} today` : "No changes today";
+  const crossed = proposalsModel(view, now).stale.length;
+  return crossed ? `${changes} · ${crossed} crossed` : changes;
 }
 
 /** The closed lines and tags for every group. `view` null: the record is not

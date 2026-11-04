@@ -302,6 +302,7 @@ describe("the priority and the pace in Settings -> Routing", () => {
       owner_request: "the owner asked for Codex first", replaced: { entries: [PRIORITY.entries[2]] } } });
     const group = screen.getByRole("article", { name: /^A conversation put / });
     expect(group).toHaveTextContent("“the owner asked for Codex first”");
+    fireEvent.click(within(group).getByRole("button", { name: "Show all 3" }));
     expect(group).toHaveTextContent("Your order before1. Claude: orchestration only");
     fireEvent.click(within(group).getByRole("button", { name: "Keep the new order" }));
     await waitFor(() => expect(sent()).toEqual([{ action: "confirm", expect: "p7" }]));

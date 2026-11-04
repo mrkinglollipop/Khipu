@@ -20,7 +20,7 @@
    cloud agents (phase 7) join with their phases. The Mac-to-Mac replication
    switch sits beside the proposal-text switch in Sizes and times. */
 
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent, KeyboardEvent, ReactNode, RefObject } from "react";
 import { ChevronRight, Loader2 } from "lucide-react";
 import { EmptyState, Tag } from "./ui";
@@ -870,11 +870,7 @@ function PrioritySection({
   const ids = entries.map((e) => `priority:move:${e.account}`).concat(entries.map((e) => `priority:remove:${e.account}`));
   return (
     <div className="section-body route-priority-set" role="group" aria-label="Your priority">
-      <p className="set-help">
-        Your order of accounts, each with your words for its role and an end if you want one. Conversations hear it
-        first, before the account lines, word for word. Khipu keeps your order as you set it and never picks or reorders
-        for you; if the first account is limited, paused or down, conversations hear that beside it.
-      </p>
+      <p className="set-help">Your order tells conversations which accounts you prefer; Khipu keeps it exactly as you set it.</p>
       {p?.pending ? (
         <p className="set-help" data-route-item="priority:pending" tabIndex={-1}>
           A conversation changed this order and waits for your answer on Needs you.
@@ -1059,7 +1055,7 @@ function AccountLine({
         <button type="button" className="fold-btn" aria-haspopup="dialog" data-route-item={key}
           onClick={() => detail.open(true)}>
           <ChevronRight size={14} className="disclosure-chevron" aria-hidden />
-          <span className="an">{a.label}</span>
+          <span className="an">{a.label}<span className="account-details-cue">Details…</span></span>
           <span className="as">
             <span className={st.tone ? `hdot ${st.tone}` : "hdot"} aria-hidden />
             <span>{st.text}</span>
@@ -1318,8 +1314,8 @@ function AccountsSection({
         </>
       ) : null}
       <p className="set-help">
-        The same accounts as Plans, from the list at the end of this group. Reports come from four places: each
-        account's plan check, your job runners, conversations, and you. Your routing table is not one of them.
+        Khipu reads the accounts selected below. Their status can come from a plan check, your job runners,
+        conversations, or you; the old routing table is not a source.
       </p>
       <p className="set-help">
         Mark paused tells conversations you want an account left alone; Lift ends it. Clear ends a limit or a
@@ -1453,12 +1449,7 @@ function NoteSection({ data, w, now }: { data: RouteView; w: Writer; now: Date }
             </div>
           </ConfirmGroup>
         ) : null}
-        <p className="set-help">
-          Conversations see this word for word, right after your standing rules, and Khipu never rewrites it. A note
-          is limited to 1,500 characters by default (Longest note in Rarely needed); at the start of a conversation a longer
-          one shows its first sentence and a pointer to read the rest. Khipu never turns it into a choice of account.
-          Earlier notes stay in Recent changes. The app hands over up to {WORDS_MOST_KB} KB of text in one change.
-        </p>
+        <p className="set-help">Conversations see this word for word after your rules; Khipu never rewrites it.</p>
     </div>
   );
 }
@@ -1596,7 +1587,7 @@ function RuleRow({
         <span className="route-rule-meta" hidden={!expanded}>
           {origin}
           {pending ? <Tag tone="warn">{r.pending_kind === "changed" ? "Changed, reconfirm" : "Added, confirm"}</Tag> : null}
-          {!pending && toConfirm ? <Tag tone="warn">Seeded, confirm</Tag> : null}
+          {!pending && toConfirm ? <Tag tone="warn">Copied rule, confirm</Tag> : null}
           {r.seeded && r.confirmed ? <Tag tone="ok">Confirmed</Tag> : null}
           {pending ? (
             <span className="set-help">
@@ -1625,7 +1616,7 @@ function RuleRow({
             onClick={() => void w.run(`${id}:undo`, "khipu_route_rule", { action: r.pending_kind === "added" ? "dismiss" : "undo", ...ruleTarget(r) }, null, back)}
           >
             <Busy on={w.isBusy(`${id}:undo`)} />
-            Undo
+            Undo change
           </button>
         ) : null}
         <button
@@ -1643,13 +1634,13 @@ function RuleRow({
           Edit
         </button>
         <button ref={removeBtn} type="button" className="sm" aria-label={`Remove rule ${name}`} aria-expanded={mine === "remove"} onClick={() => setAsk({ id: identity, kind: "remove" })}>
-          Remove
+          Remove rule
         </button>
       </span>
       {pending ? <WriteError w={w} id={`${id}:undo`} /> : null}
       {mine === "confirm" ? (
         <ConfirmGroup label={`Confirm rule ${name}?`} onClose={close} back={() => confirmBtn.current ?? editBtn.current}>
-          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${name} as written? It loses its Seeded mark.`} It stays first in every conversation.</span>
+          <span>{pending ? `Confirm this pending ${r.pending_kind === "changed" ? "change" : "addition"}?` : `Confirm rule ${name} as written? It loses its copied mark.`} It stays first in every conversation.</span>
           <WriteError w={w} id={id} />
           <div className="toolbar">
             <button
@@ -1816,22 +1807,8 @@ function RulesSection({ data, lists, w, now, revealItem }: { data: RouteView; li
             {toConfirm ? ` · ${toConfirm} to confirm` : ""}
           </Tag>
         </h2>
-        <p className="set-help">
-          {"Every conversation sees these rules first, in full. "}
-          {checkable
-            ? `Khipu can check ${checkable} of them by reading your job runners' settings; if one looks broken you get a warning.`
-            : "Khipu can check rules about -fast models, the paid xAI API and Grok work by reading your job runners' settings; none of these is one."}
-          {" Khipu never stops any work."}
-        </p>
-        <p className="set-help">
-          Rules marked Seeded were copied from your routing table and your instructions; confirm each one, or edit or
-          remove it. A conversation can add or change a rule at your request; those rows show what changed and stay
-          pending until you confirm or undo them. Khipu never rewrites a rule. A rule is limited to 600
-          characters and you may have 40 by default (Longest standing rule and Most standing rules in Rarely needed); rules
-          already stored over a limit keep working. At the start of a conversation the rules that fit the budget are
-          shown in your order and a line says how many were left to read (the app hands over up to {WORDS_MOST_KB} KB
-          of text at once).
-        </p>
+        <p className="set-help">Every conversation sees your rules first; {checkable ? `Khipu can check ${checkable} by reading your job runners' settings` : "Khipu warns if a rule it can check looks broken"}, but never stops work.</p>
+        <p className="set-help">Copied rules already apply; review them here when you have time, and answer conversation changes on Needs you.</p>
         {rules.length ? (
           <div className="route-filter">
             <span className="lbl" id={filterLabel}>
@@ -2152,7 +2129,6 @@ function ProposalRowView({ row, data, now }: { row: ProposalRow; data: RouteView
             {p.kind === "priority" && !row.withheld && data.priority?.owner_request ? (
               <> What it said you asked: “{data.priority.owner_request}”</>
             ) : null}
-            {" "}Answer it on Needs you.
           </>
         ) : p.status === "crossed" ? (
           <>{row.by}. It was written against an older version, so it never took effect. Its author was told.</>
@@ -2194,11 +2170,18 @@ function ProposalsSection({ data, now }: { data: RouteView; now: Date }) {
     .reduce<Record<string, number>>((acc, r) => ({ ...acc, [r.proposal.status]: (acc[r.proposal.status] ?? 0) + 1 }), {});
   const endedToday = model.endedToday;
   const anyDatedEnd = ended.some((r) => r.proposal.ended_at);
-  const rows = [...model.live, ...model.stale];
+  const live = model.live.filter(({ proposal: p }) => {
+    if (p.kind === "priority") return !data.priority?.pending;
+    if (p.kind === "rule") return !(data.rules ?? []).some((r) => r.pending &&
+      ((p.entity != null && r.entity === p.entity) || (p.n != null && r.n === p.n)));
+    return true;
+  });
+  const rows = [...live, ...model.stale];
+  if (!rows.length && !ended.length) return null;
   return (
     <div className="section-body">
-      <h2 className="sub-title">Proposals from conversations</h2>
-      <p className="set-help">A conversation's change is in use until you confirm or dismiss it.</p>
+      <h2 className="sub-title">Proposal history</h2>
+      <p className="set-help">Current proposals are decided on Needs you. Past and unavailable proposals are kept here.</p>
       {rows.length ? (
         <div className="mrows" role="list" aria-label="Proposals">
           {rows.map((row) => (
@@ -2243,7 +2226,7 @@ function ProposalsSection({ data, now }: { data: RouteView; now: Date }) {
       {model.live.some((r) => r.withheld) ? (
         <p className="set-help">
           Proposal words are kept on the Mac they came from because “Share proposal words between your Macs” is off in
-          Telling conversations.
+          Your Macs.
         </p>
       ) : null}
     </div>
@@ -2337,7 +2320,7 @@ function HoldsSection({
   return (
     <div className="section-body" id="route-work-holds" tabIndex={-1}>
         <h2 className="sub-title">Holds</h2>
-        <p className="set-help">Short notes about one account, this Mac or all work. Every hold from a conversation ends on its own.</p>
+        <p className="set-help">Temporary instructions for one account, this Mac, or all work. Conversation holds end on their own.</p>
         {holds.length ? (
           <div className="rows" role="list" aria-label="Holds">
             {holds.map((h, i) => {
@@ -2430,7 +2413,7 @@ function HoldsSection({
                 ? ""
                 : most
                   ? `At most ${limitWords(most, "chars")}`
-                  : `No limit on length; the app hands over up to ${WORDS_MOST_KB} KB at once`}
+                  : "No length limit from this setting"}
             </span>
           </div>
           <div className="toolbar">
@@ -2490,7 +2473,7 @@ function HoldRarelySettings({ cfg, w, reread }: { cfg: RouteConfig | null; w: Wr
     <LimitRow name="How long a conversation's hold lasts" help="When a conversation doesn't say; it can ask for longer, up to the most."
       fields={[{ key: "routing_conversation_hold", label: "Usually", unit: "time", options: [H, 4 * H, 12 * H, 24 * H, 48 * H] }, { key: "routing_conversation_hold_max", label: "At most", unit: "time", options: [24 * H, 3 * D, 7 * D, 14 * D, 30 * D, 0], zero: "No maximum" }]}
       join=" · at most " cfg={cfg} w={w} reread={reread} />
-    <LimitRow name="Longest words in a hold" help="Yours and conversations' alike."
+    <LimitRow name="Longest words in a hold" help={`Yours and conversations' alike. Each save can hand over up to ${WORDS_MOST_KB} KB of text.`}
       fields={[{ key: "routing_hold_chars", label: "Longest words", unit: "chars", options: [150, 300, 600, 1200, 0], zero: "No limit" }]} cfg={cfg} w={w} reread={reread} />
     <LimitRow name="Remind me about my own holds after" help="A reminder on Home; your hold stays until you end it."
       fields={[{ key: "routing_owner_hold_reminder", label: "Remind me after", unit: "time", options: [30 * D, 60 * D, 90 * D, 180 * D, 365 * D, 0], zero: "Never" }]} cfg={cfg} w={w} reread={reread} />
@@ -2663,7 +2646,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
                 <div key={`owner-delivery-${index}`} className="mrow delivery" role="listitem">
                   <span><span className="name">{row.label}</span><br /><span className="src">{[deliveryHarnessName(row.harness), deliveryComponentWord(row.component)].filter(Boolean).join(" · ")}</span></span>
                   <span className="mac-col">{row.mac ?? "This Mac"}</span>
-                  <span className="num">{row.last_prompt_at ? agoSpan(row.last_prompt_at, now) : "Can't be checked"}</span>
+                  <span className="num delivery-heard">{row.last_prompt_at && !Number.isNaN(Date.parse(row.last_prompt_at)) ? `Last heard ${agoSpan(row.last_prompt_at, now)}` : "Last heard unavailable"}</span>
                   <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
                 </div>
               );
@@ -2682,7 +2665,7 @@ export function DeliverySection({ data, health, healthError, healthReadAt, telli
               return (
                 <div key={`delivery-${index}`} className="mrow delivery" role="listitem">
                   <span><span className="name">{label.conversation}</span><br /><span className="src">{[label.harness, label.component].filter(Boolean).join(" · ")}</span></span>
-                  <span className="delivery-state"><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
+                  <span className="delivery-state"><span className="src">Last heard unavailable</span><Tag tone={state.tone} dot>{state.text}</Tag>{state.detail ? <span className="src">{state.detail}</span> : null}</span>
                 </div>
               );
             })}
@@ -3011,7 +2994,7 @@ const SIZES: { name: string; help: string; fields: LimitField[]; join?: string }
   },
   {
     name: "Longest note",
-    help: "Checked when you set the note; a longer one already set keeps working.",
+    help: "Checked when you set the note; longer notes already set keep working and are sent in parts when needed.",
     fields: [{ key: "routing_note_chars", label: "Longest note", unit: "chars", options: [750, 1500, 3000, 6000, 0], zero: "No limit" }],
   },
   {
@@ -3105,7 +3088,7 @@ export function replicationStatusWords(
   healthError?: string | null,
   pending?: boolean,
 ): string {
-  if (pending) return "waiting for your OK";
+  if (pending) return "waiting for your answer on Needs you";
   if (healthError) return "can't be checked";
   if (!freshness) return "checking…";
   if (freshness.status === "not_applicable") return "off";
@@ -3312,6 +3295,7 @@ function MacRoutingControls({
         These controls apply to this Mac. They do not change what conversations hear or send proposal words to cloud agents.
       </p>
       <div className="opt-list">
+        <div className="route-copy-option" role="group" aria-label="Routing copy">
         <SwitchRow
           id="route-replication-live"
           label="Copy routing between your Macs through the hub"
@@ -3327,9 +3311,10 @@ function MacRoutingControls({
           error={<WriteError w={w} id="replication-live" />}
         />
         <p className="set-help" role="status">
-          Replication: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError, cfg?.routing?.routing_replication_live?.pending === true)}
+          Routing copy: {replicationStatusWords(deliveryHealth?.replication, deliveryHealthError, cfg?.routing?.routing_replication_live?.pending === true)}
           {deliveryAge(deliveryHealth?.replication?.age_seconds) ? ` · ${deliveryAge(deliveryHealth?.replication?.age_seconds)}` : ""}
         </p>
+        </div>
         <SwitchRow
           id="route-proposal-text"
           label="Share proposal words between your Macs"
@@ -4580,15 +4565,6 @@ export function PaceSection({ data, plans, now, folds }: {
   const closed = model.rows.filter((r) => !openRows.includes(r.key));
   return (
     <div className="section-body pace-section">
-      <p className="set-help">
-        How fast each account is being used against its limit and your caps, at the last 24 hours&apos; rate (the last
-        hour&apos;s for five-hour windows). Khipu&apos;s advice for jobs is advisory; it starts and stops nothing.
-      </p>
-      <div className="legend" aria-hidden="true">
-        <span><i />used now</span>
-        <span><i className="need" />rate that lands on the limit</span>
-        <span><i className="cap" />your cap</span>
-      </div>
       {model.empty ? (
         <EmptyState
           title="No usage readings yet"
@@ -4679,6 +4655,14 @@ export function PaceSection({ data, plans, now, folds }: {
           ))}
         </div>
       ) : null}
+      <p className="set-help">
+        Pace compares recent use with each limit and your caps. Khipu&apos;s advice is advisory; it starts and stops nothing.
+      </p>
+      <div className="legend" aria-hidden="true">
+        <span><i />used now</span>
+        <span><i className="need" />rate that lands on the limit</span>
+        <span><i className="cap" />your cap</span>
+      </div>
       <SubFold k="sub:pace-push" name="When pace changes are sent to conversations"
         line="At a verdict change, and 24 h, 6 h, 1 h and 15 min before a limit" folds={folds}>
         <p className="set-help">
@@ -4793,6 +4777,28 @@ export function RoutingSettings({
   /** Re-reads the existing app-wide doctor report; it changes no routing state. */
   onRetryDelivery?: () => Promise<unknown>;
 }) {
+  const pagesRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const pages = pagesRef.current;
+    const header = document.querySelector<HTMLElement>(".panel-head");
+    const nav = pages?.querySelector<HTMLElement>(".route-page-nav");
+    if (!pages || !header || !nav) return;
+    const measure = () => {
+      pages.style.setProperty("--route-panel-head-h", `${header.getBoundingClientRect().height}px`);
+      pages.style.setProperty("--route-page-nav-h", window.innerWidth <= 760 ? `${nav.getBoundingClientRect().height}px` : "0px");
+    };
+    measure();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(header);
+    observer?.observe(nav);
+    window.addEventListener("resize", measure);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", measure);
+      pages.style.removeProperty("--route-panel-head-h");
+      pages.style.removeProperty("--route-page-nav-h");
+    };
+  }, []);
   const route = useRouting(active);
   const config = useCliState<RouteConfig>("khipu_config_show", active);
   const features = useCliState<FeaturesShape>("khipu_features_show", active);
@@ -4983,7 +4989,7 @@ export function RoutingSettings({
     const meta = GROUPS.find((g) => g.key === key)!;
     return (
       <PageGroup key={key} k={key} name={meta.name} line={overview.lines[key]}
-        tags={key === "accounts" && foundTag ? [foundTag, ...overview.tags[key]] : overview.tags[key]}>
+        tags={key === "holds" ? overview.tags[key].filter((t) => !t.text.includes("to confirm")) : key === "accounts" && foundTag ? [foundTag, ...overview.tags[key]] : overview.tags[key]}>
         {body[key]}
       </PageGroup>
     );
@@ -4991,7 +4997,7 @@ export function RoutingSettings({
 
   return (
     <div className="route-settings">
-      <div className="route-pages">
+      <div ref={pagesRef} className="route-pages">
         <nav className="route-page-nav" aria-label="Accounts and routing pages">
           {ROUTING_PAGES.map((p) => (
             <button key={p.key} type="button" data-routing-page-select={p.key} aria-current={page === p.key ? "page" : undefined}
@@ -5057,7 +5063,6 @@ export function RoutingSettings({
                   <AccountsRequestBand support={finder.support} reload={finder.reload} onChanged={() => void route.load(true)} />
                 ) : null} />
             ) : null}
-            {data ? <ProposalsSection data={data} now={now} /> : null}
             {needsNote ? (
               <p className="needs-none" role={needsNote === READING_NEEDS ? "status" : undefined}>
                 {needsNote}
@@ -5074,7 +5079,7 @@ export function RoutingSettings({
           <section className="route-page" data-routing-page="work" data-active={page === "work"} aria-labelledby="route-page-work">
             <h2 id="route-page-work" tabIndex={-1}>Who gets what work</h2>
             <nav className="route-work-jumps" aria-label="Who gets what work sections">
-              {[["Order", "route-group-priority"], ["Note", "route-work-note"], ["Rules", "route-work-rules"], ["Temporary instructions", "route-work-holds"]].map(([label, target]) => (
+              {[["Order", "route-group-priority"], ["Note", "route-work-note"], ["Rules", "route-work-rules"], ["Holds", "route-work-holds"]].map(([label, target]) => (
                 <button key={target} type="button" className="sm" onClick={() => {
                   const el = document.getElementById(target);
                   el?.scrollIntoView?.({ block: "start" });
@@ -5088,7 +5093,7 @@ export function RoutingSettings({
           </section>
           <section className="route-page" data-routing-page="macs" data-active={page === "macs"} aria-labelledby="route-page-macs">
             <h2 id="route-page-macs" tabIndex={-1}>Your Macs</h2>
-            <p className="set-help set-intro">The existing Mac-to-Mac copy controls and their current status.</p>
+            <p className="set-help set-intro">Choose what this Mac shares with your other Macs, then check whether their copies are current.</p>
             <MacRoutingControls cfg={config.data} cfgError={config.error} deliveryHealth={deliveryHealth}
               deliveryHealthError={deliveryHealthError} w={w} reread={rereadConfig} onRetryDelivery={onRetryDelivery} />
             <MacDeliverySection data={data} health={deliveryHealth} healthError={deliveryHealthError} />
@@ -5102,6 +5107,7 @@ export function RoutingSettings({
             <h2 id="route-page-changes" tabIndex={-1}>What changed</h2>
             <p className="set-help set-intro">Recent routing changes, newest first.</p>
             {group("changes")}
+            {data ? <ProposalsSection data={data} now={now} /> : null}
           </section>
           <section className="route-page" data-routing-page="wrong" data-active={page === "wrong"} aria-labelledby="route-page-wrong">
             <h2 id="route-page-wrong" tabIndex={-1}>Something's wrong</h2>

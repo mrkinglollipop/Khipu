@@ -127,21 +127,64 @@ function calls(cmd: string) {
 
 async function page() {
   render(<RoutingSettings active />);
-  await screen.findByRole("list", { name: "Proposals" });
+  await screen.findByRole("region", { name: "Needs you" });
+}
+
+async function proposalHistory() {
+  fireEvent.click(screen.getByRole("button", { name: "What changed" }));
+  return screen.findByRole("list", { name: "Proposals" });
 }
 
 describe("Proposals and holds: proposals beside the owner's words", () => {
+  it("keeps a live note proposal in What changed because it has no Decide card", async () => {
+    answers.khipu_route_view = view({
+      note: { text: "Keep reviews on this Mac." },
+      proposals: {
+        "prop-note": { id: "prop-note", entity: "note", kind: "note", status: "live", at: "2026-10-14T15:15:00Z" },
+      },
+    });
+    await page();
+    const list = await proposalHistory();
+    expect(within(list).getByRole("listitem")).toHaveAttribute("data-route-item", "proposal:prop-note");
+    expect(list).toHaveTextContent("In use");
+  });
+
+  it("shows changed priority lines first, and reveals every original entry with Show all 20", async () => {
+    const entries = Array.from({ length: 20 }, (_, i) => ({ account: `account-${i + 1}|`, label: `Account ${i + 1}`, role: `role-${i + 1}` }));
+    const next = [entries[7], ...entries.slice(0, 7), ...entries.slice(8)].map((e) => e.account === "account-3|" ? { ...e, role: "Changed review role" } : e);
+    answers.khipu_route_view = view({ priority: { entries: next, pending: true, version: "shown-20", replaced: { entries, until: null } } });
+    await page();
+    const card = await screen.findByRole("article", { name: /A conversation put Account/ });
+    expect(card).toHaveTextContent("3. Account 3: role-3");
+    expect(card).toHaveTextContent("4. Account 3: Changed review role");
+    expect(within(card).queryByText(/Account 10: role-10/)).toBeNull();
+    fireEvent.click(within(card).getByRole("button", { name: "Show all 20" }));
+    expect(within(card).getAllByText(/Account 10: role-10/)).toHaveLength(2);
+    expect(card).toHaveTextContent("20. Account 20: role-20");
+    expect(calls("khipu_route_priority")).toEqual([]);
+  });
+
+  it("has one active proposal presentation on Needs you and keeps Edit and Dismiss reachable", async () => {
+    await page();
+    const card = await screen.findByRole("article", { name: "A conversation reworded your rule 1" });
+    expect(within(screen.getByRole("region", { name: "Needs you" })).queryByRole("list", { name: "Proposals" })).toBeNull();
+    expect(within(card).getByRole("button", { name: "Edit them first" })).toBeVisible();
+    expect(within(card).getByRole("button", { name: "Keep my words" })).toBeVisible();
+    expect(card).not.toHaveTextContent("Answer it on Needs you");
+  });
+
   it("shows each live proposal beside the owner's words, crossed apart, ended folded away", async () => {
     await page();
-    const list = screen.getByRole("list", { name: "Proposals" });
-    const rule = within(list).getByText("Rule 1").closest(".mrow")!;
+    const rule = await screen.findByRole("article", { name: "A conversation reworded your rule 1" });
     expect(rule).toHaveTextContent("Use at most 80% of the xAI week.");
     expect(rule).toHaveTextContent("Use at most 76% of the xAI week.");
-    expect(rule).toHaveTextContent("In use");
-    const prio = within(list).getByText("Your priority").closest(".mrow")!;
+    expect(rule).toHaveTextContent("The words in use now");
+    const prio = screen.getByRole("article", { name: /A conversation changed your order/ });
     expect(prio).toHaveTextContent("at most 10 points ahead");
     expect(prio).toHaveTextContent("at most 15 points ahead");
-    expect(prio).toHaveTextContent("What it said you asked: “loosen Codex's pace”");
+    expect(prio).toHaveTextContent("It says you asked“loosen Codex's pace”");
+    const list = await proposalHistory();
+    expect(within(list).queryByText("Rule 1")).toBeNull();
     const crossed = within(list).getByText("Rule 6").closest(".mrow")!;
     expect(crossed).toHaveTextContent("Crossed");
     expect(crossed).toHaveTextContent("never took effect");
@@ -242,8 +285,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     expect(document.body.textContent).not.toContain("What it said you asked");
     expect(document.body.textContent).not.toContain("It says you asked");
     expect(screen.queryByRole("button", { name: "Keep the new order" })).toBeNull();
-    const list = screen.getByRole("list", { name: "Proposals" });
-    const prio = within(list).getByText("Your priority").closest(".mrow")!;
+    const prio = screen.getByRole("article", { name: "A conversation on another Mac changed your order of accounts" });
     expect(prio).toHaveTextContent("Its words stay on the Mac it came from");
   });
 
@@ -257,7 +299,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
       },
     });
     await page();
-    const list = screen.getByRole("list", { name: "Proposals" });
+    const list = await proposalHistory();
     expect(within(list).getByText("Rule 6")).toBeInTheDocument();
     expect(within(list).queryByText("Rule 8")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Show" }));
@@ -274,7 +316,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
       },
     });
     await page();
-    const list = screen.getByRole("list", { name: "Proposals" });
+    const list = await proposalHistory();
     const row = within(list).getByText("Rule 4").closest(".mrow")! as HTMLElement;
     expect(row).toHaveTextContent(/isn't in this read/);
     expect(within(row).queryByRole("button")).toBeNull();
@@ -320,7 +362,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     const sw = screen.getByRole("switch", { name: /Copy routing between your Macs through the hub/ });
     expect(sw).not.toBeChecked();
     expect(screen.getByText(/Mac-to-Mac copy, separate from the copy for cloud agents/)).toBeInTheDocument();
-    expect(screen.getByText(/Replication: checking…/)).toBeInTheDocument();
+    expect(screen.getByText(/Routing copy: checking…/)).toBeInTheDocument();
     fireEvent.click(sw);
     await waitFor(() => expect(calls("khipu_config_set")).toContainEqual({ key: "routing_replication_live", value: "on" }));
   });
@@ -337,20 +379,20 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
     };
     await page();
     expect(screen.getByRole("switch", { name: /Copy routing between your Macs through the hub/ })).not.toBeChecked();
-    expect(screen.getByText(/Replication: waiting for your OK/)).toBeInTheDocument();
-    expect(screen.queryByText(/Replication: off/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Routing copy: waiting for your answer on Needs you/)).toBeInTheDocument();
+    expect(screen.queryByText(/Routing copy: off/)).not.toBeInTheDocument();
   });
 
   it("shows Retry cleanup only when the copy cleanup gave up, and runs the cleanup command", async () => {
     const { unmount } = render(<RoutingSettings active deliveryHealth={{ status: "green", gateway: { status: "not_applicable" } }} />);
-    await screen.findByRole("list", { name: "Proposals" });
+    await screen.findByRole("region", { name: "Needs you" });
     expect(screen.queryByRole("button", { name: /Retry cleanup/ })).toBeNull();
     unmount();
     render(<RoutingSettings active deliveryHealth={{ status: "red", gateway: {
       status: "red", cleanup_gave_up: true,
       reason_words: "Routing copy cleanup stopped after 6 failed tries; a copy may still be on the hub. Retry it from Settings.",
     } }} />);
-    await screen.findByRole("list", { name: "Proposals" });
+    await screen.findByRole("region", { name: "Needs you" });
     expect(screen.getByText(/stopped after 6 failed tries/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Retry cleanup/ }));
     await waitFor(() => expect(invokeMock.mock.calls.filter((c) => c[0] === "khipu_gateway_copy_cleanup")).toHaveLength(1));
@@ -361,7 +403,7 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
       status: "red", cleanup_interrupted: true,
       reason_words: "Routing copy cleanup was interrupted; a copy may still be on the hub. Retry it from Settings.",
     } }} />);
-    await screen.findByRole("list", { name: "Proposals" });
+    await screen.findByRole("region", { name: "Needs you" });
     expect(screen.getByText(/cleanup was interrupted/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Retry cleanup/ }));
     await waitFor(() => expect(invokeMock.mock.calls.filter((c) => c[0] === "khipu_gateway_copy_cleanup")).toHaveLength(1));
@@ -372,14 +414,14 @@ describe("Proposals and holds: proposals beside the owner's words", () => {
       status: "red", cleanup_full: true,
       reason_words: "Too many unresolved routing copy cleanups; copies may still be on the hub. Retry cleanup from Settings.",
     } }} />);
-    await screen.findByRole("list", { name: "Proposals" });
+    await screen.findByRole("region", { name: "Needs you" });
     expect(screen.getByText(/Too many unresolved/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /Retry cleanup/ }));
     await waitFor(() => expect(invokeMock.mock.calls.filter((c) => c[0] === "khipu_gateway_copy_cleanup")).toHaveLength(1));
   });
 
   it("words a waiting request ahead of every other replication state", () => {
-    expect(replicationStatusWords({ status: "not_applicable" }, null, true)).toBe("waiting for your OK");
+    expect(replicationStatusWords({ status: "not_applicable" }, null, true)).toBe("waiting for your answer on Needs you");
     expect(replicationStatusWords({ status: "not_applicable" }, null, false)).toBe("off");
   });
 

@@ -57,6 +57,10 @@ export type DecideCard = {
   asked: string | null;
   /** The difference in a line, where comparing the two boxes by eye is work. */
   changed: { cap: string; text: string } | null;
+  /** Entries hidden behind the priority card's explicit full-list reveal. */
+  detailCount?: number;
+  changedBefore?: { cap: string; text: string } | null;
+  changedNow?: { cap: string; text: string } | null;
   ifIgnored: string;
   /** The button that keeps the change; null when it can't be kept here. */
   keep: string | null;
@@ -161,6 +165,17 @@ export function priorityCard(view: RouteView, now: Date): DecideCard | null {
       ? proposalAuthor(proposal.author)
       : (p.pending_by || "a conversation");
   const day = endsDay(proposal?.at);
+  const old = p.replaced?.entries ?? [];
+  const shared = p.entries.filter((e) => old.some((o) => o.account === e.account));
+  const kept = keptInOrder(shared.map((e) => old.findIndex((o) => o.account === e.account)));
+  const changed = new Set<string>();
+  shared.forEach((e, i) => {
+    const before = old.find((o) => o.account === e.account)!;
+    if (!kept.has(i) || (before.role ?? "") !== (e.role ?? "") || (before.until ?? null) !== (e.until ?? null)) changed.add(e.account);
+  });
+  for (const e of [...old, ...p.entries]) if (!old.some((o) => o.account === e.account) || !p.entries.some((n) => n.account === e.account)) changed.add(e.account);
+  const changedWords = (entries: typeof old) => entries.map((e, i) => changed.has(e.account)
+    ? priorityWords([e], now)!.replace(/^1\./, `${i + 1}.`) : null).filter(Boolean).join("\n");
   return {
     key: "needs:priority",
     target: { type: "priority" },
@@ -173,6 +188,9 @@ export function priorityCard(view: RouteView, now: Date): DecideCard | null {
       const text = priorityChanges(p);
       return text ? { cap: "What changed", text } : null;
     })(),
+    detailCount: Math.max(old.length, p.entries.length),
+    changedBefore: { cap: "Changed lines before", text: changedWords(old) || (old.length ? "No earlier lines changed." : "You had no order set.") },
+    changedNow: { cap: "Changed lines now", text: p.proposal_withheld ? WITHHELD : changedWords(p.entries) || "Those lines were removed." },
     ifIgnored: day
       ? `The new order stays in use until ${day}, then ${had ? "your order comes back" : "it ends: you had no order before"}.`
       : `The new order stays in use, and ${STAYS_WAITING}.`,

@@ -2,6 +2,7 @@
    and Home's Confirm: what it is, before and now, who asked, and what happens
    if the owner does nothing. Buttons stay with whoever hosts it. */
 
+import { useState } from "react";
 import type { DecideCard } from "./routingNeeds";
 
 /** One line to a line; in a list, wrapping under its own text rather than its number. */
@@ -17,6 +18,10 @@ function Lines({ text }: { text: string }) {
 }
 
 export function DecideWords({ card }: { card: DecideCard }) {
+  const [showAll, setShowAll] = useState(false);
+  const priority = card.target.type === "priority";
+  const before = priority && !showAll ? card.changedBefore ?? card.before : card.before;
+  const after = priority && !showAll ? card.changedNow ?? card.now : card.now;
   return (
     <>
       <h4 className="needs-title">{card.title}</h4>
@@ -25,21 +30,26 @@ export function DecideWords({ card }: { card: DecideCard }) {
           <b>{card.changed.cap}:</b> {card.changed.text}
         </p>
       ) : null}
-      {card.before || card.now ? (
+      {(before || after) ? (
         <div className="needs-ba">
-          {card.before ? (
+          {before ? (
             <div>
-              <span className="cap">{card.before.cap}</span>
-              <Lines text={card.before.text} />
+              <span className="cap">{before.cap}</span>
+              <Lines text={before.text} />
             </div>
           ) : null}
-          {card.now ? (
+          {after ? (
             <div>
-              <span className="cap">{card.now.cap}</span>
-              <Lines text={card.now.text} />
+              <span className="cap">{after.cap}</span>
+              <Lines text={after.text} />
             </div>
           ) : null}
         </div>
+      ) : null}
+      {priority && !showAll && (card.before || card.now) ? (
+        <button type="button" className="sm" onClick={() => setShowAll(true)}>
+          Show all {card.detailCount ?? "priority entries"}
+        </button>
       ) : null}
       <dl className="needs-facts">
         <dt>Who</dt>

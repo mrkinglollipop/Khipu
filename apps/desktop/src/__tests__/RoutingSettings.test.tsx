@@ -564,7 +564,7 @@ describe("Settings -> Routing: standing rules", () => {
     await page();
     const three = row("Standing rules", "3.");
     expect(three).toHaveTextContent("From your routing table, Oct 13");
-    expect(three).toHaveTextContent("Seeded, confirm");
+    expect(three).toHaveTextContent("Copied rule, confirm");
     expect(three).toHaveTextContent("Checked by Khipu");
     const seven = row("Standing rules", "7.");
     expect(seven).toHaveTextContent("Confirmed");
@@ -772,8 +772,8 @@ describe("Settings -> Routing: standing rules", () => {
 
   it("words the help line by how many rules Khipu can check", async () => {
     await page();
-    expect(screen.getByText(/Khipu can check 1 of them by reading your job runners' settings/)).toBeInTheDocument();
-    expect(screen.getByText(/Khipu never stops any work\./)).toBeInTheDocument();
+    expect(screen.getByText(/Khipu can check 1 by reading your job runners' settings/)).toBeInTheDocument();
+    expect(screen.getByText(/but never stops work\./)).toBeInTheDocument();
   });
 
   it("filters rules with named, counted chips", async () => {
@@ -1992,7 +1992,7 @@ describe("Settings -> Routing: no fixed cap on the owner's words (R2-4)", () => 
     answers.khipu_config_show = config({ routing_hold_chars: setting(0, 300) });
     await page();
     fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
-    expect(await screen.findByText("No limit on length; the app hands over up to 128 KB at once")).toBeInTheDocument();
+    expect(await screen.findByText("No length limit from this setting")).toBeInTheDocument();
     const words = "Keep this account for the nightly review only. ".repeat(100).trim();
     expect(words.length).toBeGreaterThan(4000);
     const form = screen.getByRole("form", { name: "Add a hold" });
@@ -2001,7 +2001,9 @@ describe("Settings -> Routing: no fixed cap on the owner's words (R2-4)", () => 
     await waitFor(() => expect(calls("khipu_route_hold_add")).toHaveLength(1));
     expect(calls("khipu_route_hold_add")[0]!.text).toBe(words);
     fireEvent.click(screen.getByRole("button", { name: "Add hold…" }));
-    expect(screen.getByText("No limit on length; the app hands over up to 128 KB at once")).toBeInTheDocument();
+    expect(screen.getByText("No length limit from this setting")).toBeInTheDocument();
+    openRare("Priority and hold limits");
+    expect(screen.getByText(/Each save can hand over up to 128 KB of text/)).toBeVisible();
   });
 });
 
