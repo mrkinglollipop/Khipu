@@ -172,27 +172,28 @@ def items(view: dict, now: datetime) -> list[dict]:
     grouped: dict[tuple, list[dict]] = {}
     for row in live:
         sub = row.get("subject") or {}
-        grouped.setdefault((row["account"], sub.get("kind"), sub.get("id"), sub.get("mac")), []).append(row)
+        grouped.setdefault((overrides._ident(row["account"]), sub.get("kind"), sub.get("id"), sub.get("mac")), []).append(row)
     for rows in grouped.values():
         rows.sort(key=lambda r: r.get("at") or "")
         for old in rows[:-1]:
             found.append(_item(
                 "stacked", f"stacked:{old['id']}",
-                f"{routing._label_for_key(old['account'])} has two overrides for {overrides.subject_words(old['subject'])}.",
+                f"{routing._label_for_key(overrides._key(old['account']))} has two overrides for {overrides.subject_words(old['subject'])}.",
                 yes="End the older one.", confirm={"action": "route.override.end", "args": {"override": old["id"]}},
                 override=old["id"]))
     caps = {a["key"]: next((c.get("pct") for c in a.get("caps") or [] if c.get("kind") == "share"), None)
             for a in view.get("accounts") or []}
     for row in live:
-        label = routing._label_for_key(row["account"])
+        account = overrides._key(row["account"])
+        label = routing._label_for_key(account)
         who = overrides.subject_words(row.get("subject") or {})
         end = {"action": "route.override.end", "args": {"override": row["id"]}}
-        if row["account"] in closed:
+        if account in closed:
             found.append(_item(
                 "closed_account", f"closed-override:{row['id']}",
-                f"{who[:1].upper() + who[1:]} may run ahead on {label}, which is {closed[row['account']]['state']} right now.",
+                f"{who[:1].upper() + who[1:]} may run ahead on {label}, which is {closed[account]['state']} right now.",
                 yes="End the override.", confirm=end, override=row["id"]))
-        share = caps.get(row["account"])
+        share = caps.get(account)
         if row.get("ceiling_pct") is not None and share is not None and row["ceiling_pct"] > share:
             found.append(_item(
                 "over_cap", f"over-cap:{row['id']}",
@@ -233,7 +234,7 @@ def ending_soon(view: dict, now: datetime) -> list[str]:
     for row in overrides.list_overrides(now=now):
         end = routing._parse(row.get("until"))
         if end is not None and end - now <= SOON:
-            out.append(f"The override on {routing._label_for_key(row['account'])} ends {overrides.short_time(row['until'])}.")
+            out.append(f"The override on {routing._label_for_key(overrides._key(row['account']))} ends {overrides.short_time(row['until'])}.")
     return out
 
 

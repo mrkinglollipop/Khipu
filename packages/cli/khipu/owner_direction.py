@@ -2392,6 +2392,9 @@ def _receipt_what(want: dict, result, before=None) -> str:
         words = facts.get("exception") or facts.get("role") or facts.get("append") or entry.get("role")
         until = f" until {facts['until']}" if facts.get("exception") and facts.get("until") else ""
         changed = f"Changed {entry.get('label') or routing._label_for_key(target)} in the priority{until}:" + _quoted(words)
+        if result.get("similar_exception"):
+            changed += (f" It reads almost the same as an instruction already there ({result['similar_exception']}:"
+                        f"{_quoted(result.get('similar_text'))}), which stays in force until it ends")
         if facts.get("confirm_pending"):
             # One yes covered both: name the conversation's request it confirmed.
             prior = (before.get("replaced") or {}).get("entries") if isinstance(before, dict) else None

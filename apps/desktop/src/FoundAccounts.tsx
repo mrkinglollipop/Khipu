@@ -857,7 +857,7 @@ export function RenameDialog({
   const updated = [
     "Plans, Accounts and routing, your priority list",
     refs.holds.length ? plural(refs.holds.length, "hold", "holds") : null,
-    refs.lanes.length ? plural(refs.lanes.length, "lane", "lanes") : null,
+    refs.lanes.length ? plural(refs.lanes.length, "job slot", "job slots") : null,
   ].filter(Boolean) as string[];
   const named = [
     ...refs.rules.map((r) => `standing rule ${r.n} (“${r.text}”)`),
@@ -1031,7 +1031,7 @@ export function StopTrackingDialog({
             <div>
               <input type="checkbox" id={`${id}-l`} checked={lanes} onChange={(e) => setLanes(e.target.checked)} />
               <label htmlFor={`${id}-l`}>
-                Remove it from {plural(refs.lanes.length, "lane", "lanes")}: {refs.lanes.join(", ")}
+                Remove it from {plural(refs.lanes.length, "job slot", "job slots")}: {refs.lanes.join(", ")}
               </label>
             </div>
           ) : null}

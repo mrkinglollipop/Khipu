@@ -28,7 +28,7 @@ from datetime import datetime
 from khipu import owner_direction, routing
 
 CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held", "proposal",
-                 "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm")
+                 "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
 LOOK_KINDS = ("remind", "disagree", "broken", "contradiction", "signin", "plan", "crossing", "lane", "silent",
               "unreadable", "refused", "delivery-behind", "delivery-copy", "delivery-read")
 KINDS = CONFIRM_KINDS + LOOK_KINDS
@@ -866,8 +866,32 @@ def _looks(view: dict, now: datetime) -> tuple[list[dict], list[dict]]:
 # ---- the answer -------------------------------------------------------------------------------
 
 
+def _override_reviews(now: datetime) -> list[dict]:
+    """An override with no end whose review day has come: one yes keeps it for
+    another week, one no ends it."""
+    from khipu import conversation_overrides as overrides
+
+    out = []
+    for row in overrides.list_overrides(now=now):
+        if not (row.get("indefinite") and (routing._parse(row.get("review_at")) or now) <= now):
+            continue
+        who = overrides.subject_words(row.get("subject") or {})
+        label = routing._label_for_key(overrides._key(row["account"]))
+        out.append(_item(
+            "override_review", f"override-review:{row['id']}",
+            f"{who[:1].upper() + who[1:]} was let run ahead of pace on {label} with no end, and it is time to look at "
+            "it again.", at=row.get("review_at"),
+            confirm_does=f"Keeps it for another {overrides.REVIEW_DAYS} days, then asks again.",
+            undo_does="Ends it now: that conversation goes back to the normal pace.",
+            if_ignored="It keeps running ahead of pace, and this keeps asking.",
+            confirm=_act("route.override.keep", override=row["id"]),
+            undo=_act("route.override.end", override=row["id"])))
+    return out
+
+
 def _local_confirmations(view: dict, now: datetime) -> list[dict]:
-    return _priority(view, now) + _rules(view) + _settings() + _accounts() + _tier_table(view) + _cap_proposals(now)
+    return (_priority(view, now) + _rules(view) + _settings() + _accounts() + _tier_table(view)
+            + _cap_proposals(now) + _override_reviews(now))
 
 
 def _finished(item: dict, caller: str, now: datetime) -> dict:

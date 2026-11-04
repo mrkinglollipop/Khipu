@@ -401,7 +401,7 @@ def rank(view: dict, now, *, purpose: str = "job", tier=None, kind=None,
     for entry in entries:
         advice = account_advice(view, entry, now, purpose=purpose, tier=tier, kind=kind,
                                 privacy=privacy, sensitive=sensitive, explicit=target_key is not None,
-                                declared_tier=declared_tier, override=(overrides or {}).get(entry["key"]))
+                                declared_tier=declared_tier, override=(overrides or {}).get(routing.account_id(entry["key"])) if overrides else None)
         if not advice["eligible"]:
             group = 3
             why = advice["why_eligible"]

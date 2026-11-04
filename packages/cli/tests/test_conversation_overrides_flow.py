@@ -209,16 +209,34 @@ def test_the_same_instruction_again_writes_nothing_and_names_the_existing_one(wo
     assert len(codex["exceptions"]) == 1
 
 
-def test_a_near_copy_is_refused_naming_the_match_but_different_numbers_are_not(world):
+def test_a_near_copy_goes_through_with_a_receipt_naming_the_similar_one(world, khipu_app):
+    routing._owner_write({"type": "priority_set", "entries": [{"account": "codex|", "label": "Codex", "role": "r"}],
+                          "until": None}, "app")
+    first = routing.amend_priority("Codex", exception="re-check of PRs #3 and #11 before the release goes out today",
+                                   until=_in(5), via="app", expect=routing.priority_version())
+    out = routing.amend_priority("Codex", exception="re-check of PRs #3 and #11 before the release goes out today please",
+                                 until=_in(5), via="app", expect=routing.priority_version())
+    # Written, not refused; the answer names the similar instruction that is still in force.
+    assert out.get("duplicate") is None and out["exception_id"] != first["exception_id"]
+    assert out["similar_exception"] == first["exception_id"] and "re-check of PRs #3" in out["similar_text"]
+    routing.amend_priority("Codex", exception="re-check of PRs #3 and #12 before the release goes out today",
+                           until=_in(5), via="app", expect=routing.priority_version())
+    codex = next(e for e in routing.read_view()["priority"]["entries"] if e["account"] == "codex|")
+    assert len(codex["exceptions"]) == 3
+
+
+def test_a_near_copy_held_for_one_yes_has_its_normal_receipt_naming_the_similar_one(world):
     routing._owner_write({"type": "priority_set", "entries": [{"account": "codex|", "label": "Codex", "role": "r"}],
                           "until": None}, "app")
     routing.amend_priority("Codex", exception="re-check of PRs #3 and #11 before the release goes out today",
                            until=_in(5), via="app", expect=routing.priority_version())
-    with pytest.raises(routing.RouteError, match="reads almost the same"):
-        routing.amend_priority("Codex", exception="re-check of PRs #3 and #11 before the release goes out today please",
-                               until=_in(5), via="app", expect=routing.priority_version())
-    routing.amend_priority("Codex", exception="re-check of PRs #3 and #12 before the release goes out today",
-                           until=_in(5), via="app", expect=routing.priority_version())
+    version = routing.priority_version()
+    _hook("also re-check PRs #3 and #11 before the release goes out today please")
+    bad, out = _act("route.priority.amend", {"account": "Codex", "expect": version, "until": _in(5),
+                                              "exception": "re-check of PRs #3 and #11 before the release goes out today please"})
+    assert not bad and out["ok"] is True, out
+    assert "reads almost the same as an instruction already there" in out["receipt"]
+    assert f"khipu owner-direction undo {out['owner_action']}" in out["receipt"]
     codex = next(e for e in routing.read_view()["priority"]["entries"] if e["account"] == "codex|")
     assert len(codex["exceptions"]) == 2
 

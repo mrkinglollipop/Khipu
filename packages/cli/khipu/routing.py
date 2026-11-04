@@ -8284,7 +8284,7 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
                 row["exceptions"] = live
             if exception is not None:
                 # The same instruction again writes nothing (a retry's second
-                # copy); a near copy is named, not stacked.
+                # copy); a near copy goes through and its receipt names the similar one.
                 from khipu import priority_cleanup
 
                 twin = priority_cleanup.find_duplicate(exception, row.get("exceptions"))
@@ -8292,11 +8292,6 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
                     done = {"duplicate": True, "exception_id": twin[1]["id"], "exception_until": twin[1]["until"]}
                     rows.append(row)
                     continue
-                if twin:
-                    raise RouteError(
-                        f"{row['label']} already has an instruction that reads almost the same "
-                        f"({twin[1]['id']}: \"{_word_clip(twin[1]['text'], 80)}\", ends {twin[1]['until']}); "
-                        f"end that one first (end_exception {twin[1]['id']}) or say what is different")
                 if len(row.get("exceptions") or []) >= EXCEPTION_MOST:
                     raise RouteError(f"{row['label']} already has {EXCEPTION_MOST} exceptions; end one first")
                 made, note = _new_exception(key, exception, until, now=now, conversation=conversation, by=by,
@@ -8306,6 +8301,10 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
                 done = {"exception_id": made["id"], "exception_until": made["until"],
                         **({"exception_until_default": note} if note else {}),
                         **({"share_pct": made["share_pct"]} if made.get("share_pct") is not None else {})}
+                if twin:
+                    # A near copy goes through, with its receipt and undo, and the receipt names it.
+                    done.update(similar_exception=twin[1]["id"], similar_text=_word_clip(twin[1]["text"], 80),
+                                similar_until=twin[1]["until"])
             elif end_exception is not None:
                 left = [x for x in row.get("exceptions", []) if x["id"] != str(end_exception).strip()]
                 if len(left) == len(row.get("exceptions", [])):
@@ -11400,7 +11399,8 @@ def _priority_receipt(view: dict, now: datetime) -> dict | None:
 def _conversation_priority_answer(written: dict, now: datetime | None) -> dict:
     view = read_view(now)
     out = {k: written[k] for k in (*_WRITE_FIELDS, "exception_id", "exception_until", "exception_until_default",
-                                   "exception_ended", "lost") if k in written}
+                                   "exception_ended", "similar_exception", "similar_text", "similar_until",
+                                   "lost") if k in written}
     for entry in out.get("lost") or []:
         entry["id"] = account_id(entry.pop("account"))
     out["priority"] = _priority_receipt(view, now or _now())

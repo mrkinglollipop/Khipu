@@ -204,6 +204,23 @@ def _append(make, now: datetime) -> Any:
     return result
 
 
+def _ident(account: str) -> str:
+    """The account's one id (``codex:main``), whether it was saved under that id or
+    under an older login-folder key (``codex|``): both mean the same account."""
+    try:
+        return routing.account_id(account)
+    except Exception:  # noqa: BLE001 - an account Khipu cannot name keeps its own text
+        return account
+
+
+def _key(account: str) -> str:
+    """The login key behind an account id, for its label."""
+    try:
+        return routing._resolve_account_key(account)
+    except routing.RouteError:
+        return account
+
+
 def _event(kind: str, now: datetime, **fields) -> dict:
     return {"type": kind, "id": routing.event_identity.uuid7(), "at": _iso(now), "by": "owner", **fields}
 
@@ -215,7 +232,7 @@ def grant(values: dict, *, now: datetime | None = None) -> dict:
     now = _now(now)
     if not isinstance(values, dict):
         raise routing.RouteError("an override needs its account, effect and frozen subject")
-    account = routing._resolve_account_key(_clean(values.get("account"), "account", 128))
+    account = _ident(routing._resolve_account_key(_clean(values.get("account"), "account", 128)))
     subj = values.get("subject")
     if not isinstance(subj, dict) or subj.get("kind") not in ("thread", "session", "project") or not isinstance(subj.get("id"), str):
         raise routing.RouteError("an override needs the conversation subject shown in its ask")
@@ -242,7 +259,7 @@ def grant(values: dict, *, now: datetime | None = None) -> dict:
     def make(rows):
         rows_ended = []
         for old in _effective(rows, now):
-            if old.get("account") == account and _same(old.get("subject") or {}, subj):
+            if _ident(old.get("account") or "") == account and _same(old.get("subject") or {}, subj):
                 rows_ended.append(_event("end", now, override=old["id"]))
         return [*rows_ended, record], rows_ended
 
@@ -335,13 +352,14 @@ def matches(who: dict, now: datetime) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for row in list_overrides(now=now):
         if _applies_to(row, who):
-            out.setdefault(row["account"], row)
+            out.setdefault(_ident(row["account"]), row)
     return out
 
 
 def match(account: str, author: dict | None = None, *, now: datetime | None = None, environ: dict | None = None) -> tuple[dict | None, str | None]:
     now = _now(now)
-    if not any(r.get("account") == account for r in list_overrides(now=now)):
+    account = _ident(account)
+    if not any(_ident(r.get("account") or "") == account for r in list_overrides(now=now)):
         return None, None  # nothing granted for this account: no lookups
     who = resolve(author, environ=environ)
     if who["subject"] is None:
@@ -426,7 +444,7 @@ def ask_for(action: str, values: dict) -> str | None:
             row = next((r for r in list_overrides() if r.get("id") == values.get("override")), None)
             if row is None:
                 return None
-            label = routing._label_for_key(row["account"])
+            label = routing._label_for_key(_key(row["account"]))
             who = subject_words(row.get("subject") or {})
             if action == "route.override.end":
                 return f"End the override that lets {who} run ahead of pace on {label} now?"
@@ -455,7 +473,7 @@ def walkthrough(*, now: datetime | None = None, leave: str | None = None, keep_p
 def owner_row(row: dict, now: datetime) -> dict:
     """One override as the app lists it, in plain words."""
     who = subject_words(row.get("subject") or {})
-    return {"id": row["id"], "label": routing._label_for_key(row["account"]), "who": who[:1].upper() + who[1:],
+    return {"id": row["id"], "label": routing._label_for_key(_key(row["account"])), "who": who[:1].upper() + who[1:],
             "until": row.get("until"), "indefinite": bool(row.get("indefinite")), "review_at": row.get("review_at"),
             "review_due": bool(row.get("indefinite") and (_parse(row.get("review_at")) or now) <= now),
             "cap": cap_words(row)[:1].upper() + cap_words(row)[1:]}

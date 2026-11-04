@@ -444,7 +444,7 @@ describe("routing attention and health row edges", () => {
     expect(items).toEqual([{
       key: "routing:lane:Project A/opus-batch",
       tone: "warn",
-      title: "A limit came from a lane not matched to an account",
+      title: "A limit came from a job slot not matched to an account",
       cause: "A limit came from Project A's opus-batch job slot, which isn't matched to an account; it ends at 2:00 PM. Conversations are told the job slot's name only, never a guessed account.",
     }]);
   });
