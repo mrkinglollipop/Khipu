@@ -7935,7 +7935,10 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
 
 
 def _held_priority(now: datetime | None, *, pending: bool | None = None) -> dict:
-    held = read_view(now).get("priority")
+    view = read_view(now)
+    held = view.get("priority")
+    if held is None and pending is True and (view.get("priority_stored") or {}).get("pending"):
+        held = view["priority_stored"]
     if held is None:
         raise RouteError("there is no priority set")
     if pending is True and not held.get("pending"):
@@ -7950,6 +7953,9 @@ def confirm_priority(*, via: str, now: datetime | None = None, expect=None, hold
     with _lock():
         _check_priority(expect, now)
         held = _held_priority(now, pending=True)
+        end = _parse((read_view(now).get("priority_stored") or {}).get("until") or held.get("until"))
+        if end is not None and end <= (now or _now()):
+            raise RouteError("the pending priority's saved end has passed; it can only be declined")
         if held.get("proposal_withheld"):
             raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
         view = read_view(now)
@@ -10194,6 +10200,21 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     # words them itself, in local times.
     if view.get("priority"):
         out["priority"] = {k: v for k, v in view["priority"].items() if k not in ("pending_author", "event_id")}
+    stored = view.get("priority_stored") or {}
+    end = _parse(stored.get("until"))
+    if stored.get("pending") and end and end <= now:
+        out["expired_priority"] = stored
+    from khipu import owner_direction
+
+    out["decline_only_requests"] = []
+    for request in owner_direction._read_requests(owner_direction.requests_path()):
+        if request.get("state") != "pending":
+            continue
+        why = owner_direction.unapplyable_reason(request, now=now.timestamp())
+        if why:
+            out["decline_only_requests"].append({"id": request["id"], "words": why,
+                                                   "ask": request.get("ask"), "at": request.get("created_at"),
+                                                   "by": author_words(request.get("by"), push=False)})
     out["plan_facts"] = plan_facts(view, now)
     out["pace_order"] = cfg["routing_pace_order"]
     # Where a registered runner's own budget caps have no Khipu fact, or
@@ -12582,8 +12603,12 @@ def _owner_via(args, intent: dict | None = None) -> str | None:
         owner_direction.noted(intent, _OWNER_AUTH.get())
         return "app"
     if getattr(args, "by_direction", False):
-        _OWNER_AUTH.set(owner_direction.gate(intent))
-        return "direction"
+        stamp = owner_direction.gate(intent)
+        _OWNER_AUTH.set(stamp)
+        # ``needs-you --yes/--no`` proves the owner on a direct terminal,
+        # then reuses this guarded replay.  Keep the write's provenance in
+        # sync with that terminal proof instead of labelling it a direction.
+        return "cli" if stamp.get("auth") == "terminal" else "direction"
     if not typed_yes("This is an owner's change to the routing record. Type yes to confirm: "):
         return None
     _OWNER_AUTH.set({"auth": "terminal", "auth_chain": " < ".join(_caller()["chain"])})

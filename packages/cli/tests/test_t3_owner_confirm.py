@@ -200,7 +200,11 @@ def _hold_in_t3(world, *, ago: float = 0.0, request_message: bool = True) -> str
 
 
 def _confirm_id(request: str):
-    return owner_act.act("direction.confirm", {"request": request})
+    ok, out = owner_act.act("direction.confirm", {"request": request})
+    if ok and out.get("started"):
+        from khipu import owner_background
+        return owner_background.run(out["request"])
+    return ok, out
 
 
 # ---- T3: the owner's message in T3's record decides ----------------------------------------------

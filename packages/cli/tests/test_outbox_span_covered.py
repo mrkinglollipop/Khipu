@@ -228,8 +228,8 @@ def test_a_covering_row_whose_source_is_forgotten_holds(pg, monkeypatch):
     # racing the read can show it: the check is asked of the row's raw too.
     land(COVER)
     dead()
-    monkeypatch.setattr(tombstones, "hub_source_forgotten",
-                        lambda cur, payload, source=None: payload.get("summary") == COVER["summary"])
+    monkeypatch.setattr(tombstones, "hub_sources_forgotten",
+                        lambda cur, payloads: [p.get("summary") == COVER["summary"] for p in payloads])
     assert_held(pg, span.FORGOTTEN)
 
 
@@ -332,7 +332,13 @@ def test_apply_says_what_it_did_in_plain_words(pg, monkeypatch):
     with mock.patch("khipu.routing.typed_yes", return_value=True):
         rc, text = run("--apply")
     assert rc == 0, text
-    assert "1 dead job. Retired 1" in text and "Nothing was written to the hub" in text
+    assert "Started; it will finish on its own" in text
+    from khipu import owner_background
+    request = next(r for r in owner_direction._read_requests(owner_direction.requests_path()) if r["state"] == "applying")
+    ok, done = owner_background.run(request["id"])
+    assert ok and done["retired"] == 1, done
+    final = span.words(done)
+    assert "1 dead job. Retired 1" in final and "Nothing was written to the hub" in final
     assert TEXT not in text and JOB["summary"] not in text
 
 
@@ -795,16 +801,22 @@ def test_owner_act_holds_even_after_a_recent_turn_until_his_answer_is_proven(own
     assert len(outbox.dead_jobs()) == 1 and records() == []
     say(tmp_path, owned, "yes, retire them")
     ok, done = owner_act.act("direction.confirm", {"request": out["request"]})
+    assert ok and done["started"] and not done["applied"], done
+    from khipu import owner_background
+    ok, done = owner_background.run(done["request"])
     assert ok and done["retired"] == 1 and done["owner_action"], done
     assert outbox.dead_jobs() == [] and len(records()) == 1
     line = next(x for x in owner_direction.actions() if x["id"] == done["owner_action"])
     assert line["action"] == "outbox.span_covered" and line["auth"] == "direction" and line["state"] == "applied"
+    assert line["result"]["retired"] == 1
     assert [e["kind"] for e in owner_direction.preference_merges(line["id"], "preference_resolutions")] == [
         capture.SPAN_KIND]
     # Undo puts the job back whole, and the record goes.
     say(tmp_path, owned, "undo that please")
-    result = owner_direction.undo(done["owner_action"], "direction")
-    assert result["restored"] == 1, result
+    ok, undo_started = owner_act.act("direction.undo", {"id": done["owner_action"]})
+    assert ok and undo_started["started"], undo_started
+    ok, result = owner_background.run(undo_started["request"])
+    assert ok and result["restored"] == 1, result
     assert len(outbox.dead_jobs()) == 1 and records() == []
 
 
@@ -814,3 +826,39 @@ def test_a_dispatched_job_cannot_even_hold_it(owned, tmp_path, monkeypatch):
     ok, out = owner_act.act("outbox.span_covered", {})
     assert not ok and out["code"] == "no_recorded_turn", out
     assert len(outbox.dead_jobs()) == 1
+
+
+def test_source_reads_are_batched_and_each_job_file_is_read_once(pg, monkeypatch):
+    import time
+    land(COVER)
+    for n in range(120):
+        dead(refused(summary=f"Part {n}"))
+    paths = outbox.dead_jobs()
+    reads = []
+    real_read = Path.read_bytes
+    def read(path):
+        if path in paths:
+            reads.append(path)
+        return real_read(path)
+    monkeypatch.setattr(Path, "read_bytes", read)
+    queries = []
+    class Cursor:
+        def __init__(self, cur):
+            self.cur = cur
+        def execute(self, sql, params=None):
+            queries.append(sql)
+            return self.cur.execute(sql, params)
+        def fetchall(self):
+            return self.cur.fetchall()
+        def fetchone(self):
+            return self.cur.fetchone()
+    started = time.monotonic()
+    entries = span._read(paths)
+    with pg.connect() as conn, conn.cursor() as cur:
+        assert span._judge(Cursor(cur), entries)
+    seconds = time.monotonic() - started
+    assert len(reads) == 120 and len(set(reads)) == 120
+    assert sum("SELECT identity FROM forgotten_sources" in q for q in queries) == 1
+    assert sum(q.startswith("SELECT id, session_id") for q in queries) == 1
+    assert all(entry["reason"] is None for entry in entries)
+    print(f"span-covered: 120 jobs, {len(queries)} hub queries, {seconds:.3f}s")

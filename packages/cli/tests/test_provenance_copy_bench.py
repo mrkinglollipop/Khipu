@@ -292,16 +292,20 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
 
         quiet = threading.Event()
         quiet.set()
+        patch_gate = threading.Lock()
 
         def patch_loop() -> None:
             for row in itertools.cycle(live_rows):
                 if stop.wait(0.2):
                     return
                 quiet.wait()
-                out = hs.upsert_episode(row, [])
-                side["patches"] += 1
-                if not (out.get("ok") or out.get("deferred") or "in progress" in str(out.get("error"))):
-                    side["patch_errors"].append(out)
+                with patch_gate:
+                    if not quiet.is_set():
+                        continue
+                    out = hs.upsert_episode(row, [])
+                    side["patches"] += 1
+                    if not (out.get("ok") or out.get("deferred") or "in progress" in str(out.get("error"))):
+                        side["patch_errors"].append(out)
 
         def rss_loop() -> None:
             while not stop.wait(0.01):
@@ -332,22 +336,24 @@ def test_the_copy_under_a_sustained_workload_meets_its_bounds(pg, replica, pg_cl
                 # Live patches wait while the unchanged pull runs, so any
                 # write to the file is the pull's own.
                 quiet.clear()
-                time.sleep(0.25)
-                before = _file_hash()
-                timer.start()
-                started = time.monotonic()
-                out = hs.pull_changes(include_ledger=False)
-                unchanged.append(time.monotonic() - started)
-                timer.stop()
-                unchanged_phases.append(dict(timer.phases))
-                unchanged_copy.append(out["facts"]["seconds"])
-                assert out["ok"] and out["facts"].get("skipped"), out
-                # A pull that re-read an episode (a deferred live patch's
-                # missed marker) was not an unchanged one.
-                if _file_hash() != before and not any(out.get(k) for k in (
-                        "episodes", "tombstones", "vectors", "missed_retried")):
-                    wrote.append({k: out.get(k) for k in ("episodes", "tombstones", "vectors", "missed_retried",
-                                                          "kept_newer", "topics", "project_aliases")})
+                # Wait for any in-flight patch to finish before attributing
+                # file changes to the unchanged pull alone.
+                with patch_gate:
+                    before = _file_hash()
+                    timer.start()
+                    started = time.monotonic()
+                    out = hs.pull_changes(include_ledger=False)
+                    unchanged.append(time.monotonic() - started)
+                    timer.stop()
+                    unchanged_phases.append(dict(timer.phases))
+                    unchanged_copy.append(out["facts"]["seconds"])
+                    assert out["ok"] and out["facts"].get("skipped"), out
+                    # A pull that re-read an episode (a deferred live patch's
+                    # missed marker) was not an unchanged one.
+                    if _file_hash() != before and not any(out.get(k) for k in (
+                            "episodes", "tombstones", "vectors", "missed_retried")):
+                        wrote.append({k: out.get(k) for k in ("episodes", "tombstones", "vectors", "missed_retried",
+                                                              "kept_newer", "topics", "project_aliases")})
                 quiet.set()
         finally:
             stop.set()

@@ -564,6 +564,8 @@ export type RouteDeliveryHealth = {
 };
 
 export type RouteView = {
+  expired_priority?: RoutePriority;
+  decline_only_requests?: { id: string; words: string; ask?: string; at?: string; by?: string }[];
   proposals?: Record<string, RouteProposal>;
   definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
   record?: boolean;

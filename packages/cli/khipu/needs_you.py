@@ -206,6 +206,8 @@ def _item(kind: str, key: str, words: str, *, by=None, at=None, confirm_does: st
     item = {"kind": kind, "key": key, "sort": "confirmation" if kind in CONFIRM_KINDS else "look", "words": said,
             "_by": by, "at": at, "confirm_does": confirm_does, "undo_does": undo_does,
             "settle": {"confirm": confirm, "undo": undo}, **extra}
+    if confirm or undo:
+        item.setdefault("if_ignored", "It stays waiting until you answer.")
     if do:
         item["do"] = do
     if _CLIPPED.get() or said != routing._one_line(words):
@@ -219,14 +221,21 @@ def _item(kind: str, key: str, words: str, *, by=None, at=None, confirm_does: st
 
 
 def _priority(view: dict, now: datetime) -> list[dict]:
-    held = view.get("priority") or {}
+    held = view.get("priority") or view.get("priority_stored") or {}
     if not held.get("pending"):
         return []
     version = view.get("priority_version") or "p0"
-    undo = _act("route.priority.undo", expect=routing.pending_priority_pin(view))
+    pin = routing.pending_priority_pin(view)
+    undo = _act("route.priority.undo", expect=pin)
     undo_does = ("Puts back the priority it replaced." if held.get("replaced")
                  else "Removes it: you had no priority set before.")
     by, at = held.get("pending_author") or held.get("written_by"), held.get("at")
+    ends = routing._parse((view.get("priority_stored") or {}).get("until") or held.get("until"))
+    if ends is not None and ends <= now:
+        return [_item("priority", "priority", "A conversation changed your account priority, but its saved end has "
+                      "passed. It can only be declined; Khipu will not apply it.", by=by, at=at,
+                      confirm_does="It cannot be kept: its saved end has passed.",
+                      undo_does=undo_does, undo=undo, decline_only=True)]
     if held.get("proposal_withheld"):
         return [_item("priority", "priority", "A conversation on another Mac changed your account priority. Its "
                       "words stay on that Mac, so they can't be shown here.", by=by, at=at,
@@ -238,6 +247,8 @@ def _priority(view: dict, now: datetime) -> list[dict]:
              + "; ".join(_said(c, _WORDS_MOST) for c in changes) + "."
              + (f" It said you asked: {_quote(asked)}." if asked else ""))
     return [_item("priority", "priority", words, by=by, at=at,
+                  if_ignored=(f"The new priority stays in use until {held['until']}, and stays waiting for your answer."
+                              if held.get("until") else "The new priority stays in use, and stays waiting for your answer."),
                   confirm_does="Makes these changes your own priority, so it stops showing as unconfirmed.",
                   undo_does=undo_does, confirm=_act("route.priority.confirm", expect=routing.pending_priority_pin(view)), undo=undo)]
 
@@ -483,6 +494,13 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
                              by=row.get("by"), at=row.get("created_at"), undo=decline,
                              undo_does="Drops the old held request. Nothing changes."))
             continue
+        reason = owner_direction.unapplyable_reason(row)
+        if reason:
+            out.append(_item("held", f"held:{request}", reason +
+                             (f" It asks: {_quote_ask(row.get('ask'))}." if row.get("ask") else ""),
+                             by=row.get("by"), at=row.get("created_at"), undo=decline,
+                             undo_does="Drops the held request. Nothing changes.", decline_only=True))
+            continue
         placed, same_target = False, False
         for item in items:
             for side in ("confirm", "undo"):
@@ -504,7 +522,7 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
         if action in _ANSWERS and (not same_target or pinned):
             out.append(_item("held", f"held:{request}", f"A conversation asked to {phrase}, and it was held for you. "
                              "What it answered has since changed or been settled, so it can only be refused." + said, by=by,
-                             at=at, confirm_does="Nothing to confirm: it would be refused.",
+                             at=at, decline_only=True, confirm_does="Nothing to confirm: it would be refused.",
                              undo_does="Drops the held request. Nothing changes.", undo=decline))
             continue
         out.append(_item("held", f"held:{request}", f"A conversation asked to {phrase}, and it is held until you "
@@ -884,7 +902,8 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
     return sorted(items, key=lambda it: rank[it["kind"]]), unread, view
 
 
-def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None, now: datetime | None = None) -> dict:
+def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None, now: datetime | None = None,
+            record_read: bool = True) -> dict:
     """The answer of ``khipu_needs_you``. Every read that fails is named in
     ``unread``, and "nothing" is only said when none did. ``key``: one item, its
     words whole. Reading it is the ask (``owner_direction.note_read``)."""
@@ -924,7 +943,7 @@ def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None,
                                + f"). Read again with offset {offset + MOST}.")
     if unread:
         answer["unread"] = unread
-    if page:
+    if page and record_read:
         why = owner_direction.note_read(_shown(page))
         if why:
             # With no record of the ask, a yes could not be told from the question: no settle to offer.

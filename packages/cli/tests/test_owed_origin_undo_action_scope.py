@@ -6,6 +6,7 @@ from tests.test_owed_origin_selective_undo import corrected, states  # noqa: F40
 from tests.test_owed_origin_correction import origin_db  # noqa: F401
 from tests.test_owed_tidy import _direction
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.owner_jobs import finish_owner_job
 
 
 @pytest.fixture
@@ -22,7 +23,7 @@ def undo_action(batch, ids=None):
     args = {"project": "example/widget", "batch": batch}
     if ids is not None:
         args["ids"] = ids
-    ok, out = owner_act.act("owed.tidy", args)
+    ok, out = finish_owner_job(owner_act.act("owed.tidy", args))
     assert ok, out
     return next(a for a in owner_direction.actions() if a["id"] == out["owner_action"])
 
@@ -52,7 +53,7 @@ def test_lost_finish_preserves_exact_scope(ordinary, monkeypatch):
     conn, ids, batch = ordinary
     undo_action(batch, [ids[0]])
     monkeypatch.setattr(owner_direction, "finish", lambda result: result)
-    ok, out = owner_act.act("owed.tidy", {"project": "example/widget", "batch": batch})
+    ok, out = finish_owner_job(owner_act.act("owed.tidy", {"project": "example/widget", "batch": batch}))
     assert ok and out["restored"] == 1
     owner_direction._PENDING.set(None)  # Simulate process exit without a completion line.
     line = next(a for a in owner_direction.actions()
@@ -81,6 +82,10 @@ def test_scope_log_failure_rolls_back_database(ordinary, monkeypatch):
             raise OSError("synthetic scope log failure")
         return original(line)
     monkeypatch.setattr(owner_direction, "_append", fail_success_scope)
-    with pytest.raises(OSError, match="synthetic scope log failure"):
-        undo_action(batch, [ids[0]])
+    from khipu import owner_background
+    ok, started = owner_act.act("owed.tidy", {"project": "example/widget", "batch": batch, "ids": [ids[0]]})
+    assert ok and started["started"]
+    ok, failed = owner_background.run(started["request"])
+    assert not ok and failed["code"] == "failed"
+    assert "OSError" in failed["error"]
     assert states(conn, ids) == [("agent", "job")] * 2

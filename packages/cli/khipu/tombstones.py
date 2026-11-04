@@ -1020,6 +1020,30 @@ def hub_source_forgotten(cur, payload: dict[str, Any],
     return cur.fetchone() is not None
 
 
+
+def hub_sources_forgotten(cur, payloads: list[dict[str, Any]]) -> list[bool | None]:
+    """The same source decisions in one hub read; None marks an unreadable payload."""
+    from khipu.db import has_table
+
+    registry = _read_unlocked()
+    local, identities = [], []
+    for payload in payloads:
+        try:
+            hidden = _known(registry, payload)
+            group = [] if hidden else _hub_identities(payload, None)
+        except RegistryError:
+            hidden, group = None, []
+        local.append(hidden)
+        identities.append(group)
+    all_ids = sorted({identity for group in identities for identity in group})
+    forgotten = set()
+    if all_ids and has_table(cur, "forgotten_sources"):
+        cur.execute("SELECT identity FROM forgotten_sources WHERE identity = ANY(%s)", (all_ids,))
+        forgotten = {row[0] for row in cur.fetchall()}
+    return [None if hidden is None else hidden or not forgotten.isdisjoint(group)
+            for hidden, group in zip(local, identities)]
+
+
 def hub_source_forgotten_tags(cur, tags: Any) -> bool:
     """``hub_source_forgotten`` for a payload no longer at hand, by the
     registry tags a writer kept for it (``identity_strings``): whether this

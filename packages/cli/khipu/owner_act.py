@@ -522,9 +522,10 @@ def act(action, args) -> tuple[bool, dict]:
         return _held_on_a_read(_hold(action, values, ask=owner_direction.CONFIRM_ONLY[action]))
     token = owner_direction.ANSWERING.set(owner_direction.signature(action, values))
     try:
+        proof = None
         if not held:
             try:
-                owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
+                proof = owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
             except owner_direction.DirectionRefused as refused:
                 if refused.code == "not_confirmed":
                     return False, refused.refusal()  # the turn that read the list: no hold, nothing to ask yet
@@ -542,6 +543,10 @@ def act(action, args) -> tuple[bool, dict]:
             from khipu import needs_you
 
             return _held_on_a_read(_hold(action, values, ask=needs_you.ask_for(action, values)))
+        from khipu import owner_background
+
+        if proof and owner_background.is_long(action, values):
+            return owner_background.start_authorized(action, values, proof)
         return _run(action, full)
     finally:
         owner_direction.ANSWERING.reset(token)
@@ -699,15 +704,25 @@ def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, d
                            "request. In another conversation, read the full held item first, then the owner can answer once.")}
 
 
-def _confirm(args) -> tuple[bool, dict]:
+def _confirm(args, *, terminal: bool = False) -> tuple[bool, dict]:
     from khipu import owner_direction
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
         return False, _bad(f"{CONFIRM} takes request, the held request's id").refusal()
     try:
-        request, stamp = owner_direction.confirm(args["request"])
+        request, stamp = owner_direction.confirm(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
+    from khipu import owner_background
+
+    if owner_background.is_long(request["action"], request.get("args") or {}):
+        return owner_background.start(request)
+    return _apply_confirmed(request, stamp)
+
+
+def _apply_confirmed(request: dict, stamp: dict) -> tuple[bool, dict]:
+    from khipu import owner_direction
+
     action, ok, result = request["action"], False, None
     try:
         head, positionals = argv(action, _values(action, request.get("args") or {}))
@@ -724,18 +739,43 @@ def _confirm(args) -> tuple[bool, dict]:
     return ok, dict(result or {}, request=request["id"], confirmed=stamp["confirmed"])
 
 
-def _decline(args) -> tuple[bool, dict]:
+def _decline(args, *, terminal: bool = False) -> tuple[bool, dict]:
     from khipu import owner_direction
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
         return False, _bad(f"{DECLINE} takes request, the held request's id").refusal()
     try:
-        request = owner_direction.decline(args["request"])
+        request = owner_direction.decline(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
     return True, {"ok": True, "declined": True, "applied": False, "request": request["id"],
                   "line": "The held request is dropped. Nothing was changed.",
                   "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}
+
+
+def settle_terminal(action: str, args: dict) -> tuple[bool, dict]:
+    """Settle one fully displayed Needs-you item after ``typed_yes`` proved a
+    direct terminal.  This follows the same hold/replay path as the app and
+    MCP; only terminal proof replaces a conversation's recorded reply."""
+    if action in (CONFIRM, DECLINE):
+        request = args.get("request") if isinstance(args, dict) else None
+        if not isinstance(request, str):
+            return False, _bad("the held request is missing").refusal()
+        return (_confirm({"request": request}, terminal=True) if action == CONFIRM
+                else _decline({"request": request}, terminal=True))
+    from khipu import needs_you, owner_direction
+
+    try:
+        full = _values(action, args)
+        prepared = needs_you.prepare_answer(action, full)
+        if prepared:
+            full, ask = prepared
+        else:
+            ask = None
+        held = owner_direction.hold(action, full, ask=ask, terminal=True)
+    except (owner_direction.DirectionRefused, Refused) as refused:
+        return False, refused.refusal()
+    return _confirm({"request": held["id"]}, terminal=True)
 
 
 def _run(action: str, full: list[str]) -> tuple[bool, dict]:

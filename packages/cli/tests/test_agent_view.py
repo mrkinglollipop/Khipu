@@ -846,4 +846,8 @@ def test_generated_folder_and_user_names_never_reach_an_agent(tmp_path, monkeypa
     home, accounts = _setup(tmp_path, monkeypatch, user, names)
     _seed(home, accounts, user)
     for surface, out in _agent_surfaces(capsys).items():
+        # The randomly named pytest container can itself contain a one-letter
+        # generated alias. Remove only that public fixture prefix; the fake
+        # user's and login folders' private path segments remain checked.
+        out = json.loads(json.dumps(out, ensure_ascii=False).replace(str(tmp_path), "/fixture"))
         assert _survivors(out, [*names, user]) == [], (seed, surface, names, user)
