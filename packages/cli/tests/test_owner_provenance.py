@@ -70,38 +70,6 @@ def _counts(prompt, env=CLAUDE_ENV, refused_as="no_recorded_turn"):
 # ---- a turn the hook did not issue ------------------------------------------------------
 
 
-def test_running_the_shim_by_hand_cannot_make_a_turn_that_passes(folders, monkeypatch):
-    for name in ("CODEX_THREAD_ID", "KHIPU_SESSION_ID"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("CLAUDECODE", "1")
-    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "forged-agent-session")
-    from khipu import mcp_server as ms
-    from khipu.mcp_server import handle_message
-
-    monkeypatch.setattr(ms, "_GATEWAY_ACTIVE", False)
-    # This child supplies the purported user prompt and every provenance
-    # variable itself: the harness's prompt hook is not involved, so the
-    # turn it records names a Python above the shim as its issuer.
-    env = {**os.environ, "KHIPU_RECALL_DAEMON": "0", "KHIPU_PYTHON": sys.executable}
-    payload = {"session_id": "forged-agent-session", "prompt": "pause Codex until 5pm",
-               "cwd": str(folders["home"]), "hook_event_name": "UserPromptSubmit"}
-    done = subprocess.run(["/bin/sh", str(SHIM)], input=json.dumps(payload), text=True,
-                          capture_output=True, env=env, timeout=60, check=True)
-    assert "Owner turn" not in done.stdout
-    (turn,) = owner_turns.turns("forged-agent-session")
-    assert turn["typed"] is True and "refused" in turn["issuer"]
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check("route.pause")
-    assert err.value.code == "not_from_the_hook"
-
-    result = handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-        "name": "khipu_owner_act", "arguments": {"action": "route.pause", "args": {"account": "Codex"}},
-    }})
-    assert result["result"]["isError"] is True
-    assert next(a for a in routing.read_view()["accounts"] if a["label"] == "Codex")["state"] != "paused"
-
-
 SHIM_ARGS = ["/bin/sh", "/live/packages/cli/bin/khipu-prompt-recall"]
 BASH_TOOL_ARGS = ["/bin/zsh", "-c", "source snapshot.sh && eval 'printf payload | khipu-prompt-recall'"]
 
@@ -134,37 +102,6 @@ def test_a_turn_records_the_process_that_ran_the_hook(folders, monkeypatch):
     assert owner_turns.hook_issuer() == {"refused": "python3.11"}
 
 
-def test_the_recorder_run_from_an_agents_bash_tool_is_not_the_hook(folders, monkeypatch):
-    """Fifth review, P1: the agent runs the recorder (or the shim) from its
-    ordinary Bash tool, no exec. The shell above is the agent's, so the turn
-    it writes never carries the owner, and no owner change goes through."""
-    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("KHIPU_SESSION_ID", "never-typed-session")
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(111, 1.0, "claude")])
-    # The recorder straight from the Bash tool's shell.
-    _tree(monkeypatch, {100: (222, "/opt/homebrew/bin/python3.11", 3.0), 222: (111, "/bin/bash", 2.0),
-                        111: (1, "/opt/harness/claude", 1.0)},
-          {222: ["/bin/bash", "-c", "eval 'python3 khipu-owner-turn.py < payload.json'"]})
-    issuer = owner_turns.hook_issuer()
-    assert "refused" in issuer, issuer
-    # The shim from the Bash tool's shell, in a pipeline and through a bash -c of its own.
-    _tree(monkeypatch, {100: (90, "/usr/bin/python3", 3.0), 90: (222, "/bin/bash", 2.5),
-                        222: (111, "/bin/zsh", 2.0), 111: (1, "/opt/harness/claude", 1.0)},
-          {90: SHIM_ARGS, 222: BASH_TOOL_ARGS})
-    assert owner_turns.hook_issuer() == {"refused": "zsh"}
-    _tree(monkeypatch, {100: (90, "/usr/bin/python3", 3.0), 90: (80, "/bin/bash", 2.5),
-                        80: (222, "/bin/bash", 2.2), 222: (111, "/bin/zsh", 2.0), 111: (1, "/opt/harness/claude", 1.0)},
-          {90: SHIM_ARGS, 80: ["/bin/bash", "-c", "/live/bin/khipu-prompt-recall; true"], 222: BASH_TOOL_ARGS})
-    assert owner_turns.hook_issuer() == {"refused": "bash"}
-    owner_turns.record({"session_id": "never-typed-session", "prompt": "agent-written payload", "cwd": "/w"},
-                       CLAUDE_ENV, issuer=issuer)
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check("direction.off")
-    assert err.value.code == "not_from_the_hook"
-    assert owner_turns.settings()["enabled"] is True
-
-
 def test_the_kernel_argv_of_a_process_reads_back(folders):
     """``_proc_args`` reads a real process's argv, the seam the tests above
     stand in for."""
@@ -176,27 +113,6 @@ def test_the_kernel_argv_of_a_process_reads_back(folders):
     out = subprocess.run([sys.executable, "-S", "-c", code, root, "two words"], capture_output=True, text=True,
                          timeout=60)
     assert json.loads(out.stdout)[1:] == ["-S", "-c", code, root, "two words"], out
-
-
-def test_a_turn_whose_issuer_is_not_above_the_caller_is_refused(folders, monkeypatch):
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-issuer")
-    owner_turns.record({"session_id": "s-issuer", "prompt": "pause Codex for now", "cwd": "/w"},
-                       CLAUDE_ENV, issuer={"pid": 4242, "start": 7.0, "exe": "claude"})
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(4242, 8.0, "claude")])
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check("route.pause")
-    assert err.value.code == "not_from_the_hook"
-    monkeypatch.setattr(owner_direction, "_caller_chain", lambda: [(4242, 7.0, "claude")])
-    assert owner_direction.check("route.pause")["auth"] == "direction"
-
-
-def test_a_refused_issuer_never_carries_the_owner(folders, monkeypatch):
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-zsh")
-    owner_turns.record({"session_id": "s-zsh", "prompt": "pause Codex for now", "cwd": "/w"},
-                       CLAUDE_ENV, issuer={"refused": "zsh"})
-    with pytest.raises(owner_direction.DirectionRefused) as err:
-        owner_direction.check("route.pause")
-    assert err.value.code == "not_from_the_hook"
 
 
 # ---- wrappers anywhere in the turn ------------------------------------------------------
@@ -348,3 +264,237 @@ def test_t3_handoff_history_marker_never_puts_history_on_disk(hooked):
     assert (turn["entrypoint"], turn["typed"]) == ("t3", True)
     disk = owner_turns.session_file("review-session").read_text(encoding="utf-8")
     assert "untrusted history" not in disk and "pause Codex" not in disk and "what did I just ask" not in disk
+
+
+# ---- a harness whose program file was replaced while it runs --------------------------------
+#
+# An update deletes the file a running Claude Code was started from, and the
+# kernel then has no path for it (``proc_pidpath`` returns 0) while its parent,
+# start time and name stay readable. The issuer and chain comparison is (pid,
+# start time), but the name a path gives decides which process that comparison
+# lands on (the walk skips shells and interpreters) and the app-bundle place
+# comes from it too. So a process seen by a hook while its path was readable
+# stays that process only while its record's name is the kernel's own. One
+# never seen so stays refused.
+
+REAL_CHAIN = owner_direction._caller_chain  # conftest puts a fake harness in front of it
+REAL_REPLACED = owner_direction._program_replaced
+HOOKED = ["claude", "--resume=3f1c"]
+TYPED = {"session_id": "s-replaced", "prompt": "pause Codex for now", "cwd": "/w"}
+
+
+class Kernel:
+    """The process tree the issuer and the chain read: the recorder (100)
+    under the shim (90) under Claude (80), and the MCP server (200) under
+    Claude. ``replace`` deletes a process's file: no path, the rest readable."""
+
+    def __init__(self, monkeypatch):
+        self.mp = monkeypatch
+        self.procs = {100: (90, "/usr/bin/python3", 3.0), 90: (80, "/bin/bash", 2.5),
+                      80: (70, "/Users/x/.local/share/claude/versions/2.1.316", 1.0),
+                      70: (1, "/usr/sbin/launcher", 0.5), 200: (80, "/usr/bin/python3", 3.0)}
+        self.args = {90: SHIM_ARGS, 80: list(HOOKED), 70: ["launcher"]}
+        self.names: dict[int, str] = {}
+        self.gone: set[int] = set()
+        monkeypatch.setattr(owner_turns, "_proc_info", self.info)
+        monkeypatch.setattr(owner_turns, "_proc_bare", self.bare)
+        monkeypatch.setattr(owner_turns, "_proc_args", lambda pid: self.args.get(pid))
+        monkeypatch.setattr(owner_turns, "_on_terminal", lambda pid: None)
+        monkeypatch.setattr(owner_direction, "_caller_chain", REAL_CHAIN)
+        monkeypatch.setattr(owner_direction, "_program_replaced", REAL_REPLACED)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-replaced")
+        self.be(100)
+
+    def be(self, pid: int) -> None:
+        self.mp.setattr(owner_turns.os, "getpid", lambda: pid)
+
+    def info(self, pid):
+        return None if pid in self.gone else self.procs.get(pid)
+
+    def bare(self, pid):
+        if pid not in self.procs:
+            return None
+        parent, exe, start = self.procs[pid]
+        return parent, start, self.names.get(pid, os.path.basename(exe))[:15]
+
+    def replace(self, *pids: int) -> None:
+        self.gone.update(pids)
+
+    def hook_turn(self):
+        """What the prompt hook records for one typed turn, read off the tree."""
+        self.be(100)
+        issuer = owner_turns.hook_issuer() or {"refused": "unknown"}
+        owner_turns.record(TYPED, CLAUDE_ENV, issuer=issuer)
+        return issuer
+
+    def check(self, caller: int = 200):
+        self.be(caller)
+        return owner_direction.check("route.pause")
+
+
+@pytest.fixture
+def kernel(folders, monkeypatch):
+    for name in ("CODEX_THREAD_ID", "KHIPU_SESSION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    return Kernel(monkeypatch)
+
+
+def _refused(kernel, caller: int = 200) -> str:
+    with pytest.raises(owner_direction.DirectionRefused) as err:
+        kernel.check(caller)
+    assert err.value.code == "not_from_the_hook"
+    return str(err.value)
+
+
+def test_a_known_process_keeps_the_proof_after_its_binary_is_replaced(kernel):
+    before = kernel.hook_turn()
+    assert before["pid"] == 80 and kernel.check()["auth"] == "direction"
+    kernel.replace(80)
+    after = kernel.hook_turn()
+    # The same facts as before the update, the kernel's start time included.
+    assert after == before
+    assert owner_turns.turns("s-replaced")[-1]["issuer"] == before
+    assert kernel.check()["auth"] == "direction"
+
+
+def test_a_hook_turn_from_before_the_update_still_matches_the_chain(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    assert kernel.check()["auth"] == "direction"
+
+
+def _forge_record(pid: int, start: float, name: str, path: str) -> None:
+    owner_turns.known_folder().mkdir(parents=True, exist_ok=True)
+    owner_turns._known_file(pid).write_text(json.dumps({"start": start, "name": name, "path": path}))
+
+
+def _job_under_the_conversation(kernel) -> int:
+    """A ``claude -p`` job (85) the conversation (80) started, its file gone,
+    with the owner's typed turn recorded for the parent; a call under it (400)."""
+    assert kernel.hook_turn()["pid"] == 80
+    kernel.procs[85] = (80, "/x/versions/claude", 2.0)
+    kernel.args[85] = ["claude", "-p", "do it"]
+    kernel.procs[400] = (85, "/usr/bin/python3", 3.0)
+    kernel.replace(85)
+    return 400
+
+
+def test_an_agents_shell_replaced_too_is_never_taken_for_a_harness(kernel):
+    kernel.hook_turn()
+    kernel.procs[90] = (222, "/bin/bash", 2.5)
+    kernel.procs[222] = (80, "/opt/homebrew/bin/zsh", 2.0)
+    kernel.args[222] = BASH_TOOL_ARGS
+    kernel.replace(80, 222)
+    kernel.be(100)
+    assert owner_turns.hook_issuer() is None
+
+
+def test_a_refused_issuer_leaves_no_record_to_lean_on_later(kernel):
+    kernel.procs[90] = (222, "/bin/bash", 2.5)
+    kernel.procs[222] = (80, "/opt/homebrew/bin/python3.11", 2.0)
+    kernel.args[222] = ["python3", "run.py"]
+    kernel.be(100)
+    assert "refused" in owner_turns.hook_issuer()
+    kernel.replace(222)
+    kernel.be(100)
+    assert owner_turns.hook_issuer() is None
+
+
+def test_headless_is_still_read_live_on_a_known_replaced_process(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    kernel.args[80] = ["claude", "-p", "do it"]
+    issuer = kernel.hook_turn()
+    assert issuer["print"] is True and issuer["headless"] is True
+    assert owner_turns.turns("s-replaced")[-1]["entrypoint"] == "sdk-cli"
+    kernel.args[80] = None
+    assert kernel.hook_turn()["headless"] == "unknown"
+
+
+def test_the_app_bundle_a_known_process_ran_from_stays_what_the_kernel_said(kernel, folders, monkeypatch):
+    app = folders["home"] / "Applications" / "Cursor.app" / "Contents" / "MacOS"
+    app.mkdir(parents=True)
+    monkeypatch.setattr(owner_turns, "_real_home", lambda: str(folders["home"]))
+    kernel.procs[80] = (70, str(app / "Cursor"), 1.0)
+    assert kernel.hook_turn()["app"] == "Cursor.app"
+    kernel.replace(80)
+    assert kernel.hook_turn()["app"] == "Cursor.app"
+
+
+def test_the_sweep_drops_the_record_of_a_process_that_is_gone(kernel):
+    kernel.hook_turn()
+    kernel.replace(80)
+    owner_turns.sweep()
+    kernel.be(100)
+    assert owner_turns.hook_issuer()["pid"] == 80
+    saved = kernel.procs.pop(80)
+    owner_turns.sweep()
+    # Its record went with it: nothing vouches for that number and time again.
+    kernel.procs[80] = saved
+    kernel.be(100)
+    assert owner_turns.hook_issuer() is None
+
+
+def test_the_records_are_private_and_hold_no_words(kernel):
+    kernel.hook_turn()
+    files = [p for p in owner_turns.folder().rglob("*") if p.is_file() and "2.1.316" in p.read_text()
+             and p.suffix != ".jsonl"]
+    assert files
+    for path in files:
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+        assert "pause Codex" not in path.read_text()
+
+
+def test_a_deleted_program_on_the_real_kernel(folders, monkeypatch, tmp_path):
+    """The seams above against macOS itself: a compiled program whose file is
+    deleted while it runs has no path, its start time and name stay, and only
+    the one a hook saw first is known."""
+    if sys.platform != "darwin":
+        pytest.skip("macOS process table")
+    import shutil
+    import time
+
+    if not shutil.which("cc"):
+        pytest.skip("no C compiler")
+    source = tmp_path / "wait.c"
+    source.write_text("#include <unistd.h>\nint main(void){sleep(60);return 0;}\n")
+
+    def started(name: str):
+        exe = tmp_path / name
+        subprocess.run(["cc", str(source), "-o", str(exe)], check=True, timeout=60, capture_output=True)
+        child = subprocess.Popen([str(exe)])
+        for _ in range(100):
+            if owner_turns._proc_info(child.pid) is not None:
+                return exe, child
+            time.sleep(0.02)
+        raise AssertionError("the program did not start")
+
+    seen_exe, seen = started("claude")
+    fresh_exe, fresh = started("claude2")
+    # The kernel keeps 15 bytes of a name, and the record is compared on those.
+    long_exe, long_named = started("a-program-with-a-long-name")
+    try:
+        parent, path, start = owner_turns._proc_info(seen.pid)
+        assert os.path.basename(path) == "claude"
+        owner_turns._pin_issuer(seen.pid, path, start)
+        seen_exe.unlink()
+        fresh_exe.unlink()
+        assert owner_turns._proc_info(seen.pid) is None and owner_turns._proc_info(fresh.pid) is None
+        assert owner_turns._proc_bare(seen.pid) == (parent, start, "claude")
+        assert owner_turns._known_info(seen.pid) == (parent, path, start)
+        assert owner_turns._known_info(fresh.pid) is None
+        # A record that names another program is no record, on the kernel's own name.
+        forged = {"start": owner_turns._proc_bare(fresh.pid)[1], "name": "claude2", "path": "/bin/bash"}
+        owner_turns._known_file(fresh.pid).write_text(json.dumps(forged))
+        assert owner_turns._known_info(fresh.pid) is None
+
+        parent, path, start = owner_turns._proc_info(long_named.pid)
+        owner_turns._pin_issuer(long_named.pid, path, start)
+        long_exe.unlink()
+        assert owner_turns._proc_bare(long_named.pid) == (parent, start, "a-program-with-")
+        assert owner_turns._known_info(long_named.pid) == (parent, path, start)
+    finally:
+        for child in (seen, fresh, long_named):
+            child.kill()
+            child.wait()

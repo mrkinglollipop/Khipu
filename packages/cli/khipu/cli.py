@@ -2626,7 +2626,8 @@ def _owed_tidy_by_direction(args: argparse.Namespace, project: str) -> int:
     try:
         if args.apply:
             try:
-                doc = json.loads(Path(args.apply).read_text(encoding="utf-8"))
+                frozen = owner_direction.reviewed_file(args.apply)
+                doc = json.loads(frozen.decode("utf-8") if frozen is not None else Path(args.apply).read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
                 res = {"ok": False, "error": f"could not read the plan: {type(exc).__name__}"}
             else:
@@ -3651,7 +3652,7 @@ def _owner_only(args: argparse.Namespace, intent: "dict | None" = None) -> "str 
     finally:
         routing._OWNER_AUTH.reset(auth)
     if via is None:
-        print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+        print(json.dumps({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"}))
         return 2
     return via
 
@@ -3760,7 +3761,7 @@ def cmd_config(args: argparse.Namespace) -> int:
             else:
                 via = routing._owner_via(args, _accounts_list_intent(args))
                 if via is None:
-                    print(json.dumps({"ok": False, "error": routing._REFUSED, "code": "owner_only"}))
+                    print(json.dumps({"ok": False, "error": routing.terminal_refusal(), "code": "owner_only"}))
                     return 2
             # One write path for the list: the save becomes the account
             # operations it implies (track, rename, stop, move), each with
@@ -3898,7 +3899,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         if isinstance(via, int):
             return via if via == 0 else 2
         try:
-            path = _routing.answer_setting_request(key, action)
+            path = _routing.answer_setting_request(key, action, expect=getattr(args, "expect", None))
         except ValueError as err:
             print(json.dumps({"ok": False, "error": str(err), "code": getattr(err, "code", None)}))
             return 2
@@ -4550,6 +4551,7 @@ def _outbox_merge_preferences(args: argparse.Namespace) -> int:
         owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
         via = "cli"
     if via is None:
+        refused["error"] = routing.terminal_refusal(refused.get("error"))
         print(json.dumps(refused))
         return 2
     try:
@@ -6276,6 +6278,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help='set: {"scope": "opus", "mock": "opus", ...} naming every task class')
     rtier.add_argument("--at-owner-request", default=None, metavar="REQUEST",
                        help="A conversation: the owner's request, in one line (set only; stays a proposal)")
+    rtier.add_argument("--expect", default=None, metavar="PIN",
+                       help="The proposed table as it was shown; refused if it changed since")
     rtier.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(rtier)
 

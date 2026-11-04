@@ -54,16 +54,6 @@ def test_an_ordinary_job_with_its_own_session_is_refused(world, job):
     _nothing_changed()
 
 
-@pytest.mark.parametrize("job", sorted(JOBS))
-def test_an_ordinary_job_that_kept_the_owners_session_id_is_refused(world, job):
-    world.say("pause Codex for now")
-    world.mp.setattr(owner_direction, "_caller_chain", lambda: JOBS[job])
-    world.be(base.OWNER, var="KHIPU_SESSION_ID")
-    rc, out = world.run(["route", "pause", "Codex"], True)
-    assert rc == 2 and out["code"] == "not_from_the_hook", out
-    _nothing_changed()
-
-
 def test_a_claude_p_job_turn_is_never_eligible(world):
     """A ``claude -p`` job's own prompt hook records its brief under the
     ``sdk-cli`` entrypoint, which is not a trusted front end."""

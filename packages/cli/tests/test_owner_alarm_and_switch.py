@@ -89,6 +89,7 @@ def test_the_owner_acknowledges_the_alarm_by_chat(world):
     _later_append()
     assert owner_direction.verify_log()["ok"] is True
     # Undo brings the alarm back as it was.
+    world.say()
     rc, out = world.run(["owner-direction", "undo", line["id"]], True)
     assert rc == 0 and owner_direction.verify_log()["ok"] is False, out
 

@@ -200,6 +200,14 @@ def list_all(cur) -> dict:
     return {"ok": True, "groups": groups, "pairs": pairs, "pair_counts": counts, "sweep": sweep}
 
 
+def all_asked_pairs(cur) -> list[dict]:
+    """Every pair still waiting on the owner, whichever project it names."""
+    rows = _savepoint(cur, "project_group_all_asked",
+                      f"SELECT {_PAIR_COLS} FROM project_pairs WHERE state = %s ORDER BY created_at, a, b", (ASKED,),
+                      known=("project_pairs", "a", "b", "root_commit", "state", "created_at", "decided_at"))
+    return [_pair_dict(r) for r in rows]
+
+
 def asked_pairs(cur, project: str | None) -> list[dict]:
     """The pairs still waiting on the owner that involve ``project``'s group."""
     if not project:
@@ -614,8 +622,8 @@ def _gate(args, want: dict) -> int | None:
         owner_direction.noted(want, {"auth": "terminal"})
         return None
     return _emit({"ok": False, "code": "owner_only",
-                  "error": "only the Khipu app, the owner's yes typed on a terminal, or a conversation the owner is "
-                           "typing in (owner direction) can make this change; nothing was changed"}, 2)
+                  "error": routing.terminal_refusal("only the Khipu app, the owner's yes typed on a terminal, or a conversation the owner is "
+                           "typing in (owner direction) can make this change; nothing was changed")}, 2)
 
 
 def check_names(names: list[Any]) -> str | None:

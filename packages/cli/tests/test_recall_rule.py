@@ -443,8 +443,11 @@ class SliceBudgetTest(unittest.TestCase):
 # rule and the MCP instructions gain one line") added the khipu_route line,
 # about 230 characters, so the ceiling is 5,500: raised for that line, not
 # for growth in general. Repo renames slice D added the khipu_project line
-# (about 290 characters), so the ceiling is 5,800.
-RULE_MD_CEILING = 5800
+# (about 290 characters), so the ceiling is 5,800. The khipu_needs_you line
+# (about 170 characters, near the top because Claude Code cuts long server
+# instructions) makes it 5,900, the most the hook budget leaves it
+# (test_routing_rules_budget).
+RULE_MD_CEILING = 5900
 
 
 class RuleMdCeilingTest(unittest.TestCase):

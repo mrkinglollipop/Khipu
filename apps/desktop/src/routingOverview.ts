@@ -303,6 +303,9 @@ export function routingProblems(
   return out;
 }
 
+/* Every kind a problem can be. A new one must be placed in APP_KINDS or
+   APP_NOT_NEEDS in packages/cli/khipu/needs_you.py, the list a conversation
+   reads (tests/test_owner_needs_you.py fails until it is). */
 const TAG_WORDS: Record<string, (n: number) => string> = {
   limit: (n) => (n === 1 ? "1 at its limit" : `${n} at their limit`),
   down: (n) => `${n} down`,

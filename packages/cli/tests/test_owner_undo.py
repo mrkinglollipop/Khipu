@@ -369,10 +369,12 @@ def _no_finish(monkeypatch):
 def test_an_added_rule_whose_finish_was_lost_can_still_be_undone(world, monkeypatch):
     world.say()
     restore = _no_finish(monkeypatch)
+    world.say()
     rc, out = world.run(["route", "rule", "add", "Never use fast mode"], True)
     assert rc == 0 and out.get("record_incomplete"), out
     restore()
     assert owner_direction.line_state(out["owner_action"]) == "unconfirmed"
+    world.say()
     rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0, undone
     assert "Never use fast mode" not in [r["text"] for r in routing.read_view()["rules"]]
@@ -381,10 +383,12 @@ def test_an_added_rule_whose_finish_was_lost_can_still_be_undone(world, monkeypa
 def test_an_owner_hold_whose_finish_was_lost_can_still_be_undone(world, monkeypatch):
     world.say()
     restore = _no_finish(monkeypatch)
+    world.say()
     rc, out = world.run(["route", "hold", "while the Mac updates", "--account", "Codex", "--reason", "keep"], True)
     assert rc == 0 and out.get("record_incomplete"), out
     restore()
     assert [h for h in routing.read_view()["holds"] if h["owner"]]
+    world.say()
     rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0, undone
     assert not [h for h in routing.read_view()["holds"] if h["owner"]]
@@ -393,11 +397,13 @@ def test_an_owner_hold_whose_finish_was_lost_can_still_be_undone(world, monkeypa
 def test_a_purge_whose_finish_was_lost_is_scheduled_and_can_be_cancelled(world, monkeypatch):
     world.say()
     restore = _no_finish(monkeypatch)
+    world.say()
     rc, out = world.run(["ledger", "purge", "R1", "--project", "atlas", "--json"], True)
     assert rc == 0, out
     restore()
     (line,) = owner_direction.actions()
     assert line["state"] == "unconfirmed" and line["runs_at_ts"] > owner_direction._clock()
+    world.say()
     rc, undone = world.run(["owner-direction", "undo", line["id"]], True)
     assert rc == 0 and undone["state"] == "cancelled", undone
     assert owner_direction.run_due(line["runs_at_ts"] + 100) == []
@@ -432,9 +438,11 @@ def test_a_lost_finish_rule_undo_retires_its_own_rule_not_one_added_meanwhile(wo
     monkeypatch.setattr(routing, "add_rule", interleaved)
     world.say()
     restore = _no_finish(monkeypatch)
+    world.say()
     rc, out = world.run(["route", "rule", "add", "Rule requested by this action"], True)
     assert rc == 0 and out.get("record_incomplete"), out
     restore()
+    world.say()
     rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0, undone
     assert [r["text"] for r in routing.read_view()["rules"]] == ["Independent concurrent rule"]
@@ -450,9 +458,11 @@ def test_a_lost_finish_hold_undo_ends_its_own_hold_not_one_added_meanwhile(world
     monkeypatch.setattr(routing, "add_hold", interleaved)
     world.say()
     restore = _no_finish(monkeypatch)
+    world.say()
     rc, out = world.run(["route", "hold", "while the Mac updates", "--account", "Codex", "--reason", "keep"], True)
     assert rc == 0 and out.get("record_incomplete"), out
     restore()
+    world.say()
     rc, undone = world.run(["owner-direction", "undo", out["owner_action"]], True)
     assert rc == 0, undone
     assert [h["text"] for h in routing.read_view()["holds"] if h["owner"]] == ["another owner hold"]
@@ -488,11 +498,13 @@ def test_confirming_a_seeded_rule_by_direction_can_be_undone(world):
     assert rc == 0 and routing.read_view()["rules"][0]["confirmed"], out
     (line,) = owner_direction.actions()
     assert not line.get("no_undo") and line["before"] == {"seeded": True}
+    world.say()
     rc, undone = world.run(["owner-direction", "undo", line["id"]], True)
     assert rc == 0, undone
     (rule,) = routing.read_view()["rules"]
     assert (rule["text"], rule["seeded"], rule["confirmed"]) == ("Fake seeded rule", True, False)
     # Confirming it again works as it did the first time.
+    world.say()
     rc, out = world.run(["route", "rule", "confirm", "1"], True)
     assert rc == 0 and routing.read_view()["rules"][0]["confirmed"], out
 

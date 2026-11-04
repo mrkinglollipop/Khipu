@@ -116,6 +116,21 @@ class ResolverTest(unittest.TestCase):
                 self.assertEqual(sc.resolve_session_ref(host_pids=[20], cwd=td),
                                  ("claude_code", "mine", "process"))
 
+    def test_a_known_process_whose_file_was_replaced_still_matches_its_issuer(self):
+        # An update took the path of the conversation's Claude. Its record from
+        # before that keeps it the same process here too, not a mismatch.
+        with tempfile.TemporaryDirectory() as td, _home(td), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "unknown"}):
+            now = sc.time.time()
+            _state("claude_code", "mine", cwd=td)
+            _state("claude_code", "other", cwd=td)
+            _owner_turn("mine", 20, 100.25, ts=now - 20 * 60)
+            _owner_turn("other", 30, 101.5, ts=now)
+            with mock.patch.object(ot, "_proc_info", return_value=None), \
+                    mock.patch.object(ot, "_known_info", return_value=(99, "/bin/claude", 100.25)):
+                self.assertEqual(sc.resolve_session_ref(host_pids=[20], cwd=td),
+                                 ("claude_code", "mine", "process"))
+
     def test_claude_session_env_cannot_select_a_non_claude_candidate(self):
         with tempfile.TemporaryDirectory() as td, _home(td), \
                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "codex-thread"}):
