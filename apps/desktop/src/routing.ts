@@ -564,6 +564,17 @@ export type RouteDeliveryHealth = {
 };
 
 export type RouteView = {
+  /** Owner-local conversation pace overrides. They never enter a routing push. */
+  conversation_overrides?: Array<{
+    id: string;
+    account: string;
+    effect: string;
+    until?: string | null;
+    indefinite?: boolean;
+    review_at?: string | null;
+    ceiling_pct?: number | null;
+    subject?: { kind?: string; id?: string; project?: string | null };
+  }> | null;
   proposals?: Record<string, RouteProposal>;
   definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
   record?: boolean;

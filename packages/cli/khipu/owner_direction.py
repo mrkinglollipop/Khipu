@@ -91,7 +91,7 @@ ACTIONS: frozenset[str] = frozenset({
     "route.rule.edit", "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo",
     "route.rule.dismiss", "route.hold.add", "route.hold.end", "route.cap.set", "route.cap.remove",
     "route.priority.set", "route.priority.amend", "route.priority.confirm",
-    "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm",
+    "route.priority.undo", "route.priority.clear", "route.tier_table.set", "route.tier_table.confirm", "route.override.grant", "route.override.end",
     "route.tier_table.clear", "accounts.track", "accounts.rename", "accounts.stop",
     "accounts.move", "accounts.decline", "accounts.offer_again", "accounts.auto_track", "accounts.request.confirm",
     "accounts.request.undo", "config.usage_accounts", "config.routing_setting", "config.answer_request.confirm",
@@ -123,7 +123,7 @@ ROUTING_INSTANT: frozenset[str] = frozenset({
     "route.pause", "route.lift", "route.note.set", "route.note.end", "route.rule.add", "route.rule.edit",
     "route.rule.retire", "route.rule.restore", "route.rule.confirm", "route.rule.undo", "route.rule.dismiss",
     "route.hold.add", "route.hold.end", "route.priority.set", "route.priority.amend", "route.priority.confirm",
-    "route.priority.undo",
+    "route.priority.undo", "route.override.grant", "route.override.end",
 })
 
 

@@ -3030,6 +3030,36 @@ def _tool_route_advise(args: dict) -> dict:
                           sensitive=bool(args.get("sensitive")))
 
 
+def _tool_route_overrides(args: dict) -> dict:
+    """Read the caller's frozen override subject or the owner walkthrough.
+
+    Grants and endings intentionally remain owner actions; this endpoint never
+    mutates the local override log.
+    """
+    args = _validate_tool_args("khipu_route_overrides", args)
+    if _via_https_gateway():
+        return {"available": False, "reason": ROUTING_GATEWAY_REASON}
+    if not isinstance(args, dict) or set(args) - {"view", "account"}:
+        raise ValueError("khipu_route_overrides takes optional view and account")
+    from khipu import conversation_overrides, routing
+    view = args.get("view", "mine")
+    if view == "walkthrough":
+        return conversation_overrides.walkthrough()
+    if view != "mine":
+        raise ValueError("view must be mine or walkthrough")
+    author = routing.conversation_author()
+    subject, reason = conversation_overrides.subject(author)
+    account = args.get("account")
+    if account is not None and not isinstance(account, str):
+        raise ValueError("account must be text")
+    if account:
+        matched, why = conversation_overrides.match(account, author)
+        return {"available": subject is not None, "subject": subject, "override": matched, "reason": reason or why}
+    return {"available": subject is not None, "subject": subject,
+            "overrides": [x for x in conversation_overrides.list_overrides() if subject and x.get("subject") == subject],
+            "reason": reason}
+
+
 def _tool_route_report(args: dict) -> dict:
     """khipu_route_report: a report, a hold or a hold's end. Who wrote it is
     Khipu's to say, from this server's own environment and folder (the
@@ -3326,6 +3356,7 @@ TOOL_FUNCS = {
     "khipu_usage": _tool_usage,
     "khipu_route": _tool_route,
     "khipu_route_advise": _tool_route_advise,
+    "khipu_route_overrides": _tool_route_overrides,
     "khipu_route_report": _tool_route_report,
     "khipu_route_rule": _tool_route_rule,
     "khipu_route_priority": _tool_route_priority,
@@ -3337,7 +3368,7 @@ TOOL_FUNCS = {
 
 # Tools the HTTPS gateway neither lists nor runs: owner direction needs the
 # owner's typed turns, which only a prompt hook on the owner's Mac records.
-_LOCAL_ONLY = frozenset({"khipu_owner_act", "khipu_needs_you"})
+_LOCAL_ONLY = frozenset({"khipu_owner_act", "khipu_needs_you", "khipu_route_overrides"})
 
 
 def _result(req_id, payload: dict) -> dict:
@@ -3349,6 +3380,7 @@ def _result(req_id, payload: dict) -> dict:
 # Memory content (khipu_search, khipu_get, khipu_status's prior work) is
 # never scrubbed: that would alter what was remembered.
 _AGENT_SCRUBBED = frozenset({"khipu_usage", "khipu_route", "khipu_route_advise", "khipu_route_report",
+                             "khipu_route_overrides",
                              "khipu_route_rule", "khipu_route_priority", "khipu_status", "khipu_owner_act",
                              "khipu_needs_you"})
 # The strict projection's scan: conversation-written words with secret-shaped

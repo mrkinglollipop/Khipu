@@ -191,6 +191,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_delivery_live_after": ("duration", 12 * 3600, "How long a delivery identity counts as live"),
     "routing_delivery_slack": ("count", 2, "Extra delivery points before stalled delivery turns red"),
     "routing_ledger_keep_days": ("count", 7, "Remove a conversation's routing delivery ledger after this many unused days (0: never)"),
+    "routing_override_log_keep_days": ("count", 30, "Keep ended conversation override records for this many days (0: never)"),
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit beyond the hook's own cap)"),
@@ -6515,6 +6516,18 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
         out.update({k: ranked[0][k] for k in
                     ("account", "label", "verdict", "reason", "evidence", "numbers", "caps",
                      "eligible", "why_eligible")})
+        # Overrides are intentionally narrower than the shared routing view:
+        # only this conversation's pace answer changes. Holds, states, limits,
+        # spend, concurrency and eligibility keep their normal verdict.
+        from khipu import conversation_overrides
+        override, refused = conversation_overrides.advice(target, now=now, environ=environ)
+        if override is not None:
+            # The structured advice engine owns the verdict.  Keeping this
+            # annotation separate prevents a free-text reason from turning a
+            # spend/concurrency/eligibility hold into a go.
+            out["override"] = override
+        elif refused:
+            out["override_refused"] = refused
     return out
 
 
@@ -10258,6 +10271,13 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     from khipu import routing_mismatches
 
     out["model_mismatches"] = routing_mismatches.today(now)
+    # Owner-facing only.  The per-conversation log never travels in a
+    # routing push, a cloud copy, or another conversation's read.
+    from khipu import conversation_overrides
+    try:
+        out["conversation_overrides"] = conversation_overrides.list_overrides(now=now)
+    except Exception:  # noqa: BLE001 - a damaged optional log must not break routing
+        out["conversation_overrides"] = None
     # Owner-local only: file paths and quoted owner words from the scan
     # report never enter the fold or any routing delivery projection.
     from khipu import routing_scan_report
@@ -10896,6 +10916,13 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
+    if key is not None:
+        from khipu import conversation_overrides
+        override, refusal = conversation_overrides.advice(key, now=now)
+        if override is not None:
+            out["override_line"] = override["line"]
+        elif refusal:
+            out["override_line"] = refusal
     if view.get("tier_table"):
         out["tier_table"] = view["tier_table"]
     out["contradictions"] = list(view.get("contradictions") or [])

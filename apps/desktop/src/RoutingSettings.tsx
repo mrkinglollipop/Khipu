@@ -5101,6 +5101,7 @@ export function RoutingSettings({
           <section className="route-page" data-routing-page="conversations" data-active={page === "conversations"} aria-labelledby="route-page-conversations">
             <h2 id="route-page-conversations" tabIndex={-1}>Conversations</h2>
             <p className="set-help set-intro">What each conversation has heard and when Khipu tells it about routing.</p>
+            {data ? <ConversationOverridesSection overrides={data.conversation_overrides} now={now} /> : null}
             {group("telling")}
           </section>
           <section className="route-page" data-routing-page="changes" data-active={page === "changes"} aria-labelledby="route-page-changes">
@@ -5143,4 +5144,23 @@ export function RoutingSettings({
       ) : null}
     </div>
   );
+}
+
+/** Deliberately small: grants/endings stay in the owner-confirmed walk-through,
+ * so this list cannot silently change a conversation's pace. */
+function ConversationOverridesSection({ overrides, now }: { overrides: RouteView["conversation_overrides"]; now: Date }) {
+  if (overrides == null) return <p className="set-help">Conversation overrides couldn&apos;t be read.</p>;
+  return <section className="route-page-group" aria-labelledby="conversation-overrides">
+    <div className="route-page-group-head"><h3 id="conversation-overrides">Overrides <Tag>{overrides.length}</Tag></h3></div>
+    <div className="route-page-group-body">
+      <p className="set-help">These only change the named conversation&apos;s pace advice. Account holds, limits and eligibility still apply.</p>
+      {overrides.length ? <ul className="mrows" role="list" aria-label="Conversation overrides">
+        {overrides.map((row) => <li key={row.id} className="mrow">
+          <span><strong>{row.account}</strong> — ahead of pace{row.ceiling_pct ? `, up to ${row.ceiling_pct}%` : " at the account setting"}.</span>
+          <span className="meta">{row.indefinite ? `Review ${whenLocal(row.review_at, now)}` : `Ends ${whenLocal(row.until, now)}`}</span>
+          <button type="button" className="sm" aria-label={`Review override for ${row.account}`} onClick={() => document.getElementById("route-page-changes")?.scrollIntoView({ block: "start" })}>Review override</button>
+        </li>)}
+      </ul> : <p className="set-help">No conversation overrides are in force.</p>}
+    </div>
+  </section>;
 }

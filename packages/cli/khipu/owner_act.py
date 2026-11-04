@@ -48,6 +48,10 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
+    "route.override.grant": (("account", "subject", "effect", "request"), ("until", "indefinite", "review_at", "children", "ceiling_pct", "reason", "ref")),
+    "route.override.end": (("override",), ()),
+    "route.override.grant": (("account", "subject", "effect", "request"), ("until", "indefinite", "review_at", "children", "ceiling_pct", "reason", "ref")),
+    "route.override.end": (("override",), ()),
     "route.tier_table.set": (("tiers",), ("expect",)),
     "route.tier_table.confirm": ((), ("expect",)),
     "route.tier_table.clear": ((), ("expect",)),
@@ -105,7 +109,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions"}
+_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "children"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -146,7 +150,14 @@ def _values(action: str, args) -> dict:
     for key, value in args.items():
         if value is None:
             continue
-        if action == "route.tier_table.set" and key == "tiers":
+        if action == "route.override.grant" and key == "subject":
+            if not isinstance(value, dict):
+                raise _bad("subject must be the frozen conversation subject shown in the ask")
+            value = dict(value)
+        elif action == "route.override.grant" and key == "ceiling_pct":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 100:
+                raise _bad("ceiling_pct must be above 0 and at most 100")
+        elif action == "route.tier_table.set" and key == "tiers":
             from khipu.routing_advisory import valid_tiers
 
             if not valid_tiers(value):
@@ -240,6 +251,8 @@ def _values(action: str, args) -> dict:
         extra = sorted(set(out) & {"pct", "slack", "usd", "days", "n"} - used)
         if extra:
             raise _bad(f"a {out.get('kind')} cap does not take {', '.join(extra)}")
+    if action == "route.override.grant" and bool(out.get("indefinite")) == bool(out.get("until")):
+        raise _bad("an override takes exactly one of until or indefinite")
     return out
 
 
@@ -507,6 +520,15 @@ def act(action, args) -> tuple[bool, dict]:
     pending = None
     try:
         values = _values(action, args)
+        if action in ("route.override.grant", "route.override.end"):
+            try:
+                owner_direction.check(action, instant=True)
+            except owner_direction.DirectionRefused as refused:
+                return False, refused.refusal()
+            from khipu import conversation_overrides
+            result = (conversation_overrides.grant(values) if action == "route.override.grant"
+                      else conversation_overrides.end(values["override"]))
+            return True, {"ok": True, "override": result}
         pending = _priority_pending(action, values)
         if pending is None and not owner_direction.REQUEST_APPLIED.get():
             from khipu import needs_you
