@@ -23,7 +23,7 @@ def test_missing_evidence_is_unknown_and_does_not_write(replay):
     result = health.doctor_block({"unmatched": []}, replay.now, routing.settings())
     assert result["status"] == "unknown"
     assert "live delivery identities" in result["missing"]
-    assert "today's hook outcomes" in result["missing"]
+    assert "recent hook outcomes" in result["missing"]
     assert set(replay.root.rglob("*")) == before
 
 

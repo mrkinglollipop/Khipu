@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import inspect
 import io
 import json
 from contextlib import redirect_stdout
@@ -264,7 +265,6 @@ def test_a_hub_that_cannot_be_read_holds_everything(pg, monkeypatch):
     report = retire()
     assert not report["ok"] and report["retired"] == 0 and report["held"] == {span.CHECK_FAILED: 1}
     assert len(outbox.dead_jobs()) == 1 and records() == []
-    assert span.retryable() == {}
 
 
 def test_a_forget_list_that_cannot_be_read_holds_everything(pg, monkeypatch):
@@ -538,7 +538,7 @@ def test_a_row_older_than_the_job_is_a_late_repeat_that_only_counts_and_stays_he
     land(row_at(ts="2026-10-31T01:00:00Z", transcript_range="0:500"))
     dead(summary_only())
     assert_held(pg, span.LATE_REPEAT)
-    assert "stays held" in span.HOLD_WORDS[span.LATE_REPEAT] and span.LATE_REPEAT in span.RETRYABLE
+    assert "stays held" in span.HOLD_WORDS[span.LATE_REPEAT]
 
 
 def test_a_late_repeat_beside_later_parts_of_the_session_is_counted_the_same_way(pg):
@@ -604,13 +604,13 @@ def test_the_drain_never_runs_it(pg, monkeypatch):
     (path,) = dead()
     snapshot = path.read_bytes()
     before = counts(pg)
-    for name in ("apply", "dry_run", "retryable"):
+    for name in ("apply", "dry_run"):
         monkeypatch.setattr(span, name, mock.Mock(side_effect=AssertionError(f"the drain called {name}")))
     outbox.drain()
     assert path.read_bytes() == snapshot and records() == [] and counts(pg) == before
 
 
-def test_only_the_cli_and_an_explicit_retry_import_it():
+def test_only_the_cli_and_the_owner_undo_import_it():
     root = Path(cli.__file__).parent
     importers = set()
     for module in root.glob("*.py"):
@@ -624,11 +624,7 @@ def test_only_the_cli_and_an_explicit_retry_import_it():
                 names = [f"{node.module}.{a.name}" for a in node.names]
             if any("outbox_span_covered" in n for n in names):
                 importers.add(module.stem)
-    assert importers == {"cli", "outbox", "owner_direction"}
-    source = (root / "outbox.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    (drain,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "drain"]
-    assert "outbox_span_covered" not in ast.get_source_segment(source, drain)
+    assert importers == {"cli", "owner_direction"}
 
 
 # ---- retry-dead, and text that was forgotten ----------------------------------------------------
@@ -646,37 +642,24 @@ def test_retry_dead_holds_the_refused_kind_and_warns_with_a_count(pg):
     assert counts(pg) == before
 
 
-def test_the_explicit_flag_moves_only_what_cannot_be_retired_and_touches_nothing_forgotten(pg):
-    land(COVER)
-    dead()  # covered: retires, never retries
-    dead(refused(summary="Carries more than the row", decisions=["A decision no row holds"]))
-    dead(refused(summary="Spans further", transcript_range="400:900"))
-    out = outbox.retry_dead(include_announce_refused=True)
-    assert out["moved"] == 2 and out["announce_refused_held"] == 1, out
-    assert len(outbox.dead_jobs()) == 1
-    assert retire()["retired"] == 1
-
-
-def test_a_refused_job_that_moves_says_what_the_drain_will_do(pg):
-    dead()
-    out = outbox.retry_dead(include_announce_refused=True)
-    assert out["moved"] == 1 and out["announce_refused_moved"] == 1 and "announce_refused_held" not in out, out
-    assert out["warning"].startswith("1 dead job refused") and "went back to the queue" in out["warning"]
-    assert "new episode" in out["warning"] and "commitments, decisions and embeddings" in out["warning"]
-
-
 def test_a_plain_job_that_moves_gets_no_warning(pg):
     bury(refused(), reason="x", last_error="OperationalError: gone")
-    out = outbox.retry_dead(include_announce_refused=True)
-    assert out["moved"] == 1 and "warning" not in out and "announce_refused_moved" not in out, out
+    out = outbox.retry_dead()
+    assert out["moved"] == 1 and "warning" not in out, out
 
 
-def test_a_failed_read_retries_no_refused_job(pg, monkeypatch):
-    dead()
-    monkeypatch.setattr(db, "connect", mock.Mock(side_effect=OSError("no route")))
-    out = outbox.retry_dead(include_announce_refused=True)
-    assert out["moved"] == 0 and out["announce_refused_held"] == 1
-    assert outbox.jobs() == []
+def test_the_retry_flag_is_gone_and_a_plain_retry_leaves_a_refused_job_in_dead(pg):
+    # Moved jobs sharing an exact window that no row held yet all passed the hub check;
+    # the drain inserted the first, then skipped and deleted the rest (Codex, 2026-11-05).
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["outbox", "retry-dead", "--include-announce-refused"])
+    assert not inspect.signature(outbox.retry_dead).parameters
+    (path,) = dead()
+    snapshot = path.read_bytes()
+    out = outbox.retry_dead()
+    assert out["moved"] == 0 and out["announce_refused_held"] == 1, out
+    assert path.read_bytes() == snapshot and outbox.jobs() == []
+    assert "--include-announce-refused" not in out["warning"] + outbox.status()["fix"]
 
 
 def hub_text(hub_, text):
@@ -690,7 +673,7 @@ def test_a_forgotten_text_job_cannot_reach_the_hub(pg, elsewhere):
     forget_for_real(pg, land(COVER), elsewhere=elsewhere)
     dead()
     assert hub_text(pg, TEXT) == 0
-    for attempt in (retire, outbox.retry_dead, lambda: outbox.retry_dead(include_announce_refused=True), outbox.drain):
+    for attempt in (retire, outbox.retry_dead, outbox.drain):
         attempt()
         assert hub_text(pg, TEXT) == 0
     assert len(outbox.dead_jobs()) == 1 and outbox.jobs() == [] and records() == []
@@ -709,11 +692,11 @@ def test_forgets_sweep_reads_both_identities_in_the_record(pg):
 
 # ---- doctor's and the command's words -----------------------------------------------------------
 
-def test_doctor_names_the_dry_run_first_and_that_retry_may_land_duplicates(pg):
+def test_doctor_names_the_dry_run_and_that_retry_may_land_duplicates(pg):
     dead()
     status = outbox.status()
     assert status["announce_refused"] == 1
-    assert status["fix"].startswith("Run `khipu outbox span-covered` first") and "duplicates" in status["fix"]
+    assert status["fix"].startswith("`khipu outbox span-covered` counts") and "duplicates" in status["fix"]
     assert storage_bounds.held_counts()["outbox_announce_refused"] == 1
     text = storage_bounds.warnings({"outbox_dead": 1053, "outbox_announce_refused": 906, "capture_held": 0})[0]
     assert text.index("khipu outbox span-covered") < text.index("khipu outbox retry-dead")
@@ -734,7 +717,7 @@ def test_the_storage_warning_gives_the_span_advice_only_for_its_kind(pg):
 
 def test_doctor_keeps_the_dry_run_first_for_this_kind_and_retry_for_any_other(pg):
     dead()
-    assert cli._doctor_local_checks(None)["outbox"]["fix"] == outbox.SPAN_FIRST
+    assert cli._doctor_local_checks(None)["outbox"]["fix"] == outbox.SPAN_COUNT
     for path in outbox.dead_jobs():
         path.unlink()
     bury(refused(), reason="x", last_error="OperationalError: gone")
@@ -742,24 +725,12 @@ def test_doctor_keeps_the_dry_run_first_for_this_kind_and_retry_for_any_other(pg
     assert cli._doctor_local_checks(None)["outbox"]["fix"] == "run `khipu outbox retry-dead`"
 
 
-def test_the_retry_dead_help_names_the_held_kind():
-    out = io.StringIO()
-    with redirect_stdout(out), pytest.raises(SystemExit):
-        cli.main(["outbox", "retry-dead", "--help"])
-    text = " ".join(out.getvalue().split())
-    assert "--include-announce-refused" in text
-    parser = cli.build_parser()
-    assert parser.parse_args(["outbox", "retry-dead"]).include_announce_refused is False
+def test_the_outbox_help_names_the_held_kind():
     out = io.StringIO()
     with redirect_stdout(out), pytest.raises(SystemExit):
         cli.main(["outbox", "--help"])
     text = " ".join(out.getvalue().split())
     assert "stay held" in text and "duplicates" in text and "span-covered" in text
-    out = io.StringIO()
-    with redirect_stdout(out), pytest.raises(SystemExit):
-        cli.main(["outbox", "retry-dead", "--help"])
-    text = " ".join(out.getvalue().split())
-    assert "lands each as a new episode" in text and "commitments, decisions and embeddings" in text
 
 
 # ---- the owner's own yes ------------------------------------------------------------------------

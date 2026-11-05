@@ -113,7 +113,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 | `regen-memory` | Write the `MEMORY.from-khipu.md` sidecar from topics. `--index` rebuilds the live `MEMORY.md`. |
 | `provenance` | Fact provenance maintenance: `backfill` proves legacy restaters' claims; `index` indexes episode source identities and sweeps refused carriers. |
 | `topic-graph` | `topic-graph backfill` updates topic links and graph edges from topic files. |
-| `outbox` | The offline queue for captures whose database write failed: `drain`, `status`, `retry-dead`, and `span-covered`, which counts (or with `--apply` retires) dead jobs whose range and evidence fields another episode holds; a retired job's own summary stays only in its local record. Run it before `retry-dead`, which may land those as duplicates and holds them back unless given `--include-announce-refused`. |
+| `outbox` | The offline queue for captures whose database write failed: `drain`, `status`, `retry-dead`, and `span-covered`, which counts (or with `--apply` retires) dead jobs whose range and evidence fields another episode holds; a retired job's own summary stays only in its local record. `retry-dead` leaves jobs refused for not announcing their source identities held. |
 
 `ledger` uses `--project` to select a project and `--json` for JSON output. Writes accept `--op-id` for safe retries. `ledger import FILE` supports `--dry-run` and `--catch-up`; `ledger export --tracker-json` exports the tracker shape. `ledger project` can rename, hide, or show a project.
 

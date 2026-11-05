@@ -5,9 +5,8 @@ so at the legacy key that hash can never match an enriched row: the replay
 failed 25 times and was buried. ``capture._replay_lacks`` proves the replay
 instead, and ``CaptureEvidenceConflict`` keeps guarding everything else.
 
-Also pinned here, on the real schema, for the owner's decision: what
-``retry-dead`` does with a job refused for not announcing its identities, and
-which writers that refusal can reach. Every database is a hermetic one.
+Also pinned here, on the real schema: which writers the refusal for not
+announcing a job's identities can reach. Every database is a hermetic one.
 """
 from __future__ import annotations
 
@@ -339,63 +338,11 @@ def test_a_lossy_line_with_no_range_proves_nothing_and_stays_for_the_owner(at_th
         recovery_replay(line)
 
 
-# ---- question 1: retry-dead on a job refused for not announcing -------------------
-
-SPANNING = {
-    "ts": "2026-11-01T04:00:00Z", "summary": "The whole release work, reviewed end to end, later on",
-    "session_id": JOB["session_id"], "harness": "codex", "event": "stop",
-    "transcript_range": "0:500", "project": PROJECT, "topics": [], "decisions": ["Keep the fence strict"],
-}
 REFUSED = {"last_error": "CheckViolation: khipu: an episode write must announce its source identities "
                          "(khipu.source_identities)"}
 
 
-def refused_job(**changes):
-    # The Sep 14 app's job: no part, no window for a single-part window, no digest.
-    out = job(**changes)
-    out.pop("window_id")
-    return out
-
-
-def test_retry_dead_lands_a_refused_job_as_a_new_episode_beside_its_spanning_one(pg):
-    spanning = land(SPANNING)
-    payload = refused_job()
-    assert "transcript_sha256" not in payload
-    bury(payload, reason="CheckViolation", **REFUSED)
-    before = counts(pg)
-    assert outbox.retry_dead(include_announce_refused=True)["moved"] == 1
-    report = outbox.drain()
-    assert report["replayed"] == 1 and not report.get("resolved"), report
-    after = counts(pg)
-    assert after["episodes"] == before["episodes"] + 1
-    assert after["commitments"] == before["commitments"] + 1
-    with pg.connect() as conn:
-        rows = conn.execute("SELECT id, transcript_range FROM episodes WHERE session_id = %s ORDER BY id",
-                            (JOB["session_id"],)).fetchall()
-    assert [r[1] for r in rows] == ["0:500", "100:200"] and rows[0][0] == spanning
-
-
-def test_duplicate_capture_handling_does_not_catch_it_even_with_a_digest(pg):
-    # #477's same-content check needs equal window text; a span's text differs.
-    land({**SPANNING, "transcript_sha256": "digest-of-the-whole-span"})
-    bury(refused_job(transcript_sha256="digest-of-the-part"), reason="CheckViolation", **REFUSED)
-    before = counts(pg)
-    outbox.retry_dead(include_announce_refused=True)
-    assert outbox.drain()["replayed"] == 1
-    assert counts(pg)["episodes"] == before["episodes"] + 1
-
-
-def test_only_near_text_within_five_minutes_folds_it_into_an_existing_episode(pg):
-    episode = land({**SPANNING, "ts": "2026-11-01T01:03:00Z", "summary": JOB["summary"] + " today"})
-    bury(refused_job(decisions=SPANNING["decisions"]), reason="CheckViolation", **REFUSED)
-    before = counts(pg)
-    outbox.retry_dead(include_announce_refused=True)
-    assert outbox.drain()["replayed"] == 1
-    assert counts(pg)["episodes"] == before["episodes"]
-    assert row(pg, episode)[0]["merged_from"][0]["match"] == capture.MATCH_SIMILARITY
-
-
-# ---- question 2: who can reach the unannounced refusal ----------------------------
+# ---- who can reach the unannounced refusal -------------------------------------
 
 def test_an_unannounced_insert_is_refused_and_buried_and_the_current_writer_lands_it(at_the_key, monkeypatch):
     with monkeypatch.context() as old_app:
@@ -410,8 +357,8 @@ def test_an_unannounced_insert_is_refused_and_buried_and_the_current_writer_land
         queued.write_text(json.dumps(envelope))
         # Unlike 08K01 ("predates fact provenance") it is not deferred: it buries.
         assert outbox.drain().get("buried") == 1
-    assert outbox.retry_dead(include_announce_refused=True)["moved"] == 1
-    assert outbox.drain()["replayed"] == 1
+    assert outbox.retry_dead()["moved"] == 0
+    assert capture.write_pg(job())["episode_inserted"]
     assert counts(at_the_key)["episodes"] == 1
 
 

@@ -24,7 +24,6 @@ const appCss: string = readFileSync(
 );
 import { accountSource, accountState, lastChangeWords, midSentence, notRefreshedWords, ruleWords, useRouting } from "../routing";
 import type { RouteAccount, RouteView, RoutingState } from "../routing";
-import { routingAttention } from "../doctorAttention";
 import { HealthReportRows, routingHealthRow } from "../healthRows";
 import type { UsageReport } from "../PlansCard";
 
@@ -345,7 +344,7 @@ describe("Home Routing card, the other states", () => {
     expect(screen.getByText("Could not read the routing record")).toBeInTheDocument();
   });
 
-  it("names a job runner that stopped reporting, on Home and in the health report", () => {
+  it("names a job runner that stopped reporting in the health report, without raising an alarm", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(AFTERNOON);
     const v: RouteView = {
@@ -356,21 +355,14 @@ describe("Home Routing card, the other states", () => {
       })],
       changes: [{ version: 3, at: "2026-10-14T19:00:00Z", entities: ["account:grok|"] }],
     };
-    const items = routingAttention(v, AFTERNOON);
-    expect(items).toEqual([{
-      key: "routing:runner:Project B",
-      tone: "warn",
-      title: "A job runner stopped reporting",
-      cause: "Your Project B job runner's last report was at 2:12 PM. Limits it finds won't reach your conversations until it runs again. Khipu stopped nothing.",
-    }]);
     const row = routingHealthRow(v, AFTERNOON);
     expect(row).toEqual({
       key: "routing",
-      status: "err",
+      status: "ok",
       label: "Routing",
       detail: "Your Project B job runner stopped reporting at 2:12 PM. Last change 3:00 PM: Grok Build limit reached (a guess). No standing rule looks broken.",
     });
-    render(<HealthReportRows parsed={{}} attention={items} routing={v} />);
+    render(<HealthReportRows parsed={{}} attention={[]} routing={v} />);
     expect(screen.getByText("Routing")).toBeInTheDocument();
     expect(screen.getByText(/Your Project B job runner stopped reporting at 2:12 PM\. Last change 3:00 PM/)).toBeInTheDocument();
   });
@@ -409,49 +401,17 @@ describe("Home Routing card, two sources disagree and a rule may be broken", () 
     expect(broken).toHaveTextContent("may be broken, 11:22 AM");
   });
 
-  it("raises a broken rule as an attention item that stops nothing, and the health row red", () => {
-    const items = routingAttention(conflictView(), MORNING);
-    expect(items).toEqual([{
-      key: "routing:rules",
-      tone: "warn",
-      title: "A standing rule may be broken",
-      cause: "Your rule says never a -fast tier. Your Project A job runner's settings name a model ending in -fast for its grokcheck lane (seen at 11:22 AM in its settings file). Khipu stopped nothing; it only reports.",
-    }]);
+  it("marks a broken rule in the health row red", () => {
     const row = routingHealthRow(conflictView(), MORNING);
     expect(row?.status).toBe("err");
     expect(row?.detail).toContain("A standing rule may be broken: Project A's settings name a model ending in -fast for its grokcheck lane.");
     expect(row?.detail).not.toContain("No standing rule looks broken");
   });
 
-  it("warns once sources have disagreed for longer than the warn time", () => {
-    const later = new Date("2026-10-14T16:05:00Z");
-    const items = routingAttention(conflictView(), later).filter((a) => a.key.startsWith("routing:disagree"));
-    expect(items).toEqual([{
-      key: "routing:disagree:Claude second",
-      tone: "warn",
-      title: "Sources disagree about Claude second",
-      cause: "Sources have disagreed about Claude second for more than 30 minutes. The Routing card shows the stronger report and names both; conversations are told both.",
-    }]);
-    expect(routingAttention({ ...conflictView(), warn_after: { disagreement: 0 } }, later)
-      .some((a) => a.key.startsWith("routing:disagree"))).toBe(false);
-  });
 });
 
 describe("routing attention and health row edges", () => {
-  it("names a limit from a lane not matched to an account, never a guessed account", () => {
-    const v: RouteView = { ...mainView(), unmatched: [{ runner: "Project A", lane: "opus-batch", until: "2026-10-14T18:00:00Z" }] };
-    const items = routingAttention(v, MORNING);
-    expect(items).toEqual([{
-      key: "routing:lane:Project A/opus-batch",
-      tone: "warn",
-      title: "A limit came from a job slot not matched to an account",
-      cause: "A limit came from Project A's opus-batch job slot, which isn't matched to an account; it ends at 2:00 PM. Conversations are told the job slot's name only, never a guessed account.",
-    }]);
-  });
-
-  it("raises nothing without a record, and the health row is grey", () => {
-    expect(routingAttention({ record: false, accounts: [] }, MORNING)).toEqual([]);
-    expect(routingAttention(null, MORNING)).toEqual([]);
+  it("has no health row without a record, and a grey one when there is none on this Mac", () => {
     expect(routingHealthRow({ record: false, accounts: [] }, MORNING)).toEqual({ key: "routing", status: "skipped", label: "Routing" });
     expect(routingHealthRow(null, MORNING)).toBeNull();
   });
@@ -506,9 +466,6 @@ describe("Home Routing card, fix round 1", () => {
     expect(within(row).getByText("Sources disagree")).toBeInTheDocument();
     expect(row).toHaveTextContent(
       "A Claude Code conversation in project-c reported Opus open at 1:00 PM. Claude's own message counts for more than a conversation's report, so the Opus limit shows here; conversations are told both.");
-    // The attention item names the same model, and the card has its note.
-    const items = routingAttention(v, AFTERNOON).filter((a) => a.key.startsWith("routing:disagree"));
-    expect(items.map((a) => a.title)).toEqual(["Sources disagree about Claude main (Opus)"]);
   });
 
   it("reminds the owner of his own old hold, and only that one (F2)", () => {
@@ -637,25 +594,6 @@ describe.skipIf(!CHROME)("Home Routing card, fix round 2 (laid out in headless C
   }, 90000);
 });
 
-describe("Home Routing card, fix round 2", () => {
-  it("raises the broken rule in the words the approved conflict mock shows (R2-3)", () => {
-    const mock: string = readFileSync(
-      `${(globalThis as unknown as { process: { cwd(): string } }).process.cwd()}/../../docs/mockups/2026-10-14-routing/home-routing-conflict.html`,
-      "utf8",
-    );
-    const m = mock.match(/<b>A standing rule may be broken<\/b><span>([^<]*)<\/span>/);
-    expect(m).not.toBeNull();
-    const v = mainView();
-    v.accounts = [];
-    v.rule_checks = [{
-      rule: 3, status: "broken", at: "2026-10-14T15:22:00Z", runner: "Project A", file: "settings",
-      text: "A standing rule may be broken: Project A's settings name a model ending in -fast for its grokcheck lane.",
-    }];
-    const [item] = routingAttention(v, MORNING);
-    expect(item.cause).toBe(m![1].replace(/&#x27;|&#39;/g, "'"));
-  });
-});
-
 describe("Home Routing card, final fix round", () => {
   const fast = (runner: string, lane: string, at: string) => ({
     rule: 3, status: "broken", at, runner, file: "settings",
@@ -668,45 +606,9 @@ describe("Home Routing card, final fix round", () => {
     const v = mainView();
     v.accounts = [];
     v.rule_checks = [fast("Project A", "grokcheck", "2026-10-14T15:22:00Z"), fast("Project B", "grokfix", "2026-10-14T15:30:00Z")];
-    const [item] = routingAttention(v, MORNING);
-    expect(item.title).toBe("A standing rule may be broken");
-    expect(item.cause).toBe(
-      "Your rule says never a -fast tier. "
-      + "Your Project A job runner's settings name a model ending in -fast for its grokcheck lane (seen at 11:22 AM in its settings file). "
-      + "Your Project B job runner's settings name a model ending in -fast for its grokfix lane (seen at 11:30 AM in its settings file). "
-      + "Khipu stopped nothing; it only reports.");
     render(<RoutingCard state={stateOf(v)} />);
     expect(screen.getByText(/7 standing rules/)).toHaveTextContent("1 may be broken");
     expect(screen.getByText(/Never a -fast tier\./).closest("li")).toHaveTextContent("may be broken, 11:30 AM");
-  });
-
-  it("counts two broken rules as two and names each by its number (C1)", () => {
-    const v = mainView();
-    v.accounts = [];
-    v.rule_checks = [
-      fast("Project A", "grokcheck", "2026-10-14T15:22:00Z"),
-      fast("Project A", "grokfix", "2026-10-14T15:22:00Z"),
-      { rule: 2, status: "broken", at: "2026-10-14T15:22:00Z", runner: "Project A", file: "settings",
-        text: "A standing rule may be broken: Project A's Grok check lane has no confirming lane from another model family." },
-    ];
-    const [item] = routingAttention(v, MORNING);
-    expect(item.title).toBe("2 standing rules may be broken");
-    expect(item.cause.match(/Your rule 3 says never a -fast tier\./g)).toHaveLength(1);
-    expect(item.cause).toContain("Your rule 2 says every Grok result that is acted on gets a re-check from a different model family. Your Project A job runner's Grok check lane");
-  });
-
-  it("names the job runner whose events log a rule was judged on (C3)", () => {
-    const v = mainView();
-    v.accounts = [];
-    v.rules = [...(v.rules ?? []), { n: 8, text: "Grok never works on a private pipeline." }];
-    v.rule_checks = [{
-      rule: 8, status: "broken", at: "2026-10-14T15:22:00Z", runner: "Project A", file: "events",
-      text: "A standing rule may be broken: a Grok lane is set to work on payroll, which is marked private.",
-    }];
-    const [item] = routingAttention(v, MORNING);
-    expect(item.cause).toBe(
-      "Your rule says Grok never works on a private pipeline. A Grok lane is set to work on payroll, which is marked private "
-      + "(seen at 11:22 AM in your Project A job runner's events log). Khipu stopped nothing; it only reports.");
   });
 
   it("keeps a rule's opening name as written and lower-cases a common opening word (C2)", () => {

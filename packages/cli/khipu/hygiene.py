@@ -769,15 +769,15 @@ def run_commitments_hygiene(
 
     Order is deliberate and cheapest-first: the deterministic filter
     (``commitments.rejection_reason``) first, so obvious status chatter never
-    costs a model call; then the deterministic owner guard — anything
-    ``resolve_owner`` already calls the user's own never goes to the model at
-    all (``keep``/``user-owed``); then the summariser model in batches of
+    costs a model call; then the deterministic owner guard — anything stored
+    as the user's or a third party's never goes to the model at all
+    (``keep``/``user-owed``, ``agent-owed``); then the summariser model in batches of
     ``JUDGE_BATCH``, capped at ``max_calls``; then paraphrase de-duplication
     (token containment, then cosine) among whatever survived. Anything past
     the call cap is reported ``unjudged`` and left strictly alone.
     """
     from khipu import commitments as co
-    from khipu.commitments import OWNER_USER, rejection_reason, resolve_owner
+    from khipu.commitments import OWNER_AGENT, OWNER_USER, rejection_reason
     from khipu.db import has_columns
 
     judge = judge or _model_judge
@@ -791,19 +791,20 @@ def run_commitments_hygiene(
     survivors: list[dict[str, Any]] = []
     judged: list[dict[str, Any]] = []
     for row in rows:
-        owner = resolve_owner(row["text"], kind=row.get("kind"), declared=row.get("owner"))
-        # Dedup groups by the owner Owed shows, and the owner guard reads it.
+        # The stored owner, which is also what Owed shows: dedup groups by it
+        # and the owner guard reads it.
         row["owner"], row["owner_label"] = co.row_owner(row)
+        owner = row["owner"]
         reason = rejection_reason(row["text"], owner=owner, kind=row.get("kind"))
         if reason is not None:
             verdicts[row["id"]] = {"verdict": "drop", "reason": f"filter:{reason}"}
-        elif owner == OWNER_USER:
-            # Guard (2026-09-05): a row the deterministic owner rule already
-            # resolved as the USER's never reaches the model at all — the
-            # summariser was never told who the user is, so it dropped rows
-            # like "Matt to merge L&D PR #48" as "not user or assistant
+        elif owner in (OWNER_USER, OWNER_AGENT):
+            # Guard (2026-09-05): a row stored as the USER's or a third
+            # party's never reaches the model at all — the summariser dropped
+            # rows like "Matt to merge L&D PR #48" as "not user or assistant
             # action". It still takes part in duplicate grouping below.
-            verdicts[row["id"]] = {"verdict": "keep", "reason": "user-owed"}
+            verdicts[row["id"]] = {"verdict": "keep",
+                                   "reason": "user-owed" if owner == OWNER_USER else "agent-owed"}
             judged.append(row)
         else:
             survivors.append(row)
@@ -1042,7 +1043,7 @@ def run_session_ended_pass(
         # A restatement that adds a cross-session trigger lands in latest_text;
         # the opening text alone must not decide.
         trigger = has_future_trigger(text) or has_future_trigger(latest)
-        owner, _label = row_owner(row, future_trigger=trigger)
+        owner, _label = row_owner(row)
         ended = ((bool(row.get("aged")) or bool(row.get("end_event")))
                  and not bool(row.get("recently_restated")))
         if owner == "user":

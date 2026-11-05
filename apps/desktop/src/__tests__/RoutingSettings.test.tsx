@@ -209,11 +209,6 @@ async function page() {
   await screen.findByRole("list", { name: "Accounts" });
 }
 
-function expandNeeds() {
-  const needs = screen.getByRole("region", { name: "Needs you" });
-  for (let button; (button = within(needs).queryByRole("button", { name: /^Show \d+ more/ }));) fireEvent.click(button);
-}
-
 function openRare(name: string) {
   fireEvent.click(screen.getByRole("button", { name: "Rarely needed" }));
   const fold = screen.getByRole("button", { name });
@@ -1496,12 +1491,8 @@ describe("Settings -> Routing: providers and lanes", () => {
     expect(row("Job slots", "main-opus")).toHaveTextContent("the runner's settings and its login name different accounts");
     expect(within(row("Job slots", "main-opus")).getByText("Conflict")).toBeInTheDocument();
     expect(row("Job slots", "main-opus")).toHaveTextContent("Fix the runner's settings, or pick the account here.");
-    const needs = screen.getByRole("region", { name: "Needs you" });
-    expect(within(needs).getByText("Job slot claude in project-a matches two accounts")).toBeInTheDocument();
-    expect(within(needs).getByText("Job slot review-2 in project-a has no account")).toBeInTheDocument();
-    expect(within(needs).queryByText(/main-opus/)).toBeNull();
-    expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("2 job slots without an account");
-    expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("1 job slot conflicts");
+    // Not something to answer: it stays on this page and out of Needs you.
+    expect(screen.queryByRole("region", { name: "Needs you" })?.textContent ?? "").not.toMatch(/Job slot/);
   });
 
   it("keeps the job runner folders beside the job slots, saying how each is doing", async () => {
@@ -1710,13 +1701,12 @@ describe("Settings -> Routing: checks and copies", () => {
     return v;
   }
 
-  it("words every contradiction and upkeep flag, and Needs you carries the contradictions", async () => {
+  it("words every contradiction and upkeep flag, and keeps them out of Needs you", async () => {
     answers.khipu_route_view = checksView();
     await page();
     const group = screen.getByRole("region", { name: "Checks and copies" });
     const closed = document.querySelector('[data-settings-group="checks"]')!;
     expect(closed).toHaveTextContent("2 contradictions · 3 rules to look at");
-    expect(closed.querySelector(".tag.warn")).toHaveTextContent("2 contradictions");
     expect(within(group).getByText("Khipu flags these so you can fix them. None of them stops any work.")).toBeInTheDocument();
 
     expect(row("Contradictions and out-of-date words", "Priority 2 names Grok Build, which you paused until Fri 9:00 AM"))
@@ -1741,14 +1731,7 @@ describe("Settings -> Routing: checks and copies", () => {
     // Neither the table nor any flag offers Confirm, Compare, Dismiss or Set a level.
     expect(within(group).queryByRole("button", { name: /Confirm|Compare|Dismiss|Set a level|Make it a cap/ })).toBeNull();
 
-    expandNeeds();
-    const needs = screen.getByRole("region", { name: "Needs you" });
-    expect(within(needs).getByText("Priority 2 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
-    expect(within(needs).getByText("Priority 3 names Antigravity, which Khipu doesn't track")).toBeInTheDocument();
-    expect(within(needs).queryByText(/Rule 9|Rules 3 and 6|edit to rule 7/)).toBeNull();
-    fireEvent.click(within(needs).getByRole("button", { name: "Look at it: Priority 2 names Grok Build, which you paused until Fri 9:00 AM" }));
-    const target = document.querySelector<HTMLElement>('[data-route-item="check:account_state:grok:main:priority-1:0"]')!;
-    await waitFor(() => expect(document.activeElement).toBe(target));
+    expect(screen.queryByRole("region", { name: "Needs you" })?.textContent ?? "").not.toMatch(/Priority 2|Priority 3|Rule 9/);
   });
 
   it("names the rule a rule-sourced contradiction comes from, by its public id", async () => {
@@ -1769,9 +1752,6 @@ describe("Settings -> Routing: checks and copies", () => {
     const titled = row("Contradictions and out-of-date words", "Rule 12 names Grok Build");
     expect(titled).toHaveTextContent("Rule 12 names Grok Build, which you paused until Fri 9:00 AM");
     expect(titled).toHaveTextContent("Your rule names an account you paused.");
-    expandNeeds();
-    expect(within(screen.getByRole("region", { name: "Needs you" }))
-      .getByText("Rule 12 names Grok Build, which you paused until Fri 9:00 AM")).toBeInTheDocument();
   });
 
   it("folds the confirmed model table with all eleven kinds of work", async () => {

@@ -34,6 +34,9 @@ def tearDownModule():
     co.reset_user_patterns()
 
 
+_CAPTURE = object()  # `_seed(owner=...)`: store the owner capture would decide
+
+
 class _CommitmentsCursor:
     """In-memory stand-in for the commitments table.
 
@@ -61,12 +64,16 @@ class _CommitmentsCursor:
 
         _db._TABLE_COLUMNS_CACHE.pop("commitments", None)
 
-    def _seed(self, text, *, project="acme/widget", kind="followup", owner=None,
+    def _seed(self, text, *, project="acme/widget", kind="followup", owner=_CAPTURE,
               episode=1, session_id=None, status="open", future_trigger=False,
               due_after=None, opened_at="t0"):
         """Insert a row WITHOUT going through open_from_episode's filter — for
         tests about auto_close / stale / listing, whose fixtures predate the
-        precision filter and are not what those tests are about."""
+        precision filter and are not what those tests are about. The stored
+        owner is the one capture would have decided for the text, unless the
+        test gives one (``None`` stores none, like a legacy row)."""
+        if owner is _CAPTURE:
+            owner = co.resolve_owner(text, kind=kind)
         cid = self.next_id
         self.next_id += 1
         self.rows[cid] = {
@@ -969,14 +976,19 @@ class OwedOutputTest(unittest.TestCase):
 
     def test_a_legacy_model_owner_is_normalised_not_echoed(self):
         """Rows opened before this change carry whatever the model said
-        ("Peer 1", "ASSISTANT"); the desktop's "Needs you" section is
-        owner == 'user', so the listed value is always one of the two."""
+        ("Peer 1", "ASSISTANT", nothing); the desktop's "Needs you" section
+        is owner == 'user', so the listed value is always one of the owners,
+        read from the stored value alone: a name that is no owner is the
+        user's, the one default that no automatic rule acts on, and the text
+        never overrules the stored owner."""
         cur = _CommitmentsCursor(migrated=True)
         cur._seed("Critique the draft plan for the app", owner="Peer 1")
         cur._seed("Matt reviews and merges the stack himself", owner="ASSISTANT")
+        cur._seed("Rebuild the search index", owner=None)
         rows = {r["text"]: r["owner"] for r in co.list_owed(cur, project="acme/widget")}
-        self.assertEqual(rows["Critique the draft plan for the app"], "assistant")
-        self.assertEqual(rows["Matt reviews and merges the stack himself"], "user")
+        self.assertEqual(rows["Critique the draft plan for the app"], "user")
+        self.assertEqual(rows["Matt reviews and merges the stack himself"], "assistant")
+        self.assertEqual(rows["Rebuild the search index"], "user")
 
     def test_a_stored_future_trigger_column_is_read_when_present(self):
         cur = _CommitmentsCursor(migrated=True, trigger=True)
@@ -1229,15 +1241,15 @@ class ConfigurableUserAliasesTest(unittest.TestCase):
                 co.OWNER_USER,
             )
 
-    def test_matt_is_not_recognised_when_the_only_configured_alias_is_priya(self):
+    def test_matt_stays_the_user_and_a_configured_alias_adds_to_him(self):
         with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "priya"}):
             co.reset_user_patterns()
-            # Not the user: with the alias priya, "Matt" is a third party named
-            # as the subject, so the item is his as an agent, never the user's.
-            self.assertEqual(
-                co.resolve_owner_and_label("Matt to decide whether the release ships"),
-                (co.OWNER_AGENT, "Matt"),
-            )
+            # Matt's names are built in (the same on every Mac); a name no one
+            # configured is a third party named as the subject, an agent's item.
+            self.assertEqual(co.resolve_owner_and_label("Matt to decide whether the release ships"),
+                             (co.OWNER_USER, None))
+            self.assertEqual(co.resolve_owner_and_label("Sam to decide whether the release ships"),
+                             (co.OWNER_AGENT, "Sam"))
 
 
 if __name__ == "__main__":

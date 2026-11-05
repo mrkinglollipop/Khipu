@@ -119,8 +119,13 @@ _NOT_A_DELAY = ("skipped:no-session", "skipped:no-fork")
 _SESSION_RE = re.compile(r"\] session=(?P<session>\S+) ")
 
 
+# Prompts older than this say nothing about whether delivery works now: a fixed
+# problem must stop showing within the hour, not at the next UTC midnight.
+PROMPT_WINDOW_S = 3600
+
+
 def prompt_health(now, warn_pct=1.0):
-    """Today's per-prompt routing outcomes. ``prompt-skips``: more than
+    """The last hour's per-prompt routing outcomes. ``prompt-skips``: more than
     ``warn_pct`` percent of them ran out of time (``ROUTING_OUT_OF_TIME``,
     the doctor's ``routing_slow_read_pct``; 0 never warns); a skip for any
     other reason (a record changed under the read, an unsaved fold) is
@@ -131,14 +136,18 @@ def prompt_health(now, warn_pct=1.0):
 
     try:
         raw = recall_prompt._tail_text(recall_prompt._log_path(), max_bytes=recall_prompt._OUTCOMES_TAIL_BYTES)
+    except FileNotFoundError:
+        raw = ""  # no prompt has been logged yet: idle
     except OSError:
-        return _result([], ["today's hook outcomes"])
-    statuses, runs, longest = [], {}, 0
+        return _result([], ["hook outcome log unreadable"])
+    statuses, runs, longest, ahead = [], {}, 0, False
     for line in raw.splitlines():
         match = recall_prompt._LOG_LINE_RE.match(line)
         stamp = _time(match.group("stamp")) if match else None
         status = recall_prompt.routing_status_of(line)
-        if stamp and stamp.date() == now.astimezone(timezone.utc).date() and stamp <= now and status:
+        if stamp and stamp > now and status:
+            ahead = True
+        if stamp and 0 <= (now - stamp).total_seconds() <= PROMPT_WINDOW_S and status:
             statuses.append(status)
             found = _SESSION_RE.search(line)
             session = found.group("session") if found else "?"
@@ -146,8 +155,9 @@ def prompt_health(now, warn_pct=1.0):
                 delayed = status.startswith("skipped:") and status not in _NOT_A_DELAY
                 runs[session] = runs.get(session, 0) + 1 if delayed else 0
                 longest = max(longest, runs[session])
+    missing = ["hook outcome dated ahead of the clock"] if ahead else []
     if not statuses:
-        return _result([], ["today's hook outcomes"])
+        return _result([], missing + ["recent hook outcomes"])
     skipped = sum(s.startswith("skipped:") for s in statuses)
     late = sum(s in recall_prompt.ROUTING_OUT_OF_TIME for s in statuses)
     rate = 100 * late / len(statuses)
@@ -156,7 +166,7 @@ def prompt_health(now, warn_pct=1.0):
         reasons.append("prompt-skips")
     if longest >= PROMPT_DELAY_RUN:
         reasons.append("prompt-delay")
-    return _result(reasons, [], count=len(statuses), skipped=skipped, out_of_time=late, rate_pct=rate,
+    return _result(reasons, missing, count=len(statuses), skipped=skipped, out_of_time=late, rate_pct=rate,
                    warn_pct=warn_pct, longest_skip_run=longest)
 
 
@@ -173,6 +183,30 @@ def _ledger_quiet(data, path, now, live_after):
     except (OSError, OverflowError, ValueError):
         return False
     return (now - max(stamps)).total_seconds() > live_after
+
+
+# Missing evidence that only means nothing is going on: no prompt in the last hour, no live conversation.
+# Any other missing item means a ledger, cursor, log or publication could not be read.
+IDLE_MISSING = frozenset({"recent hook outcomes", "live delivery identities"})
+
+
+AHEAD_SLACK_S = 300  # evidence dated further ahead than this is not from this clock
+
+
+def unchecked(block) -> list[str]:
+    """What could not be read or published. No hook outcomes is only idle when no conversation is live."""
+    live = bool(block.get("identities"))
+    return [m for m in block.get("missing") or ["routing check"] if m not in IDLE_MISSING
+            or (live and m == "recent hook outcomes")]
+
+
+def delivery_ok(block) -> bool:
+    """False for a failure and for anything that could not be checked; True for a check that is fine,
+    switched off, or idle."""
+    status = block.get("status") if isinstance(block, dict) else None
+    if status in ("green", "not_applicable"):
+        return True
+    return status == "unknown" and not unchecked(block)
 
 
 def doctor_block(view, now, cfg):
@@ -250,7 +284,8 @@ def doctor_block(view, now, cfg):
             replication = routing_replication.status(now)
         except (TypeError, ValueError, OverflowError):
             replication = {"age_seconds": None}
-        if replication["age_seconds"] is None:
+        caught = _time(replication.get("caught_up_at"))
+        if replication["age_seconds"] is None or (caught and (caught - now).total_seconds() > AHEAD_SLACK_S):
             missing.append("cross-Mac caught-up cursor")
             replication["status"] = "unknown"
         else:
@@ -317,6 +352,9 @@ def doctor_block(view, now, cfg):
         if publication.get("published_at"):
             published_at = _time(publication["published_at"])
             age = max(0, (now - published_at).total_seconds()) if published_at else None
+            if published_at and (published_at - now).total_seconds() > AHEAD_SLACK_S:
+                missing.append("gateway publication dated ahead of the clock")
+                gateway["status"] = "unknown"
             gateway["published_at"] = publication["published_at"]
             gateway["published_epoch"] = publication.get("epoch")
             gateway["published_revision"] = publication.get("revision")
@@ -344,12 +382,6 @@ def doctor_block(view, now, cfg):
             reasons.append("gateway-cleanup-full")
     if not rows:
         missing.append("live delivery identities")
-    for lane in view.get("unmatched") or []:
-        stamp = _time(lane.get("limited_since"))
-        if stamp is None:
-            missing.append("unmatched limit run timestamp")
-        elif (now - stamp).total_seconds() >= 3600:
-            reasons.append("unmatched-limit")
     result = _result(reasons, missing, identities=rows, prompts=prompts,
                      replication=replication, gateway=gateway)
     from khipu import features
@@ -358,8 +390,7 @@ def doctor_block(view, now, cfg):
         # With the push off nothing is delivered to conversations, so there are
         # no hook outcomes or delivery identities to find: that is the setting,
         # not a fault. Anything else the check found still counts.
-        absent = {"today's hook outcomes", "live delivery identities"}
-        left = [m for m in result["missing"] if m not in absent]
+        left = [m for m in result["missing"] if m not in IDLE_MISSING]
         if not result["reasons"] and not left:
             return dict(result, status="not_applicable", missing=[],
                         words="Routing lines are switched off on this Mac, so nothing is delivered to conversations to check.")

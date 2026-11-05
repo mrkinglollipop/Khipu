@@ -130,12 +130,13 @@ def _worker(seconds):
     return subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
 
 
-def test_a_worker_killed_mid_run_becomes_interrupted_and_is_shown_in_needs_you(world, monkeypatch):
-    from khipu import needs_you
+def _die(world, monkeypatch, *, entry: bool):
+    """A confirmed request whose worker died; with ``entry``, after writing its owner-actions line ahead."""
     request = _started(world, monkeypatch)
-    # The worker wrote its line ahead, then died before finishing.
-    owner_direction.gate(owner_direction.intent("route.pause", "Codex"))
-    owner_direction._PENDING.set(None)
+    if entry:
+        owner_direction._append({"kind": "action", "id": "a-1", "at": owner_direction._iso(owner_direction._clock()),
+                                 "action": "route.pause", "target": "Codex", "state": "pending",
+                                 "confirmed": {"request": request}})
     worker = _worker(60)
     owner_background._save(request, {"state": "started", "started_ts": time.time(), "pid": worker.pid,
                                      "worker": owner_background._identity(worker.pid)})
@@ -147,10 +148,25 @@ def test_a_worker_killed_mid_run_becomes_interrupted_and_is_shown_in_needs_you(w
     assert row["state"] == "interrupted" and row["error_code"] == "interrupted"
     assert owner_background.heal() == []  # settled once
     assert json.loads(owner_background.path(request).read_text())["state"] == "finished"
-    # Not replayed: the held action never ran again, and the owner-actions log shows it unfinished.
+    return request
+
+
+def test_a_worker_killed_after_its_action_entry_is_in_owner_actions_and_not_on_the_list(world, monkeypatch):
+    from khipu import needs_you
+    _die(world, monkeypatch, entry=True)
+    # Not replayed, and the owner-actions log shows it unfinished: nothing more for the owner to answer.
     assert next(r for r in owner_direction.actions() if r["action"] == "route.pause")["state"] == "unconfirmed"
-    items = [i for i in needs_you.waiting(record_read=False)["items"] if i["kind"] == "interrupted"]
-    assert len(items) == 1 and "interrupted before it finished" in items[0]["words"] and "Khipu has not run it again" in items[0]["words"]
+    assert needs_you.waiting(record_read=False)["items"] == []
+
+
+def test_a_worker_killed_before_any_action_entry_is_still_listed(world, monkeypatch):
+    from khipu import needs_you
+    request = _die(world, monkeypatch, entry=False)
+    assert owner_direction.actions() == []  # the log has no trace of it
+    (item,) = needs_you.waiting(record_read=False)["items"]
+    assert item["kind"] == "interrupted" and item["key"] == f"interrupted:{request}"
+    assert "didn't finish" in item["words"] and "pause an account" in item["words"]
+    assert "Say it again" in item["do"] and request not in item["words"]
 
 
 def test_a_live_slow_worker_is_never_called_interrupted(world, monkeypatch):

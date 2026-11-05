@@ -68,9 +68,6 @@ HOLD_WORDS = {
                       "whole: look at that record in the outbox's resolved folder, remove it if it is wrong, then "
                       "run this again"),
 }
-# What a retry may land: not provably a duplicate, and nothing forgotten near it.
-RETRYABLE = frozenset({NO_COVERING_ROW, RANGE_NOT_CONTAINED, RANGE_NOT_NUMERIC, NOT_SAME_WINDOW, OFFSETS_RESTARTED,
-                       LATE_REPEAT, EVIDENCE_MISSING})
 
 _ROWS_SQL = ("SELECT id, session_id, transcript_range, deleted_at, raw FROM episodes "
              "WHERE session_id = ANY(%s) OR raw->>'session_id' = ANY(%s) ORDER BY id")
@@ -264,16 +261,6 @@ def dry_run() -> dict[str, Any]:
     return {"ok": read, "dry_run": True, "dead_jobs": len(entries),
             "would_retire": sum(1 for e in entries if not e["reason"]), "would_hold": dict(sorted(held.items())),
             **({} if read else {"error": _UNREADABLE_HUB})}
-
-
-def retryable() -> dict[Path, bytes]:
-    """The refused dead jobs a retry may land, with the bytes judged; none when
-    the hub could not be read."""
-    from khipu import outbox
-
-    entries = _read(outbox.dead_jobs())
-    _judged(entries)
-    return {e["path"]: e["snapshot"] for e in entries if e["reason"] in RETRYABLE}
 
 
 def _record(entry: dict[str, Any]) -> dict[str, Any]:

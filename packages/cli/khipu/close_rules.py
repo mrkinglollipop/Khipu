@@ -597,7 +597,7 @@ def _open_items(cur, project: str | None, *, commitment_id: int | None = None,
     ``commitments.row_owner`` reads it (the owner guard's input)."""
     from khipu.commitments import (
         _future_trigger_ready, _lineage_columns_ready, _reassigned_column_ready, _seen_columns_ready,
-        has_future_trigger, row_owner,
+        row_owner,
     )
 
     where = "status = 'open' AND project IS NOT NULL"
@@ -638,8 +638,7 @@ def _open_items(cur, project: str | None, *, commitment_id: int | None = None,
     for r in cur.fetchall():
         item = dict(zip(cols, r))
         item["stored_owner"] = item.get("owner")
-        trigger = has_future_trigger(item.get("text") or "") or bool(item.get("future_trigger"))
-        item["owner"], item["owner_label"] = row_owner(item, future_trigger=trigger)
+        item["owner"], item["owner_label"] = row_owner(item)
         out.append(item)
     from khipu.tombstones import withhold
 

@@ -216,6 +216,19 @@ LOCAL_GATES = (
 )
 
 
+# Every `*_ok` key that gates plain doctor's overall `ok` (and so the summary's lines). Beside it,
+# `*_ok` keys in the report that do not: routing_delivery_ok (evidence), and the nightly step flags
+# that `nightly_steps_ok` already folds in.
+OK_GATES = (
+    "hub_ok", "drift_ok", "graph_drift_ok", "outbox_ok", "backup_ok", "capture_liveness_ok", "git_sync_ok",
+    "dsn_file_ok", "index_freshness_ok", "jobs_ok", "embed_coverage_ok", "synth_budget_ok", "synth_provider_ok",
+    "graph_backup_ok", "graph_offsite_ok", "hub_snapshot_ok", "ledger_copy_ok", "recall_probe_ok", "bundle_seal_ok",
+    "literal_trgm_ok", "prompt_recall_snapshot_ok", "prompt_recall_outcomes_ok", "recall_daemon_ok", "forget_list_ok",
+    "nightly_steps_ok", "topics_embed_lag_ok", "degraded_rate_ok", "launchers_ok", "ledger_outbox_ok",
+    "disk_space_ok", "recall_eval_ok", "schema_migrations_ok",
+)
+
+
 def _doctor_local_checks(mem: Path | None) -> dict:
     """Every doctor check that needs nothing but this Mac: no hub, no
     network, no probe. Returns each check's block and its ``*_ok`` (the keys
@@ -238,12 +251,21 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     # is the age signal that was missing. Red only past an hour — draining
     # takes a few minutes normally, an hour is evidence something is stuck.
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
-    outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
-    # Red for a dead job from the last day or one waiting on the owner; the old
-    # announce-refused ones an older app left are said plainly (``outbox.plain``)
-    # and counted, not red while nothing newer dies beside them.
-    outbox_ok = (outbox.get("pending") == 0 and not outbox.get("dead_waiting", outbox.get("dead"))
-                 and outbox_oldest_ok)
+    # A queued job whose age can't be told is not shown to be young.
+    waiting_age = outbox.get("oldest_pending_seconds")
+    outbox_oldest_ok = (waiting_age or 0) <= 3600 and not (waiting_age is None and (outbox.get("pending") or 0) > 0)
+    # A capture queued minutes ago is on its way: the queue is red only for one
+    # stuck past an hour, a job that can't be read, a dead job from the last day
+    # or one waiting on the owner (the old announce-refused ones an older app
+    # left are said plainly in ``outbox.plain`` and counted, not red while
+    # nothing newer dies beside them). ``outbox_ok`` is left that way because the
+    # promote gate reads it. ``at_risk`` is the narrower question: is any capture
+    # not proven to be in memory and not about to be retried, which a young or
+    # offline queue is not (it is safe on this Mac and drained), and which every
+    # held job is, old refused ones included.
+    dead_waiting = outbox.get("dead_waiting", outbox.get("dead")) or 0
+    outbox_ok = ("error" not in outbox and not outbox.get("unreadable") and not dead_waiting and outbox_oldest_ok)
+    outbox["at_risk"] = bool("error" in outbox or outbox.get("unreadable") or outbox.get("dead"))
     # Dead letters sit outside drain(); only retry-dead moves them back. Held
     # file lines with preferences the hub lacks would only fail again there,
     # so status's fix (naming the merge first) stands for them.
@@ -688,12 +710,12 @@ def _doctor_embed_checks() -> tuple[dict, bool, dict]:
         # are re-read) and kept for topics_embed_lag below, so one doctor run
         # plans the memory space once instead of reading ~28 MB of text twice.
         embed_coverage = coverage(detail=True, cached_plan=True, keep_gaps=memory_gaps_kept)
-        embed_coverage_ok = (
-            embed_coverage.get("episodes", {}).get("missing", 0) == 0
-            and embed_coverage.get("topics", {}).get("missing", 0) == 0
-            and embed_coverage.get("missing", 0) == 0
-            and embed_coverage.get("stale", 0) == 0
-        )
+        # Red when a chunk has gone unembedded for over an hour (topics_embed_lag's
+        # threshold). The per-row counts are not used: an episode with no text has
+        # no chunk to embed and would stay "missing" for good.
+        gap = (embed_coverage.get("missing", 0) or 0) + (embed_coverage.get("stale", 0) or 0)
+        waited = embed_coverage.get("oldest_gap_minutes")
+        embed_coverage_ok = gap == 0 or (isinstance(waited, int) and waited <= 60)
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
         embed_coverage_ok = False
@@ -1056,6 +1078,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         work_block = _work.doctor_block()
     except Exception as e:  # noqa: BLE001  (a failed check must not crash doctor)
         work_block = {"warnings": [], "error": f"{type(e).__name__}: {e}"}
+    from khipu import routing_health
+
     out = {
         "status": status,
         "hub_ok": hub_ok,
@@ -1110,7 +1134,9 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         # starts) or red (a fresh fold nears the prompt's budget). Never gates `ok`.
         "routing_log": routing_block.get("log"),
         "routing_delivery": routing_block.get("routing_delivery", {"status": "unknown", "missing": ["routing check"]}),
-        "routing_delivery_ok": routing_block.get("routing_delivery", {}).get("status") in ("green", "not_applicable"),
+        # Not red when idle (no prompts, no live conversation); red for a failure and for anything unreadable.
+        "routing_delivery_ok": routing_health.delivery_ok(
+            routing_block.get("routing_delivery", {"status": "unknown", "missing": ["routing check"]})),
         "owner_direction": owner_direction_block,
         "owner_actions_log": owner_actions_log_block,
         "ledger": ledger_block,
@@ -1128,59 +1154,6 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
                      + _replica_schema_warnings(local) + _recall_outcomes_warnings(local)
                      + _storage_warnings(local) + _owner_writes_warnings()),
         "not_configured": not_configured,
-        "ok": (
-            hub_ok
-            and drift_ok
-            and graph.get("ok", False)
-            and outbox_ok
-            and backup["ok"]
-            and bool(liveness.get("ok"))
-            and bool(git_sync.get("ok"))
-            and dsn_file_ok
-            and index_freshness_ok
-            and jobs_ok
-            and embed_coverage_ok
-            and synth_budget_ok
-            and synth_provider_ok
-            and bool(_graph_backup.get("ok"))
-            # graph_offsite_ok was reported but never aggregated, so a stale
-            # offsite copy left doctor (and the soak probe reading doctor.ok)
-            # green for days (08-28..08-31).
-            and bool(_graph_offsite.get("ok"))
-            # hub_snapshot["ok"] was computed and displayed but never folded
-            # into the aggregate — a snapshot stuck behind ingest by hours
-            # still read doctor.ok == true (W6, 2026-09-03).
-            and bool(hub_snapshot.get("ok", True))
-            and bool(ledger_copy.get("ok"))
-            # recall_probe_ok: the end-to-end "capture then search finds it"
-            # signal (W6.1) — red when no probe has run, the last one failed,
-            # or it is older than 7 days. This is a hard gate, not a warning.
-            and bool(recall_probe.get("ok"))
-            # bundle_seal_ok: red the moment a running .app bundle has gained
-            # a file post-signing (0.3.15's root cause). `ok` is true for both
-            # a clean signature and `na` (not running from inside a bundle).
-            and bool(bundle_seal_block.get("ok"))
-            # literal_trgm_ok: true for a clean index set AND for the
-            # documented no-op skip (pg_trgm unavailable); false only when
-            # the extension exists but an index is actually missing.
-            and bool(literal_trgm.get("ok"))
-            and bool(prompt_recall_snapshot.get("ok"))
-            and bool(prompt_recall_outcomes_block.get("ok"))
-            and bool(recall_daemon_block.get("ok"))
-            and bool(forget_list_block.get("ok"))
-            and all(bool(v.get("ok")) for v in nightly_steps.values())
-            and bool(topics_lag.get("ok"))
-            and bool(degraded_rate.get("ok"))
-            # launchers_ok: red only when some pack's own config points at a
-            # dangling/not_a_link launcher. An inconsistent root set
-            # (`launchers["consistent"]`) is a warning, folded in separately
-            # below, and never reaches this aggregate.
-            and bool(launchers.get("ok"))
-            and local["ledger_outbox_ok"]
-            and local["disk_space_ok"]
-            and local["recall_eval_ok"]
-            and schema_ok
-        ),
         "graph_backup": _graph_backup,
         "graph_backup_ok": bool(_graph_backup.get("ok")),
         "graph_offsite": _graph_offsite,
@@ -1217,7 +1190,11 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "disk_space_ok": local["disk_space_ok"],
         "schema_migrations_ok": schema_ok,
     }
-    print(_strict_json(out, indent=2, default=str))
+    from khipu.doctor_summary import health_summary
+
+    # The one list `ok` is made from; the summary names every failing member.
+    out["ok"] = all(out[k] for k in OK_GATES)
+    print(_strict_json({"summary": health_summary(out), **out}, indent=2, default=str))
     return 0 if out["ok"] else 2
 
 
@@ -4585,7 +4562,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
         print(json.dumps(outbox.status(), indent=2))
         return 0
     if args.outbox_cmd == "retry-dead":
-        print(json.dumps(outbox.retry_dead(include_announce_refused=args.include_announce_refused), indent=2))
+        print(json.dumps(outbox.retry_dead(), indent=2))
         return 0
     if args.outbox_cmd == "merge-line-preferences":
         return _outbox_merge_preferences(args)
@@ -7239,16 +7216,12 @@ def build_parser() -> argparse.ArgumentParser:
     obd = ob_sub.add_parser("drain", help="Replay queued captures into PG")
     obd.add_argument("--limit", type=int, default=None)
     ob_sub.add_parser("status", help="Pending count + oldest age + dead-letter count")
-    obr = ob_sub.add_parser(
+    ob_sub.add_parser(
         "retry-dead",
         help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue. Jobs refused for "
              "not announcing their source identities stay held and are counted, since a retry may land them as "
-             "duplicates: run `span-covered` first",
+             "duplicates: `span-covered` counts them",
     )
-    obr.add_argument("--include-announce-refused", action="store_true",
-                     help="Also retry the refused jobs span-covered can't retire and no forgotten episode overlaps "
-                          "(reads the hub; a failed read retries none). The next drain lands each as a new episode, "
-                          "with its commitments, decisions and embeddings, beside any episode already spanning it")
     obs = ob_sub.add_parser(
         "span-covered",
         help="Dead jobs refused for not announcing their source identities, whose range sits inside another episode "

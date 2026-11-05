@@ -20,14 +20,18 @@ def test_a_mac_with_the_routing_push_off_has_nothing_to_deliver_and_is_not_unkno
 
 def test_a_mac_with_the_push_on_and_no_evidence_is_still_unknown(replay):
     result = health.doctor_block({"unmatched": []}, replay.now, routing.settings())
-    assert result["status"] == "unknown" and "today's hook outcomes" in result["missing"]
+    assert result["status"] == "unknown" and "recent hook outcomes" in result["missing"]
 
 
 def test_a_real_delivery_problem_is_not_hidden_by_the_push_being_off(replay, monkeypatch):
     monkeypatch.setenv("KHIPU_FEATURE_ROUTING_PUSH", "0")
-    result = health.doctor_block({"unmatched": [{"limited_since": routing._iso(replay.now - timedelta(hours=3))}]},
-                                 replay.now, routing.settings())
-    assert result["status"] == "red" and "unmatched-limit" in result["reasons"]
+    log = recall_prompt._log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    stamp = routing._iso(replay.now - timedelta(minutes=5))
+    log.write_text("".join(f"{stamp} [khipu-prompt-recall] session=s{i} reason=no_hits ms=1 hits=[] legs=[] "
+                           "degraded=None routing=skipped:budget\n" for i in range(3)))
+    result = health.doctor_block({"unmatched": []}, replay.now, routing.settings())
+    assert result["status"] == "red" and "prompt-skips" in result["reasons"]
 
 
 def _recall_line(when: datetime, n: int) -> str:

@@ -84,7 +84,6 @@ def test_expired_unsupported_samples_archive_without_losing_supported_unsent_row
     assert replicas.sync(a, hub)['ok']
     sample_ids = {row['id'] for row in rows if row['type'] == 'usage_sample'}
     owner_ids = {row['id'] for row in rows if rc._owner(row)}
-    assert sample_ids <= set(rr._state()['deferred'])
     unsent = [dict(type='source_seen', id=f'unsent-{n}', seq=max(row['seq'] for row in rows) + n + 1, runner='unsent', status='{}',
                    written_at=routing._iso(END - timedelta(days=20)),
                    written_by={'kind': 'runner'}, via='runner') for n in range(6)]

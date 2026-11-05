@@ -61,8 +61,8 @@ def test_the_sign_in_item_says_it_is_this_mac(monkeypatch):
     monkeypatch.setattr(usage, "_load_cache", lambda: {"k": {"ok": False, "error": "not_signed_in"}})
     monkeypatch.setattr(usage, "all_accounts", lambda: [account])
     monkeypatch.setattr(usage, "_key", lambda a: "k")
-    items, unread = needs_you._plans(None, datetime.now(timezone.utc))
-    (item,) = items
+    unread = []
+    (item,) = needs_you._signins(unread)
     assert unread == [] and item["kind"] == "signin"
     assert "not signed in on this Mac" in item["words"] and "here" in item["words"]
 

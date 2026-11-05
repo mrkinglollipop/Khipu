@@ -119,10 +119,9 @@ OLD_DEAD_S = 24 * 3600
 # The hub's answer to a capture whose legacy key an older episode holds under
 # different evidence (``capture._write_legacy``): retrying cannot change it.
 LEGACY_KEY_CONFLICT = "CaptureEvidenceConflict: legacy episode key conflicts with distinct evidence on episode"
-SPAN_FIRST = ("Run `khipu outbox span-covered` first: a dry run that counts the jobs whose range and evidence fields "
-              "another episode holds. "
-              "`khipu outbox retry-dead` may land those as duplicates, so it leaves this kind held unless told "
-              "otherwise.")
+SPAN_COUNT = ("`khipu outbox span-covered` counts the jobs whose range and evidence fields another episode holds, as "
+              "a dry run. `khipu outbox retry-dead` leaves this kind held: a retry could land them as duplicates or "
+              "drop them unwritten.")
 
 
 def legacy_key_conflict(job: Any) -> bool:
@@ -638,25 +637,17 @@ def announce_refused_count() -> int:
     return count
 
 
-def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
+def retry_dead() -> dict[str, Any]:
     """Move every dead job back to the queue with attempts reset, except jobs
     refused for not announcing their source identities: a retry can land one as
-    a near-duplicate episode beside the episode spanning it, or live with text
-    a forgotten episode held. They stay and are counted.
-    ``include_announce_refused`` moves those a hub read shows are safe to land
-    (``outbox_span_covered.retryable``); a failed read moves none."""
+    a near-duplicate episode beside the episode spanning it, live with text a
+    forgotten episode held, or drop it unwritten at an exact-window skip. They
+    stay and are counted."""
     moved = 0
     quarantined = 0
     refused_held = 0
-    refused_moved = 0
     from khipu import memory_lock
     from khipu.tombstones import RegistryError, write_guard
-
-    retryable: dict[Path, bytes] = {}
-    if include_announce_refused:
-        from khipu import outbox_span_covered
-
-        retryable = outbox_span_covered.retryable()
 
     # Do not hold the outbox lock while taking the registry lock: forget takes
     # the memory lock, the registry, then the outbox. A job is re-read under
@@ -698,7 +689,7 @@ def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
                         if not allowed:
                             jp.unlink(missing_ok=True)
                             continue
-                        if announce_refused(job) and retryable.get(jp) != snapshot:
+                        if announce_refused(job):
                             refused_held += 1
                             continue
                         job["attempts"] = 0
@@ -709,7 +700,6 @@ def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
                             _atomic_write(destination, job)
                         jp.unlink(missing_ok=True)
                         moved += 1
-                        refused_moved += announce_refused(job)
             except RegistryError as exc:
                 _log(f"retry-dead refused for {jp.name}: {exc}")
                 continue
@@ -718,23 +708,11 @@ def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
     native_moved = retry_held()
     out = {"moved": moved + native_moved, "native_moved": native_moved,
            "quarantined": quarantined, "pending": len(jobs())}
-    warnings = []
-    if refused_moved:
-        out["announce_refused_moved"] = refused_moved
-        warnings.append(f"{refused_moved} dead job{'' if refused_moved == 1 else 's'} refused for not announcing source "
-                        "identities went back to the queue: the next drain lands each as a new episode, with its "
-                        "commitments, decisions and embeddings, beside any episode already spanning it.")
     if refused_held:
         out["announce_refused_held"] = refused_held
-        warnings.append(f"{refused_held} dead job{'' if refused_held == 1 else 's'} refused for not announcing "
-                          "source identities stayed held: "
-                          + ("span-covered can retire them, a forgotten episode overlaps them, or a check could not "
-                             "run." if include_announce_refused else
-                             "a retry may land them as duplicates, or with text a forgotten episode held. Run `khipu "
-                             "outbox span-covered` first (a dry run); `--include-announce-refused` then retries only "
-                             "the ones it can't retire and no forgotten episode overlaps."))
-    if warnings:
-        out["warning"] = " ".join(warnings)
+        out["warning"] = (f"{refused_held} dead job{'' if refused_held == 1 else 's'} refused for not announcing source "
+                          "identities stayed held: a retry could land them as duplicates, or with text a forgotten "
+                          "episode held, or drop them unwritten. `khipu outbox span-covered` counts them (a dry run).")
     return out
 
 
@@ -765,9 +743,9 @@ def status() -> dict[str, Any]:
                 raise ValueError("job envelope is not an object")
             outbox_payloads(job)
             q = job.get("queued_at")
-            if not isinstance(q, str):
-                raise ValueError("queued_at is not a string")
-            age = int((now - datetime.fromisoformat(q)).total_seconds()) if q else None
+            if not isinstance(q, str) or not q.strip():
+                raise ValueError("queued_at is blank")
+            age = int((now - datetime.fromisoformat(q)).total_seconds())
         except (OSError, ValueError, TypeError, RecursionError):
             unreadable += 1
             continue
@@ -866,7 +844,7 @@ def status() -> dict[str, Any]:
             # A buried job never re-enters the queue on its own.
             result["fix"] += " Then run `khipu outbox retry-dead` to replay the buried ones."
     if refused:
-        result["fix"] = f"{result['fix']} {SPAN_FIRST}" if result.get("fix") else SPAN_FIRST
+        result["fix"] = f"{result['fix']} {SPAN_COUNT}" if result.get("fix") else SPAN_COUNT
     return result
 
 

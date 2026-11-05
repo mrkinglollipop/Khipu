@@ -91,6 +91,13 @@ describe("healthRows (pure)", () => {
     expect(row?.status).toBe("skipped");
   });
 
+  it("shows doctor's five plain lines above the rows", () => {
+    const summary = ["Saving memory: fine.", "Finding things: fine.", "Routing: Routing lines were left out of 4 of the last hour's 10 prompts. Fix: see whether the Mac is busy.",
+      "Database and disk: fine.", "Background jobs: fine."];
+    const { container } = render(<HealthReportRows parsed={{ summary }} attention={[]} />);
+    expect([...container.querySelectorAll("[data-health-summary]")].map((n) => n.textContent)).toEqual(summary);
+  });
+
   it("keeps unknown routing delivery grey even when its aggregate boolean is false", () => {
     const row = healthRows(fixture({ routing_delivery_ok: false, routing_delivery: { status: "unknown", missing: ["receipt ledger"] } }))
       .find((item) => item.key === "routing_delivery_ok");

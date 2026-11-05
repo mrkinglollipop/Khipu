@@ -63,9 +63,10 @@ def owed(hub, tmp_path, monkeypatch):  # noqa: F811
 
 def _seed(conn, n, *, start=0, text="follow up on item {i}", kind="followup", owner=None,
           origin="conversation", label=None, at=None, step_s=1) -> list[int]:
-    """``n`` open items; ``opened_at`` steps every three rows, so ids break ties."""
+    """``n`` open items; ``opened_at`` steps every three rows, so ids break ties.
+    The stored owner is the one given, else the one capture would decide for the text."""
     at = at or BASE_AT
-    rows = [(text.format(i=i), PROJECT, owner, kind, at + timedelta(seconds=step_s * ((i - start) // 3)),
+    rows = [(text.format(i=i), PROJECT, owner or co.resolve_owner(text.format(i=i), kind=kind), kind, at + timedelta(seconds=step_s * ((i - start) // 3)),
              co.content_hash(PROJECT, text.format(i=i)), origin, label)
             for i in range(start, start + n)]
     with conn.transaction(), conn.cursor() as cur:
