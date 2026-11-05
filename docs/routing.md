@@ -734,7 +734,12 @@ over three days old from `routing_events`: no other kind and no other sender's, 
 day past the oldest it would ever send, and no pull cursor depends on them. Another Mac's
 readings are left out when both name a reset still ahead more than an hour apart
 from this Mac's own fresh reading: that login reads a different allowance under
-that account id, and pooling them would leave both Macs unknown. Caps cross on
+that account id, and pooling them would leave both Macs unknown. To say which
+account a Mac's login really is, stop tracking it there with `keep_priority`, then
+track that login under the account's name: this writes a binding only that Mac reads,
+and never `accounts rename`, whose `account_rename` every Mac follows. That Mac then
+reports readings for the right account and closes advice for the one it has no login to.
+Caps cross on
 every window `routing_pace.cap_window` accepts. Kinds the projection does not
 cover are reported as `deferred_kinds`, retained locally and retried after a
 projection upgrade; they do not block supported events.

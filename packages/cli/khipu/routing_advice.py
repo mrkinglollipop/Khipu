@@ -109,6 +109,18 @@ def eligibility(view: dict, entry: dict, *, tier=None, kind=None, privacy=False,
     return True, "provider facts allow this work"
 
 
+def _login_here_is_another_account(view: dict, entry: dict) -> bool:
+    """Whether this Mac has a login of this account's provider that is another
+    account's. An account a login here reads has a login key (``claude|``); one
+    known only from another Mac keeps its stable id (``claude:main``). A provider
+    with no login here says nothing: its work can run elsewhere, as it always did."""
+    key = entry["key"]
+    provider, colon, _rest = key.partition(":")
+    return bool(colon) and "|" not in key and any(
+        a["key"].startswith(provider + "|") and a.get("configured") is not False
+        for a in view.get("accounts") or [])
+
+
 def _pace_reading_unknown(pace: dict) -> bool:
     """Whether one pace object's usage reading cannot be placed at now.
 
@@ -297,6 +309,8 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         # that the account is out of service for the owner.
         verdict, reason = "closed", (f"{entry['reason']} on this Mac, so it can't be read here"
                                      if entry.get("reason") in ("not signed in", "not installed") else "down")
+    elif _login_here_is_another_account(view, entry):
+        verdict, reason = "closed", "not logged in on this Mac: its login here is another account"
     elif model_limited:
         verdict, reason = "closed", f"{tier} limited"
     elif pace_plan_closed:
