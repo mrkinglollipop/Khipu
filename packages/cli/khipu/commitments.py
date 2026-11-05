@@ -545,10 +545,38 @@ def normalize_owner(raw: Any) -> str | None:
     return None
 
 
-def _user_signal(text: str, *, kind: str | None = None, future_trigger: bool | None = None) -> bool:
+# A bare instruction to run, read or check something is a step the assistant
+# or the orchestrator takes ("Run the dry-run on the M1 Mac", "Run `khipu
+# doctor` on the secondary Mac", "Look at the 38 routing changes", "Verify
+# against live T3 ..."): the extractor marks them "user" or "question" because
+# a person is in the conversation, but nobody asked the person. Only an
+# instruction with no user named and no decision or personal action asked is
+# one, and only a new item is read this way: a stored row keeps the owner it
+# has, because an assistant-owned row may be closed by rules that never touch
+# the owner's. A wrong miss leaves the item on the owner's list, as before.
+
+_PERSON_STEP_RE = re.compile(
+    r"\b(?:you|your|yours|decide|decision|approve|approval|choose|confirm|consent|"
+    r"sign(?:s|ed|ing)?[\s-]*(?:in|out)|log(?:s|ged|ging)?[\s-]*(?:in|out)|login|"
+    r"touch\s*id|password|passcode|credentials?|pay|payment|purchase|buy)\b", re.I)
+
+
+def _machine_step(text: str, kind: str | None = None, future_trigger: bool | None = None) -> bool:
+    s = (text or "").strip()
+    if s.endswith("?") or str(kind or "").lower() == "blocker":
+        return False
+    body = _without_trigger_clause(s) if (future_trigger is not False) else s
+    if not _MACHINE_STEP_RE.match(body) or _PERSON_STEP_RE.search(body):
+        return False
+    patterns = _compile_user_patterns()
+    return not (patterns.actor_re.search(body) or patterns.decision_re.search(body))
+
+
+def _user_signal(text: str, *, kind: str | None = None, future_trigger: bool | None = None,
+                 new_item: bool = False) -> bool:
     s = (text or "").strip()
     if str(kind or "").lower() == "question":
-        return True
+        return not (new_item and _machine_step(s, kind, future_trigger))
     if s.endswith("?"):
         return True
     body = _without_trigger_clause(s) if (future_trigger is not False) else s
@@ -585,6 +613,9 @@ _NOT_NAMES = frozenset("""
     please when if once after before until while who what which why how each every all both
     tests test docs doc ci it's let make run build check
 """.split())
+
+_MACHINE_STEP_RE = re.compile(
+    _LEAD_IN + r"(?:run|re-?run|look\s+at|inspect|diagnose|investigate|measure|verify|read)\b", re.I)
 
 
 def commit_subject(text: str) -> tuple[str, str | None] | None:
@@ -624,7 +655,8 @@ def commit_subject(text: str) -> tuple[str, str | None] | None:
 def resolve_owner_and_label(text: str, *, kind: str | None = None, declared: Any = None,
                             future_trigger: bool | None = None,
                             origin: str | None = None,
-                            declared_label: Any = None) -> tuple[str, str | None]:
+                            declared_label: Any = None,
+                            new_item: bool = False) -> tuple[str, str | None]:
     """``(owner, owner_label)`` for one commitment, deterministically. The one
     owner function: capture, the clean-up and reassignment defaults all call
     it, and ``tests/test_commitment_owner.py`` holds its table of cases.
@@ -672,11 +704,13 @@ def resolve_owner_and_label(text: str, *, kind: str | None = None, declared: Any
         label = agent_actor(body)
         if label:
             return OWNER_AGENT, label
-    if _user_signal(text, kind=kind, future_trigger=future_trigger):
+    if _user_signal(text, kind=kind, future_trigger=future_trigger, new_item=new_item):
         return users
     if not future_trigger:
         if speaker == "other":
             return OWNER_AGENT, clean_owner_label(declared_label) or (ORCHESTRATOR if job else "other")
+        if new_item and speaker == OWNER_USER and _machine_step(body, kind, future_trigger):
+            return OWNER_ASSISTANT, None
         if speaker == OWNER_USER:
             return users
         if speaker:
@@ -1336,7 +1370,7 @@ def open_from_episode(cur, payload: dict[str, Any], episode_id: int) -> int:
         trigger = has_future_trigger(norm["text"])
         owner, owner_label = resolve_owner_and_label(
             norm["text"], kind=norm["kind"], declared=norm["owner"], future_trigger=trigger,
-            origin=origin, declared_label=norm.get("owner_label"),
+            origin=origin, declared_label=norm.get("owner_label"), new_item=True,
         )
         reason = rejection_reason(norm["text"], owner=owner, kind=norm["kind"])
         if reason is not None:

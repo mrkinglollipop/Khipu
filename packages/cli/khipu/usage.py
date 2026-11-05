@@ -2387,7 +2387,9 @@ def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = Non
                 if isinstance(v, dict) and v.get("provider") == "deepseek") > 1:
             return {**base, "status": "unknown", "usd": None,
                     "reason": "more than one DeepSeek account is defined, and Khipu reads one DeepSeek key"}
-        if not _deepseek_key() and not deepseek_history_file().exists():
+        from khipu import keychain
+
+        if not keychain.key_present("deepseek", _deepseek_key) and not deepseek_history_file().exists():
             # Spend is read where the key is. A Mac that never had one has no
             # reader, which is not the same as a reading that failed or a key
             # that was taken away from a history it was keeping.
@@ -2860,11 +2862,13 @@ def _account_from_entry(entry) -> dict:
 def available(harness: str) -> bool:
     """Whether Khipu can read this harness by default: its CLI is installed,
     or (GLM, which has no CLI) a key is stored."""
+    from khipu import keychain
+
     if harness == "deepseek":
-        return bool(_deepseek_key())
+        return keychain.key_present("deepseek", _deepseek_key)
     if harness == "kimi":
-        return bool(_kimi_key())
-    return bool(_glm_key()) if harness == "glm" else bool(_command(harness))
+        return keychain.key_present("kimi", _kimi_key)
+    return keychain.key_present("glm", _glm_key) if harness == "glm" else bool(_command(harness))
 
 
 def reads_none(config: dict | None = None) -> bool:

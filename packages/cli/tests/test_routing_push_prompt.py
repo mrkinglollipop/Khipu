@@ -918,7 +918,7 @@ def test_the_routing_clock_starts_when_the_read_starts(home, monkeypatch):
 
     _record()
     config = json.loads((home["data"] / "config.json").read_text())
-    config.pop("routing_prompt_budget_ms")  # the default, 50 ms
+    config["routing_prompt_budget_ms"] = 50  # shorter than the slow start below
     (home["data"] / "config.json").write_text(json.dumps(config))
     assert routing.prompt_budget() == 0.05
     real = features.enabled

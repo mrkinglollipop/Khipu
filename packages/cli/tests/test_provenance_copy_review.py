@@ -284,3 +284,35 @@ def test_owner_act_reads_the_owner_list(pg, replica, monkeypatch):
         assert conn.execute("SELECT count(*) FROM forgotten_sources").fetchone()[0] == 0
     ok, out = owner_act.act("forget.list", {"id": 1})
     assert not ok and out["code"] == "bad_args"
+
+
+# ---- round 4: a partly sent forget lists only what the hub lacks -----------------------
+
+
+def test_a_copy_that_finds_some_tags_on_the_hub_lists_only_the_missing_ones(pg, replica):
+    """The registry holds three tags and the hub two of them: the list names
+    the one the hub lacks, not every registry tag (the owner was told 143
+    records when the hub lacked 52)."""
+    replica(pg)
+    pg.memory.mkdir(exist_ok=True)
+    assert hs.refresh()["facts"].get("copied")
+    held, lacking = ["k:" + "aa" * 32, "k:" + "ab" * 32], "k:" + "ac" * 32
+    tombstones.publish_identities({t[2:] for t in held + [lacking]}, set())
+    with pg.connect() as conn:
+        provenance.refuse(conn.cursor(), sorted(tombstones.hub_form(t) for t in held))
+        conn.commit()
+    assert forget.unsent_forgets()["count"] == 3  # nothing has looked at the hub yet
+    assert not hs.copy_facts()["ok"]
+    listed = forget.unsent_forgets()
+    assert listed["strings"] == [lacking] and listed["count"] == 1, listed
+
+
+def test_the_owner_words_count_conversations_and_marks_apart(monkeypatch):
+    from khipu import needs_you
+
+    monkeypatch.setattr(forget, "unsent_forgets", lambda: {
+        "ok": True, "strings": [f"h:{i:064x}" for i in range(52)], "ids": [], "episodes": 13, "count": 52})
+    words = needs_you._forgets()[0]["words"]
+    assert words.startswith("You forgot 13 conversations on this Mac. ")
+    assert "52 identifying marks" in words and "143" not in words
+    assert "your other Macs can still show" not in words

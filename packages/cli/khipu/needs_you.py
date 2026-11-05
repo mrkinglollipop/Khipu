@@ -600,9 +600,19 @@ def _forgets() -> list[dict]:
     strings = listed.get("strings") or []
     if strings:
         n = len(strings)
-        out.append(_item("forget_send", "forget_send", f"You forgot {n} conversation record{'' if n == 1 else 's'} on "
-                         "this Mac and the hub does not know yet, so your other Macs can still show "
-                         f"{'it' if n == 1 else 'them'}.", at=listed.get("at"),
+        # The strings are fingerprints of what was forgotten (a conversation has several), not
+        # conversations. The hub hides a forgotten conversation as soon as its own record of the
+        # forget exists; a missing fingerprint only means a copy of the same text arriving from
+        # another Mac might not be refused.
+        marks = f"{n} identifying mark{'' if n == 1 else 's'}"
+        forgot = listed.get("episodes")
+        if isinstance(forgot, int) and forgot > 0:
+            head = f"You forgot {forgot} conversation{'' if forgot == 1 else 's'} on this Mac. "
+        else:
+            head = "You forgot conversations on this Mac. "
+        out.append(_item("forget_send", "forget_send", head + f"The hub has not recorded {marks} for "
+                         f"{'it' if forgot == 1 else 'them'} yet, so a copy sent from another Mac "
+                         "might not be refused.", at=listed.get("at"),
                          confirm_does="Sends the forgets to the hub. This can't be undone: the hub keeps them "
                                       "forgotten.",
                          undo_does="No undo to choose: if you leave it, it stays waiting here.",

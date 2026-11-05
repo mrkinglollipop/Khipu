@@ -1,8 +1,12 @@
 """macOS Keychain helpers for Khipu secrets (DSN and provider keys)."""
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from khipu.output_guard import secret_result
@@ -55,6 +59,65 @@ def get_password(account: str, *, service: str = SERVICE) -> str | None:
     return val or None
 
 
+# The per-prompt routing read only asks whether a provider key exists (is
+# DeepSeek or GLM an account here, is there a spend to read). Each answer cost a
+# ``security`` process (15-20 ms on a loaded Mac, three per read, over half of
+# it), so inside ``prompt_scope`` the yes or no, never the key, is kept for a
+# minute in this Mac's cache folder and dropped when a key is stored.
+PRESENCE_TTL_S = 60.0
+_PROMPT = threading.local()
+
+
+@contextlib.contextmanager
+def prompt_scope():
+    before = getattr(_PROMPT, "on", False)
+    _PROMPT.on = True
+    try:
+        yield
+    finally:
+        _PROMPT.on = before
+
+
+def _presence_path() -> Path:
+    return Path.home() / "Library" / "Caches" / "Khipu" / "login-usage" / "key-presence.json"
+
+
+def _drop_presence() -> None:
+    with contextlib.suppress(OSError):
+        _presence_path().unlink()
+
+
+def key_present(name: str, resolve) -> bool:
+    """Whether ``resolve()`` finds a key. Inside ``prompt_scope`` an answer under
+    ``PRESENCE_TTL_S`` old is reused; anywhere else it is asked every time."""
+    if not getattr(_PROMPT, "on", False):
+        return bool(resolve())
+    path, now = _presence_path(), time.time()
+    try:
+        row = json.loads(path.read_text(encoding="utf-8")).get(name)
+        if isinstance(row, list) and len(row) == 2 and isinstance(row[0], bool) \
+                and isinstance(row[1], (int, float)) and 0 <= now - row[1] <= PRESENCE_TTL_S:
+            return row[0]
+    except (OSError, ValueError, AttributeError):
+        pass
+    present = bool(resolve())
+    try:
+        try:
+            held = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            held = {}
+        held = held if isinstance(held, dict) else {}
+        held[name] = [present, now]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(json.dumps(held), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return present
+
+
 def _may_migrate() -> bool:
     """Legacy-secret migration writes the live Keychain and config dir; an
     isolated run (``KHIPU_ISOLATED_DIR``) only reads."""
@@ -90,6 +153,7 @@ def set_password(account: str, password: str, *, service: str = SERVICE) -> None
         raise RuntimeError(
             f"keychain add failed: {(r.stderr or r.stdout or '').strip()}"
         )
+    _drop_presence()
 
 
 def migrate_legacy_secrets() -> dict:

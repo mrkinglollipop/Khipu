@@ -195,7 +195,11 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit beyond the hook's own cap)"),
-    "routing_prompt_budget_ms": ("count", 50, "Time allowed before a prompt, in milliseconds"),
+    # Measured 2026-11-05 on the M1 at load 19-27: a fresh per-prompt child read
+    # the record in 104 ms (p50 and p90 107) once provider-key lookups left the
+    # read, 163 ms (p90 182) before. A prompt that runs no search has nothing
+    # else to wait on, so a 50 ms budget lost to every one of them.
+    "routing_prompt_budget_ms": ("count", 200, "Time allowed before a prompt, in milliseconds"),
     "routing_start_budget_ms": ("count", 1000, "Time allowed at the start of a conversation, in milliseconds"),
     "routing_resend_after_versions": ("count", 20, "Send everything again after this many changes (0: never)"),
     "routing_resend_after": ("duration", 6 * 3600, "Send everything again after (0: never)"),
@@ -11817,7 +11821,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_advice, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, keychain, paths, redact, routing_advice, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
         session_capture, usage)
 
 
@@ -12514,7 +12518,19 @@ def prompt_push(marker: dict | None, *, budget: float, now: datetime | None = No
                 on_fold=None, session_id: str | None = None, fold_wait: float | None = None,
                 kick=None) -> dict:
     """Offer a leased batch when the marker carries a hook delivery identity.
-    ``fold_wait``, ``kick``: as for ``_prompt_push``."""
+    ``fold_wait``, ``kick``: as for ``_prompt_push``. Provider-key lookups
+    inside it are the minute-old yes or no of ``keychain.prompt_scope``, never
+    a ``security`` process per prompt."""
+    from khipu import keychain
+
+    with keychain.prompt_scope():
+        return _prompt_push_scoped(marker, budget=budget, now=now, on_fold=on_fold, session_id=session_id,
+                                   fold_wait=fold_wait, kick=kick)
+
+
+def _prompt_push_scoped(marker: dict | None, *, budget: float, now: datetime | None = None,
+                        on_fold=None, session_id: str | None = None, fold_wait: float | None = None,
+                        kick=None) -> dict:
     if session_id is not None:
         from khipu.routing_delivery import Marker
 

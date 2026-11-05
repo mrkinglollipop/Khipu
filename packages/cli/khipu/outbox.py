@@ -116,10 +116,20 @@ ANNOUNCE_REFUSAL = "CheckViolation: khipu: an episode write must announce its so
 # beside it, is a finished story from an older app: counted, said plainly, and
 # not what turns the outbox row red.
 OLD_DEAD_S = 24 * 3600
+# The hub's answer to a capture whose legacy key an older episode holds under
+# different evidence (``capture._write_legacy``): retrying cannot change it.
+LEGACY_KEY_CONFLICT = "CaptureEvidenceConflict: legacy episode key conflicts with distinct evidence on episode"
 SPAN_FIRST = ("Run `khipu outbox span-covered` first: a dry run that counts the jobs whose range and evidence fields "
               "another episode holds. "
               "`khipu outbox retry-dead` may land those as duplicates, so it leaves this kind held unless told "
               "otherwise.")
+
+
+def legacy_key_conflict(job: Any) -> bool:
+    """A held job the hub refused because an older episode holds its legacy key."""
+    error = job.get("last_error") if isinstance(job, dict) else None
+    return bool(isinstance(job, dict) and job.get("evidence_conflict") and isinstance(error, str)
+                and LEGACY_KEY_CONFLICT in error)
 
 
 def announce_refused(job: Any) -> bool:
@@ -776,6 +786,7 @@ def status() -> dict[str, Any]:
     held_conflicts = []
     refused = 0
     refused_old = 0
+    conflicts_old = 0
     newest_died: float | None = None
     clock = time.time()
     for jp in dead_jobs():
@@ -792,6 +803,7 @@ def status() -> dict[str, Any]:
         refused += announce_refused(held)
         refused_old += bool(announce_refused(held) and not held.get("evidence_conflict")
                             and clock - died > OLD_DEAD_S)
+        conflicts_old += bool(legacy_key_conflict(held) and clock - died > OLD_DEAD_S)
         if held.get("evidence_conflict"):
             held_conflicts.append(jp.name)
             line_conflicts += _is_line_conflict(held)
@@ -820,15 +832,21 @@ def status() -> dict[str, Any]:
     # (a dead job in the last day) or waiting on the owner (the rest).
     newest_age = None if newest_died is None else int(clock - newest_died)
     result["announce_refused_old"] = refused_old
+    result["legacy_key_conflicts_old"] = conflicts_old
     result["dead_newest_age_s"] = newest_age
-    result["dead_waiting"] = max(dead - refused_old, 0) if (newest_age is None or newest_age > OLD_DEAD_S) \
-        else dead
+    result["dead_waiting"] = max(dead - refused_old - conflicts_old, 0) \
+        if (newest_age is None or newest_age > OLD_DEAD_S) else dead
     if refused_old:
         result["plain"] = (f"{refused_old} old capture{'' if refused_old == 1 else 's'} an older app sent without "
                            "announcing its source identities sit refused"
                            + (f"; the newest died {newest_age // 3600} h ago" if newest_age is not None else "")
                            + (", and nothing newer has died" if (newest_age or 0) > OLD_DEAD_S else "")
                            + ". They are kept whole and wait for your word: `khipu outbox span-covered` counts them.")
+    if conflicts_old:
+        old_note = (f"{conflicts_old} old capture{'' if conflicts_old == 1 else 's'} met an older episode holding "
+                    "the same legacy key under different evidence and sit held")
+        result["plain"] = f"{result['plain']} {old_note[0].upper()}{old_note[1:]}." if result.get("plain") \
+            else f"{old_note}; nothing newer has died. They are kept whole."
     if native_held:
         from khipu.session_capture import held_by_harness
 

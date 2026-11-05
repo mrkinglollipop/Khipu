@@ -24,6 +24,12 @@ def _result(reasons, missing, **fields):
                 reasons=list(dict.fromkeys(reasons)), missing=list(dict.fromkeys(missing)), **fields)
 
 
+# A conversation with no delivery point for this long is idle or ended. Only
+# the reasons that need a later prompt to matter are set aside for it.
+IDLE_AFTER_S = 3600
+_ONLY_WHILE_PROMPTING = ("lease-expired-twice", "budget-stall")
+
+
 def component_health(state, now, *, slack=2, child=False):
     """Malformed evidence is unknown, never a healthy empty component.
     ``child``: an agent component, owed only what its pages will carry."""
@@ -93,8 +99,16 @@ def _component_health(state, now, *, slack, child=False):
             expired += 1
         if expired >= 2:
             reasons.append("lease-expired-twice")
-    return _result(reasons, missing, owed=sum(not e.get("acked") for e in state["entries"].values()
-                                             if isinstance(e, dict)))
+    owed = sum(not e.get("acked") for e in state["entries"].values() if isinstance(e, dict))
+    last = _time(state.get("last_delivery_point"))
+    if last is not None and (now - last).total_seconds() > IDLE_AFTER_S:
+        # Nothing has asked this conversation for routing since: a lease that
+        # ran out, or a budget not yet spent, has no later prompt to be a
+        # problem at. An ended or idle conversation is not the owner's to fix.
+        quiet = [r for r in reasons if r in _ONLY_WHILE_PROMPTING]
+        reasons = [r for r in reasons if r not in _ONLY_WHILE_PROMPTING]
+        return _result(reasons, missing, owed=owed, idle=True, quiet_reasons=quiet)
+    return _result(reasons, missing, owed=owed)
 
 
 # A conversation whose routing lines were skipped on this many prompts in a
