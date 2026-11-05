@@ -212,6 +212,56 @@ def test_a_reader_that_failed_says_so_and_caps_keep_their_place(replay):
     assert routing_advice._pace_reading_unknown(pace)
 
 
+def _down_here(replay, *rows):
+    """Grok readings in the log, then this Mac's reader saying it is signed out."""
+    replay.write(*rows)
+    target = replay.data / "state" / "usage.json"
+    target.parent.mkdir(exist_ok=True)
+    at = routing._iso(replay.now)
+    target.write_text(json.dumps({"version": 2, "rows": {"grok|": {
+        "ok": False, "error": "not_signed_in", "probed_at": at, "last_attempt_at": at, "windows": []}}}))
+    view = replay.view()
+    grok = next(a for a in view["accounts"] if a["key"] == "grok|")
+    assert (grok["state"], grok["reason"]) == (routing.DOWN, "not signed in")
+    return view, grok, next(p for p in grok["pace"] if p["window"] == "five_hour")
+
+
+def _grok_sample(replay, minutes_ago, used=12.0, **extra):
+    return {"type": "usage_sample", "account": "grok|", "window": "five_hour", "t_err": 60, "source": "probe",
+            "witness_at": routing._iso(replay.now - timedelta(minutes=minutes_ago)), "used_pct": used,
+            "resets_at": routing._iso(replay.now + timedelta(hours=3)), "written_by": {"kind": "probe"},
+            "via": "probe", **extra}
+
+
+def test_a_failed_reader_wins_over_idle_on_the_line_and_the_evidence(replay):
+    """Unchanged at 130, 70 and 10 minutes ago, then a current not_signed_in."""
+    view, grok, pace = _down_here(replay, *[_grok_sample(replay, m) for m in (130, 70, 10)])
+    assert "idle" not in pace
+    assert pace["why"] == "reader failed: not signed in"
+    assert pace["plan"]["verdict"] == "unknown" and pace["plan"]["needed_pct_per_h"] is None
+    assert routing_pace.pace_line("Grok", pace, replay.now) == "Grok five-hour: reader failed: not signed in"
+    assert routing_advice._pace_reading_unknown(pace)
+    assert routing_advice.account_advice(view, grok, replay.now)["evidence"] == "unknown"
+
+
+def test_a_failed_reader_wins_over_moving_readings_too(replay):
+    _view, _grok, pace = _down_here(replay, *[_grok_sample(replay, 40 - i * 10, used=10.0 + i) for i in range(4)])
+    assert pace["why"] == "reader failed: not signed in" and pace["rate_pct_per_h"] is not None
+    assert pace["plan"]["verdict"] == "unknown"
+
+
+def test_another_macs_current_reading_stands_in_for_this_macs_failed_reader(replay):
+    other = "b" * 32
+    _view, _grok, pace = _down_here(replay, *[_grok_sample(replay, m, source="check") for m in (130, 70, 10)])
+    routing.routing_dir().joinpath("remote.jsonl").write_text("".join(
+        json.dumps({**_grok_sample(replay, m), "id": f"r{m}", "mac": other, "hub_order": m + 1, "seq": m,
+                    "written_at": routing._iso(replay.now - timedelta(minutes=m))}) + "\n" for m in (130, 70, 10)))
+    grok = next(a for a in replay.view()["accounts"] if a["key"] == "grok|")
+    pace = next(p for p in grok["pace"] if p["window"] == "five_hour")
+    assert not pace["why"], pace["why"]
+    assert pace["idle"] is True
+
+
 def test_no_readings_yet_is_not_called_a_failed_reader():
     pace = routing_pace.compute_pace([], [], NOW, "weekly")
     assert routing_pace.pace_line("Grok", pace, NOW) == (

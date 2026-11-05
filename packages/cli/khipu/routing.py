@@ -4277,6 +4277,19 @@ def pace_sample(event: dict) -> tuple[tuple[str, str], dict] | None:
     return (event["account"], window), sample
 
 
+def _failed_reader(entry: dict, samples: list[dict], mac: str | None, now: datetime) -> str | None:
+    """Why this Mac's reader says it cannot read the account, unless another
+    Mac's current reading stands in for it."""
+    from khipu import routing_pace
+
+    if entry.get("state") != DOWN or entry.get("reason") not in ("not signed in", "not installed"):
+        return None
+    if any(s.get("mac") not in (mac, "legacy")
+           and 0 <= (now - s["t"]).total_seconds() <= routing_pace.QUIET_READING_S for s in samples):
+        return None
+    return entry["reason"]
+
+
 def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
          extra: Iterable[dict] = (), sources: dict | None = None, mac: str | None = None,
          events_ordered: bool = False) -> dict:
@@ -4924,16 +4937,8 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                     [c for (a, ww, _k2, _purpose), c in pace_caps.items()
                      if a == entry["key"] and ww == w],
                     priority, entry["key"], now),
-                now, w) for w in windows]
-            if entry.get("state") == DOWN and entry.get("reason") in ("not signed in", "not installed"):
-                # This Mac's reader said so: not an account nothing can read,
-                # and not a reading that merely has not come.
-                for pace in entry["pace"]:
-                    why = pace.get("why") or ""
-                    if why == "this account can't be probed":
-                        pace["why"] = f"reader failed: {entry['reason']}"
-                    elif why.startswith("last reading "):
-                        pace["why"] = f"reader failed: {entry['reason']}; {why}"
+                now, w, failed_reader=_failed_reader(entry, pace_samples.get((entry["key"], w), []), mac, now))
+                for w in windows]
         mine = [c for (a, _w, _k2, _purpose), c in sorted(pace_caps.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2], kv[0][3] != "job"))
                 if a == entry["key"]]
         if mine:

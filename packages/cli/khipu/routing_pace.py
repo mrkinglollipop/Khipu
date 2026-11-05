@@ -414,12 +414,16 @@ def at(pace, now):
     return out
 
 
-def compute_pace(samples, caps, now, window):
+def compute_pace(samples, caps, now, window, *, failed_reader=None):
     """One window's pace object from sanitized sample dicts.
 
     Samples carry ``t``/``reset`` datetimes, ``used``, ``mac``, ``source``,
     ``cycle`` and ``t_err``. Caps are checked cap dicts for this window.
+    ``failed_reader`` is why this Mac's reader says it cannot read the account,
+    when no other Mac's reading stands in for it: whatever the readings looked
+    like before, they say nothing of now.
     """
+    no_reading = f"reader failed: {failed_reader}" if failed_reader else "this account can't be probed"
     params = _sample_params(window, samples)
     pace = {"window": window, "cycle_resets_at": None, "trailing_h": params["trailing_h"] if params else None, "buckets": 0,
             "valid_pct": 0.0, "observed_pct": 0.0, "gappy": False, "rate_pct_per_h": None, "why": None,
@@ -436,7 +440,7 @@ def compute_pace(samples, caps, now, window):
                                "slack": target_cap["slack"], "allowance_pct": None, "used_pct": None,
                                "verdict": "unknown", "why": "no reading"}
     if not samples:
-        pace["why"] = "this account can't be probed"
+        pace["why"] = no_reading
         return pace
     if params is None:
         # A cap may name a month before any reading gives its length.
@@ -449,7 +453,7 @@ def compute_pace(samples, caps, now, window):
     samples = [dict(s, t=min(s["t"], now)) for s in samples
                if s["t"] <= now + timedelta(seconds=s.get("t_err") or 0)]
     if not samples:
-        pace["why"] = "this account can't be probed"
+        pace["why"] = no_reading
         return pace
     _cycles(samples, window)
     # Only the windows the calculations read can matter: the trailing window
@@ -588,7 +592,9 @@ def compute_pace(samples, caps, now, window):
         needed = (100 - used) / (secs_to_reset / 3600)
     pace["plan"]["needed_pct_per_h"] = needed
     why = None
-    if pending:
+    if failed_reader:
+        why = no_reading
+    elif pending:
         why = "possible reset; waiting for the next reading"
     elif disagrees:
         why = "reset time disagrees between readings"
@@ -612,7 +618,7 @@ def compute_pace(samples, caps, now, window):
     allowed = why is None
     # Gaps and thin coverage invalidate the rate, not a fresh usage level.
     # Unsettled, expired or stale readings cannot establish a reached ceiling.
-    level_known = (bool(in_window) and not (pending or disagrees or ambiguous)
+    level_known = (bool(in_window) and not (failed_reader or pending or disagrees or ambiguous)
                    and secs_to_reset is not None and secs_to_reset > 0 and fresh_enough)
     if not level_known:
         pace["plan"]["needed_pct_per_h"] = None
