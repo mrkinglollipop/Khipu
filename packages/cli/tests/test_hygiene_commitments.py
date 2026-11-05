@@ -33,10 +33,11 @@ def tearDownModule():
 
 class _Cursor:
     def __init__(self, rows, *, migrated: bool = True):
-        # rows: list of (id, text, project, kind, owner, opened_at)
+        # rows: list of (id, text, project, kind, owner, opened_at); a row with
+        # no owner stores the one capture would have decided for its text
         self.rows = {
             r[0]: {"id": r[0], "text": r[1], "project": r[2], "kind": r[3],
-                   "owner": r[4], "opened_at": r[5], "status": "open",
+                   "owner": r[4] or co.resolve_owner(r[1], kind=r[3]), "opened_at": r[5], "status": "open",
                    "close_reason": None, "seen_count": 1}
             for r in rows
         }
@@ -332,9 +333,11 @@ class _SessionCursor:
     that opened them, with that session's age and sessionend flag."""
 
     def __init__(self, rows, *, trigger_col: bool = False):
-        # rows: (id, text, kind, owner, session_id, aged, end_event)
+        # rows: (id, text, kind, owner, session_id, aged, end_event); a row with
+        # no owner stores the one capture would have decided for its text
         self.rows = {
-            r[0]: {"id": r[0], "text": r[1], "kind": r[2], "owner": r[3],
+            r[0]: {"id": r[0], "text": r[1], "kind": r[2],
+                   "owner": r[3] or co.resolve_owner(r[1], kind=r[2]),
                    "session_id": r[4], "aged": r[5], "end_event": r[6],
                    "project": "acme/widget", "opened_at": "t0", "status": "open",
                    "close_reason": None, "future_trigger": False}
@@ -491,7 +494,7 @@ class SessionEndedPassTest(unittest.TestCase):
         self.assertEqual(cur.rows[1]["status"], "open")
         # The owner's own item (as read) is never rewritten by a rule, not
         # even to store the owner it already shows.
-        self.assertIsNone(cur.rows[1]["owner"])
+        self.assertEqual(cur.rows[1]["owner"], "user")
         self.assertEqual(cur.rows[2]["status"], "closed")
         self.assertEqual(cur.rows[2]["close_reason"], "session-ended")
         self.assertTrue(cur.rows[3]["future_trigger"])

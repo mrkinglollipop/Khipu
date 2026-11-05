@@ -99,12 +99,18 @@ class Flood:
             self._n += 1
             return int(cur.fetchone()[0])
 
-    def item(self, group: str, text: str, *, kind="followup", episode: int, owner="user", at=None) -> int:
+    def item(self, group: str, text: str, *, kind="followup", episode: int, owner="user", at=None,
+             label=None) -> int:
+        cols, marks, vals = ["text", "project", "owner", "kind", "opened_episode", "opened_at", "status", "content_hash"], \
+            ["%s"] * 6 + ["'open'", "%s"], \
+            [text, PROJECT, owner, kind, episode, at or BASE_AT, co.content_hash(PROJECT, text)]
+        if label:
+            cols.append("owner_label")
+            marks.append("%s")
+            vals.append(label)
         with self.conn.transaction(), self.conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO commitments (text, project, owner, kind, opened_episode, opened_at, status, "
-                "content_hash) VALUES (%s, %s, %s, %s, %s, %s, 'open', %s) RETURNING id",
-                (text, PROJECT, owner, kind, episode, at or BASE_AT, co.content_hash(PROJECT, text)))
+            cur.execute(f"INSERT INTO commitments ({', '.join(cols)}) VALUES ({', '.join(marks)}) RETURNING id",
+                        vals)
             cid = int(cur.fetchone()[0])
             fact_seed.adopt(cur, "commitment", cid)
         self.groups.setdefault(group, []).append(cid)
@@ -127,7 +133,8 @@ def _flood(conn, *, model_questions: int = 6) -> Flood:
     for i in range(5):
         f.item("job_names_user", f"Matt to decide the {_words(i + 300)} rollout order", episode=job)
     for i in range(5):
-        f.item("agent_named", f"The orchestrator must resolve the {_words(i + 400)} conflict", episode=conv)
+        f.item("agent_named", f"The orchestrator must resolve the {_words(i + 400)} conflict", episode=conv,
+               owner="agent", label="orchestrator")
     for i in range(4):
         f.item("conv_names_user", f"Matt to approve the {_words(i + 500)} release notes", episode=conv)
     for i in range(6):

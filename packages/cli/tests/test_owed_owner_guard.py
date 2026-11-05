@@ -301,11 +301,13 @@ def _legacy_users_item(cur, **kw) -> int:
     return cid
 
 
-def test_the_legacy_item_reads_as_someone_elses_but_is_stored_as_the_users(racing):
-    # The premise of the tests below: without the stored owner, the guard would let it by.
+def test_the_legacy_item_reads_as_the_users_whatever_its_text_says(racing):
+    # A read gives the stored owner, not one worked out from the words, so the
+    # guard sees the same owner on every Mac. The tests below hold the guard
+    # to the stored owner itself.
     cid = _legacy_users_item(racing)
     row = co.row_at_write(racing, cid)
-    assert row["stored_owner"] == co.OWNER_USER and row["owner"] != co.OWNER_USER
+    assert row["stored_owner"] == co.OWNER_USER and row["owner"] == co.OWNER_USER
 
 
 @pytest.mark.parametrize("rule", sorted(co.AUTOMATIC_RULES))
