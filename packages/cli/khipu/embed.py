@@ -3722,6 +3722,26 @@ def topics_embed_lag_minutes(
     }
 
 
+def _oldest_gap_minutes(cur, missing, stale) -> int | None:
+    """How long the oldest chunk gap has waited: 0 with none, None when its
+    row can't be found (so the caller never reads that as fresh). A chunk
+    captured minutes ago is waiting for the Stop hook's catch-up, not behind."""
+    refs = {kind: sorted({ref for k, ref, _i in [*missing, *stale] if k == kind}) for kind in ("episode", "topic")}
+    if not refs["episode"] and not refs["topic"]:
+        return 0
+    cur.execute(
+        "SELECT MIN(at) FROM (SELECT GREATEST(ingested_at, changed_at) AS at FROM episodes WHERE id::text = ANY(%s)"
+        " UNION ALL SELECT GREATEST(updated_at, created_at) FROM topics WHERE slug = ANY(%s)) g",
+        (refs["episode"], refs["topic"]),
+    )
+    oldest = cur.fetchone()[0]
+    if oldest is None:
+        return None
+    from datetime import datetime, timezone
+
+    return max(0, int((datetime.now(timezone.utc) - (oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc))).total_seconds() // 60))
+
+
 def coverage(
     *,
     profile: str | None = None,
@@ -3815,6 +3835,7 @@ def coverage(
             if detail:
                 plan, missing, stale = memory_gaps(cur, profile, cached=cached_plan)
                 chunk_block = memory_coverage_fields(plan, missing, stale)
+                chunk_block["oldest_gap_minutes"] = _oldest_gap_minutes(cur, missing, stale)
                 if keep_gaps is not None:
                     keep_gaps.update(profile=profile, missing=missing, stale=stale)
     e = by.get("episode", {"refs": 0, "chunks": 0})

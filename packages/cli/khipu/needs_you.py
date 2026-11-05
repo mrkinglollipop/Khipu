@@ -6,19 +6,12 @@ each item's words, who asked and when, what yes and no do, and the exact
 nothing: settling goes through the owner gates as ever (``owner_direction``).
 
 Two sorts of item. A confirmation (``CONFIRM_KINDS``) waits for a yes or a no.
-A look (``LOOK_KINDS``) is the rest of what the app's Needs you shows: a problem
-only the owner can act on, with ``do`` saying how, and a settle when one action
-answers it.
-
-The app computes its Needs you list itself (``routingProblems`` and
-``deliveryProblems`` in apps/desktop/src/routingOverview.ts), from the same
-routing JSON read here. ``APP_KINDS`` places every kind it knows, and
-tests/test_owner_needs_you.py reads that file, so a kind added on either side
-fails until it is placed on both.
+A look (``LOOK_KINDS``) waits on a sign-in or a hold that may be ended. Only what
+the owner can answer is listed: a problem to run a command for belongs to
+``khipu doctor`` and ``khipu_route``, not here.
 
 No note kind: a note is the owner's alone to write (``routing._OWNER_ONLY``), so
-none can wait. A live proposal is the pending rule or priority it overlays; a
-``proposal`` item appears only for one with nothing left to show.
+none can wait. A live proposal is the pending rule or priority it overlays.
 """
 from __future__ import annotations
 
@@ -27,30 +20,10 @@ from datetime import datetime
 
 from khipu import owner_direction, routing
 
-CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held", "proposal",
+CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held",
                  "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
-LOOK_KINDS = ("remind", "disagree", "broken", "contradiction", "signin", "plan", "crossing", "lane", "silent",
-              "unreadable", "refused", "delivery-behind", "delivery-copy", "delivery-read")
-# Looks the app has no tag for: a change that was interrupted shows in a conversation's list only.
-CLI_ONLY_KINDS = ("interrupted",)
-KINDS = CONFIRM_KINDS + LOOK_KINDS + CLI_ONLY_KINDS
-
-# Each kind the app's routingOverview.ts knows (``TAG_WORDS``): the kind it is
-# here, or why its Needs you never shows it.
-APP_KINDS: dict[str, str] = {
-    "priority": "priority", "confirm": "rule", "old-file-rules": "rule", "proposal": "proposal", "remind": "remind", "disagree": "disagree",
-    "broken": "broken", "contradiction": "contradiction", "signin": "signin", "plan": "plan",
-    "crossing": "crossing", "lane": "lane", "silent": "silent", "unreadable": "unreadable", "refused": "refused",
-    "delivery-behind": "delivery-behind", "delivery-copy": "delivery-copy", "delivery-read": "delivery-read",
-}
-APP_NOT_NEEDS = {
-    "limit": "an account at its limit: a state, no Needs you line",
-    "down": "an account down: a state, no Needs you line",
-    "model-limit": "a model at its limit: a state, no Needs you line",
-    "plans-read": "the plans couldn't be read: a closed line's tag, reported under unread here",
-    "conflict": "a lane's launcher contradicts it: the lane row's own tag, no Needs you line",
-    "table": "the old routing table file can't be read: a closed line's tag, no Needs you line",
-}
+LOOK_KINDS = ("remind", "signin")
+KINDS = CONFIRM_KINDS + LOOK_KINDS
 
 SETTLE_ACTIONS = owner_direction.SETTLE_ACTIONS
 # The ones whose whole job is to answer something waiting: a held one with
@@ -171,12 +144,6 @@ def _ago(at, now: datetime) -> str | None:
     return "just now"
 
 
-def _in_hours(at: str, now: datetime) -> str:
-    when = routing._parse(at)
-    hours = round((when - now).total_seconds() / 3600) if when else 0
-    return "within the hour" if hours < 1 else f"in about {hours} hour{'' if hours == 1 else 's'}"
-
-
 def _title_of(session: str) -> str | None:
     """A T3 conversation's own title, the name the owner knows it by."""
     from khipu import t3
@@ -291,25 +258,6 @@ def _rules(view: dict) -> list[dict]:
         out.append(_item("rule", key, words, by=by, at=r.get("at"),
                          confirm_does="Makes these words your own standing rule.", undo_does=undo_does,
                          confirm=_act("route.rule.confirm", rule=n, expect=revision), undo=undo))
-    return out
-
-
-def _proposals(view: dict) -> list[dict]:
-    """A live proposal with no pending rule or priority left to show it."""
-    held = view.get("priority") or {}
-    pending = {r.get("entity") for r in view.get("rules") or [] if r.get("pending")}
-    out = []
-    for p in (view.get("proposals") or {}).values():
-        if p.get("status") != "live":
-            continue
-        if (p.get("kind") == "priority" and held.get("pending")) or (p.get("kind") == "rule" and p.get("entity") in pending):
-            continue
-        out.append(_item("proposal", f"proposal:{p.get('id')}", "A conversation's proposal is still open, but what it "
-                         "changes is no longer in the record to show. It ends by itself seven days after it was "
-                         "made.", by=p.get("author"), at=p.get("at"),
-                         confirm_does="Nothing to confirm: there is no change left to make yours.",
-                         undo_does="Nothing to undo: it ends by itself.",
-                         do="No answer is needed. To see it, read khipu_route with view proposals."))
     return out
 
 
@@ -633,34 +581,6 @@ def _forgets() -> list[dict]:
     return out
 
 
-INTERRUPTED_SHOWN_S = 7 * 24 * 3600  # an interrupted job stays listed this long
-
-
-def _interrupted() -> list[dict]:
-    """Long changes the owner confirmed whose worker died before they finished.
-    Never run again by Khipu, since part of one may have applied."""
-    from khipu import owner_background
-
-    owner_background.heal()
-    rows = owner_direction._read_requests(owner_direction.requests_path())
-    now = owner_direction._clock()
-    out = []
-    for row in rows:
-        if row.get("state") != "interrupted" or now - float(row.get("settled_ts") or 0) > INTERRUPTED_SHOWN_S:
-            continue
-        again = [r for r in rows if r.get("action") == row.get("action") and r.get("args") == row.get("args")
-                 and r.get("state") == "applied" and float(r.get("settled_ts") or 0) > float(row.get("settled_ts") or 0)]
-        if again:
-            continue
-        out.append(_item("interrupted", f"interrupted:{row.get('id')}",
-                         f"A change you confirmed, to {ACTION_WORDS.get(row.get('action'), 'make a change')}, was "
-                         "interrupted before it finished, most likely because the Mac restarted. Part of it may "
-                         "already be done. Khipu has not run it again.", at=row.get("settled_at"),
-                         do="Ask in a conversation to run it again, then say yes once. Check the result first where "
-                            "running it twice would matter."))
-    return out
-
-
 def _alarm() -> list[dict]:
     alarm = owner_direction.read_alarm()
     if alarm is None:
@@ -712,173 +632,34 @@ def project_pair_item(a: str, b: str, at: str | None) -> dict:
                  confirm=_act("project.merge", a=a, b=b, show_as=b), undo=_act("project.keep_separate", a=a, b=b))
 
 
-# ---- what else the app's Needs you shows -------------------------------------------------------
+# ---- what else waits on the owner ----------------------------------------------------------------
 
 
-def _alive(iso, now: datetime) -> bool:
-    when = routing._parse(iso) if isinstance(iso, str) else None
-    return bool(when and when > now)
-
-
-def _disagreements(pub: dict, now: datetime) -> list[dict]:
-    out = []
-    for a in pub.get("accounts") or []:
-        model = any(m.get("disagreement") and _alive(m.get("until"), now) for m in a.get("models") or [])
-        if not (a.get("disagreement") or model):
-            continue
-        label = routing.their_words(a.get("label"))
-        at = (a.get("disagreement") or {}).get("at") if isinstance(a.get("disagreement"), dict) else None
-        out.append(_item("disagree", f"disagree:{a.get('label')}", f"Two sources disagree about whether {label} can "
-                         "take work, so Khipu can't say for sure.", at=at,
-                         confirm_does=f"Treats {label} as open again.", undo_does="Leaves it as it is.",
-                         confirm=_act("route.clear", account=a.get("label")) if a.get("disagreement") else None,
-                         do="Ask which source is right. If the limit is wrong, clear it; if it is right, it ends by "
-                            "itself."))
-    return out
-
-
-def _plans(stale, now: datetime) -> tuple[list[dict], list[dict]]:
-    """Only what is cached: this read never starts a probe."""
+def _signins(unread: list[dict]) -> list[dict]:
+    """An account not signed in on this Mac. Only what is cached: this read never starts a probe."""
     from khipu import usage
 
     try:
         cache, accounts = usage._load_cache(), usage.all_accounts()
     except Exception:  # noqa: BLE001 - reported as unread
-        return [], [{"what": "plan readings", "why": "they couldn't be read"}]
-    stale = stale if isinstance(stale, (int, float)) and not isinstance(stale, bool) and stale >= 0 else 12 * 3600
+        unread.append({"what": "plan readings", "why": "they couldn't be read"})
+        return []
     out = []
     for account in accounts:
         row = None if account.get("invalid") else cache.get(usage._key(account))
-        if not isinstance(row, dict):
+        if not isinstance(row, dict) or (row.get("error") if row.get("ok") is False else row.get("live_error")) != "not_signed_in":
             continue
-        code = row.get("error") if row.get("ok") is False else row.get("live_error")
-        if not code or code == "pending":
-            continue
-        if code not in ("not_signed_in", "no_plan_limits"):
-            live = [w for w in row.get("windows") or [] if isinstance(w, dict)
-                    and isinstance(w.get("used_pct"), (int, float))
-                    and not (routing._parse(w.get("resets_at")) and routing._parse(w.get("resets_at")) <= now)]
-            at = routing._parse(row.get("observed_at") or row.get("last_good_at") or row.get("probed_at"))
-            if live and (not stale or (at is not None and (now - at).total_seconds() < stale)):
-                continue  # a passing gap with recent figures, as the app's passingGapHeld
         name = routing.their_words(account.get("label") or account.get("harness") or "An account")
-        if code == "not_signed_in":
-            kind, words = "signin", f"{name} is not signed in on this Mac, so Khipu can't read its plan here."
-            do = f"Sign in with {name}'s own program on this Mac."
-        elif code == "no_plan_limits":
-            kind, words = "plan", f"{name}'s sign-in reports no plan limits, so Khipu can't tell how much is left."
-            do = f"Check that {name} is signed in to the plan you mean to use."
-        else:
-            kind, words = "plan", f"Khipu can't read {name}'s plan, and the figures it kept are out of date."
-            do = f"Check that {name}'s program runs. Khipu keeps trying by itself."
-        out.append(_item(kind, f"plan:{account.get('label')}", words, do=do))
-    return out, []
-
-
-def _lanes(pub: dict, cfg: dict) -> list[dict]:
-    """The app's ``lanesWithoutAccount``: each lane with no account, once."""
-    lane_map = cfg.get("routing_lane_map") if isinstance(cfg.get("routing_lane_map"), dict) else {}
-    accounts = pub.get("accounts") or []
-    found: list[tuple[str, str]] = []
-
-    def add(runner, lane):
-        if (runner, lane) not in found:
-            found.append((runner, lane))
-
-    runners = (pub.get("sources") or {}).get("runners") or []
-    for r in runners:
-        matches = r.get("lane_matches") or {}
-        for lane in r.get("lanes") or []:
-            if not (lane_map.get(r.get("name")) or {}).get(lane) and not (matches.get(lane) or {}).get("account"):
-                add(r.get("name"), lane)
-    known = {a.get("label") for a in accounts} | {a.get("key") for a in accounts}
-    for runner, lanes in lane_map.items():
-        for lane, target in (lanes or {}).items():
-            if target and target not in known:
-                add(runner, lane)
-    for u in pub.get("unmatched") or []:
-        add(u.get("runner"), u.get("lane"))
-    out = []
-    for runner, lane in found:
-        match = (next((r for r in runners if r.get("name") == runner), {}).get("lane_matches") or {}).get(lane) or {}
-        if match.get("reason") == "launcher evidence contradicts the declaration":
-            continue
-        n = len(match.get("candidates") or [])
-        where = f"Job lane {routing.their_words(lane)} in {routing.their_words(runner)}"
-        words = (f"{where} could belong to {n} accounts, so Khipu can't count its work against any of them."
-                 if n >= 2 else f"{where} has no account, so Khipu can't count its work against one.")
-        out.append(_item("lane", f"lane:{runner}/{lane}", words,
-                         do="Say which account the lane belongs to, then record it with route.definition.set "
-                            "(definition lane_map)."))
+        out.append(_item("signin", f"plan:{account.get('label')}",
+                         f"{name} is not signed in on this Mac, so Khipu can't read its plan here.",
+                         do=f"Sign in with {name}'s own program on this Mac."))
     return out
 
 
-def _crossings(pub: dict, now: datetime) -> list[dict]:
-    """The app's ``paceModel`` crossings: an open account's earliest cap or
-    plan limit inside six hours at its trailing rate."""
+def _holds_to_review(view: dict, now: datetime) -> list[dict]:
+    """A hold the owner set that is still on after a while: one yes ends it."""
     out = []
-    for a in pub.get("accounts") or []:
-        if a.get("state") in ("limited", "down", "paused"):
-            continue
-        best = None
-        for pace in a.get("pace") or []:
-            for obj, pct, target in ((pace.get("share_cap"), (pace.get("share_cap") or {}).get("pct"), "share"),
-                                     (pace.get("day_cap"), (pace.get("day_cap") or {}).get("pct"), "day"),
-                                     (pace.get("plan"), 100, "plan")):
-                if not isinstance(obj, dict):
-                    continue
-                at = obj.get("runs_out_at") if "runs_out_at" in obj else obj.get("reaches_cap_at")
-                when = routing._parse(at) if isinstance(at, str) else None
-                hours = (when - now).total_seconds() / 3600 if when else None
-                if hours is not None and hours > 0 and (best is None or hours < best[0]):
-                    best = (hours, at, pct, target)
-        if best is None or best[0] > 6:
-            continue
-        label = routing.their_words(a.get("label"))
-        what = "runs out of its plan limit" if best[3] == "plan" else f"reaches the {round(best[2] or 0)}% cap you set"
-        out.append(_item("crossing", f"crossing:{a.get('label')}", f"{label} {what} {_in_hours(best[1], now)} if work "
-                         "keeps going at this rate.",
-                         do="Decide whether to send less to it, pause it (route.pause) or change its cap "
-                            "(route.cap.set). Or let it run."))
-    return out
-
-
-def _delivery(view: dict, cfg: dict, now: datetime) -> list[dict]:
-    """The app's ``deliveryProblems``, from the evidence ``khipu doctor`` reads."""
-    from khipu import routing_health
-
-    def add(key, kind, words):
-        return _item(kind, key, words, do="Run khipu doctor for what it found.")
-
-    try:
-        health = routing_health.doctor_block(view, now, cfg)
-    except Exception:  # noqa: BLE001 - the app's "couldn't be read" line
-        return [add("delivery-read", "delivery-read", "Khipu couldn't read whether routing changes are reaching your "
-                    "conversations.")]
-    out = []
-    for i, row in enumerate(health.get("identities") or []):
-        if not isinstance(row, dict) or row.get("status") != "red":
-            continue
-        owed = row.get("owed")
-        tail = f": {owed} changes haven't reached it" if type(owed) is int and owed >= 0 else ""
-        out.append(add(f"delivery:{i}", "delivery-behind", f"One of your conversations has a problem getting routing "
-                       f"changes{tail}."))
-    if (health.get("replication") or {}).get("status") == "red":
-        out.append(add("delivery-macs", "delivery-copy", "The routing copy on your other Macs is behind."))
-    if (health.get("gateway") or {}).get("status") == "red":
-        out.append(add("delivery-cloud", "delivery-copy", "The cloud routing copy is behind."))
-    if health.get("status") == "red" and not out:
-        out.append(add("delivery-health", "delivery-behind", "Routing changes may not be reaching your conversations."))
-    return out
-
-
-def _looks(view: dict, now: datetime) -> tuple[list[dict], list[dict]]:
-    """Everything else the app's Needs you shows, from what it reads:
-    ``khipu route --json`` is ``public_view``."""
-    pub = routing.public_view(view, now)
-    cfg = routing.settings()
-    out = []
-    for h in pub.get("holds") or []:
+    for h in routing.public_view(view, now).get("holds") or []:
         if h.get("remind"):
             scope = routing.their_words(h.get("scope_label"))
             why = f" Its words: {_quote(h.get('text'))}." if h.get("text") else ""
@@ -886,37 +667,7 @@ def _looks(view: dict, now: datetime) -> tuple[list[dict], list[dict]]:
                              + why, at=h.get("at"), by=h.get("written_by"),
                              confirm_does="Ends the hold, so work can go there again.", undo_does="Keeps the hold.",
                              confirm=_act("route.hold.end", hold=h.get("id"))))
-    out += _disagreements(pub, now)
-    broken: dict = {}
-    for c in pub.get("rule_checks") or []:
-        if c.get("status") == "broken":
-            broken.setdefault(c.get("rule"), []).append(str(c.get("text") or ""))
-    rules = {r.get("n"): r for r in view.get("rules") or []}
-    for n, texts in broken.items():
-        said = texts[0].removeprefix("A standing rule may be broken: ").rstrip(".")
-        rule = (rules.get(n) or {}).get("text")
-        words = f"A standing rule may be broken: {said}." + (f" The rule says: {_quote(rule)}." if rule else "")
-        out.append(_item("broken", f"broken:{n}", words,
-                         do="Fix what it names, or change the rule (route.rule.edit, route.rule.retire)."))
-    for i, c in enumerate(pub.get("contradictions") or []):
-        out.append(_item("contradiction", f"contradiction:{i}", f"Two things you told Khipu can't both hold: "
-                         f"{c.get('text')}",
-                         do="Say which one holds, then change the other (a rule, your priority or a pause)."))
-    plans, unread = _plans(cfg.get("routing_stale_after"), now)
-    out += plans
-    out += _crossings(pub, now)
-    out += _lanes(pub, cfg)
-    for r in (pub.get("sources") or {}).get("runners") or []:
-        if r.get("silent") or r.get("unreadable"):
-            kind = "silent" if r.get("silent") and not r.get("unreadable") else "unreadable"
-            out.append(_item(kind, f"runner:{r.get('name')}", routing.runner_line(r, now).rstrip(".") + ".",
-                             do="Check the job runner is running and its folder can be read."))
-    for name in (pub.get("sources") or {}).get("refused") or []:
-        out.append(_item("refused", f"refused:{name}", f"Khipu refused to read the {routing.their_words(name)} job "
-                         "runner folder, because it is inside a private folder.",
-                         do="Move that folder out of the private folder, or remove it from the job runner settings."))
-    out += _delivery(view, cfg, now)
-    return out, unread
+    return out
 
 
 # ---- the answer -------------------------------------------------------------------------------
@@ -994,14 +745,13 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
         unread.append({"what": "the routing record", "why": str(err)})
     if view is not None:
         try:
-            items += _local_confirmations(view, now) + _proposals(view)
+            items += _local_confirmations(view, now)
         except Exception:  # noqa: BLE001 - named in unread; never its text, which may name a file
             unread.append({"what": "confirmations in the routing record", "why": "they couldn't be read"})
     held, missed = _held(items)
     items += held
     unread += missed
-    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm),
-                        ("changes that were interrupted", _interrupted)):
+    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm)):
         try:
             items += build()
         except Exception:  # noqa: BLE001 - named in unread
@@ -1014,11 +764,9 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
                            "why": "the hub can't be reached right now"})
     if view is not None:
         try:
-            looks, missed = _looks(view, now)
-            items += looks
-            unread += missed
+            items += _holds_to_review(view, now) + _signins(unread)
         except Exception:  # noqa: BLE001 - named in unread
-            unread.append({"what": "account and job problems", "why": "they couldn't be read"})
+            unread.append({"what": "holds and sign-ins", "why": "they couldn't be read"})
     rank = {k: i for i, k in enumerate(KINDS)}
     return sorted(items, key=lambda it: rank[it["kind"]]), unread, view
 

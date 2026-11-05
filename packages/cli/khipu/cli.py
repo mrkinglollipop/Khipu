@@ -239,11 +239,16 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     # takes a few minutes normally, an hour is evidence something is stuck.
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
-    # Red for a dead job from the last day or one waiting on the owner; the old
-    # announce-refused ones an older app left are said plainly (``outbox.plain``)
-    # and counted, not red while nothing newer dies beside them.
-    outbox_ok = (outbox.get("pending") == 0 and not outbox.get("dead_waiting", outbox.get("dead"))
-                 and outbox_oldest_ok)
+    # A capture queued minutes ago is on its way: the queue is red only for one
+    # stuck past an hour, a job that can't be read, a dead job from the last day
+    # or one waiting on the owner (the old announce-refused ones an older app
+    # left are said plainly in ``outbox.plain`` and counted, not red while
+    # nothing newer dies beside them). ``at_risk`` is the narrower question: could
+    # a capture be lost or left out of memory for good, which a stuck or
+    # offline queue cannot (it is safe on this Mac and retried).
+    dead_waiting = outbox.get("dead_waiting", outbox.get("dead")) or 0
+    outbox_ok = ("error" not in outbox and not outbox.get("unreadable") and not dead_waiting and outbox_oldest_ok)
+    outbox["at_risk"] = bool("error" in outbox or outbox.get("unreadable") or dead_waiting)
     # Dead letters sit outside drain(); only retry-dead moves them back. Held
     # file lines with preferences the hub lacks would only fail again there,
     # so status's fix (naming the merge first) stands for them.
@@ -688,12 +693,12 @@ def _doctor_embed_checks() -> tuple[dict, bool, dict]:
         # are re-read) and kept for topics_embed_lag below, so one doctor run
         # plans the memory space once instead of reading ~28 MB of text twice.
         embed_coverage = coverage(detail=True, cached_plan=True, keep_gaps=memory_gaps_kept)
-        embed_coverage_ok = (
-            embed_coverage.get("episodes", {}).get("missing", 0) == 0
-            and embed_coverage.get("topics", {}).get("missing", 0) == 0
-            and embed_coverage.get("missing", 0) == 0
-            and embed_coverage.get("stale", 0) == 0
-        )
+        # Red when a chunk has gone unembedded for over an hour (topics_embed_lag's
+        # threshold). The per-row counts are not used: an episode with no text has
+        # no chunk to embed and would stay "missing" for good.
+        gap = (embed_coverage.get("missing", 0) or 0) + (embed_coverage.get("stale", 0) or 0)
+        waited = embed_coverage.get("oldest_gap_minutes")
+        embed_coverage_ok = gap == 0 or (isinstance(waited, int) and waited <= 60)
     except Exception as e:  # noqa: BLE001
         embed_coverage = {"error": f"{type(e).__name__}: {e}"}
         embed_coverage_ok = False
@@ -1110,7 +1115,8 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         # starts) or red (a fresh fold nears the prompt's budget). Never gates `ok`.
         "routing_log": routing_block.get("log"),
         "routing_delivery": routing_block.get("routing_delivery", {"status": "unknown", "missing": ["routing check"]}),
-        "routing_delivery_ok": routing_block.get("routing_delivery", {}).get("status") in ("green", "not_applicable"),
+        # Red only on evidence of a failure: "unknown" is a check with nothing to read yet.
+        "routing_delivery_ok": routing_block.get("routing_delivery", {}).get("status") != "red",
         "owner_direction": owner_direction_block,
         "owner_actions_log": owner_actions_log_block,
         "ledger": ledger_block,
@@ -1217,7 +1223,9 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         "disk_space_ok": local["disk_space_ok"],
         "schema_migrations_ok": schema_ok,
     }
-    print(_strict_json(out, indent=2, default=str))
+    from khipu.doctor_summary import health_summary
+
+    print(_strict_json({"summary": health_summary(out), **out}, indent=2, default=str))
     return 0 if out["ok"] else 2
 
 

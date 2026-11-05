@@ -236,7 +236,7 @@ function expandNeeds() {
 }
 
 async function settled() {
-  await screen.findByRole("region", { name: "Needs you" });
+  await waitFor(() => expect(screen.queryByRole("region", { name: "Needs you" }) ?? screen.queryByText("Nothing here needs you.")).toBeTruthy());
   await waitFor(() => expect(groupButton("When conversations hear")).toHaveTextContent("On: at the start"));
 }
 
@@ -257,7 +257,7 @@ function oneLaneUnmatched(): RouteView {
 }
 
 describe("Accounts and routing: Nothing here needs you only after every check ran", () => {
-  it("says it is still reading while the settings are read, then lists the lane they show", async () => {
+  it("says it is still reading while the settings are read, then that nothing needs you", async () => {
     let release!: (v: unknown) => void;
     answers.khipu_route_view = oneLaneUnmatched();
     answers.khipu_config_show = () => new Promise((r) => (release = r));
@@ -266,10 +266,10 @@ describe("Accounts and routing: Nothing here needs you only after every check ra
     expect(screen.getByText("Reading what needs you…")).toHaveAttribute("role", "status");
     expect(screen.queryByText("Nothing here needs you.")).toBeNull();
     await act(async () => release(config()));
-    const needs = await screen.findByRole("region", { name: "Needs you" });
-    expect(needs).toHaveTextContent("Job slot review-2 in Project A has no account");
+    // A job slot with no account is no longer something to answer: it is in the Job runners page, not here.
+    expect(await screen.findByText("Nothing here needs you.")).toBeInTheDocument();
     expect(screen.queryByText("Reading what needs you…")).toBeNull();
-    expect(screen.queryByText("Nothing here needs you.")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Needs you" })).toBeNull();
   });
 
   it("says which checks didn't run when the settings can't be read", async () => {
@@ -303,7 +303,7 @@ describe("Accounts and routing: Nothing here needs you only after every check ra
 });
 
 describe("Accounts and routing: every problem shows, once", () => {
-  it("names every problem kind on its closed group's line and in Needs you, each counted once", async () => {
+  it("lists only what the owner can answer in Needs you, each counted once, and leaves the rest to doctor", async () => {
     store.set(OPEN_KEY, "[]");
     answers.khipu_route_view = troubled();
     answers.khipu_config_show = config({ routing_table: setting("/notes/routing/ROUTING-NOW.md", null) });
@@ -312,11 +312,12 @@ describe("Accounts and routing: every problem shows, once", () => {
 
     const tags = (name: string) => [...groupButton(name).querySelectorAll(".tag")].map((t) => t.textContent);
     // Two accounts are limited in the fixture: the tag counts both.
-    expect(tags("Accounts")).toEqual(["2 at their limit", "Sources disagree", "1 down", "1 plan can't be read", "1 not signed in"]);
+    expect(tags("Accounts")).toEqual(["2 at their limit", "1 down", "1 not signed in"]);
     expect(groupButton("Accounts")).toHaveTextContent("5 accounts: 1 open, 2 at their limit, 1 paused, 1 down");
     expect(tags("Priority")).toEqual(["To confirm"]);
-    expect(tags("Your note and standing rules")).toEqual(["1 from your old file", "1 may be broken"]);
-    expect(tags("Job runners and job slots")).toEqual(["1 stopped reporting", "1 can't be read", "1 job slot without an account"]);
+    expect(tags("Your note and standing rules")).toEqual(["1 from your old file"]);
+    // A dark runner, a refused folder, a job slot without an account: read in `khipu doctor`, not listed here.
+    expect(tags("Job runners and job slots")).toEqual([]);
     expect(tags("Old routing table file")).toEqual(["Can't read the file"]);
     expect(tags("Holds")).toEqual([]);
 
@@ -324,29 +325,20 @@ describe("Accounts and routing: every problem shows, once", () => {
     const needs = screen.getByRole("region", { name: "Needs you" });
     const lines = within(needs).getAllByRole("listitem").map((li) => li.querySelector("b")!.textContent);
     expect(lines).toEqual([
-      "Claude second: two reports disagree",
-      "Khipu can't read Grok Build's plan",
       "Codex isn't signed in",
-      "Your rule 7 may have been broken",
-      "Your Project B job runner stopped reporting at 10:02 AM",
-      "Khipu can't read Project C's files",
-      "Job slot opus-batch in Project B has no account",
       "1 rule copied from your old routing file was never reviewed",
     ]);
-    expect(needs).toHaveTextContent("Project A's settings name gpt-5-fast.");
     expect(within(needs).getByRole("article", { name: /order of accounts|ahead of/ })).toBeInTheDocument();
     // The limited and down accounts are tags only: their state is the action.
     expect(needs).not.toHaveTextContent("Claude main");
     expect(needs).not.toHaveTextContent("Muse");
-    for (const name of ["Compare: the Claude second disagreement", "See the account: Grok Build", "Go to sign in: Codex",
-      "Read them", "See the rule: rule 7", "Look into it: the Project B job runner", "Look into it: the Project C job runner",
-      "Choose an account: job slot opus-batch"]) {
+    for (const name of ["Go to sign in: Codex", "Read them"]) {
       expect(within(needs).getByRole("button", { name })).toBeInTheDocument();
     }
     // The account lines carry their own problems' tags, from the same list.
     const line = (label: string) =>
       within(screen.getByRole("list", { name: "Accounts" })).getAllByRole("listitem").find((li) => li.textContent?.startsWith(label))!;
-    expect(line("Claude second").querySelector(".at")).toHaveTextContent("Sources disagree");
+    expect(line("Claude second").querySelector(".at")?.textContent).toBe("");
     expect(line("Grok Build").querySelector(".at")?.textContent).toBe("");
     // The line opens the Routing detail; its Plan detail says the read failed, once.
     fireEvent.click(within(line("Grok Build")).getByRole("button", { name: /^Grok Build/ }));
@@ -392,13 +384,6 @@ describe("Accounts and routing: every problem shows, once", () => {
     };
     const overview = routingOverview(v, null, null, null, { routing: config().routing, push: { enabled: true } }, MORNING);
     expect(overview.lines.changes).not.toContain("crossed");
-  });
-
-  it("counts a lane once when both the runner's lanes and a limit from it say it has no account", () => {
-    const v = troubled();
-    const problems = routingProblems(v, null, null, { routing: config().routing, push: { enabled: true } }, MORNING);
-    expect(problems.filter((p) => p.kind === "lane")).toHaveLength(1);
-    expect(new Set(problems.map((p) => p.key)).size).toBe(problems.length);
   });
 
   it("says plainly when nothing needs you, and while the record is read", async () => {
@@ -472,43 +457,6 @@ describe("Accounts and routing: links select their page", () => {
     expect(document.querySelector('[data-route-item="rule:rule-uuid-3"]')).toBeNull();
     expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true");
 
-    fireEvent.click(within(needs).getByRole("button", { name: "Compare: the Claude second disagreement" }));
-    const line = document.querySelector<HTMLButtonElement>('[data-route-item="account:claude|/logins/claude-second"]')!;
-    await waitFor(() => expect(document.activeElement).toBe(line));
-    expect(document.querySelector('[data-routing-page="accounts"]')).toHaveAttribute("data-active", "true");
-    // The line opens the Routing detail (no fold of its own); the disagreement is there.
-    expect(line).toHaveAttribute("aria-haspopup", "dialog");
-    fireEvent.click(line);
-    expect(within(screen.getByRole("dialog")).getByRole("group", { name: "Claude second: two reports disagree" })).toBeVisible();
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Close details" }));
-
-    fireEvent.click(within(needs).getByRole("button", { name: "Choose an account: job slot opus-batch" }));
-    await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="lane:Project B/opus-batch"]')));
-    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Project B job runner" }));
-    await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="runner:Project B"]')));
-    expect(document.querySelector('[data-routing-page="wrong"]')).toHaveAttribute("data-active", "true");
-  });
-
-  it("gives a runner that isn't in your folders list a row of its own, and Show focuses it", async () => {
-    store.set(OPEN_KEY, "[]");
-    const v = view();
-    v.sources!.runners!.push({ name: "Project C", path: "/runners/c", heartbeat_at: "2026-10-14T13:00:00Z", interval: 30,
-      silent: true, unreadable: false, lanes: [], files: {} });
-    v.sources!.refused = ["Private"];
-    answers.khipu_route_view = v;
-    render(<RoutingSettings active />);
-    await settled();
-    expandNeeds();
-    const needs = screen.getByRole("region", { name: "Needs you" });
-    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Project C job runner" }));
-    const row = document.querySelector<HTMLElement>('[data-route-item="runner:Project C"]')!;
-    await waitFor(() => expect(document.activeElement).toBe(row));
-    expect(row).toHaveTextContent("Stopped reporting at 9:00 AM");
-    expect(row).toHaveTextContent("Not in your job runner folders · /runners/c");
-    fireEvent.click(within(needs).getByRole("button", { name: "Look into it: the Private folder" }));
-    const refused = document.querySelector<HTMLElement>('[data-route-item="runner:Private"]')!;
-    await waitFor(() => expect(document.activeElement).toBe(refused));
-    expect(refused).toHaveTextContent("Refused: it is inside a private folder");
   });
 
   it("Show expands a seeded rule beyond the initial rules page before focusing it", async () => {
@@ -543,7 +491,8 @@ describe("Accounts and routing: permanent pages", () => {
     ];
     answers.khipu_route_view = record;
     render(<RoutingSettings active />);
-    await settled();
+    // Nothing here needs the owner, and no plan read is passed in, so Needs you stays on "Reading".
+    await waitFor(() => expect(groupButton("When conversations hear")).toHaveTextContent("On: at the start"));
     expect(groupButton("Accounts")).toHaveTextContent("2 accounts: 1 open, 1 probably open");
     fireEvent.click(screen.getByRole("button", { name: "Your accounts" }));
     expect(document.querySelector('[data-routing-page="accounts"]')).toHaveAttribute("data-active", "true");
@@ -725,18 +674,14 @@ describe("Accounts and routing: a passing gap keeps its figures, as on Home", ()
     expect(groupButton("Accounts").querySelectorAll(".tag")).toHaveLength(0);
   });
 
-  it("makes it a problem once the kept figures are older than the stale setting, or there are none", () => {
+  it("never makes a plan that can't be read a problem, however old the kept figures are", () => {
     const v = gapView();
-    const plan = (row: UsageAccount) => routingProblems(v, { accounts: [row] }, null, settingsOf(43200), MORNING)
+    const plan = (row: UsageAccount, stale = 43200) => routingProblems(v, { accounts: [row] }, null, settingsOf(stale), MORNING)
       .filter((p) => p.key === `plan:${SECOND}`);
     expect(plan(gapRow())).toEqual([]);
-    expect(routingProblems(v, { accounts: [gapRow()] }, null, settingsOf(6 * 3600), MORNING).map((p) => p.needs))
-      .toContain("Khipu can't read Claude second's plan");
-    // 0 is "Never": kept figures never go out of date.
-    expect(routingProblems(v, { accounts: [gapRow({ last_good_at: "2026-10-01T00:00:00Z" })] }, null, settingsOf(0), MORNING)
-      .filter((p) => p.key === `plan:${SECOND}`)).toEqual([]);
-    expect(plan(gapRow({ windows: [] }))).toHaveLength(1);
-    expect(plan(gapRow({ error: "timeout" }))).toEqual([]);
+    expect(plan(gapRow(), 6 * 3600)).toEqual([]);
+    expect(plan(gapRow({ windows: [] }))).toEqual([]);
+    expect(plan(gapRow({ error: "no_plan_limits" }))).toEqual([]);
     // Stale kept figures leave the row's figures to the routing record.
     expect(accountWeek(v.plan_facts![SECOND], MORNING, gapRow(), 6 * 3600).week).toBeNull();
   });
@@ -746,15 +691,11 @@ describe("Accounts and routing: a passing gap keeps its figures, as on Home", ()
     render(<RoutingSettings active plansState={plansOf([gapRow({ error: "not_signed_in" })])} />);
     const needs = await screen.findByRole("region", { name: "Needs you" });
     await waitFor(() => expect(needs).toHaveTextContent("Claude second isn't signed in"));
-    const v = gapView();
-    expect(routingProblems(v, { accounts: [gapRow({ error: "no_plan_limits" })] }, null, settingsOf(43200), MORNING).map((p) => p.needs))
-      .toContain("Claude second's sign-in reports no plan limits");
   });
 });
 
 describe.skipIf(!CHROME)("Accounts and routing laid out at 1100 wide", () => {
-  /** Five accounts, five problems: a disagreement, a plan that can't be read,
-   *  a rule to confirm, a runner that stopped reporting and a lane with no account. */
+  /** Five accounts with every kind of trouble the page once listed; only the rule to review is listed now. */
   function five(): RouteView {
     const v = view();
     const [main, second, ...rest] = v.accounts ?? [];
@@ -782,7 +723,7 @@ describe.skipIf(!CHROME)("Accounts and routing laid out at 1100 wide", () => {
     await settled();
     const defaultHtml = container.innerHTML;
     expandNeeds();
-    expect(within(screen.getByRole("region", { name: "Needs you" })).getAllByRole("listitem")).toHaveLength(5);
+    expect(within(screen.getByRole("region", { name: "Needs you" })).getAllByRole("listitem")).toHaveLength(1);
     const heights = heightsInChrome(defaultHtml);
     const budgets: Record<string, number> = { needs: 1600, accounts: 1800, work: 1600, macs: 800, conversations: 1800, changes: 1000, wrong: 2200, rare: 650 };
     expect(Object.keys(heights)).toEqual(Object.keys(budgets));

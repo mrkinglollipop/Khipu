@@ -138,15 +138,4 @@ describe("Telling conversations: delivery and health", () => {
     expect(copies).toHaveTextContent("Can't be checked");
   });
 
-  it("surfaces delivery failures in Needs you even when the routing record failed", () => {
-    const model = routingOverview(null, "route failed", null, null, { routing: null, push: null, delivery: DELIVERY_HEALTH }, DELIVERY_NOW);
-    expect(model.problems.filter((item) => item.group === "telling")).toHaveLength(2);
-    const needs = model.problems.map((item) => item.needs).join(" ");
-    expect(needs).not.toContain("Conversation 2");
-    expect(needs).toContain("Codex");
-    expect(needs).toContain("last 2 changes");
-    for (const pattern of SESSION_ID_SHAPED) expect(needs).not.toMatch(pattern);
-    expect(model.tags.telling.every((tag) => tag.tone === "err")).toBe(true);
-  });
-
 });

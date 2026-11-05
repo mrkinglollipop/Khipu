@@ -366,8 +366,8 @@ export function plansHealthRow(plans: UsageReport | null | undefined, now: Date 
 
 /** The "Routing" row, from `khipu_route_view` (routing truth phase 4): the
  *  last change, any standing rule that may be broken and any job runner that
- *  stopped reporting or can't be read. Red only for those two; it never
- *  blocks anything. Grey with no routing record on this Mac; no row until
+ *  stopped reporting or can't be read. Red only for a rule that may be broken;
+ *  it never blocks anything. Grey with no routing record on this Mac; no row until
  *  the record has been read. */
 export function routingHealthRow(view: RouteView | null | undefined, now: Date = new Date()): HealthRow | null {
   if (!view || !Array.isArray(view.accounts)) return null;
@@ -381,7 +381,8 @@ export function routingHealthRow(view: RouteView | null | undefined, now: Date =
   if (!broken.length && (view.rules ?? []).length) parts.push("No standing rule looks broken.");
   return {
     key: "routing",
-    status: runners.length || broken.length ? "err" : "ok",
+    // A dark job runner is said in the words but is not an alarm: only a rule that may be broken is red.
+    status: broken.length ? "err" : "ok",
     label: LABELS.routing,
     detail: parts.join(" ") || "Nothing has changed yet.",
   };
@@ -620,8 +621,15 @@ export function HealthReportRows({
   busy?: boolean;
 }) {
   const rows = healthRows(parsed, plans, routing);
+  // The five plain lines at the top of `khipu doctor`: fine, or what is wrong and what would fix it.
+  const summary = Array.isArray(parsed.summary) ? parsed.summary.filter((l): l is string => typeof l === "string") : [];
   return (
     <div className="rows" data-health-report>
+      {summary.map((line) => (
+        <div key={line} className="row-item" data-health-summary>
+          <span className="row-meta wrap">{line}</span>
+        </div>
+      ))}
       {rows.map((row) => {
         if (row.status === "ok") {
           const text = [row.detail, row.note].filter(Boolean).join("; ");

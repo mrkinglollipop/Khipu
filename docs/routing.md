@@ -723,7 +723,7 @@ live hub, live configuration, hook or launch agent was changed for this slice.
 ## Delivery health
 
 `khipu doctor --json` exposes `routing_delivery` (also inside `routing`) and
-`routing_delivery_ok`. The check reads existing delivery ledgers, today's stamped
+`routing_delivery_ok` (red only when the check finds a failure; "unknown" is not red). The check reads existing delivery ledgers, the last hour's stamped
 hook outcomes, replication cursors and gateway delivery rows; it never probes or
 changes routing, owner actions, dispatch policy or the promotion gate. Desktop
 clients can consume the same check. Settings → Accounts and routing →
@@ -754,9 +754,8 @@ prompts skipping routing for lack of time (`skipped:budget`, `skipped:fold-busy`
 conversation skipping routing on 3 or more prompts in a row (`prompt-delay`),
 a cross-Mac caught-up cursor more than 10 minutes behind, a gateway delivered
 projection still behind after `routing_cloud_copy_stale_after` seconds since the
-current local revision's `folded_at`, and a limited lane still
-unmatched for an hour of one continuous unmatched run. UTC timestamps select today's hook outcomes from the
-existing bounded log tail. Copy checks are not applicable when their switches
+current local revision's `folded_at`. A lane with no account is not a delivery fault. Hook outcomes
+from the last hour are read from the existing bounded log tail. Copy checks are not applicable when their switches
 are off. Enabled copies without timestamps, unreadable ledgers, absent live
 identities and missing hook outcomes say `unknown` with named missing evidence,
 never green. A gateway identity outside the 12-hour delivery liveness window no

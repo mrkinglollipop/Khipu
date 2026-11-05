@@ -130,7 +130,7 @@ def _worker(seconds):
     return subprocess.Popen([sys.executable, "-c", f"import time; time.sleep({seconds})"])
 
 
-def test_a_worker_killed_mid_run_becomes_interrupted_and_is_shown_in_needs_you(world, monkeypatch):
+def test_a_worker_killed_mid_run_becomes_interrupted_and_is_not_a_needs_you_line(world, monkeypatch):
     from khipu import needs_you
     request = _started(world, monkeypatch)
     # The worker wrote its line ahead, then died before finishing.
@@ -149,8 +149,8 @@ def test_a_worker_killed_mid_run_becomes_interrupted_and_is_shown_in_needs_you(w
     assert json.loads(owner_background.path(request).read_text())["state"] == "finished"
     # Not replayed: the held action never ran again, and the owner-actions log shows it unfinished.
     assert next(r for r in owner_direction.actions() if r["action"] == "route.pause")["state"] == "unconfirmed"
-    items = [i for i in needs_you.waiting(record_read=False)["items"] if i["kind"] == "interrupted"]
-    assert len(items) == 1 and "interrupted before it finished" in items[0]["words"] and "Khipu has not run it again" in items[0]["words"]
+    # Nothing for the owner to answer: it stays in the owner-actions log, not on the list.
+    assert needs_you.waiting(record_read=False)["items"] == []
 
 
 def test_a_live_slow_worker_is_never_called_interrupted(world, monkeypatch):

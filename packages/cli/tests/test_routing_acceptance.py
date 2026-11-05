@@ -1355,7 +1355,7 @@ def test_14_scanner_live_claims_and_false_positives(replay, line, flag):
 
 
 @pytest.mark.parametrize("condition", ["budget-stall", "lease-expired-twice", "ack-unshown", "prompt-skips",
-                                      "cross-mac-stale", "gateway-stale", "unmatched-limit"])
+                                      "cross-mac-stale", "gateway-stale"])
 def test_15_health_red_and_recovery(replay, condition, gateway_hub):
     from khipu import routing_delivery, routing_replication
 
@@ -1420,8 +1420,6 @@ def test_15_health_red_and_recovery(replay, condition, gateway_hub):
                                                    owed=out["owed_entities"], shown=out["shown_entities"])
         else:
             replay.ack(info)
-    elif condition == "unmatched-limit":
-        replay.configure(routing_lane_map={"synthetic-runner": {"unmapped": "Codex"}})
     elif condition == "cross-mac-stale":
         routing_replication._save({"caught_up_at": routing._iso(replay.now)})
     elif condition == "gateway-stale":

@@ -2,15 +2,16 @@
    clarity phase 3, docs/plans/2026-10-15-settings-clarity.md section 3; mocks
    docs/mockups/2026-10-15-settings-clarity/routing.html and
    routing-states.html). Pure: what each group's closed line says, and every
-   problem on the page, each counted once from one source. The Needs you list,
-   the closed lines' tags and Home's attention items read the same sources
-   (`brokenRules`, `quietRunners` in routing.ts). */
+   problem on the page, each counted once from one source. The Needs you list
+   holds only what the owner can answer: a decision, a hold to review, a
+   sign-in. The rest (a dark job runner, delivery, a rule check) is read from
+   `khipu doctor`, `khipu route` and the group's own panel. */
 
-import { accountClassification, brokenRules, capitalise, deliveryConversationLabels, disagreementWords, holdReminder, holdWords, modelDisagreementWords, quietRunners, rateWords, readWhen, ruleWords, runnerWords, whenLocal } from "./routing";
+import { accountClassification, holdReminder, holdWords, rateWords, readWhen, whenLocal } from "./routing";
 import type { PlanFact, RouteDeliveryHealth, RouteProvider, RouteRule, RouteView } from "./routing";
 import { almostPrefix } from "./humanWords";
 import { proposalsModel } from "./routingProposals";
-import { checksLine, checksModel } from "./routingChecks";
+import { checksLine } from "./routingChecks";
 import { paceModel } from "./routingPace";
 import { keptWindow, passingGapHeld, planStatus } from "./PlansCard";
 import type { UsageAccount, UsageReport } from "./PlansCard";
@@ -198,40 +199,21 @@ export function routingProblems(
     if (a.state === "open" && (a.models ?? []).some((m) => m.until && new Date(m.until).getTime() > now.getTime())) {
       out.push({ key: `model-limit:${a.key}`, group: "accounts", kind: "model-limit", tone: "warn" });
     }
-    // As the account's disagreement panel shows them: its own, and each
-    // model's while that model's limit lasts.
-    const modelDisagrees = (a.models ?? []).some(
-      (m) => m.disagreement && m.until && new Date(m.until).getTime() > now.getTime(),
-    );
-    if (a.disagreement || modelDisagrees) {
-      out.push({ key: `disagree:${a.key}`, group: "accounts", kind: "disagree", tone: "warn",
-        needs: `${a.label}: two reports disagree`, detail: disagreementWords(a, now) ?? modelDisagreementWords(a, now)[0],
-        act: "Compare", show: `the ${a.label} disagreement`, item: `account:${a.key}` });
-    }
   }
   for (const row of plans?.accounts ?? []) {
     const st = planStatus(row, now);
-    if (!st.code || st.code === "pending") continue;
-    // A passing gap with recent figures kept is no problem (the shared rule
-    // Home uses); kept figures past the stale setting make it one.
-    if (passingGapHeld(row, staleAfterSeconds(s), now)) continue;
+    // Only a sign-in is the owner's to fix; a plan that can't be read is Khipu's to retry.
+    if (st.code !== "not_signed_in" || passingGapHeld(row, staleAfterSeconds(s), now)) continue;
     const name = row.account || row.harness || "An account";
-    const signIn = st.code === "not_signed_in";
     const routed = (view.accounts ?? []).some((a) => row.key != null && a.key === row.key);
     out.push({
       key: `plan:${row.key ?? name}`,
       group: "accounts",
-      kind: signIn ? "signin" : "plan",
+      kind: "signin",
       tone: "warn",
-      needs: signIn
-        ? `${name} isn't signed in`
-        : st.code === "no_plan_limits"
-          ? `${name}'s sign-in reports no plan limits`
-          : `Khipu can't read ${name}'s plan`,
-      detail: signIn
-        ? "Khipu can't see how much it has left until you sign in again."
-        : "So Khipu can't say how much it has left.",
-      act: signIn ? "Go to sign in" : "See the account",
+      needs: `${name} isn't signed in`,
+      detail: "Khipu can't see how much it has left until you sign in again.",
+      act: "Go to sign in",
       show: name,
       item: routed ? `account:${row.key}` : `plan:${row.key ?? name}`,
     });
@@ -266,14 +248,6 @@ export function routingProblems(
       item: `rule:${oldRules[0].n}`,
     });
   }
-  for (const { rule, checks } of brokenRules(view)) {
-    const said = (checks[0]?.text ?? "").replace(/^A standing rule may be broken: /, "").replace(/\.$/, "");
-    const r = (view.rules ?? []).find((x) => x.n === rule);
-    out.push({ key: `broken:${rule}`, group: "rules", kind: "broken", tone: "warn",
-      needs: `Your rule ${rule} may have been broken`,
-      detail: said ? `${capitalise(said)}.` : r ? `It says ${ruleWords(r.text)}.` : undefined,
-      act: "See the rule", show: `rule ${rule}`, item: `rule:${rule}` });
-  }
   proposals.live.forEach((row) => {
     out.push({ key: `proposal:${row.proposal.id}`, group: "holds", kind: "proposal", tone: "warn", item: `proposal:${row.proposal.id}` });
   });
@@ -285,46 +259,7 @@ export function routingProblems(
         act: "See it", show: `the instruction about ${h.scope_label}`, item: `hold:${h.id}` });
     }
   }
-  for (const r of quietRunners(view)) {
-    out.push({ key: `runner:${r.name}`, group: "runners", kind: r.silent && !r.unreadable ? "silent" : "unreadable",
-      tone: "err", needs: runnerWords(r, now).replace(/\.$/, ""),
-      detail: r.silent ? "Limits it finds won't reach your conversations until it runs again." : "Limits it finds can't reach your conversations until Khipu can read them.",
-      act: "Look into it", show: `the ${r.name} job runner`, item: `runner:${r.name}` });
-  }
-  for (const name of view.sources?.refused ?? []) {
-    out.push({ key: `refused:${name}`, group: "runners", kind: "refused", tone: "err",
-      needs: `Khipu won't read the ${name} job runner folder`, detail: "It is inside a private folder, so Khipu refused it.",
-      act: "Look into it", show: `the ${name} folder`, item: `runner:${name}` });
-  }
-  for (const { runner, lane } of lanesWithoutAccount(view, s)) {
-    const match = (view.sources?.runners ?? []).find((r) => r.name === runner)?.lane_matches?.[lane];
-    // A lane whose declared account its launcher contradicts: the lane row
-    // says how, so it counts under its own tag, not Needs you.
-    if (match?.reason === "launcher evidence contradicts the declaration") {
-      out.push({ key: `lane-conflict:${runner}/${lane}`, group: "runners", kind: "conflict", tone: "warn",
-        item: `lane:${runner}/${lane}` });
-      continue;
-    }
-    const n = match?.candidates.length ?? 0;
-    out.push({ key: `lane:${runner}/${lane}`, group: "runners", kind: "lane", tone: "warn",
-      needs: n >= 2
-        ? `Job slot ${lane} in ${runner} matches ${n === 2 ? "two accounts" : `${n} accounts`}`
-        : `Job slot ${lane} in ${runner} has no account`,
-      detail: "Limits it reports can't count against an account until you choose one.",
-      act: "Choose an account", show: `job slot ${lane}`, item: `lane:${runner}/${lane}` });
-  }
   if (view.sources?.table?.error) out.push({ key: "table", group: "table", kind: "table", tone: "warn" });
-  // Advisory contradictions need the owner to choose which line holds, so
-  // each gets its own Needs you line; rule upkeep is an advisory mark only.
-  for (const row of checksModel(view, now).contradictions) {
-    out.push({ key: `check:${row.key}`, group: "checks", kind: "contradiction", tone: "warn",
-      needs: row.title, detail: row.sub || undefined, act: "Look at it", show: row.title, item: `check:${row.key}` });
-  }
-  // Pace crossings under 6 h: the same rows the Pace group opens by itself.
-  for (const crossing of paceModel(view, plans, now).crossings) {
-    out.push({ key: crossing.key, group: "pace", kind: "crossing", tone: "warn",
-      needs: crossing.needs, detail: "At the pace it is being used now.", act: "See its pace", show: crossing.show, item: crossing.item });
-  }
   return out;
 }
 
@@ -335,61 +270,15 @@ const TAG_WORDS: Record<string, (n: number) => string> = {
   limit: (n) => (n === 1 ? "1 at its limit" : `${n} at their limit`),
   down: (n) => `${n} down`,
   "model-limit": (n) => (n === 1 ? "1 with a model at its limit" : `${n} with a model at its limit`),
-  disagree: (n) => (n === 1 ? "Sources disagree" : `Sources disagree on ${n}`),
-  plan: (n) => (n === 1 ? "1 plan can't be read" : `${n} plans can't be read`),
   signin: (n) => `${n} not signed in`,
   "plans-read": () => "Plans couldn't be read",
   priority: () => "To confirm",
   confirm: (n) => `${n} to confirm`,
-  broken: (n) => `${n} may be broken`,
   "old-file-rules": (n) => `${n} from your old file`,
   proposal: (n) => (n === 1 ? "1 to confirm" : `${n} to confirm`),
   remind: (n) => plural(n, "hold to look at", "holds to look at"),
-  silent: (n) => `${n} stopped reporting`,
-  unreadable: (n) => `${n} can't be read`,
-  refused: (n) => `${n} refused`,
-  lane: (n) => plural(n, "job slot without an account", "job slots without an account"),
-  conflict: (n) => plural(n, "job slot conflicts", "job slots conflict"),
   table: () => "Can't read the file",
-  contradiction: (n) => plural(n, "contradiction", "contradictions"),
-  crossing: (n) => plural(n, "cap crossing", "cap crossings"),
-  "delivery-behind": (n) => `${n} delivery ${n === 1 ? "problem" : "problems"}`,
-  "delivery-copy": (n) => `${n} ${n === 1 ? "copy" : "copies"} behind`,
-  "delivery-read": () => "Couldn't read delivery",
 };
-
-/** Delivery remains visible even when the separate routing-record read fails. */
-function deliveryProblems(s: OverviewSettings): Problem[] {
-  const out: Problem[] = [];
-  const act = "See who has what";
-  const add = (key: string, kind: string, needs: string, detail: string) => out.push({ key, kind, needs, detail, act, group: "telling", tone: "err", show: "what your conversations have heard" });
-  const older = "It may still be using an older picture of your accounts.";
-  if (s.deliveryError) {
-    out.push({ key: "delivery-read", kind: "delivery-read", needs: "Khipu couldn't check whether conversations are hearing your changes",
-      detail: "That is not the same as all of them being up to date.", act, group: "telling", tone: "warn", show: "what your conversations have heard" });
-    return out;
-  }
-  const health = s.delivery;
-  if (!health) return out;
-  const identities = Array.isArray(health.identities) ? health.identities : [];
-  const labels = deliveryConversationLabels(identities);
-  identities.forEach((row, index) => {
-    if (row?.status !== "red") return;
-    const label = labels[index];
-    const owed = Number.isInteger(row.owed) ? (row.owed as number) : 0;
-    // The read has no project or title to name it by, and "Conversation 1" is
-    // only a row number in Telling conversations.
-    const whose = label.harness ? `one of your ${label.harness} conversations` : "one of your conversations";
-    const who = label.component === "main" ? capitalise(whose) : `A helper in ${whose}`;
-    add(`delivery:${index}`, "delivery-behind", owed > 0
-      ? `${who} hasn't heard your last ${owed === 1 ? "change" : `${owed} changes`}`
-      : `${who} may not be hearing your changes`, older);
-  });
-  if (health.replication?.status === "red") add("delivery-macs", "delivery-copy", "Your other Macs are behind on routing changes", "They may still be telling conversations something older.");
-  if (health.gateway?.status === "red") add("delivery-cloud", "delivery-copy", "The cloud copy of your routing is behind", "Conversations that read it may hear something older.");
-  if (health.status === "red" && !out.length) add("delivery-health", "delivery-behind", "Some conversations may not be hearing your changes", older);
-  return out;
-}
 
 /** A group's problem tags: one per kind, counted. */
 export function groupTags(problems: Problem[], group: GroupKey): GroupTag[] {
@@ -539,7 +428,7 @@ export function routingOverview(
   s: OverviewSettings,
   now: Date,
 ): Overview {
-  const problems = [...(view ? routingProblems(view, plans, plansError, s, now) : []), ...deliveryProblems(s)];
+  const problems = view ? routingProblems(view, plans, plansError, s, now) : [];
   const pace = view ? paceModel(view, plans, now) : null;
   const lines = {} as Record<GroupKey, string>;
   const tags = {} as Record<GroupKey, GroupTag[]>;
@@ -603,7 +492,6 @@ export function accountWeek(
 }
 
 const ACCOUNT_TAG: Record<string, string> = {
-  disagree: "Sources disagree",
   signin: "Not signed in",
 };
 

@@ -119,8 +119,13 @@ _NOT_A_DELAY = ("skipped:no-session", "skipped:no-fork")
 _SESSION_RE = re.compile(r"\] session=(?P<session>\S+) ")
 
 
+# Prompts older than this say nothing about whether delivery works now: a fixed
+# problem must stop showing within the hour, not at the next UTC midnight.
+PROMPT_WINDOW_S = 3600
+
+
 def prompt_health(now, warn_pct=1.0):
-    """Today's per-prompt routing outcomes. ``prompt-skips``: more than
+    """The last hour's per-prompt routing outcomes. ``prompt-skips``: more than
     ``warn_pct`` percent of them ran out of time (``ROUTING_OUT_OF_TIME``,
     the doctor's ``routing_slow_read_pct``; 0 never warns); a skip for any
     other reason (a record changed under the read, an unsaved fold) is
@@ -132,13 +137,13 @@ def prompt_health(now, warn_pct=1.0):
     try:
         raw = recall_prompt._tail_text(recall_prompt._log_path(), max_bytes=recall_prompt._OUTCOMES_TAIL_BYTES)
     except OSError:
-        return _result([], ["today's hook outcomes"])
+        return _result([], ["recent hook outcomes"])
     statuses, runs, longest = [], {}, 0
     for line in raw.splitlines():
         match = recall_prompt._LOG_LINE_RE.match(line)
         stamp = _time(match.group("stamp")) if match else None
         status = recall_prompt.routing_status_of(line)
-        if stamp and stamp.date() == now.astimezone(timezone.utc).date() and stamp <= now and status:
+        if stamp and 0 <= (now - stamp).total_seconds() <= PROMPT_WINDOW_S and status:
             statuses.append(status)
             found = _SESSION_RE.search(line)
             session = found.group("session") if found else "?"
@@ -147,7 +152,7 @@ def prompt_health(now, warn_pct=1.0):
                 runs[session] = runs.get(session, 0) + 1 if delayed else 0
                 longest = max(longest, runs[session])
     if not statuses:
-        return _result([], ["today's hook outcomes"])
+        return _result([], ["recent hook outcomes"])
     skipped = sum(s.startswith("skipped:") for s in statuses)
     late = sum(s in recall_prompt.ROUTING_OUT_OF_TIME for s in statuses)
     rate = 100 * late / len(statuses)
@@ -344,12 +349,6 @@ def doctor_block(view, now, cfg):
             reasons.append("gateway-cleanup-full")
     if not rows:
         missing.append("live delivery identities")
-    for lane in view.get("unmatched") or []:
-        stamp = _time(lane.get("limited_since"))
-        if stamp is None:
-            missing.append("unmatched limit run timestamp")
-        elif (now - stamp).total_seconds() >= 3600:
-            reasons.append("unmatched-limit")
     result = _result(reasons, missing, identities=rows, prompts=prompts,
                      replication=replication, gateway=gateway)
     from khipu import features
@@ -358,7 +357,7 @@ def doctor_block(view, now, cfg):
         # With the push off nothing is delivered to conversations, so there are
         # no hook outcomes or delivery identities to find: that is the setting,
         # not a fault. Anything else the check found still counts.
-        absent = {"today's hook outcomes", "live delivery identities"}
+        absent = {"recent hook outcomes", "live delivery identities"}
         left = [m for m in result["missing"] if m not in absent]
         if not result["reasons"] and not left:
             return dict(result, status="not_applicable", missing=[],

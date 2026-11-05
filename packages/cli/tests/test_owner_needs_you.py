@@ -25,7 +25,6 @@ from tests.test_t3_owner_confirm import (ACCOUNTS, THREAD, T3_SESSION, _be, _be_
 
 assert world  # the fixture, imported for pytest
 OTHER = "s-other-conversation"
-OVERVIEW = Path(__file__).resolve().parents[3] / "apps" / "desktop" / "src" / "routingOverview.ts"
 TIERS = {k: "sonnet" for k in __import__("khipu.routing_advisory", fromlist=["TASK_CLASSES"]).TASK_CLASSES}
 FAR = "2030-01-01T00:00:00Z"
 IDS = re.compile(r"req-[0-9a-f]+|\bsr-[0-9a-f]+|\btt-[0-9a-f]+|\bpp-[0-9a-f]+|\bp\d+\b|s-t3-owner|s-other-conversation")
@@ -136,46 +135,7 @@ def _proposal_status(kind: str) -> str:
     return [p["status"] for p in routing.read_view()["proposals"].values() if p.get("kind") == kind][-1]
 
 
-# ---- the two inventories ----------------------------------------------------------------------
-
-
-def _ts_source() -> str:
-    return OVERVIEW.read_text(encoding="utf-8")
-
-
-def _tag_words(text: str) -> set[str]:
-    block = text[text.index("const TAG_WORDS"):]
-    block = block[:block.index("\n};")]
-    return {a or b for a, b in re.findall(r'^\s+(?:"([\w-]+)"|(\w+)):\s*\(', block, re.M)}
-
-
-def test_every_kind_the_app_knows_is_placed_here():
-    tags = _tag_words(_ts_source())
-    assert tags == set(needs_you.APP_KINDS) | set(needs_you.APP_NOT_NEEDS)
-    assert not set(needs_you.APP_KINDS) & set(needs_you.APP_NOT_NEEDS)
-    assert set(needs_you.APP_KINDS.values()) <= set(needs_you.KINDS)
-
-
-def test_every_kind_the_app_can_raise_has_a_tag():
-    """A problem raised with a kind TAG_WORDS doesn't name would slip past the test above."""
-    text = _ts_source()
-    body = text[text.index("export function routingProblems"):text.index("/** A group's problem tags")]
-    raised = set(re.findall(r'kind:\s*"([\w-]+)"', body))
-    raised |= {k for pair in re.findall(r'kind:[^,]*\?\s*"([\w-]+)"\s*:\s*"([\w-]+)"', body) for k in pair}
-    raised |= set(re.findall(r'add\([^,]+,\s*"([\w-]+)"', body))
-    assert raised and raised <= _tag_words(text), raised - _tag_words(text)
-    # Sanity: the regexes see kinds of every shape.
-    assert {"disagree", "silent", "unreadable", "signin", "plan", "delivery-copy", "delivery-read"} <= raised
-
-
-def test_what_the_app_keeps_off_its_needs_you_really_has_no_needs_line():
-    text = _ts_source()
-    for kind in needs_you.APP_NOT_NEEDS:
-        for start in [m.start() for m in re.finditer(rf'kind:\s*"{kind}"', text)]:
-            statement = text[start:text.index("}", start)]
-            assert "needs:" not in statement, kind
-    for kind in set(needs_you.APP_KINDS) - {"plan", "signin", "silent", "unreadable", "confirm", "priority"}:
-        assert re.search(rf'"{kind}"|kind: "{kind}"', text), kind
+# ---- the inventory --------------------------------------------------------------------------------
 
 
 def test_every_answering_action_is_offered_and_every_action_has_words():
@@ -255,8 +215,7 @@ def _all_confirmations(world, monkeypatch) -> dict[str, dict]:
 
 def test_every_confirmation_kind_appears_with_words_and_its_settle(world, monkeypatch):
     found = _all_confirmations(world, monkeypatch)
-    # ``proposal`` only shows for a proposal with nothing left to show: its own test.
-    assert set(found) == set(needs_you.CONFIRM_KINDS) - {"proposal"}
+    assert set(found) == set(needs_you.CONFIRM_KINDS)
     for kind, item in found.items():
         assert item["sort"] == "confirmation", kind
         assert item["words"].strip() and not IDS.search(item["words"]), (kind, item["words"])
@@ -289,16 +248,6 @@ def test_who_asked_is_named_without_a_session_id(world):
     assert item["asked_by"]["when"] == "just now" and item["asked_by"]["at"]
 
 
-def test_a_proposal_with_nothing_left_to_show_is_listed_with_no_settle(world, monkeypatch):
-    real = routing.read_view
-    monkeypatch.setattr(routing, "read_view", lambda *a, **k: dict(real(*a, **k), proposals={
-        "x": {"id": "x", "kind": "priority", "status": "live", "at": "2026-11-01T00:00:00Z",
-              "author": {"kind": "conversation", "harness": "codex"}}}))
-    item = _one("proposal")
-    assert item["settle"] == {"confirm": None, "undo": None} and item["do"]
-    assert "Codex conversation" in item["asked_by"]["who"]
-
-
 def test_a_live_proposal_over_a_pending_rule_is_one_item_not_two(world):
     _rule_added(world)
     assert [i["kind"] for i in _items()] == ["rule"]
@@ -306,21 +255,20 @@ def test_a_live_proposal_over_a_pending_rule_is_one_item_not_two(world):
 
 LOOK_PUB = {
     "holds": [{"id": "h1", "remind": True, "scope_label": "Grok", "text": "keep off Grok", "at": "2026-10-01T00:00:00Z"}],
+    # Everything below is a problem with no yes, no or sign-in to answer it: none may be listed.
     "accounts": [
         {"key": "claude|", "label": "Claude", "state": "open", "disagreement": {"state": "limited", "at": "2026-11-01T00:00:00Z"},
          "pace": [{"window": "week", "plan": {"runs_out_at": None}, "share_cap": {"pct": 40, "runs_out_at": "SOON"}}]},
-        {"key": "grok|", "label": "Grok", "state": "limited",
-         "pace": [{"window": "week", "plan": {"runs_out_at": "SOON"}}]},
     ],
     "rule_checks": [{"status": "broken", "rule": 2, "text": "A standing rule may be broken: Lane 3 runs a fast model."}],
     "contradictions": [{"kind": "x", "text": "Your priority names Grok, which you paused."}],
     "sources": {"refused": ["Private"], "runners": [
         {"name": "Silent", "silent": True, "lanes": []}, {"name": "Unread", "unreadable": True, "lanes": []},
-        {"name": "Jobs", "lanes": ["L1", "L2", "L3"],
-         "lane_matches": {"L2": {"candidates": ["a", "b"]},
-                          "L3": {"reason": "launcher evidence contradicts the declaration", "candidates": []}}}]},
-    "unmatched": [],
+        {"name": "Jobs", "lanes": ["L1", "L2"], "lane_matches": {"L2": {"candidates": ["a", "b"]}}}]},
+    "unmatched": [{"runner": "Jobs", "lane": "L9"}],
 }
+REMOVED_KINDS = {"silent", "unreadable", "refused", "lane", "delivery-behind", "delivery-copy", "delivery-read", "proposal",
+                 "interrupted", "disagree", "broken", "contradiction", "crossing", "plan"}
 
 
 @pytest.fixture
@@ -332,39 +280,37 @@ def looks(world, monkeypatch):
         "claude|": {"ok": False, "error": "not_signed_in"},
         "codex|": {"ok": False, "error": "no_plan_limits"},
         "grok|": {"ok": False, "error": "timeout", "windows": []}})
+    # Evidence of a delivery problem is in the doctor's hands, not this list.
     monkeypatch.setattr(routing_health, "doctor_block", lambda *a, **k: {
-        "status": "red", "identities": [{"identity": "x", "status": "red", "owed": 4}, {"identity": "y", "status": "green"}],
-        "replication": {"status": "red"}, "gateway": {"status": "green"}})
+        "status": "red", "identities": [{"identity": "x", "status": "red", "owed": 4}],
+        "replication": {"status": "red"}, "gateway": {"status": "red"}})
     return world
 
 
-def test_every_look_kind_the_app_shows_appears_with_words(looks):
+def test_only_what_the_owner_can_answer_is_listed(looks, monkeypatch):
+    """A yes to a hold, a sign-in; never a silent runner, a job slot, a delivery gap, a refused folder, a check that
+    a rule may be broken, an account the sources disagree about or a plan that can't be read."""
+    real = routing.read_view
+    monkeypatch.setattr(routing, "read_view", lambda *a, **k: dict(real(*a, **k), proposals={
+        "x": {"id": "x", "kind": "priority", "status": "live", "at": "2026-11-01T00:00:00Z",
+              "author": {"kind": "conversation", "harness": "codex"}}}))
     items = _items()
-    kinds = {i["kind"] for i in items}
-    assert kinds >= (set(needs_you.LOOK_KINDS) - {"delivery-read"}), set(needs_you.LOOK_KINDS) - kinds
-    for item in items:
-        assert item["sort"] == "look" and item["words"].strip(), item
-        assert item["settle"]["confirm"] or item["do"], item
-        assert item["asked_by"]["who"]
+    assert {i["kind"] for i in items} == {"remind", "signin"}
+    assert not REMOVED_KINDS & set(needs_you.KINDS)
     by = {i["key"]: i for i in items}
     assert by["hold:h1"]["settle"]["confirm"] == {"action": "route.hold.end", "args": {"hold": "h1"}}
-    assert by["disagree:Claude"]["settle"]["confirm"] == {"action": "route.clear", "args": {"account": "Claude"}}
-    assert "Grok" not in by["crossing:Claude"]["words"] and "40% cap" in by["crossing:Claude"]["words"]
-    # Grok is at its limit: it isn't heading anywhere, as in the app.
-    assert "crossing:Grok" not in by
-    # A lane whose launcher contradicts it is the lane row's own tag, as in the app.
-    assert {"lane:Jobs/L1", "lane:Jobs/L2"} <= set(by) and "lane:Jobs/L3" not in by
-    assert "2 accounts" in by["lane:Jobs/L2"]["words"]
-    # A passing gap with no figures is a plan problem; a sign-in is one to fix.
-    assert by["plan:Claude"]["kind"] == "signin" and by["plan:Grok"]["kind"] == "plan"
+    assert by["plan:Claude"]["kind"] == "signin" and "plan:Codex" not in by and "plan:Grok" not in by
+    for item in items:
+        assert item["sort"] == "look" and item["words"].strip() and (item["settle"]["confirm"] or item["do"]), item
+        assert not re.search(r"khipu doctor|\brun\b", item.get("do") or "", re.I), item
 
 
-def test_the_delivery_read_failure_is_its_own_line(world, monkeypatch):
+def test_the_delivery_check_failing_to_read_is_not_a_line(world, monkeypatch):
     def fail(*a, **k):
         raise OSError("no")
 
     monkeypatch.setattr(routing_health, "doctor_block", fail)
-    assert _one("delivery-read")["words"]
+    assert _items() == []
 
 
 def test_confirmations_come_before_looks(looks):

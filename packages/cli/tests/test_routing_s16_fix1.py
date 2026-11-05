@@ -131,7 +131,8 @@ def test_unmatched_limit_age_starts_with_the_current_continuous_run(replay):
     replay.ack(info)
     _outcomes(replay)
     health = routing.doctor_block(now=replay.now)["routing_delivery"]
-    assert "unmatched-limit" in health["reasons"]
+    # A job slot with no account is not a delivery fault: no one can act on it from here.
+    assert "unmatched-limit" not in health["reasons"]
 
     replay.write(evidence(3, "open"))
     assert "unmatched-limit" not in routing.doctor_block(now=replay.now)["routing_delivery"]["reasons"]
