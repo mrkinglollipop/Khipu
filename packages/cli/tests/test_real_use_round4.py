@@ -122,8 +122,9 @@ from khipu import commitments as co
     ("Look at the 38 routing changes not delivered to subagent conversation agent:a2d (lease expired twice).", "followup"),
     ("Verify against live T3 whether stored prompt text matches the hook's sha256.", "followup"),
 ])
-def test_a_bare_instruction_to_run_or_read_something_is_not_the_users(text, kind):
-    assert co.resolve_owner(text, kind=kind, declared="user") == co.OWNER_ASSISTANT
+def test_a_new_bare_instruction_to_run_or_read_something_is_not_the_users(text, kind):
+    owner, _ = co.resolve_owner_and_label(text, kind=kind, declared="user", new_item=True)
+    assert owner == co.OWNER_ASSISTANT
 
 
 @pytest.mark.parametrize("text,kind", [
@@ -133,9 +134,20 @@ def test_a_bare_instruction_to_run_or_read_something_is_not_the_users(text, kind
     ("Approve the Grok 90% rule", "question"),
     ("Should we run the dry-run on the M1 Mac?", "question"),
     ("Delete /Volumes/KhipuBuild/wt-old; the safety check refused it.", "followup"),
+    ("Read the proposal and decide whether to approve the purchase.", "question"),
+    ("Verify your identity with Touch ID to unlock the login keychain.", "blocker"),
+    ("Run the installer and sign in with the second account.", "followup"),
+    ("Run the migration on the hub.", "blocker"),
 ])
 def test_what_a_person_must_decide_or_do_stays_theirs(text, kind):
-    assert co.resolve_owner(text, kind=kind, declared="user") == co.OWNER_USER
+    owner, _ = co.resolve_owner_and_label(text, kind=kind, declared="user", new_item=True)
+    assert owner == co.OWNER_USER
+
+
+@pytest.mark.parametrize("kind", ["followup", "question"])
+def test_a_stored_item_keeps_the_owner_it_has(kind):
+    row = {"owner": co.OWNER_USER, "kind": kind, "text": "Run the dry-run on the M1 Mac."}
+    assert co.row_owner(row)[0] == co.OWNER_USER
 
 
 # ---- routing at a prompt: short prompts lost to a 50 ms budget -------------------------------
