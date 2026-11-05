@@ -245,3 +245,25 @@ def test_legacy_view_without_cap_decisions_is_refolded(mac):
     current = routing.read_view(NOW)
     assert "advice_cap_decisions" in current
     assert "advice_cap_decisions" not in routing.public_view(current, NOW)
+
+
+def test_the_copy_between_macs_rewriting_its_cursors_does_not_withdraw_a_current_answer(mac):
+    """replication.json is rewritten every few seconds with cursors and clock
+    readings only. An answer whose semantic revision still matches a view folded
+    after that write stays valid; before the refold it is still withdrawn."""
+    from khipu import routing_replication
+
+    _folder, before = _seed_cap(mac, "concurrency")
+    generation = routing._generation(before, routing.settings())
+    assert recall_prompt._routing_generation_current(generation)
+    path = routing.routing_dir() / "replication.json"
+    path.write_text(json.dumps({"caught_up_at": "2026-01-01T00:00:00Z"}))
+    assert path in {routing.routing_dir() / "replication.json"} and routing_replication.fingerprint()[1]
+    assert not recall_prompt._routing_generation_current(generation)  # not yet folded in
+    assert routing.refold_in_background() == "folded"
+    assert recall_prompt._routing_generation_current(generation)
+    # A change to what the view says still withdraws the answer.
+    routing.set_priority([{"account": "Main", "role": "second"}], via="app", expect=routing.priority_version())
+    path.write_text(json.dumps({"caught_up_at": "2026-01-01T00:00:13Z"}))
+    routing.refold_in_background()
+    assert not recall_prompt._routing_generation_current(generation)
