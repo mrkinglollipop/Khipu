@@ -293,7 +293,10 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
     elif entry.get("state") == routing.LIMITED:
         verdict, reason = "closed", "limited"
     elif entry.get("state") == routing.DOWN:
-        verdict, reason = "closed", "down"
+        # Not signed in or not installed here says what this Mac cannot read, not
+        # that the account is out of service for the owner.
+        verdict, reason = "closed", (f"{entry['reason']} on this Mac, so it can't be read here"
+                                     if entry.get("reason") in ("not signed in", "not installed") else "down")
     elif model_limited:
         verdict, reason = "closed", f"{tier} limited"
     elif pace_plan_closed:

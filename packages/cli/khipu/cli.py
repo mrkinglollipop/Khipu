@@ -239,7 +239,11 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     # takes a few minutes normally, an hour is evidence something is stuck.
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
-    outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
+    # Red for a dead job from the last day or one waiting on the owner; the old
+    # announce-refused ones an older app left are said plainly (``outbox.plain``)
+    # and counted, not red while nothing newer dies beside them.
+    outbox_ok = (outbox.get("pending") == 0 and not outbox.get("dead_waiting", outbox.get("dead"))
+                 and outbox_oldest_ok)
     # Dead letters sit outside drain(); only retry-dead moves them back. Held
     # file lines with preferences the hub lacks would only fail again there,
     # so status's fix (naming the merge first) stands for them.
@@ -498,6 +502,24 @@ def _disk_space_warnings(local: dict) -> list[str]:
     """An amber disk is a warning; red is already its own failed check."""
     block = local.get("disk_space") or {}
     return [block["message"]] if block.get("level") == "amber" and block.get("message") else []
+
+
+def _fold_gateway_liveness(liveness: dict, gw_liveness: dict, aegis_gw: dict) -> None:
+    """Put the gateway's and Aegis's round-trip results into the capture
+    liveness rows, red only on evidence that matters on this Mac."""
+    liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
+    if not gw_liveness.get("ok", True):
+        liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
+        liveness["ok"] = False
+    if aegis_gw.get("applicable"):
+        aegis_row = liveness.setdefault("harnesses", {}).setdefault("aegis", {"harness": "aegis", "ok": True})
+        aegis_row["gateway"] = aegis_gw
+        # Red only where Aegis has run its hook on this Mac: a harness never seen
+        # here has no recall to be 401'd (the 2026-09-14 gap was a used Aegis).
+        if not aegis_gw.get("ok", True) and aegis_row.get("seen", True):
+            aegis_row["ok"] = False
+            liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "aegis"]))
+            liveness["ok"] = False
 
 
 def _doctor_rerank() -> tuple[dict, list[str]]:
@@ -982,17 +1004,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
     fact_provenance = workers["provenance"].result()
     if not hub_ok and fact_provenance.get("error"):
         fact_provenance = {"ok": True, "warnings": [], "skipped": "the database did not answer"}
-    liveness.setdefault("harnesses", {})["gateway"] = gw_liveness
-    if not gw_liveness.get("ok", True):
-        liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "gateway"]))
-        liveness["ok"] = False
-    if aegis_gw.get("applicable"):
-        aegis_row = liveness.setdefault("harnesses", {}).setdefault("aegis", {"harness": "aegis", "ok": True})
-        aegis_row["gateway"] = aegis_gw
-        if not aegis_gw.get("ok", True):
-            aegis_row["ok"] = False
-            liveness["red"] = list(dict.fromkeys([*(liveness.get("red") or []), "aegis"]))
-            liveness["ok"] = False
+    _fold_gateway_liveness(liveness, gw_liveness, aegis_gw)
     # Plan usage (docs/plans/2026-10-14-plan-usage.md, phase 2): each account's
     # tightest window still in force, read from the usage cache only (no CLI
     # is probed, nothing waits), and one warning per window at 90% or more.

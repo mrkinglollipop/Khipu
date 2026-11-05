@@ -3139,8 +3139,12 @@ def gateway_liveness_check() -> dict[str, Any]:
         return {"ok": True, "applicable": False, "note": "no gateway_url configured"}
     token = _gateway_token()
     if not token:
-        return {"ok": False, "applicable": True,
-                "error": f"gateway_url configured but no bearer token ({GROK_BOT_TOKEN_ENV} or Keychain gateway_token)"}
+        # The token is what a Mac sends gateway captures with. Without one nothing
+        # here sends through the gateway, so its health is not this Mac's to
+        # judge (a join kit copies the URL to every Mac, token or not).
+        return {"ok": True, "applicable": False,
+                "note": "this Mac has a gateway_url but no gateway token, so nothing here sends through the gateway "
+                        f"and it isn't checked from here ({GROK_BOT_TOKEN_ENV} or Keychain gateway_token would turn it on)"}
     try:
         body = _gateway_healthz(url, token, timeout=10)
     except Exception as e:  # noqa: BLE001 — a network hiccup is red, not a crash

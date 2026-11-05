@@ -369,6 +369,7 @@ def _accounts(view: dict) -> tuple[dict, dict]:
             continue
         record = _record(account.get("key"), account.get("label"), account.get("harness"),
                          account.get("state"), account.get("configured", True))
+        record["reason"] = account.get("reason")
         if record["key"] is not None:
             by_key[record["key"]] = record
         if record.get("label"):
@@ -430,10 +431,17 @@ def _held_keys(view: dict) -> set:
     return found
 
 
+# Down because of this Mac alone (no sign-in or program here): a fact about this
+# Mac's setup, not something the owner said, and the account may be fine on his
+# other Macs. The sign-in item in Needs you covers it.
+_THIS_MAC_ONLY = ("not signed in", "not installed")
+
+
 def _priority_state(record: dict | None, entry: dict, held: set):
     if entry.get("in_settings") is False:
         return "untracked"
-    return _rule_state(record, held) or ("down" if record and record.get("state") == "down" else None)
+    down = record and record.get("state") == "down" and record.get("reason") not in _THIS_MAC_ONLY
+    return _rule_state(record, held) or ("down" if down else None)
 
 
 def _rule_state(record: dict | None, held: set):

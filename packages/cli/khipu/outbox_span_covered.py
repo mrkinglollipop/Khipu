@@ -43,6 +43,7 @@ RANGE_NOT_CONTAINED = "range_not_contained"
 RANGE_NOT_NUMERIC = "range_not_numeric"
 NOT_SAME_WINDOW = "not_same_window"
 OFFSETS_RESTARTED = "offsets_restarted"
+LATE_REPEAT = "late_repeat"
 EVIDENCE_MISSING = "evidence_missing"
 FORGOTTEN = "forgotten"
 DIFFERENT_ERROR = "different_error"
@@ -55,6 +56,9 @@ HOLD_WORDS = {
     RANGE_NOT_NUMERIC: "the job's transcript range is not two increasing numbers",
     NOT_SAME_WINDOW: "the covering episode is another window or part, or differs in transcript digest or project",
     OFFSETS_RESTARTED: "the session's transcript offsets restarted, so a range can't place the job's text",
+    LATE_REPEAT: ("a live episode holds its range and every evidence field, but the job was written after later parts "
+                  "of the session, which can't be told from a transcript that restarted; the session's own episodes "
+                  "show no restart. Counted here only: it stays held until the owner says it counts"),
     EVIDENCE_MISSING: "the job carries evidence no covering episode holds",
     FORGOTTEN: "a forgotten episode overlaps the job, or its source is forgotten",
     DIFFERENT_ERROR: "the job failed with a different error",
@@ -66,7 +70,7 @@ HOLD_WORDS = {
 }
 # What a retry may land: not provably a duplicate, and nothing forgotten near it.
 RETRYABLE = frozenset({NO_COVERING_ROW, RANGE_NOT_CONTAINED, RANGE_NOT_NUMERIC, NOT_SAME_WINDOW, OFFSETS_RESTARTED,
-                       EVIDENCE_MISSING})
+                       LATE_REPEAT, EVIDENCE_MISSING})
 
 _ROWS_SQL = ("SELECT id, session_id, transcript_range, deleted_at, raw FROM episodes "
              "WHERE session_id = ANY(%s) OR raw->>'session_id' = ANY(%s) ORDER BY id")
@@ -131,14 +135,16 @@ def _generation_window(raw: dict[str, Any], span: tuple[int, int]) -> bool:
     return window != hashlib.sha256(f"{harness}:{native}:{span[0]}:{span[1]}".encode("utf-8")).hexdigest()
 
 
-def _offsets_restarted(view: dict[str, Any], rows: list[tuple]) -> bool:
+def _offsets_restarted(view: dict[str, Any], rows: list[tuple], *, with_job: bool = True) -> bool:
     """What a session shows of an offset reset, across its rows and the job: a
     transcript generation's window, or an end offset moving back in time. A
-    rewrite an older writer read straight through shows neither."""
+    rewrite an older writer read straight through shows neither. ``with_job``
+    False reads the session's rows alone."""
     from khipu.capture import _instant, _transcript_span
 
     points = []
-    for raw in (view, *(r[4] for r in rows if isinstance(r[4], dict) and r[4].get("harness") == view.get("harness"))):
+    for raw in (*((view,) if with_job else ()),
+                *(r[4] for r in rows if isinstance(r[4], dict) and r[4].get("harness") == view.get("harness"))):
         span = _transcript_span(raw.get("transcript_range"))
         if span is None:
             continue
@@ -158,7 +164,8 @@ def _offsets_restarted(view: dict[str, Any], rows: list[tuple]) -> bool:
 def _verdict(cur, view: dict[str, Any], rows: list[tuple], withheld: frozenset[int],
              forgotten: dict[int, bool | None] | None = None) -> tuple[str | None, tuple | None]:
     """(why the job holds, None), or (None, the row that retires it)."""
-    from khipu.capture import _span_contains, _span_lacks, _span_rewound, _span_same_window, _transcript_span
+    from khipu.capture import (_evidence_lacks, _span_contains, _span_lacks, _span_rewound, _span_same_window,
+                               _transcript_span)
     from khipu.tombstones import hub_source_forgotten
 
     def hidden(payload):
@@ -186,16 +193,18 @@ def _verdict(cur, view: dict[str, Any], rows: list[tuple], withheld: frozenset[i
     containing = [r for r in live if _span_contains(r[4], view)]
     if not containing:
         return RANGE_NOT_CONTAINED, None
-    if _offsets_restarted(view, rows):
+    # A restart the session's own rows or the job's window show holds it. A job that
+    # only moves back in time against rows with no restart (a repeat written after
+    # later parts) is judged on the rest and named apart, so the count shows how many.
+    if _offsets_restarted(view, rows, with_job=False) or _generation_window(view, inner):
         return OFFSETS_RESTARTED, None
     same = [r for r in containing if _span_same_window(r[4], view)]
     if not same:
         return NOT_SAME_WINDOW, None
-    if all(_span_rewound(r[4], view) for r in same):
-        return OFFSETS_RESTARTED, None
+    late = _offsets_restarted(view, rows) or all(_span_rewound(r[4], view) for r in same)
     for row in same:
-        if _span_lacks(row[4], view) == []:
-            return None, row
+        if (_evidence_lacks(row[4], view) if late else _span_lacks(row[4], view)) == []:
+            return (LATE_REPEAT, None) if late else (None, row)
     return EVIDENCE_MISSING, None
 
 

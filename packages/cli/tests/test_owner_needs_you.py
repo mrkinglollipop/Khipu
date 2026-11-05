@@ -1069,16 +1069,17 @@ def test_a_read_of_an_older_request_does_not_let_a_newer_one_apply(world):
     assert _priority_waits()
 
 
-def test_a_shortened_item_is_not_shown_until_it_is_read_whole(world):
+def test_a_yes_after_a_shortened_read_answers_that_item(world):
+    """The agent showed him the words it read; a shortened item's answer is pinned to the
+    item's own revision, so the owner's yes after that read settles it (round 3)."""
     _rule_added(world, "the words " * 50 + "THE TAIL")
     _owner_types(world, "what needs my confirmation?")
     (item,) = _items()
     assert item["cut"] is True and "THE TAIL" not in item["words"]
     _owner_types(world, "yes")
     ok, out = _act_on(item["settle"]["confirm"])
-    assert ok and out["pending"] is True and "THE TAIL" in out["ask"], out
-    (whole,) = _items(key=item["key"])
-    assert "THE TAIL" in whole["words"] and "cut" not in whole
+    assert ok and not out.get("pending"), out
+    assert routing.read_view()["rules"][0]["confirmed"] is True
 
 
 def test_what_the_gate_cannot_do_a_typed_message_after_the_read_passes_whatever_it_says(world):

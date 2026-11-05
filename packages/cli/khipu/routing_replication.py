@@ -173,12 +173,12 @@ def settings_status():
     for key, row in newest.items():
         try:
             remote_value = json.loads(row["value_json"])
-            remote_value = routing._coerce(routing.SETTINGS[key][0], remote_value, key)
+            remote_value = routing._coerce(routing.synced_kind(key), remote_value, key)
         except (ValueError, TypeError, KeyError):
             continue
-        local_value = routing.settings(config)[key]
+        local_value = routing.synced_value(config, key) if key in routing.SYNCED_FEATURES else routing.settings(config)[key]
         if local_value != remote_value:
-            differences.append({"key": key, "name": routing.SETTINGS[key][2], "local": local_value,
+            differences.append({"key": key, "name": routing.synced_name(key), "local": local_value,
                                 "remote": remote_value, "remote_snapshot": row.get("snapshot") is True,
                                 "remote_at": row.get("written_at")})
     return {"enabled": routing._replication_live(), "differences": differences,
@@ -225,21 +225,21 @@ def _apply_remote_settings(state):
                 if r.get("mac") != mine and r.get("snapshot") is not True and applied.get(k) != r.get("id")]
     for key, row in todo:
         try:
-            value = routing._coerce(routing.SETTINGS[key][0], json.loads(row["value_json"]), key)
+            value = routing._coerce(routing.synced_kind(key), json.loads(row["value_json"]), key)
         except (ValueError, TypeError, KeyError):
             continue
         was_set = row.get("value_set") is True
-        if routing.settings()[key] != value:
+        from khipu.config import load_config
+
+        here = routing.synced_value(load_config(), key) if key in routing.SYNCED_FEATURES else routing.settings()[key]
+        if here != value:
             where = mac_label(row.get("mac"))
             stamp = {"auth": "other_mac", "words": f"the same change made on {where}"}
             owner_direction.noted(owner_direction.intent("config.routing_setting", key, facts={"from": where}), stamp)
             try:
                 with routing._lock(), mutate_config() as data:
                     owner_direction.record_setting_before(key, data)
-                    if was_set:
-                        data[key] = value
-                    else:
-                        data.pop(key, None)
+                    routing.store_setting(data, key, value, was_set)
             except Exception:
                 owner_direction.finish({"ok": False})
                 raise
@@ -450,7 +450,13 @@ def sync_if_due(now=None):
 
 REQUEST_KEPT_S = 14 * 86400
 _ASK_MOST = 1200
-_FINAL = {"applied": "applied", "applying": "applied", "failed": "failed", "interrupted": "failed", "declined": "declined"}
+_FINAL = {"applied": "applied", "applying": "applied", "failed": "failed", "interrupted": "failed", "declined": "declined",
+          "withdrawn": "gone"}
+# Bumped whenever a ``request_state`` line learns a new fact. A Mac whose saved
+# publishing state is older sends everything it holds, and what it has ended,
+# once more, so a row another Mac mirrored in an older shape is corrected without
+# waiting for a request to change.
+REQUEST_LINE_FORMAT = 2
 
 
 def _sig(text):
@@ -466,10 +472,9 @@ def _request_rows():
     from khipu.redact import redact_secrets
 
     out = []
-    try:
-        rows = owner_direction._read_requests(owner_direction.requests_path())
-    except (OSError, ValueError):
-        rows = []
+    # A file that cannot be read says nothing about the requests in it: the caller
+    # sends no line this round rather than calling them all gone.
+    rows = owner_direction._read_requests(owner_direction.requests_path())
     for row in rows:
         if row.get("action") == owner_direction.READ_ACTION or row.get("remote") or not row.get("id"):
             continue
@@ -545,13 +550,23 @@ def publish_requests():
         state = _state()
         if state.get("mac") not in (None, routing._local_mac()):
             return
-        rows = _request_rows()
+        try:
+            rows = _request_rows()
+        except (OSError, ValueError):
+            return
         seen = {r[0] for r in rows}
-        # A setting request that is no longer waiting was answered here.
+        # Whatever was sent as waiting and is no longer here, a setting answered
+        # or a held request withdrawn or dropped, is told as gone, so no other
+        # Mac keeps asking the owner about it.
         gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False, None, None)
                 for request, (st, sig, *_rest) in (state.get("requests_published") or {}).items()
-                if request not in seen and st == "pending" and request.startswith("setting:")]
-        if _emit_request_states(rows + gone, state):
+                if request not in seen and st == "pending"]
+        stale_format = state.get("requests_format") != REQUEST_LINE_FORMAT
+        if stale_format:
+            state["requests_published"] = {}
+            state["requests_format"] = REQUEST_LINE_FORMAT
+        sent = _emit_request_states(rows + gone, state)
+        if sent or stale_format:
             state.setdefault("mac", routing._local_mac())
             _save(state)
 

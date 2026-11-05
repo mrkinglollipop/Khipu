@@ -532,10 +532,21 @@ def test_a_zero_width_row_covers_nothing(pg):
     assert_held(pg, span.RANGE_NOT_CONTAINED)
 
 
-def test_a_row_older_than_the_job_means_the_offset_went_back(pg):
+def test_a_row_older_than_the_job_is_a_late_repeat_that_only_counts_and_stays_held(pg):
+    """The job repeats a range an older row holds, and the session's own rows show no restart: it is
+    named apart so the count shows how many, and nothing about it is retired."""
     land(row_at(ts="2026-10-31T01:00:00Z", transcript_range="0:500"))
     dead(summary_only())
-    assert_held(pg, span.OFFSETS_RESTARTED)
+    assert_held(pg, span.LATE_REPEAT)
+    assert "stays held" in span.HOLD_WORDS[span.LATE_REPEAT] and span.LATE_REPEAT in span.RETRYABLE
+
+
+def test_a_late_repeat_beside_later_parts_of_the_session_is_counted_the_same_way(pg):
+    """A sessionend repeat of 0:N written after the session's later parts (the second Mac's case)."""
+    land(row_at(ts="2026-10-31T01:00:00Z", transcript_range="0:500"))
+    land(row_at(ts="2026-10-31T02:00:00Z", summary="A later part", transcript_range="500:900"))
+    dead(summary_only())
+    assert_held(pg, span.LATE_REPEAT)
 
 
 def test_equal_digests_prove_the_text_even_from_an_older_row(pg):

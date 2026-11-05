@@ -249,11 +249,64 @@ _SYNC_EXCLUDED = frozenset({
 })
 
 
+# Feature switches (``khipu features``) that are the owner's choice on every Mac,
+# not a limit of one machine: they copy as setting_set lines like a setting, and
+# live in config.json's ``features`` object, where ``features.enabled`` reads them.
+SYNCED_FEATURES = frozenset({"routing_push"})
+
+
 def settings_syncable(key: str) -> bool:
     """Whether a routing setting may leave this Mac in a setting_set event."""
+    if key in SYNCED_FEATURES:
+        return True
     return key in SETTINGS and key not in _SYNC_EXCLUDED and SETTINGS[key][0] in {
         "duration", "count", "number", "switch", "durations", "names",
     }
+
+
+def synced_name(key: str) -> str:
+    """The words for a copied setting or feature switch."""
+    if key in SYNCED_FEATURES:
+        from khipu import features
+
+        return features.FEATURES[key]
+    return SETTINGS[key][2]
+
+
+def stored_setting(data: dict, key: str) -> tuple[Any, bool]:
+    """(value, is it set) as config holds a copied setting: a flat key, or a
+    feature switch inside ``features``."""
+    if key in SYNCED_FEATURES:
+        feats = data.get("features") if isinstance(data.get("features"), dict) else {}
+        return feats.get(key), isinstance(feats.get(key), bool)
+    return data.get(key), key in data
+
+
+def store_setting(data: dict, key: str, value: Any, is_set: bool) -> None:
+    """Put a copied setting back as ``stored_setting`` reads it (unset removes it)."""
+    if key in SYNCED_FEATURES:
+        feats = dict(data["features"]) if isinstance(data.get("features"), dict) else {}
+        if is_set:
+            feats[key] = bool(value)
+        else:
+            feats.pop(key, None)
+        data["features"] = feats
+    elif is_set:
+        data[key] = value
+    else:
+        data.pop(key, None)
+
+
+def synced_value(data: dict, key: str) -> Any:
+    """The effective value of a copied setting: stored, else its default."""
+    if key in SYNCED_FEATURES:
+        value, is_set = stored_setting(data, key)
+        return value if is_set else False
+    return data.get(key, SETTINGS[key][1])
+
+
+def synced_kind(key: str) -> str:
+    return "switch" if key in SYNCED_FEATURES else SETTINGS[key][0]
 
 
 def _setting_event(key: str, value, value_set: bool, *, snapshot: bool = False) -> dict:
@@ -648,12 +701,13 @@ def _sync_events(key: str, data: dict, requests: dict) -> list[dict]:
     if key == "routing_replication_live":
         out.append({"type": "settings_sync_switch", "enabled": data.get(key) is True})
         if data.get(key) is True:
-            for other in SETTINGS:
+            for other in (*SETTINGS, *sorted(SYNCED_FEATURES)):
                 if settings_syncable(other):
-                    out.append(_setting_event(other, data.get(other, SETTINGS[other][1]), other in data, snapshot=True))
+                    out.append(_setting_event(other, synced_value(data, other), stored_setting(data, other)[1],
+                                              snapshot=True))
     elif data.get("routing_replication_live") is True and "routing_replication_live" not in requests \
             and settings_syncable(key):
-        out.append(_setting_event(key, data.get(key, SETTINGS[key][1]), key in data))
+        out.append(_setting_event(key, synced_value(data, key), stored_setting(data, key)[1]))
     return out
 
 
@@ -2923,7 +2977,7 @@ def _checked(data: dict) -> dict | None:
             value = _loads(out["value_json"])
             # Both an explicit value and an omitted/default value are
             # canonicalised by the receiving version before any config write.
-            _coerce(SETTINGS[key][0], value, key)
+            _coerce(synced_kind(key), value, key)
         except (ValueError, TypeError, json.JSONDecodeError):
             return None
     if out["type"] == "settings_sync_switch" and not isinstance(out.get("enabled"), bool):

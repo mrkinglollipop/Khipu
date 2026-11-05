@@ -221,8 +221,9 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
     try:
         turn = _recent_turn(session, conf, now)
     except DirectionRefused:
-        if any(t.get("entrypoint") == "t3" for t in owner_turns.turns(session, now)):
-            # A T3 conversation: its turns never count directly, so the
+        if any(t.get("entrypoint") in ("t3", "t3-unverified") for t in owner_turns.turns(session, now)):
+            # A T3 conversation (or one whose hook could not read T3's record in
+            # time, which T3's record is asked again here): its turns never count directly, so the
             # change is held for the owner to confirm (``hold``, ``confirm``).
             # T3's own record decides whether it is a job (``_t3_bound``).
             with t3.owner_read_budget():
@@ -444,7 +445,7 @@ def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | 
         session = _caller_session(environ)
         with _requests_locked() as path, t3.owner_read_budget():
             turns_ = owner_turns.turns(session, now)
-            in_t3 = any(t.get("entrypoint") == "t3" for t in turns_)
+            in_t3 = any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_)
             if not in_t3 and owner_turns.dispatched_job(environ, session):
                 return None
             thread = _t3_bound(environ, session, now)[0] if in_t3 else None
@@ -572,7 +573,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             extra = {}
             if terminal or authorized is not None:
                 pass
-            elif any(t.get("entrypoint") == "t3" for t in turns_):
+            elif any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_):
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
                     seeded = _seed(thread, session, signature(action, args))
@@ -2032,7 +2033,8 @@ def record_setting_before(key: str, data: dict) -> None:
             ("config.routing_setting", "config.answer_request.confirm", "config.answer_request.undo")
             or pend["intent"]["target"] != key):
         return
-    before = {"value": data.get(key), "set": key in data}
+    stored, is_set = routing.stored_setting(data, key)
+    before = {"value": stored, "set": is_set}
     request = routing._setting_requests(data).get(key)
     if request is not None or key == "routing_replication_live":
         before["request"] = request
@@ -2658,7 +2660,8 @@ def _before(want: dict):
         from khipu import config
 
         data = config.load_config()
-        before = {"value": data.get(target), "set": target in data}
+        stored, is_set = routing.stored_setting(data, target)
+        before = {"value": stored, "set": is_set}
         request = routing._setting_requests(data).get(target)
         if request is not None or target == "routing_replication_live":
             before["request"] = request
@@ -2776,11 +2779,8 @@ def _restore_setting(key: str, value, was_set: bool, request=None) -> None:
 
     emitted: list[dict] = []
     with routing._lock(), mutate_config() as data:
-        before = routing.settings(data).get(key)
-        if was_set:
-            data[key] = value
-        else:
-            data.pop(key, None)
+        before = routing.synced_value(data, key) if key in routing.SYNCED_FEATURES else routing.settings(data).get(key)
+        routing.store_setting(data, key, value, was_set)
         requests = routing._setting_requests(data)
         if request is not None:
             requests[key] = request
@@ -2791,9 +2791,11 @@ def _restore_setting(key: str, value, was_set: bool, request=None) -> None:
         else:
             data.pop(routing.SETTINGS_REQUEST_KEY, None)
         # An Undo is the owner's change too: the other Macs follow it.
+        now_value = routing.synced_value(data, key) if key in routing.SYNCED_FEATURES else routing.settings(data).get(key)
         if routing.settings_syncable(key) and data.get("routing_replication_live") is True \
-                and "routing_replication_live" not in requests and routing.settings(data).get(key) != before:
-            emitted.append(routing._setting_event(key, data.get(key, routing.SETTINGS[key][1]), key in data))
+                and "routing_replication_live" not in requests and now_value != before:
+            emitted.append(routing._setting_event(key, routing.synced_value(data, key),
+                                                  routing.stored_setting(data, key)[1]))
     if emitted:
         routing._write_many(routing.owner_lines(emitted, "app"))
     routing.refresh_view()  # config.json is an input of the view: the next prompt finds it current
