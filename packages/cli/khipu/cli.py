@@ -239,7 +239,11 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     # takes a few minutes normally, an hour is evidence something is stuck.
     outbox["oldest_pending_seconds"] = outbox.get("oldest_age_s")
     outbox_oldest_ok = (outbox.get("oldest_pending_seconds") or 0) <= 3600
-    outbox_ok = outbox.get("pending") == 0 and not outbox.get("dead") and outbox_oldest_ok
+    # Red for a dead job from the last day or one waiting on the owner; the old
+    # announce-refused ones an older app left are said plainly (``outbox.plain``)
+    # and counted, not red while nothing newer dies beside them.
+    outbox_ok = (outbox.get("pending") == 0 and not outbox.get("dead_waiting", outbox.get("dead"))
+                 and outbox_oldest_ok)
     # Dead letters sit outside drain(); only retry-dead moves them back. Held
     # file lines with preferences the hub lacks would only fail again there,
     # so status's fix (naming the merge first) stands for them.

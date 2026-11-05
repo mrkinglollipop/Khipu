@@ -117,3 +117,62 @@ def test_a_dead_job_with_no_harness_in_its_name_does_not_make_an_unused_aegis_re
     row = sc.liveness("aegis")
     assert row["ok"] is True and row["seen"] is False
     assert sc.job_harness(tmp_path / "job.json", {}) == "aegis"  # the default that could misfile a job
+
+
+# ---- the outbox row: what is old and what is new -----------------------------------------------
+
+
+def _dead_job(outbox, name, *, error, age_h):
+    import json
+    import os
+    import time
+    path = outbox.dead_dir() / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"payload": {"ts": "2026-10-31T00:00:00Z", "summary": "x", "session_id": "claude_code:s"},
+                                "queued_at": "2026-10-31T00:00:00+00:00", "attempts": 9, "last_error": error}))
+    then = time.time() - age_h * 3600
+    os.utime(path, (then, then))
+    return path
+
+
+def _doctor_outbox_ok(status):
+    # The gate cli._doctor_local_checks applies to outbox.status().
+    return status.get("pending") == 0 and not status.get("dead_waiting", status.get("dead"))
+
+
+def test_old_refused_jobs_are_said_plainly_and_do_not_keep_the_outbox_red(tmp_path, monkeypatch):
+    from khipu import outbox
+    monkeypatch.setenv("KHIPU_OUTBOX", str(tmp_path))
+    for i in range(3):
+        _dead_job(outbox, f"old{i}.json", error=outbox.ANNOUNCE_REFUSAL + " (x)", age_h=30 + i)
+    st = outbox.status()
+    assert st["dead"] == 3 and st["announce_refused_old"] == 3
+    assert "3 old captures" in st["plain"] and "nothing newer has died" in st["plain"]
+    assert _doctor_outbox_ok(st)
+
+
+def test_a_new_dead_job_beside_old_ones_is_red(tmp_path, monkeypatch):
+    from khipu import outbox
+    monkeypatch.setenv("KHIPU_OUTBOX", str(tmp_path))
+    _dead_job(outbox, "old.json", error=outbox.ANNOUNCE_REFUSAL + " (x)", age_h=48)
+    _dead_job(outbox, "new.json", error="ValueError: payload rejected", age_h=1)
+    assert not _doctor_outbox_ok(outbox.status())
+
+
+def test_an_old_dead_job_that_is_not_the_announce_refusal_stays_red(tmp_path, monkeypatch):
+    from khipu import outbox
+    monkeypatch.setenv("KHIPU_OUTBOX", str(tmp_path))
+    _dead_job(outbox, "other.json", error="ValueError: payload rejected", age_h=100)
+    st = outbox.status()
+    assert st["announce_refused_old"] == 0 and not _doctor_outbox_ok(st)
+
+
+def test_an_old_refused_job_waiting_on_an_owner_answer_stays_red(tmp_path, monkeypatch):
+    import json
+    from khipu import outbox
+    monkeypatch.setenv("KHIPU_OUTBOX", str(tmp_path))
+    path = _dead_job(outbox, "forget.json", error="held: forget conflict", age_h=100)
+    job = json.loads(path.read_text())
+    job["evidence_conflict"] = True
+    path.write_text(json.dumps(job))
+    assert not _doctor_outbox_ok(outbox.status())

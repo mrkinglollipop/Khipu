@@ -112,6 +112,10 @@ def _canonical(value: Any) -> str:
 # What the hub's trigger says to a writer from before announce_hub_identities,
 # as the drain records it (``type: message``, with the message's tail clipped).
 ANNOUNCE_REFUSAL = "CheckViolation: khipu: an episode write must announce its source identities"
+# A dead job this old, refused for not announcing and with nothing newer dying
+# beside it, is a finished story from an older app: counted, said plainly, and
+# not what turns the outbox row red.
+OLD_DEAD_S = 24 * 3600
 SPAN_FIRST = ("Run `khipu outbox span-covered` first: a dry run that counts the jobs whose range and evidence fields "
               "another episode holds. "
               "`khipu outbox retry-dead` may land those as duplicates, so it leaves this kind held unless told "
@@ -771,12 +775,23 @@ def status() -> dict[str, Any]:
     quarantined = len(list(quarantine_dir().glob("*.json"))) if quarantine_dir().is_dir() else 0
     held_conflicts = []
     refused = 0
+    refused_old = 0
+    newest_died: float | None = None
+    clock = time.time()
     for jp in dead_jobs():
+        try:
+            st = jp.stat()
+            died = st.st_mtime  # a job is rewritten with its last error when it is buried
+            newest_died = died if newest_died is None else max(newest_died, died)
+        except OSError:
+            died = clock
         try:
             held = _read_job(jp)
         except (OSError, ValueError, TypeError, RecursionError):
             continue  # dead still names unreadable held work
         refused += announce_refused(held)
+        refused_old += bool(announce_refused(held) and not held.get("evidence_conflict")
+                            and clock - died > OLD_DEAD_S)
         if held.get("evidence_conflict"):
             held_conflicts.append(jp.name)
             line_conflicts += _is_line_conflict(held)
@@ -801,6 +816,19 @@ def status() -> dict[str, Any]:
             # Where the dead count comes from, and how recently any of it was tried.
             "dead_detail": {"outbox_dead": len(dead_jobs()), "quarantined": quarantined,
                             "native_held": len(native_held)}}
+    # What is old and what is new, for doctor: red is for something still happening
+    # (a dead job in the last day) or waiting on the owner (the rest).
+    newest_age = None if newest_died is None else int(clock - newest_died)
+    result["announce_refused_old"] = refused_old
+    result["dead_newest_age_s"] = newest_age
+    result["dead_waiting"] = max(dead - refused_old, 0) if (newest_age is None or newest_age > OLD_DEAD_S) \
+        else dead
+    if refused_old:
+        result["plain"] = (f"{refused_old} old capture{'' if refused_old == 1 else 's'} an older app sent without "
+                           "announcing its source identities sit refused"
+                           + (f"; the newest died {newest_age // 3600} h ago" if newest_age is not None else "")
+                           + (", and nothing newer has died" if (newest_age or 0) > OLD_DEAD_S else "")
+                           + ". They are kept whole and wait for your word: `khipu outbox span-covered` counts them.")
     if native_held:
         from khipu.session_capture import held_by_harness
 
