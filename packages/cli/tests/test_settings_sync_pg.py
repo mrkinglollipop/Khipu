@@ -6,7 +6,7 @@ no fake hub, no live state. Each test is something the owner does: a setting
 changed on one Mac reaches the other and Undo works there; first switch-on
 lists differences and overwrites nothing; a request held on one Mac is answered
 on the other and applies once; a stale answer says so; an older Mac's code
-(``origin/main``) reads the new lines without harm."""
+(``OLDER_MAC``, the last commit before they existed) reads the new lines without harm."""
 from __future__ import annotations
 
 import json
@@ -26,6 +26,8 @@ from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_routing_acceptance import Replay
 
 REPO = Path(__file__).resolve().parents[3]
+# Pinned: this must stay older than the settings lines, so never a moving branch.
+OLDER_MAC = "4c5df2eb4fb5ce0e0e70985856270d81dca4dfbc"
 KEY, OTHER_KEY = "routing_summary_chars", "routing_rule_chars"
 _ENV = ("KHIPU_SESSION_ID", "CODEX_THREAD_ID", "GROK_HOOK_NAME", "GROK_HOOK_EVENT", "KHIPU_HARNESS",
         "KHIPU_ISOLATED_DIR", "KHIPU_OWNER_TURN", "CLAUDE_CODE_SESSION_ID")
@@ -400,10 +402,10 @@ def test_an_older_mac_on_main_reads_the_new_lines_without_harm(macs, pg, tmp_pat
 
     old = tmp_path / "old-main"
     old.mkdir()
-    tar = subprocess.run(["git", "-C", str(REPO), "archive", "origin/main", "packages/cli/khipu"],
+    tar = subprocess.run(["git", "-C", str(REPO), "archive", OLDER_MAC, "packages/cli/khipu"],
                          capture_output=True)
     if tar.returncode:
-        pytest.skip("origin/main is not available to build the older Mac from")
+        pytest.skip("the older commit is not available to build the older Mac from")
     subprocess.run(["tar", "-x", "-C", str(old)], input=tar.stdout, check=True)
     assert "request_answer" not in (old / "packages/cli/khipu/routing.py").read_text()
     home = tmp_path / "old-home"
