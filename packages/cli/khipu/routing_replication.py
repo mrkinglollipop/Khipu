@@ -29,6 +29,11 @@ POLL_SECONDS = 30
 UPLOAD_PER_TURN = 64
 ROUND_BUDGET_S = 240.0  # how long one sync keeps sending slices (each is saved durably) before the next tick takes over
 CONTROL_EVERY_S = 270  # just under the 5-minute timer, so every tick looks
+# The hub keeps a Mac's own pace readings a day past the oldest it would ever send
+# (``routing_pace.WIRE_OLDEST_S``), so a pruned row can never come back as new.
+HUB_SAMPLE_KEPT_S = 3 * 86400
+HUB_PRUNE_EVERY_S = 3600
+HUB_PRUNE_MOST = 2000
 
 
 def _path(name):
@@ -103,7 +108,7 @@ def _sync_lock():
 # a view and the cached log read do not move with them. The hub's clock offset
 # is kept to the minute: its jitter is sub-second, a real skew is not.
 _BOOKKEEPING = frozenset({"pull_cursor", "caught_up_at", "checked_local_at", "scan_after", "scan_until",
-                          "scan_order", "completed_order"})
+                          "scan_order", "completed_order", "samples_pruned_at"})
 _state_token_cache: dict[str, tuple[list, list]] = {}
 
 
@@ -384,13 +389,32 @@ class PostgresHub:
                 cur.execute("SELECT event_id, hub_order, payload, received_at, rule_number FROM routing_events WHERE event_id = %s",
                             (payload["id"],))
                 row = cur.fetchone()
+                # The advisory lock makes this row new. Its count is what this Mac
+                # has ever sent, moved by one: rows it pruned are still sent.
                 cur.execute("INSERT INTO routing_sources(mac, last_hub_order, last_event_id, event_count, last_seen_at) "
-                            "SELECT %s, coalesce(max(hub_order), 0), %s, count(*), clock_timestamp() FROM routing_events WHERE sender_mac = %s "
-                            "ON CONFLICT (mac) DO UPDATE SET last_hub_order = EXCLUDED.last_hub_order, "
-                            "last_event_id = EXCLUDED.last_event_id, event_count = EXCLUDED.event_count, "
-                            "last_seen_at = EXCLUDED.last_seen_at", (mac, payload["id"], mac))
+                            "VALUES (%s, %s, %s, 1, clock_timestamp()) "
+                            "ON CONFLICT (mac) DO UPDATE SET "
+                            "last_hub_order = greatest(routing_sources.last_hub_order, EXCLUDED.last_hub_order), "
+                            "last_event_id = EXCLUDED.last_event_id, event_count = routing_sources.event_count + 1, "
+                            "last_seen_at = EXCLUDED.last_seen_at", (mac, row[1], payload["id"]))
                 receipt = self._receipt(row)
         return receipt
+
+    def prune_samples(self, mac):
+        """Drop this sender's own pace readings no Mac's pace can still read; no
+        other kind and no other sender's. Pulls page by (received time, id) from
+        where they are, so a row gone behind them moves no cursor, and rule numbers
+        and receipts belong to kinds this never touches."""
+        from khipu import db
+
+        with db.connect(statement_timeout_s=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM routing_events WHERE event_id IN ("
+                            "SELECT event_id FROM routing_events WHERE sender_mac = %s "
+                            "AND payload ->> 'type' = 'usage_sample' "
+                            "AND received_at < clock_timestamp() - make_interval(secs => %s) LIMIT %s)",
+                            (mac, HUB_SAMPLE_KEPT_S, HUB_PRUNE_MOST))
+                return cur.rowcount
 
     @staticmethod
     def _receipt(row):
@@ -447,6 +471,17 @@ def _wire_samples(local, now):
         send |= chosen
         hold |= waiting
     return send, hold
+
+
+def _prune_hub_samples(hub, mac, state, now):
+    """After a sync that sent readings, at most once an hour, the hub's copy of
+    this Mac's old ones go. A failure costs nothing: the next hour tries again."""
+    last = routing._parse(state.get("samples_pruned_at"))
+    if not hasattr(hub, "prune_samples") or (last is not None and 0 <= (now - last).total_seconds() < HUB_PRUNE_EVERY_S):
+        return
+    state["samples_pruned_at"] = routing._iso(now)
+    with contextlib.suppress(Exception):
+        hub.prune_samples(mac)
 
 
 def sync(*, hub=None, limit=500, max_pages=20):
@@ -952,6 +987,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
             deadline = time.monotonic() + ROUND_BUDGET_S
             first_round = True
             wire_send, wire_hold = _wire_samples(local, routing._now())
+            sent_samples = False
             while True:
                 # Each round sends one bounded slice and then pulls, so a large
                 # local backlog never starves the other Macs; rounds repeat while
@@ -980,6 +1016,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                             if receipt["event_id"] != projected[0]["id"]:
                                 raise ValueError("wrong upload receipt")
                             sent_this_turn += 1
+                            sent_samples = True
                             if sent_this_turn >= UPLOAD_PER_TURN:
                                 local_pending = any(
                                     later.get("id") and later.get("seq", n) > uploaded.get(later.get("mac") or "legacy", 0)
@@ -1015,6 +1052,9 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                             for n, later in ordered[position:]
                         )
                         break
+                if sent_samples:
+                    _prune_hub_samples(hub, mac, state, routing._now())
+                    sent_samples = False
                 for _ in range(max_pages):
                     after = state.get("scan_after") or [state.get("pull_cursor", EPOCH), ""]
                     result = hub.pull(after, state.get("scan_until"), limit)

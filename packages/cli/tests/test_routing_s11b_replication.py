@@ -555,7 +555,8 @@ def test_postgres_transport_uses_primary_key_and_preserves_microsecond_cursor(pa
     assert len(stored) == 1
     assert any("greatest(routing_sources.rule_number_floor" in sql for sql, _ in statements)
     assert any("ON CONFLICT (event_id) DO NOTHING" in sql for sql, _ in statements)
-    assert any("coalesce(max(hub_order), 0)" in sql for sql, _ in statements)
+    assert any("event_count = routing_sources.event_count + 1" in sql for sql, _ in statements)
+    assert not any("count(*)" in sql or "max(hub_order)" in sql for sql, _ in statements)
     assert not any("ON CONFLICT (hub_order)" in sql for sql, _ in statements)
     after = (receipt["received_at"], receipt["event_id"])
     result = hub.pull(after, None, 1)

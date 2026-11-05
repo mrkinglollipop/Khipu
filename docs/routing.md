@@ -728,7 +728,10 @@ allowance from the one reader, `routing_pace.compute_pace`. To keep that small a
 Mac sends only the newest `usage_sample` of each closed pace bucket (a bucket
 where the reading fell or the reset moved goes whole), at the next quarter hour
 and no older than two days; `compute_pace` reads the same buckets either way.
-Its own readings' receipts and echoes never rewrite `remote.jsonl`. Another Mac's
+Its own readings' receipts and echoes never rewrite `remote.jsonl`. At most once
+an hour, after a sync that sent readings, a Mac removes its own `usage_sample` rows
+over three days old from `routing_events`: no other kind and no other sender's, a
+day past the oldest it would ever send, and no pull cursor depends on them. Another Mac's
 readings are left out when both name a reset still ahead more than an hour apart
 from this Mac's own fresh reading: that login reads a different allowance under
 that account id, and pooling them would leave both Macs unknown. Caps cross on
