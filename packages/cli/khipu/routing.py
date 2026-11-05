@@ -1407,6 +1407,12 @@ def _fold_accounts(config: dict) -> list[dict]:
 def _label_for_key(key: str) -> str:
     from khipu import usage
 
+    if account_identity.STABLE.fullmatch(key):
+        # A shared id (``claude:second``) on a Mac that holds no label for it:
+        # the reverse of ``stable_id``, which drops the provider from the label.
+        provider, _, name = key.partition(":")
+        base = usage.LABELS.get(provider, provider)
+        return base if name == "main" else f"{base} {name.replace('-', ' ')}"
     harness, _, home = key.partition("|")
     base = usage.LABELS.get(harness, harness or "?")
     return f"{base} ({_clean(Path(home).name, NAME_MAX)})" if home else base

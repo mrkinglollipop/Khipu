@@ -603,3 +603,36 @@ def test_a_row_mirrored_before_the_fix_is_corrected_by_the_holders_next_line(mac
     sync_all(a, b)
     item = _item_on(b, request)
     assert item["decline_only"] is True and item["asked_by"]["who"] == "a Claude Code conversation on Studio"
+
+
+# ---- the same account names on a Mac that has no account list -----------------------------------
+
+
+def _account_labels(mac):
+    mac.activate()
+    return {a["key"]: a["label"] for a in routing.read_view(now=mac.now)["accounts"]}
+
+
+def test_accounts_the_other_mac_reads_keep_the_owners_names_on_a_mac_with_no_list(macs):
+    a, b = macs
+    both_on(a, b)
+    a.configure(usage_accounts=[{"label": "Claude second", "harness": "claude", "home": str(a.root / "login")},
+                                {"label": "Muse", "harness": "muse"}])
+    b.config.pop("usage_accounts")
+    b.configure()
+    a.activate()
+    routing.pause("Claude second", until="24h", via="app")
+    routing.pause("Muse", until="24h", via="app")
+    sync_all(a, b)
+    seen, mine = _account_labels(b), _account_labels(a)
+    assert {"claude:second", "muse:main"} <= set(seen), seen
+    assert (seen["claude:second"], seen["muse:main"]) == ("Claude second", "Muse"), seen
+    assert not any(":" in label for label in seen.values())
+    assert mine["claude:second"] == seen["claude:second"] if "claude:second" in mine else True
+
+
+def test_a_label_is_derived_from_a_shared_id_when_no_mac_holds_one():
+    assert routing._label_for_key("muse:main") == "Muse"
+    assert routing._label_for_key("claude:second") == "Claude second"
+    assert routing._label_for_key("codex:main") == "Codex"
+    assert routing._label_for_key("claude|/some/home") == "Claude (home)"
