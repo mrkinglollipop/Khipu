@@ -545,10 +545,29 @@ def normalize_owner(raw: Any) -> str | None:
     return None
 
 
+# A bare instruction to run, read or check something is a step the assistant
+# or the orchestrator takes ("Run the dry-run on the M1 Mac", "Run `khipu
+# doctor` on the secondary Mac", "Look at the 38 routing changes", "Verify
+# against live T3 ..."): the extractor marks them "user" or "question" because
+# a person is in the conversation, but nobody asked the person. Only an
+# instruction with no user named and no decision asked is one.
+
+
+def _machine_step(text: str, future_trigger: bool | None = None) -> bool:
+    s = (text or "").strip()
+    if s.endswith("?"):
+        return False
+    body = _without_trigger_clause(s) if (future_trigger is not False) else s
+    if not _MACHINE_STEP_RE.match(body):
+        return False
+    patterns = _compile_user_patterns()
+    return not (patterns.actor_re.search(body) or patterns.decision_re.search(body))
+
+
 def _user_signal(text: str, *, kind: str | None = None, future_trigger: bool | None = None) -> bool:
     s = (text or "").strip()
     if str(kind or "").lower() == "question":
-        return True
+        return not _machine_step(s, future_trigger)
     if s.endswith("?"):
         return True
     body = _without_trigger_clause(s) if (future_trigger is not False) else s
@@ -585,6 +604,9 @@ _NOT_NAMES = frozenset("""
     please when if once after before until while who what which why how each every all both
     tests test docs doc ci it's let make run build check
 """.split())
+
+_MACHINE_STEP_RE = re.compile(
+    _LEAD_IN + r"(?:run|re-?run|look\s+at|inspect|diagnose|investigate|measure|verify|read)\b", re.I)
 
 
 def commit_subject(text: str) -> tuple[str, str | None] | None:
@@ -677,6 +699,8 @@ def resolve_owner_and_label(text: str, *, kind: str | None = None, declared: Any
     if not future_trigger:
         if speaker == "other":
             return OWNER_AGENT, clean_owner_label(declared_label) or (ORCHESTRATOR if job else "other")
+        if speaker == OWNER_USER and _machine_step(body, future_trigger):
+            return OWNER_ASSISTANT, None
         if speaker == OWNER_USER:
             return users
         if speaker:

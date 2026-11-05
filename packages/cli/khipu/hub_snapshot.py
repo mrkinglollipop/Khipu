@@ -1916,11 +1916,17 @@ def unsent_forgets(path: Path | None = None) -> dict[str, Any]:
         seen = set(json.loads(certified)) if certified else set()
     except ValueError:
         value, seen = empty, set()
+    forgotten = None
     try:
-        pending = set(read_gate().tags) - seen
+        gate = read_gate()
+        pending = set(gate.tags) - seen
+        forgotten = len(gate.episode_ids)
     except Exception:  # noqa: BLE001 - an unreadable registry lists what the copy found
         pending = set()
+    # ``episodes``: how many conversations this Mac's registry holds as
+    # forgotten (a count of ids, not of identity strings).
     return {"strings": sorted(set(value.get("strings") or []) | pending), "ids": list(value.get("ids") or []),
+            **({"episodes": forgotten} if forgotten is not None else {}),
             **({"at": value["at"]} if value.get("at") else {})}
 
 
@@ -2493,6 +2499,12 @@ def _publish_copy(con: sqlite3.Connection, gate: Any, local: Mapping[str, Any], 
         if _meta_get(con, _FACT_DIGEST_KEY) is not None:
             _meta_put(con, _FACT_DIGEST_KEY, None)
             _meta_put(con, _FACT_STAMP_KEY, None)
+        # This read did find the other registry tags on the hub. Without
+        # recording them, ``unsent_forgets`` counts every registry tag as
+        # "not seen on the hub" for as long as anything is missing.
+        seen = sorted(set(local["tags"]) - set(read["missing"]))
+        if _meta_get(con, _FACT_CERTIFIED_KEY) != json.dumps(seen):
+            _meta_put(con, _FACT_CERTIFIED_KEY, json.dumps(seen))
         return {"ok": False, "refreshed": False, "unsent": len(read["missing"]) + len(read["unmet"]),
                 "error": "this Mac holds forgets the hub lacks; facts stay hidden until they are resolved"}
     if read.get("skip"):
