@@ -85,10 +85,12 @@ def _note_worker(request: str, pid: int) -> None:
         pass
 
 
-def prepare(request: dict) -> None:
-    """Persist recovery evidence before the request can become applying."""
-    if is_long(request["action"], request.get("args") or {}):
-        _save(request["id"], {"state": "started", "started_ts": time.time()})
+def prepare(request: dict, *, inline: bool = False) -> None:
+    """Persist recovery evidence before every claim, including inline work."""
+    job = {"state": "started", "started_ts": time.time()}
+    if inline or not is_long(request["action"], request.get("args") or {}):
+        job.update(pid=os.getpid(), worker=_identity(os.getpid()))
+    _save(request["id"], job)
 
 
 def start(request: dict) -> tuple[bool, dict]:

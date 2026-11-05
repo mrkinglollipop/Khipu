@@ -972,6 +972,8 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
                     "auth": "terminal", "harness": "shell", "session": session,
                     "confirmed": {"source": "terminal", "message": "typed yes", "message_at": _iso(now)}}
                 stamp["confirmed"]["request"] = request_id
+                from khipu import owner_background
+                owner_background.prepare(request, inline=True)
                 request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session))
                 _save(path, state, now)
                 return request, stamp
