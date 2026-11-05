@@ -8268,6 +8268,48 @@ esac
         assert!(cancelled.is_ok(), "cancel after making a folder: {cancelled:?}");
     }
 
+    /// The Your Macs Yes/No buttons call `khipu_owner_answer`. Run that real
+    /// command function, through the real CLI, against a fictional data
+    /// folder. A test binary is not the installed app, so the CLI refuses the
+    /// owner's answer (`owner_only`): that proves the argv, the spawn, the
+    /// fictional folder and that a refusal comes back as the JSON the page
+    /// shows. It does not prove an accepted answer (the CLI's own tests drive
+    /// that with the app as the caller) and it is not a click.
+    #[cfg(unix)]
+    #[test]
+    fn the_owner_answer_command_reaches_the_real_cli_and_a_refusal_comes_back() {
+        let python = std::path::Path::new("/opt/homebrew/bin/python3.11");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
+        if !python.is_file() || !root.join(".python_libs").is_dir() {
+            eprintln!("skipped: needs python3.11 and the checkout's .python_libs");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("khipu-owner-answer-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        let keys = ["KHIPU_ROOT", "KHIPU_PYTHON", "KHIPU_DATA_DIR", "KHIPU_CAPTURE_HOME", "KHIPU_KEYCHAIN", "HOME"];
+        let saved: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
+        std::env::set_var("KHIPU_ROOT", &root);
+        std::env::set_var("KHIPU_PYTHON", python);
+        std::env::set_var("KHIPU_DATA_DIR", dir.join("data"));
+        std::env::set_var("KHIPU_CAPTURE_HOME", dir.join("capture"));
+        std::env::set_var("KHIPU_KEYCHAIN", "0");
+        std::env::set_var("HOME", dir.join("home"));
+        let yes = tauri::async_runtime::block_on(khipu_owner_answer("rm-req-0a1b2c3d4e5f".to_string(), "yes".to_string()));
+        let bad_id = tauri::async_runtime::block_on(khipu_owner_answer("--yes".to_string(), "yes".to_string()));
+        for (key, value) in keys.iter().zip(saved) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = yes.expect("a refusal is JSON the page reads, not a failed invoke");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("the CLI answered in JSON");
+        assert_eq!(parsed["ok"], false, "{out}");
+        assert_eq!(parsed["code"], "owner_only", "{out}");
+        assert!(bad_id.is_err(), "an id that reads as a flag never reaches the CLI");
+    }
+
     #[test]
     fn new_folder_name_rules() {
         assert_eq!(

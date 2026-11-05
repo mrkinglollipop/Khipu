@@ -2576,6 +2576,62 @@ describe("Settings -> Accounts and routing: reading a tool's own login", () => {
   });
 });
 
+describe("Your Macs: answering a request held on another Mac", () => {
+  const waiting = (extra: Record<string, unknown> = {}) => ({
+    ...config(),
+    settings_sync: {
+      enabled: true, differences: [], requests: [],
+      waiting: [{ id: "rm-req-1", request: "req-1", mac: "Studio", state: "pending", ask: "Confirm route.pause (account: Codex)",
+        answerable: true, decline_only: false, reason: null, asked_by: "a Claude Code conversation",
+        asked_at: "2026-10-12T15:40:00Z", ...extra }],
+    },
+  });
+  const openMacs = async () => {
+    await page();
+    const nav = screen.getByRole("navigation", { name: "Accounts and routing pages" });
+    fireEvent.click(within(nav).getByRole("button", { name: "Your Macs" }));
+    return document.querySelector<HTMLElement>('[data-routing-page="macs"]')!;
+  };
+
+  it("says who asked and when, and sends the real command with the yes", async () => {
+    answers.khipu_config_show = waiting();
+    answers.khipu_owner_answer = "answered";
+    const macs = await openMacs();
+    const row = await within(macs).findByRole("group", { name: "Studio" });
+    expect(row).toHaveTextContent("A Claude Code conversation asked");
+    expect(row).toHaveTextContent("Confirm route.pause");
+    fireEvent.click(within(row).getByRole("button", { name: "Yes" }));
+    await waitFor(() => expect(calls("khipu_owner_answer")).toEqual([{ request: "rm-req-1", answer: "yes" }]));
+  });
+
+  it("offers only No, with the holder's reason, for a request the holder would refuse", async () => {
+    answers.khipu_config_show = waiting({ decline_only: true, reason: "This request has expired because its saved end has passed. Decline it; it cannot be applied." });
+    const macs = await openMacs();
+    const row = await within(macs).findByRole("group", { name: "Studio" });
+    expect(within(row).queryByRole("button", { name: "Yes" })).toBeNull();
+    expect(within(row).getByRole("button", { name: "No" })).toBeInTheDocument();
+    expect(row).toHaveTextContent("has expired because its saved end has passed");
+  });
+
+  it("shows the CLI's own refusal (a JSON answer with ok: false) in the row too", async () => {
+    answers.khipu_config_show = waiting();
+    answers.khipu_owner_answer = { ok: false, error: "This is the owner's command: it needs a typed confirmation.", code: "owner_only" };
+    const macs = await openMacs();
+    const row = await within(macs).findByRole("group", { name: "Studio" });
+    fireEvent.click(within(row).getByRole("button", { name: "No" }));
+    expect(await within(row).findByRole("alert")).toHaveTextContent(/didn't make that change.*owner's command/);
+  });
+
+  it("shows the CLI's refusal in the row when the answer fails", async () => {
+    answers.khipu_config_show = waiting();
+    answers.khipu_owner_answer = () => { throw new Error("khipu exited 2: that request is no longer waiting"); };
+    const macs = await openMacs();
+    const row = await within(macs).findByRole("group", { name: "Studio" });
+    fireEvent.click(within(row).getByRole("button", { name: "Yes" }));
+    expect(await within(row).findByRole("alert")).toHaveTextContent(/didn't make that change.*no longer waiting/);
+  });
+});
+
 describe("Settings -> Accounts and routing: eight pages", () => {
   it("keeps every page in the permanent navigation and moves existing Mac controls without changing their command", async () => {
     await page();

@@ -639,8 +639,12 @@ def remote_requests():
         if not remote:
             continue
         state = row.get("state")
+        blocked = owner_direction.UNAPPLYABLE_WORDS.get(remote.get("blocked")) if state == "pending" else None
         out.append({"id": row.get("id"), "ask": None if remote.get("withheld") else row.get("ask"),
                     "answerable": not remote.get("withheld"),
+                    # The holder would refuse a yes: only a no is offered, for the reason it gives.
+                    "decline_only": bool(blocked), "reason": blocked,
+                    "asked_by": (row.get("by") or {}).get("words"), "asked_at": row.get("created_at"),
                     "request": remote.get("request"), "mac": mac_label(remote.get("mac")), "state": state,
                     "words": row.get("receipt") or (
                         "Your answer is on its way; it applies there within a few minutes." if state == "answered"

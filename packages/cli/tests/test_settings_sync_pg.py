@@ -575,6 +575,10 @@ def test_a_request_the_holder_would_refuse_is_decline_only_on_the_other_mac_with
     assert reason in item["words"] and "Studio" in item["words"]
     assert item["asked_by"]["who"] == "a Claude Code conversation on Studio"
     assert item["asked_by"]["when"] == "3 days ago", item["asked_by"]
+    # The app's Your Macs list reads the same facts.
+    (shown,) = [r for r in b.mirrors() if r["request"] == request]
+    assert shown["decline_only"] is True and shown["reason"] == reason
+    assert shown["asked_by"] == "a Claude Code conversation"
     # Declining still reaches the holder.
     b.say("no, drop it", "sB")
     bad, out = b.act("direction.decline", {"request": f"rm-{request}"}, "sB")
