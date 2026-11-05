@@ -31,6 +31,14 @@ def seeded(replay):
     return replay
 
 
+@pytest.fixture
+def idle(replay):
+    routing.report(account="Codex", state="open", author=AUTHOR)
+    replay.write(*[sample(T0 - timedelta(hours=30) + timedelta(minutes=50 * i), 40.0) for i in range(36)])
+    assert next(a for a in replay.view()["accounts"] if a["key"] == "codex|")["pace"][0]["idle"] is True
+    return replay
+
+
 def answer(replay):
     view = routing._prompt_view(replay.now, kick=lambda why: None)
     return view, routing._generation(view, routing.settings())
@@ -49,15 +57,58 @@ def current_used(view, key="codex|"):
     return next(p for p in entry["pace"] if p["window"] == "weekly")["used_pct"]
 
 
-def test_astra_probe_a_same_meaning_local_append_keeps_the_answer(seeded):
+def test_astra_probe_a_same_meaning_local_append_keeps_the_answer(idle):
     """Appending only a usage sample and saving a view that means the same."""
-    view, generation = answer(seeded)
-    used = current_used(view)
-    raw_append(sample(seeded.now, used))
+    view, generation = answer(idle)
+    raw_append(sample(idle.now, current_used(view)))
     assert recall_prompt._routing_generation_current(generation), "before any refold"
-    routing._poll_refold(seeded.now)
+    routing._poll_refold(idle.now)
     assert routing._load_view()["fingerprint"]["events"] != view["fingerprint"]["events"]
     assert recall_prompt._routing_generation_current(generation), "after a refold that means the same"
+
+
+def test_an_equal_reading_no_fold_has_read_is_not_excused_unless_it_cannot_matter(replay):
+    """Codex: 12% at 200, 140 and 80 minutes ago. The buffered view says "last
+    reading 1.3 h old"; a current 12% makes it idle with a known allowance."""
+    routing.report(account="Codex", state="open", author=AUTHOR)
+    reset = replay.now + timedelta(hours=3)
+    replay.write(*[sample(replay.now - timedelta(minutes=m), 12.0, window="five_hour", reset=reset) for m in (200, 140, 80)])
+    view, generation = answer(replay)
+    pace = next(p for a in view["accounts"] if a["key"] == "codex|" for p in a["pace"] if p["window"] == "five_hour")
+    assert pace["why"] == "last reading 1.3 h old"
+    raw_append(sample(replay.now, 12.0, window="five_hour", reset=reset))
+    assert routing_generation.stale_input(generation) == "events:usage_sample"
+    routing._poll_refold(replay.now)
+    after = routing._load_view()
+    pace = next(p for a in after["accounts"] if a["key"] == "codex|" for p in a["pace"] if p["window"] == "five_hour")
+    assert pace["idle"] is True and pace["plan"]["needed_pct_per_h"] is not None
+    assert routing_generation.revision(after) != routing_generation.revision(view)
+    assert routing_generation.stale_input(generation) == "view:revision"
+
+
+def test_an_equal_reading_on_a_window_with_a_forecast_waits_for_a_fold(seeded):
+    """Rate and coverage move with it, so only a fold can say what it changes."""
+    view, generation = answer(seeded)
+    raw_append(sample(seeded.now, current_used(view)))
+    assert routing_generation.stale_input(generation) == "events:usage_sample"
+    routing._poll_refold(seeded.now)
+    assert routing_generation.revision(routing._load_view()) == routing_generation.revision(view)
+    assert routing_generation.stale_input(generation) is None
+
+
+@pytest.mark.parametrize("change", [
+    {"used_pct": 41.0}, {"resets_at": routing._iso(RESET + timedelta(seconds=1))}, {"window": "five_hour"},
+    {"account": "grok|"}, {"resets_at": None}])
+def test_only_the_same_value_in_the_same_cycle_of_an_idle_window_cannot_change_it(change):
+    view = {"accounts": [{"key": "codex|", "pace": [{"window": "weekly", "idle": True, "used_pct": 40.0,
+                                                    "cycle_resets_at": routing._iso(RESET)}]}]}
+    row = sample(T0, 40.0)
+    assert routing_generation._cannot_change(row, view)
+    assert not routing_generation._cannot_change(dict(row, **change), view)
+    view["accounts"][0]["pace"][0].update(idle=False)
+    assert not routing_generation._cannot_change(row, view)
+    view["accounts"][0]["pace"][0].update(idle=True, day_cap={"verdict": "unknown"})
+    assert not routing_generation._cannot_change(row, view)
 
 
 def test_a_moved_reading_a_fold_found_harmless_keeps_the_answer(seeded):
@@ -70,7 +121,8 @@ def test_a_moved_reading_a_fold_found_harmless_keeps_the_answer(seeded):
     assert recall_prompt._routing_generation_current(generation)
 
 
-def test_concurrent_samples_and_repeated_prompts_never_reject_unchanged_input(seeded):
+def test_concurrent_samples_and_repeated_prompts_never_reject_unchanged_input(idle):
+    seeded = idle
     view, _generation = answer(seeded)
     used = current_used(view)
     stop = threading.Event()
@@ -224,7 +276,8 @@ def test_an_answer_with_nothing_to_show_cannot_go_stale(seeded):
     assert at.add_to("", out)[1] == {"status": "none"}
 
 
-def test_an_answer_with_words_is_delivered_when_only_a_reading_moved_on(seeded):
+def test_an_answer_with_words_is_delivered_when_only_a_reading_moved_on(idle):
+    seeded = idle
     view, generation = answer(seeded)
     raw_append(sample(seeded.now, current_used(view)))
     at, writer = _fake_reader([(0.0, json.dumps(_buffered(view, generation)).encode() + b"\n")])

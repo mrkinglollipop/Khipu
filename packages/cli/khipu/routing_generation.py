@@ -108,20 +108,23 @@ def _kind_word(row: dict) -> str:
     return kind if isinstance(kind, str) and re.fullmatch(r"[a-z_]{1,40}", kind) else "other"
 
 
-def _same_reading(row: dict, view: dict) -> bool:
-    """Whether a pace reading says what the view already holds for its window:
-    the same usage in the same cycle, with nothing waiting to settle. It moves
-    only the time of the newest reading, which no answer's advice rests on."""
+def _cannot_change(row: dict, view: dict) -> bool:
+    """Whether a pace reading no fold has read yet cannot change what the view
+    shows. Equal usage and reset is not enough: a reading also moves freshness
+    and coverage, which can settle a reason, name a rate or lower one. Only a
+    window already idle has nothing for that to move: one more reading of its
+    value in its cycle leaves it idle, at the same level, at the same rate of
+    nothing. A per-day cap still unknown is read for coverage, so it can move."""
     if row.get("type") != "usage_sample":
         return False
     entry = next((a for a in view.get("accounts") or [] if a.get("key") == row.get("account")), None)
     pace = next((p for p in (entry or {}).get("pace") or [] if p.get("window") == row.get("window")), None)
-    if pace is None or pace.get("used_pct") is None or row.get("used_pct") != pace["used_pct"]:
+    if pace is None or pace.get("idle") is not True or row.get("used_pct") != pace.get("used_pct"):
         return False
-    if str(pace.get("why") or "").startswith(("possible reset", "reset ")):
+    if (pace.get("day_cap") or {}).get("verdict") == "unknown":
         return False
     held, read = _parse(pace.get("cycle_resets_at")), _parse(row.get("resets_at"))
-    return held is not None and read is not None and abs((held - read).total_seconds()) <= 60
+    return held is not None and held == read
 
 
 def _log_decision(path: str, answered, observed) -> str | None:
@@ -141,8 +144,8 @@ def _log_decision(path: str, answered, observed) -> str | None:
 
 def _unread_change(path: str, view: dict, answered, observed) -> str | None:
     """A report counts as what the fold made of it. The saved view (its revision
-    already matched) says so when it read that far; past that, only a reading it
-    already holds can be excused."""
+    already matched) says so when it read that far; past that, only a reading
+    that cannot change what it shows is excused (``_cannot_change``)."""
     folded = (view.get("fingerprint") or {}).get("events")
     if folded == observed:
         return None
@@ -153,7 +156,7 @@ def _unread_change(path: str, view: dict, answered, observed) -> str | None:
     if unread is None:
         return "events:rewritten"
     for row in unread:
-        if not _same_reading(row, view):
+        if not _cannot_change(row, view):
             return f"events:{_kind_word(row)}"
     return None
 
