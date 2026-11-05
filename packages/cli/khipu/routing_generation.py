@@ -149,6 +149,11 @@ def _unread_change(path: str, view: dict, answered, observed) -> str | None:
     folded = (view.get("fingerprint") or {}).get("events")
     if folded == observed:
         return None
+    if isinstance(folded, list) and folded[2] == observed[2] and folded[1] > observed[1]:
+        # A fold that got further than this check's stat has read all it saw. The
+        # log only grows, so one now shorter than that fold read was rewritten.
+        now = os.stat(path)
+        return None if now.st_ino == folded[2] and now.st_size >= folded[1] else "events:rewritten"
     # A view older than the answer (a stale answer took the log's stat at its
     # read): what was there then is that answer's, delivered a prompt late.
     read_to = folded if isinstance(folded, list) and folded[2] == observed[2] and folded[1] > answered[1] else answered

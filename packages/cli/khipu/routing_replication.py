@@ -404,7 +404,8 @@ class PostgresHub:
         """Drop this sender's own pace readings no Mac's pace can still read; no
         other kind and no other sender's. Pulls page by (received time, id) from
         where they are, so a row gone behind them moves no cursor, and rule numbers
-        and receipts belong to kinds this never touches."""
+        and receipts belong to kinds this never touches. Two Macs sharing one
+        mac-id would prune each other's: already broken, and left unguarded on purpose."""
         from khipu import db
 
         with db.connect(statement_timeout_s=5) as conn:

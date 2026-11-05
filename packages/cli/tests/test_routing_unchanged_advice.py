@@ -149,14 +149,50 @@ def test_concurrent_samples_and_repeated_prompts_never_reject_unchanged_input(id
             _view, generation = answer(seeded)
             time.sleep(0.01)  # the answer sits in the pipe while search runs
             asked += 1
-            if not recall_prompt._routing_generation_current(generation):
-                rejected.append(generation)
+            cause = routing_generation.stale_input(generation)
+            if cause:
+                rejected.append(cause)
     finally:
         stop.set()
         thread.join()
     assert not errors
     assert wrote[0] >= 5, "the writer never ran alongside the prompts"
     assert rejected == [], f"{len(rejected)} of {asked} prompts rejected with {wrote[0]} samples written"
+
+
+def _fold_lands_during_the_check(monkeypatch, then=None):
+    """Between the check's stat of the log and its read of the view, a writer
+    appends and a fold saves: the view has read further than the check saw."""
+    read = routing_generation._read_view
+
+    def later(path):
+        monkeypatch.setattr(routing_generation, "_read_view", read)
+        routing._write_many([sample(routing._now(), 40.0)])
+        if then:
+            then()
+        return read(path)
+    monkeypatch.setattr(routing_generation, "_read_view", later)
+
+
+def test_a_fold_ahead_of_what_the_check_saw_is_no_rewrite(idle, monkeypatch):
+    view, generation = answer(idle)
+    raw_append(sample(idle.now, current_used(view)))
+    _fold_lands_during_the_check(monkeypatch)
+    assert routing_generation.stale_input(generation) is None
+
+
+def test_a_log_shorter_than_a_fold_ahead_of_the_check_read_was_rewritten(idle, monkeypatch):
+    view, generation = answer(idle)
+    raw_append(sample(idle.now, current_used(view)))
+
+    def cut():
+        # Back to what the check saw, on the same file: only a rewrite does that.
+        path = routing.events_file()
+        lines = path.read_bytes().splitlines(keepends=True)
+        with path.open("r+b") as fh:
+            fh.truncate(sum(map(len, lines[:-1])))
+    _fold_lands_during_the_check(monkeypatch, then=cut)
+    assert routing_generation.stale_input(generation) == "events:rewritten"
 
 
 def test_pace_figures_moving_is_no_change_in_what_is_decided():
