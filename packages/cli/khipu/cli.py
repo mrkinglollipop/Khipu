@@ -4775,6 +4775,9 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     return 0 if out.get("ok") else 1
 
 
+ROUTING_COPY_MAX_S = 230
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
     from khipu.hub_snapshot import refresh, snapshot_freshness
 
@@ -4818,9 +4821,11 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         # The routing copy between Macs must not depend on a prompt helper
         # being alive. Last, so a slow hub cannot delay the stages above.
         try:
-            from khipu import routing
+            from khipu import deadline, routing
 
-            out["routing_copy"] = routing.poll_refold()
+            # Under the five-minute tick, so a hub that stops answering cannot hold the next run off.
+            with deadline.limit(ROUTING_COPY_MAX_S, "the routing copy"):
+                out["routing_copy"] = routing.poll_refold()
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["routing_copy"] = timer_error(exc)
         print(json.dumps(out, indent=2))
