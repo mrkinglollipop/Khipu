@@ -2131,7 +2131,7 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
         # Generated identifiers are deliberately high entropy. Only these exact
         # typed shapes bypass the free-text secret heuristic; paths never do.
         if shape in ("id", "revision_id", "mac_id") and re.fullmatch(
-                r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac)-)?[0-9a-f]{8}-[0-9a-f]{4}-[57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value):
+                r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac|cap)-)?[0-9a-f]{8}-[0-9a-f]{4}-[57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value):
             return value
         if shape == "revision_id" and re.fullmatch(r"[0-9a-f]{64}", value):
             return value
@@ -2606,7 +2606,7 @@ EXCEPTION_WORDS_MOST = 500  # characters one exception's words may hold
 
 
 _TYPED_UUID = re.compile(
-    r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac)-)?"
+    r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac|cap)-)?"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 
 
