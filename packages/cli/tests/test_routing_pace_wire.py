@@ -203,6 +203,54 @@ def test_a_bucket_with_a_possible_reset_goes_whole_and_an_open_one_waits():
     assert wire(ancient, now)[0] == (set(), set())
 
 
+def _quarter_hour_reset(now=T0):
+    """Usage fell to 2 and rose, all under one named reset, 3 of the readings in
+    a later bucket than the fall from 50."""
+    return [(now - timedelta(minutes=m), used) for m, used in ((80, 50.0), (50, 50.0), (20, 50.0), (14, 2.0), (12, 3.0), (10, 4.0))]
+
+
+def test_a_reset_confirmed_by_three_readings_stays_confirmed_across_buckets():
+    rows = [{"t": at, "used": used, "reset": RESET} for at, used in _quarter_hour_reset()]
+    (send, hold), _tagged = wire(rows, T0)
+    assert not hold and {3, 4, 5} <= send, f"sent {sorted(send)}"
+    full = pace_of(rows, T0)
+    kept = pace_of([r for i, r in enumerate(rows) if i in send], T0)
+    assert not str(full["why"]).startswith("possible reset")
+    assert full["why"] == kept["why"] and full["used_pct"] == kept["used_pct"] == 4.0
+
+
+def test_both_macs_agree_on_a_reset_confirmed_at_a_quarter_hour(pair):
+    a, b, hub = pair
+    a.activate()
+    assert a.now.timestamp() % 900 == 0
+    a.write(*[sample(at, used) for at, used in _quarter_hour_reset(a.now)])
+    settle(a, b, hub)
+    a.activate()
+    here = weekly(a.view())[0]
+    b.activate()
+    there = weekly(b.view())[0]
+    assert not str(there["why"]).startswith("possible reset"), there["why"]
+    assert (there["why"], there["used_pct"], there["plan"]["verdict"]) == (here["why"], here["used_pct"], here["plan"]["verdict"])
+    assert len([r for r in hub.calls if r["type"] == "usage_sample"]) >= 4
+
+
+@pytest.mark.parametrize("values,kept", [
+    # A dip that comes back is a correction, read from every reading, rebound included.
+    ((50, 49, 48, 50, 51, 52), {0, 1, 2, 3, 5}),
+    # Far below for three readings: a new cycle, and rising after that thins again.
+    ((50, 2, 3, 4, 5, 6, 7), {0, 1, 2, 3, 6}),
+    # Far below twice and then back: never settled.
+    ((50, 2, 3, 50, 51), {0, 1, 2, 3, 4}),
+    # Just rising: only the newest of the bucket goes.
+    ((50, 51, 52, 53), {3})])
+def test_what_a_fall_needs_crosses_and_nothing_more(values, kept):
+    start = T0 - timedelta(hours=1)
+    rows = [{"t": start + timedelta(minutes=i), "used": float(v), "reset": RESET} for i, v in enumerate(values)]
+    assert wire(rows, T0)[0][0] == kept
+    full, thin = pace_of(rows, T0), pace_of([r for i, r in enumerate(rows) if i in kept], T0)
+    assert full["why"] == thin["why"] and full["used_pct"] == thin["used_pct"] and full["cycle_resets_at"] == thin["cycle_resets_at"]
+
+
 def _rewrites(monkeypatch):
     done = []
     real = replication._atomic

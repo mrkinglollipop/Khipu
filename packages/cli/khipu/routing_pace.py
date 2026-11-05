@@ -306,30 +306,57 @@ def shared_readings(samples, mine, now):
 # others do. Sending only that, once the bucket has closed and at the next
 # quarter hour, gives the other Mac the same buckets; every window's closed
 # buckets go together, so they reach the other Mac as one pull and one rewrite of
-# its copy. Nothing older than what pace can read is sent.
+# its copy. A fall is the exception: the reset detector reads it reading by
+# reading. Nothing older than what pace can read is sent.
 WIRE_TICK_S = 900
 WIRE_OLDEST_S = 2 * 86400
+_RESET_DROP = 5
+_RESET_READINGS = 3
+
+
+def _after_a_fall(readings):
+    """The readings ``compute_pace``'s reset detector reads one by one, in time
+    order: the highest before a fall, then everything until usage returns to it
+    or enough readings stay far enough below it to settle a new cycle."""
+    keep, high, top, low, under = set(), None, None, [], False
+    for at, s in enumerate(readings):
+        if at and abs((s["reset"] - readings[at - 1]["reset"]).total_seconds()) > 3600:
+            high, top, low, under = None, None, [], False  # another cycle has its own highest
+        if high is None or s["used"] >= high:
+            if under:
+                keep.add(s["_id"])  # the rebound that closes a dip
+            high, top, low, under = s["used"], s["_id"], [], False
+            continue
+        keep.update((top, s["_id"]))
+        under = True
+        low = low + [s] if s["used"] < high - _RESET_DROP else []
+        if len(low) == _RESET_READINGS:
+            top = max(low, key=lambda r: r["used"])["_id"]
+            high, low, under = max(r["used"] for r in low), [], False
+    return keep
 
 
 def wire_choice(readings, now):
     """(to send now, to hold until the bucket closes) of one Mac's readings of
     one account window, as sets of their ``_id``; the rest never leave. A bucket
-    where the reading fell or the reset moved goes whole, as a possible reset
-    has to be judged from every reading."""
+    where the reset moved goes whole, and so does everything after a fall that
+    the reset detector needs, whichever bucket it is in."""
     send, hold = set(), set()
     params = _sample_params(readings[0].get("window"), readings) if readings else None
     if params is None:
         return send, hold
     tick = now.timestamp() // WIRE_TICK_S * WIRE_TICK_S
+    ordered = sorted(readings, key=lambda x: x["t"])
+    fallen = _after_a_fall(ordered)
     buckets = {}
-    for s in sorted(readings, key=lambda x: x["t"]):
+    for s in ordered:
         buckets.setdefault(int(s["t"].timestamp() // params["bucket_s"]), []).append(s)
     for number, group in buckets.items():
         if (number + 1) * params["bucket_s"] > tick:
             hold.update(s["_id"] for s in group)
         elif (now - group[-1]["t"]).total_seconds() <= WIRE_OLDEST_S:
-            rising = all(a["used"] <= b["used"] and a["reset"] == b["reset"] for a, b in zip(group, group[1:]))
-            send.update(s["_id"] for s in (group[-1:] if rising else group))
+            one_reset = all(a["reset"] == b["reset"] for a, b in zip(group, group[1:]))
+            send.update(s["_id"] for s in group if s is group[-1] or not one_reset or s["_id"] in fallen)
     return send, hold
 
 
