@@ -2064,7 +2064,8 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
     # words travel only as a pending proposal's do (``proposal_text``).
     "request_state": {"request": "id", "req_kind": frozenset({"held", "setting"}),
                       "req_state": frozenset({"pending", "applied", "declined", "failed", "stale", "gone"}),
-                      "req_action": "id", "sig": "revision_id", "asked_at": "time", "withheld": "bool"},
+                      "req_action": "id", "sig": "revision_id", "asked_at": "time", "withheld": "bool",
+                      "asked_harness": "name", "req_blocked": frozenset({"expired", "out_of_date"})},
     "request_answer": {"request": "id", "req_answer": frozenset({"confirm", "decline"}), "sig": "revision_id",
                        "answer_harness": "name", "message_sha": "revision_id"},
     "cap_set": {"account": "account", "kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
@@ -2506,7 +2507,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
                 "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal", "batch",
                 "batch_target", "key", "value_json", "request", "req_kind", "req_state", "req_action",
-                "sig", "ask", "req_answer", "answer_harness", "message_sha")
+                "sig", "ask", "req_answer", "answer_harness", "message_sha", "asked_at", "asked_harness", "req_blocked")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at", "asked_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",

@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg
@@ -525,3 +526,80 @@ def test_needs_you_yes_and_no_answer_a_request_held_on_the_other_mac_the_same_wa
     sync_all(b, a)
     assert a.paused()
     assert [x for x in a.log() if x.get("action") == "route.pause"][0]["confirmed"]["source"] == "other_mac"
+
+
+# ---- a request held on the other Mac reads the same on both Macs -------------------------------
+
+
+def _hold_priority_amend(mac, session="sP"):
+    """A conversation asks to amend the priority; it is held for the owner."""
+    mac.activate()
+    routing.set_priority([{"account": "Codex"}, {"account": "Grok"}], via="app", expect=routing.priority_version())
+    mac.say("add a note to the Codex priority", session)
+    bad, out = mac.act("direction.request", {"action": "route.priority.amend", "args": {
+        "account": "Codex", "append": "and docs", "expect": routing.priority_version()}}, session)
+    assert not bad and out["pending"] is True, out
+    return out["request"]
+
+
+def _item_on(mac, request, session="sB"):
+    (item,) = [i for i in mac.waiting(session)["items"] if i["key"] == f"held:rm-{request}"]
+    return item
+
+
+def test_a_waiting_request_on_the_other_mac_says_who_asked_and_when(macs):
+    a, b = macs
+    both_on(a, b)
+    request = _hold_priority_amend(a)
+    sync_all(a, b)
+    item = _item_on(b, request)
+    assert item["asked_by"]["who"] == "a Claude Code conversation on Studio", item["asked_by"]
+    assert item["asked_by"]["when"] == "just now" and "unknown writer" not in json.dumps(item)
+    assert item["settle"]["confirm"]["action"] == "direction.confirm" and not item.get("decline_only")
+
+
+def test_a_request_the_holder_would_refuse_is_decline_only_on_the_other_mac_with_the_same_reason(macs):
+    a, b = macs
+    both_on(a, b)
+    request = _hold_priority_amend(a)
+    sync_all(a, b)
+    a.activate()
+    routing.set_priority([{"account": "Grok"}], via="app", expect=routing.priority_version())  # makes it out of date
+    held = next(r for r in owner_direction._read_requests(owner_direction.requests_path()) if r["id"] == request)
+    reason = owner_direction.unapplyable_reason(held)
+    assert reason
+    sync_all(a, b)
+    b.now = datetime.now(timezone.utc) + timedelta(days=3)  # the request was asked in real time
+    item = _item_on(b, request)
+    assert item["decline_only"] is True and item["settle"]["confirm"] is None
+    assert reason in item["words"] and "Studio" in item["words"]
+    assert item["asked_by"]["who"] == "a Claude Code conversation on Studio"
+    assert item["asked_by"]["when"] == "3 days ago", item["asked_by"]
+    # Declining still reaches the holder.
+    b.say("no, drop it", "sB")
+    bad, out = b.act("direction.decline", {"request": f"rm-{request}"}, "sB")
+    assert not bad and out["sent"] is True, out
+    sync_all(b, a)
+    held = next(r for r in owner_direction._read_requests(owner_direction.requests_path()) if r["id"] == request)
+    assert held["state"] == "declined"
+
+
+def test_a_row_mirrored_before_the_fix_is_corrected_by_the_holders_next_line(macs):
+    a, b = macs
+    both_on(a, b)
+    request = _hold_priority_amend(a)
+    sync_all(a, b)
+    b.activate()
+    path = owner_direction.requests_path()
+    state = owner_direction._load(path)
+    for row in state["requests"]:
+        if row.get("remote"):
+            row["by"] = {"kind": "other_mac"}
+            row["remote"].pop("blocked", None)
+            row["created_at"] = owner_direction._iso((b.now - timedelta(seconds=10)).timestamp())
+    owner_direction._save(path, state, b.now.timestamp())
+    a.activate()
+    routing.set_priority([{"account": "Grok"}], via="app", expect=routing.priority_version())
+    sync_all(a, b)
+    item = _item_on(b, request)
+    assert item["decline_only"] is True and item["asked_by"]["who"] == "a Claude Code conversation on Studio"

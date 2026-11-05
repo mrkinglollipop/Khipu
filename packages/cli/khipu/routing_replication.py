@@ -427,8 +427,11 @@ def _request_rows():
         if withheld:
             ask = ("A conversation asked to "
                    + needs_you.ACTION_WORDS.get(row.get("action"), "make a change") + ".")
+        blocked = owner_direction.unapplyable_code(row) if state == "pending" else None
         out.append((str(row["id"]), "held", state, str(row.get("action") or ""),
-                    _sig(owner_direction.signature(row["action"], row["args"])), row.get("created_at"), ask, withheld))
+                    _sig(owner_direction.signature(row["action"], row["args"])), row.get("created_at"), ask, withheld,
+                    (row.get("by") or {}).get("harness") if isinstance(row.get("by"), dict)
+                    and row["by"].get("kind") in (None, "conversation") else None, blocked))
     config = load_config()
     for key, waiting in routing._setting_requests(config).items():
         if key not in routing.SETTINGS:
@@ -438,13 +441,22 @@ def _request_rows():
         words = (f"A conversation asked to change a routing setting: {name}. It would go from "
                  f"{needs_you._setting_value(kind, before)} to {needs_you._setting_value(kind, config.get(key))}.")
         out.append((f"setting:{key}", "setting", "pending", "config.answer_request",
-                    _sig(routing.setting_request_pin(key, waiting, config.get(key))), waiting.get("at"), words, False))
+                    _sig(routing.setting_request_pin(key, waiting, config.get(key))), waiting.get("at"), words, False,
+                    None, None))
     return out
 
 
-def _request_event(request, kind, state, action, sig, asked_at, ask, withheld):
+def _request_event(request, kind, state, action, sig, asked_at, ask, withheld, by=None, blocked=None):
+    from khipu import owner_direction
+
     event = {"type": "request_state", "request": request, "req_kind": kind, "req_state": state, "sig": sig,
              "withheld": withheld, "ask": ask, "written_by": {"kind": "check"}, "via": "check"}
+    # Which harness asked (never a session or a name) and why the holder can
+    # now only refuse it, so the other Mac reads the same item.
+    if isinstance(by, str) and by:
+        event["asked_harness"] = by
+    if blocked in owner_direction.UNAPPLYABLE_WORDS:
+        event["req_blocked"] = blocked
     if action and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", action):
         event["req_action"] = action
     if isinstance(asked_at, str) and asked_at:
@@ -458,11 +470,14 @@ def _emit_request_states(rows, state):
     sent = state.setdefault("requests_published", {})
     batch = []
     for row in rows:
-        request, kind, st, action, sig, asked_at, ask, withheld = row
-        if sent.get(request) == [st, sig]:
+        request, kind, st, action, sig, asked_at, ask, withheld, by, blocked = row
+        # A waiting request is sent again when its refusal reason appears; an
+        # older line without the reason slot is sent once more to carry it.
+        key = [st, sig, blocked or ""] if st == "pending" else [st, sig]
+        if sent.get(request) == key:
             continue
         batch.append(_request_event(*row))
-        sent[request] = [st, sig]
+        sent[request] = key
     if batch:
         routing._write_many(batch)
     return len(batch)
@@ -479,8 +494,8 @@ def publish_requests():
         rows = _request_rows()
         seen = {r[0] for r in rows}
         # A setting request that is no longer waiting was answered here.
-        gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False)
-                for request, (st, sig) in (state.get("requests_published") or {}).items()
+        gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False, None, None)
+                for request, (st, sig, *_rest) in (state.get("requests_published") or {}).items()
                 if request not in seen and st == "pending" and request.startswith("setting:")]
         if _emit_request_states(rows + gone, state):
             state.setdefault("mac", routing._local_mac())
@@ -519,6 +534,31 @@ def _write_mirror(update):
     return True
 
 
+def _asked_at(row, now):
+    """When the holder's conversation asked, not when this Mac heard of it."""
+    from khipu import owner_direction
+
+    at = row.get("asked_at")
+    if isinstance(at, str) and routing._parse(at) is not None:
+        return at
+    return owner_direction._iso(now) if now is not None else None
+
+
+def _asked_by(row):
+    """Who asked, in Khipu's own fixed words for a harness; anything else is dropped."""
+    harness = row.get("asked_harness")
+    if not isinstance(harness, str) or not harness:
+        return None
+    return routing.author_words({"kind": "conversation", "harness": harness}, push=True)
+
+
+def _blocked(row):
+    from khipu import owner_direction
+
+    code = row.get("req_blocked")
+    return code if code in owner_direction.UNAPPLYABLE_WORDS else None
+
+
 def mirror_remote_requests(state):
     """A request another Mac holds, as a held request here; and how it ended
     there, so a request settled elsewhere never lingers."""
@@ -540,7 +580,18 @@ def mirror_remote_requests(state):
             current = next((r for r in rows if r.get("id") == mirror), None)
             if final == "pending":
                 if current is not None:
-                    return False
+                    # A line from a newer holder can add who asked, when, or that
+                    # it can now only be refused; a request stays one row.
+                    if current.get("state") != "pending":
+                        return False
+                    words, blocked, at = _asked_by(row), _blocked(row), _asked_at(row, None) or current.get("created_at")
+                    if ((current.get("by") or {}).get("words"), (current.get("remote") or {}).get("blocked"),
+                            current.get("created_at")) == (words, blocked, at):
+                        return False
+                    current["by"] = {"kind": "other_mac", "words": words}
+                    current.setdefault("remote", {})["blocked"] = blocked
+                    current["created_at"] = at
+                    return True
                 if row.get("withheld") is True or not row.get("ask"):
                     ask = ("A conversation on " + where + " asked for a change. Its words stay on that Mac, so they "
                            "can't be shown here: answer it there.")
@@ -548,10 +599,12 @@ def mirror_remote_requests(state):
                 else:
                     ask, withheld = str(row["ask"]), False
                 rows.append({"id": mirror, "action": "direction.remote", "args": {"request": request, "mac": mac},
-                             "state": "pending", "created_ts": now, "created_at": owner_direction._iso(now),
-                             "session": None, "by": {"kind": "other_mac"}, "ask": ask, "files": None,
+                             "state": "pending", "created_ts": now, "created_at": _asked_at(row, now),
+                             "session": None, "by": {"kind": "other_mac", "words": _asked_by(row)}, "ask": ask,
+                             "files": None,
                              "remote": {"mac": mac, "request": request, "sig": row.get("sig"), "withheld": withheld,
-                                        "kind": row.get("req_kind"), "action": row.get("req_action")}})
+                                        "kind": row.get("req_kind"), "action": row.get("req_action"),
+                                        "blocked": _blocked(row)}})
                 return True
             if current is None or current.get("state") not in ("pending", "answered", "applying"):
                 return False
@@ -623,7 +676,7 @@ def _emit_outcomes(outcomes, state):
     batch = []
     for request, (verdict, sig) in outcomes:
         batch.append(_request_event(request, "setting" if request.startswith("setting:") else "held", verdict, "", sig,
-                                    None, "", False))
+                                    None, "", False, None, None))
         if verdict not in ("stale", "gone"):
             # A stale answer says something about the answer, not the request:
             # the request's own state is still what ``publish_requests`` sends.

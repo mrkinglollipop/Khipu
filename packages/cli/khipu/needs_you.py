@@ -192,6 +192,9 @@ def _who(by, caller: str) -> str:
     """Who asked, in words: never a session id."""
     if not isinstance(by, dict):
         return "a conversation"
+    if by.get("kind") == "other_mac":
+        # Another Mac's request: its harness's fixed words, if it sent them, and which Mac.
+        return f"{by.get('words') or 'a conversation'} on {by.get('mac') or 'your other Mac'}"
     if by.get("kind") not in (None, "conversation"):
         return routing.author_words(by, push=True)
     session = by.get("session")
@@ -525,12 +528,24 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
             where = routing_replication_label(remote.get("mac"))
             said = f" It asks: {_quote_ask(row.get('ask'))}." if row.get("ask") and not remote.get("withheld") else ""
             if remote.get("withheld"):
-                out.append(_item("held", f"held:{request}", row.get("ask") or "", by={"kind": "other_mac"}, at=row.get("created_at"),
+                out.append(_item("held", f"held:{request}", row.get("ask") or "",
+                                 by={"kind": "other_mac", "mac": where, "words": (row.get("by") or {}).get("words")},
+                                 at=row.get("created_at"),
                                  confirm_does="Can't be answered here: answer it on " + where + ".",
                                  undo_does="Nothing to undo here."))
                 continue
+            by = {"kind": "other_mac", "mac": where, "words": (row.get("by") or {}).get("words")}
+            if remote.get("blocked") in owner_direction.UNAPPLYABLE_WORDS:
+                # The holder would refuse a yes, so this Mac offers only the no, for the same reason.
+                out.append(_item("held", f"held:{request}", f"On {where}, a conversation asked for a change. "
+                                 f"{owner_direction.UNAPPLYABLE_WORDS[remote['blocked']]}{said}", by=by,
+                                 at=row.get("created_at"), decline_only=True,
+                                 confirm_does="Nothing to confirm: it would be refused.",
+                                 undo_does=f"Tells {where} no: it drops the request and nothing changes.",
+                                 undo=decline))
+                continue
             out.append(_item("held", f"held:{request}", f"On {where}, a conversation asked for a change, and it is "
-                             f"held until you answer.{said}", by={"kind": "other_mac", "mac": where}, at=row.get("created_at"),
+                             f"held until you answer.{said}", by=by, at=row.get("created_at"),
                              confirm_does=f"Tells {where} yes: it makes the change there within a few minutes.",
                              undo_does=f"Tells {where} no: it drops the request and nothing changes.",
                              confirm=_act("direction.confirm", request=request), undo=decline))
