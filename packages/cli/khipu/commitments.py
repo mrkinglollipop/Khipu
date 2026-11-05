@@ -49,6 +49,10 @@ ASSISTANT_OWNERS = frozenset({
 # alias — used both for the owner-normalization set and (as multi-word
 # phrases) inside the actor/decision regexes.
 _GENERIC_USER_OWNER_WORDS = ("user", "operator", "human", "you", "owner")
+# This is the maintainer's own tool, and an owner alias decides an item for good
+# when it is written, so every Mac writes with the same two names whatever its
+# config holds (the configured list adds to them).
+_BUILT_IN_USER_ALIASES = ("matt", "matthew")
 _GENERIC_USER_REGEX_PHRASES = ("the user", "user", "the operator", "you")
 OWNER_USER = "user"
 OWNER_ASSISTANT = "assistant"
@@ -265,8 +269,8 @@ _FUTURE_TRIGGER_RE = re.compile(
 def user_aliases() -> tuple[str, ...]:
     """Every name that means "the user" when an item is WRITTEN: lowercased,
     de-duplicated. The configured list (``khipu config --set user_aliases
-    "matt,matthew"`` / ``KHIPU_USER_ALIASES``), then the generic words that
-    always mean the user.
+    "priya"`` / ``KHIPU_USER_ALIASES``) after the built-in ``matt`` and
+    ``matthew``, then the generic words that always mean the user.
 
     Only capture and the clean-up's proposals read this. A stored row's owner
     is never re-derived from it (:func:`row_owner`), and no machine detail (the
@@ -284,7 +288,7 @@ def user_aliases() -> tuple[str, ...]:
             seen.add(val)
             out.append(val)
 
-    for alias in list_setting("user_aliases"):
+    for alias in (*_BUILT_IN_USER_ALIASES, *list_setting("user_aliases")):
         _add(alias)
     for word in _GENERIC_USER_OWNER_WORDS:
         _add(word)
@@ -729,8 +733,7 @@ def row_owner(row: dict[str, Any]) -> tuple[str, str | None]:
     """
     owner = str(row.get("owner") or "").strip().lower().rstrip(":")
     if owner == OWNER_AGENT:
-        return OWNER_AGENT, (clean_owner_label(row.get("owner_label"))
-                             or agent_actor(row.get("text") or "") or ORCHESTRATOR)
+        return OWNER_AGENT, clean_owner_label(row.get("owner_label")) or ORCHESTRATOR
     if owner in ASSISTANT_OWNERS:
         return OWNER_ASSISTANT, None
     return OWNER_USER, None
@@ -1865,9 +1868,26 @@ def row_guard(row: dict[str, Any], rule: str) -> str | None:
     owner decides: the owner rules infer an owner only when an item is first
     captured, and a stored owner moves only by the owner or by an explicit
     reassignment of someone else's item, so an item stored as the user's is
-    his however its text reads now. An item that reads as his today is kept
-    too, as it is shown to him."""
-    return owner_guard(row.get("stored_owner"), rule) or owner_guard(row.get("owner"), rule)
+    his however its text reads now."""
+    return owner_guard(guarded_owner(row), rule)
+
+
+def guarded_owner(row: dict[str, Any]) -> str:
+    """The owner an automatic rule's guard reads for a row, deliberately
+    conservative: the stored owner, and the user too when the words name him
+    as the one to act on an item stored for the assistant. A row stored for a
+    third party or set by hand is as stored. Display (:func:`row_owner`) never
+    reads the words; only a refusal to close does, so a close can be refused
+    that the stored owner alone would permit."""
+    stored = row.get("stored_owner", row.get("owner"))
+    owner = row_owner({**row, "owner": stored})[0]
+    if owner != OWNER_ASSISTANT or row.get("owner_reassigned_at"):
+        return owner
+    text = row.get("text") or ""
+    trigger = has_future_trigger(text) or bool(row.get("future_trigger"))
+    named = resolve_owner_and_label(text, kind=row.get("kind"), declared=owner, future_trigger=trigger,
+                                    origin=row.get("origin"))[0]
+    return OWNER_USER if named == OWNER_USER else owner
 
 
 def _owner_cols(cur) -> list[str]:

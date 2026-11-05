@@ -1241,15 +1241,15 @@ class ConfigurableUserAliasesTest(unittest.TestCase):
                 co.OWNER_USER,
             )
 
-    def test_matt_is_not_recognised_when_the_only_configured_alias_is_priya(self):
+    def test_matt_stays_the_user_and_a_configured_alias_adds_to_him(self):
         with mock.patch.dict(os.environ, {"KHIPU_USER_ALIASES": "priya"}):
             co.reset_user_patterns()
-            # Not the user: with the alias priya, "Matt" is a third party named
-            # as the subject, so the item is his as an agent, never the user's.
-            self.assertEqual(
-                co.resolve_owner_and_label("Matt to decide whether the release ships"),
-                (co.OWNER_AGENT, "Matt"),
-            )
+            # Matt's names are built in (the same on every Mac); a name no one
+            # configured is a third party named as the subject, an agent's item.
+            self.assertEqual(co.resolve_owner_and_label("Matt to decide whether the release ships"),
+                             (co.OWNER_USER, None))
+            self.assertEqual(co.resolve_owner_and_label("Sam to decide whether the release ships"),
+                             (co.OWNER_AGENT, "Sam"))
 
 
 if __name__ == "__main__":

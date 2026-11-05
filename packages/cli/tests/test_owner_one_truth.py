@@ -80,11 +80,11 @@ def test_the_text_never_overrules_the_stored_owner(monkeypatch, tmp_path):
 
 
 def test_no_machine_detail_is_a_source_of_the_owner_aliases(monkeypatch, tmp_path):
-    _machine(monkeypatch, tmp_path, aliases="", user="schwartz", git_name="Matthew Schwartz")
-    assert set(co.user_aliases()) == set(co._GENERIC_USER_OWNER_WORDS)
+    _machine(monkeypatch, tmp_path, aliases="", user="riveras", git_name="Sam Rivera")
+    assert set(co.user_aliases()) == {"matt", "matthew", *co._GENERIC_USER_OWNER_WORDS}
     git = subprocess.run(["git", "config", "--global", "user.name"], capture_output=True, text=True).stdout
-    assert git.strip() == "Matthew Schwartz", "the fixture's git name is in place"
-    assert "matthew" not in co.user_aliases() and "schwartz" not in co.user_aliases()
+    assert git.strip() == "Sam Rivera", "the fixture's git name is in place"
+    assert "sam" not in co.user_aliases() and "riveras" not in co.user_aliases()
 
 
 @pytest.mark.parametrize("stored", [None, "", "Peer 1", "matt", "someone"])
@@ -105,5 +105,39 @@ def test_capture_still_decides_the_owner_from_the_aliases_it_has(monkeypatch, tm
     """The aliases matter once, when an item is written; the owner it gets is then stored."""
     _machine(monkeypatch, tmp_path, **MACHINES["main-mac"])
     assert co.resolve_owner("Matt to decide whether the release ships") == "user"
+    # A configured name adds to Matt's.
     _machine(monkeypatch, tmp_path, **MACHINES["another-name"])
     assert co.resolve_owner("Priya to decide whether the release ships") == "user"
+    assert co.resolve_owner("Matt to decide whether the release ships") == "user"
+
+
+def test_a_close_is_refused_for_an_assistant_row_whose_words_name_the_user_as_the_actor(monkeypatch, tmp_path):
+    """The display owner is the stored one, but an automatic close stays conservative,
+    the same on every Mac."""
+    row = {"text": "Matt reviews and merges the stack himself", "kind": "followup", "owner": "ASSISTANT",
+           "origin": "conversation"}
+    plain = {"text": "Rebuild the search index", "kind": "followup", "owner": "ASSISTANT",
+             "origin": "conversation"}
+    for machine in sorted(MACHINES):
+        _machine(monkeypatch, tmp_path, **MACHINES[machine])
+        assert co.row_owner(dict(row)) == ("assistant", None)
+        assert co.row_guard(dict(row), "session-ended")
+        assert co.row_guard(dict(plain), "session-ended") is None
+        # An owner's own reassignment to the assistant is honoured.
+        assert co.row_guard(dict(row, owner_reassigned_at="2026-10-20T10:00:00+00:00"), "session-ended") is None
+
+
+def test_an_agent_label_is_the_stored_one_never_read_from_the_text():
+    row = {"owner": "agent", "owner_label": None, "text": "The reviewer must check the release branch"}
+    assert co.row_owner(row) == ("agent", co.ORCHESTRATOR)
+    assert co.row_owner(dict(row, owner_label="builder")) == ("agent", "builder")
+
+
+def test_capture_gives_one_owner_on_every_mac(monkeypatch, tmp_path):
+    """Matt's names are built in, so a Mac with no configured aliases writes what the main Mac writes."""
+    got = set()
+    for machine in sorted(MACHINES):
+        _machine(monkeypatch, tmp_path, **dict(MACHINES[machine], aliases=MACHINES[machine]["aliases"]))
+        got.add(co.resolve_owner_and_label("Matt to decide whether the release ships", declared="user"))
+        got.add(co.resolve_owner_and_label("Matthew to decide whether the release ships", declared="user"))
+    assert got == {("user", None)}

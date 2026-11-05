@@ -529,11 +529,11 @@ def _check_plan(doc: Any) -> str | None:
 
 
 def _guarded_owner(row: dict) -> str:
-    """The owner the guard reads for a row ``_select`` gave: the stored one
-    (``commitments.row_guard``), never the owner the plan would give it."""
+    """The owner the guard reads for a row ``_select`` gave (``commitments.guarded_owner``),
+    never the owner the plan would give it."""
     from khipu import commitments as co
 
-    return co.row_owner(row)[0]
+    return co.guarded_owner(row)
 
 
 def _is_users(row: dict) -> bool:
