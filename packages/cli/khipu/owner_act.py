@@ -61,7 +61,9 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.tier_table.clear": ((), ("expect",)),
     "accounts.track": (("entries",), ("expect",)),
     "accounts.rename": (("account", "name"), ("expect",)),
-    "accounts.stop": (("account",), ("expect",)),
+    # ``keep_priority``: this Mac stops reading the login, and the account stays in
+    # the owner's priority, which every Mac shares.
+    "accounts.stop": (("account",), ("expect", "keep_priority")),
     "accounts.move": (("account", "folder"), ("expect",)),
     "accounts.decline": (("harness",), ("folder",)),
     "accounts.offer_again": (("harness",), ("folder",)),
@@ -114,7 +116,7 @@ _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
 _RULE_ENTITY = re.compile(r"rule-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "helpers", "whole_folder"}
+_FLAGS = {"keep_priority", "catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "helpers", "whole_folder"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -377,7 +379,7 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
     if action == "accounts.track":
         return ["accounts", "track", *_opts(v, "entries", "expect")], []
     if action in ("accounts.rename", "accounts.stop", "accounts.move"):
-        return ["accounts", verb, *_opts(v, "account", "name", "folder", "expect")], []
+        return ["accounts", verb, *_opts(v, "account", "name", "folder", "expect", "keep_priority")], []
     if action in ("accounts.decline", "accounts.offer_again"):
         return ["accounts", verb.replace("_", "-"), *_opts(v, "harness", "folder")], []
     if action == "accounts.auto_track":
