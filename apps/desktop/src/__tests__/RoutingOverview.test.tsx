@@ -237,7 +237,7 @@ function expandNeeds() {
 
 async function settled() {
   await screen.findByRole("region", { name: "Needs you" });
-  await waitFor(() => expect(groupButton("Telling conversations")).toHaveTextContent("On: at the start"));
+  await waitFor(() => expect(groupButton("When conversations hear")).toHaveTextContent("On: at the start"));
 }
 
 /** The fixture with nothing to act on. */
@@ -291,7 +291,7 @@ describe("Accounts and routing: Nothing here needs you only after every check ra
     const loading: PlanUsageState = { ...plansOf([]), data: null, loading: true };
     const { rerender } = render(<RoutingSettings active plansState={loading} />);
     await screen.findByRole("list", { name: "Accounts" });
-    await waitFor(() => expect(groupButton("Telling conversations")).toHaveTextContent("On: at the start"));
+    await waitFor(() => expect(groupButton("When conversations hear")).toHaveTextContent("On: at the start"));
     expect(screen.getByText("Reading what needs you…")).toBeInTheDocument();
     expect(screen.queryByText("Nothing here needs you.")).toBeNull();
     rerender(<RoutingSettings active plansState={{ ...loading, loading: false, error: "The usage check did not run." }} />);
@@ -315,8 +315,8 @@ describe("Accounts and routing: every problem shows, once", () => {
     expect(tags("Accounts")).toEqual(["2 at their limit", "Sources disagree", "1 down", "1 plan can't be read", "1 not signed in"]);
     expect(groupButton("Accounts")).toHaveTextContent("5 accounts: 1 open, 2 at their limit, 1 paused, 1 down");
     expect(tags("Priority")).toEqual(["To confirm"]);
-    expect(tags("Your note and standing rules")).toEqual(["1 to confirm", "1 may be broken"]);
-    expect(tags("Providers and lanes")).toEqual(["1 stopped reporting", "1 can't be read", "1 lane without an account"]);
+    expect(tags("Your note and standing rules")).toEqual(["1 from your old file", "1 may be broken"]);
+    expect(tags("Job runners and job slots")).toEqual(["1 stopped reporting", "1 can't be read", "1 job slot without an account"]);
     expect(tags("Old routing table file")).toEqual(["Can't read the file"]);
     expect(tags("Holds")).toEqual([]);
 
@@ -430,7 +430,7 @@ describe("Accounts and routing: every problem shows, once", () => {
       expect(groupButton(g.name)).toHaveTextContent("Not read");
       expect(groupButton(g.name).querySelector(".tag.err")).toHaveTextContent("Couldn't read");
     }
-    expect(groupButton("Telling conversations")).not.toHaveTextContent("Not read");
+    expect(groupButton("When conversations hear")).not.toHaveTextContent("Not read");
     fail = false;
     fireEvent.click(within(alert).getByRole("button", { name: "Try again" }));
     await screen.findByRole("list", { name: "Accounts" });
@@ -466,8 +466,8 @@ describe("Accounts and routing: links select their page", () => {
     expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
     fireEvent.click(within(needs).getByRole("button", { name: "Read them" }));
-    expect(within(needs).getByRole("button", { name: "Keep as written" })).toBeInTheDocument();
-    fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
+    expect(within(needs).queryByRole("button", { name: "Keep as written" })).toBeNull();
+    fireEvent.click(within(needs).getByRole("button", { name: "Edit rules" }));
     await waitFor(() => expect(document.activeElement).toBe(document.querySelector('[data-route-item="rule:3"]')));
     expect(document.querySelector('[data-route-item="rule:rule-uuid-3"]')).toBeNull();
     expect(document.querySelector('[data-routing-page="work"]')).toHaveAttribute("data-active", "true");
@@ -526,7 +526,7 @@ describe("Accounts and routing: links select their page", () => {
     expandNeeds();
     const needs = screen.getByRole("region", { name: "Needs you" });
     fireEvent.click(within(needs).getByRole("button", { name: "Read them" }));
-    fireEvent.click(within(needs).getByRole("button", { name: "Edit or remove" }));
+    fireEvent.click(within(needs).getByRole("button", { name: "Edit rules" }));
     const target = document.querySelector<HTMLElement>('[data-route-item="rule:17"]')!;
     await waitFor(() => expect(target).toBeInTheDocument());
     await waitFor(() => expect(document.activeElement).toBe(target));
@@ -567,13 +567,13 @@ describe("Accounts and routing: permanent pages", () => {
 // Every control on the page before phase 3, by its accessible name, captured
 // from RoutingSettings.test.tsx's fixture ("Save" twice).
 const BEFORE = ["Add to the end", "Add", "With no priority set, list accounts by how soon their allowance runs out unused",
-  "Change: Warn when a priority a conversation set is still unconfirmed after", "Edit note", "End this note", "All, 2 rules", "To confirm, 1 rule", "Checked by Khipu, 1 rule",
-  "May be broken, 0 rules", "Confirm rule 3", "Edit rule 3", "Remove rule 3", "Edit rule 7", "Remove rule 7", "New rule", "Add rule…",
+  "Change: Warn when a priority a conversation set is still unconfirmed after", "Edit note", "End this note", "All, 2 rules", "To confirm, 0 rules", "Checked by Khipu, 1 rule",
+  "May be broken, 0 rules", "Edit rule 3", "Remove rule 3", "Edit rule 7", "Remove rule 7", "New rule", "Add rule…",
   "End the hold on this Mac", "Words", "About", "Kind", "Ends", "Add hold", "Change: How long a conversation's hold lasts",
   "Change: Longest words in a hold", "Change: Remind me about my own holds after", "Check an account at its reset time",
   "Change: Wait after the reset time", "First retry in seconds", "Second retry in seconds", "Save", "Change: Wait while the Mac is busy",
   "Tell conversations about routing", "At the start of a conversation, and after it is compacted", "Before each prompt",
-  "Before handing work to another agent", "Change your dispatch scripts", "Change: Longest summary at the start of a conversation",
+  "Before handing work to another agent", "Change your hand-off scripts", "Change: Longest summary at the start of a conversation",
   "Change: Longest update before a prompt", "Change: Longest line", "Change: Time allowed before a prompt",
   "Change: Warn when reading before a prompt is too slow on more than", "Change: Time allowed at the start of a conversation",
   "Change: Send everything again when a conversation is this far behind", "Change: Treat a report as out of date after",
@@ -581,8 +581,8 @@ const BEFORE = ["Add to the end", "Add", "With no priority set, list accounts by
   "Change: Say the record is not refreshed after", "Add a folder…", "Remove the Project A folder", "Remove the Project B folder",
   "Change: Say a job runner stopped reporting after", "Change: How much of the end of a runner's events.log is read",
   "Change: Newest limit lines kept from each runner", "Change: Look at the folders and the routing table every",
-  "Change the account for Project A's codex lane", "Change the account for Project A's main lane",
-  "Change the account for Project A's secondary lane", "Account for opus-batch", "Save", "Change the account for Project B's secondary lane",
+  "Change the account for Project A's codex job slot", "Change the account for Project A's main job slot",
+  "Change the account for Project A's secondary job slot", "Account for opus-batch", "Save", "Change the account for Project B's secondary job slot",
   "Change the routing table file", "Bring back standing rule 6"];
 
 const ROLES = ["button", "textbox", "combobox", "switch", "checkbox", "spinbutton"] as const;
@@ -596,7 +596,7 @@ describe("Accounts and routing: nothing that was on the page is missing", () => 
     await settled();
     // A lane row opens its map form on request now (slice 15c's mock), so the
     // controls it had before are checked with it open.
-    fireEvent.click(screen.getByRole("button", { name: "Change the account for Project B's opus-batch lane" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change the account for Project B's opus-batch job slot" }));
     fireEvent.click(screen.getByRole("button", { name: "Change which accounts Khipu reads" }));
     await screen.findByRole("form", { name: "Add an account" });
     // The source inventory counts preserved controls in collapsed Rarely

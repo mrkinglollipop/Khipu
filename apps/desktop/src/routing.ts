@@ -564,6 +564,8 @@ export type RouteDeliveryHealth = {
 };
 
 export type RouteView = {
+  expired_priority?: RoutePriority;
+  decline_only_requests?: { id: string; words: string; ask?: string; at?: string; by?: string }[];
   proposals?: Record<string, RouteProposal>;
   definitions?: { providers?: Record<string, RouteProvider>; accounts?: Record<string, unknown> };
   record?: boolean;
@@ -1021,7 +1023,7 @@ const BROKEN_LEAD = "A standing rule may be broken: ";
 const CANNOT_SEE: Record<string, string> = {
   fast_tier: "the model is set inside the launch script, which Khipu doesn't read.",
   paid_xai: "the launch environment is set inside the launch script, which Khipu doesn't read.",
-  grok_confirm: "the confirming lane's kind isn't set in your job runner's settings.",
+  grok_confirm: "the confirming job slot's kind isn't set in your job runner's settings.",
   grok_private: "Khipu hasn't read your job runner's list of added work yet.",
 };
 
@@ -1045,9 +1047,9 @@ function leftOutLine(cells: RuleCell[]): string {
     .map((c) => {
       const k = c.skipped ?? {};
       const items = [
-        k.lanes ? count(k.lanes, "lane", "lanes") : "",
-        k.kinds ? count(k.kinds, "lane whose kind it can't name", "lanes whose kind it can't name") : "",
-        k.fix_lanes ? count(k.fix_lanes, "default fix lane", "default fix lanes") : "",
+        k.lanes ? count(k.lanes, "job slot", "job slots") : "",
+        k.kinds ? count(k.kinds, "job slot whose kind it can't name", "job slots whose kind it can't name") : "",
+        k.fix_lanes ? count(k.fix_lanes, "default fix job slot", "default fix job slots") : "",
         k.added ? count(k.added, "line of added work", "lines of added work") : "",
         k.unfinished_line ? "an unfinished last line of added work" : "",
       ].filter(Boolean);
@@ -1086,13 +1088,13 @@ function resultLine(result: RuleResult | RuleCheckResult, f: string, nowMs: numb
   switch (result.result) {
     case "broken": {
       const words = (result.text ?? "").replace(BROKEN_LEAD, "");
-      const more = result.more ? ` ${result.more === 1 ? "1 more lane" : `${result.more} more lanes`} too.` : "";
+      const more = result.more ? ` ${result.more === 1 ? "1 more job slot" : `${result.more} more job slots`} too.` : "";
       return { text: `${by}: may be broken.${words ? ` ${words.charAt(0).toUpperCase()}${words.slice(1)}` : ""}${more}`, tone: "warn" };
     }
     case "ok": {
       const ago = fmtAgoSince(result.at, nowMs);
       const n = result.unchecked ?? 0;
-      const rest = n ? ` ${n === 1 ? "1 lane" : `${n} lanes`} couldn't be checked: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}` : "";
+      const rest = n ? ` ${n === 1 ? "1 job slot" : `${n} job slots`} couldn't be checked: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}` : "";
       const head = top ? `${by} in your job runners' settings: nothing wrong found` : `${by}: passed`;
       const scanned = cells.filter((c) => c.scan?.done);
       const lines = scanned.reduce((sum, c) => sum + (c.scan?.lines ?? 0), 0);
@@ -1117,7 +1119,7 @@ function resultLine(result: RuleResult | RuleCheckResult, f: string, nowMs: numb
     case "cannot_check":
       return { text: `${by}, but not here: ${CANNOT_SEE[result.check ?? ""] ?? CANNOT_SEE.fast_tier}`, tone: "" };
     case "no_lane":
-      return { text: `${by}, but not yet: none of your job runners has a lane this rule is about.`, tone: "" };
+      return { text: `${by}, but not yet: none of your job runners has a job slot this rule is about.`, tone: "" };
     case "no_runner":
       return { text: `${by}, but not yet: add a job runner folder so it has something to read.`, tone: "" };
     case "unreadable": // an older Khipu's word for not_read, with no cells to name
@@ -1212,7 +1214,7 @@ function entityWords(entity: string, view: RouteView): string {
   }
   if (kind === "lane") {
     const [runner, lane] = ident.split("/");
-    return `${runner}'s ${lane} lane changed`;
+    return `${runner}'s ${lane} job slot changed`;
   }
   if (entity === "table") return "the routing table's current-state section changed";
   return entity;
@@ -1373,7 +1375,7 @@ export function deliveryReason(reason: string): string {
     "gateway-cleanup-stopped": "removing the cloud copy stopped after 6 failed tries",
     "gateway-cleanup-interrupted": "removing the cloud copy was interrupted",
     "gateway-cleanup-full": "too many unresolved cloud copy cleanups",
-    "unmatched-limit": "an unmatched lane has a limit for over an hour",
+    "unmatched-limit": "an unmatched job slot has a limit for over an hour",
   };
   return words[reason] ?? reason.replace(/-/g, " ");
 }

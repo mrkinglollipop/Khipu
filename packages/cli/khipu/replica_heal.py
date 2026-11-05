@@ -266,12 +266,14 @@ def plan(
 
 
 def _hub_reachable() -> tuple[bool, str | None]:
+    from khipu import deadline
     from khipu.hub_snapshot import HUB_CONNECT_TIMEOUT_S, try_hub_connect
 
     try:
-        with try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
+        with deadline.limit(HUB_CONNECT_TIMEOUT_S * 4, "the hub check"):
+            with try_hub_connect(connect_timeout=HUB_CONNECT_TIMEOUT_S) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
         return True, None
     except Exception as exc:  # noqa: BLE001 - any failure to connect is "not reachable"
         return False, f"{type(exc).__name__}: {exc}"[:300]

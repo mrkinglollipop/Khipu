@@ -191,6 +191,7 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     "routing_delivery_live_after": ("duration", 12 * 3600, "How long a delivery identity counts as live"),
     "routing_delivery_slack": ("count", 2, "Extra delivery points before stalled delivery turns red"),
     "routing_ledger_keep_days": ("count", 7, "Remove a conversation's routing delivery ledger after this many unused days (0: never)"),
+    "routing_override_log_keep_days": ("count", 30, "Keep ended conversation override records for this many days (0: never)"),
     "routing_delivery_lease": ("duration", 60, "How long an unacknowledged routing batch stays in flight"),
     "routing_prompt_chars": ("count", 400, "Longest update before a prompt, rules and note aside (0: no limit)"),
     "routing_child_chars": ("count", 4000, "Longest routing block for a subagent at its start (0: no limit beyond the hook's own cap)"),
@@ -236,6 +237,30 @@ SETTINGS: dict[str, tuple[str, Any, str]] = {
     # config path; never replicated or pushed.
     "routing_mac_names": ("mac_names", {}, "Names you gave your Macs, by Mac id"),
 }
+
+# Settings that are meaningful on every owner Mac. This is an allow-list:
+# paths, login folders, egress switches and per-machine limits stay local.
+_SYNC_EXCLUDED = frozenset({
+    "routing_rules_seed", "routing_lane_map", "routing_sources", "routing_table",
+    "routing_replication_live", "routing_proposal_text_between_macs",
+    "routing_cloud_copy", "routing_cloud_copy_hold_words", "routing_cloud_copy_rules",
+    "routing_usage_login_grok", "routing_usage_login_cursor", "routing_usage_login_opencode",
+    "routing_busy_load", "routing_busy_wait", "routing_busy_tries", "routing_mac_names",
+})
+
+
+def settings_syncable(key: str) -> bool:
+    """Whether a routing setting may leave this Mac in a setting_set event."""
+    return key in SETTINGS and key not in _SYNC_EXCLUDED and SETTINGS[key][0] in {
+        "duration", "count", "number", "switch", "durations", "names",
+    }
+
+
+def _setting_event(key: str, value, value_set: bool, *, snapshot: bool = False) -> dict:
+    """A closed, typed setting event; JSON preserves booleans and lists."""
+    return {"type": "setting_set", "key": key,
+            "value_json": json.dumps(value, sort_keys=True, separators=(",", ":")),
+            "value_set": value_set, "snapshot": snapshot}
 
 _UNITS = {"w": 604800, "wk": 604800, "week": 604800, "weeks": 604800, "d": 86400, "day": 86400, "days": 86400,
           "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600, "m": 60, "min": 60, "mins": 60,
@@ -568,6 +593,7 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
     if key not in SETTINGS:
         raise KeyError(f"unknown routing setting {key!r}")
     kind = SETTINGS[key][0]
+    emitted: list[dict] = []
     with _lock(), mutate_config() as data:
         requests = _setting_requests(data)
         if request is not None and key in requests:
@@ -604,8 +630,31 @@ def set_setting(key: str, raw, *, request: dict | None = None) -> Path:
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
+        if request is None:
+            emitted = _sync_events(key, data, requests)
+    if emitted:
+        _write_many(owner_lines(emitted, "app"))
     refresh_view()  # config.json is an input of the view: the next prompt finds it current
     return config_file()
+
+
+def _sync_events(key: str, data: dict, requests: dict) -> list[dict]:
+    """What the owner's change to ``key`` sends the other Macs. The routing-copy
+    key is the one setting which must cross even while the copy is off: its
+    small typed line is ignored by older readers. Turning it on also sends a
+    snapshot of every shared setting, which the receiver lists as differences
+    rather than applying."""
+    out: list[dict] = []
+    if key == "routing_replication_live":
+        out.append({"type": "settings_sync_switch", "enabled": data.get(key) is True})
+        if data.get(key) is True:
+            for other in SETTINGS:
+                if settings_syncable(other):
+                    out.append(_setting_event(other, data.get(other, SETTINGS[other][1]), other in data, snapshot=True))
+    elif data.get("routing_replication_live") is True and "routing_replication_live" not in requests \
+            and settings_syncable(key):
+        out.append(_setting_event(key, data.get(key, SETTINGS[key][1]), key in data))
+    return out
 
 
 def setting_request_pin(key: str, waiting: dict, value) -> str:
@@ -626,6 +675,7 @@ def answer_setting_request(key: str, action: str, *, expect: str | None = None) 
 
     if action not in ("confirm", "undo"):
         raise SettingError("answer confirm or undo", "bad_answer")
+    emitted: list[dict] = []
     with _lock(), mutate_config() as data:
         from khipu import owner_direction
 
@@ -646,6 +696,11 @@ def answer_setting_request(key: str, action: str, *, expect: str | None = None) 
             data[SETTINGS_REQUEST_KEY] = requests
         else:
             data.pop(SETTINGS_REQUEST_KEY, None)
+        if action == "confirm":
+            # His yes makes the conversation's value his own: the other Macs follow it.
+            emitted = _sync_events(key, data, requests)
+    if emitted:
+        _write_many(owner_lines(emitted, "app"))
     refresh_view()
     return config_file()
 
@@ -2001,6 +2056,22 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
                     "state_id": "id", "schedule_id": "id"},
     "owner_change": {"target": "id", "auth": "owner_auth",
                      "harness": "name"},
+    # Settings use JSON only after the local reader has re-coerced the value.
+    # New kinds are intentionally absent from old maps, so old Macs drop them.
+    "setting_set": {"key": "name", "value_json": "setting_json", "value_set": "bool", "snapshot": "bool"},
+    "settings_sync_switch": {"enabled": "bool"},
+    # What waits on the owner on one Mac, and his answer given on another. The
+    # words travel only as a pending proposal's do (``proposal_text``).
+    "request_state": {"request": "id", "req_kind": frozenset({"held", "setting"}),
+                      "req_state": frozenset({"pending", "applied", "declined", "failed", "stale", "gone"}),
+                      "req_action": "id", "sig": "revision_id", "asked_at": "time", "withheld": "bool"},
+    "request_answer": {"request": "id", "req_answer": frozenset({"confirm", "decline"}), "sig": "revision_id",
+                       "answer_harness": "name", "message_sha": "revision_id"},
+    "cap_set": {"account": "account", "kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
+                "purpose": frozenset({"job", "check"}), "pct": "float", "slack": "float", "usd": "float",
+                "days": "float", "n": "int", "revision": "id", "tier": "name", "sensitive_only": "bool", "until": "time"},
+    "cap_remove": {"account": "account", "cap_kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
+                   "purpose": frozenset({"job", "check"})},
 }
 # Kinds whose "text" is owner words; a hold's text is owner words only when
 # the hold is the owner's, and priority "role" words follow the same switch
@@ -2060,7 +2131,7 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
         # Generated identifiers are deliberately high entropy. Only these exact
         # typed shapes bypass the free-text secret heuristic; paths never do.
         if shape in ("id", "revision_id", "mac_id") and re.fullmatch(
-                r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac)-)?[0-9a-f]{8}-[0-9a-f]{4}-[57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value):
+                r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac|cap)-)?[0-9a-f]{8}-[0-9a-f]{4}-[57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", value):
             return value
         if shape == "revision_id" and re.fullmatch(r"[0-9a-f]{64}", value):
             return value
@@ -2088,6 +2159,14 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
             return value if safe_name(value) == value else None
         if shape == "scope_text":
             return value if value in ("all", "quota") or _MODEL_NAME.fullmatch(value) else None
+        if shape == "setting_json":
+            if len(value) > 4096 or _dangerous(value):
+                return None
+            try:
+                parsed = _loads(value)
+            except ValueError:
+                return None
+            return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
         if shape == "reset_status":
             return value if value in _RESET_STATUSES else None
         if shape == "reset_reason":
@@ -2121,6 +2200,8 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
         return None
 
     def scalar(shape, value):
+        if shape == "bool":
+            return value if isinstance(value, bool) else None
         if shape == "int":
             return value if isinstance(value, int) and not isinstance(value, bool) \
                 and abs(value) <= _WHOLE_MOST else None
@@ -2299,6 +2380,9 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
                     row["text"] = text
             elif kind in _TEXT_KINDS and (not pending or proposal_text):
                 row["text"] = text
+        if kind == "request_state" and isinstance(event.get("ask"), str) and proposal_text \
+                and event.get("withheld") is not True:
+            row["ask"] = event["ask"]
         if proposal_text and isinstance(event.get("owner_request"), str):
             row["owner_request"] = event["owner_request"]
         if kind in ("rule_add", "rule_edit") and isinstance(event.get("prior_text"), str) \
@@ -2421,14 +2505,15 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "harness", "to", "started_at", "model", "family", "transport", "mac", "legacy_mac", "entity", "base",
                 "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
                 "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal", "batch",
-                "batch_target")
+                "batch_target", "key", "value_json", "request", "req_kind", "req_state", "req_action",
+                "sig", "ask", "req_answer", "answer_harness", "message_sha")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
-                "witness_at", "expires_at", "reset_at", "resets_at")
+                "witness_at", "expires_at", "reset_at", "resets_at", "asked_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",
                  "batch_n", "window_mins")
 _WHOLE_MOST = 2 ** 53
 _SWITCH_FIELDS = ("message_time", "owner", "seeded", "until_default", "counted", "pending", "prior_confirmed", "number_pending",
-                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt")
+                  "observed", "observed_turn", "session_logs", "silent", "unmatched", "receipt", "value_set", "enabled", "snapshot", "withheld")
 _AUTHOR_FIELDS = ("kind", "harness", "project", "session", "provider_session", "name", "file", "mac")
 _HOLD_KINDS = ("account", "machine", "all")
 
@@ -2521,7 +2606,7 @@ EXCEPTION_WORDS_MOST = 500  # characters one exception's words may hold
 
 
 _TYPED_UUID = re.compile(
-    r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac)-)?"
+    r"(?:(?:rule|hold|proposal|note|priority|pause|definition|mac|cap)-)?"
     r"[0-9a-f]{8}-[0-9a-f]{4}-[57][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 
 
@@ -2822,6 +2907,27 @@ def _checked(data: dict) -> dict | None:
             out[field] = _no_surrogates(raw)
         if not out.get("account") or not out.get("id"):
             return None
+    if out["type"] == "setting_set":
+        key = out.get("key")
+        if not settings_syncable(key) or not isinstance(out.get("value_set"), bool) \
+                or not isinstance(out.get("value_json"), str):
+            return None
+        try:
+            value = _loads(out["value_json"])
+            # Both an explicit value and an omitted/default value are
+            # canonicalised by the receiving version before any config write.
+            _coerce(SETTINGS[key][0], value, key)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+    if out["type"] == "settings_sync_switch" and not isinstance(out.get("enabled"), bool):
+        return None
+    if out["type"] in ("request_state", "request_answer"):
+        shapes = _REPLICATION_FIELDS[out["type"]]
+        for field in ("request", "sig") + (("req_kind", "req_state") if out["type"] == "request_state"
+                                           else ("req_answer",)):
+            if not isinstance(out.get(field), str) or (isinstance(shapes.get(field), frozenset)
+                                                       and out[field] not in shapes[field]):
+                return None
     return out
 
 
@@ -4005,8 +4111,10 @@ def _priority_now(held: dict, now: datetime, labels: dict, in_settings: dict,
         # Tracking includes owner-defined accounts without a usage reader.
         # Only legacy login keys get the default-login fallback; an absent
         # stable definition is no longer tracked even with no known accounts.
-        configured = key in known_keys or in_settings.get(
-            key, not known_keys and "|" in key and not key.partition("|")[2] and not none)
+        # A stable id from another Mac may have no local ``harness|home``
+        # binding yet.  Absence is not an explicit owner choice to untrack;
+        # only a configured list omission or an owner untracked note is.
+        configured = key in known_keys or in_settings.get(key, not none)
         active.append({"account": key, "label": label, "role": item.get("role"), "until": item.get("until"),
                        "in_settings": bool(configured)})
         # An exception shows only before its end; one that has passed leaves
@@ -4824,7 +4932,21 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
     note_out = None if note is None else {"text": note["text"], "at": _iso(note["at"]),
                                           "written_by": note["written_by"], "via": note["via"]}
     labels = {e["key"]: e["label"] for e in entries}
-    in_settings = {e["key"]: e["configured"] for e in entries}
+    # With no account list stored here (and not "read no accounts"), an account
+    # this Mac doesn't track is not "stopped tracking": the priority is the
+    # owner's, shared by every Mac, and a second Mac keeps no list of its own.
+    # Only his untracked note or a removed definition (below) marks one stopped.
+    in_settings = {e["key"]: bool(e["configured"] or not none) for e in entries}
+    in_settings.update({key: False for key, note in notes.items() if note.get("state") == "untracked"})
+    # An account definition the owner removed is no longer tracked, with or
+    # without an account list on this Mac.
+    removed: dict[str, bool] = {}
+    for event in events:
+        if event.get("type") in ("definition_set", "definition_remove") and event.get("definition") == "account" \
+                and (event.get("written_by") or {}).get("kind") == "owner" and isinstance(event.get("value"), dict) \
+                and isinstance(event["value"].get("id"), str):
+            removed[event["value"]["id"]] = event["type"] == "definition_remove"
+    in_settings.update({key: False for key, gone in removed.items() if gone})
     if cfg.get("_accounts_version"):
         priority_version = f"{priority_version}.{cfg['_accounts_version']}"
     priority_out, priority_ended = _fold_priority(priority, now, labels, in_settings, known_keys, none=none)
@@ -6506,8 +6628,15 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
         target = _account_for_a_conversation(account, accounts() + list(view.get("accounts") or []))
     elif lane:
         target = _lane_account_key(lane, view)
+    # A conversation's own pace override: found once for the caller, applied
+    # only to the answer for its conversation; the shared view never holds it.
+    from khipu import conversation_overrides
+    overrides, refused = {}, None
+    if any(r.get("account") for r in conversation_overrides.list_overrides(now=now)):
+        who = conversation_overrides.resolve(environ=environ)
+        overrides, refused = conversation_overrides.matches(who, now), who.get("reason")
     ranked = routing_advice.rank(view, now, purpose=effective, tier=tier, kind=kind,
-                                 privacy=privacy, sensitive=sensitive, target_key=target)
+                                 privacy=privacy, sensitive=sensitive, target_key=target, overrides=overrides)
     out: dict = {"purpose": effective, "requested_purpose": purpose, "dispatched": dispatched,
                  "tier": tier, "kind": kind, "privacy": bool(privacy), "sensitive": sensitive, "ranked": ranked,
                  "about": ABOUT, "advisory": True}
@@ -6515,6 +6644,10 @@ def advise(account: str | None = None, *, lane: str | None = None, tier: str | N
         out.update({k: ranked[0][k] for k in
                     ("account", "label", "verdict", "reason", "evidence", "numbers", "caps",
                      "eligible", "why_eligible")})
+        if ranked[0].get("override"):
+            out["override"] = ranked[0]["override"]
+        elif refused:
+            out["override_refused"] = refused
     return out
 
 
@@ -7733,7 +7866,15 @@ def _priority_entries(raw, *, now: datetime, conversation: bool, by: str | None 
             if any(len(x["text"]) > EXCEPTION_WORDS_MOST for x in [*exceptions, *live]):
                 raise RouteError(f"priority entry {i}: an exception holds at most {EXCEPTION_WORDS_MOST} characters")
             if live:
-                out[-1]["exceptions"] = live
+                from khipu import priority_cleanup
+
+                kept: list[dict] = []
+                for x in live:
+                    # A repeat of an instruction already in this entry is dropped, never stacked.
+                    twin = priority_cleanup.find_duplicate(x["text"], kept)
+                    if not (twin and twin[0] == "same"):
+                        kept.append(x)
+                out[-1]["exceptions"] = kept
     return out
 
 
@@ -7935,7 +8076,10 @@ def _request_priority(entries, *, until, owner_request, author, via: str, now: d
 
 
 def _held_priority(now: datetime | None, *, pending: bool | None = None) -> dict:
-    held = read_view(now).get("priority")
+    view = read_view(now)
+    held = view.get("priority")
+    if held is None and pending is True and (view.get("priority_stored") or {}).get("pending"):
+        held = view["priority_stored"]
     if held is None:
         raise RouteError("there is no priority set")
     if pending is True and not held.get("pending"):
@@ -7950,6 +8094,9 @@ def confirm_priority(*, via: str, now: datetime | None = None, expect=None, hold
     with _lock():
         _check_priority(expect, now)
         held = _held_priority(now, pending=True)
+        end = _parse((read_view(now).get("priority_stored") or {}).get("until") or held.get("until"))
+        if end is not None and end <= (now or _now()):
+            raise RouteError("the pending priority's saved end has passed; it can only be declined")
         if held.get("proposal_withheld"):
             raise RouteError("proposal text is not shared on this Mac; confirm it on its source Mac")
         view = read_view(now)
@@ -8140,6 +8287,15 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
             if live:
                 row["exceptions"] = live
             if exception is not None:
+                # The same instruction again writes nothing (a retry's second
+                # copy); a near copy goes through and its receipt names the similar one.
+                from khipu import priority_cleanup
+
+                twin = priority_cleanup.find_duplicate(exception, row.get("exceptions"))
+                if twin and twin[0] == "same":
+                    done = {"duplicate": True, "exception_id": twin[1]["id"], "exception_until": twin[1]["until"]}
+                    rows.append(row)
+                    continue
                 if len(row.get("exceptions") or []) >= EXCEPTION_MOST:
                     raise RouteError(f"{row['label']} already has {EXCEPTION_MOST} exceptions; end one first")
                 made, note = _new_exception(key, exception, until, now=now, conversation=conversation, by=by,
@@ -8149,6 +8305,10 @@ def _amended_priority(account, *, append=None, role=None, until=None, exception=
                 done = {"exception_id": made["id"], "exception_until": made["until"],
                         **({"exception_until_default": note} if note else {}),
                         **({"share_pct": made["share_pct"]} if made.get("share_pct") is not None else {})}
+                if twin:
+                    # A near copy goes through, with its receipt and undo, and the receipt names it.
+                    done.update(similar_exception=twin[1]["id"], similar_text=_word_clip(twin[1]["text"], 80),
+                                similar_until=twin[1]["until"])
             elif end_exception is not None:
                 left = [x for x in row.get("exceptions", []) if x["id"] != str(end_exception).strip()]
                 if len(left) == len(row.get("exceptions", [])):
@@ -8420,6 +8580,8 @@ def amend_priority(account, *, append=None, role=None, until=None, exception=Non
                                               end_exception=end_exception, now=now, conversation=False,
                                               by="owner", source=str(via), share_pct=share_pct)
         _check_role_budget(rows, now)
+        if done.get("duplicate") and confirm_pending is None:
+            return {"ok": True, "duplicate": True, "entries": [e["label"] for e in rows], **done}
         # ``holds``: end or keep for each hold on an account it names, as a
         # set takes them (``_require_hold_choices``).
         choices = {"holds": holds} if holds is not None else {}
@@ -8509,6 +8671,8 @@ def request_priority_amend(account, *, append=None, role=None, until=None, excep
         except PriorityEntryMoved as moved:
             return _crossed_entries(moved.lost)
         _check_role_budget(rows, now)
+        if done.get("duplicate"):
+            return {"ok": True, "duplicate": True, "pending": False, "entries": [e["label"] for e in rows], **done}
         observed = _observed_base("priority", base=base, expect=expect)
         written, view = _write({"type": "priority_set", "entries": rows, "until": whole, "pending": True,
                                 "base": observed,
@@ -10194,6 +10358,21 @@ def public_view(view: dict, now: datetime, account: str | None = None) -> dict:
     # words them itself, in local times.
     if view.get("priority"):
         out["priority"] = {k: v for k, v in view["priority"].items() if k not in ("pending_author", "event_id")}
+    stored = view.get("priority_stored") or {}
+    end = _parse(stored.get("until"))
+    if stored.get("pending") and end and end <= now:
+        out["expired_priority"] = stored
+    from khipu import owner_direction
+
+    out["decline_only_requests"] = []
+    for request in owner_direction._read_requests(owner_direction.requests_path()):
+        if request.get("state") != "pending":
+            continue
+        why = owner_direction.unapplyable_reason(request, now=now.timestamp())
+        if why:
+            out["decline_only_requests"].append({"id": request["id"], "words": why,
+                                                   "ask": request.get("ask"), "at": request.get("created_at"),
+                                                   "by": author_words(request.get("by"), push=False)})
     out["plan_facts"] = plan_facts(view, now)
     out["pace_order"] = cfg["routing_pace_order"]
     # Where a registered runner's own budget caps have no Khipu fact, or
@@ -10896,6 +11075,13 @@ def _conversation_view(*, since_version=None, account: str | None = None, now: d
         out["dark_runners"] = [runner_line(r, now) for r in (view.get("sources") or {}).get("runners") or []
                                if r.get("silent") or r.get("unreadable")]
     out["about"] = ABOUT
+    if key is not None:
+        from khipu import conversation_overrides
+        override, refusal = conversation_overrides.advice(key, now=now)
+        if override is not None:
+            out["override_line"] = override["line"]
+        elif refusal:
+            out["override_line"] = refusal
     if view.get("tier_table"):
         out["tier_table"] = view["tier_table"]
     out["contradictions"] = list(view.get("contradictions") or [])
@@ -11217,7 +11403,8 @@ def _priority_receipt(view: dict, now: datetime) -> dict | None:
 def _conversation_priority_answer(written: dict, now: datetime | None) -> dict:
     view = read_view(now)
     out = {k: written[k] for k in (*_WRITE_FIELDS, "exception_id", "exception_until", "exception_until_default",
-                                   "exception_ended", "lost") if k in written}
+                                   "exception_ended", "similar_exception", "similar_text", "similar_until",
+                                   "lost") if k in written}
     for entry in out.get("lost") or []:
         entry["id"] = account_id(entry.pop("account"))
     out["priority"] = _priority_receipt(view, now or _now())
@@ -12582,8 +12769,12 @@ def _owner_via(args, intent: dict | None = None) -> str | None:
         owner_direction.noted(intent, _OWNER_AUTH.get())
         return "app"
     if getattr(args, "by_direction", False):
-        _OWNER_AUTH.set(owner_direction.gate(intent))
-        return "direction"
+        stamp = owner_direction.gate(intent)
+        _OWNER_AUTH.set(stamp)
+        # ``needs-you --yes/--no`` proves the owner on a direct terminal,
+        # then reuses this guarded replay.  Keep the write's provenance in
+        # sync with that terminal proof instead of labelling it a direction.
+        return "cli" if stamp.get("auth") == "terminal" else "direction"
     if not typed_yes("This is an owner's change to the routing record. Type yes to confirm: "):
         return None
     _OWNER_AUTH.set({"auth": "terminal", "auth_chain": " < ".join(_caller()["chain"])})
@@ -12986,6 +13177,62 @@ def _tier_table_intent(args, action: str) -> dict | None:
     return owner_direction.intent(f"route.tier_table.{action}", "tier_table", facts=facts)
 
 
+def _override_cli(args) -> int:
+    """``khipu route override grant|end|keep``: the owner's change to one
+    conversation's pace, by the same owner check as every routing change."""
+    from khipu import conversation_overrides as overrides, owner_direction
+
+    verb, params = args.action, list(args.params)
+    if verb in ("list", "walk"):
+        # Reads for the app only: every conversation's override is the owner's to see.
+        if not getattr(args, "from_app", False) or not _caller()["app"]:
+            _print_json({"ok": False, "error": "Only the Khipu app lists conversation overrides."})
+            return 2
+        if verb == "list":
+            now = _now()
+            rows = overrides.list_overrides(now=now)
+            _print_json({"ok": True, "overrides": [overrides.owner_row(r, now) for r in rows]})
+        else:
+            _print_json(overrides.walkthrough(leave=args.leave, keep_pair=args.keep, restart=args.restart))
+        return 0
+
+    def intent():
+        if len(params) != 1:
+            raise RouteError("grant takes the account; end and keep take the override's id")
+        if verb != "grant":
+            return owner_direction.intent(f"route.override.{verb}", params[0])
+        try:
+            subject = json.loads(args.subject or "")
+        except ValueError:
+            raise RouteError("--subject is the conversation the ask showed, as JSON") from None
+        facts = {"subject": subject, "until": args.until, "indefinite": bool(args.indefinite),
+                 "children": not args.no_children, "ceiling_pct": args.ceiling_pct, "window": args.window}
+        return owner_direction.intent("route.override.grant", _resolve_account_key(params[0]),
+                                      facts={k: v for k, v in facts.items() if v not in (None, False) or k == "children"})
+
+    want = _intent_or_none(intent)
+    if _owner_via(args, want) is None:
+        _print_json({"ok": False, "error": terminal_refusal()})
+        return 2
+    now = _now()
+    if verb == "grant":
+        row = overrides.grant({"account": params[0], "subject": want["facts"]["subject"], "effect": args.effect,
+                               "until": args.until, "indefinite": args.indefinite, "ceiling_pct": args.ceiling_pct,
+                               "window": args.window, "children": not args.no_children, "reason": args.reason,
+                               "ref": args.ref, "request": args.request or "owner grant"}, now=now)
+        out = {"ok": True, "id": row["id"], "account": row["account"], "until": row.get("until"),
+               "review_at": row.get("review_at"), "indefinite": bool(row.get("indefinite")),
+               "replaced": row["replaced"]}
+    elif verb == "end":
+        row = overrides.end(params[0], now=now)
+        out = {"ok": True, "override": params[0], "end": row["id"]}
+    else:
+        row = overrides.keep(params[0], now=now)
+        out = {"ok": True, "override": params[0], "review_at": row["review_at"]}
+    _print_json(_finish_owner(out))
+    return 0
+
+
 def _finish_owner(out: dict) -> dict:
     from khipu import owner_direction
 
@@ -13238,6 +13485,8 @@ def run_cli(args) -> int:
                            hold_id=_planned_id("route.hold.add") if owner_flag else None)
             _print_json(_finish_owner(out) if owner_flag else out)
             return 0
+        if cmd == "override":
+            return _override_cli(args)
         if cmd == "priority":
             return _priority_cli(args, now)
         if cmd == "tier-table":

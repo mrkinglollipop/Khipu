@@ -361,7 +361,7 @@ function itemRow(change: RouteChange, item: RouteChangeItem, i: number, now: Dat
   }
   if (kind === "lane") {
     const [runner, lane] = ident.split("/");
-    const subject = `${runner}'s ${lane} lane`;
+    const subject = `${runner}'s ${lane} job slot`;
     if (!cur) return { ...base, subject, text: "its limit is over" };
     const until = str(cur.until);
     return {

@@ -28,15 +28,17 @@ from datetime import datetime
 from khipu import owner_direction, routing
 
 CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held", "proposal",
-                 "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm")
+                 "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
 LOOK_KINDS = ("remind", "disagree", "broken", "contradiction", "signin", "plan", "crossing", "lane", "silent",
               "unreadable", "refused", "delivery-behind", "delivery-copy", "delivery-read")
-KINDS = CONFIRM_KINDS + LOOK_KINDS
+# Looks the app has no tag for: a change that was interrupted shows in a conversation's list only.
+CLI_ONLY_KINDS = ("interrupted",)
+KINDS = CONFIRM_KINDS + LOOK_KINDS + CLI_ONLY_KINDS
 
 # Each kind the app's routingOverview.ts knows (``TAG_WORDS``): the kind it is
 # here, or why its Needs you never shows it.
 APP_KINDS: dict[str, str] = {
-    "priority": "priority", "confirm": "rule", "proposal": "proposal", "remind": "remind", "disagree": "disagree",
+    "priority": "priority", "confirm": "rule", "old-file-rules": "rule", "proposal": "proposal", "remind": "remind", "disagree": "disagree",
     "broken": "broken", "contradiction": "contradiction", "signin": "signin", "plan": "plan",
     "crossing": "crossing", "lane": "lane", "silent": "silent", "unreadable": "unreadable", "refused": "refused",
     "delivery-behind": "delivery-behind", "delivery-copy": "delivery-copy", "delivery-read": "delivery-read",
@@ -71,7 +73,10 @@ ACTION_WORDS = {
     "route.rule.restore": "bring back a retired standing rule", "route.rule.confirm": "confirm a standing rule",
     "route.rule.undo": "undo a conversation's edit to a standing rule",
     "route.rule.dismiss": "drop a standing rule a conversation proposed", "route.hold.add": "put a hold on work",
-    "route.hold.end": "end a hold on work", "route.cap.set": "set a usage cap on an account",
+    "route.hold.end": "end a hold on work",
+    "route.override.grant": "let one conversation run ahead of pace on an account",
+    "route.override.end": "end a conversation's override early",
+    "route.override.keep": "keep a conversation's override for another week", "route.cap.set": "set a usage cap on an account",
     "route.cap.remove": "remove a usage cap from an account", "route.priority.set": "replace your account priority",
     "route.priority.amend": "change one account's entry in your priority",
     "route.priority.confirm": "confirm a conversation's change to your priority",
@@ -206,6 +211,8 @@ def _item(kind: str, key: str, words: str, *, by=None, at=None, confirm_does: st
     item = {"kind": kind, "key": key, "sort": "confirmation" if kind in CONFIRM_KINDS else "look", "words": said,
             "_by": by, "at": at, "confirm_does": confirm_does, "undo_does": undo_does,
             "settle": {"confirm": confirm, "undo": undo}, **extra}
+    if confirm or undo:
+        item.setdefault("if_ignored", "It stays waiting until you answer.")
     if do:
         item["do"] = do
     if _CLIPPED.get() or said != routing._one_line(words):
@@ -219,14 +226,21 @@ def _item(kind: str, key: str, words: str, *, by=None, at=None, confirm_does: st
 
 
 def _priority(view: dict, now: datetime) -> list[dict]:
-    held = view.get("priority") or {}
+    held = view.get("priority") or view.get("priority_stored") or {}
     if not held.get("pending"):
         return []
     version = view.get("priority_version") or "p0"
-    undo = _act("route.priority.undo", expect=routing.pending_priority_pin(view))
+    pin = routing.pending_priority_pin(view)
+    undo = _act("route.priority.undo", expect=pin)
     undo_does = ("Puts back the priority it replaced." if held.get("replaced")
                  else "Removes it: you had no priority set before.")
     by, at = held.get("pending_author") or held.get("written_by"), held.get("at")
+    ends = routing._parse((view.get("priority_stored") or {}).get("until") or held.get("until"))
+    if ends is not None and ends <= now:
+        return [_item("priority", "priority", "A conversation changed your account priority, but its saved end has "
+                      "passed. It can only be declined; Khipu will not apply it.", by=by, at=at,
+                      confirm_does="It cannot be kept: its saved end has passed.",
+                      undo_does=undo_does, undo=undo, decline_only=True)]
     if held.get("proposal_withheld"):
         return [_item("priority", "priority", "A conversation on another Mac changed your account priority. Its "
                       "words stay on that Mac, so they can't be shown here.", by=by, at=at,
@@ -238,6 +252,8 @@ def _priority(view: dict, now: datetime) -> list[dict]:
              + "; ".join(_said(c, _WORDS_MOST) for c in changes) + "."
              + (f" It said you asked: {_quote(asked)}." if asked else ""))
     return [_item("priority", "priority", words, by=by, at=at,
+                  if_ignored=(f"The new priority stays in use until {held['until']}, and stays waiting for your answer."
+                              if held.get("until") else "The new priority stays in use, and stays waiting for your answer."),
                   confirm_does="Makes these changes your own priority, so it stops showing as unconfirmed.",
                   undo_does=undo_does, confirm=_act("route.priority.confirm", expect=routing.pending_priority_pin(view)), undo=undo)]
 
@@ -319,6 +335,21 @@ def _settings() -> list[dict]:
                          confirm_does=does, undo_does="Puts back the value it replaced.",
                          confirm=_act("config.answer_request.confirm", key=key, expect=pin),
                          undo=_act("config.answer_request.undo", key=key, expect=pin)))
+    # One persistent, explicit pointer for first-enable conflicts.  The
+    # choices live on Your Macs where both values are visible; no inferred
+    # answer is ever applied merely because a remote snapshot arrived.
+    try:
+        from khipu import routing_replication
+
+        differences = routing_replication.settings_status().get("differences") or []
+        if differences:
+            out.append(_item("setting", "settings-sync", f"On {len(differences)} setting difference"
+                             f"{'s' if len(differences) != 1 else ''} between your Macs to choose.",
+                             confirm_does="Open Your Macs and choose which value to use.",
+                             undo_does="Nothing is changed until you choose.",
+                             do="Open Accounts and routing, then Your Macs."))
+    except Exception:  # noqa: BLE001 - a read failure never hides real requests
+        pass
     return out
 
 
@@ -463,6 +494,12 @@ def _quote_ask(ask) -> str:
     return f'"{_said(ask, _WORDS_MOST)}"'
 
 
+def routing_replication_label(mac) -> str:
+    from khipu import routing_replication
+
+    return routing_replication.mac_label(mac)
+
+
 def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
     """(held items, what couldn't be read). A held answer to a listed item
     settles that item, so it is not listed twice: the item's settle becomes
@@ -482,6 +519,28 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
                              "full content must be shown before it applies.",
                              by=row.get("by"), at=row.get("created_at"), undo=decline,
                              undo_does="Drops the old held request. Nothing changes."))
+            continue
+        remote = row.get("remote")
+        if remote:
+            where = routing_replication_label(remote.get("mac"))
+            said = f" It asks: {_quote_ask(row.get('ask'))}." if row.get("ask") and not remote.get("withheld") else ""
+            if remote.get("withheld"):
+                out.append(_item("held", f"held:{request}", row.get("ask") or "", by={"kind": "other_mac"}, at=row.get("created_at"),
+                                 confirm_does="Can't be answered here: answer it on " + where + ".",
+                                 undo_does="Nothing to undo here."))
+                continue
+            out.append(_item("held", f"held:{request}", f"On {where}, a conversation asked for a change, and it is "
+                             f"held until you answer.{said}", by={"kind": "other_mac", "mac": where}, at=row.get("created_at"),
+                             confirm_does=f"Tells {where} yes: it makes the change there within a few minutes.",
+                             undo_does=f"Tells {where} no: it drops the request and nothing changes.",
+                             confirm=_act("direction.confirm", request=request), undo=decline))
+            continue
+        reason = owner_direction.unapplyable_reason(row)
+        if reason:
+            out.append(_item("held", f"held:{request}", reason +
+                             (f" It asks: {_quote_ask(row.get('ask'))}." if row.get("ask") else ""),
+                             by=row.get("by"), at=row.get("created_at"), undo=decline,
+                             undo_does="Drops the held request. Nothing changes.", decline_only=True))
             continue
         placed, same_target = False, False
         for item in items:
@@ -504,7 +563,7 @@ def _held(items: list[dict]) -> tuple[list[dict], list[dict]]:
         if action in _ANSWERS and (not same_target or pinned):
             out.append(_item("held", f"held:{request}", f"A conversation asked to {phrase}, and it was held for you. "
                              "What it answered has since changed or been settled, so it can only be refused." + said, by=by,
-                             at=at, confirm_does="Nothing to confirm: it would be refused.",
+                             at=at, decline_only=True, confirm_does="Nothing to confirm: it would be refused.",
                              undo_does="Drops the held request. Nothing changes.", undo=decline))
             continue
         out.append(_item("held", f"held:{request}", f"A conversation asked to {phrase}, and it is held until you "
@@ -545,6 +604,34 @@ def _forgets() -> list[dict]:
                          undo_does="Marks the hub's one as a different conversation, so it stays.",
                          confirm=_act("forget.here", id=str(ident)), undo=_act("forget.not_same", id=str(ident)),
                          permanent=True))
+    return out
+
+
+INTERRUPTED_SHOWN_S = 7 * 24 * 3600  # an interrupted job stays listed this long
+
+
+def _interrupted() -> list[dict]:
+    """Long changes the owner confirmed whose worker died before they finished.
+    Never run again by Khipu, since part of one may have applied."""
+    from khipu import owner_background
+
+    owner_background.heal()
+    rows = owner_direction._read_requests(owner_direction.requests_path())
+    now = owner_direction._clock()
+    out = []
+    for row in rows:
+        if row.get("state") != "interrupted" or now - float(row.get("settled_ts") or 0) > INTERRUPTED_SHOWN_S:
+            continue
+        again = [r for r in rows if r.get("action") == row.get("action") and r.get("args") == row.get("args")
+                 and r.get("state") == "applied" and float(r.get("settled_ts") or 0) > float(row.get("settled_ts") or 0)]
+        if again:
+            continue
+        out.append(_item("interrupted", f"interrupted:{row.get('id')}",
+                         f"A change you confirmed, to {ACTION_WORDS.get(row.get('action'), 'make a change')}, was "
+                         "interrupted before it finished, most likely because the Mac restarted. Part of it may "
+                         "already be done. Khipu has not run it again.", at=row.get("settled_at"),
+                         do="Ask in a conversation to run it again, then say yes once. Check the result first where "
+                            "running it twice would matter."))
     return out
 
 
@@ -809,8 +896,32 @@ def _looks(view: dict, now: datetime) -> tuple[list[dict], list[dict]]:
 # ---- the answer -------------------------------------------------------------------------------
 
 
+def _override_reviews(now: datetime) -> list[dict]:
+    """An override with no end whose review day has come: one yes keeps it for
+    another week, one no ends it."""
+    from khipu import conversation_overrides as overrides
+
+    out = []
+    for row in overrides.list_overrides(now=now):
+        if not (row.get("indefinite") and (routing._parse(row.get("review_at")) or now) <= now):
+            continue
+        who = overrides.subject_words(row.get("subject") or {})
+        label = routing._label_for_key(overrides._key(row["account"]))
+        out.append(_item(
+            "override_review", f"override-review:{row['id']}",
+            f"{who[:1].upper() + who[1:]} was let run ahead of pace on {label} with no end, and it is time to look at "
+            "it again.", at=row.get("review_at"),
+            confirm_does=f"Keeps it for another {overrides.REVIEW_DAYS} days, then asks again.",
+            undo_does="Ends it now: that conversation goes back to the normal pace.",
+            if_ignored="It keeps running ahead of pace, and this keeps asking.",
+            confirm=_act("route.override.keep", override=row["id"]),
+            undo=_act("route.override.end", override=row["id"])))
+    return out
+
+
 def _local_confirmations(view: dict, now: datetime) -> list[dict]:
-    return _priority(view, now) + _rules(view) + _settings() + _accounts() + _tier_table(view) + _cap_proposals(now)
+    return (_priority(view, now) + _rules(view) + _settings() + _accounts() + _tier_table(view)
+            + _cap_proposals(now) + _override_reviews(now))
 
 
 def _finished(item: dict, caller: str, now: datetime) -> dict:
@@ -862,7 +973,8 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
     held, missed = _held(items)
     items += held
     unread += missed
-    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm)):
+    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm),
+                        ("changes that were interrupted", _interrupted)):
         try:
             items += build()
         except Exception:  # noqa: BLE001 - named in unread
@@ -884,7 +996,8 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
     return sorted(items, key=lambda it: rank[it["kind"]]), unread, view
 
 
-def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None, now: datetime | None = None) -> dict:
+def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None, now: datetime | None = None,
+            record_read: bool = True) -> dict:
     """The answer of ``khipu_needs_you``. Every read that fails is named in
     ``unread``, and "nothing" is only said when none did. ``key``: one item, its
     words whole. Reading it is the ask (``owner_direction.note_read``)."""
@@ -924,7 +1037,7 @@ def waiting(*, kind: str | None = None, offset: int = 0, key: str | None = None,
                                + f"). Read again with offset {offset + MOST}.")
     if unread:
         answer["unread"] = unread
-    if page:
+    if page and record_read:
         why = owner_direction.note_read(_shown(page))
         if why:
             # With no record of the ask, a yes could not be told from the question: no settle to offer.
@@ -993,6 +1106,10 @@ def ask_for(action: str, values: dict) -> str | None:
     the reason a hold fails."""
     whole, clipped = _WHOLE.set(True), _CLIPPED.set(False)
     try:
+        if action.startswith("route.override."):
+            from khipu import conversation_overrides
+
+            return conversation_overrides.ask_for(action, values)
         if action == "config.routing_setting":
             return f"Khipu holds this until you answer: {_action_words(action, values)}. Confirm?"
         if action not in SETTLE_ACTIONS:

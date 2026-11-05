@@ -536,6 +536,7 @@ def test_plain_cli_listing_obeys_page_cap(monkeypatch, capsys):
 
 import copy  # noqa: E402
 from tests.fact_seed import announce  # noqa: E402
+from tests.owner_jobs import finish_owner_job
 
 
 
@@ -757,7 +758,7 @@ def test_close_those_by_direction_closes_the_owners_items_and_undo_reopens_them(
     mine = _seed(owed, 3, text="should we ship widget {i}?", kind="question")
     monkeypatch.setattr(routing, "typed_yes", lambda prompt: pytest.fail("the terminal was asked"))
     _direction(tmp_path, monkeypatch)
-    ok_, out = owner_act.act("owed.change", {"ids": mine, "change": "close", "why": "Matt said close those"})
+    ok_, out = finish_owner_job(owner_act.act("owed.change", {"ids": mine, "change": "close", "why": "Matt said close those"}))
     assert ok_ and out["changed"] == 3 and out["owner_action"], out
     assert set(_status(owed, mine).values()) == {"closed"}
     rc, undone = _owner_undo(out["owner_action"])
@@ -773,7 +774,7 @@ def test_close_those_is_refused_without_a_recent_owner_turn(owed, tmp_path, monk
     mine = _seed(owed, 2, text="should we ship widget {i}?", kind="question")
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "s-nobody-typed")
-    ok_, out = owner_act.act("owed.change", {"ids": mine, "change": "close", "why": "a job thinks so"})
+    ok_, out = finish_owner_job(owner_act.act("owed.change", {"ids": mine, "change": "close", "why": "a job thinks so"}))
     assert not ok_ and out["code"] == "no_recorded_turn", out
     assert "Nothing was changed" in out["error"]
     assert set(_status(owed, mine).values()) == {"open"}
@@ -785,8 +786,8 @@ def test_a_direction_reassign_is_undone_back_to_the_owner(owed, tmp_path, monkey
     mine = _seed(owed, 2, text="should we ship widget {i}?", kind="question")
     before = _state(owed, mine)
     _direction(tmp_path, monkeypatch)
-    ok_, out = owner_act.act("owed.change", {"ids": mine, "change": "reassign", "why": "the builder has these",
-                                             "to": "agent", "label": "builder"})
+    ok_, out = finish_owner_job(owner_act.act("owed.change", {"ids": mine, "change": "reassign", "why": "the builder has these",
+                                             "to": "agent", "label": "builder"}))
     assert ok_ and out["changed"] == 2, out
     assert _state(owed, mine) != before
     rc, undone = _owner_undo(out["owner_action"])
@@ -803,7 +804,7 @@ def test_owed_change_by_direction_takes_only_its_own_arguments():
                  {"ids": [1, True], "change": "close", "why": "x"},
                  {"ids": [1, 2], "change": "snooze", "why": "x"},
                  {"ids": [1, 2], "change": "close"}):
-        ok_, out = owner_act.act("owed.change", args)
+        ok_, out = finish_owner_job(owner_act.act("owed.change", args))
         assert not ok_ and out["code"] == "bad_args", (args, out)
     head, pos = owner_act.argv("owed.change", owner_act._values(
         "owed.change", {"ids": [4, 5], "change": "close", "why": "done"}))

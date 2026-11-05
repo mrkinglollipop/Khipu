@@ -6,6 +6,7 @@ from datetime import timedelta
 import pytest
 
 from khipu import routing
+from khipu.routing_replication import UPLOAD_PER_TURN
 from tests.test_routing_acceptance import Replay, T0, AUTHOR
 
 
@@ -134,6 +135,25 @@ def test_12_partial_pull_does_not_claim_caught_up_and_resumes(pair):
     assert replication.status()["sources"]
 
 
+def test_upload_backlog_yields_to_pull_after_a_bounded_slice(pair, monkeypatch):
+    from khipu import routing_replication
+    monkeypatch.setattr(routing_replication, "ROUND_BUDGET_S", 0)  # one slice per sync, as a busy timer tick
+    a, b, hub = pair
+    a.activate()
+    for n in range(UPLOAD_PER_TURN + 3):
+        routing.add_rule(f"backlog {n}", via="app")
+    first = sync(a, hub)
+    assert first["ok"] and first["local_pending"] and not first["caught_up"]
+    # A peer can already receive this bounded slice; it is not stuck behind
+    # the source Mac's whole historical upload queue.
+    assert sync(b, hub)["ok"]
+    assert len(b.view()["rules"]) == UPLOAD_PER_TURN
+    # With the budget back, one sync keeps sending slices until nothing is left.
+    monkeypatch.setattr(routing_replication, "ROUND_BUDGET_S", 240.0)
+    assert sync(a, hub)["caught_up"]
+    assert sync(b, hub)["ok"] and len(b.view()["rules"]) == UPLOAD_PER_TURN + 3
+
+
 def test_12_overlap_finds_late_commit_behind_previous_cursor(pair):
     from khipu.hub_snapshot import FRESHNESS_OVERLAP_S
     a, b, hub = pair
@@ -177,11 +197,36 @@ def test_12_default_off_never_constructs_transport(pair, monkeypatch):
     a, _, _ = pair
     a.activate()
     a.configure(routing_replication_live=False)
+    monkeypatch.setattr(routing, "_hub_configured", lambda: False)
     def forbidden():
         pytest.fail("disabled replication attempted a hub connection")
     monkeypatch.setattr(replication, "PostgresHub", forbidden)
     assert replication.sync()["disabled"]
     routing.poll_refold()
+
+
+def test_off_mac_touches_only_the_copy_switch_once_per_tick(pair, monkeypatch):
+    """With the copy off and a hub configured, a Mac reads one small record
+    (the copy switch) at most once a timer tick, and sends nothing else."""
+    from khipu import routing_replication as replication
+    a, _, hub = pair
+    a.activate()
+    a.configure(routing_replication_live=False)
+    routing.add_rule("local only", via="app")
+    calls = []
+
+    class Narrow(Hub):
+        def pull(self, after, until, limit):
+            calls.append("pull")
+            return super().pull(after, until, limit)
+    narrow = Narrow()
+    assert replication.sync(hub=narrow)["disabled"]
+    assert calls == ["pull"] and not narrow.calls and not narrow.rows
+    assert replication.sync(hub=narrow)["disabled"]
+    assert calls == ["pull"]
+    a.advance(300)
+    assert replication.sync(hub=narrow)["disabled"]
+    assert calls == ["pull", "pull"] and not narrow.rows
 
 
 def test_12_missing_and_path_ids_are_skipped_before_upload(pair):
@@ -398,6 +443,47 @@ def test_unprojected_kinds_are_reported_and_retried_after_projection_upgrade(pai
     assert len(hub.rows) == 2
 
 
+def test_settings_events_and_caps_use_the_existing_closed_projection(pair, monkeypatch):
+    a, _, _ = pair
+    a.activate()
+    event = a.event("setting_set", 1, key="routing_summary_chars", value_json="900", value_set=True)
+    cap = a.event("cap_set", 2, account="codex|", kind="share", window="weekly", pct=30,
+                  revision="cap-test", purpose="job")
+    projected = routing.replication_payload([event, cap], bindings={"codex|": "codex:main"})
+    assert [row["type"] for row in projected] == ["setting_set", "cap_set"]
+    assert projected[0]["key"] == "routing_summary_chars"
+    assert projected[1]["account"] == "codex:main" and projected[1]["pct"] == 30
+
+    # Compatibility proof: this is the untouched old closed-map behaviour.
+    # An older reader has no new entries, so it drops them rather than failing
+    # or copying their values.
+    old = dict(routing._REPLICATION_FIELDS)
+    monkeypatch.delitem(routing._REPLICATION_FIELDS, "setting_set")
+    monkeypatch.delitem(routing._REPLICATION_FIELDS, "cap_set")
+    assert routing.replication_payload([event, cap], bindings={"codex|": "codex:main"}) == []
+    routing._REPLICATION_FIELDS.clear()
+    routing._REPLICATION_FIELDS.update(old)
+
+
+def test_off_mac_polls_and_applies_owner_copy_switch(pair):
+    a, b, hub = pair
+    a.activate()
+    routing.set_setting("routing_replication_live", "on")
+    assert sync(a, hub)["ok"]
+    b.activate()
+    b.configure(routing_replication_live=False)
+    assert sync(b, hub)["ok"]
+    assert routing.settings()["routing_replication_live"] is True
+    a.activate()
+    routing.set_setting("routing_replication_live", "off")
+    assert [e["enabled"] for e in routing.read_events()[0] if e["type"] == "settings_sync_switch"] == [True, False]
+    assert sync(a, hub)["ok"]
+    assert [r["payload"]["enabled"] for r in hub.rows.values() if r["payload"]["type"] == "settings_sync_switch"] == [True, False]
+    b.activate()
+    assert sync(b, hub)["ok"]
+    assert routing.settings()["routing_replication_live"] is False
+
+
 def test_completed_old_scan_reports_its_actual_age(pair):
     from khipu import routing_replication as replication
     a, b, hub = pair
@@ -535,3 +621,19 @@ def test_confirmed_words_and_proposal_identity_share_one_locked_read(pair, monke
     assert view["rules"][0]["text"] == "first proposal"
     second_event = next(e for e in routing.read_events()[0] if e["id"] == results[0]["id"])
     assert view["proposals"][second_event["proposal"]]["status"] == "crossed"
+
+
+def test_first_catch_up_status_words_and_overlap_is_not_failure(pair, monkeypatch):
+    from khipu import routing_replication as replication
+    from contextlib import contextmanager
+    a, b, hub = pair
+    a.activate()
+    monkeypatch.setattr(replication, "_state", lambda: {"uploaded": {"mac": 3}})
+    assert replication.status()["first_catch_up"] is True
+    assert "first time" in replication.age_line()
+    @contextmanager
+    def occupied():
+        raise BlockingIOError()
+        yield
+    monkeypatch.setattr(replication, "_sync_lock", occupied)
+    assert replication.sync(hub=hub) == {"ok": True, "caught_up": False, "busy": True}

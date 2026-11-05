@@ -13,7 +13,7 @@ python3 -m khipu <command>
 
 Most commands need the Python dependencies on `PYTHONPATH` first; [packages/cli/README.md](../packages/cli/README.md) shows the one-time setup. To type `khipu` instead, add a shell alias (for example `alias khipu='python3.11 -m khipu'`). The desktop app bundles its own copy of the CLI and Python.
 
-There are 64 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
+There are 65 top-level commands; the reference below includes storage, ledger, work, owner-direction, and accounts.
 
 ## Health and status
 
@@ -77,6 +77,7 @@ Topic bodies come in pages by byte offset. `--offset` and `--max-bytes` (default
 
 | Command | What it does |
 | --- | --- |
+| `needs-you` | Show what waits on the owner. `--json` prints structured output; `--item KEY_OR_NUMBER` shows one whole item. `--yes KEY_OR_NUMBER` and `--no KEY_OR_NUMBER` display it and ask once for a typed yes in a real owner terminal. Conversation shells answer in the conversation or app. |
 | `owed` | List, close, reopen, snooze or reassign commitments, dismiss routing directions, and plan a one-time cleanup. |
 | `work` | Project progress, running jobs, and Waiting on you; see below for summary checks and owner answers. |
 | `decisions` | The decisions registry. |
@@ -296,3 +297,5 @@ These are launchers, not commands you normally run by hand. `khipu integrations 
 | `khipu-delegation-hook` | Routing push before work is handed to another agent. Never denies or alters a call. |
 
 For the MCP tools these launchers serve, see [mcp-tools.md](mcp-tools.md). For the routing record, see [routing.md](routing.md). For jobs, backups and the gateway, see [operations.md](operations.md).
+
+Owner actions that scan or change batches return “Started; it will finish on its own.” after authorization. They run in a detached process, so closing or timing out the conversation does not stop them. Owner actions records the final outcome and counts, including how many dead outbox jobs were retired. `outbox span-covered` keeps its read-only dry run; `--apply` starts the confirmed work.

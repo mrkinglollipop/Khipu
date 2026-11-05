@@ -157,7 +157,7 @@ NOT_CAPTURE = {
                     "record's own lines, not captures"),
     **dict.fromkeys(("routing._append_locked", "routing._fold_turn", "routing._id_salt",
                      "routing._save_view", "routing_replay._routing_quiet", "routing_replay._seed",
-                     "routing_replay.replay"), _ROUTING),
+                     "routing_replay.replay", "conversation_overrides._append", "priority_cleanup._save"), _ROUTING),
     **dict.fromkeys(("memory_md.regen_memory_md", "notes._write_state", "organise._backup_index",
                      "organise._write_evidence", "organise.rewrite_index", "organise.split_note"),
                     _NOTES),

@@ -662,7 +662,7 @@ export const WORK_LIMITS: Limit[] = [
       { key: "work_max_trains", label: "Trains", unit: "changes", options: [10, 20, 50, 0], zero: "No limit" },
       { key: "work_max_runs", label: "Test runs", unit: "changes", options: [10, 20, 50, 0], zero: "No limit" },
     ] },
-  { name: "A summary is out of date after", help: "Automatic: five of the runner's own intervals, at least 2 minutes.",
+  { name: "A summary is out of date after", help: "Automatic: five of the job runner's own intervals, at least 2 minutes.",
     fields: [{ key: "work_stale_after", label: "Out of date after", unit: "time", options: ["auto", 2 * MIN, 10 * MIN, HOUR, 0], zero: "No limit" }] },
   { name: "A job is quiet after", help: "A running job with no word for this long says so.",
     fields: [{ key: "work_job_quiet_after", label: "Quiet after", unit: "time", options: [5 * MIN, 15 * MIN, 30 * MIN, HOUR, 0], zero: "No limit" }] },

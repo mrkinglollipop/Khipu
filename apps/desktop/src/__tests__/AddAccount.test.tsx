@@ -792,7 +792,7 @@ describe("one tracked account", () => {
     render(<RenameDialog open account={acct} refs={refs} taken={["Claude client", "Claude main", "Codex"]} support={HERE}
       onClose={() => {}} onRenamed={renamed} />);
     expect(screen.getByRole("heading", { name: /Rename Claude client/ })).toBeInTheDocument();
-    expect(screen.getByText(/Plans, Accounts and routing, your priority list, 1 hold and 2 lanes/)).toBeInTheDocument();
+    expect(screen.getByText(/Plans, Accounts and routing, your priority list, 1 hold and 2 job slots/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Edit rule 4" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Edit your note" })).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Codex" } });
@@ -808,7 +808,7 @@ describe("one tracked account", () => {
     render(<StopTrackingDialog open account={acct} refs={refs} support={HERE} onClose={() => {}} onStopped={() => {}} />);
     expect(screen.getByRole("checkbox", { name: /Remove it from your priority list \(it is second; Codex moves up\)/ })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: /End its pause now/ })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Remove it from 2 lanes: review-1, docs" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Remove it from 2 job slots: review-1, docs" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: /End the hold “client work only”/ })).not.toBeChecked();
     expect(screen.getByText(/and its sign-in\. Conversations that run on it keep working/)).toBeInTheDocument();
     expect(screen.getByText(/as a found account, until you choose Offer again/)).toBeInTheDocument();
@@ -838,8 +838,8 @@ describe("one tracked account", () => {
     expect(hold).not.toBeChecked();
     expect(screen.getByRole("checkbox", { name: /Remove it from your priority list/ })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: /End its pause now/ })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Remove it from 2 lanes: review-1, docs" })).toBeChecked();
-    fireEvent.click(screen.getByRole("checkbox", { name: /Remove it from 2 lanes/ }));
+    expect(screen.getByRole("checkbox", { name: "Remove it from 2 job slots: review-1, docs" })).toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Remove it from 2 job slots/ }));
     fireEvent.click(screen.getByRole("button", { name: "Stop tracking" }));
     await waitFor(() => expect(calls("khipu_accounts_stop")).toHaveLength(1));
     expect(calls("khipu_accounts_stop")[0][1]).toEqual({
@@ -1088,11 +1088,11 @@ describe("setup's Accounts step with what discovery found", () => {
 });
 
 describe("What's new", () => {
-  it("adds one sentence to the Accounts and routing item, no new item", () => {
+  it("describes the Accounts and routing pages in the one existing item, no new item", () => {
     const release = NOTICES.find((n) => n.version === "0.4.16")!;
     const items = release.items.filter((i) => i.title === "Accounts and routing");
     expect(items).toHaveLength(1);
-    expect(items[0].text).toBe("Khipu tells your conversations which accounts have room. It also finds your other logins and lets you add one.");
+    expect(items[0].text).toBe("Accounts and routing now has one page for each job: your accounts, preferences, Macs, conversations, changes, checks and technical settings. Find a setting also accepts the old names.");
     expect(release.items.filter((i) => /logins/.test(i.title))).toHaveLength(0);
   });
 });

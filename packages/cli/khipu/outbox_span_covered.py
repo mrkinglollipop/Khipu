@@ -84,7 +84,7 @@ def _read(paths: list[Path]) -> list[dict[str, Any]]:
         entries.append(entry)
         try:
             entry["snapshot"] = path.read_bytes()
-            entry["job"] = outbox._read_job(path)
+            entry["job"] = outbox._read_job(path, snapshot=entry["snapshot"])
             entry["view"] = _hub_view(entry["job"]["payload"])
         except (OSError, ValueError, TypeError, RecursionError):
             entry["reason"] = CHECK_FAILED
@@ -155,18 +155,26 @@ def _offsets_restarted(view: dict[str, Any], rows: list[tuple]) -> bool:
     return False
 
 
-def _verdict(cur, view: dict[str, Any], rows: list[tuple], withheld: frozenset[int]) -> tuple[str | None, tuple | None]:
+def _verdict(cur, view: dict[str, Any], rows: list[tuple], withheld: frozenset[int],
+             forgotten: dict[int, bool | None] | None = None) -> tuple[str | None, tuple | None]:
     """(why the job holds, None), or (None, the row that retires it)."""
     from khipu.capture import _span_contains, _span_lacks, _span_rewound, _span_same_window, _transcript_span
     from khipu.tombstones import hub_source_forgotten
 
-    if hub_source_forgotten(cur, view):
+    def hidden(payload):
+        result = forgotten[id(payload)] if forgotten is not None else hub_source_forgotten(cur, payload)
+        if result is None:
+            from khipu.tombstones import RegistryError
+            raise RegistryError("source identity could not be read")
+        return result
+
+    if hidden(view):
         return FORGOTTEN, None
     inner = _transcript_span(view.get("transcript_range"))
     for eid, _session, column_range, deleted_at, raw in rows:
         raw = raw if isinstance(raw, dict) else {}
         if _may_overlap(inner, [column_range, raw.get("transcript_range")]) and (
-                deleted_at is not None or int(eid) in withheld or (raw and hub_source_forgotten(cur, raw))):
+                deleted_at is not None or int(eid) in withheld or (raw and hidden(raw))):
             return FORGOTTEN, None
     if inner is None:
         return RANGE_NOT_NUMERIC, None
@@ -195,13 +203,16 @@ def _judge(cur, entries: list[dict[str, Any]], *, lock: bool = False) -> bool:
     """Set each unsettled entry's ``reason`` or ``row``; False when the session
     read itself failed. Every failure holds: a database error aborts the
     transaction, so each later check fails too."""
-    from khipu.tombstones import withheld_episode_ids
+    from khipu.tombstones import withheld_episode_ids, hub_sources_forgotten
 
     pending = [e for e in entries if e["reason"] is None]
     try:
         withheld = withheld_episode_ids()
         sessions = {s for e in pending if isinstance(s := e["view"].get("session_id"), str) and s}
         rows = _rows(cur, sessions, lock=lock) if sessions else {}
+        payloads = {id(e["view"]): e["view"] for e in pending}
+        payloads.update({id(row[4]): row[4] for group in rows.values() for row in group if isinstance(row[4], dict)})
+        forgotten = dict(zip(payloads, hub_sources_forgotten(cur, list(payloads.values()))))
     except Exception:  # noqa: BLE001 - a read that can't run holds every job
         for entry in pending:
             entry["reason"] = CHECK_FAILED
@@ -210,7 +221,7 @@ def _judge(cur, entries: list[dict[str, Any]], *, lock: bool = False) -> bool:
         session = entry["view"].get("session_id")
         try:
             entry["reason"], entry["row"] = _verdict(
-                cur, entry["view"], rows.get(session, []) if isinstance(session, str) else [], withheld)
+                cur, entry["view"], rows.get(session, []) if isinstance(session, str) else [], withheld, forgotten)
         except Exception:  # noqa: BLE001 - a check that can't run holds the job
             entry["reason"], entry["row"] = CHECK_FAILED, None
     return True
@@ -378,6 +389,8 @@ def undo(entries: list[dict[str, Any]]) -> dict[str, Any]:
 
 def words(out: dict[str, Any]) -> str:
     """The result in plain words: counts only, never a job's text."""
+    if out.get("started"):
+        return out["line"]
     if "dead_jobs" not in out:
         return str(out.get("error") or "Nothing was changed.")
     jobs = f"{out['dead_jobs']} dead job{'' if out['dead_jobs'] == 1 else 's'}."

@@ -113,6 +113,9 @@ export const ACTION_LABELS: Record<string, string> = {
   "route.rule.confirm": "Confirmed a standing rule",
   "route.rule.undo": "Undid a change to a standing rule",
   "route.rule.dismiss": "Dismissed a standing rule",
+  "route.override.grant": "Let a conversation run ahead of pace",
+  "route.override.end": "Ended an override early",
+  "route.override.keep": "Kept an override for another week",
   "route.hold.add": "Added a hold",
   "route.hold.end": "Ended a hold",
   "route.cap.set": "Set a usage cap",
@@ -230,6 +233,12 @@ export function actionWords(a: OwnerAction, rules?: RouteRule[] | null): string 
       return `Undid the change to ${rw}`;
     case "route.rule.dismiss":
       return `Dismissed ${rw}`;
+    case "route.override.grant":
+      return `Let a conversation run ahead of pace on ${accountWords(t)}`;
+    case "route.override.end":
+      return "Ended an override early";
+    case "route.override.keep":
+      return "Kept an override for another week";
     case "route.hold.add":
       return "Added a hold";
     case "route.hold.end":

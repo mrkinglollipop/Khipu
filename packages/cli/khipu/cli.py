@@ -2460,6 +2460,106 @@ def cmd_route(args: argparse.Namespace) -> int:
     return routing.run_cli(args)
 
 
+def _needs_item(selector: str) -> tuple[dict, dict, int] | None:
+    """One whole needs-you item by stable key or 1-based list number.
+
+    The CLI is not a conversation disclosure, so these reads never affect a
+    later conversation's answer boundary.
+    """
+    from khipu import needs_you
+
+    if selector.isdigit() and int(selector) == 0:
+        return None
+    if selector.isdigit() and int(selector) > 0:
+        number = int(selector)
+        answer = needs_you.waiting(offset=((number - 1) // needs_you.MOST) * needs_you.MOST, record_read=False)
+        index = (number - 1) % needs_you.MOST
+        if index >= len(answer.get("items") or []):
+            return None
+        key = answer["items"][index]["key"]
+    else:
+        key = selector
+    answer = needs_you.waiting(key=key, record_read=False)
+    items = answer.get("items") or []
+    if len(items) != 1:
+        return None
+    return answer, items[0], number if selector.isdigit() else 0
+
+
+def _print_needs_plain(answer: dict, *, selected: int | None = None) -> None:
+    if answer.get("line"):
+        print(answer["line"])
+    for index, item in enumerate(answer.get("items") or [], start=selected or 1):
+        print(f"{index}. [{item.get('kind')}] {item.get('words')}")
+        asked = item.get("asked_by") or {}
+        if asked:
+            print(f"   Asked by: {asked.get('who')}. {asked.get('when') or ''}")
+        if item.get("confirm_does"):
+            print(f"   Yes: {item['confirm_does']}")
+        if item.get("undo_does"):
+            print(f"   No: {item['undo_does']}")
+        if item.get("if_ignored"):
+            print(f"   If ignored: {item['if_ignored']}")
+        if item.get("do"):
+            print(f"   Do: {item['do']}")
+        if item.get("decline_only"):
+            print("   This item is decline-only; it cannot be applied.")
+    if answer.get("more_line"):
+        print(answer["more_line"])
+    for unread in answer.get("unread") or []:
+        print(f"Couldn't read {unread.get('what')}: {unread.get('why')}")
+
+
+def cmd_needs_you(args: argparse.Namespace) -> int:
+    """The local owner list in the same words the app and MCP use."""
+    from khipu import needs_you, owner_act, routing
+
+    selector = args.item or args.yes or args.no
+    if selector:
+        found = _needs_item(selector)
+        if found is None:
+            out = {"ok": False, "error": "No needs-you item has that key or number."}
+            print(_strict_json(out) if args.json else out["error"])
+            return 2
+        answer, item, number = found
+        answer = dict(answer, selected_number=number)
+    else:
+        answer = needs_you.waiting(record_read=False)
+        item, number = None, None
+    if not (args.yes or args.no):
+        if args.json:
+            print(_strict_json(answer, indent=2, default=str))
+        else:
+            _print_needs_plain(answer, selected=number)
+        return 0
+
+    assert item is not None
+    # The full item is the disclosure. Do not repeat its payload in the
+    # terminal prompt, nor present an expired item as something that can keep.
+    if args.json:
+        # stdout stays a machine-readable settlement result, but the owner
+        # still sees the complete exact item before the terminal prompt.
+        print(_strict_json(answer, indent=2, default=str), file=sys.stderr)
+    else:
+        _print_needs_plain(answer, selected=number)
+    offered = item.get("settle", {}).get("confirm" if args.yes else "undo")
+    if not isinstance(offered, dict):
+        message = "This item is decline-only; use --no to drop it." if item.get("decline_only") else "This item has no action to apply."
+        print(_strict_json({"ok": False, "error": message}) if args.json else message)
+        return 2
+    confirmed = routing.typed_yes("Type yes to apply this displayed decision: ")
+    if not confirmed:
+        message = routing.terminal_refusal("No change was made; use a direct conversation or the Khipu app.")
+        print(_strict_json({"ok": False, "error": message}) if args.json else message)
+        return 2
+    ok, out = owner_act.settle_terminal(offered.get("action"), offered.get("args") or {})
+    if args.json:
+        print(_strict_json(out, indent=2, default=str))
+    else:
+        print(out.get("receipt") or out.get("line") or out.get("error") or ("Applied." if ok else "No change was made."))
+    return 0 if ok else 2
+
+
 def cmd_owed(args: argparse.Namespace) -> int:
     """W3.4: `khipu owed` — list, close, reopen, or snooze commitments. With
     the hub away a close, reopen or snooze waits on this Mac and replays when
@@ -4073,6 +4173,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "usage_accounts": usage.accounts_status(),
         "cli_settings": cli_settings_status(),
         "routing": _routing.settings_status(),
+        "settings_sync": __import__("khipu.routing_replication", fromlist=["settings_status"]).settings_status(),
         "ledger": _ledger.settings_status(),
         "replica": replica_heal.settings_status(),
         "storage": _storage.settings_status(),
@@ -4601,7 +4702,9 @@ def _outbox_span_covered(args: argparse.Namespace) -> int:
     elif routing.typed_yes("This moves the dead jobs a dry run would retire to the outbox's resolved folder. Each "
                            "job's own summary then stays only in that local record; nothing is written to the hub "
                            "(Undo puts them back). Type yes to confirm: "):
-        owner_direction.noted(want, {"auth": "terminal", "auth_chain": " < ".join(routing._caller()["chain"])})
+        from khipu import owner_act
+        _ok, started = owner_act.settle_terminal(outbox_span_covered.ACTION, {})
+        return show(started)
     else:
         show({"ok": False, "code": "owner_only",
               "error": "Retiring dead jobs is the owner's change: type yes on a terminal, or ask for it through "
@@ -4672,6 +4775,9 @@ def cmd_jobs(args: argparse.Namespace) -> int:
     return 0 if out.get("ok") else 1
 
 
+ROUTING_COPY_MAX_S = 230
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
     from khipu.hub_snapshot import refresh, snapshot_freshness
 
@@ -4702,10 +4808,26 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
             out["owner_direction"] = timer_error(exc)
         try:
+            from khipu import owner_background
+
+            out["owner_jobs"] = {"interrupted": owner_background.heal()}
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out["owner_jobs"] = timer_error(exc)
+        try:
             jobs._write_job_state("replica_refresh", rc)
             out["job_state"] = {"ok": True}
         except Exception as exc:  # noqa: BLE001 — no timer stage starves the next
             out["job_state"] = timer_error(exc)
+        # The routing copy between Macs must not depend on a prompt helper
+        # being alive. Last, so a slow hub cannot delay the stages above.
+        try:
+            from khipu import deadline, routing
+
+            # Under the five-minute tick, so a hub that stops answering cannot hold the next run off.
+            with deadline.limit(ROUTING_COPY_MAX_S, "the routing copy"):
+                out["routing_copy"] = routing.poll_refold()
+        except Exception as exc:  # noqa: BLE001 — timer housekeeping is isolated
+            out["routing_copy"] = timer_error(exc)
         print(json.dumps(out, indent=2))
         return rc
     if args.snapshot_cmd == "status":
@@ -5560,6 +5682,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     d.set_defaults(func=cmd_doctor)
 
+    ny = sub.add_parser("needs-you", help="Everything waiting on the owner, in the app and MCP's own words")
+    ny.add_argument("--json", action="store_true", help="Print the complete structured answer")
+    choose = ny.add_mutually_exclusive_group()
+    choose.add_argument("--item", metavar="KEY_OR_NUMBER", help="Show one item whole by stable key or list number")
+    choose.add_argument("--yes", metavar="KEY_OR_NUMBER", help="Keep the displayed item after a terminal yes")
+    choose.add_argument("--no", metavar="KEY_OR_NUMBER", help="Decline or undo the displayed item after a terminal yes")
+    ny.set_defaults(func=cmd_needs_you)
+
     storage_p = sub.add_parser("storage", help="Free disk space and what Khipu holds, as JSON (read-only)")
     storage_p.set_defaults(func=cmd_storage)
 
@@ -6225,6 +6355,26 @@ def build_parser() -> argparse.ArgumentParser:
     hold.add_argument("--owner", action="store_true", help="The owner's hold (asks for a typed confirmation)")
     hold.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
     _owner_flags(hold)
+    rover = rt_sub.add_parser("override", help="Owner: let one conversation run ahead of pace on an account "
+                              "(grant ACCOUNT --subject JSON --until T | --indefinite), end one early (end ID) "
+                              "or keep one with no end (keep ID); list and walk are the app's reads", parents=[rt_json])
+    rover.add_argument("action", choices=("grant", "end", "keep", "list", "walk"))
+    rover.add_argument("params", nargs="*")
+    rover.add_argument("--subject", default=None, metavar="JSON", help="Who it is for, as the ask showed it")
+    rover.add_argument("--effect", default="ahead_of_pace")
+    rover.add_argument("--until", default=None, metavar="T")
+    rover.add_argument("--indefinite", action="store_true")
+    rover.add_argument("--no-children", dest="no_children", action="store_true")
+    rover.add_argument("--ceiling-pct", dest="ceiling_pct", type=float, default=None)
+    rover.add_argument("--window", default=None, choices=("weekly", "five-hour"))
+    rover.add_argument("--reason", default=None)
+    rover.add_argument("--ref", default=None)
+    rover.add_argument("--request", default=None, help="The owner's words, one line")
+    rover.add_argument("--leave", default=None, metavar="KEY", help="walk: set this item aside")
+    rover.add_argument("--keep", default=None, metavar="KEY", help="walk: keep this pair of twins as they are")
+    rover.add_argument("--restart", action="store_true", help="walk: forget what was set aside")
+    rover.add_argument("--from-app", action="store_true", help=argparse.SUPPRESS)
+    _owner_flags(rover)
     rpause = rt_sub.add_parser("pause", help="Owner: mark an account paused (asks for a typed confirmation)",
                                parents=[rt_json])
     rpause.add_argument("account")

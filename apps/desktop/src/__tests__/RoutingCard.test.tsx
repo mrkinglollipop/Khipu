@@ -389,7 +389,7 @@ describe("Home Routing card, two sources disagree and a rule may be broken", () 
     v.rule_checks = [{
       rule: 3, status: "broken", at: "2026-10-14T15:22:00Z", runner: "Project A", file: "settings",
       text: "A standing rule may be broken: Project A's settings name a model ending in -fast for its grokcheck lane.",
-    }, { rule: 4, status: "cannot_check", text: "Project A's grok lane: whether it uses the paid xAI API can't be checked: the launch environment is set inside grok" }];
+    }, { rule: 4, status: "cannot_check", text: "Project A's grok job slot: whether it uses the paid xAI API can't be checked: the launch environment is set inside grok" }];
     return v;
   }
 
@@ -444,8 +444,8 @@ describe("routing attention and health row edges", () => {
     expect(items).toEqual([{
       key: "routing:lane:Project A/opus-batch",
       tone: "warn",
-      title: "A limit came from a lane not matched to an account",
-      cause: "A limit came from Project A's opus-batch lane, which isn't matched to an account; it ends at 2:00 PM. Conversations are told the lane's name only, never a guessed account.",
+      title: "A limit came from a job slot not matched to an account",
+      cause: "A limit came from Project A's opus-batch job slot, which isn't matched to an account; it ends at 2:00 PM. Conversations are told the job slot's name only, never a guessed account.",
     }]);
   });
 

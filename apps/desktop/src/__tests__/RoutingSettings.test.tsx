@@ -564,10 +564,9 @@ describe("Settings -> Routing: standing rules", () => {
     await page();
     const three = row("Standing rules", "3.");
     expect(three).toHaveTextContent("From your routing table, Oct 13");
-    expect(three).toHaveTextContent("Copied rule, confirm");
+    expect(three).toHaveTextContent("Copied from old file");
     expect(three).toHaveTextContent("Checked by Khipu");
     const seven = row("Standing rules", "7.");
-    expect(seven).toHaveTextContent("Confirmed");
     expect(seven).toHaveTextContent("Passed to every conversation as written. Khipu has no way to check this one.");
     expect(within(seven).queryByRole("button", { name: "Confirm rule 7" })).toBeNull();
     expect(screen.queryByText(/Watched/)).toBeNull();
@@ -591,7 +590,7 @@ describe("Settings -> Routing: standing rules", () => {
       "Checked by Khipu, but not yet: add a job runner folder so it has something to read.",
     );
     expect(ruleResultLine(true, { rule: 3, result: "no_lane" }).text).toBe(
-      "Checked by Khipu, but not yet: none of your job runners has a lane this rule is about.",
+      "Checked by Khipu, but not yet: none of your job runners has a job slot this rule is about.",
     );
     expect(ruleResultLine(true, { rule: 3, check: "fast_tier", result: "cannot_check" }).text).toBe(
       "Checked by Khipu, but not here: the model is set inside the launch script, which Khipu doesn't read.",
@@ -604,7 +603,7 @@ describe("Settings -> Routing: standing rules", () => {
       "Checked by Khipu, but not here: Khipu hasn't read your job runner's list of added work yet.",
     );
     expect(ruleResultLine(true, { rule: 2, check: "grok_confirm", result: "ok", at: "2026-10-14T15:36:00Z", unchecked: 1 }).text).toContain(
-      "1 lane couldn't be checked: the confirming lane's kind isn't set",
+      "1 job slot couldn't be checked: the confirming job slot's kind isn't set",
     );
     for (const r of ["no_runner", "no_lane", "cannot_check", "unreadable", "broken"])
       expect(ruleResultLine(true, { rule: 3, result: r, at: "2026-10-14T15:36:00Z" }).text).not.toContain("nothing wrong found");
@@ -692,7 +691,7 @@ describe("Settings -> Routing: standing rules", () => {
     await page();
     const three = row("Standing rules", "3.");
     expect(three).toHaveTextContent(
-      "Checked by Khipu, but not fully: Khipu left out 3 lanes in project A; and 1 lane and 12 lines of added work in project B.",
+      "Checked by Khipu, but not fully: Khipu left out 3 job slots in project A; and 1 job slot and 12 lines of added work in project B.",
     );
     expect(three).not.toHaveTextContent("nothing wrong found");
     expect(screen.getByRole("button", { name: "May be broken, 0 rules" })).toBeInTheDocument();
@@ -785,7 +784,7 @@ describe("Settings -> Routing: standing rules", () => {
     const chips = screen.getByRole("group", { name: "Show rules" });
     const all = within(chips).getByRole("button", { name: "All, 2 rules" });
     expect(all).toHaveAttribute("aria-pressed", "true");
-    within(chips).getByRole("button", { name: "To confirm, 1 rule" });
+    within(chips).getByRole("button", { name: "To confirm, 0 rules" });
     within(chips).getByRole("button", { name: "Checked by Khipu, 1 rule" });
     const broken = within(chips).getByRole("button", { name: "May be broken, 1 rule" });
     fireEvent.click(broken);
@@ -797,6 +796,12 @@ describe("Settings -> Routing: standing rules", () => {
   });
 
   it("confirms a rule only after asking", async () => {
+    // Only a conversation's pending change asks; rules copied from the old file do not.
+    answers.khipu_route_view = () => {
+      const v = view();
+      v.rules = [{ ...v.rules![0], pending: true, pending_kind: "added", pending_by: "a Codex conversation" }, ...v.rules!.slice(1)];
+      return v;
+    };
     await page();
     fireEvent.click(screen.getByRole("button", { name: "Confirm rule 3" }));
     expect(calls("khipu_route_rule")).toEqual([]);
@@ -1137,10 +1142,10 @@ describe("Settings -> Routing: telling conversations", () => {
       calls("khipu_config_set").length ? config({ routing_dispatch_scripts: setting(["dispatch.py", "run-job.sh"], []) }) : config();
     await page();
     openRare("Sizes, timing and hand-off scripts");
-    const row = screen.getByText("Your dispatch scripts").closest(".row-item") as HTMLElement;
+    const row = screen.getByText("Your hand-off scripts").closest(".row-item") as HTMLElement;
     expect(within(row).getByText("None")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Change your dispatch scripts" }));
-    const form = screen.getByRole("form", { name: "Change your dispatch scripts" });
+    fireEvent.click(screen.getByRole("button", { name: "Change your hand-off scripts" }));
+    const form = screen.getByRole("form", { name: "Change your hand-off scripts" });
     const input = within(form).getByLabelText("File names");
     fireEvent.change(input, { target: { value: "scripts/dispatch.py" } });
     fireEvent.click(within(form).getByRole("button", { name: "Save" }));
@@ -1206,7 +1211,7 @@ describe("Settings -> Routing: telling conversations", () => {
     answers.khipu_route_view = { ...view(), old_switches: { env: false, file: true } };
     await page();
     expect(screen.getByText(/Your old "routing off" switch is set/)).toBeInTheDocument();
-    expect(screen.getByText(/delete it to turn the telling back on/)).toBeInTheDocument();
+    expect(screen.getByText(/delete it to turn these updates back on/)).toBeInTheDocument();
   });
 });
 
@@ -1329,7 +1334,7 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
   it("lists folders with their last read, stopped reporting, and removes one after asking", async () => {
     await page();
     await screen.findByRole("list", { name: "Job runner folders" });
-    expect(row("Job runner folders", "Project A")).toHaveTextContent("Read just now · 3 lanes");
+    expect(row("Job runner folders", "Project A")).toHaveTextContent("Read just now · 3 job slots");
     expect(row("Job runner folders", "Project A")).toHaveTextContent("/runners/a · reports every 20 s");
     expect(row("Job runner folders", "Project B")).toHaveTextContent("Stopped reporting at 10:02 AM");
     expect(row("Job runner folders", "Project B")).toHaveTextContent("last good read 10:02 AM, 1 h 38 min ago");
@@ -1363,10 +1368,10 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
 
   it("matches an unmatched lane to an account", async () => {
     await page();
-    const list = await screen.findByRole("list", { name: "Lanes" });
+    const list = await screen.findByRole("list", { name: "Job slots" });
     const lane = within(list).getAllByRole("listitem").find((r) => r.textContent?.startsWith("opus-batch"))!;
     expect(lane).toHaveTextContent("No account");
-    fireEvent.click(within(lane).getByRole("button", { name: "Change the account for Project B's opus-batch lane" }));
+    fireEvent.click(within(lane).getByRole("button", { name: "Change the account for Project B's opus-batch job slot" }));
     fireEvent.change(within(lane).getByLabelText("Account for opus-batch"), { target: { value: "Claude main" } });
     fireEvent.click(within(lane).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(calls("khipu_config_set")).toHaveLength(1));
@@ -1390,7 +1395,7 @@ describe("Settings -> Routing: job runner folders, lanes, the table and changes"
   });
 });
 
-// Routing slice 15c: the Providers and lanes group (mocks
+// Routing slice 15c: the Job runners and job slots group (mocks
 // docs/mockups/2026-10-21-routing/lanes-light.html and lanes-states-light.html).
 // Every way a lane can match, and the provider facts the owner wrote.
 describe("Settings -> Routing: providers and lanes", () => {
@@ -1446,8 +1451,8 @@ describe("Settings -> Routing: providers and lanes", () => {
     answers.khipu_config_show = lanesConfig();
     await page();
     openRare("Providers and account setup");
-    expect(screen.getByRole("region", { name: "Providers and lanes" })).toBeInTheDocument();
-    expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("5 providers · 2 folders, 8 lanes");
+    expect(screen.getByRole("region", { name: "Job runners and job slots" })).toBeInTheDocument();
+    expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("5 providers · 2 folders, 8 job slots");
     const rows = screen.getByRole("list", { name: "Providers" });
     expect(within(rows).getAllByRole("listitem").map((r) => r.querySelector(".name")?.textContent)).toEqual([
       "Claude", "Codex", "Grok", "GLM", "Muse",
@@ -1467,46 +1472,46 @@ describe("Settings -> Routing: providers and lanes", () => {
     answers.khipu_config_show = lanesConfig();
     await page();
     fireEvent.click(screen.getByRole("button", { name: "Something's wrong" }));
-    expect(row("Lanes", "claude")).toHaveTextContent("project-a runner");
-    expect(row("Lanes", "claude")).toHaveTextContent("No account");
-    expect(row("Lanes", "claude")).toHaveTextContent("two accounts match the name");
-    expect(within(row("Lanes", "claude")).getByText("Pick one")).toBeInTheDocument();
-    expect(row("Lanes", "claude")).toHaveTextContent("Could be: Claude main, Claude second");
-    expect(row("Lanes", "grok-review")).toHaveTextContent("Grok Build");
-    expect(row("Lanes", "grok-review")).toHaveTextContent("you mapped it");
-    expect(within(row("Lanes", "grok-review")).getByText("Yours")).toBeInTheDocument();
-    expect(row("Lanes", "review-2")).toHaveTextContent("no name match and nothing declared");
+    expect(row("Job slots", "claude")).toHaveTextContent("project-a runner");
+    expect(row("Job slots", "claude")).toHaveTextContent("No account");
+    expect(row("Job slots", "claude")).toHaveTextContent("two accounts match the name");
+    expect(within(row("Job slots", "claude")).getByText("Pick one")).toBeInTheDocument();
+    expect(row("Job slots", "claude")).toHaveTextContent("Could be: Claude main, Claude second");
+    expect(row("Job slots", "grok-review")).toHaveTextContent("Grok Build");
+    expect(row("Job slots", "grok-review")).toHaveTextContent("you mapped it");
+    expect(within(row("Job slots", "grok-review")).getByText("Yours")).toBeInTheDocument();
+    expect(row("Job slots", "review-2")).toHaveTextContent("no name match and nothing declared");
     // The account column and the warn tag both say it.
-    expect(within(row("Lanes", "review-2")).getAllByText("No account")).toHaveLength(2);
-    expect(row("Lanes", "review-2")).toHaveTextContent(
-      "Add an account line for this lane in the runner's settings, or map it here.",
+    expect(within(row("Job slots", "review-2")).getAllByText("No account")).toHaveLength(2);
+    expect(row("Job slots", "review-2")).toHaveTextContent(
+      "Add an account line for this job slot in the runner's settings, or map it here.",
     );
-    expect(row("Lanes", "main-sonnet")).toHaveTextContent("the runner says so; a job from it used Claude main's login");
-    expect(within(row("Lanes", "main-sonnet")).getByText("Confirmed")).toBeInTheDocument();
-    expect(row("Lanes", "secondary-haiku")).toHaveTextContent("the runner says so; no job has proved it yet");
-    expect(within(row("Lanes", "secondary-haiku")).getByText("Claimed")).toBeInTheDocument();
-    expect(row("Lanes", "codex")).toHaveTextContent("matched by name");
-    expect(within(row("Lanes", "codex")).getByText("By name")).toBeInTheDocument();
+    expect(row("Job slots", "main-sonnet")).toHaveTextContent("the runner says so; a job from it used Claude main's login");
+    expect(within(row("Job slots", "main-sonnet")).getByText("Confirmed")).toBeInTheDocument();
+    expect(row("Job slots", "secondary-haiku")).toHaveTextContent("the runner says so; no job has proved it yet");
+    expect(within(row("Job slots", "secondary-haiku")).getByText("Claimed")).toBeInTheDocument();
+    expect(row("Job slots", "codex")).toHaveTextContent("matched by name");
+    expect(within(row("Job slots", "codex")).getByText("By name")).toBeInTheDocument();
     // A declaration its launcher contradicts: its own tag, never Needs you.
-    expect(row("Lanes", "main-opus")).toHaveTextContent("the runner's settings and its login name different accounts");
-    expect(within(row("Lanes", "main-opus")).getByText("Conflict")).toBeInTheDocument();
-    expect(row("Lanes", "main-opus")).toHaveTextContent("Fix the runner's settings, or pick the account here.");
+    expect(row("Job slots", "main-opus")).toHaveTextContent("the runner's settings and its login name different accounts");
+    expect(within(row("Job slots", "main-opus")).getByText("Conflict")).toBeInTheDocument();
+    expect(row("Job slots", "main-opus")).toHaveTextContent("Fix the runner's settings, or pick the account here.");
     const needs = screen.getByRole("region", { name: "Needs you" });
     expect(within(needs).getByText("Job slot claude in project-a matches two accounts")).toBeInTheDocument();
     expect(within(needs).getByText("Job slot review-2 in project-a has no account")).toBeInTheDocument();
     expect(within(needs).queryByText(/main-opus/)).toBeNull();
-    expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("2 lanes without an account");
-    expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("1 lane conflicts");
+    expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("2 job slots without an account");
+    expect(document.querySelector('[data-settings-group="runners"]')!.textContent).toContain("1 job slot conflicts");
   });
 
-  it("keeps the job runner folders beside the lanes, saying how each is doing", async () => {
+  it("keeps the job runner folders beside the job slots, saying how each is doing", async () => {
     answers.khipu_route_view = lanesView();
     answers.khipu_config_show = lanesConfig();
     await page();
     fireEvent.click(screen.getByRole("button", { name: "Something's wrong" }));
-    expect(screen.getByRole("region", { name: "Providers and lanes" })).toHaveTextContent("2 folders, both reporting");
-    expect(row("Job runner folders", "project-a")).toHaveTextContent("Read just now · 3 lanes");
-    expect(within(row("Lanes", "claude")).queryByRole("button", { name: "Remove" })).toBeNull();
+    expect(screen.getByRole("region", { name: "Job runners and job slots" })).toHaveTextContent("2 folders, both reporting");
+    expect(row("Job runner folders", "project-a")).toHaveTextContent("Read just now · 3 job slots");
+    expect(within(row("Job slots", "claude")).queryByRole("button", { name: "Remove" })).toBeNull();
   });
 
   it("says No job runners yet and keeps its Add a folder control", async () => {
@@ -1519,8 +1524,8 @@ describe("Settings -> Routing: providers and lanes", () => {
     fireEvent.click(screen.getByRole("button", { name: "Something's wrong" }));
     expect(document.querySelector('[data-settings-group="runners"]')).toHaveTextContent("No job runner folders");
     expect(screen.getByText("No job runners yet")).toBeInTheDocument();
-    expect(screen.getByText("Add a job runner folder and its lanes show here with the account each one uses.")).toBeInTheDocument();
-    fireEvent.click(within(screen.getByRole("region", { name: "Providers and lanes" })).getByRole("button", { name: "Add a folder…" }));
+    expect(screen.getByText("Add a job runner folder and its job slots show here with the account each one uses.")).toBeInTheDocument();
+    fireEvent.click(within(screen.getByRole("region", { name: "Job runners and job slots" })).getByRole("button", { name: "Add a folder…" }));
     expect(await screen.findByRole("form", { name: "Add a job runner folder" })).toBeInTheDocument();
   });
 });
@@ -2143,12 +2148,12 @@ describe("Settings -> Routing: Codex review of phase 4", () => {
   it("keeps both lane changes made before the first one's re-read (finding 1)", async () => {
     const cli = heldConfig();
     await page();
-    const lanes = await screen.findByRole("list", { name: "Lanes" });
+    const lanes = await screen.findByRole("list", { name: "Job slots" });
     const opus = within(lanes).getAllByRole("listitem").find((r) => r.textContent?.startsWith("opus-batch"))!;
-    fireEvent.click(within(opus).getByRole("button", { name: "Change the account for Project B's opus-batch lane" }));
+    fireEvent.click(within(opus).getByRole("button", { name: "Change the account for Project B's opus-batch job slot" }));
     fireEvent.change(within(opus).getByLabelText("Account for opus-batch"), { target: { value: "Claude main" } });
     fireEvent.click(within(opus).getByRole("button", { name: "Save" }));
-    fireEvent.click(screen.getByRole("button", { name: "Change the account for Project A's codex lane" }));
+    fireEvent.click(screen.getByRole("button", { name: "Change the account for Project A's codex job slot" }));
     const codex = within(lanes).getAllByRole("listitem").find((r) => r.textContent?.startsWith("codex"))!;
     fireEvent.change(within(codex).getByLabelText("Account for codex"), { target: { value: "Claude second" } });
     fireEvent.click(within(codex).getByRole("button", { name: "Save" }));
@@ -2373,7 +2378,7 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
     expect(screen.queryByText(/No job runner folders yet/)).toBeNull();
     expect(screen.queryByText(/Lanes show here once/)).toBeNull();
     expect(screen.getByText(/Looking for job runner folders/).closest("[aria-busy]")).toHaveAttribute("aria-busy", "true");
-    expect(screen.getByText(/Looking for job runner lanes/)).toBeInTheDocument();
+    expect(screen.getByText(/Looking for job slots/)).toBeInTheDocument();
     cfg.release(config({ routing_push_prompt: setting(false) }));
     feats.release({ features: { routing_push: { enabled: true, source: "file" } } });
     await waitFor(() => expect(screen.getByRole("switch", { name: "Before each prompt" })).not.toBeChecked());
@@ -2401,15 +2406,15 @@ describe("Settings -> Routing: nothing shows a false off while it is read", () =
     await waitFor(() => expect(screen.getByRole("switch", { name: "Before each prompt" })).toBeChecked());
   });
 
-  it("says Reading… for folders and lanes before the routing record is read", async () => {
+  it("says Reading… for folders and job slots before the routing record is read", async () => {
     const rec = hold<unknown>();
     answers.khipu_route_view = () => rec.p;
     render(<RoutingSettings active />);
-    await screen.findByText(/Looking for job runner lanes/);
+    await screen.findByText(/Looking for job slots/);
     expect(screen.queryByText(/Lanes show here once/)).toBeNull();
     rec.release(view());
     await screen.findByRole("list", { name: "Accounts" });
-    await waitFor(() => expect(screen.queryByText(/Looking for job runner lanes/)).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/Looking for job slots/)).toBeNull());
   });
 
   it("shows a conversation's change to a routing setting and answers it as the owner", async () => {
@@ -2445,7 +2450,7 @@ it("shows a Cursor lane matched to Grok without writing a lane override", async 
     lane_matches: { "cursor-grok": { account: "Grok", matched_by: "declaration", candidates: ["Grok"] } } }];
   answers.khipu_route_view = v;
   await page();
-  const lanes = await screen.findByRole("list", { name: "Lanes" });
+  const lanes = await screen.findByRole("list", { name: "Job slots" });
   expect(lanes).toHaveTextContent("cursor-grok");
   expect(lanes).toHaveTextContent("the runner says so; no job has proved it yet");
   expect(within(lanes).queryByText("No account")).toBeNull();
@@ -2593,7 +2598,7 @@ describe("Settings -> Accounts and routing: eight pages", () => {
     fireEvent.click(within(nav).getByRole("button", { name: "Something's wrong" }));
     const wrong = document.querySelector<HTMLElement>('[data-routing-page="wrong"]')!;
     expect(wrong).toHaveAttribute("data-active", "true");
-    expect(within(wrong).getByText("Providers and lanes")).toBeInTheDocument();
-    expect(within(wrong).getByRole("list", { name: "Lanes" })).toBeInTheDocument();
+    expect(within(wrong).getByText("Job runners and job slots")).toBeInTheDocument();
+    expect(within(wrong).getByRole("list", { name: "Job slots" })).toBeInTheDocument();
   });
 });

@@ -8,10 +8,14 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import hashlib
+import re
 import threading
+import time
 import os
 import secrets
 import tempfile
+from datetime import datetime, timezone
 from datetime import timedelta
 
 from khipu import routing
@@ -22,6 +26,9 @@ def _stamp(dt):
 
 EPOCH = "1970-01-01T00:00:00Z"
 POLL_SECONDS = 30
+UPLOAD_PER_TURN = 64
+ROUND_BUDGET_S = 240.0  # how long one sync keeps sending slices (each is saved durably) before the next tick takes over
+CONTROL_EVERY_S = 270  # just under the 5-minute timer, so every tick looks
 
 
 def _path(name):
@@ -98,6 +105,102 @@ def cache_key():
 
 
 RETENTION_KINDS = frozenset({"usage_sample", "source_seen", "evidence", "observation", "observation_renew", "reset_check"})
+
+
+def _event_order(row):
+    """Owner timestamp first, hub order only as its deterministic tie-break."""
+    at = routing._parse(row.get("written_at")) or datetime.min.replace(tzinfo=timezone.utc)
+    return at, row.get("hub_order", 0) if isinstance(row.get("hub_order"), int) else 0
+
+
+def settings_status():
+    """Local/remote values retained for Your Macs; no value is silently picked
+    while a first-enable snapshot disagrees."""
+    from khipu.config import load_config
+
+    remote = [e for e in remote_events() if e.get("type") == "setting_set"]
+    newest = {}
+    for row in remote:
+        key = row.get("key")
+        if routing.settings_syncable(key) and (key not in newest or _event_order(row) > _event_order(newest[key])):
+            newest[key] = row
+    config = load_config()
+    differences = []
+    for key, row in newest.items():
+        try:
+            remote_value = json.loads(row["value_json"])
+            remote_value = routing._coerce(routing.SETTINGS[key][0], remote_value, key)
+        except (ValueError, TypeError, KeyError):
+            continue
+        local_value = routing.settings(config)[key]
+        if local_value != remote_value:
+            differences.append({"key": key, "name": routing.SETTINGS[key][2], "local": local_value,
+                                "remote": remote_value, "remote_snapshot": row.get("snapshot") is True,
+                                "remote_at": row.get("written_at")})
+    return {"enabled": routing._replication_live(), "differences": differences,
+            "requests": [r for r in remote_requests() if r["state"] != "pending"][:10],
+            "waiting": [r for r in remote_requests() if r["state"] == "pending"][:10]}
+
+
+def mac_label(mac):
+    """What the owner calls a Mac, from his own names; never a path or address."""
+    names = routing.settings().get("routing_mac_names") or {}
+    name = names.get(mac) if isinstance(mac, str) else None
+    return name if isinstance(name, str) and name.strip() else "your other Mac"
+
+
+def _newest_setting_events():
+    """The latest ``setting_set`` per key across this Mac's own lines and every
+    Mac's received ones: owner time first, hub order only as the tie-break."""
+    local = [e for e in routing._read_event_lines()[0] if e.get("type") == "setting_set"]
+    newest = {}
+    for row in merge(local):
+        key = row.get("key")
+        if row.get("type") == "setting_set" and routing.settings_syncable(key) \
+                and (key not in newest or _event_order(row) > _event_order(newest[key])):
+            newest[key] = row
+    return newest
+
+
+def _apply_remote_settings(state):
+    """Apply the other Macs' later owner changes, once each. A change this
+    Mac's owner made after them stays; a snapshot taken at first switch-on
+    never overwrites (it is listed in ``settings_status`` until chosen); an
+    Undo here is not undone by the next pull, because each change applies by
+    its event id only once. Every applied change is logged to the owner-actions
+    log, so Undo works on this Mac."""
+    if not routing._replication_live():
+        return
+    from khipu import owner_direction
+    from khipu.config import mutate_config
+
+    with routing._lock():
+        mine = routing._local_mac()
+        applied = dict(_state().get("settings_applied") or {})
+        todo = [(k, r) for k, r in _newest_setting_events().items()
+                if r.get("mac") != mine and r.get("snapshot") is not True and applied.get(k) != r.get("id")]
+    for key, row in todo:
+        try:
+            value = routing._coerce(routing.SETTINGS[key][0], json.loads(row["value_json"]), key)
+        except (ValueError, TypeError, KeyError):
+            continue
+        was_set = row.get("value_set") is True
+        if routing.settings()[key] != value:
+            where = mac_label(row.get("mac"))
+            stamp = {"auth": "other_mac", "words": f"the same change made on {where}"}
+            owner_direction.noted(owner_direction.intent("config.routing_setting", key, facts={"from": where}), stamp)
+            try:
+                with routing._lock(), mutate_config() as data:
+                    owner_direction.record_setting_before(key, data)
+                    if was_set:
+                        data[key] = value
+                    else:
+                        data.pop(key, None)
+            except Exception:
+                owner_direction.finish({"ok": False})
+                raise
+            owner_direction.finish({"ok": True, key: value})
+        state.setdefault("settings_applied", {})[key] = row["id"]
 
 
 def _remote_snapshot(data=None):
@@ -262,10 +365,400 @@ class PostgresHub:
         return dict(rows=[self._receipt(r) for r in rows[:limit]], complete=len(rows) <= limit,
                     hub_now=now, until=upper, sources=sources)
 
+    def pull_controls(self, after, limit):
+        """The off-state poll reads only the singleton copy-control stream."""
+        from khipu import db
+
+        with db.connect(statement_timeout_s=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT event_id, hub_order, payload, received_at, rule_number FROM routing_events "
+                            "WHERE payload ->> 'type' = 'settings_sync_switch' "
+                            "AND (received_at, event_id) > (%s::timestamptz, %s) "
+                            "ORDER BY received_at, event_id LIMIT %s", (*after, limit))
+                rows = cur.fetchall()
+        return {"rows": [self._receipt(r) for r in rows]}
+
 
 def sync(*, hub=None, limit=500, max_pages=20):
     """One bounded exchange (``_sync``), then the view refolded if it wrote."""
     return _refreshing(lambda: _sync(hub=hub, limit=limit, max_pages=max_pages))
+
+
+# ---- what waits on the owner, on every Mac ---------------------------------------------------
+#
+# A request a conversation holds for the owner lives in that Mac's own files.
+# It travels as a ``request_state`` line (the routing log, ``_sync`` and
+# ``routing_events``, no other path); the other Mac keeps a mirror row in its
+# own held-requests file, so Needs you, the app and the CLI list it like any
+# held request and the owner's yes or no is proved there as always. His answer
+# goes back as a ``request_answer`` line; the Mac that holds the request applies
+# it with its own owner handling (``owner_direction.confirm``) exactly once.
+
+REQUEST_KEPT_S = 14 * 86400
+_ASK_MOST = 1200
+_FINAL = {"applied": "applied", "applying": "applied", "failed": "failed", "interrupted": "failed", "declined": "declined"}
+
+
+def _sig(text):
+    """What an answer is bound to, as the whole hash the routing record's
+    ``revision_id`` shape carries (a short hex string reads as a key)."""
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def _request_rows():
+    """This Mac's own requests as (id, kind, state, action, sig, asked_at, ask, withheld)."""
+    from khipu import owner_direction, needs_you
+    from khipu.config import load_config
+    from khipu.redact import redact_secrets
+
+    out = []
+    try:
+        rows = owner_direction._read_requests(owner_direction.requests_path())
+    except (OSError, ValueError):
+        rows = []
+    for row in rows:
+        if row.get("action") == owner_direction.READ_ACTION or row.get("remote") or not row.get("id"):
+            continue
+        state = "pending" if row.get("state") == "pending" else _FINAL.get(row.get("state"))
+        if state is None or not isinstance(row.get("args"), dict) or not owner_direction.reviewed_hold(row):
+            continue
+        ask = str(row.get("ask") or "")
+        withheld = bool(row.get("files")) or len(ask) > _ASK_MOST or bool(redact_secrets(ask, force=True)[1])
+        if withheld:
+            ask = ("A conversation asked to "
+                   + needs_you.ACTION_WORDS.get(row.get("action"), "make a change") + ".")
+        out.append((str(row["id"]), "held", state, str(row.get("action") or ""),
+                    _sig(owner_direction.signature(row["action"], row["args"])), row.get("created_at"), ask, withheld))
+    config = load_config()
+    for key, waiting in routing._setting_requests(config).items():
+        if key not in routing.SETTINGS:
+            continue
+        kind, default, name = routing.SETTINGS[key]
+        before = waiting.get("prior") if waiting.get("prior_set") else default
+        words = (f"A conversation asked to change a routing setting: {name}. It would go from "
+                 f"{needs_you._setting_value(kind, before)} to {needs_you._setting_value(kind, config.get(key))}.")
+        out.append((f"setting:{key}", "setting", "pending", "config.answer_request",
+                    _sig(routing.setting_request_pin(key, waiting, config.get(key))), waiting.get("at"), words, False))
+    return out
+
+
+def _request_event(request, kind, state, action, sig, asked_at, ask, withheld):
+    event = {"type": "request_state", "request": request, "req_kind": kind, "req_state": state, "sig": sig,
+             "withheld": withheld, "ask": ask, "written_by": {"kind": "check"}, "via": "check"}
+    if action and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", action):
+        event["req_action"] = action
+    if isinstance(asked_at, str) and asked_at:
+        event["asked_at"] = asked_at
+    return event
+
+
+def _emit_request_states(rows, state):
+    """One ``request_state`` line for each request whose state changed since
+    the last one sent; ``state`` remembers what was sent."""
+    sent = state.setdefault("requests_published", {})
+    batch = []
+    for row in rows:
+        request, kind, st, action, sig, asked_at, ask, withheld = row
+        if sent.get(request) == [st, sig]:
+            continue
+        batch.append(_request_event(*row))
+        sent[request] = [st, sig]
+    if batch:
+        routing._write_many(batch)
+    return len(batch)
+
+
+def publish_requests():
+    """Tell the other Macs what waits here, and how each request ended."""
+    if not routing._replication_live():
+        return
+    with routing._lock():
+        state = _state()
+        if state.get("mac") not in (None, routing._local_mac()):
+            return
+        rows = _request_rows()
+        seen = {r[0] for r in rows}
+        # A setting request that is no longer waiting was answered here.
+        gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False)
+                for request, (st, sig) in (state.get("requests_published") or {}).items()
+                if request not in seen and st == "pending" and request.startswith("setting:")]
+        if _emit_request_states(rows + gone, state):
+            state.setdefault("mac", routing._local_mac())
+            _save(state)
+
+
+def answer_remote(request, stamp, answer):
+    """The owner's yes or no, typed here, to a request another Mac holds."""
+    remote = request.get("remote") or {}
+    source = (request.get("confirmed") or request.get("declined") or {})
+    sha = (stamp or {}).get("prompt_sha256") or source.get("message_sha256")
+    event = {"type": "request_answer", "request": remote["request"], "req_answer": answer, "sig": remote["sig"]}
+    harness = (stamp or {}).get("harness")
+    if isinstance(harness, str) and harness:
+        event["answer_harness"] = harness
+    if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha):
+        event["message_sha"] = sha
+    routing._write_many(routing.owner_lines([event], "direction"))
+    return True
+
+
+def _mirror_id(request):
+    return "rm-" + request
+
+
+def _write_mirror(update):
+    """``update(rows, now)`` under the held-requests lock; True when it saved."""
+    from khipu import owner_direction
+
+    now = owner_direction._clock()
+    with owner_direction._requests_locked() as path:
+        state = owner_direction._load(path)
+        if update(state["requests"], now) is False:
+            return False
+        owner_direction._save(path, state, now)
+    return True
+
+
+def mirror_remote_requests(state):
+    """A request another Mac holds, as a held request here; and how it ended
+    there, so a request settled elsewhere never lingers."""
+    from khipu import owner_direction
+
+    mine = routing._local_mac()
+    newest = {}
+    for row in remote_events():
+        if row.get("type") == "request_state" and row.get("mac") not in (None, mine):
+            key = (row.get("mac"), row.get("request"))
+            if key not in newest or _event_order(row) > _event_order(newest[key]):
+                newest[key] = row
+    for (mac, request), row in newest.items():
+        where = mac_label(mac)
+        final = row.get("req_state")
+        mirror = _mirror_id(request)
+
+        def update(rows, now, row=row, mac=mac, request=request, mirror=mirror, where=where, final=final):
+            current = next((r for r in rows if r.get("id") == mirror), None)
+            if final == "pending":
+                if current is not None:
+                    return False
+                if row.get("withheld") is True or not row.get("ask"):
+                    ask = ("A conversation on " + where + " asked for a change. Its words stay on that Mac, so they "
+                           "can't be shown here: answer it there.")
+                    withheld = True
+                else:
+                    ask, withheld = str(row["ask"]), False
+                rows.append({"id": mirror, "action": "direction.remote", "args": {"request": request, "mac": mac},
+                             "state": "pending", "created_ts": now, "created_at": owner_direction._iso(now),
+                             "session": None, "by": {"kind": "other_mac"}, "ask": ask, "files": None,
+                             "remote": {"mac": mac, "request": request, "sig": row.get("sig"), "withheld": withheld,
+                                        "kind": row.get("req_kind"), "action": row.get("req_action")}})
+                return True
+            if current is None or current.get("state") not in ("pending", "answered", "applying"):
+                return False
+            answered = current.get("state") != "pending"
+            text = {"applied": f"Applied on {where}.",
+                    "declined": f"Dropped on {where}.",
+                    "failed": f"{where} could not apply it, so nothing changed there.",
+                    "gone": f"It was already settled on {where}.",
+                    "stale": f"That was already settled on {where} before your answer arrived, so your answer "
+                             "changed nothing."}.get(final, f"It ended on {where}.")
+            if not answered and final in ("applied", "declined", "gone", "stale"):
+                text = f"It was settled on {where} before you answered. " + text
+            current.update(state="stale" if final in ("stale", "gone") else final, settled_ts=now,
+                           settled_at=owner_direction._iso(now), receipt=text)
+            return True
+
+        _write_mirror(update)
+
+
+def remote_requests():
+    """The requests this Mac mirrors from others and how each stands, for Your
+    Macs and ``route replication status``: plain words, newest first."""
+    from khipu import owner_direction
+
+    out = []
+    try:
+        rows = owner_direction._read_requests(owner_direction.requests_path())
+    except (OSError, ValueError):
+        return out
+    for row in rows:
+        remote = row.get("remote")
+        if not remote:
+            continue
+        state = row.get("state")
+        out.append({"id": row.get("id"), "ask": None if remote.get("withheld") else row.get("ask"),
+                    "answerable": not remote.get("withheld"),
+                    "request": remote.get("request"), "mac": mac_label(remote.get("mac")), "state": state,
+                    "words": row.get("receipt") or (
+                        "Your answer is on its way; it applies there within a few minutes." if state == "answered"
+                        else "Waiting for your answer." if state == "pending" else None),
+                    "stale": state == "stale"})
+    return out
+
+
+def apply_remote_answers(state):
+    """Apply each answer another Mac sent to a request held here, once, with
+    this Mac's own owner handling. A duplicate delivery does nothing; an answer
+    to a request that already ended says so on the other Mac."""
+    from khipu import owner_act, owner_direction
+
+    mine = routing._local_mac()
+    done = set(state.get("answers_done") or [])
+    answers = [e for e in remote_events() if e.get("type") == "request_answer" and e.get("mac") not in (None, mine)
+               and e.get("id") not in done]
+    outcomes = []
+    for answer in sorted(answers, key=_event_order):
+        request, wanted = answer.get("request"), answer.get("req_answer")
+        verdict = _apply_one(answer, request, wanted, owner_act, owner_direction)
+        done.add(answer["id"])
+        if verdict:
+            outcomes.append((request, verdict))
+    state["answers_done"] = sorted(done)[-500:]
+    if outcomes:
+        _emit_outcomes(outcomes, state)
+
+
+def _emit_outcomes(outcomes, state):
+    sent = state.setdefault("requests_published", {})
+    batch = []
+    for request, (verdict, sig) in outcomes:
+        batch.append(_request_event(request, "setting" if request.startswith("setting:") else "held", verdict, "", sig,
+                                    None, "", False))
+        if verdict not in ("stale", "gone"):
+            # A stale answer says something about the answer, not the request:
+            # the request's own state is still what ``publish_requests`` sends.
+            sent[request] = [verdict, sig]
+    routing._write_many(batch)
+
+
+def _apply_one(answer, request, wanted, owner_act, owner_direction):
+    """(state to publish, sig) or None for a harmless duplicate."""
+    sig = answer.get("sig") or ""
+    if isinstance(request, str) and request.startswith("setting:"):
+        return _apply_setting_answer(answer, request, wanted, owner_act, owner_direction)
+    try:
+        rows = owner_direction._read_requests(owner_direction.requests_path())
+    except (OSError, ValueError):
+        return ("failed", sig)
+    row = next((r for r in rows if r.get("id") == request and not r.get("remote")), None)
+    if row is None:
+        return ("gone", sig)
+    if row.get("state") != "pending":
+        duplicate = (wanted == "confirm" and row.get("state") in ("applying", "applied")) or (
+            wanted == "decline" and row.get("state") == "declined")
+        return None if duplicate else ("stale", sig)
+    if _sig(owner_direction.signature(row.get("action"), row.get("args"))) != sig:
+        return ("stale", sig)
+    try:
+        if wanted == "decline":
+            owner_direction.decline(request, remote=answer)
+            return ("declined", sig)
+        claimed, stamp = owner_direction.confirm(request, remote=answer)
+    except owner_direction.DirectionRefused as refused:
+        return ("stale" if refused.code in ("not_pending", "not_found") else "failed", sig)
+    ok, _result = owner_act.apply_confirmed(claimed, stamp)
+    return ("applied" if ok else "failed", sig)
+
+
+def _apply_setting_answer(answer, request, wanted, owner_act, owner_direction):
+    from khipu.config import load_config
+
+    key, sig = request.partition(":")[2], answer.get("sig") or ""
+    config = load_config()
+    waiting = routing._setting_requests(config).get(key)
+    if waiting is None:
+        return None if _state().get("requests_published", {}).get(request, [None])[0] in ("applied", "declined", "gone") \
+            else ("gone", sig)
+    pin = routing.setting_request_pin(key, waiting, config.get(key))
+    if _sig(pin) != sig:
+        return ("stale", sig)
+    action = "config.answer_request." + ("confirm" if wanted == "confirm" else "undo")
+    stamp = owner_direction.remote_stamp(answer)
+    request_row = {"id": request, "action": action, "args": {"key": key, "expect": pin}}
+    try:
+        head, positionals = owner_act.argv(action, owner_act._values(action, request_row["args"]))
+        full = owner_act.full_argv(head, positionals, ["--owner-direction"])
+        with owner_direction.confirmed_replay(action, stamp):
+            ok, _result = owner_act._run(action, full)
+    except owner_act.Refused:
+        ok = False
+    return ("applied" if ok and wanted == "confirm" else "declined" if ok else "failed", sig)
+
+
+def _apply_remote_switch(rows):
+    """The narrow off-state exception: one owner switch controls copy on all
+    Macs. Older clients safely ignore this new payload kind."""
+    rows = [r for r in rows if (r.get("payload") or {}).get("type") == "settings_sync_switch"]
+    if not rows:
+        return
+    newest = max(rows, key=lambda r: _event_order(dict(r.get("payload") or {}, hub_order=r.get("hub_order"))))
+    enabled = newest["payload"].get("enabled")
+    if not isinstance(enabled, bool):
+        return
+    with routing._lock():
+        mine = [e for e in routing._read_event_lines()[0] if e.get("type") == "settings_sync_switch"]
+    # This Mac's owner flipped it after that line was written: his later word stands.
+    if mine and max(_event_order(e) for e in mine) >= _event_order(dict(newest["payload"], hub_order=newest.get("hub_order"))):
+        return
+    from khipu.config import mutate_config
+    with routing._lock(), mutate_config() as data:
+        data["routing_replication_live"] = enabled
+
+
+def _control_sync(*, hub=None):
+    """The periodic off-state control poll. It only uploads/pulls the tiny
+    switch record; ordinary routing stays gated until that record says on."""
+    if hub is None and not routing._hub_configured():
+        return {"ok": True, "disabled": True, "caught_up": False}
+    from khipu.config import load_config
+
+    if "routing_replication_live" in routing._setting_requests(load_config()):
+        # A conversation asked to turn the copy on and the owner has not
+        # answered: this Mac makes no hub call at all until he does.
+        return {"ok": True, "disabled": True, "caught_up": False}
+    try:
+        with _sync_lock(), routing._lock():
+            mac = routing._mac_locked()
+            local, _bad = routing._read_event_lines()
+        state = _state()
+        # One look per timer tick, never one per prompt: a Mac with the copy
+        # off touches the hub for this one small record and nothing else.
+        polled = routing._parse(state.get("control_polled_at"))
+        now = routing._now()
+        pending = any(e.get("type") == "settings_sync_switch" and e.get("id") not in (state.get("control_uploaded") or [])
+                      for e in local)
+        if polled is not None and (now - polled).total_seconds() < CONTROL_EVERY_S and not pending:
+            return {"ok": True, "disabled": True, "caught_up": False}
+        state["control_polled_at"] = routing._iso(now)
+        _save(state)
+        hub = hub if hub is not None else PostgresHub()
+        sent = set(state.get("control_uploaded", []))
+        for event in local:
+            if event.get("type") != "settings_sync_switch" or not event.get("id") or event["id"] in sent:
+                continue
+            payload = routing.replication_payload([event], bindings={})
+            if payload:
+                hub.upload(mac, payload[0])
+                sent.add(event["id"])
+        state["control_uploaded"] = sorted(sent)[-32:]
+        cursor = state.get("control_cursor", [EPOCH, ""])
+        # Test/downgrade hubs have only the old broad pull API. Re-read its
+        # small synthetic window from zero so a same-timestamp late insert
+        # cannot hide behind an event-id cursor; real hubs use the indexed
+        # control-only query above.
+        result = hub.pull_controls(cursor, 64) if hasattr(hub, "pull_controls") else hub.pull([EPOCH, ""], None, 64)
+        rows = result.get("rows") or []
+        _apply_remote_switch(rows)
+        if rows:
+            state["control_cursor"] = [rows[-1]["received_at"], rows[-1]["event_id"]]
+        _save(state)
+        return {"ok": True, "disabled": True, "caught_up": False}
+    except BlockingIOError:
+        # The periodic timer overlapping another sync is ordinary contention,
+        # not a failed transport or a reason to alarm the owner.
+        return {"ok": True, "caught_up": False, "busy": True}
+    except Exception:
+        return {"ok": False, "caught_up": False, "error": "replication_unavailable"}
 
 
 def _sync(*, hub=None, limit=500, max_pages=20):
@@ -276,7 +769,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
     Errors are closed codes: a connection exception may contain credentials.
     """
     if not routing._replication_live():
-        return dict(ok=True, disabled=True, caught_up=False)
+        return _control_sync(hub=hub)
     if limit <= 0 or max_pages <= 0:
         raise ValueError("replication limits must be positive")
     from khipu.hub_snapshot import FRESHNESS_OVERLAP_S
@@ -284,6 +777,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
     state = None
     try:
         with _sync_lock():
+            publish_requests()
             with routing._lock():
                 mac = routing._mac_locked()
                 local, _bad = routing._read_event_lines()
@@ -303,56 +797,88 @@ def _sync(*, hub=None, limit=500, max_pages=20):
             deferred = state.setdefault("deferred", {})
             skipped = 0
             ordered = sorted(enumerate(local, 1), key=lambda pair: (pair[1].get("mac", ""), pair[1].get("seq", pair[0]), pair[0]))
-            for position, event in ordered:
-                origin = event.get("mac") or "legacy"
-                seq = event.get("seq", position)
-                if seq <= uploaded.get(origin, 0) and event.get("id") not in deferred:
-                    continue
-                projected = routing.replication_payload([event], bindings=bindings)
-                # A rejected identifier is not a new id; it must never upload.
-                if projected and projected[0].get("id"):
-                    receipt = hub.upload(mac, projected[0])
-                    if receipt["event_id"] != projected[0]["id"]:
-                        raise ValueError("wrong upload receipt")
-                    _store([receipt])
-                    deferred.pop(event["id"], None)
-                elif not projected and event.get("id"):
-                    deferred[event["id"]] = event["type"]
-                else:
-                    skipped += 1
-                uploaded[origin] = max(seq, uploaded.get(origin, 0))
-                _save(state)
-            for _ in range(max_pages):
-                after = state.get("scan_after") or [state.get("pull_cursor", EPOCH), ""]
-                result = hub.pull(after, state.get("scan_until"), limit)
-                upper = routing._parse(result["until"])
-                hub_now = routing._parse(result["hub_now"])
-                if upper is None or hub_now is None:
-                    raise ValueError("invalid hub clock")
-                rows = result["rows"]
-                _store(rows)
-                state["scan_order"] = max([state.get("scan_order", 0)] + [r["hub_order"] for r in rows])
-                state["sources"] = result["sources"]
-                state["hub_offset_seconds"] = (hub_now - routing._now()).total_seconds()
-                if result["complete"]:
-                    state["completed_order"] = max(state.get("completed_order", 0), state.pop("scan_order", 0))
-                    state["pull_cursor"] = _stamp(upper - timedelta(seconds=FRESHNESS_OVERLAP_S))
-                    state["caught_up_at"] = routing._iso(upper)
-                    state["checked_local_at"] = routing._iso(routing._now())
-                    state.pop("scan_after", None)
-                    state.pop("scan_until", None)
-                    state.pop("error", None)
+            deadline = time.monotonic() + ROUND_BUDGET_S
+            first_round = True
+            while True:
+                # Each round sends one bounded slice and then pulls, so a large
+                # local backlog never starves the other Macs; rounds repeat while
+                # the budget lasts, and what is left goes on the next tick.
+                sent_this_turn = 0
+                local_pending = False
+                finished = None
+                for position, event in ordered:
+                    origin = event.get("mac") or "legacy"
+                    seq = event.get("seq", position)
+                    retry = seq <= uploaded.get(origin, 0)
+                    # A deferred row is tried again once per sync, not every round.
+                    if retry and (event.get("id") not in deferred or not first_round):
+                        continue
+                    projected = routing.replication_payload([event], bindings=bindings)
+                    # A rejected identifier is not a new id; it must never upload.
+                    if projected and projected[0].get("id"):
+                        receipt = hub.upload(mac, projected[0])
+                        if receipt["event_id"] != projected[0]["id"]:
+                            raise ValueError("wrong upload receipt")
+                        _store([receipt])
+                        deferred.pop(event["id"], None)
+                    elif not projected and event.get("id"):
+                        deferred[event["id"]] = event["type"]
+                    else:
+                        skipped += 1
+                    uploaded[origin] = max(seq, uploaded.get(origin, 0))
                     _save(state)
-                    return dict(ok=True, caught_up=True, skipped=skipped,
-                                deferred_kinds=sorted(set(deferred.values())))
-                if not rows:
-                    raise ValueError("pull made no progress")
-                state["scan_after"] = [rows[-1]["received_at"], rows[-1]["event_id"]]
-                state["scan_until"] = result["until"]
-                _save(state)
-            return dict(ok=True, caught_up=False, partial=True)
+                    # A deferred row tried again is not new work for the slice.
+                    sent_this_turn += 0 if retry else 1
+                    # Uploading an old local backlog before ever pulling starves
+                    # every other Mac.  One bounded slice, then a pull, makes
+                    # progress fair and leaves the remaining local rows durable.
+                    if sent_this_turn >= UPLOAD_PER_TURN:
+                        local_pending = any(
+                            later.get("id") and later.get("seq", n) > uploaded.get(later.get("mac") or "legacy", 0)
+                            for n, later in ordered[position:]
+                        )
+                        break
+                for _ in range(max_pages):
+                    after = state.get("scan_after") or [state.get("pull_cursor", EPOCH), ""]
+                    result = hub.pull(after, state.get("scan_until"), limit)
+                    upper = routing._parse(result["until"])
+                    hub_now = routing._parse(result["hub_now"])
+                    if upper is None or hub_now is None:
+                        raise ValueError("invalid hub clock")
+                    rows = result["rows"]
+                    _store(rows)
+                    _apply_remote_switch(rows)
+                    _apply_remote_settings(state)
+                    apply_remote_answers(state)
+                    mirror_remote_requests(state)
+                    state["scan_order"] = max([state.get("scan_order", 0)] + [r["hub_order"] for r in rows])
+                    state["sources"] = result["sources"]
+                    state["hub_offset_seconds"] = (hub_now - routing._now()).total_seconds()
+                    if result["complete"]:
+                        state["completed_order"] = max(state.get("completed_order", 0), state.pop("scan_order", 0))
+                        state["pull_cursor"] = _stamp(upper - timedelta(seconds=FRESHNESS_OVERLAP_S))
+                        state["caught_up_at"] = routing._iso(upper)
+                        state["checked_local_at"] = routing._iso(routing._now())
+                        state.pop("scan_after", None)
+                        state.pop("scan_until", None)
+                        state.pop("error", None)
+                        _save(state)
+                        finished = dict(ok=True, caught_up=not local_pending, local_pending=local_pending, skipped=skipped,
+                                        deferred_kinds=sorted(set(deferred.values())))
+                        break
+                    if not rows:
+                        raise ValueError("pull made no progress")
+                    state["scan_after"] = [rows[-1]["received_at"], rows[-1]["event_id"]]
+                    state["scan_until"] = result["until"]
+                    _save(state)
+                if finished is None:
+                    return dict(ok=True, caught_up=False, partial=True)
+                if local_pending and time.monotonic() < deadline:
+                    first_round = False
+                    continue
+                return finished
     except BlockingIOError:
-        return dict(ok=False, caught_up=False, error="busy")
+        return dict(ok=True, caught_up=False, busy=True)
     except Exception:
         # Keep cursors as last persisted: the failed operation may have committed.
         return dict(ok=False, caught_up=False, error="replication_unavailable")
@@ -384,7 +910,11 @@ def status(now=None):
     caught = routing._parse(state.get("caught_up_at"))
     offset = state.get("hub_offset_seconds", 0)
     age = max(0, (now + timedelta(seconds=offset) - caught).total_seconds()) if caught else None
+    first_catch_up = caught is None and bool(state.get("uploaded") or state.get("scan_after"))
     return dict(caught_up_at=state.get("caught_up_at"), age_seconds=age,
+                first_catch_up=first_catch_up,
+                words=("Copying routing between your Macs for the first time. This can take a few minutes."
+                       if first_catch_up else None),
                 stale=age is None or age > 600, sources=state.get("sources", []),
                 hub_offset_seconds=state.get("hub_offset_seconds"),
                 deferred_kinds=sorted(set(state.get("deferred", {}).values())))
@@ -393,7 +923,10 @@ def status(now=None):
 def age_line(now=None):
     if not routing._replication_live():
         return None
-    age = status(now)["age_seconds"]
+    current = status(now)
+    if current["first_catch_up"]:
+        return current["words"]
+    age = current["age_seconds"]
     return ("routing from other Macs has not been received yet" if age is None else
             f"routing from other Macs is {int(age // 60)} min old")
 

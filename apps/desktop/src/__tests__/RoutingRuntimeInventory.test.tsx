@@ -116,7 +116,7 @@ const probes: Probe[] = [
   async () => { const p = await home("Conversations"); expect(p.getByRole("list", { name: "Live conversations" })).toBeVisible(); expect(p.getByRole("list", { name: "What each kind of conversation hears" })).toBeVisible(); expect(p.getByText(/old.*routing off.*file/)).toBeVisible(); },
   async () => { const p = await home("Your Macs"); expect(p.getByRole("list", { name: "Other Macs and the cloud" })).toBeVisible(); },
   async () => { const p = await home("Conversations"); for (const name of ["Tell conversations about routing", "At the start of a conversation, and after it is compacted", "Before each prompt", "Before handing work to another agent"]) expect(p.getByRole("switch", { name })).toBeVisible(); },
-  async () => { const p = await rare("Sizes, timing and hand-off scripts"); expect(p.getByRole("button", { name: "Change your dispatch scripts" })).toBeVisible(); },
+  async () => { const p = await rare("Sizes, timing and hand-off scripts"); expect(p.getByRole("button", { name: "Change your hand-off scripts" })).toBeVisible(); },
   async () => buttons(await rare("Sizes, timing and hand-off scripts"), ["Longest summary at the start of a conversation", "Longest update before a prompt", "Longest routing block for a subagent at its start", "Longest line", "Longest standing rule", "Most standing rules", "Longest note", "Most of your rules, note and priority shown at the start of a conversation"]),
   async () => buttons(await rare("Sizes, timing and hand-off scripts"), ["Send everything again when a conversation is this far behind", "Treat a report as out of date after", "How long a limit reported without a time lasts"]),
   async () => buttons(await rare("Sizes, timing and hand-off scripts"), ["Warn when reading before a prompt is too slow on more than", "Warn when two reports disagree for", "Say the record is not refreshed after"]),
@@ -124,7 +124,7 @@ const probes: Probe[] = [
   async () => { const p = await home("Your Macs"); expect(p.getByRole("switch", { name: "Copy routing between your Macs through the hub" })).toBeVisible(); expect(p.getByRole("switch", { name: "Share proposal words between your Macs" })).toBeVisible(); expect(p.getByRole("button", { name: "Retry cleanup" })).toBeVisible(); },
   async () => { const p = await rare("Checking accounts when they reset"); expect(p.getByRole("switch", { name: "Check an account at its reset time" })).toBeVisible(); buttons(p, ["Wait after the reset time"]); expect(p.getByLabelText("First retry in seconds")).toBeVisible(); expect(p.getByLabelText("Second retry in seconds")).toBeVisible(); },
   async () => { const p = await rare("Checking accounts when they reset"); fireEvent.click(p.getByRole("button", { name: "Change: Wait while the Mac is busy" })); for (const label of ["Load", "Wait", "Busy attempts"]) expect(within(p.getByRole("form", { name: "Change: Wait while the Mac is busy" })).getByLabelText(label)).toBeVisible(); },
-  async () => { const p = await rare("Providers and account setup"); expect(p.getByRole("list", { name: "Providers" })).toBeVisible(); expect(p.getByRole("button", { name: "Add provider account" })).toBeVisible(); const w = await home("Something's wrong"); expect(w.getByRole("list", { name: "Lanes" })).toBeVisible(); expect(w.getByRole("searchbox", { name: /Search.*lanes/ })).toBeVisible(); expect(w.getAllByRole("button", { name: /Change the account for/ }).length).toBeGreaterThan(0); },
+  async () => { const p = await rare("Providers and account setup"); expect(p.getByRole("list", { name: "Providers" })).toBeVisible(); expect(p.getByRole("button", { name: "Add provider account" })).toBeVisible(); const w = await home("Something's wrong"); expect(w.getByRole("list", { name: "Job slots" })).toBeVisible(); expect(w.getByRole("searchbox", { name: /Search.*job slots/ })).toBeVisible(); expect(w.getAllByRole("button", { name: /Change the account for/ }).length).toBeGreaterThan(0); },
   async () => { const p = await home("Something's wrong"); expect(p.getByRole("list", { name: "Job runner folders" })).toBeVisible(); expect(p.getByRole("button", { name: "Add a folder…" })).toBeVisible(); const r = await rare("Old routing table file"); expect(r.getByRole("button", { name: "Change the routing table file" })).toBeVisible(); },
   async () => { const p = await home("What changed"); expect(p.getByRole("group", { name: "Changes by" })).toBeVisible(); expect(p.getByRole("group", { name: "Changes to" })).toBeVisible(); expect(p.getByRole("button", { name: "Bring back standing rule 6" })).toBeVisible(); },
 ];
@@ -164,6 +164,50 @@ describe("Runtime parity for every approved scope inventory row", () => {
     const p = await home("Conversations");
     fireEvent.click(p.getByRole("switch", { name: "At the start of a conversation, and after it is compacted" }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("khipu_config_set", expect.objectContaining({ key: "routing_push_start", value: "off" })));
+  });
+  it("finds settings by their old homes and opens the matching page", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
+    const find = screen.getByRole("searchbox", { name: "Find a setting" });
+    fireEvent.change(find, { target: { value: "routing copy" } });
+    const option = screen.getByRole("option", { name: /Copy routing between your Macs/ });
+    expect(option).toHaveTextContent("Your Macs");
+    fireEvent.click(option);
+    const macs = document.querySelector<HTMLElement>('[data-routing-page="macs"]')!;
+    await waitFor(() => expect(macs).toHaveAttribute("data-active", "true"));
+    expect(within(macs).getByRole("switch", { name: "Copy routing between your Macs through the hub" })).toBeVisible();
+    fireEvent.change(find, { target: { value: "telling" } });
+    fireEvent.click(screen.getByRole("option", { name: /Tell conversations about routing/ }));
+    const conversations = document.querySelector<HTMLElement>('[data-routing-page="conversations"]')!;
+    await waitFor(() => expect(conversations).toHaveAttribute("data-active", "true"));
+    expect(within(conversations).getByRole("switch", { name: "Tell conversations about routing" })).toBeVisible();
+  });
+
+  it("says on each rarely needed setting whether it is the same on every Mac or this Mac only", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
+    const p = await rare("Sizes, timing and hand-off scripts");
+    const row = (name: string) => p.getByRole("button", { name: `Change: ${name}` }).closest(".route-limit") as HTMLElement;
+    expect(row("Longest line")).toHaveTextContent("Same on my Macs");
+    expect(row("Time allowed before a prompt")).toHaveTextContent("This Mac only");
+    expect(p.getByRole("button", { name: "Change your hand-off scripts" }).closest(".route-limit")).toHaveTextContent("Same on my Macs");
+  });
+
+  it("lists copied old-file rules once under When you have time without asking for confirmation", async () => {
+    record.rules = [{ n: 77, text: "Never use a fast tier.", seeded: true, confirmed: false }];
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Accounts and routing" }));
+    await waitFor(() => expect(document.querySelector('[data-settings-group="resets"]')).toHaveTextContent("On"));
+    const needs = await home("Needs you");
+    const later = needs.getByRole("list", { name: "When you have time" });
+    expect(within(later).getByText("1 rule copied from your old routing file was never reviewed")).toBeVisible();
+    fireEvent.click(within(later).getByRole("button", { name: "Read them" }));
+    expect(within(later).getByText("Never use a fast tier.")).toBeVisible();
+    expect(within(later).queryByRole("button", { name: "Keep as written" })).toBeNull();
+    const work = await home("Who gets what work");
+    expect(work.queryByRole("button", { name: "Confirm rule 77" })).toBeNull();
   });
   it("the rule's More control reveals all words and origin in place without changing its writer buttons", async () => {
     record.rules![0].text = "Keep the complete original wording, including extraordinarilylongunbrokenwordsandpaths0123456789. ".repeat(40);

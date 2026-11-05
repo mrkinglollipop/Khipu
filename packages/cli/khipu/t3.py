@@ -492,6 +492,86 @@ def delegated_thread_result(thread_id: str) -> tuple[bool, bool]:
             con.close()
 
 
+def _parent_id(mapping) -> str | None:
+    """The parent thread a T3 record names (``lineage.parentThreadId`` or a
+    column/key with ``parent`` and ``thread`` in its name), or None."""
+    if not isinstance(mapping, dict):
+        return None
+    lineage = mapping.get("lineage")
+    found = _parent_id(lineage) if isinstance(lineage, dict) else None
+    if found:
+        return found
+    for key, value in mapping.items():
+        name = str(key).lower()
+        if "parent" in name and "thread" in name and isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def thread_exists_result(thread_id: str) -> tuple[bool, bool]:
+    """``(exists, definitive)``: whether T3's thread table has this thread."""
+    if not isinstance(thread_id, str) or not thread_id:
+        return False, False
+    path = _thread_db_path()
+    if not path.is_file():
+        return False, False
+    con = None
+    try:
+        con = _connect_readonly(path)
+        _bind_read_budget(con)
+        tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if "orchestration_v2_projection_threads" not in tables:
+            return False, False
+        row = con.execute("SELECT 1 FROM orchestration_v2_projection_threads WHERE thread_id = ? LIMIT 1",
+                          (thread_id,)).fetchone()
+        return row is not None, True
+    except (OSError, ValueError, sqlite3.Error):
+        return False, False
+    finally:
+        if con is not None:
+            con.close()
+
+
+def parent_thread_result(thread_id: str) -> tuple[str | None, bool]:
+    """``(parent thread id, definitive)`` for a T3 thread, read the way
+    ``delegated_thread_result`` reads it.  A top-level thread has no parent
+    (``(None, True)``); a read that did not complete is ``(None, False)``."""
+    if not isinstance(thread_id, str) or not thread_id:
+        return None, False
+    path = _thread_db_path()
+    if not path.is_file():
+        return None, False
+    con = None
+    try:
+        con = _connect_readonly(path)
+        _bind_read_budget(con)
+        tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table in ("orchestration_v2_projection_threads", "orchestration_v2_projection_provider_threads"):
+            if table not in tables:
+                continue
+            cur = con.execute(f"SELECT * FROM {table} WHERE thread_id = ?", (thread_id,))
+            cols = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                record = dict(zip(cols, row))
+                found = _parent_id(record)
+                if found:
+                    return found, True
+                payload = record.get("payload_json")
+                if isinstance(payload, str):
+                    try:
+                        found = _parent_id(json.loads(payload))
+                    except ValueError:
+                        found = None
+                    if found:
+                        return found, True
+        return None, True
+    except (OSError, ValueError, sqlite3.Error):
+        return None, False
+    finally:
+        if con is not None:
+            con.close()
+
+
 def thread_title(thread_id: str) -> str | None:
     """A T3 thread's own title, read read-only from its thread projection.
 

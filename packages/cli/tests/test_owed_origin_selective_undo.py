@@ -8,6 +8,7 @@ import pytest
 from khipu import cli, commitments, owed_tidy, owner_act, routing
 from tests.test_owed_origin_correction import origin_db, seed  # noqa: F401
 from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
+from tests.owner_jobs import finish_owner_job
 
 
 @pytest.fixture
@@ -101,8 +102,8 @@ def test_cli_selection_and_owner_act_selection(corrected, monkeypatch, tmp_path)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "selective-undo")
     owner_turns.record({"session_id": "selective-undo", "prompt": "undo the second correction",
                        "cwd": str(tmp_path)}, {"CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli"})
-    ok, result = owner_act.act("owed.tidy", {"project": "example/widget", "batch": batch,
-                                           "ids": [ids[1]]})
+    ok, result = finish_owner_job(owner_act.act("owed.tidy", {"project": "example/widget", "batch": batch,
+                                           "ids": [ids[1]]}))
     assert ok and result["restored"] == 1
     line = next(a for a in owner_direction.actions() if a["id"] == result["owner_action"])
     assert line["facts"]["ids"] == [ids[1]]
@@ -119,5 +120,5 @@ def test_cli_rejects_invalid_selection_before_io(monkeypatch, args):
 
 
 def test_owner_act_rejects_selection_on_apply():
-    ok, result = owner_act.act("owed.tidy", {"project": "example/widget", "plan": "unused.json", "ids": [1]})
+    ok, result = finish_owner_job(owner_act.act("owed.tidy", {"project": "example/widget", "plan": "unused.json", "ids": [1]}))
     assert not ok and "undo" in result["error"]

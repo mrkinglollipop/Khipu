@@ -252,7 +252,8 @@ export const POST_UPDATE_NOTICES: VersionNotice[] = [
       {
         requires: "routing-overview",
         title: "Accounts and routing",
-        text: "Khipu tells your conversations which accounts have room. It also finds your other logins and lets you add one.",
+        text: "Accounts and routing now has one page for each job: your accounts, preferences, Macs, conversations, changes, checks and technical settings. Find a setting also accepts the old names.",
+        short: "One page per job, with Find a setting for old names too.",
         target: { kind: "settings", section: "routing", group: "accounts" },
         setUp: "routing",
       },

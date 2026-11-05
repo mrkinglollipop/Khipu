@@ -48,6 +48,13 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "route.priority.confirm": ((), ("expect",)),
     "route.priority.undo": ((), ("expect",)),
     "route.priority.clear": ((), ("expect",)),
+    # One conversation's pace override. ``subject`` is never the caller's to name: Khipu reads it from this
+    # server's own environment and T3's record and freezes it into the ask (``whole_folder``: every conversation in this folder).
+    # ``helpers`` false keeps the conversations it starts out of it.
+    "route.override.grant": (("account", "request"), ("whole_folder", "subject", "until", "indefinite", "helpers",
+                                                       "ceiling_pct", "window", "reason", "ref")),
+    "route.override.end": (("override",), ()),
+    "route.override.keep": (("override",), ()),
     "route.tier_table.set": (("tiers",), ("expect",)),
     "route.tier_table.confirm": ((), ("expect",)),
     "route.tier_table.clear": ((), ("expect",)),
@@ -105,7 +112,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
-_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions"}
+_FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "helpers", "whole_folder"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
             "reason": ("machine-busy", "disk-low", "keep", "outage", "other")}
@@ -146,7 +153,14 @@ def _values(action: str, args) -> dict:
     for key, value in args.items():
         if value is None:
             continue
-        if action == "route.tier_table.set" and key == "tiers":
+        if action == "route.override.grant" and key == "subject":
+            if not isinstance(value, dict):
+                raise _bad("subject must be the frozen conversation subject shown in the ask")
+            value = dict(value)
+        elif action == "route.override.grant" and key == "ceiling_pct":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 100:
+                raise _bad("ceiling_pct must be above 0 and at most 100")
+        elif action == "route.tier_table.set" and key == "tiers":
             from khipu.routing_advisory import valid_tiers
 
             if not valid_tiers(value):
@@ -240,7 +254,25 @@ def _values(action: str, args) -> dict:
         extra = sorted(set(out) & {"pct", "slack", "usd", "days", "n"} - used)
         if extra:
             raise _bad(f"a {out.get('kind')} cap does not take {', '.join(extra)}")
+    if action == "route.override.grant" and bool(out.get("indefinite")) == bool(out.get("until")):
+        raise _bad("an override takes exactly one of until or indefinite")
     return out
+
+
+def _with_frozen_subject(args) -> dict:
+    """The conversation an override is for, read here from this server's own
+    environment and T3's record (never from the call), and frozen into the
+    ask the owner answers. ``Refused`` when Khipu can't tell who is asking."""
+    from khipu import conversation_overrides
+
+    if not isinstance(args, dict):
+        raise _bad("route.override.grant takes arguments")
+    if "subject" in args:
+        raise _bad("the conversation an override is for is Khipu's to name, not the call's")
+    subject, why = conversation_overrides.subject(scope="project" if args.get("whole_folder") is True else "conversation")
+    if subject is None:
+        raise Refused("unknown_conversation", why or "Khipu can't tell which conversation this is.")
+    return dict(args, subject=subject)
 
 
 def _opts(values: dict, *keys: str) -> list[str]:
@@ -312,6 +344,14 @@ def argv(action: str, values: dict) -> tuple[list[str], list[str]]:
         return ["route", "hold", *_opts(v, "reason", "until"), *where], [v["text"]]
     if action == "route.hold.end":
         return ["route", "hold"], ["end", v["hold"]]
+    if action == "route.override.grant":
+        if not isinstance(v.get("subject"), dict):
+            raise _bad("an override needs the conversation Khipu froze into its ask")
+        return ["route", "override", "grant", "--subject=" + json.dumps(v["subject"], sort_keys=True),
+                *(["--no-children"] if v.get("helpers") is False else []),
+                *_opts(v, "until", "indefinite", "ceiling_pct", "window", "reason", "ref", "request")], [v["account"]]
+    if action in ("route.override.end", "route.override.keep"):
+        return ["route", "override", verb], [v["override"]]
     if action.startswith("route.cap."):
         return ["route", "cap", verb, *_opts(v, "window", "kind", "pct", "slack", "usd", "days", "n",
                                              "revision", "purpose", "tier", "sensitive_only", "until")], [v["account"]]
@@ -455,7 +495,33 @@ def _forget_list() -> dict:
 # only when the owner-direction check passes, so the owner can choose
 # forget.here or forget.not_same. The app reads its list through
 # ``khipu episode forget-pending`` instead.
-_READS = {"forget.list": _forget_list}
+def _overrides_mine() -> dict:
+    """The override that applies to this conversation, if any: what it hears
+    about itself and nothing about anyone else's."""
+    from khipu import conversation_overrides as overrides, routing
+
+    who = overrides.resolve()
+    if who["subject"] is None:
+        return {"ok": True, "available": False, "reason": who["reason"], "overrides": []}
+    now = routing._now()
+    return {"ok": True, "available": True, "overrides": [overrides.describe(r, now) | {"account": r["account"]}
+                                                          for r in overrides.matches(who, now).values()]}
+
+
+def _walkthrough(leave=None, keep=None, restart=False) -> dict:
+    """One clean-up item at a time (``priority_cleanup``). Only a
+    conversation the owner is typing in is shown the items themselves."""
+    from khipu import conversation_overrides as overrides
+
+    if not owner_turn():
+        return {"ok": True, "available": False,
+                "line": "Only a conversation the owner is typing in can walk through the clean-up."}
+    return overrides.walkthrough(leave=leave, keep_pair=keep, restart=restart is True)
+
+
+_READS = {"forget.list": _forget_list, "route.overrides.mine": _overrides_mine}
+# Reads that take a few arguments (the walk-through's bookmark: leave an item, keep a pair, start over).
+_ARG_READS = {"route.walkthrough": (_walkthrough, ("leave", "keep", "restart"))}
 
 
 def _parsed(text: str) -> dict:
@@ -493,6 +559,11 @@ def act(action, args) -> tuple[bool, dict]:
         if not isinstance(args, dict) or args:
             return False, _bad(f"{action} takes no arguments").refusal()
         return True, _READS[action]()
+    if isinstance(action, str) and action in _ARG_READS:
+        reader, allowed = _ARG_READS[action]
+        if not isinstance(args, dict) or set(args) - set(allowed):
+            return False, _bad(f"{action} takes only {', '.join(allowed)}").refusal()
+        return True, reader(**args)
     if action == CONFIRM:
         return _confirm(args)
     if action == DECLINE:
@@ -506,6 +577,8 @@ def act(action, args) -> tuple[bool, dict]:
         return False, {"ok": False, "code": "not_by_direction", "error": "That change can't be made by direction."}
     pending = None
     try:
+        if action == "route.override.grant":
+            args = _with_frozen_subject(args)
         values = _values(action, args)
         pending = _priority_pending(action, values)
         if pending is None and not owner_direction.REQUEST_APPLIED.get():
@@ -522,9 +595,10 @@ def act(action, args) -> tuple[bool, dict]:
         return _held_on_a_read(_hold(action, values, ask=owner_direction.CONFIRM_ONLY[action]))
     token = owner_direction.ANSWERING.set(owner_direction.signature(action, values))
     try:
+        proof = None
         if not held:
             try:
-                owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
+                proof = owner_direction.check(action, instant=owner_direction.instant_allowed(action, values.get("id")))
             except owner_direction.DirectionRefused as refused:
                 if refused.code == "not_confirmed":
                     return False, refused.refusal()  # the turn that read the list: no hold, nothing to ask yet
@@ -542,6 +616,10 @@ def act(action, args) -> tuple[bool, dict]:
             from khipu import needs_you
 
             return _held_on_a_read(_hold(action, values, ask=needs_you.ask_for(action, values)))
+        from khipu import owner_background
+
+        if proof and owner_background.is_long(action, values):
+            return owner_background.start_authorized(action, values, proof)
         return _run(action, full)
     finally:
         owner_direction.ANSWERING.reset(token)
@@ -699,15 +777,35 @@ def _hold(action: str, values: dict, *, ask: str | None = None) -> tuple[bool, d
                            "request. In another conversation, read the full held item first, then the owner can answer once.")}
 
 
-def _confirm(args) -> tuple[bool, dict]:
+def _confirm(args, *, terminal: bool = False) -> tuple[bool, dict]:
     from khipu import owner_direction
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
         return False, _bad(f"{CONFIRM} takes request, the held request's id").refusal()
     try:
-        request, stamp = owner_direction.confirm(args["request"])
+        request, stamp = owner_direction.confirm(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
+    if request.get("remote"):
+        return _answered_for_another_mac(request, stamp, "confirm")
+    from khipu import owner_background
+
+    if owner_background.is_long(request["action"], request.get("args") or {}):
+        return owner_background.start(request)
+    return _apply_confirmed(request, stamp)
+
+
+def _apply_confirmed(request: dict, stamp: dict) -> tuple[bool, dict]:
+    ok, result = apply_confirmed(request, stamp)
+    return ok, dict(result or {}, request=request["id"], confirmed=stamp["confirmed"])
+
+
+def apply_confirmed(request: dict, stamp: dict) -> tuple[bool, dict | None]:
+    """Run a request ``owner_direction.confirm`` claimed (state ``applying``)
+    and record how it ended. Used for the owner's yes typed here and for one
+    typed on another Mac (``routing_replication.apply_remote_answers``)."""
+    from khipu import owner_direction
+
     action, ok, result = request["action"], False, None
     try:
         head, positionals = argv(action, _values(action, request.get("args") or {}))
@@ -721,21 +819,77 @@ def _confirm(args) -> tuple[bool, dict]:
             owner_direction.settle(request["id"], ok, result)
         except OSError:
             pass
-    return ok, dict(result or {}, request=request["id"], confirmed=stamp["confirmed"])
+    return ok, result
 
 
-def _decline(args) -> tuple[bool, dict]:
+def _answered_for_another_mac(request: dict, stamp: dict, answer: str) -> tuple[bool, dict]:
+    """The owner answered, here, a request another of his Macs is holding:
+    send his answer through the routing record, where that Mac applies it."""
+    from khipu import owner_direction, routing_replication
+
+    sent = False
+    try:
+        sent = routing_replication.answer_remote(request, stamp, answer)
+    except Exception:  # noqa: BLE001 - said plainly below; the row stays answerable
+        sent = False
+    try:
+        owner_direction.settle(request["id"], sent, {"code": "not_sent"}, state_name="answered" if sent else None)
+    except OSError:
+        pass
+    if not sent:
+        return False, {"ok": False, "code": "not_sent", "request": request["id"],
+                       "error": "Khipu could not record your answer to send to your other Mac. Nothing was changed."}
+    return True, {"ok": True, "applied": False, "sent": True, "request": request["id"],
+                  "line": "Your answer is on its way to the other Mac, which applies it within a few minutes."}
+
+
+def _decline(args, *, terminal: bool = False) -> tuple[bool, dict]:
     from khipu import owner_direction
 
     if not isinstance(args, dict) or set(args) != {"request"} or not isinstance(args["request"], str):
         return False, _bad(f"{DECLINE} takes request, the held request's id").refusal()
     try:
-        request = owner_direction.decline(args["request"])
+        request = owner_direction.decline(args["request"], terminal=terminal)
     except owner_direction.DirectionRefused as refused:
         return False, refused.refusal()
+    if request.get("remote"):
+        from khipu import routing_replication
+
+        try:
+            routing_replication.answer_remote(request, None, "decline")
+        except Exception:  # noqa: BLE001 - the no is recorded here; the other Mac's request ends by itself
+            pass
+        return True, {"ok": True, "declined": True, "applied": False, "sent": True, "request": request["id"],
+                      "line": "Your no is on its way to the other Mac, which drops the request. Nothing was changed.",
+                      "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}
     return True, {"ok": True, "declined": True, "applied": False, "request": request["id"],
                   "line": "The held request is dropped. Nothing was changed.",
                   "owner_action": request.get("owner_action"), "receipt": request.get("receipt")}
+
+
+def settle_terminal(action: str, args: dict) -> tuple[bool, dict]:
+    """Settle one fully displayed Needs-you item after ``typed_yes`` proved a
+    direct terminal.  This follows the same hold/replay path as the app and
+    MCP; only terminal proof replaces a conversation's recorded reply."""
+    if action in (CONFIRM, DECLINE):
+        request = args.get("request") if isinstance(args, dict) else None
+        if not isinstance(request, str):
+            return False, _bad("the held request is missing").refusal()
+        return (_confirm({"request": request}, terminal=True) if action == CONFIRM
+                else _decline({"request": request}, terminal=True))
+    from khipu import needs_you, owner_direction
+
+    try:
+        full = _values(action, args)
+        prepared = needs_you.prepare_answer(action, full)
+        if prepared:
+            full, ask = prepared
+        else:
+            ask = None
+        held = owner_direction.hold(action, full, ask=ask, terminal=True)
+    except (owner_direction.DirectionRefused, Refused) as refused:
+        return False, refused.refusal()
+    return _confirm({"request": held["id"]}, terminal=True)
 
 
 def _run(action: str, full: list[str]) -> tuple[bool, dict]:

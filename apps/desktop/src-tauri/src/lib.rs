@@ -1051,6 +1051,7 @@ const ROUTING_COUNT_KEYS: &[&str] = &[
     "routing_runner_limited_lines",
     "routing_busy_tries",
     "routing_ledger_keep_days",
+    "routing_override_log_keep_days",
 ];
 /// Numbers of 0 or more, a fraction allowed (a percentage).
 const ROUTING_NUMBER_KEYS: &[&str] = &["routing_slow_read_pct", "routing_busy_load"];
@@ -1605,6 +1606,25 @@ fn config_request_argv(key: &str, action: &str) -> Result<Vec<String>, String> {
             action.to_string()])
 }
 
+/// The owner's yes or no to a request held for him, here or on another Mac
+/// (`khipu owner-direction answer`). The id can never read as a flag.
+fn owner_answer_argv(request: &str, answer: &str) -> Result<Vec<String>, String> {
+    let plain = !request.is_empty()
+        && request.len() <= 128
+        && request.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && request.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'));
+    if !plain {
+        return Err(format!("not a held request: {request:?}"));
+    }
+    let flag = match answer {
+        "yes" => "--yes",
+        "no" => "--no",
+        _ => return Err(format!("not an answer to a request: {answer:?}")),
+    };
+    Ok(vec!["owner-direction".to_string(), "answer".to_string(), "--from-app".to_string(), request.to_string(),
+            flag.to_string()])
+}
+
 /// Embedding profile ids look like `gemini-embedding-2@768`; the CLI also
 /// accepts `:` and `/` (an Ollama tag such as `nomic-embed-text:latest@768`).
 /// The first character is alphanumeric, so an id can never read as a flag.
@@ -1687,6 +1707,11 @@ async fn khipu_config_unset(key: String, expect: Option<String>) -> Result<Strin
 #[tauri::command]
 async fn khipu_config_request(key: String, action: String) -> Result<String, String> {
     run_khipu_cli_async(config_request_argv(&key, &action)?).await
+}
+
+#[tauri::command]
+async fn khipu_owner_answer(request: String, answer: String) -> Result<String, String> {
+    run_khipu_cli_async(owner_answer_argv(&request, &answer)?).await
 }
 
 #[tauri::command]
@@ -2651,6 +2676,11 @@ async fn khipu_owner_direction_show() -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn khipu_owner_request_decline(id: String) -> Result<String, String> {
+    run_khipu_cli_async(vec!["owner-direction".into(), "decline".into(), "--from-app".into(), "--".into(), id]).await
+}
+
+#[tauri::command]
 async fn khipu_owner_direction_actions() -> Result<String, String> {
     run_khipu_cli_async(fixed_argv(OWNER_DIRECTION_ACTIONS_ARGV)).await
 }
@@ -2801,6 +2831,68 @@ async fn khipu_route_cap(action: String, account: String, cap: RouteCapArgs, op:
 #[tauri::command]
 async fn khipu_route_hold_end(id: String, op: Option<String>) -> Result<String, String> {
     run_khipu_cli_async(route_operation_argv(route_hold_end_argv(&id)?, op.as_deref())?).await
+}
+
+// Conversation overrides and the priority tidy-up (docs/plans/2026-11-03-conversation-overrides.md).
+// Each is one fixed verb of `khipu route override` with `--from-app`; the webview names a verb and an id.
+
+/// The override verbs the app offers besides reading: end one early, keep one with no end.
+const ROUTE_OVERRIDE_VERBS: &[&str] = &["end", "keep"];
+
+fn route_override_argv(verb: &str, id: &str) -> Result<Vec<String>, String> {
+    if !ROUTE_OVERRIDE_VERBS.contains(&verb) {
+        return Err(format!("not a change to an override: {verb:?}"));
+    }
+    let mut argv = route_base("override");
+    argv.extend([verb.to_string(), checked_route_id(id)?]);
+    Ok(argv)
+}
+
+fn route_cleanup_walk_argv(leave: Option<&str>, keep: Option<&str>, restart: bool) -> Result<Vec<String>, String> {
+    let mut argv = route_base("override");
+    argv.push("walk".to_string());
+    if let Some(key) = leave {
+        argv.push(format!("--leave={}", checked_route_id(key)?));
+    }
+    if let Some(key) = keep {
+        argv.push(format!("--keep={}", checked_route_id(key)?));
+    }
+    if restart {
+        argv.push("--restart".to_string());
+    }
+    Ok(argv)
+}
+
+/// End one temporary instruction early: `route priority amend ACCOUNT --end-exception=ID --expect=V`.
+fn route_exception_end_argv(account: &str, id: &str, expect: &str) -> Result<Vec<String>, String> {
+    let mut argv = route_base("priority");
+    argv.push("amend".to_string());
+    argv.push(checked_route_account(account)?);
+    argv.push(format!("--end-exception={}", checked_route_id(id)?));
+    argv.push(format!("--expect={}", checked_route_id(expect)?));
+    Ok(argv)
+}
+
+#[tauri::command]
+async fn khipu_route_override_view() -> Result<String, String> {
+    let mut argv = route_base("override");
+    argv.push("list".to_string());
+    run_khipu_cli_async(argv).await
+}
+
+#[tauri::command]
+async fn khipu_route_override_act(verb: String, id: String) -> Result<String, String> {
+    run_khipu_cli_async(route_override_argv(&verb, &id)?).await
+}
+
+#[tauri::command]
+async fn khipu_route_cleanup_walk(leave: Option<String>, keep: Option<String>, restart: Option<bool>) -> Result<String, String> {
+    run_khipu_cli_async(route_cleanup_walk_argv(leave.as_deref(), keep.as_deref(), restart.unwrap_or(false))?).await
+}
+
+#[tauri::command]
+async fn khipu_route_exception_end(account: String, id: String, expect: String) -> Result<String, String> {
+    run_khipu_cli_async(route_exception_end_argv(&account, &id, &expect)?).await
 }
 
 // ---- Work: the live view and the ledger (docs/plans/2026-10-15-work-view.md, phase 4)
@@ -5473,6 +5565,7 @@ pub fn run() {
             khipu_config_set,
             khipu_snapshot_refresh,
             khipu_config_request,
+            khipu_owner_answer,
             khipu_config_unset,
             khipu_budget_status,
             khipu_budget_lift_synth_today,
@@ -5489,6 +5582,7 @@ pub fn run() {
             khipu_gateway_copy_cleanup,
             khipu_owner_direction_show,
             khipu_owner_direction_actions,
+            khipu_owner_request_decline,
             khipu_owner_direction_undo,
             khipu_owner_direction_acknowledge,
             khipu_owner_direction_switch,
@@ -5505,6 +5599,10 @@ pub fn run() {
             khipu_route_rule,
             khipu_route_hold_add,
             khipu_route_hold_end,
+            khipu_route_override_view,
+            khipu_route_override_act,
+            khipu_route_cleanup_walk,
+            khipu_route_exception_end,
             khipu_route_cap,
             khipu_route_priority,
             khipu_route_definition,
@@ -6343,6 +6441,18 @@ mod settings_command_tests {
         assert!(route_pause_argv("Codex", Some("2026-10-16T09:00:00Z\n--x")).is_err());
         assert!(route_clear_argv("Codex", Some("-e1")).is_err());
         assert!(route_clear_argv("Codex", Some("e1 --from-app")).is_err());
+        assert_eq!(route_override_argv("end", "abc-123").unwrap(), v(&["route", "override", "--from-app", "end", "abc-123"]));
+        assert!(route_override_argv("grant", "abc-123").is_err());
+        assert!(route_override_argv("end", "--all").is_err());
+        assert_eq!(
+            route_cleanup_walk_argv(Some("dup:codex|:xaa111"), None, false).unwrap(),
+            v(&["route", "override", "--from-app", "walk", "--leave=dup:codex|:xaa111"])
+        );
+        assert!(route_cleanup_walk_argv(Some("--x"), None, false).is_err());
+        assert_eq!(
+            route_exception_end_argv("codex|", "xaa111", "p3").unwrap(),
+            v(&["route", "priority", "--from-app", "amend", "codex|", "--end-exception=xaa111", "--expect=p3"])
+        );
         assert!(route_hold_end_argv("--all").is_err());
         assert!(route_hold_end_argv("h1\nend").is_err());
         assert!(route_hold_add_argv("x", "--all", "all", None, None).is_err());
@@ -6507,6 +6617,15 @@ mod settings_command_tests {
         assert!(config_request_argv("routing_lane_map", "--x").is_err());
         assert!(config_request_argv("usage_accounts", "confirm").is_err());
         assert!(config_request_argv("--from-app", "confirm").is_err());
+        assert_eq!(
+            owner_answer_argv("rm-req-0a1b2c3d4e5f", "yes").unwrap(),
+            ["owner-direction", "answer", "--from-app", "rm-req-0a1b2c3d4e5f", "--yes"]
+        );
+        assert_eq!(owner_answer_argv("rm-setting:routing_stale_after", "no").unwrap()[4], "--no");
+        assert!(owner_answer_argv("--yes", "yes").is_err());
+        assert!(owner_answer_argv("", "yes").is_err());
+        assert!(owner_answer_argv("rm-req-1", "--no").is_err());
+        assert!(owner_answer_argv("rm-req-1 --yes", "yes").is_err());
     }
 
     #[test]

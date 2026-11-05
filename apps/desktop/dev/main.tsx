@@ -255,6 +255,21 @@ function RoutingReplication() {
   );
 }
 
+ /** Settings -> Accounts and routing, opened on its Your Macs page. */
+function RoutingMacs({ off = false }: { off?: boolean }) {
+  useEffect(() => {
+    const open = () => document.querySelector<HTMLButtonElement>('[data-routing-page-select="macs"]')?.click();
+    const timer = window.setInterval(open, 250);
+    const stop = window.setTimeout(() => window.clearInterval(timer), 5000);
+    return () => { window.clearInterval(timer); window.clearTimeout(stop); };
+  }, []);
+  return (
+    <div className="settings-pane" style={{ width: "100%", maxWidth: 1100, margin: "0 auto" }}>
+      <RoutingSettings active deliveryHealth={{ status: "green", identities: [], replication: off ? { status: "not_applicable" } : { status: "green", age_seconds: 120, caught_up_at: "2026-10-21T18:38:00Z", stale: false }, gateway: { status: "not_applicable" } }} />
+    </div>
+  );
+}
+
  /** Settings -> Accounts and routing with only Proposals and holds open
  *  (slice 15b), against the fictional record in fakeTauri. */
 function RoutingProposals() {
@@ -314,6 +329,17 @@ function RoutingNeeds() {
   );
 }
 
+/** Just the settings pane, no app shell: how it reads when the window is narrow. */
+function RoutingBare() {
+  return (
+    <div className="main-content" style={{ padding: "12px" }}>
+      <div className="panel-body wide settings-body" style={{ maxWidth: "none", minWidth: 0 }}>
+        <RoutingSettings active plansState={{ data: null, error: null, reread: async () => {} } as never} />
+      </div>
+    </div>
+  );
+}
+
 /** Home's routing card with a priority a conversation set. */
 function HomeNeeds() {
   const route = useRouting(true);
@@ -321,10 +347,17 @@ function HomeNeeds() {
 }
 
 const STATES: Record<string, { title: string; fake?: Fake; render: () => ReactNode }> = {
+  "routing-settings-cde": { title: "Accounts and routing: CDE pages (fictional fixture)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
+  "routing-settings-cde-worst": { title: "Accounts and routing: CDE long-text fixture", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
   "routing-needs": { title: "Needs you: every kind of item (settings reorg slice A)", fake: { routeNeeds: true, nineB: true }, render: () => <RoutingNeeds /> },
+  "routing-overrides": { title: "Conversation overrides and the tidy-up walk", fake: { routeNeeds: true, nineB: true, overrides: true }, render: () => <RoutingNeeds /> },
+  "routing-overrides-bare": { title: "Conversation overrides and the tidy-up walk, pane only", fake: { routeNeeds: true, nineB: true, overrides: true }, render: () => <RoutingBare /> },
   "routing-needs-worst": { title: "Needs you: the longest words (settings reorg slice A)", fake: { routeNeeds: true, worst: true, nineB: true }, render: () => <RoutingNeeds /> },
   "home-needs": { title: "Home: Confirm a priority a conversation set", fake: { routeNeeds: true, nineB: true }, render: () => <HomeNeeds /> },
   pace: { title: "Pace, caps and advice (fictional mock data)", render: () => <PaceGroup /> },
+  "macs-first": { title: "Your Macs: first switch-on, differences to choose", fake: { routeMacs: "first" }, render: () => <RoutingMacs /> },
+  "macs-settled": { title: "Your Macs: all settled", fake: { routeMacs: "settled" }, render: () => <RoutingMacs /> },
+  "macs-off": { title: "Your Macs: copy off", fake: { routeMacs: "off" }, render: () => <RoutingMacs off /> },
   delivery: { title: "Telling conversations (fictional delivery evidence)", fake: { route15a: true }, render: () => <RoutingDelivery /> },
   "delivery-unknown": { title: "Telling conversations (missing evidence)", fake: { route15a: true }, render: () => <RoutingDelivery health={{ status: "unknown", identities: [], missing: ["live delivery identities"], replication: { status: "unknown" }, gateway: { status: "unknown" } }} /> },
   "delivery-error": { title: "Telling conversations (failed delivery read)", fake: { route15a: true }, render: () => <RoutingDelivery error="The delivery report could not be read" /> },
@@ -438,14 +471,14 @@ function Page() {
       </main>
     );
   }
-  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst") {
+  if (hash === "routing-proposals" || hash === "routing-replication" || hash === "routing-needs" || hash === "routing-needs-worst" || hash === "routing-settings-cde" || hash === "routing-settings-cde-worst" || hash.startsWith("routing-overrides")) {
     // The Settings pane at its app width, uncapped by the 960 state frame.
     return <div style={{ height: "100%" }} data-state={hash}>{st.render()}</div>;
   }
   return (
     // The pace group is screenshotted at the Settings pane's own 720px width,
     // so it wraps where the approved mock does rather than across a wider page.
-    <main style={{ padding: 24, maxWidth: hash === "pace" ? 744 : hash.startsWith("delivery") ? 768 : hash.startsWith("projects") ? "none" : 960 }} data-state={hash}>
+    <main style={{ padding: 24, maxWidth: hash.startsWith("macs") ? "none" : hash === "pace" ? 744 : hash.startsWith("delivery") ? 768 : hash.startsWith("projects") ? "none" : 960 }} data-state={hash}>
       <h1 style={{ fontSize: 14, color: "var(--muted)" }}>{st.title}</h1>
       {st.render()}
     </main>
