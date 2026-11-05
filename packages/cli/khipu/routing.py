@@ -4925,6 +4925,15 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
                      if a == entry["key"] and ww == w],
                     priority, entry["key"], now),
                 now, w) for w in windows]
+            if entry.get("state") == DOWN and entry.get("reason") in ("not signed in", "not installed"):
+                # This Mac's reader said so: not an account nothing can read,
+                # and not a reading that merely has not come.
+                for pace in entry["pace"]:
+                    why = pace.get("why") or ""
+                    if why == "this account can't be probed":
+                        pace["why"] = f"reader failed: {entry['reason']}"
+                    elif why.startswith("last reading "):
+                        pace["why"] = f"reader failed: {entry['reason']}; {why}"
         mine = [c for (a, _w, _k2, _purpose), c in sorted(pace_caps.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2], kv[0][3] != "job"))
                 if a == entry["key"]]
         if mine:

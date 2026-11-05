@@ -265,11 +265,16 @@ def _cycles(samples, window):
             s["_cycle_key"] = target or ("reset", i, iso(comp[0]["reset"]))
 
 
+# How long an hourly reading stands: an unchanged window is stored once an hour
+# (``should_sample``, from the polls that run anyway), so its newest stored
+# reading is that old without anything being wrong, one poll's slack included.
+IDLE_READING_S = 75 * 60
+
 # Another Mac's readings count only when they read the same allowance. Both
 # name a reset still ahead and those resets lie further apart than one cycle's
 # estimates can (``_cycles``): this Mac's login is not the account the other
 # Mac reads under that name, and pooling them would make both unknown.
-OWN_READING_FRESH_S = 75 * 60
+OWN_READING_FRESH_S = IDLE_READING_S
 
 
 def shared_readings(samples, mine, now):
@@ -355,9 +360,10 @@ def next_change(samples, now, window, *, day=False):
             if isinstance(moment, datetime) and moment > now and (best is None or moment < best):
                 best = moment
     if newest is not None:
-        stale = min(newest, now) + timedelta(seconds=2 * params["sample_s"])
-        if stale > now and (best is None or stale < best):
-            best = stale
+        for stale in (min(newest, now) + timedelta(seconds=2 * params["sample_s"]),
+                      min(newest, now) + timedelta(seconds=IDLE_READING_S)):
+            if stale > now and (best is None or stale < best):
+                best = stale
     return best
 
 
@@ -550,6 +556,17 @@ def compute_pace(samples, caps, now, window):
                 gap += inside
         return gains, durations, gap, disagree
 
+    # Quiet for the hour before its newest reading: the writer is on its hourly
+    # cadence, so a reading up to that old is not one that failed to come.
+    age = (now - blist[-1]["time"]).total_seconds()
+    fresh_enough = age <= 2 * params["sample_s"] or (age <= IDLE_READING_S and all(
+        b["value"] == blist[-1]["value"] for b in blist
+        if (blist[-1]["time"] - b["time"]).total_seconds() < 3600))
+    # No use to forecast: the same reading from before the trailing window to a
+    # reading still within its hourly cadence, however few readings that took.
+    before_start = [b for b in blist if b["time"] <= start]
+    idle = (fresh_enough and bool(before_start) and blist[-1]["segment"] == before_start[-1]["segment"]
+            and all(b["value"] == blist[-1]["value"] and not b["correction"] for b in [before_start[-1], *in_window]))
     gains, valid_dur, gap_time, disagree_time = clipped(start, now)
     rate = gains / (valid_dur / 3600) if valid_dur > 0 else None
     pace["rate_pct_per_h"] = rate
@@ -571,11 +588,15 @@ def compute_pace(samples, caps, now, window):
         why = "reset time spread over more than an hour"
     elif secs_to_reset is not None and secs_to_reset <= 0:
         why = "reset passed; waiting for a new reading"
-    elif blist and (now - blist[-1]["time"]).total_seconds() > 2 * params["sample_s"]:
-        age_h = (now - blist[-1]["time"]).total_seconds() / 3600
+    elif idle:
+        pace["idle"] = True
+        pace["buckets"] = max(pace["buckets"], 1)
+        rate = pace["rate_pct_per_h"] = 0.0
+    elif blist and not fresh_enough:
+        age_h = age / 3600
         why = f"last reading {_hours(age_h)} h old"
     elif len(in_window) < 3:
-        why = f"only {len(in_window)} readings in the last {params['trailing_h']} h"
+        why = f"only {len(in_window)} reading{'' if len(in_window) == 1 else 's'} in the last {params['trailing_h']} h"
     elif pace["valid_pct"] < 50 or pace["observed_pct"] < 50:
         if disagree_time > 0:
             why = f"readings disagree for {_hours(disagree_time / 3600)} of the last {params['trailing_h']} h"
@@ -585,9 +606,8 @@ def compute_pace(samples, caps, now, window):
     allowed = why is None
     # Gaps and thin coverage invalidate the rate, not a fresh usage level.
     # Unsettled, expired or stale readings cannot establish a reached ceiling.
-    level_known = (bool(in_window) and not (pending or disagrees or ambiguous)
-                   and secs_to_reset is not None and secs_to_reset > 0
-                   and (now - blist[-1]["time"]).total_seconds() <= 2 * params["sample_s"])
+    level_known = ((bool(in_window) or fresh_enough) and not (pending or disagrees or ambiguous)
+                   and secs_to_reset is not None and secs_to_reset > 0 and fresh_enough)
     if not level_known:
         pace["plan"]["needed_pct_per_h"] = None
 
@@ -774,6 +794,28 @@ def _window_word(window):
     return str(window).replace("_", " ")
 
 
+def _unknown_words(why):
+    """What is true of a window with no forecast, in plain words."""
+    if not why:
+        return "not enough history for a pace"
+    if why.startswith(("only ", "readings cover only ")):
+        return f"not enough history for a pace: {why}"
+    if why.startswith("last reading "):
+        return f"no fresh reading, its reader is failing or has not run: {why}"
+    if why.startswith("reader failed"):
+        return why
+    return f"pace unknown at the trailing average: {why}"
+
+
+def _allowance_words(pace):
+    """How much is left now, when a current reading says so: the plan's needed
+    rate is known only then (``level_known``)."""
+    used = _num(pace.get("used_pct"))
+    if used is None or _num((pace.get("plan") or {}).get("needed_pct_per_h")) is None:
+        return ""
+    return f"; {used:g}% used, {max(100 - used, 0):g}% left"
+
+
 def pace_line(label, pace, now):
     word = _window_word(pace["window"])
     rate = pace.get("rate_pct_per_h")
@@ -789,8 +831,10 @@ def pace_line(label, pace, now):
         allowance_text = f"{allowance:.2f}%" if isinstance(allowance, (int, float)) else "its allowance"
         return (f"{label} {word}: {target['verdict']} of its pace target "
                 f"({target.get('used_pct'):g}% used against a {allowance_text} allowance)")[:160]
+    if pace.get("idle"):
+        return f"{label} {word}: idle, no use to forecast{_allowance_words(pace)}"
     if verdict == "unknown" or pace.get("why"):
-        return f"{label} {word}: pace unknown at the trailing average: {pace.get('why') or 'not enough readings'}"
+        return f"{label} {word}: {_unknown_words(pace.get('why'))}{_allowance_words(pace)}"
     needed = obj.get("needed_pct_per_h")
     needed_text = f"{_rate_words(needed)}%/h" if needed is not None else "no rate"
     lands = f"{needed_text} lands on {obj.get('pct') or 100:g}%" if isinstance(obj.get('pct') or 100, (int, float)) \
@@ -907,7 +951,8 @@ def should_sample(existing, candidate, *, costly=False):
     if abs(candidate["used"] - last["used"]) >= 0.5 and age >= 120:
         return True
     # The fast cadence applies only while usage moved in the last hour;
-    # an idle window is sampled hourly (the age check above).
+    # an idle window is sampled hourly (the age check above), which is all
+    # ``compute_pace`` needs to call it idle, so an idle window costs no more.
     recent = [s for s in prior if (candidate["t"] - s["t"]).total_seconds() <= 3600]
     moved_recently = len(recent) > 1 and max(s["used"] for s in recent) > min(s["used"] for s in recent)
     return moved_recently and age >= interval

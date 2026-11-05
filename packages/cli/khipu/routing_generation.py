@@ -40,7 +40,7 @@ def digest(view: dict) -> str:
 def _reason(value):
     """Which reason a pace figure gives, without its figures: "readings cover
     only 7.5 of the last 24 h" going to 7.6 is the clock, not a change."""
-    return _NUMBER.sub("#", value) if isinstance(value, str) else value
+    return _NUMBER.sub("#", value).replace("readings", "reading") if isinstance(value, str) else value
 
 
 def revision(view: dict) -> str:
@@ -58,7 +58,7 @@ def revision(view: dict) -> str:
     for account in view.get("accounts") or []:
         windows = []
         for pace in account.get("pace") or []:
-            decision = {key: pace[key] for key in ("headline", "cycle_resets_at") if key in pace}
+            decision = {key: pace[key] for key in ("headline", "cycle_resets_at", "idle") if key in pace}
             if "why" in pace:
                 decision["why"] = _reason(pace["why"])
             for key in ("plan", "share_cap", "day_cap", "pace_target", "check_pace_target"):

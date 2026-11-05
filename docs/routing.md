@@ -399,6 +399,13 @@ reports within, ahead or recovering against the elapsed-window allowance plus
 slack. These figures differ from the arithmetic needed pace used for default
 account ordering.
 
+An unchanged window is stored once an hour, from the polls that run anyway. The
+same reading from before the trailing period to a reading no more than 75 minutes
+old is idle: it has no use to forecast, and its pace line says so with what is
+left. Otherwise the line says which is true: not enough history for a pace, no
+fresh reading (usage that was moving has stopped being read, or a reading is past
+its hourly cadence), reader failed (this Mac cannot sign in), or the pace itself.
+
 Pace and advice changes, forecast threshold crossings (24 hours, 6 hours,
 1 hour and 15 minutes) and sufficiently moved forecasts are pushed through the
 delivery protocol. Acknowledgement records which text was received.
