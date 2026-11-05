@@ -11978,8 +11978,11 @@ def _generation(view: dict, cfg: dict) -> list[list]:
     fingerprint = view.get("fingerprint") if isinstance(view.get("fingerprint"), dict) else {}
     files = [[str(events_file()), fingerprint.get("events")], [str(config_file()), fingerprint.get("config")],
              [str(view_file()), getattr(_view_seen, "stat", None), revision(view)],
-             [str(routing_dir() / "remote.jsonl"), (fingerprint.get("replication") or (None, None))[0]],
-             [str(routing_dir() / "replication.json"), (fingerprint.get("replication") or (None, None))[1]]]
+             [str(routing_dir() / "remote.jsonl"), (fingerprint.get("replication") or (None, None))[0]]]
+    # Not replication.json: every sync rewrites its cursors and clock readings
+    # (about every 5 s with the copy on), none of which an answer was read
+    # from. What the other Macs sent is remote.jsonl, which stays; a change in
+    # what replication.json says moves the view's fingerprint at the next fold.
     seed = cfg.get("routing_rules_seed")
     if seed:
         files.append([str(Path(seed)), fingerprint.get("seed")])
