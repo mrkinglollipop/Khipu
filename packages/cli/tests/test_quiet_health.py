@@ -102,9 +102,9 @@ def test_skips_from_before_the_last_hour_no_longer_count(replay):
     assert result["status"] == "green" and result["count"] == 20 and result["out_of_time"] == 0
 
 
-def test_a_skip_in_the_last_hour_still_shows(replay):
+def test_three_skips_in_the_last_hour_still_show(replay):
     now = acceptance.T0
-    _log([(now - timedelta(minutes=10, seconds=i), f"t{i}", "skipped:budget" if i == 3 else "none") for i in range(20)])
+    _log([(now - timedelta(minutes=10, seconds=i), f"t{i}", "skipped:budget" if i in (3, 6, 9) else "none") for i in range(20)])
     assert health.prompt_health(now, 1.0)["reasons"] == ["prompt-skips"]
 
 
@@ -192,7 +192,7 @@ def test_a_malformed_delivery_ledger_is_red_and_the_summary_says_it_could_not_be
     block = health.doctor_block({"unmatched": []}, replay.now, routing.settings())
     assert "delivery ledger unreadable" in block["missing"] and health.delivery_ok(block) is False
     line = health_summary({"routing_delivery": block, "routing_delivery_ok": False})[2]
-    assert line.startswith("Routing: Routing delivery couldn't be checked: ") and "delivery ledger unreadable" in line
+    assert "could not confirm that conversations received the latest account advice" in line
 
 
 def test_a_future_dated_hook_outcome_is_not_read_as_idle(replay):
@@ -283,7 +283,7 @@ def test_no_hook_outcomes_is_only_idle_when_no_conversation_is_live():
     assert health.delivery_ok(idle) is True
     live = {"status": "unknown", "missing": ["recent hook outcomes"], "identities": [{"identity": "x", "status": "green"}]}
     assert health.delivery_ok(live) is False
-    assert "couldn't be checked: recent hook outcomes" in health_summary({"routing_delivery": live, "routing_delivery_ok": False})[2]
+    assert "could not confirm that conversations received the latest account advice" in health_summary({"routing_delivery": live, "routing_delivery_ok": False})[2]
 
 
 def test_a_blank_queued_at_is_unreadable_even_beside_a_young_job(tmp_path, monkeypatch):
@@ -304,4 +304,20 @@ def test_the_summary_names_skips_and_unreadable_evidence_together():
     block = {"status": "red", "reasons": ["prompt-skips"], "prompts": {"count": 10, "out_of_time": 4},
              "missing": ["delivery ledger unreadable"]}
     line = health_summary({"routing_delivery": block, "routing_delivery_ok": False})[2]
-    assert "4 of the last hour's 10 prompts" in line and "couldn't be checked: delivery ledger unreadable" in line
+    assert "4 of the last hour's 10 prompts" in line and "could not confirm that conversations received the latest account advice" in line
+
+
+def test_one_late_prompt_out_of_thirteen_is_not_red(replay):
+    _log([(acceptance.T0, f"s{i}", "skipped:budget" if i == 0 else "none") for i in range(13)])
+    result = health.prompt_health(acceptance.T0)
+    assert result["out_of_time"] == 1 and result["count"] == 13
+    assert result["status"] == "green"
+
+
+def test_delivery_words_explain_the_effect_without_internal_names():
+    block = {"status": "red", "reasons": ["cross-mac-stale", "gateway-stale"],
+             "missing": ["gateway delivered copy revision"]}
+    line = health_summary({"routing_delivery": block, "routing_delivery_ok": False})[2]
+    assert "other Mac may still be using older account advice" in line
+    assert "cloud conversations received" in line
+    assert "Settings" not in line and "cross-mac-stale" not in line and "gateway" not in line

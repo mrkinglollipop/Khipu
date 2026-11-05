@@ -126,7 +126,7 @@ PROMPT_WINDOW_S = 3600
 
 def prompt_health(now, warn_pct=1.0):
     """The last hour's per-prompt routing outcomes. ``prompt-skips``: more than
-    ``warn_pct`` percent of them ran out of time (``ROUTING_OUT_OF_TIME``,
+    ``warn_pct`` percent and at least three of them ran out of time (``ROUTING_OUT_OF_TIME``,
     the doctor's ``routing_slow_read_pct``; 0 never warns); a skip for any
     other reason (a record changed under the read, an unsaved fold) is
     sent with a later prompt and is not counted. ``prompt-delay``: one
@@ -162,7 +162,7 @@ def prompt_health(now, warn_pct=1.0):
     late = sum(s in recall_prompt.ROUTING_OUT_OF_TIME for s in statuses)
     rate = 100 * late / len(statuses)
     reasons = []
-    if warn_pct and rate > warn_pct:
+    if warn_pct and late >= 3 and rate > warn_pct:
         reasons.append("prompt-skips")
     if longest >= PROMPT_DELAY_RUN:
         reasons.append("prompt-delay")

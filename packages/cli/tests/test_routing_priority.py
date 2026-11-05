@@ -934,3 +934,24 @@ def test_a_reused_process_number_is_not_the_app(home, capsys):
     assert cli.main(["route", "note", "--from-app", "--", "set", "x"]) == 2
     callers.tree = {me: (900, "/usr/bin/python3", 100.0), 900: (1, str(callers.app), 50.0)}
     assert cli.main(["route", "note", "--from-app", "--", "set", "x"]) == 0
+
+
+def test_early_exhaustion_forecast_overrides_plenty_of_time(home, monkeypatch):
+    # The live contradiction: 34% left over 43 hours, burning 1%/h.
+    row = _row("Claude second", "claude", "/logins/claude-second", _week(66, T0 + timedelta(hours=43)))
+    monkeypatch.setattr(usage, "_load_cache", lambda: {SECOND: row})
+    pace = {"window": "weekly", "used_pct": 66, "rate_pct_per_h": 1,
+            "cycle_resets_at": routing._iso(T0 + timedelta(hours=43)),
+            "headline": "plan", "plan": {"verdict": "outpacing", "needed_pct_per_h": 34 / 43,
+            "runs_out_at": routing._iso(T0 + timedelta(hours=34)), "before_reset_s": 9 * 3600}}
+    entry = {"key": SECOND, "label": "Claude second", "pace": [pace]}
+    fact = routing.plan_facts({"accounts": [entry]}, T0)[SECOND]
+    line = routing.pace_words(fact, T0) + "; " + routing.pace_line_for(entry, T0)
+    assert "plenty of time" not in line
+    assert "before reset" in line and "outpacing" in line
+    # A forecast close enough to be called on pace must not contradict an
+    # explicit early run-out time either.
+    pace["plan"]["verdict"] = "on_pace"
+    assert "plenty of time" not in routing.plan_facts({"accounts": [entry]}, T0)[SECOND]["words"]
+    entry["pace"] = []
+    assert routing.plan_facts({"accounts": [entry]}, T0)[SECOND]["words"] == "plenty of time"

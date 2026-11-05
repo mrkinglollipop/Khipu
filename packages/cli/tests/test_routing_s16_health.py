@@ -102,7 +102,7 @@ def test_enabled_copies_without_evidence_are_unknown(replay):
     assert "gateway delivered copy revision" in result["missing"]
 
 
-def test_prompt_rate_uses_today_and_strict_one_percent(replay):
+def test_prompt_rate_uses_hour_and_requires_three_late_prompts(replay):
     path = recall_prompt._log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     def line(at, status):
@@ -110,7 +110,7 @@ def test_prompt_rate_uses_today_and_strict_one_percent(replay):
     path.write_text(line(T0 - timedelta(days=1), "skipped:budget") * 500
                     + line(T0, "skipped:budget") + line(T0, "none") * 99)
     assert health.prompt_health(T0)["status"] == "green"
-    path.write_text(path.read_text() + line(T0, "skipped:busy"))
+    path.write_text(path.read_text() + line(T0, "skipped:busy") * 2)
     assert health.prompt_health(T0)["status"] == "red"
 
 

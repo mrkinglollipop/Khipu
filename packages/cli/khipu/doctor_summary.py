@@ -9,7 +9,7 @@ def _outbox(d: dict) -> str:
     if box.get("error"):
         return "the queue of captures can't be read"
     parts = []
-    held = box.get("dead") or 0
+    held = box.get("recoverable_dead", box.get("dead")) or 0
     if held:
         parts.append(f"{held} capture{' sits' if held == 1 else 's sit'} held on this Mac, safe but not in memory, and "
                      "Khipu will not retry " + ("it" if held == 1 else "them") + " by itself")
@@ -44,9 +44,19 @@ def _delivery(d: dict) -> str:
         parts.append(f"routing lines were left out of {prompts.get('out_of_time')} of the last hour's "
                      f"{prompts.get('count')} prompts")
     elif block.get("reasons"):
-        parts.append("routing changes may not be reaching conversations (" + ", ".join(block["reasons"]) + ")")
+        reasons = block["reasons"]
+        if "cross-mac-stale" in reasons:
+            parts.append("the other Mac may still be using older account advice")
+        if "gateway-stale" in reasons:
+            parts.append("conversations connected through the cloud may still be using older account advice")
+        if any(r not in {"cross-mac-stale", "gateway-stale"} for r in reasons):
+            parts.append("some conversations have not received the latest account advice")
     if block.get("missing") and unchecked(block):
-        parts.append("routing delivery couldn't be checked: " + ", ".join(unchecked(block)))
+        gaps = unchecked(block)
+        if "gateway delivered copy revision" in gaps:
+            parts.append("Khipu could not confirm which account advice cloud conversations received")
+        if any(m != "gateway delivered copy revision" for m in gaps):
+            parts.append("Khipu could not confirm that conversations received the latest account advice")
     return "; ".join(parts) or "routing changes may not be reaching conversations"
 
 
@@ -84,7 +94,7 @@ WORDS = {
     "literal_trgm_ok": (1, "a text-search index is missing", None),
     "degraded_rate_ok": (1, "searches are falling back to a weaker mode", None),
     "routing_delivery_ok": (2, _delivery,
-                            "raise the time allowed before a prompt in Settings → Routing, or see whether the Mac is busy"),
+                            "ask the conversation to check current account advice before starting more work; Khipu tries again on later prompts"),
     "hub_ok": (3, "the database does not answer", "check the connection with `khipu status`"),
     "backup_ok": (3, "the database backup is stale", None),
     "graph_backup_ok": (3, "the local graph backup is stale", None),
@@ -126,6 +136,9 @@ def health_summary(report: dict) -> list[str]:
     lines = []
     for i, area in enumerate(AREAS):
         here = [(what, fix) for a, what, fix in bad if a == i]
+        if i == 0 and not here and (report.get("outbox") or {}).get("empty_held"):
+            lines.append(f"{area}: {(report['outbox'].get('plain') or 'A held capture had nothing to save.')}")
+            continue
         lines.append(f"{area}: fine." if not here else f"{area}: " + " ".join(
             f"{what[:1].upper() + what[1:]}. Fix: {fix}." for what, fix in here))
     return lines

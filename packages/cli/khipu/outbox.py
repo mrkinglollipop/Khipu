@@ -790,15 +790,31 @@ def status() -> dict[str, Any]:
     # Existing doctor callers use ``dead`` to detect work that cannot replay.
     from khipu.session_capture import held_jobs
 
-    native_held = [p.name for p in held_jobs()]
+    native_paths = held_jobs()
+    native_held = [p.name for p in native_paths]
+    empty_held = 0
+    from khipu.session_capture import _retry_state
+    for held_path in native_paths:
+        try:
+            held = json.loads(held_path.read_text())
+            payload = held.get("extracted_payload")
+            if (_retry_state(held_path).get("last_error") == "capture rc=65"
+                    and isinstance(payload, dict) and not str(payload.get("summary") or "").strip()
+                    and not any(payload.get(k) for k in ("verbatim", "decisions", "preferences", "commitments"))):
+                empty_held += 1
+        except (OSError, ValueError, AttributeError):
+            pass
+
     dead = len(dead_jobs()) + quarantined + len(native_held)
+    # Empty refused captures remain on disk, but there is no memory to recover.
     # Every waiting capture is waiting only because the hub could not be
     # reached: the promotion gate does not refuse a candidate on that.
     offline_only = (bool(js) and offline == len(js) and not unreadable
                     and not dead and not evidence_conflicts)
     result = {"dir": str(outbox_dir()), "pending": len(js), "oldest_age_s": oldest_age,
             "oldest_job": oldest_job, "unreadable": unreadable,
-            "dead": dead, "quarantined": quarantined, "native_held": native_held,
+            "dead": dead, "empty_held": empty_held, "recoverable_dead": dead - empty_held,
+            "quarantined": quarantined, "native_held": native_held,
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
             "evidence_conflicts": evidence_conflicts,
             "held_conflicts": len(held_conflicts), "held_conflict_jobs": held_conflicts,
@@ -814,8 +830,12 @@ def status() -> dict[str, Any]:
     result["dead_newest_age_s"] = newest_age
     result["dead_waiting"] = max(dead - refused_old - conflicts_old, 0) \
         if (newest_age is None or newest_age > OLD_DEAD_S) else dead
+    result["dead_waiting"] = max(0, result["dead_waiting"] - empty_held)
+    if empty_held:
+        result["plain"] = (f"{empty_held} held capture{'s had' if empty_held != 1 else ' had'} nothing to save. "
+                           "The files are kept; retrying them would not help.")
     if refused_old:
-        result["plain"] = (f"{refused_old} old capture{'' if refused_old == 1 else 's'} an older app sent without "
+        result["plain"] = (result.get("plain", "") + " " if result.get("plain") else "") + (f"{refused_old} old capture{'' if refused_old == 1 else 's'} an older app sent without "
                            "announcing its source identities sit refused"
                            + (f"; the newest died {newest_age // 3600} h ago" if newest_age is not None else "")
                            + (", and nothing newer has died" if (newest_age or 0) > OLD_DEAD_S else "")

@@ -52,3 +52,31 @@ def test_non_applicable_nightly_steps_are_named_for_a_grey_row(monkeypatch):
     health = jobs.nightly_step_health()
     skipped = jobs.skipped_step_names(health)
     assert "notes_reconcile" in skipped and "embed_provider" in skipped, (health, skipped)
+
+
+def test_empty_held_capture_is_informational_and_kept(tmp_path, monkeypatch):
+    from khipu import cli, session_capture
+    from khipu.doctor_summary import health_summary
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
+    queue = session_capture.queue_dir()
+    queue.mkdir(parents=True, exist_ok=True)
+    held = queue / "empty.json"
+    original = json.dumps({"extracted_payload": {"summary": ""}})
+    held.write_text(original)
+    meta = session_capture._retry_state_path(held)
+    meta.write_text(json.dumps({"disposition": "held", "last_error": "capture rc=65"}))
+    local = cli._doctor_local_checks(None)
+    assert local["outbox_ok"] is True, local["outbox"]
+    assert local["outbox"]["at_risk"] is False
+    assert local["outbox"]["dead"] == 1
+    line = health_summary({"outbox": local["outbox"], "outbox_ok": True})[0]
+    assert "nothing to save" in line and "retry-dead" not in line
+    assert held.read_text() == original and meta.exists()
+    # Real content refused with the same exit code still needs attention.
+    held.write_text(json.dumps({"extracted_payload": {"summary": "important"}}))
+    local = cli._doctor_local_checks(None)
+    assert local["outbox_ok"] is False
+    assert "retry-dead" in local["outbox"]["fix"]

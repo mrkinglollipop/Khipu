@@ -265,12 +265,12 @@ def _doctor_local_checks(mem: Path | None) -> dict:
     # held job is, old refused ones included.
     dead_waiting = outbox.get("dead_waiting", outbox.get("dead")) or 0
     outbox_ok = ("error" not in outbox and not outbox.get("unreadable") and not dead_waiting and outbox_oldest_ok)
-    outbox["at_risk"] = bool("error" in outbox or outbox.get("unreadable") or outbox.get("dead"))
+    outbox["at_risk"] = bool("error" in outbox or outbox.get("unreadable") or outbox.get("recoverable_dead", outbox.get("dead")))
     # Dead letters sit outside drain(); only retry-dead moves them back. Held
     # file lines with preferences the hub lacks would only fail again there,
     # so status's fix (naming the merge first) stands for them.
     # So would one refused for not announcing, and worse: status names the dry run.
-    if (outbox.get("dead") or 0) > 0 and outbox.get("pending") == 0 and not outbox.get("line_conflicts") \
+    if (outbox.get("recoverable_dead", outbox.get("dead")) or 0) > 0 and outbox.get("pending") == 0 and not outbox.get("line_conflicts") \
             and not outbox.get("announce_refused"):
         outbox["fix"] = "run `khipu outbox retry-dead`"
     elif not outbox_oldest_ok and not outbox.get("evidence_conflicts"):

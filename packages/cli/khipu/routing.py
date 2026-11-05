@@ -9426,7 +9426,21 @@ def plan_facts(view: dict, now: datetime) -> dict[str, dict]:
     out = {}
     for entry in view.get("accounts") or []:
         try:
-            out[entry["key"]] = plan_fact(rows.get(entry["key"]), now)
+            fact = plan_fact(rows.get(entry["key"]), now)
+            # Even allowance arithmetic cannot promise time when observed
+            # consumption predicts exhaustion before a reset.
+            if fact.get("words") == "plenty of time":
+                from khipu import routing_pace
+                for pace in entry.get("pace") or []:
+                    current = routing_pace.at(pace, now)
+                    plan = current.get("plan") or {}
+                    runs_out = _parse(plan.get("runs_out_at"))
+                    reset = _parse(current.get("cycle_resets_at"))
+                    if (plan.get("verdict") in {"outpacing", "limit_reached"}
+                            or (runs_out is not None and reset is not None and runs_out < reset)):
+                        fact["words"] = "at current use, the allowance may run out before reset"
+                        break
+            out[entry["key"]] = fact
         except Exception:  # noqa: BLE001 - one hand-edited row costs its own figures, never the summary
             out[entry["key"]] = {"readable": False, "why": "plan figures can't be read just now"}
     return out
