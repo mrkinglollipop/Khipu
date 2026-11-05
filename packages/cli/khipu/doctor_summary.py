@@ -9,18 +9,15 @@ def _outbox(d: dict) -> str:
     if box.get("error"):
         return "the queue of captures can't be read"
     parts = []
-    waiting = box.get("dead_waiting", box.get("dead")) or 0
-    if waiting:
-        parts.append(f"{waiting} capture{' sits' if waiting == 1 else 's sit'} held on this Mac, safe but not in "
-                     "memory, and Khipu will not retry " + ("it" if waiting == 1 else "them") + " by itself")
+    held = box.get("dead") or 0
+    if held:
+        parts.append(f"{held} capture{' sits' if held == 1 else 's sit'} held on this Mac, safe but not in memory, and "
+                     "Khipu will not retry " + ("it" if held == 1 else "them") + " by itself")
     if box.get("unreadable"):
         parts.append(f"{box['unreadable']} queued capture file{'' if box['unreadable'] == 1 else 's'} can't be read")
     if (box.get("oldest_pending_seconds") or 0) > 3600:
         parts.append(f"{box.get('pending')} queued, the oldest for {box['oldest_pending_seconds'] // 3600} hours: "
                      "safe on this Mac, not yet in the database")
-    old = box.get("dead", 0) - waiting
-    if old > 0:
-        parts.append(f"{old} older ones are held too (kept whole, nothing newer has died)")
     return "; ".join(parts) or "captures are waiting past the limit"
 
 
@@ -43,6 +40,11 @@ def _delivery(d: dict) -> str:
     if "prompt-skips" in (block.get("reasons") or []):
         return (f"routing lines were left out of {prompts.get('out_of_time')} of the last hour's "
                 f"{prompts.get('count')} prompts")
+    if block.get("status") == "unknown":
+        from khipu.routing_health import IDLE_MISSING
+
+        return "routing delivery couldn't be checked: " + ", ".join(m for m in block.get("missing") or []
+                                                                  if m not in IDLE_MISSING)
     return "routing changes may not be reaching conversations (" + ", ".join(block.get("reasons") or ["no reason given"]) + ")"
 
 
@@ -57,39 +59,71 @@ def _jobs(d: dict) -> str:
     return "failing: " + ", ".join(bad) if bad else "a background job is failing"
 
 
-# (area, [(flag, what is wrong: text or function of the report, what would fix it)])
-AREAS = (
-    ("Saving memory", (
-        ("outbox_ok", _outbox, _outbox_fix),
-        ("capture_liveness_ok", _capture, "run `khipu sessions liveness` for the harness and its last error"),
-        ("ledger_outbox_ok", "queued ledger writes have not reached the database", "see ledger_outbox in the report"))),
-    ("Finding things", (
-        ("embed_coverage_ok", _embed, "run `khipu embed backfill`"),
-        ("index_freshness_ok", "the search index is out of date", "see index_freshness in the report"),
-        ("drift_ok", "memory files and the database disagree", "run `khipu reconcile`"),
-        ("recall_probe_ok", "the capture-then-search probe failed or is over 7 days old", "see recall_probe in the report"),
-        ("prompt_recall_outcomes_ok", "prompt-time recall is timing out", "see prompt_recall_outcomes in the report"))),
-    ("Routing", (
-        ("routing_delivery_ok", _delivery,
-         "raise the time allowed before a prompt in Settings → Routing, or see whether the Mac is busy"),)),
-    ("Database and disk", (
-        ("hub_ok", "the database does not answer", "check the connection with `khipu status`"),
-        ("backup_ok", "the database backup is stale", "see backup in the report"),
-        ("disk_space_ok", "disk space is low", "free space where Khipu writes"),
-        ("schema_migrations_ok", "the database has pending migrations", "apply them"))),
-    ("Background jobs", (
-        ("jobs_ok", _jobs, "run `khipu jobs status`"),
-        ("nightly_steps_ok", _jobs, "run `khipu jobs status`"),
-        ("synth_budget_ok", "the summariser's daily limit is spent", "wait for UTC midnight or `khipu budget lift synth`"))),
-)
+AREAS = ("Saving memory", "Finding things", "Routing", "Database and disk", "Jobs and other checks")
+OTHER = 4  # a failing check no one wrote words for lands here, named
+
+# Every check that feeds overall `ok` (cli.OK_GATES), plus routing delivery, which only reports:
+# key -> (area, what is wrong: text or function of the report, what would fix it: text or None for "see its block").
+WORDS = {
+    "outbox_ok": (0, _outbox, _outbox_fix),
+    "capture_liveness_ok": (0, _capture, "run `khipu sessions liveness` for the harness and its last error"),
+    "ledger_outbox_ok": (0, "queued ledger writes have not reached the database", None),
+    "git_sync_ok": (0, "the memory files are not syncing to GitHub", None),
+    "embed_coverage_ok": (1, _embed, "run `khipu embed backfill`"),
+    "index_freshness_ok": (1, "the search index is out of date", None),
+    "topics_embed_lag_ok": (1, "topic embeddings are over an hour behind", "run `khipu embed backfill`"),
+    "drift_ok": (1, "memory files and the database disagree", "run `khipu reconcile`"),
+    "graph_drift_ok": (1, "the graph and the database disagree", None),
+    "recall_probe_ok": (1, "the capture-then-search probe failed or is over 7 days old", None),
+    "prompt_recall_snapshot_ok": (1, "this Mac's offline recall copy is behind", None),
+    "prompt_recall_outcomes_ok": (1, "prompt-time recall is timing out", None),
+    "recall_daemon_ok": (1, "the warm recall service is running old code", None),
+    "recall_eval_ok": (1, "recall accuracy fell on the nightly check", None),
+    "literal_trgm_ok": (1, "a text-search index is missing", None),
+    "degraded_rate_ok": (1, "searches are falling back to a weaker mode", None),
+    "routing_delivery_ok": (2, _delivery,
+                            "raise the time allowed before a prompt in Settings → Routing, or see whether the Mac is busy"),
+    "hub_ok": (3, "the database does not answer", "check the connection with `khipu status`"),
+    "backup_ok": (3, "the database backup is stale", None),
+    "graph_backup_ok": (3, "the local graph backup is stale", None),
+    "graph_offsite_ok": (3, "the off-site graph backup is stale", None),
+    "hub_snapshot_ok": (3, "this Mac's copy of the database is behind", None),
+    "ledger_copy_ok": (3, "this Mac's copy of the ledger is behind", None),
+    "disk_space_ok": (3, "disk space is low", "free space where Khipu writes"),
+    "schema_migrations_ok": (3, "the database has pending migrations", "apply them"),
+    "dsn_file_ok": (3, "the database address file is stale", None),
+    "jobs_ok": (4, _jobs, "run `khipu jobs status`"),
+    "nightly_steps_ok": (4, _jobs, "run `khipu jobs status`"),
+    "synth_budget_ok": (4, "the summariser's daily limit is spent", "wait for UTC midnight or `khipu budget lift synth`"),
+    "synth_provider_ok": (4, "the summariser's provider is not usable", None),
+    "launchers_ok": (4, "an agent launcher points at a missing file", None),
+    "bundle_seal_ok": (4, "the app bundle has a file it should not", None),
+    "forget_list_ok": (4, "Khipu can't read this Mac's forget list", None),
+}
+
+
+def failing(report: dict) -> list[tuple[int, str, str]]:
+    """(area, what is wrong, fix) for every gate of overall ``ok`` that is False, plus routing delivery
+    and a capture at risk."""
+    from khipu.cli import OK_GATES
+
+    keys = [k for k in (*OK_GATES, "routing_delivery_ok") if k in report and not report[k]]
+    out = []
+    for key in keys:
+        area, what, fix = WORDS.get(key, (OTHER, f"{key.removesuffix('_ok').replace('_', ' ')} is failing", None))
+        out.append((area, what(report) if callable(what) else what,
+                    fix(report) if callable(fix) else fix or f"see {key.removesuffix('_ok')} in the report"))
+    if (report.get("outbox") or {}).get("at_risk") and "outbox_ok" not in keys:
+        out.append((0, _outbox(report), _outbox_fix(report)))
+    return list(dict.fromkeys(out))
 
 
 def health_summary(report: dict) -> list[str]:
     """One line per area: ``Area: fine.`` or ``Area: what is wrong. Fix: ...``"""
+    bad = failing(report)
     lines = []
-    for area, checks in AREAS:
-        bad = list(dict.fromkeys((what(report) if callable(what) else what, fix(report) if callable(fix) else fix)
-                                 for flag, what, fix in checks if report.get(flag) is False))
-        lines.append(f"{area}: fine." if not bad else f"{area}: " + " ".join(
-            f"{what[:1].upper() + what[1:]}. Fix: {fix}." for what, fix in bad[:2]))
+    for i, area in enumerate(AREAS):
+        here = [(what, fix) for a, what, fix in bad if a == i]
+        lines.append(f"{area}: fine." if not here else f"{area}: " + " ".join(
+            f"{what[:1].upper() + what[1:]}. Fix: {fix}." for what, fix in here))
     return lines

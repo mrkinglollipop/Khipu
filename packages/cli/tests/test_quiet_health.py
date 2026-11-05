@@ -166,5 +166,93 @@ def test_each_summary_line_names_what_is_wrong_and_what_would_fix_it():
                             "embed_coverage_ok": False, "embed_coverage": {"missing": 3, "stale": 1}})
     assert lines[1] == "Finding things: 4 search chunks unembedded for over an hour. Fix: run `khipu embed backfill`."
     assert lines[3].startswith("Database and disk: The database does not answer. Fix: ")
-    assert lines[4] == "Background jobs: Failing: nightly. Fix: run `khipu jobs status`."
+    assert lines[4] == "Jobs and other checks: Failing: nightly. Fix: run `khipu jobs status`."
     assert len(lines) == 5
+
+
+# ---- review round: unreadable delivery state is never fine ------------------------------------
+
+
+def test_idle_delivery_is_fine_but_anything_unreadable_is_not():
+    idle = {"status": "unknown", "missing": ["recent hook outcomes", "live delivery identities"], "reasons": []}
+    assert health.delivery_ok(idle) is True
+    assert health.delivery_ok({"status": "not_applicable", "missing": []}) is True
+    for why in ("delivery ledger unreadable", "delivery ledger malformed", "cross-Mac caught-up cursor",
+                "gateway publication failed; retry pending", "hook outcome log unreadable",
+                "delivery point is ahead of the clock", "hook outcome dated ahead of the clock"):
+        assert health.delivery_ok({"status": "unknown", "missing": ["recent hook outcomes", why]}) is False, why
+    assert health.delivery_ok({"status": "unknown", "missing": ["routing check"]}) is False
+    assert health.delivery_ok({"status": "red", "reasons": ["prompt-skips"]}) is False
+
+
+def test_a_malformed_delivery_ledger_is_red_and_the_summary_says_it_could_not_be_checked(replay):
+    folder = recall_prompt._dedup_path("ledger").parent
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "recall--x.routing.json").write_text("{not json")
+    block = health.doctor_block({"unmatched": []}, replay.now, routing.settings())
+    assert "delivery ledger unreadable" in block["missing"] and health.delivery_ok(block) is False
+    line = health_summary({"routing_delivery": block, "routing_delivery_ok": False})[2]
+    assert line.startswith("Routing: Routing delivery couldn't be checked: ") and "delivery ledger unreadable" in line
+
+
+def test_a_future_dated_hook_outcome_is_not_read_as_idle(replay):
+    now = acceptance.T0
+    _log([(now + timedelta(minutes=30), "s1", "none")])
+    result = health.prompt_health(now, 1.0)
+    assert "hook outcome dated ahead of the clock" in result["missing"] and result["status"] == "unknown"
+    assert health.delivery_ok(result) is False
+    _log([])
+    assert health.delivery_ok(health.prompt_health(now, 1.0)) is True  # no prompts at all: idle
+
+
+def test_an_unreadable_hook_log_is_not_idle(replay, monkeypatch):
+    def fail(*a, **k):
+        raise OSError("denied")
+
+    monkeypatch.setattr(recall_prompt, "_tail_text", fail)
+    result = health.prompt_health(acceptance.T0, 1.0)
+    assert result["missing"] == ["hook outcome log unreadable"] and health.delivery_ok(result) is False
+
+
+# ---- review round: a held capture is at risk, whatever its age --------------------------------
+
+
+def test_an_old_refused_capture_is_at_risk_and_the_summary_says_so_without_changing_outbox_ok(green_doctor):
+    with mock.patch("khipu.outbox.status", return_value={
+            "pending": 0, "oldest_age_s": None, "unreadable": 0, "dead": 1, "dead_waiting": 0, "announce_refused_old": 1}):
+        out = _doctor(green_doctor, {"status": "green"})
+    assert out["outbox_ok"] is True  # unchanged: the promote gate reads it
+    assert out["outbox"]["at_risk"] is True
+    assert out["summary"][0].startswith("Saving memory: 1 capture sits held on this Mac, safe but not in memory")
+
+
+# ---- review round: the five lines cannot all say fine while doctor fails ----------------------
+
+
+def _all_good():
+    return {**{k: True for k in cli.OK_GATES}, "routing_delivery_ok": True, "outbox": {}}
+
+
+@pytest.mark.parametrize("key", cli.OK_GATES)
+def test_every_check_that_feeds_ok_shows_in_the_summary_when_it_fails(key):
+    report = _all_good()
+    assert health_summary(report) == [f"{a}: fine." for a in
+                                      ("Saving memory", "Finding things", "Routing", "Database and disk", "Jobs and other checks")]
+    report[key] = False
+    lines = health_summary(report)
+    assert any(not line.endswith("fine.") for line in lines), key
+    assert "Fix:" in "".join(lines) and key not in "".join(lines)  # plain words, not the key
+
+
+def test_every_gate_has_words_and_every_ok_key_in_a_real_report_is_a_gate_or_named_as_not_one(green_doctor):
+    from khipu.doctor_summary import WORDS
+
+    assert set(cli.OK_GATES) <= set(WORDS), set(cli.OK_GATES) - set(WORDS)
+    out = _doctor(green_doctor, {"status": "green"})
+    not_gates = {"routing_delivery_ok", "notes_reconcile_ok", "embed_provider_ok", "commitments_hygiene_ok", "mark_stale_ok"}
+    keys = {k for k in out if k.endswith("_ok")}
+    assert keys <= set(cli.OK_GATES) | not_gates, keys - set(cli.OK_GATES) - not_gates
+    assert set(cli.OK_GATES) <= keys
+    assert out["ok"] == all(out[k] for k in cli.OK_GATES)
+    if not out["ok"]:
+        assert any(not line.endswith("fine.") for line in out["summary"])

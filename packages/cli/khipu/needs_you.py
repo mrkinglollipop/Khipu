@@ -6,7 +6,8 @@ each item's words, who asked and when, what yes and no do, and the exact
 nothing: settling goes through the owner gates as ever (``owner_direction``).
 
 Two sorts of item. A confirmation (``CONFIRM_KINDS``) waits for a yes or a no.
-A look (``LOOK_KINDS``) waits on a sign-in or a hold that may be ended. Only what
+A look (``LOOK_KINDS``) waits on a sign-in, a hold that may be ended, or a
+confirmed change that died before it left any record of itself. Only what
 the owner can answer is listed: a problem to run a command for belongs to
 ``khipu doctor`` and ``khipu_route``, not here.
 
@@ -22,7 +23,7 @@ from khipu import owner_direction, routing
 
 CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held",
                  "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
-LOOK_KINDS = ("remind", "signin")
+LOOK_KINDS = ("remind", "signin", "interrupted")
 KINDS = CONFIRM_KINDS + LOOK_KINDS
 
 SETTLE_ACTIONS = owner_direction.SETTLE_ACTIONS
@@ -581,6 +582,30 @@ def _forgets() -> list[dict]:
     return out
 
 
+INTERRUPTED_SHOWN_S = 7 * 24 * 3600  # an interrupted change stays listed this long
+
+
+def _interrupted() -> list[dict]:
+    """A change the owner confirmed whose worker died before writing its
+    owner-actions entry: nothing else records that it never finished. One that
+    did get its entry is in Owner actions, so it is not listed here. Khipu never
+    runs it again, since part of it may have applied."""
+    from khipu import owner_background
+
+    owner_background.heal()
+    rows = owner_direction._read_requests(owner_direction.requests_path())
+    logged = {((a.get("confirmed") or {}).get("request")) for a in owner_direction.actions()}
+    now = owner_direction._clock()
+    return [_item("interrupted", f"interrupted:{row.get('id')}",
+                  f"A change you confirmed, to {ACTION_WORDS.get(row.get('action'), 'make a change')}, didn't finish, "
+                  "most likely because the Mac restarted. Part of it may already be done. Khipu has not run it again.",
+                  at=row.get("settled_at"),
+                  do="Say it again in a conversation to run it, or leave it to drop it. Check the result first where "
+                     "running it twice would matter.")
+            for row in rows if row.get("state") == "interrupted" and row.get("id") not in logged
+            and now - float(row.get("settled_ts") or 0) <= INTERRUPTED_SHOWN_S]
+
+
 def _alarm() -> list[dict]:
     alarm = owner_direction.read_alarm()
     if alarm is None:
@@ -751,7 +776,8 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
     held, missed = _held(items)
     items += held
     unread += missed
-    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm)):
+    for name, build in (("conversations forgotten on this Mac", _forgets), ("the owner-actions alarm", _alarm),
+                        ("changes that were interrupted", _interrupted)):
         try:
             items += build()
         except Exception:  # noqa: BLE001 - named in unread

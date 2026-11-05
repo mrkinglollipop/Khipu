@@ -136,13 +136,17 @@ def prompt_health(now, warn_pct=1.0):
 
     try:
         raw = recall_prompt._tail_text(recall_prompt._log_path(), max_bytes=recall_prompt._OUTCOMES_TAIL_BYTES)
+    except FileNotFoundError:
+        raw = ""  # no prompt has been logged yet: idle
     except OSError:
-        return _result([], ["recent hook outcomes"])
-    statuses, runs, longest = [], {}, 0
+        return _result([], ["hook outcome log unreadable"])
+    statuses, runs, longest, ahead = [], {}, 0, False
     for line in raw.splitlines():
         match = recall_prompt._LOG_LINE_RE.match(line)
         stamp = _time(match.group("stamp")) if match else None
         status = recall_prompt.routing_status_of(line)
+        if stamp and stamp > now and status:
+            ahead = True
         if stamp and 0 <= (now - stamp).total_seconds() <= PROMPT_WINDOW_S and status:
             statuses.append(status)
             found = _SESSION_RE.search(line)
@@ -151,8 +155,9 @@ def prompt_health(now, warn_pct=1.0):
                 delayed = status.startswith("skipped:") and status not in _NOT_A_DELAY
                 runs[session] = runs.get(session, 0) + 1 if delayed else 0
                 longest = max(longest, runs[session])
+    missing = ["hook outcome dated ahead of the clock"] if ahead else []
     if not statuses:
-        return _result([], ["recent hook outcomes"])
+        return _result([], missing + ["recent hook outcomes"])
     skipped = sum(s.startswith("skipped:") for s in statuses)
     late = sum(s in recall_prompt.ROUTING_OUT_OF_TIME for s in statuses)
     rate = 100 * late / len(statuses)
@@ -161,7 +166,7 @@ def prompt_health(now, warn_pct=1.0):
         reasons.append("prompt-skips")
     if longest >= PROMPT_DELAY_RUN:
         reasons.append("prompt-delay")
-    return _result(reasons, [], count=len(statuses), skipped=skipped, out_of_time=late, rate_pct=rate,
+    return _result(reasons, missing, count=len(statuses), skipped=skipped, out_of_time=late, rate_pct=rate,
                    warn_pct=warn_pct, longest_skip_run=longest)
 
 
@@ -178,6 +183,20 @@ def _ledger_quiet(data, path, now, live_after):
     except (OSError, OverflowError, ValueError):
         return False
     return (now - max(stamps)).total_seconds() > live_after
+
+
+# Missing evidence that only means nothing is going on: no prompt in the last hour, no live conversation.
+# Any other missing item means a ledger, cursor, log or publication could not be read.
+IDLE_MISSING = frozenset({"recent hook outcomes", "live delivery identities"})
+
+
+def delivery_ok(block) -> bool:
+    """False for a failure and for anything that could not be checked; True for a check that is fine,
+    switched off, or idle."""
+    status = block.get("status") if isinstance(block, dict) else None
+    if status in ("green", "not_applicable"):
+        return True
+    return status == "unknown" and set(block.get("missing") or ["routing check"]) <= IDLE_MISSING
 
 
 def doctor_block(view, now, cfg):
@@ -357,8 +376,7 @@ def doctor_block(view, now, cfg):
         # With the push off nothing is delivered to conversations, so there are
         # no hook outcomes or delivery identities to find: that is the setting,
         # not a fault. Anything else the check found still counts.
-        absent = {"recent hook outcomes", "live delivery identities"}
-        left = [m for m in result["missing"] if m not in absent]
+        left = [m for m in result["missing"] if m not in IDLE_MISSING]
         if not result["reasons"] and not left:
             return dict(result, status="not_applicable", missing=[],
                         words="Routing lines are switched off on this Mac, so nothing is delivered to conversations to check.")

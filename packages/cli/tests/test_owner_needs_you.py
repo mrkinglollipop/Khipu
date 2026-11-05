@@ -268,7 +268,7 @@ LOOK_PUB = {
     "unmatched": [{"runner": "Jobs", "lane": "L9"}],
 }
 REMOVED_KINDS = {"silent", "unreadable", "refused", "lane", "delivery-behind", "delivery-copy", "delivery-read", "proposal",
-                 "interrupted", "disagree", "broken", "contradiction", "crossing", "plan"}
+                 "disagree", "broken", "contradiction", "crossing", "plan"}
 
 
 @pytest.fixture
