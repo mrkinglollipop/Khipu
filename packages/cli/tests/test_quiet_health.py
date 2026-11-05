@@ -256,3 +256,52 @@ def test_every_gate_has_words_and_every_ok_key_in_a_real_report_is_a_gate_or_nam
     assert out["ok"] == all(out[k] for k in cli.OK_GATES)
     if not out["ok"]:
         assert any(not line.endswith("fine.") for line in out["summary"])
+
+
+# ---- last round --------------------------------------------------------------------------------
+
+
+def test_a_cursor_or_publication_dated_in_the_future_could_not_be_checked(replay, monkeypatch):
+    from khipu import routing_gateway_copy, routing_replication
+
+    future = routing._iso(replay.now + timedelta(hours=2))
+    monkeypatch.setattr(routing, "_replication_live", lambda: True)
+    monkeypatch.setattr(routing_replication, "status",
+                        lambda now=None: {"caught_up_at": future, "age_seconds": 0, "stale": False})
+    block = health.doctor_block({"unmatched": []}, replay.now, routing.settings())
+    assert "cross-Mac caught-up cursor" in block["missing"] and block["replication"]["status"] == "unknown"
+    monkeypatch.setattr(routing, "_replication_live", lambda: False)
+    monkeypatch.setattr(routing_gateway_copy, "status", lambda: {"gateway_rows": [], "published_at": future,
+                                                                 "health_refreshed_at": routing._iso(replay.now)})
+    block = health.doctor_block({"unmatched": []}, replay.now, dict(routing.settings(), routing_cloud_copy=True))
+    assert "gateway publication dated ahead of the clock" in block["missing"]
+    assert health.delivery_ok(block) is False
+
+
+def test_no_hook_outcomes_is_only_idle_when_no_conversation_is_live():
+    idle = {"status": "unknown", "missing": ["recent hook outcomes", "live delivery identities"], "identities": []}
+    assert health.delivery_ok(idle) is True
+    live = {"status": "unknown", "missing": ["recent hook outcomes"], "identities": [{"identity": "x", "status": "green"}]}
+    assert health.delivery_ok(live) is False
+    assert "couldn't be checked: recent hook outcomes" in health_summary({"routing_delivery": live, "routing_delivery_ok": False})[2]
+
+
+def test_a_blank_queued_at_is_unreadable_even_beside_a_young_job(tmp_path, monkeypatch):
+    from khipu import outbox
+
+    monkeypatch.setenv("KHIPU_OUTBOX", str(tmp_path))
+    outbox.enqueue({"ts": "2026-08-17T18:00:00Z", "summary": "a"}, reason="t")
+    outbox.enqueue({"ts": "2026-08-17T19:00:00Z", "summary": "b"}, reason="t")
+    blank = outbox.jobs()[0]
+    job = json.loads(blank.read_text())
+    job["queued_at"] = ""
+    blank.write_text(json.dumps(job))
+    status = outbox.status()
+    assert status["pending"] == 2 and status["unreadable"] == 1
+
+
+def test_the_summary_names_skips_and_unreadable_evidence_together():
+    block = {"status": "red", "reasons": ["prompt-skips"], "prompts": {"count": 10, "out_of_time": 4},
+             "missing": ["delivery ledger unreadable"]}
+    line = health_summary({"routing_delivery": block, "routing_delivery_ok": False})[2]
+    assert "4 of the last hour's 10 prompts" in line and "couldn't be checked: delivery ledger unreadable" in line

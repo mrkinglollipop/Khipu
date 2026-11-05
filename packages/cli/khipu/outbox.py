@@ -765,9 +765,9 @@ def status() -> dict[str, Any]:
                 raise ValueError("job envelope is not an object")
             outbox_payloads(job)
             q = job.get("queued_at")
-            if not isinstance(q, str):
-                raise ValueError("queued_at is not a string")
-            age = int((now - datetime.fromisoformat(q)).total_seconds()) if q else None
+            if not isinstance(q, str) or not q.strip():
+                raise ValueError("queued_at is blank")
+            age = int((now - datetime.fromisoformat(q)).total_seconds())
         except (OSError, ValueError, TypeError, RecursionError):
             unreadable += 1
             continue

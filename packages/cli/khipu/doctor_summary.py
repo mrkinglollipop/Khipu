@@ -37,15 +37,17 @@ def _embed(d: dict) -> str:
 def _delivery(d: dict) -> str:
     block = d.get("routing_delivery") or {}
     prompts = block.get("prompts") or {}
-    if "prompt-skips" in (block.get("reasons") or []):
-        return (f"routing lines were left out of {prompts.get('out_of_time')} of the last hour's "
-                f"{prompts.get('count')} prompts")
-    if block.get("status") == "unknown":
-        from khipu.routing_health import IDLE_MISSING
+    from khipu.routing_health import unchecked
 
-        return "routing delivery couldn't be checked: " + ", ".join(m for m in block.get("missing") or []
-                                                                  if m not in IDLE_MISSING)
-    return "routing changes may not be reaching conversations (" + ", ".join(block.get("reasons") or ["no reason given"]) + ")"
+    parts = []
+    if "prompt-skips" in (block.get("reasons") or []):
+        parts.append(f"routing lines were left out of {prompts.get('out_of_time')} of the last hour's "
+                     f"{prompts.get('count')} prompts")
+    elif block.get("reasons"):
+        parts.append("routing changes may not be reaching conversations (" + ", ".join(block["reasons"]) + ")")
+    if block.get("missing") and unchecked(block):
+        parts.append("routing delivery couldn't be checked: " + ", ".join(unchecked(block)))
+    return "; ".join(parts) or "routing changes may not be reaching conversations"
 
 
 def _capture(d: dict) -> str:

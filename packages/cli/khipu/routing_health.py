@@ -190,13 +190,23 @@ def _ledger_quiet(data, path, now, live_after):
 IDLE_MISSING = frozenset({"recent hook outcomes", "live delivery identities"})
 
 
+AHEAD_SLACK_S = 300  # evidence dated further ahead than this is not from this clock
+
+
+def unchecked(block) -> list[str]:
+    """What could not be read or published. No hook outcomes is only idle when no conversation is live."""
+    live = bool(block.get("identities"))
+    return [m for m in block.get("missing") or ["routing check"] if m not in IDLE_MISSING
+            or (live and m == "recent hook outcomes")]
+
+
 def delivery_ok(block) -> bool:
     """False for a failure and for anything that could not be checked; True for a check that is fine,
     switched off, or idle."""
     status = block.get("status") if isinstance(block, dict) else None
     if status in ("green", "not_applicable"):
         return True
-    return status == "unknown" and set(block.get("missing") or ["routing check"]) <= IDLE_MISSING
+    return status == "unknown" and not unchecked(block)
 
 
 def doctor_block(view, now, cfg):
@@ -274,7 +284,8 @@ def doctor_block(view, now, cfg):
             replication = routing_replication.status(now)
         except (TypeError, ValueError, OverflowError):
             replication = {"age_seconds": None}
-        if replication["age_seconds"] is None:
+        caught = _time(replication.get("caught_up_at"))
+        if replication["age_seconds"] is None or (caught and (caught - now).total_seconds() > AHEAD_SLACK_S):
             missing.append("cross-Mac caught-up cursor")
             replication["status"] = "unknown"
         else:
@@ -341,6 +352,9 @@ def doctor_block(view, now, cfg):
         if publication.get("published_at"):
             published_at = _time(publication["published_at"])
             age = max(0, (now - published_at).total_seconds()) if published_at else None
+            if published_at and (published_at - now).total_seconds() > AHEAD_SLACK_S:
+                missing.append("gateway publication dated ahead of the clock")
+                gateway["status"] = "unknown"
             gateway["published_at"] = publication["published_at"]
             gateway["published_epoch"] = publication.get("epoch")
             gateway["published_revision"] = publication.get("revision")
