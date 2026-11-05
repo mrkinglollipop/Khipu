@@ -202,11 +202,14 @@ def test_debt_aged_by_the_old_offer_count_starts_again_at_the_next_take(replay):
 
     for _ in range(6):
         delivery.offer(planned(), session="s1")  # the old count: every offer a point
-    assert "budget-stall" in health.component_health(delivery.snapshot("s1"), T0)["reasons"]
+    state = delivery.snapshot("s1")
+    # Judged at the ledger's own last point: an hour on, the conversation is idle and has no stall.
+    at = health._time(state["last_delivery_point"])
+    assert "budget-stall" in health.component_health(state, at)["reasons"]
     delivery.offer(planned(), session="s1", deferred=True)
     state = delivery.snapshot("s1")
     assert state["point_basis"] == "take"
-    assert "budget-stall" not in health.component_health(state, T0)["reasons"]
+    assert "budget-stall" not in health.component_health(state, health._time(state["last_delivery_point"]))["reasons"]
 
 
 def test_a_take_with_no_ledger_makes_none(replay):

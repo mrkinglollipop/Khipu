@@ -136,3 +136,114 @@ def test_a_bare_instruction_to_run_or_read_something_is_not_the_users(text, kind
 ])
 def test_what_a_person_must_decide_or_do_stays_theirs(text, kind):
     assert co.resolve_owner(text, kind=kind, declared="user") == co.OWNER_USER
+
+
+# ---- routing at a prompt: short prompts lost to a 50 ms budget -------------------------------
+
+
+def _answer_in_the_pipe(read_seconds, *, budget):
+    """A routing child that was ready now and took ``read_seconds`` to read, as
+    the pipe a prompt with no search of its own (nothing else to wait on) collects."""
+    import json
+    import os
+    import time
+
+    from khipu import recall_prompt
+
+    began = time.monotonic()
+    done = began + read_seconds
+    answer = {"kind": "none", "version": 1, "text": "", "generation": [], "done": done}
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, f"{began!r} {budget!r}\n".encode() + json.dumps(answer).encode() + b"\n")
+    os.close(write_fd)
+    at = recall_prompt._RoutingAtPrompt()
+    at.fd, at.status = read_fd, "skipped:budget"
+    at.forked = began
+    at.cap = began + 1.0
+    return at
+
+
+def test_the_default_budget_takes_a_read_as_long_as_the_measured_one(tmp_path, monkeypatch):
+    from khipu import routing
+
+    monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path))
+    budget = routing.prompt_budget()
+    assert budget >= 0.15, "104 ms p50 and 182 ms p90 were measured for the read at load 19-27"
+    at = _answer_in_the_pipe(0.12, budget=budget)  # a 120 ms read, no search to hide it behind
+    assert at.collect() is not None
+
+
+def test_a_50_ms_budget_loses_that_same_read(tmp_path, monkeypatch):
+    # The old default, kept as evidence of what the test above guards against.
+    at = _answer_in_the_pipe(0.12, budget=0.05)
+    assert at.collect() is None
+
+
+# ---- routing at a prompt: no Keychain process per prompt ---------------------------------------
+
+
+def test_provider_key_presence_is_asked_once_a_minute_inside_a_prompt_read(tmp_path, monkeypatch):
+    from khipu import keychain
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    asked = []
+    resolve = lambda: asked.append(1) or "k"  # noqa: E731
+    with keychain.prompt_scope():
+        assert keychain.key_present("glm", resolve) and keychain.key_present("glm", resolve)
+    assert len(asked) == 1
+    stored = (tmp_path / "Library/Caches/Khipu/login-usage/key-presence.json").read_text()
+    assert '"k"' not in stored  # the answer is kept, never the key
+    # Anywhere else it is asked every time: the owner's own reads stay exact.
+    assert keychain.key_present("glm", resolve) and keychain.key_present("glm", resolve)
+    assert len(asked) == 3
+
+
+def test_a_presence_answer_older_than_a_minute_is_asked_again(tmp_path, monkeypatch):
+    import time
+
+    from khipu import keychain
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    asked = []
+    with keychain.prompt_scope():
+        keychain.key_present("glm", lambda: asked.append(1))
+        later = time.time() + keychain.PRESENCE_TTL_S + 1
+        monkeypatch.setattr(keychain.time, "time", lambda: later)
+        keychain.key_present("glm", lambda: asked.append(1))
+    assert len(asked) == 2
+
+
+def test_storing_a_key_drops_the_remembered_answer(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from khipu import keychain
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(keychain, "keychain_available", lambda: True)
+    monkeypatch.setattr(keychain, "_security", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""))
+    with keychain.prompt_scope():
+        assert not keychain.key_present("glm", lambda: None)
+        keychain.set_password("glm_api_key", "secret-value")
+        assert keychain.key_present("glm", lambda: "now there")
+
+
+def test_the_prompt_read_does_not_start_a_security_process_for_provider_keys(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+
+    from khipu import keychain, usage
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(keychain, "_security", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(
+        AssertionError("a Keychain process on the prompt path")))
+    for name in ("resolve_glm_key", "resolve_deepseek_key", "resolve_kimi_key"):
+        monkeypatch.setattr(keychain, name, lambda: None)
+    asked = []
+    monkeypatch.setattr(usage, "_glm_key", lambda: asked.append("glm") or None)
+    monkeypatch.setattr(usage, "_deepseek_key", lambda: asked.append("deepseek") or None)
+    with keychain.prompt_scope():
+        for _ in range(3):
+            usage.available("glm")
+            usage.available("deepseek")
+            usage.deepseek_spend_total(datetime.now(timezone.utc), 7, 10.0)
+    assert sorted(asked) == ["deepseek", "glm"] and calls == []
