@@ -9431,7 +9431,13 @@ def plan_facts(view: dict, now: datetime) -> dict[str, dict]:
             # consumption predicts exhaustion before a reset.
             if fact.get("words") == "plenty of time":
                 from khipu import routing_pace
+                window = _longest_window(rows.get(entry["key"]) or {}, now)
                 for pace in entry.get("pace") or []:
+                    # A short or model-specific allowance says nothing about
+                    # the whole-account window described by this fact.
+                    if (not window or window.get("model") or pace.get("model") or pace.get("scope")
+                            or pace.get("window") != window.get("name")):
+                        continue
                     current = routing_pace.at(pace, now)
                     plan = current.get("plan") or {}
                     runs_out = _parse(plan.get("runs_out_at"))

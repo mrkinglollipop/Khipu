@@ -955,3 +955,18 @@ def test_early_exhaustion_forecast_overrides_plenty_of_time(home, monkeypatch):
     assert "plenty of time" not in routing.plan_facts({"accounts": [entry]}, T0)[SECOND]["words"]
     entry["pace"] = []
     assert routing.plan_facts({"accounts": [entry]}, T0)[SECOND]["words"] == "plenty of time"
+
+
+@pytest.mark.parametrize("short_verdict", ["outpacing", "limit_reached"])
+def test_short_and_model_windows_do_not_change_weekly_words(home, monkeypatch, short_verdict):
+    row = _row("Claude second", "claude", "/logins/claude-second", _week(66, T0 + timedelta(hours=43)))
+    monkeypatch.setattr(usage, "_load_cache", lambda: {SECOND: row})
+    weekly = {"window": "weekly", "plan": {"verdict": "on_pace"}}
+    entry = {"key": SECOND, "pace": [
+        {"window": "five_hour", "plan": {"verdict": short_verdict}},
+        {"window": "weekly_fable", "plan": {"verdict": "outpacing"}},
+        {"window": "weekly", "model": "Fable", "plan": {"verdict": "outpacing"}},
+        weekly]}
+    assert routing.plan_facts({"accounts": [entry]}, T0)[SECOND]["words"] == "plenty of time"
+    weekly["plan"]["verdict"] = "outpacing"
+    assert "plenty of time" not in routing.plan_facts({"accounts": [entry]}, T0)[SECOND]["words"]
