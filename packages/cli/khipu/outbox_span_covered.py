@@ -50,7 +50,6 @@ DIFFERENT_ERROR = "different_error"
 CHECK_FAILED = "check_failed"
 CHANGED = "changed"
 RECORD_CONFLICT = "record_conflict"
-WOULD_SKIP = "would_skip"
 HOLD_WORDS = {
     NO_COVERING_ROW: "no live episode in the same session and harness",
     RANGE_NOT_CONTAINED: "no live episode's range contains the job's",
@@ -65,15 +64,10 @@ HOLD_WORDS = {
     DIFFERENT_ERROR: "the job failed with a different error",
     CHECK_FAILED: "a check could not run, so the job stays held",
     CHANGED: "the job changed after it was read",
-    WOULD_SKIP: ("a live episode already holds the job's exact window, so a retry would write nothing and remove the "
-                 "job, and its own wording would be kept nowhere"),
     RECORD_CONFLICT: ("an interrupted run left a record for the job that it can't finish from, and both are kept "
                       "whole: look at that record in the outbox's resolved folder, remove it if it is wrong, then "
                       "run this again"),
 }
-# What a retry may land: not provably a duplicate, and nothing forgotten near it.
-RETRYABLE = frozenset({NO_COVERING_ROW, RANGE_NOT_CONTAINED, RANGE_NOT_NUMERIC, NOT_SAME_WINDOW, OFFSETS_RESTARTED,
-                       LATE_REPEAT, EVIDENCE_MISSING})
 
 _ROWS_SQL = ("SELECT id, session_id, transcript_range, deleted_at, raw FROM episodes "
              "WHERE session_id = ANY(%s) OR raw->>'session_id' = ANY(%s) ORDER BY id")
@@ -211,15 +205,6 @@ def _verdict(cur, view: dict[str, Any], rows: list[tuple], withheld: frozenset[i
     return EVIDENCE_MISSING, None
 
 
-def _retry_would_vanish(cur, view: dict[str, Any]) -> bool:
-    """Whether the drain would answer this job "exact window: skip" and delete it
-    with nothing written, so a retry can't land it (``capture._dedup_exact_window``,
-    the drain's own check)."""
-    from khipu.capture import _dedup_exact_window
-
-    return _dedup_exact_window(cur, view) is not None
-
-
 def _judge(cur, entries: list[dict[str, Any]], *, lock: bool = False) -> bool:
     """Set each unsettled entry's ``reason`` or ``row``; False when the session
     read itself failed. Every failure holds: a database error aborts the
@@ -243,8 +228,6 @@ def _judge(cur, entries: list[dict[str, Any]], *, lock: bool = False) -> bool:
         try:
             entry["reason"], entry["row"] = _verdict(
                 cur, entry["view"], rows.get(session, []) if isinstance(session, str) else [], withheld, forgotten)
-            if entry["reason"] in RETRYABLE and _retry_would_vanish(cur, entry["view"]):
-                entry["reason"] = WOULD_SKIP
         except Exception:  # noqa: BLE001 - a check that can't run holds the job
             entry["reason"], entry["row"] = CHECK_FAILED, None
     return True
@@ -278,16 +261,6 @@ def dry_run() -> dict[str, Any]:
     return {"ok": read, "dry_run": True, "dead_jobs": len(entries),
             "would_retire": sum(1 for e in entries if not e["reason"]), "would_hold": dict(sorted(held.items())),
             **({} if read else {"error": _UNREADABLE_HUB})}
-
-
-def retryable() -> dict[Path, bytes]:
-    """The refused dead jobs a retry may land, with the bytes judged; none when
-    the hub could not be read."""
-    from khipu import outbox
-
-    entries = _read(outbox.dead_jobs())
-    _judged(entries)
-    return {e["path"]: e["snapshot"] for e in entries if e["reason"] in RETRYABLE}
 
 
 def _record(entry: dict[str, Any]) -> dict[str, Any]:
