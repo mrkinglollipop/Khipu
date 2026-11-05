@@ -889,8 +889,15 @@ def _turn_proof(environ, session: str, request: dict, now: float) -> dict | str:
     return why
 
 
-def unapplyable_reason(request: dict, *, now: float | None = None) -> str | None:
-    """Why a saved priority request can now only be declined."""
+UNAPPLYABLE_WORDS = {
+    "expired": "This request has expired because its saved end has passed. Decline it; it cannot be applied.",
+    "out_of_date": "This request is out of date because the priority changed since it was saved. Decline it; it cannot be applied.",
+}
+
+
+def unapplyable_code(request: dict, *, now: float | None = None) -> str | None:
+    """Why a saved priority request can now only be declined: ``expired``,
+    ``out_of_date``, or None. The code is what crosses to another Mac."""
     action, values = request.get("action", ""), request.get("args") or {}
     if not action.startswith("route.priority.") or action == "route.priority.undo":
         return None
@@ -899,19 +906,24 @@ def unapplyable_reason(request: dict, *, now: float | None = None) -> str | None
     moment = datetime.fromtimestamp(_clock() if now is None else now, timezone.utc)
     end = routing._parse(values.get("until"))
     if end is not None and end <= moment:
-        return "This request has expired because its saved end has passed. Decline it; it cannot be applied."
+        return "expired"
     view = routing.read_view(moment)
     for key in ("expect", "confirm_pending"):
         expected = values.get(key)
         if expected is not None:
             actual = routing.pending_priority_pin(view) if str(expected).startswith("pp-") else view.get("priority_version", "p0")
             if expected != actual:
-                return "This request is out of date because the priority changed since it was saved. Decline it; it cannot be applied."
+                return "out_of_date"
     if action == "route.priority.confirm":
         end = routing._parse((view.get("priority_stored") or {}).get("until"))
         if end is not None and end <= moment:
-            return "This request has expired because its saved end has passed. Decline it; it cannot be applied."
+            return "expired"
     return None
+
+
+def unapplyable_reason(request: dict, *, now: float | None = None) -> str | None:
+    """Why a saved priority request can now only be declined."""
+    return UNAPPLYABLE_WORDS.get(unapplyable_code(request, now=now))
 
 
 def remote_stamp(answer: dict) -> dict:

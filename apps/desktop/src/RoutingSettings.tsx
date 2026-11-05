@@ -111,7 +111,8 @@ import type { ChangeRow, LimitUnit } from "./routingWords";
 type SyncDifference = { key: string; name: string; local: unknown; remote: unknown; remote_snapshot?: boolean };
 /** A request another Mac held for the owner and how it ended there (never its words). */
 type SyncRequest = { id?: string; request: string; mac: string; state: string; words?: string | null; stale?: boolean;
-  ask?: string | null; answerable?: boolean };
+  ask?: string | null; answerable?: boolean; decline_only?: boolean; reason?: string | null; asked_by?: string | null;
+  asked_at?: string | null };
 type RouteConfig = {
   routing?: Record<string, RouteSetting>;
   settings_sync?: { enabled?: boolean; differences?: SyncDifference[]; requests?: SyncRequest[]; waiting?: SyncRequest[] };
@@ -3439,13 +3440,21 @@ function MacRoutingControls({
                 {(cfg?.settings_sync?.waiting ?? []).map((r) => (
                   <div className="row-item route-sync-row" key={r.id ?? r.request} role="group" aria-label={r.mac}>
                     <span className="route-name">{r.mac}</span>
-                    <span className="set-help route-sync-values">{r.ask ?? "Its words stay on that Mac: answer it there."}</span>
+                    <span className="set-help route-sync-values">
+                      {r.asked_by ? `${r.asked_by[0].toUpperCase()}${r.asked_by.slice(1)} asked${r.asked_at ? ` ${whenLocal(r.asked_at, new Date())}` : ""}. ` : ""}
+                      {r.ask ?? "Its words stay on that Mac: answer it there."}
+                      {r.reason ? ` ${r.reason}` : ""}
+                    </span>
                     {r.answerable && r.id ? (
                       <span className="route-actions">
                         <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-no-${r.id}`, "khipu_owner_answer", { request: r.id, answer: "no" }, reread)}>No</button>
-                        <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-yes-${r.id}`, "khipu_owner_answer", { request: r.id, answer: "yes" }, reread)}>Yes</button>
+                        {r.decline_only ? null : (
+                          <button type="button" className="sm" disabled={w.anyBusy} onClick={() => void w.run(`sync-yes-${r.id}`, "khipu_owner_answer", { request: r.id, answer: "yes" }, reread)}>Yes</button>
+                        )}
                       </span>
                     ) : null}
+                    <WriteError w={w} id={`sync-no-${r.id}`} />
+                    <WriteError w={w} id={`sync-yes-${r.id}`} />
                   </div>
                 ))}
               </div>

@@ -325,11 +325,16 @@ def account_advice(view: dict, entry: dict, now, *, purpose: str = "job",
         # Measured DeepSeek spend, including filling history, is judged
         # normally. Only unavailable or untrusted reads keep the cap unknown.
         elif entry.get("harness") == "deepseek" and any(
-                s.get("kind") == "spend" and s.get("verdict") == "unknown" for s in statuses):
+                s.get("kind") == "spend" and s.get("verdict") == "unknown" and not s.get("no_reader")
+                for s in statuses):
             verdict, reason = "hold_back", "cap status unknown"
         elif crossing:
             verdict = "hold_back"
             reason = "a cap crosses within the hour at the trailing average"
+        elif entry.get("harness") == "deepseek" and any(
+                s.get("kind") == "spend" and s.get("no_reader") for s in statuses):
+            # A cap this Mac cannot measure is not a reason to stop work: say it is unchecked here.
+            reason = f"{why_eligible}; the DeepSeek spend cap is not checked from this Mac, which has no DeepSeek reader"
     applied = None
     if override is not None and purpose in ("job", "check"):
         from khipu import conversation_overrides

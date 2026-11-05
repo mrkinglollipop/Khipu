@@ -1407,6 +1407,12 @@ def _fold_accounts(config: dict) -> list[dict]:
 def _label_for_key(key: str) -> str:
     from khipu import usage
 
+    if account_identity.STABLE.fullmatch(key):
+        # A shared id (``claude:second``) on a Mac that holds no label for it:
+        # the reverse of ``stable_id``, which drops the provider from the label.
+        provider, _, name = key.partition(":")
+        base = usage.LABELS.get(provider, provider)
+        return base if name == "main" else f"{base} {name.replace('-', ' ')}"
     harness, _, home = key.partition("|")
     base = usage.LABELS.get(harness, harness or "?")
     return f"{base} ({_clean(Path(home).name, NAME_MAX)})" if home else base
@@ -2064,7 +2070,8 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
     # words travel only as a pending proposal's do (``proposal_text``).
     "request_state": {"request": "id", "req_kind": frozenset({"held", "setting"}),
                       "req_state": frozenset({"pending", "applied", "declined", "failed", "stale", "gone"}),
-                      "req_action": "id", "sig": "revision_id", "asked_at": "time", "withheld": "bool"},
+                      "req_action": "id", "sig": "revision_id", "asked_at": "time", "withheld": "bool",
+                      "asked_harness": "name", "req_blocked": frozenset({"expired", "out_of_date"})},
     "request_answer": {"request": "id", "req_answer": frozenset({"confirm", "decline"}), "sig": "revision_id",
                        "answer_harness": "name", "message_sha": "revision_id"},
     "cap_set": {"account": "account", "kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
@@ -2506,7 +2513,7 @@ _TEXT_FIELDS = ("id", "account", "runner", "lane", "reason", "target", "state", 
                 "op", "op_body", "proposal", "kind", "witness_at", "expires_at", "definition", "reset_at", "source_id",
                 "resets_at", "cycle", "revision", "cap_kind", "confirm_revision", "confirm_proposal", "batch",
                 "batch_target", "key", "value_json", "request", "req_kind", "req_state", "req_action",
-                "sig", "ask", "req_answer", "answer_harness", "message_sha")
+                "sig", "ask", "req_answer", "answer_harness", "message_sha", "asked_at", "asked_harness", "req_blocked")
 _TIME_FIELDS = ("written_at", "until", "clock_at", "reset_until", "next_at", "reset_moved_to", "started_at",
                 "witness_at", "expires_at", "reset_at", "resets_at", "asked_at")
 _WHOLE_FIELDS = ("n", "count", "seq", "checks", "busy_tries", "lock_tries", "hub_order", "local_order", "rule_number", "t_err",
@@ -6528,6 +6535,8 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
                 for field in ("at_least_usd", "partial", "since", "topups_seen", "topup_intervals",
                               "possible_miss_seconds"):
                     extra[field] = total.get(field)
+                if total.get("no_reader"):
+                    extra["no_reader"] = True
             out.append({**base, "cap_usd": cap.get("usd"), "days": cap.get("days"),
                         "usd": total.get("usd"), "events": total.get("events"), **extra,
                         "verdict": spend_verdict or routing_pace.spend_verdict(total, cap["usd"]),

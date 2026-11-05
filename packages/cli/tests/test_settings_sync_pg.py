@@ -6,7 +6,7 @@ no fake hub, no live state. Each test is something the owner does: a setting
 changed on one Mac reaches the other and Undo works there; first switch-on
 lists differences and overwrites nothing; a request held on one Mac is answered
 on the other and applies once; a stale answer says so; an older Mac's code
-(``origin/main``) reads the new lines without harm."""
+(``OLDER_MAC``, the last commit before they existed) reads the new lines without harm."""
 from __future__ import annotations
 
 import json
@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import psycopg
@@ -25,6 +26,8 @@ from tests.hermetic_pg import hub, pg_cluster  # noqa: F401
 from tests.test_routing_acceptance import Replay
 
 REPO = Path(__file__).resolve().parents[3]
+# Pinned: this must stay older than the settings lines, so never a moving branch.
+OLDER_MAC = "4c5df2eb4fb5ce0e0e70985856270d81dca4dfbc"
 KEY, OTHER_KEY = "routing_summary_chars", "routing_rule_chars"
 _ENV = ("KHIPU_SESSION_ID", "CODEX_THREAD_ID", "GROK_HOOK_NAME", "GROK_HOOK_EVENT", "KHIPU_HARNESS",
         "KHIPU_ISOLATED_DIR", "KHIPU_OWNER_TURN", "CLAUDE_CODE_SESSION_ID")
@@ -399,10 +402,10 @@ def test_an_older_mac_on_main_reads_the_new_lines_without_harm(macs, pg, tmp_pat
 
     old = tmp_path / "old-main"
     old.mkdir()
-    tar = subprocess.run(["git", "-C", str(REPO), "archive", "origin/main", "packages/cli/khipu"],
+    tar = subprocess.run(["git", "-C", str(REPO), "archive", OLDER_MAC, "packages/cli/khipu"],
                          capture_output=True)
     if tar.returncode:
-        pytest.skip("origin/main is not available to build the older Mac from")
+        pytest.skip("the older commit is not available to build the older Mac from")
     subprocess.run(["tar", "-x", "-C", str(old)], input=tar.stdout, check=True)
     assert "request_answer" not in (old / "packages/cli/khipu/routing.py").read_text()
     home = tmp_path / "old-home"
@@ -525,3 +528,117 @@ def test_needs_you_yes_and_no_answer_a_request_held_on_the_other_mac_the_same_wa
     sync_all(b, a)
     assert a.paused()
     assert [x for x in a.log() if x.get("action") == "route.pause"][0]["confirmed"]["source"] == "other_mac"
+
+
+# ---- a request held on the other Mac reads the same on both Macs -------------------------------
+
+
+def _hold_priority_amend(mac, session="sP"):
+    """A conversation asks to amend the priority; it is held for the owner."""
+    mac.activate()
+    routing.set_priority([{"account": "Codex"}, {"account": "Grok"}], via="app", expect=routing.priority_version())
+    mac.say("add a note to the Codex priority", session)
+    bad, out = mac.act("direction.request", {"action": "route.priority.amend", "args": {
+        "account": "Codex", "append": "and docs", "expect": routing.priority_version()}}, session)
+    assert not bad and out["pending"] is True, out
+    return out["request"]
+
+
+def _item_on(mac, request, session="sB"):
+    (item,) = [i for i in mac.waiting(session)["items"] if i["key"] == f"held:rm-{request}"]
+    return item
+
+
+def test_a_waiting_request_on_the_other_mac_says_who_asked_and_when(macs):
+    a, b = macs
+    both_on(a, b)
+    request = _hold_priority_amend(a)
+    sync_all(a, b)
+    item = _item_on(b, request)
+    assert item["asked_by"]["who"] == "a Claude Code conversation on Studio", item["asked_by"]
+    assert item["asked_by"]["when"] == "just now" and "unknown writer" not in json.dumps(item)
+    assert item["settle"]["confirm"]["action"] == "direction.confirm" and not item.get("decline_only")
+
+
+def test_a_request_the_holder_would_refuse_is_decline_only_on_the_other_mac_with_the_same_reason(macs):
+    a, b = macs
+    both_on(a, b)
+    request = _hold_priority_amend(a)
+    sync_all(a, b)
+    a.activate()
+    routing.set_priority([{"account": "Grok"}], via="app", expect=routing.priority_version())  # makes it out of date
+    held = next(r for r in owner_direction._read_requests(owner_direction.requests_path()) if r["id"] == request)
+    reason = owner_direction.unapplyable_reason(held)
+    assert reason
+    sync_all(a, b)
+    b.now = datetime.now(timezone.utc) + timedelta(days=3)  # the request was asked in real time
+    item = _item_on(b, request)
+    assert item["decline_only"] is True and item["settle"]["confirm"] is None
+    assert reason in item["words"] and "Studio" in item["words"]
+    assert item["asked_by"]["who"] == "a Claude Code conversation on Studio"
+    assert item["asked_by"]["when"] == "3 days ago", item["asked_by"]
+    # The app's Your Macs list reads the same facts.
+    (shown,) = [r for r in b.mirrors() if r["request"] == request]
+    assert shown["decline_only"] is True and shown["reason"] == reason
+    assert shown["asked_by"] == "a Claude Code conversation"
+    # Declining still reaches the holder.
+    b.say("no, drop it", "sB")
+    bad, out = b.act("direction.decline", {"request": f"rm-{request}"}, "sB")
+    assert not bad and out["sent"] is True, out
+    sync_all(b, a)
+    held = next(r for r in owner_direction._read_requests(owner_direction.requests_path()) if r["id"] == request)
+    assert held["state"] == "declined"
+
+
+def test_a_row_mirrored_before_the_fix_is_corrected_by_the_holders_next_line(macs):
+    a, b = macs
+    both_on(a, b)
+    request = _hold_priority_amend(a)
+    sync_all(a, b)
+    b.activate()
+    path = owner_direction.requests_path()
+    state = owner_direction._load(path)
+    for row in state["requests"]:
+        if row.get("remote"):
+            row["by"] = {"kind": "other_mac"}
+            row["remote"].pop("blocked", None)
+            row["created_at"] = owner_direction._iso((b.now - timedelta(seconds=10)).timestamp())
+    owner_direction._save(path, state, b.now.timestamp())
+    a.activate()
+    routing.set_priority([{"account": "Grok"}], via="app", expect=routing.priority_version())
+    sync_all(a, b)
+    item = _item_on(b, request)
+    assert item["decline_only"] is True and item["asked_by"]["who"] == "a Claude Code conversation on Studio"
+
+
+# ---- the same account names on a Mac that has no account list -----------------------------------
+
+
+def _account_labels(mac):
+    mac.activate()
+    return {a["key"]: a["label"] for a in routing.read_view(now=mac.now)["accounts"]}
+
+
+def test_accounts_the_other_mac_reads_keep_the_owners_names_on_a_mac_with_no_list(macs):
+    a, b = macs
+    both_on(a, b)
+    a.configure(usage_accounts=[{"label": "Claude second", "harness": "claude", "home": str(a.root / "login")},
+                                {"label": "Muse", "harness": "muse"}])
+    b.config.pop("usage_accounts")
+    b.configure()
+    a.activate()
+    routing.pause("Claude second", until="24h", via="app")
+    routing.pause("Muse", until="24h", via="app")
+    sync_all(a, b)
+    seen, mine = _account_labels(b), _account_labels(a)
+    assert {"claude:second", "muse:main"} <= set(seen), seen
+    assert (seen["claude:second"], seen["muse:main"]) == ("Claude second", "Muse"), seen
+    assert not any(":" in label for label in seen.values())
+    assert mine["claude:second"] == seen["claude:second"] if "claude:second" in mine else True
+
+
+def test_a_label_is_derived_from_a_shared_id_when_no_mac_holds_one():
+    assert routing._label_for_key("muse:main") == "Muse"
+    assert routing._label_for_key("claude:second") == "Claude second"
+    assert routing._label_for_key("codex:main") == "Codex"
+    assert routing._label_for_key("claude|/some/home") == "Claude (home)"

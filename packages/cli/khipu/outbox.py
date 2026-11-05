@@ -797,7 +797,14 @@ def status() -> dict[str, Any]:
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
             "evidence_conflicts": evidence_conflicts,
             "held_conflicts": len(held_conflicts), "held_conflict_jobs": held_conflicts,
-            "line_conflicts": line_conflicts, "announce_refused": refused, "resolved": resolved}
+            "line_conflicts": line_conflicts, "announce_refused": refused, "resolved": resolved,
+            # Where the dead count comes from, and how recently any of it was tried.
+            "dead_detail": {"outbox_dead": len(dead_jobs()), "quarantined": quarantined,
+                            "native_held": len(native_held)}}
+    if native_held:
+        from khipu.session_capture import held_by_harness
+
+        result["dead_detail"]["native_held_by_harness"] = held_by_harness()
     if line_conflicts:
         # Most of these lines differ from the hub only by preference text it
         # lacks (2026-10-27); retry-dead alone would just fail them again.

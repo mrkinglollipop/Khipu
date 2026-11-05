@@ -289,6 +289,7 @@ function detailFor(key: string, parsed: Record<string, unknown>): string | undef
   if (key === "routing_delivery_ok") {
     const delivery = parsed.routing_delivery as { status?: unknown; reasons?: unknown; missing?: unknown } | undefined;
     if (!delivery || typeof delivery !== "object") return "delivery evidence was not reported";
+    if ((delivery as { status?: unknown }).status === "not_applicable") return "routing lines are switched off on this Mac, so nothing is delivered to check";
     const values = delivery.status === "unknown" ? delivery.missing : delivery.reasons;
     return Array.isArray(values) && values.every((value) => typeof value === "string") && values.length
       ? values.map((value) => deliveryReason(value)).join("; ")
@@ -491,7 +492,10 @@ export function healthRows(
     const deliveryBlock = parsed.routing_delivery;
     if (
       key === "routing_delivery_ok" &&
-      (!deliveryBlock || typeof deliveryBlock !== "object" || (deliveryBlock as { status?: unknown }).status === "unknown")
+      (!deliveryBlock ||
+        typeof deliveryBlock !== "object" ||
+        (deliveryBlock as { status?: unknown }).status === "unknown" ||
+        (deliveryBlock as { status?: unknown }).status === "not_applicable")
     ) {
       return { key, status: "skipped", label, ...extra };
     }
@@ -649,7 +653,11 @@ export function HealthReportRows({
                 className="muted"
               />
               <span className="row-main">{row.label}</span>
-              <span className="row-meta wrap">{row.key === "routing_delivery_ok" ? `can't be checked${row.detail ? `: ${row.detail}` : ""}` : "not set up"}</span>
+              <span className="row-meta wrap">{row.key === "routing_delivery_ok"
+                  ? row.detail?.startsWith("routing lines are switched off")
+                    ? row.detail
+                    : `can't be checked${row.detail ? `: ${row.detail}` : ""}`
+                  : "not set up"}</span>
             </div>
           );
         }
