@@ -11,10 +11,12 @@ its work:
    read-only;
 2. **close** as a duplicate of an older item that stays open
    (``hygiene._duplicate_groups``: token containment, then stored cosine);
-3. **reassign** when the owner rules (``commitments.resolve_owner_and_label``),
-   re-run on the stored text and the origin, give another owner than the one
-   shown today. The origin is the row's, or ``job`` when the capture that
-   opened it has a parent session (the lineage a pre-0033 row never stored);
+3. **reassign** when the capture that opened an item was a dispatched job's
+   (a parent session: the lineage a pre-0033 row never stored) and the owner
+   rules (``commitments.resolve_owner_and_label``), re-run with the origin
+   ``job``, give another owner than the stored one. An item whose origin is
+   as stored keeps its stored owner: capture decided it once, and the
+   clean-up never re-reads it from the text on whichever Mac runs it;
 4. a **model pass** over the items no owner rule decided (the capture's
    declared owner, or no one named), never the user's own and never an item
    that names the user by any alias, in batches of ``JUDGE_BATCH``, at most
@@ -211,26 +213,27 @@ def _owner_rule(row: dict[str, Any], origin: str, trigger: bool) -> str:
 
 
 def _owners(row: dict[str, Any]) -> tuple[dict, dict, str]:
-    """``(before, after, rule)``: the owner shown today, the owner the rules
-    give with the origin the lineage shows, and the rule that decided."""
+    """``(before, after, rule)``: the stored owner, the owner the rules give
+    with the origin the lineage shows (the stored owner when the origin is
+    as stored), and the rule that decided."""
     from khipu import commitments as co
 
     trigger = co.has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
     stored_origin = row.get("origin") or co.ORIGIN_CONVERSATION
-    owner, label = co.row_owner(row, future_trigger=trigger)
+    owner, label = co.row_owner(row)
     before = {"owner": owner, "owner_label": label, "origin": stored_origin}
     if str(row.get("owner") or "").lower() == co.OWNER_AGENT:
         return before, dict(before), "the orchestrator's or a third party's, as stored"
     if row.get("owner_reassigned_at") and row.get("owner") in (co.OWNER_USER, co.OWNER_ASSISTANT):
         return before, dict(before), "set by hand"
     origin = co.ORIGIN_JOB if (stored_origin == co.ORIGIN_JOB or row.get("lineage")) else stored_origin
+    if origin == stored_origin:
+        return before, dict(before), _owner_rule(row, origin, trigger)
     new_owner, new_label = co.resolve_owner_and_label(
         row.get("text") or "", kind=row.get("kind"), declared=row.get("owner"), future_trigger=trigger,
         origin=origin, declared_label=row.get("owner_label"))
     after = {"owner": new_owner, "owner_label": new_label, "origin": origin}
-    rule = _owner_rule(row, origin, trigger)
-    if origin != stored_origin:
-        rule += "; the capture that opened it was a dispatched job's"
+    rule = _owner_rule(row, origin, trigger) + "; the capture that opened it was a dispatched job's"
     return before, after, rule
 
 
@@ -525,21 +528,12 @@ def _check_plan(doc: Any) -> str | None:
     return None
 
 
-def _owner_now(row: dict) -> str:
-    from khipu import commitments as co
-
-    trigger = co.has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
-    return co.row_owner(row, future_trigger=trigger)[0]
-
-
 def _guarded_owner(row: dict) -> str:
-    """The owner the guard reads for a row ``_select`` gave: the user when it
-    is stored as his or shows as his today (``commitments.row_guard``), never
-    the owner the plan would give it."""
+    """The owner the guard reads for a row ``_select`` gave: the stored one
+    (``commitments.row_guard``), never the owner the plan would give it."""
     from khipu import commitments as co
 
-    return co.OWNER_USER if co.OWNER_USER in (str(row.get("owner") or "").lower(), _owner_now(row)) \
-        else _owner_now(row)
+    return co.row_owner(row)[0]
 
 
 def _is_users(row: dict) -> bool:

@@ -17,7 +17,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import threading
 from contextlib import contextmanager
 from datetime import datetime
@@ -255,34 +254,24 @@ _FUTURE_TRIGGER_RE = re.compile(
 # of a literal name, compiled once (`_compile_user_patterns`, cached) and
 # rebuildable on demand (`reset_user_patterns`, e.g. after `khipu config
 # --set user_aliases ...` or in a test that patches KHIPU_USER_ALIASES).
+#
+# Aliases decide an owner only when an item is WRITTEN (capture, a reassignment's
+# default, the clean-up's proposals). A stored owner is a fact of the row:
+# `row_owner` reads it and never re-derives it from the text, so a read gives
+# the same owner on every Mac whatever aliases that Mac has configured.
 # ---------------------------------------------------------------------------
 
 
-def _git_user_first_name() -> str | None:
-    """First token of `git config --global user.name`, lowercased. Fail-open
-    (no git, no config, timeout) — this is a DEFAULT alias source, never a
-    hard requirement."""
-    try:
-        out = subprocess.run(
-            ["git", "config", "--global", "user.name"],
-            capture_output=True, text=True, timeout=2,
-        )
-    except Exception:  # noqa: BLE001 — fail-open: no derived alias
-        return None
-    name = (out.stdout or "").strip()
-    if not name:
-        return None
-    first = name.split()[0].strip().lower()
-    return first or None
-
-
 def user_aliases() -> tuple[str, ...]:
-    """Every name that means "the user" on this hub: lowercased, de-duplicated.
+    """Every name that means "the user" when an item is WRITTEN: lowercased,
+    de-duplicated. The configured list (``khipu config --set user_aliases
+    "matt,matthew"`` / ``KHIPU_USER_ALIASES``), then the generic words that
+    always mean the user.
 
-    Order: the configured list (``khipu config --set user_aliases
-    "matt,matthew"`` / ``KHIPU_USER_ALIASES``), then derived defaults (first
-    token of the machine's git ``user.name``, then ``$USER``), then the
-    generic words that always mean the user regardless of configuration.
+    Only capture and the clean-up's proposals read this. A stored row's owner
+    is never re-derived from it (:func:`row_owner`), and no machine detail (the
+    git name, ``$USER``) is a source: two Macs reading one hub show one owner
+    for an item.
     """
     from khipu.config import list_setting
 
@@ -297,8 +286,6 @@ def user_aliases() -> tuple[str, ...]:
 
     for alias in list_setting("user_aliases"):
         _add(alias)
-    _add(_git_user_first_name())
-    _add(os.environ.get("USER"))
     for word in _GENERIC_USER_OWNER_WORDS:
         _add(word)
     return tuple(out)
@@ -730,22 +717,23 @@ def resolve_owner(text: str, *, kind: str | None = None, declared: Any = None,
                                    future_trigger=future_trigger, origin=origin)[0]
 
 
-def row_owner(row: dict[str, Any], *, future_trigger: bool | None = None) -> tuple[str, str | None]:
-    """``(owner, owner_label)`` for a stored row. A stored ``agent`` owner is
-    authoritative (only the rules above, or an explicit reassign, write it,
-    and its text may no longer show why, as with a job's "Matt to decide X");
-    anything else is re-resolved from the text, with the row's origin."""
-    if str(row.get("owner") or "").strip().lower() == OWNER_AGENT:
+def row_owner(row: dict[str, Any]) -> tuple[str, str | None]:
+    """``(owner, owner_label)`` of a stored row: the owner it was given, read
+    the same on every Mac. Capture decides an owner once (:func:`resolve_owner_and_label`)
+    and an explicit reassignment replaces it; both write the ``owner`` column,
+    so a read never re-derives it from the text or from whose machine reads.
+
+    A row with no recognisable stored owner (opened before migration 0013,
+    where a model wrote "Peer 1" or nothing) is the user's: the one default
+    that never lets an automatic rule act on an item that may be his.
+    """
+    owner = str(row.get("owner") or "").strip().lower().rstrip(":")
+    if owner == OWNER_AGENT:
         return OWNER_AGENT, (clean_owner_label(row.get("owner_label"))
                              or agent_actor(row.get("text") or "") or ORCHESTRATOR)
-    # A reassigned owner (migration 0035) is kept as written.
-    if row.get("owner_reassigned_at") and row.get("owner") in (OWNER_USER, OWNER_ASSISTANT):
-        return str(row["owner"]), None
-    return resolve_owner_and_label(
-        row.get("text") or "", kind=row.get("kind"), declared=row.get("owner"),
-        future_trigger=future_trigger, origin=row.get("origin"),
-        declared_label=row.get("owner_label"),
-    )
+    if owner in ASSISTANT_OWNERS:
+        return OWNER_ASSISTANT, None
+    return OWNER_USER, None
 
 
 def is_reporting_text(text: str) -> bool:
@@ -1627,7 +1615,7 @@ def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None 
     # forget-fence: commitment writer or write check; returns ids, flags or the locked row it writes
     """The open items in ``scope``'s lineage: ``id`` and ``text``, with
     ``origin`` and, for ``with_owner``, the columns :func:`row_owner` reads
-    (its resolved ``owner`` and ``owner_label`` replace the stored ones)."""
+    (``owner`` and ``owner_label`` as it gives them)."""
     lineage, params = _lineage_clause(cur, payload or {"project": scope}, episode_id)
     cols = ["id", "text"] + (["origin"] if with_origin else [])
     # Near-dup / relay need latest_text even when owner columns are unused.
@@ -1637,8 +1625,6 @@ def _open_commitments(cur, scope: str | None, *, payload: dict[str, Any] | None 
         cols += ["owner", "kind"]
         if _owner_columns_ready(cur):
             cols += [c for c in ("origin", "owner_label") if c not in cols]
-        if _reassigned_column_ready(cur):
-            cols.append("owner_reassigned_at")
         if _close_columns_ready(cur):
             cols += ["prs", "pr_check"]
     cur.execute(
@@ -1910,8 +1896,7 @@ def _resolved(row: dict[str, Any]) -> dict[str, Any]:
                 row[field] = json.loads(row[field])
             except ValueError:
                 row[field] = None
-    trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
-    row["owner"], row["owner_label"] = row_owner(row, future_trigger=trigger)
+    row["owner"], row["owner_label"] = row_owner(row)
     return row
 
 
@@ -2363,15 +2348,6 @@ def _session_open_commitments(cur, session_id: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _is_user_owed(row: dict[str, Any]) -> bool:
-    """Never auto-retire something the USER owes — a question, or anything
-    whose owner is the user. Those are the only commitments Owed exists for."""
-    if str(row.get("kind") or "").lower() == "question":
-        return True
-    owner = str(row.get("owner") or "").strip().lower()
-    return bool(owner) and owner in _compile_user_patterns().owners
-
-
 def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
     """Close this session's own commitments when the session ends.
 
@@ -2410,10 +2386,11 @@ def close_session_plan(cur, payload: dict[str, Any], episode_id: int) -> int:
         # "… next session" must keep the row open through sessionend.
         trigger = (has_future_trigger(row["text"] or "")
                    or has_future_trigger(row.get("latest_text") or ""))
-        owner, _label = row_owner(row, future_trigger=trigger)
+        owner, _label = row_owner(row)
         # Only the assistant's own items die with its session: the user's,
-        # and an agent's (a job's item for its orchestrator), outlive it.
-        if _is_user_owed(row) or owner != OWNER_ASSISTANT:
+        # an agent's (a job's item for its orchestrator) and any question
+        # outlive it.
+        if str(row.get("kind") or "").lower() == "question" or owner != OWNER_ASSISTANT:
             continue
         if is_end and not trigger:
             # A later capture restating this row bumps seen_count; the opening
@@ -2595,15 +2572,12 @@ def resolve_owed_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         row.setdefault("last_seen_at", None)
         row["seen_count"] = int(row.get("seen_count") or 1)
-        # owner / future_trigger are RESOLVED here, not read raw: rows opened
-        # before migration 0013 carry a model-supplied owner ("Peer 1",
-        # "ASSISTANT", NULL) and no future_trigger at all, and the desktop's
-        # "Needs you" section is exactly `owner == 'user'`. Deterministic
-        # detection wins, so a legacy row lists the same way a new one does;
-        # a stored `agent` owner (migration 0033's third owner) is kept.
+        # The owner is the stored one (row_owner), the same on every Mac; the
+        # future trigger is read from the text, since rows opened before
+        # migration 0013 carry none.
         trigger = has_future_trigger(row.get("text") or "") or bool(row.get("future_trigger"))
         row["future_trigger"] = trigger
-        row["owner"], row["owner_label"] = row_owner(row, future_trigger=trigger)
+        row["owner"], row["owner_label"] = row_owner(row)
         row.setdefault("origin", None)
         # Migration 0034's fields, the same shape on a hub without them. A
         # looser decision match is offered, never applied (design (b)).
