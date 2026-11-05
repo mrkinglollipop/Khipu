@@ -1619,38 +1619,11 @@ def routing_forkserver_main(fd: int, *, schedule: "RefoldSchedule | None" = None
 
 
 def _routing_generation_current(files) -> bool:
-    """Whether every file a routing answer was read from
-    (``routing._generation``) still has its stat or, for a rewritten view,
-    the same semantic routing revision. Changed heartbeats require an
-    equivalent view folded from their current stats. An answer can sit in
-    the pipe while search runs; telemetry-only saves must not suppress it."""
-    if not isinstance(files, list):
-        return False
-    changed = {}
-    views = []
-    for item in files:
-        if not (isinstance(item, list) and len(item) in (2, 3) and isinstance(item[0], str)):
-            return False
-        if len(item) == 3 and not isinstance(item[2], str):
-            return False
-        try:
-            st = os.stat(item[0])
-            now = [st.st_mtime_ns, st.st_size, st.st_ino]
-        except OSError:
-            now = None
-        if len(item) == 3:
-            views.append((item, now != item[1]))
-        elif now != item[1]:
-            changed[item[0]] = now
-    if changed and not views:
-        return False
-    for item, rewritten in views:
-        if rewritten or changed:
-            from khipu.routing_generation import matches
+    """Whether a routing answer's record generation still stands
+    (``routing_generation.stale_input``)."""
+    from khipu.routing_generation import stale_input
 
-            if not matches(item[0], item[2], heartbeats=changed):
-                return False
-    return True
+    return stale_input(files) is None
 
 
 class _RoutingAtPrompt:
@@ -1659,6 +1632,7 @@ class _RoutingAtPrompt:
 
     def __init__(self) -> None:
         self.status: str | None = None  # None: push off, nothing logged
+        self.stale_input: str | None = None  # what changed, when status is skipped:stale
         self.budget = 0.0
         self.forked = self.cap = time.monotonic()  # cap: the latest the prompt waits for routing
         self.pid: int | None = None
@@ -1812,7 +1786,12 @@ class _RoutingAtPrompt:
                 cutoff = min(cutoff, limit)  # nor after the request's own deadline
             if not isinstance(done, (int, float)) or isinstance(done, bool) or done > cutoff:
                 return None  # finished after its budget: routing=skipped:budget, the marker unmoved
-            if not _routing_generation_current(out.get("generation")):
+            if out["kind"] == "none":
+                return out  # nothing to show and no marker to move, so nothing can be out of date
+            from khipu.routing_generation import stale_input
+
+            self.stale_input = stale_input(out.get("generation"))
+            if self.stale_input:
                 self.status = "skipped:stale"  # the record changed since its read: the marker unmoved
                 return None
             return out
@@ -1849,6 +1828,9 @@ class _RoutingAtPrompt:
         a pointer to ``khipu_route`` does (once per version), and only a
         block that went whole is recorded as heard."""
         if out is None:
+            if self.status == "skipped:stale" and self.stale_input:
+                # The log's routing= field names the input that changed.
+                return ctx, {"status": f"skipped:stale:{self.stale_input}"}
             return ctx, ({"status": self.status} if self.status else None)
         if out["kind"] == "none" or not isinstance(out.get("text"), str) or not out["text"].strip():
             return ctx, {"status": "none"}

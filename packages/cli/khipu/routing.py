@@ -12050,6 +12050,8 @@ def _generation(view: dict, cfg: dict) -> list[list]:
     from khipu.routing_generation import revision
 
     fingerprint = view.get("fingerprint") if isinstance(view.get("fingerprint"), dict) else {}
+    # The log's growth since this stat is judged by what it adds, not by the
+    # stat alone (``routing_generation.stale_input``).
     files = [[str(events_file()), fingerprint.get("events")], [str(config_file()), fingerprint.get("config")],
              [str(view_file()), getattr(_view_seen, "stat", None), revision(view)],
              [str(routing_dir() / "remote.jsonl"), (fingerprint.get("replication") or (None, None))[0]]]

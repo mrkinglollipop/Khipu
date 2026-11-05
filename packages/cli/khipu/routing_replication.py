@@ -18,7 +18,7 @@ import tempfile
 from datetime import datetime, timezone
 from datetime import timedelta
 
-from khipu import routing
+from khipu import routing, routing_generation
 
 def _stamp(dt):
     return dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -148,7 +148,7 @@ def cache_key():
     return tuple(tuple(value or ()) for value in fingerprint())
 
 
-RETENTION_KINDS = frozenset({"usage_sample", "source_seen", "evidence", "observation", "observation_renew", "reset_check"})
+RETENTION_KINDS = routing_generation.TELEMETRY_KINDS
 # Held on purpose until their bucket closes (``_wire_samples``), so not a kind this copy cannot send.
 _WAITS_ITS_TURN = frozenset({"usage_sample"})
 

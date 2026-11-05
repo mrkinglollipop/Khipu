@@ -46,8 +46,8 @@ def _settled(pair):
 
 
 def _answer(view, generation):
-    return {"kind": "none", "version": view["version"], "epoch": view["epoch"], "generation": generation,
-            "done": time.monotonic()}
+    return {"kind": "changes", "text": "words", "version": view["version"], "epoch": view["epoch"],
+            "generation": generation, "done": time.monotonic()}
 
 
 def test_a_no_op_sync_does_not_move_the_fingerprint_the_view_or_the_entry_cache(pair):
