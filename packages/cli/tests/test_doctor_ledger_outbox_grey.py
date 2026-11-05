@@ -54,7 +54,7 @@ def test_non_applicable_nightly_steps_are_named_for_a_grey_row(monkeypatch):
     assert "notes_reconcile" in skipped and "embed_provider" in skipped, (health, skipped)
 
 
-def test_empty_held_capture_is_informational_and_kept(tmp_path, monkeypatch):
+def test_held_verbatim_only_capture_with_open_loop_is_informational_and_kept(tmp_path, monkeypatch):
     from khipu import cli, session_capture
     from khipu.doctor_summary import health_summary
 
@@ -62,9 +62,15 @@ def test_empty_held_capture_is_informational_and_kept(tmp_path, monkeypatch):
     monkeypatch.setenv("KHIPU_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("KHIPU_CAPTURE_HOME", str(tmp_path / "capture"))
     queue = session_capture.queue_dir()
+    assert queue == tmp_path / "capture" / "queue"
     queue.mkdir(parents=True, exist_ok=True)
-    held = queue / "empty.json"
-    original = json.dumps({"extracted_payload": {"summary": ""}})
+    held = queue / "no-summary.json"
+    original = json.dumps({"extracted_payload": {
+        "summary": "", "summary_kind": "verbatim_only", "topics": [], "people": [],
+        "decisions": [], "preferences": [], "scope": "fixture", "closed_loops": [],
+        "decision_details": [], "edges": [], "topic_pages": [],
+        "open_loops": [{"due_after": None, "future_trigger": None, "kind": "followup",
+                        "owner": "agent", "owner_label": "fixture", "text": "Fixture follow-up"}]}})
     held.write_text(original)
     meta = session_capture._retry_state_path(held)
     meta.write_text(json.dumps({"disposition": "held", "last_error": "capture rc=65"}))
@@ -73,7 +79,10 @@ def test_empty_held_capture_is_informational_and_kept(tmp_path, monkeypatch):
     assert local["outbox"]["at_risk"] is False
     assert local["outbox"]["dead"] == 1
     line = health_summary({"outbox": local["outbox"], "outbox_ok": True})[0]
-    assert "nothing to save" in line and "retry-dead" not in line
+    assert "no summary, so Khipu can't save it" in line
+    assert "Retrying won't help; the file is kept" in line
+    assert "nothing to save" not in line and "retry-dead" not in line
+    assert local["outbox"]["no_summary_held"] == 1
     assert held.read_text() == original and meta.exists()
     # Real content refused with the same exit code still needs attention.
     held.write_text(json.dumps({"extracted_payload": {"summary": "important"}}))

@@ -321,3 +321,12 @@ def test_delivery_words_explain_the_effect_without_internal_names():
     assert "other Mac may still be using older account advice" in line
     assert "cloud conversations received" in line
     assert "Settings" not in line and "cross-mac-stale" not in line and "gateway" not in line
+
+
+def test_routing_fix_requires_no_owner_chore():
+    line = health_summary({"routing_delivery_ok": False,
+                           "routing_delivery": {"reasons": ["prompt-skips"],
+                                                "prompts": {"count": 13, "out_of_time": 3}}})[2]
+    assert ("nothing for you to do; Khipu tries again on later prompts. "
+            "If this is still here tomorrow, tell a conversation") in line
+    assert "ask the conversation to check" not in line

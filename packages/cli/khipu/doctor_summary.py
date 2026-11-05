@@ -94,7 +94,7 @@ WORDS = {
     "literal_trgm_ok": (1, "a text-search index is missing", None),
     "degraded_rate_ok": (1, "searches are falling back to a weaker mode", None),
     "routing_delivery_ok": (2, _delivery,
-                            "ask the conversation to check current account advice before starting more work; Khipu tries again on later prompts"),
+                            "nothing for you to do; Khipu tries again on later prompts. If this is still here tomorrow, tell a conversation"),
     "hub_ok": (3, "the database does not answer", "check the connection with `khipu status`"),
     "backup_ok": (3, "the database backup is stale", None),
     "graph_backup_ok": (3, "the local graph backup is stale", None),
@@ -136,8 +136,10 @@ def health_summary(report: dict) -> list[str]:
     lines = []
     for i, area in enumerate(AREAS):
         here = [(what, fix) for a, what, fix in bad if a == i]
-        if i == 0 and not here and (report.get("outbox") or {}).get("empty_held"):
-            lines.append(f"{area}: {(report['outbox'].get('plain') or 'A held capture had nothing to save.')}")
+        if i == 0 and not here and (report.get("outbox") or {}).get("no_summary_held"):
+            note = report["outbox"].get("plain") or (
+                "A held capture has no summary, so Khipu can't save it. Retrying won't help; the file is kept.")
+            lines.append(f"{area}: {note}")
             continue
         lines.append(f"{area}: fine." if not here else f"{area}: " + " ".join(
             f"{what[:1].upper() + what[1:]}. Fix: {fix}." for what, fix in here))
