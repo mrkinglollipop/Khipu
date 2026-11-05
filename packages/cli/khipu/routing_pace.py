@@ -265,16 +265,18 @@ def _cycles(samples, window):
             s["_cycle_key"] = target or ("reset", i, iso(comp[0]["reset"]))
 
 
-# How long an hourly reading stands: an unchanged window is stored once an hour
-# (``should_sample``, from the polls that run anyway), so its newest stored
-# reading is that old without anything being wrong, one poll's slack included.
-IDLE_READING_S = 75 * 60
+# An unchanged window is stored this often (``should_sample``, from the polls that
+# run anyway), so its newest reading is inside a one-hour trailing window with
+# polls to spare. A quiet window's reading older than an hour has not come when
+# it should have.
+IDLE_SAMPLE_S = 50 * 60
+QUIET_READING_S = 3600
 
 # Another Mac's readings count only when they read the same allowance. Both
 # name a reset still ahead and those resets lie further apart than one cycle's
 # estimates can (``_cycles``): this Mac's login is not the account the other
 # Mac reads under that name, and pooling them would make both unknown.
-OWN_READING_FRESH_S = IDLE_READING_S
+OWN_READING_FRESH_S = QUIET_READING_S
 
 
 def shared_readings(samples, mine, now):
@@ -360,10 +362,9 @@ def next_change(samples, now, window, *, day=False):
             if isinstance(moment, datetime) and moment > now and (best is None or moment < best):
                 best = moment
     if newest is not None:
-        for stale in (min(newest, now) + timedelta(seconds=2 * params["sample_s"]),
-                      min(newest, now) + timedelta(seconds=IDLE_READING_S)):
-            if stale > now and (best is None or stale < best):
-                best = stale
+        stale = min(newest, now) + timedelta(seconds=2 * params["sample_s"])
+        if stale > now and (best is None or stale < best):
+            best = stale
     return best
 
 
@@ -556,17 +557,24 @@ def compute_pace(samples, caps, now, window):
                 gap += inside
         return gains, durations, gap, disagree
 
-    # Quiet for the hour before its newest reading: the writer is on its hourly
-    # cadence, so a reading up to that old is not one that failed to come.
-    age = (now - blist[-1]["time"]).total_seconds()
-    fresh_enough = age <= 2 * params["sample_s"] or (age <= IDLE_READING_S and all(
-        b["value"] == blist[-1]["value"] for b in blist
-        if (blist[-1]["time"] - b["time"]).total_seconds() < 3600))
-    # No use to forecast: the same reading from before the trailing window to a
-    # reading still within its hourly cadence, however few readings that took.
-    before_start = [b for b in blist if b["time"] <= start]
-    idle = (fresh_enough and bool(before_start) and blist[-1]["segment"] == before_start[-1]["segment"]
-            and all(b["value"] == blist[-1]["value"] and not b["correction"] for b in [before_start[-1], *in_window]))
+    # How far back the reading has stood still, as real readings of the one cycle.
+    still = [blist[-1]] if not blist[-1]["correction"] else []
+    earlier = None
+    for b in reversed(blist[:-1]):
+        if still and b["segment"] == still[-1]["segment"] and b["value"] == still[-1]["value"] and not b["correction"]:
+            still.append(b)
+        else:
+            earlier = b
+            break
+    newest_at, age = blist[-1]["time"], (now - blist[-1]["time"]).total_seconds()
+    # Two readings an hour's quiet apart put the writer on its slower cadence, so
+    # one up to an hour old is not late. One reading alone says nothing of that.
+    quiet = len(still) >= 2 and (earlier is None or (newest_at - earlier["time"]).total_seconds() >= QUIET_READING_S)
+    fresh_enough = age <= 2 * params["sample_s"] or (quiet and age <= QUIET_READING_S)
+    # No use to forecast: unchanged from before the trailing window to a reading
+    # inside it, across real time.
+    idle = (fresh_enough and bool(in_window) and len(still) >= 2 and still[-1]["time"] <= start
+            and (newest_at - still[-1]["time"]).total_seconds() >= min(trailing, IDLE_SAMPLE_S))
     gains, valid_dur, gap_time, disagree_time = clipped(start, now)
     rate = gains / (valid_dur / 3600) if valid_dur > 0 else None
     pace["rate_pct_per_h"] = rate
@@ -590,9 +598,7 @@ def compute_pace(samples, caps, now, window):
         why = "reset passed; waiting for a new reading"
     elif idle:
         pace["idle"] = True
-        pace["buckets"] = max(pace["buckets"], 1)
-        rate = pace["rate_pct_per_h"] = 0.0
-    elif blist and not fresh_enough:
+    elif not fresh_enough:
         age_h = age / 3600
         why = f"last reading {_hours(age_h)} h old"
     elif len(in_window) < 3:
@@ -606,7 +612,7 @@ def compute_pace(samples, caps, now, window):
     allowed = why is None
     # Gaps and thin coverage invalidate the rate, not a fresh usage level.
     # Unsettled, expired or stale readings cannot establish a reached ceiling.
-    level_known = ((bool(in_window) or fresh_enough) and not (pending or disagrees or ambiguous)
+    level_known = (bool(in_window) and not (pending or disagrees or ambiguous)
                    and secs_to_reset is not None and secs_to_reset > 0 and fresh_enough)
     if not level_known:
         pace["plan"]["needed_pct_per_h"] = None
@@ -946,13 +952,13 @@ def should_sample(existing, candidate, *, costly=False):
     age = (candidate["t"] - last["t"]).total_seconds()
     if age <= 0:
         return False
-    if age >= 3600:
+    if age >= IDLE_SAMPLE_S:
         return True
     if abs(candidate["used"] - last["used"]) >= 0.5 and age >= 120:
         return True
     # The fast cadence applies only while usage moved in the last hour;
-    # an idle window is sampled hourly (the age check above), which is all
-    # ``compute_pace`` needs to call it idle, so an idle window costs no more.
+    # an idle window is sampled at ``IDLE_SAMPLE_S`` (the age check above), which
+    # is all ``compute_pace`` needs to call it idle.
     recent = [s for s in prior if (candidate["t"] - s["t"]).total_seconds() <= 3600]
     moved_recently = len(recent) > 1 and max(s["used"] for s in recent) > min(s["used"] for s in recent)
     return moved_recently and age >= interval

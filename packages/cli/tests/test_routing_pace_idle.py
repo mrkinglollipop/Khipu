@@ -1,7 +1,8 @@
-"""An idle account is not unknown. Idle windows are stored hourly and a five-hour
+"""An idle account is not unknown. Idle windows were stored hourly and a five-hour
 pace reads one hour, so it used to say "only 2 readings" or "last reading 0.7 h
 old" for ever. The words now say which is true: idle, not enough history, the
-reader failed, and what is left when that is known. No more readings, no more polls."""
+reader failed, and what is left when that is known. No more polls: idle readings
+come from the ones that run anyway."""
 from __future__ import annotations
 
 import json
@@ -38,15 +39,41 @@ def test_the_one_hour_idle_fixture_says_idle_and_keeps_the_allowance():
     assert not routing_advice._pace_reading_unknown(pace)
 
 
-@pytest.mark.parametrize("age", [0, 5, 21, 40, 59, 74])
-def test_idle_holds_all_the_way_through_the_hourly_cadence(age):
-    rows = [reading(age + 120), reading(age + 60), reading(age)]
+@pytest.mark.parametrize("age", [0, 5, 21, 40, 59])
+def test_idle_holds_all_the_way_through_its_cadence(age):
+    rows = [reading(age + 100), reading(age + 50), reading(age)]
     pace = five_hour(rows)
     assert pace.get("idle") is True and pace["why"] is None, pace["why"]
     assert pace["plan"]["needed_pct_per_h"] is not None
+    assert pace["buckets"] >= 1 and pace["valid_pct"] > 0
+    assert not routing_advice._pace_reading_unknown(pace)
 
 
-def test_a_reading_older_than_the_hourly_cadence_is_no_longer_idle():
+@pytest.mark.parametrize("used,age", [(85.0, 70), (85.0, 61), (12.0, 200), (12.0, 21)])
+def test_one_reading_is_never_idle_it_reads_as_no_fresh_reading(used, age):
+    """A reader that stopped looks like this: a single old reading, reset ahead."""
+    pace = five_hour([reading(age, used=used)])
+    assert "idle" not in pace
+    assert pace["why"] == f"last reading {round(age / 60, 1):g} h old"
+    assert pace["plan"]["verdict"] == "unknown" and pace["rate_pct_per_h"] is None
+    assert routing_advice._pace_reading_unknown(pace), "unknown evidence must stay unknown"
+    line = routing_pace.pace_line("Claude", pace, NOW)
+    assert line.startswith("Claude five-hour: no fresh reading") and "% left" not in line
+
+
+def test_two_readings_too_close_together_are_not_real_time_at_rest():
+    pace = five_hour([reading(61), reading(59)])
+    assert "idle" not in pace
+    assert routing_pace.pace_line("Claude", pace, NOW).startswith("Claude five-hour: not enough history")
+
+
+def test_readings_that_stopped_past_the_trailing_window_are_not_idle():
+    pace = five_hour([reading(130), reading(70)])
+    assert "idle" not in pace and pace["why"] == "last reading 1.2 h old"
+    assert routing_advice._pace_reading_unknown(pace)
+
+
+def test_a_reading_older_than_its_cadence_is_no_longer_idle():
     pace = five_hour([reading(200), reading(140), reading(80)])
     assert "idle" not in pace
     assert pace["why"] == "last reading 1.3 h old"
@@ -83,13 +110,16 @@ def drive(start_used=12.0, *, moves=(), minutes=6 * 60, poll=5):
 
 def test_a_quiet_day_stores_hourly_and_reads_idle_after_the_first_hour():
     stored, lines = drive()
-    assert len(stored) == 7, "no more readings than an idle window stored before"
+    assert len(stored) <= 8, "one reading about every 50 minutes, however often the polls run"
     for minute, line, _pace in lines:
         if minute >= 60:
             assert line == "Claude five-hour: idle, no use to forecast; 12% used, 88% left", (minute, line)
+        elif minute <= 20:
+            assert "not enough history for a pace: only 1 reading in the last 1 h; 12% used" in line, (minute, line)
+        elif minute < 50:
+            assert "no fresh reading" in line, (minute, line)
         else:
-            assert line.startswith("Claude five-hour: not enough history for a pace: only 1 reading in the last 1 h"), (minute, line)
-            assert line.endswith("12% used, 88% left"), (minute, line)
+            assert "not enough history for a pace: only 2 readings" in line, (minute, line)
 
 
 def test_changed_usage_gives_a_rate_again_through_honest_words():
@@ -161,9 +191,9 @@ def test_a_reset_or_a_disagreement_is_never_called_idle():
 
 def test_the_view_is_folded_again_when_an_idle_reading_runs_out():
     at = routing_pace.next_change(HOURLY, NOW, "five_hour")
-    assert at is not None and at <= HOURLY[-1]["t"] + timedelta(seconds=routing_pace.IDLE_READING_S)
-    later = NOW + timedelta(minutes=55)
-    assert routing_pace.next_change(HOURLY, later, "five_hour") == HOURLY[-1]["t"] + timedelta(seconds=routing_pace.IDLE_READING_S)
+    assert at is not None and at <= HOURLY[-1]["t"] + timedelta(hours=1)
+    later = NOW + timedelta(minutes=45)
+    assert routing_pace.next_change(HOURLY, later, "five_hour") == HOURLY[-1]["t"] + timedelta(hours=1)
 
 
 def test_a_reader_that_failed_says_so_and_caps_keep_their_place(replay):
