@@ -4562,7 +4562,7 @@ def cmd_outbox(args: argparse.Namespace) -> int:
         print(json.dumps(outbox.status(), indent=2))
         return 0
     if args.outbox_cmd == "retry-dead":
-        print(json.dumps(outbox.retry_dead(include_announce_refused=args.include_announce_refused), indent=2))
+        print(json.dumps(outbox.retry_dead(), indent=2))
         return 0
     if args.outbox_cmd == "merge-line-preferences":
         return _outbox_merge_preferences(args)
@@ -7216,16 +7216,12 @@ def build_parser() -> argparse.ArgumentParser:
     obd = ob_sub.add_parser("drain", help="Replay queued captures into PG")
     obd.add_argument("--limit", type=int, default=None)
     ob_sub.add_parser("status", help="Pending count + oldest age + dead-letter count")
-    obr = ob_sub.add_parser(
+    ob_sub.add_parser(
         "retry-dead",
         help="Move captures buried after KHIPU_OUTBOX_MAX_ATTEMPTS failures back into the queue. Jobs refused for "
              "not announcing their source identities stay held and are counted, since a retry may land them as "
-             "duplicates: run `span-covered` first",
+             "duplicates: `span-covered` counts them",
     )
-    obr.add_argument("--include-announce-refused", action="store_true",
-                     help="Also retry the refused jobs span-covered can't retire and no forgotten episode overlaps "
-                          "(reads the hub; a failed read retries none). The next drain lands each as a new episode, "
-                          "with its commitments, decisions and embeddings, beside any episode already spanning it")
     obs = ob_sub.add_parser(
         "span-covered",
         help="Dead jobs refused for not announcing their source identities, whose range sits inside another episode "
