@@ -2387,6 +2387,12 @@ def deepseek_spend_total(now: datetime, days: float, cap_usd: float | None = Non
                 if isinstance(v, dict) and v.get("provider") == "deepseek") > 1:
             return {**base, "status": "unknown", "usd": None,
                     "reason": "more than one DeepSeek account is defined, and Khipu reads one DeepSeek key"}
+        if not _deepseek_key() and not deepseek_history_file().exists():
+            # Spend is read where the key is. A Mac that never had one has no
+            # reader, which is not the same as a reading that failed or a key
+            # that was taken away from a history it was keeping.
+            return {**base, "status": "unknown", "usd": None, "no_reader": True,
+                    "reason": "this Mac has no DeepSeek key, so it reads no DeepSeek spend"}
         state, data = _deepseek_state(now)
         if state != "ok":
             return {**base, "status": "unknown", "usd": None, "reason": state}

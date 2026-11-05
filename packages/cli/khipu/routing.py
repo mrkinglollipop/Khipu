@@ -6535,6 +6535,8 @@ def cap_statuses(view: dict, entry: dict, now: datetime, *, confirmations: bool 
                 for field in ("at_least_usd", "partial", "since", "topups_seen", "topup_intervals",
                               "possible_miss_seconds"):
                     extra[field] = total.get(field)
+                if total.get("no_reader"):
+                    extra["no_reader"] = True
             out.append({**base, "cap_usd": cap.get("usd"), "days": cap.get("days"),
                         "usd": total.get("usd"), "events": total.get("events"), **extra,
                         "verdict": spend_verdict or routing_pace.spend_verdict(total, cap["usd"]),

@@ -684,15 +684,44 @@ def test_usage_unknown_non_floor_caps_keep_go_with_unknown_evidence(ds, monkeypa
 
 
 @pytest.mark.parametrize("purpose", ["job", "check", "orchestration"])
-@pytest.mark.parametrize("has_key", [False, True], ids=["no-key", "no-history"])
-def test_usage_unknown_deepseek_spend_without_evidence_holds_all_purposes(ds, monkeypatch, purpose, has_key):
-    ds.key = KEY if has_key else None
+def test_usage_unknown_deepseek_spend_with_a_key_but_no_history_holds_all_purposes(ds, monkeypatch, purpose):
     entry = dict(_entry(), state="open")
     monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
     (status,) = routing.cap_statuses({}, entry, NOW)
     assert status["verdict"] == "unknown" and status["at_least_usd"] is None
     advice = routing_advice.account_advice({}, entry, NOW, purpose=purpose)
     assert advice["verdict"] == "hold_back" and advice["evidence"] == "unknown"
+
+
+@pytest.mark.parametrize("purpose", ["job", "check", "orchestration"])
+def test_a_mac_that_never_had_a_deepseek_reader_does_not_hold_work_for_a_cap_it_cannot_read(ds, monkeypatch, purpose):
+    """A cap that arrived from another Mac, on a Mac with no key and no history: unchecked, not unknown-so-stop."""
+    ds.key = None
+    entry = dict(_entry(), state="open")
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    (status,) = routing.cap_statuses({}, entry, NOW)
+    assert status["verdict"] == "unknown" and status["no_reader"] is True and status["usd"] is None
+    advice = routing_advice.account_advice({}, entry, NOW, purpose=purpose)
+    assert advice["verdict"] == "go", advice
+    assert "not checked from this Mac" in advice["reason"] and "no DeepSeek reader" in advice["reason"]
+
+
+def test_a_mac_whose_deepseek_key_was_taken_away_from_a_history_still_holds(ds, monkeypatch):
+    _read(ds, "100.00", _ago(days=8))
+    _read(ds, "60.00", _ago(minutes=1))
+    ds.key = None
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    (status,) = routing.cap_statuses({}, dict(_entry(), state="open"), NOW)
+    assert status["verdict"] == "unknown" and not status.get("no_reader")
+    assert routing_advice.account_advice({}, dict(_entry(), state="open"), NOW)["verdict"] == "hold_back"
+
+
+def test_a_cap_over_the_limit_still_holds_where_the_reader_is(ds, monkeypatch):
+    _read(ds, "100.00", _ago(days=8))
+    _read(ds, "40.00", NOW)
+    monkeypatch.setattr(routing, "account_id", lambda key: "fake-account")
+    advice = routing_advice.account_advice({}, dict(_entry(), state="open"), NOW)
+    assert advice["verdict"] == "hold_back" and "spend" in advice["reason"]
 
 
 def _runner_stream(usd):
