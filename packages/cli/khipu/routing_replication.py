@@ -173,12 +173,12 @@ def settings_status():
     for key, row in newest.items():
         try:
             remote_value = json.loads(row["value_json"])
-            remote_value = routing._coerce(routing.SETTINGS[key][0], remote_value, key)
+            remote_value = routing._coerce(routing.synced_kind(key), remote_value, key)
         except (ValueError, TypeError, KeyError):
             continue
-        local_value = routing.settings(config)[key]
+        local_value = routing.synced_value(config, key) if key in routing.SYNCED_FEATURES else routing.settings(config)[key]
         if local_value != remote_value:
-            differences.append({"key": key, "name": routing.SETTINGS[key][2], "local": local_value,
+            differences.append({"key": key, "name": routing.synced_name(key), "local": local_value,
                                 "remote": remote_value, "remote_snapshot": row.get("snapshot") is True,
                                 "remote_at": row.get("written_at")})
     return {"enabled": routing._replication_live(), "differences": differences,
@@ -225,21 +225,21 @@ def _apply_remote_settings(state):
                 if r.get("mac") != mine and r.get("snapshot") is not True and applied.get(k) != r.get("id")]
     for key, row in todo:
         try:
-            value = routing._coerce(routing.SETTINGS[key][0], json.loads(row["value_json"]), key)
+            value = routing._coerce(routing.synced_kind(key), json.loads(row["value_json"]), key)
         except (ValueError, TypeError, KeyError):
             continue
         was_set = row.get("value_set") is True
-        if routing.settings()[key] != value:
+        from khipu.config import load_config
+
+        here = routing.synced_value(load_config(), key) if key in routing.SYNCED_FEATURES else routing.settings()[key]
+        if here != value:
             where = mac_label(row.get("mac"))
             stamp = {"auth": "other_mac", "words": f"the same change made on {where}"}
             owner_direction.noted(owner_direction.intent("config.routing_setting", key, facts={"from": where}), stamp)
             try:
                 with routing._lock(), mutate_config() as data:
                     owner_direction.record_setting_before(key, data)
-                    if was_set:
-                        data[key] = value
-                    else:
-                        data.pop(key, None)
+                    routing.store_setting(data, key, value, was_set)
             except Exception:
                 owner_direction.finish({"ok": False})
                 raise

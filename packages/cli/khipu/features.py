@@ -140,9 +140,29 @@ def set_enabled(name: str, value: bool):
     with mutate_config() as data:
         feats = data.get("features")
         feats = dict(feats) if isinstance(feats, dict) else {}
+        changed = feats.get(name) is not bool(value)
         feats[name] = bool(value)
         data["features"] = feats
+    if changed:
+        _copy_to_other_macs(name)
     return config_file()
+
+
+def _copy_to_other_macs(name: str) -> None:
+    """A switch that is the owner's choice on every Mac (``routing.SYNCED_FEATURES``)
+    goes to the other Macs as a setting line, like a routing setting, while the
+    routing copy is on; with it off nothing is sent, as for any setting."""
+    from khipu.config import load_config
+
+    data = load_config()
+    if data.get("routing_replication_live") is not True:
+        return
+    from khipu import routing
+
+    if name in routing.SYNCED_FEATURES:
+        routing._write_many(routing.owner_lines(
+            [routing._setting_event(name, routing.synced_value(data, name), routing.stored_setting(data, name)[1])],
+            "cli"))
 
 
 def _unknown_names() -> list[str]:

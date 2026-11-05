@@ -106,3 +106,57 @@ def test_an_unreadable_request_file_does_not_call_every_request_gone(macs):
     before = len(_lines(a, request))
     a.sync()
     assert len(_lines(a, request)) == before
+
+
+# ---- routing_push, the feature switch, copies between Macs like a setting -------------------------
+
+
+def _feature_on(mac):
+    from khipu.config import load_config
+    mac.activate()
+    return (load_config().get("features") or {}).get("routing_push")
+
+
+def test_the_routing_push_switch_set_on_one_mac_reaches_the_other_and_can_be_undone(macs):
+    from khipu import features
+    a, b = macs
+    both_on(a, b)
+    a.activate()
+    features.set_enabled("routing_push", True)
+    sync_all(a, b)
+    assert _feature_on(b) is True
+    (line,) = [x for x in b.log() if x.get("kind") == "action" and x.get("target") == "routing_push"]
+    assert line["action"] == "config.routing_setting" and line["auth"] == "other_mac" and "Studio" in line["words"]
+    assert line.get("before") == {"value": None, "set": False}
+    assert b.undo_in_app(line["id"]) == 0
+    assert _feature_on(b) is None
+    sync_all(b)  # a pull never re-applies what the owner took back
+    assert _feature_on(b) is None
+
+
+def test_the_first_switch_on_lists_routing_push_as_a_difference_and_overwrites_nothing(macs):
+    from khipu import features
+    a, b = macs
+    a.activate()
+    features.set_enabled("routing_push", True)
+    b.activate()
+    features.set_enabled("routing_push", False)
+    a.activate()
+    routing.set_setting("routing_replication_live", "on")
+    sync_all(a)
+    assert b.sync()["disabled"] is True
+    sync_all(b, a)
+    b.activate()
+    differences = rr.settings_status()["differences"]
+    (diff,) = [d for d in differences if d["key"] == "routing_push"]
+    assert (diff["local"], diff["remote"]) == (False, True) and diff["remote_snapshot"] is True
+    assert _feature_on(b) is False
+
+
+def test_a_switch_that_was_never_copied_off_stays_a_machine_choice_when_the_copy_is_off(macs):
+    from khipu import features
+    a, b = macs
+    a.activate()
+    features.set_enabled("routing_push", True)
+    sync_all(a)
+    assert _feature_on(b) is None

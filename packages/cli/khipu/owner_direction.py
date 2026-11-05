@@ -2033,7 +2033,8 @@ def record_setting_before(key: str, data: dict) -> None:
             ("config.routing_setting", "config.answer_request.confirm", "config.answer_request.undo")
             or pend["intent"]["target"] != key):
         return
-    before = {"value": data.get(key), "set": key in data}
+    stored, is_set = routing.stored_setting(data, key)
+    before = {"value": stored, "set": is_set}
     request = routing._setting_requests(data).get(key)
     if request is not None or key == "routing_replication_live":
         before["request"] = request
@@ -2659,7 +2660,8 @@ def _before(want: dict):
         from khipu import config
 
         data = config.load_config()
-        before = {"value": data.get(target), "set": target in data}
+        stored, is_set = routing.stored_setting(data, target)
+        before = {"value": stored, "set": is_set}
         request = routing._setting_requests(data).get(target)
         if request is not None or target == "routing_replication_live":
             before["request"] = request
@@ -2777,11 +2779,8 @@ def _restore_setting(key: str, value, was_set: bool, request=None) -> None:
 
     emitted: list[dict] = []
     with routing._lock(), mutate_config() as data:
-        before = routing.settings(data).get(key)
-        if was_set:
-            data[key] = value
-        else:
-            data.pop(key, None)
+        before = routing.synced_value(data, key) if key in routing.SYNCED_FEATURES else routing.settings(data).get(key)
+        routing.store_setting(data, key, value, was_set)
         requests = routing._setting_requests(data)
         if request is not None:
             requests[key] = request
@@ -2792,9 +2791,11 @@ def _restore_setting(key: str, value, was_set: bool, request=None) -> None:
         else:
             data.pop(routing.SETTINGS_REQUEST_KEY, None)
         # An Undo is the owner's change too: the other Macs follow it.
+        now_value = routing.synced_value(data, key) if key in routing.SYNCED_FEATURES else routing.settings(data).get(key)
         if routing.settings_syncable(key) and data.get("routing_replication_live") is True \
-                and "routing_replication_live" not in requests and routing.settings(data).get(key) != before:
-            emitted.append(routing._setting_event(key, data.get(key, routing.SETTINGS[key][1]), key in data))
+                and "routing_replication_live" not in requests and now_value != before:
+            emitted.append(routing._setting_event(key, routing.synced_value(data, key),
+                                                  routing.stored_setting(data, key)[1]))
     if emitted:
         routing._write_many(routing.owner_lines(emitted, "app"))
     routing.refresh_view()  # config.json is an input of the view: the next prompt finds it current
