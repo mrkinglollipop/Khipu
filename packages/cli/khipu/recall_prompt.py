@@ -3901,7 +3901,41 @@ def _tail_text(path: Path, *, max_bytes: int) -> str:
         size = f.tell()
         block = min(size, max_bytes)
         f.seek(size - block)
-        return f.read().decode("utf-8", errors="replace")
+        text = f.read().decode("utf-8", errors="replace")
+    # A log that was just started afresh keeps one older copy (``logcap``): the
+    # week the doctor reads does not stop at the moment of the rotation.
+    older = path.with_name(path.name + ".1")
+    if block < max_bytes and older.is_file() and not older.is_symlink():
+        try:
+            with older.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                room = min(size, max_bytes - block)
+                f.seek(size - room)
+                text = f.read().decode("utf-8", errors="replace") + text
+        except OSError:
+            pass
+    return text
+
+
+def _log_facts(path: Path) -> dict[str, Any]:
+    """What the outcome log held, so a check that found nothing says where it
+    looked: the file, its size, when it was last written, and its lines by
+    writer (the delegation hook writes here on every tool call)."""
+    facts: dict[str, Any] = {"path": str(path)}
+    try:
+        facts["bytes"] = path.stat().st_size
+        facts["last_written_at"] = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        by_writer: dict[str, int] = {}
+        for line in split_lines(_tail_text(path, max_bytes=_OUTCOMES_TAIL_BYTES)):
+            m = _LOG_LINE_RE.match(line)
+            tag = re.match(r"\S+ \[([^\]]+)\]", line)
+            name = "recall" if m else tag.group(1) if tag else "other"
+            by_writer[name] = by_writer.get(name, 0) + 1
+        facts["lines_by_writer"] = by_writer
+    except OSError:
+        pass
+    return facts
 
 
 def _rate_window_s() -> int:
@@ -3985,6 +4019,7 @@ def prompt_recall_outcomes(*, now: datetime | None = None,
             # measure, and a check that could not measure must not read ok.
             return {**base, "ok": False, "insufficient": True, "unmeasured": True,
                     "error": "no recall calls to measure in the last 7 days",
+                    "log": _log_facts(path),
                     "fix": "check the prompt-recall hook is installed and firing"}
         # A thin but nonzero sample (< 20 searched calls in seven days) is
         # yellow, not a hard red that alone blocks a promote.

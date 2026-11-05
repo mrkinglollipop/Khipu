@@ -336,5 +336,17 @@ def doctor_block(view, now, cfg):
             missing.append("unmatched limit run timestamp")
         elif (now - stamp).total_seconds() >= 3600:
             reasons.append("unmatched-limit")
-    return _result(reasons, missing, identities=rows, prompts=prompts,
-                   replication=replication, gateway=gateway)
+    result = _result(reasons, missing, identities=rows, prompts=prompts,
+                     replication=replication, gateway=gateway)
+    from khipu import features
+
+    if not features.enabled("routing_push"):
+        # With the push off nothing is delivered to conversations, so there are
+        # no hook outcomes or delivery identities to find: that is the setting,
+        # not a fault. Anything else the check found still counts.
+        absent = {"today's hook outcomes", "live delivery identities"}
+        left = [m for m in result["missing"] if m not in absent]
+        if not result["reasons"] and not left:
+            return dict(result, status="not_applicable", missing=[],
+                        words="Routing lines are switched off on this Mac, so nothing is delivered to conversations to check.")
+    return result

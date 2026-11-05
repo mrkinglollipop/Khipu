@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { healthRows, HealthReportRows } from "../healthRows";
 import { buildAttention } from "../doctorAttention";
+import { deliveryReason } from "../routing";
 import type { Attention } from "../doctorAttention";
 
 afterEach(() => {
@@ -97,6 +98,21 @@ describe("healthRows (pure)", () => {
     render(<HealthReportRows parsed={{ routing_delivery_ok: false, routing_delivery: { status: "unknown", missing: ["receipt ledger"] } }} attention={[]} />);
     expect(screen.getByText("can't be checked: receipt ledger")).toBeInTheDocument();
     expect(screen.queryByText("not set up")).toBeNull();
+  });
+
+  it("a Mac with the routing lines switched off says so in grey instead of 'can't be checked'", () => {
+    const parsed = { routing_delivery_ok: true, routing_delivery: { status: "not_applicable", missing: [], reasons: [] } };
+    const row = healthRows(fixture(parsed)).find((item) => item.key === "routing_delivery_ok");
+    expect(row).toMatchObject({ status: "skipped", detail: expect.stringContaining("switched off") });
+    render(<HealthReportRows parsed={parsed} attention={[]} />);
+    expect(screen.getByText(/routing lines are switched off on this Mac/)).toBeInTheDocument();
+    expect(screen.queryByText(/can't be checked/)).toBeNull();
+  });
+
+  it("names what the delivery reds mean", () => {
+    expect(deliveryReason("lease-expired-twice")).toMatch(/went quiet/);
+    expect(deliveryReason("budget-stall")).toMatch(/started before the last update/);
+    expect(deliveryReason("prompt-delay")).toMatch(/three or more prompts in a row/);
   });
 
   it("keeps a missing routing delivery block grey, not red", () => {

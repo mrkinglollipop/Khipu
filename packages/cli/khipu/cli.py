@@ -1098,7 +1098,7 @@ def _cmd_doctor_body(args, workers, mem, status_payload, backup_health) -> int:
         # starts) or red (a fresh fold nears the prompt's budget). Never gates `ok`.
         "routing_log": routing_block.get("log"),
         "routing_delivery": routing_block.get("routing_delivery", {"status": "unknown", "missing": ["routing check"]}),
-        "routing_delivery_ok": routing_block.get("routing_delivery", {}).get("status") == "green",
+        "routing_delivery_ok": routing_block.get("routing_delivery", {}).get("status") in ("green", "not_applicable"),
         "owner_direction": owner_direction_block,
         "owner_actions_log": owner_actions_log_block,
         "ledger": ledger_block,

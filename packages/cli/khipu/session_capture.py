@@ -3890,6 +3890,37 @@ def _age(ts: Any) -> int | None:
     return int(time.time() - t) if t is not None else None
 
 
+def job_harness(path: Path, job: dict) -> str:
+    """The harness a queued capture belongs to: its own field, else its file
+    name, else Aegis (the oldest jobs carried neither)."""
+    parts = path.name.split("-")
+    return str(job.get("harness") or (parts[1] if len(parts) > 2 else "aegis"))
+
+
+def held_by_harness() -> dict[str, dict]:
+    """The held (dead) native captures by harness: how many, and how long ago
+    the newest and oldest were last tried."""
+    out: dict[str, dict] = {}
+    for path in held_jobs():
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            job = {}
+        row = out.setdefault(job_harness(path, job if isinstance(job, dict) else {}),
+                             {"held": 0, "last_tried_age_s_min": None, "last_tried_age_s_max": None, "errors": {}})
+        row["held"] += 1
+        age = _age(_retry_state(path).get("last_attempt_at"))
+        if age is not None:
+            row["last_tried_age_s_min"] = age if row["last_tried_age_s_min"] is None else min(row["last_tried_age_s_min"], age)
+            row["last_tried_age_s_max"] = age if row["last_tried_age_s_max"] is None else max(row["last_tried_age_s_max"], age)
+        error = str(_retry_state(path).get("last_error") or "")[:80]
+        if error:
+            row["errors"][error] = row["errors"].get(error, 0) + 1
+    for row in out.values():
+        row["errors"] = dict(sorted(row["errors"].items(), key=lambda kv: -kv[1])[:3])
+    return out
+
+
 def _queue_by_harness() -> dict[str, dict]:
     out: dict[str, dict] = {}
     now = time.time()
@@ -3914,8 +3945,7 @@ def _queue_by_harness() -> dict[str, dict]:
             window = str(job["window_id"])
             held_windows[window] = min(held_windows.get(window, 1 << 30), _part_index(job) or 0)
     for p, claimed, job in records:
-        parts = p.name.split("-")
-        h = str(job.get("harness") or (parts[1] if len(parts) > 2 else "aegis"))
+        h = job_harness(p, job)
         try:
             st = p.stat()
             age = int(now - st.st_mtime)

@@ -1367,8 +1367,13 @@ export function paceWords(fact: PlanFact | null | undefined, now: Date): string 
 export function deliveryReason(reason: string): string {
   const words: Record<string, string> = {
     "ack-unshown": "a change was acknowledged before it was shown",
-    "budget-stall": "a change is still owed past its delivery budget",
-    "lease-expired-twice": "a change's delivery lease expired twice",
+    "budget-stall":
+      "a conversation or its helper agent is behind on routing changes: it has run more steps than the changes owed to it allow. " +
+      "One that started before the last update, or that has ended, keeps what it last had; the next prompt or a new conversation catches up",
+    "lease-expired-twice":
+      "a change was offered to a conversation twice and not confirmed (usually one that went quiet partway). " +
+      "It is offered again on that conversation's next prompt",
+    "prompt-delay": "routing lines were skipped on three or more prompts in a row in one conversation; they arrive with a later prompt",
     "prompt-skips": "too many prompts skipped routing",
     "cross-mac-stale": "the cross-Mac copy is behind",
     "gateway-stale": "the cloud copy is behind",
