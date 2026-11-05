@@ -96,8 +96,52 @@ def _sync_lock():
         os.close(fd)
 
 
+# What each sync rewrites whether or not it brought or sent anything: the pull
+# position, the scan position, and the clock readings that say when the copy
+# last looked (and the hub's "last seen" time for each other Mac, below). They
+# say how current the copy is, not what the record says, so
+# a view and the cached log read do not move with them. The hub's clock offset
+# is kept to the minute: its jitter is sub-second, a real skew is not.
+_BOOKKEEPING = frozenset({"pull_cursor", "caught_up_at", "checked_local_at", "scan_after", "scan_until",
+                          "scan_order", "completed_order"})
+_state_token_cache: dict[str, tuple[list, list]] = {}
+
+
+def _state_token():
+    """What ``replication.json`` says apart from its bookkeeping (a digest, as
+    a one-item list), None when the file is missing. A file that cannot be
+    read as a state counts by its stat, so damage is always a change."""
+    path = _path("replication.json")
+    stat = routing._stat(path)
+    if stat is None:
+        return None
+    cached = _state_token_cache.get(str(path))
+    if cached is not None and cached[0] == stat:
+        return cached[1]
+    try:
+        state = json.loads(path.read_text())
+        if not isinstance(state, dict):
+            raise ValueError("not a state")
+    except (OSError, ValueError):
+        return list(stat)
+    body = {k: v for k, v in state.items() if k not in _BOOKKEEPING}
+    # Each pull lists the other Macs with when the hub last saw them: which
+    # Macs, not when, is what the state says.
+    if isinstance(body.get("sources"), list):
+        body["sources"] = sorted(str(s.get("mac")) for s in body["sources"] if isinstance(s, dict))
+    offset = body.get("hub_offset_seconds")
+    if isinstance(offset, (int, float)) and not isinstance(offset, bool):
+        body["hub_offset_seconds"] = round(offset / 60)
+    token = [hashlib.sha256(json.dumps(body, sort_keys=True).encode("utf-8")).hexdigest()]
+    _state_token_cache[str(path)] = (stat, token)
+    return token
+
+
 def fingerprint():
-    return [routing._stat(_path("remote.jsonl")), routing._stat(_path("replication.json"))]
+    """The copy's two inputs to a fold: ``remote.jsonl`` (what other Macs sent,
+    by stat) and what ``replication.json`` says (``_state_token``). A sync that
+    brought nothing and sent nothing moves neither."""
+    return [routing._stat(_path("remote.jsonl")), _state_token()]
 
 
 def cache_key():
@@ -382,6 +426,16 @@ class PostgresHub:
 def sync(*, hub=None, limit=500, max_pages=20):
     """One bounded exchange (``_sync``), then the view refolded if it wrote."""
     return _refreshing(lambda: _sync(hub=hub, limit=limit, max_pages=max_pages))
+
+
+def sync_if_due(now=None):
+    """``sync``, unless one finished within ``POLL_SECONDS``. Polls run far more
+    often than that, and each exchange is several hub queries."""
+    last = routing._parse(_state().get("checked_local_at"))
+    now = now or routing._now()
+    if last is not None and 0 <= (now - last).total_seconds() < POLL_SECONDS:
+        return dict(ok=True, recent=True, caught_up=False)
+    return sync()
 
 
 # ---- what waits on the owner, on every Mac ---------------------------------------------------
@@ -871,6 +925,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                     if retry and (event.get("id") not in deferred or not first_round):
                         continue
                     projected = routing.replication_payload([event], bindings=bindings)
+                    known = (uploaded.get(origin), deferred.get(event.get("id")))
                     # A rejected identifier is not a new id; it must never upload.
                     if projected and projected[0].get("id"):
                         receipt = hub.upload(mac, projected[0])
@@ -883,7 +938,11 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                     else:
                         skipped += 1
                     uploaded[origin] = max(seq, uploaded.get(origin, 0))
-                    _save(state)
+                    # A deferred row that is still deferred changed nothing: saving the
+                    # whole state for each one (a thousand usage samples) rewrote it
+                    # and synced it a thousand times a round.
+                    if not retry or known != (uploaded.get(origin), deferred.get(event.get("id"))):
+                        _save(state)
                     # A deferred row tried again is not new work for the slice.
                     sent_this_turn += 0 if retry else 1
                     # Uploading an old local backlog before ever pulling starves

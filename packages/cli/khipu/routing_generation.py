@@ -88,13 +88,12 @@ def matches(path: str, expected: str, *, heartbeats: dict | None = None) -> bool
                     fingerprints[runner["name"]][index]
                 for runner in view["sources"]["runners"]
             }
-            # The copy between Macs rewrites its cursors and clock readings
-            # every few seconds. A view folded after that write recorded it,
-            # and its semantic revision already matched above: the same
-            # standard a runner heartbeat meets.
-            for name, stat in zip(("remote.jsonl", "replication.json"),
-                                  (view.get("fingerprint") or {}).get("replication") or (None, None)):
-                recorded[str(Path(path).parent / name)] = stat
+            # What another Mac sent: a view folded after that write recorded
+            # it, and its semantic revision already matched above, the same
+            # standard a runner heartbeat meets. (replication.json is not an
+            # input of an answer: its bookkeeping is no change of the record.)
+            recorded[str(Path(path).parent / "remote.jsonl")] = (
+                ((view.get("fingerprint") or {}).get("replication") or (None, None))[0])
             for heartbeat, observed in heartbeats.items():
                 # Only a fold that read this exact heartbeat can establish
                 # equivalence; other changed inputs always invalidate it.

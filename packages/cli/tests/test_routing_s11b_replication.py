@@ -637,3 +637,27 @@ def test_first_catch_up_status_words_and_overlap_is_not_failure(pair, monkeypatc
         yield
     monkeypatch.setattr(replication, "_sync_lock", occupied)
     assert replication.sync(hub=hub) == {"ok": True, "caught_up": False, "busy": True}
+
+
+def test_a_poll_syncs_only_when_the_last_exchange_is_old(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from khipu import routing_replication as rr
+
+    now = datetime(2026, 11, 5, 12, tzinfo=timezone.utc)
+    calls = []
+    monkeypatch.setattr(rr, "sync", lambda: calls.append(1) or {"ok": True})
+
+    def last(seconds):
+        at = None if seconds is None else (now - timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        monkeypatch.setattr(rr, "_state", lambda: {"checked_local_at": at} if at else {})
+
+    last(5)
+    assert rr.sync_if_due(now)["recent"] is True and not calls
+    last(rr.POLL_SECONDS)
+    rr.sync_if_due(now)
+    last(None)
+    rr.sync_if_due(now)
+    last(-120)  # a clock moved back must not stop the copy
+    rr.sync_if_due(now)
+    assert len(calls) == 3
