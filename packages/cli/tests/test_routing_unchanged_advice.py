@@ -276,6 +276,37 @@ def test_an_answer_with_nothing_to_show_cannot_go_stale(seeded):
     assert at.add_to("", out)[1] == {"status": "none"}
 
 
+def test_a_rule_that_lands_behind_an_empty_answer_is_delivered_next_prompt(replay):
+    """An empty answer skips the check, so this prompt says nothing of the rule
+    and logs none. It must move no marker, or the rule would be lost for good."""
+    session = "s-none"
+    routing.report(account="Codex", state="open", author=AUTHOR)
+    _out, _context, info = replay.offer(session)
+    replay.ack(info)
+    empty, _context, _info = replay.offer(session)
+    assert empty["kind"] == "none"
+    view = routing._load_view()
+    buffered = _buffered(view, routing._generation(view, routing.settings()), kind="none", text=None)
+    routing.add_rule("the rule that landed behind it", via="app")
+    assert routing_generation.stale_input(buffered["generation"]) == "events:rule_add"
+    at, writer = _fake_reader([(0.0, json.dumps(buffered).encode() + b"\n")])
+    writer.join(5)
+    at.session = session
+    before = recall_prompt.routing_marker(session)
+    out = at.collect()
+    context, logged = at.add_to("recall words", out)
+    assert context == "recall words" and logged == {"status": "none"}
+    assert recall_prompt._routing_delivered(logged, True) == " routing=none"
+    assert recall_prompt.routing_marker(session) == before, "the empty answer moved the marker"
+    # The next prompt owes it, and hands it over once.
+    following, context, info = replay.offer(session)
+    assert following["version"] > before["version"] and following["kind"] != "none"
+    assert "the rule that landed behind it" in context
+    replay.ack(info)
+    assert recall_prompt.routing_marker(session)["version"] == following["version"]
+    assert replay.offer(session)[0]["kind"] == "none"
+
+
 def test_an_answer_with_words_is_delivered_when_only_a_reading_moved_on(idle):
     seeded = idle
     view, generation = answer(seeded)
