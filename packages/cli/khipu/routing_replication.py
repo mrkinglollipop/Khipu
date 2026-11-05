@@ -450,7 +450,13 @@ def sync_if_due(now=None):
 
 REQUEST_KEPT_S = 14 * 86400
 _ASK_MOST = 1200
-_FINAL = {"applied": "applied", "applying": "applied", "failed": "failed", "interrupted": "failed", "declined": "declined"}
+_FINAL = {"applied": "applied", "applying": "applied", "failed": "failed", "interrupted": "failed", "declined": "declined",
+          "withdrawn": "gone"}
+# Bumped whenever a ``request_state`` line learns a new fact. A Mac whose saved
+# publishing state is older sends everything it holds, and what it has ended,
+# once more, so a row another Mac mirrored in an older shape is corrected without
+# waiting for a request to change.
+REQUEST_LINE_FORMAT = 2
 
 
 def _sig(text):
@@ -466,10 +472,9 @@ def _request_rows():
     from khipu.redact import redact_secrets
 
     out = []
-    try:
-        rows = owner_direction._read_requests(owner_direction.requests_path())
-    except (OSError, ValueError):
-        rows = []
+    # A file that cannot be read says nothing about the requests in it: the caller
+    # sends no line this round rather than calling them all gone.
+    rows = owner_direction._read_requests(owner_direction.requests_path())
     for row in rows:
         if row.get("action") == owner_direction.READ_ACTION or row.get("remote") or not row.get("id"):
             continue
@@ -545,13 +550,23 @@ def publish_requests():
         state = _state()
         if state.get("mac") not in (None, routing._local_mac()):
             return
-        rows = _request_rows()
+        try:
+            rows = _request_rows()
+        except (OSError, ValueError):
+            return
         seen = {r[0] for r in rows}
-        # A setting request that is no longer waiting was answered here.
+        # Whatever was sent as waiting and is no longer here, a setting answered
+        # or a held request withdrawn or dropped, is told as gone, so no other
+        # Mac keeps asking the owner about it.
         gone = [(request, "setting" if request.startswith("setting:") else "held", "gone", "", sig, None, "", False, None, None)
                 for request, (st, sig, *_rest) in (state.get("requests_published") or {}).items()
-                if request not in seen and st == "pending" and request.startswith("setting:")]
-        if _emit_request_states(rows + gone, state):
+                if request not in seen and st == "pending"]
+        stale_format = state.get("requests_format") != REQUEST_LINE_FORMAT
+        if stale_format:
+            state["requests_published"] = {}
+            state["requests_format"] = REQUEST_LINE_FORMAT
+        sent = _emit_request_states(rows + gone, state)
+        if sent or stale_format:
             state.setdefault("mac", routing._local_mac())
             _save(state)
 

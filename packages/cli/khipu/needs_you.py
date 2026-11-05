@@ -752,8 +752,8 @@ def _plans(stale, now: datetime) -> tuple[list[dict], list[dict]]:
                 continue  # a passing gap with recent figures, as the app's passingGapHeld
         name = routing.their_words(account.get("label") or account.get("harness") or "An account")
         if code == "not_signed_in":
-            kind, words = "signin", f"{name} is not signed in, so Khipu can't read its plan."
-            do = f"Sign in with {name}'s own program."
+            kind, words = "signin", f"{name} is not signed in on this Mac, so Khipu can't read its plan here."
+            do = f"Sign in with {name}'s own program on this Mac."
         elif code == "no_plan_limits":
             kind, words = "plan", f"{name}'s sign-in reports no plan limits, so Khipu can't tell how much is left."
             do = f"Check that {name} is signed in to the plan you mean to use."
