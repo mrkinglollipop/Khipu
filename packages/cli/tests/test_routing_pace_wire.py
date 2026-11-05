@@ -145,7 +145,50 @@ def test_with_no_reading_of_its_own_a_mac_shows_what_the_others_disagree_about()
     mine, one, two = "m" * 32, "a" * 32, "b" * 32
     rows = [{"t": now - timedelta(minutes=5), "used": 1.0, "reset": RESET, "mac": one},
             {"t": now - timedelta(minutes=5), "used": 2.0, "reset": RESET + timedelta(days=2), "mac": two}]
-    assert routing_pace.shared_readings(rows, mine, now) == rows
+    assert routing_pace.shared_readings(rows, mine, now, "weekly") == rows
+
+
+def _guarded(own, now=T0):
+    """A day of another Mac's good readings under its own reset, and ``own``."""
+    other = [{"t": now - timedelta(minutes=30 * i), "used": 60.0 - i * 0.1, "reset": RESET, "mac": "a" * 32,
+              "source": "probe", "t_err": 60} for i in range(50)]
+    rows = routing_pace.shared_readings(other + [own], "m" * 32, now, "weekly")
+    return other, rows, routing_pace.compute_pace(rows, [], now, "weekly")
+
+
+@pytest.mark.parametrize("own", [
+    # Two hours ahead of the clock: compute_pace cannot place it.
+    {"t": T0 + timedelta(hours=2), "t_err": 60},
+    # Its clock too coarse for this window: compute_pace discards it.
+    {"t": T0 - timedelta(minutes=1), "t_err": 86400}])
+def test_a_local_reading_the_pace_cannot_use_never_removes_good_remote_evidence(own):
+    other, rows, pace = _guarded({"used": 5.0, "reset": RESET + timedelta(days=2), "mac": "m" * 32, "source": "probe", **own})
+    assert len(rows) == len(other) + 1, "the other Mac's readings were dropped on the word of an unusable one"
+    assert pace["why"] != "this account can't be probed"
+    assert pace["why"] is None and pace["used_pct"] == 60.0
+
+
+def test_a_local_reading_ahead_only_within_its_own_uncertainty_still_counts():
+    other, rows, pace = _guarded({"t": T0 + timedelta(seconds=30), "used": 5.0, "reset": RESET + timedelta(days=2),
+                                  "mac": "m" * 32, "source": "probe", "t_err": 60})
+    assert len(rows) == 1 and pace["used_pct"] == 5.0
+
+
+def test_a_future_local_reading_in_the_log_leaves_the_other_macs_pace_standing(pair):
+    a, b, hub = pair
+    a.activate()
+    a.write(*day_of_use())
+    b.activate()
+    b.write(sample(b.now + timedelta(hours=2), 5.0, reset=RESET + timedelta(days=2)))
+    settle(a, b, hub)
+    b.activate()
+    pace = weekly(b.view())[0]
+    assert pace["why"] is None and pace["used_pct"] == weekly_used(a)
+
+
+def weekly_used(mac):
+    mac.activate()
+    return weekly(mac.view())[0]["used_pct"]
 
 
 def wire(readings, now):

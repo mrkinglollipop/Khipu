@@ -236,6 +236,14 @@ def _filter(samples, params):
     return out
 
 
+def _placed(samples, params, now):
+    """The readings that can count at ``now``. A witness ahead of now is a skewed
+    clock: within its own uncertainty it is a reading for now; beyond it, it
+    cannot be placed at all."""
+    return [dict(s, t=min(s["t"], now)) for s in _filter(samples, params)
+            if s["t"] <= now + timedelta(seconds=s.get("t_err") or 0)]
+
+
 def _cycles(samples, window):
     for s in samples:
         raw = s.get("cycle")
@@ -279,20 +287,24 @@ QUIET_READING_S = 3600
 OWN_READING_FRESH_S = QUIET_READING_S
 
 
-def shared_readings(samples, mine, now):
+def shared_readings(samples, mine, now, window):
     """``samples`` of one account window, without the other Macs' whose current
-    reset contradicts this Mac's own fresh reading. With no fresh reading of
-    its own, or one past its reset, this Mac cannot tell, and all of them stay
-    (``compute_pace`` then says when they disagree)."""
-    timed = [s for s in samples if s.get("reset") is not None]
-    own = [s for s in timed if s.get("mac") == mine]
-    if not mine or not own or len(own) == len(samples):
+    reset contradicts this Mac's own fresh reading. Only readings ``compute_pace``
+    can place are witnesses here. With no fresh one of its own, or one past its
+    reset, this Mac cannot tell, and all of them stay (``compute_pace`` then says
+    when they disagree)."""
+    params = _sample_params(window, samples)
+    if not mine or params is None or all(s.get("mac") == mine for s in samples):
+        return samples
+    placed = _placed(samples, params, now)
+    own = [s for s in placed if s.get("mac") == mine]
+    if not own:
         return samples
     newest = max(own, key=lambda s: s["t"])
     if newest["reset"] <= now or (now - newest["t"]).total_seconds() > OWN_READING_FRESH_S:
         return samples
     last = {}
-    for s in timed:
+    for s in placed:
         if s.get("mac") not in last or s["t"] > last[s.get("mac")]["t"]:
             last[s.get("mac")] = s
     other = {m for m, s in last.items() if m not in (mine, "legacy") and s["reset"] > now
@@ -474,11 +486,7 @@ def compute_pace(samples, caps, now, window, *, failed_reader=None):
         pace["why"] = "no reading yet gives this window's length"
         return pace
     trailing = params["trailing_s"]
-    samples = _filter(samples, params)
-    # A witness ahead of now is a skewed clock: within its own uncertainty
-    # it is a reading for now; beyond it, it cannot be placed at all.
-    samples = [dict(s, t=min(s["t"], now)) for s in samples
-               if s["t"] <= now + timedelta(seconds=s.get("t_err") or 0)]
+    samples = _placed(samples, params, now)
     if not samples:
         pace["why"] = no_reading
         return pace

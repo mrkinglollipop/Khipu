@@ -4924,7 +4924,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             pace_caps[slot_key] = live[0]
             if live[2] is not None:
                 pace_cap_at[slot_key] = live[2]
-    pace_samples = {slot: _pace.shared_readings(group, mac, now) for slot, group in pace_samples.items()}
+    pace_samples = {slot: _pace.shared_readings(group, mac, now, slot[1]) for slot, group in pace_samples.items()}
     for entry in entries:
         windows = sorted({w for (a, w) in pace_samples if a == entry["key"]}
                          | {w for (a, w, _k2, _purpose) in pace_caps if a == entry["key"] and w})
