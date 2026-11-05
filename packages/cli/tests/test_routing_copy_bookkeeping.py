@@ -46,8 +46,8 @@ def _settled(pair):
 
 
 def _answer(view, generation):
-    return {"kind": "none", "version": view["version"], "epoch": view["epoch"], "generation": generation,
-            "done": time.monotonic()}
+    return {"kind": "changes", "text": "words", "version": view["version"], "epoch": view["epoch"],
+            "generation": generation, "done": time.monotonic()}
 
 
 def test_a_no_op_sync_does_not_move_the_fingerprint_the_view_or_the_entry_cache(pair):
@@ -156,17 +156,18 @@ def test_each_bookkeeping_field_alone_leaves_the_fingerprint_alone(pair, field):
 
 
 def test_a_sync_with_only_deferred_rows_saves_the_state_once_not_once_per_row(pair, monkeypatch):
-    """A Mac with a thousand usage samples (kept local, retried each sync) used
-    to rewrite and sync replication.json once per sample, every round."""
+    """A Mac with a thousand usage samples used to rewrite and sync
+    replication.json once per sample, every round. These never cross: nothing
+    can place them, as they carry no witness or reset time."""
     a, _, hub = pair
     a.activate()
     for i in range(1, 41):
         a.write(a.event("usage_sample", i, account="codex|", window="weekly", used_pct=1))
     routing.add_rule("still ships", via="app")
-    assert sync(a, hub)["deferred_kinds"] == ["usage_sample"]
+    assert sync(a, hub)["deferred_kinds"] == []
     writes = []
     real = replication._atomic
     monkeypatch.setattr(replication, "_atomic", lambda path, data: (writes.append(path.name), real(path, data)))
     hub.now += timedelta(seconds=10)
-    assert sync(a, hub)["deferred_kinds"] == ["usage_sample"]
+    assert sync(a, hub)["deferred_kinds"] == []
     assert writes.count("replication.json") <= 2

@@ -399,6 +399,14 @@ reports within, ahead or recovering against the elapsed-window allowance plus
 slack. These figures differ from the arithmetic needed pace used for default
 account ordering.
 
+An unchanged window is stored about every 50 minutes, from the polls that run
+anyway. At least two readings of one value, from before the trailing period to
+one inside it, are idle: there is no use to forecast, and the pace line says so
+with what is left. Otherwise the line says which is true: not enough history for
+a pace, no fresh reading (usage that was moving has stopped being read, or a
+reading is past its cadence), reader failed (this Mac cannot sign in, and no other
+Mac's reading is current), or the pace itself.
+
 Pace and advice changes, forecast threshold crossings (24 hours, 6 hours,
 1 hour and 15 minutes) and sufficiently moved forecasts are pushed through the
 delivery protocol. Acknowledgement records which text was received.
@@ -715,10 +723,21 @@ placeholder on the other Mac. Confirm on the source Mac, where the words are
 visible; the confirmation carries those now-confirmed words. Owner words and
 local history are not rewritten. Missing or rejected event IDs never upload.
 
-The closed 11a projection does not yet cover newer pace samples, caps and tier
-facts. Unsupported kinds are reported as `deferred_kinds`, retained locally and
-retried after a projection upgrade; they do not block supported events. No
-live hub, live configuration, hook or launch agent was changed for this slice.
+Pace readings cross as one history, so both Macs compute one pace for a shared
+allowance from the one reader, `routing_pace.compute_pace`. To keep that small a
+Mac sends only the newest `usage_sample` of each closed pace bucket (a bucket
+where the reading fell or the reset moved goes whole), at the next quarter hour
+and no older than two days; `compute_pace` reads the same buckets either way.
+Its own readings' receipts and echoes never rewrite `remote.jsonl`. At most once
+an hour, after a sync that sent readings, a Mac removes its own `usage_sample` rows
+over three days old from `routing_events`: no other kind and no other sender's, a
+day past the oldest it would ever send, and no pull cursor depends on them. Another Mac's
+readings are left out when both name a reset still ahead more than an hour apart
+from this Mac's own fresh reading: that login reads a different allowance under
+that account id, and pooling them would leave both Macs unknown. Caps cross on
+every window `routing_pace.cap_window` accepts. Kinds the projection does not
+cover are reported as `deferred_kinds`, retained locally and retried after a
+projection upgrade; they do not block supported events.
 
 ## Delivery health
 

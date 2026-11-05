@@ -18,7 +18,7 @@ import tempfile
 from datetime import datetime, timezone
 from datetime import timedelta
 
-from khipu import routing
+from khipu import routing, routing_generation
 
 def _stamp(dt):
     return dt.isoformat(timespec="microseconds").replace("+00:00", "Z")
@@ -29,6 +29,11 @@ POLL_SECONDS = 30
 UPLOAD_PER_TURN = 64
 ROUND_BUDGET_S = 240.0  # how long one sync keeps sending slices (each is saved durably) before the next tick takes over
 CONTROL_EVERY_S = 270  # just under the 5-minute timer, so every tick looks
+# The hub keeps a Mac's own pace readings a day past the oldest it would ever send
+# (``routing_pace.WIRE_OLDEST_S``), so a pruned row can never come back as new.
+HUB_SAMPLE_KEPT_S = 3 * 86400
+HUB_PRUNE_EVERY_S = 3600
+HUB_PRUNE_MOST = 2000
 
 
 def _path(name):
@@ -103,7 +108,7 @@ def _sync_lock():
 # a view and the cached log read do not move with them. The hub's clock offset
 # is kept to the minute: its jitter is sub-second, a real skew is not.
 _BOOKKEEPING = frozenset({"pull_cursor", "caught_up_at", "checked_local_at", "scan_after", "scan_until",
-                          "scan_order", "completed_order"})
+                          "scan_order", "completed_order", "samples_pruned_at"})
 _state_token_cache: dict[str, tuple[list, list]] = {}
 
 
@@ -148,7 +153,9 @@ def cache_key():
     return tuple(tuple(value or ()) for value in fingerprint())
 
 
-RETENTION_KINDS = frozenset({"usage_sample", "source_seen", "evidence", "observation", "observation_renew", "reset_check"})
+RETENTION_KINDS = routing_generation.TELEMETRY_KINDS
+# Held on purpose until their bucket closes (``_wire_samples``), so not a kind this copy cannot send.
+_WAITS_ITS_TURN = frozenset({"usage_sample"})
 
 
 def _event_order(row):
@@ -316,6 +323,10 @@ def _store_locked(receipts):
                                         **({"rule_number": number} if number is not None else {})))
         if checked is None:
             raise ValueError("invalid hub event")
+        # This Mac's own readings are in its own log: their echo adds nothing
+        # the fold reads, and would rewrite this file for each one.
+        if checked["type"] == "usage_sample" and checked.get("mac") == routing._local_mac():
+            continue
         from khipu import routing_compact
 
         if (order <= retired and payload["id"] not in rows and checked["type"] in RETENTION_KINDS
@@ -378,13 +389,33 @@ class PostgresHub:
                 cur.execute("SELECT event_id, hub_order, payload, received_at, rule_number FROM routing_events WHERE event_id = %s",
                             (payload["id"],))
                 row = cur.fetchone()
+                # The advisory lock makes this row new. Its count is what this Mac
+                # has ever sent, moved by one: rows it pruned are still sent.
                 cur.execute("INSERT INTO routing_sources(mac, last_hub_order, last_event_id, event_count, last_seen_at) "
-                            "SELECT %s, coalesce(max(hub_order), 0), %s, count(*), clock_timestamp() FROM routing_events WHERE sender_mac = %s "
-                            "ON CONFLICT (mac) DO UPDATE SET last_hub_order = EXCLUDED.last_hub_order, "
-                            "last_event_id = EXCLUDED.last_event_id, event_count = EXCLUDED.event_count, "
-                            "last_seen_at = EXCLUDED.last_seen_at", (mac, payload["id"], mac))
+                            "VALUES (%s, %s, %s, 1, clock_timestamp()) "
+                            "ON CONFLICT (mac) DO UPDATE SET "
+                            "last_hub_order = greatest(routing_sources.last_hub_order, EXCLUDED.last_hub_order), "
+                            "last_event_id = EXCLUDED.last_event_id, event_count = routing_sources.event_count + 1, "
+                            "last_seen_at = EXCLUDED.last_seen_at", (mac, row[1], payload["id"]))
                 receipt = self._receipt(row)
         return receipt
+
+    def prune_samples(self, mac):
+        """Drop this sender's own pace readings no Mac's pace can still read; no
+        other kind and no other sender's. Pulls page by (received time, id) from
+        where they are, so a row gone behind them moves no cursor, and rule numbers
+        and receipts belong to kinds this never touches. Two Macs sharing one
+        mac-id would prune each other's: already broken, and left unguarded on purpose."""
+        from khipu import db
+
+        with db.connect(statement_timeout_s=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM routing_events WHERE event_id IN ("
+                            "SELECT event_id FROM routing_events WHERE sender_mac = %s "
+                            "AND payload ->> 'type' = 'usage_sample' "
+                            "AND received_at < clock_timestamp() - make_interval(secs => %s) LIMIT %s)",
+                            (mac, HUB_SAMPLE_KEPT_S, HUB_PRUNE_MOST))
+                return cur.rowcount
 
     @staticmethod
     def _receipt(row):
@@ -421,6 +452,37 @@ class PostgresHub:
                             "ORDER BY received_at, event_id LIMIT %s", (*after, limit))
                 rows = cur.fetchall()
         return {"rows": [self._receipt(r) for r in rows]}
+
+
+def _wire_samples(local, now):
+    """(ids to send now, ids to hold) of this Mac's own pace readings
+    (``routing_pace.wire_choice``), witness by witness."""
+    from khipu import routing_pace
+
+    groups = {}
+    for event in local:
+        if event.get("type") == "usage_sample" and event.get("id"):
+            parsed = routing.pace_sample(event)
+            if parsed is not None:
+                sample = dict(parsed[1], _id=event["id"], window=parsed[0][1])
+                groups.setdefault((*parsed[0], sample["mac"], sample["source"]), []).append(sample)
+    send, hold = set(), set()
+    for readings in groups.values():
+        chosen, waiting = routing_pace.wire_choice(readings, now)
+        send |= chosen
+        hold |= waiting
+    return send, hold
+
+
+def _prune_hub_samples(hub, mac, state, now):
+    """After a sync that sent readings, at most once an hour, the hub's copy of
+    this Mac's old ones go. A failure costs nothing: the next hour tries again."""
+    last = routing._parse(state.get("samples_pruned_at"))
+    if not hasattr(hub, "prune_samples") or (last is not None and 0 <= (now - last).total_seconds() < HUB_PRUNE_EVERY_S):
+        return
+    state["samples_pruned_at"] = routing._iso(now)
+    with contextlib.suppress(Exception):
+        hub.prune_samples(mac)
 
 
 def sync(*, hub=None, limit=500, max_pages=20):
@@ -925,6 +987,8 @@ def _sync(*, hub=None, limit=500, max_pages=20):
             ordered = sorted(enumerate(local, 1), key=lambda pair: (pair[1].get("mac", ""), pair[1].get("seq", pair[0]), pair[0]))
             deadline = time.monotonic() + ROUND_BUDGET_S
             first_round = True
+            wire_send, wire_hold = _wire_samples(local, routing._now())
+            sent_samples = False
             while True:
                 # Each round sends one bounded slice and then pulls, so a large
                 # local backlog never starves the other Macs; rounds repeat while
@@ -941,6 +1005,26 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                         continue
                     projected = routing.replication_payload([event], bindings=bindings)
                     known = (uploaded.get(origin), deferred.get(event.get("id")))
+                    if event.get("type") == "usage_sample":
+                        # A reading goes when its bucket is due, or never: it
+                        # is no reason to rewrite this Mac's files, one by one.
+                        uploaded[origin] = max(seq, uploaded.get(origin, 0))
+                        deferred.pop(event.get("id"), None)
+                        if event.get("id") in wire_hold:
+                            deferred[event["id"]] = event["type"]
+                        elif event.get("id") in wire_send and projected:
+                            receipt = hub.upload(mac, projected[0])
+                            if receipt["event_id"] != projected[0]["id"]:
+                                raise ValueError("wrong upload receipt")
+                            sent_this_turn += 1
+                            sent_samples = True
+                            if sent_this_turn >= UPLOAD_PER_TURN:
+                                local_pending = any(
+                                    later.get("id") and later.get("seq", n) > uploaded.get(later.get("mac") or "legacy", 0)
+                                    for n, later in ordered[position:]
+                                )
+                                break
+                        continue
                     # A rejected identifier is not a new id; it must never upload.
                     if projected and projected[0].get("id"):
                         receipt = hub.upload(mac, projected[0])
@@ -969,6 +1053,9 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                             for n, later in ordered[position:]
                         )
                         break
+                if sent_samples:
+                    _prune_hub_samples(hub, mac, state, routing._now())
+                    sent_samples = False
                 for _ in range(max_pages):
                     after = state.get("scan_after") or [state.get("pull_cursor", EPOCH), ""]
                     result = hub.pull(after, state.get("scan_until"), limit)
@@ -995,7 +1082,7 @@ def _sync(*, hub=None, limit=500, max_pages=20):
                         state.pop("error", None)
                         _save(state)
                         finished = dict(ok=True, caught_up=not local_pending, local_pending=local_pending, skipped=skipped,
-                                        deferred_kinds=sorted(set(deferred.values())))
+                                        deferred_kinds=sorted(set(deferred.values()) - _WAITS_ITS_TURN))
                         break
                     if not rows:
                         raise ValueError("pull made no progress")
@@ -1048,7 +1135,7 @@ def status(now=None):
                        if first_catch_up else None),
                 stale=age is None or age > 600, sources=state.get("sources", []),
                 hub_offset_seconds=state.get("hub_offset_seconds"),
-                deferred_kinds=sorted(set(state.get("deferred", {}).values())))
+                deferred_kinds=sorted(set(state.get("deferred", {}).values()) - _WAITS_ITS_TURN))
 
 
 def age_line(now=None):
