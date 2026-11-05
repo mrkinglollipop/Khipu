@@ -205,3 +205,25 @@ def test_a_finished_job_is_untouched_by_the_timer(world, monkeypatch):
     ok, _ = owner_background.run(request)
     assert ok and owner_background.heal(time.time() + 10**7) == []
     assert _row(request)["state"] == "applied"
+
+
+def test_crash_after_claim_before_start_is_recovered(world, monkeypatch):
+    request = _hold_in_t3(world)
+    monkeypatch.setattr(owner_background, "LONG_ACTIONS", {"route.pause"})
+    world["t3"].message(THREAD, time.time() + 1, text="yes")
+    _t3_hook_turn(prompt="yes")
+    # Stop at the exact boundary: confirm saved applying, start never ran.
+    owner_direction.confirm(request)
+    assert _row(request)["state"] == "applying"
+    assert owner_background.heal() == []
+    assert owner_background.heal(time.time() + owner_background.NO_WORKER_GRACE_S + 5) == [request]
+    assert _row(request)["state"] == "interrupted"
+    assert owner_background.heal(time.time() + 10**7) == []
+
+
+def test_crash_before_claim_leaves_request_confirmable(world, monkeypatch):
+    request = _hold_in_t3(world)
+    monkeypatch.setattr(owner_background, "LONG_ACTIONS", {"route.pause"})
+    owner_background.prepare(_row(request))
+    assert owner_background.heal(time.time() + 10**7) == []
+    assert _row(request)["state"] == "pending"

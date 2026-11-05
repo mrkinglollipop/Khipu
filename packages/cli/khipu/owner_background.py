@@ -85,6 +85,12 @@ def _note_worker(request: str, pid: int) -> None:
         pass
 
 
+def prepare(request: dict) -> None:
+    """Persist recovery evidence before the request can become applying."""
+    if is_long(request["action"], request.get("args") or {}):
+        _save(request["id"], {"state": "started", "started_ts": time.time()})
+
+
 def start(request: dict) -> tuple[bool, dict]:
     from khipu import owner_direction
 
@@ -160,6 +166,10 @@ def heal(now: float | None = None) -> list[str]:
             continue
         ident = file.stem
         request = next((r for r in owner_direction._read_requests(owner_direction.requests_path()) if r.get("id") == ident), None)
+        if request is not None and request.get("state") == "pending":
+            # Preparation precedes claiming the request. A crash before the
+            # claim leaves it pending, so a later confirmation can still run.
+            continue
         if request is not None and request.get("state") == "applying":
             if not _worker_gone(job, now):
                 continue

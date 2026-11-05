@@ -596,6 +596,8 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             if authorized is not None:
                 confirmed = dict(authorized.get("confirmed") or {}, request=request["id"],
                                  source="owner_turn", message_at=_iso(now))
+                from khipu import owner_background
+                owner_background.prepare(request)
                 request.update(state="applying", confirmed=confirmed,
                                execution_stamp=dict(authorized, confirmed=confirmed))
             state = _load(path)
@@ -991,6 +993,8 @@ def confirm(request_id: str, *, env=None, now: float | None = None, remote: dict
                 _save(path, state, now)
                 raise DirectionRefused("not_confirmed", stamp)
             stamp["confirmed"]["request"] = request_id
+            from khipu import owner_background
+            owner_background.prepare(request)
             request.update(state="applying", confirmed=dict(stamp["confirmed"], session=session),
                            execution_stamp=dict(stamp))
             _save(path, state, now)
