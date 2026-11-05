@@ -728,8 +728,8 @@ def retry_dead(*, include_announce_refused: bool = False) -> dict[str, Any]:
         out["announce_refused_held"] = refused_held
         warnings.append(f"{refused_held} dead job{'' if refused_held == 1 else 's'} refused for not announcing "
                           "source identities stayed held: "
-                          + ("span-covered can retire them, a forgotten episode overlaps them, or a check could not "
-                             "run." if include_announce_refused else
+                          + ("span-covered can retire them, a forgotten episode overlaps them, a live episode already "
+                             "holds their exact window, or a check could not run." if include_announce_refused else
                              "a retry may land them as duplicates, or with text a forgotten episode held. Run `khipu "
                              "outbox span-covered` first (a dry run); `--include-announce-refused` then retries only "
                              "the ones it can't retire and no forgotten episode overlaps."))

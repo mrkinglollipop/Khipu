@@ -509,14 +509,22 @@ def test_a_row_nothing_tells_apart_proves_the_fields(row, job):
 
 @pytest.mark.parametrize("row_changes,job_changes", [
     ({"window_id": W, "part": "1/2"}, {"window_id": W, "part": "2/2"}),
-    ({"transcript_sha256": "digest-a"}, {"transcript_sha256": "digest-b"}),
-    ({"project": "acme/other"}, {"project": "acme/span"}),
     ({"transcript_range": "0:500", "window_id": WIDE, "part": "1/2"}, {}),
 ])
 def test_a_sibling_or_another_project_keeps_its_summary_out_of_the_archive(pg, row_changes, job_changes):
     land(row_at(**row_changes))
     dead(summary_only(**job_changes))
     assert_held(pg, span.NOT_SAME_WINDOW)
+
+
+@pytest.mark.parametrize("row_changes,job_changes", [
+    ({"transcript_sha256": "digest-a"}, {"transcript_sha256": "digest-b"}),
+    ({"project": "acme/other"}, {"project": "acme/span"}),
+])
+def test_a_row_at_the_same_key_that_differs_holds_it_as_a_retry_would_remove_it(pg, row_changes, job_changes):
+    land(row_at(**row_changes))
+    dead(summary_only(**job_changes))
+    assert_held(pg, span.WOULD_SKIP)
 
 
 def test_another_window_at_the_same_range_holds(pg):
@@ -669,6 +677,24 @@ def test_a_plain_job_that_moves_gets_no_warning(pg):
     bury(refused(), reason="x", last_error="OperationalError: gone")
     out = outbox.retry_dead(include_announce_refused=True)
     assert out["moved"] == 1 and "warning" not in out and "announce_refused_moved" not in out, out
+
+
+def test_a_job_whose_exact_window_a_row_holds_stays_held_rather_than_vanishing(pg):
+    # 2026-11-05, the M1's 1,076 dead jobs: the old app re-summarised one window
+    # again and again, so most jobs share a window with no part. The drain answers
+    # those "exact window: skip" and removes the file, writing nothing, while this
+    # flag said they would land. Wording and details only the job holds went nowhere.
+    land({**COVER, "transcript_range": JOB["transcript_range"], "summary": "Another run's wording of this window"})
+    (path,) = dead(refused(decisions=["A detail only this run wrote down"]))
+    snapshot = path.read_bytes()
+    before = counts(pg)
+    out = outbox.retry_dead(include_announce_refused=True)
+    assert out["moved"] == 0 and out["announce_refused_held"] == 1, out
+    assert path.read_bytes() == snapshot and outbox.jobs() == []
+    outbox.drain()
+    assert path.read_bytes() == snapshot and counts(pg) == before and records() == []
+    assert span.dry_run()["would_hold"] == {span.WOULD_SKIP: 1}
+    assert "exact window" in span.words(span.dry_run())
 
 
 def test_a_failed_read_retries_no_refused_job(pg, monkeypatch):
