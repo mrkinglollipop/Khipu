@@ -432,6 +432,42 @@ def _known_nightly_steps() -> list[str]:
     return sorted({step for step, _fix in _NIGHTLY_STEP_CHECKS.values()})
 
 
+# Last completed night's receipts, kept beside tonight's partial run. A nightly
+# restarts nightly-last.json from nothing, and the run lasts well over an hour
+# (the open-item pass alone is one hub round trip per item), so for that whole
+# window every step tonight has not reached yet had no receipt and doctor, and
+# with it `khipu promote`, read red. The carried entries keep their own
+# timestamps, so a step that failed last night still reads red and a receipt
+# older than NIGHTLY_STEP_STALE_HOURS still reads stale.
+_CARRIED_STEPS: list[dict[str, Any]] = []
+
+
+def _slim_receipt(entry: dict[str, Any]) -> dict[str, Any]:
+    out = {k: entry.get(k) for k in ("name", "ok", "error", "ts") if k in entry}
+    if isinstance(entry.get("deferred"), str):
+        out["deferred"] = entry["deferred"]
+    return out
+
+
+def _capture_previous_receipts() -> None:
+    """Remember the receipts on disk before this run's first write replaces
+    them. A run that stopped partway keeps the older receipts it had carried
+    for the steps it never reached."""
+    global _CARRIED_STEPS
+    carried: dict[str, dict[str, Any]] = {}
+    try:
+        data = nightly_last() or {}
+        for key in ("previous_steps", "steps"):  # later keys win: the newer receipt
+            rows = data.get(key)
+            for entry in rows if isinstance(rows, list) else []:
+                if isinstance(entry, dict) and isinstance(entry.get("name"), str) \
+                        and isinstance(entry.get("ok"), bool):
+                    carried[entry["name"]] = _slim_receipt(entry)
+    except Exception:  # noqa: BLE001 — a broken receipt must not fail the night
+        carried = {}
+    _CARRIED_STEPS = list(carried.values())
+
+
 def _record_nightly_step(
     steps: list[dict[str, Any]], name: str, *, ok: bool, counts: Any = None, error: str | None = None,
     deferred: str | None = None,
@@ -455,7 +491,17 @@ def _record_nightly_step(
     steps.append(entry)
     try:
         _nightly_last_path().write_text(
-            json.dumps({"steps": steps, "known_steps": _known_nightly_steps()}, default=str, indent=2),
+            json.dumps(
+                {
+                    "steps": steps,
+                    "known_steps": _known_nightly_steps(),
+                    "previous_steps": [
+                        e for e in _CARRIED_STEPS
+                        if e.get("name") not in {str(x.get("name")) for x in steps}
+                    ],
+                },
+                default=str, indent=2,
+            ),
             encoding="utf-8",
         )
     except OSError:
@@ -475,6 +521,7 @@ def _run_nightly_locked() -> int:
     # Capture last night's briefs outcome before this run overwrites the
     # receipt: a second night of lock-held deferral goes red.
     _capture_previous_briefs_step()
+    _capture_previous_receipts()
     drain_result = _step_result(_drain_sessions())
     _record_nightly_step(steps, "sessions_drain", **drain_result)
     driver_error = None
@@ -1562,6 +1609,16 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
                 # Steps are appended in run order; the last write for a name
                 # (the most recent nightly's outcome) is what doctor judges.
                 by_name[entry["name"]] = entry
+    # A run in progress has not reached every step: a step with no receipt
+    # tonight is judged on the receipt kept from the last completed night,
+    # under that receipt's own timestamp (so failure and staleness still show).
+    carried_names: set[str] = set()
+    if data and isinstance(data.get("previous_steps"), list):
+        for entry in data["previous_steps"]:
+            if isinstance(entry, dict) and entry.get("name") and entry["name"] not in by_name \
+                    and isinstance(entry.get("ok"), bool):
+                by_name[entry["name"]] = entry
+                carried_names.add(entry["name"])
     source = str(_nightly_last_path())
     out: dict[str, dict[str, Any]] = {}
     if applicable:
@@ -1709,6 +1766,7 @@ def nightly_step_health() -> dict[str, dict[str, Any]]:
             ),
             "ts": entry.get("ts"),
             "source": source,
+            **({"carried": True} if step_name in carried_names else {}),
         }
     return out
 
