@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from contextlib import redirect_stderr, redirect_stdout
 
 # action: (required keys, optional keys). Every key is text unless named in
@@ -112,6 +113,7 @@ SPECS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 _LISTS = {"entries", "list", "checks", "ids"}
 _HOLDS = {"holds"}
 _INTS = {"rule"}
+_RULE_ENTITY = re.compile(r"rule-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _FLAGS = {"catch_up", "hide", "show", "sensitive_only", "over_newer", "include_content", "include_decisions", "indefinite", "helpers", "whole_folder"}
 _CHOICES = {"scope": ("account", "machine", "all"), "children": ("remove", "move-up"),
             "change": ("close", "reopen", "reassign"), "to": ("user", "assistant", "agent"),
@@ -189,7 +191,11 @@ def _values(action: str, args) -> dict:
         elif key in _INTS:
             if isinstance(value, str) and value.strip().isdigit():
                 value = int(value.strip())
-            if type(value) is not int or value < 1:
+            named = key == "rule" and isinstance(value, str) and bool(_RULE_ENTITY.fullmatch(value.strip()))
+            if named:
+                # A rule added while the hub numbers rules has no number yet: its uuid names it.
+                value = value.strip()
+            elif type(value) is not int or value < 1:
                 raise _bad(f"{key} must be a whole number above 0")
         elif key == "pct":
             if isinstance(value, str):
@@ -726,13 +732,18 @@ def apply_request(kind: str, out, *, only: str | None = None) -> dict:
                     return out
             action, args = "route.priority.confirm", {"expect": routing.pending_priority_pin(view)}
         else:
-            number = out.get("n")
-            rule = next((r for r in routing.read_view().get("rules") or [] if r["n"] == number), None)
+            number, entity = out.get("n"), out.get("entity")
+            # A rule written while the hub numbers rules has no number until a sync
+            # brings it: it is found, and named in the confirm, by its uuid.
+            rule = next((r for r in routing.read_view().get("rules") or []
+                         if (r["n"] == number if type(number) is int else r.get("entity") == entity)), None)
             mine = routing.conversation_author().get("session")
-            if (type(number) is not int or rule is None or not rule.get("pending") or not mine
-                    or (rule.get("pending_author") or {}).get("session") != mine):
+            if (rule is None or not rule.get("pending") or not mine
+                    or (rule.get("pending_author") or {}).get("session") != mine
+                    or (type(number) is not int and not isinstance(entity, str))):
                 return out
-            action, args = "route.rule.confirm", {"rule": number, "expect": rule["revision"]}
+            action, args = "route.rule.confirm", {"rule": number if type(number) is int else entity,
+                                                  "expect": rule["revision"]}
         # Never a hold: a turn that cannot be proved owner's is left alone.
         checking = owner_direction.REQUEST_APPLIED.set(True)
         try:

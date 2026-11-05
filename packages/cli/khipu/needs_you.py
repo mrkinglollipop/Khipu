@@ -267,7 +267,8 @@ def _rules(view: dict) -> list[dict]:
         pending = bool(r.get("pending"))
         if not pending and not (r.get("seeded") and not r.get("confirmed")):
             continue
-        n, revision = r.get("n"), r.get("revision")
+        # A rule the hub has not numbered yet is named by its uuid, never null.
+        n, revision = (r.get("n") if r.get("n") is not None else r.get("entity")), r.get("revision")
         by = (r.get("pending_author") if pending else None) or {"kind": "seed"}
         key = f"rule:{r.get('entity')}"
         if r.get("proposal_withheld"):
@@ -966,8 +967,9 @@ def _can_settle_here() -> dict:
 
 
 def _shown(page: list[dict]) -> list[str]:
-    """Each pinned answer an item showed whole."""
-    return [owner_direction.signature(offered["action"], offered["args"]) for item in page if not item.get("cut")
+    """Each pinned answer an item showed, a shortened item too: the answer is pinned to the
+    item's own revision, and the agent shows the owner the words it read."""
+    return [owner_direction.signature(offered["action"], offered["args"]) for item in page
             for offered in item["settle"].values() if offered]
 
 

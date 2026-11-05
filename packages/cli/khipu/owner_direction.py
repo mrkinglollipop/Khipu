@@ -221,8 +221,9 @@ def check(action: str, *, env=None, now: float | None = None, instant: bool = Fa
     try:
         turn = _recent_turn(session, conf, now)
     except DirectionRefused:
-        if any(t.get("entrypoint") == "t3" for t in owner_turns.turns(session, now)):
-            # A T3 conversation: its turns never count directly, so the
+        if any(t.get("entrypoint") in ("t3", "t3-unverified") for t in owner_turns.turns(session, now)):
+            # A T3 conversation (or one whose hook could not read T3's record in
+            # time, which T3's record is asked again here): its turns never count directly, so the
             # change is held for the owner to confirm (``hold``, ``confirm``).
             # T3's own record decides whether it is a job (``_t3_bound``).
             with t3.owner_read_budget():
@@ -444,7 +445,7 @@ def note_read(shown: list[str], *, env=None, now: float | None = None) -> str | 
         session = _caller_session(environ)
         with _requests_locked() as path, t3.owner_read_budget():
             turns_ = owner_turns.turns(session, now)
-            in_t3 = any(t.get("entrypoint") == "t3" for t in turns_)
+            in_t3 = any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_)
             if not in_t3 and owner_turns.dispatched_job(environ, session):
                 return None
             thread = _t3_bound(environ, session, now)[0] if in_t3 else None
@@ -572,7 +573,7 @@ def hold(action: str, args: dict, *, env=None, now: float | None = None, ask: st
             extra = {}
             if terminal or authorized is not None:
                 pass
-            elif any(t.get("entrypoint") == "t3" for t in turns_):
+            elif any(t.get("entrypoint") in ("t3", "t3-unverified") for t in turns_):
                 with t3.owner_read_budget():
                     thread, _ = _t3_bound(environ, session, now)
                     seeded = _seed(thread, session, signature(action, args))
