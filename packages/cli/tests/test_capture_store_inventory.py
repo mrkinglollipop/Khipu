@@ -37,6 +37,8 @@ _REPLICA_META = ("replica bookkeeping: meta, freshness, erasure and purge marker
 _REGISTRY = "the forgotten-source registry: identities and ids, never text"
 
 NOT_CAPTURE = {
+    "keychain.key_present": "for a prompt read, whether a key name has a key: name, yes or no and time only; "
+                            "never the key and no capture text",
     "tombstones._record_fence": "the forget fence's last outcome: readable flag, a reason word and counts only; "
                                 "no capture text",
     "session_capture._write_claim_owner": "PID and kernel process birth metadata only; no capture text",

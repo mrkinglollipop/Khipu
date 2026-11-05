@@ -11821,7 +11821,7 @@ def prompt_imports() -> None:
     interpreter's imports (tens of milliseconds on the one-shot path); the
     recall daemon calls it at start, so its children have nothing to import."""
     from khipu import (  # noqa: F401
-        agent_view, claude_homes, config, discover, features, identity, paths, redact, routing_advice, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
+        agent_view, claude_homes, config, discover, features, identity, keychain, paths, redact, routing_advice, routing_advisory, routing_delivery, routing_pace, routing_providers, routing_sources,
         session_capture, usage)
 
 
