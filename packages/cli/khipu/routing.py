@@ -2132,10 +2132,15 @@ _REPLICATION_FIELDS: dict[str, dict[str, Any]] = {
                       "asked_harness": "name", "req_blocked": frozenset({"expired", "out_of_date"})},
     "request_answer": {"request": "id", "req_answer": frozenset({"confirm", "decline"}), "sig": "revision_id",
                        "answer_harness": "name", "message_sha": "revision_id"},
-    "cap_set": {"account": "account", "kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
+    # A pace reading crosses whole, under the shapes the fold reads it with
+    # (``pace_sample``): ``routing_pace.wire_choice`` says which ones go.
+    "usage_sample": {"account": "account", "window": "pace_window", "witness_at": "time", "used_pct": "float",
+                     "resets_at": "time", "t_err": "int", "window_mins": "int", "cycle": "name",
+                     "source": frozenset(SOURCES)},
+    "cap_set": {"account": "account", "kind": "name", "window": "cap_window",
                 "purpose": frozenset({"job", "check"}), "pct": "float", "slack": "float", "usd": "float",
                 "days": "float", "n": "int", "revision": "id", "tier": "name", "sensitive_only": "bool", "until": "time"},
-    "cap_remove": {"account": "account", "cap_kind": "name", "window": frozenset({"five_hour", "five-hour", "weekly", "daily"}),
+    "cap_remove": {"account": "account", "cap_kind": "name", "window": "cap_window",
                    "purpose": frozenset({"job", "check"})},
 }
 # Kinds whose "text" is owner words; a hold's text is owner words only when
@@ -2222,6 +2227,14 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
             from khipu.routing_sources import safe_name
 
             return value if safe_name(value) == value else None
+        if shape == "cap_window":
+            from khipu.routing_pace import cap_window
+
+            return value if value in _WINDOW_CODES or cap_window(value) else None
+        if shape == "pace_window":
+            from khipu.routing_sources import safe_name
+
+            return value if safe_name(value) == value else None
         if shape == "scope_text":
             return value if value in ("all", "quota") or _MODEL_NAME.fullmatch(value) else None
         if shape == "setting_json":
@@ -2300,6 +2313,8 @@ def replication_payload(events: Iterable[dict], *, proposal_text: bool | None = 
             value = scalar(shape, event[field])
             if value is not None:
                 row[field] = value
+        if kind == "usage_sample" and not {"account", "window", "witness_at", "used_pct"} <= set(row):
+            continue  # no other Mac could place it: it stays this Mac's own
         hlc = event.get("hlc")
         if isinstance(hlc, dict) and isinstance(hlc.get("mac"), str) and hlc["mac"] \
                 and shaped("mac_id", hlc["mac"]) is not None \
@@ -4896,6 +4911,7 @@ def fold(events: list[dict], *, now: datetime, cfg: dict, known: list[dict],
             pace_caps[slot_key] = live[0]
             if live[2] is not None:
                 pace_cap_at[slot_key] = live[2]
+    pace_samples = {slot: _pace.shared_readings(group, mac, now) for slot, group in pace_samples.items()}
     for entry in entries:
         windows = sorted({w for (a, w) in pace_samples if a == entry["key"]}
                          | {w for (a, w, _k2, _purpose) in pace_caps if a == entry["key"] and w})

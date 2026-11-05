@@ -433,12 +433,14 @@ def test_poll_drives_replication_before_fold_and_caps_interval(pair, monkeypatch
 def test_unprojected_kinds_are_reported_and_retried_after_projection_upgrade(pair, monkeypatch):
     a, _, hub = pair
     a.activate()
-    a.write(a.event("usage_sample", 1, account="codex|", window="weekly", used_pct=1))
+    projection = routing._REPLICATION_FIELDS["reset_check"]
+    monkeypatch.delitem(routing._REPLICATION_FIELDS, "reset_check")
+    a.write(a.event("reset_check", 1, account="codex|"))
     routing.add_rule("still ships", via="app")
     result = sync(a, hub)
-    assert result["deferred_kinds"] == ["usage_sample"]
+    assert result["deferred_kinds"] == ["reset_check"]
     assert len(hub.rows) == 1
-    monkeypatch.setitem(routing._REPLICATION_FIELDS, "usage_sample", {"account": "account"})
+    monkeypatch.setitem(routing._REPLICATION_FIELDS, "reset_check", projection)
     assert sync(a, hub)["deferred_kinds"] == []
     assert len(hub.rows) == 2
 

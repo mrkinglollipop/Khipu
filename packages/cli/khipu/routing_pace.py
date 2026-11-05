@@ -265,6 +265,67 @@ def _cycles(samples, window):
             s["_cycle_key"] = target or ("reset", i, iso(comp[0]["reset"]))
 
 
+# Another Mac's readings count only when they read the same allowance. Both
+# name a reset still ahead and those resets lie further apart than one cycle's
+# estimates can (``_cycles``): this Mac's login is not the account the other
+# Mac reads under that name, and pooling them would make both unknown.
+OWN_READING_FRESH_S = 75 * 60
+
+
+def shared_readings(samples, mine, now):
+    """``samples`` of one account window, without the other Macs' whose current
+    reset contradicts this Mac's own fresh reading. With no fresh reading of
+    its own, or one past its reset, this Mac cannot tell, and all of them stay
+    (``compute_pace`` then says when they disagree)."""
+    timed = [s for s in samples if s.get("reset") is not None]
+    own = [s for s in timed if s.get("mac") == mine]
+    if not mine or not own or len(own) == len(samples):
+        return samples
+    newest = max(own, key=lambda s: s["t"])
+    if newest["reset"] <= now or (now - newest["t"]).total_seconds() > OWN_READING_FRESH_S:
+        return samples
+    last = {}
+    for s in timed:
+        if s.get("mac") not in last or s["t"] > last[s.get("mac")]["t"]:
+            last[s.get("mac")] = s
+    other = {m for m, s in last.items() if m not in (mine, "legacy") and s["reset"] > now
+             and abs((s["reset"] - newest["reset"]).total_seconds()) > 3600}
+    return [s for s in samples if s.get("mac") not in other] if other else samples
+
+
+# What a Mac sends of its readings (``wire_choice``). ``compute_pace`` reads a
+# window bucket by bucket, taking each bucket's highest reading at its newest
+# time, so while a bucket rises under one reset its newest reading says all the
+# others do. Sending only that, once the bucket has closed and at the next
+# quarter hour, gives the other Mac the same buckets; every window's closed
+# buckets go together, so they reach the other Mac as one pull and one rewrite of
+# its copy. Nothing older than what pace can read is sent.
+WIRE_TICK_S = 900
+WIRE_OLDEST_S = 2 * 86400
+
+
+def wire_choice(readings, now):
+    """(to send now, to hold until the bucket closes) of one Mac's readings of
+    one account window, as sets of their ``_id``; the rest never leave. A bucket
+    where the reading fell or the reset moved goes whole, as a possible reset
+    has to be judged from every reading."""
+    send, hold = set(), set()
+    params = _sample_params(readings[0].get("window"), readings) if readings else None
+    if params is None:
+        return send, hold
+    tick = now.timestamp() // WIRE_TICK_S * WIRE_TICK_S
+    buckets = {}
+    for s in sorted(readings, key=lambda x: x["t"]):
+        buckets.setdefault(int(s["t"].timestamp() // params["bucket_s"]), []).append(s)
+    for number, group in buckets.items():
+        if (number + 1) * params["bucket_s"] > tick:
+            hold.update(s["_id"] for s in group)
+        elif (now - group[-1]["t"]).total_seconds() <= WIRE_OLDEST_S:
+            rising = all(a["used"] <= b["used"] and a["reset"] == b["reset"] for a, b in zip(group, group[1:]))
+            send.update(s["_id"] for s in (group[-1:] if rising else group))
+    return send, hold
+
+
 # A view holding pace figures is folded again at least this often. Its
 # allowances, needed rates and trailing averages drift with the clock between
 # readings; the step changes (a reading going stale, a reset passing, a
