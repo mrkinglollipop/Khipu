@@ -12541,7 +12541,7 @@ def _poll_refold(now: datetime | None = None, *, on_fold=None) -> dict:
     Replication runs outside the routing lock before the local fold."""
     from khipu import routing_replication
 
-    routing_replication.sync()
+    routing_replication.sync_if_due()
     with lock_budget(LIGHT_LOCK_BUDGET):
         now = now or _now()
         fingerprint, cfg, _known = _inputs()

@@ -428,6 +428,16 @@ def sync(*, hub=None, limit=500, max_pages=20):
     return _refreshing(lambda: _sync(hub=hub, limit=limit, max_pages=max_pages))
 
 
+def sync_if_due(now=None):
+    """``sync``, unless one finished within ``POLL_SECONDS``. Polls run far more
+    often than that, and each exchange is several hub queries."""
+    last = routing._parse(_state().get("checked_local_at"))
+    now = now or routing._now()
+    if last is not None and 0 <= (now - last).total_seconds() < POLL_SECONDS:
+        return dict(ok=True, recent=True, caught_up=False)
+    return sync()
+
+
 # ---- what waits on the owner, on every Mac ---------------------------------------------------
 #
 # A request a conversation holds for the owner lives in that Mac's own files.
