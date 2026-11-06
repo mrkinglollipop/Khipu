@@ -226,13 +226,13 @@ class LibraryLegTest(unittest.TestCase):
         lit.assert_not_called()
         cos.assert_not_called()
 
-    def test_default_search_includes_libraries_beside_memory(self):
+    def test_explicit_opt_in_includes_libraries_beside_memory(self):
         cur = FakeCur(cosine=[_cos_row(score=0.82)])
         mem = {"kind": "episode", "id": "11", "label": "ep", "snippet": "ep", "score": 0.9,
                "rank_text": "divine council"}
         with _hub(cur):
             with mock.patch.object(em, "_cosine_candidates", return_value=[mem]):
-                out = em.hybrid_search("divine council", limit=5)
+                out = em.hybrid_search("divine council", limit=5, include_libraries=True)
         self.assertEqual({r["kind"] for r in out["results"]}, {"episode", "library"})
 
     def test_default_search_keeps_a_weak_library_neighbour_out_of_fusion(self):
@@ -240,7 +240,7 @@ class LibraryLegTest(unittest.TestCase):
         strong = _cos_row(7, 3, 0.82)
         cur = FakeCur(cosine=[strong, weak])
         with _hub(cur):
-            default = em.hybrid_search("divine council", limit=8)
+            default = em.hybrid_search("divine council", limit=8, include_libraries=True)
             explicit = em.hybrid_search("divine council", kind="library", limit=8)
         self.assertEqual(_ids(default), ["library:biblical:7#3"])
         self.assertIn("library:biblical:7#9", _ids(explicit))   # explicit keeps every candidate
@@ -258,8 +258,8 @@ class LibraryLegTest(unittest.TestCase):
     def test_an_episode_shaped_filter_switches_the_library_legs_off(self):
         cur = FakeCur(cosine=[_cos_row()])
         with _hub(cur):
-            em.hybrid_search("divine council", project="acme/widget")
-            em.hybrid_search("divine council", since="7d")
+            em.hybrid_search("divine council", project="acme/widget", include_libraries=True)
+            em.hybrid_search("divine council", since="7d", include_libraries=True)
         self.assertFalse(cur.sql("library_"))
 
     def test_no_library_tables_means_no_libraries_and_no_error(self):
@@ -273,7 +273,7 @@ class LibraryLegTest(unittest.TestCase):
 
         cur = NoTables()
         with _hub(cur):
-            out = em.hybrid_search("divine council", limit=3)
+            out = em.hybrid_search("divine council", limit=3, include_libraries=True)
         self.assertNotIn("libraries", out)
         self.assertFalse(cur.sql("FROM library_sources"))
 
@@ -332,7 +332,7 @@ class DegradedLegTest(unittest.TestCase):
 
         for kwargs in ({}, {"kind": "library"}, {"source": "biblical"}):
             with self.subTest(kwargs=kwargs), _hub(Denied()):
-                out = em.hybrid_search("council", mode="literal", **kwargs)
+                out = em.hybrid_search("council", mode="literal", **kwargs, include_libraries=True)
             self.assertIn("library:unavailable", out["degraded_legs"])
             self.assertIn("library_registry_error", out["timing"])
 
@@ -341,7 +341,7 @@ class DegradedLegTest(unittest.TestCase):
             with self.subTest(query=query):
                 cur = FakeCur(chunks=[_chunk_row(text=f"matching {query}")])
                 with _hub(cur):
-                    out = em.hybrid_search(query, mode="literal")
+                    out = em.hybrid_search(query, mode="literal", include_libraries=True)
                 self.assertIn("library:biblical:7#3", _ids(out))
                 self.assertGreater(out["results"][0]["lexical_hits"], 0)
 
@@ -387,7 +387,7 @@ class UnindexedProfileTest(unittest.TestCase):
                       index_present=False)
         qv = mock.Mock(return_value=(QVEC, "off"))
         with _hub(cur, query_vec=qv):
-            out = em.hybrid_search("divine council", limit=5)
+            out = em.hybrid_search("divine council", limit=5, include_libraries=True)
         self.assertIn(f"library_cosine:{PROFILE}:no-index", out["degraded_legs"])
         self.assertFalse(cur.sql("FROM library_embeddings"))
         qv.assert_not_called()                                  # no wasted embed either
@@ -397,7 +397,7 @@ class UnindexedProfileTest(unittest.TestCase):
     def test_default_search_runs_cosine_when_the_index_exists(self):
         cur = FakeCur(cosine=[_cos_row()], index_present=True)
         with _hub(cur):
-            out = em.hybrid_search("divine council", limit=5)
+            out = em.hybrid_search("divine council", limit=5, include_libraries=True)
         self.assertEqual(len(cur.sql("FROM library_embeddings")), 1)
         self.assertNotIn(f"library_cosine:{PROFILE}:no-index", out.get("degraded_legs", []))
         self.assertIn("library:biblical:7#3", _ids(out))
@@ -406,7 +406,7 @@ class UnindexedProfileTest(unittest.TestCase):
         from khipu.profiles import profile_index_name
         cur = FakeCur(cosine=[_cos_row()])
         with _hub(cur):
-            em.hybrid_search("divine council", limit=5)
+            em.hybrid_search("divine council", limit=5, include_libraries=True)
         (_, params), = cur.sql("FROM pg_indexes")
         self.assertEqual(params, (profile_index_name(PROFILE, "library_embeddings"),))
 
@@ -414,16 +414,16 @@ class UnindexedProfileTest(unittest.TestCase):
         cur = FakeCur(cosine=[_cos_row()], index_present=False)
         clock = [1000.0]
         with _hub(cur), mock.patch.object(ls.time, "monotonic", side_effect=lambda: clock[0]):
-            em.hybrid_search("divine council", limit=5)
-            em.hybrid_search("divine council again", limit=5)
+            em.hybrid_search("divine council", limit=5, include_libraries=True)
+            em.hybrid_search("divine council again", limit=5, include_libraries=True)
             self.assertEqual(len(cur.sql("FROM pg_indexes")), 2)
             cur.index_present = True                  # the index is built meanwhile
             clock[0] += ls.INDEX_CHECK_TTL_S - 1
-            em.hybrid_search("divine council third", limit=5)
+            em.hybrid_search("divine council third", limit=5, include_libraries=True)
             self.assertEqual(len(cur.sql("FROM pg_indexes")), 2)   # still the cached "no"
             self.assertFalse(cur.sql("FROM library_embeddings"))
             clock[0] += 2                              # past the TTL: re-asked, now present
-            em.hybrid_search("divine council fourth", limit=5)
+            em.hybrid_search("divine council fourth", limit=5, include_libraries=True)
         self.assertEqual(len(cur.sql("FROM pg_indexes")), 3)
         self.assertEqual(len(cur.sql("FROM library_embeddings")), 1)
 
@@ -438,7 +438,7 @@ class UnindexedProfileTest(unittest.TestCase):
 
         cur.execute = boom
         with _hub(cur):
-            out = em.hybrid_search("divine council", limit=5)
+            out = em.hybrid_search("divine council", limit=5, include_libraries=True)
         self.assertEqual(len(cur.sql("FROM library_embeddings")), 1)
         self.assertNotIn(f"library_cosine:{PROFILE}:no-index", out.get("degraded_legs", []))
         self.assertEqual(ls._INDEX_SEEN, {})
@@ -578,7 +578,7 @@ class BoundedLegTest(unittest.TestCase):
     def test_the_default_search_keeps_libraries_on_a_short_leash(self):
         cur = FakeCur(cosine=[_cos_row()])
         with _hub(cur):
-            em.hybrid_search("divine council", limit=12)
+            em.hybrid_search("divine council", limit=12, include_libraries=True)
             em.hybrid_search("divine council", limit=12, kind="library")
         cos = [(s, p) for s, p in cur.sql("FROM library_embeddings")
                if not s.startswith("SELECT EXISTS")]
@@ -636,7 +636,7 @@ class ConcurrentLibraryLegsTest(unittest.TestCase):
                 yield conn
 
             with mock.patch("khipu.hub_snapshot.try_hub_connect", _connect):
-                out = em.hybrid_search("divine council", limit=5)
+                out = em.hybrid_search("divine council", limit=5, include_libraries=True)
         self.assertCountEqual(calls, [threading.current_thread().name,
                                      "khipu-library-legs", "khipu-hybrid-literal"])
         self.assertIn("library:biblical:7#3", _ids(out))
@@ -657,7 +657,7 @@ class ConcurrentLibraryLegsTest(unittest.TestCase):
                 mock.patch.object(em, "LIBRARY_JOIN_FLOOR_S", 0.05), \
                 mock.patch.object(em, "_cosine_candidates", return_value=[dict(self.MEM)]):
             try:
-                out = em.hybrid_search("divine council", limit=5)
+                out = em.hybrid_search("divine council", limit=5, include_libraries=True)
             finally:
                 release.set()
         self.assertIn("library:timeout", out["degraded_legs"])
@@ -669,7 +669,7 @@ class ConcurrentLibraryLegsTest(unittest.TestCase):
         with _hub(cur), \
                 mock.patch.object(ls, "library_candidates", side_effect=RuntimeError("boom")), \
                 mock.patch.object(em, "_cosine_candidates", return_value=[dict(self.MEM)]):
-            out = em.hybrid_search("divine council", limit=5)
+            out = em.hybrid_search("divine council", limit=5, include_libraries=True)
         self.assertIn("library:error", out["degraded_legs"])
         self.assertEqual(_ids(out), ["11"])
         self.assertIn("boom", out["timing"]["library_error"])
@@ -986,9 +986,9 @@ class FloorByProfileTest(unittest.TestCase):
         weak = _cos_row(7, 9, 0.50, text="unrelated gardening notes")
         cur = FakeCur(cosine=[weak])
         with _hub(cur), self._cfg({}):
-            self.assertEqual(_ids(em.hybrid_search("divine council", limit=5)), [])
+            self.assertEqual(_ids(em.hybrid_search("divine council", limit=5, include_libraries=True)), [])
         with _hub(cur), self._cfg({PROFILE: 0.45}):
-            out = em.hybrid_search("divine council", limit=5)
+            out = em.hybrid_search("divine council", limit=5, include_libraries=True)
         self.assertEqual(_ids(out), ["library:biblical:7#9"])
         self.assertEqual(out["results"][0]["profile"], PROFILE)
 

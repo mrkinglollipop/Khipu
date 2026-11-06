@@ -722,7 +722,7 @@ class HybridOrderingTest(unittest.TestCase):
                 mock.patch("khipu.recency.apply_recency", side_effect=lambda rows: rows), \
                 mock.patch.object(embed, "_apply_search_filters", side_effect=lambda _c, rows, **_k: rows), \
                 mock.patch("khipu.features.enabled", return_value=False):
-            out = embed.hybrid_search("AI", mode="literal", limit=1)
+            out = embed.hybrid_search("AI", mode="literal", limit=1, include_libraries=True)
         self.assertEqual([r["id"] for r in out["results"]], ["library:docs:1#0"])
 
     def test_validity_ranking_runs_before_limit_and_current_episode_wins(self) -> None:

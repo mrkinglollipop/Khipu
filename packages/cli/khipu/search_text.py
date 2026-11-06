@@ -307,7 +307,7 @@ def fuse_ranked_lists(
 
             # Preserve evidence across chunks and retrieval legs without
             # replacing the canonical row based on incomparable raw scores.
-            for field in ("cosine", "lexical_hits"):
+            for field in ("cosine", "lexical_hits", "exact_phrase"):
                 try:
                     incoming = float(row[field])
                 except (TypeError, ValueError):
@@ -371,3 +371,13 @@ def parse_time_filter(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def session_query(query: str) -> str | None:
+    """Recognize UUID session ids, with or without their harness prefix."""
+    q = query.strip()
+    return q if re.fullmatch(r"(?:[a-zA-Z][\w-]*:)?[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", q) else None
+
+
+def session_matches(stored: str, query: str) -> bool:
+    return stored.startswith(query) or (":" not in query and stored.partition(":")[2].startswith(query))

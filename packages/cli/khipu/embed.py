@@ -1435,6 +1435,18 @@ def episode_text(row: dict[str, Any]) -> str:
         note = verbatim.get("note")
         if note:
             parts.append(f"note: {note}")
+        # Retain future stored owner-text fields as well as the original tier.
+        def strings(value):
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, dict):
+                return [t for v in value.values() for t in strings(v)]
+            if isinstance(value, list):
+                return [t for v in value for t in strings(v)]
+            return []
+        for key, value in verbatim.items():
+            if key not in {"errors", "commands", "paths", "quotes", "note"}:
+                parts.extend(strings(value))
     return "\n".join(p for p in parts if p).strip()
 
 
@@ -2741,7 +2753,8 @@ class _SearchFilters:
             else:
                 parts.append(typed)
         if self.session_id:
-            parts.append(f"{a}session_id LIKE %(kf_session)s ESCAPE '" + chr(92) + "'")
+            parts.append(f"({a}session_id LIKE %(kf_session)s ESCAPE '" + chr(92) + "'"
+                         + (f" OR split_part({a}session_id, ':', 2) LIKE %(kf_session)s ESCAPE '" + chr(92) + "'" if ":" not in self.session_id else "") + ")")
         if self.harness:
             split = f"split_part(COALESCE({a}session_id, ''), ':', 1)"
             expr = (f"COALESCE(NULLIF({a}harness, ''), {split})" if flags["harness"] else split)
@@ -2909,7 +2922,8 @@ def _apply_search_filters(
                 }
                 if typed not in row_project and row_project not in alias_exact:
                     continue
-            if session_id and not (m.get("session_id") or "").startswith(session_id):
+            from khipu.search_text import session_matches
+            if session_id and not session_matches(m.get("session_id") or "", session_id):
                 continue
             if harness:
                 row_harness = m.get("harness") or (m.get("session_id") or "").split(":", 1)[0]
@@ -3084,6 +3098,16 @@ def _rank_search_rows(
     # score they leave behind.
     from khipu.recency import apply_project_and_status, apply_recency
 
+    if not project_boost:
+        # Infer only from agreement among independently lexical top hits;
+        # a solitary cosine neighbour cannot nominate its own project.
+        evidence = [r for r in fused[:5] if int(r.get("lexical_hits") or 0) > 0 and r.get("project")]
+        from collections import Counter
+        counts = Counter(str(r["project"]).casefold() for r in evidence)
+        if counts:
+            candidate, votes = counts.most_common(1)[0]
+            if votes >= 2 and votes > len(evidence) / 2:
+                project_boost = candidate
     fused = apply_project_and_status(fused, project=project_boost)
     return apply_recency(fused)
 
@@ -3104,7 +3128,7 @@ def hybrid_search(
     project_boost: str | None = None,
     tz: str | None = None,
     source: str | None = None,
-    include_libraries: bool = True,
+    include_libraries: bool | None = None,
     rank: Callable[[list[dict[str, Any]], Any], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     # forget-fence source: a search leg; every search output fences the fused rows (khipu_search, khipu search, the prompt push, offline search)
@@ -3146,8 +3170,7 @@ def hybrid_search(
     ``cli._id_shaped`` / ``cli._literal_candidates``.
 
     Libraries (Session C, ``khipu.library_search``): ``kind="library"`` searches
-    only the enabled library sources; ``kind=None`` adds them to the memory
-    kinds unless ``include_libraries=False``. ``source`` names one library and
+    only the enabled library sources; default memory search excludes libraries. ``source`` names one library and
     implies ``kind="library"`` (any other kind with a source is refused). Each
     distinct embedding profile among the libraries gets its own cosine list
     (the query embedded once per profile) and the chunk/title ILIKE leg gets
@@ -3187,7 +3210,7 @@ def hybrid_search(
         allowed = (_SEMANTIC_KINDS if mode == "semantic" else _LITERAL_KINDS) + (LIBRARY_KIND,)
         if kind not in allowed:
             raise ValueError(f"kind must be one of {allowed}")
-        if kind == LIBRARY_KIND and not include_libraries:
+        if kind == LIBRARY_KIND and include_libraries is False:
             raise ValueError("kind 'library' conflicts with include_libraries=False")
 
     limit = max(1, int(limit))
@@ -3212,7 +3235,7 @@ def hybrid_search(
     # when the caller allows them, and never under an episode/timestamp-shaped
     # filter (a library row has neither). ``source`` was folded into ``kind``.
     want_library = (
-        include_libraries and kind in (None, LIBRARY_KIND) and not filters.active
+        (kind == LIBRARY_KIND or include_libraries is True) and include_libraries is not False and kind in (None, LIBRARY_KIND) and not filters.active
     )
     lib_cos_lists: list[list[dict[str, Any]]] = []
     lib_literal: list[dict[str, Any]] = []
@@ -3292,7 +3315,9 @@ def hybrid_search(
         else:
             literal_rows = list(literal_box.get("rows") or [])
 
+    _connect_started = time.monotonic()
     with try_hub_connect() as conn:
+        timing["hub_connect_ms"] = round((time.monotonic() - _connect_started) * 1000, 1)
         with conn.cursor() as cur:
             if mode == "literal" and want_literal:
                 literal_kind = kind if kind in _LITERAL_KINDS else None
@@ -3380,6 +3405,8 @@ def hybrid_search(
                         r["lexical_hits"] = token_hit_count(r.get("rank_text") or "", tokens)
                         if push_terms:
                             note_prompt_term_hits(r, r.get("rank_text") or "", push_terms)
+                    text = r.get("rank_text") or ""
+                    r["exact_phrase"] = bool(r.get("exact_phrase") or query.casefold() in text.casefold())
                     r.pop("rank_text", None)
             timing["lexical_ms"] = round((time.monotonic() - _t) * 1000, 1)
             if lib_names and kind is None:
@@ -3558,6 +3585,9 @@ def hybrid_search(
                 )
             except Exception:  # noqa: BLE001 — validity is additive, never a search failure
                 pass
+            # Exact stored words win after every optional ranker and before
+            # truncation; semantic neighbours cannot spend boosts past them.
+            fused.sort(key=lambda r: not r.get("exact_phrase", False))
             fused = _fair_fill(fused, limit)
             timing["enrich_ms"] = round((time.monotonic() - _t) * 1000, 1)
 
@@ -3601,18 +3631,18 @@ CONFIDENCE_COSINE_WEAK = 0.75
 def search_confidence(rows: list[dict[str, Any]], *, token_count: int) -> str:
     """"none" | "weak" | "strong" for a search's TOP hit (R4).
 
-    Full literal coverage (every query token found verbatim in the top hit)
-    or a high raw cosine is "strong". Partial coverage, a single literal
+    Exact phrase or full token coverage in the top hit is "strong".
+    Cosine alone is at most "weak"; lower hits cannot certify the top hit. Partial coverage, a single literal
     hit, or a middling cosine is "weak". Nothing (no rows, or a hit with
     neither a literal token nor a usable cosine) is "none" — the thing a
     fused RRF score alone could never say.
     """
     if not rows:
         return "none"
-    top_cosine = max((r.get("cosine") for r in rows if r.get("cosine") is not None), default=None)
-    top_lexical = max((int(r.get("lexical_hits") or 0) for r in rows), default=0)
+    top_cosine = rows[0].get("cosine")
+    top_lexical = int(rows[0].get("lexical_hits") or 0)
     full_coverage = token_count > 0 and top_lexical >= token_count
-    if full_coverage or (top_cosine is not None and top_cosine >= CONFIDENCE_COSINE_STRONG):
+    if rows[0].get("exact_phrase") or full_coverage:
         return "strong"
     if top_lexical >= 1 or (top_cosine is not None and top_cosine >= CONFIDENCE_COSINE_WEAK):
         return "weak"

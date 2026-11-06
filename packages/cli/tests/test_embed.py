@@ -1771,9 +1771,9 @@ class SearchConfidenceTest(unittest.TestCase):
         rows = [{"kind": "topic", "id": "x", "cosine": 0.5, "lexical_hits": 4}]
         self.assertEqual(em.search_confidence(rows, token_count=4), "strong")
 
-    def test_high_cosine_alone_is_strong(self):
+    def test_high_cosine_alone_is_weak(self):
         rows = [{"kind": "episode", "id": "1", "cosine": 0.85, "lexical_hits": 0}]
-        self.assertEqual(em.search_confidence(rows, token_count=5), "strong")
+        self.assertEqual(em.search_confidence(rows, token_count=5), "weak")
 
     def test_a_single_literal_hit_without_full_coverage_is_weak(self):
         rows = [{"kind": "episode", "id": "1", "cosine": 0.6, "lexical_hits": 1}]
@@ -1785,12 +1785,12 @@ class SearchConfidenceTest(unittest.TestCase):
         rows_partial = [{"kind": "episode", "id": "1", "lexical_hits": 1}]
         self.assertEqual(em.search_confidence(rows_partial, token_count=2), "weak")
 
-    def test_it_looks_at_the_best_row_not_just_the_top_ranked_one(self):
+    def test_confidence_describes_the_top_ranked_row(self):
         rows = [
             {"kind": "episode", "id": "top-ranked", "cosine": 0.5, "lexical_hits": 0},
             {"kind": "topic", "id": "buried", "cosine": 0.9, "lexical_hits": 0},
         ]
-        self.assertEqual(em.search_confidence(rows, token_count=3), "strong")
+        self.assertEqual(em.search_confidence(rows, token_count=3), "none")
 
 
 class LiteralTrgmStatusTest(unittest.TestCase):
