@@ -59,7 +59,7 @@ class JobsRunTest(unittest.TestCase):
              mock.patch.object(jobs.subprocess, "Popen", side_effect=_driver_process(run_fn)) as run_mock, \
              mock.patch("khipu.session_capture.drain", return_value={"failed": 0}), \
              mock.patch("khipu.embed.backfill", return_value={"embedded": 0}), \
-             mock.patch.object(jobs, "_commitment_close_rules", return_value={"ok": True}), \
+             mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
              mock.patch.object(jobs, "_recall_eval_step", return_value={"ok": True}), \
              mock.patch("khipu.embed.prune_query_cache", return_value=0):
             # The nightly's own embed sweep and cache prune reach the hub;
@@ -78,7 +78,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly") as run_mock, \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}) as m_reconcile, \
                 mock.patch.object(jobs, "_mark_stale_commitments") as m_stale, \
-                mock.patch.object(jobs, "_hygiene_commitments") as m_hygiene:
+                mock.patch.object(jobs, "_provenance_nightly") as m_hygiene:
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         run_mock.assert_called_once()
@@ -97,9 +97,9 @@ class JobsRunTest(unittest.TestCase):
                     mock.patch.object(jobs, "_reconcile_notes_if_due"), \
                     mock.patch.object(jobs, "_embed_backfill"), \
                     mock.patch.object(jobs, "_prune_query_cache"), \
-                    mock.patch.object(jobs, "_commitment_close_rules"), \
+                    mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_mark_stale_commitments"), \
-                    mock.patch.object(jobs, "_hygiene_commitments"), \
+                    mock.patch.object(jobs, "_provenance_nightly"), \
                     mock.patch.object(jobs, "_ledger_nightly"), \
                     mock.patch.object(jobs, "_refresh_snapshot"), \
                     mock.patch.object(jobs, "_recall_eval_step"), \
@@ -107,7 +107,7 @@ class JobsRunTest(unittest.TestCase):
                 self.assertEqual(jobs.run_nightly(), expected)
             script.assert_called_once()
             self.assertFalse(record.call_args_list[0].kwargs["ok"])
-            self.assertEqual(record.call_count, 18)
+            self.assertEqual(record.call_count, 17)
 
     def test_run_nightly_writes_nightly_last_json_with_every_step(self):
         """F3/D1: nightly-last.json is the persisted evidence Phase 6 will
@@ -119,7 +119,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True, "written": 2}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
-                mock.patch.object(jobs, "_hygiene_commitments"):
+                mock.patch.object(jobs, "_provenance_nightly"):
             jobs.run_nightly()
         payload = json.loads((self.data_dir / "nightly-last.json").read_text())
         names = [s["name"] for s in payload["steps"]]
@@ -127,9 +127,9 @@ class JobsRunTest(unittest.TestCase):
             names,
             ["sessions_drain", "consolidate_nightly", "notes_reconcile", "embed_backfill",
              "summary_kind_backfill", "query_cache_prune", "routing_ledger_prune", "storage_sweep",
-             "owner_actions_chain", "commitments_close_rules", "fact_changes_prune",
+             "owner_actions_chain", "provenance_backfill", "fact_changes_prune",
              "commitments_mark_stale",
-             "commitments_hygiene", "ledger", "receipt_prune", "project_renames",
+             "ledger", "receipt_prune", "project_renames",
              "recall_eval", "snapshot_refresh"],
         )
         for step in payload["steps"]:
@@ -153,7 +153,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
-                mock.patch.object(jobs, "_hygiene_commitments"), \
+                mock.patch.object(jobs, "_provenance_nightly"), \
                 mock.patch("khipu.hub_snapshot.refresh",
                             return_value={"ok": True, "path": "/x", "counts": {"episodes": 3}}) as dump:
             self.assertEqual(jobs.run_nightly(), 0)
@@ -166,7 +166,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
-                mock.patch.object(jobs, "_hygiene_commitments"), \
+                mock.patch.object(jobs, "_provenance_nightly"), \
                 mock.patch("khipu.hub_snapshot.refresh", side_effect=OSError("hub unreachable")):
             self.assertEqual(jobs.run_nightly(), 0)
         payload = json.loads((self.data_dir / "nightly-last.json").read_text())
@@ -185,7 +185,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
-                mock.patch.object(jobs, "_hygiene_commitments"), \
+                mock.patch.object(jobs, "_provenance_nightly"), \
                 mock.patch("khipu.embed.backfill",
                             return_value={"embedded": 3, "embed_provider": "missing key"}):
             jobs.run_nightly()
@@ -212,12 +212,11 @@ class JobsRunTest(unittest.TestCase):
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch("khipu.db.connect", return_value=conn), \
                 mock.patch("khipu.commitments.mark_stale", return_value=4) as m_stale, \
-                mock.patch.object(jobs, "_commitment_close_rules"), \
-                mock.patch.object(jobs, "_hygiene_commitments"):
+                mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
+                mock.patch.object(jobs, "_provenance_nightly"):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         m_stale.assert_called_once_with(cur)
-        conn.commit.assert_called_once()
 
     def test_run_nightly_survives_a_commitment_staling_failure(self):
         def _run(cmd, stdout, stderr, env):  # noqa: ARG001
@@ -239,7 +238,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", side_effect=RuntimeError("boom")), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
-                mock.patch.object(jobs, "_hygiene_commitments"):
+                mock.patch.object(jobs, "_provenance_nightly"):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
 
@@ -253,7 +252,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
-                mock.patch.object(jobs, "_hygiene_commitments"), \
+                mock.patch.object(jobs, "_provenance_nightly"), \
                 mock.patch("khipu.embed.backfill", return_value={"embedded": 7}) as m_bf, \
                 mock.patch("khipu.embed.prune_query_cache", side_effect=RuntimeError("hub down")):
             rc = jobs.run_nightly()
@@ -266,15 +265,14 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
-                mock.patch.object(jobs, "_hygiene_commitments"), \
+                mock.patch.object(jobs, "_provenance_nightly"), \
                 mock.patch("khipu.embed.backfill", side_effect=RuntimeError("quota")):
             self.assertEqual(jobs.run_nightly(), 2)
         self.assertIn("backfill skipped: RuntimeError: quota",
                       (self.log_dir / "khipu-nightly.out.log").read_text())
 
-    def test_run_nightly_runs_the_commitments_hygiene_pass(self):
-        """W3 Owed quality (2026-09-05): the two hygiene passes run every
-        night, not only on demand via `khipu hygiene commitments`."""
+    def test_run_nightly_omits_the_commitments_hygiene_pass(self):
+        """The removed hygiene pass performs no backups or model calls."""
         def _run(cmd, stdout, stderr, env):  # noqa: ARG001
             stdout.write(b"ok\n")
             return mock.Mock(returncode=0)
@@ -290,7 +288,7 @@ class JobsRunTest(unittest.TestCase):
         with self._patch_run("CONSOLIDATE_NIGHTLY", _run, "khipu-nightly"), \
                 mock.patch("khipu.notes.reconcile", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_mark_stale_commitments"), \
-                mock.patch.object(jobs, "_commitment_close_rules"), \
+                mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
                 mock.patch.object(jobs, "_fact_changes_prune"), \
                 mock.patch.object(jobs, "_receipt_prune"), \
                 mock.patch("khipu.db.connect", return_value=conn), \
@@ -305,13 +303,12 @@ class JobsRunTest(unittest.TestCase):
                 ) as m_rejudge:
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
-        m_backup.assert_called_once_with(conn)
-        m_session.assert_called_once_with(cur, apply=True)
-        m_rejudge.assert_called_once_with(cur, apply=True)
-        conn.commit.assert_called_once()
+        m_backup.assert_not_called()
+        m_session.assert_not_called()
+        m_rejudge.assert_not_called()
         log = (self.log_dir / "khipu-nightly.out.log").read_text()
-        self.assertIn("[khipu-hygiene] session-ended", log)
-        self.assertIn("rejudge", log)
+        self.assertNotIn("[khipu-hygiene] session-ended", log)
+        self.assertNotIn("rejudge", log)
 
     def test_run_nightly_survives_a_commitments_hygiene_failure(self):
         """A failure in the hygiene pass must never flip a good nightly to
@@ -328,7 +325,44 @@ class JobsRunTest(unittest.TestCase):
             rc = jobs.run_nightly()
         self.assertEqual(rc, 0)
         log = (self.log_dir / "khipu-nightly.out.log").read_text()
-        self.assertIn("[khipu-hygiene] skipped: RuntimeError: hub down", log)
+        self.assertNotIn("[khipu-hygiene]", log)
+
+    def test_provenance_backfill_still_runs_and_failure_is_nonzero(self):
+        actual = jobs._provenance_nightly
+        for okay in (True, False):
+            with self.subTest(okay=okay):
+                conn = mock.MagicMock()
+                conn.__enter__.return_value = conn
+                result = {"ok": okay, **({} if okay else {"reason": "synthetic backfill failure"})}
+                with self._patch_run("CONSOLIDATE_NIGHTLY", lambda *a, **k: mock.Mock(returncode=0), "khipu-nightly"), \
+                     mock.patch.object(jobs, "_provenance_nightly", side_effect=actual), \
+                     mock.patch("khipu.db.connect", return_value=conn), \
+                     mock.patch.object(jobs, "_provenance_backfill", return_value=result) as backfill, \
+                     mock.patch.object(jobs, "_mark_stale_commitments"), \
+                     mock.patch.object(jobs, "_reconcile_notes_if_due", return_value={"ok": True}):
+                    self.assertEqual(jobs.run_nightly(), 0 if okay else 1)
+                backfill.assert_called_once_with(conn)
+                receipt = json.loads((self.data_dir / "nightly-last.json").read_text())
+                entry = next(e for e in receipt['steps'] if e['name'] == 'provenance_backfill')
+                self.assertEqual(entry['ok'], okay)
+                self.assertFalse(any(e['name'] in ('commitments_close_rules', 'commitments_hygiene') for e in receipt['steps']))
+
+    def test_provenance_backfill_retries_a_damaged_connection_without_losing_failure(self):
+        first, second = mock.MagicMock(), mock.MagicMock()
+        for conn in (first, second):
+            conn.__enter__.return_value = conn
+        with mock.patch("khipu.db.connect", side_effect=[first, second]), \
+             mock.patch.object(jobs, "_nightly_log"), \
+             mock.patch.object(jobs, "_provenance_backfill", side_effect=[
+                 {"ok": False, "transient": True, "connection_unusable": True, "reason": "lost connection"},
+                 {"ok": True}]) as backfill:
+            out = jobs._provenance_nightly()
+        self.assertFalse(out['ok'])
+        self.assertTrue(out['retry']['ok'])
+        self.assertEqual([call.args[0] for call in backfill.call_args_list], [first, second])
+        first.close.assert_called_once_with()
+        first.commit.assert_not_called()
+        second.commit.assert_called_once_with()
 
     def test_run_monthly_passes_dry_run(self):
         captured: list[list[str]] = []

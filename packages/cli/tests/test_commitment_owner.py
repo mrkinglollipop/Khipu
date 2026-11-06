@@ -7,8 +7,8 @@ speaker's own "I will" (conditional or not) is the speaker's; "Bob will
 review" or "the reviewer must" names a third party (owner ``agent`` with that
 label), whoever says it and in any session; and a dispatched job's "user" is
 the orchestrator that wrote its brief, so a job's questions, its "Matt to
-decide X" and its user's "I will" belong to the orchestrator. Nothing is
-dropped: only the owner and where an item shows change.
+decide X" and its user's "I will" belong to the orchestrator. Inferred owner
+work is now dropped from conversation captures; agent work remains.
 
 No live database except the last class, which uses the throwaway PostgreSQL
 of tests/hermetic_pg.py (a hub at migration 0029, so without 0033's columns).
@@ -160,15 +160,13 @@ class JobRulesTest(unittest.TestCase):
         self.assertEqual(co.capture_origin(CONVERSATION), "conversation")
         self.assertEqual(co.capture_origin(JOB), "job")
 
-    def test_a_conversations_question_stays_the_users(self):
+    def test_a_conversations_extracted_owner_question_is_not_created(self):
         text = "Should the export include archived rows or only live ones?"
         cur = _OwnerCursor()
         _open(cur, CONVERSATION, {"text": text, "kind": "question", "owner": "user"})
-        row = _by_text(cur, text)
-        self.assertEqual((row["owner"], row["owner_label"], row["origin"]),
-                         ("user", None, "conversation"))
+        self.assertEqual(cur.rows, {})
 
-    def test_no_item_is_dropped_counts_in_equal_counts_out(self):
+    def test_only_conversation_owner_items_are_dropped(self):
         loops = [
             {"text": "Matt to decide whether the release ships with the seal fix", "kind": "question"},
             {"text": "The orchestrator must resolve the rebase conflict", "kind": "blocker"},
@@ -179,11 +177,11 @@ class JobRulesTest(unittest.TestCase):
         ]
         for base, origin in ((JOB, "job"), (CONVERSATION, "conversation")):
             cur = _OwnerCursor()
-            self.assertEqual(_open(cur, base, *loops), len(loops))
+            self.assertEqual(_open(cur, base, *loops), 5 if origin == "job" else 2)
             self.assertEqual({r["origin"] for r in cur.rows.values()}, {origin})
             # Read back: every row is listed, none filtered out by its owner.
             listed = co.list_owed(cur, project="acme/widget", limit=None)
-            self.assertEqual(len(listed), len(loops))
+            self.assertEqual(len(listed), 5 if origin == "job" else 2)
         # From a job nothing stays the user's; a promise stays the job's own.
         owners = {r["text"]: r["owner"] for r in co.list_owed(_seeded_job_cursor(loops),
                                                               project="acme/widget", limit=None)}
@@ -198,35 +196,13 @@ def _seeded_job_cursor(loops):
 
 
 class RelayTest(unittest.TestCase):
-    def test_a_conversation_item_closes_the_matching_job_item_not_itself(self):
-        cur = _OwnerCursor()
-        job_text = "Matt to decide whether the export includes archived rows"
-        _open(cur, JOB, {"text": job_text, "kind": "question"}, episode=1)
-        conv_text = "Matt to decide whether the export includes archived rows or not"
-        self.assertEqual(_open(cur, CONVERSATION, {"text": conv_text, "kind": "question"}, episode=2), 1)
-        job_row, conv_row = _by_text(cur, job_text), _by_text(cur, conv_text)
-        self.assertEqual(conv_row["status"], "open")
-        self.assertEqual(conv_row["owner"], "user")
-        self.assertEqual(job_row["status"], "closed")
-        self.assertEqual(job_row["close_reason"], f"relayed-by {conv_row['id']}")
-
-    def test_an_identical_relay_closes_the_job_item_and_opens_the_users(self):
+    def test_summary_owner_question_does_not_close_a_matching_job_item(self):
         cur = _OwnerCursor()
         text = "Matt to decide whether the export includes archived rows"
-        _open(cur, JOB, {"text": text, "kind": "question"}, episode=1)
-        self.assertEqual(_open(cur, CONVERSATION, {"text": text, "kind": "question"}, episode=2), 1)
-        rows = sorted(cur.rows.values(), key=lambda r: r["id"])
-        self.assertEqual([r["status"] for r in rows], ["closed", "open"])
-        self.assertEqual(rows[0]["close_reason"], f"relayed-by {rows[1]['id']}")
-        self.assertEqual(rows[1]["origin"], "conversation")
-
-    def test_a_job_item_never_closes_a_conversation_item(self):
-        cur = _OwnerCursor()
-        conv_text = "Matt to decide whether the export includes archived rows"
-        _open(cur, CONVERSATION, {"text": conv_text, "kind": "question"}, episode=1)
-        _open(cur, JOB, {"text": conv_text + " or not", "kind": "question"}, episode=2)
-        self.assertEqual(_by_text(cur, conv_text)["status"], "open")
-        self.assertFalse(any(r["status"] == "closed" for r in cur.rows.values()))
+        self.assertEqual(_open(cur, JOB, {"text": text, "kind": "question"}), 1)
+        self.assertEqual(_open(cur, CONVERSATION, {"text": text, "kind": "question"}, episode=2), 0)
+        self.assertEqual(len(cur.rows), 1)
+        self.assertEqual(_by_text(cur, text)["status"], "open")
 
 
 def _owed_row(cid, text, owner, *, kind="followup", label=None, origin="conversation"):
@@ -287,27 +263,14 @@ class SessionStartSliceTest(unittest.TestCase):
             + [_owed_row(10 + i, f"Rebase the PR #{i} stack onto main", "agent", label="orchestrator",
                          origin="job") for i in range(5)])
 
-    def test_a_conversation_sees_at_most_three_orchestrator_items_marked(self):
-        from khipu import recall_rule
-
-        data = _slice(self.ROWS)
-        agents = [c for c in data["commitments"] if c["owner"] == "agent"]
-        self.assertEqual(len(agents), 3)
-        text = recall_rule._render_project_slice("acme/widget", data)
-        items = [line for line in text.splitlines() if line.startswith("- [")]
-        self.assertEqual(sum("(for the orchestrator)" in line for line in items), 3)
-        self.assertEqual(sum("(needs the user)" in line for line in items), 2)
-        for line in text.splitlines():
-            if "PR #" in line:
-                self.assertNotIn("needs the user", line)
-
-    def test_a_job_session_sees_no_orchestrator_items(self):
-        data = _slice(self.ROWS, job=True)
-        self.assertEqual([c["owner"] for c in data["commitments"]], ["user", "user"])
-
-    def test_zero_lifts_the_orchestrator_cap(self):
-        data = _slice(self.ROWS, cap=0)
-        self.assertEqual(sum(c["owner"] == "agent" for c in data["commitments"]), 5)
+    def test_conversation_and_job_slices_do_not_fetch_commitments(self):
+        for job in (False, True):
+            with self.subTest(job=job):
+                data = _slice(self.ROWS, job=job)
+            self.assertEqual(data["commitments"], [])
+            # Neither conversation nor job sessions render the removed block.
+            from khipu import recall_rule
+            self.assertNotIn("Open commitments", recall_rule._render_project_slice("acme/widget", data))
 
     def test_the_cap_is_a_count_setting_with_a_default_of_three(self):
         from khipu import config
@@ -327,8 +290,7 @@ class WaitingOnYouTest(unittest.TestCase):
                          "kind": "question"}, episode=1)
         _open(cur, JOB, {"text": "The orchestrator must resolve the rebase conflict",
                          "kind": "blocker"}, episode=1)
-        _open(cur, CONVERSATION, {"text": "Matt must supply the second Mac's hostname",
-                                  "kind": "blocker"}, episode=2)
+        cur._seed("Matt must supply the second Mac's hostname", kind="blocker", owner="user", episode=2)
 
         class Conn:
             def cursor(self):
@@ -463,9 +425,9 @@ def test_a_pre_migration_hub_still_answers_reads_and_writes(hub):  # noqa: F811
         ep = _episode(cur)
         assert _pg_open(cur, JOB, "Matt to decide whether the release ships with the seal fix",
                         "question", ep) == 1
-        assert _pg_open(cur, CONVERSATION, "Matt must supply the second Mac's hostname", "blocker", ep) == 1
+        assert _pg_open(cur, CONVERSATION, "Matt must supply the second Mac's hostname", "blocker", ep) == 0
         rows = co.list_owed(cur, project="acme/widget", limit=None)
-        assert sorted(r["owner"] for r in rows) == ["agent", "user"]
+        assert sorted(r["owner"] for r in rows) == ["agent"]
     conn.commit()
     db._TABLE_COLUMNS_CACHE.clear()
     hub.migrate()
@@ -479,10 +441,9 @@ def test_a_pre_migration_hub_still_answers_reads_and_writes(hub):  # noqa: F811
         ep = _episode(cur)
         assert _pg_open(cur, JOB, "The orchestrator must resolve the rebase conflict", "blocker", ep) == 1
         cur.execute("SELECT origin, owner, owner_label FROM commitments ORDER BY id")
-        assert cur.fetchall() == [("conversation", "agent", None), ("conversation", "user", None),
-                                  ("job", "agent", "orchestrator")]
+        assert cur.fetchall() == [("conversation", "agent", None), ("job", "agent", "orchestrator")]
         rows = co.list_owed(cur, project="acme/widget", limit=None)
-        assert len(rows) == 3
+        assert len(rows) == 2
     conn.commit()
 
 
@@ -604,9 +565,15 @@ def test_the_owner_comes_from_the_session_not_the_words(text, kind, declared, la
             cur = _OwnerCursor()
             loop = {"text": text, "kind": kind, **({"owner": declared} if declared else {}),
                     **({"owner_label": label} if label else {})}
-            assert _open(cur, JOB if origin == "job" else CONVERSATION, loop) == 1
-            row = _by_text(cur, text)
-            assert (row["owner"], row.get("owner_label")) == expected
+            assert co.resolve_owner_and_label(text, kind=kind, declared=declared, declared_label=label,
+                                              origin=origin) == expected
+            inserted = _open(cur, JOB if origin == "job" else CONVERSATION, loop)
+            if expected[0] == "user":
+                assert inserted == 0 and not cur.rows
+            else:
+                assert inserted == 1
+                row = _by_text(cur, text)
+                assert (row["owner"], row.get("owner_label")) == expected
         finally:
             co.reset_user_patterns()
 
@@ -632,8 +599,8 @@ def test_an_assistant_duplicate_cannot_swallow_the_owners_new_promise():
         _open(cur, CONVERSATION, {"text": "I will review the deployment checklist before release",
                                   "kind": "promise", "owner": "user"}, episode=2)
         user_rows = [r for r in co.list_owed(cur, project="acme/widget", limit=None) if r["owner"] == "user"]
-        assert user_rows, "The owner made a real promise, but dedup kept only an assistant-owned row"
-        assert any("I will" in r["text"] for r in user_rows), "His promise text must survive"
+        assert user_rows == [], "Summary extraction must not create owner promises"
+        assert len(cur.rows) == 1
 
 
 def test_reviewer_work_in_a_conversation_must_not_die_with_the_session(monkeypatch):
@@ -673,15 +640,15 @@ def test_similar_items_of_different_owners_both_stay_and_same_owner_restatements
     cur = _OwnerCursor()
     _open(cur, CONVERSATION, {"text": "Review the deployment checklist before release", "kind": "followup",
                               "owner": "assistant"})
-    # The same words, the owner's own: a second row, not a fold.
+    # Summary-derived owner wording must not create a second row.
     assert _open(cur, CONVERSATION, {"text": "Review the deployment checklist before release",
-                                     "kind": "followup", "owner": "user"}, episode=2) == 1
+                                     "kind": "followup", "owner": "user"}, episode=2) == 0
     owners = sorted(r["owner"] for r in cur.rows.values())
-    assert owners == ["assistant", "user"]
+    assert owners == ["assistant"]
     # The assistant restating its own item folds into it.
     assert _open(cur, CONVERSATION, {"text": "Review the deployment checklist before the release",
                                      "kind": "followup", "owner": "assistant"}, episode=3) == 0
-    assert len(cur.rows) == 2
+    assert len(cur.rows) == 1
 
 
 # ---- the fourth review ------------------------------------------------------
@@ -738,51 +705,29 @@ class _RelayCursor(_OwnerCursor):
         super().execute(sql, params)
 
 
-def test_reopened_job_relay_does_not_swallow_a_renewed_owner_question(monkeypatch):
+def test_reopened_job_item_is_not_closed_by_a_summary_owner_question(monkeypatch):
     monkeypatch.setattr(co, "_close_columns_ready", lambda cur: True)
     monkeypatch.setattr(co, "_lineage_columns_ready", lambda cur: False)
     monkeypatch.setattr(co, "_reassigned_column_ready", lambda cur: False)
     cur = _RelayCursor()
     text = "Matt to decide whether the export includes archived rows"
     assert _open(cur, JOB, dict(text=text, kind="question", owner="user")) == 1
-    assert _open(cur, CONVERSATION, dict(text=text, kind="question", owner="user"), episode=2) == 1
-    assert cur.rows[1]["status"] == "closed"
-    assert co.set_status(cur, 2, "closed", reason="Owner closed the relayed item", by=co.BY_APP)
+    assert co.set_status(cur, 1, "closed", reason="Job finished", by=co.BY_APP)
     assert co.set_status(cur, 1, "open", by=co.BY_APP)
-    assert cur.rows[1]["reopened_rule_keys"] == [co.evidence_key("relayed-by", text)]
-    inserted = _open(cur, CONVERSATION, dict(text=text, kind="question", owner="user"), episode=4)
-    own = [r for r in cur.rows.values() if r["owner"] == "user" and r["status"] == "open"]
-    assert inserted == 1 and own, f"the owner question was swallowed: inserted={inserted}, rows={cur.rows}"
-    # The reopened job item stays open beside it.
-    assert cur.rows[1]["status"] == "open"
+    assert _open(cur, CONVERSATION, dict(text=text, kind="question", owner="user"), episode=4) == 0
+    assert cur.rows[1]['status'] == 'open'
+    assert not any(r['owner'] == 'user' for r in cur.rows.values())
 
 
-def test_a_renewed_owner_question_after_a_reopened_relay_is_visible_on_the_hub(hub):  # noqa: F811
+def test_summary_owner_question_cannot_replace_a_job_item_on_the_hub(hub):  # noqa: F811
     from khipu import db
-
-    conn = hub.connect()
-    hub.migrate(conn=conn)
-    db._TABLE_COLUMNS_CACHE.clear()
-    text = "Matt to decide whether the export includes archived rows"
-
-    def _ep(cur, n):
-        announce(cur)
-        cur.execute("INSERT INTO episodes (ts, summary, raw) VALUES (now(), %s, '{}'::jsonb) RETURNING id",
-                    (f"episode {n}",))
-        return int(cur.fetchone()[0])
-
-    with conn.cursor() as cur:
-        assert _pg_open(cur, JOB, text, "question", _ep(cur, 1)) == 1
-        assert _pg_open(cur, CONVERSATION, text, "question", _ep(cur, 2)) == 1
-        cur.execute("SELECT id, origin, status FROM commitments ORDER BY id")
-        (job_id, _, job_status), (conv_id, _, _) = cur.fetchall()
-        assert job_status == "closed"
-        assert co.set_status(cur, conv_id, "closed", reason="answered", by=co.BY_APP)
-        assert co.set_status(cur, job_id, "open", by=co.BY_APP)
-        assert _pg_open(cur, CONVERSATION, text, "question", _ep(cur, 3)) == 1
-    conn.commit()
-    with conn.cursor() as cur:
-        rows = co.list_owed(cur, project="acme/widget", limit=None)
-        mine = [r for r in rows if r["owner"] == co.OWNER_USER and r["text"] == text]
-        assert len(mine) == 1, rows
-        assert any(r["id"] == job_id for r in rows), "the reopened job item stays open too"
+    with hub.connect() as conn:
+        hub.migrate(conn=conn)
+        db._TABLE_COLUMNS_CACHE.clear()
+        with conn.cursor() as cur:
+            text = "Matt to decide whether the export includes archived rows"
+            episode = _episode(cur)
+            assert _pg_open(cur, JOB, text, "question", episode) == 1
+            assert _pg_open(cur, CONVERSATION, text, "question", episode) == 0
+            rows = co.list_owed(cur, project="acme/widget", limit=None)
+            assert len(rows) == 1 and rows[0]['owner'] == 'agent' and rows[0]['status'] == 'open'

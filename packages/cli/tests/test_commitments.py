@@ -763,11 +763,8 @@ class PrecisionFilterTest(unittest.TestCase):
             "Send 'screen free' message to Khipu session",
             "Matt to decide whether 0.3.17 ships with the seal fix",
         ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
-        self.assertEqual(
-            [r["text"] for r in cur.rows.values()],
-            ["Matt to decide whether 0.3.17 ships with the seal fix"],
-        )
+        self.assertEqual(co.open_from_episode(cur, payload, 1), 0)
+        self.assertEqual(list(cur.rows.values()), [])
 
 
 class OpenDedupTest(unittest.TestCase):
@@ -775,14 +772,14 @@ class OpenDedupTest(unittest.TestCase):
     across successive captures of one session."""
 
     payload = {"project": "acme/widget", "open_loops": [
-        "Matt to decide whether the seal fix ships in 0.3.17",
+        "Check whether the seal fix ships in 0.3.17",
     ]}
 
     def test_paraphrase_does_not_open_a_second_row(self):
         cur = _CommitmentsCursor(migrated=True)
         co.open_from_episode(cur, self.payload, 1)
         again = {"project": "acme/widget", "open_loops": [
-            "Matt to decide whether the seal fix ships in 0.3.17 or waits",
+            "Check whether the seal fix ships in 0.3.17 or waits",
         ]}
         with mock.patch.object(co, "_has_commitment_embeddings", _has_no_embeddings):
             self.assertEqual(co.open_from_episode(cur, again, 2), 0)
@@ -810,7 +807,7 @@ class OpenDedupTest(unittest.TestCase):
         co.open_from_episode(cur, self.payload, 1)
         cid = list(cur.rows.keys())[0]
         other = {"project": "acme/widget", "open_loops": [
-            "Matt should choose between shipping and holding the release",
+            "Investigate release readiness and deployment status",
         ]}
         with mock.patch.object(co, "_has_commitment_embeddings", _has_embeddings), \
                 mock.patch.object(co, "_cosine_scores", return_value={cid: 0.93}):
@@ -1164,11 +1161,8 @@ class ReportingRuleTest(unittest.TestCase):
             "Reply with the SHA each PR now points at.",
             "Matt to decide whether 0.3.17 ships with the seal fix",
         ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
-        self.assertEqual(
-            [r["text"] for r in cur.rows.values()],
-            ["Matt to decide whether 0.3.17 ships with the seal fix"],
-        )
+        self.assertEqual(co.open_from_episode(cur, payload, 1), 0)
+        self.assertEqual(list(cur.rows.values()), [])
 
 
 class OpenStoresOwnerAndTriggerTest(unittest.TestCase):
@@ -1178,9 +1172,9 @@ class OpenStoresOwnerAndTriggerTest(unittest.TestCase):
             {"text": "Matt must merge the stacked PRs", "owner": "Matt"},
             {"text": "Rebuild the search index", "owner": "Peer 1"},
         ]}
-        self.assertEqual(co.open_from_episode(cur, payload, 1), 2)
+        self.assertEqual(co.open_from_episode(cur, payload, 1), 1)
         owners = {r["text"]: r["owner"] for r in cur.rows.values()}
-        self.assertEqual(owners["Matt must merge the stacked PRs"], "user")
+        self.assertNotIn("Matt must merge the stacked PRs", owners)
         self.assertEqual(owners["Rebuild the search index"], "assistant")
 
     def test_future_trigger_is_stored_when_the_column_exists(self):

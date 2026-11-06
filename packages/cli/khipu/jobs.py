@@ -552,15 +552,14 @@ def _run_nightly_locked() -> int:
     _record_nightly_step(steps, "storage_sweep", **_step_result(sweep_result),
                          deferred=sweep_result.get("deferred") if isinstance(sweep_result, dict) else None)
     _record_nightly_step(steps, "owner_actions_chain", **_step_result(_owner_actions_chain()))
-    completion_result = _step_result(_commitment_close_rules())
-    _record_nightly_step(steps, "commitments_close_rules", **completion_result)
+    provenance_result = _step_result(_provenance_nightly())
+    _record_nightly_step(steps, "provenance_backfill", **provenance_result)
     # Its own step: it used to ride at the end of close-rules and was skipped
     # whenever anything before it there raised.
     changes_result = _fact_changes_prune()
     _record_nightly_step(steps, "fact_changes_prune", **_step_result(changes_result),
                          deferred=changes_result.get("deferred") if isinstance(changes_result, dict) else None)
     _record_nightly_step(steps, "commitments_mark_stale", **_step_result(_mark_stale_commitments()))
-    _record_nightly_step(steps, "commitments_hygiene", **_step_result(_hygiene_commitments()))
     _record_nightly_step(steps, "ledger", **_step_result(_ledger_nightly()))
     receipt_result = _receipt_prune()
     _record_nightly_step(steps, "receipt_prune", **_step_result(receipt_result),
@@ -580,7 +579,7 @@ def _run_nightly_locked() -> int:
                              deferred=briefs_result.get("deferred")
                              if isinstance(briefs_result, dict) else None)
     briefs_ok = briefs_result is None or _step_result(briefs_result)["ok"]
-    final_rc = rc or (0 if drain_result["ok"] and briefs_ok and completion_result["ok"] else 1)
+    final_rc = rc or (0 if drain_result["ok"] and briefs_ok and provenance_result["ok"] else 1)
     _write_job_state("nightly", final_rc)
     return final_rc
 
@@ -1187,9 +1186,9 @@ def _provenance_outcome(out: dict[str, Any]) -> dict[str, Any]:
 
 
 def _provenance_backfill(conn) -> dict[str, Any]:
-    """``khipu provenance backfill`` inside the nightly's close-rules step,
-    until every project is covered. Errors remain visible and the rules
-    still run; only transient database errors are nonfatal to the nightly."""
+    """Witness backfill, gap replay and identity indexing until projects are covered.
+    The nightly wrapper records failures and retries damaged connections.
+    """
     out: dict[str, Any] = {}
     try:
         from khipu import provenance
@@ -1224,13 +1223,50 @@ def _provenance_backfill(conn) -> dict[str, Any]:
     return _provenance_outcome(out)
 
 
+def _provenance_nightly() -> dict[str, Any]:
+    """Keep witness backfill, gap replay and identity indexing independent of Owed rules.
+
+    A damaged connection gets one fresh attempt. Keep the first failure in
+    the receipt even if the retry succeeds; any failure makes this night nonzero.
+    """
+    from khipu.db import connect
+
+    attempts = []
+    for attempt in range(2):
+        try:
+            with connect() as conn:
+                result = _provenance_outcome(_provenance_backfill(conn))
+                if result.get("connection_unusable"):
+                    conn.close()
+                else:
+                    conn.commit()
+        except Exception as exc:  # independent nightly steps must still run
+            result = {"ok": False, "reason": f"{type(exc).__name__}: {exc}",
+                      "transient": _transient_provenance_error(exc)}
+        attempts.append(result)
+        if not (result.get("connection_unusable") or result.get("transient")) or attempt:
+            break
+    failures = [r for r in attempts if not r.get("ok", True)]
+    out = {"ok": not failures, "provenance": attempts[0]}
+    if len(attempts) > 1:
+        out["retry"] = attempts[1]
+    if failures:
+        fatal = [r for r in failures if not r.get("transient", False)]
+        out["reason"] = (fatal or failures)[0].get("reason") or "provenance backfill failed"
+    _nightly_log(f"provenance-backfill: {json.dumps(out, default=str)[:600]}")
+    return out
+
+
 def _commitment_close_rules() -> dict[str, Any]:
-    """Owed slice 2: the fact-provenance witness backfill while projects
+    """Legacy direct wrapper, still exercised by close-rule/provenance tests.
+
+    Not called by the nightly. Retained with those tests, whose removal is
+    outside this slice. Owed slice 2: fact-provenance witness backfill while projects
     are pending, fill ``prs`` on rows from before migration 0034, then
     run the PR and decision close rules over every open item
     (``close_rules.run_nightly``). Before mark_stale, so an item whose PR merged
-    closes as done rather than aging out. Failure is recorded without blocking
-    the remaining steps, and makes a successful driver's nightly nonzero."""
+    closes as done rather than aging out. Its returned outcome is consumed
+    only by direct callers; the nightly has its own provenance-only step."""
     witness: dict[str, Any] | None = None
     preparation: dict[str, Any] | None = None
     try:
@@ -1276,43 +1312,6 @@ def _commitment_close_rules() -> dict[str, Any]:
         out["ok"] = False
         out.setdefault("reason", witness.get("reason") or witness.get("error") or "provenance backfill failed")
     _nightly_log(f"commitments-close-rules: {json.dumps(out, default=str)[:300]}")
-    return out
-
-
-def _hygiene_commitments() -> dict[str, Any]:
-    """W3 Owed quality (2026-09-05): run the two hygiene passes every night
-    instead of only on demand via `khipu hygiene commitments`.
-
-    Same posture as `_mark_stale_commitments` — a backup first
-    (``hygiene.backup_commitments``, never DELETEs), then the model-free
-    ownership pass (``run_session_ended_pass``) and the re-judge/dedup pass
-    (``run_commitments_hygiene``), both applied. Fail-open: a failure here is
-    logged and must never turn a good nightly into a bad one (the external
-    CONSOLIDATE_NIGHTLY driver's exit code is what gates job_status/doctor).
-    """
-    try:
-        from khipu import hygiene
-        from khipu.db import connect
-
-        with connect() as conn:
-            backup_dir = hygiene.backup_commitments(conn)
-            with conn.cursor() as cur:
-                session_report = hygiene.run_session_ended_pass(cur, apply=True)
-                rejudge_report = hygiene.run_commitments_hygiene(cur, apply=True)
-            conn.commit()
-        _nightly_log(
-            f"[khipu-hygiene] session-ended {session_report.get('counts')} · "
-            f"rejudge {rejudge_report.get('counts')} · backup {backup_dir}"
-        )
-        out = {
-            "ok": True, "session_ended": session_report.get("counts"),
-            "rejudge": rejudge_report.get("counts"), "backup": str(backup_dir),
-        }
-    except Exception as exc:  # noqa: BLE001 — nightly must not fail on this
-        from khipu.storage import describe_os_error
-
-        _nightly_log(f"[khipu-hygiene] skipped: {describe_os_error(exc)}")
-        out = {"ok": False, "error": describe_os_error(exc)}
     return out
 
 
@@ -1415,6 +1414,10 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
         "owner_actions_chain",
         "open Owner actions and check the entry the doctor row names",
     ),
+    "provenance_backfill_ok": (
+        "provenance_backfill",
+        "check the provenance backfill failure and retry the nightly",
+    ),
     "fact_changes_prune_ok": (
         "fact_changes_prune",
         "run `khipu jobs install nightly` or wait for the next nightly",
@@ -1422,14 +1425,6 @@ _NIGHTLY_STEP_CHECKS: dict[str, tuple[str, str]] = {
     "receipt_prune_ok": (
         "receipt_prune",
         "run `khipu jobs install nightly` or wait for the next nightly",
-    ),
-    "commitments_close_rules_ok": (
-        "commitments_close_rules",
-        "run `khipu jobs install nightly` or wait for the next nightly",
-    ),
-    "commitments_hygiene_ok": (
-        "commitments_hygiene",
-        "run `khipu hygiene commitments` and check the error",
     ),
     "mark_stale_ok": (
         "commitments_mark_stale",

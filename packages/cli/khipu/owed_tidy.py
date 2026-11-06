@@ -131,6 +131,9 @@ def _log(msg: str) -> None:
 # ---- reading ----------------------------------------------------------------
 
 
+ALL_PROJECTS = "<all-owner-items>"
+
+
 def _select(cur, project: str, *, ids: list[int] | None = None, lock: bool = False) -> dict[int, dict]:
     """``{id: row}`` for the project's open items (or for ``ids``, any
     status), with the opening capture's parent session as ``lineage``.
@@ -148,6 +151,9 @@ def _select(cur, project: str, *, ids: list[int] | None = None, lock: bool = Fal
                    "WHERE e.id = commitments.opened_episode)")
     where = "project IS NOT DISTINCT FROM %s AND " + ("id = ANY(%s)" if ids is not None else "status = 'open'")
     params: tuple = (project, list(ids)) if ids is not None else (project,)
+    if project == ALL_PROJECTS:
+        where = "id = ANY(%s)" if ids is not None else "status = 'open'"
+        params = (list(ids),) if ids is not None else ()
     cur.execute(f"SELECT {', '.join(cols)}, {lineage} FROM commitments WHERE {where} "
                 f"AND {_not_forgotten_clause(cur)} ORDER BY id{' FOR UPDATE' if lock else ''}", params)
     out = {}
@@ -565,6 +571,10 @@ def apply(doc: dict[str, Any], *, owner_gate: str | None = None) -> dict[str, An
     from khipu import commitments as co, offline
     from khipu.db import connect
 
+    from khipu import owed_reset
+    if isinstance(doc, dict) and doc.get("format") == owed_reset.FORMAT:
+        return owed_reset.apply(doc, owner_gate=owner_gate)
+
     why = _check_plan(doc)
     if why:
         return {"ok": False, "changed": 0, "error": why + "; nothing was changed"}
@@ -673,7 +683,7 @@ BULK_PRIOR_FIELDS = (*PRIOR_FIELDS, "due_after")
 
 
 def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
-               gate: str | None, origin_correction: bool = False) -> tuple[dict[int, bool], list[str]]:
+               gate: str | None, origin_correction: bool = False, all_projects: bool = False) -> tuple[dict[int, bool], list[str]]:
     # forget-fence: owner bulk write; returns changed flags and batch ids (rows via the fenced _select)
     """Apply ``change(cid) -> bool`` (a close, reopen, snooze or reassign) to
     ``ids`` as undoable batches, one per project, in the caller's
@@ -688,6 +698,8 @@ def bulk_batch(cur, ids: list[int], action: str, change, *, reason: str,
     by_project: dict[str | None, list[int]] = {}
     for cid, project in cur.fetchall():
         by_project.setdefault(project, []).append(int(cid))
+    if all_projects:
+        by_project = {ALL_PROJECTS: list(ids)}
     changed: dict[int, bool] = {}
     batches: list[str] = []
     for project, pids in by_project.items():

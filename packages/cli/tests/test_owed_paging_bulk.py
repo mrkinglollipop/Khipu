@@ -717,9 +717,11 @@ def test_similar_items_of_two_owners_both_stay_linked_on_the_hub(owed):
             assert co.open_from_episode(cur, dict(base, open_loops=[
                 {"text": "Review the deployment checklist before release", "kind": "followup",
                  "owner": "assistant"}]), ep) == 1
-            assert co.open_from_episode(cur, dict(base, open_loops=[
-                {"text": "I will review the deployment checklist before release", "kind": "promise",
-                 "owner": "user"}]), ep) == 1
+            from tests.fact_seed import owner_commitment
+            cur.execute("SELECT id FROM commitments WHERE opened_episode = %s", (ep,))
+            assistant = cur.fetchone()[0]
+            owner_commitment(cur, "I will review the deployment checklist before release", project=PROJECT,
+                             episode_id=ep, kind="promise", linked_ids=[assistant])
             assert co.open_from_episode(cur, dict(base, open_loops=[
                 {"text": "Review the deployment checklist before the release", "kind": "followup",
                  "owner": "assistant"}]), ep) == 0

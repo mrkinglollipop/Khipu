@@ -539,6 +539,9 @@ _WORDING = {
 # section 4's legacy proof must be re-checked before it is added here.
 # "dynamic" is an UPDATE whose SET list is built at run time.
 WORDING_WRITERS = {
+    # Explicit asks declare the writer and record a source (or NULL-source
+    # manual) claim, then project in the same owner-write transaction.
+    ("explicit_asks", "_write_ask", "INSERT INTO commitments"),
     # prs from the anchor's own text (rows from before 0034).
     ("close_rules", "backfill_prs", "UPDATE commitments"),
     # pr_check notes; keeps refs as they were (and drops needs_owner: phase 3).

@@ -454,7 +454,8 @@ class IdleSweepTest(unittest.TestCase):
 
     def test_dry_run_lists_sessions_and_unread_counts(self):
         _, st = self.session(session_id="original:id")
-        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+        with mock.patch("khipu.session_capture.time.time", return_value=self.now), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             cli.main(["sessions", "sweep", "--dry-run", "--limit", "1"])
         session = json.loads(stdout.getvalue())["sessions"][0]
         self.assertEqual((session["harness"], session["session_id"], session["unread_turns"]),

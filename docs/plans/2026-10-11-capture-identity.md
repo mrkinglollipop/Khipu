@@ -444,6 +444,7 @@ entry with the reason it holds no capture data. A new writer therefore cannot sh
 | legacy writer | data folder `.legacy_writers/<pgid>.json` | the process group of a legacy writer that may still append | scan "legacy writers" |
 | recall golden set | data folder `recall-golden.jsonl`, or the file `KHIPU_RECALL_GOLDEN` names | recall test queries, which usually quote a captured episode's private text, with the episode ids each expects | scan "recall golden": every line naming the episode in `expect` or `stale` is dropped; a file that cannot be read or judged keeps the forget open |
 | work view | data folder `state/work/view.json` and `.view.json.*.tmp` rewrites beside it (the same writer, `work._write_json`, saves `last/*.json`, `links.json` and `hidden.json` there: job summaries, ids and hashes only) | the Work view's read model, which lists open commitments' text | scan "work view": the saved view and its temps are removed, since forget has just closed the commitments the episode opened; the next `khipu work` writes it again without them; a file that cannot be listed or removed keeps the forget open |
+| Owed reset export | owner-chosen `owed reset --export FILE` and `FILE.sha256` | capture-derived commitment rows and lineage | kept: external copy; forget cannot find or erase it; disclosed in export output and help |
 | recall eval record | a file the owner names with `khipu recall eval --record` | the golden queries, quoted text included, and the ids each returned | kept: an owner-chosen file outside the data folder that forget cannot find |
 | session state | capture home `state/<harness>--<session>.json` and `.capture-now.json` | offsets and hashes; carried text and a capture note not yet queued | none: the carried text belongs to the next window, which is refused when queued if its source is forgotten |
 | capture log | capture home `logs/session-capture.log` | drain and hook events: file names, counts and lengths | none: it never holds summary or transcript text |
@@ -549,3 +550,5 @@ Limits accepted for this merge, each a follow-up rather than a blocker:
 - **A recall golden line is matched by episode id only.** A line whose query quotes a forgotten episode
   but whose `expect` names only a topic or another episode is kept, since the registry holds identities and
   ids, never the forgotten text.
+
+The Owed reset export is an external archive copy: a later forget does not reach it. The export command reports this boundary and its help states it; no automatic archive scan is installed.

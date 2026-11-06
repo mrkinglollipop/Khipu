@@ -61,7 +61,7 @@ def test_slice_marks_only_the_current_lineages_assistant_items_yours(
     rendered = recall_rule._render_project_slice(
         'p', activity.project_slice(project='p', host_session_id='codex:this-root'),
     )
-    assert ('(yours)' in rendered) is expected
+    assert '(yours)' not in rendered
 
 
 @pytest.mark.parametrize('owner', ['user', 'assistant', 'agent'])
@@ -123,8 +123,8 @@ def test_lineage_comes_from_the_opening_episode_when_owed_rows_have_no_session(
     monkeypatch.setattr(config, 'load_config', lambda: {})
     rendered = recall_rule._render_project_slice(
         'p', activity.project_slice(project='p', host_session_id='codex:this-root'))
-    assert ('(yours)' in rendered) is expected
-    assert 'I will send the final report' in rendered
+    assert '(yours)' not in rendered
+    assert 'I will send the final report' not in rendered
     # The slice's one batched column read (information_schema) runs first by design.
     lineage = [q for q in queries if 'information_schema' not in q]
-    assert ('e.parent_session_id' in lineage[0]) is has_parent
+    assert not any('SELECT c.id, e.session_id' in q for q in lineage)

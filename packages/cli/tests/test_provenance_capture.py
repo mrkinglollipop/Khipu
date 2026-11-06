@@ -318,6 +318,11 @@ def test_capture_schedules_project_only_live_claims(pg, schedule):
             out = capture.write_pg(_payload(**CAPTURES[step]))
             assert out["episode_inserted"], (schedule, step)
             eid = out["episode_id"]
+            if CAPTURES[step].get('owner') == 'user':
+                from tests.fact_seed import owner_commitment
+                with pg.connect() as conn, conn.cursor() as cur:
+                    owner_commitment(cur, CAPTURES[step]['loop'], project=PROJECT, episode_id=eid,
+                                     kind=CAPTURES[step]['kind'])
             seen.append(eid)
             titled = CAPTURES[step].get("title", "default") is not None
             want = {"commitment", "decision"} | ({"deliverable"} if titled else set())

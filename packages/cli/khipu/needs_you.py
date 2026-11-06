@@ -23,7 +23,7 @@ from khipu import owner_direction, routing
 
 CONFIRM_KINDS = ("priority", "rule", "setting", "accounts", "tier_table", "cap_proposal", "held",
                  "job_origin", "project_pair", "forget_send", "forget_id", "log_alarm", "override_review")
-LOOK_KINDS = ("remind", "signin", "interrupted")
+LOOK_KINDS = ("remind", "signin", "interrupted", "ask")
 KINDS = CONFIRM_KINDS + LOOK_KINDS
 
 SETTLE_ACTIONS = owner_direction.SETTLE_ACTIONS
@@ -104,7 +104,7 @@ HOW_TO_SETTLE = (
     "the account list, but has no place for a request held from a conversation. A settle of null means no such "
     "action exists; do says what to do instead. An item with cut: true is shortened: read read_full and show it "
     "whole before asking; until then it asks again before it applies.")
-ALSO = "Work the owner owes (Owed items marked as needing them) is a separate list: read it with khipu_owed."
+ALSO = "Explicit asks are included here and in khipu_owed; older Owed items remain in khipu_owed until the owner resets them."
 
 
 # Whether the words stay whole (a ``key`` read, an ask), and whether a quote
@@ -621,7 +621,7 @@ def _alarm() -> list[dict]:
 def _hub_items() -> list[dict]:
     """What waits on the hub: job-origin corrections and same-project pairs.
     Raises when the hub can't be read, so the answer says so."""
-    from khipu import owed_origin, project_group
+    from khipu import owed_origin, project_group, explicit_asks
     from khipu.config import read_only_config
     from khipu.db import has_table
     from khipu.hub_snapshot import try_hub_connect
@@ -637,6 +637,7 @@ def _hub_items() -> list[dict]:
                     preview = owed_origin._pending_preview(cur, doc)
                 n = (preview.get("counts") or {}).get("total") or 0
                 out.append(job_origin_item(rid, n, routing._iso(at) if at else None))
+        out += explicit_asks.needs_you(cur)
         out += [project_pair_item(p["a"], p["b"], p.get("created_at")) for p in project_group.all_asked_pairs(cur)]
     return out
 
@@ -786,7 +787,7 @@ def _gather(now: datetime) -> tuple[list[dict], list[dict], dict | None]:
         try:
             items += _hub_items()
         except Exception:  # noqa: BLE001 - a hub down leaves the rest of the list standing
-            unread.append({"what": "job-origin corrections and same-project questions",
+            unread.append({"what": "explicit asks, job-origin corrections and same-project questions",
                            "why": "the hub can't be reached right now"})
     if view is not None:
         try:

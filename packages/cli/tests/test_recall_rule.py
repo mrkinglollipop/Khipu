@@ -296,8 +296,8 @@ class RepoScopedSliceTest(unittest.TestCase):
             out = rr._pushed_memory_slice("/repo/khipu")
         m_search.assert_not_called()
         self.assertIn("project: `acme/khipu`", out)
-        self.assertIn("Open commitments", out)
-        self.assertIn("ship it", out)
+        self.assertNotIn("Open commitments", out)
+        self.assertNotIn("ship it", out)
         self.assertIn("Recent episodes", out)
         self.assertIn("Linked topics", out)
         self.assertIn("2d old", out)
@@ -332,7 +332,7 @@ class RepoScopedSliceTest(unittest.TestCase):
             "khipu.activity.project_slice",
             return_value={
                 "commitments": [{"id": 1, "text": "ship it", "kind": "followup"}],
-                "episodes": [], "topics": [],
+                "episodes": [{"id": 2, "summary": "retained episode"}], "topics": [],
             },
         ), mock.patch("khipu.cli._search_query"):
             out = rr._pushed_memory_slice("/repo/khipu")

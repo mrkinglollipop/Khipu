@@ -613,6 +613,10 @@ TOOLS: list[dict] = [
         "name": "khipu_owed_update",
         "annotations": {"readOnlyHint": False, "idempotentHint": True},
         "description": (
+            "File an explicit owner ask with action=ask, requester, question, yes and no; project and live source episode_id are optional. "
+            "The sentence is requester asks: question Yes: yes. No: no. An omitted episode_id stays NULL. "
+            "This records a question only: it cannot confirm or apply anything. An identical open ask returns "
+            "its existing id and already_open=true. The conversation hearing the answer closes that id here. "
             "Close, reopen, snooze or reassign commitments by id (ids come "
             "from khipu_owed). A routing_direction has an rd-* string id: "
             "close it singly to dismiss it; reopen, snooze, reassign and bulk "
@@ -633,7 +637,13 @@ TOOLS: list[dict] = [
                 "id": {"type": ["integer", "string"], "description": "Commitment id (integer or decimal string), or rd-* routing direction id (close only)"},
                 "ids": {"type": "array", "items": {"type": ["integer", "string"]}, "minItems": 1,
                         "description": "Several commitment ids (integers or decimal strings) (at most the owed_bulk_max setting, 500, 0 for no limit)"},
-                "action": {"type": "string", "description": "close | reopen | snooze | reassign"},
+                "action": {"type": "string", "description": "ask | close | reopen | snooze | reassign"},
+                "requester": {"type": "string", "description": "ask only: who is asking"},
+                "question": {"type": "string", "description": "ask only: required one-line question"},
+                "project": {"type": "string", "description": "ask only: optional project, resolved as in khipu_owed"},
+                "yes": {"type": "string", "description": "ask only: what yes does"},
+                "no": {"type": "string", "description": "ask only: what no does"},
+                "episode_id": {"type": "integer", "description": "ask only: optional live source episode"},
                 "until": {"type": "string", "description": "snooze only: 2026-09-30, 7d, 2w, 1m"},
                 "owner": {"type": "string", "description": "reassign only: user | assistant | agent"},
                 "owner_label": {"type": "string",
@@ -2220,6 +2230,11 @@ def _tool_owed_update(args: dict) -> dict:
     from khipu import commitments, owner_writes
     from khipu.owed_tidy import BULK_ACTIONS
 
+    if action == "ask":
+        from khipu import explicit_asks
+        values = explicit_asks.validate(args)
+        return owner_writes.run("owed_update", {"action": "ask", **values}, queue_ok=False)
+
     if action not in BULK_ACTIONS:
         raise ValueError("action must be 'close', 'reopen', 'snooze' or 'reassign'")
 
@@ -2363,6 +2378,10 @@ def _owed_update_on_hub(args: dict) -> dict:
     (``owner_writes.apply_on_hub``); an id the hub already answered applies
     nothing again. Local routing-direction dismissals use this shared
     dispatcher too, without a hub connection or a queued replay."""
+    if args.get("action") == "ask":
+        from khipu.explicit_asks import file_on_hub
+        return file_on_hub(args)
+
     direction_id = args.get("id")
     if isinstance(direction_id, str) and direction_id.startswith("rd-"):
         if _via_https_gateway():

@@ -99,3 +99,38 @@ def announce(cur, *identities: str) -> None:
     conn = getattr(cur, "connection", cur)
     cur.execute("SELECT set_config('khipu.source_identities', %s, %s)",
                 (",".join(identities or (uuid.uuid4().hex,)), not getattr(conn, "autocommit", False)))
+
+
+def owner_commitment(cur, text, *, project, episode_id, kind="followup", linked_ids=()):
+    """Seed historical owner work directly; capture no longer creates it.
+
+    Keep episode claims on migrated hubs, so forget/provenance assertions
+    still exercise the original lineage rather than an immortal owner claim.
+    """
+    from khipu import commitments as co, db
+    import json
+
+    h = co.content_hash(project, text)
+    cur.execute("SELECT 1 FROM commitments WHERE project IS NOT DISTINCT FROM %s AND content_hash = %s "
+                "AND status = 'open'", (project, h))
+    if cur.fetchone():
+        h = co.content_hash(project, text + "\x00owner:user:")
+    values = dict(text=text, project=project, owner="user", kind=kind, opened_episode=episode_id,
+                  content_hash=h, origin="conversation", owner_label=None, linked_ids=list(linked_ids),
+                  prs=None)
+    from khipu.close_rules import parse_prs, pr_requirement_labels
+    values['prs'] = parse_prs(text)
+    values['pr_check'] = json.dumps({'refs': pr_requirement_labels(text, project)})
+    have = db.table_columns(cur, "commitments")
+    values = {k: v for k, v in values.items() if k in have}
+    cur.execute("SELECT to_regclass('public.fact_claims') IS NOT NULL")
+    if cur.fetchone()[0]:
+        provenance.declare_writer(cur)
+    cur.execute("INSERT INTO commitments (" + ", ".join(values) + ") VALUES (" +
+                ", ".join("%s::jsonb" if k == "pr_check" else "%s" for k in values) + ") RETURNING id",
+                tuple(values.values()))
+    cid = int(cur.fetchone()[0])
+    adopt(cur, "commitment", cid)
+    for linked in linked_ids:
+        cur.execute("UPDATE commitments SET linked_ids = array_append(linked_ids, %s) WHERE id = %s", (cid, linked))
+    return cid

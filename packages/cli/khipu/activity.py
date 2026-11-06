@@ -350,7 +350,7 @@ def _annotate_episode_validity(cur, episodes: list[dict]) -> list[dict]:
     return _validity.annotate(episodes, counts, None)
 
 
-_SLICE_TABLES = ("episodes", "commitments", "decisions", "decision_links", "topics", "project_aliases",
+_SLICE_TABLES = ("episodes", "decisions", "decision_links", "topics", "project_aliases",
                  "project_pairs")
 
 
@@ -366,12 +366,10 @@ def project_slice(
     job: bool = False,
 ) -> dict[str, Any]:
     # forget-fence source: session start fences the slice (recall_rule._fenced_slice)
-    """W4 pushed-slice reads for a resolved repo: open commitments, recent
-    episodes for the project, the topic pages those episodes actually link
+    """Session-start reads for a resolved repo: recent episodes for the project, the topic pages those episodes actually link
     to (their already-hygiene-resolved ``topics`` array — real graph edges,
     not guessed slugs), and (O2) decisions still standing in the last 14
-    days. Order matches the plan's acceptance shape: commitments, then
-    episodes, then topics; ``recall_rule`` renders them and owns the
+    days. The slice contains decisions, episodes and topics; ``recall_rule`` renders them and owns the
     cwd-token fallback and the token budget.
 
     ``host_session_id`` (this session's own lineage id, ``harness:hostid``)
@@ -385,46 +383,12 @@ def project_slice(
     a plain read with no fail-open of its own, same posture as every other
     function in this module.
 
-    Items for the orchestrator (owner ``agent``, from its jobs) follow the
-    ``commitment_limit`` others, at most ``owed_orchestrator_slice_max`` of
-    them (0: no limit), and only for a conversation: a ``job`` session sees
-    none (owed scope, decision 2).
+    Commitments are no longer fetched for session start. The empty
+    ``commitments`` key and unused limits remain for older callers.
     """
-    from khipu import commitments as _commitments
     from khipu import decisions as _decisions
     from khipu.embed import _episode_schema_flags
 
-    def mark_same_session_lineage(rows: list[dict[str, Any]]) -> None:
-        # forget-fence: marks the caller's rows; adds no row
-        """Mark assistant rows from this session or one of its direct children.
-
-        Project Owed deliberately contains every assistant's work.  The
-        session-start rendering only calls a row "(yours)" when the episode
-        that opened it belongs to this session lineage.
-        """
-        if not host_session_id:
-            return
-        assistants = [r for r in rows if r.get("owner") == _commitments.OWNER_ASSISTANT]
-        if not assistants:
-            return
-        missing = [r["id"] for r in assistants if not (r.get("session_id") or r.get("parent_session_id"))]
-        lineage: dict[int, tuple[str | None, str | None]] = {
-            int(r["id"]): (r.get("session_id"), r.get("parent_session_id")) for r in assistants
-        }
-        if missing:
-            flags = _episode_schema_flags(cur)
-            parent = "e.parent_session_id" if flags.get("parent_session_id") else "NULL::text"
-            cur.execute(
-                f"SELECT c.id, e.session_id, {parent} FROM commitments c "
-                "JOIN episodes e ON e.id = c.opened_episode WHERE c.id = ANY(%s)",
-                (missing,),
-            )
-            lineage.update({int(cid): (session_id, parent_id) for cid, session_id, parent_id in cur.fetchall()})
-        for row in assistants:
-            session_id, parent_id = lineage.get(int(row["id"]), (None, None))
-            row["same_session_lineage"] = host_session_id in (session_id, parent_id)
-
-    owed: list[dict[str, Any]] = []
     episodes: list[dict[str, Any]] = []
     topics: list[dict[str, Any]] = []
     decisions: list[dict[str, Any]] = []
@@ -437,22 +401,6 @@ def project_slice(
         prime_table_columns(conn, *_SLICE_TABLES)
         with conn.cursor() as cur:
             if project:
-                # O3: a snoozed row (due_after in the future) is parked — it
-                # must not reappear in the session-start slice before its
-                # due date, even though `khipu owed`/the desktop still list
-                # it so it can be managed.
-                rows = _commitments.list_owed(
-                    cur, project=project, status="open", limit=None,
-                    hide_snoozed=True,
-                )
-                mark_same_session_lineage(rows)
-                owed = [r for r in rows if r.get("owner") != _commitments.OWNER_AGENT][:commitment_limit]
-                if not job:
-                    from khipu.config import count_setting
-
-                    cap = count_setting("owed_orchestrator_slice_max")
-                    agents = [r for r in rows if r.get("owner") == _commitments.OWNER_AGENT]
-                    owed += agents[:cap] if cap else agents
                 from datetime import timedelta
 
                 decisions = _decisions.standing_decisions(
@@ -571,4 +519,4 @@ def project_slice(
                 from khipu.project_group import asked_pairs
 
                 pairs = asked_pairs(cur, project)
-    return {"commitments": owed, "episodes": episodes, "topics": topics, "decisions": decisions, "pairs": pairs}
+    return {"commitments": [], "episodes": episodes, "topics": topics, "decisions": decisions, "pairs": pairs}

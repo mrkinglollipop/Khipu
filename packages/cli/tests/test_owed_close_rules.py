@@ -78,9 +78,13 @@ def _episode(cur, *, summary=None, raw=None) -> int:
 
 def _open(cur, text, kind="followup", payload=None) -> int:
     ep = _episode(cur)
+    base = payload or BASE
+    if co.resolve_owner(text, kind=kind, origin=co.capture_origin(base)) == co.OWNER_USER:
+        from tests.fact_seed import owner_commitment
+        return owner_commitment(cur, text, project=PROJECT, episode_id=ep, kind=kind)
     with mock.patch.object(co, "_cosine_scores", _no_cosine), \
          mock.patch.object(co, "_has_commitment_embeddings", lambda cur, ids: False):
-        assert co.open_from_episode(cur, dict(payload or BASE, open_loops=[{"text": text, "kind": kind}]), ep) == 1
+        assert co.open_from_episode(cur, dict(base, open_loops=[{"text": text, "kind": kind}]), ep) == 1
     cur.execute("SELECT id FROM commitments WHERE opened_episode = %s", (ep,))
     return int(cur.fetchone()[0])
 

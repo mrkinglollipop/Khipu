@@ -422,16 +422,16 @@ def test_completion_failure_fails_nightly_but_later_steps_run(tmp_path, monkeypa
     monkeypatch.setattr(jobs, '_drain_sessions', lambda: {'ok': True})
     later = []
     for name in ('_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
-                 '_mark_stale_commitments', '_hygiene_commitments', '_ledger_nightly',
+                 '_mark_stale_commitments', '_provenance_nightly', '_ledger_nightly',
                  '_project_renames_sweep', '_refresh_snapshot', '_briefs_build_if_on'):
         monkeypatch.setattr(jobs, name, lambda name=name: later.append(name) or {'ok': True})
-    monkeypatch.setattr(jobs, '_commitment_close_rules', lambda: {'ok': False, 'reason': 'synthetic failure'})
+    monkeypatch.setattr(jobs, '_provenance_nightly', lambda: {'ok': False, 'reason': 'synthetic failure'})
     # _run_script takes a positional script argument too.
     monkeypatch.setattr(jobs, '_run_script', lambda *a, **kw: driver_rc)
     assert jobs.run_nightly() == expected
     assert '_refresh_snapshot' in later and '_briefs_build_if_on' in later
     steps = jobs.nightly_last()['steps']
-    assert next(s for s in steps if s['name'] == 'commitments_close_rules')['ok'] is False
+    assert next(s for s in steps if s['name'] == 'provenance_backfill')['ok'] is False
     assert json.loads((tmp_path/'state/job-nightly.json').read_text())['exit'] == expected
 
 
