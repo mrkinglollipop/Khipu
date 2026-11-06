@@ -291,3 +291,34 @@ def test_shared_account_definition_removal_still_reaches_the_other_mac(pair):
     view = b.view()
     assert view["priority"]["entries"][0]["in_settings"] is False
     assert "no longer tracked" in routing.priority_line(view["priority"], b.now, view=view)
+
+
+@pytest.mark.parametrize("local_list", ["same", "none", "other"])
+@pytest.mark.parametrize("state", ["untracked", "tracked", "renamed"])
+def test_peer_notes_yield_only_to_a_locally_tracked_login(pair, local_list, state):
+    a, b, hub = pair
+    if local_list == "none":
+        b.config.pop("usage_accounts")
+        b.configure()
+    elif local_list == "other":
+        b.configure(usage_accounts=[{"harness": "codex", "label": "Codex"}])
+    a.activate()
+    routing.report(account="Claude", state="open", author=AUTHOR)
+    routing.set_priority([{"account": "Claude"}], via="app", expect=routing.priority_version())
+    a.write({"type": "account_note", "account": "claude|", "state": state,
+             "text": "Old Claude", "written_by": {"kind": "owner"}, "via": "app"})
+    for mac in (a, b):
+        assert sync(mac, hub)["ok"]
+    b.activate()
+    view = b.view()
+    key = "claude|" if local_list == "same" else "claude:main"
+    item = next((e for e in view["accounts"] if e["key"] == key), {})
+    if local_list == "same":
+        assert item.get("note") is None
+        assert view["priority"]["entries"][0]["in_settings"] is True
+        assert "no longer tracked" not in routing.change_line(f"account:{key}", view, b.now)
+    elif state == "untracked":
+        assert view["priority"]["entries"][0]["in_settings"] is False
+        assert "no longer tracked" in routing.priority_line(view["priority"], b.now, view=view)
+    else:
+        assert item["note"][0] == state
