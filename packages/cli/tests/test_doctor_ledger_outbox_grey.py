@@ -83,7 +83,6 @@ def test_held_verbatim_only_capture_with_open_loop_needs_recovery(tmp_path, monk
     assert "Retrying won't help" not in line
     assert "nothing to save" not in line
     assert "retry-dead" in local["outbox"]["fix"]
-    assert local["outbox"]["no_summary_held"] == 0
     assert held.read_text() == original and meta.exists()
     # Real content refused with the same exit code still needs attention.
     held.write_text(json.dumps({"extracted_payload": {"summary": "important"}}))

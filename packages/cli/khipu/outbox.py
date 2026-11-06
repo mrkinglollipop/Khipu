@@ -723,15 +723,6 @@ def jobs() -> list[Path]:
         return []
 
 
-def held_without_summary(path: Path) -> bool:
-    """Blank summary is not proof of unsavable evidence (or of an rc=65 cause).
-
-    Kept for status consumers; no held job can be excluded from recovery on
-    the strength of its summary or generic exit code alone.
-    """
-    return False
-
-
 def status() -> dict[str, Any]:
     """`pending` is what makes doctor red. `oldest_*` describe the job that has
     been WAITING longest, which is not the same as the one whose episode has the
@@ -801,7 +792,6 @@ def status() -> dict[str, Any]:
 
     native_paths = held_jobs()
     native_held = [p.name for p in native_paths]
-    no_summary_held = sum(held_without_summary(p) for p in native_paths)
 
     dead = len(dead_jobs()) + quarantined + len(native_held)
     # Every waiting capture is waiting only because the hub could not be
@@ -810,7 +800,7 @@ def status() -> dict[str, Any]:
                     and not dead and not evidence_conflicts)
     result = {"dir": str(outbox_dir()), "pending": len(js), "oldest_age_s": oldest_age,
             "oldest_job": oldest_job, "unreadable": unreadable,
-            "dead": dead, "no_summary_held": no_summary_held, "recoverable_dead": dead - no_summary_held,
+            "dead": dead,
             "quarantined": quarantined, "native_held": native_held,
             "max_attempts": MAX_ATTEMPTS, "offline": offline, "offline_only": offline_only,
             "evidence_conflicts": evidence_conflicts,
@@ -827,7 +817,6 @@ def status() -> dict[str, Any]:
     result["dead_newest_age_s"] = newest_age
     result["dead_waiting"] = max(dead - refused_old - conflicts_old, 0) \
         if (newest_age is None or newest_age > OLD_DEAD_S) else dead
-    result["dead_waiting"] = max(0, result["dead_waiting"] - no_summary_held)
     if refused_old:
         result["plain"] = (result.get("plain", "") + " " if result.get("plain") else "") + (f"{refused_old} old capture{'' if refused_old == 1 else 's'} an older app sent without "
                            "announcing its source identities sit refused"

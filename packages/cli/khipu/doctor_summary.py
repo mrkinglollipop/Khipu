@@ -9,7 +9,7 @@ def _outbox(d: dict) -> str:
     if box.get("error"):
         return "the queue of captures can't be read"
     parts = []
-    held = box.get("recoverable_dead", box.get("dead")) or 0
+    held = box.get("dead") or 0
     if held:
         parts.append(f"{held} capture{' sits' if held == 1 else 's sit'} held on this Mac, safe but not in memory, and "
                      "Khipu will not retry " + ("it" if held == 1 else "them") + " by itself")
@@ -136,11 +136,6 @@ def health_summary(report: dict) -> list[str]:
     lines = []
     for i, area in enumerate(AREAS):
         here = [(what, fix) for a, what, fix in bad if a == i]
-        if i == 0 and not here and (report.get("outbox") or {}).get("no_summary_held"):
-            note = report["outbox"].get("plain") or (
-                "A held capture has no summary, so Khipu can't save it. Retrying won't help; the file is kept.")
-            lines.append(f"{area}: {note}")
-            continue
         lines.append(f"{area}: fine." if not here else f"{area}: " + " ".join(
             f"{what[:1].upper() + what[1:]}. Fix: {fix}." for what, fix in here))
     return lines
