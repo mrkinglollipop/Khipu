@@ -613,8 +613,10 @@ TOOLS: list[dict] = [
         "name": "khipu_owed_update",
         "annotations": {"readOnlyHint": False, "idempotentHint": True},
         "description": (
-            "File an explicit owner ask with action=ask, requester, yes, no and episode_id (source episode). "
-            "This records a question only: it cannot confirm or apply anything. "
+            "File an explicit owner ask with action=ask, requester, question, yes and no; project and live source episode_id are optional. "
+            "The sentence is requester asks: question Yes: yes. No: no. An omitted episode_id stays NULL. "
+            "This records a question only: it cannot confirm or apply anything. An identical open ask returns "
+            "its existing id and already_open=true. The conversation hearing the answer closes that id here. "
             "Close, reopen, snooze or reassign commitments by id (ids come "
             "from khipu_owed). A routing_direction has an rd-* string id: "
             "close it singly to dismiss it; reopen, snooze, reassign and bulk "
@@ -637,9 +639,11 @@ TOOLS: list[dict] = [
                         "description": "Several commitment ids (integers or decimal strings) (at most the owed_bulk_max setting, 500, 0 for no limit)"},
                 "action": {"type": "string", "description": "ask | close | reopen | snooze | reassign"},
                 "requester": {"type": "string", "description": "ask only: who is asking"},
+                "question": {"type": "string", "description": "ask only: required one-line question"},
+                "project": {"type": "string", "description": "ask only: optional project, resolved as in khipu_owed"},
                 "yes": {"type": "string", "description": "ask only: what yes does"},
                 "no": {"type": "string", "description": "ask only: what no does"},
-                "episode_id": {"type": "integer", "description": "ask only: live source episode"},
+                "episode_id": {"type": "integer", "description": "ask only: optional live source episode"},
                 "until": {"type": "string", "description": "snooze only: 2026-09-30, 7d, 2w, 1m"},
                 "owner": {"type": "string", "description": "reassign only: user | assistant | agent"},
                 "owner_label": {"type": "string",

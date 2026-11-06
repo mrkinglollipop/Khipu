@@ -99,7 +99,13 @@ def command(args):
 
 
 def add_parser(sub):
-    parser = sub.add_parser("reset", help="Preview/export open owner items; does not close them")
+    parser = sub.add_parser("reset", help="Preview/export open owner items; does not close them",
+                            description="Use --dry-run to print counts and protected asks without writing; "
+                            "--export FILE writes full owner items and FILE.sha256. Review the archive, then "
+                            "apply through the existing owner gate: khipu owed tidy --project "
+                            "'<all-owner-items>' --apply FILE. Undo the resulting batch with the same project "
+                            "and --undo BATCH. Explicit asks and recent owner-ask evidence are kept separately; "
+                            "new or changed items are not silently closed. No automatic reset is installed.")
     parser.add_argument("--dry-run", action="store_true", help="Print counts and separate protected asks; write nothing")
     parser.add_argument("--export", metavar="FILE", help="Export full archive and FILE.sha256")
     parser.set_defaults(func=command)

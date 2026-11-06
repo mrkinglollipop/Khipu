@@ -201,22 +201,23 @@ class ProjectSliceTest(unittest.TestCase):
         # query), so the fake cursor sees four real queries here: commitments,
         # episodes, episode-linked topics, then note-topics (still under
         # topic_limit=3 after one episode-linked hit) — in that order.
-        results = [[commitment_row], [episode_row], [topic_row], []]
+        results = [[episode_row], [topic_row], []]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
         }):
             out, cur = self._run(results, project="acme/widget")
-        self.assertEqual(out["commitments"][0]["text"], "ship the fix")
+        self.assertEqual(out["commitments"], [])
+        self.assertFalse(any("FROM commitments" in sql for sql in cur.statements))
         self.assertEqual(out["episodes"][0]["id"], 42)
         self.assertEqual(out["episodes"][0]["topics"], ["real-topic"])
         self.assertEqual(out["topics"][0]["slug"], "real-topic")
         self.assertIsInstance(out["topics"][0]["age_days"], int)
         # episodes filtered on project (or COALESCE(project, scope)) — verify
         # the project value actually reached the WHERE clause params.
-        episodes_call = cur.statements[1]
+        episodes_call = cur.statements[0]
         self.assertIn("COALESCE(project, scope) = %s", episodes_call)
-        self.assertEqual(cur.params[1], ("acme/widget", 5))
-        self.assertIn("note:%", cur.statements[3])
+        self.assertEqual(cur.params[0], ("acme/widget", 5))
+        self.assertIn("note:%", cur.statements[2])
 
     def test_note_topics_fill_remaining_budget_after_episode_linked_ones(self):
         """W4.3: khipu.notes.reconcile-mirrored `note:` topics carry no
@@ -228,7 +229,7 @@ class ProjectSliceTest(unittest.TestCase):
         # the suite ran after it (audit 2026-09-04, environmental failure).
         note_row = ("note:some-note", "Some Note",
                     dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2, hours=1), "active")
-        results = [[], [episode_row], [note_row]]
+        results = [[episode_row], [note_row]]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
         }):
@@ -247,13 +248,13 @@ class ProjectSliceTest(unittest.TestCase):
             (f"t{i}", f"Topic {i}", dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc), "active")
             for i in (1, 2, 3)
         ]
-        results = [[], [episode_row], topic_rows]
+        results = [[episode_row], topic_rows]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
         }):
             out, cur = self._run(results, project="acme/widget")
         self.assertEqual(len(out["topics"]), 3)
-        self.assertEqual(len(cur.statements), 3, "no fourth (notes) query once the budget is full")
+        self.assertEqual(len(cur.statements), 2, "no fourth (notes) query once the budget is full")
 
     def test_no_project_no_commitments_query_at_all(self):
         """project=None: commitments.list_owed must never run (there is
@@ -304,8 +305,8 @@ class ProjectSliceTest(unittest.TestCase):
         }):
             # Third result: the note-topics query (project is set, no
             # episode-linked topic slugs, so the notes lookup still fires).
-            out, cur = self._run([[], [episode_row], []], project="acme/widget")
-        episodes_call = cur.statements[1]
+            out, cur = self._run([[episode_row], []], project="acme/widget")
+        episodes_call = cur.statements[0]
         self.assertIn("scope = %s", episodes_call)
         # The project fallback is the point; the summary filter's own
         # COALESCE(raw->>'summary_kind', '') is allowed.
@@ -320,11 +321,11 @@ class ProjectSliceTest(unittest.TestCase):
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
         }):
-            out, cur = self._run([[], [episode_row], []], project="acme/widget")
+            out, cur = self._run([[episode_row], []], project="acme/widget")
         self.assertEqual(out["topics"], [])
         # commitments, episodes, note-topics — three queries, none of them
         # the (skipped) episode-linked-slug lookup.
-        self.assertEqual(len(cur.statements), 3)
+        self.assertEqual(len(cur.statements), 2)
         self.assertIn("note:%", cur.statements[-1])
 
 
@@ -354,12 +355,12 @@ class TopicSlugOverFetchTest(unittest.TestCase):
         )
         topic_row = ("real-topic", "Real Topic",
                      dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc), "active")
-        results = [[], [episode_row], [topic_row], []]
+        results = [[episode_row], [topic_row], []]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
         }):
             out, cur = self._run(results, project="acme/widget", topic_limit=3)
-        looked_up = cur.params[2][0]
+        looked_up = cur.params[1][0]
         self.assertIn("real-topic", looked_up,
                       "the 4th slug was cut before the lookup with topic_limit=3")
         self.assertEqual([t["slug"] for t in out["topics"]], ["real-topic"])
@@ -371,7 +372,7 @@ class TopicSlugOverFetchTest(unittest.TestCase):
         )
         when = dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc)
         rows = [(f"t{i}", f"T{i}", when, "active") for i in range(1, 6)]
-        results = [[], [episode_row], rows]
+        results = [[episode_row], rows]
         with mock.patch("khipu.embed._episode_schema_flags", return_value={
             "project": True, "deleted_at": True,
         }):

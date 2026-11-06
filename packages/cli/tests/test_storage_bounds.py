@@ -344,7 +344,7 @@ def test_the_nightly_records_each_new_step(homes, monkeypatch):
     for fn in ("_drain_sessions", "_reconcile_notes_if_due", "_embed_backfill", "_summary_kind_backfill",
                "_prune_query_cache", "_prune_routing_ledgers", "_storage_sweep", "_owner_actions_chain",
                "_commitment_close_rules", "_fact_changes_prune", "_mark_stale_commitments",
-               "_hygiene_commitments", "_ledger_nightly", "_receipt_prune", "_project_renames_sweep",
+               "_provenance_nightly", "_ledger_nightly", "_receipt_prune", "_project_renames_sweep",
                "_recall_eval_step", "_refresh_snapshot", "_briefs_build_if_on", "_capture_previous_briefs_step"):
         monkeypatch.setattr(jobs, fn, lambda *a, **k: {"ok": True})
     monkeypatch.setattr(jobs, "_run_script", lambda *a, **k: 0)
@@ -352,7 +352,7 @@ def test_the_nightly_records_each_new_step(homes, monkeypatch):
     jobs._run_nightly_locked()
     for step in ("storage_sweep", "owner_actions_chain", "fact_changes_prune", "receipt_prune"):
         assert step in names
-    assert names.index("fact_changes_prune") > names.index("commitments_close_rules")
+    assert names.index("fact_changes_prune") > names.index("provenance_backfill")
 
 
 def test_fact_changes_prune_is_its_own_step_and_survives_a_close_rules_failure(homes, monkeypatch):

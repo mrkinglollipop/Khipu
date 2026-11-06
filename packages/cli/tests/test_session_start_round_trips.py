@@ -84,11 +84,12 @@ def test_the_slice_reads_exactly_what_it_read_with_every_lookup_repeated(slice_h
         m.setattr(db, "prime_table_columns", lambda *a, **k: None)
         sent = _statements(m)
         slow = _slice()
-    assert sum("SAVEPOINT project_alias_group" in s for s in sent) >= 3  # the old path, really taken
+    assert sum("SAVEPOINT project_alias_group" in s for s in sent) >= 2  # the old path, really taken
     assert fast == slow
     # The alias's own rows are in it: nothing was dropped to save the trips.
     assert {e["summary"] for e in fast["episodes"]} >= {"episode 1 in o/old-name", "episode 0 in o/canon"}
-    assert "item 1" in {c["text"] for c in fast["commitments"]}
+    assert fast["commitments"] == []
+    assert not any("FROM commitments" in s for s in sent)
     assert [d["text"] for d in fast["decisions"]] == ["decided for canon"]
     assert fast["pairs"] and fast["topics"]
 

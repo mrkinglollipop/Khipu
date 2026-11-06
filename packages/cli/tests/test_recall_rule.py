@@ -332,7 +332,7 @@ class RepoScopedSliceTest(unittest.TestCase):
             "khipu.activity.project_slice",
             return_value={
                 "commitments": [{"id": 1, "text": "ship it", "kind": "followup"}],
-                "episodes": [], "topics": [],
+                "episodes": [{"id": 2, "summary": "retained episode"}], "topics": [],
             },
         ), mock.patch("khipu.cli._search_query"):
             out = rr._pushed_memory_slice("/repo/khipu")

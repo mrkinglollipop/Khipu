@@ -96,7 +96,7 @@ class EmbedBackfillRegressionTest(unittest.TestCase):
             mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}),
             mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}),
             mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}),
-            mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}),
+            mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}),
             mock.patch.object(jobs, "_briefs_build_if_on", return_value=None),
             mock.patch.object(jobs, "_write_job_state") as write_state,
         ):
@@ -136,7 +136,7 @@ class EmbedProviderIntegrationRegressionTest(unittest.TestCase):
                 mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}),
                 mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}),
                 mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}),
-                mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}),
+                mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}),
                 mock.patch.object(jobs, "_briefs_build_if_on", return_value=None),
             ):
                 rc = jobs.run_nightly()
@@ -417,7 +417,7 @@ class NightlyAggregateRegressionTest(unittest.TestCase):
                     mock.patch.object(jobs, "_embed_backfill", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_prune_query_cache", return_value={"ok": True}), \
                     mock.patch.object(jobs, "_mark_stale_commitments", return_value={"ok": True}), \
-                    mock.patch.object(jobs, "_hygiene_commitments", return_value={"ok": True}), \
+                    mock.patch.object(jobs, "_provenance_nightly", return_value={"ok": True}), \
                     mock.patch("khipu.features.enabled", return_value=True), \
                     mock.patch("khipu.db.connect", return_value=mock.MagicMock()), \
                     mock.patch.object(briefs, "acquire_build_lock", return_value=True), \

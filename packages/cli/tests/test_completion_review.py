@@ -261,7 +261,7 @@ def test_nested_cleanup_failure_must_fail_nightly(harness, monkeypatch, tmp_path
     monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path)
     monkeypatch.setattr(jobs, '_run_script', lambda *a, **kw: 0)
     for name in ('_drain_sessions', '_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
-                 '_mark_stale_commitments', '_hygiene_commitments', '_ledger_nightly',
+                 '_mark_stale_commitments', '_ledger_nightly',
                  '_project_renames_sweep', '_refresh_snapshot', '_briefs_build_if_on'):
         monkeypatch.setattr(jobs, name, lambda: {'ok': True})
     assert jobs.run_nightly() != 0
@@ -271,7 +271,7 @@ def _install_nightly_cleanup(monkeypatch, tmp_path):
     monkeypatch.setattr(jobs, 'ensure_data_dir', lambda: tmp_path)
     monkeypatch.setattr(jobs, '_run_script', lambda *a, **kw: 0)
     for name in ('_drain_sessions', '_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
-                 '_mark_stale_commitments', '_hygiene_commitments', '_ledger_nightly',
+                 '_mark_stale_commitments', '_ledger_nightly',
                  '_project_renames_sweep', '_refresh_snapshot', '_briefs_build_if_on'):
         monkeypatch.setattr(jobs, name, lambda: {'ok': True})
     monkeypatch.setattr(close_rules.GitHub, 'state', lambda *a: ('merged', None))
@@ -314,7 +314,7 @@ def test_replay_fatal_then_dropped_connection_keeps_failure(harness, monkeypatch
         raise psycopg.errors.ConnectionFailure('connection lost on second group')
     monkeypatch.setattr(provenance, '_gap_step', step)
     assert jobs.run_nightly() != 0, 'fatal first replay failure was erased by later disconnection'
-    assert seen == [2, 3]
+    assert seen == [2, 3] * len(receipts)
     assert receipts[0]['transient'] is False
     assert 'UndefinedColumn: fatal schema error in replay' in receipts[0]['reason']
     assert receipts[0]['gaps']['failed'] == 2
@@ -344,14 +344,14 @@ def test_index_schema_failure_survives_rollback_disconnect(harness, monkeypatch,
         return 0
     monkeypatch.setattr(close_rules, 'backfill_prs', prepare)
     assert jobs.run_nightly() != 0, 'fatal index failure was erased by rollback disconnection'
-    assert seen == ['UndefinedColumn']
+    assert seen == ['UndefinedColumn'] * len(receipts)
     assert receipts[0]['transient'] is False
     assert 'UndefinedColumn: fatal schema error in index' in receipts[0]['reason']
     assert receipts[0]['index']['transient'] is False
     assert receipts[0]['connection_unusable'] is True
     # The change-stream prune is its own nightly step now: it runs whatever close-rules did.
     prune.assert_called_once()
-    assert prepared and all(conn not in failed_connections for conn in prepared)
+    assert prepared == [], 'PR backfill is no longer part of the nightly'
 
 
 @pytest.mark.parametrize('disconnect', [False, True], ids=['rollback-ok', 'rollback-disconnect'])
@@ -380,8 +380,8 @@ def test_replay_receipt_write_failure_classifies_before_rollback(
     monkeypatch.setattr(Cursor, 'execute', execute)
     fatal = psycopg.errors.UndefinedColumn in (replay_error, receipt_error)
     rc = jobs.run_nightly()
-    assert errors == [receipt_error.__name__]
-    assert (rc != 0) is fatal, receipts
+    assert errors == [receipt_error.__name__] * len(receipts)
+    assert rc != 0, receipts
     out = receipts[0]
     assert out['ok'] is False
     assert out['transient'] is not fatal
@@ -414,7 +414,7 @@ def test_replay_receipt_write_rollback_failure_keeps_original_failure(harness, m
         original(cur, sql, params)
     monkeypatch.setattr(Cursor, 'execute', execute)
     assert jobs.run_nightly() != 0, 'fatal replay failure was erased by receipt rollback disconnection'
-    assert seen == [2], 'replay continued using the connection after rollback failed'
+    assert seen == [2] * len(receipts), 'replay continued using the connection after rollback failed'
     assert receipts[0]['transient'] is False
     assert 'UndefinedColumn: fatal schema error before receipt' in receipts[0]['reason']
     assert receipts[0]['gaps']['failed'] == 1

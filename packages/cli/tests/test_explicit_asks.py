@@ -24,7 +24,7 @@ def test_summary_question_does_not_create_owner_work():
 
 def test_filed_ask_is_visible_and_has_no_authority(owed, monkeypatch):
     eid = Flood(owed).episode()
-    out = mcp_server._tool_owed_update({"action": "ask", "requester": "Builder", "yes": "use the new design",
+    out = mcp_server._tool_owed_update({"action": "ask", "requester": "Builder", "question": "Use this design?", "yes": "use the new design",
                                       "no": "keep the current design", "episode_id": eid})
     assert out["ok"], out
     with owed.transaction(), owed.cursor() as cur:
@@ -32,13 +32,15 @@ def test_filed_ask_is_visible_and_has_no_authority(owed, monkeypatch):
         assert next(r for r in rows if r["id"] == out["id"])["owner"] == "user"
         items = explicit_asks.needs_you(cur)
     assert len(items) == 1
-    assert 'Builder asks' in items[0]["words"]
+    assert 'Builder asks: Use this design? Yes: use the new design. No: keep the current design.' in items[0]["words"]
+    assert f"id={out['id']}" in items[0]['do']
+    assert "cannot apply a change" in items[0]['do']
     assert items[0]["settle"] == {"confirm": None, "undo": None}
     monkeypatch.setattr(needs_you, '_gather', lambda now: (items, [], None))
     answer = needs_you.waiting(record_read=False)
     assert answer['items'][0]['kind'] == 'ask'
     with pytest.raises(ValueError):
-        mcp_server._tool_owed_update({"action": "ask", "requester": "Builder", "yes": "x", "no": "y",
+        mcp_server._tool_owed_update({"action": "ask", "requester": "Builder", "question": "Use this design?", "yes": "x", "no": "y",
                                       "episode_id": eid, "owner_gate": "direction"})
 
 
@@ -49,7 +51,7 @@ def test_reset_dry_run_export_apply_and_whole_batch_undo(owed, tmp_path, capsys,
     # Span projects: one reset must still be one reversible batch.
     with owed.cursor() as cur:
         cur.execute('UPDATE commitments SET project = %s WHERE id = %s', ('other/repo', ids[-1]))
-    ask = mcp_server._tool_owed_update({'action': 'ask', 'requester': 'Reviewer', 'yes': 'change design',
+    ask = mcp_server._tool_owed_update({'action': 'ask', 'requester': 'Reviewer', 'question': 'Change the design?', 'yes': 'change design',
                                       'no': 'keep design', 'episode_id': eid})
     assert ask['ok'], ask
     recent = flood.item('recent', 'Matt to approve a real recent request', episode=eid)
@@ -72,7 +74,7 @@ def test_reset_dry_run_export_apply_and_whole_batch_undo(owed, tmp_path, capsys,
     assert digest in path.with_suffix('.json.sha256').read_text()
     monkeypatch.setattr(co, 'bulk_owner_gate', lambda n: None)
     assert not owed_reset.apply(doc)['ok']
-    late = mcp_server._tool_owed_update({'action': 'ask', 'requester': 'Builder', 'yes': 'use another design',
+    late = mcp_server._tool_owed_update({'action': 'ask', 'requester': 'Builder', 'question': 'Use another design?', 'yes': 'use another design',
                                        'no': 'keep this design', 'episode_id': eid})
     assert late['ok'], late
     out = owed_tidy.apply(doc, owner_gate='direction')
@@ -89,3 +91,44 @@ def test_reset_dry_run_export_apply_and_whole_batch_undo(owed, tmp_path, capsys,
         after = {r[0]['id']: r[0] for r in cur.fetchall()}
     for prior, in before:
         assert {f: after[prior['id']].get(f) for f in FIELDS} == {f: prior.get(f) for f in FIELDS}
+
+
+@pytest.mark.parametrize('project', [None, PROJECT])
+def test_ask_without_episode_and_duplicate_are_visible(owed, project):
+    args = {'action': 'ask', 'requester': 'Builder', 'question': 'Use the revised layout?',
+            'yes': 'use it', 'no': 'keep it', 'project': project}
+    first = mcp_server._tool_owed_update(args)
+    second = mcp_server._tool_owed_update(args)
+    assert first['ok'] and second['ok'], (first, second)
+    assert second['id'] == first['id'] and second['already_open'] is True
+    with owed.transaction(), owed.cursor() as cur:
+        cur.execute('SELECT opened_episode FROM commitments WHERE id = %s', (first['id'],))
+        assert cur.fetchone() == (None,)
+        rows = co.list_owed(cur, project=project)
+        assert [(r['id'], r['owner']) for r in rows] == [(first['id'], 'user')]
+        assert [r['key'] for r in explicit_asks.needs_you(cur)] == [f"ask:{first['id']}"]
+        cur.execute("SELECT is_nullable FROM information_schema.columns WHERE table_name = 'commitments' AND column_name = 'opened_episode'")
+        assert cur.fetchone() == ('YES',)
+
+
+def test_ask_requires_question_and_live_supplied_episode(owed):
+    args = {'action': 'ask', 'requester': 'Builder', 'yes': 'use it', 'no': 'keep it'}
+    with pytest.raises(ValueError, match='question'):
+        mcp_server._tool_owed_update(args)
+    with pytest.raises(ValueError, match='missing or forgotten'):
+        mcp_server._tool_owed_update(dict(args, question='Use it?', episode_id=999999))
+
+
+def test_ask_project_resolves_bare_name_and_alias(owed):
+    flood = Flood(owed)
+    eid = flood.episode()
+    flood.item('visible', 'Assistant to rebuild the index', owner='assistant', episode=eid)
+    with owed.cursor() as cur:
+        cur.execute('INSERT INTO project_aliases (alias, project) VALUES (%s, %s)', ('old/widget', PROJECT))
+    args = {'action': 'ask', 'requester': 'Builder', 'question': 'Use it?', 'yes': 'use it', 'no': 'keep it'}
+    first = mcp_server._tool_owed_update(dict(args, project='widget'))
+    second = mcp_server._tool_owed_update(dict(args, project='old/widget'))
+    assert second['id'] == first['id'] and second['already_open'], (first, second)
+    with owed.cursor() as cur:
+        cur.execute('SELECT project FROM commitments WHERE id = %s', (first['id'],))
+        assert cur.fetchone() == (PROJECT,)

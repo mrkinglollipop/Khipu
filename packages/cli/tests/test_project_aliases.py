@@ -83,7 +83,7 @@ def test_session_start_slice_by_either_key(seeded, key):
     from khipu import activity
 
     out = activity.project_slice(project=key)
-    assert len(out["commitments"]) == 2
+    assert out["commitments"] == []
     assert len(out["decisions"]) == 2
     assert len(out["episodes"]) == 2
 

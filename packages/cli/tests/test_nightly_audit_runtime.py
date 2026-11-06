@@ -190,7 +190,7 @@ def test_missing_driver_continues_independent_maintenance(tmp_path, monkeypatch)
     monkeypatch.setattr(jobs, 'CONSOLIDATE_NIGHTLY', tmp_path / 'missing.py')
     monkeypatch.setattr(jobs, '_drain_sessions', lambda: {'ok': True})
     later = ['_reconcile_notes_if_due', '_embed_backfill', '_prune_query_cache',
-        '_commitment_close_rules', '_mark_stale_commitments', '_hygiene_commitments',
+        '_mark_stale_commitments', '_provenance_nightly',
         '_ledger_nightly', '_project_renames_sweep', '_refresh_snapshot', '_briefs_build_if_on']
     mocks = []
     for name in later:
