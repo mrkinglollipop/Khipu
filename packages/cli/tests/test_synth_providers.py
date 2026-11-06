@@ -469,7 +469,7 @@ def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path
             sid = argv[-1]
             assert str(UUID(sid)) == sid
             assert sid in synth_cli.session_ids()
-            assert argv == ['claude', '-p', '--setting-sources', '', '--model', 'm',
+            assert argv == ['claude', '-p', '--no-session-persistence', '--setting-sources', '', '--model', 'm',
                             '--system-prompt', extract.CLAUDE_CLI_SYSTEM_PROMPT,
                             '--output-format', 'json', '--max-turns', '1', '--disallowedTools',
                             'Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent', '--session-id', sid]
@@ -498,6 +498,43 @@ def test_cli_exact_argv_stdin_env_usage_budget_and_no_capture(provider, tmp_path
     if provider == 'codex-cli':
         assert not Path(calls[0][0][10]).exists()
         assert '00000000-0000-4000-8000-000000000001' in synth_cli.session_ids()
+
+
+def test_concurrent_claude_calls_stay_isolated_and_cannot_capture(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    monkeypatch.setattr(synth_cli, 'binary', lambda name: name)
+    monkeypatch.setattr(extract, '_synth_budget_take', lambda: None)
+    monkeypatch.setattr(extract, '_record_usage', lambda *a, **kw: None)
+    barrier = Barrier(2, timeout=10)
+    calls = []
+
+    def run(argv, **kw):
+        cwd = Path(kw['cwd'])
+        sid = argv[-1]
+        assert '--no-session-persistence' in argv
+        assert list(cwd.iterdir()) == []
+        (cwd / 'isolation-check').write_text(kw['input'])
+        calls.append((cwd, sid))
+        barrier.wait()
+        assert (cwd / 'isolation-check').read_text() == kw['input']
+        assert sid in synth_cli.session_ids()
+        payload = {'session_id': sid, 'cwd': str(cwd),
+                   'transcript_path': str(cwd / 'session.jsonl')}
+        for event in ('Stop', 'SessionEnd'):
+            assert sc.hook_main(json.dumps(dict(payload, hook_event_name=event)),
+                                'claude_code')['reason'] == 'synth-cli'
+        assert sc.transcript_path(payload, 'claude_code') is None
+        return subprocess.CompletedProcess(argv, 0, json.dumps({'result': kw['input']}), '')
+
+    with mock.patch.object(extract.subprocess, 'run', side_effect=run), ThreadPoolExecutor(2) as pool:
+        results = list(pool.map(lambda p: extract._generate_claude_cli(
+            p, model_id='m', retries=0), ['first', 'second']))
+    assert results == ['first', 'second']
+    assert len({cwd for cwd, _ in calls}) == len({sid for _, sid in calls}) == 2
+    assert all(not cwd.exists() for cwd, _ in calls)
+    assert sc.queued_jobs() == [] and not sc.state_dir().exists()
 
 
 @pytest.mark.parametrize('provider', ['claude-cli', 'codex-cli'])

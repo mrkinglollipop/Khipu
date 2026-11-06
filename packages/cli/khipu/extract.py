@@ -466,7 +466,9 @@ def _generate_claude_cli(prompt: str, *, model_id: str, timeout: int = 60, retri
         try:
             sid = synth_cli.new_session()
             with tempfile.TemporaryDirectory(prefix="work-", dir=synth_cli.root()) as cwd:
-                argv = [cli, "-p", "--setting-sources", "", "--model", model_id,
+                # Keep per-call cwd isolation, but do not leave a Claude project
+                # namespace/transcript behind for each temporary directory.
+                argv = [cli, "-p", "--no-session-persistence", "--setting-sources", "", "--model", model_id,
                         "--system-prompt", CLAUDE_CLI_SYSTEM_PROMPT,
                         "--output-format", "json", "--max-turns", "1", "--disallowedTools",
                         "Bash,Edit,Write,Read,Glob,Grep,WebSearch,WebFetch,Agent", "--session-id", sid]
